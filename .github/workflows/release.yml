@@ -1,0 +1,69 @@
+name: Release
+
+# Fires when you push a version tag, e.g.:
+#     git tag v0.1.0
+#     git push origin v0.1.0
+# Builds a release binary on each OS and attaches it to a GitHub Release for
+# that tag (created automatically if it doesn't exist yet).
+on:
+  push:
+    tags: ["v*"]
+
+# Needed so the workflow can create the Release and upload assets.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Release (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: windows-latest
+            target: windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux GUI build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p schemaic-app
+
+      # Stage the binary alongside the license notices that must ship with a
+      # distributed build, then archive (.tar.gz on Linux, .zip on Windows).
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir dist
+          cp target/release/schemaic dist/
+          cp LICENSE THIRD-PARTY-NOTICES.md README.md dist/
+          cp crates/schemaic-ui/fonts/LICENSE.txt dist/IBMPlex-OFL.txt
+          cp licenses/Lucide-LICENSE.txt dist/
+          tar czf "schemaic-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" -C dist .
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/schemaic.exe dist/
+          Copy-Item LICENSE, THIRD-PARTY-NOTICES.md, README.md dist/
+          Copy-Item crates/schemaic-ui/fonts/LICENSE.txt dist/IBMPlex-OFL.txt
+          Copy-Item licenses/Lucide-LICENSE.txt dist/
+          Compress-Archive -Path dist/* -DestinationPath "schemaic-${{ github.ref_name }}-${{ matrix.target }}.zip"
+
+      - name: Publish to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: schemaic-${{ github.ref_name }}-${{ matrix.target }}.*

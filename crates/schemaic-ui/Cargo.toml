@@ -1,0 +1,12 @@
+[package]
+name = "schemaic-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+schemaic-core = { workspace = true }
+schemaic-term = { workspace = true }
+floem = { workspace = true }
+serde_json = { workspace = true }
+pulldown-cmark = { version = "0.13.4", default-features = false }

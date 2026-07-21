@@ -1,0 +1,16 @@
+[package]
+name = "schemaic-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+schemaic-core = { workspace = true }
+thiserror = { workspace = true }
+mysql_async = { workspace = true }
+futures-util = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+russh = { workspace = true }
+ssh-key = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,86 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/schemaic-core",
+    "crates/schemaic-db",
+    "crates/schemaic-ai",
+    "crates/schemaic-term",
+    "crates/schemaic-ui",
+    "crates/schemaic-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Schemaic contributors"]
+
+[workspace.dependencies]
+# Internal crates
+schemaic-core = { path = "crates/schemaic-core" }
+schemaic-db = { path = "crates/schemaic-db" }
+schemaic-ai = { path = "crates/schemaic-ai" }
+schemaic-term = { path = "crates/schemaic-term" }
+schemaic-ui = { path = "crates/schemaic-ui" }
+
+# UI
+# `rfd-tokio` enables the native file picker (`file_action::open_file`), used by
+# the Manage-Connections SSH key-pair "Browse…" button.
+floem = { version = "0.2.0", features = ["rfd-tokio"] }
+
+# Async / DB (wired in M1)
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+tokio-util = "0.7"
+# Async MySQL/MariaDB driver. We need per-column wire metadata (org_table /
+# org_name / key flags) for the editing system — sqlx's MySQL driver discards it.
+# `minimal` = no TLS/compression (the app connects over localhost SSH tunnels /
+# plain TCP, matching the old sqlx config which enabled no TLS either).
+mysql_async = { version = "0.34", default-features = false, features = ["minimal"] }
+futures-util = "0.3"
+# SSH tunnelling. Use the `ring` crypto backend instead of the default
+# `aws-lc-rs` to avoid the aws-lc-sys C/cmake build.
+russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
+# Version pinned to match russh's transitive dependency (for `ssh_key::PublicKey`).
+ssh-key = "=0.7.0-rc.11"
+
+# Errors / logging / serde
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Profiling build: release-grade optimization (so we measure real perf, not a slow
+# debug build) but with full debug symbols so a sampling profiler (samply, etc.) can
+# resolve stacks. Build with `cargo build --profile profiling -p schemaic-app`, then
+# `samply record target/profiling/schemaic.exe`. Kept separate from `release`.
+[profile.profiling]
+inherits = "release"
+debug = true
+
+# Dev-build performance. The app's per-frame work while scrolling lives almost
+# entirely in dependencies — Floem's layout/`virtual_stack`, `cosmic-text` shaping,
+# the vger/wgpu renderer — which run an order of magnitude slower when compiled
+# unoptimized. That was the "glitchy fast scrolling": an unoptimized-build artifact,
+# not a real bug (the optimized build scrolls 200k rows smoothly). So we optimize
+# **dependencies** at -O3 in dev to match release-grade scroll smoothness, while
+# keeping **our own crates** at opt-level 0 for fast incremental rebuilds +
+# debuggability. `package."*"` also matches our crates when they're built as
+# dependencies of `schemaic-app`, so each is pinned back to 0 explicitly.
+# One-time cost: a full -O3 rebuild of all dependencies (a few minutes, once).
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.schemaic-core]
+opt-level = 0
+[profile.dev.package.schemaic-db]
+opt-level = 0
+[profile.dev.package.schemaic-ai]
+opt-level = 0
+[profile.dev.package.schemaic-term]
+opt-level = 0
+[profile.dev.package.schemaic-ui]
+opt-level = 0
+[profile.dev.package.schemaic-app]
+opt-level = 0
