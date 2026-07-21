@@ -8,6 +8,9 @@
 # Claude Code local settings (per-machine permissions, etc.)
 .claude/
 
+# Private working notes — kept local, never published.
+TODO.md
+
 # Editor / IDE folders
 .vscode/
 .idea/

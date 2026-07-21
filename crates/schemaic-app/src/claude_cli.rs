@@ -10,9 +10,10 @@
 /// UI can honestly report a failed auto-detect instead of a phantom `claude`.
 pub(crate) fn detect_claude_bin() -> Option<String> {
     if let Ok(p) = std::env::var("SCHEMAIC_CLAUDE_BIN")
-        && !p.trim().is_empty() {
-            return Some(p);
-        }
+        && !p.trim().is_empty()
+    {
+        return Some(p);
+    }
     if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
         let exe = std::path::PathBuf::from(home)
             .join(".local")

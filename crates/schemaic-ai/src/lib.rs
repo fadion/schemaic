@@ -113,9 +113,10 @@ pub fn parse_stream_line(line: &str) -> Vec<StreamEvent> {
         Some("stream_event") => {
             if v.pointer("/event/type").and_then(|t| t.as_str()) == Some("content_block_delta")
                 && v.pointer("/event/delta/type").and_then(|t| t.as_str()) == Some("text_delta")
-                && let Some(t) = v.pointer("/event/delta/text").and_then(|t| t.as_str()) {
-                    return vec![StreamEvent::TextDelta(t.to_string())];
-                }
+                && let Some(t) = v.pointer("/event/delta/text").and_then(|t| t.as_str())
+            {
+                return vec![StreamEvent::TextDelta(t.to_string())];
+            }
             Vec::new()
         }
         // Full assistant message — used for tool_use blocks (text is streamed).
@@ -209,12 +210,13 @@ impl TurnState {
                 // *and* then runs it. Drop that echoed fence from the prose so
                 // the SQL shows once — in the chip.
                 if let Some(sql) = sql
-                    && let Some(Seg::Text(s)) = self.segs.last_mut() {
-                        strip_matching_fence(s, sql);
-                        if s.trim().is_empty() {
-                            self.segs.pop();
-                        }
+                    && let Some(Seg::Text(s)) = self.segs.last_mut()
+                {
+                    strip_matching_fence(s, sql);
+                    if s.trim().is_empty() {
+                        self.segs.pop();
                     }
+                }
                 self.segs.push(Seg::Tool(ToolCall {
                     name: name.clone(),
                     sql: sql.clone(),

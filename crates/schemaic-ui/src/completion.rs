@@ -400,10 +400,11 @@ fn tables_in_scope(sql: &str, lo: usize, hi: usize, caret: usize) -> Vec<TableRe
                     }
                     i += 1;
                     if matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::Dot))
-                        && let Some(second) = toks.get(i + 1).and_then(|t| word(&t.kind)) {
-                            name = second;
-                            i += 2;
-                        }
+                        && let Some(second) = toks.get(i + 1).and_then(|t| word(&t.kind))
+                    {
+                        name = second;
+                        i += 2;
+                    }
                     // Optional alias: `AS x` or a bare non-keyword word.
                     let mut alias = None;
                     match toks.get(i).map(|t| &t.kind) {

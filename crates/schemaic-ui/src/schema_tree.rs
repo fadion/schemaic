@@ -288,9 +288,10 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                     }
                     Some(i) if rows[i].expandable => {
                         if let Some(child) = rows.get(i + 1)
-                            && child.parent.as_deref() == Some(rows[i].key.as_str()) {
-                                nav.selected.set(Some(child.key.clone()));
-                            }
+                            && child.parent.as_deref() == Some(rows[i].key.as_str())
+                        {
+                            nav.selected.set(Some(child.key.clone()));
+                        }
                     }
                     Some(_) => {}
                     None => nav.selected.set(Some(rows[0].key.clone())),

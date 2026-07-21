@@ -340,14 +340,13 @@ pub(crate) fn render_markdown(src: &str, actions: CodeActions) -> impl IntoView 
                     table_head_rows = 1;
                 }
                 TagEnd::TableRow => table_rows.push(std::mem::take(&mut cur_row)),
-                TagEnd::Table
-                    if !table_rows.is_empty() => {
-                        out.push(md_table(
-                            std::mem::take(&mut table_rows),
-                            table_head_rows,
-                            base,
-                        ));
-                    }
+                TagEnd::Table if !table_rows.is_empty() => {
+                    out.push(md_table(
+                        std::mem::take(&mut table_rows),
+                        table_head_rows,
+                        base,
+                    ));
+                }
                 _ => {}
             },
             Event::Text(t) => {

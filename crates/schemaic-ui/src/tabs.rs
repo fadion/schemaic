@@ -109,10 +109,11 @@ fn tab_chip(tab: Tab, active: RwSignal<usize>, close_tab: Rc<dyn Fn(usize)>) -> 
         // last tab is handled specially by `close_tab` (clear + brief flash).
         .on_event(EventListener::PointerDown, move |e| {
             if let Event::PointerDown(pe) = e
-                && pe.button.is_auxiliary() {
-                    (close_tab)(tab.id);
-                    return EventPropagation::Stop;
-                }
+                && pe.button.is_auxiliary()
+            {
+                (close_tab)(tab.id);
+                return EventPropagation::Stop;
+            }
             EventPropagation::Continue
         })
         // Top-rounded tab: drawn `TAB_RADIUS` px taller than the bar with a

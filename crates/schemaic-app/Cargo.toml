@@ -21,3 +21,9 @@ serde_json = { workspace = true }
 crossbeam-channel = "0.5"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Decode the embedded window-icon PNG to RGBA at startup (png feature only).
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Embed the app icon into the Windows .exe (Explorer/taskbar icon of the file).
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

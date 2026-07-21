@@ -26,20 +26,20 @@ Zed-inspired, aiming to replace DataGrip.
   the "block" style, **preserving keyword case verbatim**; built on the same `skip_noncode`
   boundary lexer so `#`/`--` comments, strings, and backtick identifiers pass through untouched;
   indent unit follows the editor tab-width/soft-tabs settings). The
-  UI/app keep thin wrappers over these; regression tests for the review's C1–C5/C7/H1/H2 live here.
+  UI/app keep thin wrappers over these; the regression tests live here too.
 - `schemaic-db` — MySQL/MariaDB connectivity (`mysql_async`) + SSH tunnels. Populates each
   result column's `origin` (real table/column + key flags) from the wire protocol. The
   connection **identity** is the `Db` handle (`Db::connect(&Connection, tunnel_port)`), not a
   `mysql://user:pass@host/db` URL: credentials go to the driver via `OptsBuilder` (so passwords
-  with `@ / # ? %` need no escaping, and no plaintext URL is threaded anywhere — review §3.1/B7).
+  with `@ / # ? %` need no escaping, and no plaintext URL is threaded anywhere).
   `fetch_query`/`run_batch`/`fetch_schema`/`ping`/`commit_writes`/`refetch_rows` are `Db` methods
   taking the target database per call. SSH tunnels return a `TunnelHandle` (drop → listener/port freed) with
   keepalives + TOFU host-key verification (`ssh_known_hosts.json`).
 - `schemaic-ai` — persistent `claude` CLI session (stream-json), turn parsing.
 - `schemaic-term` — terminal panel + shell.
-- `schemaic-ui` — the Floem UI. `lib.rs` is large (being split into modules, review Phase 4);
+- `schemaic-ui` — the Floem UI. `lib.rs` is large (being split into modules);
   it holds the central `Ui` struct (threaded everywhere) and the `workspace`/panel views. `Ui`
-  is split per-domain (review §3.3): `Copy` signal bundles (`TabsUi`/`SchemaUi`/`ConnUi`/`AiUi`/
+  is split per-domain: `Copy` signal bundles (`TabsUi`/`SchemaUi`/`ConnUi`/`AiUi`/
   `TermUi`/`LayoutUi`/`OverlayUi`) + `Rc<…Actions>` callback bundles — so `ui.run` is
   `ui.tab_actions.run`, `ui.db_nodes` is `ui.schema.db_nodes`, the tabs signal is `ui.tabs_ui.tabs`.
   Extracted so far: `consts.rs` (layout/dimension constants, glob-imported), `widgets.rs`
@@ -71,37 +71,37 @@ Zed-inspired, aiming to replace DataGrip.
 - `schemaic-app` — `main.rs` wires signals + callbacks and builds the `Ui`; also the
   built-in MCP server (`--mcp-serve`) the AI panel talks to. A query tab's identity is
   `(conn_id, database)`; the app resolves `conn_id` → a `Db` at run time (`db_for`), so a tab
-  keeps running against the connection it was opened under after a connection switch (review H13).
+  keeps running against the connection it was opened under after a connection switch.
   The MCP subprocess receives its DB endpoint as JSON in `$SCHEMAIC_MCP_ENDPOINT`, set via a
   per-session temp `--mcp-config` file (removed on session drop) — never a command-line arg, so
-  credentials don't leak to other same-user processes (review C6). The pure free-function
+  credentials don't leak to other same-user processes. The pure free-function
   clusters are split out: `claude_cli.rs` (`claude` binary discovery — PATH/PATHEXT/override
   resolution) and `ai.rs` (`AiSession`/`start_ai_session` streaming, MCP-config plumbing,
   `ai_context`/`inline_system_prompt`). The reactive wiring (the `app_view` closures) stays in
   `main.rs`.
 
-## Invariants from the architecture review (don't regress these)
+## Architecture invariants (don't regress these)
 
-These are mistakes the Fable 5 review found and fixed; re-introducing them is a regression:
+These are load-bearing invariants; re-introducing the anti-patterns they guard against is a regression:
 
 - **One SQL boundary lexer.** Any code that scans SQL for string / `-- ` / `#` / `/* */` /
   backtick boundaries MUST build on `schemaic_core::sql::skip_noncode` (statement split, WHERE
   guard, AI read-only gate, `tokenize_range`, `syntax_errors`, `sql_highlight`). Never hand-roll a
-  second scanner — five drifting copies was the original bug (§3.4).
+  second scanner — five drifting copies was the original bug.
 - **Connection identity is the `Db` handle / `conn_id`, never a `mysql://user:pass@host/db` URL.**
   Credentials go through `OptsBuilder`; they never appear in a URL, a command-line arg, or a log.
-  The MCP subprocess gets its endpoint via a temp `--mcp-config` file, not argv (C6). Don't add new
-  plaintext-secret surfaces (at-rest `connections.json` is still plaintext — keyring is a TODO).
+  The MCP subprocess gets its endpoint via a temp `--mcp-config` file, not argv. Don't add new
+  plaintext-secret surfaces.
 - **Own per-entity signals in a child `Scope`; dispose it *deferred*.** A `Tab` / `ConnNode` creates
   its signals in `parent.create_child()`, and the code that removes it disposes that scope via
   `exec_after(Duration::ZERO, …)` — one tick later, *after* the keyed `dyn_container` has rebuilt
   and unmounted the old view. Disposing synchronously frees signals a still-mounted view reads this
-  frame → disposed-signal panic (C14). Same deferral for any "replace + free" of scoped state.
+  frame → disposed-signal panic. Same deferral for any "replace + free" of scoped state.
 - **Themable colors reach reactive styles as `fn() -> Color`, never a captured `Color`.** A `Color`
   read once at build freezes and won't follow a live theme switch; pass the theme fn and call it
   inside the `.style(move |s| …)` closure (see `FieldCfg::background`/`text_color`).
 - **Pure logic lives in `schemaic-core` with unit tests** — SQL boundaries, edit-model analysis,
-  export (incl. CSV formula-injection guard), diff, DDL. The UI keeps thin wrappers (§5).
+  export (incl. CSV formula-injection guard), diff, DDL. The UI keeps thin wrappers.
 - **Write-back is transactional with a 1-row safety net.** `commit_writes` runs a `GridWrite`
   (row `DELETE`s → cell `UPDATE`s → new-row `INSERT`s) in one transaction and requires each
   statement to affect exactly 1 row (else roll back all) — so an over-optimistic updatability
@@ -122,6 +122,10 @@ These are mistakes the Fable 5 review found and fixed; re-introducing them is a 
 
 ## Commits & releases
 
+- **Never commit unless the user explicitly asks.** Making edits does **not** imply
+  committing them — leave changes in the working tree for the user to review. Run
+  `git commit` only on an explicit request (same for `git tag` / `git push`).
+  Amending an existing commit is fine when the user is iterating on one.
 - **Commit format: Conventional Commits** — `type(scope): subject`, subject in
   imperative mood, no trailing period, lower-case after the colon. Types:
   `feat` / `fix` / `refactor` / `perf` / `docs` / `test` / `chore` / `build` / `ci`.
