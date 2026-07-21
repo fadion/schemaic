@@ -1,0 +1,23 @@
+[package]
+name = "schemaic-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "schemaic"
+path = "src/main.rs"
+
+[dependencies]
+schemaic-core = { workspace = true }
+schemaic-ui = { workspace = true }
+schemaic-db = { workspace = true }
+schemaic-ai = { workspace = true }
+schemaic-term = { workspace = true }
+floem = { workspace = true }
+tokio = { workspace = true, features = ["process", "io-util", "io-std"] }
+tokio-util = { workspace = true }
+serde_json = { workspace = true }
+crossbeam-channel = "0.5"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

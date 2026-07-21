@@ -1,0 +1,19 @@
+#!/bin/sh
+# Schemaic pre-commit hook: rejects unformatted code and clippy warnings.
+#
+# Enable once per clone (the hook is not active until you point git at it):
+#     git config core.hooksPath .githooks
+#
+# Bypass for a single commit with:  git commit --no-verify
+# CI should re-run these (plus `cargo deny check` and `cargo test`) since hooks
+# can be skipped locally.
+
+set -e
+
+echo "pre-commit › cargo fmt --check"
+cargo fmt --all -- --check
+
+echo "pre-commit › cargo clippy (warnings = errors)"
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "pre-commit › ok"

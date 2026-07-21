@@ -1,0 +1,31 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# Generated third-party license manifest (regenerate with cargo-about)
+/THIRD-PARTY-LICENSES.html
+
+# Claude Code local settings (per-machine permissions, etc.)
+.claude/
+
+# Editor / IDE folders
+.vscode/
+.idea/
+.vs/
+.zed/
+*.iml
+*.sublime-workspace
+*.sublime-project
+
+# Editor swap / backup files
+*.swp
+*.swo
+*~
+\#*\#
+.\#*
+Session.vim
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini

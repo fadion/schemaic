@@ -1,0 +1,12 @@
+[package]
+name = "schemaic-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+portable-pty = "0.8"
+alacritty_terminal = "0.24"
+anyhow = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }

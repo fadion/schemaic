@@ -1,0 +1,23 @@
+# Normalize line endings: store everything as LF in the repo so Linux/CI builds
+# are clean regardless of contributors' OS or local git config. Git for Windows
+# still checks files out with whatever your editor prefers.
+* text=auto eol=lf
+
+# Explicit text types (belt-and-suspenders for the auto detection above).
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.txt   text eol=lf
+*.sh    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+Cargo.lock text eol=lf
+.githooks/* text eol=lf
+
+# Binary assets — never touch line endings.
+*.ttf   binary
+*.otf   binary
+*.png   binary
+*.jpg   binary
+*.ico   binary
