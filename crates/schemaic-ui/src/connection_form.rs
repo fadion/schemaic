@@ -62,9 +62,10 @@ fn key_pair_fields(draft: DraftSignals) -> impl IntoView {
                 FileDialogOptions::new().title("Select private key"),
                 move |file| {
                     if let Some(info) = file
-                        && let Some(path) = info.path.first() {
-                            key_sig.set(path.to_string_lossy().to_string());
-                        }
+                        && let Some(path) = info.path.first()
+                    {
+                        key_sig.set(path.to_string_lossy().to_string());
+                    }
                 },
             )
         })

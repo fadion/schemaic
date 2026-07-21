@@ -1045,34 +1045,35 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // replace, plus the caret point for anchoring the popup.
         if mods.control()
             && let KeyInput::Keyboard(Key::Character(c), _) = &kp.key
-                && c.as_str().eq_ignore_ascii_case("k") {
-                    editor_sig.with_untracked(|e| {
-                        let cur = e.cursor.get_untracked();
-                        let offset = cur.offset();
-                        let (a, b) = cur.get_selection().unwrap_or((offset, offset));
-                        // Normalize: a backward selection (dragged or shift-selected
-                        // right-to-left) reports start > end, which makes the later
-                        // `sql.get(start..end)` slice return None → the snippet is
-                        // dropped and Ctrl+K silently ignores the selection.
-                        let (start, end) = (a.min(b), a.max(b));
-                        cmdk.start.set(start);
-                        cmdk.end.set(end);
-                        // Anchor to the BOTTOM of the caret's line (absolute
-                        // screen coords via `points_of_offset().1`), not the
-                        // per-line baseline `line_point_of_offset` returns —
-                        // that baseline is ~0 on an empty line but ~font-ascent
-                        // once the line has glyphs, which shoved the box down
-                        // whenever the editor had code.
-                        let (_, mut below) = e.points_of_offset(offset, CursorAffinity::Backward);
-                        below.y += EDITOR_PAD_TOP;
-                        cmdk.point.set(below);
-                    });
-                    cmdk.input.set(String::new());
-                    inline_ai.set(InlineAiState::Idle);
-                    comp.open.set(false);
-                    cmdk.open.set(true);
-                    return CommandExecuted::Yes;
-                }
+            && c.as_str().eq_ignore_ascii_case("k")
+        {
+            editor_sig.with_untracked(|e| {
+                let cur = e.cursor.get_untracked();
+                let offset = cur.offset();
+                let (a, b) = cur.get_selection().unwrap_or((offset, offset));
+                // Normalize: a backward selection (dragged or shift-selected
+                // right-to-left) reports start > end, which makes the later
+                // `sql.get(start..end)` slice return None → the snippet is
+                // dropped and Ctrl+K silently ignores the selection.
+                let (start, end) = (a.min(b), a.max(b));
+                cmdk.start.set(start);
+                cmdk.end.set(end);
+                // Anchor to the BOTTOM of the caret's line (absolute
+                // screen coords via `points_of_offset().1`), not the
+                // per-line baseline `line_point_of_offset` returns —
+                // that baseline is ~0 on an empty line but ~font-ascent
+                // once the line has glyphs, which shoved the box down
+                // whenever the editor had code.
+                let (_, mut below) = e.points_of_offset(offset, CursorAffinity::Backward);
+                below.y += EDITOR_PAD_TOP;
+                cmdk.point.set(below);
+            });
+            cmdk.input.set(String::new());
+            inline_ai.set(InlineAiState::Idle);
+            comp.open.set(false);
+            cmdk.open.set(true);
+            return CommandExecuted::Yes;
+        }
         // Ctrl+Alt+L — reformat SQL (DataGrip's shortcut). Match the *physical* L
         // key, not the produced character: on Windows Ctrl+Alt is delivered as
         // AltGr, so the logical `Key::Character` may not be "l".
@@ -1092,129 +1093,128 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         // token, so the toggle is computed in `core::text_ops` and applied as one
         // full-buffer edit (a single undo step). Ctrl+X diverges from DataGrip
         // (which cuts) — here it deletes the line.
-        if mods.control() && !mods.shift()
-            && let KeyInput::Keyboard(Key::Character(c), _) = &kp.key {
-                let c = c.as_str();
-                if c == "/" {
-                    editor_sig.with_untracked(|e| {
+        if mods.control()
+            && !mods.shift()
+            && let KeyInput::Keyboard(Key::Character(c), _) = &kp.key
+        {
+            let c = c.as_str();
+            if c == "/" {
+                editor_sig.with_untracked(|e| {
+                    let doc = e.doc();
+                    let full = doc.text().to_string();
+                    let cur = e.cursor.get_untracked();
+                    let off = cur.offset();
+                    let (a, b) = cur.get_selection().unwrap_or((off, off));
+                    let edit = toggle_line_comment(&full, a.min(b), a.max(b));
+                    doc.edit_single(
+                        Selection::region(0, full.len()),
+                        &edit.text,
+                        EditType::ToggleComment,
+                    );
+                    e.cursor
+                        .update(|cc| cc.set_insert(Selection::region(edit.sel.0, edit.sel.1)));
+                });
+                return CommandExecuted::Yes;
+            }
+            if c.eq_ignore_ascii_case("d") {
+                editor_sig.with_untracked(|e| {
+                    let has_sel = e
+                        .cursor
+                        .get_untracked()
+                        .get_selection()
+                        .is_some_and(|(a, b)| a != b);
+                    if has_sel {
+                        // Selection: duplicate the spanned line(s) (Floem default).
+                        e.doc().run_command(
+                            e,
+                            &Command::Edit(EditCommand::DuplicateLineDown),
+                            Some(1),
+                            mods,
+                        );
+                    } else {
+                        // Bare caret: copy the whole current line onto a fresh line
+                        // below. Done manually because Floem's DuplicateLineDown
+                        // slices `line_start..next_line_start`, so on a line with no
+                        // trailing newline (the last line) the copy has no `\n` and
+                        // lands on the *same* line. Prepending `\n` guarantees a new
+                        // line below regardless.
                         let doc = e.doc();
                         let full = doc.text().to_string();
-                        let cur = e.cursor.get_untracked();
-                        let off = cur.offset();
-                        let (a, b) = cur.get_selection().unwrap_or((off, off));
-                        let edit = toggle_line_comment(&full, a.min(b), a.max(b));
-                        doc.edit_single(
-                            Selection::region(0, full.len()),
-                            &edit.text,
-                            EditType::ToggleComment,
-                        );
-                        e.cursor
-                            .update(|cc| cc.set_insert(Selection::region(edit.sel.0, edit.sel.1)));
-                    });
-                    return CommandExecuted::Yes;
-                }
-                if c.eq_ignore_ascii_case("d") {
-                    editor_sig.with_untracked(|e| {
-                        let has_sel = e
-                            .cursor
-                            .get_untracked()
-                            .get_selection()
-                            .is_some_and(|(a, b)| a != b);
-                        if has_sel {
-                            // Selection: duplicate the spanned line(s) (Floem default).
-                            e.doc().run_command(
-                                e,
-                                &Command::Edit(EditCommand::DuplicateLineDown),
-                                Some(1),
-                                mods,
-                            );
-                        } else {
-                            // Bare caret: copy the whole current line onto a fresh line
-                            // below. Done manually because Floem's DuplicateLineDown
-                            // slices `line_start..next_line_start`, so on a line with no
-                            // trailing newline (the last line) the copy has no `\n` and
-                            // lands on the *same* line. Prepending `\n` guarantees a new
-                            // line below regardless.
-                            let doc = e.doc();
-                            let full = doc.text().to_string();
-                            let off = e.cursor.get_untracked().offset();
-                            let ls = full[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                            let le = full[off..]
-                                .find('\n')
-                                .map(|i| off + i)
-                                .unwrap_or(full.len());
-                            let insert = format!("\n{}", &full[ls..le]);
-                            doc.edit_single(
-                                Selection::region(le, le),
-                                &insert,
-                                EditType::InsertChars,
-                            );
-                            // Keep the caret at the same column on the duplicated line.
-                            let new_caret = le + 1 + (off - ls);
-                            e.cursor.update(|c| c.set_offset(new_caret, false, false));
-                        }
-                    });
-                    return CommandExecuted::Yes;
-                }
-                if c.eq_ignore_ascii_case("x") {
-                    // Selection-aware: with a selection, fall through to the default
-                    // handler's Ctrl+X = cut; on a bare caret, delete the line.
-                    let has_sel = editor_sig.with_untracked(|e| {
-                        e.cursor
-                            .get_untracked()
-                            .get_selection()
-                            .is_some_and(|(a, b)| a != b)
-                    });
-                    if !has_sel {
-                        editor_sig.with_untracked(|e| {
-                            e.doc().run_command(
-                                e,
-                                &Command::Edit(EditCommand::DeleteLine),
-                                Some(1),
-                                mods,
-                            );
-                        });
-                        return CommandExecuted::Yes;
+                        let off = e.cursor.get_untracked().offset();
+                        let ls = full[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                        let le = full[off..]
+                            .find('\n')
+                            .map(|i| off + i)
+                            .unwrap_or(full.len());
+                        let insert = format!("\n{}", &full[ls..le]);
+                        doc.edit_single(Selection::region(le, le), &insert, EditType::InsertChars);
+                        // Keep the caret at the same column on the duplicated line.
+                        let new_caret = le + 1 + (off - ls);
+                        e.cursor.update(|c| c.set_offset(new_caret, false, false));
                     }
-                    // else: fall through → default handler cuts the selection.
-                }
-                if c.eq_ignore_ascii_case("f") {
-                    // Open the find bar (its input autofocuses on mount).
-                    find_open.set(true);
+                });
+                return CommandExecuted::Yes;
+            }
+            if c.eq_ignore_ascii_case("x") {
+                // Selection-aware: with a selection, fall through to the default
+                // handler's Ctrl+X = cut; on a bare caret, delete the line.
+                let has_sel = editor_sig.with_untracked(|e| {
+                    e.cursor
+                        .get_untracked()
+                        .get_selection()
+                        .is_some_and(|(a, b)| a != b)
+                });
+                if !has_sel {
+                    editor_sig.with_untracked(|e| {
+                        e.doc().run_command(
+                            e,
+                            &Command::Edit(EditCommand::DeleteLine),
+                            Some(1),
+                            mods,
+                        );
+                    });
                     return CommandExecuted::Yes;
                 }
+                // else: fall through → default handler cuts the selection.
             }
+            if c.eq_ignore_ascii_case("f") {
+                // Open the find bar (its input autofocuses on mount).
+                find_open.set(true);
+                return CommandExecuted::Yes;
+            }
+        }
         // Panel toggles (also handled at the workspace root for non-editor
         // focus). Ctrl+Shift+E = Schema, Ctrl+Shift+A = AI, Ctrl+` = Terminal.
         // AI/Terminal share the right slot, so each key shows-or-hides its panel.
         if mods.control()
-            && let KeyInput::Keyboard(Key::Character(c), _) = &kp.key {
-                let c = c.as_str();
-                if mods.shift() && c.eq_ignore_ascii_case("e") {
-                    schema_visible.update(|v| *v = !*v);
-                    return CommandExecuted::Yes;
-                }
-                if mods.shift() && c.eq_ignore_ascii_case("a") {
-                    right_panel.update(|p| {
-                        *p = if matches!(*p, RightPanel::Ai) {
-                            RightPanel::None
-                        } else {
-                            RightPanel::Ai
-                        };
-                    });
-                    return CommandExecuted::Yes;
-                }
-                if c == "`" {
-                    right_panel.update(|p| {
-                        *p = if matches!(*p, RightPanel::Terminal) {
-                            RightPanel::None
-                        } else {
-                            RightPanel::Terminal
-                        };
-                    });
-                    return CommandExecuted::Yes;
-                }
+            && let KeyInput::Keyboard(Key::Character(c), _) = &kp.key
+        {
+            let c = c.as_str();
+            if mods.shift() && c.eq_ignore_ascii_case("e") {
+                schema_visible.update(|v| *v = !*v);
+                return CommandExecuted::Yes;
             }
+            if mods.shift() && c.eq_ignore_ascii_case("a") {
+                right_panel.update(|p| {
+                    *p = if matches!(*p, RightPanel::Ai) {
+                        RightPanel::None
+                    } else {
+                        RightPanel::Ai
+                    };
+                });
+                return CommandExecuted::Yes;
+            }
+            if c == "`" {
+                right_panel.update(|p| {
+                    *p = if matches!(*p, RightPanel::Terminal) {
+                        RightPanel::None
+                    } else {
+                        RightPanel::Terminal
+                    };
+                });
+                return CommandExecuted::Yes;
+            }
+        }
         if mods.control() && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Enter), _)) {
             let sql = query.get_untracked();
             editor_sig.with_untracked(|e| {
@@ -1362,18 +1362,19 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             EventListener::PointerWheel,
             Box::new(move |e| {
                 if let Event::PointerWheel(pe) = e
-                    && pe.modifiers.shift() {
-                        // Windows delivers shift+wheel as a vertical delta; map it to x.
-                        let dx = if pe.delta.x != 0.0 {
-                            pe.delta.x
-                        } else {
-                            pe.delta.y
-                        };
-                        if dx != 0.0 {
-                            ed_wheel.scroll_delta.set(floem::kurbo::Vec2::new(dx, 0.0));
-                        }
-                        return EventPropagation::Stop;
+                    && pe.modifiers.shift()
+                {
+                    // Windows delivers shift+wheel as a vertical delta; map it to x.
+                    let dx = if pe.delta.x != 0.0 {
+                        pe.delta.x
+                    } else {
+                        pe.delta.y
+                    };
+                    if dx != 0.0 {
+                        ed_wheel.scroll_delta.set(floem::kurbo::Vec2::new(dx, 0.0));
                     }
+                    return EventPropagation::Stop;
+                }
                 EventPropagation::Continue
             }),
         );
@@ -1698,31 +1699,33 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         })
         .on_event(EventListener::PointerDown, move |e| {
             if let Event::PointerDown(pe) = e
-                && pe.button.is_primary() {
-                    v_grab.set(pe.pos.y); // offset within the thumb where grabbed
-                    v_drag.set(true);
-                    vid.request_active(); // capture moves even off the thumb
-                    return EventPropagation::Stop;
-                }
+                && pe.button.is_primary()
+            {
+                v_grab.set(pe.pos.y); // offset within the thumb where grabbed
+                v_drag.set(true);
+                vid.request_active(); // capture moves even off the thumb
+                return EventPropagation::Stop;
+            }
             EventPropagation::Continue
         })
         .on_event(EventListener::PointerMove, move |e| {
             if v_drag.get_untracked()
-                && let Event::PointerMove(pe) = e {
-                    if let Some((track_h, thumb_h, max_scroll)) = v_geo(&ed_vdrag) {
-                        let vp = ed_vdrag.viewport.get_untracked();
-                        let cur_rel = vp.y0 / max_scroll * (track_h - thumb_h);
-                        // `pe.pos.y` is relative to the (moving) thumb origin, so the
-                        // delta from the grab offset is how far to shift the thumb.
-                        let new_rel = (cur_rel + pe.pos.y - v_grab.get_untracked())
-                            .clamp(0.0, track_h - thumb_h);
-                        let y = new_rel / (track_h - thumb_h) * max_scroll;
-                        ed_vdrag
-                            .scroll_to
-                            .set(Some(floem::kurbo::Vec2::new(vp.x0, y)));
-                    }
-                    return EventPropagation::Stop;
+                && let Event::PointerMove(pe) = e
+            {
+                if let Some((track_h, thumb_h, max_scroll)) = v_geo(&ed_vdrag) {
+                    let vp = ed_vdrag.viewport.get_untracked();
+                    let cur_rel = vp.y0 / max_scroll * (track_h - thumb_h);
+                    // `pe.pos.y` is relative to the (moving) thumb origin, so the
+                    // delta from the grab offset is how far to shift the thumb.
+                    let new_rel =
+                        (cur_rel + pe.pos.y - v_grab.get_untracked()).clamp(0.0, track_h - thumb_h);
+                    let y = new_rel / (track_h - thumb_h) * max_scroll;
+                    ed_vdrag
+                        .scroll_to
+                        .set(Some(floem::kurbo::Vec2::new(vp.x0, y)));
                 }
+                return EventPropagation::Stop;
+            }
             EventPropagation::Continue
         })
         .on_event(EventListener::PointerUp, move |_| {
@@ -1790,29 +1793,31 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         })
         .on_event(EventListener::PointerDown, move |e| {
             if let Event::PointerDown(pe) = e
-                && pe.button.is_primary() {
-                    h_grab.set(pe.pos.x);
-                    h_drag.set(true);
-                    hid.request_active();
-                    return EventPropagation::Stop;
-                }
+                && pe.button.is_primary()
+            {
+                h_grab.set(pe.pos.x);
+                h_drag.set(true);
+                hid.request_active();
+                return EventPropagation::Stop;
+            }
             EventPropagation::Continue
         })
         .on_event(EventListener::PointerMove, move |e| {
             if h_drag.get_untracked()
-                && let Event::PointerMove(pe) = e {
-                    if let Some((avail, thumb_w, max_scroll)) = h_geo(&ed_hdrag) {
-                        let vp = ed_hdrag.viewport.get_untracked();
-                        let cur_rel = vp.x0 / max_scroll * (avail - thumb_w);
-                        let new_rel = (cur_rel + pe.pos.x - h_grab.get_untracked())
-                            .clamp(0.0, avail - thumb_w);
-                        let x = new_rel / (avail - thumb_w) * max_scroll;
-                        ed_hdrag
-                            .scroll_to
-                            .set(Some(floem::kurbo::Vec2::new(x, vp.y0)));
-                    }
-                    return EventPropagation::Stop;
+                && let Event::PointerMove(pe) = e
+            {
+                if let Some((avail, thumb_w, max_scroll)) = h_geo(&ed_hdrag) {
+                    let vp = ed_hdrag.viewport.get_untracked();
+                    let cur_rel = vp.x0 / max_scroll * (avail - thumb_w);
+                    let new_rel =
+                        (cur_rel + pe.pos.x - h_grab.get_untracked()).clamp(0.0, avail - thumb_w);
+                    let x = new_rel / (avail - thumb_w) * max_scroll;
+                    ed_hdrag
+                        .scroll_to
+                        .set(Some(floem::kurbo::Vec2::new(x, vp.y0)));
                 }
+                return EventPropagation::Stop;
+            }
             EventPropagation::Continue
         })
         .on_event(EventListener::PointerUp, move |_| {

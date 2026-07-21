@@ -76,10 +76,11 @@ struct EventProxy {
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         if let Event::PtyWrite(text) = event
-            && let Ok(mut w) = self.writer.lock() {
-                let _ = w.write_all(text.as_bytes());
-                let _ = w.flush();
-            }
+            && let Ok(mut w) = self.writer.lock()
+        {
+            let _ = w.write_all(text.as_bytes());
+            let _ = w.flush();
+        }
     }
 }
 
@@ -325,12 +326,14 @@ impl Terminal {
         // Bar/underline shapes skip this and are overlaid by the UI.
         if bake_block
             && let Some((cr, cc)) = cursor
-                && cr < lines && cc < cols {
-                    let cell = &mut grid[cr][cc];
-                    let glyph_fg = DEFAULT_BG;
-                    cell.fg = glyph_fg;
-                    cell.bg = Some(CURSOR);
-                }
+            && cr < lines
+            && cc < cols
+        {
+            let cell = &mut grid[cr][cc];
+            let glyph_fg = DEFAULT_BG;
+            cell.fg = glyph_fg;
+            cell.bg = Some(CURSOR);
+        }
 
         let total_lines = term.grid().history_size() + lines;
         let rows = grid.into_iter().map(coalesce_row).collect();
@@ -407,9 +410,9 @@ impl CellData {
     ) -> Self {
         let flags = cell.flags;
         // Wide-char spacers hold no glyph of their own.
-        let c = if flags.intersects(
-            Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::HIDDEN,
-        ) {
+        let c = if flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::HIDDEN)
+        {
             // Spacer cells hold no glyph; hidden cells render blank.
             ' '
         } else {
@@ -522,10 +525,7 @@ fn coalesce_row(cells: Vec<CellData>) -> Row {
     Row { runs }
 }
 
-fn resolve_color(
-    c: AnsiColor,
-    palette: &alacritty_terminal::term::color::Colors,
-) -> (u8, u8, u8) {
+fn resolve_color(c: AnsiColor, palette: &alacritty_terminal::term::color::Colors) -> (u8, u8, u8) {
     match c {
         AnsiColor::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
         AnsiColor::Indexed(i) => palette[i as usize]

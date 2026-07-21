@@ -920,27 +920,29 @@ fn col_resize_handle(gs: GridState, ci: usize) -> impl IntoView {
     })
     .on_event(EventListener::PointerDown, move |e| {
         if let Event::PointerDown(pe) = e
-            && pe.button.is_primary() {
-                dragging.set(true);
-                hid.request_active();
-                return EventPropagation::Stop;
-            }
+            && pe.button.is_primary()
+        {
+            dragging.set(true);
+            hid.request_active();
+            return EventPropagation::Stop;
+        }
         EventPropagation::Continue
     })
     .on_event(EventListener::PointerMove, move |e| {
         if dragging.get_untracked()
-            && let Event::PointerMove(pe) = e {
-                // Same moving-handle trick as `v_resize_handle`: the divider
-                // re-centres on the column edge each frame, so the offset from
-                // centre is the incremental delta.
-                let d = pe.pos.x - RESIZE_HIT_W / 2.0;
-                gs.widths.update(|w| {
-                    if let Some(x) = w.get_mut(ci) {
-                        *x = (*x + d).clamp(MIN_COL_W, 1200.0);
-                    }
-                });
-                return EventPropagation::Stop;
-            }
+            && let Event::PointerMove(pe) = e
+        {
+            // Same moving-handle trick as `v_resize_handle`: the divider
+            // re-centres on the column edge each frame, so the offset from
+            // centre is the incremental delta.
+            let d = pe.pos.x - RESIZE_HIT_W / 2.0;
+            gs.widths.update(|w| {
+                if let Some(x) = w.get_mut(ci) {
+                    *x = (*x + d).clamp(MIN_COL_W, 1200.0);
+                }
+            });
+            return EventPropagation::Stop;
+        }
         EventPropagation::Continue
     })
     .on_event(EventListener::PointerUp, move |_| {
@@ -2494,14 +2496,14 @@ fn set_format(gs: GridState, ci: usize, fmt: ColumnFormat) {
             .columns
             .get(ci)
             .map(|c| c.name.clone())
-        {
-            let conn = gs.conn_id.get_untracked();
-            gs.fmt_rules
-                .update(|rules| format::upsert(rules, conn, &db, &table, &col, fmt));
-            if let Some(save) = gs.save_formats.get_untracked() {
-                (save)();
-            }
+    {
+        let conn = gs.conn_id.get_untracked();
+        gs.fmt_rules
+            .update(|rules| format::upsert(rules, conn, &db, &table, &col, fmt));
+        if let Some(save) = gs.save_formats.get_untracked() {
+            (save)();
         }
+    }
 }
 
 /// The "Format as" submenu entries for a column header (current choice checked).

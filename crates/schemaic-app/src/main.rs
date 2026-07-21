@@ -31,14 +31,20 @@ use floem::kurbo::Size;
 use floem::reactive::{
     RwSignal, Scope, SignalGet, SignalUpdate, SignalWith, create_effect, create_memo,
 };
-use floem::window::WindowConfig;
+use floem::window::{Icon, WindowConfig};
 use schemaic_core::connection::{ConnStatus, Connection};
 use schemaic_core::model::{CommitDone, GridWrite, QueryState, RefetchRequest};
 
 /// Outcome of a background connect + schema-load task: `(tunnel port, tunnel
 /// handle, database names)` on success, or an error message.
-type ConnectResult =
-    Result<(Option<u16>, Option<schemaic_db::ssh::TunnelHandle>, Vec<String>), String>;
+type ConnectResult = Result<
+    (
+        Option<u16>,
+        Option<schemaic_db::ssh::TunnelHandle>,
+        Vec<String>,
+    ),
+    String,
+>;
 /// Self-rescheduling cursor-blink tick — holds an `Rc` to itself so it can re-arm.
 type BlinkTick = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 use schemaic_core::persist::{self, ConnectionsFile, UiState};
@@ -91,15 +97,28 @@ fn main() {
         .expect("build tokio runtime");
     let handle = rt.handle().clone();
 
-    let config = WindowConfig::default()
+    let mut config = WindowConfig::default()
         .size(Size::new(1280.0, 820.0))
         .title(schemaic_core::APP_NAME);
+    if let Some(icon) = app_icon() {
+        config = config.window_icon(icon);
+    }
 
     Application::new()
         .window(move |_id| app_view(handle.clone()), Some(config))
         .run();
 
     drop(rt);
+}
+
+/// Decode the bundled PNG into a window icon (title bar / taskbar, both OSes).
+/// Returns `None` if the image can't be decoded, in which case the window just
+/// uses the platform default.
+fn app_icon() -> Option<Icon> {
+    let bytes = include_bytes!("../../../assets/icon.png");
+    let img = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    Icon::from_rgba(img.into_raw(), w, h).ok()
 }
 
 /// Build the terminal shell that launches the DB CLI for `conn`, optionally
@@ -871,10 +890,9 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             // free its signals (C14).
             let closed_cx = tabs.with_untracked(|v| v.iter().find(|t| t.id == id).map(|t| t.cx));
             tabs.update(|v| v.retain(|t| t.id != id));
-            if was_active
-                && let Some(n) = neighbor {
-                    active.set(n);
-                }
+            if was_active && let Some(n) = neighbor {
+                active.set(n);
+            }
             // Dispose deferred: the center view is keyed on the active tab, so it
             // rebuilds (unmounting this tab's editor/grid) after the `active.set`
             // above. Freeing the scope now would drop signals its still-mounted
@@ -1210,64 +1228,60 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             // Result payload: the effective tunnel port (if SSH), a *newly opened*
             // tunnel handle to cache (None when reusing a cached one), and the db
             // names.
-            let send = create_ext_action(
-                cx,
-                move |res: ConnectResult| match res {
-                    Ok((tunnel_port, new_handle, names)) => {
-                        if let Some(handle) = new_handle {
-                            // Dropping any prior handle here tears its listener down.
-                            tunnels_cache.borrow_mut().insert(conn_send.id, handle);
-                        }
-                        // Build these nodes in a fresh child scope; dispose the
-                        // previous set's scope (deferred, so the schema tree —
-                        // keyed on node id — rebuilds off the new nodes before the
-                        // old signals are freed) so schema signals don't leak
-                        // across connection switches / refreshes (C14).
-                        let node_cx = cx.create_child();
-                        let mut nodes = Vec::with_capacity(names.len());
-                        for (i, name) in names.iter().enumerate() {
-                            nodes.push(ConnNode::new(node_cx, i + 1, name, name));
-                        }
-                        db_nodes.set(nodes.clone());
-                        if let Some(old) = nodes_scope_cb.borrow_mut().replace(node_cx) {
-                            exec_after(Duration::ZERO, move |_| old.dispose());
-                        }
-                        // Bind any tab of THIS connection that doesn't yet have a
-                        // database (e.g. the initial tab) to the first database.
-                        if let Some(first) = names.first() {
-                            tabs.with_untracked(|v| {
-                                for t in v {
-                                    if t.conn_id.get_untracked() == conn_send.id
-                                        && t.database.get_untracked().is_none()
-                                    {
-                                        t.database.set(Some(first.clone()));
-                                    }
+            let send = create_ext_action(cx, move |res: ConnectResult| match res {
+                Ok((tunnel_port, new_handle, names)) => {
+                    if let Some(handle) = new_handle {
+                        // Dropping any prior handle here tears its listener down.
+                        tunnels_cache.borrow_mut().insert(conn_send.id, handle);
+                    }
+                    // Build these nodes in a fresh child scope; dispose the
+                    // previous set's scope (deferred, so the schema tree —
+                    // keyed on node id — rebuilds off the new nodes before the
+                    // old signals are freed) so schema signals don't leak
+                    // across connection switches / refreshes (C14).
+                    let node_cx = cx.create_child();
+                    let mut nodes = Vec::with_capacity(names.len());
+                    for (i, name) in names.iter().enumerate() {
+                        nodes.push(ConnNode::new(node_cx, i + 1, name, name));
+                    }
+                    db_nodes.set(nodes.clone());
+                    if let Some(old) = nodes_scope_cb.borrow_mut().replace(node_cx) {
+                        exec_after(Duration::ZERO, move |_| old.dispose());
+                    }
+                    // Bind any tab of THIS connection that doesn't yet have a
+                    // database (e.g. the initial tab) to the first database.
+                    if let Some(first) = names.first() {
+                        tabs.with_untracked(|v| {
+                            for t in v {
+                                if t.conn_id.get_untracked() == conn_send.id
+                                    && t.database.get_untracked().is_none()
+                                {
+                                    t.database.set(Some(first.clone()));
                                 }
-                            });
-                        }
-                        // One `Db` for this connection, cloned per-database fetch.
-                        let db = Db::connect(&conn_send, tunnel_port);
-                        for node in nodes {
-                            let sig = node.schema;
-                            let dbname = node.database.clone();
-                            let db = db.clone();
-                            let send_schema =
-                                create_ext_action(cx, move |st: SchemaState| sig.set(st));
-                            handle_inner.spawn(async move {
-                                let st = match db.fetch_schema(&dbname).await {
-                                    Ok(s) => SchemaState::Loaded(s),
-                                    Err(e) => SchemaState::Failed(e.to_string()),
-                                };
-                                send_schema(st);
-                            });
-                        }
+                            }
+                        });
                     }
-                    Err(e) => {
-                        tracing::error!("schema load failed: {e}");
-                        db_nodes.set(Vec::new());
+                    // One `Db` for this connection, cloned per-database fetch.
+                    let db = Db::connect(&conn_send, tunnel_port);
+                    for node in nodes {
+                        let sig = node.schema;
+                        let dbname = node.database.clone();
+                        let db = db.clone();
+                        let send_schema = create_ext_action(cx, move |st: SchemaState| sig.set(st));
+                        handle_inner.spawn(async move {
+                            let st = match db.fetch_schema(&dbname).await {
+                                Ok(s) => SchemaState::Loaded(s),
+                                Err(e) => SchemaState::Failed(e.to_string()),
+                            };
+                            send_schema(st);
+                        });
                     }
-                },
-            );
+                }
+                Err(e) => {
+                    tracing::error!("schema load failed: {e}");
+                    db_nodes.set(Vec::new());
+                }
+            });
             let conn_task = conn.clone();
             handle.spawn(async move {
                 // Establish (or reuse) the SSH tunnel, then build the `Db`. A

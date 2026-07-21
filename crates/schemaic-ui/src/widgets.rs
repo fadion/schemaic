@@ -406,18 +406,19 @@ pub(crate) fn shift_hscroll<V: IntoView + 'static>(child: V) -> Scroll {
         EventListener::PointerWheel,
         move |e| {
             if let Event::PointerWheel(pe) = e
-                && pe.modifiers.shift() {
-                    // Windows sends Shift+wheel as a vertical delta; map it to x.
-                    let dx = if pe.delta.x != 0.0 {
-                        pe.delta.x
-                    } else {
-                        pe.delta.y
-                    };
-                    if dx != 0.0 {
-                        wheel.set(floem::kurbo::Vec2::new(dx, 0.0));
-                    }
-                    return EventPropagation::Stop;
+                && pe.modifiers.shift()
+            {
+                // Windows sends Shift+wheel as a vertical delta; map it to x.
+                let dx = if pe.delta.x != 0.0 {
+                    pe.delta.x
+                } else {
+                    pe.delta.y
+                };
+                if dx != 0.0 {
+                    wheel.set(floem::kurbo::Vec2::new(dx, 0.0));
                 }
+                return EventPropagation::Stop;
+            }
             EventPropagation::Continue
         },
     )

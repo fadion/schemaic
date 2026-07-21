@@ -2089,20 +2089,22 @@ fn encode_key(ke: &floem::keyboard::KeyEvent) -> Option<Vec<u8>> {
     let ctrl = mods.control() || mods.meta();
     match &ke.key.logical_key {
         Key::Character(s) => {
-            if ctrl && !mods.alt()
-                && let Some(c) = s.chars().next() {
-                    let up = c.to_ascii_uppercase();
-                    if up.is_ascii_alphabetic() {
-                        return Some(vec![(up as u8) & 0x1f]);
-                    }
-                    match c {
-                        ' ' => return Some(vec![0]),
-                        '[' => return Some(vec![0x1b]),
-                        ']' => return Some(vec![0x1d]),
-                        '\\' => return Some(vec![0x1c]),
-                        _ => {}
-                    }
+            if ctrl
+                && !mods.alt()
+                && let Some(c) = s.chars().next()
+            {
+                let up = c.to_ascii_uppercase();
+                if up.is_ascii_alphabetic() {
+                    return Some(vec![(up as u8) & 0x1f]);
                 }
+                match c {
+                    ' ' => return Some(vec![0]),
+                    '[' => return Some(vec![0x1b]),
+                    ']' => return Some(vec![0x1d]),
+                    '\\' => return Some(vec![0x1c]),
+                    _ => {}
+                }
+            }
             let mut bytes = s.as_bytes().to_vec();
             // Alt prefixes ESC (Meta) — but NOT AltGr (Ctrl+Alt), which produces a
             // real character (e.g. `@` on a German layout); prefixing ESC there
@@ -2371,24 +2373,26 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
             if let Event::KeyDown(ke) = e {
                 let m = ke.modifiers;
                 // Ctrl+Shift+C / Ctrl+Shift+V for copy / paste.
-                if (m.control() || m.meta()) && m.shift()
-                    && let Key::Character(s) = &ke.key.logical_key {
-                        match s.as_str() {
-                            "c" | "C" => {
-                                if let Some(t) = (copy_key)() {
-                                    let _ = floem::Clipboard::set_contents(t);
-                                }
-                                return EventPropagation::Stop;
+                if (m.control() || m.meta())
+                    && m.shift()
+                    && let Key::Character(s) = &ke.key.logical_key
+                {
+                    match s.as_str() {
+                        "c" | "C" => {
+                            if let Some(t) = (copy_key)() {
+                                let _ = floem::Clipboard::set_contents(t);
                             }
-                            "v" | "V" => {
-                                if let Ok(t) = floem::Clipboard::get_contents() {
-                                    (paste_key)(t);
-                                }
-                                return EventPropagation::Stop;
-                            }
-                            _ => {}
+                            return EventPropagation::Stop;
                         }
+                        "v" | "V" => {
+                            if let Ok(t) = floem::Clipboard::get_contents() {
+                                (paste_key)(t);
+                            }
+                            return EventPropagation::Stop;
+                        }
+                        _ => {}
                     }
+                }
                 if let Some(bytes) = encode_key(ke) {
                     (input)(bytes);
                     return EventPropagation::Stop;
@@ -2410,21 +2414,23 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
         })
         .on_event(EventListener::PointerDown, move |e| {
             if let Event::PointerDown(pe) = e
-                && pe.button.is_primary() {
-                    let (r, c) = cell_at(pe.pos.x, pe.pos.y);
-                    (sel_start)(r, c);
-                    dragging.set(true);
-                    moved.set(false);
-                }
+                && pe.button.is_primary()
+            {
+                let (r, c) = cell_at(pe.pos.x, pe.pos.y);
+                (sel_start)(r, c);
+                dragging.set(true);
+                moved.set(false);
+            }
             EventPropagation::Continue
         })
         .on_event(EventListener::PointerMove, move |e| {
             if dragging.get_untracked()
-                && let Event::PointerMove(pe) = e {
-                    let (r, c) = cell_at(pe.pos.x, pe.pos.y);
-                    moved.set(true);
-                    (sel_update)(r, c);
-                }
+                && let Event::PointerMove(pe) = e
+            {
+                let (r, c) = cell_at(pe.pos.x, pe.pos.y);
+                moved.set(true);
+                (sel_update)(r, c);
+            }
             EventPropagation::Continue
         })
         .on_event(EventListener::PointerUp, move |_| {
@@ -2434,9 +2440,10 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
                     // Copy-on-select: mirror the finished selection to the
                     // clipboard (keep it highlighted so the user sees what stuck).
                     if copy_on_select.get_untracked()
-                        && let Some(t) = (copy_sel)() {
-                            let _ = floem::Clipboard::set_contents(t);
-                        }
+                        && let Some(t) = (copy_sel)()
+                    {
+                        let _ = floem::Clipboard::set_contents(t);
+                    }
                 } else {
                     (sel_clear_up)();
                 }
@@ -2719,25 +2726,28 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     let arrow_down = on_arrow_down.clone();
     let editor = text_editor_keys(text_sig.get_untracked(), move |editor_sig, kp, mods| {
         if let Some(esc) = &escape
-            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Escape), _)) {
-                (esc)();
-                return CommandExecuted::Yes;
-            }
+            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Escape), _))
+        {
+            (esc)();
+            return CommandExecuted::Yes;
+        }
         // Arrow Up/Down drive an external list (command-palette nav) instead of
         // the caret, when the caller opted in.
         if let Some(cb) = &arrow_up
-            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::ArrowUp), _)) {
-                (cb)();
-                return CommandExecuted::Yes;
-            }
+            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::ArrowUp), _))
+        {
+            (cb)();
+            return CommandExecuted::Yes;
+        }
         if let Some(cb) = &arrow_down
             && matches!(
                 kp.key,
                 KeyInput::Keyboard(Key::Named(NamedKey::ArrowDown), _)
-            ) {
-                (cb)();
-                return CommandExecuted::Yes;
-            }
+            )
+        {
+            (cb)();
+            return CommandExecuted::Yes;
+        }
         if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Enter), _)) {
             if multiline {
                 // Plain Enter submits; Shift/Ctrl+Enter fall through → newline.
