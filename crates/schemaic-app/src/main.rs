@@ -1,10 +1,15 @@
+// Release builds are GUI-subsystem on Windows, so launching the .exe doesn't pop
+// a console window. Debug builds keep the console so `tracing` logs stay visible
+// during development.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! Schemaic — native SQL editor. Binary entry point.
 //!
 //! The app owns all the mutable state (tabs, saved connections, the loaded
 //! schema) as signals in the root scope, plus the `Rc<dyn Fn>` callbacks the UI
 //! invokes. A connection is a *server*; the schema sidebar lists all of the
 //! active connection's databases. DB IO runs on the tokio runtime and results
-//! are marshalled back through Floem's async→UI seam (ARCHITECTURE §5).
+//! are marshalled back through Floem's async→UI seam.
 
 mod ai;
 mod claude_cli;
