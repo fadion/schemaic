@@ -2269,33 +2269,11 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
 
     // Title row: "TERMINAL" left; open-DB-CLI + restart + settings gear right,
     // each 10px apart (gear 12px from the edge), matching the AI panel's spacing.
-    let db_cli_btn = icons::icon(icons::DATABASE, 16.0)
-        .on_click_stop(move |_| (open_cli)(None))
-        .style(|s| {
-            s.flex_shrink(0.0_f32)
-                .margin_top(8.0)
-                .margin_right(10.0)
-                .color(theme::text_muted())
-                .hover(|s| s.color(theme::text()))
-        });
-    let restart_btn = icons::icon(icons::REFRESH_CW, 16.0)
-        .on_click_stop(move |_| (restart)())
-        .style(|s| {
-            s.flex_shrink(0.0_f32)
-                .margin_top(8.0)
-                .margin_right(10.0)
-                .color(theme::text_muted())
-                .hover(|s| s.color(theme::text()))
-        });
-    let gear = icons::icon(icons::SLIDERS_VERTICAL, 16.0)
-        .on_click_stop(move |_| settings_open.set(true))
-        .style(|s| {
-            s.flex_shrink(0.0_f32)
-                .margin_top(8.0)
-                .margin_right(12.0)
-                .color(theme::text_muted())
-                .hover(|s| s.color(theme::text()))
-        });
+    let db_cli_btn = toolbar_icon(icons::DATABASE, 5.0, 2.0, || true, move || (open_cli)(None));
+    let restart_btn = toolbar_icon(icons::REFRESH_CW, 5.0, 2.0, || true, move || (restart)());
+    let gear = toolbar_icon(icons::SLIDERS_VERTICAL, 5.0, 7.0, || true, move || {
+        settings_open.set(true)
+    });
     let icons_group = h_stack((db_cli_btn, restart_btn, gear))
         .style(|s| s.flex_row().items_start().flex_shrink(0.0_f32));
     let title_row = h_stack((section_title("TERMINAL"), icons_group))

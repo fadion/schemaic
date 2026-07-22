@@ -16,7 +16,7 @@ use floem::reactive::create_memo;
 use schemaic_core::history::{self, HistoryEntry};
 
 use crate::theme::{FONT_BODY, FONT_LABEL};
-use crate::widgets::{autohide, section_title};
+use crate::widgets::{autohide, section_title, toolbar_icon};
 use crate::{Ui, icons, theme};
 
 /// Current wall-clock time, unix millis (for relative "x ago" labels).
@@ -75,15 +75,7 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
         autohide(scroll(list)).style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0));
 
     // Title row: "QUERY HISTORY" left; a trash-2 (clear) right.
-    let trash = icons::icon(icons::TRASH_2, 16.0)
-        .on_click_stop(move |_| (clear)())
-        .style(|s| {
-            s.flex_shrink(0.0_f32)
-                .margin_top(8.0)
-                .margin_right(12.0)
-                .color(theme::text_muted())
-                .hover(|s| s.color(theme::text()))
-        });
+    let trash = toolbar_icon(icons::TRASH_2, 5.0, 7.0, || true, move || (clear)());
     let title_row = h_stack((section_title("QUERY HISTORY"), trash))
         .style(|s| s.width_full().flex_row().items_start().justify_between());
 

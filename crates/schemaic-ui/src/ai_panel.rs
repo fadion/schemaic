@@ -21,7 +21,7 @@ use schemaic_core::transcript::{Seg, ToolCall, TurnStats};
 use crate::consts::CHAT_PAD_H;
 use crate::markdown::{CodeActions, render_markdown};
 use crate::widgets::{
-    autohide_state, jump_to_bottom_button, section_title, thin_scroll, verb_spinner,
+    autohide_state, jump_to_bottom_button, section_title, thin_scroll, toolbar_icon, verb_spinner,
 };
 use crate::{ChatMessage, FieldCfg, Role, Ui, edit_field, icons, theme};
 
@@ -208,24 +208,12 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     // Title row: "AI ASSISTANT" left; a new-chat button and the settings gear
     // right. The gear is rightmost (12px from the edge); new-chat sits 10px to its
     // left (matching the schema panel's eye→gear gap).
-    let new_chat = icons::icon(icons::MESSAGE_SQUARE_PLUS, 16.0)
-        .on_click_stop(move |_| (new_chat_cb)())
-        .style(|s| {
-            s.flex_shrink(0.0_f32)
-                .margin_top(8.0)
-                .margin_right(10.0)
-                .color(theme::text_muted())
-                .hover(|s| s.color(theme::text()))
-        });
-    let gear = icons::icon(icons::SLIDERS_VERTICAL, 16.0)
-        .on_click_stop(move |_| settings_open.set(true))
-        .style(|s| {
-            s.flex_shrink(0.0_f32)
-                .margin_top(8.0)
-                .margin_right(12.0)
-                .color(theme::text_muted())
-                .hover(|s| s.color(theme::text()))
-        });
+    let new_chat = toolbar_icon(icons::MESSAGE_SQUARE_PLUS, 5.0, 2.0, || true, move || {
+        (new_chat_cb)()
+    });
+    let gear = toolbar_icon(icons::SLIDERS_VERTICAL, 5.0, 7.0, || true, move || {
+        settings_open.set(true)
+    });
     let icons_group =
         h_stack((new_chat, gear)).style(|s| s.flex_row().items_start().flex_shrink(0.0_f32));
     let title_row = h_stack((section_title("AI ASSISTANT"), icons_group))
