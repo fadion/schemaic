@@ -275,6 +275,35 @@ These are load-bearing invariants; re-introducing the anti-patterns they guard a
   app shutdown the reactive scope disposes its signals, and the last in-flight timer then
   panics on `get_untracked` (`Option::unwrap` on `None`). Guard every signal read in such
   a tick with `try_get_untracked` and bail (stop rescheduling) once any returns `None`.
+- **`.clip()` makes a flex item shrink-to-content — it won't stretch to its parent.** A
+  clipped child of a definite-width parent sizes to its own content instead of stretching,
+  so a `flex_grow` spacer inside it collapses (right-aligned children stop reaching the
+  edge). Put `.clip()` on a container that already has a *definite* size (e.g. the fixed-
+  width `v_stack`), not on the flex row whose stretch you depend on. (Bit the find/replace
+  bar: the replace row's `All` wouldn't right-align until the clip moved up to the sized
+  parent.)
+- **`s.hide()` / `s.flex()` (display none/flex) beat height/scale for a reactive
+  show-hide.** Toggling `display` in a reactive `.style` closure adds/removes the element
+  from layout cleanly — no clip, no overflow, no leftover space. Prefer it to animating
+  height when you don't actually need the animation.
+- **In-flow reveal animations are janky; only `.absolute()` transforms animate smoothly.**
+  A `.transition(Height, …)` on an *in-flow* element reflows its container every frame and
+  Floem only steps transitions on redraw ticks, so it stutters (~5fps). The smooth
+  animations here (Ctrl+K expand) all animate an `.absolute()` overlay's inset/size so
+  nothing reflows. Don't try to animate in-flow height/width; either animate an absolute
+  overlay or just toggle `display`.
+- **`Style::rotate` is RADIANS (kurbo `Affine::rotate`), pivoted at the view's centre.**
+  Pass `std::f64::consts::FRAC_PI_2` for 90°, not `90.0` (which is ~14 turns → the glyph
+  spins off and vanishes). `scale` is a `Pct`. Both transition via the generic
+  `.transition(Rotation, …)` / `.transition(ScaleX, …)`. Even with the right value, a
+  transform-transition on a small `svg` proved unreliable — an icon swap is the safe
+  fallback for a chevron-flip.
+- **`edit_field` is the input that lets you control Escape/blur; `text_input` eats Escape.**
+  Floem's `text_input` handles Escape internally (`clear_focus`) in `event_before_children`
+  and returns `Stop`, so your `on_event(KeyDown)` never sees it. The app's `edit_field`
+  routes Escape to `on_escape` and (now) focus-loss to `on_blur` (guarded to skip the mount
+  run) — use it for any field needing discard-on-Escape / commit-on-blur (e.g. inline
+  rename, find/replace).
 
 ## Popup menus (`menu_panel`)
 
