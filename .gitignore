@@ -11,6 +11,12 @@
 # Private working notes — kept local, never published.
 TODO.md
 
+# Stray smoke-test capture files (redirected stdout/stderr from launch checks)
+scratch_out.txt
+scratch_err.txt
+se.txt
+so.txt
+
 # Editor / IDE folders
 .vscode/
 .idea/
