@@ -152,20 +152,21 @@ pub fn chip_active() -> Color {
     ui().chip_active
 }
 
-// Query tabs.
+// Query + results tabs (flat, full-height).
 pub fn tab_active() -> Color {
     ui().tab_active
 }
-pub fn tab_close_active() -> Color {
-    ui().tab_close_active
+// Vertical line between tabs + the full-width strip separators.
+pub fn tab_separator() -> Color {
+    ui().tab_separator
 }
-// Hover surface for inactive tabs only.
-pub fn tab_hover() -> Color {
-    ui().tab_hover
+// Inactive tab label/×; brightens to `text` on hover and when active.
+pub fn tab_text() -> Color {
+    ui().tab_text
 }
-// Active-tab label — brighter than the inactive `text_muted` for contrast.
-pub fn tab_text_active() -> Color {
-    ui().tab_text_active
+// The tab close (×) glyph — a fixed, muted tint, independent of the label colour.
+pub fn tab_close() -> Color {
+    ui().tab_close
 }
 
 // Accent (selection, active connection dot, focus).
