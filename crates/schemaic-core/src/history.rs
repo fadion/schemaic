@@ -24,6 +24,10 @@ pub struct HistoryEntry {
     pub sql: String,
     /// Wall-clock time it ran, unix epoch milliseconds.
     pub ts: u64,
+    /// The originating tab's user-assigned name, if any (shown as a label in the
+    /// history panel). `None` for tabs left at the default "Query N".
+    #[serde(default)]
+    pub tab_name: Option<String>,
 }
 
 /// The persisted history file (`history.json`).
@@ -101,6 +105,7 @@ mod tests {
             database: Some("db".to_string()),
             sql: sql.to_string(),
             ts,
+            tab_name: None,
         }
     }
 

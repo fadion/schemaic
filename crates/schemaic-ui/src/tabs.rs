@@ -5,13 +5,16 @@
 
 use std::rc::Rc;
 
+use floem::AnyView;
 use floem::event::{Event, EventListener, EventPropagation};
 use floem::prelude::*;
 use floem::reactive::create_effect;
+use floem::style::TextOverflow;
+use floem::views::TooltipExt;
 
-use crate::consts::TAB_BAR_H;
-use crate::widgets::wheel_hscroll;
-use crate::{Tab, Ui, icons, theme};
+use crate::consts::{TAB_BAR_H, TAB_MAX_W};
+use crate::widgets::{measure_text_px, wheel_hscroll};
+use crate::{FieldCfg, Tab, Ui, bg_transparent, edit_field, icons, theme};
 
 // ===== moved from lib.rs (tab bar) =====
 // ── Tab bar ─────────────────────────────────────────────────────────────────
@@ -69,33 +72,125 @@ pub(crate) fn tab_bar(ui: Ui) -> impl IntoView {
     })
 }
 
-fn tab_chip(tab: Tab, active: RwSignal<usize>, close_tab: Rc<dyn Fn(usize)>) -> impl IntoView {
-    let close_x = close_tab.clone();
-    // Close (×): 16px Lucide X, a fixed muted tint (`tab_close`), independent of
-    // the label's dim→bright behaviour. The X glyph only fills the middle of its
-    // 16px box (~3px transparent padding per side), so the margins are trimmed by
-    // ~3px to land the *visual* gaps at 10px (icon→edge, text→icon).
-    let close = icons::icon(icons::X, 16.0)
-        .on_click_stop(move |_| (close_x)(tab.id))
-        .style(|s| {
-            s.flex_shrink(0.0_f32)
-                .margin_right(7.0)
-                .color(theme::tab_close())
-        });
+// Width available to the title *text* inside a full-width (200px) tab: the tab
+// max minus the left margin (10), label→× gap (7), the × box (16) and its right
+// margin (7). A title wider than this ellipsizes and gains a tooltip.
+const TAB_TITLE_AVAIL: f64 = TAB_MAX_W - 40.0;
 
-    // Text: 10px from the left edge; ~7px + the icon's ~3px inset ≈ 10px to the ×.
-    // Colour inherited from the tab container.
-    let label = text(format!("Query {}", tab.label)).style(|s| {
-        s.margin_left(10.0)
-            .margin_right(7.0)
-            .font_size(theme::FONT_BODY)
+fn tab_chip(tab: Tab, active: RwSignal<usize>, close_tab: Rc<dyn Fn(usize)>) -> impl IntoView {
+    // Commit the inline rename: an empty/blank name reverts to the default
+    // "Query N" (stored as `None`). Called from Enter and from focus-loss.
+    let commit: Rc<dyn Fn()> = Rc::new(move || {
+        let new = tab.edit_buf.get_untracked().trim().to_string();
+        tab.name.set(if new.is_empty() { None } else { Some(new) });
+        tab.editing.set(false);
     });
 
-    let chip = h_stack((label, close))
+    // Content swaps between the display label and the inline rename field. Keyed
+    // on `(editing, title)` so it rebuilds when either the mode or the (possibly
+    // renamed) title changes; the title read tracks the `name` signal.
+    let commit_field = commit.clone();
+    let close_content = close_tab.clone();
+    let content = dyn_container(
+        move || (tab.editing.get(), tab.title()),
+        move |(editing, title)| -> AnyView {
+            if editing {
+                // Inline rename field. `edit_field` (unlike floem's `text_input`,
+                // which swallows Escape into its own `clear_focus`) routes Escape
+                // to `on_escape`, so we can *discard* on Escape and *commit* on
+                // Enter / click-away. The blur commit is guarded on `editing` so
+                // Enter/Escape (which set `editing = false` first) don't re-fire it.
+                let commit_enter = commit_field.clone();
+                let commit_blur = commit_field.clone();
+                let cfg = FieldCfg {
+                    background: bg_transparent,
+                    border_color: Some(bg_transparent),
+                    border_radius: 0.0,
+                    font_size: theme::FONT_BODY,
+                    autofocus: true,
+                    height: Some(TAB_BAR_H),
+                    on_submit: Some(commit_enter),
+                    on_escape: Some(Rc::new(move || tab.editing.set(false))),
+                    on_blur: Some(Rc::new(move || {
+                        if tab.editing.get_untracked() {
+                            (commit_blur)();
+                        }
+                    })),
+                    ..FieldCfg::default()
+                };
+                // Width auto-grows with the typed text from a small base up to the
+                // tab max (the chip's `max_width` is the hard cap).
+                return edit_field(tab.edit_buf, cfg)
+                    .style(move |s| {
+                        let w = (tab.edit_buf.with(|b| measure_text_px(b)) + 24.0)
+                            .clamp(60.0, TAB_MAX_W - 2.0);
+                        s.width(w)
+                    })
+                    .into_any();
+            }
+
+            // Display: label (ellipsized past the tab width) + close ×. A title
+            // that would be clipped gets a tooltip with its full text; a title
+            // that fits gets none.
+            let truncated = measure_text_px(&title) > TAB_TITLE_AVAIL;
+            let full = title.clone();
+            let label = text(title).style(|s| {
+                s.margin_left(10.0)
+                    .margin_right(7.0)
+                    .max_width(TAB_TITLE_AVAIL)
+                    .text_overflow(TextOverflow::Ellipsis)
+                    .font_size(theme::FONT_BODY)
+            });
+            let label: AnyView = if truncated {
+                label
+                    .tooltip(move || {
+                        text(full.clone()).style(|s| {
+                            s.padding_horiz(8.0)
+                                .padding_vert(5.0)
+                                .background(theme::bg_panel())
+                                .border(1.0)
+                                .border_color(theme::border())
+                                .border_radius(4.0)
+                                .color(theme::text())
+                                .font_size(theme::FONT_BODY)
+                        })
+                    })
+                    .into_any()
+            } else {
+                label.into_any()
+            };
+
+            // Close (×): 16px Lucide X, fixed muted tint (`tab_close`). The glyph
+            // fills only the middle of its 16px box (~3px transparent padding per
+            // side), so the margins are trimmed ~3px to land 10px *visual* gaps.
+            let close_x = close_content.clone();
+            let close = icons::icon(icons::X, 16.0)
+                .on_click_stop(move |_| (close_x)(tab.id))
+                .style(|s| {
+                    s.flex_shrink(0.0_f32)
+                        .margin_right(7.0)
+                        .color(theme::tab_close())
+                });
+            h_stack((label, close))
+                .style(|s| s.flex_row().items_center())
+                .into_any()
+        },
+    );
+
+    let chip = content
         .on_click_stop(move |_| active.set(tab.id))
+        // Double-click a tab to rename it in place: seed the buffer with the
+        // current title and switch to the field. Guarded so double-clicking
+        // *inside* the field (word-select) doesn't reset the buffer mid-edit.
+        .on_event_stop(EventListener::DoubleClick, move |_| {
+            if !tab.editing.get_untracked() {
+                tab.edit_buf.set(tab.title());
+                tab.editing.set(true);
+            }
+        })
         // Middle-click (mouse-wheel button) closes the tab, as in most editors.
         // `Click`/`DoubleClick` only fire for the primary button, so this can't
-        // clash with activating the tab or double-click-to-open.
+        // clash with activating the tab or double-click-to-rename.
         .on_event(EventListener::PointerDown, move |e| {
             if let Event::PointerDown(pe) = e
                 && pe.button.is_auxiliary()
@@ -105,13 +200,15 @@ fn tab_chip(tab: Tab, active: RwSignal<usize>, close_tab: Rc<dyn Fn(usize)>) -> 
             }
             EventPropagation::Continue
         })
-        // Flat, full-height tab: chrome background (invisible against the strip)
-        // when inactive, `tab_active` when active; a right separator line divides
-        // it from the next tab. The container's `color` cascades to the label + ×.
+        // Flat, full-height tab capped at `TAB_MAX_W`: chrome background (invisible
+        // against the strip) when inactive, `tab_active` when active; a right
+        // separator line divides it from the next tab. The container's `color`
+        // cascades to the label + ×.
         .style(move |s| {
             let s = s
                 .flex_row()
                 .items_center()
+                .max_width(TAB_MAX_W)
                 .border_right(1.0)
                 .border_color(theme::tab_separator());
             if active.get() == tab.id {

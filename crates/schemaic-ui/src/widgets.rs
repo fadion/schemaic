@@ -395,6 +395,17 @@ pub(crate) fn menu_enter<V: IntoView + 'static>(view: V) -> impl IntoView {
     })
 }
 
+/// Measure a string's rendered width (px) at `FONT_BODY`, through the same global
+/// `FontSystem` the views paint with, so the measurement matches to the pixel.
+/// Used to right-align the numeric grid editor and to size/ellipsize tab titles.
+pub(crate) fn measure_text_px(text: &str) -> f64 {
+    use floem::text::{Attrs, AttrsList, TextLayout};
+    let attrs = Attrs::new().font_size(theme::FONT_BODY);
+    let mut layout = TextLayout::new();
+    layout.set_text(text, AttrsList::new(attrs));
+    layout.size().width
+}
+
 /// Shared scrollbar styling. Handle color/thickness/rounding come from the global
 /// `Handle` class on the root; this only adds the 3px edge inset (a per-scroll prop
 /// that doesn't cascade) so the bar floats off the edge and clears the resize grip.
