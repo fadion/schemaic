@@ -36,7 +36,7 @@ use schemaic_core::schema::SchemaState;
 use schemaic_core::sql::{
     contains_write, first_unsafe, skip_noncode, statement_range, statement_ranges, unsafe_reason,
 };
-use schemaic_core::text_ops::{find_matches, toggle_line_comment};
+use schemaic_core::text_ops::{find_matches, replace_all, toggle_line_comment};
 
 use crate::completion::{
     Completion, SQL_FUNCTIONS, SQL_KEYWORDS, accept_completion, completion_popup,
@@ -810,12 +810,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // Which run-menu row is keyboard-selected (0 = Run Current, the default).
     let run_sel: RwSignal<usize> = RwSignal::new(0usize);
 
-    // In-editor find (Ctrl+F): a small bar over the editor. `find_hits` holds the
-    // byte offset of each match (recomputed as the query changes); `find_idx` is
-    // the current match. Selecting a match sets the editor selection (so it's
-    // highlighted) and centres it.
+    // In-editor find (Ctrl+F) / replace (Ctrl+H): a small bar over the editor.
+    // `find_hits` holds the byte offset of each match (recomputed as the query
+    // changes); `find_idx` is the current match. Selecting a match sets the editor
+    // selection (so it's highlighted) and centres it. `find_replace_visible`
+    // expands the second row (the replacement field + Replace / All buttons).
     let find_open: RwSignal<bool> = RwSignal::new(false);
     let find_query: RwSignal<String> = RwSignal::new(String::new());
+    let find_replace: RwSignal<String> = RwSignal::new(String::new());
+    let find_replace_visible: RwSignal<bool> = RwSignal::new(false);
     let find_hits: RwSignal<Vec<usize>> = RwSignal::new(Vec::new());
     let find_idx: RwSignal<usize> = RwSignal::new(0usize);
 
@@ -977,6 +980,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         {
             find_open.set(false);
             find_query.set(String::new());
+            find_replace.set(String::new());
             return CommandExecuted::Yes;
         }
         if comp.open.get_untracked() {
@@ -1178,8 +1182,18 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // else: fall through → default handler cuts the selection.
             }
             if c.eq_ignore_ascii_case("f") {
-                // Open the find bar (its input autofocuses on mount).
+                // Open the find bar in find-only mode (collapse any replace row left
+                // over from a previous Ctrl+H). Its input autofocuses on mount.
+                find_replace_visible.set(false);
                 find_open.set(true);
+                return CommandExecuted::Yes;
+            }
+            if c.eq_ignore_ascii_case("h") {
+                // Open the find bar with the replace row expanded.
+                find_replace_visible.set(true);
+                if !find_open.get_untracked() {
+                    find_open.set(true);
+                }
                 return CommandExecuted::Yes;
             }
         }
@@ -2317,22 +2331,121 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         Rc::new(move || {
             find_open.set(false);
             find_query.set(String::new());
+            find_replace.set(String::new());
             // Return focus to the editor so typing resumes there.
             if let Some(Some(vid)) = ed.editor_view_id.try_get_untracked() {
                 vid.request_focus();
             }
         })
     };
+    // Replace the current match with the replacement text, then recompute matches
+    // (the doc→`query` sync updates the text; we read the doc directly for an
+    // up-to-date, synchronous result) and reveal the next occurrence.
+    let replace_one: Rc<dyn Fn()> = {
+        let ed = ed_find.clone();
+        let reveal = reveal.clone();
+        Rc::new(move || {
+            let q = find_query.get_untracked();
+            if q.is_empty() {
+                return;
+            }
+            let hits = find_hits.get_untracked();
+            if hits.is_empty() {
+                return;
+            }
+            let idx = find_idx.get_untracked().min(hits.len() - 1);
+            let off = hits[idx];
+            let repl = find_replace.get_untracked();
+            ed.doc().edit_single(
+                Selection::region(off, off + q.len()),
+                &repl,
+                EditType::Other,
+            );
+            let text = ed.doc().text().to_string();
+            let new_hits = find_matches(&text, &q);
+            if new_hits.is_empty() {
+                find_hits.set(new_hits);
+                find_idx.set(0);
+                return;
+            }
+            // Advance to the first match at/after the replacement end (wrapping),
+            // so repeated Replace walks forward through the document.
+            let after = off + repl.len();
+            let next = new_hits.iter().position(|&h| h >= after).unwrap_or(0);
+            find_idx.set(next);
+            reveal(new_hits[next], q.len());
+            find_hits.set(new_hits);
+        })
+    };
+    // Replace every match in one edit, then recompute (a replacement that itself
+    // contains the needle would surface fresh matches).
+    let replace_all_cb: Rc<dyn Fn()> = {
+        let ed = ed_find.clone();
+        Rc::new(move || {
+            let q = find_query.get_untracked();
+            if q.is_empty() {
+                return;
+            }
+            let repl = find_replace.get_untracked();
+            let text = ed.doc().text().to_string();
+            let (new_text, n) = replace_all(&text, &q, &repl);
+            if n == 0 {
+                return;
+            }
+            ed.doc()
+                .edit_single(Selection::region(0, text.len()), &new_text, EditType::Other);
+            find_hits.set(find_matches(&new_text, &q));
+            find_idx.set(0);
+        })
+    };
     let find_bar = {
         let (go_submit, go_prev, go_next, go_up, go_down) =
             (go.clone(), go.clone(), go.clone(), go.clone(), go.clone());
         let close = find_close.clone();
+        let replace_one = replace_one.clone();
+        let replace_all_cb = replace_all_cb.clone();
         dyn_container(
             move || find_open.get(),
             move |open| {
                 if !open {
                     return empty().into_any();
                 }
+                let icon_btn = |markup: &'static str, sz: f32, on: Rc<dyn Fn()>| {
+                    container(icons::icon(markup, sz))
+                        .on_click_stop(move |_| (on)())
+                        .style(|s| {
+                            s.items_center()
+                                .color(theme::text_dim())
+                                .hover(|s| s.color(theme::text()))
+                        })
+                };
+
+                // Expand/collapse the replace row: chevron points right when
+                // collapsed, down when open. It sits in the outer row (`items_center`)
+                // so it slides to stay vertically centred as the bar grows.
+                let toggle = container(dyn_container(
+                    move || find_replace_visible.get(),
+                    move |vis| {
+                        icons::icon(
+                            if vis {
+                                icons::CHEVRON_DOWN
+                            } else {
+                                icons::CHEVRON_RIGHT
+                            },
+                            14.0,
+                        )
+                        .into_any()
+                    },
+                ))
+                .on_click_stop(move |_| find_replace_visible.update(|v| *v = !*v))
+                .style(|s| {
+                    s.items_center()
+                        .margin_left(2.0)
+                        .color(theme::text_dim())
+                        .hover(|s| s.color(theme::text()))
+                });
+
+                // ── Row 1: find ──
                 let on_submit: Rc<dyn Fn()> = {
                     let g = go_submit.clone();
                     Rc::new(move || (g)(1))
@@ -2353,6 +2466,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         autofocus: true,
                         font_size: 13.0,
                         border_radius: 6.0,
+                        height: Some(26.0),
                         on_submit: Some(on_submit),
                         on_escape: Some(Rc::new(move || (esc)())),
                         on_arrow_up: Some(on_up),
@@ -2374,15 +2488,6 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             .into_any()
                     },
                 );
-                let icon_btn = |markup: &'static str, sz: f32, on: Rc<dyn Fn()>| {
-                    container(icons::icon(markup, sz))
-                        .on_click_stop(move |_| (on)())
-                        .style(|s| {
-                            s.items_center()
-                                .color(theme::text_dim())
-                                .hover(|s| s.color(theme::text()))
-                        })
-                };
                 let prev_btn = icon_btn(icons::CHEVRON_UP, 15.0, {
                     let g = go_prev.clone();
                     Rc::new(move || (g)(-1))
@@ -2392,7 +2497,75 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     Rc::new(move || (g)(1))
                 });
                 let close_btn = icon_btn(icons::X, 14.0, close.clone());
-                h_stack((input, count, prev_btn, next_btn, close_btn))
+                // A flex spacer pins the counter + nav + × to the right edge; row 2
+                // does the same, so `All` lines up under the ×.
+                let row1 = h_stack((
+                    input,
+                    empty().style(|s| s.flex_grow(1.0_f32)),
+                    count,
+                    prev_btn,
+                    next_btn,
+                    close_btn,
+                ))
+                .style(|s| s.items_center().gap(8.0));
+
+                // ── Row 2: replace ──
+                // Text buttons: colour-only hover (no background). Fixed 26px height
+                // with centred text so they line up with the 26px field when the row
+                // is top-aligned (`items_start`, which keeps the reveal from spilling
+                // upward over the find row).
+                let text_btn = |label: &'static str, on: Rc<dyn Fn()>| {
+                    container(text(label).style(|s| s.font_size(theme::FONT_LABEL)))
+                        .on_click_stop(move |_| (on)())
+                        .style(|s| {
+                            s.items_center()
+                                .height(26.0)
+                                .color(theme::text_dim())
+                                .hover(|s| s.color(theme::text()))
+                        })
+                };
+                let ro = replace_one.clone();
+                let esc2 = close.clone();
+                let rinput = edit_field(
+                    find_replace,
+                    FieldCfg {
+                        placeholder: "Replace",
+                        font_size: 13.0,
+                        border_radius: 6.0,
+                        height: Some(26.0),
+                        on_submit: Some(ro),
+                        on_escape: Some(esc2),
+                        ..Default::default()
+                    },
+                )
+                .style(|s| s.width(170.0));
+                // The replace row is always mounted but shown/hidden via `display`
+                // (no animation — an in-flow height transition through a clip was
+                // janky, and the reveal isn't worth it here). Hidden ⇒ `display:none`.
+                // Left-packed (gap 0, explicit margins): `Replace` is offset 16px past
+                // the field so it lines up under the "n/total" counter in the find row
+                // (input 170 + the row's 2×8px gaps), and `All` sits 15px after it.
+                let replace_row = h_stack((
+                    rinput,
+                    text_btn("Replace", replace_one.clone()).style(|s| s.margin_left(16.0)),
+                    text_btn("All", replace_all_cb.clone()).style(|s| s.margin_left(15.0)),
+                ))
+                .style(move |s| {
+                    let s = s.items_center().padding_top(6.0);
+                    if find_replace_visible.get() {
+                        s.flex()
+                    } else {
+                        s.hide()
+                    }
+                });
+
+                // Fixed content width so BOTH rows have free space for their flex
+                // spacer — otherwise the wider row drives the width and its spacer
+                // collapses, leaving `All` hugging `Replace` instead of pinned under
+                // the ×. Sized just to the find row's packed width so the leftover
+                // spacer (hence the field→controls gap) is ~15px, not ~33px.
+                let content = v_stack((row1, replace_row)).style(|s| s.width(283.0));
+                h_stack((toggle, content))
                     .style(|s| {
                         s.items_center()
                             .gap(8.0)

@@ -126,6 +126,30 @@ pub fn find_matches(hay: &str, needle: &str) -> Vec<usize> {
     out
 }
 
+/// Replace every non-overlapping ASCII-case-insensitive occurrence of `needle`
+/// in `hay` with `replacement`, returning the new string and the number of
+/// replacements. Matches are the same ones [`find_matches`] reports (so the UI's
+/// count and replace-all agree). Empty needle → unchanged, zero replacements.
+/// Left-to-right, non-overlapping: the search resumes *after* each original
+/// match (not inside the inserted text), so a replacement that itself contains
+/// the needle won't be re-replaced in the same pass.
+pub fn replace_all(hay: &str, needle: &str, replacement: &str) -> (String, usize) {
+    let hits = find_matches(hay, needle);
+    if hits.is_empty() {
+        return (hay.to_string(), 0);
+    }
+    let n = needle.len();
+    let mut out = String::with_capacity(hay.len());
+    let mut prev = 0;
+    for &off in &hits {
+        out.push_str(&hay[prev..off]);
+        out.push_str(replacement);
+        prev = off + n;
+    }
+    out.push_str(&hay[prev..]);
+    (out, hits.len())
+}
+
 /// Whether `hay` contains `needle`, ASCII-case-insensitively. Allocation-free
 /// (unlike `find_matches`), so it's cheap to call per grid cell. Empty needle
 /// matches anything.
@@ -253,6 +277,27 @@ mod tests {
         assert_eq!(find_matches("abc", "xyz"), Vec::<usize>::new());
         // Offsets index into the original string (é is 2 bytes → bar at byte 6).
         assert_eq!(find_matches("café bar", "bar"), vec![6]);
+    }
+
+    #[test]
+    fn replace_all_matches_find() {
+        // Case-insensitive, replaces every occurrence, reports the count.
+        assert_eq!(
+            replace_all("SELECT select SeLeCt", "select", "x"),
+            ("x x x".to_string(), 3)
+        );
+        // Non-overlapping, resumes after each original match.
+        assert_eq!(replace_all("aaaa", "aa", "b"), ("bb".to_string(), 2));
+        // A replacement that contains the needle isn't re-replaced this pass.
+        assert_eq!(replace_all("a", "a", "aa"), ("aa".to_string(), 1));
+        // Empty needle / no match → unchanged, zero replacements.
+        assert_eq!(replace_all("abc", "", "x"), ("abc".to_string(), 0));
+        assert_eq!(replace_all("abc", "z", "x"), ("abc".to_string(), 0));
+        // Multibyte-safe (é is 2 bytes).
+        assert_eq!(
+            replace_all("café bar", "bar", "pub"),
+            ("café pub".to_string(), 1)
+        );
     }
 
     #[test]
