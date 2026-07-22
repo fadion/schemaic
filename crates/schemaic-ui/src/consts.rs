@@ -105,11 +105,8 @@ pub(crate) const RESIZE_MIN: f64 = 80.0;
 
 // ── Tab bar ─────────────────────────────────────────────────────────────────
 
-/// Tab bar height, top gap, and corner radius. Actual height = visible
-/// (`TAB_BAR_H - TAB_TOP_GAP`) + `TAB_RADIUS`, pushed down by `margin_top`.
+/// Tab bar height. Flat, full-height tabs fill it edge to edge.
 pub(crate) const TAB_BAR_H: f64 = 34.0;
-pub(crate) const TAB_TOP_GAP: f64 = 7.0;
-pub(crate) const TAB_RADIUS: f64 = 6.0;
 
 // ── AI chat input ───────────────────────────────────────────────────────────
 

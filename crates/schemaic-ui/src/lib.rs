@@ -2015,22 +2015,22 @@ fn result_tab_strip(
         |(i, p): &(usize, ResultPanel)| (*i, p.label.clone()),
         move |(i, panel)| result_tab_chip(i, panel.label, result_tabs, active_result),
     )
-    .style(|s| s.flex_row().items_start().gap(5.0));
+    .style(|s| s.flex_row());
 
-    h_stack((chips,))
-        .style(|s| {
-            s.width_full()
-                .flex_row()
-                .items_start()
-                .padding_left(10.0)
-                .height(TAB_BAR_H)
-                .min_height(TAB_BAR_H)
-                .flex_shrink(0.0_f32)
-                .background(theme::bg_chrome())
-                .border_bottom(1.0)
-                .border_color(theme::border())
-        })
-        .clip()
+    // Flat, full-height result tabs. Unlike the query strip, this one adds a
+    // full-width **top** separator too (the query strip sits below the header,
+    // which already provides one).
+    h_stack((chips,)).style(|s| {
+        s.width_full()
+            .flex_row()
+            .height(TAB_BAR_H)
+            .min_height(TAB_BAR_H)
+            .flex_shrink(0.0_f32)
+            .background(theme::bg_chrome())
+            .border_top(1.0)
+            .border_bottom(1.0)
+            .border_color(theme::border())
+    })
 }
 
 fn result_tab_chip(
@@ -2044,33 +2044,28 @@ fn result_tab_chip(
     let is_err = move || {
         result_tabs.with(|v| matches!(v.get(idx).map(|p| &p.state), Some(QueryState::Failed(_))))
     };
-    container(text(label).style(move |s| {
-        let s = s.margin_horiz(10.0);
-        if is_err() {
-            s.color(theme::reject_text())
-        } else if active_result.get() == idx {
-            s.color(theme::tab_text_active())
-        } else {
-            s.color(theme::text_muted())
-        }
-    }))
-    .on_click_stop(move |_| active_result.set(idx))
-    .style(move |s| {
-        let s = s
-            .flex_row()
-            .items_center()
-            .margin_top(TAB_TOP_GAP)
-            .height(TAB_BAR_H - TAB_TOP_GAP + TAB_RADIUS)
-            .padding_bottom(TAB_RADIUS)
-            .border_radius(TAB_RADIUS)
-            .font_size(theme::FONT_BODY);
-        if active_result.get() == idx {
-            s.background(theme::tab_active())
-        } else {
-            s.background(theme::bg_editor())
-                .hover(|s| s.background(theme::tab_hover()))
-        }
-    })
+    // Colour is set on the tab container and cascades to the label.
+    container(text(label).style(|s| s.margin_horiz(10.0).font_size(theme::FONT_BODY)))
+        .on_click_stop(move |_| active_result.set(idx))
+        .style(move |s| {
+            let s = s
+                .flex_row()
+                .items_center()
+                .border_right(1.0)
+                .border_color(theme::tab_separator());
+            let s = if active_result.get() == idx {
+                s.background(theme::tab_active())
+            } else {
+                s.background(theme::bg_chrome())
+            };
+            if is_err() {
+                s.color(theme::reject_text())
+            } else if active_result.get() == idx {
+                s.color(theme::text())
+            } else {
+                s.color(theme::tab_text()).hover(|s| s.color(theme::text()))
+            }
+        })
 }
 
 // ── Terminal panel ───────────────────────────────────────────────────────────
