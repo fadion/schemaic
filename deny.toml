@@ -34,9 +34,28 @@ confidence-threshold = 0.8
 # cargo-deny doesn't see them — they're covered in THIRD-PARTY-NOTICES.md.
 
 [advisories]
-# Deny known-vulnerable and yanked crates (cargo-deny defaults). Add RUSTSEC IDs
-# here to consciously accept a specific advisory.
-ignore = []
+# Unmaintained crates pulled in transitively (e.g. `paste` via wgpu/floem) can't
+# be fixed by us — only flag unmaintained advisories for our own workspace deps.
+unmaintained = "workspace"
+# Vulnerabilities are denied by default. Each entry below is a conscious, reviewed
+# exception — a specific advisory we've assessed as not reachable / not fixable.
+ignore = [
+    # quick-xml < 0.41 quadratic-time attribute parsing (DoS). Only exploitable
+    # via UNTRUSTED XML input; Schemaic parses only its own bundled SVG icons
+    # (a fixed, trusted set) through usvg/resvg. The fix (quick-xml >= 0.41) is
+    # gated behind usvg/resvg ← floem 0.2.0, so there's no upgrade path yet.
+    # Revisit when floem bumps its SVG rendering stack.
+    "RUSTSEC-2026-0194",
+    # quick-xml < 0.41 unbounded namespace-declaration allocation (memory-exhaustion
+    # DoS). Same reachability + upgrade situation as RUSTSEC-2026-0194 above.
+    "RUSTSEC-2026-0195",
+    # `rsa` "Marvin Attack" timing sidechannel (RSA key recovery). Pulled by russh
+    # for RSA SSH key/host support. No patched `rsa` release exists yet. The attack
+    # needs fine-grained timing of many RSA operations, impractical against a DB
+    # client connecting to known servers. Revisit when `rsa` ships a fix (or drop
+    # russh's `rsa` feature if RSA SSH keys aren't needed).
+    "RUSTSEC-2023-0071",
+]
 
 [bans]
 # Duplicate versions are common in a GUI + async tree; surface them without

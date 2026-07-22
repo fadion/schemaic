@@ -29,7 +29,7 @@ jobs:
           - os: windows-latest
             target: windows-x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Linux GUI build dependencies
         if: runner.os == 'Linux'
         run: |
