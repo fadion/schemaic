@@ -34,8 +34,7 @@ use schemaic_core::text_ops::contains_ignore_ascii_case;
 
 use crate::consts::*;
 use crate::widgets::{
-    MenuEntry, autohide_state, centered_msg, shift_hscroll, thin_scroll, toolbar_icon,
-    verb_spinner,
+    MenuEntry, autohide_state, centered_msg, shift_hscroll, thin_scroll, toolbar_icon, verb_spinner,
 };
 use crate::{ConnNode, FieldCfg, bg_transparent, edit_field, icons, theme};
 
