@@ -38,7 +38,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
+      # Linux: build against an older glibc (2.31 = Ubuntu 20.04 / Debian 11) with
+      # cargo-zigbuild, so the binary runs on distros older than the CI runner
+      # (which is glibc 2.39). glibc is not backward-compatible, so a binary linked
+      # against the runner's glibc would fail on older systems.
+      - name: Install Zig (Linux)
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@v1
+      - name: Install cargo-zigbuild (Linux)
+        if: runner.os == 'Linux'
+        run: cargo install --locked cargo-zigbuild
+
+      - name: Build release binary (Linux, glibc 2.31)
+        if: runner.os == 'Linux'
+        run: cargo zigbuild --release -p schemaic-app --target x86_64-unknown-linux-gnu.2.31
+
+      - name: Build release binary (Windows)
+        if: runner.os == 'Windows'
         run: cargo build --release -p schemaic-app
 
       # Stage the binary alongside the license notices that must ship with a
@@ -47,7 +63,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           mkdir dist
-          cp target/release/schemaic dist/
+          cp target/x86_64-unknown-linux-gnu/release/schemaic dist/
           cp LICENSE THIRD-PARTY-NOTICES.md README.md dist/
           cp crates/schemaic-ui/fonts/LICENSE.txt dist/IBMPlex-OFL.txt
           cp licenses/Lucide-LICENSE.txt dist/
