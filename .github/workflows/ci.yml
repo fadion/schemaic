@@ -20,7 +20,7 @@ jobs:
     name: Lint (fmt + clippy + deny)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Linux GUI build dependencies
         run: |
           sudo apt-get update
@@ -44,7 +44,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Linux GUI build dependencies
         if: runner.os == 'Linux'
         run: |
