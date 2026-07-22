@@ -13,11 +13,12 @@ use std::rc::Rc;
 use floem::prelude::*;
 use floem::reactive::create_memo;
 
+use schemaic_core::db_color::DbColorRule;
 use schemaic_core::history::{self, HistoryEntry};
 
 use crate::theme::{FONT_BODY, FONT_LABEL};
 use crate::widgets::{autohide, section_title, toolbar_icon};
-use crate::{Ui, icons, theme};
+use crate::{Ui, db_color_dot, icons, theme};
 
 /// Current wall-clock time, unix millis (for relative "x ago" labels).
 fn now_millis() -> u64 {
@@ -33,6 +34,7 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
     let right_w = ui.layout.right_w;
     let open_query = ui.tab_actions.open_query.clone();
     let clear = ui.history_actions.clear.clone();
+    let db_colors = ui.db_colors;
 
     // The active connection's entries, newest-first (already stored that way).
     let visible = create_memo(move |_| {
@@ -62,7 +64,7 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
             let oq = open_query.clone();
             let items = rows
                 .into_iter()
-                .map(move |e| history_row(e, now, oq.clone()))
+                .map(move |e| history_row(e, now, oq.clone(), db_colors))
                 .collect::<Vec<_>>();
             v_stack_from_iter(items)
                 .style(|s| s.flex_col().width_full())
@@ -92,11 +94,19 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
 
 /// One history row: SQL preview (≤3 wrapped lines, clipped) over a
 /// database + relative-time footer. Clicking opens the full SQL in a new tab.
-fn history_row(entry: HistoryEntry, now: u64, open_query: Rc<dyn Fn(String)>) -> impl IntoView {
+fn history_row(
+    entry: HistoryEntry,
+    now: u64,
+    open_query: Rc<dyn Fn(String)>,
+    db_colors: RwSignal<Vec<DbColorRule>>,
+) -> impl IntoView {
     let sql_full = entry.sql.clone();
     let preview = history::preview(&entry.sql);
     let db = entry.database.clone().unwrap_or_else(|| "—".to_string());
     let when = history::relative_time(entry.ts, now);
+    // Key for the DB-identity dot (only drawn when this run's database has a colour).
+    let dot_conn = entry.conn_id;
+    let dot_db = entry.database.clone();
 
     // ~3 lines: FONT_BODY (13) × 1.4 line-height × 3, clipped.
     let max_h = (FONT_BODY as f64) * 1.4 * 3.0;
@@ -111,12 +121,27 @@ fn history_row(entry: HistoryEntry, now: u64, open_query: Rc<dyn Fn(String)>) ->
         })
         .clip();
 
-    let footer = h_stack((
+    // Database name + its identity dot as a tight group, so the footer's `gap(8)`
+    // applies only between this group and the timestamp — the dot's spacing from
+    // the name is then purely its own `margin_left`.
+    let db_group = h_stack((
         text(db).style(|s| {
             s.font_size(FONT_LABEL)
                 .color(theme::text_dim())
                 .min_width(0.0)
         }),
+        // Identity dot next to the database name (colour set in the schema tree).
+        db_color_dot(
+            db_colors,
+            move || dot_db.clone().map(|d| (dot_conn, d)),
+            5.0,
+            0.0,
+            1.0,
+        ),
+    ))
+    .style(|s| s.items_center().min_width(0.0));
+    let footer = h_stack((
+        db_group,
         empty().style(|s| s.flex_grow(1.0_f32)),
         text(when).style(|s| {
             s.font_size(FONT_LABEL)

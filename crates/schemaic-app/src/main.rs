@@ -296,6 +296,21 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         );
     });
 
+    // Per-database identity colours (persisted, keyed by connection+database;
+    // set from the schema tree's right-click menu, shown as a dot on the DB node,
+    // the active-DB selector, and the database's query tabs).
+    let db_colors = RwSignal::new(
+        persist::load_json::<schemaic_core::db_color::DbColorsFile>("db_colors.json").rules,
+    );
+    let save_db_colors: Rc<dyn Fn()> = Rc::new(move || {
+        persist::save_json(
+            "db_colors.json",
+            &schemaic_core::db_color::DbColorsFile {
+                rules: db_colors.get_untracked(),
+            },
+        );
+    });
+
     // Persisted UI state (loaded here so tab restore below can read `restore_tabs`).
     let ui_state = persist::load_ui_state();
 
@@ -2299,6 +2314,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         persist_layout: save_ui.clone(),
         formats,
         save_formats,
+        db_colors,
+        save_db_colors,
     };
     schemaic_ui::workspace(ui)
 }

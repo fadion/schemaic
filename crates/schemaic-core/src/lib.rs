@@ -6,6 +6,7 @@
 //! models in [`connection`]/[`schema`]; and config persistence in [`persist`].
 
 pub mod connection;
+pub mod db_color;
 pub mod diff;
 pub mod edit;
 pub mod export;

@@ -387,6 +387,8 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
     let refresh_db = ui.schema_actions.refresh_db.clone();
     let collapse_db = ui.schema_actions.collapse_db.clone();
     let ai_send = ui.ai_actions.send.clone();
+    let db_colors = ui.db_colors;
+    let save_db_colors = ui.save_db_colors.clone();
 
     dyn_container(
         move || ctx.get(),
@@ -418,6 +420,38 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     entries.push(MenuEntry::action("Open in CLI", move || {
                         (ocli)(Some(dbn.clone()))
                     }));
+                    // Set colour: preset swatches + Clear, stored per (active
+                    // connection, database) and shown as a dot on the DB node,
+                    // active-DB selector, and this database's query tabs.
+                    let db_name = menu.name.clone();
+                    let mut swatches: Vec<MenuEntry> = crate::CONN_COLOR_PRESETS
+                        .iter()
+                        .map(|(name, hex, cfn)| {
+                            let dbc = db_colors;
+                            let save = save_db_colors.clone();
+                            let db = db_name.clone();
+                            let hex = hex.to_string();
+                            MenuEntry::action_icon(*name, (icons::DOT, *cfn), move || {
+                                let cid = active_conn.get_untracked();
+                                dbc.update(|r| {
+                                    schemaic_core::db_color::upsert(r, cid, &db, Some(hex.clone()))
+                                });
+                                (save)();
+                            })
+                        })
+                        .collect();
+                    swatches.push(MenuEntry::Separator);
+                    {
+                        let dbc = db_colors;
+                        let save = save_db_colors.clone();
+                        let db = db_name.clone();
+                        swatches.push(MenuEntry::action("None", move || {
+                            let cid = active_conn.get_untracked();
+                            dbc.update(|r| schemaic_core::db_color::upsert(r, cid, &db, None));
+                            (save)();
+                        }));
+                    }
+                    entries.push(MenuEntry::sub("Colour", swatches));
                 }
                 CtxKind::Table {
                     database,
