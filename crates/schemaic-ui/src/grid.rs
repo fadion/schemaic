@@ -34,7 +34,8 @@ use schemaic_core::text_ops::contains_ignore_ascii_case;
 
 use crate::consts::*;
 use crate::widgets::{
-    MenuEntry, autohide_state, centered_msg, shift_hscroll, thin_scroll, verb_spinner,
+    MenuEntry, autohide_state, centered_msg, shift_hscroll, thin_scroll, toolbar_icon,
+    verb_spinner,
 };
 use crate::{ConnNode, FieldCfg, bg_transparent, edit_field, icons, theme};
 
@@ -2101,37 +2102,6 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
 /// vertical / 5px horizontal, matching the footer icons), coloured `text_muted`
 /// and brightening to `text` on hover. `enabled` gates the click + hover; when it
 /// returns false the glyph dims to 30% alpha and is inert.
-fn toolbar_icon(
-    markup: &'static str,
-    enabled: impl Fn() -> bool + Copy + 'static,
-    on_click: impl Fn() + 'static,
-) -> impl IntoView {
-    let hov = RwSignal::new(false);
-    container(icons::icon(markup, 16.0).style(move |s| {
-        let c = if !enabled() {
-            theme::text_muted().multiply_alpha(0.3)
-        } else if hov.get() {
-            theme::text()
-        } else {
-            theme::text_muted()
-        };
-        s.color(c).flex_shrink(0.0_f32)
-    }))
-    .on_click_stop(move |_| {
-        if enabled() {
-            on_click();
-        }
-    })
-    .on_event_cont(EventListener::PointerEnter, move |_| hov.set(true))
-    .on_event_cont(EventListener::PointerLeave, move |_| hov.set(false))
-    .style(|s| {
-        s.items_center()
-            .padding_vert(3.0)
-            .padding_horiz(5.0)
-            .cursor(CursorStyle::Default)
-    })
-}
-
 /// A thin vertical divider between toolbar icon groups. Extra horizontal margin so
 /// it sits clear of the icons on either side (combined with the group gap).
 fn toolbar_sep() -> impl IntoView {
@@ -2268,13 +2238,13 @@ fn grid_toolbar(
                 return empty().into_any();
             }
             h_stack((
-                toolbar_icon(icons::PLUS, || true, move || add_pending_row(gs)),
-                toolbar_icon(icons::MINUS, row_selected, move || {
+                toolbar_icon(icons::PLUS, 0.0, 0.0, || true, move || add_pending_row(gs)),
+                toolbar_icon(icons::MINUS, 0.0, 0.0, row_selected, move || {
                     if let Some(di) = selected_data_row() {
                         gs.toggle_delete(di);
                     }
                 }),
-                toolbar_icon(icons::COPY_PLUS, row_selected, move || {
+                toolbar_icon(icons::COPY_PLUS, 0.0, 0.0, row_selected, move || {
                     if let Some(di) = selected_data_row() {
                         clone_row(gs, di);
                     }

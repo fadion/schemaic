@@ -78,6 +78,48 @@ pub(crate) fn panel_style(s: floem::style::Style) -> floem::style::Style {
         .border_radius(10.0)
 }
 
+/// A toolbar / title-bar icon button with a **padded hitbox** (5px horiz / 3px
+/// vert). Hover (dim→bright) is driven from a signal via `PointerEnter`/`Leave`
+/// on the padded container, so the *whole* box — not just the 16px glyph —
+/// highlights and takes the click. `mt`/`mr` position it (pass `0.0` when the
+/// caller lays out via separators/gaps, e.g. the results grid). `enabled` dims
+/// the glyph to 30% and swallows the click when false. Shared by the results-grid
+/// toolbar and the Schema/AI/Terminal/History panel title bars.
+pub(crate) fn toolbar_icon(
+    markup: &'static str,
+    mt: f64,
+    mr: f64,
+    enabled: impl Fn() -> bool + Copy + 'static,
+    on_click: impl Fn() + 'static,
+) -> impl IntoView {
+    let hov = RwSignal::new(false);
+    container(icons::icon(markup, 16.0).style(move |s| {
+        let c = if !enabled() {
+            theme::text_muted().multiply_alpha(0.3)
+        } else if hov.get() {
+            theme::text()
+        } else {
+            theme::text_muted()
+        };
+        s.flex_shrink(0.0_f32).color(c)
+    }))
+    .on_click_stop(move |_| {
+        if enabled() {
+            on_click();
+        }
+    })
+    .on_event_cont(EventListener::PointerEnter, move |_| hov.set(true))
+    .on_event_cont(EventListener::PointerLeave, move |_| hov.set(false))
+    .style(move |s| {
+        s.items_center()
+            .margin_top(mt)
+            .margin_right(mr)
+            .padding_horiz(5.0)
+            .padding_vert(3.0)
+            .cursor(floem::style::CursorStyle::Default)
+    })
+}
+
 /// The stored window-size signal plus the scope that owns it.
 type WindowSizeSlot = (RwSignal<(f64, f64)>, Scope);
 

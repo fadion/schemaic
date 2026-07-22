@@ -324,34 +324,52 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     // other is open switches in a single click. The icons absorb their own
     // PointerDown so the root-level dismiss handler (see `workspace`) doesn't
     // pre-close the menu and cause a toggle to immediately reopen it.
-    let eye = icons::icon(icons::EYE, 16.0)
-        .on_click_stop(move |_| {
-            close_other_menus();
-            schema_menu_open.set(false);
-            db_menu_open.update(|o| *o = !*o);
+    let eye_hov = RwSignal::new(false);
+    let eye = container(icons::icon(icons::EYE, 16.0).style(move |s| {
+        s.flex_shrink(0.0_f32).color(if eye_hov.get() {
+            theme::text()
+        } else {
+            theme::text_muted()
         })
-        .on_event_stop(EventListener::PointerDown, |_| {})
-        .style(|s| {
-            s.flex_shrink(0.0_f32)
-                .margin_top(7.0)
-                .margin_right(10.0)
-                .color(theme::text_muted())
-                .hover(|s| s.color(theme::text()))
-        });
-    let gear = icons::icon(icons::SLIDERS_VERTICAL, 16.0)
-        .on_click_stop(move |_| {
-            close_other_menus();
-            db_menu_open.set(false);
-            schema_menu_open.update(|o| *o = !*o);
+    }))
+    .on_click_stop(move |_| {
+        close_other_menus();
+        schema_menu_open.set(false);
+        db_menu_open.update(|o| *o = !*o);
+    })
+    .on_event_stop(EventListener::PointerDown, |_| {})
+    .on_event_cont(EventListener::PointerEnter, move |_| eye_hov.set(true))
+    .on_event_cont(EventListener::PointerLeave, move |_| eye_hov.set(false))
+    .style(|s| {
+        s.items_center()
+            .margin_top(4.0)
+            .margin_right(2.0)
+            .padding_horiz(5.0)
+            .padding_vert(3.0)
+    });
+    let gear_hov = RwSignal::new(false);
+    let gear = container(icons::icon(icons::SLIDERS_VERTICAL, 16.0).style(move |s| {
+        s.flex_shrink(0.0_f32).color(if gear_hov.get() {
+            theme::text()
+        } else {
+            theme::text_muted()
         })
-        .on_event_stop(EventListener::PointerDown, |_| {})
-        .style(|s| {
-            s.flex_shrink(0.0_f32)
-                .margin_top(7.0)
-                .margin_right(14.0)
-                .color(theme::text_muted())
-                .hover(|s| s.color(theme::text()))
-        });
+    }))
+    .on_click_stop(move |_| {
+        close_other_menus();
+        db_menu_open.set(false);
+        schema_menu_open.update(|o| *o = !*o);
+    })
+    .on_event_stop(EventListener::PointerDown, |_| {})
+    .on_event_cont(EventListener::PointerEnter, move |_| gear_hov.set(true))
+    .on_event_cont(EventListener::PointerLeave, move |_| gear_hov.set(false))
+    .style(|s| {
+        s.items_center()
+            .margin_top(4.0)
+            .margin_right(9.0)
+            .padding_horiz(5.0)
+            .padding_vert(3.0)
+    });
     // Title left, icon group right. `justify_between` pins the group's right edge
     // to the panel edge (a lone flex-grow spacer under-fills here — its default
     // `flex_basis: auto` leaves ~18px unclaimed — so we don't rely on it). The
