@@ -1040,7 +1040,12 @@ pub fn workspace(ui: Ui) -> impl IntoView {
     let shell = v_stack((
         header(ui.clone()),
         body(ui.clone(), schema_visible, right_panel),
-        footer(schema_visible, right_panel),
+        footer(
+            schema_visible,
+            right_panel,
+            ui.conn.connections,
+            ui.conn.active_conn,
+        ),
     ))
     .style(|s| {
         s.size_full()
@@ -1346,6 +1351,32 @@ pub(crate) fn active_conn_frame_color(
             }
         })
     })
+}
+
+/// A 2px identity-colour rule pinned to the top (`top`) or bottom edge of its
+/// parent container, in the active connection's colour when the "prominent
+/// colour" toggle is on (transparent otherwise). An absolute, pointer-events-off
+/// overlay drawn *over* the parent's existing 1px border: it takes no layout
+/// space, so toggling the setting never shifts the panels by a pixel. Wrap a
+/// fixed-size element (tab bar, grid, footer) in a `stack` with this as the last
+/// child so it paints on top and hugs the chosen edge.
+pub(crate) fn conn_edge_border(
+    connections: RwSignal<Vec<Connection>>,
+    active_conn: RwSignal<u64>,
+    top: bool,
+) -> impl IntoView {
+    empty()
+        .style(move |s| {
+            let color = active_conn_frame_color(connections, active_conn)
+                .unwrap_or(floem::peniko::Color::TRANSPARENT);
+            let s = s.absolute().inset(0.0).border_color(color);
+            if top {
+                s.border_top(2.0)
+            } else {
+                s.border_bottom(2.0)
+            }
+        })
+        .pointer_events(|| false)
 }
 
 /// Preset identity colours: the swatches offered in the connection form and the
@@ -1841,6 +1872,8 @@ fn center(ui: Ui) -> impl IntoView {
                 GridCtx {
                     source: tab.source,
                     db_nodes,
+                    connections,
+                    active_conn,
                     popup,
                     popup_anchor,
                     summarize: summarize.clone(),
@@ -1883,33 +1916,16 @@ fn center(ui: Ui) -> impl IntoView {
     // resets to the default editor height; drag-end/reset persists the layout.
     let split_handle = v_resize_handle(TAB_BAR_H, editor_h, EDITOR_H, ui.persist_layout.clone());
 
-    // A 1px identity-colour frame hugging the whole query+results column, sitting
-    // immediately inside the header/footer/panel borders — those stay intact, and
-    // the colour is still visible when the schema and AI/terminal panels are
-    // closed (the column then reaches the window edge). Sharp corners. Absolute +
-    // pointer-events-off so it neither shifts layout nor eats clicks; only the
-    // outer perimeter is drawn, so the editor↔results divider stays bare. Shown
-    // only when the active connection has the "prominent colour" toggle on
-    // (transparent border otherwise — a guard-rail for production connections).
-    let conn_frame = empty()
-        .style(move |s| {
-            let color = active_conn_frame_color(connections, active_conn)
-                .unwrap_or(floem::peniko::Color::TRANSPARENT);
-            s.absolute()
-                .inset(CONN_FRAME_INSET)
-                .border(1.0)
-                .border_color(color)
-        })
-        .pointer_events(|| false);
-
-    v_stack((
+    // Identity-colour rule under the tab strip (drawn on the "prominent colour"
+    // setting). Wrapping the tab bar in a `stack` pins the 2px line to the bar's
+    // bottom edge as a no-layout overlay, so enabling it never nudges the editor.
+    let tabs_row = stack((
         tab_bar(ui.clone()),
-        editor_area,
-        results_area,
-        split_handle,
-        conn_frame,
+        conn_edge_border(connections, active_conn, false),
     ))
-    .style(|s| {
+    .style(|s| s.width_full().flex_shrink(0.0_f32));
+
+    v_stack((tabs_row, editor_area, results_area, split_handle)).style(|s| {
         s.flex_grow(1.0_f32)
             .height_full()
             .flex_col()
@@ -3099,7 +3115,12 @@ pub(crate) fn thumb_len(desired: f64, track: f64) -> f64 {
 
 // The connection switcher dropdown: saved connections + "Manage Connections".
 // ── Footer (status bar) ──────────────────────────────────────────────────
-fn footer(schema_visible: RwSignal<bool>, right_panel: RwSignal<RightPanel>) -> impl IntoView {
+fn footer(
+    schema_visible: RwSignal<bool>,
+    right_panel: RwSignal<RightPanel>,
+    connections: RwSignal<Vec<Connection>>,
+    active_conn: RwSignal<u64>,
+) -> impl IntoView {
     // AI/Terminal toggles are mutually exclusive: turning one on replaces the
     // other; clicking the active one hides it (right column freed).
     let set_right = move |target: RightPanel| {
@@ -3143,7 +3164,7 @@ fn footer(schema_visible: RwSignal<bool>, right_panel: RwSignal<RightPanel>) -> 
         .style(|s| s.margin_right(5.0)),
     ))
     .style(|s| s.flex_row().items_center().gap(10.0));
-    h_stack((schema_icon, right_group)).style(|s| {
+    let bar = h_stack((schema_icon, right_group)).style(|s| {
         s.width_full()
             .height(theme::FOOTER_H)
             .min_height(theme::FOOTER_H)
@@ -3154,7 +3175,11 @@ fn footer(schema_visible: RwSignal<bool>, right_panel: RwSignal<RightPanel>) -> 
             .background(theme::bg_deepest())
             .border_top(1.0)
             .border_color(theme::border())
-    })
+    });
+    // Identity-colour rule on the footer's top edge (on the "prominent colour"
+    // setting): a 2px no-layout overlay over the existing 1px border.
+    stack((bar, conn_edge_border(connections, active_conn, true)))
+        .style(|s| s.width_full().flex_shrink(0.0_f32))
 }
 
 // The Find-palette search box: the shared field, autofocused on open, with a
