@@ -108,7 +108,7 @@ fn mask_of_len(n: usize) -> String {
 /// connection has a colour (new ones are auto-assigned), so there's no "none"
 /// option; the selected swatch gets a 2px border in `text()`.
 fn color_picker(color: RwSignal<Option<String>>) -> impl IntoView {
-    let swatches = crate::CONN_COLORS.iter().map(move |hex| {
+    let swatches = crate::CONN_COLOR_PRESETS.iter().map(move |(_, hex, _)| {
         let hex = (*hex).to_string();
         let hx = hex.clone();
         empty()

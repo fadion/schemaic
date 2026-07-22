@@ -12,9 +12,11 @@ use floem::reactive::create_effect;
 use floem::style::TextOverflow;
 use floem::views::TooltipExt;
 
+use schemaic_core::db_color::DbColorRule;
+
 use crate::consts::{TAB_BAR_H, TAB_MAX_W};
 use crate::widgets::{measure_text_px, wheel_hscroll};
-use crate::{FieldCfg, Tab, Ui, bg_transparent, edit_field, icons, theme};
+use crate::{FieldCfg, Tab, Ui, bg_transparent, db_color_dot, edit_field, icons, theme};
 
 // ===== moved from lib.rs (tab bar) =====
 // ── Tab bar ─────────────────────────────────────────────────────────────────
@@ -24,6 +26,7 @@ pub(crate) fn tab_bar(ui: Ui) -> impl IntoView {
     let flashing = ui.tabs_ui.flashing;
     let add_tab = ui.tab_actions.add_tab.clone();
     let close_tab = ui.tab_actions.close_tab.clone();
+    let db_colors = ui.db_colors;
     // A flashing tab's chip is hidden for the duration of the flash. Flat,
     // full-height tabs sit flush (no gap); each draws its own right separator.
     let chips = dyn_stack(
@@ -34,7 +37,7 @@ pub(crate) fn tab_bar(ui: Ui) -> impl IntoView {
                 .collect::<Vec<_>>()
         },
         |t: &Tab| t.id,
-        move |t| tab_chip(t, active, close_tab.clone()),
+        move |t| tab_chip(t, active, close_tab.clone(), db_colors),
     )
     .style(|s| s.flex_row().height_full());
 
@@ -77,7 +80,12 @@ pub(crate) fn tab_bar(ui: Ui) -> impl IntoView {
 // margin (7). A title wider than this ellipsizes and gains a tooltip.
 const TAB_TITLE_AVAIL: f64 = TAB_MAX_W - 40.0;
 
-fn tab_chip(tab: Tab, active: RwSignal<usize>, close_tab: Rc<dyn Fn(usize)>) -> impl IntoView {
+fn tab_chip(
+    tab: Tab,
+    active: RwSignal<usize>,
+    close_tab: Rc<dyn Fn(usize)>,
+    db_colors: RwSignal<Vec<DbColorRule>>,
+) -> impl IntoView {
     // Commit the inline rename: an empty/blank name reverts to the default
     // "Query N" (stored as `None`). Called from Enter and from focus-loss.
     let commit: Rc<dyn Fn()> = Rc::new(move || {
@@ -134,9 +142,10 @@ fn tab_chip(tab: Tab, active: RwSignal<usize>, close_tab: Rc<dyn Fn(usize)>) -> 
             // that fits gets none.
             let truncated = measure_text_px(&title) > TAB_TITLE_AVAIL;
             let full = title.clone();
+            // Left inset moved to the row's `padding_left` so the (optional) DB
+            // colour dot can lead the label without shifting the text when absent.
             let label = text(title).style(|s| {
-                s.margin_left(10.0)
-                    .margin_right(7.0)
+                s.margin_right(7.0)
                     .max_width(TAB_TITLE_AVAIL)
                     .text_overflow(TextOverflow::Ellipsis)
                     .font_size(theme::FONT_BODY)
@@ -171,8 +180,17 @@ fn tab_chip(tab: Tab, active: RwSignal<usize>, close_tab: Rc<dyn Fn(usize)>) -> 
                         .margin_right(7.0)
                         .color(theme::tab_close())
                 });
-            h_stack((label, close))
-                .style(|s| s.flex_row().items_center())
+            // Small DB-identity dot leading the label (only when this tab's
+            // database has a colour; zero-footprint otherwise).
+            let dot = db_color_dot(
+                db_colors,
+                move || tab.database.get().map(|db| (tab.conn_id.get(), db)),
+                0.0,
+                6.0,
+                -1.0,
+            );
+            h_stack((dot, label, close))
+                .style(|s| s.flex_row().items_center().padding_left(10.0))
                 .into_any()
         },
     );

@@ -15,11 +15,12 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::{Memo, create_effect};
 
+use schemaic_core::db_color::DbColorRule;
 use schemaic_core::schema::{ColumnInfo, IndexInfo, SchemaState, TableInfo};
 
 use crate::consts::*;
 use crate::widgets::{autohide, loading_dots, section_title, shift_hscroll};
-use crate::{ConnNode, CtxKind, CtxMenu, FieldCfg, Ui, edit_field, icons, theme};
+use crate::{ConnNode, CtxKind, CtxMenu, FieldCfg, Ui, db_color_dot, edit_field, icons, theme};
 
 // ===== moved from lib.rs (schema tree) =====
 // Keyboard-navigation state for the schema tree. `focused` = the panel has nav
@@ -135,6 +136,8 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     let open_table = ui.tab_actions.open_table.clone();
     let active_table = ui.schema.active_table;
     let active_db = ui.tabs_ui.active_db;
+    let active_conn = ui.conn.active_conn;
+    let db_colors = ui.db_colors;
     let hidden_dbs = ui.schema.hidden_dbs;
     let db_menu_open = ui.schema.db_menu_open;
     let schema_menu_open = ui.schema.schema_menu_open;
@@ -201,6 +204,8 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                     active_table,
                     active_db,
                     context_menu,
+                    active_conn,
+                    db_colors,
                     nav,
                 },
             )
@@ -417,6 +422,10 @@ struct SchemaTreeCtx {
     active_table: RwSignal<Option<(String, String)>>,
     active_db: Memo<Option<String>>,
     context_menu: RwSignal<Option<CtxMenu>>,
+    /// The active connection id + the app-wide DB-colour store, for the identity
+    /// dot on database rows. (Schema-tree nodes all belong to the active connection.)
+    active_conn: RwSignal<u64>,
+    db_colors: RwSignal<Vec<DbColorRule>>,
     nav: Nav,
 }
 
@@ -429,6 +438,8 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
         active_table,
         active_db,
         context_menu,
+        active_conn,
+        db_colors,
         nav,
     } = ctx;
     let key = format!("db:{}", conn.database);
@@ -437,6 +448,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
     let toggle_row = on_toggle.clone();
     let key_row = key.clone();
     let ctx_db = conn.database.clone();
+    let dot_db = conn.database.clone();
     let header = h_stack((
         chevron(expanded, key.clone(), on_toggle.clone()),
         icons::icon(icons::DATABASE, SCHEMA_ICON as f32).style(|s| {
@@ -446,6 +458,14 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                 .flex_shrink(0.0_f32)
         }),
         text(conn.name.clone()).style(|s| s.color(theme::text()).font_bold()),
+        // Identity dot after the name (only when this database has a colour).
+        db_color_dot(
+            db_colors,
+            move || Some((active_conn.get(), dot_db.clone())),
+            7.0,
+            0.0,
+            1.0,
+        ),
     ))
     .on_double_click_stop(move |_| (toggle_row)(key_row.clone()))
     .on_secondary_click_stop(move |_| {
@@ -541,6 +561,8 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                                 active_table,
                                 active_db,
                                 context_menu,
+                                active_conn,
+                                db_colors,
                                 nav,
                             },
                         )

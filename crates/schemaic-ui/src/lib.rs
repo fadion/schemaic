@@ -64,6 +64,7 @@ use floem::views::editor::text::{SimpleStyling, WrapMethod, default_dark_color};
 use floem::views::scroll::{Handle, Rounded, Thickness, Track};
 use floem::views::{Decorators, TextInputClass};
 use schemaic_core::connection::{ConnStatus, Connection, SshAuth};
+use schemaic_core::db_color::DbColorRule;
 use schemaic_core::format::ColumnFormatRule;
 use schemaic_core::history::HistoryEntry;
 use schemaic_core::model::{CommitDone, GridWrite, QueryState, RefetchRequest};
@@ -831,6 +832,12 @@ pub struct Ui {
     pub formats: RwSignal<Vec<ColumnFormatRule>>,
     /// Persist the formatter rules to disk (after the grid upserts one).
     pub save_formats: Rc<dyn Fn()>,
+    /// Per-database identity colours (persisted to `db_colors.json`), keyed by
+    /// `(conn_id, database)`; set from the schema tree, shown as a dot on the DB
+    /// node, the active-DB selector, and the database's query tabs.
+    pub db_colors: RwSignal<Vec<DbColorRule>>,
+    /// Persist the database-colour rules to disk (after a menu upsert).
+    pub save_db_colors: Rc<dyn Fn()>,
 }
 
 /// Which panel occupies the right column. AI and Terminal are mutually
@@ -1379,18 +1386,64 @@ pub(crate) fn conn_edge_border(
         .pointer_events(|| false)
 }
 
-/// Preset identity colours: the swatches offered in the connection form and the
-/// pool auto-assign draws from. Saturated mid-tones that read on both themes.
-pub(crate) const CONN_COLORS: &[&str] = &[
-    "#E05252", // red
-    "#E08A4B", // orange
-    "#E0C24B", // amber
-    "#52C77A", // green
-    "#43C6C6", // teal
-    "#5B8DEF", // blue
-    "#9B6DE0", // purple
-    "#E06D9B", // pink
+/// A small identity dot (6px — matching the connection status dot) for a database
+/// that has an identity colour, or a zero-footprint `empty()` when it doesn't, so
+/// uncoloured databases render exactly as before. `key` yields the `(conn_id,
+/// database)` to look up reactively; `ml`/`mr`/`mt` are the dot's margins (left /
+/// right / top), applied only when a dot is drawn — `mt` fine-tunes its vertical
+/// alignment against the neighbouring text. Rebuilds when the colour or key
+/// changes. The colour is a fixed identity hex (not themable), so capturing it by
+/// value here is correct.
+pub(crate) fn db_color_dot(
+    db_colors: RwSignal<Vec<DbColorRule>>,
+    key: impl Fn() -> Option<(u64, String)> + 'static,
+    ml: f64,
+    mr: f64,
+    mt: f64,
+) -> impl IntoView {
+    dyn_container(
+        move || {
+            key().and_then(|(cid, db)| {
+                db_colors.with(|rules| schemaic_core::db_color::lookup(rules, cid, &db))
+            })
+        },
+        move |hex| match hex.as_deref().and_then(theme::parse_hex) {
+            Some(color) => icons::icon(icons::DOT, 6.0)
+                .style(move |s| {
+                    s.color(color)
+                        .flex_shrink(0.0_f32)
+                        .margin_left(ml)
+                        .margin_right(mr)
+                        .margin_top(mt)
+                })
+                .into_any(),
+            None => empty().into_any(),
+        },
+    )
+}
+
+/// One identity-colour preset: `(display name, #rrggbb hex, parsed-colour
+/// accessor)`. The accessor is a `fn` pointer because menu icon/label colours are
+/// `fn`s (so they can follow theme switches), so each preset needs a concrete one.
+pub(crate) type ColorPreset = (&'static str, &'static str, fn() -> floem::peniko::Color);
+
+/// Preset identity colours — saturated mid-tones that read on both themes. Single
+/// source for the connection-form swatches, the auto-assign pool, and the database
+/// colour picker.
+pub(crate) const CONN_COLOR_PRESETS: &[ColorPreset] = &[
+    ("Red", "#E05252", || parse_preset("#E05252")),
+    ("Orange", "#E08A4B", || parse_preset("#E08A4B")),
+    ("Amber", "#E0C24B", || parse_preset("#E0C24B")),
+    ("Green", "#52C77A", || parse_preset("#52C77A")),
+    ("Teal", "#43C6C6", || parse_preset("#43C6C6")),
+    ("Blue", "#5B8DEF", || parse_preset("#5B8DEF")),
+    ("Purple", "#9B6DE0", || parse_preset("#9B6DE0")),
+    ("Pink", "#E06D9B", || parse_preset("#E06D9B")),
 ];
+
+fn parse_preset(hex: &str) -> floem::peniko::Color {
+    theme::parse_hex(hex).unwrap_or(floem::peniko::Color::TRANSPARENT)
+}
 
 /// Pick an identity colour for a new connection: a preset not already used by an
 /// existing connection (so colours stay distinct), or — once every preset is
@@ -1401,16 +1454,9 @@ pub fn pick_connection_color(used: &[String]) -> String {
         .map(|d| d.subsec_nanos() as usize)
         .unwrap_or(0);
     let is_used = |c: &str| used.iter().any(|u| u.eq_ignore_ascii_case(c));
-    let unused: Vec<&str> = CONN_COLORS
-        .iter()
-        .copied()
-        .filter(|c| !is_used(c))
-        .collect();
-    let pool: &[&str] = if unused.is_empty() {
-        CONN_COLORS
-    } else {
-        &unused
-    };
+    let all: Vec<&str> = CONN_COLOR_PRESETS.iter().map(|(_, hex, _)| *hex).collect();
+    let unused: Vec<&str> = all.iter().copied().filter(|c| !is_used(c)).collect();
+    let pool = if unused.is_empty() { &all } else { &unused };
     pool[seed % pool.len()].to_string()
 }
 
