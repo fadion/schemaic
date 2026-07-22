@@ -181,6 +181,10 @@ pub struct SavedTab {
     pub database: Option<String>,
     #[serde(default)]
     pub source: Option<(String, String)>,
+    /// User-assigned tab name (double-click to rename); `None` = the default
+    /// "Query N" label. Persisted so a restored tab keeps its name.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// The set of open tabs at last save, plus which one was active (its index).

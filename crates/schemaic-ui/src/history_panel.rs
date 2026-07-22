@@ -101,40 +101,65 @@ fn history_row(entry: HistoryEntry, now: u64, open_query: Rc<dyn Fn(String)>) ->
     // ~3 lines: FONT_BODY (13) × 1.4 line-height × 3, clipped.
     let max_h = (FONT_BODY as f64) * 1.4 * 3.0;
 
-    v_stack((
-        text(preview)
-            .style(move |s| {
-                s.font_size(FONT_BODY)
-                    .color(theme::text())
-                    .line_height(1.4)
-                    .width_full()
-                    .max_height(max_h)
-            })
-            .clip(),
-        h_stack((
-            text(db).style(|s| {
-                s.font_size(FONT_LABEL)
-                    .color(theme::text_dim())
-                    .min_width(0.0)
-            }),
-            empty().style(|s| s.flex_grow(1.0_f32)),
-            text(when).style(|s| {
-                s.font_size(FONT_LABEL)
-                    .color(theme::text_faint())
-                    .flex_shrink(0.0_f32)
-            }),
-        ))
-        .style(|s| s.items_center().width_full().gap(8.0)),
+    let preview_view = text(preview)
+        .style(move |s| {
+            s.font_size(FONT_BODY)
+                .color(theme::text())
+                .line_height(1.4)
+                .width_full()
+                .max_height(max_h)
+        })
+        .clip();
+
+    let footer = h_stack((
+        text(db).style(|s| {
+            s.font_size(FONT_LABEL)
+                .color(theme::text_dim())
+                .min_width(0.0)
+        }),
+        empty().style(|s| s.flex_grow(1.0_f32)),
+        text(when).style(|s| {
+            s.font_size(FONT_LABEL)
+                .color(theme::text_faint())
+                .flex_shrink(0.0_f32)
+        }),
     ))
-    .on_click_stop(move |_| (open_query)(sql_full.clone()))
-    .style(|s| {
-        s.flex_col()
-            .width_full()
-            .gap(4.0)
-            .padding_horiz(12.0)
-            .padding_vert(9.0)
-            .border_bottom(1.0)
-            .border_color(theme::border())
-            .hover(|s| s.background(theme::row_hover()))
-    })
+    .style(|s| s.items_center().width_full().gap(8.0));
+
+    // The originating tab's custom name (if any) on its own line below the footer,
+    // as a small capsule that hugs its text (wrapped in a row so it doesn't stretch
+    // full-width). Unnamed tabs add no extra row.
+    let named = entry.tab_name.clone().filter(|n| !n.trim().is_empty());
+    let inner: floem::AnyView = match named {
+        Some(n) => {
+            let capsule = text(n).style(|s| {
+                s.font_size(FONT_LABEL)
+                    .color(theme::text())
+                    .padding_horiz(7.0)
+                    .padding_vert(3.0)
+                    .background(theme::capsule_bg())
+                    .border_radius(4.0)
+                    .flex_shrink(0.0_f32)
+            });
+            // +2px over the v_stack's 4px gap → 6px between the table and the name.
+            let name_row = h_stack((capsule,)).style(|s| s.width_full().margin_top(2.0));
+            v_stack((preview_view, footer, name_row))
+                .style(|s| s.flex_col().width_full().gap(4.0))
+                .into_any()
+        }
+        None => v_stack((preview_view, footer))
+            .style(|s| s.flex_col().width_full().gap(4.0))
+            .into_any(),
+    };
+
+    container(inner)
+        .on_click_stop(move |_| (open_query)(sql_full.clone()))
+        .style(|s| {
+            s.width_full()
+                .padding_horiz(12.0)
+                .padding_vert(9.0)
+                .border_bottom(1.0)
+                .border_color(theme::border())
+                .hover(|s| s.background(theme::row_hover()))
+        })
 }

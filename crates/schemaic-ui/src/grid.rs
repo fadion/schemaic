@@ -34,7 +34,8 @@ use schemaic_core::text_ops::contains_ignore_ascii_case;
 
 use crate::consts::*;
 use crate::widgets::{
-    MenuEntry, autohide_state, centered_msg, shift_hscroll, thin_scroll, toolbar_icon, verb_spinner,
+    MenuEntry, autohide_state, centered_msg, measure_text_px, shift_hscroll, thin_scroll,
+    toolbar_icon, verb_spinner,
 };
 use crate::{ConnNode, FieldCfg, bg_transparent, edit_field, icons, theme};
 
@@ -733,18 +734,6 @@ impl GridState {
 
 /// Exact rendered pixel width of `text` in the grid's cell font (the app default
 /// sans — IBM Plex Sans — at `FONT_BODY`), via a throwaway `TextLayout`. Used to
-/// right-align the numeric inline editor precisely: Floem's `text_input` has no
-/// text-align, so we pad its left by exactly the free space (`col_w − text_w`).
-/// Goes through the same global `FontSystem` the cell renders with, so the
-/// measurement matches to the pixel (no gap, no clip).
-fn measure_text_px(text: &str) -> f64 {
-    use floem::text::{Attrs, AttrsList, TextLayout};
-    let attrs = Attrs::new().font_size(theme::FONT_BODY);
-    let mut layout = TextLayout::new();
-    layout.set_text(text, AttrsList::new(attrs));
-    layout.size().width
-}
-
 /// Estimate a column's initial width from its header + a sample of cell values.
 fn init_widths(rs: &ResultSet) -> Vec<f64> {
     let sample = rs.rows.len().min(200);

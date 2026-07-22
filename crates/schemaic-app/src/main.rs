@@ -52,6 +52,8 @@ type ConnectResult = Result<
 >;
 /// Self-rescheduling cursor-blink tick — holds an `Rc` to itself so it can re-arm.
 type BlinkTick = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+/// Record one executed query into history: `(conn_id, database, sql, tab_name)`.
+type RecordHistoryFn = Rc<dyn Fn(u64, Option<String>, String, Option<String>)>;
 use schemaic_core::persist::{self, ConnectionsFile, UiState};
 use schemaic_core::schema::SchemaState;
 use schemaic_db::{Db, DbError};
@@ -325,6 +327,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     };
                     let t = Tab::new(cx, i + 1, &s.query, conn, s.database.clone());
                     t.source.set(s.source.clone());
+                    t.name.set(s.name.clone());
                     t
                 })
                 .collect();
@@ -465,30 +468,33 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
 
     // Record an executed query into the history (newest-first, capped) and persist
     // it. Called from every run path (single Run, Run Current, Run Everything).
-    let record_history: Rc<dyn Fn(u64, Option<String>, String)> = {
-        Rc::new(move |conn_id: u64, database: Option<String>, sql: String| {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            history_entries.update(|v| {
-                schemaic_core::history::push(
-                    v,
-                    schemaic_core::history::HistoryEntry {
-                        conn_id,
-                        database,
-                        sql,
-                        ts,
+    let record_history: RecordHistoryFn = {
+        Rc::new(
+            move |conn_id: u64, database: Option<String>, sql: String, tab_name: Option<String>| {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                history_entries.update(|v| {
+                    schemaic_core::history::push(
+                        v,
+                        schemaic_core::history::HistoryEntry {
+                            conn_id,
+                            database,
+                            sql,
+                            ts,
+                            tab_name,
+                        },
+                    );
+                });
+                persist::save_json(
+                    "history.json",
+                    &schemaic_core::history::HistoryFile {
+                        entries: history_entries.get_untracked(),
                     },
                 );
-            });
-            persist::save_json(
-                "history.json",
-                &schemaic_core::history::HistoryFile {
-                    entries: history_entries.get_untracked(),
-                },
-            );
-        })
+            },
+        )
     };
 
     // Clear the active connection's history (the panel's trash button), persisting.
@@ -531,7 +537,12 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 }
             };
             let database = tab.database.get_untracked();
-            (record_history)(tab.conn_id.get_untracked(), database.clone(), sql.clone());
+            (record_history)(
+                tab.conn_id.get_untracked(),
+                database.clone(),
+                sql.clone(),
+                tab.name.get_untracked(),
+            );
 
             if let Some((_, old)) = tokens.borrow_mut().remove(&id) {
                 old.cancel();
@@ -655,8 +666,9 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             let database = tab.database.get_untracked();
             // Record each statement (oldest first, so the batch lands newest-last).
             let conn_id = tab.conn_id.get_untracked();
+            let tab_name = tab.name.get_untracked();
             for s in &stmts {
-                (record_history)(conn_id, database.clone(), s.clone());
+                (record_history)(conn_id, database.clone(), s.clone(), tab_name.clone());
             }
 
             if let Some((_, old)) = tokens.borrow_mut().remove(&id) {
@@ -1094,6 +1106,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     t.conn_id.get();
                     t.database.get();
                     t.source.get();
+                    t.name.get();
                 }
             });
             active.get();
@@ -1118,6 +1131,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                                 conn_id: t.conn_id.get_untracked(),
                                 database: t.database.get_untracked(),
                                 source: t.source.get_untracked(),
+                                name: t.name.get_untracked(),
                             })
                             .collect(),
                     }

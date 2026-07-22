@@ -114,6 +114,15 @@ pub struct Tab {
     /// `(database, table)` this tab was opened from, if any — used to highlight
     /// the source table in the schema sidebar.
     pub source: RwSignal<Option<(String, String)>>,
+    /// User-assigned tab name (double-click to rename). `None` = the default
+    /// "Query N" label. Persisted with the tab and shown in query history.
+    pub name: RwSignal<Option<String>>,
+    /// True while the tab title is being edited inline (renders a text field in
+    /// place of the label).
+    pub editing: RwSignal<bool>,
+    /// Backing buffer for the inline rename field (committed to `name` on Enter /
+    /// blur).
+    pub edit_buf: RwSignal<String>,
 }
 
 impl Tab {
@@ -138,7 +147,19 @@ impl Tab {
             conn_id: cx.create_rw_signal(conn_id),
             database: cx.create_rw_signal(database),
             source: cx.create_rw_signal(None),
+            name: cx.create_rw_signal(None),
+            editing: cx.create_rw_signal(false),
+            edit_buf: cx.create_rw_signal(String::new()),
         }
+    }
+
+    /// The tab's display title: its user-assigned name, or the default "Query N".
+    /// Reads the `name` signal reactively, so callers in a reactive scope re-run
+    /// on rename.
+    pub fn title(&self) -> String {
+        self.name
+            .get()
+            .unwrap_or_else(|| format!("Query {}", self.label))
     }
 }
 
@@ -2578,6 +2599,10 @@ pub(crate) struct FieldCfg {
     pub on_submit: Option<Rc<dyn Fn()>>,
     /// Escape key (e.g. close an overlay).
     pub on_escape: Option<Rc<dyn Fn()>>,
+    /// Focus lost — the field was blurred (clicking elsewhere, Tab-ing away). Not
+    /// fired on the initial build. Used by the inline tab-rename to commit on
+    /// click-away.
+    pub on_blur: Option<Rc<dyn Fn()>>,
     /// Arrow Up / Down (e.g. move the selection in a command-palette list). When
     /// set, the key is consumed here instead of moving the editor caret.
     pub on_arrow_up: Option<Rc<dyn Fn()>>,
@@ -2606,6 +2631,7 @@ impl Default for FieldCfg {
             border_color: None,
             on_submit: None,
             on_escape: None,
+            on_blur: None,
             on_arrow_up: None,
             on_arrow_down: None,
             trailing: None,
@@ -2671,6 +2697,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         border_color,
         on_submit,
         on_escape,
+        on_blur,
         on_arrow_up,
         on_arrow_down,
         trailing,
@@ -2842,6 +2869,11 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         floem::action::exec_after(std::time::Duration::from_millis(0), move |_| {
             if let Some(Some(vid)) = ed_af.editor_view_id.try_get_untracked() {
                 vid.request_focus();
+                // Land the caret at the end of any seeded text — a programmatic
+                // focus on a prefilled field (e.g. the inline tab rename) should
+                // sit after the text, not before it. (Empty fields: end == 0.)
+                let len = ed_af.doc().text().to_string().len();
+                ed_af.cursor.update(|c| c.set_offset(len, false, false));
             }
         });
     }
@@ -2930,7 +2962,8 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             }
         });
         let ed_blur = ed.clone();
-        create_effect(move |_| {
+        let blur_cb = on_blur.clone();
+        create_effect(move |prev: Option<()>| {
             ed_blur.editor_view_focus_lost.track();
             focused.set(false);
             ed_blur.cursor_info.hidden.set(true);
@@ -2938,6 +2971,14 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                 .cursor_info
                 .blink_timer
                 .set(floem::action::TimerToken::INVALID);
+            // Skip the initial effect run (`prev` is `None` only then) — it's
+            // establishing tracking, not a real blur — so callers don't get a
+            // spurious focus-lost on mount.
+            if prev.is_some()
+                && let Some(cb) = &blur_cb
+            {
+                (cb)();
+            }
         });
     }
 

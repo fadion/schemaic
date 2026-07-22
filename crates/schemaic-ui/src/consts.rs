@@ -107,6 +107,9 @@ pub(crate) const RESIZE_MIN: f64 = 80.0;
 
 /// Tab bar height. Flat, full-height tabs fill it edge to edge.
 pub(crate) const TAB_BAR_H: f64 = 34.0;
+/// Max width of a single query tab (px). The title truncates with an ellipsis
+/// (+ full-name tooltip) past this; the inline rename field auto-widens up to it.
+pub(crate) const TAB_MAX_W: f64 = 200.0;
 
 // ── AI chat input ───────────────────────────────────────────────────────────
 
