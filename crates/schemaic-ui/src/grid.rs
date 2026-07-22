@@ -23,6 +23,7 @@ use floem::reactive::{Memo, create_effect, create_memo};
 use floem::style::CursorStyle;
 use floem::views::{VirtualDirection, VirtualItemSize, VirtualVector};
 
+use schemaic_core::connection::Connection;
 use schemaic_core::edit::{EditModel, analyze_edit, refetch_template};
 use schemaic_core::format::{self, ColumnFormat, ColumnFormatRule};
 use schemaic_core::model::{
@@ -1136,6 +1137,10 @@ pub(crate) struct GridCtx {
     /// The active tab's source `(database, table)`, for key-icon lookup.
     pub(crate) source: RwSignal<Option<(String, String)>>,
     pub(crate) db_nodes: RwSignal<Vec<ConnNode>>,
+    /// Saved connections + the active id, for the identity-colour rule drawn at
+    /// the table's top edge (the "prominent colour" setting).
+    pub(crate) connections: RwSignal<Vec<Connection>>,
+    pub(crate) active_conn: RwSignal<u64>,
     /// Ui-level popup-menu signal (header/cell right-click menus).
     pub(crate) popup: RwSignal<Option<Vec<MenuEntry>>>,
     /// Popup anchor signal (icon-anchored toolbar dropdowns vs cursor menus).
@@ -1355,6 +1360,9 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     let key_map = Arc::new(column_key_map(gctx.source, gctx.db_nodes));
     let elapsed = rs.elapsed_ms;
     let truncated = rs.truncated;
+    // Signals for the identity-colour rule at the table's top edge (below the
+    // toolbar), captured before `gctx` fields move into the closures below.
+    let (connections, active_conn) = (gctx.connections, gctx.active_conn);
 
     // Interactive state, created once and shared across sort rebuilds.
     let gs = GridState::new(rs.clone(), &gctx);
@@ -1679,7 +1687,22 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     // can expand, then scroll), but never taller than ~200px total. Derived from
     // the panel height tracked on the root `on_resize` below (~19px/row).
     let viewer_max = RwSignal::new(6usize);
-    v_stack((toolbar, grid, value_viewer(gs, viewer_max)))
+    // Wrap the grid so a 2px identity-colour rule can pin to its top edge (right
+    // below the toolbar) without taking layout space — the "prominent colour"
+    // setting. The box inherits the grid's growth so the table still fills.
+    let grid_boxed = stack((
+        grid,
+        crate::conn_edge_border(connections, active_conn, true),
+    ))
+    .style(|s| {
+        s.flex_grow(1.0_f32)
+            .flex_basis(0.0)
+            .width_full()
+            .flex_col()
+            .min_height(120.0)
+            .min_width(0.0)
+    });
+    v_stack((toolbar, grid_boxed, value_viewer(gs, viewer_max)))
         .on_resize(move |r| {
             // Cap so the viewer leaves the grid its `min_height` (~120) + toolbar
             // (~26) + the viewer's own header (~26): rows ≈ (panel − 172) / 19.

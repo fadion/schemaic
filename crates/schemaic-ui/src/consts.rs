@@ -43,11 +43,6 @@ pub(crate) const CELL_W: f64 = 190.0;
 /// right-aligns it flush to the icon (matches `menu_stack`'s 170px min width).
 pub(crate) const GRID_COPY_MENU_W: f64 = 170.0;
 
-/// Inset of the connection-colour frame from the query+results column edges.
-/// Zero so it hugs the panel/header/footer borders (sits immediately inside them,
-/// which stay intact).
-pub(crate) const CONN_FRAME_INSET: f64 = 0.0;
-
 // ── SQL editor ──────────────────────────────────────────────────────────────
 
 /// Height of the query editor panel (a multiline SQL editor fills this box).
