@@ -466,6 +466,32 @@ pub(crate) fn shift_hscroll<V: IntoView + 'static>(child: V) -> Scroll {
     )
 }
 
+/// Wrap a child in a horizontal `scroll` with **permanently hidden bars** that
+/// pans on a *plain* (vertical) wheel — the tab strips, where there's no vertical
+/// axis, so the main wheel should nudge tabs sideways and keep overflowed tabs
+/// reachable. Both wheel axes map to x; the built-in scroll runs our listener
+/// before its own wheel handling, so `Stop` suppresses any default scrolling.
+pub(crate) fn wheel_hscroll<V: IntoView + 'static>(child: V) -> Scroll {
+    let wheel: RwSignal<floem::kurbo::Vec2> = RwSignal::new(floem::kurbo::Vec2::ZERO);
+    scroll(child)
+        .scroll_style(|cs| cs.hide_bars(true))
+        .scroll_delta(move || wheel.get())
+        .on_event(EventListener::PointerWheel, move |e| {
+            if let Event::PointerWheel(pe) = e {
+                let dx = if pe.delta.x != 0.0 {
+                    pe.delta.x
+                } else {
+                    pe.delta.y
+                };
+                if dx != 0.0 {
+                    wheel.set(floem::kurbo::Vec2::new(dx, 0.0));
+                    return EventPropagation::Stop;
+                }
+            }
+            EventPropagation::Continue
+        })
+}
+
 // ── Shared bits (section headers, centered messages, panel-toggle icon) ──
 pub(crate) fn section_title(t: &'static str) -> impl IntoView {
     text(t).style(|s| {

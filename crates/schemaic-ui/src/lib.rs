@@ -2015,12 +2015,17 @@ fn result_tab_strip(
         |(i, p): &(usize, ResultPanel)| (*i, p.label.clone()),
         move |(i, panel)| result_tab_chip(i, panel.label, result_tabs, active_result),
     )
-    .style(|s| s.flex_row());
+    .style(|s| s.flex_row().height_full());
+
+    // Chips pan horizontally on the plain wheel (no visible bars) so overflowed
+    // result tabs stay reachable — same treatment as the query strip.
+    let scroller =
+        wheel_hscroll(chips).style(|s| s.flex_shrink(1.0_f32).min_width(0.0).height_full());
 
     // Flat, full-height result tabs. Unlike the query strip, this one adds a
     // full-width **top** separator too (the query strip sits below the header,
     // which already provides one).
-    h_stack((chips,)).style(|s| {
+    h_stack((scroller,)).style(|s| {
         s.width_full()
             .flex_row()
             .height(TAB_BAR_H)
@@ -2266,9 +2271,13 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
     // each 10px apart (gear 12px from the edge), matching the AI panel's spacing.
     let db_cli_btn = toolbar_icon(icons::DATABASE, 5.0, 2.0, || true, move || (open_cli)(None));
     let restart_btn = toolbar_icon(icons::REFRESH_CW, 5.0, 2.0, || true, move || (restart)());
-    let gear = toolbar_icon(icons::SLIDERS_VERTICAL, 5.0, 7.0, || true, move || {
-        settings_open.set(true)
-    });
+    let gear = toolbar_icon(
+        icons::SLIDERS_VERTICAL,
+        5.0,
+        7.0,
+        || true,
+        move || settings_open.set(true),
+    );
     let icons_group = h_stack((db_cli_btn, restart_btn, gear))
         .style(|s| s.flex_row().items_start().flex_shrink(0.0_f32));
     let title_row = h_stack((section_title("TERMINAL"), icons_group))
