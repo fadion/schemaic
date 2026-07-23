@@ -573,7 +573,6 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
     let row_limit = ui.layout.row_limit;
     let confirm_writes = ui.layout.confirm_writes;
     let restore_tabs = ui.layout.restore_tabs;
-    let word_wrap = ui.layout.word_wrap;
 
     dyn_container(
         move || open.get(),
@@ -594,15 +593,11 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
             let general_group = v_stack((settings_section_header("General"), restore_row))
                 .style(|s| s.flex_col().gap(16.0));
 
-            // Editor group. (Tab width + spaces-vs-tabs live in the status bar.)
+            // Editor group. (Tab width, spaces-vs-tabs, and word wrap live in the
+            // status bar.)
             let font_dd = settings_dropdown(editor_font, EDITOR_FONT_SIZES, editor_font_label);
             let font_section = v_stack((settings_group_label("Font size"), font_dd)).style(ctrl);
-            let wrap_row = settings_toggle_row(
-                "Word wrap",
-                "Wrap long lines to the editor width instead of scrolling.",
-                word_wrap,
-            );
-            let editor_group = v_stack((settings_section_header("Editor"), font_section, wrap_row))
+            let editor_group = v_stack((settings_section_header("Editor"), font_section))
                 .style(|s| s.flex_col().gap(16.0));
 
             // Query group.

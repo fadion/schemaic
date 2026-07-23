@@ -3381,11 +3381,22 @@ fn footer(ui: Ui) -> impl IntoView {
             .color(theme::status_text())
             .hover(|s| s.color(theme::chip_active()))
     });
+    // Word wrap — click toggles it.
     let wrap_seg = dyn_container(
         move || word_wrap.get(),
-        move |w| footer_text((if w { "Wrap" } else { "No wrap" }).to_string()),
+        move |w| {
+            text(if w { "Wrap" } else { "No wrap" })
+                .style(|s| s.font_size(theme::FONT_STATUS))
+                .into_any()
+        },
     )
-    .style(|s| s.margin_left(15.0));
+    .on_click_stop(move |_| word_wrap.update(|w| *w = !*w))
+    .style(|s| {
+        s.margin_left(15.0)
+            .items_center()
+            .color(theme::status_text())
+            .hover(|s| s.color(theme::chip_active()))
+    });
     // Warnings: amber triangle + amber count, or a green check (no text) when clean.
     let warn_seg = dyn_container(
         move || warn_count.get(),
