@@ -5,8 +5,11 @@
 # Generated third-party license manifest (regenerate with cargo-about)
 /THIRD-PARTY-LICENSES.html
 
-# Claude Code local settings (per-machine permissions, etc.)
-.claude/
+# Claude Code: ignore everything under .claude/ (per-machine permissions in
+# settings.local.json, etc.) EXCEPT the shared subagent definitions, which are
+# checked in so the whole team gets them.
+.claude/*
+!.claude/agents/
 
 # Private working notes — kept local, never published.
 TODO.md
