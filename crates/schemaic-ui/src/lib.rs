@@ -3209,6 +3209,8 @@ fn footer(ui: Ui) -> impl IntoView {
     let soft_tabs = ui.layout.soft_tabs;
     let tab_width = ui.layout.tab_width;
     let word_wrap = ui.layout.word_wrap;
+    let popup_menu = ui.overlay.popup_menu;
+    let popup_anchor = ui.overlay.popup_anchor;
     let resources = ui.resources;
     let ai_model = ui.ai.model;
     let ai_effort = ui.ai.effort;
@@ -3317,12 +3319,68 @@ fn footer(ui: Ui) -> impl IntoView {
             .color(theme::status_text())
             .hover(|s| s.color(theme::chip_active()))
     });
-    // Tabs vs Spaces + width (display-only for now — a menu button lands later).
+    // Tabs vs Spaces + width. Click opens a menu (centred above the segment): the
+    // two indent styles, a separator, then sizes 1–6; the active style + size are
+    // tinted (chip accent). Clicking again while open toggles it shut.
+    // `tab_origin`/`tab_size` track the segment's window rect so the popup can
+    // centre on it (its x shifts as the Ln/Col text to its left grows/shrinks).
+    let tab_origin: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
+    let tab_size: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
     let tabs_seg = dyn_container(
         move || (soft_tabs.get(), tab_width.get()),
-        move |(soft, w)| footer_text(format!("{}: {}", if soft { "Spaces" } else { "Tabs" }, w)),
+        move |(soft, w)| {
+            text(format!("{}: {}", if soft { "Spaces" } else { "Tabs" }, w))
+                .style(|s| s.font_size(theme::FONT_STATUS))
+                .into_any()
+        },
     )
-    .style(|s| s.margin_left(15.0));
+    .on_move(move |p| tab_origin.set((p.x, p.y)))
+    .on_resize(move |r| tab_size.set((r.width(), r.height())))
+    // Stop the pointer-down so the workspace-root "close popup on down" handler
+    // doesn't fire for our own clicks — otherwise the down would close the menu
+    // and the up would immediately reopen it (never toggling shut).
+    .on_event_stop(EventListener::PointerDown, |_| {})
+    .on_click_stop(move |_| {
+        // Toggle: a second click on the segment closes the open menu.
+        if popup_menu.get_untracked().is_some() {
+            popup_menu.set(None);
+            return;
+        }
+        let soft = soft_tabs.get_untracked();
+        let w = tab_width.get_untracked();
+        let mut entries = vec![
+            if soft {
+                MenuEntry::action_colored("Spaces", theme::chip_active, move || soft_tabs.set(true))
+            } else {
+                MenuEntry::action("Spaces", move || soft_tabs.set(true))
+            },
+            if !soft {
+                MenuEntry::action_colored("Tabs", theme::chip_active, move || soft_tabs.set(false))
+            } else {
+                MenuEntry::action("Tabs", move || soft_tabs.set(false))
+            },
+            MenuEntry::Separator,
+        ];
+        for n in 1..=6usize {
+            entries.push(if n == w {
+                MenuEntry::action_colored(n.to_string(), theme::chip_active, move || {
+                    tab_width.set(n)
+                })
+            } else {
+                MenuEntry::action(n.to_string(), move || tab_width.set(n))
+            });
+        }
+        let (ox, oy) = tab_origin.get_untracked();
+        let (sw, _sh) = tab_size.get_untracked();
+        popup_anchor.set(Some((ox, ox + sw, oy, sw)));
+        popup_menu.set(Some(entries));
+    })
+    .style(|s| {
+        s.margin_left(15.0)
+            .items_center()
+            .color(theme::status_text())
+            .hover(|s| s.color(theme::chip_active()))
+    });
     let wrap_seg = dyn_container(
         move || word_wrap.get(),
         move |w| footer_text((if w { "Wrap" } else { "No wrap" }).to_string()),
