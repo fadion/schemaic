@@ -234,33 +234,66 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(os)
 }
 
+/// Classification of a config file's contents: parsed, absent (first run), or
+/// present-but-corrupt (carrying the parse error for the diagnostic message).
+enum Load<T> {
+    Ok(T),
+    Absent,
+    Corrupt(String),
+}
+
+/// Classify raw file bytes: `None` (file missing) → [`Load::Absent`]; bytes that
+/// parse → [`Load::Ok`]; bytes that don't → [`Load::Corrupt`]. Pure.
+fn classify<T: for<'de> Deserialize<'de>>(bytes: Option<&[u8]>) -> Load<T> {
+    match bytes {
+        None => Load::Absent,
+        Some(b) => match serde_json::from_slice(b) {
+            Ok(v) => Load::Ok(v),
+            Err(e) => Load::Corrupt(e.to_string()),
+        },
+    }
+}
+
+/// Decide the loaded value and whether the primary file must be preserved as
+/// `.corrupt`, from the primary's classification and a lazily-classified backup.
+/// Pure — the caller performs the file reads/renames. Returns `(value,
+/// corrupt_error)`: `corrupt_error` is `Some` (the primary's parse error) exactly
+/// when the primary was corrupt and so must be preserved before the next save
+/// overwrites it. The `backup` thunk is only consulted for a corrupt primary, so
+/// a healthy or absent primary never reads the `.bak`.
+fn recover<T: Default>(primary: Load<T>, backup: impl FnOnce() -> Load<T>) -> (T, Option<String>) {
+    match primary {
+        Load::Ok(v) => (v, None),
+        Load::Absent => (T::default(), None), // first run → defaults, silently
+        Load::Corrupt(err) => {
+            // Do NOT silently reset — that would let the next save overwrite the
+            // file with defaults. Recover from `.bak` if it parses, else default;
+            // either way signal that the primary must be preserved as `.corrupt`.
+            let value = match backup() {
+                Load::Ok(v) => v,
+                _ => T::default(),
+            };
+            (value, Some(err))
+        }
+    }
+}
+
 fn read_json<T: Default + for<'de> Deserialize<'de>>(path: Option<PathBuf>) -> T {
     let Some(path) = path else {
         return T::default();
     };
-    let Ok(bytes) = std::fs::read(&path) else {
-        return T::default(); // absent (first run) → defaults, silently
-    };
-    match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            // The file exists but is corrupt (e.g. a truncated write from an
-            // older build). Do NOT silently reset — that would let the next save
-            // overwrite it with defaults. Preserve it as `.corrupt`, try the
-            // `.bak`, and only then fall back to defaults.
-            eprintln!(
-                "schemaic: could not parse {} ({e}); preserving as .corrupt and trying backup",
-                path.display()
-            );
-            let _ = std::fs::rename(&path, sibling(&path, ".corrupt"));
-            if let Ok(b) = std::fs::read(sibling(&path, ".bak"))
-                && let Ok(v) = serde_json::from_slice(&b)
-            {
-                return v;
-            }
-            T::default()
-        }
+    let primary = classify::<T>(std::fs::read(&path).ok().as_deref());
+    let (value, corrupt) = recover(primary, || {
+        classify::<T>(std::fs::read(sibling(&path, ".bak")).ok().as_deref())
+    });
+    if let Some(err) = corrupt {
+        eprintln!(
+            "schemaic: could not parse {} ({err}); preserving as .corrupt and trying backup",
+            path.display()
+        );
+        let _ = std::fs::rename(&path, sibling(&path, ".corrupt"));
     }
+    value
 }
 
 fn write_json<T: Serialize>(path: Option<PathBuf>, value: &T) {
@@ -319,4 +352,72 @@ pub fn load_connections() -> ConnectionsFile {
 /// Persist saved connections (best effort).
 pub fn save_connections(file: &ConnectionsFile) {
     write_json(connections_path(), file);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Load, classify, recover, sibling};
+    use std::path::Path;
+
+    #[test]
+    fn classify_absent_ok_and_corrupt() {
+        assert!(matches!(classify::<i32>(None), Load::Absent));
+        assert!(matches!(classify::<i32>(Some(b"42")), Load::Ok(42)));
+        assert!(matches!(
+            classify::<Vec<String>>(Some(br#"["a","b"]"#)),
+            Load::Ok(v) if v == vec!["a".to_string(), "b".to_string()]
+        ));
+        assert!(matches!(
+            classify::<i32>(Some(b"not json")),
+            Load::Corrupt(_)
+        ));
+    }
+
+    #[test]
+    fn recover_uses_primary_without_reading_backup() {
+        // A healthy primary must never consult `.bak` (laziness guard).
+        let (v, corrupt) = recover(Load::Ok(5), || panic!("backup must not be read"));
+        assert_eq!(v, 5);
+        assert!(corrupt.is_none());
+    }
+
+    #[test]
+    fn recover_absent_defaults_without_reading_backup() {
+        let (v, corrupt) = recover::<i32>(Load::Absent, || panic!("backup must not be read"));
+        assert_eq!(v, 0); // i32::default()
+        assert!(corrupt.is_none());
+    }
+
+    #[test]
+    fn recover_corrupt_prefers_valid_backup_and_flags_preserve() {
+        let (v, corrupt) = recover(Load::Corrupt("bad".to_string()), || Load::Ok(9));
+        assert_eq!(v, 9);
+        assert_eq!(corrupt.as_deref(), Some("bad")); // primary preserved as .corrupt
+    }
+
+    #[test]
+    fn recover_corrupt_falls_back_to_default_when_backup_unusable() {
+        // Backup absent → default, still preserve the corrupt primary.
+        let (v, corrupt) = recover::<i32>(Load::Corrupt("e".to_string()), || Load::Absent);
+        assert_eq!(v, 0);
+        assert!(corrupt.is_some());
+        // Backup also corrupt → default, still preserve.
+        let (v, corrupt) = recover::<i32>(Load::Corrupt("e".to_string()), || {
+            Load::Corrupt("e2".to_string())
+        });
+        assert_eq!(v, 0);
+        assert!(corrupt.is_some());
+    }
+
+    #[test]
+    fn sibling_appends_suffix_to_file_name() {
+        assert_eq!(
+            sibling(Path::new("/cfg/ui_state.json"), ".bak"),
+            Path::new("/cfg/ui_state.json.bak")
+        );
+        assert_eq!(
+            sibling(Path::new("connections.json"), ".corrupt"),
+            Path::new("connections.json.corrupt")
+        );
+    }
 }

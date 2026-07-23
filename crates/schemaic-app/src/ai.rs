@@ -15,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use schemaic_core::connection::Connection;
-use schemaic_core::schema::SchemaState;
+use schemaic_core::schema::{DbSchema, SchemaState};
 use schemaic_db::Db;
 use schemaic_ui::{AiEffort, AiModel, ConnNode, InlineAiRequest, SchemaScope, Tab};
 
@@ -66,6 +66,13 @@ pub(crate) fn mcp_endpoint_from_env() -> (Db, Option<String>) {
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .unwrap_or(serde_json::Value::Null);
+    endpoint_from_value(&v)
+}
+
+/// Parse a DB endpoint from the MCP-config JSON value: host defaults to
+/// `127.0.0.1`, port to `3306`, user/pass to empty, database optional. Pure so
+/// the defaulting is unit-tested without touching the environment.
+fn endpoint_from_value(v: &serde_json::Value) -> (Db, Option<String>) {
     let host = v
         .get("host")
         .and_then(|x| x.as_str())
@@ -109,7 +116,18 @@ fn write_mcp_config(endpoint: &str) -> Option<PathBuf> {
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "schemaic".to_string());
-    let cfg = serde_json::json!({
+    let cfg = mcp_config_json(&exe, endpoint);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("schemaic-mcp-{}-{n}.json", std::process::id()));
+    write_private(&path, cfg.as_bytes()).ok()?;
+    Some(path)
+}
+
+/// The `claude` MCP config JSON launching `exe --mcp-serve` with the DB endpoint
+/// in its `env` (so credentials stay off the command line — review C6). Pure so
+/// the config shape is unit-tested.
+fn mcp_config_json(exe: &str, endpoint: &str) -> String {
+    serde_json::json!({
         "mcpServers": {
             "schemaic": {
                 "command": exe,
@@ -118,11 +136,7 @@ fn write_mcp_config(endpoint: &str) -> Option<PathBuf> {
             }
         }
     })
-    .to_string();
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("schemaic-mcp-{}-{n}.json", std::process::id()));
-    write_private(&path, cfg.as_bytes()).ok()?;
-    Some(path)
+    .to_string()
 }
 
 /// Write `bytes` to `path`, owner-only where the platform supports it.
@@ -318,33 +332,11 @@ pub(crate) fn ai_context(p: AiContextParams, instructions: &str) -> String {
                 .map(|c| c.name.clone())
         })
         .unwrap_or_else(|| "(none)".to_string());
-
-    // The active tab's database.
     let active_db = tabs.with_untracked(|v| {
         v.iter()
             .find(|t| t.id == active.get_untracked())
             .and_then(|t| t.database.get_untracked())
     });
-
-    // Schema outline, scoped per the setting.
-    let mut outline = String::new();
-    if scope != SchemaScope::None {
-        db_nodes.with_untracked(|v| {
-            for n in v {
-                if scope == SchemaScope::Active && Some(&n.database) != active_db.as_ref() {
-                    continue;
-                }
-                match n.schema.get_untracked() {
-                    SchemaState::Loaded(s) => {
-                        let tables: Vec<&str> = s.tables.iter().map(|t| t.name.as_str()).collect();
-                        outline.push_str(&format!("- {}: {}\n", n.database, tables.join(", ")));
-                    }
-                    _ => outline.push_str(&format!("- {}\n", n.database)),
-                }
-            }
-        });
-    }
-
     let current = tabs
         .with_untracked(|v| {
             v.iter()
@@ -352,6 +344,64 @@ pub(crate) fn ai_context(p: AiContextParams, instructions: &str) -> String {
                 .map(|t| t.query.get_untracked())
         })
         .unwrap_or_default();
+    let databases = snapshot_databases(db_nodes);
+    render_ai_context(
+        &conn_name,
+        active_db.as_deref(),
+        &databases,
+        &current,
+        scope,
+        run_queries,
+        instructions,
+    )
+}
+
+/// Snapshot each schema-tree node into plain data: `(database, Some(schema))`
+/// when introspection has loaded, `(database, None)` while it's still pending.
+/// Reads the signals once so the prompt builders below can stay pure.
+fn snapshot_databases(db_nodes: RwSignal<Vec<ConnNode>>) -> Vec<(String, Option<DbSchema>)> {
+    db_nodes.with_untracked(|v| {
+        v.iter()
+            .map(|n| {
+                let schema = match n.schema.get_untracked() {
+                    SchemaState::Loaded(s) => Some(s),
+                    _ => None,
+                };
+                (n.database.clone(), schema)
+            })
+            .collect()
+    })
+}
+
+/// Pure core of [`ai_context`]: assemble the AI-panel system prompt from an
+/// already-snapshotted connection name, active database, per-database schema,
+/// current query, scope, and run-queries flag. No signals — so the prompt shape
+/// (tools line, scope filtering, schema section) is unit-tested.
+fn render_ai_context(
+    conn_name: &str,
+    active_db: Option<&str>,
+    databases: &[(String, Option<DbSchema>)],
+    current: &str,
+    scope: SchemaScope,
+    run_queries: bool,
+    instructions: &str,
+) -> String {
+    // Schema outline, scoped per the setting.
+    let mut outline = String::new();
+    if scope != SchemaScope::None {
+        for (database, schema) in databases {
+            if scope == SchemaScope::Active && Some(database.as_str()) != active_db {
+                continue;
+            }
+            match schema {
+                Some(s) => {
+                    let tables: Vec<&str> = s.tables.iter().map(|t| t.name.as_str()).collect();
+                    outline.push_str(&format!("- {}: {}\n", database, tables.join(", ")));
+                }
+                None => outline.push_str(&format!("- {database}\n")),
+            }
+        }
+    }
 
     // Tools line — kept truthful: the assistant always has `list_schema`, and
     // `run_query` only when the setting allows it.
@@ -415,13 +465,27 @@ pub(crate) fn inline_system_prompt(
     active_db: Option<&str>,
     req: &InlineAiRequest,
 ) -> String {
+    let databases = snapshot_databases(db_nodes);
+    render_inline_prompt(&databases, active_db, req)
+}
+
+/// Pure core of [`inline_system_prompt`]: build the Ctrl+K generator prompt from
+/// snapshotted per-database schema. Columns are spelled out only for tables the
+/// request plausibly touches (in `active_db`, or named in the buffer/intent);
+/// every table is still listed by name. No signals — so the column-inclusion
+/// heuristic and the selection-vs-insert task line are unit-tested.
+fn render_inline_prompt(
+    databases: &[(String, Option<DbSchema>)],
+    active_db: Option<&str>,
+    req: &InlineAiRequest,
+) -> String {
     let haystack = format!("{} {}", req.current_sql, req.intent).to_lowercase();
     let mut outline = String::new();
-    db_nodes.with_untracked(|v| {
-        for n in v {
-            if let SchemaState::Loaded(s) = n.schema.get_untracked() {
-                outline.push_str(&format!("{}:\n", n.database));
-                let full_db = active_db == Some(n.database.as_str());
+    for (database, schema) in databases {
+        match schema {
+            Some(s) => {
+                outline.push_str(&format!("{database}:\n"));
+                let full_db = active_db == Some(database.as_str());
                 for t in &s.tables {
                     if full_db || haystack.contains(&t.name.to_lowercase()) {
                         let cols: Vec<&str> = t.columns.iter().map(|c| c.name.as_str()).collect();
@@ -430,11 +494,10 @@ pub(crate) fn inline_system_prompt(
                         outline.push_str(&format!("  {}\n", t.name));
                     }
                 }
-            } else {
-                outline.push_str(&format!("{}\n", n.database));
             }
+            None => outline.push_str(&format!("{database}\n")),
         }
-    });
+    }
     let task = match &req.selection {
         Some(sel) => format!(
             "The user selected this SQL to transform:\n{sel}\n\nRewrite ONLY that \
@@ -450,4 +513,228 @@ pub(crate) fn inline_system_prompt(
          Current editor contents (for context):\n{current}\n\n{task}",
         current = req.current_sql,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_sql_returns_bare_text_unchanged() {
+        assert_eq!(extract_sql("SELECT 1"), "SELECT 1");
+        assert_eq!(extract_sql("  SELECT 1  "), "SELECT 1");
+    }
+
+    #[test]
+    fn extract_sql_strips_fenced_block_with_sql_tag() {
+        assert_eq!(extract_sql("```sql\nSELECT 1\n```"), "SELECT 1");
+        // No language tag.
+        assert_eq!(extract_sql("```\nSELECT 2\n```"), "SELECT 2");
+        // Leading/trailing prose whitespace around the fence.
+        assert_eq!(extract_sql("  ```sql\nSELECT 3\n```  "), "SELECT 3");
+    }
+
+    #[test]
+    fn extract_sql_handles_unclosed_fence() {
+        // No closing fence → take everything after the opening fence + tag.
+        assert_eq!(extract_sql("```sql\nSELECT 4"), "SELECT 4");
+    }
+
+    #[test]
+    fn endpoint_json_serializes_parts_and_database() {
+        let db = Db::from_parts("h".into(), 3307, "u".into(), "p".into());
+        let out = endpoint_json(&db, Some("shop"));
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["host"], "h");
+        assert_eq!(v["port"], 3307);
+        assert_eq!(v["user"], "u");
+        assert_eq!(v["pass"], "p");
+        assert_eq!(v["database"], "shop");
+        // No default database → JSON null.
+        let out = endpoint_json(&db, None);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["database"].is_null());
+    }
+
+    #[test]
+    fn endpoint_json_roundtrips_through_value_parser() {
+        // endpoint_json → endpoint_from_value reconstructs the same endpoint,
+        // with no environment access (so no `unsafe` set_var needed).
+        let db = Db::from_parts("host".into(), 3306, "user".into(), "pw".into());
+        let json = endpoint_json(&db, Some("db1"));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let (parsed, database) = endpoint_from_value(&v);
+        assert_eq!(parsed.parts(), ("host", 3306, "user", "pw"));
+        assert_eq!(database.as_deref(), Some("db1"));
+    }
+
+    #[test]
+    fn endpoint_from_value_fills_defaults() {
+        // Empty/Null object → local defaults, no database.
+        let (db, database) = endpoint_from_value(&serde_json::Value::Null);
+        assert_eq!(db.parts(), ("127.0.0.1", 3306, "", ""));
+        assert!(database.is_none());
+        // Partial object → only the missing keys default.
+        let v = serde_json::json!({ "host": "h", "user": "u" });
+        let (db, database) = endpoint_from_value(&v);
+        assert_eq!(db.parts(), ("h", 3306, "u", ""));
+        assert!(database.is_none());
+    }
+
+    #[test]
+    fn mcp_config_json_shape() {
+        let v: serde_json::Value =
+            serde_json::from_str(&mcp_config_json("/path/schemaic", "ENDPOINT_BLOB")).unwrap();
+        let server = &v["mcpServers"]["schemaic"];
+        assert_eq!(server["command"], "/path/schemaic");
+        assert_eq!(server["args"][0], "--mcp-serve");
+        assert_eq!(server["env"]["SCHEMAIC_MCP_ENDPOINT"], "ENDPOINT_BLOB");
+    }
+
+    use schemaic_core::schema::{ColumnInfo, IndexInfo, TableInfo};
+
+    fn table(name: &str, cols: &[&str]) -> TableInfo {
+        TableInfo {
+            name: name.to_string(),
+            columns: cols
+                .iter()
+                .map(|c| ColumnInfo {
+                    name: c.to_string(),
+                    type_name: "int".to_string(),
+                    nullable: true,
+                    primary_key: false,
+                })
+                .collect(),
+            indexes: Vec::<IndexInfo>::new(),
+            is_view: false,
+            view_definition: None,
+        }
+    }
+
+    fn schema(tables: Vec<TableInfo>) -> DbSchema {
+        DbSchema { tables }
+    }
+
+    #[test]
+    fn render_ai_context_active_scope_lists_only_active_db() {
+        let dbs = vec![
+            (
+                "shop".to_string(),
+                Some(schema(vec![table("orders", &["id"])])),
+            ),
+            (
+                "blog".to_string(),
+                Some(schema(vec![table("posts", &["id"])])),
+            ),
+        ];
+        let out = render_ai_context(
+            "Local",
+            Some("shop"),
+            &dbs,
+            "SELECT 1",
+            SchemaScope::Active,
+            true,
+            "",
+        );
+        assert!(out.contains("Active connection: Local"));
+        assert!(out.contains("- shop: orders"));
+        assert!(!out.contains("blog")); // Active scope drops non-active dbs
+        // run_queries = true → mentions run_query.
+        assert!(out.contains("run_query"));
+        assert!(out.contains("```sql\nSELECT 1\n```"));
+    }
+
+    #[test]
+    fn render_ai_context_all_scope_lists_every_db_and_unloaded_shows_bare() {
+        let dbs = vec![
+            (
+                "shop".to_string(),
+                Some(schema(vec![table("orders", &["id"])])),
+            ),
+            ("blog".to_string(), None), // schema not loaded yet
+        ];
+        let out = render_ai_context("Local", Some("shop"), &dbs, "", SchemaScope::All, false, "");
+        assert!(out.contains("- shop: orders"));
+        assert!(out.contains("- blog\n")); // unloaded → name only, no ": tables"
+        // run_queries = false → the no-queries tools line.
+        assert!(out.contains("cannot run"));
+        assert!(!out.contains("with the run_query"));
+    }
+
+    #[test]
+    fn render_ai_context_none_scope_omits_schema_and_appends_instructions() {
+        let dbs = vec![(
+            "shop".to_string(),
+            Some(schema(vec![table("orders", &["id"])])),
+        )];
+        let out = render_ai_context(
+            "Local",
+            Some("shop"),
+            &dbs,
+            "",
+            SchemaScope::None,
+            true,
+            "  Prefer CTEs.  ",
+        );
+        assert!(!out.contains("Databases and tables:"));
+        assert!(!out.contains("orders"));
+        // Instructions are trimmed and appended.
+        assert!(out.contains("Additional instructions from the user:\nPrefer CTEs."));
+    }
+
+    fn req(intent: &str, current: &str, selection: Option<&str>) -> InlineAiRequest {
+        InlineAiRequest {
+            intent: intent.to_string(),
+            current_sql: current.to_string(),
+            selection: selection.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn render_inline_prompt_expands_active_db_columns_others_by_mention() {
+        let dbs = vec![(
+            "shop".to_string(),
+            Some(schema(vec![
+                table("orders", &["id", "total"]),
+                table("audit", &["id"]),
+            ])),
+        )];
+        // active_db = shop → every table in shop gets columns.
+        let out = render_inline_prompt(&dbs, Some("shop"), &req("count orders", "SELECT 1", None));
+        assert!(out.contains("orders(id, total)"));
+        assert!(out.contains("audit(id)"));
+        assert!(out.contains("to be inserted at the cursor"));
+    }
+
+    #[test]
+    fn render_inline_prompt_lists_bare_table_unless_mentioned() {
+        let dbs = vec![(
+            "blog".to_string(),
+            Some(schema(vec![
+                table("posts", &["id", "body"]),
+                table("tags", &["id"]),
+            ])),
+        )];
+        // active_db = shop (not blog) → only tables named in the request get columns.
+        let out = render_inline_prompt(
+            &dbs,
+            Some("shop"),
+            &req("update posts", "SELECT * FROM posts", None),
+        );
+        assert!(out.contains("posts(id, body)")); // mentioned → columns
+        assert!(out.contains("  tags\n")); // not mentioned → bare name
+        assert!(!out.contains("tags(")); // no columns for the unmentioned table
+    }
+
+    #[test]
+    fn render_inline_prompt_selection_asks_for_rewrite() {
+        let dbs: Vec<(String, Option<DbSchema>)> = vec![];
+        let out = render_inline_prompt(
+            &dbs,
+            None,
+            &req("uppercase", "SELECT a FROM t", Some("SELECT a FROM t")),
+        );
+        assert!(out.contains("The user selected this SQL to transform:"));
+        assert!(out.contains("Rewrite ONLY that"));
+    }
 }

@@ -129,3 +129,78 @@ impl Connection {
         format!("{}:{}", self.host, self.port)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_is_host_colon_port() {
+        let c = Connection {
+            id: 1,
+            name: "prod".to_string(),
+            db_type: "MySQL".to_string(),
+            host: "db.example.com".to_string(),
+            port: 3307,
+            user: "root".to_string(),
+            password: "secret".to_string(),
+            ssh: SshTunnel::default(),
+            color: None,
+            prominent_color: false,
+            read_only: false,
+        };
+        assert_eq!(c.endpoint(), "db.example.com:3307");
+    }
+
+    #[test]
+    fn ssh_auth_labels_and_all_cover_every_variant() {
+        assert_eq!(SshAuth::ALL.len(), 3);
+        assert_eq!(SshAuth::Password.label(), "Password");
+        assert_eq!(SshAuth::KeyPair.label(), "Key pair");
+        assert_eq!(SshAuth::Agent.label(), "SSH agent");
+        assert_eq!(SshAuth::default(), SshAuth::Password);
+    }
+
+    #[test]
+    fn ssh_tunnel_default_uses_port_22_and_password_auth() {
+        let t = SshTunnel::default();
+        assert_eq!(t.port, 22);
+        assert!(!t.enabled);
+        assert_eq!(t.auth, SshAuth::Password);
+    }
+
+    #[test]
+    fn connection_deserializes_with_backcompat_defaults() {
+        // A connection saved before db_type/ssh/color/read_only existed.
+        let json = r#"{
+            "id": 7,
+            "name": "legacy",
+            "host": "127.0.0.1",
+            "port": 3306,
+            "user": "app",
+            "password": ""
+        }"#;
+        let c: Connection = serde_json::from_str(json).unwrap();
+        assert_eq!(c.db_type, "MySQL");
+        assert_eq!(c.ssh, SshTunnel::default());
+        assert_eq!(c.color, None);
+        assert!(!c.prominent_color);
+        assert!(!c.read_only);
+    }
+
+    #[test]
+    fn ssh_tunnel_deserializes_with_auth_defaults() {
+        // Saved before key-pair/agent auth: no auth/key_path/key_passphrase.
+        let json = r#"{
+            "enabled": true,
+            "host": "jump",
+            "port": 22,
+            "user": "me",
+            "password": "pw"
+        }"#;
+        let t: SshTunnel = serde_json::from_str(json).unwrap();
+        assert_eq!(t.auth, SshAuth::Password);
+        assert_eq!(t.key_path, "");
+        assert_eq!(t.key_passphrase, "");
+    }
+}

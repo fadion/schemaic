@@ -428,4 +428,49 @@ mod tests {
             Some(ColumnFormat::None)
         );
     }
+
+    #[test]
+    fn labels_and_menu_cover_every_variant() {
+        assert_eq!(ColumnFormat::None.label(), "None");
+        assert_eq!(ColumnFormat::Timestamp.label(), "Timestamp");
+        assert_eq!(ColumnFormat::Grouped.label(), "Number grouping");
+        assert_eq!(ColumnFormat::Bytes.label(), "File size");
+        assert_eq!(ColumnFormat::Bool.label(), "Boolean");
+        // MENU lists all five, None first (the "clear" entry).
+        assert_eq!(ColumnFormat::MENU.len(), 5);
+        assert_eq!(ColumnFormat::MENU[0], ColumnFormat::None);
+        assert!(ColumnFormat::MENU.contains(&ColumnFormat::Bool));
+        assert_eq!(ColumnFormat::default(), ColumnFormat::None);
+    }
+
+    #[test]
+    fn negative_byte_count_falls_back_to_plain_number() {
+        assert_eq!(apply(ColumnFormat::Bytes, &Value::Int(-1)), "-1");
+        assert_eq!(apply(ColumnFormat::Bytes, &Value::Int(-2048)), "-2048");
+    }
+
+    #[test]
+    fn timestamp_handles_pre_1970_dates() {
+        // -1 second → 1969-12-31 23:59:59 UTC (div_euclid/rem_euclid handle it).
+        assert_eq!(
+            apply(ColumnFormat::Timestamp, &Value::Int(-1)),
+            "1969-12-31 23:59:59"
+        );
+        // -86400 → exactly one day before the epoch.
+        assert_eq!(
+            apply(ColumnFormat::Timestamp, &Value::Int(-86_400)),
+            "1969-12-31 00:00:00"
+        );
+    }
+
+    #[test]
+    fn grouping_rejects_empty_and_bad_fraction() {
+        // A lone "-" has an empty integer part → not a number → raw.
+        assert_eq!(apply(ColumnFormat::Grouped, &Value::Str("-".into())), "-");
+        // Non-digit fraction → raw.
+        assert_eq!(
+            apply(ColumnFormat::Grouped, &Value::Str("12.3a".into())),
+            "12.3a"
+        );
+    }
 }

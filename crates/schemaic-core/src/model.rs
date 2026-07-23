@@ -248,3 +248,117 @@ pub enum QueryState {
     /// The query was cancelled by the user.
     Cancelled,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn col(type_name: &str) -> Column {
+        Column {
+            name: "c".to_string(),
+            type_name: type_name.to_string(),
+            origin: None,
+        }
+    }
+
+    #[test]
+    fn value_is_null_only_for_null() {
+        assert!(Value::Null.is_null());
+        assert!(!Value::Int(0).is_null());
+        assert!(!Value::UInt(0).is_null());
+        assert!(!Value::Float(0.0).is_null());
+        assert!(!Value::Str(String::new()).is_null());
+    }
+
+    #[test]
+    fn value_display_covers_every_variant() {
+        assert_eq!(Value::Null.display(), "NULL");
+        assert_eq!(Value::Int(-42).display(), "-42");
+        assert_eq!(Value::UInt(42).display(), "42");
+        assert_eq!(Value::Str("hi".to_string()).display(), "hi");
+        // Float uses f64::to_string — integral floats print without a fraction.
+        assert_eq!(Value::Float(1.5).display(), "1.5");
+        assert_eq!(Value::Float(2.0).display(), "2");
+    }
+
+    #[test]
+    fn is_numeric_matches_numeric_types_case_insensitively() {
+        for t in [
+            "INT",
+            "int",
+            "BIGINT",
+            "tinyint(1)",
+            "DECIMAL(10,2)",
+            "numeric",
+            "FLOAT",
+            "double",
+            "YEAR",
+            "BIT",
+            "MEDIUMINT UNSIGNED",
+        ] {
+            assert!(col(t).is_numeric(), "{t} should be numeric");
+        }
+    }
+
+    #[test]
+    fn is_numeric_rejects_non_numeric_types() {
+        for t in [
+            "VARCHAR(255)",
+            "TEXT",
+            "DATETIME",
+            "JSON",
+            "BLOB",
+            "ENUM('a')",
+        ] {
+            assert!(!col(t).is_numeric(), "{t} should not be numeric");
+        }
+    }
+
+    #[test]
+    fn gridwrite_is_empty_tracks_all_three_buckets() {
+        let mut w = GridWrite::default();
+        assert!(w.is_empty());
+        w.updates.push(RowEdit {
+            database: "d".to_string(),
+            table: "t".to_string(),
+            set: vec![],
+            key: vec![],
+        });
+        assert!(!w.is_empty());
+
+        let mut w = GridWrite::default();
+        w.inserts.push(RowInsert {
+            database: "d".to_string(),
+            table: "t".to_string(),
+            cols: vec![],
+        });
+        assert!(!w.is_empty());
+
+        let mut w = GridWrite::default();
+        w.deletes.push(RowDelete {
+            database: "d".to_string(),
+            table: "t".to_string(),
+            key: vec![],
+        });
+        assert!(!w.is_empty());
+    }
+
+    #[test]
+    fn resultset_counts_reflect_dimensions() {
+        let rs = ResultSet {
+            columns: vec![col("INT"), col("TEXT")],
+            rows: vec![
+                vec![Value::Int(1), Value::Str("a".to_string())],
+                vec![Value::Int(2), Value::Str("b".to_string())],
+                vec![Value::Int(3), Value::Str("c".to_string())],
+            ],
+            ..Default::default()
+        };
+        assert_eq!(rs.row_count(), 3);
+        assert_eq!(rs.col_count(), 2);
+
+        let empty = ResultSet::default();
+        assert_eq!(empty.row_count(), 0);
+        assert_eq!(empty.col_count(), 0);
+    }
+}

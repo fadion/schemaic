@@ -283,4 +283,52 @@ mod tests {
         assert!(v[0]["id"].is_null());
         assert_eq!(v[1]["id"], 1);
     }
+
+    #[test]
+    fn value_to_json_maps_each_variant_and_nulls_nonfinite() {
+        use serde_json::Value as J;
+        assert_eq!(value_to_json(&Value::Null), J::Null);
+        assert_eq!(value_to_json(&Value::Int(-3)), J::from(-3i64));
+        assert_eq!(value_to_json(&Value::UInt(3)), J::from(3u64));
+        assert_eq!(value_to_json(&Value::Float(1.5)), J::from(1.5));
+        assert_eq!(
+            value_to_json(&Value::Str("s".into())),
+            J::String("s".into())
+        );
+        // Non-finite floats have no JSON representation → null.
+        assert_eq!(value_to_json(&Value::Float(f64::NAN)), J::Null);
+        assert_eq!(value_to_json(&Value::Float(f64::INFINITY)), J::Null);
+    }
+
+    #[test]
+    fn export_csv_has_header_and_nulls_are_empty() {
+        let out = export_csv(&rs(), &[0, 1]);
+        let lines: Vec<&str> = out.lines().collect();
+        // Header quotes the backtick column only because... it has no comma; stays bare.
+        assert_eq!(lines[0], "id,a`b");
+        assert_eq!(lines[1], "1,x");
+        // NULL id renders as an empty leading field.
+        assert_eq!(lines[2], ",y");
+    }
+
+    #[test]
+    fn export_column_csv_is_newline_separated_with_blank_nulls() {
+        // Column 0 (id): 1, then NULL → blank line.
+        let out = export_column_csv(&rs(), &[0, 1], 0);
+        assert_eq!(out, "1\n\n");
+    }
+
+    #[test]
+    fn export_column_json_is_array_in_display_order() {
+        // Column 1 (a`b) in reversed order.
+        let out = export_column_json(&rs(), &[1, 0], 1);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v[0], "y");
+        assert_eq!(v[1], "x");
+        // Column 0 with a NULL becomes JSON null.
+        let out = export_column_json(&rs(), &[0, 1], 0);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v[0], 1);
+        assert!(v[1].is_null());
+    }
 }
