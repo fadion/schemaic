@@ -897,7 +897,11 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             // every close path (× click, middle-click, Ctrl+W), so gating here
             // covers them all. Unpin first to close.
             if tabs
-                .with_untracked(|v| v.iter().find(|t| t.id == id).map(|t| t.pinned.get_untracked()))
+                .with_untracked(|v| {
+                    v.iter()
+                        .find(|t| t.id == id)
+                        .map(|t| t.pinned.get_untracked())
+                })
                 .unwrap_or(false)
             {
                 return;
