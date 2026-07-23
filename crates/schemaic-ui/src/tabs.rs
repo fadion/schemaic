@@ -12,21 +12,19 @@ use floem::reactive::create_effect;
 use floem::style::TextOverflow;
 use floem::views::TooltipExt;
 
-use schemaic_core::db_color::DbColorRule;
-
 use crate::consts::{TAB_BAR_H, TAB_MAX_W};
-use crate::widgets::{measure_text_px, wheel_hscroll};
+use crate::widgets::{MenuEntry, measure_text_px, wheel_hscroll};
 use crate::{FieldCfg, Tab, Ui, bg_transparent, db_color_dot, edit_field, icons, theme};
 
 // ===== moved from lib.rs (tab bar) =====
 // ── Tab bar ─────────────────────────────────────────────────────────────────
 pub(crate) fn tab_bar(ui: Ui) -> impl IntoView {
     let tabs = ui.tabs_ui.tabs;
-    let active = ui.tabs_ui.active;
     let flashing = ui.tabs_ui.flashing;
     let add_tab = ui.tab_actions.add_tab.clone();
-    let close_tab = ui.tab_actions.close_tab.clone();
-    let db_colors = ui.db_colors;
+    // Each chip gets its own `Ui` handle — for the close/pin/duplicate actions and
+    // the shared popup-menu channel that the right-click context menu opens on.
+    let chip_ui = ui;
     // A flashing tab's chip is hidden for the duration of the flash. Flat,
     // full-height tabs sit flush (no gap); each draws its own right separator.
     let chips = dyn_stack(
@@ -37,7 +35,7 @@ pub(crate) fn tab_bar(ui: Ui) -> impl IntoView {
                 .collect::<Vec<_>>()
         },
         |t: &Tab| t.id,
-        move |t| tab_chip(t, active, close_tab.clone(), db_colors),
+        move |t| tab_chip(t, chip_ui.clone()),
     )
     .style(|s| s.flex_row().height_full());
 
@@ -86,12 +84,14 @@ const TAB_TITLE_AVAIL: f64 = TAB_MAX_W - 40.0;
 // full-width truncated title pushes the × past the chip cap and clips it.
 const TAB_DOT_W: f64 = 12.0;
 
-fn tab_chip(
-    tab: Tab,
-    active: RwSignal<usize>,
-    close_tab: Rc<dyn Fn(usize)>,
-    db_colors: RwSignal<Vec<DbColorRule>>,
-) -> impl IntoView {
+fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
+    let active = ui.tabs_ui.active;
+    let close_tab = ui.tab_actions.close_tab.clone();
+    let db_colors = ui.db_colors;
+    let toggle_pin = ui.tab_actions.toggle_pin.clone();
+    let duplicate = ui.tab_actions.duplicate_tab.clone();
+    let overlay = ui.overlay;
+
     // Commit the inline rename: an empty/blank name reverts to the default
     // "Query N" (stored as `None`). Called from Enter and from focus-loss.
     let commit: Rc<dyn Fn()> = Rc::new(move || {
@@ -105,9 +105,11 @@ fn tab_chip(
     // renamed) title changes; the title read tracks the `name` signal.
     let commit_field = commit.clone();
     let close_content = close_tab.clone();
+    let close_mid = close_tab.clone();
     let content = dyn_container(
-        move || (tab.editing.get(), tab.title()),
-        move |(editing, title)| -> AnyView {
+        // Keyed on pinned too, so toggling pin swaps the × for the pin indicator.
+        move || (tab.editing.get(), tab.title(), tab.pinned.get()),
+        move |(editing, title, pinned)| -> AnyView {
             if editing {
                 // Inline rename field. `edit_field` (unlike floem's `text_input`,
                 // which swallows Escape into its own `clear_focus`) routes Escape
@@ -187,17 +189,32 @@ fn tab_chip(
                 label.into_any()
             };
 
-            // Close (×): 16px Lucide X, fixed muted tint (`tab_close`). The glyph
-            // fills only the middle of its 16px box (~3px transparent padding per
-            // side), so the margins are trimmed ~3px to land 10px *visual* gaps.
-            let close_x = close_content.clone();
-            let close = icons::icon(icons::X, 16.0)
-                .on_click_stop(move |_| (close_x)(tab.id))
-                .style(|s| {
-                    s.flex_shrink(0.0_f32)
-                        .margin_right(7.0)
-                        .color(theme::tab_close())
-                });
+            // Trailing icon (16px, muted `tab_close` tint, same footprint either
+            // way so pinning doesn't shift the title width): a clickable × to
+            // close, or — when pinned — a non-clickable pin indicator (a pinned
+            // tab can't be closed; unpin via the context menu first).
+            let close: AnyView = if pinned {
+                icons::icon(icons::PIN, 16.0)
+                    .style(|s| {
+                        s.flex_shrink(0.0_f32)
+                            .margin_right(7.0)
+                            .color(theme::tab_close())
+                    })
+                    .into_any()
+            } else {
+                let close_x = close_content.clone();
+                icons::icon(icons::X, 16.0)
+                    .on_click_stop(move |_| (close_x)(tab.id))
+                    .style(|s| {
+                        s.flex_shrink(0.0_f32)
+                            .margin_right(7.0)
+                            .color(theme::tab_close())
+                            // Brighten on hover to the tab's full-brightness text
+                            // colour (same one the inactive-tab hover uses).
+                            .hover(|s| s.color(theme::text()))
+                    })
+                    .into_any()
+            };
             // Small DB-identity dot leading the label (only when this tab's
             // database has a colour; zero-footprint otherwise).
             let dot = db_color_dot(
@@ -226,15 +243,40 @@ fn tab_chip(
         })
         // Middle-click (mouse-wheel button) closes the tab, as in most editors.
         // `Click`/`DoubleClick` only fire for the primary button, so this can't
-        // clash with activating the tab or double-click-to-rename.
+        // clash with activating the tab or double-click-to-rename. (A pinned tab's
+        // close is gated in `close_tab`, so middle-click no-ops on it.)
         .on_event(EventListener::PointerDown, move |e| {
             if let Event::PointerDown(pe) = e
                 && pe.button.is_auxiliary()
             {
-                (close_tab)(tab.id);
+                (close_mid)(tab.id);
                 return EventPropagation::Stop;
             }
             EventPropagation::Continue
+        })
+        // Right-click context menu — reuses the generic popup channel and its
+        // cursor edge-flipping (`popup_anchor = None` ⇒ open at the cursor, flips
+        // left/up near the window edge, so a right-most tab doesn't overflow). A
+        // pinned tab shows Unpin and omits Close (unpin to close).
+        .on_secondary_click_stop(move |_| {
+            overlay.context_menu.set(None);
+            overlay.popup_anchor.set(None);
+            let pinned = tab.pinned.get_untracked();
+            let mut entries = vec![
+                MenuEntry::action(if pinned { "Unpin" } else { "Pin" }, {
+                    let toggle = toggle_pin.clone();
+                    move || (toggle)(tab.id)
+                }),
+                MenuEntry::action("Duplicate", {
+                    let duplicate = duplicate.clone();
+                    move || (duplicate)(tab.id)
+                }),
+            ];
+            if !pinned {
+                let close = close_tab.clone();
+                entries.push(MenuEntry::action("Close", move || (close)(tab.id)));
+            }
+            overlay.popup_menu.set(Some(entries));
         })
         // Flat, full-height tab capped at `TAB_MAX_W`: chrome background (invisible
         // against the strip) when inactive, `tab_active` when active; a right
