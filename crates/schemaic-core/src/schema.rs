@@ -110,6 +110,27 @@ impl TableInfo {
     }
 }
 
+/// The introspected schema of one database.
+#[derive(Clone, Debug, Default)]
+pub struct DbSchema {
+    pub tables: Vec<TableInfo>,
+}
+
+impl DbSchema {
+    pub fn table_count(&self) -> usize {
+        self.tables.len()
+    }
+}
+
+/// Per-connection introspection lifecycle, shared loader→UI through a signal.
+#[derive(Clone, Debug)]
+pub enum SchemaState {
+    /// Introspection query is in flight.
+    Loading,
+    Loaded(DbSchema),
+    Failed(String),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,25 +204,55 @@ mod tests {
         assert!(ddl.contains("CREATE TABLE `we``ird`"));
         assert!(ddl.contains("`a``b` int"));
     }
-}
 
-/// The introspected schema of one database.
-#[derive(Clone, Debug, Default)]
-pub struct DbSchema {
-    pub tables: Vec<TableInfo>,
-}
-
-impl DbSchema {
-    pub fn table_count(&self) -> usize {
-        self.tables.len()
+    #[test]
+    fn create_ddl_view_without_definition_emits_placeholder() {
+        let t = TableInfo {
+            name: "v".to_string(),
+            columns: Vec::new(),
+            indexes: Vec::new(),
+            is_view: true,
+            view_definition: None,
+        };
+        let ddl = t.create_ddl();
+        assert!(ddl.contains("-- View definition for `v` was not available."));
+        assert!(ddl.contains("CREATE OR REPLACE VIEW `v` AS\nSELECT ...;"));
     }
-}
 
-/// Per-connection introspection lifecycle, shared loader→UI through a signal.
-#[derive(Clone, Debug)]
-pub enum SchemaState {
-    /// Introspection query is in flight.
-    Loading,
-    Loaded(DbSchema),
-    Failed(String),
+    #[test]
+    fn is_primary_only_for_the_primary_index() {
+        let ix = |name: &str| IndexInfo {
+            name: name.to_string(),
+            columns: vec!["id".to_string()],
+            unique: true,
+            foreign: false,
+        };
+        assert!(ix("PRIMARY").is_primary());
+        assert!(!ix("primary").is_primary()); // case-sensitive: only literal PRIMARY
+        assert!(!ix("email_uq").is_primary());
+    }
+
+    #[test]
+    fn db_schema_table_count() {
+        assert_eq!(DbSchema::default().table_count(), 0);
+        let s = DbSchema {
+            tables: vec![
+                TableInfo {
+                    name: "a".to_string(),
+                    columns: Vec::new(),
+                    indexes: Vec::new(),
+                    is_view: false,
+                    view_definition: None,
+                },
+                TableInfo {
+                    name: "b".to_string(),
+                    columns: Vec::new(),
+                    indexes: Vec::new(),
+                    is_view: true,
+                    view_definition: None,
+                },
+            ],
+        };
+        assert_eq!(s.table_count(), 2);
+    }
 }

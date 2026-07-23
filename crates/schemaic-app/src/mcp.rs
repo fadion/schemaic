@@ -115,10 +115,9 @@ async fn call_tool(db: &Db, database: Option<&str>, name: &str, args: &Value) ->
 const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn run_query(db: &Db, database: Option<&str>, sql: &str) -> (String, bool) {
-    let stmt = sql.trim().trim_end_matches(';').trim();
-    if stmt.is_empty() {
+    let Some(stmt) = normalize_stmt(sql) else {
         return ("Empty query.".to_string(), true);
-    }
+    };
     // Read-only gate (comment/string/identifier-aware) lives in schemaic-core,
     // where it's unit-tested alongside the other SQL analysis.
     if let Err(reason) = schemaic_core::sql::read_only_reason(stmt) {
@@ -140,6 +139,14 @@ async fn run_query(db: &Db, database: Option<&str>, sql: &str) -> (String, bool)
             ("Query timed out (30s) and was cancelled.".to_string(), true)
         }
     }
+}
+
+/// Trim surrounding whitespace and a single trailing `;` from an AI-issued
+/// statement, returning `None` if nothing is left. Pure so the empty/`;`-only
+/// cases are unit-tested.
+fn normalize_stmt(sql: &str) -> Option<&str> {
+    let stmt = sql.trim().trim_end_matches(';').trim();
+    (!stmt.is_empty()).then_some(stmt)
 }
 
 /// Render a result set as a pipe table (capped), for the assistant to read.
@@ -197,4 +204,79 @@ async fn list_schema(db: &Db) -> (String, bool) {
         }
     }
     (out, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_table, normalize_stmt};
+    use schemaic_core::model::{Column, ResultSet, Value};
+
+    #[test]
+    fn normalize_stmt_trims_and_rejects_empty() {
+        assert_eq!(normalize_stmt("  SELECT 1 ;  "), Some("SELECT 1"));
+        assert_eq!(normalize_stmt("SELECT 1"), Some("SELECT 1"));
+        assert_eq!(normalize_stmt("   "), None);
+        assert_eq!(normalize_stmt(";"), None);
+        assert_eq!(normalize_stmt(""), None);
+    }
+
+    fn col(name: &str) -> Column {
+        Column {
+            name: name.to_string(),
+            type_name: "VARCHAR".to_string(),
+            origin: None,
+        }
+    }
+
+    #[test]
+    fn empty_columns_reported() {
+        assert_eq!(format_table(&ResultSet::default()), "(no columns)");
+    }
+
+    #[test]
+    fn renders_pipe_table_with_header_and_row_count() {
+        let rs = ResultSet {
+            columns: vec![col("id"), col("name")],
+            rows: vec![
+                vec![Value::Int(1), Value::Str("Ada".into())],
+                vec![Value::Null, Value::Str("Bo".into())],
+            ],
+            ..Default::default()
+        };
+        let out = format_table(&rs);
+        assert!(out.contains("| id | name |"));
+        assert!(out.contains("| --- | --- |"));
+        assert!(out.contains("| 1 | Ada |"));
+        assert!(out.contains("| NULL | Bo |"));
+        assert!(out.ends_with("(2 rows)"));
+    }
+
+    #[test]
+    fn escapes_pipes_and_newlines_and_truncates_long_cells() {
+        let rs = ResultSet {
+            columns: vec![col("v")],
+            rows: vec![
+                vec![Value::Str("a|b\nc".into())],
+                vec![Value::Str("x".repeat(80))],
+            ],
+            ..Default::default()
+        };
+        let out = format_table(&rs);
+        // Pipe escaped, newline flattened to a space.
+        assert!(out.contains(r"a\|b c"));
+        // Long value truncated to 60 chars + ellipsis.
+        assert!(out.contains(&format!("{}…", "x".repeat(60))));
+        assert!(!out.contains(&"x".repeat(61)));
+    }
+
+    #[test]
+    fn truncated_result_notes_capped_rows() {
+        let rs = ResultSet {
+            columns: vec![col("id")],
+            rows: vec![vec![Value::Int(1)]],
+            truncated: true,
+            ..Default::default()
+        };
+        assert!(format_table(&rs).ends_with("(1+ rows, capped)"));
+    }
 }

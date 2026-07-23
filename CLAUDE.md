@@ -104,6 +104,28 @@ Re-introducing the anti-patterns these guard against is a regression:
   helper still used by code that stays goes to `widgets.rs` (glob-imported), not the new leaf
   module; mark cross-called items `pub(crate)`; build + `cargo fmt` + smoke-launch each step.
 
+## Testing (TDD is the default now)
+
+**Test-driven development is the working approach for this project going forward.** New behavior and
+bug fixes start with a failing test, then the code that makes it pass. Concretely:
+
+- **Red → green → refactor.** For any new pure-logic behavior or bug fix, write the test first (it
+  fails), then implement until it passes, then clean up with the test still green. When a bug is
+  reported, first add a test that reproduces it (red), then fix it.
+- **Where tests live.** Pure logic belongs in `schemaic-core` (or the owning crate's `src`) with an
+  inline `#[cfg(test)] mod tests`; regression tests for a bug live next to the code they guard. The
+  UI/app keep thin wrappers over `schemaic-core`, so push logic *down* into a testable core function
+  rather than testing it through the UI.
+- **Coverage bar.** Every public function that encodes a decision (parsing, analysis, formatting,
+  export, diffing, key selection, gating) must have unit tests covering the happy path, empty/edge
+  inputs, and known failure modes. Prefer many small, named tests over one broad one.
+- **Keep the suite green + fast.** `cargo test --workspace` must pass before any commit; tests stay
+  pure (no live DB / network / filesystem — model those at the boundary). Don't commit with failing
+  or `#[ignore]`d tests unless the user asks.
+- **Architecture invariants are test-enforced where possible** — e.g. the single SQL boundary lexer,
+  the 1-row write-back safety net, and edit-model key selection all have regression tests; extend
+  them rather than working around them.
+
 ## Build & run
 
 - `cargo build` / `cargo run -p schemaic-app`.

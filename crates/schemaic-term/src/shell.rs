@@ -223,9 +223,16 @@ fn wsl_distros() -> Vec<String> {
     if !out.status.success() {
         return Vec::new();
     }
-    // Decode UTF-16LE, then split on lines, trimming NULs/whitespace.
-    let u16s: Vec<u16> = out
-        .stdout
+    parse_wsl_list(&out.stdout)
+}
+
+/// Decode `wsl.exe -l -q`'s UTF-16LE output into distro names: one per line,
+/// each trimmed of NULs/whitespace, blanks dropped. Pure so it's unit-testable
+/// without spawning `wsl.exe`. A trailing odd byte (incomplete code unit) is
+/// ignored by `chunks_exact`.
+#[cfg(windows)]
+fn parse_wsl_list(stdout: &[u8]) -> Vec<String> {
+    let u16s: Vec<u16> = stdout
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
@@ -237,4 +244,40 @@ fn wsl_distros() -> Vec<String> {
         })
         .filter(|l| !l.is_empty())
         .collect()
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::parse_wsl_list;
+
+    /// Encode `s` as UTF-16LE bytes (what `wsl.exe -l -q` emits).
+    fn utf16le(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn parses_distro_names_one_per_line() {
+        let bytes = utf16le("Ubuntu\r\nDebian\r\n");
+        assert_eq!(parse_wsl_list(&bytes), vec!["Ubuntu", "Debian"]);
+    }
+
+    #[test]
+    fn trims_nuls_and_whitespace_and_drops_blanks() {
+        // wsl.exe interleaves NULs and pads with spaces; blank lines dropped.
+        let bytes = utf16le("Ubuntu\0 \r\n\r\n  Debian  \r\n");
+        assert_eq!(parse_wsl_list(&bytes), vec!["Ubuntu", "Debian"]);
+    }
+
+    #[test]
+    fn empty_output_is_empty_list() {
+        assert!(parse_wsl_list(&[]).is_empty());
+        assert!(parse_wsl_list(&utf16le("\r\n \r\n")).is_empty());
+    }
+
+    #[test]
+    fn trailing_odd_byte_is_ignored() {
+        let mut bytes = utf16le("Ubuntu");
+        bytes.push(0x00); // incomplete final code unit
+        assert_eq!(parse_wsl_list(&bytes), vec!["Ubuntu"]);
+    }
 }

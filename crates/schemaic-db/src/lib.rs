@@ -185,26 +185,34 @@ impl Db {
         analyze: bool,
         cancel: CancellationToken,
     ) -> Result<ResultSet, DbError> {
-        let stmt = sql.trim().trim_end_matches(';').trim_end();
-        if analyze {
-            let primary = format!("EXPLAIN ANALYZE {stmt}");
-            match self
-                .fetch_query(database, &primary, EXPLAIN_ROW_CAP, cancel.clone())
-                .await
-            {
-                Err(DbError::Query(_)) => {
-                    // MariaDB: `EXPLAIN ANALYZE` is invalid — it uses `ANALYZE <stmt>`.
-                    let alt = format!("ANALYZE {stmt}");
-                    self.fetch_query(database, &alt, EXPLAIN_ROW_CAP, cancel)
-                        .await
-                }
-                other => other,
+        let (primary, fallback) = explain_commands(sql, analyze);
+        match self
+            .fetch_query(database, &primary, EXPLAIN_ROW_CAP, cancel.clone())
+            .await
+        {
+            // MariaDB: `EXPLAIN ANALYZE` is invalid — retry with `ANALYZE <stmt>`.
+            Err(DbError::Query(_)) if fallback.is_some() => {
+                self.fetch_query(database, &fallback.unwrap(), EXPLAIN_ROW_CAP, cancel)
+                    .await
             }
-        } else {
-            let q = format!("EXPLAIN {stmt}");
-            self.fetch_query(database, &q, EXPLAIN_ROW_CAP, cancel)
-                .await
+            other => other,
         }
+    }
+}
+
+/// The `EXPLAIN`/`ANALYZE` command(s) for `sql`: the statement is trimmed of a
+/// trailing `;`, then wrapped. Returns `(primary, fallback)` — for `analyze` the
+/// fallback is MariaDB's `ANALYZE <stmt>` (MySQL uses `EXPLAIN ANALYZE`); plain
+/// `EXPLAIN` has no fallback. Pure so the wrapping/fallback logic is unit-tested.
+fn explain_commands(sql: &str, analyze: bool) -> (String, Option<String>) {
+    let stmt = sql.trim().trim_end_matches(';').trim_end();
+    if analyze {
+        (
+            format!("EXPLAIN ANALYZE {stmt}"),
+            Some(format!("ANALYZE {stmt}")),
+        )
+    } else {
+        (format!("EXPLAIN {stmt}"), None)
     }
 }
 
@@ -345,19 +353,6 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         .await
         .map_err(qerr)?;
 
-    let mut tables: Vec<TableInfo> = Vec::with_capacity(table_rows.len());
-    let mut index: HashMap<String, usize> = HashMap::with_capacity(table_rows.len());
-    for (name, ty) in &table_rows {
-        index.insert(name.clone(), tables.len());
-        tables.push(TableInfo {
-            name: name.clone(),
-            columns: Vec::new(),
-            indexes: Vec::new(),
-            is_view: ty.eq_ignore_ascii_case("VIEW"),
-            view_definition: None,
-        });
-    }
-
     // Columns for the whole schema in one pass, grouped back onto their tables.
     let col_rows: Vec<(String, String, String, String, String)> = conn
         .exec_map(
@@ -376,15 +371,6 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         )
         .await
         .map_err(qerr)?;
-    for (t, c, ty, nullable, key) in &col_rows {
-        let Some(&ti) = index.get(t) else { continue };
-        tables[ti].columns.push(ColumnInfo {
-            name: c.clone(),
-            type_name: ty.clone(),
-            nullable: nullable.eq_ignore_ascii_case("YES"),
-            primary_key: key == "PRI",
-        });
-    }
 
     // Foreign-key constraint names — MySQL auto-creates an index sharing the
     // constraint's name, so we tag those indexes as FOREIGN below.
@@ -398,7 +384,6 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         )
         .await
         .map_err(qerr)?;
-    let fks: HashSet<(String, String)> = fk_rows.into_iter().collect();
 
     // Indexes: one row per (index, key-column); fold consecutive columns into
     // the same index, preserving `SEQ_IN_INDEX` order.
@@ -416,7 +401,77 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         )
         .await
         .map_err(qerr)?;
-    for (t, iname, non_unique, col) in &idx_rows {
+
+    // View definitions (only if the schema has any views) — the stored SELECT
+    // body, attached to each view's `TableInfo` for `CREATE VIEW` DDL.
+    let has_views = table_rows
+        .iter()
+        .any(|(_, ty)| ty.eq_ignore_ascii_case("VIEW"));
+    let view_rows: Vec<(String, String)> = if has_views {
+        conn.exec_map(
+            "SELECT CAST(TABLE_NAME AS CHAR) AS t, CAST(VIEW_DEFINITION AS CHAR) AS def \
+                 FROM information_schema.VIEWS \
+                 WHERE TABLE_SCHEMA = ?",
+            (database,),
+            |(t, def): (String, String)| (t, def),
+        )
+        .await
+        .map_err(qerr)?
+    } else {
+        Vec::new()
+    };
+
+    Ok(assemble_schema(
+        &table_rows,
+        &col_rows,
+        &fk_rows,
+        &idx_rows,
+        &view_rows,
+    ))
+}
+
+/// Assemble the fetched `information_schema` rows into a [`DbSchema`]: group
+/// columns onto their tables, fold each index's key columns (in `SEQ_IN_INDEX`
+/// order) into one [`IndexInfo`], flag an index FOREIGN when its name matches a
+/// FK constraint, mark views, and attach view definitions. Pure — the async
+/// `collect_schema` just runs the queries and hands the rows here — so the
+/// key/uniqueness/foreign detection that drives editing + DDL is unit-tested.
+///
+/// Rows referencing a table not in `table_rows` are dropped. `idx_rows` and
+/// `col_rows` are consumed in order, so callers must sort by
+/// `TABLE_NAME, SEQ_IN_INDEX` / `ORDINAL_POSITION` as the queries do.
+fn assemble_schema(
+    table_rows: &[(String, String)],
+    col_rows: &[(String, String, String, String, String)],
+    fk_rows: &[(String, String)],
+    idx_rows: &[(String, String, i64, String)],
+    view_rows: &[(String, String)],
+) -> DbSchema {
+    let mut tables: Vec<TableInfo> = Vec::with_capacity(table_rows.len());
+    let mut index: HashMap<String, usize> = HashMap::with_capacity(table_rows.len());
+    for (name, ty) in table_rows {
+        index.insert(name.clone(), tables.len());
+        tables.push(TableInfo {
+            name: name.clone(),
+            columns: Vec::new(),
+            indexes: Vec::new(),
+            is_view: ty.eq_ignore_ascii_case("VIEW"),
+            view_definition: None,
+        });
+    }
+
+    for (t, c, ty, nullable, key) in col_rows {
+        let Some(&ti) = index.get(t) else { continue };
+        tables[ti].columns.push(ColumnInfo {
+            name: c.clone(),
+            type_name: ty.clone(),
+            nullable: nullable.eq_ignore_ascii_case("YES"),
+            primary_key: key == "PRI",
+        });
+    }
+
+    let fks: HashSet<(String, String)> = fk_rows.iter().cloned().collect();
+    for (t, iname, non_unique, col) in idx_rows {
         let Some(&ti) = index.get(t) else { continue };
         let table = &mut tables[ti];
         if let Some(existing) = table.indexes.iter_mut().find(|x| &x.name == iname) {
@@ -432,28 +487,14 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         }
     }
 
-    // View definitions (only if the schema has any views) — the stored SELECT
-    // body, attached to each view's `TableInfo` for `CREATE VIEW` DDL.
-    if tables.iter().any(|t| t.is_view) {
-        let view_rows: Vec<(String, String)> = conn
-            .exec_map(
-                "SELECT CAST(TABLE_NAME AS CHAR) AS t, CAST(VIEW_DEFINITION AS CHAR) AS def \
-                 FROM information_schema.VIEWS \
-                 WHERE TABLE_SCHEMA = ?",
-                (database,),
-                |(t, def): (String, String)| (t, def),
-            )
-            .await
-            .map_err(qerr)?;
-        for (t, def) in &view_rows {
-            let Some(&ti) = index.get(t) else { continue };
-            if !def.is_empty() {
-                tables[ti].view_definition = Some(def.clone());
-            }
+    for (t, def) in view_rows {
+        let Some(&ti) = index.get(t) else { continue };
+        if !def.is_empty() {
+            tables[ti].view_definition = Some(def.clone());
         }
     }
 
-    Ok(DbSchema { tables })
+    DbSchema { tables }
 }
 
 /// Run the (unprepared, text-protocol) statement, stopping at the row cap, and
@@ -523,11 +564,36 @@ async fn collect_rows(
 /// surface as `origin: None` — the signal that such a column is not editable.
 fn map_column(c: &MyColumn) -> Column {
     let type_name = type_name_of(c);
-    // A *binary-data* column (raw bytes), not merely "binary charset": numeric /
-    // temporal columns also report charset 63, so key off the resolved type
-    // name instead. These can't round-trip through the text protocol losslessly.
-    let binary = matches!(
-        type_name.as_str(),
+    let binary = is_binary_data_type(&type_name);
+    let f = c.flags();
+    let flags = CoreColFlags {
+        primary_key: f.contains(ColumnFlags::PRI_KEY_FLAG),
+        unique_key: f.contains(ColumnFlags::UNIQUE_KEY_FLAG),
+        not_null: f.contains(ColumnFlags::NOT_NULL_FLAG),
+        auto_increment: f.contains(ColumnFlags::AUTO_INCREMENT_FLAG),
+        no_default: f.contains(ColumnFlags::NO_DEFAULT_VALUE_FLAG),
+    };
+    let origin = column_origin(
+        &c.schema_str(),
+        &c.org_table_str(),
+        &c.org_name_str(),
+        flags,
+        binary,
+    );
+    Column {
+        name: c.name_str().to_string(),
+        type_name,
+        origin,
+    }
+}
+
+/// Is the resolved SQL type a *binary-data* column (raw bytes), not merely
+/// "binary charset"? Numeric / temporal columns also report charset 63, so this
+/// keys off the resolved type name. Such values can't round-trip through the
+/// text protocol losslessly, so the editing system treats them as read-only.
+fn is_binary_data_type(type_name: &str) -> bool {
+    matches!(
+        type_name,
         "VARBINARY"
             | "BINARY"
             | "TINYBLOB"
@@ -536,40 +602,46 @@ fn map_column(c: &MyColumn) -> Column {
             | "LONGBLOB"
             | "BIT"
             | "GEOMETRY"
-    );
-    let org_table = c.org_table_str();
-    let origin = if org_table.is_empty() {
-        None
-    } else {
-        let f = c.flags();
-        Some(ColumnOrigin {
-            database: c.schema_str().to_string(),
-            table: org_table.to_string(),
-            column: c.org_name_str().to_string(),
-            flags: CoreColFlags {
-                primary_key: f.contains(ColumnFlags::PRI_KEY_FLAG),
-                unique_key: f.contains(ColumnFlags::UNIQUE_KEY_FLAG),
-                not_null: f.contains(ColumnFlags::NOT_NULL_FLAG),
-                auto_increment: f.contains(ColumnFlags::AUTO_INCREMENT_FLAG),
-                no_default: f.contains(ColumnFlags::NO_DEFAULT_VALUE_FLAG),
-            },
-            binary,
-        })
-    };
-    Column {
-        name: c.name_str().to_string(),
-        type_name,
-        origin,
+    )
+}
+
+/// Build a column's [`ColumnOrigin`] from its wire provenance, or `None` when
+/// `org_table` is empty — an expression/aggregate/literal with no single base
+/// column, the signal that such a column is not editable.
+fn column_origin(
+    schema: &str,
+    org_table: &str,
+    org_name: &str,
+    flags: CoreColFlags,
+    binary: bool,
+) -> Option<ColumnOrigin> {
+    if org_table.is_empty() {
+        return None;
     }
+    Some(ColumnOrigin {
+        database: schema.to_string(),
+        table: org_table.to_string(),
+        column: org_name.to_string(),
+        flags,
+        binary,
+    })
 }
 
 /// Reconstruct a human SQL type name (`VARCHAR`, `INT UNSIGNED`, `DATETIME`, …)
 /// from the wire column type + flags + charset — matching what the old sqlx
 /// `type_info().name()` produced, so `parse_typed` and the UI keep behaving.
 fn type_name_of(c: &MyColumn) -> String {
-    let ct = c.column_type();
-    let flags = c.flags();
-    let binary = c.character_set() == BINARY_CHARSET;
+    resolve_type_name(
+        c.column_type(),
+        c.flags().contains(ColumnFlags::UNSIGNED_FLAG),
+        c.character_set() == BINARY_CHARSET,
+    )
+}
+
+/// Pure core of [`type_name_of`]: map a wire column type + UNSIGNED flag + binary
+/// charset to a human SQL type name. Split out so the mapping (which drives
+/// `parse_typed` and editability) is unit-tested without a wire column object.
+fn resolve_type_name(ct: ColumnType, unsigned: bool, binary: bool) -> String {
     let base = match ct {
         ColumnType::MYSQL_TYPE_TINY => "TINYINT",
         ColumnType::MYSQL_TYPE_SHORT => "SMALLINT",
@@ -647,7 +719,7 @@ fn type_name_of(c: &MyColumn) -> String {
             | ColumnType::MYSQL_TYPE_DECIMAL
             | ColumnType::MYSQL_TYPE_NEWDECIMAL
     );
-    if numeric && flags.contains(ColumnFlags::UNSIGNED_FLAG) {
+    if numeric && unsigned {
         format!("{base} UNSIGNED")
     } else {
         base.to_string()
@@ -795,23 +867,7 @@ impl Db {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
-        let cols_sql = template
-            .columns
-            .iter()
-            .map(|c| ident(c))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let where_sql = template
-            .key_cols
-            .iter()
-            .map(|&kci| format!("{} <=> ?", ident(&template.columns[kci])))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let sql = format!(
-            "SELECT {cols_sql} FROM {}.{} WHERE {where_sql} LIMIT 1",
-            ident(&template.database),
-            ident(&template.table),
-        );
+        let sql = build_refetch_sql(template);
 
         let mut conn = self.open(None, false).await?;
         let conn_id = conn.id();
@@ -931,6 +987,30 @@ fn build_delete(del: &RowDelete) -> (String, Params) {
     (sql, Params::Positional(params))
 }
 
+/// Build the `SELECT … WHERE <key> <=> ? … LIMIT 1` used to re-fetch one edited
+/// row after a commit. Identifiers are backtick-escaped; the key columns become
+/// positional NULL-safe placeholders (bound by the caller from each row's key,
+/// in `template.key_cols` order). Pure so the SQL shape is unit-tested.
+fn build_refetch_sql(template: &RefetchTemplate) -> String {
+    let cols_sql = template
+        .columns
+        .iter()
+        .map(|c| ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let where_sql = template
+        .key_cols
+        .iter()
+        .map(|&kci| format!("{} <=> ?", ident(&template.columns[kci])))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    format!(
+        "SELECT {cols_sql} FROM {}.{} WHERE {where_sql} LIMIT 1",
+        ident(&template.database),
+        ident(&template.table),
+    )
+}
+
 /// Backtick-quote an identifier, doubling any embedded backtick.
 fn ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
@@ -1025,5 +1105,419 @@ mod tests {
             sql,
             "DELETE FROM `db`.`users` WHERE `id` <=> ? AND `tenant` <=> ?"
         );
+    }
+
+    fn positional(p: &Params) -> &[MyValue] {
+        match p {
+            Params::Positional(v) => v.as_slice(),
+            _ => panic!("expected positional params"),
+        }
+    }
+
+    #[test]
+    fn build_update_sql_and_param_order() {
+        // SET params come first (in column order), then WHERE key params.
+        let edit = RowEdit {
+            database: "db".to_string(),
+            table: "users".to_string(),
+            set: vec![
+                ("name".to_string(), Some("Ada".to_string())),
+                ("nickname".to_string(), None), // set to NULL
+            ],
+            key: vec![("id".to_string(), Value::Int(7))],
+        };
+        let (sql, params) = build_update(&edit);
+        assert_eq!(
+            sql,
+            "UPDATE `db`.`users` SET `name` = ?, `nickname` = ? WHERE `id` <=> ?"
+        );
+        let p = positional(&params);
+        assert_eq!(p.len(), 3);
+        assert!(matches!(&p[0], MyValue::Bytes(b) if b == b"Ada"));
+        assert!(matches!(p[1], MyValue::NULL));
+        assert!(matches!(p[2], MyValue::Int(7)));
+    }
+
+    #[test]
+    fn build_update_escapes_backtick_identifiers() {
+        let edit = RowEdit {
+            database: "d`b".to_string(),
+            table: "t`t".to_string(),
+            set: vec![("a`b".to_string(), Some("x".to_string()))],
+            key: vec![("k`k".to_string(), Value::Int(1))],
+        };
+        let (sql, _) = build_update(&edit);
+        assert_eq!(
+            sql,
+            "UPDATE `d``b`.`t``t` SET `a``b` = ? WHERE `k``k` <=> ?"
+        );
+    }
+
+    #[test]
+    fn ident_doubles_embedded_backticks() {
+        assert_eq!(ident("plain"), "`plain`");
+        assert_eq!(ident("a`b"), "`a``b`");
+        // Two backticks → each doubled (four), wrapped → six backticks.
+        assert_eq!(ident("``"), "`".repeat(6));
+    }
+
+    #[test]
+    fn value_to_param_maps_each_variant() {
+        assert!(matches!(value_to_param(&Value::Null), MyValue::NULL));
+        assert!(matches!(value_to_param(&Value::Int(-3)), MyValue::Int(-3)));
+        assert!(matches!(value_to_param(&Value::UInt(3)), MyValue::UInt(3)));
+        assert!(matches!(value_to_param(&Value::Float(1.5)), MyValue::Double(f) if f == 1.5));
+        assert!(matches!(value_to_param(&Value::Str("s".into())), MyValue::Bytes(b) if b == b"s"));
+    }
+
+    #[test]
+    fn parse_typed_integers_unsigned_floats_and_fallback() {
+        // Signed integer types.
+        assert!(matches!(parse_typed("42".into(), "INT"), Value::Int(42)));
+        assert!(matches!(parse_typed("-1".into(), "BIGINT"), Value::Int(-1)));
+        assert!(matches!(
+            parse_typed("2024".into(), "YEAR"),
+            Value::Int(2024)
+        ));
+        // Unsigned.
+        assert!(matches!(
+            parse_typed("42".into(), "INT UNSIGNED"),
+            Value::UInt(42)
+        ));
+        // A negative into an UNSIGNED column can't parse → lossless string fallback.
+        assert!(matches!(
+            parse_typed("-1".into(), "INT UNSIGNED"),
+            Value::Str(s) if s == "-1"
+        ));
+        // Floats.
+        assert!(matches!(parse_typed("1.5".into(), "DOUBLE"), Value::Float(f) if f == 1.5));
+        assert!(matches!(parse_typed("3.0".into(), "FLOAT"), Value::Float(f) if f == 3.0));
+        // DECIMAL stays an exact string (never a lossy float).
+        assert!(matches!(
+            parse_typed("1.10".into(), "DECIMAL(10,2)"),
+            Value::Str(s) if s == "1.10"
+        ));
+        // Non-numeric type → string.
+        assert!(matches!(
+            parse_typed("hi".into(), "VARCHAR(20)"),
+            Value::Str(s) if s == "hi"
+        ));
+        // Unparseable integer → string fallback, never a panic.
+        assert!(matches!(
+            parse_typed("NaN".into(), "INT"),
+            Value::Str(s) if s == "NaN"
+        ));
+    }
+
+    #[test]
+    fn db_connect_rewrites_endpoint_for_tunnel() {
+        let conn = schemaic_core::connection::Connection {
+            id: 1,
+            name: "c".to_string(),
+            db_type: "MySQL".to_string(),
+            host: "remote.example".to_string(),
+            port: 3306,
+            user: "u".to_string(),
+            password: "p".to_string(),
+            ssh: Default::default(),
+            color: None,
+            prominent_color: false,
+            read_only: false,
+        };
+        // No tunnel → direct host/port passthrough.
+        let direct = Db::connect(&conn, None);
+        assert_eq!(direct.parts(), ("remote.example", 3306, "u", "p"));
+        // Tunnel → rewritten to 127.0.0.1:<local port>, credentials preserved.
+        let tunneled = Db::connect(&conn, Some(55001));
+        assert_eq!(tunneled.parts(), ("127.0.0.1", 55001, "u", "p"));
+    }
+
+    #[test]
+    fn db_from_parts_roundtrips() {
+        let db = Db::from_parts("h".into(), 3307, "user".into(), "pass".into());
+        assert_eq!(db.parts(), ("h", 3307, "user", "pass"));
+    }
+
+    #[test]
+    fn build_refetch_sql_single_key() {
+        let t = RefetchTemplate {
+            database: "db".to_string(),
+            table: "users".to_string(),
+            columns: vec!["id".to_string(), "name".to_string()],
+            key_cols: vec![0],
+        };
+        assert_eq!(
+            build_refetch_sql(&t),
+            "SELECT `id`, `name` FROM `db`.`users` WHERE `id` <=> ? LIMIT 1"
+        );
+    }
+
+    #[test]
+    fn build_refetch_sql_composite_key_joins_with_and() {
+        let t = RefetchTemplate {
+            database: "db".to_string(),
+            table: "t".to_string(),
+            columns: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            key_cols: vec![0, 2],
+        };
+        assert_eq!(
+            build_refetch_sql(&t),
+            "SELECT `a`, `b`, `c` FROM `db`.`t` WHERE `a` <=> ? AND `c` <=> ? LIMIT 1"
+        );
+    }
+
+    #[test]
+    fn build_refetch_sql_escapes_identifiers() {
+        let t = RefetchTemplate {
+            database: "d`b".to_string(),
+            table: "t`t".to_string(),
+            columns: vec!["a`b".to_string()],
+            key_cols: vec![0],
+        };
+        assert_eq!(
+            build_refetch_sql(&t),
+            "SELECT `a``b` FROM `d``b`.`t``t` WHERE `a``b` <=> ? LIMIT 1"
+        );
+    }
+
+    #[test]
+    fn resolve_type_name_maps_common_types() {
+        let non_binary = false;
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_LONG, false, non_binary),
+            "INT"
+        );
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_LONGLONG, false, non_binary),
+            "BIGINT"
+        );
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_NEWDECIMAL, false, non_binary),
+            "DECIMAL"
+        );
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_DATETIME, false, non_binary),
+            "DATETIME"
+        );
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_JSON, false, non_binary),
+            "JSON"
+        );
+    }
+
+    #[test]
+    fn resolve_type_name_binary_charset_flips_string_and_blob_types() {
+        // charset 63 (binary) turns text types into their binary counterparts.
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_VAR_STRING, false, true),
+            "VARBINARY"
+        );
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_VAR_STRING, false, false),
+            "VARCHAR"
+        );
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_STRING, false, true),
+            "BINARY"
+        );
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_STRING, false, false),
+            "CHAR"
+        );
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_BLOB, false, true),
+            "BLOB"
+        );
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_BLOB, false, false),
+            "TEXT"
+        );
+    }
+
+    #[test]
+    fn resolve_type_name_unsigned_only_on_numeric_types() {
+        // UNSIGNED suffix appended for numerics…
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_LONG, true, false),
+            "INT UNSIGNED"
+        );
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_NEWDECIMAL, true, false),
+            "DECIMAL UNSIGNED"
+        );
+        // …but never for non-numeric types, even if the flag is set.
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_DATETIME, true, false),
+            "DATETIME"
+        );
+        assert_eq!(
+            resolve_type_name(ColumnType::MYSQL_TYPE_VAR_STRING, true, false),
+            "VARCHAR"
+        );
+    }
+
+    #[test]
+    fn is_binary_data_type_flags_only_raw_byte_types() {
+        for t in [
+            "VARBINARY",
+            "BINARY",
+            "BLOB",
+            "TINYBLOB",
+            "LONGBLOB",
+            "BIT",
+            "GEOMETRY",
+        ] {
+            assert!(is_binary_data_type(t), "{t} should be binary data");
+        }
+        // Temporal/numeric report charset 63 too, but aren't binary DATA.
+        for t in ["DATETIME", "INT", "VARCHAR", "TEXT", "JSON", "DECIMAL"] {
+            assert!(!is_binary_data_type(t), "{t} should not be binary data");
+        }
+    }
+
+    #[test]
+    fn column_origin_none_for_empty_org_table() {
+        let flags = CoreColFlags::default();
+        // Expression/aggregate/literal → empty org_table → not editable.
+        assert!(column_origin("db", "", "expr", flags, false).is_none());
+    }
+
+    #[test]
+    fn column_origin_some_carries_provenance_and_flags() {
+        let flags = CoreColFlags {
+            primary_key: true,
+            not_null: true,
+            ..Default::default()
+        };
+        let o = column_origin("shop", "users", "id", flags, false).expect("has base table");
+        assert_eq!(o.database, "shop");
+        assert_eq!(o.table, "users");
+        assert_eq!(o.column, "id");
+        assert!(o.flags.primary_key);
+        assert!(o.flags.not_null);
+        assert!(!o.binary);
+    }
+
+    fn s(x: &str) -> String {
+        x.to_string()
+    }
+
+    #[test]
+    fn assemble_schema_groups_columns_and_flags_pk() {
+        let tables = [(s("users"), s("BASE TABLE"))];
+        let cols = [
+            (s("users"), s("id"), s("int"), s("NO"), s("PRI")),
+            (s("users"), s("email"), s("varchar(255)"), s("YES"), s("")),
+        ];
+        let schema = assemble_schema(&tables, &cols, &[], &[], &[]);
+        assert_eq!(schema.tables.len(), 1);
+        let t = &schema.tables[0];
+        assert!(!t.is_view);
+        assert_eq!(t.columns.len(), 2);
+        assert!(t.columns[0].primary_key);
+        assert!(!t.columns[0].nullable); // IS_NULLABLE = "NO"
+        assert!(!t.columns[1].primary_key);
+        assert!(t.columns[1].nullable); // "YES"
+    }
+
+    #[test]
+    fn assemble_schema_folds_composite_index_in_order() {
+        let tables = [(s("t"), s("BASE TABLE"))];
+        // Two rows for the same index name → one IndexInfo, columns in row order.
+        let idx = [
+            (s("t"), s("idx_ab"), 1, s("a")),
+            (s("t"), s("idx_ab"), 1, s("b")),
+            (s("t"), s("PRIMARY"), 0, s("id")),
+        ];
+        let schema = assemble_schema(&tables, &[], &[], &idx, &[]);
+        let t = &schema.tables[0];
+        assert_eq!(t.indexes.len(), 2);
+        let ab = t.indexes.iter().find(|i| i.name == "idx_ab").unwrap();
+        assert_eq!(ab.columns, vec!["a".to_string(), "b".to_string()]);
+        assert!(!ab.unique); // NON_UNIQUE = 1
+        let pk = t.indexes.iter().find(|i| i.name == "PRIMARY").unwrap();
+        assert!(pk.unique); // NON_UNIQUE = 0
+        assert!(pk.is_primary());
+    }
+
+    #[test]
+    fn assemble_schema_flags_foreign_index_by_constraint_name() {
+        let tables = [(s("orders"), s("BASE TABLE"))];
+        let idx = [
+            (s("orders"), s("fk_customer"), 1, s("customer_id")),
+            (s("orders"), s("idx_plain"), 1, s("total")),
+        ];
+        let fks = [(s("orders"), s("fk_customer"))];
+        let schema = assemble_schema(&tables, &[], &fks, &idx, &[]);
+        let t = &schema.tables[0];
+        assert!(
+            t.indexes
+                .iter()
+                .find(|i| i.name == "fk_customer")
+                .unwrap()
+                .foreign
+        );
+        assert!(
+            !t.indexes
+                .iter()
+                .find(|i| i.name == "idx_plain")
+                .unwrap()
+                .foreign
+        );
+    }
+
+    #[test]
+    fn assemble_schema_marks_views_and_attaches_definition() {
+        let tables = [(s("v"), s("VIEW")), (s("base"), s("BASE TABLE"))];
+        let views = [(s("v"), s("SELECT 1"))];
+        let schema = assemble_schema(&tables, &[], &[], &[], &views);
+        let v = schema.tables.iter().find(|t| t.name == "v").unwrap();
+        assert!(v.is_view);
+        assert_eq!(v.view_definition.as_deref(), Some("SELECT 1"));
+        let base = schema.tables.iter().find(|t| t.name == "base").unwrap();
+        assert!(!base.is_view);
+        assert!(base.view_definition.is_none());
+    }
+
+    #[test]
+    fn assemble_schema_drops_rows_for_unknown_tables() {
+        let tables = [(s("known"), s("BASE TABLE"))];
+        // Column/index rows referencing a table absent from `tables` are ignored.
+        let cols = [(s("ghost"), s("x"), s("int"), s("NO"), s("PRI"))];
+        let idx = [(s("ghost"), s("idx"), 1, s("x"))];
+        let schema = assemble_schema(&tables, &cols, &[], &idx, &[]);
+        assert_eq!(schema.tables.len(), 1);
+        assert!(schema.tables[0].columns.is_empty());
+        assert!(schema.tables[0].indexes.is_empty());
+    }
+
+    #[test]
+    fn assemble_schema_empty_view_definition_stays_none() {
+        // A view whose VIEW_DEFINITION came back empty (e.g. privileges) → None,
+        // so create_ddl falls back to its placeholder.
+        let tables = [(s("v"), s("VIEW"))];
+        let views = [(s("v"), s(""))];
+        let schema = assemble_schema(&tables, &[], &[], &[], &views);
+        assert!(schema.tables[0].view_definition.is_none());
+    }
+
+    #[test]
+    fn explain_commands_plain_has_no_fallback() {
+        let (primary, fallback) = explain_commands("SELECT * FROM t", false);
+        assert_eq!(primary, "EXPLAIN SELECT * FROM t");
+        assert!(fallback.is_none());
+    }
+
+    #[test]
+    fn explain_commands_analyze_offers_mariadb_fallback() {
+        let (primary, fallback) = explain_commands("SELECT 1", true);
+        assert_eq!(primary, "EXPLAIN ANALYZE SELECT 1");
+        assert_eq!(fallback.as_deref(), Some("ANALYZE SELECT 1"));
+    }
+
+    #[test]
+    fn explain_commands_strips_trailing_semicolon_and_space() {
+        let (primary, _) = explain_commands("  SELECT 1 ;  ", false);
+        assert_eq!(primary, "EXPLAIN SELECT 1");
     }
 }

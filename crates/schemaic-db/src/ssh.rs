@@ -59,6 +59,33 @@ struct TunnelClient {
     host_port: String,
 }
 
+/// The trust-on-first-use verdict for an offered server key (review H10). Pure
+/// so the security decision can be exhaustively unit-tested; the I/O wrapper in
+/// [`TunnelClient::check_server_key`] loads the store, logs, and persists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HostKeyVerdict {
+    /// Known host, key still matches → accept without touching the store.
+    Accept,
+    /// Known host, key changed → refuse (the MITM signal).
+    Refuse,
+    /// Unknown host → record the key, then accept (first-use trust).
+    RecordAndAccept,
+}
+
+/// Decide how to treat `fingerprint` offered by `host_port`, given the current
+/// known-hosts `store`. No I/O — the caller applies the verdict.
+fn known_host_decision(
+    store: &HashMap<String, String>,
+    host_port: &str,
+    fingerprint: &str,
+) -> HostKeyVerdict {
+    match store.get(host_port) {
+        Some(known) if known == fingerprint => HostKeyVerdict::Accept,
+        Some(_) => HostKeyVerdict::Refuse,
+        None => HostKeyVerdict::RecordAndAccept,
+    }
+}
+
 impl Handler for TunnelClient {
     type Error = russh::Error;
 
@@ -69,9 +96,10 @@ impl Handler for TunnelClient {
         let fingerprint = key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
         let mut store: HashMap<String, String> =
             schemaic_core::persist::load_json(KNOWN_HOSTS_FILE);
-        match store.get(&self.host_port) {
-            Some(known) if known == &fingerprint => Ok(true),
-            Some(known) => {
+        match known_host_decision(&store, &self.host_port, &fingerprint) {
+            HostKeyVerdict::Accept => Ok(true),
+            HostKeyVerdict::Refuse => {
+                let known = store.get(&self.host_port).map(String::as_str).unwrap_or("");
                 tracing::error!(
                     "SSH host-key MISMATCH for {}: known {known}, offered {fingerprint} — refusing \
                      (possible MITM; remove it from {KNOWN_HOSTS_FILE} to re-trust)",
@@ -79,7 +107,7 @@ impl Handler for TunnelClient {
                 );
                 Ok(false)
             }
-            None => {
+            HostKeyVerdict::RecordAndAccept => {
                 tracing::info!(
                     "SSH host {} not seen before; trusting key {fingerprint} (TOFU)",
                     self.host_port
@@ -280,4 +308,60 @@ pub async fn open_tunnel(
         port: local_port,
         accept_task: accept.abort_handle(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HostKeyVerdict, known_host_decision};
+    use std::collections::HashMap;
+
+    fn store(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(h, f)| (h.to_string(), f.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn unknown_host_is_recorded_and_accepted() {
+        let s = store(&[]);
+        assert_eq!(
+            known_host_decision(&s, "db.example:22", "SHA256:abc"),
+            HostKeyVerdict::RecordAndAccept
+        );
+    }
+
+    #[test]
+    fn known_host_matching_key_is_accepted() {
+        let s = store(&[("db.example:22", "SHA256:abc")]);
+        assert_eq!(
+            known_host_decision(&s, "db.example:22", "SHA256:abc"),
+            HostKeyVerdict::Accept
+        );
+    }
+
+    #[test]
+    fn known_host_changed_key_is_refused_as_mitm() {
+        let s = store(&[("db.example:22", "SHA256:abc")]);
+        assert_eq!(
+            known_host_decision(&s, "db.example:22", "SHA256:DIFFERENT"),
+            HostKeyVerdict::Refuse
+        );
+    }
+
+    #[test]
+    fn decision_is_keyed_by_host_port() {
+        // Same fingerprint recorded for a different host must not vouch for this one.
+        let s = store(&[("other:22", "SHA256:abc")]);
+        assert_eq!(
+            known_host_decision(&s, "db.example:22", "SHA256:abc"),
+            HostKeyVerdict::RecordAndAccept
+        );
+        // Same host, different port is a distinct entry.
+        let s = store(&[("db.example:22", "SHA256:abc")]);
+        assert_eq!(
+            known_host_decision(&s, "db.example:2222", "SHA256:abc"),
+            HostKeyVerdict::RecordAndAccept
+        );
+    }
 }

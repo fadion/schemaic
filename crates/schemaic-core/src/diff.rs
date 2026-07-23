@@ -240,4 +240,52 @@ mod tests {
     fn build_rows_empty_diff_is_empty() {
         assert!(build_diff_rows(Vec::new()).is_empty());
     }
+
+    #[test]
+    fn huge_middle_falls_back_to_whole_replace() {
+        // Enough distinct lines that n*m exceeds DIFF_MAX_CELLS (2M): ~1500 each
+        // → ~2.25M cells. Every line differs so there is no common prefix/suffix.
+        let old = (0..1500)
+            .map(|i| format!("a{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = (0..1500)
+            .map(|i| format!("b{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let d = line_diff(&old, &new);
+        // Fallback = all deletions first, then all insertions (no interleaving).
+        let dels = d.iter().filter(|(t, _)| *t == DiffTag::Del).count();
+        let ins = d.iter().filter(|(t, _)| *t == DiffTag::Ins).count();
+        assert_eq!(dels, 1500);
+        assert_eq!(ins, 1500);
+        let first_ins = d.iter().position(|(t, _)| *t == DiffTag::Ins).unwrap();
+        let last_del = d.iter().rposition(|(t, _)| *t == DiffTag::Del).unwrap();
+        assert!(
+            last_del < first_ins,
+            "all Dels precede all Ins in the fallback"
+        );
+    }
+
+    #[test]
+    fn build_rows_number_lines_by_side() {
+        // old: a b c ; new: a X c → Del keeps old-file numbering, Ins/Equal new.
+        let rows = build_diff_rows(line_diff("a\nb\nc", "a\nX\nc"));
+        let lines: Vec<(DiffTag, usize, String)> = rows
+            .into_iter()
+            .filter_map(|r| match r {
+                DiffRow::Line { tag, num, text } => Some((tag, num, text)),
+                DiffRow::Gap(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                (DiffTag::Equal, 1, "a".to_string()),
+                (DiffTag::Del, 2, "b".to_string()),   // old line 2
+                (DiffTag::Ins, 2, "X".to_string()),   // new line 2
+                (DiffTag::Equal, 3, "c".to_string()), // new line 3
+            ]
+        );
+    }
 }

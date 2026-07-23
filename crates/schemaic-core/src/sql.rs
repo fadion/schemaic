@@ -496,4 +496,96 @@ mod tests {
         assert!(read_only_reason("SELECT 'delete from t'").is_ok());
         assert!(read_only_reason("SELECT `update` FROM t").is_ok());
     }
+
+    #[test]
+    fn edit_distance_basic_and_edges() {
+        assert_eq!(edit_distance("", ""), 0);
+        assert_eq!(edit_distance("abc", "abc"), 0);
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("abc", ""), 3);
+        // single substitution / insertion / deletion
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(edit_distance("flaw", "lawn"), 2);
+        assert_eq!(edit_distance("SELECT", "SELET"), 1);
+        // symmetric
+        assert_eq!(edit_distance("abc", "yabd"), edit_distance("yabd", "abc"));
+    }
+
+    #[test]
+    fn first_unsafe_finds_earliest_across_statements() {
+        // First statement safe, second unsafe → reports the second.
+        let r = first_unsafe("SELECT 1; DELETE FROM t");
+        assert!(r.is_some());
+        assert!(r.unwrap().contains("DELETE"));
+        // All safe → None.
+        assert!(first_unsafe("SELECT 1; SELECT 2").is_none());
+        assert!(first_unsafe("DELETE FROM t WHERE id=1").is_none());
+        // A comment-only trailing segment doesn't hide the earlier unsafe one.
+        let r = first_unsafe("TRUNCATE TABLE t; # note");
+        assert!(r.unwrap().contains("TRUNCATE"));
+    }
+
+    #[test]
+    fn leading_keyword_skips_whitespace_and_comments() {
+        assert_eq!(
+            leading_keyword("select * from t"),
+            Some("SELECT".to_string())
+        );
+        assert_eq!(
+            leading_keyword("  \n /* c */ -- x\n update t"),
+            Some("UPDATE".to_string())
+        );
+        // Starts with a digit / punctuation → no leading word.
+        assert_eq!(leading_keyword("123 abc"), None);
+        assert_eq!(leading_keyword("   "), None);
+        assert_eq!(leading_keyword(""), None);
+        // Underscore-led identifier is a word.
+        assert_eq!(leading_keyword("_foo bar"), Some("_FOO".to_string()));
+    }
+
+    #[test]
+    fn statement_range_locates_caret_and_falls_back_after_trailing_semicolon() {
+        let sql = "SELECT 1; SELECT 2";
+        // Caret in the first statement (range runs to the bound past the `;`).
+        let (lo, hi) = statement_range(sql, 3);
+        assert_eq!(&sql[lo..hi], "SELECT 1;");
+        // Caret in the second statement.
+        let (lo, hi) = statement_range(sql, 12);
+        assert_eq!(&sql[lo..hi], "SELECT 2");
+        // Caret past the final `;` (blank trailing segment) → previous statement
+        // (its range runs to the bound past the `;`, so the `;` is included).
+        let sql = "SELECT 1;";
+        let (lo, hi) = statement_range(sql, sql.len());
+        assert_eq!(&sql[lo..hi], "SELECT 1;");
+        // Offset beyond the string length is clamped.
+        let (lo, hi) = statement_range("SELECT 1", 9999);
+        assert_eq!(&"SELECT 1"[lo..hi], "SELECT 1");
+    }
+
+    #[test]
+    fn skip_noncode_handles_escapes_doubled_quotes_and_unterminated() {
+        // Doubled '' stays inside the string.
+        let s = "'a''b' rest";
+        let end = skip_noncode(s.as_bytes(), 0).unwrap();
+        assert_eq!(&s[..end], "'a''b'");
+        // Backslash escape inside a string.
+        let s = r"'a\'b' rest";
+        let end = skip_noncode(s.as_bytes(), 0).unwrap();
+        assert_eq!(&s[..end], r"'a\'b'");
+        // Doubled backtick inside an identifier.
+        let s = "`a``b` rest";
+        let end = skip_noncode(s.as_bytes(), 0).unwrap();
+        assert_eq!(&s[..end], "`a``b`");
+        // Unterminated string runs to end.
+        let s = "'no end";
+        assert_eq!(skip_noncode(s.as_bytes(), 0), Some(s.len()));
+        // Block comment.
+        let s = "/* c */x";
+        let end = skip_noncode(s.as_bytes(), 0).unwrap();
+        assert_eq!(&s[..end], "/* c */");
+        // Not a boundary char → None.
+        assert_eq!(skip_noncode(b"abc", 0), None);
+        // `--` without trailing whitespace is NOT a comment.
+        assert_eq!(skip_noncode(b"--x", 0), None);
+    }
 }

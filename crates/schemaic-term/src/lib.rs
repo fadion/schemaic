@@ -611,3 +611,151 @@ fn home_dir() -> Option<String> {
 fn to_io(e: anyhow::Error) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alacritty_terminal::index::Line;
+
+    fn cells(s: &str) -> Vec<CellData> {
+        s.chars()
+            .map(|c| CellData {
+                c,
+                fg: DEFAULT_FG,
+                bg: None,
+                bold: false,
+                link: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn indexed_rgb_base_cube_and_grayscale() {
+        // 0..=15 map straight to the base palette.
+        assert_eq!(indexed_rgb(0), ANSI16[0]);
+        assert_eq!(indexed_rgb(15), ANSI16[15]);
+        // 6×6×6 cube: 16 is black, 231 is white.
+        assert_eq!(indexed_rgb(16), (0, 0, 0));
+        assert_eq!(indexed_rgb(231), (255, 255, 255));
+        // A mid-cube step uses v*40+55.
+        assert_eq!(indexed_rgb(196), (255, 0, 0)); // x=180 → (5,0,0)
+        // Grayscale ramp: 232 = 8, 255 = 238.
+        assert_eq!(indexed_rgb(232), (8, 8, 8));
+        assert_eq!(indexed_rgb(255), (238, 238, 238));
+    }
+
+    #[test]
+    fn named_rgb_maps_ansi_and_dim_aliases() {
+        assert_eq!(named_rgb(NamedColor::Red), ANSI16[1]);
+        assert_eq!(named_rgb(NamedColor::DimRed), ANSI16[1]); // dim aliases base
+        assert_eq!(named_rgb(NamedColor::BrightWhite), ANSI16[15]);
+        assert_eq!(named_rgb(NamedColor::Foreground), DEFAULT_FG);
+        assert_eq!(named_rgb(NamedColor::Background), DEFAULT_BG);
+    }
+
+    #[test]
+    fn is_url_char_accepts_url_bytes_rejects_others() {
+        assert!(is_url_char('a'));
+        assert!(is_url_char('Z'));
+        assert!(is_url_char('9'));
+        assert!(is_url_char(':'));
+        assert!(is_url_char('/'));
+        assert!(is_url_char('%'));
+        assert!(!is_url_char(' '));
+        assert!(!is_url_char('{'));
+        assert!(!is_url_char('«'));
+    }
+
+    #[test]
+    fn tag_links_marks_url_cells_and_trims_trailing_punctuation() {
+        let mut c = cells("see https://example.com/x.");
+        tag_links(&mut c);
+        // The trailing period is NOT part of the link.
+        let linked: String = c
+            .iter()
+            .filter(|cell| cell.link.is_some())
+            .map(|cell| cell.c)
+            .collect();
+        assert_eq!(linked, "https://example.com/x");
+        // Every linked cell carries the whole URL.
+        assert!(
+            c.iter()
+                .filter(|cell| cell.link.is_some())
+                .all(|cell| cell.link.as_deref() == Some("https://example.com/x"))
+        );
+        // Leading prose ("see ") is not linked.
+        assert!(c[0].link.is_none());
+    }
+
+    #[test]
+    fn tag_links_ignores_non_url_and_too_short() {
+        let mut c = cells("no links here, and http:// alone");
+        tag_links(&mut c);
+        assert!(c.iter().all(|cell| cell.link.is_none()));
+    }
+
+    #[test]
+    fn coalesce_row_trims_trailing_blanks_and_merges_same_style() {
+        // "ab" same style + trailing spaces (bg none) → one run "ab".
+        let row = coalesce_row(cells("ab   "));
+        assert_eq!(row.runs.len(), 1);
+        assert_eq!(row.runs[0].text, "ab");
+
+        // A style break splits runs.
+        let mut c = cells("ab");
+        c[1].bold = true;
+        let row = coalesce_row(c);
+        assert_eq!(row.runs.len(), 2);
+        assert_eq!(row.runs[0].text, "a");
+        assert_eq!(row.runs[1].text, "b");
+        assert!(row.runs[1].bold);
+    }
+
+    #[test]
+    fn coalesce_row_keeps_trailing_space_with_background() {
+        // A trailing space that carries a background is meaningful → kept.
+        let mut c = cells("a ");
+        c[1].bg = Some((10, 20, 30));
+        let row = coalesce_row(c);
+        // Two runs: 'a' (no bg) and ' ' (bg) — not trimmed.
+        assert_eq!(row.runs.iter().map(|r| r.text.len()).sum::<usize>(), 2);
+    }
+
+    fn pt(line: i32, col: usize) -> Point {
+        Point {
+            line: Line(line),
+            column: Column(col),
+        }
+    }
+
+    #[test]
+    fn in_selection_linear_spans_wrapped_lines() {
+        // Linear selection from (0,2) to (2,3): whole middle line is included.
+        let r = SelectionRange {
+            start: pt(0, 2),
+            end: pt(2, 3),
+            is_block: false,
+        };
+        assert!(!in_selection(&r, pt(0, 1))); // before start column on start line
+        assert!(in_selection(&r, pt(0, 2))); // at start
+        assert!(in_selection(&r, pt(1, 0))); // full middle line
+        assert!(in_selection(&r, pt(2, 3))); // at end
+        assert!(!in_selection(&r, pt(2, 4))); // past end column on end line
+        assert!(!in_selection(&r, pt(3, 0))); // past end line
+    }
+
+    #[test]
+    fn in_selection_block_is_a_rectangle() {
+        // Block selection columns 2..=4 across lines 0..=2.
+        let r = SelectionRange {
+            start: pt(0, 2),
+            end: pt(2, 4),
+            is_block: true,
+        };
+        assert!(in_selection(&r, pt(1, 3))); // inside the rectangle
+        assert!(in_selection(&r, pt(0, 2))); // corner
+        assert!(!in_selection(&r, pt(1, 1))); // left of the column band
+        assert!(!in_selection(&r, pt(1, 5))); // right of the column band
+        assert!(!in_selection(&r, pt(3, 3))); // below the row band
+    }
+}

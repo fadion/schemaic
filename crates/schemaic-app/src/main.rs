@@ -138,6 +138,35 @@ fn mysql_shell(
     db: Option<&str>,
 ) -> Option<schemaic_term::ShellConfig> {
     use schemaic_term::shell::which;
+    // Native client on PATH, else the WSL-side client.
+    for prog in ["mysql", "mariadb"] {
+        if which(prog).is_some() {
+            return Some(mysql_shell_config(MysqlLauncher::Native(prog), conn, db));
+        }
+    }
+    if which("wsl.exe").is_some() {
+        return Some(mysql_shell_config(MysqlLauncher::Wsl, conn, db));
+    }
+    None
+}
+
+/// Which DB client `mysql_shell` resolved to run.
+enum MysqlLauncher<'a> {
+    /// A native `mysql`/`mariadb` on PATH.
+    Native(&'a str),
+    /// The WSL-side client via `wsl.exe -e mysql`.
+    Wsl,
+}
+
+/// Build the launch config for the resolved DB client — pure argv + credential
+/// env construction, split from the PATH probing in [`mysql_shell`] so it's
+/// unit-tested. The password always rides `MYSQL_PWD` (forwarded across `WSLENV`
+/// in the WSL case) and never lands on the argv.
+fn mysql_shell_config(
+    launcher: MysqlLauncher,
+    conn: &schemaic_core::connection::Connection,
+    db: Option<&str>,
+) -> schemaic_term::ShellConfig {
     let mut cli_args: Vec<String> = vec![
         "-h".into(),
         conn.host.clone(),
@@ -149,32 +178,50 @@ fn mysql_shell(
     if let Some(d) = db {
         cli_args.push(d.to_string());
     }
-    // Native client on PATH.
-    for prog in ["mysql", "mariadb"] {
-        if which(prog).is_some() {
-            return Some(schemaic_term::ShellConfig {
-                program: prog.into(),
-                args: cli_args,
+    match launcher {
+        MysqlLauncher::Native(prog) => schemaic_term::ShellConfig {
+            program: prog.into(),
+            args: cli_args,
+            cwd: None,
+            env: vec![("MYSQL_PWD".into(), conn.password.clone())],
+        },
+        MysqlLauncher::Wsl => {
+            let mut args: Vec<String> = vec!["-e".into(), "mysql".into()];
+            args.extend(cli_args);
+            schemaic_term::ShellConfig {
+                program: "wsl.exe".into(),
+                args,
                 cwd: None,
-                env: vec![("MYSQL_PWD".into(), conn.password.clone())],
-            });
+                env: vec![
+                    ("WSLENV".into(), "MYSQL_PWD/u".into()),
+                    ("MYSQL_PWD".into(), conn.password.clone()),
+                ],
+            }
         }
     }
-    // WSL fallback: run the WSL client, forwarding MYSQL_PWD across via WSLENV.
-    if which("wsl.exe").is_some() {
-        let mut args: Vec<String> = vec!["-e".into(), "mysql".into()];
-        args.extend(cli_args);
-        return Some(schemaic_term::ShellConfig {
-            program: "wsl.exe".into(),
-            args,
-            cwd: None,
-            env: vec![
-                ("WSLENV".into(), "MYSQL_PWD/u".into()),
-                ("MYSQL_PWD".into(), conn.password.clone()),
-            ],
-        });
+}
+
+/// Map a finished inline-AI (`Ctrl+K`) generation's output to a UI state: on
+/// success, the fence-stripped SQL (or "No SQL returned" if blank); on failure,
+/// the first stderr line. Pure so the parsing of untrusted subprocess output is
+/// unit-tested (the closure keeps only the spawn + the spawn-error arm).
+fn inline_outcome(success: bool, stdout: &[u8], stderr: &[u8]) -> InlineAiState {
+    if success {
+        let sql = extract_sql(&String::from_utf8_lossy(stdout));
+        if sql.trim().is_empty() {
+            InlineAiState::Failed("No SQL returned".to_string())
+        } else {
+            InlineAiState::Ready(sql)
+        }
+    } else {
+        InlineAiState::Failed(
+            String::from_utf8_lossy(stderr)
+                .lines()
+                .next()
+                .unwrap_or("generation failed")
+                .to_string(),
+        )
     }
-    None
 }
 
 /// A throwaway shell that just prints `msg` and stays open — used to surface "no
@@ -1876,31 +1923,12 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             let send = create_ext_action(cx, move |state: InlineAiState| inline_ai.set(state));
             let jh = handle.spawn(async move {
                 let out = Command::new(bin)
-                    .arg("-p")
-                    .arg(&intent)
-                    .arg("--append-system-prompt")
-                    .arg(&system)
-                    .arg("--model")
-                    .arg(&model)
+                    .args(schemaic_ai::inline_args(&intent, &system, &model))
                     .kill_on_drop(true)
                     .output()
                     .await;
                 let state = match out {
-                    Ok(o) if o.status.success() => {
-                        let sql = extract_sql(&String::from_utf8_lossy(&o.stdout));
-                        if sql.trim().is_empty() {
-                            InlineAiState::Failed("No SQL returned".to_string())
-                        } else {
-                            InlineAiState::Ready(sql)
-                        }
-                    }
-                    Ok(o) => InlineAiState::Failed(
-                        String::from_utf8_lossy(&o.stderr)
-                            .lines()
-                            .next()
-                            .unwrap_or("generation failed")
-                            .to_string(),
-                    ),
+                    Ok(o) => inline_outcome(o.status.success(), &o.stdout, &o.stderr),
                     Err(e) => InlineAiState::Failed(e.to_string()),
                 };
                 send(state);
@@ -2433,5 +2461,108 @@ fn open_url(url: &str) {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
+#[cfg(test)]
+mod app_tests {
+    use super::{MysqlLauncher, inline_outcome, mysql_shell_config, unique_name};
+    use schemaic_core::connection::Connection;
+    use schemaic_ui::InlineAiState;
+
+    #[test]
+    fn returns_base_when_unused() {
+        assert_eq!(unique_name("Query", &[]), "Query");
+        assert_eq!(unique_name("Query", &["Other".to_string()]), "Query");
+    }
+
+    #[test]
+    fn appends_first_free_numeric_suffix() {
+        let existing = vec!["Query".to_string()];
+        assert_eq!(unique_name("Query", &existing), "Query 1");
+        let existing = vec!["Query".to_string(), "Query 1".to_string()];
+        assert_eq!(unique_name("Query", &existing), "Query 2");
+        // Gaps are filled: "Query 1" free even though "Query"/"Query 2" taken.
+        let existing = vec!["Query".to_string(), "Query 2".to_string()];
+        assert_eq!(unique_name("Query", &existing), "Query 1");
+    }
+
+    fn conn() -> Connection {
+        Connection {
+            id: 1,
+            name: "c".to_string(),
+            db_type: "MySQL".to_string(),
+            host: "10.0.0.5".to_string(),
+            port: 3307,
+            user: "root".to_string(),
+            password: "s3cr3t".to_string(),
+            ssh: Default::default(),
+            color: None,
+            prominent_color: false,
+            read_only: false,
+        }
+    }
+
+    #[test]
+    fn native_shell_puts_password_in_env_not_argv() {
+        let cfg = mysql_shell_config(MysqlLauncher::Native("mysql"), &conn(), Some("shop"));
+        assert_eq!(cfg.program, "mysql");
+        assert_eq!(
+            cfg.args,
+            vec!["-h", "10.0.0.5", "-P", "3307", "-u", "root", "shop"]
+        );
+        // Password rides MYSQL_PWD, never the command line.
+        assert_eq!(
+            cfg.env,
+            vec![("MYSQL_PWD".to_string(), "s3cr3t".to_string())]
+        );
+        assert!(!cfg.args.iter().any(|a| a.contains("s3cr3t")));
+    }
+
+    #[test]
+    fn native_shell_omits_db_when_none() {
+        let cfg = mysql_shell_config(MysqlLauncher::Native("mariadb"), &conn(), None);
+        assert_eq!(cfg.args, vec!["-h", "10.0.0.5", "-P", "3307", "-u", "root"]);
+    }
+
+    #[test]
+    fn wsl_shell_prepends_client_and_forwards_password_via_wslenv() {
+        let cfg = mysql_shell_config(MysqlLauncher::Wsl, &conn(), Some("shop"));
+        assert_eq!(cfg.program, "wsl.exe");
+        assert_eq!(
+            cfg.args,
+            vec![
+                "-e", "mysql", "-h", "10.0.0.5", "-P", "3307", "-u", "root", "shop"
+            ]
+        );
+        assert_eq!(
+            cfg.env,
+            vec![
+                ("WSLENV".to_string(), "MYSQL_PWD/u".to_string()),
+                ("MYSQL_PWD".to_string(), "s3cr3t".to_string()),
+            ]
+        );
+        assert!(!cfg.args.iter().any(|a| a.contains("s3cr3t")));
+    }
+
+    #[test]
+    fn inline_outcome_success_returns_stripped_sql() {
+        let out = inline_outcome(true, b"```sql\nSELECT 1\n```", b"");
+        assert!(matches!(out, InlineAiState::Ready(sql) if sql == "SELECT 1"));
+    }
+
+    #[test]
+    fn inline_outcome_blank_success_is_no_sql_returned() {
+        let out = inline_outcome(true, b"   \n", b"");
+        assert!(matches!(out, InlineAiState::Failed(m) if m == "No SQL returned"));
+    }
+
+    #[test]
+    fn inline_outcome_failure_surfaces_first_stderr_line() {
+        let out = inline_outcome(false, b"", b"boom: bad model\nsecond line");
+        assert!(matches!(out, InlineAiState::Failed(m) if m == "boom: bad model"));
+        // Empty stderr → a generic fallback message.
+        let out = inline_outcome(false, b"", b"");
+        assert!(matches!(out, InlineAiState::Failed(m) if m == "generation failed"));
     }
 }

@@ -77,6 +77,20 @@ pub fn build_session_args(
     a
 }
 
+/// Args for a one-shot inline (Ctrl+K) generation: `-p <intent>
+/// --append-system-prompt <system> --model <model>`. Pure — the app spawns
+/// `claude` with these — so the flag set/order is unit-tested.
+pub fn inline_args(intent: &str, system: &str, model: &str) -> Vec<String> {
+    vec![
+        "-p".into(),
+        intent.into(),
+        "--append-system-prompt".into(),
+        system.into(),
+        "--model".into(),
+        model.into(),
+    ]
+}
+
 /// Encode a user turn as a `stream-json` stdin line (newline-terminated).
 pub fn user_message_line(text: &str) -> String {
     let v = serde_json::json!({
@@ -405,5 +419,176 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    /// Position of `flag` in `args`, or None.
+    fn pos(args: &[String], flag: &str) -> Option<usize> {
+        args.iter().position(|a| a == flag)
+    }
+
+    #[test]
+    fn session_args_include_streaming_flags_and_disallowed_last() {
+        let a = build_session_args("", None, None, None, &[]);
+        // Core streaming flags present.
+        assert!(pos(&a, "-p").is_some());
+        assert!(pos(&a, "--input-format").is_some());
+        assert!(pos(&a, "--output-format").is_some());
+        assert!(pos(&a, "--include-partial-messages").is_some());
+        // No optional flags when their inputs are absent.
+        assert!(pos(&a, "--model").is_none());
+        assert!(pos(&a, "--effort").is_none());
+        assert!(pos(&a, "--append-system-prompt").is_none());
+        assert!(pos(&a, "--mcp-config").is_none());
+        assert!(pos(&a, "--allowedTools").is_none());
+        // The variadic --disallowedTools is last, followed only by tool names.
+        let d = pos(&a, "--disallowedTools").expect("disallowedTools present");
+        assert!(a[d + 1..].contains(&"Bash".to_string()));
+        assert!(a[d + 1..].contains(&"WebSearch".to_string()));
+        assert_eq!(a[d + 1..].len(), DISALLOWED_TOOLS.len());
+    }
+
+    #[test]
+    fn session_args_thread_model_effort_and_system_prompt() {
+        let a = build_session_args("ctx", Some("claude-opus-4-8"), Some("high"), None, &[]);
+        let m = pos(&a, "--model").unwrap();
+        assert_eq!(a[m + 1], "claude-opus-4-8");
+        let e = pos(&a, "--effort").unwrap();
+        assert_eq!(a[e + 1], "high");
+        let s = pos(&a, "--append-system-prompt").unwrap();
+        assert_eq!(a[s + 1], "ctx");
+    }
+
+    #[test]
+    fn session_args_allowlist_mcp_tools_only_with_config() {
+        // Tools without a config are NOT allow-listed (guarded on mcp_config_json).
+        let a = build_session_args("", None, None, None, &["mcp__schemaic__run_query"]);
+        assert!(pos(&a, "--allowedTools").is_none());
+        // With a config, the tools follow --allowedTools before --disallowedTools.
+        let a = build_session_args(
+            "",
+            None,
+            None,
+            Some("{\"mcpServers\":{}}"),
+            &["mcp__schemaic__run_query", "mcp__schemaic__list_schema"],
+        );
+        let cfg = pos(&a, "--mcp-config").unwrap();
+        assert_eq!(a[cfg + 1], "{\"mcpServers\":{}}");
+        let al = pos(&a, "--allowedTools").unwrap();
+        let dis = pos(&a, "--disallowedTools").unwrap();
+        assert!(al < dis, "allowed before disallowed");
+        assert!(a[al + 1..dis].contains(&"mcp__schemaic__run_query".to_string()));
+        assert!(a[al + 1..dis].contains(&"mcp__schemaic__list_schema".to_string()));
+    }
+
+    #[test]
+    fn inline_args_flags_in_order() {
+        let a = inline_args("count rows", "SCHEMA", "claude-opus-4-8");
+        assert_eq!(
+            a,
+            vec![
+                "-p",
+                "count rows",
+                "--append-system-prompt",
+                "SCHEMA",
+                "--model",
+                "claude-opus-4-8",
+            ]
+        );
+    }
+
+    #[test]
+    fn user_message_line_is_json_with_trailing_newline() {
+        let line = user_message_line("hello \"world\"");
+        assert!(line.ends_with('\n'));
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["type"], "user");
+        assert_eq!(v["message"]["role"], "user");
+        assert_eq!(v["message"]["content"], "hello \"world\"");
+    }
+
+    #[test]
+    fn parse_stream_line_ignores_blank_malformed_and_unknown() {
+        assert!(parse_stream_line("").is_empty());
+        assert!(parse_stream_line("   ").is_empty());
+        assert!(parse_stream_line("{not json").is_empty());
+        assert!(parse_stream_line(r#"{"type":"system"}"#).is_empty());
+        // Well-formed JSON with no "type" field.
+        assert!(parse_stream_line(r#"{"foo":1}"#).is_empty());
+    }
+
+    #[test]
+    fn parse_stream_line_decodes_text_delta() {
+        let evs = parse_stream_line(&stream_text("chunk"));
+        assert_eq!(evs.len(), 1);
+        let StreamEvent::TextDelta(t) = &evs[0] else {
+            panic!("expected TextDelta")
+        };
+        assert_eq!(t, "chunk");
+    }
+
+    #[test]
+    fn tool_result_text_handles_string_array_and_missing() {
+        // String content.
+        let line = serde_json::json!({
+            "type": "user",
+            "message": { "content": [
+                { "type": "tool_result", "content": "plain text", "is_error": true }
+            ] }
+        })
+        .to_string();
+        let evs = parse_stream_line(&line);
+        let StreamEvent::ToolResult { text, is_error } = &evs[0] else {
+            panic!("expected ToolResult")
+        };
+        assert_eq!(text, "plain text");
+        assert!(is_error);
+
+        // Array-of-blocks content joins the text fields.
+        let line = serde_json::json!({
+            "type": "user",
+            "message": { "content": [
+                { "type": "tool_result", "content": [
+                    { "type": "text", "text": "line1" },
+                    { "type": "text", "text": "line2" }
+                ] }
+            ] }
+        })
+        .to_string();
+        let evs = parse_stream_line(&line);
+        let StreamEvent::ToolResult { text, is_error } = &evs[0] else {
+            panic!("expected ToolResult")
+        };
+        assert_eq!(text, "line1\nline2");
+        assert!(!is_error); // missing is_error defaults to false
+
+        // Missing content → empty text.
+        let line = serde_json::json!({
+            "type": "user",
+            "message": { "content": [ { "type": "tool_result" } ] }
+        })
+        .to_string();
+        let evs = parse_stream_line(&line);
+        let StreamEvent::ToolResult { text, .. } = &evs[0] else {
+            panic!("expected ToolResult")
+        };
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn tool_use_captures_query_alias_for_sql() {
+        // The `input.query` alias is captured when `input.sql` is absent.
+        let line = serde_json::json!({
+            "type": "assistant",
+            "message": { "content": [
+                { "type": "tool_use", "name": "run_query", "input": { "query": "SELECT 9" } }
+            ] }
+        })
+        .to_string();
+        let evs = parse_stream_line(&line);
+        let StreamEvent::ToolUse { name, sql } = &evs[0] else {
+            panic!("expected ToolUse")
+        };
+        assert_eq!(name, "run_query");
+        assert_eq!(sql.as_deref(), Some("SELECT 9"));
     }
 }

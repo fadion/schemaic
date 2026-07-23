@@ -447,4 +447,123 @@ mod tests {
         // Read-only / non-editable (empty model) → no destination.
         assert!(EditModel::default().insert_target().is_none());
     }
+
+    #[test]
+    fn table_index_and_table_accessors() {
+        let r = rs(vec![
+            col("id", "INT", "users", true, false),
+            col("name", "VARCHAR", "users", false, false),
+        ]);
+        let schema = |_db: &str, t: &str| {
+            (t == "users")
+                .then(|| schema_with_pk("users", &["id"], &[("id", "int"), ("name", "varchar")]))
+        };
+        let m = analyze_edit(&r, schema);
+        // Both columns map to table index 0.
+        assert_eq!(m.table_index(0), Some(0));
+        assert_eq!(m.table_index(1), Some(0));
+        // Out-of-range column → None.
+        assert_eq!(m.table_index(99), None);
+        // table(idx) resolves the EditTable.
+        assert_eq!(m.table(0).map(|t| t.table.as_str()), Some("users"));
+        assert!(m.table(1).is_none());
+    }
+
+    #[test]
+    fn no_schema_falls_back_to_wire_pk_flags() {
+        // schema_for returns None (schema not loaded) but the wire marks `id` PK.
+        let r = rs(vec![
+            col("id", "INT", "users", true, false),
+            col("name", "VARCHAR", "users", false, false),
+        ]);
+        let no_schema = |_db: &str, _t: &str| None;
+        let m = analyze_edit(&r, no_schema);
+        assert!(m.editable(0), "wire PK flag makes the table editable");
+        assert!(m.editable(1));
+        let t = refetch_template(&r, &m).expect("spliceable via wire PK");
+        assert_eq!(t.key_cols, vec![0]);
+
+        // No schema AND no PK flag anywhere → read-only (no reconstructible key).
+        let r2 = rs(vec![
+            col("a", "INT", "t", false, false),
+            col("b", "INT", "t", false, false),
+        ]);
+        let m2 = analyze_edit(&r2, no_schema);
+        assert!(!m2.editable(0));
+        assert!(!m2.editable(1));
+    }
+
+    #[test]
+    fn unique_not_null_index_is_the_key_when_no_pk() {
+        // Table has no primary key but a UNIQUE, non-foreign, NOT NULL index on
+        // `email` → that becomes the WHERE key.
+        let r = rs(vec![
+            col("email", "VARCHAR", "users", false, false),
+            col("name", "VARCHAR", "users", false, false),
+        ]);
+        let schema = |_db: &str, t: &str| {
+            (t == "users").then(|| TableInfo {
+                name: "users".to_string(),
+                columns: vec![
+                    ColumnInfo {
+                        name: "email".to_string(),
+                        type_name: "varchar".to_string(),
+                        nullable: false, // NOT NULL — required for the unique-index key
+                        primary_key: false,
+                    },
+                    ColumnInfo {
+                        name: "name".to_string(),
+                        type_name: "varchar".to_string(),
+                        nullable: true,
+                        primary_key: false,
+                    },
+                ],
+                indexes: vec![crate::schema::IndexInfo {
+                    name: "email_uq".to_string(),
+                    columns: vec!["email".to_string()],
+                    unique: true,
+                    foreign: false,
+                }],
+                is_view: false,
+                view_definition: None,
+            })
+        };
+        let m = analyze_edit(&r, schema);
+        assert!(m.editable(0));
+        assert!(m.editable(1));
+        let t = refetch_template(&r, &m).expect("unique NOT NULL index is a usable key");
+        assert_eq!(t.key_cols, vec![0]); // email
+
+        // A NULLABLE unique index is NOT a safe key → read-only.
+        let schema_nullable = |_db: &str, t: &str| {
+            (t == "users").then(|| TableInfo {
+                name: "users".to_string(),
+                columns: vec![
+                    ColumnInfo {
+                        name: "email".to_string(),
+                        type_name: "varchar".to_string(),
+                        nullable: true, // nullable → can't uniquely identify a row
+                        primary_key: false,
+                    },
+                    ColumnInfo {
+                        name: "name".to_string(),
+                        type_name: "varchar".to_string(),
+                        nullable: true,
+                        primary_key: false,
+                    },
+                ],
+                indexes: vec![crate::schema::IndexInfo {
+                    name: "email_uq".to_string(),
+                    columns: vec!["email".to_string()],
+                    unique: true,
+                    foreign: false,
+                }],
+                is_view: false,
+                view_definition: None,
+            })
+        };
+        let m2 = analyze_edit(&r, schema_nullable);
+        assert!(!m2.editable(0));
+        assert!(!m2.editable(1));
+    }
 }

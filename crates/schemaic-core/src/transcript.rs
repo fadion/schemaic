@@ -81,3 +81,124 @@ fn human_count(n: u64) -> String {
         format!("{}k", n / 1000)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(name: &str) -> ToolCall {
+        ToolCall {
+            name: name.to_string(),
+            sql: None,
+            result: None,
+            is_error: false,
+        }
+    }
+
+    #[test]
+    fn short_name_strips_mcp_prefix() {
+        assert_eq!(call("mcp__schemaic__run_query").short_name(), "run_query");
+    }
+
+    #[test]
+    fn short_name_passes_through_plain_names() {
+        assert_eq!(call("Read").short_name(), "Read");
+        assert_eq!(call("").short_name(), "");
+    }
+
+    #[test]
+    fn is_empty_true_only_when_all_fields_none() {
+        assert!(TurnStats::default().is_empty());
+        assert!(
+            !TurnStats {
+                duration_ms: Some(1),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !TurnStats {
+                input_tokens: Some(1),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !TurnStats {
+                output_tokens: Some(1),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn summary_formats_sub_second_as_ms_and_over_second_as_seconds() {
+        assert_eq!(
+            TurnStats {
+                duration_ms: Some(340),
+                ..Default::default()
+            }
+            .summary(),
+            "340ms"
+        );
+        assert_eq!(
+            TurnStats {
+                duration_ms: Some(1234),
+                ..Default::default()
+            }
+            .summary(),
+            "1.2s"
+        );
+        // Exactly 1000ms is the >= boundary → seconds.
+        assert_eq!(
+            TurnStats {
+                duration_ms: Some(1000),
+                ..Default::default()
+            }
+            .summary(),
+            "1.0s"
+        );
+    }
+
+    #[test]
+    fn summary_covers_all_token_combinations() {
+        let s = TurnStats {
+            duration_ms: Some(1200),
+            input_tokens: Some(1234),
+            output_tokens: Some(340),
+        }
+        .summary();
+        assert_eq!(s, "1.2s  ·  ↑1.2k ↓340");
+
+        assert_eq!(
+            TurnStats {
+                input_tokens: Some(500),
+                ..Default::default()
+            }
+            .summary(),
+            "↑500"
+        );
+        assert_eq!(
+            TurnStats {
+                output_tokens: Some(12345),
+                ..Default::default()
+            }
+            .summary(),
+            "↓12k"
+        );
+        // No stats at all → empty string.
+        assert_eq!(TurnStats::default().summary(), "");
+    }
+
+    #[test]
+    fn human_count_buckets() {
+        assert_eq!(human_count(0), "0");
+        assert_eq!(human_count(999), "999");
+        assert_eq!(human_count(1000), "1.0k");
+        assert_eq!(human_count(1234), "1.2k");
+        assert_eq!(human_count(9999), "10.0k");
+        assert_eq!(human_count(10_000), "10k");
+        assert_eq!(human_count(12_345), "12k");
+    }
+}
