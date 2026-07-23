@@ -18,9 +18,7 @@ use schemaic_core::model::QueryState;
 use schemaic_core::schema::SchemaState;
 
 use crate::consts::DB_MENU_W;
-use crate::widgets::{
-    MenuEntry, autohide, menu_enter, menu_item_style, menu_panel, panel_style, window_size,
-};
+use crate::widgets::{MenuEntry, autohide, menu_item_style, menu_panel, panel_style, window_size};
 use crate::{ConnNode, CtxKind, Ui, icons, search_box, status_color, theme};
 
 // ===== moved from lib.rs (overlays) =====
@@ -104,26 +102,24 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
             .style(menu_item_style)
             .style(|s| s.padding_vert(8.0));
 
-            let panel = menu_enter(
-                v_stack((
-                    list,
-                    empty().style(|s| s.width_full().height(1.0).background(theme::border())),
-                    manage,
-                ))
-                .on_click_stop(|_| {})
-                .style(|s| {
-                    panel_style(s)
-                        .background(theme::bg_chrome())
-                        .min_width(300.0)
-                        .padding_vert(6.0)
-                        .margin_left(36.0)
-                        // 3px below the switcher button (which sits ~HEADER_H-7 down).
-                        .margin_top(theme::HEADER_H - 4.0)
-                        // Match the switcher button's size (the shell sets this, but
-                        // overlays are siblings of the shell and don't inherit it).
-                        .font_size(theme::FONT_TITLE)
-                }),
-            );
+            let panel = v_stack((
+                list,
+                empty().style(|s| s.width_full().height(1.0).background(theme::border())),
+                manage,
+            ))
+            .on_click_stop(|_| {})
+            .style(|s| {
+                panel_style(s)
+                    .background(theme::bg_chrome())
+                    .min_width(300.0)
+                    .padding_vert(6.0)
+                    .margin_left(36.0)
+                    // 3px below the switcher button (which sits ~HEADER_H-7 down).
+                    .margin_top(theme::HEADER_H - 4.0)
+                    // Match the switcher button's size (the shell sets this, but
+                    // overlays are siblings of the shell and don't inherit it).
+                    .font_size(theme::FONT_TITLE)
+            });
 
             // Transparent full-window layer: click outside the panel or Escape closes.
             container(panel)
@@ -192,7 +188,7 @@ pub(crate) fn active_db_menu_overlay(ui: Ui) -> impl IntoView {
             )
             .style(|s| s.flex_col());
 
-            let panel = menu_enter(container(list).on_click_stop(|_| {}).style(move |s| {
+            let panel = container(list).on_click_stop(|_| {}).style(move |s| {
                 let a = anchor.get();
                 panel_style(s)
                     .background(theme::bg_chrome())
@@ -205,7 +201,7 @@ pub(crate) fn active_db_menu_overlay(ui: Ui) -> impl IntoView {
                     .margin_left((a.x - DB_MENU_W).max(0.0))
                     .margin_top(a.y)
                     .font_size(theme::FONT_TITLE)
-            }));
+            });
 
             container(panel)
                 .keyboard_navigable()
@@ -275,25 +271,23 @@ pub(crate) fn db_visibility_overlay(ui: Ui) -> impl IntoView {
             // on the gear from switching menus). Dismissal is via the root-level
             // pointer-down handler; the panel absorbs its own pointer-downs so it
             // isn't closed while flipping items.
-            menu_enter(
-                v_stack((list,))
-                    .keyboard_navigable()
-                    .request_focus(|| {})
-                    .on_key_down(
-                        Key::Named(NamedKey::Escape),
-                        |_| true,
-                        move |_| open.set(false),
-                    )
-                    .on_event_stop(EventListener::PointerDown, |_| {})
-                    .style(|s| {
-                        panel_style(s)
-                            .background(theme::bg_chrome())
-                            .min_width(220.0)
-                            .padding_vert(6.0)
-                            .font_size(theme::FONT_TITLE)
-                    }),
-            )
-            .into_any()
+            v_stack((list,))
+                .keyboard_navigable()
+                .request_focus(|| {})
+                .on_key_down(
+                    Key::Named(NamedKey::Escape),
+                    |_| true,
+                    move |_| open.set(false),
+                )
+                .on_event_stop(EventListener::PointerDown, |_| {})
+                .style(|s| {
+                    panel_style(s)
+                        .background(theme::bg_chrome())
+                        .min_width(220.0)
+                        .padding_vert(6.0)
+                        .font_size(theme::FONT_TITLE)
+                })
+                .into_any()
         },
     )
     // Positioned just below the SCHEMA eye (2nd-from-right icon).
@@ -338,25 +332,23 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
                 .style(menu_item_style)
                 .style(|s| s.padding_vert(8.0));
 
-            menu_enter(
-                v_stack((refresh_item, collapse_item))
-                    .keyboard_navigable()
-                    .request_focus(|| {})
-                    .on_key_down(
-                        Key::Named(NamedKey::Escape),
-                        |_| true,
-                        move |_| open.set(false),
-                    )
-                    .on_event_stop(EventListener::PointerDown, |_| {})
-                    .style(|s| {
-                        panel_style(s)
-                            .background(theme::bg_chrome())
-                            .min_width(150.0)
-                            .padding_vert(6.0)
-                            .font_size(theme::FONT_TITLE)
-                    }),
-            )
-            .into_any()
+            v_stack((refresh_item, collapse_item))
+                .keyboard_navigable()
+                .request_focus(|| {})
+                .on_key_down(
+                    Key::Named(NamedKey::Escape),
+                    |_| true,
+                    move |_| open.set(false),
+                )
+                .on_event_stop(EventListener::PointerDown, |_| {})
+                .style(|s| {
+                    panel_style(s)
+                        .background(theme::bg_chrome())
+                        .min_width(150.0)
+                        .padding_vert(6.0)
+                        .font_size(theme::FONT_TITLE)
+                })
+                .into_any()
         },
     )
     // Just below the SCHEMA gear (rightmost icon).
