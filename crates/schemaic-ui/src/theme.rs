@@ -112,6 +112,12 @@ pub fn modal_backdrop() -> Color {
     Color::rgb8(0, 0, 0).multiply_alpha(0.5)
 }
 
+/// Soft drop shadow under floating tooltips (translucent black — theme-independent,
+/// reads as a shadow on both light and dark chrome).
+pub fn tooltip_shadow() -> Color {
+    Color::rgb8(0, 0, 0).multiply_alpha(0.35)
+}
+
 // Panel resize divider: the 3px overlay shown while hovering/dragging a handle.
 pub fn resize_handle() -> Color {
     ui().resize_handle

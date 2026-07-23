@@ -170,21 +170,10 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                     .text_overflow(TextOverflow::Ellipsis)
                     .font_size(theme::FONT_BODY)
             });
+            // Tooltip chrome comes from the global `TooltipClass` style (see
+            // `tooltip_style`), so the tip is just its text.
             let label: AnyView = if truncated {
-                label
-                    .tooltip(move || {
-                        text(full.clone()).style(|s| {
-                            s.padding_horiz(8.0)
-                                .padding_vert(5.0)
-                                .background(theme::bg_panel())
-                                .border(1.0)
-                                .border_color(theme::border())
-                                .border_radius(4.0)
-                                .color(theme::text())
-                                .font_size(theme::FONT_BODY)
-                        })
-                    })
-                    .into_any()
+                label.tooltip(move || text(full.clone())).into_any()
             } else {
                 label.into_any()
             };

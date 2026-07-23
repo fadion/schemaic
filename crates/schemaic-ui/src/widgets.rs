@@ -77,6 +77,26 @@ pub(crate) fn panel_style(s: floem::style::Style) -> floem::style::Style {
         .border_radius(10.0)
 }
 
+/// The app's tooltip chrome, applied globally to Floem's `TooltipClass` (see the
+/// root stylesheet in `lib.rs`) so every `.tooltip(…)` gets it — a compact
+/// bordered panel matching the app's popovers, with a soft drop shadow lifting it
+/// off the content. `color`/`font_size` are inherited, so a bare `text(…)` tip
+/// picks them up.
+pub(crate) fn tooltip_style(s: floem::style::Style) -> floem::style::Style {
+    s.background(theme::bg_panel())
+        .color(theme::text())
+        .font_size(theme::FONT_LABEL)
+        .border(1.0)
+        .border_color(theme::border())
+        .border_radius(6.0)
+        .padding_horiz(9.0)
+        .padding_vert(6.0)
+        .box_shadow_blur(12.0)
+        .box_shadow_spread(0.0)
+        .box_shadow_v_offset(3.0)
+        .box_shadow_color(theme::tooltip_shadow())
+}
+
 /// A toolbar / title-bar icon button with a **padded hitbox** (5px horiz / 3px
 /// vert). Hover (dim→bright) is driven from a signal via `PointerEnter`/`Leave`
 /// on the padded container, so the *whole* box — not just the 16px glyph —

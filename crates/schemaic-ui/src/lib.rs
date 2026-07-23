@@ -62,7 +62,7 @@ use floem::views::editor::keypress::default_key_handler;
 use floem::views::editor::keypress::key::KeyInput;
 use floem::views::editor::text::{SimpleStyling, WrapMethod, default_dark_color};
 use floem::views::scroll::{Handle, Rounded, Thickness, Track};
-use floem::views::{Decorators, TextInputClass};
+use floem::views::{Decorators, Delay, TextInputClass, TooltipClass, TooltipContainerClass};
 use schemaic_core::connection::{ConnStatus, Connection, SshAuth};
 use schemaic_core::db_color::DbColorRule;
 use schemaic_core::format::ColumnFormatRule;
@@ -1212,6 +1212,13 @@ pub fn workspace(ui: Ui) -> impl IntoView {
             .class(Track, |s| {
                 let clear = floem::peniko::Color::TRANSPARENT;
                 s.background(clear).hover(|s| s.background(clear))
+            })
+            // Custom tooltip chrome (replaces Floem's bare default) — a compact
+            // bordered panel with a soft drop shadow, applied to every `.tooltip(…)`.
+            .class(TooltipClass, tooltip_style)
+            // Shorten the hover delay from Floem's 600ms default (felt sluggish).
+            .class(TooltipContainerClass, |s| {
+                s.set(Delay, std::time::Duration::from_millis(300))
             })
     })
 }
