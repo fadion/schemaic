@@ -206,6 +206,28 @@ pub fn line_col_of_offset(text: &str, offset: usize) -> (usize, usize) {
     (line, col)
 }
 
+/// Byte offset of the start of 1-based `line` in `text`, or `None` if the line
+/// doesn't exist (line 0, or past the last line). Used by the editor's Go-to-line
+/// popup. Line 1 is offset 0; a trailing newline yields a valid final empty line.
+pub fn offset_of_line(text: &str, line: usize) -> Option<usize> {
+    if line == 0 {
+        return None;
+    }
+    if line == 1 {
+        return Some(0);
+    }
+    let mut newlines = 0usize;
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            newlines += 1;
+            if newlines == line - 1 {
+                return Some(i + 1);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,5 +396,43 @@ mod tests {
         assert_eq!(line_col_of_offset("áb", 2), (1, 2));
         // A mid-codepoint offset rounds down to the char boundary at 0.
         assert_eq!(line_col_of_offset("áb", 1), (1, 1));
+    }
+
+    #[test]
+    fn offset_of_line_basics() {
+        let src = "ab\ncd\nef";
+        assert_eq!(offset_of_line(src, 1), Some(0));
+        assert_eq!(offset_of_line(src, 2), Some(3));
+        assert_eq!(offset_of_line(src, 3), Some(6));
+    }
+
+    #[test]
+    fn offset_of_line_zero_and_past_end() {
+        let src = "ab\ncd";
+        assert_eq!(offset_of_line(src, 0), None);
+        assert_eq!(offset_of_line(src, 3), None); // only 2 lines
+        assert_eq!(offset_of_line(src, 99), None);
+    }
+
+    #[test]
+    fn offset_of_line_trailing_newline_has_final_empty_line() {
+        let src = "ab\n";
+        assert_eq!(offset_of_line(src, 2), Some(3)); // empty line 2 at end
+        assert_eq!(offset_of_line(src, 3), None);
+    }
+
+    #[test]
+    fn offset_of_line_empty_text() {
+        assert_eq!(offset_of_line("", 1), Some(0));
+        assert_eq!(offset_of_line("", 2), None);
+    }
+
+    #[test]
+    fn offset_of_line_roundtrips_with_line_col() {
+        let src = "one\ntwo\nthree";
+        for line in 1..=3 {
+            let off = offset_of_line(src, line).unwrap();
+            assert_eq!(line_col_of_offset(src, off), (line, 1));
+        }
     }
 }

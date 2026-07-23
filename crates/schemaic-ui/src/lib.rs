@@ -131,6 +131,9 @@ pub struct Tab {
     /// Caret byte offset in `query`, mirrored out of the editor by an effect in
     /// `query_pane` so the status bar can show Ln/Col for the active tab.
     pub cursor_offset: RwSignal<usize>,
+    /// Opens this tab's Go-to-line popup. Set by Ctrl+G in the editor or by
+    /// clicking the Ln/Col segment in the status bar; the editor pane owns the view.
+    pub goto_open: RwSignal<bool>,
 }
 
 impl Tab {
@@ -160,6 +163,7 @@ impl Tab {
             editing: cx.create_rw_signal(false),
             edit_buf: cx.create_rw_signal(String::new()),
             cursor_offset: cx.create_rw_signal(0),
+            goto_open: cx.create_rw_signal(false),
         }
     }
 
@@ -1894,6 +1898,7 @@ fn center(ui: Ui) -> impl IntoView {
                 Some(tab) => query_pane(QueryPaneParams {
                     query: tab.query,
                     cursor_offset: tab.cursor_offset,
+                    goto_open: tab.goto_open,
                     results: tab.results,
                     run: run.clone(),
                     run_all: run_all.clone(),
@@ -3287,11 +3292,31 @@ fn footer(ui: Ui) -> impl IntoView {
     // ── Left status cluster (after the schema icon) ──
     // Gaps: 40px between the four groups (position | editor | status | AI), 15px
     // within a group; the icon→its-label gap is 5px. All text 12px muted grey.
+    // Ln/Col — click (or Ctrl+G in the editor) opens the active tab's Go-to-line
+    // popup. Colour is set on this container so the child text inherits it and the
+    // hover (schema-icon accent) reaches the text.
     let cursor_seg = dyn_container(
         move || cursor_lc.get(),
-        move |(l, c)| footer_text(format!("Ln {l}, Col {c}")),
+        move |(l, c)| {
+            text(format!("Ln {l}, Col {c}"))
+                .style(|s| s.font_size(theme::FONT_STATUS))
+                .into_any()
+        },
     )
-    .style(|s| s.margin_left(40.0));
+    .on_click_stop(move |_| {
+        let id = active.get_untracked();
+        tabs.with_untracked(|v| {
+            if let Some(t) = v.iter().find(|t| t.id == id) {
+                t.goto_open.set(true);
+            }
+        });
+    })
+    .style(|s| {
+        s.margin_left(40.0)
+            .items_center()
+            .color(theme::status_text())
+            .hover(|s| s.color(theme::chip_active()))
+    });
     // Tabs vs Spaces + width (display-only for now — a menu button lands later).
     let tabs_seg = dyn_container(
         move || (soft_tabs.get(), tab_width.get()),
