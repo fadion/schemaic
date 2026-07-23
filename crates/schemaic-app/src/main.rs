@@ -1038,6 +1038,23 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         })
     };
 
+    // Reopen a query-history entry in a new tab. Unlike `open_query` (which
+    // targets the *active* connection/db), this restores the entry's own
+    // `conn_id`/`database` and its originating tab name — all recorded on the
+    // entry. The history panel is per-connection, so `conn_id` is the active
+    // (valid) connection. Does NOT run the query.
+    let open_history: Rc<dyn Fn(schemaic_core::history::HistoryEntry)> = {
+        let next_id = next_id.clone();
+        let place_tab = place_tab.clone();
+        Rc::new(move |entry: schemaic_core::history::HistoryEntry| {
+            let id = next_id.get();
+            next_id.set(id + 1);
+            let tab = Tab::new(cx, id, &entry.sql, entry.conn_id, entry.database);
+            tab.name.set(entry.tab_name);
+            (place_tab)(tab);
+        })
+    };
+
     // ── Persisted expand/collapse + database-visibility state ───────────────
     // Snapshot both sets to disk (best effort).
     let save_ui: Rc<dyn Fn()> = Rc::new(move || {
@@ -2267,6 +2284,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         },
         history_actions: Rc::new(HistoryActions {
             clear: clear_history,
+            open: open_history,
         }),
         term: TermUi {
             screen: term_screen,

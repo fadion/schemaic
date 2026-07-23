@@ -32,7 +32,7 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
     let entries = ui.history.entries;
     let active_conn = ui.conn.active_conn;
     let right_w = ui.layout.right_w;
-    let open_query = ui.tab_actions.open_query.clone();
+    let open_history = ui.history_actions.open.clone();
     let clear = ui.history_actions.clear.clone();
     let db_colors = ui.db_colors;
 
@@ -61,10 +61,10 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
                     .into_any();
             }
             let now = now_millis();
-            let oq = open_query.clone();
+            let oh = open_history.clone();
             let items = rows
                 .into_iter()
-                .map(move |e| history_row(e, now, oq.clone(), db_colors))
+                .map(move |e| history_row(e, now, oh.clone(), db_colors))
                 .collect::<Vec<_>>();
             v_stack_from_iter(items)
                 .style(|s| s.flex_col().width_full())
@@ -97,10 +97,11 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
 fn history_row(
     entry: HistoryEntry,
     now: u64,
-    open_query: Rc<dyn Fn(String)>,
+    open_history: Rc<dyn Fn(HistoryEntry)>,
     db_colors: RwSignal<Vec<DbColorRule>>,
 ) -> impl IntoView {
-    let sql_full = entry.sql.clone();
+    // Full entry for the click handler — restores SQL + database + tab name.
+    let entry_click = entry.clone();
     let preview = history::preview(&entry.sql);
     let db = entry.database.clone().unwrap_or_else(|| "—".to_string());
     let when = history::relative_time(entry.ts, now);
@@ -178,7 +179,7 @@ fn history_row(
     };
 
     container(inner)
-        .on_click_stop(move |_| (open_query)(sql_full.clone()))
+        .on_click_stop(move |_| (open_history)(entry_click.clone()))
         .style(|s| {
             s.width_full()
                 .padding_horiz(12.0)
