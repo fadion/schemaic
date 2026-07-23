@@ -36,7 +36,7 @@ use schemaic_core::schema::SchemaState;
 use schemaic_core::sql::{
     contains_write, first_unsafe, skip_noncode, statement_range, statement_ranges, unsafe_reason,
 };
-use schemaic_core::text_ops::{find_matches, replace_all, toggle_line_comment};
+use schemaic_core::text_ops::{find_matches, offset_of_line, replace_all, toggle_line_comment};
 
 use crate::completion::{
     Completion, SQL_FUNCTIONS, SQL_KEYWORDS, accept_completion, completion_popup,
@@ -733,6 +733,8 @@ pub(crate) struct QueryPaneParams {
     pub query: RwSignal<String>,
     /// Caret byte offset, mirrored out of the editor for the status-bar Ln/Col.
     pub cursor_offset: RwSignal<usize>,
+    /// Opens the Go-to-line popup (Ctrl+G, or a status-bar Ln/Col click).
+    pub goto_open: RwSignal<bool>,
     pub results: RwSignal<QueryState>,
     pub run: Rc<dyn Fn(String)>,
     pub run_all: Rc<dyn Fn(Vec<String>)>,
@@ -761,6 +763,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let QueryPaneParams {
         query,
         cursor_offset,
+        goto_open,
         results,
         run,
         run_all,
@@ -826,6 +829,19 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let find_replace_visible: RwSignal<bool> = RwSignal::new(false);
     let find_hits: RwSignal<Vec<usize>> = RwSignal::new(Vec::new());
     let find_idx: RwSignal<usize> = RwSignal::new(0usize);
+
+    // Go-to-line (Ctrl+G, or clicking Ln/Col in the status bar): a small popup
+    // styled like the find bar. `goto_open` lives on the `Tab` so the status bar
+    // can open it too; `goto_query` backs its one input. Mutually exclusive with
+    // the find bar (opening one closes the other) since both float at the top-right.
+    let goto_query: RwSignal<String> = RwSignal::new(String::new());
+    // Opening the popup from anywhere (incl. the status-bar click, which doesn't go
+    // through the Ctrl+G handler) closes the find bar so the two never overlap.
+    create_effect(move |_| {
+        if goto_open.get() && find_open.get_untracked() {
+            find_open.set(false);
+        }
+    });
 
     // The DataGrip-style border around the statement picked by Explain / Optimize
     // / Run Current: the byte range of that statement, or None. Cleared on any
@@ -986,6 +1002,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             find_open.set(false);
             find_query.set(String::new());
             find_replace.set(String::new());
+            return CommandExecuted::Yes;
+        }
+        // Same for the Go-to-line popup — Esc closes it from anywhere in the editor.
+        if goto_open.get_untracked()
+            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Escape), _))
+        {
+            goto_open.set(false);
+            goto_query.set(String::new());
             return CommandExecuted::Yes;
         }
         if comp.open.get_untracked() {
@@ -1189,8 +1213,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             if c.eq_ignore_ascii_case("f") {
                 // Open the find bar in find-only mode (collapse any replace row left
                 // over from a previous Ctrl+H). Its input autofocuses on mount.
+                goto_open.set(false);
                 find_replace_visible.set(false);
                 find_open.set(true);
+                return CommandExecuted::Yes;
+            }
+            if c.eq_ignore_ascii_case("g") {
+                // Open the Go-to-line popup (autofocuses on mount). An effect closes
+                // the find bar so the two never overlap at the top-right.
+                goto_open.set(true);
                 return CommandExecuted::Yes;
             }
             if c.eq_ignore_ascii_case("h") {
@@ -1293,6 +1324,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let ed_find = ed.clone(); // Ctrl+F find: select + centre a match
     let ed_fmt = ed.clone(); // right-click "Format SQL"
     let ed_cursor = ed.clone(); // mirror caret offset out for the status bar
+    let ed_goto = ed.clone(); // Ctrl+G go-to-line: move caret + centre
 
     // Mirror the caret's byte offset into the tab's `cursor_offset` signal so the
     // status bar can render Ln/Col. Tracks `ed.cursor`, so it fires on every caret
@@ -2351,6 +2383,39 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             }
         })
     };
+    // Close the Go-to-line popup and return focus to the editor.
+    let goto_close: Rc<dyn Fn()> = {
+        let ed = ed_goto.clone();
+        Rc::new(move || {
+            goto_open.set(false);
+            goto_query.set(String::new());
+            if let Some(Some(vid)) = ed.editor_view_id.try_get_untracked() {
+                vid.request_focus();
+            }
+        })
+    };
+    // Enter in the popup: jump to the typed line (start of it) and centre it, or do
+    // nothing if the input isn't a valid, in-range line number. Always closes.
+    let goto_submit: Rc<dyn Fn()> = {
+        let ed = ed_goto.clone();
+        Rc::new(move || {
+            let raw = goto_query.get_untracked();
+            goto_open.set(false);
+            goto_query.set(String::new());
+            let off = raw
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|line| offset_of_line(&ed.doc().text().to_string(), line));
+            if let Some(off) = off {
+                ed.cursor.update(|c| c.set_offset(off, false, false));
+                ed.center_window();
+            }
+            if let Some(Some(vid)) = ed.editor_view_id.try_get_untracked() {
+                vid.request_focus();
+            }
+        })
+    };
     // Replace the current match with the replacement text, then recompute matches
     // (the doc→`query` sync updates the text; we read the doc directly for an
     // up-to-date, synchronous result) and reveal the next occurrence.
@@ -2595,6 +2660,53 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         .style(|s| s.absolute().inset_top(5.0).inset_right(5.0))
     };
 
+    // Go-to-line popup: styled like the find bar (same panel + position), one row —
+    // a "Go to:" label and a narrow (≈4-char) line-number field that autofocuses.
+    let goto_bar = {
+        let submit = goto_submit.clone();
+        let close = goto_close.clone();
+        dyn_container(
+            move || goto_open.get(),
+            move |open| {
+                if !open {
+                    return empty().into_any();
+                }
+                let esc = close.clone();
+                let input = edit_field(
+                    goto_query,
+                    FieldCfg {
+                        placeholder: "",
+                        autofocus: true,
+                        font_size: 13.0,
+                        border_radius: 6.0,
+                        height: Some(26.0),
+                        on_submit: Some(submit.clone()),
+                        on_escape: Some(Rc::new(move || (esc)())),
+                        ..Default::default()
+                    },
+                )
+                .style(|s| s.width(52.0));
+                h_stack((
+                    text("Go to:")
+                        .style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_dim())),
+                    input,
+                ))
+                .style(|s| {
+                    s.items_center()
+                        .gap(8.0)
+                        .padding_horiz(8.0)
+                        .padding_vert(6.0)
+                        .background(theme::bg_panel())
+                        .border(1.0)
+                        .border_color(theme::border())
+                        .border_radius(8.0)
+                })
+                .into_any()
+            },
+        )
+        .style(|s| s.absolute().inset_top(5.0).inset_right(5.0))
+    };
+
     // Order: editor, syntax squiggles, statement highlight, run overlay, then the
     // completion popup / error+guard bars / Ctrl+K / run menu / find bar on top.
     // (The right-click AI menu is rendered at the workspace root via `popup_menu`,
@@ -2612,6 +2724,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         cmdk_view,
         run_menu_view,
         find_bar,
+        goto_bar,
     ))
     .style(|s| {
         s.flex_grow(1.0_f32)
