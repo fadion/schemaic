@@ -786,6 +786,70 @@ fn set_active(gs: GridState, i: usize, ci: usize, extend: bool) {
     scroll_active_into_view(gs, i, ci);
 }
 
+/// The window of `data_cols` (indices into `data_cols`) intersecting the
+/// horizontal viewport, plus the pixel widths of the hidden columns on each side.
+/// `start..end` + `left_pad` + `right_pad` always span the full
+/// `sum(widths[data_cols])`, so rendering only the visible columns between two
+/// spacers leaves the data pane's scroll geometry (and header alignment) unchanged.
+#[derive(Clone, PartialEq)]
+struct ColWindow {
+    start: usize,
+    end: usize,
+    left_pad: f64,
+    right_pad: f64,
+}
+
+/// Compute the visible-column window for a horizontal viewport `vp` over the data
+/// columns, widening by `overscan` columns each side so a small scroll doesn't
+/// expose a blank edge before the window memo updates.
+fn compute_window(vp: Rect, widths: &[f64], data_cols: &[usize], overscan: usize) -> ColWindow {
+    let n = data_cols.len();
+    let w = |k: usize| widths.get(data_cols[k]).copied().unwrap_or(CELL_W);
+    // Pre-layout (viewport not measured yet) — render an initial slice so the first
+    // frame isn't blank; the memo recomputes once `on_resize` seeds `gs.vp`.
+    if vp.width() <= 1.0 {
+        let end = n.min(16);
+        let right_pad: f64 = (end..n).map(w).sum();
+        return ColWindow {
+            start: 0,
+            end,
+            left_pad: 0.0,
+            right_pad,
+        };
+    }
+    let left = vp.x0;
+    let right = vp.x0 + vp.width();
+    let (mut start, mut end) = (n, n);
+    let mut x = 0.0;
+    for k in 0..n {
+        let cw = w(k);
+        if start == n && x + cw > left {
+            start = k; // first column whose right edge crosses into the viewport
+        }
+        if x >= right {
+            end = k; // first column fully past the viewport's right edge
+            break;
+        }
+        x += cw;
+    }
+    let start = start.min(n).saturating_sub(overscan);
+    let end = (end + overscan).min(n);
+    let left_pad: f64 = (0..start).map(w).sum();
+    let right_pad: f64 = (end..n).map(w).sum();
+    ColWindow {
+        start,
+        end,
+        left_pad,
+        right_pad,
+    }
+}
+
+/// A zero-content filler of a fixed width — stands in for the columns hidden on
+/// either side of the visible window so the row keeps its full scrollable width.
+fn col_spacer(w: f64, h: f64) -> impl IntoView {
+    empty().style(move |s| s.width(w).height(h).flex_shrink(0.0_f32))
+}
+
 /// Nudge the body scroll so `(i, ci)` is visible (keyboard nav).
 fn scroll_active_into_view(gs: GridState, i: usize, ci: usize) {
     let vp = gs.vp.get_untracked();
@@ -800,13 +864,23 @@ fn scroll_active_into_view(gs: GridState, i: usize, ci: usize) {
     } else if y0 + rh > vp.y0 + vp.height() {
         ny = y0 + rh - vp.height();
     }
+    // Horizontal scroll applies only to data-pane columns; the frozen column lives
+    // in its own always-visible pane. Compute the target x in *data-pane* space —
+    // widths summed excluding the frozen column — matching the column-virtualized
+    // spacer math, so scroll-into-view lands correctly even under a freeze.
     let widths = gs.widths.get_untracked();
-    let x0: f64 = widths.iter().take(ci).sum();
-    let x1 = x0 + widths.get(ci).copied().unwrap_or(0.0);
-    if x0 < vp.x0 {
-        nx = x0;
-    } else if x1 > vp.x0 + vp.width() {
-        nx = x1 - vp.width();
+    let frozen = gs.frozen.get_untracked();
+    if frozen != Some(ci) {
+        let x0: f64 = (0..ci)
+            .filter(|j| frozen != Some(*j))
+            .map(|j| widths.get(j).copied().unwrap_or(0.0))
+            .sum();
+        let x1 = x0 + widths.get(ci).copied().unwrap_or(0.0);
+        if x0 < vp.x0 {
+            nx = x0;
+        } else if x1 > vp.x0 + vp.width() {
+            nx = x1 - vp.width();
+        }
     }
     gs.scroll_to.set(Some(Point::new(nx.max(0.0), ny.max(0.0))));
 }
@@ -1430,6 +1504,18 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             let order = Arc::new(compute_order(&rs, sort_val));
             gs.order.set(order.clone());
 
+            // Column virtualization: the window of `data_cols` intersecting the
+            // horizontal viewport (+ overscan). A memo, so it recomputes on scroll
+            // but — because `create_memo` dedups on `PartialEq` — only *notifies*
+            // (rebuilding header + row cells) when the visible column set actually
+            // changes, not every pixel. The header and every data row read this
+            // SAME `win`, so the two panes stay column-aligned.
+            let win_cols = data_cols.clone();
+            let win: Memo<ColWindow> = create_memo(move |_| {
+                gs.widths
+                    .with(|w| compute_window(gs.vp.get(), w, &win_cols, 2))
+            });
+
             // ── Headers ──
             let gutter_header = container(
                 text("#").style(|s| s.font_size(11.0).color(theme::text_faint())),
@@ -1456,9 +1542,24 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             });
             let km = key_map.clone();
             let hdr_cols = data_cols.clone();
-            let data_header_row = h_stack_from_iter(
-                (0..hdr_cols.len())
-                    .map(move |k| header_cell(gs, hdr_cols[k], sort_val, sort, km.clone())),
+            // Virtualized header: leading spacer + the visible window's header cells
+            // + trailing spacer, rebuilt (via `win`) only when the visible column
+            // set changes. Same window + spacers as the body rows keep them aligned.
+            let data_header_row = dyn_container(
+                move || win.get(),
+                move |w| {
+                    let mut kids: Vec<AnyView> =
+                        vec![col_spacer(w.left_pad, GRID_HEADER_H).into_any()];
+                    for k in w.start..w.end {
+                        kids.push(
+                            header_cell(gs, hdr_cols[k], sort_val, sort, km.clone()).into_any(),
+                        );
+                    }
+                    kids.push(col_spacer(w.right_pad, GRID_HEADER_H).into_any());
+                    h_stack_from_iter(kids)
+                        .style(|s| s.flex_row().background(theme::bg_header_row()))
+                        .into_any()
+                },
             )
             .style(|s| s.flex_row().background(theme::bg_header_row()));
             let data_header = scroll(data_header_row)
@@ -1540,9 +1641,9 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                     |i| *i,
                     move |i| {
                         if i < nrows {
-                            data_row(gs, i, order_d[i], body_cols.clone(), None)
+                            data_row(gs, i, order_d[i], body_cols.clone(), None, win)
                         } else {
-                            data_row(gs, i, 0, body_cols.clone(), Some(i - nrows))
+                            data_row(gs, i, 0, body_cols.clone(), Some(i - nrows), win)
                         }
                     },
                 )
@@ -2449,13 +2550,26 @@ fn data_row(
     data_idx: usize,
     cols: Arc<Vec<usize>>,
     pending: Option<usize>,
+    win: Memo<ColWindow>,
 ) -> impl IntoView {
-    let cells: Vec<_> = cols
-        .iter()
-        .map(|&ci| cell_at(gs, pos, data_idx, ci, pending))
-        .collect();
-    h_stack_from_iter(cells)
-        .style(move |s| zebra_bg(s.flex_row().height(ROW_H).items_center(), pos))
+    // Column-virtualized: leading spacer + only the visible window's cells +
+    // trailing spacer. Keyed on `win`, so a horizontal-scroll boundary crossing
+    // rebuilds the visible rows' cells; during vertical scroll `win` is stable, so
+    // a freshly created row builds only the ~10-14 on-screen cells (the fling win).
+    dyn_container(
+        move || win.get(),
+        move |w| {
+            let mut kids: Vec<AnyView> = vec![col_spacer(w.left_pad, ROW_H).into_any()];
+            for k in w.start..w.end {
+                kids.push(cell_at(gs, pos, data_idx, cols[k], pending).into_any());
+            }
+            kids.push(col_spacer(w.right_pad, ROW_H).into_any());
+            h_stack_from_iter(kids)
+                .style(move |s| zebra_bg(s.flex_row().height(ROW_H).items_center(), pos))
+                .into_any()
+        },
+    )
+    .style(|s| s.height(ROW_H))
 }
 
 /// Clickable, two-line header cell (name + SQL type). Sorts on click, shows a
