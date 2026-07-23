@@ -531,7 +531,6 @@ fn shortcut_group(title: &'static str, rows: &[(&'static str, &'static str)]) ->
 // the live registry (editor font/tab/soft-tabs) or uses it directly (row limit,
 // confirm-writes), and saves — so a change applies and sticks instantly.
 const EDITOR_FONT_SIZES: [f32; 8] = [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 18.0, 20.0];
-const TAB_WIDTHS: [usize; 3] = [2, 4, 8];
 const ROW_LIMITS: [usize; 5] = [1_000, 10_000, 100_000, 200_000, 1_000_000];
 
 fn editor_font_label(px: f32) -> &'static str {
@@ -544,13 +543,6 @@ fn editor_font_label(px: f32) -> &'static str {
         18 => "18 px",
         20 => "20 px",
         _ => "14 px",
-    }
-}
-fn tab_width_label(w: usize) -> &'static str {
-    match w {
-        2 => "2 spaces",
-        8 => "8 spaces",
-        _ => "4 spaces",
     }
 }
 fn row_limit_label(n: usize) -> &'static str {
@@ -578,8 +570,6 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
     let ui_theme = ui.layout.ui_theme;
     let editor_theme = ui.layout.editor_theme;
     let editor_font = ui.layout.editor_font;
-    let tab_width = ui.layout.tab_width;
-    let soft_tabs = ui.layout.soft_tabs;
     let row_limit = ui.layout.row_limit;
     let confirm_writes = ui.layout.confirm_writes;
     let restore_tabs = ui.layout.restore_tabs;
@@ -604,29 +594,16 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
             let general_group = v_stack((settings_section_header("General"), restore_row))
                 .style(|s| s.flex_col().gap(16.0));
 
-            // Editor group.
+            // Editor group. (Tab width + spaces-vs-tabs live in the status bar.)
             let font_dd = settings_dropdown(editor_font, EDITOR_FONT_SIZES, editor_font_label);
-            let tab_dd = settings_dropdown(tab_width, TAB_WIDTHS, tab_width_label);
             let font_section = v_stack((settings_group_label("Font size"), font_dd)).style(ctrl);
-            let tab_section = v_stack((settings_group_label("Tab width"), tab_dd)).style(ctrl);
-            let soft_row = settings_toggle_row(
-                "Use spaces for indentation",
-                "Insert spaces to the tab width instead of a literal tab.",
-                soft_tabs,
-            );
             let wrap_row = settings_toggle_row(
                 "Word wrap",
                 "Wrap long lines to the editor width instead of scrolling.",
                 word_wrap,
             );
-            let editor_group = v_stack((
-                settings_section_header("Editor"),
-                font_section,
-                tab_section,
-                soft_row,
-                wrap_row,
-            ))
-            .style(|s| s.flex_col().gap(16.0));
+            let editor_group = v_stack((settings_section_header("Editor"), font_section, wrap_row))
+                .style(|s| s.flex_col().gap(16.0));
 
             // Query group.
             let row_dd = settings_dropdown(row_limit, ROW_LIMITS, row_limit_label);

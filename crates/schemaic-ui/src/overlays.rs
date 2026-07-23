@@ -547,33 +547,28 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
         };
         let (ww, wh) = window_size().get();
         let ph = n as f64 * 34.0 + 14.0;
-        let (x, y) = match anchor.get() {
-            // Toolbar dropdown: drop 5px below the icon, tucked under it (left edge
-            // 40px left of the icon's right edge, so it overlaps the icon like the
-            // schema/db menus); flip to right-aligned (right edge flush on the icon)
-            // if it'd spill past the window's right edge. Real panel width → no drift.
-            Some((_left, right, bottom, w)) => {
-                let open_x = right - 40.0;
-                let x = if ww > 1.0 && open_x + w > ww {
-                    (right - w).max(0.0)
+        let pw = 170.0; // menu panels' `min_width(170)`; short labels never exceed it
+        match anchor.get() {
+            // Status-bar menu: centre the panel horizontally on the anchor's
+            // x-range and sit 5px above the status bar (FOOTER_H tall at the window
+            // bottom), growing upward via `inset_bottom` so we needn't know its
+            // height. Clamp horizontally so it never spills past a window edge.
+            Some((left, right, _t, _w)) => {
+                let cx = (left + right) / 2.0;
+                let x = if ww > 1.0 {
+                    (cx - pw / 2.0).clamp(0.0, (ww - pw).max(0.0))
                 } else {
-                    open_x.max(0.0)
+                    (cx - pw / 2.0).max(0.0)
                 };
-                let y = if wh > 1.0 && bottom + 5.0 + ph > wh {
-                    (bottom - 5.0 - ph).max(0.0)
-                } else {
-                    bottom + 5.0
-                };
-                (x, y)
+                s.absolute()
+                    .inset_left(x)
+                    .inset_bottom(theme::FOOTER_H + 5.0)
             }
-            // Cursor menus (right-click): open at the pointer. `pw` matches the
-            // menu panels' actual `min_width(170)` (short labels never exceed it),
-            // so a right-edge flip lands the menu's right edge ~3px from the cursor
-            // — mirroring the 3px gap on the non-flipped side. An over-estimate here
-            // is what pushed the flipped menu ~40px too far from the cursor.
+            // Cursor menus (right-click): open at the pointer. A right-edge flip
+            // lands the menu's right edge ~3px from the cursor — mirroring the 3px
+            // gap on the non-flipped side.
             None => {
                 let (mx, my) = last_mouse.get_untracked();
-                let pw = 170.0;
                 let x = if ww > 1.0 && mx + 3.0 + pw > ww {
                     (mx - pw - 3.0).max(0.0)
                 } else {
@@ -584,10 +579,9 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
                 } else {
                     my + 3.0
                 };
-                (x, y)
+                s.absolute().inset_left(x).inset_top(y)
             }
-        };
-        s.absolute().inset_left(x).inset_top(y)
+        }
     })
 }
 
