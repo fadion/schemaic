@@ -343,7 +343,13 @@ for keyboard nav.
   `column_key_map`, cross-referencing the tab's `source` against the loaded schema (`db_nodes`). Only
   populated when the tab was opened from a table with schema loaded; arbitrary SELECTs get none.
   Nullable markers deferred.
-- **Deferred: column virtualization.** Rows are virtualized (`virtual_stack`); columns aren't (every
-  row builds all cells). Fine for typical results, heavy for very wide tables. Doing it means per-row
-  rendering only columns intersecting `[h_off, h_off+viewport_w]` + spacer widths — which fights the
-  current `h_stack`/resize/freeze layout, so it's a follow-up.
+- **Column virtualization.** Both rows (`virtual_stack`) *and* columns are virtualized: the header and
+  every data row render only the columns intersecting the horizontal viewport (+ a small overscan)
+  between two width-preserving spacers, so a wide table builds ~10-14 cells/row instead of all of them
+  (a 100k×50 inertial fling stays smooth). The visible window is a `ColWindow` (`start..end` into
+  `data_cols` + left/right spacer px) from a `create_memo` — it recomputes on scroll but, since memos
+  dedup on `PartialEq`, only *notifies* (rebuilding header + row cells) when the visible column set
+  changes, not every pixel. Header and every row read the **same** `win` memo, so the panes stay
+  aligned. Invariant: `gs.widths` stays full-length and each row's total width = `sum(widths[data_cols])`
+  (spacers make up the hidden columns), so `h_off`/`scroll_to` geometry is unchanged —
+  `scroll_active_into_view` sums in data-pane space (excluding the frozen column) to match.
