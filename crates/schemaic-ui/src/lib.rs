@@ -118,6 +118,9 @@ pub struct Tab {
     /// User-assigned tab name (double-click to rename). `None` = the default
     /// "Query N" label. Persisted with the tab and shown in query history.
     pub name: RwSignal<Option<String>>,
+    /// Pinned tabs sort to the left of the strip (in pin order), drop their close
+    /// ×, and can't be closed (×/middle-click/Ctrl+W all no-op) until unpinned.
+    pub pinned: RwSignal<bool>,
     /// True while the tab title is being edited inline (renders a text field in
     /// place of the label).
     pub editing: RwSignal<bool>,
@@ -149,6 +152,7 @@ impl Tab {
             database: cx.create_rw_signal(database),
             source: cx.create_rw_signal(None),
             name: cx.create_rw_signal(None),
+            pinned: cx.create_rw_signal(false),
             editing: cx.create_rw_signal(false),
             edit_buf: cx.create_rw_signal(String::new()),
         }
@@ -524,6 +528,12 @@ pub struct TabsActions {
     pub commit_edits: CommitFn,
     pub add_tab: Rc<dyn Fn()>,
     pub close_tab: Rc<dyn Fn(usize)>,
+    /// Toggle a tab's pinned state (by id) and re-order the strip so pinned tabs
+    /// stay contiguous at the left, in pin order.
+    pub toggle_pin: Rc<dyn Fn(usize)>,
+    /// Duplicate a tab (by id): a new tab with the same connection/database and
+    /// query, opened right after the source and made active.
+    pub duplicate_tab: Rc<dyn Fn(usize)>,
     /// (database, table) → show it in a tab: focus the tab already showing it, or
     /// open a fresh one ("Open").
     pub open_table: Rc<dyn Fn(String, String)>,

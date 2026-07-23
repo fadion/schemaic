@@ -185,6 +185,10 @@ pub struct SavedTab {
     /// "Query N" label. Persisted so a restored tab keeps its name.
     #[serde(default)]
     pub name: Option<String>,
+    /// Whether this tab was pinned. Saved in pinned-first order, so a restore
+    /// preserves both the flag and the left-of-strip position.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// The set of open tabs at last save, plus which one was active (its index).

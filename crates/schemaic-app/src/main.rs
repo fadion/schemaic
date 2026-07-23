@@ -330,7 +330,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         if saved_tabs.tabs.is_empty() {
             (vec![Tab::new(cx, 1, "", active_id, None)], 1, 2)
         } else {
-            let built: Vec<Tab> = saved_tabs
+            let mut built: Vec<Tab> = saved_tabs
                 .tabs
                 .iter()
                 .enumerate()
@@ -343,11 +343,15 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     let t = Tab::new(cx, i + 1, &s.query, conn, s.database.clone());
                     t.source.set(s.source.clone());
                     t.name.set(s.name.clone());
+                    t.pinned.set(s.pinned);
                     t
                 })
                 .collect();
             let n = built.len();
             let active_id = built[saved_tabs.active.min(n - 1)].id;
+            // Enforce the pinned-first invariant (stable, so pin order + relative
+            // unpinned order both survive) in case the file was hand-edited.
+            built.sort_by_key(|t| !t.pinned.get_untracked());
             (built, active_id, n + 1)
         };
     let tabs = RwSignal::new(initial_tabs);
@@ -889,6 +893,15 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let close_tab: Rc<dyn Fn(usize)> = {
         let tokens = tokens.clone();
         Rc::new(move |id: usize| {
+            // Pinned tabs aren't closable — this is the single choke point for
+            // every close path (× click, middle-click, Ctrl+W), so gating here
+            // covers them all. Unpin first to close.
+            if tabs
+                .with_untracked(|v| v.iter().find(|t| t.id == id).map(|t| t.pinned.get_untracked()))
+                .unwrap_or(false)
+            {
+                return;
+            }
             // H5: cancel this tab's in-flight query so it can't complete onto
             // cleared/freed signals (and stops the server-side work).
             if let Some((_, tok)) = tokens.borrow_mut().remove(&id) {
@@ -945,7 +958,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         let reuse_at = tabs.with_untracked(|v| {
             v.iter().position(|t| t.id == active_id).filter(|&i| {
                 let t = &v[i];
-                t.query.get_untracked().trim().is_empty()
+                !t.pinned.get_untracked()
+                    && t.query.get_untracked().trim().is_empty()
                     && matches!(t.results.get_untracked(), QueryState::Idle)
                     && t.result_tabs.get_untracked().is_empty()
             })
@@ -968,6 +982,58 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             exec_after(Duration::ZERO, move |_| scope.dispose());
         }
     });
+
+    // Toggle a tab's pinned state, then re-order the strip so pinned tabs stay
+    // contiguous at the left in pin order. The tab is pulled out and reinserted at
+    // the pinned/unpinned boundary (the count of leading pinned tabs) — which is
+    // correct both ways: a newly pinned tab lands just after the existing pinned
+    // ones; a newly unpinned tab lands at the first unpinned slot.
+    let toggle_pin: Rc<dyn Fn(usize)> = Rc::new(move |id: usize| {
+        let Some(t) = tabs.with_untracked(|v| v.iter().find(|x| x.id == id).copied()) else {
+            return;
+        };
+        t.pinned.set(!t.pinned.get_untracked());
+        tabs.update(|v| {
+            if let Some(pos) = v.iter().position(|x| x.id == id) {
+                let tab = v.remove(pos);
+                let boundary = v.iter().take_while(|x| x.pinned.get_untracked()).count();
+                v.insert(boundary, tab);
+            }
+        });
+    });
+
+    // Duplicate a tab: a fresh (unpinned) tab with the same connection/database and
+    // query, opened right after the source and made active. If the source is
+    // pinned, the duplicate can't sit inside the pinned block — it clamps to the
+    // first unpinned slot so the pinned-contiguous invariant holds.
+    let duplicate_tab: Rc<dyn Fn(usize)> = {
+        let next_id = next_id.clone();
+        Rc::new(move |id: usize| {
+            let Some(src) = tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied()) else {
+                return;
+            };
+            let new_id = next_id.get();
+            next_id.set(new_id + 1);
+            let nt = Tab::new(
+                cx,
+                new_id,
+                &src.query.get_untracked(),
+                src.conn_id.get_untracked(),
+                src.database.get_untracked(),
+            );
+            tabs.update(|v| {
+                let boundary = v.iter().take_while(|t| t.pinned.get_untracked()).count();
+                let at = v
+                    .iter()
+                    .position(|t| t.id == id)
+                    .map(|i| i + 1)
+                    .unwrap_or(v.len())
+                    .max(boundary);
+                v.insert(at, nt);
+            });
+            active.set(new_id);
+        })
+    };
 
     // Build + place a fresh tab showing a table: `SELECT * … LIMIT 100` bound to
     // the active connection + that db, remembering its source for tree
@@ -1139,6 +1205,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     t.database.get();
                     t.source.get();
                     t.name.get();
+                    t.pinned.get();
                 }
             });
             active.get();
@@ -1164,6 +1231,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                                 database: t.database.get_untracked(),
                                 source: t.source.get_untracked(),
                                 name: t.name.get_untracked(),
+                                pinned: t.pinned.get_untracked(),
                             })
                             .collect(),
                     }
@@ -2201,6 +2269,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             commit_edits,
             add_tab,
             close_tab,
+            toggle_pin,
+            duplicate_tab,
             open_table,
             open_table_new,
             open_query,
