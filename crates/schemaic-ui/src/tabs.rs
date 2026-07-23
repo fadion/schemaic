@@ -80,6 +80,12 @@ pub(crate) fn tab_bar(ui: Ui) -> impl IntoView {
 // margin (7). A title wider than this ellipsizes and gains a tooltip.
 const TAB_TITLE_AVAIL: f64 = TAB_MAX_W - 40.0;
 
+// A present DB-identity dot leads the label with its own 12px footprint (the 6px
+// glyph + its 6px right margin — see `db_color_dot` below). It's *not* covered by
+// `TAB_TITLE_AVAIL`'s 40, so the label cap must shed it when a dot shows; else a
+// full-width truncated title pushes the × past the chip cap and clips it.
+const TAB_DOT_W: f64 = 12.0;
+
 fn tab_chip(
     tab: Tab,
     active: RwSignal<usize>,
@@ -137,16 +143,28 @@ fn tab_chip(
                     .into_any();
             }
 
+            // Whether this tab currently shows a DB-identity dot (its footprint
+            // eats into the title width — see `TAB_DOT_W`). Read reactively so the
+            // label cap follows a colour assigned/cleared while the tab is open.
+            let has_dot = move || {
+                tab.database.get().is_some_and(|db| {
+                    db_colors
+                        .with(|r| schemaic_core::db_color::lookup(r, tab.conn_id.get(), &db))
+                        .is_some()
+                })
+            };
+
             // Display: label (ellipsized past the tab width) + close ×. A title
             // that would be clipped gets a tooltip with its full text; a title
             // that fits gets none.
-            let truncated = measure_text_px(&title) > TAB_TITLE_AVAIL;
+            let truncated =
+                measure_text_px(&title) > TAB_TITLE_AVAIL - if has_dot() { TAB_DOT_W } else { 0.0 };
             let full = title.clone();
             // Left inset moved to the row's `padding_left` so the (optional) DB
             // colour dot can lead the label without shifting the text when absent.
-            let label = text(title).style(|s| {
+            let label = text(title).style(move |s| {
                 s.margin_right(7.0)
-                    .max_width(TAB_TITLE_AVAIL)
+                    .max_width(TAB_TITLE_AVAIL - if has_dot() { TAB_DOT_W } else { 0.0 })
                     .text_overflow(TextOverflow::Ellipsis)
                     .font_size(theme::FONT_BODY)
             });
