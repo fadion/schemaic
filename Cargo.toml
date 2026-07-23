@@ -43,6 +43,11 @@ russh = { version = "0.62", default-features = false, features = ["ring", "flate
 # Version pinned to match russh's transitive dependency (for `ssh_key::PublicKey`).
 ssh-key = "=0.7.0-rc.11"
 
+# Process resource sampling for the status-bar CPU/RAM readout (cross-platform:
+# Windows/macOS/Linux). `default-features = false` + `system` = just the
+# CPU/memory/process reader, no disk/network/component/user probes.
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+
 # Errors / logging / serde
 thiserror = "2"
 anyhow = "1"

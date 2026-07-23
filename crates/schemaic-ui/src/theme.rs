@@ -344,6 +344,23 @@ pub fn plan_warn_bg() -> Color {
     ui().plan_warn_bg
 }
 
+// ── Status bar (footer) ──────────────────────────────────────────────────
+// Fixed accents, theme-independent by design: the footer reads the same muted
+// grey and the two semantic accents in every theme.
+
+/// Muted grey for status-bar text + icons (`#6E7181`).
+pub fn status_text() -> Color {
+    Color::rgb8(0x6E, 0x71, 0x81)
+}
+/// Amber for the syntax-warning icon + count (`#E08A4B`).
+pub fn status_warn() -> Color {
+    Color::rgb8(0xE0, 0x8A, 0x4B)
+}
+/// Green for the "no warnings" check (`#71C371`).
+pub fn status_ok() -> Color {
+    Color::rgb8(0x71, 0xC3, 0x71)
+}
+
 // Connection status: reachable (unreachable reuses `reject_bg`).
 pub fn conn_ok() -> Color {
     ui().conn_ok
