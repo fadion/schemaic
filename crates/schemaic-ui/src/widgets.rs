@@ -13,8 +13,7 @@ use floem::keyboard::{Key, NamedKey};
 use floem::kurbo::Point;
 use floem::prelude::*;
 use floem::reactive::Scope;
-use floem::style::{Transition, TranslateY};
-use floem::unit::PxPct;
+use floem::style::Transition;
 use floem::views::Scroll;
 use floem::views::scroll::ScrollCustomStyle;
 
@@ -365,34 +364,10 @@ fn menu_stack(entries: Vec<MenuEntry>, close: Rc<dyn Fn()>) -> impl IntoView {
 /// caller positions it absolutely. Escape (and any action) calls `close`.
 pub(crate) fn menu_panel(entries: Vec<MenuEntry>, close: Rc<dyn Fn()>) -> impl IntoView {
     let esc = close.clone();
-    menu_enter(
-        menu_stack(entries, close)
-            .keyboard_navigable()
-            .request_focus(|| {})
-            .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| (esc)()),
-    )
-}
-
-/// A quick slide-in for menus/popups: the panel drops in from 6px above over
-/// ~90ms. Menus are built fresh each open (they live in `dyn_container`s), so a
-/// per-call `shown` flip re-arms the animation every time. `translate_y` is a
-/// visual transform, so it doesn't disturb the overlay's absolute positioning.
-pub(crate) fn menu_enter<V: IntoView + 'static>(view: V) -> impl IntoView {
-    let shown = RwSignal::new(false);
-    floem::action::exec_after(std::time::Duration::ZERO, move |_| {
-        shown.try_update(|v| *v = true);
-    });
-    view.into_view().style(move |s| {
-        let s = s.transition(
-            TranslateY,
-            Transition::ease_in_out(std::time::Duration::from_millis(50)),
-        );
-        if shown.get() {
-            s
-        } else {
-            s.translate_y(PxPct::Px(-6.0))
-        }
-    })
+    menu_stack(entries, close)
+        .keyboard_navigable()
+        .request_focus(|| {})
+        .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| (esc)())
 }
 
 /// Measure a string's rendered width (px) at `FONT_BODY`, through the same global
