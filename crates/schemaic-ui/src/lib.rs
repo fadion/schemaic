@@ -719,6 +719,9 @@ pub struct HistoryUi {
 pub struct HistoryActions {
     /// Clear the history for the currently-active connection (persists).
     pub clear: Rc<dyn Fn()>,
+    /// Reopen a history entry in a new tab: seeds the SQL, the database it ran
+    /// against, and the originating tab's custom name (does NOT run it).
+    pub open: Rc<dyn Fn(HistoryEntry)>,
 }
 
 /// Panel-layout + appearance signals (Copy bundle), persisted across sessions.
