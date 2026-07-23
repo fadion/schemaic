@@ -68,6 +68,7 @@ use schemaic_core::db_color::DbColorRule;
 use schemaic_core::format::ColumnFormatRule;
 use schemaic_core::history::HistoryEntry;
 use schemaic_core::model::{CommitDone, GridWrite, QueryState, RefetchRequest};
+use schemaic_core::resource::ResourceSample;
 
 /// The grid-commit completion callback, invoked on the UI thread with the outcome.
 pub type CommitDoneFn = Rc<dyn Fn(CommitDone)>;
@@ -127,6 +128,9 @@ pub struct Tab {
     /// Backing buffer for the inline rename field (committed to `name` on Enter /
     /// blur).
     pub edit_buf: RwSignal<String>,
+    /// Caret byte offset in `query`, mirrored out of the editor by an effect in
+    /// `query_pane` so the status bar can show Ln/Col for the active tab.
+    pub cursor_offset: RwSignal<usize>,
 }
 
 impl Tab {
@@ -155,6 +159,7 @@ impl Tab {
             pinned: cx.create_rw_signal(false),
             editing: cx.create_rw_signal(false),
             edit_buf: cx.create_rw_signal(String::new()),
+            cursor_offset: cx.create_rw_signal(0),
         }
     }
 
@@ -851,6 +856,9 @@ pub struct Ui {
     pub db_colors: RwSignal<Vec<DbColorRule>>,
     /// Persist the database-colour rules to disk (after a menu upsert).
     pub save_db_colors: Rc<dyn Fn()>,
+    /// The app process's own CPU/RAM usage, sampled on a timer at the app
+    /// boundary and shown in the status bar. Transient (never persisted).
+    pub resources: RwSignal<ResourceSample>,
 }
 
 /// Which panel occupies the right column. AI and Terminal are mutually
@@ -1060,12 +1068,7 @@ pub fn workspace(ui: Ui) -> impl IntoView {
     let shell = v_stack((
         header(ui.clone()),
         body(ui.clone(), schema_visible, right_panel),
-        footer(
-            schema_visible,
-            right_panel,
-            ui.conn.connections,
-            ui.conn.active_conn,
-        ),
+        footer(ui.clone()),
     ))
     .style(|s| {
         s.size_full()
@@ -1890,6 +1893,7 @@ fn center(ui: Ui) -> impl IntoView {
             match tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied()) {
                 Some(tab) => query_pane(QueryPaneParams {
                     query: tab.query,
+                    cursor_offset: tab.cursor_offset,
                     results: tab.results,
                     run: run.clone(),
                     run_all: run_all.clone(),
@@ -3181,12 +3185,65 @@ pub(crate) fn thumb_len(desired: f64, track: f64) -> f64 {
 
 // The connection switcher dropdown: saved connections + "Manage Connections".
 // ── Footer (status bar) ──────────────────────────────────────────────────
-fn footer(
-    schema_visible: RwSignal<bool>,
-    right_panel: RwSignal<RightPanel>,
-    connections: RwSignal<Vec<Connection>>,
-    active_conn: RwSignal<u64>,
-) -> impl IntoView {
+
+/// A status-bar text segment: 12px, muted grey (`status_text`).
+fn footer_text(s: String) -> AnyView {
+    text(s)
+        .style(|st| st.color(theme::status_text()).font_size(theme::FONT_STATUS))
+        .into_any()
+}
+
+fn footer(ui: Ui) -> impl IntoView {
+    let schema_visible = ui.layout.schema_visible;
+    let right_panel = ui.layout.right_panel;
+    let connections = ui.conn.connections;
+    let active_conn = ui.conn.active_conn;
+    let tabs = ui.tabs_ui.tabs;
+    let active = ui.tabs_ui.active;
+    let db_nodes = ui.schema.db_nodes;
+    let soft_tabs = ui.layout.soft_tabs;
+    let tab_width = ui.layout.tab_width;
+    let word_wrap = ui.layout.word_wrap;
+    let resources = ui.resources;
+    let ai_model = ui.ai.model;
+    let ai_effort = ui.ai.effort;
+
+    // ── Reactive state for the left status cluster ──
+    // Caret Ln/Col of the active tab (1-based). Reads the tab's `query` +
+    // `cursor_offset` (mirrored out of the editor); safe to read per-tab signals
+    // here — the same pattern as the `read_only`/`active_db` memos.
+    let cursor_lc = create_memo(move |_| {
+        let id = active.get();
+        tabs.with(|v| {
+            v.iter().find(|t| t.id == id).map(|t| {
+                schemaic_core::text_ops::line_col_of_offset(&t.query.get(), t.cursor_offset.get())
+            })
+        })
+        .unwrap_or((1, 1))
+    });
+    // Live count of probable-typo warnings in the active tab's SQL (same analysis
+    // as the editor squiggles). Tracks the query text and the schema list.
+    let warn_count = create_memo(move |_| {
+        let id = active.get();
+        db_nodes.track();
+        let q = tabs.with(|v| v.iter().find(|t| t.id == id).map(|t| t.query.get()));
+        match q {
+            Some(q) => editor_pane::syntax_errors(&q, db_nodes).len(),
+            None => 0,
+        }
+    });
+    // Is the active tab's connection read-only? (Same derivation as `center`.)
+    let read_only = create_memo(move |_| {
+        let id = active.get();
+        let cid = tabs.with(|v| v.iter().find(|t| t.id == id).map(|t| t.conn_id.get()));
+        match cid {
+            Some(cid) => connections
+                .with(|cs| cs.iter().find(|c| c.id == cid).map(|c| c.read_only))
+                .unwrap_or(false),
+            None => false,
+        }
+    });
+
     // AI/Terminal toggles are mutually exclusive: turning one on replaces the
     // other; clicking the active one hides it (right column freed).
     let set_right = move |target: RightPanel| {
@@ -3198,13 +3255,9 @@ fn footer(
             }
         });
     };
-    // Left: Schema (folder-tree). Right: AI (wordmark), History (timeline), then
-    // Terminal. The row has no padding of its own; each icon carries its own 5px/3px
-    // padding (an enlarged click target). The edge icons add a 5px margin (schema
-    // left / terminal right) so the glyph sits ~10px from the edge; the inter-icon
-    // gaps are the right group's `gap(10)` alone. We pin the two clusters with
-    // `justify_between` — a lone flex-grow spacer under-fills by ~15px in this
-    // codebase (documented gotcha), which pushed the right icons too far in.
+    // Left edge: the Schema (folder-tree) toggle — kept on the left so it reads as
+    // opening the panel that lives on the left. Right edge: AI / History / Terminal
+    // toggles, likewise under their right-column panels.
     let schema_icon = toggle_icon(
         icons::FOLDER_TREE,
         move || schema_visible.get(),
@@ -3230,7 +3283,102 @@ fn footer(
         .style(|s| s.margin_right(5.0)),
     ))
     .style(|s| s.flex_row().items_center().gap(10.0));
-    let bar = h_stack((schema_icon, right_group)).style(|s| {
+
+    // ── Left status cluster (after the schema icon) ──
+    // Gaps: 40px between the four groups (position | editor | status | AI), 15px
+    // within a group; the icon→its-label gap is 5px. All text 12px muted grey.
+    let cursor_seg = dyn_container(
+        move || cursor_lc.get(),
+        move |(l, c)| footer_text(format!("Ln {l}, Col {c}")),
+    )
+    .style(|s| s.margin_left(40.0));
+    // Tabs vs Spaces + width (display-only for now — a menu button lands later).
+    let tabs_seg = dyn_container(
+        move || (soft_tabs.get(), tab_width.get()),
+        move |(soft, w)| footer_text(format!("{}: {}", if soft { "Spaces" } else { "Tabs" }, w)),
+    )
+    .style(|s| s.margin_left(15.0));
+    let wrap_seg = dyn_container(
+        move || word_wrap.get(),
+        move |w| footer_text((if w { "Wrap" } else { "No wrap" }).to_string()),
+    )
+    .style(|s| s.margin_left(15.0));
+    // Warnings: amber triangle + amber count, or a green check (no text) when clean.
+    let warn_seg = dyn_container(
+        move || warn_count.get(),
+        move |n| {
+            if n == 0 {
+                icons::icon(icons::CIRCLE_CHECK, 15.0)
+                    .style(|s| s.color(theme::status_ok()))
+                    .into_any()
+            } else {
+                h_stack((
+                    icons::icon(icons::TRIANGLE_ALERT, 16.0)
+                        .style(|s| s.color(theme::status_warn())),
+                    text(n.to_string()).style(|s| {
+                        s.margin_left(5.0)
+                            .color(theme::status_warn())
+                            .font_size(theme::FONT_STATUS)
+                    }),
+                ))
+                .style(|s| s.flex_row().items_center())
+                .into_any()
+            }
+        },
+    )
+    .style(|s| s.margin_left(40.0));
+    // Read-only vs write mode (from the active connection's setting). Text only:
+    // green for read-only (safe), amber for write mode (a heads-up).
+    let ro_seg = dyn_container(
+        move || read_only.get(),
+        move |ro| {
+            let (label, color) = if ro {
+                ("Read only", theme::status_ok as fn() -> Color)
+            } else {
+                ("Write mode", theme::status_warn as fn() -> Color)
+            };
+            text(label)
+                .style(move |s| s.color(color()).font_size(theme::FONT_STATUS))
+                .into_any()
+        },
+    )
+    .style(|s| s.margin_left(15.0));
+    let cpu_seg = dyn_container(
+        move || resources.get().cpu_label(),
+        move |c| footer_text(format!("CPU: {c}")),
+    )
+    .style(|s| s.margin_left(15.0));
+    let ram_seg = dyn_container(
+        move || resources.get().ram_label(),
+        move |r| footer_text(format!("RAM: {r}")),
+    )
+    .style(|s| s.margin_left(15.0));
+    let model_seg = dyn_container(
+        move || ai_model.get().label(),
+        move |m| footer_text(m.to_string()),
+    )
+    .style(|s| s.margin_left(40.0));
+    let effort_seg = dyn_container(
+        move || ai_effort.get().label(),
+        move |e| footer_text(e.to_string()),
+    )
+    .style(|s| s.margin_left(15.0));
+
+    let left_group = h_stack((
+        schema_icon,
+        cursor_seg,
+        tabs_seg,
+        wrap_seg,
+        warn_seg,
+        ro_seg,
+        cpu_seg,
+        ram_seg,
+        model_seg,
+        effort_seg,
+    ))
+    .style(|s| s.flex_row().items_center().min_width(0.0));
+
+    let bar = h_stack((left_group, right_group)).style(|s| {
         s.width_full()
             .height(theme::FOOTER_H)
             .min_height(theme::FOOTER_H)

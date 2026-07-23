@@ -2285,6 +2285,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     };
     let term_open_link: Rc<dyn Fn(String)> = Rc::new(|url: String| open_url(&url));
 
+    // App-process resource usage for the status bar, sampled on a 1s timer.
+    let resources = RwSignal::new(schemaic_core::resource::ResourceSample::default());
+    start_resource_monitor(resources);
+
     let ui = Ui {
         tabs_ui: TabsUi {
             tabs,
@@ -2436,8 +2440,59 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         save_formats,
         db_colors,
         save_db_colors,
+        resources,
     };
     schemaic_ui::workspace(ui)
+}
+
+/// Sample the app process's own CPU/RAM on a self-rescheduling ~1s timer and
+/// publish it to `sample` for the status bar. Cross-platform via `sysinfo`
+/// (Windows/macOS/Linux). CPU is normalized across logical cores. The first
+/// reading after a refresh is 0 (CPU% is a delta between two refreshes), so the
+/// CPU figure only becomes meaningful on the second tick — fine for a readout.
+fn start_resource_monitor(sample: RwSignal<schemaic_core::resource::ResourceSample>) {
+    use schemaic_core::resource::ResourceSample;
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    let pid = Pid::from_u32(std::process::id());
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let sys = Rc::new(RefCell::new(System::new()));
+
+    // Perpetual tick; reads `sample` with `try_get_untracked` and stops
+    // rescheduling once it's disposed at shutdown (else the last timer panics on
+    // a freed signal — the same rule as the terminal cursor-blink tick).
+    let tick: BlinkTick = Rc::new(RefCell::new(None));
+    let tick2 = tick.clone();
+    *tick.borrow_mut() = Some(Rc::new(move || {
+        if sample.try_get_untracked().is_none() {
+            return;
+        }
+        {
+            let mut s = sys.borrow_mut();
+            s.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[pid]),
+                true,
+                ProcessRefreshKind::nothing().with_cpu().with_memory(),
+            );
+            if let Some(p) = s.process(pid) {
+                sample.set(ResourceSample::new(p.memory(), p.cpu_usage(), cores));
+            }
+        }
+        let t = tick2.clone();
+        exec_after(Duration::from_secs(1), move |_| {
+            if let Some(f) = t.borrow().as_ref() {
+                f();
+            }
+        });
+    }));
+    let t = tick.clone();
+    exec_after(Duration::from_secs(1), move |_| {
+        if let Some(f) = t.borrow().as_ref() {
+            f();
+        }
+    });
 }
 
 /// Open an http(s) URL in the OS default browser (clicked terminal link).

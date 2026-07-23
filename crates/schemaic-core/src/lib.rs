@@ -15,6 +15,7 @@ pub mod history;
 pub mod model;
 pub mod persist;
 pub mod plan;
+pub mod resource;
 pub mod schema;
 pub mod sql;
 pub mod sqlfmt;

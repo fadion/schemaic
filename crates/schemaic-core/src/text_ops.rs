@@ -184,6 +184,28 @@ fn line_index_of(starts: &[usize], off: usize) -> usize {
     }
 }
 
+/// 1-based `(line, column)` of a byte offset within `text`, for the status-bar
+/// cursor readout. Columns count *characters* from the line start (a tab is one
+/// column), matching how editors display "Ln/Col". An offset past the end clamps
+/// to the end; an offset landing mid-codepoint rounds down to a char boundary.
+pub fn line_col_of_offset(text: &str, offset: usize) -> (usize, usize) {
+    let mut end = offset.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut line = 1usize;
+    let mut col = 1usize;
+    for ch in text[..end].chars() {
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +336,43 @@ mod tests {
         let ed = toggle_line_comment(src, 0, src.len());
         // Whole new text is two commented lines; selection covers both.
         assert_eq!(ed.sel, (0, ed.text.len()));
+    }
+
+    #[test]
+    fn line_col_start_of_empty() {
+        assert_eq!(line_col_of_offset("", 0), (1, 1));
+    }
+
+    #[test]
+    fn line_col_within_first_line() {
+        assert_eq!(line_col_of_offset("abc", 0), (1, 1));
+        assert_eq!(line_col_of_offset("abc", 2), (1, 3));
+        assert_eq!(line_col_of_offset("abc", 3), (1, 4));
+    }
+
+    #[test]
+    fn line_col_after_newline_resets_column() {
+        let src = "ab\ncd";
+        assert_eq!(line_col_of_offset(src, 3), (2, 1)); // start of line 2
+        assert_eq!(line_col_of_offset(src, 5), (2, 3)); // end of "cd"
+    }
+
+    #[test]
+    fn line_col_offset_at_newline_stays_on_first_line() {
+        // Offset points at the '\n' itself → still end of line 1.
+        assert_eq!(line_col_of_offset("ab\ncd", 2), (1, 3));
+    }
+
+    #[test]
+    fn line_col_offset_past_end_clamps() {
+        assert_eq!(line_col_of_offset("ab\ncd", 999), (2, 3));
+    }
+
+    #[test]
+    fn line_col_counts_characters_not_bytes() {
+        // "á" is two UTF-8 bytes; after it the column is 2 (one character).
+        assert_eq!(line_col_of_offset("áb", 2), (1, 2));
+        // A mid-codepoint offset rounds down to the char boundary at 0.
+        assert_eq!(line_col_of_offset("áb", 1), (1, 1));
     }
 }

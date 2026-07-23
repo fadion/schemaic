@@ -564,7 +564,9 @@ fn is_probable_typo(word: &str, known: &std::collections::HashSet<String>) -> bo
 
 /// Byte ranges of probable misspelled keywords in `sql` (skips strings,
 /// comments, and the identifier after a `.` — a qualified `db.table` part).
-fn syntax_errors(sql: &str, db_nodes: RwSignal<Vec<ConnNode>>) -> Vec<(usize, usize)> {
+/// `pub(crate)` so the status bar can report a live warning count from the same
+/// analysis that drives the editor squiggles.
+pub(crate) fn syntax_errors(sql: &str, db_nodes: RwSignal<Vec<ConnNode>>) -> Vec<(usize, usize)> {
     // Known words that must NOT be flagged: keywords + functions + all schema
     // identifiers. Functions are a separate list from keywords (§7.5 dedup), so
     // include them here too or `COUNT(…)` would squiggle as a typo.
@@ -729,6 +731,8 @@ fn statement_line_boxes(sql: &str, ed: &Editor, lo: usize, hi: usize) -> Vec<(f6
 /// overlays. Bundled so the builder takes a single argument.
 pub(crate) struct QueryPaneParams {
     pub query: RwSignal<String>,
+    /// Caret byte offset, mirrored out of the editor for the status-bar Ln/Col.
+    pub cursor_offset: RwSignal<usize>,
     pub results: RwSignal<QueryState>,
     pub run: Rc<dyn Fn(String)>,
     pub run_all: Rc<dyn Fn(Vec<String>)>,
@@ -756,6 +760,7 @@ pub(crate) struct QueryPaneParams {
 pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let QueryPaneParams {
         query,
+        cursor_offset,
         results,
         run,
         run_all,
@@ -1287,6 +1292,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let ed_wheel = ed.clone(); // shift+wheel → horizontal scroll
     let ed_find = ed.clone(); // Ctrl+F find: select + centre a match
     let ed_fmt = ed.clone(); // right-click "Format SQL"
+    let ed_cursor = ed.clone(); // mirror caret offset out for the status bar
+
+    // Mirror the caret's byte offset into the tab's `cursor_offset` signal so the
+    // status bar can render Ln/Col. Tracks `ed.cursor`, so it fires on every caret
+    // move / selection change; disposed with this pane when the tab closes.
+    create_effect(move |_| {
+        cursor_offset.set(ed_cursor.cursor.get().offset());
+    });
 
     // Builds the right-click menu entries (Ask AI… / Explain / Optimize) for the
     // app-wide `popup_menu` overlay. Rebuilt per right-click; each action reads
