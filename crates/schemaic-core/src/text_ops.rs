@@ -206,6 +206,150 @@ pub fn line_col_of_offset(text: &str, offset: usize) -> (usize, usize) {
     (line, col)
 }
 
+/// A single text replacement plus the selection to apply afterward — the result
+/// of a soft-tab indent ([`soft_tab_indent`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndentEdit {
+    /// Byte range in the original text to replace.
+    pub start: usize,
+    pub end: usize,
+    /// Replacement text.
+    pub text: String,
+    /// Selection (byte offsets into the *new* document) to apply after the edit.
+    pub sel: (usize, usize),
+}
+
+/// Compute pressing Tab with **soft tabs** (spaces) in `full`, given the current
+/// selection `[sel_a, sel_b]` (either order) and tab width `tw` (clamped ≥ 1).
+///
+/// Floem's built-in `InsertTab` uses the document buffer's own fixed indent width
+/// and ignores the configured tab width, so the editor computes the edit here and
+/// applies it directly. Behaviour mirrors a typical editor:
+/// - A bare caret inserts spaces to the next `tw` tab stop.
+/// - A selection indents every spanned line by `tw` spaces at its first non-blank
+///   column (blank lines untouched) and re-selects the indented block. A selection
+///   ending exactly at a line start doesn't pull that line in.
+pub fn soft_tab_indent(full: &str, sel_a: usize, sel_b: usize, tw: usize) -> IndentEdit {
+    let tw = tw.max(1);
+    let len = full.len();
+    let lo = sel_a.min(sel_b).min(len);
+    let hi = sel_a.max(sel_b).min(len);
+    let line_start = |off: usize| full[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+
+    if lo == hi {
+        // Bare caret: fill to the next tab stop from the caret's column.
+        let ls = line_start(lo);
+        let col = full[ls..lo].chars().count();
+        let n = tw - (col % tw);
+        let caret = lo + n;
+        return IndentEdit {
+            start: lo,
+            end: lo,
+            text: " ".repeat(n),
+            sel: (caret, caret),
+        };
+    }
+
+    // Selection: re-indent each spanned line. A selection ending exactly at a line
+    // start shouldn't include that (otherwise-untouched) line.
+    let mut eff_hi = hi;
+    if eff_hi > lo && full.as_bytes()[eff_hi - 1] == b'\n' {
+        eff_hi -= 1;
+    }
+    let region_start = line_start(lo);
+    let region_end = full[eff_hi..].find('\n').map(|i| eff_hi + i).unwrap_or(len);
+    let pad = " ".repeat(tw);
+    let block = &full[region_start..region_end];
+    let mut out = String::with_capacity(block.len() + tw * 4);
+    let mut added = 0usize;
+    for (i, line) in block.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if line.is_empty() {
+            continue; // leave blank lines unindented
+        }
+        let fnb = line.len() - line.trim_start().len(); // leading-whitespace bytes
+        out.push_str(&line[..fnb]);
+        out.push_str(&pad);
+        out.push_str(&line[fnb..]);
+        added += tw;
+    }
+    IndentEdit {
+        start: region_start,
+        end: region_end,
+        text: out,
+        sel: (region_start, region_end + added),
+    }
+}
+
+/// Leading indentation to strip for one outdent step: a single leading tab, else
+/// up to `tw` leading spaces.
+fn outdent_strip_len(line: &str, tw: usize) -> usize {
+    if line.starts_with('\t') {
+        1
+    } else {
+        line.bytes().take(tw).take_while(|&b| b == b' ').count()
+    }
+}
+
+/// Compute pressing Shift+Tab with **soft tabs** in `full` — the inverse of
+/// [`soft_tab_indent`]. Removes one indent level (a leading tab, or up to `tw`
+/// leading spaces) from each affected line:
+/// - A bare caret outdents the caret's line and shifts the caret left by however
+///   much was removed before it.
+/// - A selection outdents every spanned line and re-selects the block. A selection
+///   ending exactly at a line start doesn't pull that line in.
+///
+/// Lines with no leading whitespace are unchanged (so an all-unindented block is a
+/// no-op — `text == full[start..end]`).
+pub fn soft_tab_outdent(full: &str, sel_a: usize, sel_b: usize, tw: usize) -> IndentEdit {
+    let tw = tw.max(1);
+    let len = full.len();
+    let lo = sel_a.min(sel_b).min(len);
+    let hi = sel_a.max(sel_b).min(len);
+    let caret_mode = lo == hi;
+    let line_start = |off: usize| full[..off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+
+    let mut eff_hi = hi;
+    if !caret_mode && eff_hi > lo && full.as_bytes()[eff_hi - 1] == b'\n' {
+        eff_hi -= 1;
+    }
+    let region_start = line_start(lo);
+    let region_end = full[eff_hi..].find('\n').map(|i| eff_hi + i).unwrap_or(len);
+    let block = &full[region_start..region_end];
+
+    let mut out = String::with_capacity(block.len());
+    let mut removed_total = 0usize;
+    let mut caret_new = lo;
+    let mut abs = region_start;
+    for (i, line) in block.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+            abs += 1; // the '\n' separator
+        }
+        let r = outdent_strip_len(line, tw);
+        if caret_mode && abs <= lo && lo <= abs + line.len() {
+            // Shift the caret left by whatever was removed before it on its line.
+            caret_new = lo - r.min(lo - abs);
+        }
+        out.push_str(&line[r..]);
+        removed_total += r;
+        abs += line.len();
+    }
+    let sel = if caret_mode {
+        (caret_new, caret_new)
+    } else {
+        (region_start, region_end - removed_total)
+    };
+    IndentEdit {
+        start: region_start,
+        end: region_end,
+        text: out,
+        sel,
+    }
+}
+
 /// Byte offset of the start of 1-based `line` in `text`, or `None` if the line
 /// doesn't exist (line 0, or past the last line). Used by the editor's Go-to-line
 /// popup. Line 1 is offset 0; a trailing newline yields a valid final empty line.
@@ -434,5 +578,152 @@ mod tests {
             let off = offset_of_line(src, line).unwrap();
             assert_eq!(line_col_of_offset(src, off), (line, 1));
         }
+    }
+
+    #[test]
+    fn soft_tab_caret_at_line_start_inserts_full_width() {
+        let e = soft_tab_indent("abc", 0, 0, 4);
+        assert_eq!(
+            e,
+            IndentEdit {
+                start: 0,
+                end: 0,
+                text: "    ".into(),
+                sel: (4, 4)
+            }
+        );
+        let e2 = soft_tab_indent("abc", 0, 0, 2);
+        assert_eq!(e2.text, "  ");
+        assert_eq!(e2.sel, (2, 2));
+    }
+
+    #[test]
+    fn soft_tab_caret_fills_to_next_stop() {
+        // Caret after 1 char, width 4 → 3 spaces to reach column 4.
+        let e = soft_tab_indent("a", 1, 1, 4);
+        assert_eq!(e.text, "   ");
+        assert_eq!(e.sel, (4, 4));
+        // Caret after 2 chars, width 2 → already at a stop → a full 2 spaces.
+        let e2 = soft_tab_indent("ab", 2, 2, 2);
+        assert_eq!(e2.text, "  ");
+    }
+
+    #[test]
+    fn soft_tab_caret_column_counts_from_line_start() {
+        // Second line, caret after 1 char → 3 spaces (width 4).
+        let src = "xxxx\na";
+        let e = soft_tab_indent(src, 6, 6, 4);
+        assert_eq!(e.text, "   ");
+    }
+
+    #[test]
+    fn soft_tab_clamps_zero_width() {
+        let e = soft_tab_indent("a", 0, 0, 0);
+        assert_eq!(e.text, " "); // tw clamped to 1
+    }
+
+    #[test]
+    fn soft_tab_single_line_selection_indents_the_line() {
+        // Selecting "bc" in "abc" indents the whole line by 2 at its start.
+        let e = soft_tab_indent("abc", 1, 3, 2);
+        assert_eq!(e.start, 0);
+        assert_eq!(e.end, 3);
+        assert_eq!(e.text, "  abc");
+        assert_eq!(e.sel, (0, 5));
+    }
+
+    #[test]
+    fn soft_tab_indents_after_existing_indentation() {
+        // A line already indented by 2 gets 2 more (inserted after the leading ws).
+        let e = soft_tab_indent("  x", 3, 3, 2);
+        // caret case (col 3 → next stop at 4 → 1 space)
+        assert_eq!(e.text, " ");
+    }
+
+    #[test]
+    fn soft_tab_multiline_selection_indents_each_nonblank_line() {
+        let src = "a\nb\nc";
+        // Select from start of "a" to end of "c".
+        let e = soft_tab_indent(src, 0, 5, 2);
+        assert_eq!(e.start, 0);
+        assert_eq!(e.end, 5);
+        assert_eq!(e.text, "  a\n  b\n  c");
+        assert_eq!(e.sel, (0, 5 + 6)); // 3 lines × 2 spaces
+    }
+
+    #[test]
+    fn soft_tab_multiline_skips_blank_lines() {
+        let src = "a\n\nb";
+        let e = soft_tab_indent(src, 0, 4, 2);
+        assert_eq!(e.text, "  a\n\n  b"); // middle blank line untouched
+        assert_eq!(e.sel, (0, 4 + 4)); // only 2 lines indented
+    }
+
+    #[test]
+    fn soft_tab_selection_ending_at_line_start_excludes_that_line() {
+        let src = "a\nb\nc";
+        // Select "a\n" (ends at start of line 2) → only line 1 indented.
+        let e = soft_tab_indent(src, 0, 2, 2);
+        assert_eq!(e.end, 1); // region ends at end of line 1, not into line 2
+        assert_eq!(e.text, "  a");
+    }
+
+    #[test]
+    fn outdent_caret_removes_up_to_width_and_shifts_caret() {
+        // "    x", caret after the 4 spaces (offset 4), width 4 → strip 4, caret→0.
+        let e = soft_tab_outdent("    x", 4, 4, 4);
+        assert_eq!((e.start, e.end), (0, 5));
+        assert_eq!(e.text, "x");
+        assert_eq!(e.sel, (0, 0));
+    }
+
+    #[test]
+    fn outdent_caret_partial_indent() {
+        // Only 2 leading spaces though width is 4 → remove the 2 present.
+        let e = soft_tab_outdent("  x", 3, 3, 4);
+        assert_eq!(e.text, "x");
+        assert_eq!(e.sel, (1, 1)); // caret 3 shifted left by 2
+    }
+
+    #[test]
+    fn outdent_caret_inside_indentation_clamps() {
+        // Caret at offset 1 inside 4 leading spaces → all 4 removed, caret clamps to 0.
+        let e = soft_tab_outdent("    x", 1, 1, 4);
+        assert_eq!(e.text, "x");
+        assert_eq!(e.sel, (0, 0));
+    }
+
+    #[test]
+    fn outdent_no_leading_whitespace_is_noop() {
+        let e = soft_tab_outdent("x", 1, 1, 4);
+        assert_eq!(e.text, "x"); // unchanged
+        assert_eq!(e.text, "x".get(e.start..e.end).unwrap_or(""));
+    }
+
+    #[test]
+    fn outdent_removes_a_leading_tab() {
+        let e = soft_tab_outdent("\tx", 2, 2, 4);
+        assert_eq!(e.text, "x");
+        assert_eq!(e.sel, (1, 1));
+    }
+
+    #[test]
+    fn outdent_multiline_selection() {
+        let src = "  a\n    b\nc";
+        // Select all three lines.
+        let e = soft_tab_outdent(src, 0, src.len(), 2);
+        assert_eq!(e.text, "a\n  b\nc"); // -2 from line1, -2 from line2, none from line3
+        assert_eq!(e.sel, (0, src.len() - 4));
+    }
+
+    #[test]
+    fn outdent_roundtrips_indent() {
+        // Indent then outdent a caret line → back to the original caret + text.
+        let src = "x";
+        let ind = soft_tab_indent(src, 0, 0, 4); // "    " inserted, caret 4
+        let indented = format!("{}{}", ind.text, src); // "    x"
+        let out = soft_tab_outdent(&indented, ind.sel.0, ind.sel.1, 4);
+        assert_eq!(out.text, "x");
+        assert_eq!(out.sel, (0, 0));
     }
 }

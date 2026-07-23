@@ -36,7 +36,10 @@ use schemaic_core::schema::SchemaState;
 use schemaic_core::sql::{
     contains_write, first_unsafe, skip_noncode, statement_range, statement_ranges, unsafe_reason,
 };
-use schemaic_core::text_ops::{find_matches, offset_of_line, replace_all, toggle_line_comment};
+use schemaic_core::text_ops::{
+    find_matches, offset_of_line, replace_all, soft_tab_indent, soft_tab_outdent,
+    toggle_line_comment,
+};
 
 use crate::completion::{
     Completion, SQL_FUNCTIONS, SQL_KEYWORDS, accept_completion, completion_popup,
@@ -1058,6 +1061,67 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             ) {
                 comp.open.set(false);
             }
+        }
+        // Soft-tab indent: floem's built-in InsertTab uses the buffer's own fixed
+        // indent width (4) and ignores our configured tab width, so when soft tabs
+        // are on we compute and apply the spaces ourselves (via the tested pure
+        // `soft_tab_indent`). Hard tabs fall through to the default (a literal
+        // `\t`, whose display width already follows SqlStyling::tab_width).
+        if !mods.control()
+            && !mods.shift()
+            && !comp.open.get_untracked()
+            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _))
+            && theme::editor_soft_tabs()
+        {
+            let tw = theme::editor_tab_width();
+            editor_sig.with_untracked(|e| {
+                let full = e.doc().text().to_string();
+                let (a, b) = e.cursor.get_untracked().get_selection().unwrap_or_else(|| {
+                    let o = e.cursor.get_untracked().offset();
+                    (o, o)
+                });
+                let ed = soft_tab_indent(&full, a, b, tw);
+                e.doc().edit_single(
+                    Selection::region(ed.start, ed.end),
+                    &ed.text,
+                    EditType::InsertChars,
+                );
+                e.cursor
+                    .update(|c| c.set_insert(Selection::region(ed.sel.0, ed.sel.1)));
+            });
+            return CommandExecuted::Yes;
+        }
+        // Soft-tab outdent (Shift+Tab): the inverse of the above. Same reason —
+        // floem's built-in outdent uses the buffer's fixed indent width — so we
+        // remove one level (a leading tab, or up to `tw` spaces) per line ourselves.
+        if !mods.control()
+            && mods.shift()
+            && !comp.open.get_untracked()
+            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _))
+            && theme::editor_soft_tabs()
+        {
+            let tw = theme::editor_tab_width();
+            editor_sig.with_untracked(|e| {
+                let full = e.doc().text().to_string();
+                let (a, b) = e.cursor.get_untracked().get_selection().unwrap_or_else(|| {
+                    let o = e.cursor.get_untracked().offset();
+                    (o, o)
+                });
+                let ed = soft_tab_outdent(&full, a, b, tw);
+                // Skip the edit when nothing changes (no undo churn), but still
+                // consume the key so it never falls through to floem's fixed-width
+                // outdent.
+                if ed.text != full[ed.start..ed.end] {
+                    e.doc().edit_single(
+                        Selection::region(ed.start, ed.end),
+                        &ed.text,
+                        EditType::InsertChars,
+                    );
+                    e.cursor
+                        .update(|c| c.set_insert(Selection::region(ed.sel.0, ed.sel.1)));
+                }
+            });
+            return CommandExecuted::Yes;
         }
         // Ctrl+Space: force the completion popup open in the current context,
         // even with no prefix typed. Read the caret directly (no edit is in
