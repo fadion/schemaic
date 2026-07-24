@@ -1228,6 +1228,10 @@ fn column_key_map(
 pub(crate) struct GridCtx {
     /// The active tab's source `(database, table)`, for key-icon lookup.
     pub(crate) source: RwSignal<Option<(String, String)>>,
+    /// A column name to select + scroll into view once the grid loads, then clear
+    /// (schema-tree column double-click → open table + highlight column). The grid
+    /// consumes it via an effect, so re-requesting on an already-loaded tab works.
+    pub(crate) highlight_col: RwSignal<Option<String>>,
     pub(crate) db_nodes: RwSignal<Vec<ConnNode>>,
     /// Saved connections + the active id, for the identity-colour rule drawn at
     /// the table's top edge (the "prominent colour" setting).
@@ -1486,6 +1490,40 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             })
         };
         gs.edit_model.set(Arc::new(model));
+    });
+
+    // Column-highlight request from a schema-tree column double-click: select the
+    // whole named column (header + every cell) and scroll it into view, then clear
+    // the request. An effect — not a one-shot read — so re-requesting the highlight
+    // on an already-open tab (which rebuilds this grid) still fires. The scroll is
+    // deferred a tick so the panes have mounted and `gs.vp` is measured (a fresh
+    // build runs this effect before the first layout, when the viewport is zero).
+    let highlight_col = gctx.highlight_col;
+    let rs_hl = rs.clone();
+    create_effect(move |_| {
+        let Some(name) = highlight_col.get() else {
+            return;
+        };
+        highlight_col.set(None);
+        let Some(ci) = rs_hl.columns.iter().position(|c| c.name == name) else {
+            return;
+        };
+        // Anchor at the last row, active at the first, so the whole column is
+        // selected while the scroll target (active) keeps the view at the top.
+        let last = nrows.saturating_sub(1);
+        floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+            // The grid may have been disposed (tab switched/closed) before this
+            // tick — bail if its signals are freed rather than panicking on a read.
+            if gs.active.try_get_untracked().is_none() {
+                return;
+            }
+            gs.anchor.set(Some((last, ci)));
+            gs.active.set(Some((0, ci)));
+            scroll_active_into_view(gs, 0, ci);
+            if let Some(f) = gs.focus_id.get_untracked() {
+                f.request_focus();
+            }
+        });
     });
 
     // Horizontal offset shared between the header and the body so columns stay

@@ -8,8 +8,10 @@
 
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::time::Duration;
 
 use floem::AnyView;
+use floem::action::exec_after;
 use floem::event::{Event, EventListener, EventPropagation};
 use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
@@ -33,6 +35,16 @@ use crate::{ConnNode, CtxKind, CtxMenu, FieldCfg, Ui, db_color_dot, edit_field, 
 struct Nav {
     focused: RwSignal<bool>,
     selected: RwSignal<Option<String>>,
+    /// One-shot "scroll this row into view" request (its key), consumed by
+    /// `with_nav_scroll`. Set only by keyboard navigation — NOT by focus-gain — so
+    /// clicking a row to focus the tree never yanks the viewport to another row.
+    reveal: RwSignal<Option<String>>,
+}
+
+/// Move the nav cursor to `key` AND request it scrolled into view (keyboard nav).
+fn nav_select(nav: Nav, key: String) {
+    nav.selected.set(Some(key.clone()));
+    nav.reveal.set(Some(key));
 }
 
 // One row in the flattened, currently-visible tree (respecting expand state,
@@ -123,8 +135,16 @@ fn is_nav_selected(nav: Nav, key: &str) -> bool {
 fn with_nav_scroll(view: AnyView, nav: Nav, key: String) -> AnyView {
     let id = view.id();
     create_effect(move |_| {
-        if nav.focused.get() && nav.selected.with(|s| s.as_deref() == Some(key.as_str())) {
-            id.scroll_to(None);
+        if nav.reveal.with(|r| r.as_deref() == Some(key.as_str())) {
+            // Defer to the next tick so the scroll target is computed against
+            // settled layout — an immediate `scroll_to` runs before the viewport
+            // reflects the prior move and under-scrolls, so the bar visibly lags
+            // several rows behind the cursor. Clearing `reveal` here (after the
+            // scroll) keeps it a one-shot, so a later focus toggle can't re-scroll.
+            exec_after(Duration::ZERO, move |_| {
+                id.scroll_to(None);
+                nav.reveal.set(None);
+            });
         }
     });
     view
@@ -136,6 +156,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     let expanded = ui.schema.expanded;
     let on_toggle = ui.schema_actions.on_toggle.clone();
     let open_table = ui.tab_actions.open_table.clone();
+    let open_table_col = ui.tab_actions.open_table_col.clone();
     let active_table = ui.schema.active_table;
     let active_db = ui.tabs_ui.active_db;
     let active_conn = ui.conn.active_conn;
@@ -175,6 +196,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     let nav = Nav {
         focused: RwSignal::new(false),
         selected: RwSignal::new(None),
+        reveal: RwSignal::new(None),
     };
 
     // Cloned up front: `on_toggle`/`open_table` are moved into the tree's
@@ -182,6 +204,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     // (Right/Left toggle; Enter opens the selected table).
     let nav_toggle = on_toggle.clone();
     let nav_open_table = open_table.clone();
+    let nav_open_table_col = open_table_col.clone();
 
     // Not `width_full`: the tree sizes to its widest row so the horizontal
     // scrollbar appears when a deep/long row overflows the panel. Hidden
@@ -203,6 +226,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                     filter,
                     on_toggle: on_toggle.clone(),
                     open_table: open_table.clone(),
+                    open_table_col: open_table_col.clone(),
                     active_table,
                     active_db,
                     context_menu,
@@ -245,15 +269,33 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
             let Event::KeyDown(ke) = e else {
                 return EventPropagation::Continue;
             };
-            // Enter on a selected table row opens it (a new query tab, or the
-            // existing one if it's already open — see `open_table` in the app).
+            // Enter opens the selected row: a table row → open it (new tab, or the
+            // existing one — see `open_table`); a column row → open its table and
+            // highlight the column (mirrors the column double-click). Columns are
+            // matched by reconstructing their exact nav key from the schema rather
+            // than parsing `col:db:table:name` (identifiers may contain ':').
             if matches!(ke.key.logical_key, Key::Named(NamedKey::Enter)) {
                 if let Some(sel) = nav.selected.get_untracked() {
-                    for node in db_nodes.get_untracked() {
-                        let prefix = format!("tbl:{}:", node.database);
-                        if let Some(table) = sel.strip_prefix(&prefix) {
+                    'find: for node in db_nodes.get_untracked() {
+                        let tbl_prefix = format!("tbl:{}:", node.database);
+                        if let Some(table) = sel.strip_prefix(&tbl_prefix) {
                             (nav_open_table)(node.database.clone(), table.to_string());
-                            break;
+                            break 'find;
+                        }
+                        if let SchemaState::Loaded(schema) = node.schema.get_untracked() {
+                            for t in &schema.tables {
+                                for c in &t.columns {
+                                    let k = format!("col:{}:{}:{}", node.database, t.name, c.name);
+                                    if k == sel {
+                                        (nav_open_table_col)(
+                                            node.database.clone(),
+                                            t.name.clone(),
+                                            c.name.clone(),
+                                        );
+                                        break 'find;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -280,14 +322,14 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                         Some(i) => (i + 1).min(rows.len() - 1),
                         None => 0,
                     };
-                    nav.selected.set(Some(rows[ni].key.clone()));
+                    nav_select(nav, rows[ni].key.clone());
                 }
                 -1 => {
                     let ni = match pos {
                         Some(i) => i.saturating_sub(1),
                         None => rows.len() - 1,
                     };
-                    nav.selected.set(Some(rows[ni].key.clone()));
+                    nav_select(nav, rows[ni].key.clone());
                 }
                 2 => match pos {
                     Some(i) if rows[i].expandable && !rows[i].expanded => {
@@ -297,11 +339,11 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                         if let Some(child) = rows.get(i + 1)
                             && child.parent.as_deref() == Some(rows[i].key.as_str())
                         {
-                            nav.selected.set(Some(child.key.clone()));
+                            nav_select(nav, child.key.clone());
                         }
                     }
                     Some(_) => {}
-                    None => nav.selected.set(Some(rows[0].key.clone())),
+                    None => nav_select(nav, rows[0].key.clone()),
                 },
                 -2 => match pos {
                     Some(i) if rows[i].expandable && rows[i].expanded => {
@@ -309,10 +351,10 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                     }
                     Some(i) => {
                         if let Some(parent) = rows[i].parent.clone() {
-                            nav.selected.set(Some(parent));
+                            nav_select(nav, parent);
                         }
                     }
-                    None => nav.selected.set(Some(rows[0].key.clone())),
+                    None => nav_select(nav, rows[0].key.clone()),
                 },
                 _ => {}
             }
@@ -423,6 +465,9 @@ struct SchemaTreeCtx {
     filter: RwSignal<String>,
     on_toggle: Rc<dyn Fn(String)>,
     open_table: Rc<dyn Fn(String, String)>,
+    /// Open the column's table and highlight that column in the grid (column-row
+    /// double-click).
+    open_table_col: Rc<dyn Fn(String, String, String)>,
     active_table: RwSignal<Option<(String, String)>>,
     active_db: Memo<Option<String>>,
     context_menu: RwSignal<Option<CtxMenu>>,
@@ -439,6 +484,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
         filter,
         on_toggle,
         open_table,
+        open_table_col,
         active_table,
         active_db,
         context_menu,
@@ -506,6 +552,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
     let key_children = key.clone();
     let database = conn.database.clone();
     let ot_tables = open_table;
+    let otc_tables = open_table_col;
     let toggle_tables = on_toggle;
     let children = dyn_container(
         move || {
@@ -552,6 +599,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                     }
                     let db = database.clone();
                     let ot = ot_tables.clone();
+                    let otc = otc_tables.clone();
                     let toggle = toggle_tables.clone();
                     v_stack_from_iter(tables.into_iter().map(move |t| {
                         table_node(
@@ -562,6 +610,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                                 filter,
                                 on_toggle: toggle.clone(),
                                 open_table: ot.clone(),
+                                open_table_col: otc.clone(),
                                 active_table,
                                 active_db,
                                 context_menu,
@@ -589,6 +638,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
         expanded,
         on_toggle,
         open_table,
+        open_table_col,
         active_table,
         context_menu,
         nav,
@@ -665,6 +715,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
             }
             let counts = count_row(col_count, key_count);
             let (cdb, ctbl) = (cols_db.clone(), cols_table.clone());
+            let otc = open_table_col.clone();
             // Columns backing a FOREIGN KEY index — tinted purple like their key.
             let fk_cols: HashSet<String> = idxs
                 .iter()
@@ -679,7 +730,15 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
                 } else {
                     ColKey::None
                 };
-                column_row(c, ckind, context_menu, cdb.clone(), ctbl.clone(), nav)
+                column_row(
+                    c,
+                    ckind,
+                    context_menu,
+                    cdb.clone(),
+                    ctbl.clone(),
+                    otc.clone(),
+                    nav,
+                )
             }))
             .style(|s| s.flex_col());
             let (kdb, ktbl) = (cols_db.clone(), cols_table.clone());
@@ -766,12 +825,17 @@ fn column_row(
     context_menu: RwSignal<Option<CtxMenu>>,
     database: String,
     table: String,
+    open_table_col: Rc<dyn Fn(String, String, String)>,
     nav: Nav,
 ) -> impl IntoView {
     let name = c.name;
     let ty = c.type_name;
     let ctx_name = name.clone();
     let ctx_ty = ty.clone();
+    // Double-click opens the column's table (reusing a tab) + highlights it.
+    let dbl_db = database.clone();
+    let dbl_table = table.clone();
+    let dbl_col = name.clone();
     let nav_key = format!("col:{database}:{table}:{name}");
     // The glyph always reflects the column's *type* family — the key glyph is for
     // the key/index rows, not the columns they cover (so `id` is a numeric column,
@@ -780,8 +844,11 @@ fn column_row(
     // colour so it reads as a quieter marker beside the full-strength name.
     let glyph = column_type_icon(classify_column_type(&ty));
     let row = h_stack((
-        icons::icon(glyph, SCHEMA_ICON as f32)
-            .style(move |s| s.color(kind.color().multiply_alpha(0.5)).margin_right(ICON_GAP).flex_shrink(0.0_f32)),
+        icons::icon(glyph, SCHEMA_ICON as f32).style(move |s| {
+            s.color(kind.color().multiply_alpha(0.5))
+                .margin_right(ICON_GAP)
+                .flex_shrink(0.0_f32)
+        }),
         text(name),
         text(ty).style(|s| {
             s.color(theme::text_muted())
@@ -792,6 +859,9 @@ fn column_row(
     // The name inherits `kind.color()`; the icon overrides to 50% of it above and
     // the type text to muted.
     .style(move |s| s.color(kind.color()).items_center())
+    .on_double_click_stop(move |_| {
+        (open_table_col)(dbl_db.clone(), dbl_table.clone(), dbl_col.clone())
+    })
     .on_secondary_click_stop(move |_| {
         let ai_prompt = format!(
             "In `{database}`.`{table}`, explain the `{ctx_name}` column (type `{ctx_ty}`) — \

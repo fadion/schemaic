@@ -137,6 +137,10 @@ pub struct Tab {
     /// A byte offset the editor should jump the caret to (move + centre + focus),
     /// then clear. Set by the status-bar warning count to reach the first warning.
     pub jump_offset: RwSignal<Option<usize>>,
+    /// A column name to select + scroll into view once this tab's grid is loaded,
+    /// then clear. Set by double-clicking a column row in the schema tree (open the
+    /// table, highlight the column); the grid consumes it reactively (`grid_view`).
+    pub highlight_col: RwSignal<Option<String>>,
 }
 
 impl Tab {
@@ -168,6 +172,7 @@ impl Tab {
             cursor_offset: cx.create_rw_signal(0),
             goto_open: cx.create_rw_signal(false),
             jump_offset: cx.create_rw_signal(None),
+            highlight_col: cx.create_rw_signal(None),
         }
     }
 
@@ -553,6 +558,10 @@ pub struct TabsActions {
     /// (database, table) → always open the table in a brand-new tab, even if it's
     /// already open ("Open in new tab").
     pub open_table_new: Rc<dyn Fn(String, String)>,
+    /// (database, table, column) → open the table (reusing an existing tab) and
+    /// select + scroll the named column into view in the grid (schema-tree column
+    /// double-click).
+    pub open_table_col: Rc<dyn Fn(String, String, String)>,
     /// Open a new query tab containing `sql` (does NOT run it).
     pub open_query: Rc<dyn Fn(String)>,
     /// Switch the active tab to a database (remembers it as the new-tab default).
@@ -1774,9 +1783,10 @@ fn body(
         if ww < 1.0 {
             return right_w.get();
         }
-        right_w
-            .get()
-            .clamp(RIGHT_MIN_W, (ww - CENTER_MIN_W - SCHEMA_MIN_W).max(RIGHT_MIN_W))
+        right_w.get().clamp(
+            RIGHT_MIN_W,
+            (ww - CENTER_MIN_W - SCHEMA_MIN_W).max(RIGHT_MIN_W),
+        )
     };
     let eff_schema_w = move || {
         if !schema_visible.get() || !schema_panel_allowed() {
@@ -1786,9 +1796,10 @@ fn body(
         if ww < 1.0 {
             return schema_w.get();
         }
-        schema_w
-            .get()
-            .clamp(SCHEMA_MIN_W, (ww - CENTER_MIN_W - eff_right_w()).max(SCHEMA_MIN_W))
+        schema_w.get().clamp(
+            SCHEMA_MIN_W,
+            (ww - CENTER_MIN_W - eff_right_w()).max(SCHEMA_MIN_W),
+        )
     };
 
     // Left: the schema tree. Always mounted (it only reads signals; nothing is
@@ -2060,6 +2071,7 @@ fn center(ui: Ui) -> impl IntoView {
                 cancel.clone(),
                 GridCtx {
                     source: tab.source,
+                    highlight_col: tab.highlight_col,
                     db_nodes,
                     connections,
                     active_conn,
