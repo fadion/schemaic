@@ -81,6 +81,12 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
         }
     });
 
+    // A `scroll` hands its child unbounded width, so the bubble list can't just
+    // `width_full` (it would size to content and never wrap). Instead we measure
+    // the scroll viewport's width (below) and pin the list to it, so the bubbles
+    // track the panel as it's resized. Seeded to the default until first layout.
+    let panel_w = RwSignal::new(theme::AI_W);
+
     // Whole list rebuilds on any change (few messages; also lets the pending
     // bubble flip to its answer in place without stale-view issues).
     let convo = dyn_container(
@@ -111,9 +117,10 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                 )
                 .into_any();
             }
-            // Fixed width (a scroll gives its child unbounded width) so bubble
-            // text wraps. 10px between messages; the first label sits 10px below
-            // the title; bubbles carry their own 15/60px side margins.
+            // Width pinned to the scroll viewport (`panel_w`, measured below) so a
+            // scroll's unbounded child width doesn't stop the text wrapping, while
+            // still tracking the panel as it's resized. 10px between messages; the
+            // first label sits 10px below the title; bubbles carry their own margins.
             let actions = code_actions.clone();
             let regen = regenerate.clone();
             let last = msgs.len().saturating_sub(1);
@@ -131,9 +138,9 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                 )
             }));
             ai_seen().set(total);
-            list.style(|s| {
+            list.style(move |s| {
                 s.flex_col()
-                    .width(theme::AI_W)
+                    .width(panel_w.get())
                     .gap(10.0)
                     .padding_top(10.0)
                     .padding_bottom(10.0)
@@ -175,6 +182,14 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
         .scroll_to(move || {
             bump.get();
             Some(Point::new(0.0, 1.0e9))
+        })
+        // Publish the viewport width so the bubble list can size to it (responsive
+        // bubbles). The list is clipped by the scroll, so this can't feed back into
+        // the scroll's own width — no layout loop.
+        .on_resize(move |r| {
+            if (r.width() - panel_w.get_untracked()).abs() > 0.5 {
+                panel_w.set(r.width());
+            }
         })
         .style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0));
 
