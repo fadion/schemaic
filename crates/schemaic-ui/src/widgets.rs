@@ -164,8 +164,8 @@ pub(crate) fn window_size() -> RwSignal<(f64, f64)> {
 
 // ── Reusable themed popup menu (with nested submenus) ───────────────────────
 //
-// `menu_panel(entries, close)` renders a themed popup (matching the schema /
-// editor context menus) from a `Vec<MenuEntry>`; a `Sub` entry hover-expands a
+// `menu_panel(entries, close, width)` renders a themed popup (matching the schema
+// / editor context menus) from a `Vec<MenuEntry>`; a `Sub` entry hover-expands a
 // nested panel to its right. The caller positions the returned panel absolutely
 // (at the cursor, etc.). Dismissal: the panel absorbs its own pointer-downs so a
 // root-level "pointer-down anywhere closes the menu" handler only fires for
@@ -316,7 +316,8 @@ fn menu_entry_view(
             children,
         } => {
             let n = children.len();
-            let sub = menu_stack(children, close);
+            // Submenus keep the standard width (they only appear in the grid menus).
+            let sub = menu_stack(children, close, 170.0);
             // The parent row's window position/width, to decide edge-flips.
             let row_origin: RwSignal<Point> = RwSignal::new(Point::ZERO);
             let row_w = RwSignal::new(0.0_f64);
@@ -362,7 +363,8 @@ fn menu_entry_view(
 }
 
 /// One menu level: the styled panel of rows (used for the root and every submenu).
-fn menu_stack(entries: Vec<MenuEntry>, close: Rc<dyn Fn()>) -> impl IntoView {
+/// `width` is the panel's `min_width` (short labels never exceed it).
+fn menu_stack(entries: Vec<MenuEntry>, close: Rc<dyn Fn()>, width: f64) -> impl IntoView {
     let open_sub: RwSignal<Option<usize>> = RwSignal::new(None);
     let rows: Vec<AnyView> = entries
         .into_iter()
@@ -371,20 +373,24 @@ fn menu_stack(entries: Vec<MenuEntry>, close: Rc<dyn Fn()>) -> impl IntoView {
         .collect();
     v_stack_from_iter(rows)
         .on_event_stop(EventListener::PointerDown, |_| {})
-        .style(|s| {
+        .style(move |s| {
             panel_style(s)
                 .background(theme::bg_chrome())
-                .min_width(170.0)
+                .min_width(width)
                 .padding_vert(6.0)
                 .font_size(theme::FONT_TITLE)
         })
 }
 
-/// A reusable themed popup menu with nested submenus. Returns the panel; the
-/// caller positions it absolutely. Escape (and any action) calls `close`.
-pub(crate) fn menu_panel(entries: Vec<MenuEntry>, close: Rc<dyn Fn()>) -> impl IntoView {
+/// A reusable themed popup menu with nested submenus, `width` px wide. Returns the
+/// panel; the caller positions it absolutely. Escape (and any action) calls `close`.
+pub(crate) fn menu_panel(
+    entries: Vec<MenuEntry>,
+    close: Rc<dyn Fn()>,
+    width: f64,
+) -> impl IntoView {
     let esc = close.clone();
-    menu_stack(entries, close)
+    menu_stack(entries, close, width)
         .keyboard_navigable()
         .request_focus(|| {})
         .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| (esc)())

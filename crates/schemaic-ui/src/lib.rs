@@ -800,6 +800,9 @@ pub struct OverlayUi {
     /// real width — unlike the cursor path's conservative estimate). Set by the
     /// grid's Copy toolbar dropdown; cleared (`None`) by the cursor right-click menus.
     pub popup_anchor: RwSignal<Option<(f64, f64, f64, f64)>>,
+    /// `min_width` (px) of the next `popup_menu`. An opener sets it before opening;
+    /// it resets to 170 on close, so menus that don't set one get the default.
+    pub popup_width: RwSignal<f64>,
     /// Last pointer position in window coords (anchors the context menu).
     pub last_mouse: RwSignal<(f64, f64)>,
     pub find_open: RwSignal<bool>,
@@ -1058,6 +1061,17 @@ pub fn workspace(ui: Ui) -> impl IntoView {
     let last_mouse = ui.overlay.last_mouse;
     let context_menu = ui.overlay.context_menu;
     let popup_menu = ui.overlay.popup_menu;
+    // Reset the popup width to the default whenever the popup closes (covers every
+    // close path: Escape/action, the root pointer-down, and the grid's dismiss), so
+    // a menu that doesn't set a width gets 170.
+    {
+        let popup_width = ui.overlay.popup_width;
+        create_effect(move |_| {
+            if popup_menu.get().is_none() && popup_width.get_untracked() != 170.0 {
+                popup_width.set(170.0);
+            }
+        });
+    }
     let db_menu_open = ui.schema.db_menu_open;
     let schema_menu_open = ui.schema.schema_menu_open;
     // Panel visibility is owned by the app (loaded from / saved to disk), so the
@@ -1815,6 +1829,7 @@ fn center(ui: Ui) -> impl IntoView {
     let context_menu = ui.overlay.context_menu;
     let popup = ui.overlay.popup_menu;
     let popup_anchor = ui.overlay.popup_anchor;
+    let popup_width = ui.overlay.popup_width;
     let editor_h = ui.layout.editor_h;
     // Reveal the AI panel + send a message (the grid cell "AI Summary" builds a
     // context-rich prompt itself, so this just reveals + forwards).
@@ -1922,6 +1937,7 @@ fn center(ui: Ui) -> impl IntoView {
                     confirm_writes,
                     popup_menu: popup,
                     popup_anchor,
+                    popup_width,
                     open_plan: open_plan.clone(),
                     nav: navkeys.clone(),
                 })
@@ -3215,6 +3231,7 @@ fn status_menu_seg(
     menu_owner: RwSignal<u8>,
     popup_menu: RwSignal<Option<Vec<MenuEntry>>>,
     popup_anchor: RwSignal<Option<(f64, f64, f64, f64)>>,
+    popup_width: RwSignal<f64>,
     margin: f64,
 ) -> impl IntoView {
     let origin: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
@@ -3239,6 +3256,7 @@ fn status_menu_seg(
         let (ox, oy) = origin.get_untracked();
         let (sw, _sh) = size.get_untracked();
         popup_anchor.set(Some((ox, ox + sw, oy, sw)));
+        popup_width.set(125.0);
         popup_menu.set(Some((build)()));
     })
     .style(move |s| {
@@ -3262,6 +3280,7 @@ fn footer(ui: Ui) -> impl IntoView {
     let word_wrap = ui.layout.word_wrap;
     let popup_menu = ui.overlay.popup_menu;
     let popup_anchor = ui.overlay.popup_anchor;
+    let popup_width = ui.overlay.popup_width;
     let toggle_read_only = ui.conn_actions.toggle_read_only.clone();
     let resources = ui.resources;
     // Which status-bar segment owns the shared popup (0 none / 1 tabs / 2 model /
@@ -3420,6 +3439,7 @@ fn footer(ui: Ui) -> impl IntoView {
         menu_owner,
         popup_menu,
         popup_anchor,
+        popup_width,
         15.0,
     );
     // Word wrap — click toggles it.
@@ -3528,6 +3548,7 @@ fn footer(ui: Ui) -> impl IntoView {
         menu_owner,
         popup_menu,
         popup_anchor,
+        popup_width,
         15.0,
     );
     let effort_seg = status_menu_seg(
@@ -3551,6 +3572,7 @@ fn footer(ui: Ui) -> impl IntoView {
         menu_owner,
         popup_menu,
         popup_anchor,
+        popup_width,
         15.0,
     );
     let cpu_seg = dyn_container(
