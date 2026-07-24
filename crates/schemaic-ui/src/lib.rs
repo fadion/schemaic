@@ -134,6 +134,9 @@ pub struct Tab {
     /// Opens this tab's Go-to-line popup. Set by Ctrl+G in the editor or by
     /// clicking the Ln/Col segment in the status bar; the editor pane owns the view.
     pub goto_open: RwSignal<bool>,
+    /// A byte offset the editor should jump the caret to (move + centre + focus),
+    /// then clear. Set by the status-bar warning count to reach the first warning.
+    pub jump_offset: RwSignal<Option<usize>>,
 }
 
 impl Tab {
@@ -164,6 +167,7 @@ impl Tab {
             edit_buf: cx.create_rw_signal(String::new()),
             cursor_offset: cx.create_rw_signal(0),
             goto_open: cx.create_rw_signal(false),
+            jump_offset: cx.create_rw_signal(None),
         }
     }
 
@@ -1917,6 +1921,7 @@ fn center(ui: Ui) -> impl IntoView {
                     query: tab.query,
                     cursor_offset: tab.cursor_offset,
                     goto_open: tab.goto_open,
+                    jump_offset: tab.jump_offset,
                     results: tab.results,
                     run: run.clone(),
                     run_all: run_all.clone(),
@@ -3458,30 +3463,45 @@ fn footer(ui: Ui) -> impl IntoView {
             .color(theme::status_text())
             .hover(|s| s.color(theme::chip_active()))
     });
-    // Warnings: amber triangle + amber count, or a green check (no text) when clean.
+    // Warnings: amber triangle + amber count (click jumps to the first warning,
+    // hovering to the brighter amber), or a green check (no text, inert) when clean.
+    // Colour lives on the container so the icon (currentColor) + count inherit it.
     let warn_seg = dyn_container(
         move || warn_count.get(),
         move |n| {
             if n == 0 {
-                icons::icon(icons::CIRCLE_CHECK, 15.0)
-                    .style(|s| s.color(theme::status_ok()))
-                    .into_any()
+                icons::icon(icons::CIRCLE_CHECK, 15.0).into_any()
             } else {
                 h_stack((
-                    icons::icon(icons::TRIANGLE_ALERT, 16.0)
-                        .style(|s| s.color(theme::status_warn())),
-                    text(n.to_string()).style(|s| {
-                        s.margin_left(5.0)
-                            .color(theme::status_warn())
-                            .font_size(theme::FONT_STATUS)
-                    }),
+                    icons::icon(icons::TRIANGLE_ALERT, 16.0),
+                    text(n.to_string()).style(|s| s.margin_left(5.0).font_size(theme::FONT_STATUS)),
                 ))
                 .style(|s| s.flex_row().items_center())
                 .into_any()
             }
         },
     )
-    .style(|s| s.margin_left(40.0));
+    .on_click_stop(move |_| {
+        // Jump the editor to the first warning (no-op when there are none).
+        let id = active.get_untracked();
+        tabs.with_untracked(|v| {
+            if let Some(t) = v.iter().find(|t| t.id == id) {
+                let q = t.query.get_untracked();
+                if let Some(&(start, _)) = editor_pane::syntax_errors(&q, db_nodes).first() {
+                    t.jump_offset.set(Some(start));
+                }
+            }
+        });
+    })
+    .style(move |s| {
+        let s = s.margin_left(40.0).items_center();
+        if warn_count.get() == 0 {
+            s.color(theme::status_ok())
+        } else {
+            s.color(theme::status_warn())
+                .hover(|s| s.color(theme::status_warn_hover()))
+        }
+    });
     // Read-only vs write mode (the active connection's setting). Read-only reads
     // as normal status text; write mode is amber so it stands out. Click toggles
     // it — a shortcut for the Manage-Connections read-only switch. Colour + hover
