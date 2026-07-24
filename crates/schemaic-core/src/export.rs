@@ -68,14 +68,14 @@ pub fn export_json(rs: &ResultSet, order: &[usize]) -> String {
     let keys = unique_column_keys(rs);
     let arr: Vec<serde_json::Value> = order
         .iter()
-        .filter_map(|&di| rs.rows.get(di))
-        .map(|row| {
+        .filter(|&&di| di < rs.row_count())
+        .map(|&di| {
             let mut obj = serde_json::Map::new();
             for (ci, key) in keys.iter().enumerate() {
                 obj.insert(
                     key.clone(),
-                    row.get(ci)
-                        .map(value_to_json)
+                    rs.cell(di, ci)
+                        .map(|c| value_to_json(&c.to_value()))
                         .unwrap_or(serde_json::Value::Null),
                 );
             }
@@ -108,10 +108,8 @@ pub fn export_column_json(rs: &ResultSet, order: &[usize], ci: usize) -> String 
     let arr: Vec<serde_json::Value> = order
         .iter()
         .map(|&di| {
-            rs.rows
-                .get(di)
-                .and_then(|r| r.get(ci))
-                .map(value_to_json)
+            rs.cell(di, ci)
+                .map(|c| value_to_json(&c.to_value()))
                 .unwrap_or(serde_json::Value::Null)
         })
         .collect();
@@ -122,9 +120,10 @@ pub fn export_column_json(rs: &ResultSet, order: &[usize], ci: usize) -> String 
 pub fn export_column_csv(rs: &ResultSet, order: &[usize], ci: usize) -> String {
     let mut out = String::new();
     for &di in order {
-        let v = match rs.rows.get(di).and_then(|r| r.get(ci)) {
-            Some(Value::Null) | None => String::new(),
-            Some(v) => csv_field(&v.display()),
+        let v = match rs.cell(di, ci) {
+            None => String::new(),
+            Some(c) if c.is_null() => String::new(),
+            Some(c) => csv_field(c.display()),
         };
         out.push_str(&v);
         out.push('\n');
@@ -142,17 +141,19 @@ pub fn export_csv(rs: &ResultSet, order: &[usize]) -> String {
         .join(",");
     out.push('\n');
     for &di in order {
-        if let Some(row) = rs.rows.get(di) {
-            let line = (0..rs.columns.len())
-                .map(|ci| match row.get(ci) {
-                    Some(Value::Null) | None => String::new(),
-                    Some(v) => csv_field(&v.display()),
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            out.push_str(&line);
-            out.push('\n');
+        if di >= rs.row_count() {
+            continue;
         }
+        let line = (0..rs.columns.len())
+            .map(|ci| match rs.cell(di, ci) {
+                None => String::new(),
+                Some(c) if c.is_null() => String::new(),
+                Some(c) => csv_field(c.display()),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        out.push_str(&line);
+        out.push('\n');
     }
     out
 }
@@ -186,15 +187,17 @@ pub fn export_markdown(rs: &ResultSet, order: &[usize]) -> String {
     let mut out = row_line(rs.columns.iter().map(|c| md_cell(&c.name)).collect());
     out.push_str(&row_line((0..n).map(|_| "---".to_string()).collect()));
     for &di in order {
-        if let Some(row) = rs.rows.get(di) {
-            let cells = (0..n)
-                .map(|ci| match row.get(ci) {
-                    Some(Value::Null) | None => String::new(),
-                    Some(v) => md_cell(&v.display()),
-                })
-                .collect();
-            out.push_str(&row_line(cells));
+        if di >= rs.row_count() {
+            continue;
         }
+        let cells = (0..n)
+            .map(|ci| match rs.cell(di, ci) {
+                None => String::new(),
+                Some(c) if c.is_null() => String::new(),
+                Some(c) => md_cell(c.display()),
+            })
+            .collect();
+        out.push_str(&row_line(cells));
     }
     out
 }
@@ -211,18 +214,20 @@ pub fn export_html(rs: &ResultSet, order: &[usize]) -> String {
     }
     out.push_str("</tr>\n</thead>\n<tbody>\n");
     for &di in order {
-        if let Some(row) = rs.rows.get(di) {
-            out.push_str("<tr>");
-            for ci in 0..rs.columns.len() {
-                out.push_str("<td>");
-                match row.get(ci) {
-                    Some(Value::Null) | None => {}
-                    Some(v) => out.push_str(&html_escape(&v.display())),
-                }
-                out.push_str("</td>");
-            }
-            out.push_str("</tr>\n");
+        if di >= rs.row_count() {
+            continue;
         }
+        out.push_str("<tr>");
+        for ci in 0..rs.columns.len() {
+            out.push_str("<td>");
+            match rs.cell(di, ci) {
+                None => {}
+                Some(c) if c.is_null() => {}
+                Some(c) => out.push_str(&html_escape(c.display())),
+            }
+            out.push_str("</td>");
+        }
+        out.push_str("</tr>\n");
     }
     out.push_str("</tbody>\n</table>\n");
     out
@@ -244,19 +249,20 @@ pub fn export_inserts(rs: &ResultSet, order: &[usize], source: Option<(&str, &st
         .join(", ");
     let mut out = String::new();
     for &di in order {
-        if let Some(row) = rs.rows.get(di) {
-            let vals = (0..rs.columns.len())
-                .map(|ci| {
-                    row.get(ci)
-                        .map(sql_literal)
-                        .unwrap_or_else(|| "NULL".to_string())
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            out.push_str(&format!(
-                "INSERT INTO {table_sql} ({cols}) VALUES ({vals});\n"
-            ));
+        if di >= rs.row_count() {
+            continue;
         }
+        let vals = (0..rs.columns.len())
+            .map(|ci| {
+                rs.cell(di, ci)
+                    .map(|c| sql_literal(&c.to_value()))
+                    .unwrap_or_else(|| "NULL".to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            "INSERT INTO {table_sql} ({cols}) VALUES ({vals});\n"
+        ));
     }
     out
 }
@@ -275,16 +281,13 @@ mod tests {
     }
 
     fn rs() -> ResultSet {
-        ResultSet {
-            columns: vec![col("id"), col("a`b")],
-            rows: vec![
+        ResultSet::from_rows(
+            vec![col("id"), col("a`b")],
+            vec![
                 vec![Value::Int(1), Value::Str("x".to_string())],
                 vec![Value::Null, Value::Str("y".to_string())],
             ],
-            elapsed_ms: 0,
-            truncated: false,
-            affected: None,
-        }
+        )
     }
 
     #[test]
@@ -333,13 +336,10 @@ mod tests {
 
     #[test]
     fn json_suffixes_duplicate_columns() {
-        let rs = ResultSet {
-            columns: vec![col("id"), col("id"), col("id")],
-            rows: vec![vec![Value::Int(1), Value::Int(2), Value::Int(3)]],
-            elapsed_ms: 0,
-            truncated: false,
-            affected: None,
-        };
+        let rs = ResultSet::from_rows(
+            vec![col("id"), col("id"), col("id")],
+            vec![vec![Value::Int(1), Value::Int(2), Value::Int(3)]],
+        );
         let v: serde_json::Value = serde_json::from_str(&export_json(&rs, &[0])).unwrap();
         assert_eq!(v[0]["id"], 1);
         assert_eq!(v[0]["id_2"], 2);
@@ -422,13 +422,10 @@ mod tests {
 
     #[test]
     fn export_html_escapes_entities_and_nulls_are_empty() {
-        let rs = ResultSet {
-            columns: vec![col("a<b>")],
-            rows: vec![vec![Value::Str("x&y".to_string())], vec![Value::Null]],
-            elapsed_ms: 0,
-            truncated: false,
-            affected: None,
-        };
+        let rs = ResultSet::from_rows(
+            vec![col("a<b>")],
+            vec![vec![Value::Str("x&y".to_string())], vec![Value::Null]],
+        );
         let out = export_html(&rs, &[0, 1]);
         assert!(out.contains("<th>a&lt;b&gt;</th>"));
         assert!(out.contains("<td>x&amp;y</td>"));

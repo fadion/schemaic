@@ -257,13 +257,7 @@ mod tests {
     }
 
     fn rs(columns: Vec<Column>) -> ResultSet {
-        ResultSet {
-            columns,
-            rows: Vec::new(),
-            elapsed_ms: 0,
-            truncated: false,
-            affected: None,
-        }
+        ResultSet::from_rows(columns, Vec::new())
     }
 
     /// Schema table with the given primary-key column names (INT, NOT NULL).

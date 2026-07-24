@@ -27,8 +27,8 @@ use schemaic_core::connection::Connection;
 use schemaic_core::edit::{EditModel, analyze_edit, refetch_template};
 use schemaic_core::format::{self, ColumnFormat, ColumnFormatRule};
 use schemaic_core::model::{
-    CommitDone, GridWrite, QueryState, RefetchRequest, RefetchRow, ResultSet, RowDelete, RowEdit,
-    RowInsert, Value,
+    CellRef, CellTag, CommitDone, GridWrite, QueryState, RefetchRequest, RefetchRow, ResultSet,
+    RowDelete, RowEdit, RowInsert, Value,
 };
 use schemaic_core::schema::SchemaState;
 use schemaic_core::text::plural;
@@ -157,14 +157,11 @@ fn cycle_sort(sort: RwSignal<SortState>, ci: usize) {
 /// A stable permutation of row indices for the given sort (identity when
 /// `None`). Nulls sort last; numeric columns compare numerically.
 fn compute_order(rs: &ResultSet, sort: SortState) -> Vec<usize> {
-    let mut idx: Vec<usize> = (0..rs.rows.len()).collect();
+    let mut idx: Vec<usize> = (0..rs.row_count()).collect();
     if let Some((c, asc)) = sort {
         idx.sort_by(|&a, &b| {
-            let o = match (
-                rs.rows.get(a).and_then(|r| r.get(c)),
-                rs.rows.get(b).and_then(|r| r.get(c)),
-            ) {
-                (Some(x), Some(y)) => cmp_value(x, y),
+            let o = match (rs.cell(a, c), rs.cell(b, c)) {
+                (Some(x), Some(y)) => cmp_cell(x, y),
                 _ => Ordering::Equal,
             };
             if asc { o } else { o.reverse() }
@@ -173,23 +170,26 @@ fn compute_order(rs: &ResultSet, sort: SortState) -> Vec<usize> {
     idx
 }
 
-fn value_num(v: &Value) -> Option<f64> {
-    match v {
-        Value::Int(i) => Some(*i as f64),
-        Value::UInt(u) => Some(*u as f64),
-        Value::Float(f) => Some(*f),
+/// Numeric view of a cell for sorting — only for numeric-*tagged* cells (a `Str`
+/// that happens to look like a number is compared as text, matching the old
+/// `Value`-variant gate). Parses the arena text to `f64` on demand.
+fn cell_num(c: CellRef) -> Option<f64> {
+    match c.tag {
+        CellTag::Int | CellTag::UInt | CellTag::Float => c.text().parse::<f64>().ok(),
         _ => None,
     }
 }
 
-fn cmp_value(a: &Value, b: &Value) -> Ordering {
-    match (a, b) {
-        (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => Ordering::Greater,
-        (_, Value::Null) => Ordering::Less,
-        _ => match (value_num(a), value_num(b)) {
+/// Sort comparison between two cells: NULLs sort last; two numeric cells compare
+/// numerically; anything else compares by displayed text.
+fn cmp_cell(a: CellRef, b: CellRef) -> Ordering {
+    match (a.is_null(), b.is_null()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => match (cell_num(a), cell_num(b)) {
             (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
-            _ => a.display().cmp(&b.display()),
+            _ => a.display().cmp(b.display()),
         },
     }
 }
@@ -366,13 +366,13 @@ impl GridState {
     /// equals the original the entry is dropped (no longer dirty).
     fn stage(&self, di: usize, ci: usize, val: Option<String>) {
         // Original as `Option<String>`: NULL → `None`.
-        let orig = self
-            .rs
-            .get_untracked()
-            .rows
-            .get(di)
-            .and_then(|r| r.get(ci))
-            .map(|v| if v.is_null() { None } else { Some(v.display()) });
+        let orig = self.rs.get_untracked().cell(di, ci).map(|c| {
+            if c.is_null() {
+                None
+            } else {
+                Some(c.display().to_string())
+            }
+        });
         let orig = orig.unwrap_or(None);
         self.dirty.update(|d| {
             if orig == val {
@@ -430,7 +430,7 @@ impl GridState {
         let rs = self.rs.get_untracked();
         let ncols = rs.col_count();
         let mut map: HashMap<usize, Option<String>> = HashMap::new();
-        if let Some(row) = rs.rows.get(data_idx) {
+        if data_idx < rs.row_count() {
             for ci in 0..ncols {
                 if !model.editable(ci) {
                     continue;
@@ -444,8 +444,15 @@ impl GridState {
                 if auto {
                     continue; // server assigns the auto-increment key
                 }
-                if let Some(v) = row.get(ci) {
-                    map.insert(ci, if v.is_null() { None } else { Some(v.display()) });
+                if let Some(c) = rs.cell(data_idx, ci) {
+                    map.insert(
+                        ci,
+                        if c.is_null() {
+                            None
+                        } else {
+                            Some(c.display().to_string())
+                        },
+                    );
                 }
             }
         }
@@ -547,10 +554,8 @@ impl GridState {
                 .iter()
                 .map(|&kci| {
                     let val = rs
-                        .rows
-                        .get(di)
-                        .and_then(|r| r.get(kci))
-                        .cloned()
+                        .cell(di, kci)
+                        .map(|c| c.to_value())
                         .unwrap_or(Value::Null);
                     (real_col(kci), val)
                 })
@@ -627,11 +632,20 @@ impl GridState {
         dis.sort_unstable(); // deterministic DELETE order
         dis.into_iter()
             .filter_map(|di| {
-                let row = rs.rows.get(di)?;
+                if di >= rs.row_count() {
+                    return None;
+                }
                 let key: Vec<(String, Value)> = tbl
                     .key_cols
                     .iter()
-                    .map(|&kci| (real_col(kci), row.get(kci).cloned().unwrap_or(Value::Null)))
+                    .map(|&kci| {
+                        (
+                            real_col(kci),
+                            rs.cell(di, kci)
+                                .map(|c| c.to_value())
+                                .unwrap_or(Value::Null),
+                        )
+                    })
                     .collect();
                 Some(RowDelete {
                     database: tbl.database.clone(),
@@ -669,10 +683,8 @@ impl GridState {
                         Some(Some(t)) => Value::Str(t.clone()),
                         Some(None) => Value::Null,
                         None => rs
-                            .rows
-                            .get(di)
-                            .and_then(|r| r.get(kci))
-                            .cloned()
+                            .cell(di, kci)
+                            .map(|c| c.to_value())
                             .unwrap_or(Value::Null),
                     })
                     .collect();
@@ -690,21 +702,7 @@ impl GridState {
     fn apply_splice(&self, rows: Vec<(usize, Vec<Value>)>) {
         if !rows.is_empty() {
             self.rs.update(|arc| {
-                let rs = Arc::make_mut(arc);
-                for (di, cells) in &rows {
-                    if let Some(row) = rs.rows.get_mut(*di) {
-                        if cells.len() == row.len() {
-                            *row = cells.clone();
-                        } else {
-                            // Defensive: partial overwrite on a length mismatch.
-                            for (i, v) in cells.iter().enumerate() {
-                                if let Some(slot) = row.get_mut(i) {
-                                    *slot = v.clone();
-                                }
-                            }
-                        }
-                    }
-                }
+                Arc::make_mut(arc).splice_rows(&rows);
             });
             if let Some(sync) = self.sync_canonical.get_untracked() {
                 (sync)(self.rs.get_untracked());
@@ -742,16 +740,16 @@ impl GridState {
 /// sans — IBM Plex Sans — at `FONT_BODY`), via a throwaway `TextLayout`. Used to
 /// Estimate a column's initial width from its header + a sample of cell values.
 fn init_widths(rs: &ResultSet, key_map: &HashMap<String, ColKey>) -> Vec<f64> {
-    let sample = rs.rows.len().min(200);
+    let sample = rs.row_count().min(200);
     rs.columns
         .iter()
         .enumerate()
         .map(|(ci, col)| {
             let mut chars = col.name.chars().count() + 3; // room for the sort arrow
             chars = chars.max(col.type_name.chars().count());
-            for r in rs.rows.iter().take(sample) {
-                if let Some(v) = r.get(ci) {
-                    chars = chars.max(v.display().chars().count().min(60));
+            for r in 0..sample {
+                if let Some(c) = rs.cell(r, ci) {
+                    chars = chars.max(c.display().chars().count().min(60));
                 }
             }
             // A key column's header carries a leading key icon; budget for it so the
@@ -778,9 +776,9 @@ fn autofit_width(rs: &ResultSet, ci: usize, has_key: bool) -> f64 {
     if let Some(c) = rs.columns.get(ci) {
         chars = chars.max(c.type_name.chars().count());
     }
-    for r in &rs.rows {
-        if let Some(v) = r.get(ci) {
-            chars = chars.max(v.display().chars().count().min(140));
+    for r in 0..rs.row_count() {
+        if let Some(c) = rs.cell(r, ci) {
+            chars = chars.max(c.display().chars().count().min(140));
         }
     }
     let icon = if has_key { HEADER_KEY_ICON_W } else { 0.0 };
@@ -920,13 +918,8 @@ fn copy_selection(gs: GridState) {
             if ci > c0 {
                 out.push('\t');
             }
-            let s = rs
-                .rows
-                .get(di)
-                .and_then(|r| r.get(ci))
-                .map(|v| v.display())
-                .unwrap_or_default();
-            out.push_str(&s);
+            let s = rs.cell(di, ci).map(|c| c.display()).unwrap_or_default();
+            out.push_str(s);
         }
     }
     let _ = floem::Clipboard::set_contents(out);
@@ -1090,10 +1083,8 @@ fn value_viewer(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                 let name = col.map(|c| c.name.clone()).unwrap_or_default();
                 let ty = col.map(|c| c.type_name.clone()).unwrap_or_default();
                 let raw = rs
-                    .rows
-                    .get(di)
-                    .and_then(|r| r.get(ci))
-                    .map(|v| v.display())
+                    .cell(di, ci)
+                    .map(|c| c.display().to_string())
                     .unwrap_or_default();
                 title_sig.set(format!("{name}  ·  {ty}  ·  Row {}", i + 1));
                 text_sig.set(pretty_json(&raw).unwrap_or_else(|| raw.clone()));
@@ -1947,11 +1938,9 @@ fn start_edit(gs: GridState, i: usize, ci: usize) {
             None => gs
                 .rs
                 .get_untracked()
-                .rows
-                .get(di)
-                .and_then(|r| r.get(ci))
-                .filter(|v| !v.is_null()) // original NULL → edit from empty
-                .map(|v| v.display())
+                .cell(di, ci)
+                .filter(|c| !c.is_null()) // original NULL → edit from empty
+                .map(|c| c.display().to_string())
                 .unwrap_or_default(),
         }
     };
@@ -2126,9 +2115,9 @@ fn grid_find(gs: GridState, forward: bool, from_current: bool) {
         };
         let (dr, ci) = (lin / ncols, lin % ncols);
         let data = order[dr];
-        if let Some(v) = rs.rows.get(data).and_then(|r| r.get(ci)) {
+        if let Some(c) = rs.cell(data, ci) {
             let fmt = formats.get(ci).copied().unwrap_or_default();
-            if contains_ignore_ascii_case(&format::apply(fmt, v), &q) {
+            if contains_ignore_ascii_case(&format::apply(fmt, &c.to_value()), &q) {
                 gs.active.set(Some((dr, ci)));
                 gs.anchor.set(Some((dr, ci)));
                 scroll_active_into_view(gs, dr, ci);
@@ -2164,16 +2153,15 @@ fn grid_find_hits(gs: GridState) -> (Vec<usize>, bool) {
     let mut more = false;
     let mut scanned = 0usize;
     'outer: for (dr, &data) in order.iter().enumerate() {
-        let row = rs.rows.get(data);
         for ci in 0..ncols {
             if scanned >= FIND_COUNT_CELL_BUDGET {
                 more = true;
                 break 'outer;
             }
             scanned += 1;
-            if let Some(v) = row.and_then(|r| r.get(ci)) {
+            if let Some(c) = rs.cell(data, ci) {
                 let fmt = formats.get(ci).copied().unwrap_or_default();
-                if contains_ignore_ascii_case(&format::apply(fmt, v), &q) {
+                if contains_ignore_ascii_case(&format::apply(fmt, &c.to_value()), &q) {
                     hits.push(dr * ncols + ci);
                     if hits.len() >= FIND_MAX_HITS {
                         more = true;
@@ -2907,12 +2895,10 @@ fn data_cell(
                 }
                 None => {
                     let staged = gs.dirty.with(|d| d.get(&dkey).cloned());
-                    let (orig, orig_null) =
-                        gs.rs
-                            .with(|rs| match rs.rows.get(data_idx).and_then(|r| r.get(ci)) {
-                                Some(v) => (format::apply(fmt, v), v.is_null()),
-                                None => (String::new(), true),
-                            });
+                    let (orig, orig_null) = gs.rs.with(|rs| match rs.cell(data_idx, ci) {
+                        Some(c) => (format::apply(fmt, &c.to_value()), c.is_null()),
+                        None => (String::new(), true),
+                    });
                     (staged, orig, orig_null)
                 }
             };
@@ -3126,10 +3112,8 @@ fn data_cell(
                 None => match pending {
                     Some(_) => String::new(),
                     None => rs
-                        .rows
-                        .get(data_idx)
-                        .and_then(|r| r.get(ci))
-                        .map(|v| v.display())
+                        .cell(data_idx, ci)
+                        .map(|c| c.display().to_string())
                         .unwrap_or_default(),
                 },
             };
@@ -3147,10 +3131,8 @@ fn data_cell(
                 None => gs.dirty.with_untracked(|d| d.contains_key(&dkey)),
             };
             let formatted_val = if fmt != ColumnFormat::None && !staged_here && pending.is_none() {
-                rs.rows
-                    .get(data_idx)
-                    .and_then(|r| r.get(ci))
-                    .map(|v| format::apply(fmt, v))
+                rs.cell(data_idx, ci)
+                    .map(|c| format::apply(fmt, &c.to_value()))
                     .unwrap_or_else(|| val.clone())
             } else {
                 val.clone()

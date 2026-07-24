@@ -158,11 +158,12 @@ fn format_table(rs: &ResultSet) -> String {
     let header: Vec<&str> = rs.columns.iter().map(|c| c.name.as_str()).collect();
     out.push_str(&format!("| {} |\n", header.join(" | ")));
     out.push_str(&format!("| {} |\n", vec!["---"; header.len()].join(" | ")));
-    for row in &rs.rows {
-        let cells: Vec<String> = row
-            .iter()
-            .map(|v| {
-                let s = v.display().replace('|', "\\|").replace('\n', " ");
+    let ncols = rs.col_count();
+    for r in 0..rs.row_count() {
+        let cells: Vec<String> = (0..ncols)
+            .map(|c| {
+                let raw = rs.cell(r, c).map(|cell| cell.display()).unwrap_or_default();
+                let s = raw.replace('|', "\\|").replace('\n', " ");
                 if s.chars().count() > 60 {
                     format!("{}…", s.chars().take(60).collect::<String>())
                 } else {
@@ -235,14 +236,13 @@ mod tests {
 
     #[test]
     fn renders_pipe_table_with_header_and_row_count() {
-        let rs = ResultSet {
-            columns: vec![col("id"), col("name")],
-            rows: vec![
+        let rs = ResultSet::from_rows(
+            vec![col("id"), col("name")],
+            vec![
                 vec![Value::Int(1), Value::Str("Ada".into())],
                 vec![Value::Null, Value::Str("Bo".into())],
             ],
-            ..Default::default()
-        };
+        );
         let out = format_table(&rs);
         assert!(out.contains("| id | name |"));
         assert!(out.contains("| --- | --- |"));
@@ -253,14 +253,13 @@ mod tests {
 
     #[test]
     fn escapes_pipes_and_newlines_and_truncates_long_cells() {
-        let rs = ResultSet {
-            columns: vec![col("v")],
-            rows: vec![
+        let rs = ResultSet::from_rows(
+            vec![col("v")],
+            vec![
                 vec![Value::Str("a|b\nc".into())],
                 vec![Value::Str("x".repeat(80))],
             ],
-            ..Default::default()
-        };
+        );
         let out = format_table(&rs);
         // Pipe escaped, newline flattened to a space.
         assert!(out.contains(r"a\|b c"));
@@ -271,12 +270,8 @@ mod tests {
 
     #[test]
     fn truncated_result_notes_capped_rows() {
-        let rs = ResultSet {
-            columns: vec![col("id")],
-            rows: vec![vec![Value::Int(1)]],
-            truncated: true,
-            ..Default::default()
-        };
+        let rs =
+            ResultSet::from_rows(vec![col("id")], vec![vec![Value::Int(1)]]).with_truncated(true);
         assert!(format_table(&rs).ends_with("(1+ rows, capped)"));
     }
 }
