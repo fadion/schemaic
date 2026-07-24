@@ -134,7 +134,10 @@ fn visible_nav_rows(
                     expanded: false,
                 });
             }
-            for ix in &t.indexes {
+            // PRIMARY first, matching the tree's key ordering (stable sort).
+            let mut ord: Vec<&IndexInfo> = t.indexes.iter().collect();
+            ord.sort_by_key(|ix| !ix.is_primary());
+            for ix in ord {
                 rows.push(NavRow {
                     key: format!("idx:{}:{}:{}", n.database, t.name, ix.name),
                     parent: Some(tbl_key.clone()),
@@ -277,7 +280,9 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
             )
         },
     )
-    .style(|s| s.flex_col());
+    // Bottom padding so the last row can scroll clear of the (overlay) horizontal
+    // scrollbar instead of sitting under it.
+    .style(|s| s.flex_col().padding_bottom(10.0));
 
     // Keyboard navigation: arrow keys walk `visible_nav_rows` when the tree has
     // focus. Down/Up move the cursor (never expand); Right expands a collapsed
@@ -838,9 +843,12 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
             }))
             .style(|s| s.flex_col());
             let (kdb, ktbl) = (cols_db.clone(), cols_table.clone());
+            // PRIMARY first, then the rest in their original order (stable sort).
+            let mut sorted_idxs: Vec<IndexInfo> = idxs.to_vec();
+            sorted_idxs.sort_by_key(|ix| !ix.is_primary());
             let keys_block = v_stack_from_iter(
-                idxs.iter()
-                    .cloned()
+                sorted_idxs
+                    .into_iter()
                     .map(move |ix| key_row(ix, context_menu, kdb.clone(), ktbl.clone(), nav)),
             )
             .style(|s| s.flex_col());
