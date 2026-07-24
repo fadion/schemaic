@@ -950,6 +950,20 @@ fn export_csv(gs: GridState) -> String {
     )
 }
 
+fn export_markdown(gs: GridState) -> String {
+    schemaic_core::export::export_markdown(
+        gs.rs.get_untracked().as_ref(),
+        gs.order.get_untracked().as_slice(),
+    )
+}
+
+fn export_html(gs: GridState) -> String {
+    schemaic_core::export::export_html(
+        gs.rs.get_untracked().as_ref(),
+        gs.order.get_untracked().as_slice(),
+    )
+}
+
 fn export_inserts(gs: GridState) -> String {
     let rs = gs.rs.get_untracked();
     let order = gs.order.get_untracked();
@@ -2412,6 +2426,12 @@ fn grid_toolbar(
             }),
             MenuEntry::action("SQL", move || {
                 let _ = floem::Clipboard::set_contents(export_inserts(gs));
+            }),
+            MenuEntry::action("Markdown", move || {
+                let _ = floem::Clipboard::set_contents(export_markdown(gs));
+            }),
+            MenuEntry::action("HTML", move || {
+                let _ = floem::Clipboard::set_contents(export_html(gs));
             }),
         ]));
     })

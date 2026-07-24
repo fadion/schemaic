@@ -11,7 +11,8 @@ Zed-inspired, aiming to replace DataGrip.
     read-only gate. The *single* SQL boundary lexer; `tokenize_range`/`syntax_errors`/`sql_highlight`
     all build on it so string/`#`/`--`/`/* */`/backtick boundaries agree by construction.
   - `edit.rs` — `analyze_edit` → `EditModel` (write-back updatability analysis).
-  - `export.rs` — CSV/JSON/SQL export (incl. CSV formula-injection guard).
+  - `export.rs` — CSV/JSON/SQL/Markdown/HTML export (incl. CSV formula-injection guard;
+    Markdown pipe/backslash escaping; HTML entity escaping).
   - `diff.rs` — `line_diff`/`build_diff_rows` (Ctrl+K preview).
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
     persisted to `history.json`.

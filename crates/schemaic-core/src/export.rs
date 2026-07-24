@@ -157,6 +157,77 @@ pub fn export_csv(rs: &ResultSet, order: &[usize]) -> String {
     out
 }
 
+/// Escape a Markdown table cell. A `|` starts a new column, so it must be
+/// backslash-escaped; backslash is Markdown's escape char, so a literal `\`
+/// doubles (else it would swallow a following `|`). Newlines would break the
+/// row — GitHub renders `<br>` inside table cells, so map them there (a lone CR
+/// is dropped so CRLF doesn't emit a double break).
+pub fn md_cell(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace('\r', "")
+        .replace('\n', "<br>")
+}
+
+/// Escape text for HTML element content. `&` is replaced first so the `&` in
+/// the `&lt;`/`&gt;` entities isn't re-escaped.
+pub fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// The whole result as a GitHub-Flavored-Markdown table (header row + `---`
+/// separator + data rows). Cells are escaped via [`md_cell`]; NULL renders as an
+/// empty cell (matching [`export_csv`]).
+pub fn export_markdown(rs: &ResultSet, order: &[usize]) -> String {
+    let n = rs.columns.len();
+    let row_line = |cells: Vec<String>| format!("| {} |\n", cells.join(" | "));
+    let mut out = row_line(rs.columns.iter().map(|c| md_cell(&c.name)).collect());
+    out.push_str(&row_line((0..n).map(|_| "---".to_string()).collect()));
+    for &di in order {
+        if let Some(row) = rs.rows.get(di) {
+            let cells = (0..n)
+                .map(|ci| match row.get(ci) {
+                    Some(Value::Null) | None => String::new(),
+                    Some(v) => md_cell(&v.display()),
+                })
+                .collect();
+            out.push_str(&row_line(cells));
+        }
+    }
+    out
+}
+
+/// The whole result as an HTML `<table>` (thead + tbody). Cells/headers are
+/// escaped via [`html_escape`]; NULL renders as an empty `<td>` (matching
+/// [`export_csv`]).
+pub fn export_html(rs: &ResultSet, order: &[usize]) -> String {
+    let mut out = String::from("<table>\n<thead>\n<tr>");
+    for c in &rs.columns {
+        out.push_str("<th>");
+        out.push_str(&html_escape(&c.name));
+        out.push_str("</th>");
+    }
+    out.push_str("</tr>\n</thead>\n<tbody>\n");
+    for &di in order {
+        if let Some(row) = rs.rows.get(di) {
+            out.push_str("<tr>");
+            for ci in 0..rs.columns.len() {
+                out.push_str("<td>");
+                match row.get(ci) {
+                    Some(Value::Null) | None => {}
+                    Some(v) => out.push_str(&html_escape(&v.display())),
+                }
+                out.push_str("</td>");
+            }
+            out.push_str("</tr>\n");
+        }
+    }
+    out.push_str("</tbody>\n</table>\n");
+    out
+}
+
 /// The result as `INSERT` statements. `source` is the real `(database, table)`
 /// when known; otherwise a `` `table` `` placeholder is emitted for the user to
 /// fill in. Identifiers are backtick-escaped.
@@ -316,6 +387,60 @@ mod tests {
         // Column 0 (id): 1, then NULL → blank line.
         let out = export_column_csv(&rs(), &[0, 1], 0);
         assert_eq!(out, "1\n\n");
+    }
+
+    #[test]
+    fn md_cell_escapes_pipe_backslash_and_newline() {
+        // A pipe would start a new column — escape it. Backslash is Markdown's
+        // escape char, so a literal `\` must double (else it'd escape the `|`).
+        assert_eq!(md_cell("a|b"), "a\\|b");
+        assert_eq!(md_cell("C:\\x"), "C:\\\\x");
+        assert_eq!(md_cell("a\\|b"), "a\\\\\\|b");
+        // Newlines would break the row → GFM `<br>`; a lone CR is dropped.
+        assert_eq!(md_cell("a\nb"), "a<br>b");
+        assert_eq!(md_cell("a\r\nb"), "a<br>b");
+        assert_eq!(md_cell("plain"), "plain");
+    }
+
+    #[test]
+    fn export_markdown_has_header_separator_and_orders_rows() {
+        // order [1, 0] → NULL-id row first; NULL renders as an empty cell.
+        let out = export_markdown(&rs(), &[1, 0]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "| id | a`b |");
+        assert_eq!(lines[1], "| --- | --- |");
+        assert_eq!(lines[2], "|  | y |");
+        assert_eq!(lines[3], "| 1 | x |");
+    }
+
+    #[test]
+    fn html_escape_orders_ampersand_first() {
+        // `&` must be escaped before `<`/`>` or `&lt;` would become `&amp;lt;`.
+        assert_eq!(html_escape("a<b>&c"), "a&lt;b&gt;&amp;c");
+        assert_eq!(html_escape("plain"), "plain");
+    }
+
+    #[test]
+    fn export_html_escapes_entities_and_nulls_are_empty() {
+        let rs = ResultSet {
+            columns: vec![col("a<b>")],
+            rows: vec![
+                vec![Value::Str("x&y".to_string())],
+                vec![Value::Null],
+            ],
+            elapsed_ms: 0,
+            truncated: false,
+            affected: None,
+        };
+        let out = export_html(&rs, &[0, 1]);
+        assert!(out.contains("<th>a&lt;b&gt;</th>"));
+        assert!(out.contains("<td>x&amp;y</td>"));
+        // NULL → empty cell, not the literal "NULL".
+        assert!(out.contains("<td></td>"));
+        // Well-formed table scaffolding.
+        assert!(out.trim_start().starts_with("<table>"));
+        assert!(out.contains("<thead>") && out.contains("<tbody>"));
+        assert!(out.trim_end().ends_with("</table>"));
     }
 
     #[test]
