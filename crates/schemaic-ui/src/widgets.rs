@@ -400,8 +400,13 @@ pub(crate) fn menu_panel(
 /// `FontSystem` the views paint with, so the measurement matches to the pixel.
 /// Used to right-align the numeric grid editor and to size/ellipsize tab titles.
 pub(crate) fn measure_text_px(text: &str) -> f64 {
+    measure_text_px_at(text, theme::FONT_BODY)
+}
+
+/// Like [`measure_text_px`] but at an explicit font size (e.g. the 16px Find box).
+pub(crate) fn measure_text_px_at(text: &str, size: f32) -> f64 {
     use floem::text::{Attrs, AttrsList, TextLayout};
-    let attrs = Attrs::new().font_size(theme::FONT_BODY);
+    let attrs = Attrs::new().font_size(size);
     let mut layout = TextLayout::new();
     layout.set_text(text, AttrsList::new(attrs));
     layout.size().width
