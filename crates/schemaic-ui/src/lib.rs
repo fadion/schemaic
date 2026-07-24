@@ -574,6 +574,7 @@ pub(crate) struct NavKeys {
     pub tabs: RwSignal<Vec<Tab>>,
     pub active: RwSignal<usize>,
     pub find_open: RwSignal<bool>,
+    pub find_query: RwSignal<String>,
     pub add_tab: Rc<dyn Fn()>,
     pub close_tab: Rc<dyn Fn(usize)>,
 }
@@ -588,8 +589,16 @@ impl NavKeys {
             self.cycle(shift);
             return true;
         }
-        // Ctrl+Shift+<letter/digit> belong to the panel toggles, not us.
+        // Ctrl+Shift+P → command palette: Find-Anywhere pre-filled with ">".
         if shift {
+            if ch == Some("p") {
+                self.find_query.set(">".to_string());
+                if !self.find_open.get_untracked() {
+                    self.find_open.set(true);
+                }
+                return true;
+            }
+            // Other Ctrl+Shift+<letter/digit> belong to the panel toggles, not us.
             return false;
         }
         match ch {
@@ -1099,6 +1108,7 @@ pub fn workspace(ui: Ui) -> impl IntoView {
         tabs: ui.tabs_ui.tabs,
         active: ui.tabs_ui.active,
         find_open: ui.overlay.find_open,
+        find_query: ui.overlay.find_query,
         add_tab: ui.tab_actions.add_tab.clone(),
         close_tab: ui.tab_actions.close_tab.clone(),
     };
@@ -1964,6 +1974,7 @@ fn center(ui: Ui) -> impl IntoView {
         tabs: ui.tabs_ui.tabs,
         active: ui.tabs_ui.active,
         find_open: ui.overlay.find_open,
+        find_query: ui.overlay.find_query,
         add_tab: ui.tab_actions.add_tab.clone(),
         close_tab: ui.tab_actions.close_tab.clone(),
     };
@@ -2817,6 +2828,14 @@ pub(crate) struct FieldCfg {
     /// set, the key is consumed here instead of moving the editor caret.
     pub on_arrow_up: Option<Rc<dyn Fn()>>,
     pub on_arrow_down: Option<Rc<dyn Fn()>>,
+    /// Tab (e.g. accept the command-palette ghost completion). When set, the key
+    /// is consumed here instead of inserting a tab / moving focus.
+    pub on_tab: Option<Rc<dyn Fn()>>,
+    /// A "move caret to end" pulse: when this signal changes, the field refocuses
+    /// and drops the caret at the end of the text. Used after a programmatic
+    /// completion (the palette's command → argument transition) so typing
+    /// continues after the inserted text, not at the start.
+    pub caret_end: Option<RwSignal<u64>>,
     /// A trailing action rendered INSIDE the field, right-aligned (same spot as
     /// the clearable ×) — e.g. the AI-panel send/stop icon. A factory so the view
     /// is built inside the field.
@@ -2844,6 +2863,8 @@ impl Default for FieldCfg {
             on_blur: None,
             on_arrow_up: None,
             on_arrow_down: None,
+            on_tab: None,
+            caret_end: None,
             trailing: None,
         }
     }
@@ -2910,6 +2931,8 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         on_blur,
         on_arrow_up,
         on_arrow_down,
+        on_tab,
+        caret_end,
         trailing,
     } = cfg;
     // An in-flow trailing action (like the clearable ×) shrinks the editor.
@@ -2943,11 +2966,20 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     let escape = on_escape.clone();
     let arrow_up = on_arrow_up.clone();
     let arrow_down = on_arrow_down.clone();
+    let tab = on_tab.clone();
     let editor = text_editor_keys(text_sig.get_untracked(), move |editor_sig, kp, mods| {
         if let Some(esc) = &escape
             && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Escape), _))
         {
             (esc)();
+            return CommandExecuted::Yes;
+        }
+        // Tab accepts an external completion (the palette ghost) when opted in.
+        if let Some(cb) = &tab
+            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _))
+            && !mods.shift()
+        {
+            (cb)();
             return CommandExecuted::Yes;
         }
         // Arrow Up/Down drive an external list (command-palette nav) instead of
@@ -3085,6 +3117,27 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                 let len = ed_af.doc().text().to_string().len();
                 ed_af.cursor.update(|c| c.set_offset(len, false, false));
             }
+        });
+    }
+
+    // Caret-to-end pulse: refocus and drop the caret at the end whenever the
+    // signal changes (skipping the initial run). Deferred a tick so the
+    // signal→doc reconcile above has applied the new text first.
+    if let Some(pulse) = caret_end {
+        let ed_ce = ed.clone();
+        create_effect(move |prev: Option<u64>| {
+            let v = pulse.get();
+            if prev.is_some_and(|p| p != v) {
+                let ed2 = ed_ce.clone();
+                floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+                    if let Some(Some(vid)) = ed2.editor_view_id.try_get_untracked() {
+                        vid.request_focus();
+                    }
+                    let len = ed2.doc().text().to_string().len();
+                    ed2.cursor.update(|c| c.set_offset(len, false, false));
+                });
+            }
+            v
         });
     }
 
@@ -3795,12 +3848,15 @@ fn footer(ui: Ui) -> impl IntoView {
 // The Find-palette search box: the shared field, autofocused on open, with a
 // larger font. Escape closes the palette; Up/Down move the result selection and
 // Enter opens the selected result (command-palette style).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn search_box(
     query: RwSignal<String>,
     on_escape: Rc<dyn Fn()>,
     on_arrow_up: Rc<dyn Fn()>,
     on_arrow_down: Rc<dyn Fn()>,
     on_submit: Rc<dyn Fn()>,
+    on_tab: Rc<dyn Fn()>,
+    caret_end: RwSignal<u64>,
 ) -> impl IntoView {
     edit_field(
         query,
@@ -3813,6 +3869,8 @@ pub(crate) fn search_box(
             on_arrow_up: Some(on_arrow_up),
             on_arrow_down: Some(on_arrow_down),
             on_submit: Some(on_submit),
+            on_tab: Some(on_tab),
+            caret_end: Some(caret_end),
             ..Default::default()
         },
     )

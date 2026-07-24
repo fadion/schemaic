@@ -680,6 +680,7 @@ pub(crate) fn help_overlay(ui: Ui) -> impl IntoView {
                     "Global",
                     &[
                         ("Ctrl+P", "Find Anywhere"),
+                        ("Ctrl+Shift+P", "Command palette"),
                         ("Ctrl+T", "New query tab"),
                         ("Ctrl+W", "Close query tab"),
                         ("Ctrl+Tab", "Cycle tabs (Shift = reverse)"),

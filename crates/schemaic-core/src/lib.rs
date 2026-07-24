@@ -13,6 +13,7 @@ pub mod export;
 pub mod format;
 pub mod history;
 pub mod model;
+pub mod palette;
 pub mod persist;
 pub mod plan;
 pub mod resource;

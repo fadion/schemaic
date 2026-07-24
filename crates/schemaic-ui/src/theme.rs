@@ -135,6 +135,11 @@ pub fn query_highlight() -> Color {
     ui().query_highlight
 }
 
+/// Matched-substring highlight (bold) in the command palette / Find results.
+pub fn match_highlight() -> Color {
+    ui().match_highlight
+}
+
 // Text.
 pub fn text() -> Color {
     ui().text

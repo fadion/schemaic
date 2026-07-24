@@ -8,6 +8,7 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use floem::AnyView;
 use floem::event::EventListener;
 use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
@@ -17,9 +18,14 @@ use schemaic_core::connection::Connection;
 use schemaic_core::model::QueryState;
 use schemaic_core::schema::SchemaState;
 
-use crate::consts::DB_MENU_W;
-use crate::widgets::{MenuEntry, autohide, menu_item_style, menu_panel, panel_style, window_size};
-use crate::{ConnNode, CtxKind, PopupAnchor, Ui, icons, search_box, status_color, theme};
+use crate::consts::{CHAT_PAD_H, CHAT_PAD_V, DB_MENU_W};
+use crate::widgets::{
+    MenuEntry, autohide, measure_text_px_at, menu_item_style, menu_panel, panel_style, window_size,
+};
+use crate::{
+    ConnNode, CtxKind, PopupAnchor, RightPanel, Ui, icons, right_panel_allowed, schema_panel_allowed,
+    search_box, status_color, theme,
+};
 
 // ===== moved from lib.rs (overlays) =====
 pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
@@ -610,13 +616,729 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
     })
 }
 
-// Find Anywhere: fuzzy (substring) search over loaded tables (and their columns).
+/// One actionable row in the palette — a table hit, a command, a command's
+/// argument option, or a live result. `activate` does the whole thing (run the
+/// action and close the overlay, or transition into argument entry).
+#[derive(Clone)]
+struct PaletteItem {
+    primary: String,
+    secondary: String,
+    activate: Rc<dyn Fn()>,
+    /// The full query string Tab completes to (and the ghost previews), or `None`
+    /// for free-text/search rows with nothing to complete.
+    complete: Option<String>,
+    /// Substring of `primary` to bold-highlight (the matched search/filter term),
+    /// or `None` for rows with no meaningful match to show.
+    match_term: Option<String>,
+}
+
+/// Render `primary` with the first case-insensitive occurrence of `term` bolded +
+/// tinted (`match_highlight`). Plain text when there's no term / no match.
+fn highlighted_primary(primary: &str, term: &Option<String>) -> AnyView {
+    let seg = |t: &str, hit: bool| {
+        text(t.to_string()).style(move |s| {
+            let s = s.font_size(14.0);
+            if hit {
+                s.color(theme::match_highlight()).font_bold()
+            } else {
+                s.color(theme::text())
+            }
+        })
+    };
+    let m = term
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .and_then(|t| schemaic_core::text_ops::find_matches(primary, t).first().map(|&s| (s, s + t.len())));
+    match m {
+        Some((start, end)) => h_stack((
+            seg(&primary[..start], false),
+            seg(&primary[start..end], true),
+            seg(&primary[end..], false),
+        ))
+        .style(|s| s.flex_row().items_center())
+        .into_any(),
+        None => seg(primary, false).into_any(),
+    }
+}
+
+/// `() -> [(value, label)]` — an argument-command's choice list.
+type OptionsFn = Rc<dyn Fn() -> Vec<(String, String)>>;
+/// `arg -> rows` — a free-text command's live results.
+type ItemsFn = Rc<dyn Fn(&str) -> Vec<PaletteItem>>;
+
+/// How a command consumes its argument. Every `run`/action closure already closes
+/// the overlay, so `build_items` doesn't add that itself.
+enum CmdArg {
+    /// No argument — runs on Enter.
+    Instant(Rc<dyn Fn()>),
+    /// Pick one of `(value, label)`; `run(value)`.
+    Options { list: OptionsFn, run: Rc<dyn Fn(String)> },
+    /// A number clamped to `[min, max]`; `run(n)`. `empty` handles a missing arg.
+    Number {
+        min: i64,
+        max: i64,
+        run: Rc<dyn Fn(i64)>,
+        empty: Option<Rc<dyn Fn()>>,
+    },
+    /// Free text → its own result rows (a live search, or a single confirm row).
+    Text(ItemsFn),
+}
+
+/// A command-palette entry. `name` is the canonical lowercase keyword the pure
+/// parser matches (see `schemaic_core::palette`); `label`/`hint` are display.
+struct Command {
+    name: &'static str,
+    label: &'static str,
+    hint: &'static str,
+    arg: CmdArg,
+}
+
+impl Command {
+    fn takes_arg(&self) -> bool {
+        !matches!(self.arg, CmdArg::Instant(_))
+    }
+}
+
+/// Build the command registry. Every action closure captures `close` and closes
+/// the overlay when it runs.
+fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
+    let tabs = ui.tabs_ui.tabs;
+    let active = ui.tabs_ui.active;
+    let add_tab = ui.tab_actions.add_tab.clone();
+    let close_tab = ui.tab_actions.close_tab.clone();
+    let duplicate_tab = ui.tab_actions.duplicate_tab.clone();
+    let run_all = ui.tab_actions.run_all.clone();
+    let schema_visible = ui.layout.schema_visible;
+    let right_panel = ui.layout.right_panel;
+    let editor_font = ui.layout.editor_font;
+    let soft_tabs = ui.layout.soft_tabs;
+    let tab_width = ui.layout.tab_width;
+    let word_wrap = ui.layout.word_wrap;
+    let ui_theme = ui.layout.ui_theme;
+    let editor_theme = ui.layout.editor_theme;
+    let connections = ui.conn.connections;
+    let active_conn = ui.conn.active_conn;
+    let switch_conn = ui.conn_actions.switch_conn.clone();
+    let entries = ui.history.entries;
+    let hist_open = ui.history_actions.open.clone();
+    let hist_clear = ui.history_actions.clear.clone();
+    let ai_send = ui.ai_actions.send.clone();
+    let term_input = ui.term_actions.input.clone();
+
+    // The active tab (Copy) — for query-scoped commands.
+    let active_tab = move || {
+        let id = active.get_untracked();
+        tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied())
+    };
+    // An instant command whose action `f` runs then closes the overlay.
+    let instant = |f: Rc<dyn Fn()>, close: &Rc<dyn Fn()>| {
+        let close = close.clone();
+        CmdArg::Instant(Rc::new(move || {
+            (f)();
+            (close)();
+        }))
+    };
+
+    vec![
+        Command {
+            name: "toggle panel",
+            label: "Toggle Panel",
+            hint: "schema · ai · terminal · query history",
+            arg: CmdArg::Options {
+                list: Rc::new(|| {
+                    [
+                        ("schema", "Schema"),
+                        ("ai", "AI"),
+                        ("terminal", "Terminal"),
+                        ("history", "Query History"),
+                    ]
+                    .into_iter()
+                    .map(|(v, l)| (v.to_string(), l.to_string()))
+                    .collect()
+                }),
+                run: {
+                    let close = close.clone();
+                    Rc::new(move |v: String| {
+                        match v.as_str() {
+                            "schema" => {
+                                if schema_panel_allowed() {
+                                    schema_visible.update(|s| *s = !*s);
+                                }
+                            }
+                            other => {
+                                if right_panel_allowed() {
+                                    let target = match other {
+                                        "terminal" => RightPanel::Terminal,
+                                        "history" => RightPanel::History,
+                                        _ => RightPanel::Ai,
+                                    };
+                                    right_panel
+                                        .update(|p| *p = if *p == target { RightPanel::None } else { target });
+                                }
+                            }
+                        }
+                        (close)();
+                    })
+                },
+            },
+        },
+        Command {
+            name: "new tab",
+            label: "New Tab",
+            hint: "",
+            arg: instant(add_tab.clone(), &close),
+        },
+        Command {
+            name: "duplicate tab",
+            label: "Duplicate Tab",
+            hint: "",
+            arg: instant(
+                {
+                    let dup = duplicate_tab.clone();
+                    Rc::new(move || {
+                        if let Some(t) = active_tab() {
+                            (dup)(t.id);
+                        }
+                    })
+                },
+                &close,
+            ),
+        },
+        Command {
+            name: "close tab",
+            label: "Close Tab",
+            hint: "",
+            arg: instant(
+                {
+                    let close_tab = close_tab.clone();
+                    Rc::new(move || {
+                        if let Some(t) = active_tab() {
+                            (close_tab)(t.id);
+                        }
+                    })
+                },
+                &close,
+            ),
+        },
+        Command {
+            name: "next tab",
+            label: "Next Tab",
+            hint: "",
+            arg: instant(Rc::new(move || cycle_tab(tabs, active, 1)), &close),
+        },
+        Command {
+            name: "previous tab",
+            label: "Previous Tab",
+            hint: "",
+            arg: instant(Rc::new(move || cycle_tab(tabs, active, -1)), &close),
+        },
+        Command {
+            name: "format code",
+            label: "Format Code",
+            hint: "",
+            arg: instant(
+                Rc::new(move || {
+                    if let Some(t) = active_tab() {
+                        let unit = if soft_tabs.get_untracked() {
+                            " ".repeat(tab_width.get_untracked())
+                        } else {
+                            "\t".to_string()
+                        };
+                        let out = schemaic_core::sqlfmt::format_sql(&t.query.get_untracked(), &unit);
+                        t.query.set(out);
+                    }
+                }),
+                &close,
+            ),
+        },
+        Command {
+            name: "run",
+            label: "Run",
+            hint: "run all statements",
+            arg: instant(
+                Rc::new(move || {
+                    if let Some(t) = active_tab() {
+                        let q = t.query.get_untracked();
+                        let stmts: Vec<String> = schemaic_core::sql::statement_ranges(&q)
+                            .into_iter()
+                            .map(|(lo, hi)| q[lo..hi].to_string())
+                            .filter(|s| !s.trim().is_empty())
+                            .collect();
+                        if !stmts.is_empty() {
+                            (run_all)(stmts);
+                        }
+                    }
+                }),
+                &close,
+            ),
+        },
+        Command {
+            name: "go to line",
+            label: "Go to Line",
+            hint: "<number>",
+            arg: CmdArg::Number {
+                min: 1,
+                max: i64::MAX,
+                run: {
+                    let close = close.clone();
+                    Rc::new(move |n: i64| {
+                        if let Some(t) = active_tab()
+                            && let Some(off) = schemaic_core::text_ops::offset_of_line(
+                                &t.query.get_untracked(),
+                                n as usize,
+                            )
+                        {
+                            t.jump_offset.set(Some(off));
+                        }
+                        (close)();
+                    })
+                },
+                // No number → open the editor's Go-to-line popup.
+                empty: Some({
+                    let close = close.clone();
+                    Rc::new(move || {
+                        if let Some(t) = active_tab() {
+                            t.goto_open.set(true);
+                        }
+                        (close)();
+                    })
+                }),
+            },
+        },
+        Command {
+            name: "history",
+            label: "History",
+            hint: "<search>",
+            arg: CmdArg::Text({
+                let close = close.clone();
+                Rc::new(move |arg: &str| {
+                    let conn = active_conn.get_untracked();
+                    entries.with_untracked(|v| {
+                        v.iter()
+                            .filter(|e| e.conn_id == conn && schemaic_core::history::matches_query(e, arg))
+                            .take(50)
+                            .map(|e| {
+                                let entry = e.clone();
+                                let hist_open = hist_open.clone();
+                                let close = close.clone();
+                                PaletteItem {
+                                    primary: schemaic_core::history::preview(&entry.sql),
+                                    secondary: entry.database.clone().unwrap_or_default(),
+                                    activate: Rc::new(move || {
+                                        (hist_open)(entry.clone());
+                                        (close)();
+                                    }),
+                                    complete: None,
+                                    match_term: Some(arg.to_string()),
+                                }
+                            })
+                            .collect()
+                    })
+                })
+            }),
+        },
+        Command {
+            name: "clear history",
+            label: "Clear History",
+            hint: "current connection",
+            arg: instant(hist_clear.clone(), &close),
+        },
+        Command {
+            name: "ai",
+            label: "Ask AI",
+            hint: "<prompt>",
+            arg: CmdArg::Text({
+                let close = close.clone();
+                Rc::new(move |arg: &str| {
+                    let arg = arg.trim();
+                    if arg.is_empty() {
+                        return vec![hint_item("Ask AI", "Type a prompt…")];
+                    }
+                    let prompt = arg.to_string();
+                    let ai_send = ai_send.clone();
+                    let close = close.clone();
+                    vec![PaletteItem {
+                        primary: "Ask AI".to_string(),
+                        secondary: prompt.clone(),
+                        activate: Rc::new(move || {
+                            if right_panel_allowed() {
+                                right_panel.set(RightPanel::Ai);
+                            }
+                            (ai_send)(prompt.clone());
+                            (close)();
+                        }),
+                        complete: None,
+                        match_term: None,
+                    }]
+                })
+            }),
+        },
+        Command {
+            name: "terminal",
+            label: "Terminal",
+            hint: "<command>",
+            arg: CmdArg::Text({
+                let close = close.clone();
+                Rc::new(move |arg: &str| {
+                    let arg = arg.trim();
+                    if arg.is_empty() {
+                        return vec![hint_item("Run in Terminal", "Type a command…")];
+                    }
+                    let cmd = arg.to_string();
+                    let term_input = term_input.clone();
+                    let close = close.clone();
+                    vec![PaletteItem {
+                        primary: "Run in Terminal".to_string(),
+                        secondary: cmd.clone(),
+                        activate: Rc::new(move || {
+                            if right_panel_allowed() {
+                                right_panel.set(RightPanel::Terminal);
+                            }
+                            (term_input)(format!("{cmd}\r").into_bytes());
+                            (close)();
+                        }),
+                        complete: None,
+                        match_term: None,
+                    }]
+                })
+            }),
+        },
+        Command {
+            name: "ui theme",
+            label: "UI Theme",
+            hint: "light · dark",
+            arg: CmdArg::Options {
+                list: Rc::new(|| {
+                    theme::UiThemeKind::ALL
+                        .into_iter()
+                        .map(|k| (k.key().to_string(), k.label().to_string()))
+                        .collect()
+                }),
+                run: {
+                    let close = close.clone();
+                    Rc::new(move |v: String| {
+                        ui_theme.set(theme::UiThemeKind::from_key(&v));
+                        (close)();
+                    })
+                },
+            },
+        },
+        Command {
+            name: "editor theme",
+            label: "Editor Theme",
+            hint: "<theme>",
+            arg: CmdArg::Options {
+                list: Rc::new(|| {
+                    theme::EditorThemeKind::ALL
+                        .into_iter()
+                        .map(|k| (k.key().to_string(), k.label().to_string()))
+                        .collect()
+                }),
+                run: {
+                    let close = close.clone();
+                    Rc::new(move |v: String| {
+                        editor_theme.set(theme::EditorThemeKind::from_key(&v));
+                        (close)();
+                    })
+                },
+            },
+        },
+        Command {
+            name: "font size",
+            label: "Font Size",
+            hint: "<8–32>",
+            arg: CmdArg::Number {
+                min: 8,
+                max: 32,
+                run: {
+                    let close = close.clone();
+                    Rc::new(move |n: i64| {
+                        editor_font.set(n as f32);
+                        (close)();
+                    })
+                },
+                empty: None,
+            },
+        },
+        Command {
+            name: "increase font size",
+            label: "Increase Font Size",
+            hint: "",
+            arg: instant(
+                Rc::new(move || editor_font.update(|f| *f = (*f + 1.0).clamp(8.0, 32.0))),
+                &close,
+            ),
+        },
+        Command {
+            name: "decrease font size",
+            label: "Decrease Font Size",
+            hint: "",
+            arg: instant(
+                Rc::new(move || editor_font.update(|f| *f = (*f - 1.0).clamp(8.0, 32.0))),
+                &close,
+            ),
+        },
+        Command {
+            name: "indent style",
+            label: "Indent Style",
+            hint: "tabs · spaces",
+            arg: CmdArg::Options {
+                list: Rc::new(|| {
+                    vec![
+                        ("spaces".to_string(), "Spaces".to_string()),
+                        ("tabs".to_string(), "Tabs".to_string()),
+                    ]
+                }),
+                run: {
+                    let close = close.clone();
+                    Rc::new(move |v: String| {
+                        soft_tabs.set(v == "spaces");
+                        (close)();
+                    })
+                },
+            },
+        },
+        Command {
+            name: "indent width",
+            label: "Indent Width",
+            hint: "<1–8>",
+            arg: CmdArg::Number {
+                min: 1,
+                max: 8,
+                run: {
+                    let close = close.clone();
+                    Rc::new(move |n: i64| {
+                        tab_width.set(n as usize);
+                        (close)();
+                    })
+                },
+                empty: None,
+            },
+        },
+        Command {
+            name: "toggle word wrap",
+            label: "Toggle Word Wrap",
+            hint: "",
+            arg: instant(Rc::new(move || word_wrap.update(|w| *w = !*w)), &close),
+        },
+        Command {
+            name: "switch connection",
+            label: "Switch Connection",
+            hint: "<connection>",
+            arg: CmdArg::Options {
+                list: Rc::new(move || {
+                    connections.with(|cs| {
+                        cs.iter()
+                            .map(|c| (c.id.to_string(), c.name.clone()))
+                            .collect()
+                    })
+                }),
+                run: {
+                    let close = close.clone();
+                    Rc::new(move |v: String| {
+                        if let Ok(id) = v.parse::<u64>() {
+                            (switch_conn)(id);
+                        }
+                        (close)();
+                    })
+                },
+            },
+        },
+    ]
+}
+
+/// Move the active tab by `step` (±1), wrapping around the strip order.
+fn cycle_tab(tabs: RwSignal<Vec<crate::Tab>>, active: RwSignal<usize>, step: isize) {
+    let ids: Vec<usize> = tabs.with_untracked(|v| v.iter().map(|t| t.id).collect());
+    if ids.is_empty() {
+        return;
+    }
+    let cur = active.get_untracked();
+    let idx = ids.iter().position(|&x| x == cur).unwrap_or(0) as isize;
+    let n = ids.len() as isize;
+    let next = ((idx + step) % n + n) % n;
+    active.set(ids[next as usize]);
+}
+
+/// A non-actionable informational row (Enter does nothing, palette stays open).
+fn hint_item(primary: &str, secondary: &str) -> PaletteItem {
+    PaletteItem {
+        primary: primary.to_string(),
+        secondary: secondary.to_string(),
+        activate: Rc::new(|| {}),
+        complete: None,
+        match_term: None,
+    }
+}
+
+/// Turn a parsed query into the list of rows to show. `caret_end` is pulsed by a
+/// command→argument transition so the caret jumps to the end of the inserted text.
+#[allow(clippy::too_many_arguments)]
+fn build_items(
+    parsed: schemaic_core::palette::Parsed,
+    commands: &[Command],
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    hidden: RwSignal<HashSet<String>>,
+    open_table: &Rc<dyn Fn(String, String)>,
+    close: &Rc<dyn Fn()>,
+    query: RwSignal<String>,
+    caret_end: RwSignal<u64>,
+) -> Vec<PaletteItem> {
+    use schemaic_core::palette::Parsed;
+    match parsed {
+        // Default table/column search (unchanged behaviour): open the table.
+        Parsed::Search(q) => {
+            let q = q.trim().to_lowercase();
+            if q.is_empty() {
+                return Vec::new();
+            }
+            find_matches(db_nodes, hidden, &q, 80)
+                .into_iter()
+                .map(|hit| {
+                    let primary = match &hit.column {
+                        Some(c) => format!("{}.{c}", hit.table),
+                        None => hit.table.clone(),
+                    };
+                    // Ghost/Tab target: the matched name (column when it's a column
+                    // hit, else the table). The ghost only paints when the query is a
+                    // true prefix of it, so a mid-string match shows nothing.
+                    let complete = hit.column.clone().unwrap_or_else(|| hit.table.clone());
+                    let (db, table) = (hit.db.clone(), hit.table.clone());
+                    let open_table = open_table.clone();
+                    let close = close.clone();
+                    PaletteItem {
+                        primary,
+                        secondary: hit.db,
+                        activate: Rc::new(move || {
+                            (open_table)(db.clone(), table.clone());
+                            (close)();
+                        }),
+                        complete: Some(complete),
+                        match_term: Some(q.clone()),
+                    }
+                })
+                .collect()
+        }
+        // Command mode, still choosing: filter the command list. Instant commands
+        // run on Enter; argument-commands transition into argument entry.
+        Parsed::Filter(f) => {
+            let f = f.trim().to_lowercase();
+            commands
+                .iter()
+                .filter(|c| f.is_empty() || c.label.to_lowercase().contains(&f) || c.name.contains(&f))
+                .map(|c| {
+                    // Tab/ghost target: the command name, plus a trailing space for
+                    // argument-commands so the caret lands ready for the argument.
+                    let complete = if c.takes_arg() {
+                        format!(">{} ", c.name)
+                    } else {
+                        format!(">{}", c.name)
+                    };
+                    let activate: Rc<dyn Fn()> = match &c.arg {
+                        CmdArg::Instant(run) => run.clone(),
+                        // Argument-command: transition into argument entry (same as
+                        // accepting the completion) and move the caret to the end.
+                        _ => {
+                            let s = complete.clone();
+                            Rc::new(move || {
+                                query.set(s.clone());
+                                caret_end.update(|n| *n += 1);
+                            })
+                        }
+                    };
+                    PaletteItem {
+                        primary: c.label.to_string(),
+                        secondary: c.hint.to_string(),
+                        activate,
+                        complete: Some(complete),
+                        match_term: Some(f.clone()),
+                    }
+                })
+                .collect()
+        }
+        // A resolved argument-command: render its argument choices/results.
+        Parsed::Command { name, arg } => {
+            let Some(c) = commands.iter().find(|c| c.name == name) else {
+                return Vec::new();
+            };
+            match &c.arg {
+                CmdArg::Instant(run) => vec![PaletteItem {
+                    primary: c.label.to_string(),
+                    secondary: String::new(),
+                    activate: run.clone(),
+                    complete: None,
+                    match_term: None,
+                }],
+                CmdArg::Options { list, run } => {
+                    let a = arg.trim().to_lowercase();
+                    list()
+                        .into_iter()
+                        .filter(|(v, l)| {
+                            a.is_empty() || l.to_lowercase().contains(&a) || v.to_lowercase().contains(&a)
+                        })
+                        .map(|(v, l)| {
+                            let run = run.clone();
+                            let v2 = v.clone();
+                            PaletteItem {
+                                primary: l,
+                                secondary: String::new(),
+                                activate: Rc::new(move || (run)(v2.clone())),
+                                // Tab fills the argument with this option's value.
+                                complete: Some(format!(">{} {}", c.name, v)),
+                                match_term: Some(a.clone()),
+                            }
+                        })
+                        .collect()
+                }
+                CmdArg::Number {
+                    min,
+                    max,
+                    run,
+                    empty,
+                } => {
+                    let t = arg.trim();
+                    if t.is_empty() {
+                        return match empty {
+                            Some(e) => vec![PaletteItem {
+                                primary: c.label.to_string(),
+                                secondary: "↵".to_string(),
+                                activate: e.clone(),
+                                complete: None,
+                                match_term: None,
+                            }],
+                            None => vec![hint_item(c.label, c.hint)],
+                        };
+                    }
+                    match t.parse::<i64>() {
+                        Ok(n) => {
+                            let clamped = n.clamp(*min, *max);
+                            let run = run.clone();
+                            vec![PaletteItem {
+                                primary: c.label.to_string(),
+                                secondary: format!("→ {clamped}"),
+                                activate: Rc::new(move || (run)(clamped)),
+                                complete: None,
+                                match_term: None,
+                            }]
+                        }
+                        Err(_) => vec![hint_item(c.label, "Enter a number")],
+                    }
+                }
+                CmdArg::Text(f) => f(&arg),
+            }
+        }
+    }
+}
+
+// Find Anywhere / command palette. No `>` prefix → table/column search; a `>`
+// prefix enters command mode (see `schemaic_core::palette` + `palette_commands`).
 pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
     let open = ui.overlay.find_open;
     let query = ui.overlay.find_query;
     let db_nodes = ui.schema.db_nodes;
     let hidden = ui.schema.hidden_dbs;
     let open_table = ui.tab_actions.open_table.clone();
+    let ui_reg = ui.clone(); // for building the command registry per open
 
     dyn_container(
         move || open.get(),
@@ -625,6 +1347,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                 return empty().into_any();
             }
             let open_table = open_table.clone();
+            let ui_reg = ui_reg.clone();
             // Custom box (not `text_input`) so we control Escape → close. Closing
             // also clears the query, so reopening Find starts blank and a stale
             // result list never flashes.
@@ -633,51 +1356,119 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                 open.set(false);
             });
 
-            // Current matches + the keyboard-selected row, shared by the list
-            // render and the search box's Up/Down/Enter handlers (TODO).
-            let hits: RwSignal<Vec<FindHit>> = RwSignal::new(Vec::new());
-            let selected = RwSignal::new(0usize);
-            create_effect(move |_| {
-                let q = query.get().trim().to_lowercase();
-                let m = if q.is_empty() {
-                    Vec::new()
-                } else {
-                    find_matches(db_nodes, hidden, &q, 80)
-                };
-                hits.set(m);
-                selected.set(0); // reset the cursor to the top on every new query
-            });
+            // The command registry (rebuilt per open) + the names of its
+            // argument-taking commands, which the pure parser needs.
+            let commands = Rc::new(palette_commands(&ui_reg, close.clone()));
+            let arg_names: Vec<&'static str> = commands
+                .iter()
+                .filter(|c| c.takes_arg())
+                .map(|c| c.name)
+                .collect();
 
-            // Open the selected hit (Enter or click) — opens its table either way.
-            let open_sel: Rc<dyn Fn()> = {
+            // Current rows + the keyboard-selected index, recomputed from the query.
+            let items: RwSignal<Vec<PaletteItem>> = RwSignal::new(Vec::new());
+            let selected = RwSignal::new(0usize);
+            // Pulsed to move the caret to the end after a completion/transition.
+            let caret_end = RwSignal::new(0u64);
+            // Programmatic scroll target for keyboard nav (grid pattern: the scroll
+            // reads this, its own on_scroll is owned by `autohide`).
+            let list_scroll: RwSignal<Option<floem::kurbo::Point>> = RwSignal::new(None);
+            {
+                let commands = commands.clone();
                 let open_table = open_table.clone();
                 let close = close.clone();
-                Rc::new(move || {
-                    let idx = selected.get_untracked();
-                    let picked = hits
-                        .with_untracked(|v| v.get(idx).map(|h| (h.db.clone(), h.table.clone())));
-                    if let Some((db, table)) = picked {
-                        (open_table)(db, table);
-                        (close)();
-                    }
-                })
-            };
+                create_effect(move |_| {
+                    let raw = query.get();
+                    let parsed = schemaic_core::palette::parse(&raw, &arg_names);
+                    items.set(build_items(
+                        parsed,
+                        &commands,
+                        db_nodes,
+                        hidden,
+                        &open_table,
+                        &close,
+                        query,
+                        caret_end,
+                    ));
+                    selected.set(0); // reset the cursor to the top on every new query
+                });
+            }
+
+            // Activate the selected row (Enter or click).
+            let open_sel: Rc<dyn Fn()> = Rc::new(move || {
+                let act = items.with_untracked(|v| v.get(selected.get_untracked()).map(|it| it.activate.clone()));
+                if let Some(act) = act {
+                    (act)();
+                }
+            });
+            // Tab accepts the selected row's completion (the ghost): set the query
+            // to it and move the caret to the end.
+            let on_tab: Rc<dyn Fn()> = Rc::new(move || {
+                let comp = items
+                    .with_untracked(|v| v.get(selected.get_untracked()).and_then(|it| it.complete.clone()));
+                if let Some(c) = comp {
+                    query.set(c);
+                    caret_end.update(|n| *n += 1);
+                }
+            });
             let on_up: Rc<dyn Fn()> =
                 Rc::new(move || selected.update(|i| *i = i.saturating_sub(1)));
             let on_down: Rc<dyn Fn()> = Rc::new(move || {
-                let n = hits.with_untracked(|v| v.len());
+                let n = items.with_untracked(|v| v.len());
                 if n > 0 {
                     selected.update(|i| *i = (*i + 1).min(n - 1));
                 }
             });
 
-            let input = search_box(query, close.clone(), on_up, on_down, open_sel.clone());
+            let field = search_box(
+                query,
+                close.clone(),
+                on_up,
+                on_down,
+                open_sel.clone(),
+                on_tab,
+                caret_end,
+            );
+            // Ghost completion: the dim tail of the selected row's `complete` beyond
+            // what's typed, painted over the input right after the text — so Tab's
+            // target is visible inline. Only when the typed text is a prefix of it.
+            let ghost = dyn_container(
+                move || {
+                    let q = query.get();
+                    let sel = selected.get();
+                    items.with(|v| {
+                        v.get(sel).and_then(|it| it.complete.clone()).and_then(|c| {
+                            (c.len() > q.len() && c.to_lowercase().starts_with(&q.to_lowercase()))
+                                .then(|| c[q.len()..].to_string())
+                        })
+                    })
+                },
+                move |g| match g {
+                    Some(suffix) => text(suffix)
+                        // Match the field's 1.46 line-height factor so the ghost
+                        // glyph sits on the same baseline as the typed text (a
+                        // default, tighter line box floated it ~4px too high). The
+                        // placeholder colour keeps it a subtle hint, not competing
+                        // with the typed text.
+                        .style(|s| s.color(theme::placeholder()).font_size(16.0).line_height(1.46))
+                        .into_any(),
+                    None => empty().into_any(),
+                },
+            )
+            .style(move |s| {
+                // Right after the typed text: box border (1) + horizontal padding +
+                // the measured width of the query at the field's 16px font.
+                let x = 1.0 + CHAT_PAD_H + measure_text_px_at(&query.get(), 16.0);
+                s.absolute().inset_left(x).inset_top(1.0 + CHAT_PAD_V)
+            })
+            .pointer_events(|| false);
+            let input = stack((field, ghost)).style(|s| s.width_full());
 
             // Suggestions appear only once something is typed (empty → just the box).
             let results = dyn_container(
-                move || hits.get(),
+                move || items.get(),
                 move |list| {
-                    if query.with_untracked(|q| q.trim().is_empty()) {
+                    if query.with_untracked(|q| q.is_empty()) {
                         return empty().into_any();
                     }
                     if list.is_empty() {
@@ -685,54 +1476,86 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                         return text("Nothing found")
                             .style(|s| {
                                 s.color(theme::text_muted())
-                                    .font_size(theme::FONT_BODY)
+                                    .font_size(14.0)
                                     .padding_horiz(12.0)
-                                    .padding_vert(6.0)
-                                    .margin_top(10.0)
+                                    .padding_vert(9.0)
                             })
                             .into_any();
                     }
-                    let open_sel = open_sel.clone();
-                    // Same look as the dropdown menus (menu_item_style): the name
-                    // (`table` or `table.column`) then its database, dim,
-                    // left-aligned. The keyboard-selected row is highlighted; click
-                    // or Enter opens its table (and clears the search).
-                    v_stack_from_iter(list.into_iter().enumerate().map(move |(i, hit)| {
-                        let open_sel = open_sel.clone();
-                        let name = match &hit.column {
-                            Some(c) => format!("{}.{c}", hit.table),
-                            None => hit.table.clone(),
-                        };
-                        h_stack((
-                            text(name)
-                                .style(|s| s.color(theme::text()).font_size(theme::FONT_BODY)),
-                            text(hit.db.clone()).style(|s| {
-                                s.color(theme::text_muted()).font_size(theme::FONT_BODY)
-                            }),
+                    // Same look as the dropdown menus (menu_item_style): the primary
+                    // label then a dim secondary, left-aligned. The keyboard-selected
+                    // row is highlighted; click or Enter activates it.
+                    let total = list.len();
+                    v_stack_from_iter(list.into_iter().enumerate().map(move |(i, item)| {
+                        let activate = item.activate.clone();
+                        let row = h_stack((
+                            highlighted_primary(&item.primary, &item.match_term),
+                            text(item.secondary.clone())
+                                .style(|s| s.color(theme::text_muted()).font_size(14.0)),
                         ))
                         .on_click_stop(move |_| {
                             selected.set(i);
-                            (open_sel)();
+                            (activate)();
                         })
                         .style(move |s| {
-                            let s = menu_item_style(s);
+                            // +3px over menu_item_style's 6px vertical padding.
+                            let s = menu_item_style(s).padding_vert(9.0);
                             if selected.get() == i {
                                 s.background(theme::row_selected())
                             } else {
                                 s
                             }
-                        })
+                        });
+                    // Keep the keyboard-selected row in view. The ends scroll fully to
+                    // the top / bottom (so the first row clears the input's 10px gap
+                    // and the last row reaches the end); middle rows reveal minimally
+                    // (deferred a tick so it clamps against settled layout).
+                    let row_id = row.id();
+                    create_effect(move |_| {
+                        if selected.get() != i {
+                            return;
+                        }
+                        if i == 0 {
+                            list_scroll.set(Some(floem::kurbo::Point::ZERO));
+                        } else if i + 1 == total {
+                            list_scroll.set(Some(floem::kurbo::Point::new(0.0, 1.0e7)));
+                        } else {
+                            list_scroll.set(None);
+                            floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+                                row_id.scroll_to(None);
+                            });
+                        }
+                    });
+                    row
                     }))
-                    .style(|s| s.flex_col().margin_top(10.0))
+                    // Right gutter clears the floating scrollbar (3px edge inset +
+                    // 6px handle) so a row's highlight stops just before it rather
+                    // than running underneath.
+                    .style(|s| s.flex_col().width_full().padding_right(10.0))
                     .into_any()
                 },
-            );
+            )
+            // Fill the scroll's viewport width so the inner v_stack's `width_full`
+            // (and each row's highlight) spans edge to edge, not just content width.
+            .style(|s| s.width_full());
 
             // Panel: 400px input + 15px padding all around (→ 430px wide), results
             // below. Sizes to content; the results scroll caps its height.
             let panel = v_stack((
                 input,
-                autohide(scroll(results)).style(|s| s.width_full().max_height(360.0)),
+                autohide(scroll(results).scroll_to(move || list_scroll.get()))
+                    // 10px gap here (not inside the content) so the scrollbar clears
+                    // the input too, and the first row keeps the gap when scrolled up.
+                    // Only when there's something to show — an empty query collapses
+                    // the container, so the panel's padding stays even around the box.
+                    .style(move |s| {
+                        let s = s.width_full().max_height(360.0);
+                        if query.with(|q| q.is_empty()) {
+                            s
+                        } else {
+                            s.margin_top(10.0)
+                        }
+                    }),
             ))
             .on_click_stop(|_| {})
             .style(|s| {
