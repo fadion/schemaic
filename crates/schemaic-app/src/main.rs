@@ -13,7 +13,14 @@
 
 mod ai;
 mod claude_cli;
+mod heap;
 mod mcp;
+
+/// Process-wide heap accounting (live/peak bytes), for leak-vs-retention
+/// diagnosis. Delegates to the system allocator; only adds two atomics per
+/// alloc. Logging is opt-in via `SCHEMAIC_HEAP_LOG` (see `heap::spawn_logger`).
+#[global_allocator]
+static GLOBAL: heap::Tracking = heap::Tracking;
 
 use ai::{
     AiContextParams, AiSession, AiSettings, AiStreamMsg, StartAiParams, ai_context, extract_sql,
@@ -94,6 +101,9 @@ fn main() {
         schemaic_core::APP_NAME,
         schemaic_core::APP_VERSION
     );
+
+    // Opt-in heap logging (SCHEMAIC_HEAP_LOG=1) for memory diagnosis.
+    heap::spawn_logger();
 
     // Register the bundled IBM Plex faces before any text is laid out.
     schemaic_ui::fonts::load_fonts();
