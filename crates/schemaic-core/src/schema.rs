@@ -3,6 +3,8 @@
 //! `information_schema`; the UI renders them as the collapsible schema tree and
 //! (later) uses them as the autocomplete substrate.
 
+use crate::model::Value;
+
 /// A single column of a table.
 #[derive(Clone, Debug)]
 pub struct ColumnInfo {
@@ -32,6 +34,23 @@ impl IndexInfo {
     }
 }
 
+/// A foreign-key constraint: which local columns reference which columns of which
+/// table. Populated from `information_schema.KEY_COLUMN_USAGE`; `columns` (the
+/// referencing columns, in this table) and `ref_columns` (the referenced columns)
+/// are aligned by key position. Drives "Follow" navigation from the data grid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignKeyInfo {
+    /// Referencing columns in *this* table, in key order.
+    pub columns: Vec<String>,
+    /// Referenced schema/database. `None` when the server reports none (treated
+    /// as the same database as the referencing table).
+    pub ref_schema: Option<String>,
+    /// Referenced table.
+    pub ref_table: String,
+    /// Referenced columns, aligned to [`ForeignKeyInfo::columns`].
+    pub ref_columns: Vec<String>,
+}
+
 /// Backtick-quote a SQL identifier, doubling any embedded backtick.
 fn ddl_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
@@ -43,6 +62,8 @@ pub struct TableInfo {
     pub name: String,
     pub columns: Vec<ColumnInfo>,
     pub indexes: Vec<IndexInfo>,
+    /// Foreign-key constraints declared on this table (with their targets).
+    pub foreign_keys: Vec<ForeignKeyInfo>,
     /// True if this is a VIEW rather than a base table (`TABLE_TYPE = 'VIEW'`).
     pub is_view: bool,
     /// For views, the stored SELECT (`information_schema.VIEWS.VIEW_DEFINITION`),
@@ -126,6 +147,73 @@ impl TableInfo {
         }
         self.name.to_lowercase().contains(needle_lower) || self.any_column_matches(needle_lower)
     }
+
+    /// The foreign key whose referencing columns include `column`, if any — the
+    /// FK the data grid follows when right-clicking a cell in `column`. Works for
+    /// single- and composite-column keys.
+    pub fn fk_for_column(&self, column: &str) -> Option<&ForeignKeyInfo> {
+        self.foreign_keys
+            .iter()
+            .find(|fk| fk.columns.iter().any(|c| c == column))
+    }
+}
+
+/// A resolved "follow this foreign key" navigation target: the referenced table
+/// (so the new tab's grid stays editable, sourced from that table) plus a
+/// ready-to-run `SELECT` filtered to the referenced row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FollowTarget {
+    pub database: String,
+    pub table: String,
+    pub sql: String,
+}
+
+/// Build a [`FollowTarget`] opening the table `fk` references, filtered to the
+/// row keyed by `values` — the referencing row's values for `fk.columns`, in that
+/// order (one value for a single-column FK; several for a composite). A NULL value
+/// filters with `IS NULL`. `default_schema` is used when the FK names no schema
+/// (a same-database reference). Returns `None` if `values` doesn't cover every
+/// key column (can't build a safe, unambiguous `WHERE`).
+///
+/// Identifiers are backtick-escaped and values rendered as SQL literals via the
+/// shared [`crate::export`] helpers, so the query is safe to run verbatim.
+pub fn follow_target(
+    fk: &ForeignKeyInfo,
+    values: &[Value],
+    default_schema: &str,
+) -> Option<FollowTarget> {
+    if fk.ref_columns.is_empty() || values.len() != fk.ref_columns.len() {
+        return None;
+    }
+    let database = fk
+        .ref_schema
+        .clone()
+        .unwrap_or_else(|| default_schema.to_string());
+    let table = fk.ref_table.clone();
+    let where_sql = fk
+        .ref_columns
+        .iter()
+        .zip(values)
+        .map(|(col, v)| {
+            let ident = crate::export::ident_sql(col);
+            if v.is_null() {
+                format!("{ident} IS NULL")
+            } else {
+                format!("{ident} = {}", crate::export::sql_literal(v))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql = format!(
+        "SELECT * FROM {}.{} WHERE {where_sql}",
+        crate::export::ident_sql(&database),
+        crate::export::ident_sql(&table),
+    );
+    Some(FollowTarget {
+        database,
+        table,
+        sql,
+    })
 }
 
 /// The introspected schema of one database.
@@ -213,6 +301,15 @@ mod tests {
         }
     }
 
+    fn fk(cols: &[&str], schema: Option<&str>, table: &str, ref_cols: &[&str]) -> ForeignKeyInfo {
+        ForeignKeyInfo {
+            columns: cols.iter().map(|s| s.to_string()).collect(),
+            ref_schema: schema.map(|s| s.to_string()),
+            ref_table: table.to_string(),
+            ref_columns: ref_cols.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
     #[test]
     fn classify_column_type_covers_each_family() {
         use ColumnTypeClass::*;
@@ -247,6 +344,7 @@ mod tests {
                 col("customer_email", "varchar(255)", true, false),
             ],
             indexes: Vec::new(),
+            foreign_keys: Vec::new(),
             is_view: false,
             view_definition: None,
         };
@@ -285,6 +383,7 @@ mod tests {
                     foreign: false,
                 },
             ],
+            foreign_keys: Vec::new(),
             is_view: false,
             view_definition: None,
         };
@@ -304,6 +403,7 @@ mod tests {
             name: "v".to_string(),
             columns: Vec::new(),
             indexes: Vec::new(),
+            foreign_keys: Vec::new(),
             is_view: true,
             view_definition: Some("SELECT 1".to_string()),
         };
@@ -316,6 +416,7 @@ mod tests {
             name: "we`ird".to_string(),
             columns: vec![col("a`b", "int", true, false)],
             indexes: Vec::new(),
+            foreign_keys: Vec::new(),
             is_view: false,
             view_definition: None,
         };
@@ -330,6 +431,7 @@ mod tests {
             name: "v".to_string(),
             columns: Vec::new(),
             indexes: Vec::new(),
+            foreign_keys: Vec::new(),
             is_view: true,
             view_definition: None,
         };
@@ -360,6 +462,7 @@ mod tests {
                     name: "a".to_string(),
                     columns: Vec::new(),
                     indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
                     is_view: false,
                     view_definition: None,
                 },
@@ -367,11 +470,83 @@ mod tests {
                     name: "b".to_string(),
                     columns: Vec::new(),
                     indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
                     is_view: true,
                     view_definition: None,
                 },
             ],
         };
         assert_eq!(s.table_count(), 2);
+    }
+
+    fn table_with_fks(fks: Vec<ForeignKeyInfo>) -> TableInfo {
+        TableInfo {
+            name: "orders".to_string(),
+            columns: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: fks,
+            is_view: false,
+            view_definition: None,
+        }
+    }
+
+    #[test]
+    fn fk_for_column_matches_any_referencing_column() {
+        let t = table_with_fks(vec![
+            fk(&["customer_id"], None, "customers", &["id"]),
+            fk(&["a", "b"], None, "other", &["x", "y"]),
+        ]);
+        assert_eq!(
+            t.fk_for_column("customer_id").unwrap().ref_table,
+            "customers"
+        );
+        // A composite FK matches on any of its member columns.
+        assert_eq!(t.fk_for_column("b").unwrap().ref_table, "other");
+        // A column that's in no FK.
+        assert!(t.fk_for_column("note").is_none());
+        // No FKs at all.
+        assert!(table_with_fks(Vec::new()).fk_for_column("x").is_none());
+    }
+
+    #[test]
+    fn follow_target_single_column_uses_default_schema() {
+        let f = fk(&["customer_id"], None, "customers", &["id"]);
+        let ft = follow_target(&f, &[Value::Int(42)], "shop").unwrap();
+        assert_eq!(ft.database, "shop"); // ref_schema None → default
+        assert_eq!(ft.table, "customers");
+        assert_eq!(ft.sql, "SELECT * FROM `shop`.`customers` WHERE `id` = 42");
+    }
+
+    #[test]
+    fn follow_target_honors_explicit_ref_schema() {
+        let f = fk(&["c"], Some("other_db"), "customers", &["id"]);
+        let ft = follow_target(&f, &[Value::UInt(7)], "shop").unwrap();
+        assert_eq!(ft.database, "other_db");
+        assert_eq!(
+            ft.sql,
+            "SELECT * FROM `other_db`.`customers` WHERE `id` = 7"
+        );
+    }
+
+    #[test]
+    fn follow_target_escapes_idents_and_values_and_handles_null_composite() {
+        // Composite FK, backtick-y identifiers, a string value (escaped) and a NULL.
+        let f = fk(&["a", "b"], None, "t`x", &["r`1", "r2"]);
+        let ft = follow_target(&f, &[Value::Str("O'Hara".into()), Value::Null], "db").unwrap();
+        assert_eq!(ft.table, "t`x");
+        assert_eq!(
+            ft.sql,
+            "SELECT * FROM `db`.`t``x` WHERE `r``1` = 'O''Hara' AND `r2` IS NULL"
+        );
+    }
+
+    #[test]
+    fn follow_target_rejects_wrong_arity() {
+        // Fewer values than key columns → can't build a safe WHERE.
+        let f = fk(&["a", "b"], None, "t", &["x", "y"]);
+        assert!(follow_target(&f, &[Value::Int(1)], "db").is_none());
+        // A FK with no columns.
+        let empty = fk(&[], None, "t", &[]);
+        assert!(follow_target(&empty, &[], "db").is_none());
     }
 }

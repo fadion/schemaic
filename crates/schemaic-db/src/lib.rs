@@ -13,7 +13,7 @@
 
 pub mod ssh;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use futures_util::StreamExt;
 use mysql_async::consts::{ColumnFlags, ColumnType};
@@ -24,7 +24,7 @@ use schemaic_core::model::{
     Column, ColumnFlags as CoreColFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
     ResultBuilder, ResultSet, RowDelete, RowEdit, RowInsert, Value,
 };
-use schemaic_core::schema::{ColumnInfo, DbSchema, IndexInfo, TableInfo};
+use schemaic_core::schema::{ColumnInfo, DbSchema, ForeignKeyInfo, IndexInfo, TableInfo};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, thiserror::Error)]
@@ -372,15 +372,24 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         .await
         .map_err(qerr)?;
 
-    // Foreign-key constraint names — MySQL auto-creates an index sharing the
-    // constraint's name, so we tag those indexes as FOREIGN below.
-    let fk_rows: Vec<(String, String)> = conn
+    // Foreign keys, one row per referencing key-column with its referenced
+    // target, ordered so a composite key's columns fold in order. Drives both the
+    // FOREIGN index tag (below) and the grid's "Follow FK" navigation. The
+    // `REFERENCED_TABLE_NAME IS NOT NULL` filter keeps only FK usages (the same
+    // view lists plain PK/unique key usages with NULL references).
+    let fk_col_rows: Vec<FkColRow> = conn
         .exec_map(
-            "SELECT CAST(TABLE_NAME AS CHAR) AS t, CAST(CONSTRAINT_NAME AS CHAR) AS n \
-             FROM information_schema.TABLE_CONSTRAINTS \
-             WHERE TABLE_SCHEMA = ? AND CONSTRAINT_TYPE = 'FOREIGN KEY'",
+            "SELECT CAST(TABLE_NAME AS CHAR) AS t, \
+                    CAST(CONSTRAINT_NAME AS CHAR) AS cn, \
+                    CAST(COLUMN_NAME AS CHAR) AS col, \
+                    CAST(REFERENCED_TABLE_SCHEMA AS CHAR) AS rs, \
+                    CAST(REFERENCED_TABLE_NAME AS CHAR) AS rt, \
+                    CAST(REFERENCED_COLUMN_NAME AS CHAR) AS rc \
+             FROM information_schema.KEY_COLUMN_USAGE \
+             WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL \
+             ORDER BY TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION",
             (database,),
-            |(t, n): (String, String)| (t, n),
+            |(t, cn, col, rs, rt, rc): FkColRow| (t, cn, col, rs, rt, rc),
         )
         .await
         .map_err(qerr)?;
@@ -424,11 +433,24 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
     Ok(assemble_schema(
         &table_rows,
         &col_rows,
-        &fk_rows,
+        &fk_col_rows,
         &idx_rows,
         &view_rows,
     ))
 }
+
+/// One `KEY_COLUMN_USAGE` row for a foreign key: `(table, constraint, column,
+/// ref_schema, ref_table, ref_column)`. The referenced fields are `Option` since
+/// the column is nullable in the catalogue (though non-null for the FK rows we
+/// select). Aliased to keep [`assemble_schema`]'s signature readable.
+type FkColRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 /// Assemble the fetched `information_schema` rows into a [`DbSchema`]: group
 /// columns onto their tables, fold each index's key columns (in `SEQ_IN_INDEX`
@@ -443,7 +465,7 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
 fn assemble_schema(
     table_rows: &[(String, String)],
     col_rows: &[(String, String, String, String, String)],
-    fk_rows: &[(String, String)],
+    fk_col_rows: &[FkColRow],
     idx_rows: &[(String, String, i64, String)],
     view_rows: &[(String, String)],
 ) -> DbSchema {
@@ -455,6 +477,7 @@ fn assemble_schema(
             name: name.clone(),
             columns: Vec::new(),
             indexes: Vec::new(),
+            foreign_keys: Vec::new(),
             is_view: ty.eq_ignore_ascii_case("VIEW"),
             view_definition: None,
         });
@@ -470,20 +493,63 @@ fn assemble_schema(
         });
     }
 
-    let fks: HashSet<(String, String)> = fk_rows.iter().cloned().collect();
+    // Fold the FK key-column rows into one `ForeignKeyInfo` per (table,
+    // constraint), preserving column order. Rows missing a referenced table/
+    // column are skipped (can't form a usable target).
+    let mut fk_slot: HashMap<(usize, String), usize> = HashMap::new();
+    for (t, cn, col, rs, rt, rc) in fk_col_rows {
+        let Some(&ti) = index.get(t) else { continue };
+        let (Some(rt), Some(rc)) = (rt.as_ref(), rc.as_ref()) else {
+            continue;
+        };
+        match fk_slot.get(&(ti, cn.clone())) {
+            Some(&fi) => {
+                let fk = &mut tables[ti].foreign_keys[fi];
+                fk.columns.push(col.clone());
+                fk.ref_columns.push(rc.clone());
+            }
+            None => {
+                let fi = tables[ti].foreign_keys.len();
+                tables[ti].foreign_keys.push(ForeignKeyInfo {
+                    columns: vec![col.clone()],
+                    ref_schema: rs.clone(),
+                    ref_table: rt.clone(),
+                    ref_columns: vec![rc.clone()],
+                });
+                fk_slot.insert((ti, cn.clone()), fi);
+            }
+        }
+    }
+
     for (t, iname, non_unique, col) in idx_rows {
         let Some(&ti) = index.get(t) else { continue };
         let table = &mut tables[ti];
         if let Some(existing) = table.indexes.iter_mut().find(|x| &x.name == iname) {
             existing.columns.push(col.clone());
         } else {
-            let foreign = fks.contains(&(t.clone(), iname.clone()));
             table.indexes.push(IndexInfo {
                 name: iname.clone(),
                 columns: vec![col.clone()],
                 unique: *non_unique == 0,
-                foreign,
+                foreign: false, // set by the column-match pass below
             });
+        }
+    }
+
+    // Tag each index FOREIGN when its columns are exactly a FK's referencing
+    // columns — matched by *columns*, not name. A FK's backing index is often
+    // named after the column (e.g. classicmodels `customerNumber`), not the
+    // constraint (`orders_ibfk_1`), so a name match misses it. Done after folding
+    // so an index's full column list is known.
+    for table in tables.iter_mut() {
+        let fk_cols: Vec<&[String]> = table
+            .foreign_keys
+            .iter()
+            .map(|fk| fk.columns.as_slice())
+            .filter(|cols| !cols.is_empty())
+            .collect();
+        for ix in table.indexes.iter_mut() {
+            ix.foreign = fk_cols.iter().any(|&cols| ix.columns == cols);
         }
     }
 
@@ -1436,21 +1502,32 @@ mod tests {
     }
 
     #[test]
-    fn assemble_schema_flags_foreign_index_by_constraint_name() {
+    fn assemble_schema_flags_foreign_index_by_columns_not_name() {
         let tables = [(s("orders"), s("BASE TABLE"))];
+        // The FK's backing index is named after the column (`customerNumber`), not
+        // the constraint (`orders_ibfk_1`) — the classicmodels case. Matching by
+        // name misses it; matching by columns flags it.
         let idx = [
-            (s("orders"), s("fk_customer"), 1, s("customer_id")),
+            (s("orders"), s("customerNumber"), 1, s("customerNumber")),
             (s("orders"), s("idx_plain"), 1, s("total")),
         ];
-        let fks = [(s("orders"), s("fk_customer"))];
+        let fks = [(
+            s("orders"),
+            s("orders_ibfk_1"),
+            s("customerNumber"),
+            Some(s("shop")),
+            Some(s("customers")),
+            Some(s("customerNumber")),
+        )];
         let schema = assemble_schema(&tables, &[], &fks, &idx, &[]);
         let t = &schema.tables[0];
         assert!(
             t.indexes
                 .iter()
-                .find(|i| i.name == "fk_customer")
+                .find(|i| i.name == "customerNumber")
                 .unwrap()
-                .foreign
+                .foreign,
+            "FK-backing index flagged FOREIGN by columns despite name != constraint"
         );
         assert!(
             !t.indexes
@@ -1458,6 +1535,58 @@ mod tests {
                 .find(|i| i.name == "idx_plain")
                 .unwrap()
                 .foreign
+        );
+    }
+
+    #[test]
+    fn assemble_schema_builds_foreign_keys_with_targets() {
+        let tables = [(s("orders"), s("BASE TABLE"))];
+        // One single-column FK and one composite FK (two ordered rows).
+        let fks = [
+            (
+                s("orders"),
+                s("fk_customer"),
+                s("customer_id"),
+                Some(s("shop")),
+                Some(s("customers")),
+                Some(s("id")),
+            ),
+            (
+                s("orders"),
+                s("fk_line"),
+                s("order_id"),
+                Some(s("shop")),
+                Some(s("lines")),
+                Some(s("order_id")),
+            ),
+            (
+                s("orders"),
+                s("fk_line"),
+                s("line_no"),
+                Some(s("shop")),
+                Some(s("lines")),
+                Some(s("no")),
+            ),
+        ];
+        let schema = assemble_schema(&tables, &[], &fks, &[], &[]);
+        let t = &schema.tables[0];
+        assert_eq!(t.foreign_keys.len(), 2);
+
+        let single = t.fk_for_column("customer_id").unwrap();
+        assert_eq!(single.ref_table, "customers");
+        assert_eq!(single.ref_schema.as_deref(), Some("shop"));
+        assert_eq!(single.ref_columns, vec!["id".to_string()]);
+
+        // Composite FK: both columns fold into one FK, in ORDINAL_POSITION order.
+        let composite = t.fk_for_column("line_no").unwrap();
+        assert_eq!(composite.ref_table, "lines");
+        assert_eq!(
+            composite.columns,
+            vec!["order_id".to_string(), "line_no".to_string()]
+        );
+        assert_eq!(
+            composite.ref_columns,
+            vec!["order_id".to_string(), "no".to_string()]
         );
     }
 

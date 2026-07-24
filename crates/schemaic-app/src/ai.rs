@@ -606,6 +606,7 @@ mod tests {
                 })
                 .collect(),
             indexes: Vec::<IndexInfo>::new(),
+            foreign_keys: Vec::new(),
             is_view: false,
             view_definition: None,
         }
