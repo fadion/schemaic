@@ -1202,6 +1202,31 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         Rc::new(move |database: String, table: String| (spawn)(database, table, None))
     };
 
+    // Follow a foreign key from the grid: open the referenced table in a fresh tab
+    // running the supplied filter `SELECT`, and auto-run it. Sourced from
+    // `(database, table)` so the new grid is editable and shows key icons — like a
+    // normal table tab, only with a WHERE. The referenced table lives on the same
+    // connection (FKs can't cross servers), possibly in another database.
+    let open_table_filtered: Rc<dyn Fn(String, String, String)> = {
+        let next_id = next_id.clone();
+        let place_tab = place_tab.clone();
+        let run = run.clone();
+        Rc::new(move |database: String, table: String, sql: String| {
+            let id = next_id.get();
+            next_id.set(id + 1);
+            let tab = Tab::new(
+                cx,
+                id,
+                &sql,
+                active_conn.get_untracked(),
+                Some(database.clone()),
+            );
+            tab.source.set(Some((database, table)));
+            (place_tab)(tab);
+            run(sql);
+        })
+    };
+
     // Open a new tab with `sql` in the editor but do NOT run it (used by
     // "Generate DDL" in the schema context menu, and the AI code-block bar).
     let open_query: Rc<dyn Fn(String)> = {
@@ -2383,6 +2408,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             open_table_new,
             open_table_col,
             open_query,
+            open_table_filtered,
             set_active_db,
             open_db_cli,
             run_plan,

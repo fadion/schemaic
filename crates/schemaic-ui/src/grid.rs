@@ -30,7 +30,7 @@ use schemaic_core::model::{
     CellRef, CellTag, CommitDone, GridWrite, QueryState, RefetchRequest, RefetchRow, ResultSet,
     RowDelete, RowEdit, RowInsert, Value,
 };
-use schemaic_core::schema::SchemaState;
+use schemaic_core::schema::{ForeignKeyInfo, SchemaState};
 use schemaic_core::text::plural;
 use schemaic_core::text_ops::contains_ignore_ascii_case;
 
@@ -240,6 +240,9 @@ pub(crate) fn loaded_view(rs: Arc<ResultSet>, gctx: GridCtx) -> AnyView {
 type SummarizeFn = Rc<dyn Fn(String)>;
 /// Splice sink: replace the tab's canonical result set after an in-place commit.
 type SyncCanonicalFn = Rc<dyn Fn(Arc<ResultSet>)>;
+/// "Follow foreign key" callback: open the referenced `(database, table)` in a new
+/// tab running the given filter `sql`. The grid builds the SQL from a FK + row.
+type FollowFn = Rc<dyn Fn(String, String, String)>;
 /// Staged cell edits grouped `(table_idx, data_row) → [(result_ci, new_value)]`,
 /// ordered (BTreeMap) so a failing commit reproduces identically.
 type EditGroups = BTreeMap<(usize, usize), Vec<(usize, Option<String>)>>;
@@ -320,6 +323,14 @@ struct GridState {
     /// live in `GridCtx` (written by `grid_view`, read by the panel-level bar).
     find_open: RwSignal<bool>,
     find_query: RwSignal<String>,
+    /// Per result-column foreign-key "follow" specs (keyed by result-column index;
+    /// a composite FK maps each member column to the same spec). Populated by
+    /// `grid_view` from the source table's schema; empty when there's nothing to
+    /// follow. Read by the cell menu to offer "Follow".
+    follow: RwSignal<Rc<HashMap<usize, Rc<FollowSpec>>>>,
+    /// Open the referenced table filtered to the followed row (wrapped so
+    /// `GridState` stays `Copy`).
+    follow_fk: RwSignal<Option<FollowFn>>,
 }
 
 impl GridState {
@@ -383,6 +394,9 @@ impl GridState {
             // Shared with the find bar (rendered up at the RESULTS-panel level).
             find_open: gctx.find_open,
             find_query: gctx.find_query,
+            // Empty until `grid_view` resolves the source table's FKs into it.
+            follow: RwSignal::new(Rc::new(HashMap::new())),
+            follow_fk: RwSignal::new(Some(gctx.follow_fk.clone())),
         }
     }
 
@@ -1258,6 +1272,98 @@ fn column_key_map(
     map
 }
 
+/// Everything the cell "Follow" action needs for one foreign key: the FK (its
+/// target), the result-column indices holding its referencing columns (so a
+/// clicked row's key values can be read), and the source database (used when the
+/// FK names no schema). Shared by every referencing column of a composite key.
+#[derive(Clone)]
+struct FollowSpec {
+    fk: ForeignKeyInfo,
+    /// Result-column indices for `fk.columns`, in the same order.
+    value_cols: Vec<usize>,
+    default_schema: String,
+}
+
+/// Resolve, per result-column, the foreign key it participates in — for the cell
+/// "Follow" menu. Only the source table's own columns (matched by provenance) are
+/// considered, so a joined result maps the correct side; a FK whose referencing
+/// columns aren't all present in the result is skipped (can't read its values).
+/// Empty unless the tab has a source table with loaded schema and FKs.
+fn build_follow_specs(
+    rs: &ResultSet,
+    source: RwSignal<Option<(String, String)>>,
+    db_nodes: RwSignal<Vec<ConnNode>>,
+) -> HashMap<usize, Rc<FollowSpec>> {
+    let mut map = HashMap::new();
+    let Some((db, table)) = source.get_untracked() else {
+        return map;
+    };
+    let nodes = db_nodes.get_untracked();
+    let Some(node) = nodes.iter().find(|n| n.database == db) else {
+        return map;
+    };
+    let SchemaState::Loaded(schema) = node.schema.get_untracked() else {
+        return map;
+    };
+    let Some(t) = schema.tables.iter().find(|t| t.name == table) else {
+        return map;
+    };
+    if t.foreign_keys.is_empty() {
+        return map;
+    }
+    // Real column name (of this source table) → its result-column index.
+    let mut real_to_ci: HashMap<&str, usize> = HashMap::new();
+    for (ci, col) in rs.columns.iter().enumerate() {
+        if let Some(o) = &col.origin
+            && o.table == table
+            && o.database == db
+        {
+            real_to_ci.entry(o.column.as_str()).or_insert(ci);
+        }
+    }
+    for fk in &t.foreign_keys {
+        let value_cols: Option<Vec<usize>> = fk
+            .columns
+            .iter()
+            .map(|c| real_to_ci.get(c.as_str()).copied())
+            .collect();
+        let Some(value_cols) = value_cols else {
+            continue; // a referencing column isn't in the result → can't follow
+        };
+        let spec = Rc::new(FollowSpec {
+            fk: fk.clone(),
+            value_cols: value_cols.clone(),
+            default_schema: db.clone(),
+        });
+        for ci in value_cols {
+            map.insert(ci, spec.clone());
+        }
+    }
+    map
+}
+
+/// Execute a "follow foreign key" for data-row `data_idx` under `spec`: read the
+/// row's key values for the FK's referencing columns (from the committed result),
+/// build the referenced-table query, and hand it to the app. Shared by the cell
+/// menu's "Follow relation" and the Ctrl-click shortcut.
+fn follow_relation(gs: GridState, data_idx: usize, spec: &FollowSpec) {
+    let rs = gs.rs.get_untracked();
+    let values: Vec<Value> = spec
+        .value_cols
+        .iter()
+        .map(|&vc| {
+            rs.cell(data_idx, vc)
+                .map(|c| c.to_value())
+                .unwrap_or(Value::Null)
+        })
+        .collect();
+    if let Some(ft) = schemaic_core::schema::follow_target(&spec.fk, &values, &spec.default_schema)
+        && let Some(cb) = gs.follow_fk.get_untracked()
+    {
+        (cb)(ft.database, ft.table, ft.sql);
+    }
+}
+
 /// Bundle of app-provided context the results grid needs, threaded from
 /// `query_pane` down through the results-view chain.
 #[derive(Clone)]
@@ -1281,6 +1387,9 @@ pub(crate) struct GridCtx {
     pub(crate) popup_width: RwSignal<f64>,
     /// Reveal the AI panel + send a message (used for the cell "AI Summary").
     pub(crate) summarize: Rc<dyn Fn(String)>,
+    /// Follow a foreign key: open the referenced `(database, table)` in a new tab
+    /// running the given filter `sql` (built by the grid from a FK + the row).
+    pub(crate) follow_fk: FollowFn,
     /// Close any open popup / schema context menu (so a grid click dismisses them
     /// — grid cells consume the pointer-down, so the root handler never fires).
     pub(crate) dismiss: Rc<dyn Fn()>,
@@ -1500,6 +1609,9 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
 
     // Interactive state, created once and shared across sort rebuilds.
     let gs = GridState::new(rs.clone(), &gctx, &key_map);
+    // Resolve the source table's foreign keys → per-column "Follow" specs (once).
+    gs.follow
+        .set(Rc::new(build_follow_specs(&rs, gctx.source, gctx.db_nodes)));
     // Editability: which columns can be written back, and each base table's
     // WHERE key — derived from the result's per-column provenance + schema. The
     // closure looks up a base table's schema from the live `db_nodes` signals.
@@ -2898,6 +3010,14 @@ fn data_cell(
         .map(|o| (o.flags.auto_increment, o.flags.no_default, o.flags.not_null))
         .unwrap_or((false, false, false));
     let col_editable = gs.edit_model.get_untracked().editable(ci);
+    // This cell's column is a foreign key with a resolvable target (real rows
+    // only) → offer "Follow" (menu + Ctrl-click) and underline the value.
+    let follow_spec: Option<Rc<FollowSpec>> = if pending.is_none() {
+        gs.follow.get_untracked().get(&ci).cloned()
+    } else {
+        None
+    };
+    let is_fk = follow_spec.is_some();
     // Content: an inline editor when this cell is open for editing, otherwise the
     // (possibly edited) value. The original value is read from `gs.rs` here so a
     // post-commit splice (which updates `gs.rs`) refreshes the cell in place;
@@ -3070,6 +3190,12 @@ fn data_cell(
                             // (`<auto>`/`<required>`/`<null>`/`<default>`) render faint.
                             s.color(theme::text_faint())
                                 .font_style(floem::text::Style::Italic)
+                        } else if is_fk {
+                            // Foreign-key value: underline it (in the text colour) as
+                            // a "followable relation" affordance (Ctrl-click follows).
+                            s.color(theme::text())
+                                .border_bottom(1.0)
+                                .border_color(theme::text())
                         } else {
                             s.color(theme::text())
                         }
@@ -3088,6 +3214,8 @@ fn data_cell(
             s
         }
     });
+    let fs_click = follow_spec.clone();
+    let fs_menu = follow_spec; // moved into the right-click menu closure below
     container(content)
         .on_event(EventListener::PointerDown, move |e| {
             if let Event::PointerDown(pe) = e {
@@ -3096,6 +3224,19 @@ fn data_cell(
                 // never sees it).
                 gs.dismiss_overlays();
                 if pe.button.is_primary() {
+                    // Ctrl/Cmd+click a foreign-key cell follows the relation (a
+                    // shortcut for the menu's "Follow relation"). Skipped while this
+                    // cell is being edited — then the click just edits the text.
+                    let ctrl = pe.modifiers.control() || pe.modifiers.meta();
+                    let editing_here = gs.edit_cell.get_untracked() == Some((i, ci));
+                    if ctrl
+                        && !editing_here
+                        && let Some(spec) = &fs_click
+                    {
+                        set_active(gs, i, ci, false);
+                        follow_relation(gs, data_idx, spec);
+                        return EventPropagation::Stop;
+                    }
                     // Single-cell selection only — no drag-select / shift-extend
                     // (the grid has no multi-cell actions).
                     set_active(gs, i, ci, false);
@@ -3211,6 +3352,16 @@ fn data_cell(
             if fmt != ColumnFormat::None {
                 entries.push(MenuEntry::action("Copy formatted", move || {
                     let _ = floem::Clipboard::set_contents(formatted_val.clone());
+                }));
+            }
+            // "Follow relation" — this cell's column is a foreign key with a known
+            // target. Real rows only (a pending new row has no committed key to
+            // navigate to). Opens the referenced table filtered to this row's key.
+            // (Static label — table names can get long; Ctrl-click is the shortcut.)
+            if let Some(spec) = &fs_menu {
+                let spec = spec.clone();
+                entries.push(MenuEntry::action("Follow relation", move || {
+                    follow_relation(gs, data_idx, &spec);
                 }));
             }
             if nullable && !deleted {

@@ -801,6 +801,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
     let key_children = key.clone();
     let cols = table.columns;
     let idxs = table.indexes;
+    let fkeys = table.foreign_keys;
     let cols_db = database.clone();
     let cols_table = table.name.clone();
     let col_term = name_term;
@@ -816,11 +817,12 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
             let (cdb, ctbl) = (cols_db.clone(), cols_table.clone());
             let otc = open_table_col.clone();
             let cterm = col_term.clone();
-            // Columns backing a FOREIGN KEY index — tinted purple like their key.
-            let fk_cols: HashSet<String> = idxs
+            // Foreign-key referencing columns — tinted purple like their key.
+            // From the table's FKs directly (authoritative), not the backing
+            // index's name, which needn't match the constraint (classicmodels).
+            let fk_cols: HashSet<String> = fkeys
                 .iter()
-                .filter(|ix| ix.foreign)
-                .flat_map(|ix| ix.columns.iter().cloned())
+                .flat_map(|fk| fk.columns.iter().cloned())
                 .collect();
             let cols_block = v_stack_from_iter(cols.iter().cloned().map(move |c| {
                 let ckind = if c.primary_key {

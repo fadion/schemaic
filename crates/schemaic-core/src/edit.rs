@@ -274,6 +274,7 @@ mod tests {
                 })
                 .collect(),
             indexes: Vec::new(),
+            foreign_keys: Vec::new(),
             is_view: false,
             view_definition: None,
         }
@@ -518,6 +519,7 @@ mod tests {
                     unique: true,
                     foreign: false,
                 }],
+                foreign_keys: Vec::new(),
                 is_view: false,
                 view_definition: None,
             })
@@ -552,6 +554,7 @@ mod tests {
                     unique: true,
                     foreign: false,
                 }],
+                foreign_keys: Vec::new(),
                 is_view: false,
                 view_definition: None,
             })

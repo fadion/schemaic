@@ -564,6 +564,11 @@ pub struct TabsActions {
     pub open_table_col: Rc<dyn Fn(String, String, String)>,
     /// Open a new query tab containing `sql` (does NOT run it).
     pub open_query: Rc<dyn Fn(String)>,
+    /// (database, table, sql) → open a brand-new tab sourced from `(database,
+    /// table)` (so its grid stays editable) running `sql`, and auto-run it. Used by
+    /// the grid's "Follow foreign key" to land on the referenced table filtered to
+    /// a row.
+    pub open_table_filtered: Rc<dyn Fn(String, String, String)>,
     /// Switch the active tab to a database (remembers it as the new-tab default).
     pub set_active_db: Rc<dyn Fn(String)>,
     /// Open the DB CLI for the active connection in the terminal, optionally
@@ -1974,6 +1979,7 @@ fn center(ui: Ui) -> impl IntoView {
         }
     });
     let commit_edits = ui.tab_actions.commit_edits.clone();
+    let follow_fk = ui.tab_actions.open_table_filtered.clone();
     let active_db = ui.tabs_ui.active_db;
     let active_db_menu_open = ui.tabs_ui.active_db_menu_open;
     let active_db_anchor = ui.tabs_ui.active_db_anchor;
@@ -2079,6 +2085,7 @@ fn center(ui: Ui) -> impl IntoView {
                     popup_anchor,
                     popup_width,
                     summarize: summarize.clone(),
+                    follow_fk: follow_fk.clone(),
                     dismiss: dismiss_menus.clone(),
                     commit: commit_edits.clone(),
                     // `results_view` fills this in for the single-result path; the
