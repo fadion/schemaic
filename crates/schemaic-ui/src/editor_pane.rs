@@ -49,7 +49,7 @@ use crate::consts::*;
 use crate::diff_view::diff_view;
 use crate::widgets::*;
 use crate::{
-    ConnNode, CtxMenu, FieldCfg, InlineAiRequest, InlineAiState, NavKeys, RightPanel,
+    ConnNode, CtxMenu, FieldCfg, InlineAiRequest, InlineAiState, NavKeys, PopupAnchor, RightPanel,
     bg_transparent, edit_field, icons, sql_highlight, theme, thumb_len,
 };
 
@@ -760,7 +760,7 @@ pub(crate) struct QueryPaneParams {
     pub read_only: Memo<bool>,
     pub confirm_writes: RwSignal<bool>,
     pub popup_menu: RwSignal<Option<Vec<MenuEntry>>>,
-    pub popup_anchor: RwSignal<Option<(f64, f64, f64, f64)>>,
+    pub popup_anchor: RwSignal<Option<PopupAnchor>>,
     pub popup_width: RwSignal<f64>,
     pub open_plan: Rc<dyn Fn(String)>,
     pub nav: NavKeys,

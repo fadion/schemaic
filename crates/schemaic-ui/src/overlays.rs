@@ -19,7 +19,7 @@ use schemaic_core::schema::SchemaState;
 
 use crate::consts::DB_MENU_W;
 use crate::widgets::{MenuEntry, autohide, menu_item_style, menu_panel, panel_style, window_size};
-use crate::{ConnNode, CtxKind, Ui, icons, search_box, status_color, theme};
+use crate::{ConnNode, CtxKind, PopupAnchor, Ui, icons, search_box, status_color, theme};
 
 // ===== moved from lib.rs (overlays) =====
 pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
@@ -555,11 +555,11 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
         let ph = n as f64 * 34.0 + 14.0;
         let pw = popup_width.get(); // matches the panel's min_width for edge flips
         match anchor.get() {
-            // Status-bar menu: centre the panel horizontally on the anchor's
+            // Status-bar segment menu: centre the panel horizontally on the anchor's
             // x-range and sit 5px above the status bar (FOOTER_H tall at the window
             // bottom), growing upward via `inset_bottom` so we needn't know its
             // height. Clamp horizontally so it never spills past a window edge.
-            Some((left, right, _t, _w)) => {
+            Some(PopupAnchor::AboveFooter(left, right)) => {
                 let cx = (left + right) / 2.0;
                 let x = if ww > 1.0 {
                     (cx - pw / 2.0).clamp(0.0, (ww - pw).max(0.0))
@@ -569,6 +569,25 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
                 s.absolute()
                     .inset_left(x)
                     .inset_bottom(theme::FOOTER_H + 5.0)
+            }
+            // Toolbar dropdown (grid Copy): drop 5px below the icon, tucked under it
+            // (left edge 40px left of the icon's right edge, so it overlaps the icon
+            // like the schema/db menus); flip to right-aligned (right edge flush on
+            // the icon) if it'd spill past the window's right edge, and flip upward if
+            // it'd spill past the bottom. Real panel width → no drift.
+            Some(PopupAnchor::BelowIcon(_left, right, bottom)) => {
+                let open_x = right - 40.0;
+                let x = if ww > 1.0 && open_x + pw > ww {
+                    (right - pw).max(0.0)
+                } else {
+                    open_x.max(0.0)
+                };
+                let y = if wh > 1.0 && bottom + 5.0 + ph > wh {
+                    (bottom - 5.0 - ph).max(0.0)
+                } else {
+                    bottom + 5.0
+                };
+                s.absolute().inset_left(x).inset_top(y)
             }
             // Cursor menus (right-click): open at the pointer. A right-edge flip
             // lands the menu's right edge ~3px from the cursor — mirroring the 3px
