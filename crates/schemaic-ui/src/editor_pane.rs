@@ -1434,31 +1434,67 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let run_optimize = inline_ai_run.clone();
             let show_plan = open_plan.clone();
             let ed_format = ed_fmt.clone();
+            // The three AI actions carry the sparkle (matching AI Summary in the
+            // grid); Plan + Format sit below the separator as plain actions.
             vec![
-                MenuEntry::action("Ask AI…", move || {
-                    let off = menu_offset.get_untracked();
-                    cmdk.start.set(off);
-                    cmdk.end.set(off);
-                    let (_, mut below) = ed_ask.points_of_offset(off, CursorAffinity::Backward);
-                    below.y += EDITOR_PAD_TOP;
-                    cmdk.point.set(below);
-                    cmdk.input.set(String::new());
-                    inline_ai.set(InlineAiState::Idle);
-                    cmdk.open.set(true);
-                }),
-                MenuEntry::action("Explain", move || {
-                    let sql = query.get_untracked();
-                    let (lo, hi) = statement_range(&sql, menu_offset.get_untracked());
-                    if let Some(stmt) = sql.get(lo..hi).filter(|s| !s.is_empty()) {
-                        // Reveal the AI panel only if it isn't already showing — a
-                        // redundant `set(Ai)` disposes the live panel mid-update.
-                        if !matches!(right_panel.get_untracked(), RightPanel::Ai) {
-                            right_panel.set(RightPanel::Ai);
+                MenuEntry::action_icon(
+                    "Ask AI…",
+                    (icons::SPARKLES, theme::key_foreign),
+                    move || {
+                        let off = menu_offset.get_untracked();
+                        cmdk.start.set(off);
+                        cmdk.end.set(off);
+                        let (_, mut below) = ed_ask.points_of_offset(off, CursorAffinity::Backward);
+                        below.y += EDITOR_PAD_TOP;
+                        cmdk.point.set(below);
+                        cmdk.input.set(String::new());
+                        inline_ai.set(InlineAiState::Idle);
+                        cmdk.open.set(true);
+                    },
+                ),
+                MenuEntry::action_icon(
+                    "Explain",
+                    (icons::SPARKLES, theme::key_foreign),
+                    move || {
+                        let sql = query.get_untracked();
+                        let (lo, hi) = statement_range(&sql, menu_offset.get_untracked());
+                        if let Some(stmt) = sql.get(lo..hi).filter(|s| !s.is_empty()) {
+                            // Reveal the AI panel only if it isn't already showing — a
+                            // redundant `set(Ai)` disposes the live panel mid-update.
+                            if !matches!(right_panel.get_untracked(), RightPanel::Ai) {
+                                right_panel.set(RightPanel::Ai);
+                            }
+                            (ai_explain)(format!("Explain this SQL query:\n```sql\n{stmt}\n```"));
+                            highlight_pick(&sql, lo, hi, highlight);
                         }
-                        (ai_explain)(format!("Explain this SQL query:\n```sql\n{stmt}\n```"));
-                        highlight_pick(&sql, lo, hi, highlight);
-                    }
-                }),
+                    },
+                ),
+                MenuEntry::action_icon(
+                    "Optimize",
+                    (icons::SPARKLES, theme::key_foreign),
+                    move || {
+                        let sql = query.get_untracked();
+                        let (lo, hi) = statement_range(&sql, menu_offset.get_untracked());
+                        if let Some(stmt) = sql.get(lo..hi).filter(|s| !s.is_empty()) {
+                            let stmt = stmt.to_string();
+                            cmdk.start.set(lo);
+                            cmdk.end.set(hi);
+                            cmdk.input.set("Optimize this query".to_string());
+                            inline_ai.set(InlineAiState::Busy);
+                            cmdk.open.set(true);
+                            (run_optimize)(InlineAiRequest {
+                                intent: "Rewrite this SQL query to be more efficient and \
+                                readable while preserving its exact result set. Return \
+                                only the SQL."
+                                    .to_string(),
+                                current_sql: sql.clone(),
+                                selection: Some(stmt),
+                            });
+                            highlight_pick(&sql, lo, hi, highlight);
+                        }
+                    },
+                ),
+                MenuEntry::Separator,
                 MenuEntry::action("Plan", move || {
                     let sql = query.get_untracked();
                     let (lo, hi) = statement_range(&sql, menu_offset.get_untracked());
@@ -1467,28 +1503,6 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         highlight_pick(&sql, lo, hi, highlight);
                     }
                 }),
-                MenuEntry::action("Optimize", move || {
-                    let sql = query.get_untracked();
-                    let (lo, hi) = statement_range(&sql, menu_offset.get_untracked());
-                    if let Some(stmt) = sql.get(lo..hi).filter(|s| !s.is_empty()) {
-                        let stmt = stmt.to_string();
-                        cmdk.start.set(lo);
-                        cmdk.end.set(hi);
-                        cmdk.input.set("Optimize this query".to_string());
-                        inline_ai.set(InlineAiState::Busy);
-                        cmdk.open.set(true);
-                        (run_optimize)(InlineAiRequest {
-                            intent: "Rewrite this SQL query to be more efficient and \
-                                readable while preserving its exact result set. Return \
-                                only the SQL."
-                                .to_string(),
-                            current_sql: sql.clone(),
-                            selection: Some(stmt),
-                        });
-                        highlight_pick(&sql, lo, hi, highlight);
-                    }
-                }),
-                MenuEntry::Separator,
                 MenuEntry::action("Format", move || format_editor(&ed_format)),
             ]
         })
