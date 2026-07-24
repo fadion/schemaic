@@ -738,6 +738,9 @@ pub(crate) struct QueryPaneParams {
     pub cursor_offset: RwSignal<usize>,
     /// Opens the Go-to-line popup (Ctrl+G, or a status-bar Ln/Col click).
     pub goto_open: RwSignal<bool>,
+    /// When set, jump the caret to this byte offset (move + centre + focus), then
+    /// clear it. Driven by the status-bar warning count.
+    pub jump_offset: RwSignal<Option<usize>>,
     pub results: RwSignal<QueryState>,
     pub run: Rc<dyn Fn(String)>,
     pub run_all: Rc<dyn Fn(Vec<String>)>,
@@ -768,6 +771,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         query,
         cursor_offset,
         goto_open,
+        jump_offset,
         results,
         run,
         run_all,
@@ -1391,12 +1395,27 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let ed_fmt = ed.clone(); // right-click "Format SQL"
     let ed_cursor = ed.clone(); // mirror caret offset out for the status bar
     let ed_goto = ed.clone(); // Ctrl+G go-to-line: move caret + centre
+    let ed_jump = ed.clone(); // status-bar warning count: jump to first warning
 
     // Mirror the caret's byte offset into the tab's `cursor_offset` signal so the
     // status bar can render Ln/Col. Tracks `ed.cursor`, so it fires on every caret
     // move / selection change; disposed with this pane when the tab closes.
     create_effect(move |_| {
         cursor_offset.set(ed_cursor.cursor.get().offset());
+    });
+
+    // Jump the caret to a byte offset requested from outside (the status-bar
+    // warning count), then clear the request. Centres + refocuses like Go-to-line.
+    create_effect(move |_| {
+        let Some(off) = jump_offset.get() else {
+            return;
+        };
+        ed_jump.cursor.update(|c| c.set_offset(off, false, false));
+        ed_jump.center_window();
+        if let Some(Some(vid)) = ed_jump.editor_view_id.try_get_untracked() {
+            vid.request_focus();
+        }
+        jump_offset.set(None);
     });
 
     // Builds the right-click menu entries (Ask AI… / Explain / Optimize) for the
