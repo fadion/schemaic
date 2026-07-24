@@ -554,11 +554,31 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
         },
     )
     .style(move |s| {
-        let Some(n) = popup.with(|p| p.as_ref().map(|e| e.len())) else {
+        // Estimated panel height, used to place an upward edge-flip so the panel's
+        // bottom lands just above the cursor. Sum per entry kind — an action row is
+        // ≈30.5px (14px line + 8px padding both sides − sub-pixel), a separator is
+        // ≈9px (a 1px rule + 4px margins both sides) — because counting separators
+        // as full rows shoved the flipped panel tens of px too high. `+14` = the
+        // panel's 6px vertical padding (both sides) + 1px border (both sides). These
+        // are placement estimates, not the flip *decision*, so being close matters.
+        let Some(ph) = popup.with(|p| {
+            p.as_ref().map(|entries| {
+                entries
+                    .iter()
+                    .map(|e| {
+                        if matches!(e, MenuEntry::Separator) {
+                            9.0
+                        } else {
+                            30.5
+                        }
+                    })
+                    .sum::<f64>()
+                    + 14.0
+            })
+        }) else {
             return s;
         };
         let (ww, wh) = window_size().get();
-        let ph = n as f64 * 34.0 + 14.0;
         let pw = popup_width.get(); // matches the panel's min_width for edge flips
         match anchor.get() {
             // Status-bar segment menu: centre the panel horizontally on the anchor's
