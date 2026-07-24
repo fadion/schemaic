@@ -879,7 +879,9 @@ fn schema_panel_w() -> RwSignal<f64> {
 /// Reading `schema_panel_w()` inside a reactive `.style(…)` closure re-runs it on
 /// resize. `TREE_ROW_MIN_W` is the floor (before the panel width is published).
 fn tree_row_min_w() -> f64 {
-    (schema_panel_w().get() - 3.0).max(TREE_ROW_MIN_W)
+    // −2 (not −3): the row's highlight then sits flush inside the panel's 1px
+    // `border_right` instead of stopping 1px short of it.
+    (schema_panel_w().get() - 2.0).max(TREE_ROW_MIN_W)
 }
 
 // Rows fill the panel width (so hover/selection highlight spans it) via a live
