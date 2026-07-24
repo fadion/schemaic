@@ -1049,6 +1049,13 @@ fn col_resize_handle(gs: GridState, ci: usize, has_key: bool) -> impl IntoView {
         EventPropagation::Continue
     })
     .on_double_click_stop(move |_| {
+        // A `DoubleClick` consumes the second `PointerUp`, so the PointerUp handler
+        // above never runs to end the drag — clear it here too, or the divider stays
+        // "stuck" resizing on every hover until the next click.
+        if dragging.get_untracked() {
+            dragging.set(false);
+            hid.clear_active();
+        }
         let rs = gs.rs.get_untracked();
         let w = autofit_width(&rs, ci, has_key);
         gs.widths.update(|ws| {
