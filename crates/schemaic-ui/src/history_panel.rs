@@ -18,7 +18,7 @@ use schemaic_core::history::{self, HistoryEntry};
 
 use crate::theme::{FONT_BODY, FONT_LABEL};
 use crate::widgets::{autohide, section_title, toolbar_icon};
-use crate::{Ui, db_color_dot, icons, theme};
+use crate::{FieldCfg, Ui, db_color_dot, edit_field, icons, theme};
 
 /// Current wall-clock time, unix millis (for relative "x ago" labels).
 fn now_millis() -> u64 {
@@ -36,12 +36,18 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
     let clear = ui.history_actions.clear.clone();
     let db_colors = ui.db_colors;
 
-    // The active connection's entries, newest-first (already stored that way).
+    // Panel-local search filter (matched against SQL / database / tab name). Local
+    // to this panel build — resets when the History panel is re-opened.
+    let search = RwSignal::new(String::new());
+
+    // The active connection's entries, newest-first (already stored that way),
+    // narrowed to the search filter.
     let visible = create_memo(move |_| {
         let conn = active_conn.get();
+        let q = search.get();
         entries.with(|v| {
             v.iter()
-                .filter(|e| e.conn_id == conn)
+                .filter(|e| e.conn_id == conn && history::matches_query(e, &q))
                 .cloned()
                 .collect::<Vec<_>>()
         })
@@ -51,7 +57,13 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
         move || visible.get(),
         move |rows| {
             if rows.is_empty() {
-                return text("No queries yet.")
+                // Distinguish "nothing recorded" from "filtered everything out".
+                let msg = if search.get_untracked().trim().is_empty() {
+                    "No queries yet."
+                } else {
+                    "No matching queries."
+                };
+                return text(msg)
                     .style(|s| {
                         s.font_size(14.0)
                             .color(theme::text_muted())
@@ -81,7 +93,17 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
     let title_row = h_stack((section_title("QUERY HISTORY"), trash))
         .style(|s| s.width_full().flex_row().items_start().justify_between());
 
-    v_stack((title_row, scrolled)).style(move |s| {
+    v_stack((
+        title_row,
+        // Same 5px above / 10px below the search box as the schema panel (≈15px
+        // each visually); spacers (not margins) so the flex-grow scroll's height
+        // stays exact (a sibling's vertical margin isn't subtracted → overflow).
+        empty().style(|s| s.height(5.0).flex_shrink(0.0_f32)),
+        history_search(search),
+        empty().style(|s| s.height(10.0).flex_shrink(0.0_f32)),
+        scrolled,
+    ))
+    .style(move |s| {
         s.width(right_w.get())
             .flex_shrink(0.0_f32)
             .height_full()
@@ -90,6 +112,21 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
             .border_left(1.0)
             .border_color(theme::border())
     })
+}
+
+// The history search box — same look/dimensions/placeholder as the schema tree's
+// `schema_search`. Non-empty narrows the list by SQL / database / tab name.
+fn history_search(filter: RwSignal<String>) -> impl IntoView {
+    edit_field(
+        filter,
+        FieldCfg {
+            placeholder: "Search…",
+            background: theme::bg_chrome,
+            clearable: true,
+            ..Default::default()
+        },
+    )
+    .style(|s| s.margin_left(12.0).margin_right(12.0).flex_shrink(0.0_f32))
 }
 
 /// One history row: SQL preview (≤3 wrapped lines, clipped) over a
