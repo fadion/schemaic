@@ -154,16 +154,40 @@ fn cycle_sort(sort: RwSignal<SortState>, ci: usize) {
     });
 }
 
+/// A precomputed sort key for one cell: whether it's NULL, its numeric value if
+/// it's a numeric-*tagged* cell, and its (borrowed, arena-slice) text. Built once
+/// per row so a sort parses each numeric cell a single time (O(n)) instead of on
+/// every comparison (O(n log n)) — see [`compute_order`].
+struct SortKey<'a> {
+    null: bool,
+    num: Option<f64>,
+    text: &'a str,
+}
+
 /// A stable permutation of row indices for the given sort (identity when
-/// `None`). Nulls sort last; numeric columns compare numerically.
+/// `None`). Nulls sort last; two numeric cells compare numerically; anything
+/// else compares by displayed text — same ordering as a per-pair comparison,
+/// but with the per-cell key parsed once up front (decorate-sort).
 fn compute_order(rs: &ResultSet, sort: SortState) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..rs.row_count()).collect();
     if let Some((c, asc)) = sort {
+        // Decorate: one key per row (each numeric cell parsed exactly once).
+        let keys: Vec<SortKey> = (0..rs.row_count())
+            .map(|r| match rs.cell(r, c) {
+                Some(cell) => SortKey {
+                    null: cell.is_null(),
+                    num: cell_num(cell),
+                    text: cell.text(),
+                },
+                None => SortKey {
+                    null: true,
+                    num: None,
+                    text: "",
+                },
+            })
+            .collect();
         idx.sort_by(|&a, &b| {
-            let o = match (rs.cell(a, c), rs.cell(b, c)) {
-                (Some(x), Some(y)) => cmp_cell(x, y),
-                _ => Ordering::Equal,
-            };
+            let o = cmp_key(&keys[a], &keys[b]);
             if asc { o } else { o.reverse() }
         });
     }
@@ -172,7 +196,7 @@ fn compute_order(rs: &ResultSet, sort: SortState) -> Vec<usize> {
 
 /// Numeric view of a cell for sorting — only for numeric-*tagged* cells (a `Str`
 /// that happens to look like a number is compared as text, matching the old
-/// `Value`-variant gate). Parses the arena text to `f64` on demand.
+/// `Value`-variant gate). Parses the arena text to `f64`.
 fn cell_num(c: CellRef) -> Option<f64> {
     match c.tag {
         CellTag::Int | CellTag::UInt | CellTag::Float => c.text().parse::<f64>().ok(),
@@ -180,16 +204,16 @@ fn cell_num(c: CellRef) -> Option<f64> {
     }
 }
 
-/// Sort comparison between two cells: NULLs sort last; two numeric cells compare
-/// numerically; anything else compares by displayed text.
-fn cmp_cell(a: CellRef, b: CellRef) -> Ordering {
-    match (a.is_null(), b.is_null()) {
+/// Compare two precomputed [`SortKey`]s: NULLs sort last; two numeric cells
+/// compare numerically; anything else compares by text.
+fn cmp_key(a: &SortKey, b: &SortKey) -> Ordering {
+    match (a.null, b.null) {
         (true, true) => Ordering::Equal,
         (true, false) => Ordering::Greater,
         (false, true) => Ordering::Less,
-        (false, false) => match (cell_num(a), cell_num(b)) {
+        (false, false) => match (a.num, b.num) {
             (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
-            _ => a.display().cmp(b.display()),
+            _ => a.text.cmp(b.text),
         },
     }
 }
@@ -3309,5 +3333,99 @@ fn truncate(s: &str, max: usize) -> String {
         out
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use schemaic_core::model::Column;
+
+    fn col(name: &str, ty: &str) -> Column {
+        Column {
+            name: name.to_string(),
+            type_name: ty.to_string(),
+            origin: None,
+        }
+    }
+
+    // Single-column result of the given cells, so `compute_order` sorts column 0.
+    fn rs_col(ty: &str, cells: Vec<Value>) -> ResultSet {
+        ResultSet::from_rows(
+            vec![col("c", ty)],
+            cells.into_iter().map(|v| vec![v]).collect(),
+        )
+    }
+
+    #[test]
+    fn compute_order_none_is_identity() {
+        let rs = rs_col("INT", vec![Value::Int(3), Value::Int(1), Value::Int(2)]);
+        assert_eq!(compute_order(&rs, None), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn compute_order_numeric_ascending_and_descending() {
+        // Numeric-tagged cells compare numerically, not lexically (10 > 9).
+        let rs = rs_col(
+            "INT",
+            vec![Value::Int(10), Value::Int(9), Value::Int(-1), Value::Int(2)],
+        );
+        assert_eq!(compute_order(&rs, Some((0, true))), vec![2, 3, 1, 0]);
+        assert_eq!(compute_order(&rs, Some((0, false))), vec![0, 1, 3, 2]);
+    }
+
+    #[test]
+    fn compute_order_nulls_sort_last_ascending() {
+        // Ascending: non-nulls in order (1, 2), NULL last.
+        let rs = rs_col("INT", vec![Value::Int(2), Value::Null, Value::Int(1)]);
+        assert_eq!(compute_order(&rs, Some((0, true))), vec![2, 0, 1]);
+        // Descending reverses the whole comparator (unchanged from the original
+        // sort), so a NULL lands first — asserted here to pin that behavior.
+        assert_eq!(compute_order(&rs, Some((0, false))), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn compute_order_text_is_lexical() {
+        // String-tagged cells compare as text ("10" < "9" lexically).
+        let rs = rs_col(
+            "VARCHAR",
+            vec![
+                Value::Str("banana".into()),
+                Value::Str("apple".into()),
+                Value::Str("cherry".into()),
+            ],
+        );
+        assert_eq!(compute_order(&rs, Some((0, true))), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn compute_order_matches_naive_pairwise_on_mixed_column() {
+        // Decorate-sort must order identically to a per-pair comparison even when a
+        // column mixes numeric-tagged and string-tagged cells (the defensive case):
+        // numeric compares numerically only when *both* are numeric, else by text.
+        let cells = vec![
+            Value::Int(100),
+            Value::Str("apple".into()),
+            Value::Null,
+            Value::Int(9),
+            Value::Str("9zzz".into()),
+        ];
+        let rs = rs_col("MIXED", cells);
+        let got = compute_order(&rs, Some((0, true)));
+        // Reference: sort indices with a fresh per-pair comparator over cells.
+        let mut want: Vec<usize> = (0..rs.row_count()).collect();
+        want.sort_by(|&a, &b| {
+            let (x, y) = (rs.cell(a, 0).unwrap(), rs.cell(b, 0).unwrap());
+            match (x.is_null(), y.is_null()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => match (cell_num(x), cell_num(y)) {
+                    (Some(p), Some(q)) => p.partial_cmp(&q).unwrap_or(Ordering::Equal),
+                    _ => x.display().cmp(y.display()),
+                },
+            }
+        });
+        assert_eq!(got, want);
     }
 }
