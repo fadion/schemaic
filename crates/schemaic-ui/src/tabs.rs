@@ -265,6 +265,7 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                 let close = close_tab.clone();
                 entries.push(MenuEntry::action("Close", move || (close)(tab.id)));
             }
+            overlay.popup_width.set(120.0);
             overlay.popup_menu.set(Some(entries));
         })
         // Flat, full-height tab capped at `TAB_MAX_W`: chrome background (invisible

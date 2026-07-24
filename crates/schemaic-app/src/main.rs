@@ -2329,6 +2329,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             context_menu,
             popup_menu: RwSignal::new(None),
             popup_anchor: RwSignal::new(None),
+            popup_width: RwSignal::new(170.0),
             last_mouse,
             find_open,
             find_query,

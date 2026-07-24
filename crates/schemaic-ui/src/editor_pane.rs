@@ -758,6 +758,7 @@ pub(crate) struct QueryPaneParams {
     pub confirm_writes: RwSignal<bool>,
     pub popup_menu: RwSignal<Option<Vec<MenuEntry>>>,
     pub popup_anchor: RwSignal<Option<(f64, f64, f64, f64)>>,
+    pub popup_width: RwSignal<f64>,
     pub open_plan: Rc<dyn Fn(String)>,
     pub nav: NavKeys,
 }
@@ -787,6 +788,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         confirm_writes,
         popup_menu,
         popup_anchor,
+        popup_width,
         open_plan,
         nav,
     } = p;
@@ -1699,6 +1701,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     // Open at the cursor (window coords via `last_mouse`), rendered
                     // at the workspace root so it floats over the results pane.
                     popup_anchor.set(None);
+                    popup_width.set(120.0);
                     popup_menu.set(Some((build_editor_menu)()));
                     comp.open.set(false);
                     return EventPropagation::Stop;

@@ -127,7 +127,7 @@ pub(crate) const SCROLL_HIDE_MS: u64 = 3000;
 // ── Menus / misc ────────────────────────────────────────────────────────────
 
 /// Fixed width of the active-database menu (right-aligned under its trigger).
-pub(crate) const DB_MENU_W: f64 = 220.0;
+pub(crate) const DB_MENU_W: f64 = 170.0;
 
 /// The masking glyph used by password fields. Must be a single ASCII byte so the
 /// buffer's byte length tracks its char length and the cursor stays valid.

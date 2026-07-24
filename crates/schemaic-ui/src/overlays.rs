@@ -283,7 +283,7 @@ pub(crate) fn db_visibility_overlay(ui: Ui) -> impl IntoView {
                 .style(|s| {
                     panel_style(s)
                         .background(theme::bg_chrome())
-                        .min_width(220.0)
+                        .min_width(170.0)
                         .padding_vert(6.0)
                         .font_size(theme::FONT_TITLE)
                 })
@@ -512,7 +512,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
 
             // Dismissal is a root-level pointer-down handler (see `workspace`); the
             // panel absorbs its own pointer-downs so it isn't closed mid-click.
-            menu_panel(entries, Rc::new(move || ctx.set(None))).into_any()
+            menu_panel(entries, Rc::new(move || ctx.set(None)), 170.0).into_any()
         },
     )
     // Anchor 3px below-right of the cursor (window coords tracked at root).
@@ -534,11 +534,17 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
     let popup = ui.overlay.popup_menu;
     let last_mouse = ui.overlay.last_mouse;
     let anchor = ui.overlay.popup_anchor;
+    let popup_width = ui.overlay.popup_width;
     dyn_container(
         move || popup.get(),
         move |entries| match entries {
             None => empty().into_any(),
-            Some(entries) => menu_panel(entries, Rc::new(move || popup.set(None))).into_any(),
+            Some(entries) => {
+                // Width was set by the opener; an effect in `workspace` resets it to
+                // the default when the popup closes, so the next menu gets 170.
+                let w = popup_width.get_untracked();
+                menu_panel(entries, Rc::new(move || popup.set(None)), w).into_any()
+            }
         },
     )
     .style(move |s| {
@@ -547,7 +553,7 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
         };
         let (ww, wh) = window_size().get();
         let ph = n as f64 * 34.0 + 14.0;
-        let pw = 170.0; // menu panels' `min_width(170)`; short labels never exceed it
+        let pw = popup_width.get(); // matches the panel's min_width for edge flips
         match anchor.get() {
             // Status-bar menu: centre the panel horizontally on the anchor's
             // x-range and sit 5px above the status bar (FOOTER_H tall at the window
