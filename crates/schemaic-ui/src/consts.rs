@@ -146,6 +146,14 @@ pub(crate) const GRID_CHAR_W: f64 = 7.0; // ≈ advance width of the 13px cell f
 pub(crate) const RESIZE_HIT_W: f64 = 7.0; // grab width of a column-resize divider
 pub(crate) const GRID_HEADER_H: f64 = 40.0; // two-line header (name + type)
 pub(crate) const GUTTER_W: f64 = 52.0; // row-number gutter width (frozen)
+// Right padding for right-aligned (numeric) headers + cells — a touch more than
+// the 10px sides so the value doesn't hug the edge/border. Header and cell share
+// it so numbers line up under their column name.
+pub(crate) const GRID_NUM_PAD_RIGHT: f64 = 14.0;
+// Extra header width a key column needs over a plain one: its leading key icon
+// (14px) + gap (8px) beyond the normal side padding. Added to the width estimate
+// so a long type line (e.g. `INT UNSIGNED`) on a PK/FK column isn't clipped.
+pub(crate) const HEADER_KEY_ICON_W: f64 = 22.0;
 
 /// Auto-hide delay (ms) for the overlay scrollbars after scrolling stops.
 pub(crate) const SCROLL_HIDE_MS: u64 = 3000;
