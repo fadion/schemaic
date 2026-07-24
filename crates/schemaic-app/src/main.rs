@@ -1090,25 +1090,30 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // the active connection + that db, remembering its source for tree
     // highlighting. Reuses a blank active tab (via `place_tab`), but never dedupes
     // to an already-open table tab — that's the caller's job.
-    let spawn_table_tab: Rc<dyn Fn(String, String)> = {
+    let spawn_table_tab: Rc<dyn Fn(String, String, Option<String>)> = {
         let run = run.clone();
         let next_id = next_id.clone();
         let place_tab = place_tab.clone();
-        Rc::new(move |database: String, table: String| {
-            let id = next_id.get();
-            next_id.set(id + 1);
-            let sql = format!("SELECT * FROM {table} LIMIT 100");
-            let tab = Tab::new(
-                cx,
-                id,
-                &sql,
-                active_conn.get_untracked(),
-                Some(database.clone()),
-            );
-            tab.source.set(Some((database, table)));
-            (place_tab)(tab);
-            run(sql);
-        })
+        Rc::new(
+            move |database: String, table: String, highlight: Option<String>| {
+                let id = next_id.get();
+                next_id.set(id + 1);
+                let sql = format!("SELECT * FROM {table} LIMIT 100");
+                let tab = Tab::new(
+                    cx,
+                    id,
+                    &sql,
+                    active_conn.get_untracked(),
+                    Some(database.clone()),
+                );
+                tab.source.set(Some((database, table)));
+                // A column to select once the results load (schema-tree column
+                // double-click). Consumed + cleared by the grid.
+                tab.highlight_col.set(highlight);
+                (place_tab)(tab);
+                run(sql);
+            },
+        )
     };
 
     // Open a table from the sidebar / Find ("Open"): if a tab is already showing
@@ -1117,6 +1122,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // table under a different connection doesn't wrongly steal focus (H13).
     let open_table: Rc<dyn Fn(String, String)> = {
         let spawn = spawn_table_tab.clone();
+        let run = run.clone();
         Rc::new(move |database: String, table: String| {
             let existing = tabs.with_untracked(|v| {
                 v.iter()
@@ -1124,13 +1130,58 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         t.source.get_untracked() == Some((database.clone(), table.clone()))
                             && t.conn_id.get_untracked() == active_conn.get_untracked()
                     })
-                    .map(|t| t.id)
+                    .copied()
             });
-            if let Some(id) = existing {
-                active.set(id);
+            if let Some(tab) = existing {
+                active.set(tab.id);
+                // A restored tab keeps its query text but hasn't run (restore never
+                // auto-runs), so switching to it would show an empty grid. Run it now
+                // — a freshly-opened table tab always runs on open, so reusing one
+                // should match. (`run` targets the now-active tab.)
+                if matches!(tab.results.get_untracked(), QueryState::Idle) {
+                    (run)(tab.query.get_untracked());
+                }
                 return;
             }
-            (spawn)(database, table);
+            (spawn)(database, table, None);
+        })
+    };
+
+    // Open a table and highlight one of its columns in the grid (schema-tree column
+    // double-click). Same tab-reuse rules as `open_table`, but records the column to
+    // select once the grid loads. For an already-open tab, set the highlight *then*
+    // switch to it — switching rebuilds that tab's grid, whose effect consumes it.
+    let open_table_col: Rc<dyn Fn(String, String, String)> = {
+        let spawn = spawn_table_tab.clone();
+        let run = run.clone();
+        Rc::new(move |database: String, table: String, column: String| {
+            let existing = tabs.with_untracked(|v| {
+                v.iter()
+                    .find(|t| {
+                        t.source.get_untracked() == Some((database.clone(), table.clone()))
+                            && t.conn_id.get_untracked() == active_conn.get_untracked()
+                    })
+                    .copied()
+            });
+            if let Some(tab) = existing {
+                tab.highlight_col.set(Some(column));
+                // Only switch tabs when we're not already on it: `active.set` never
+                // dedups, so re-setting the current id would rebuild (and dispose)
+                // the live grid out from under the highlight effect. When the tab is
+                // already active, setting `highlight_col` alone re-fires its mounted
+                // grid's effect, which re-selects on the live grid — no rebuild.
+                if active.get_untracked() != tab.id {
+                    active.set(tab.id);
+                }
+                // A restored tab has its query but hasn't run — run it now so the
+                // grid loads and the highlight effect can fire (it consumes
+                // `highlight_col` once the results are `Loaded`).
+                if matches!(tab.results.get_untracked(), QueryState::Idle) {
+                    (run)(tab.query.get_untracked());
+                }
+                return;
+            }
+            (spawn)(database, table, Some(column));
         })
     };
 
@@ -1138,7 +1189,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // ("Open in new tab" — only offered by the menu when a tab for it exists).
     let open_table_new: Rc<dyn Fn(String, String)> = {
         let spawn = spawn_table_tab.clone();
-        Rc::new(move |database: String, table: String| (spawn)(database, table))
+        Rc::new(move |database: String, table: String| (spawn)(database, table, None))
     };
 
     // Open a new tab with `sql` in the editor but do NOT run it (used by
@@ -2320,6 +2371,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             duplicate_tab,
             open_table,
             open_table_new,
+            open_table_col,
             open_query,
             set_active_db,
             open_db_cli,
