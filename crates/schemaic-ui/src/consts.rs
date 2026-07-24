@@ -154,6 +154,10 @@ pub(crate) const GRID_NUM_PAD_RIGHT: f64 = 14.0;
 // (14px) + gap (8px) beyond the normal side padding. Added to the width estimate
 // so a long type line (e.g. `INT UNSIGNED`) on a PK/FK column isn't clipped.
 pub(crate) const HEADER_KEY_ICON_W: f64 = 22.0;
+// Trailing-debounce delay for the schema-tree + query-history search boxes: the
+// input stays live, but the expensive re-filter/re-expand fires once the typing
+// pauses this long — so a single keystroke doesn't churn a large schema/history.
+pub(crate) const SEARCH_DEBOUNCE_MS: u64 = 150;
 
 /// Auto-hide delay (ms) for the overlay scrollbars after scrolling stops.
 pub(crate) const SCROLL_HIDE_MS: u64 = 3000;

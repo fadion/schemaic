@@ -24,7 +24,9 @@ use schemaic_core::schema::{
 use schemaic_core::text::plural;
 
 use crate::consts::*;
-use crate::widgets::{autohide, loading_dots, section_title, shift_hscroll};
+use crate::widgets::{
+    autohide, debounced, highlight_text, loading_dots, section_title, shift_hscroll,
+};
 use crate::{ConnNode, CtxKind, CtxMenu, FieldCfg, Ui, db_color_dot, edit_field, icons, theme};
 
 // ===== moved from lib.rs (schema tree) =====
@@ -75,6 +77,24 @@ fn visible_nav_rows(
         if hidden.contains(&n.database) {
             continue;
         }
+        // Mirror the tree's search filtering (so arrow-key nav walks exactly what's
+        // shown): a DB matches by its own name or by containing a matching table; a
+        // DB whose schema is still loading is kept (we can't know its tables yet).
+        let db_hit = filtering && n.name.to_lowercase().contains(&filt);
+        let schema_state = n.schema.get_untracked();
+        let schema = match &schema_state {
+            SchemaState::Loaded(s) => Some(s),
+            _ => None,
+        };
+        if filtering && !db_hit {
+            let has_match = match schema {
+                Some(s) => s.tables.iter().any(|t| t.matches_search(&filt)),
+                None => true,
+            };
+            if !has_match {
+                continue;
+            }
+        }
         let db_key = format!("db:{}", n.database);
         let db_open = exp.contains(&db_key) || filtering;
         rows.push(NavRow {
@@ -86,15 +106,17 @@ fn visible_nav_rows(
         if !db_open {
             continue;
         }
-        let SchemaState::Loaded(schema) = n.schema.get_untracked() else {
+        let Some(schema) = schema else {
             continue;
         };
         for t in &schema.tables {
-            if filtering && !t.name.to_lowercase().contains(&filt) {
+            if filtering && !db_hit && !t.matches_search(&filt) {
                 continue;
             }
             let tbl_key = format!("tbl:{}:{}", n.database, t.name);
-            let tbl_open = exp.contains(&tbl_key);
+            // A column match force-reveals the table's columns/keys (like the tree).
+            let force_cols = filtering && t.any_column_matches(&filt);
+            let tbl_open = exp.contains(&tbl_key) || force_cols;
             rows.push(NavRow {
                 key: tbl_key.clone(),
                 parent: Some(db_key.clone()),
@@ -190,9 +212,12 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
             active_db_menu_open.set(false);
         }
     };
-    // Live table-name filter (local to the panel). Non-empty ⇒ every database is
-    // force-expanded and its tables are narrowed to matches.
-    let filter = RwSignal::new(String::new());
+    // Search filter (local to the panel). `filter_input` is bound to the search box
+    // (updates per keystroke); `filter` is its debounced mirror — the tree filters,
+    // highlights, and re-expands off `filter`, so a burst of typing churns the
+    // (potentially large) schema once, not on every character.
+    let filter_input = RwSignal::new(String::new());
+    let filter = debounced(filter_input, Duration::from_millis(SEARCH_DEBOUNCE_MS));
     // Keyboard-navigation cursor + focus (local to the panel).
     let nav = Nav {
         focused: RwSignal::new(false),
@@ -212,10 +237,24 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     // databases are filtered out entirely (also drops them from local search).
     let tree = dyn_stack(
         move || {
+            let filt = filter.get();
+            let filt = filt.trim().to_lowercase();
             db_nodes
                 .get()
                 .into_iter()
                 .filter(|c| !hidden_dbs.get().contains(&c.database))
+                // While filtering, drop a database with no match: neither its own
+                // name nor any of its tables/columns matches. A database whose schema
+                // is still loading is kept (we can't know its tables yet).
+                .filter(|c| {
+                    if filt.is_empty() || c.name.to_lowercase().contains(&filt) {
+                        return true;
+                    }
+                    match c.schema.get() {
+                        SchemaState::Loaded(s) => s.tables.iter().any(|t| t.matches_search(&filt)),
+                        _ => true,
+                    }
+                })
                 .collect::<Vec<_>>()
         },
         |c: &ConnNode| c.id,
@@ -437,7 +476,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
         // sibling isn't subtracted from the flex-grow scroll's height, so it
         // overflows and clips short of the footer.
         empty().style(|s| s.height(5.0).flex_shrink(0.0_f32)),
-        schema_search(filter),
+        schema_search(filter_input),
         empty().style(|s| s.height(10.0).flex_shrink(0.0_f32)),
         tree,
     ))
@@ -500,6 +539,26 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
     let key_row = key.clone();
     let ctx_db = conn.database.clone();
     let dot_db = conn.database.clone();
+    // The database name, highlighting the search term. Wrapped in a `dyn_container`
+    // on `filter` so the highlight tracks the search without rebuilding the node
+    // (`dyn_stack` keys DB nodes by id and won't rebuild a surviving one).
+    let name_disp = conn.name.clone();
+    let db_name = dyn_container(
+        move || filter.get(),
+        move |f| {
+            let f = f.trim();
+            let term = (!f.is_empty()).then(|| f.to_string());
+            highlight_text(
+                name_disp.clone(),
+                term,
+                theme::FONT_BODY,
+                theme::text,
+                true,
+                1.0,
+            )
+            .into_any()
+        },
+    );
     let header = h_stack((
         chevron(expanded, key.clone(), on_toggle.clone()),
         icons::icon(icons::DATABASE, SCHEMA_ICON as f32).style(|s| {
@@ -508,7 +567,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                 .margin_right(ICON_GAP)
                 .flex_shrink(0.0_f32)
         }),
-        text(conn.name.clone()).style(|s| s.color(theme::text()).font_bold()),
+        db_name,
         // Identity dot after the name (only when this database has a colour).
         db_color_dot(
             db_colors,
@@ -552,6 +611,8 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
     // force-expands the node and narrows its tables to name matches.
     let key_children = key.clone();
     let database = conn.database.clone();
+    // Lower-cased display name, for the "the DB itself matched" check below.
+    let db_name_lc = conn.name.to_lowercase();
     let ot_tables = open_table;
     let otc_tables = open_table_col;
     let toggle_tables = on_toggle;
@@ -566,6 +627,8 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
         move |(open, state, filt)| {
             let filt = filt.trim().to_lowercase();
             let filtering = !filt.is_empty();
+            // The DB itself matched → show all its tables (not just matching ones).
+            let db_hit = filtering && db_name_lc.contains(&filt);
             if !open && !filtering {
                 return empty().into_any();
             }
@@ -587,7 +650,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                     let tables: Vec<TableInfo> = schema
                         .tables
                         .into_iter()
-                        .filter(|t| !filtering || t.name.to_lowercase().contains(&filt))
+                        .filter(|t| !filtering || db_hit || t.matches_search(&filt))
                         .collect();
                     if tables.is_empty() {
                         // Hide the node's body entirely while filtering with no
@@ -637,6 +700,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
 fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl IntoView {
     let SchemaTreeCtx {
         expanded,
+        filter,
         on_toggle,
         open_table,
         open_table_col,
@@ -645,6 +709,25 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
         nav,
         ..
     } = ctx;
+    // The active filter term to highlight in the table + column names (the tree
+    // rebuilds this node on every `filter` change, so an untracked read here is
+    // always current). `force_cols` reveals a table's columns when the match is on a
+    // column (not the table name), so the highlighted column is actually visible.
+    let name_term = {
+        let f = filter.get_untracked();
+        let f = f.trim();
+        (!f.is_empty()).then(|| f.to_string())
+    };
+    let force_cols = match &name_term {
+        Some(t) => {
+            let tl = t.to_lowercase();
+            table
+                .columns
+                .iter()
+                .any(|c| c.name.to_lowercase().contains(&tl))
+        }
+        None => false,
+    };
     let key = format!("tbl:{}:{}", database, table.name);
     let col_count = table.columns.len();
     let key_count = table.indexes.len();
@@ -670,7 +753,14 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
                 .margin_right(ICON_GAP)
                 .flex_shrink(0.0_f32)
         }),
-        text(table.name.clone()).style(|s| s.color(theme::text())),
+        highlight_text(
+            table.name.clone(),
+            name_term.clone(),
+            theme::FONT_BODY,
+            theme::text,
+            false,
+            1.0,
+        ),
     ))
     .on_double_click_stop(move |_| (open_table)(dbl_db.clone(), dbl_table.clone()))
     .on_secondary_click_stop(move |_| {
@@ -708,8 +798,11 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
     let idxs = table.indexes;
     let cols_db = database.clone();
     let cols_table = table.name.clone();
+    let col_term = name_term;
     let children = dyn_container(
-        move || expanded.get().contains(&key_children),
+        // Show columns/keys when the table is expanded OR when a column matched the
+        // filter (`force_cols`) — so the highlighted column is actually revealed.
+        move || expanded.get().contains(&key_children) || force_cols,
         move |open| {
             if !open {
                 return empty().into_any();
@@ -717,6 +810,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
             let counts = count_row(col_count, key_count);
             let (cdb, ctbl) = (cols_db.clone(), cols_table.clone());
             let otc = open_table_col.clone();
+            let cterm = col_term.clone();
             // Columns backing a FOREIGN KEY index — tinted purple like their key.
             let fk_cols: HashSet<String> = idxs
                 .iter()
@@ -738,6 +832,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
                     cdb.clone(),
                     ctbl.clone(),
                     otc.clone(),
+                    cterm.clone(),
                     nav,
                 )
             }))
@@ -827,6 +922,7 @@ fn column_row(
     database: String,
     table: String,
     open_table_col: Rc<dyn Fn(String, String, String)>,
+    term: Option<String>,
     nav: Nav,
 ) -> impl IntoView {
     let name = c.name;
@@ -850,7 +946,14 @@ fn column_row(
                 .margin_right(ICON_GAP)
                 .flex_shrink(0.0_f32)
         }),
-        text(name),
+        highlight_text(
+            name,
+            term,
+            theme::FONT_BODY,
+            move || kind.color(),
+            false,
+            1.0,
+        ),
         text(ty).style(|s| {
             s.color(theme::text_muted())
                 .font_size(theme::FONT_LABEL)

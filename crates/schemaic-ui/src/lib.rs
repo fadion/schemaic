@@ -3309,6 +3309,9 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                                 .items_center()
                                 .margin_left(6.0)
                                 .color(theme::text())
+                                // Override the field's text (I-beam) cursor — the ×
+                                // is a button, not editable text.
+                                .cursor(CursorStyle::Default)
                                 .hover(|s| s.color(theme::text_dim()))
                         })
                         .into_any()
