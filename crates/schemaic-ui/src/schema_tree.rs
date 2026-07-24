@@ -386,12 +386,14 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
 
     v_stack((
         title_row,
-        // Spacers (not search margins) for the 10px above / 15px below the box:
-        // any vertical margin on a flex sibling isn't subtracted from the
-        // flex-grow scroll's height, so it overflows and clips short of the footer.
-        empty().style(|s| s.height(10.0).flex_shrink(0.0_f32)),
+        // Spacers (not search margins): 5px above / 10px below the box, which land
+        // at ~15px each visually (the box + title row add ~10px top / ~5px bottom of
+        // their own). Spacers not margins because any vertical margin on a flex
+        // sibling isn't subtracted from the flex-grow scroll's height, so it
+        // overflows and clips short of the footer.
+        empty().style(|s| s.height(5.0).flex_shrink(0.0_f32)),
         schema_search(filter),
-        empty().style(|s| s.height(15.0).flex_shrink(0.0_f32)),
+        empty().style(|s| s.height(10.0).flex_shrink(0.0_f32)),
         tree,
     ))
     .style(move |s| {

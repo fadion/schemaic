@@ -78,6 +78,28 @@ pub fn preview(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Whether a history entry matches a free-text filter (ASCII case-insensitive),
+/// checking the SQL, the database name, and the originating tab name. An empty
+/// (or whitespace-only) query matches everything. The SQL is matched against its
+/// whitespace-collapsed [`preview`], so a multi-word query reads across the
+/// statement's original newlines — matching what the panel shows.
+pub fn matches_query(entry: &HistoryEntry, query: &str) -> bool {
+    use crate::text_ops::contains_ignore_ascii_case;
+    let q = query.trim();
+    if q.is_empty() {
+        return true;
+    }
+    contains_ignore_ascii_case(&preview(&entry.sql), q)
+        || entry
+            .database
+            .as_deref()
+            .is_some_and(|d| contains_ignore_ascii_case(d, q))
+        || entry
+            .tab_name
+            .as_deref()
+            .is_some_and(|t| contains_ignore_ascii_case(t, q))
+}
+
 /// Human "time ago" for a history timestamp, given the current time (both unix
 /// millis). Coarse buckets — seconds / minutes / hours / days / weeks.
 pub fn relative_time(ts: u64, now: u64) -> String {
@@ -174,6 +196,31 @@ mod tests {
         clear_conn(&mut v, 1);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].conn_id, 2);
+    }
+
+    #[test]
+    fn matches_filters_by_sql_database_and_tab_name() {
+        let mut e = entry(1, "SELECT * FROM film", 100);
+        e.database = Some("sakila".to_string());
+        e.tab_name = Some("My Films".to_string());
+        // Empty / whitespace-only query matches everything.
+        assert!(matches_query(&e, ""));
+        assert!(matches_query(&e, "   "));
+        // Case-insensitive substring of the SQL.
+        assert!(matches_query(&e, "film"));
+        assert!(matches_query(&e, "FILM"));
+        // Database name and tab name.
+        assert!(matches_query(&e, "sakila"));
+        assert!(matches_query(&e, "my films"));
+        // No match anywhere.
+        assert!(!matches_query(&e, "zzz"));
+        // Matches against the whitespace-collapsed preview, so a multi-word query
+        // spans the original newline.
+        let ml = entry(1, "SELECT *\n  FROM   film", 100);
+        assert!(matches_query(&ml, "from film"));
+        // A None tab_name doesn't match (and doesn't panic).
+        let bare = entry(1, "SELECT 1", 100); // tab_name: None
+        assert!(!matches_query(&bare, "nope"));
     }
 
     #[test]
