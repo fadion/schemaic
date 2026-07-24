@@ -30,6 +30,10 @@ pub(crate) const LEVEL_INDENT: f64 = 16.0;
 /// this tracks the label so tuning `CHEVRON_GAP` alone can't un-indent them.)
 pub(crate) const LEAF_PAD: f64 =
     ROW_PAD + LEVEL_INDENT + SCHEMA_ICON + CHEVRON_GAP + SCHEMA_ICON + ICON_GAP;
+/// Left padding of a leaf row that carries its own 16px icon (column type / key).
+/// Columns nest one `LEVEL_INDENT` under their table — the same step tables get
+/// under their database — so the icon sits one level right of the table's glyph.
+pub(crate) const COL_PAD: f64 = LEAF_PAD - SCHEMA_ICON - ICON_GAP + LEVEL_INDENT;
 /// Minimum width of a schema-tree row: short rows fill (nice hover), long rows
 /// extend past it so the horizontal scrollbar kicks in.
 pub(crate) const TREE_ROW_MIN_W: f64 = theme::SCHEMA_W - 20.0;

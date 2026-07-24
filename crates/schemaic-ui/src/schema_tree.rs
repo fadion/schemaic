@@ -16,7 +16,9 @@ use floem::prelude::*;
 use floem::reactive::{Memo, create_effect};
 
 use schemaic_core::db_color::DbColorRule;
-use schemaic_core::schema::{ColumnInfo, IndexInfo, SchemaState, TableInfo};
+use schemaic_core::schema::{
+    ColumnInfo, ColumnTypeClass, IndexInfo, SchemaState, TableInfo, classify_column_type,
+};
 
 use crate::consts::*;
 use crate::widgets::{autohide, loading_dots, section_title, shift_hscroll};
@@ -663,11 +665,22 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
             }
             let counts = count_row(col_count, key_count);
             let (cdb, ctbl) = (cols_db.clone(), cols_table.clone());
-            let cols_block = v_stack_from_iter(
-                cols.iter()
-                    .cloned()
-                    .map(move |c| column_row(c, context_menu, cdb.clone(), ctbl.clone(), nav)),
-            )
+            // Columns backing a FOREIGN KEY index — tinted purple like their key.
+            let fk_cols: HashSet<String> = idxs
+                .iter()
+                .filter(|ix| ix.foreign)
+                .flat_map(|ix| ix.columns.iter().cloned())
+                .collect();
+            let cols_block = v_stack_from_iter(cols.iter().cloned().map(move |c| {
+                let ckind = if c.primary_key {
+                    ColKey::Primary
+                } else if fk_cols.contains(&c.name) {
+                    ColKey::Foreign
+                } else {
+                    ColKey::None
+                };
+                column_row(c, ckind, context_menu, cdb.clone(), ctbl.clone(), nav)
+            }))
             .style(|s| s.flex_col());
             let (kdb, ktbl) = (cols_db.clone(), cols_table.clone());
             let keys_block = v_stack_from_iter(
@@ -714,33 +727,71 @@ fn capsule(label: String) -> impl IntoView {
 
 // A single column (leaf): name then, 12px to its right, the SQL type. Primary
 // keys take the gold accent. No right-alignment — the type trails the name.
+/// Whether a column participates in a key, for tinting its row (the glyph still
+/// reflects the column's *type*; only the colour signals key membership).
+#[derive(Clone, Copy, PartialEq)]
+enum ColKey {
+    Primary,
+    Foreign,
+    None,
+}
+
+impl ColKey {
+    /// Row colour: gold PK / purple FK / normal text.
+    fn color(self) -> floem::peniko::Color {
+        match self {
+            ColKey::Primary => theme::key_primary(),
+            ColKey::Foreign => theme::key_foreign(),
+            ColKey::None => theme::text(),
+        }
+    }
+}
+
+/// The schema-tree glyph for a column type family.
+fn column_type_icon(class: ColumnTypeClass) -> &'static str {
+    match class {
+        ColumnTypeClass::Text => icons::TYPE,
+        ColumnTypeClass::Numeric => icons::HASH,
+        ColumnTypeClass::Boolean => icons::CIRCLE_DOT,
+        ColumnTypeClass::DateTime => icons::CALENDAR,
+        ColumnTypeClass::Json => icons::BRACES,
+        ColumnTypeClass::Binary => icons::FILE_DIGIT,
+        ColumnTypeClass::Other => icons::PANEL_LEFT_DASHED,
+    }
+}
+
 fn column_row(
     c: ColumnInfo,
+    kind: ColKey,
     context_menu: RwSignal<Option<CtxMenu>>,
     database: String,
     table: String,
     nav: Nav,
 ) -> impl IntoView {
-    let pk = c.primary_key;
     let name = c.name;
     let ty = c.type_name;
     let ctx_name = name.clone();
     let ctx_ty = ty.clone();
     let nav_key = format!("col:{database}:{table}:{name}");
+    // The glyph always reflects the column's *type* family — the key glyph is for
+    // the key/index rows, not the columns they cover (so `id` is a numeric column,
+    // and `PRIMARY(id)` is the key). Key membership only tints the row: a PK column
+    // stays gold, an FK column purple. The icon is a 50%-alpha version of that
+    // colour so it reads as a quieter marker beside the full-strength name.
+    let glyph = column_type_icon(classify_column_type(&ty));
     let row = h_stack((
-        text(name).style(move |s| {
-            s.color(if pk {
-                theme::key_primary()
-            } else {
-                theme::text()
-            })
-        }),
+        icons::icon(glyph, SCHEMA_ICON as f32)
+            .style(move |s| s.color(kind.color().multiply_alpha(0.5)).margin_right(ICON_GAP).flex_shrink(0.0_f32)),
+        text(name),
         text(ty).style(|s| {
             s.color(theme::text_muted())
                 .font_size(theme::FONT_LABEL)
                 .margin_left(12.0)
         }),
     ))
+    // The name inherits `kind.color()`; the icon overrides to 50% of it above and
+    // the type text to muted.
+    .style(move |s| s.color(kind.color()).items_center())
     .on_secondary_click_stop(move |_| {
         let ai_prompt = format!(
             "In `{database}`.`{table}`, explain the `{ctx_name}` column (type `{ctx_ty}`) — \
@@ -755,7 +806,7 @@ fn column_row(
     .style({
         let hl = nav_key.clone();
         move |s| {
-            let s = tree_row(s, LEAF_PAD);
+            let s = tree_row(s, COL_PAD);
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
             } else {
@@ -790,13 +841,22 @@ fn key_row(
     let label = format!("{} ({cols})", ix.name);
     let nav_key = format!("idx:{database}:{table}:{}", ix.name);
     let row = h_stack((
-        text(label).style(move |s| s.color(color)),
+        icons::icon(icons::KEY_ROUND, SCHEMA_ICON as f32).style(move |s| {
+            // 50%-alpha key colour, matching the column icons' quieter marker.
+            s.color(color.multiply_alpha(0.5))
+                .margin_right(ICON_GAP)
+                .flex_shrink(0.0_f32)
+        }),
+        text(label),
         text(tag).style(|s| {
             s.color(theme::text_muted())
                 .font_size(theme::FONT_LABEL)
                 .margin_left(12.0)
         }),
     ))
+    // Label + key glyph share the index's colour (gold PK / purple FK / blue);
+    // the trailing tag overrides to muted above.
+    .style(move |s| s.color(color).items_center())
     .on_secondary_click_stop(move |_| {
         let ai_prompt = format!(
             "In `{database}`.`{table}`, explain the `{ctx_name}` {kind} on ({cols}) — its \
@@ -811,7 +871,7 @@ fn key_row(
     .style({
         let hl = nav_key.clone();
         move |s| {
-            let s = tree_row(s, LEAF_PAD);
+            let s = tree_row(s, COL_PAD);
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
             } else {

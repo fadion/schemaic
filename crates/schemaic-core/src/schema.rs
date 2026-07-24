@@ -122,6 +122,57 @@ impl DbSchema {
     }
 }
 
+/// Broad category of a column's SQL type, for picking a schema-tree icon. The UI
+/// maps each variant to a Lucide glyph; keeping the classification here makes it
+/// pure and testable (and reusable beyond the tree).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColumnTypeClass {
+    /// `char`/`varchar`/`text`/`enum`/`set` — string types.
+    Text,
+    /// `int`/`decimal`/`float`/… — numeric types.
+    Numeric,
+    /// `bool`/`boolean`.
+    Boolean,
+    /// `date`/`datetime`/`time`/`timestamp`/`year`.
+    DateTime,
+    /// `json` and the spatial/geometry types.
+    Json,
+    /// `blob`/`binary`/`varbinary` — raw bytes.
+    Binary,
+    /// Anything unrecognised.
+    Other,
+}
+
+/// Classify a column's declared SQL `type_name` (e.g. `varchar(45)`,
+/// `int(11) unsigned`, `decimal(10,2)`) by its leading type keyword. Case- and
+/// modifier-insensitive; note MySQL `bool`/`boolean` is a `tinyint(1)` alias, so
+/// only the literal `bool`/`boolean` spelling maps to [`ColumnTypeClass::Boolean`]
+/// (a bare `tinyint` is [`ColumnTypeClass::Numeric`]).
+pub fn classify_column_type(type_name: &str) -> ColumnTypeClass {
+    // Leading keyword: up to the first `(`, space, or end.
+    let base: String = type_name
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    match base.as_str() {
+        "bool" | "boolean" => ColumnTypeClass::Boolean,
+        "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" | "decimal" | "dec"
+        | "numeric" | "fixed" | "float" | "double" | "real" | "bit" => ColumnTypeClass::Numeric,
+        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum" | "set" => {
+            ColumnTypeClass::Text
+        }
+        "date" | "datetime" | "time" | "timestamp" | "year" => ColumnTypeClass::DateTime,
+        "json" | "geometry" | "geomcollection" | "geometrycollection" | "point" | "linestring"
+        | "polygon" | "multipoint" | "multilinestring" | "multipolygon" => ColumnTypeClass::Json,
+        "blob" | "tinyblob" | "mediumblob" | "longblob" | "binary" | "varbinary" => {
+            ColumnTypeClass::Binary
+        }
+        _ => ColumnTypeClass::Other,
+    }
+}
+
 /// Per-connection introspection lifecycle, shared loader→UI through a signal.
 #[derive(Clone, Debug)]
 pub enum SchemaState {
@@ -142,6 +193,31 @@ mod tests {
             nullable,
             primary_key: pk,
         }
+    }
+
+    #[test]
+    fn classify_column_type_covers_each_family() {
+        use ColumnTypeClass::*;
+        assert_eq!(classify_column_type("varchar(45)"), Text);
+        assert_eq!(classify_column_type("CHAR(2)"), Text);
+        assert_eq!(classify_column_type("longtext"), Text);
+        assert_eq!(classify_column_type("enum('a','b')"), Text);
+        assert_eq!(classify_column_type("int(11) unsigned"), Numeric);
+        assert_eq!(classify_column_type("tinyint"), Numeric);
+        assert_eq!(classify_column_type("decimal(10,2)"), Numeric);
+        assert_eq!(classify_column_type("DOUBLE"), Numeric);
+        // bool/boolean spelling → Boolean; a bare tinyint stays Numeric.
+        assert_eq!(classify_column_type("boolean"), Boolean);
+        assert_eq!(classify_column_type("bool"), Boolean);
+        assert_eq!(classify_column_type("datetime"), DateTime);
+        assert_eq!(classify_column_type("timestamp"), DateTime);
+        assert_eq!(classify_column_type("date"), DateTime);
+        assert_eq!(classify_column_type("json"), Json);
+        assert_eq!(classify_column_type("geometry"), Json);
+        assert_eq!(classify_column_type("longblob"), Binary);
+        assert_eq!(classify_column_type("varbinary(16)"), Binary);
+        assert_eq!(classify_column_type("weird_custom_type"), Other);
+        assert_eq!(classify_column_type(""), Other);
     }
 
     #[test]
