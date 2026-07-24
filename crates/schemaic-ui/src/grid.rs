@@ -38,7 +38,7 @@ use crate::widgets::{
     MenuEntry, autohide_state, centered_msg, measure_text_px, shift_hscroll, thin_scroll,
     toolbar_icon, verb_spinner,
 };
-use crate::{ConnNode, FieldCfg, bg_transparent, edit_field, icons, theme};
+use crate::{ConnNode, FieldCfg, PopupAnchor, bg_transparent, edit_field, icons, theme};
 
 // ===== moved from lib.rs (results grid) =====
 /// The lifecycle phase of a [`QueryState`], without its payload — a deduped key
@@ -263,9 +263,12 @@ struct GridState {
     commit_err: RwSignal<Option<String>>,
     /// Ui-level popup-menu signal, for the header/cell right-click menus.
     popup: RwSignal<Option<Vec<MenuEntry>>>,
-    /// Anchor for the popup: `Some((icon_left, icon_right, icon_bottom, w))` opens
-    /// it under a toolbar icon (the Copy dropdown); `None` opens at the cursor.
-    popup_anchor: RwSignal<Option<(f64, f64, f64, f64)>>,
+    /// Anchor for the popup: `Some(PopupAnchor::BelowIcon(..))` opens it under a
+    /// toolbar icon (the Copy dropdown); `None` opens at the cursor.
+    popup_anchor: RwSignal<Option<PopupAnchor>>,
+    /// `min_width` of the next popup panel; the Copy dropdown sets it so a stale
+    /// width from a prior (narrower) menu can't shrink it.
+    popup_width: RwSignal<f64>,
     /// The result's source `(database, table)` — for the cell "AI Summary" context.
     source: RwSignal<Option<(String, String)>>,
     /// Callbacks wrapped in signals so `GridState` stays `Copy`. `summarize`
@@ -342,6 +345,7 @@ impl GridState {
             commit_err: gctx.commit_err,
             popup: gctx.popup,
             popup_anchor: gctx.popup_anchor,
+            popup_width: gctx.popup_width,
             source: gctx.source,
             summarize: RwSignal::new(Some(gctx.summarize.clone())),
             dismiss: RwSignal::new(Some(gctx.dismiss.clone())),
@@ -1218,7 +1222,9 @@ pub(crate) struct GridCtx {
     /// Ui-level popup-menu signal (header/cell right-click menus).
     pub(crate) popup: RwSignal<Option<Vec<MenuEntry>>>,
     /// Popup anchor signal (icon-anchored toolbar dropdowns vs cursor menus).
-    pub(crate) popup_anchor: RwSignal<Option<(f64, f64, f64, f64)>>,
+    pub(crate) popup_anchor: RwSignal<Option<PopupAnchor>>,
+    /// `min_width` of the next popup panel (the Copy dropdown sets its own).
+    pub(crate) popup_width: RwSignal<f64>,
     /// Reveal the AI panel + send a message (used for the cell "AI Summary").
     pub(crate) summarize: Rc<dyn Fn(String)>,
     /// Close any open popup / schema context menu (so a grid click dismisses them
@@ -2391,11 +2397,12 @@ fn grid_toolbar(
         if let Some(d) = gs.dismiss.get_untracked() {
             (d)();
         }
-        // Anchor the panel under the icon (left/right edges + bottom).
+        // Anchor the panel just below the icon (left/right edges + bottom).
         let o = copy_origin.get_untracked();
         let sz = 16.0; // the COPY glyph size above
+        gs.popup_width.set(GRID_COPY_MENU_W);
         gs.popup_anchor
-            .set(Some((o.x, o.x + sz, o.y + sz, GRID_COPY_MENU_W)));
+            .set(Some(PopupAnchor::BelowIcon(o.x, o.x + sz, o.y + sz)));
         gs.popup.set(Some(vec![
             MenuEntry::action("JSON", move || {
                 let _ = floem::Clipboard::set_contents(export_json(gs));

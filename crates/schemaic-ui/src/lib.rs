@@ -787,6 +787,22 @@ pub struct LayoutUi {
     pub restore_tabs: RwSignal<bool>,
 }
 
+/// Where the shared `popup_menu` anchors when it's *not* opened at the cursor.
+/// Two distinct placements share the one `popup_menu` channel, so the opener must
+/// say which it wants — a bare tuple let the status-bar and toolbar cases blur into
+/// one and mis-placed the grid's Copy dropdown at the footer.
+#[derive(Clone, Copy)]
+pub enum PopupAnchor {
+    /// Toolbar dropdown (grid Copy): the panel drops a few px below the icon and
+    /// grows downward, left-aligned under it (overlapping it); if that would spill
+    /// past the window's bottom it flips to grow upward. `(icon_left, icon_right,
+    /// icon_bottom)` in window coords; the width comes from `popup_width`.
+    BelowIcon(f64, f64, f64),
+    /// Status-bar segment menu: centered on the segment's x-range and sitting 5px
+    /// above the footer, growing upward. `(seg_left, seg_right)` in window coords.
+    AboveFooter(f64, f64),
+}
+
 /// Overlay signals (Copy bundle): the two menu channels, the cursor anchor, and
 /// the Find / error modals. No callbacks.
 #[derive(Clone, Copy)]
@@ -794,16 +810,12 @@ pub struct OverlayUi {
     /// Schema-tree right-click menu target; `None` when closed.
     pub context_menu: RwSignal<Option<CtxMenu>>,
     /// Generic popup menu (built `MenuEntry` list). Opens at `last_mouse` unless
-    /// `popup_anchor` is set (a toolbar dropdown anchored under its icon).
+    /// `popup_anchor` is set (a toolbar / status-bar dropdown anchored to a widget).
     pub popup_menu: RwSignal<Option<Vec<MenuEntry>>>,
-    /// When set, `popup_menu` anchors under an icon instead of the cursor:
-    /// `(icon_left, icon_right, icon_bottom, panel_width)` in window coords. The
-    /// panel drops a few px below the icon and opens left-aligned under it
-    /// (overlapping it); if that would spill past the window's right edge it flips
-    /// to right-aligned under the icon (right edge flush on `icon_right`, using the
-    /// real width — unlike the cursor path's conservative estimate). Set by the
-    /// grid's Copy toolbar dropdown; cleared (`None`) by the cursor right-click menus.
-    pub popup_anchor: RwSignal<Option<(f64, f64, f64, f64)>>,
+    /// When set, `popup_menu` anchors to a widget (see `PopupAnchor`) instead of the
+    /// cursor. Set by the grid's Copy dropdown (`BelowIcon`) and the status-bar
+    /// segment menus (`AboveFooter`); cleared (`None`) by the cursor right-click menus.
+    pub popup_anchor: RwSignal<Option<PopupAnchor>>,
     /// `min_width` (px) of the next `popup_menu`. An opener sets it before opening;
     /// it resets to 170 on close, so menus that don't set one get the default.
     pub popup_width: RwSignal<f64>,
@@ -1975,6 +1987,7 @@ fn center(ui: Ui) -> impl IntoView {
                     active_conn,
                     popup,
                     popup_anchor,
+                    popup_width,
                     summarize: summarize.clone(),
                     dismiss: dismiss_menus.clone(),
                     commit: commit_edits.clone(),
@@ -3235,7 +3248,7 @@ fn status_menu_seg(
     build_entries: impl Fn() -> Vec<MenuEntry> + 'static,
     menu_owner: RwSignal<u8>,
     popup_menu: RwSignal<Option<Vec<MenuEntry>>>,
-    popup_anchor: RwSignal<Option<(f64, f64, f64, f64)>>,
+    popup_anchor: RwSignal<Option<PopupAnchor>>,
     popup_width: RwSignal<f64>,
     margin: f64,
 ) -> impl IntoView {
@@ -3258,9 +3271,9 @@ fn status_menu_seg(
             return;
         }
         menu_owner.set(owner);
-        let (ox, oy) = origin.get_untracked();
+        let (ox, _oy) = origin.get_untracked();
         let (sw, _sh) = size.get_untracked();
-        popup_anchor.set(Some((ox, ox + sw, oy, sw)));
+        popup_anchor.set(Some(PopupAnchor::AboveFooter(ox, ox + sw)));
         popup_width.set(125.0);
         popup_menu.set(Some((build)()));
     })
