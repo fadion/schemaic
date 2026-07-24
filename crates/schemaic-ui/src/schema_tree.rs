@@ -21,6 +21,7 @@ use schemaic_core::db_color::DbColorRule;
 use schemaic_core::schema::{
     ColumnInfo, ColumnTypeClass, IndexInfo, SchemaState, TableInfo, classify_column_type,
 };
+use schemaic_core::text::plural;
 
 use crate::consts::*;
 use crate::widgets::{autohide, loading_dots, section_title, shift_hscroll};
@@ -760,8 +761,8 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
 // The "N cols · M keys" capsule row shown directly under a table's header.
 fn count_row(cols: usize, keys: usize) -> impl IntoView {
     h_stack((
-        capsule(format!("{cols} cols")),
-        capsule(format!("{keys} keys")),
+        capsule(format!("{cols} {}", plural(cols, "col", "cols"))),
+        capsule(format!("{keys} {}", plural(keys, "key", "keys"))),
     ))
     .style(|s| {
         s.flex_row()

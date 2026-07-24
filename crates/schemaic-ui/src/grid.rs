@@ -31,6 +31,7 @@ use schemaic_core::model::{
     RowInsert, Value,
 };
 use schemaic_core::schema::SchemaState;
+use schemaic_core::text::plural;
 use schemaic_core::text_ops::contains_ignore_ascii_case;
 
 use crate::consts::*;
@@ -2296,8 +2297,10 @@ fn grid_toolbar(
 ) -> impl IntoView {
     let cap = if truncated { " (capped)" } else { "" };
     let stats = text(format!(
-        "{} rows{cap} · {ncols} cols · {elapsed_ms} ms",
-        human_count(nrows)
+        "{} {}{cap} · {ncols} {} · {elapsed_ms} ms",
+        human_count(nrows),
+        plural(nrows, "row", "rows"),
+        plural(ncols, "col", "cols"),
     ))
     .style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL));
     // Sorting a capped result reorders only the fetched subset — flag it.
