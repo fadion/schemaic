@@ -51,10 +51,17 @@ impl QueryPlan {
     /// scan it for the common performance smells.
     pub fn from_result(rs: &ResultSet) -> QueryPlan {
         let columns: Vec<String> = rs.columns.iter().map(|c| c.name.clone()).collect();
-        let rows: Vec<Vec<String>> = rs
-            .rows
-            .iter()
-            .map(|r| r.iter().map(|v| v.display()).collect())
+        let ncols = rs.col_count();
+        let rows: Vec<Vec<String>> = (0..rs.row_count())
+            .map(|r| {
+                (0..ncols)
+                    .map(|c| {
+                        rs.cell(r, c)
+                            .map(|cell| cell.display().to_string())
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
             .collect();
         let warnings = analyze(&columns, &rows);
         QueryPlan {
@@ -166,8 +173,8 @@ mod tests {
 
     /// Build a fake classic-EXPLAIN result set from headers + string rows.
     fn rs(headers: &[&str], rows: &[&[&str]]) -> ResultSet {
-        ResultSet {
-            columns: headers
+        ResultSet::from_rows(
+            headers
                 .iter()
                 .map(|h| Column {
                     name: h.to_string(),
@@ -175,14 +182,10 @@ mod tests {
                     origin: None,
                 })
                 .collect(),
-            rows: rows
-                .iter()
+            rows.iter()
                 .map(|r| r.iter().map(|c| Value::Str(c.to_string())).collect())
                 .collect(),
-            elapsed_ms: 0,
-            truncated: false,
-            affected: None,
-        }
+        )
     }
 
     const HEADERS: &[&str] = &[

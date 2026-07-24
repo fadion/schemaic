@@ -41,6 +41,99 @@ impl Value {
     }
 }
 
+/// Compact per-cell type tag for the columnar [`ResultSet`] storage. The cell's
+/// text lives in the owning column's arena; this tag says how to interpret it
+/// (and whether it is SQL `NULL`). Mirrors the [`Value`] variants. Stored as the
+/// top 3 bits of each cell's packed offset word (see [`ColumnData`]) — no
+/// per-cell byte of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellTag {
+    Null,
+    Int,
+    UInt,
+    Float,
+    Str,
+}
+
+impl CellTag {
+    /// 3-bit encoding packed into the high bits of a column's offset word.
+    fn to_bits(self) -> u32 {
+        match self {
+            CellTag::Null => 0,
+            CellTag::Int => 1,
+            CellTag::UInt => 2,
+            CellTag::Float => 3,
+            CellTag::Str => 4,
+        }
+    }
+
+    /// Inverse of [`CellTag::to_bits`]. Any unused bit pattern maps to `Str` —
+    /// the safe default (raw text), so a stray value can never mis-parse.
+    fn from_bits(bits: u32) -> CellTag {
+        match bits {
+            0 => CellTag::Null,
+            1 => CellTag::Int,
+            2 => CellTag::UInt,
+            3 => CellTag::Float,
+            _ => CellTag::Str,
+        }
+    }
+}
+
+/// A borrowed view of a single result cell: its type tag plus its stored text
+/// (empty for NULL). Cheap to copy, no allocation — this is what the grid reads
+/// on the hot render/sort/scan paths. Reconstruct an owned, typed [`Value`] with
+/// [`CellRef::to_value`] only where one is actually needed (edit keys, JSON).
+#[derive(Clone, Copy, Debug)]
+pub struct CellRef<'a> {
+    pub tag: CellTag,
+    text: &'a str,
+}
+
+impl<'a> CellRef<'a> {
+    pub fn is_null(&self) -> bool {
+        self.tag == CellTag::Null
+    }
+
+    /// The text to render in a grid cell: NULL renders as the literal `NULL`
+    /// (matching [`Value::display`]); every other cell renders its stored text.
+    /// Borrowed — no allocation.
+    pub fn display(&self) -> &'a str {
+        if self.is_null() { "NULL" } else { self.text }
+    }
+
+    /// The raw stored text — empty for NULL, the canonical value text otherwise.
+    /// Used where NULL must render blank rather than as `NULL` (CSV/JSON/HTML).
+    pub fn text(&self) -> &'a str {
+        self.text
+    }
+
+    /// Reconstruct the owned, typed [`Value`] by parsing the stored text per the
+    /// tag. A numeric cell whose text unexpectedly fails to parse degrades to a
+    /// `Str` (defensive — the tag is set from a real parsed value at build time).
+    pub fn to_value(&self) -> Value {
+        match self.tag {
+            CellTag::Null => Value::Null,
+            CellTag::Int => self
+                .text
+                .parse()
+                .map(Value::Int)
+                .unwrap_or_else(|_| Value::Str(self.text.to_string())),
+            CellTag::UInt => self
+                .text
+                .parse()
+                .map(Value::UInt)
+                .unwrap_or_else(|_| Value::Str(self.text.to_string())),
+            CellTag::Float => self
+                .text
+                .parse()
+                .map(Value::Float)
+                .unwrap_or_else(|_| Value::Str(self.text.to_string())),
+            CellTag::Str => Value::Str(self.text.to_string()),
+        }
+    }
+}
+
 /// Where a result column really came from — the MySQL wire protocol reports
 /// this per column, even through aliases and joins. `None` (see [`Column`])
 /// means the column has no single base column (an expression, aggregate, or
@@ -110,13 +203,123 @@ impl Column {
     }
 }
 
-/// A fully materialized result set. `schemaic_db::Db` loads rows into memory up
-/// to a caller-supplied row cap (`truncated` flags when more exist); true
-/// streaming is a future change.
+/// Width of the offset field in a packed cell word; the remaining top 3 bits
+/// carry the [`CellTag`]. 29 bits caps a column's arena at 512 MiB of text.
+const OFFSET_BITS: u32 = 29;
+/// Mask for the offset field of a packed cell word.
+const OFFSET_MASK: u32 = (1 << OFFSET_BITS) - 1;
+/// Max text bytes per column arena (the largest representable offset).
+const MAX_ARENA: usize = OFFSET_MASK as usize;
+
+/// One column's cells in the compact **columnar** layout: a single `u32` per
+/// cell (its [`CellTag`] packed into the top 3 bits, its text's end offset into
+/// the arena in the low 29 bits) plus one `arena` holding every cell's canonical
+/// text back-to-back. Cell `i` spans `arena[start..end]`, where `end` is the low
+/// 29 bits of `ends[i]` and `start` those of `ends[i - 1]` (or `0` for the first
+/// cell); a NULL cell has an empty span and a `Null` tag, and a numeric cell
+/// stores its canonical display text — so a cell's rendered text is a zero-copy
+/// slice of the arena.
+///
+/// This replaces the old row-major `Vec<Value>` (a 32-byte `Value` per cell plus
+/// a heap allocation per string): **4 bytes** of fixed overhead per cell plus the
+/// text bytes, and one arena allocation per column instead of one per string.
+#[derive(Clone, Debug, Default)]
+struct ColumnData {
+    /// Per cell: `(tag << OFFSET_BITS) | end_offset`. The tag rides in the top 3
+    /// bits so there's no separate tag byte; the offset (low 29 bits) reaches
+    /// [`MAX_ARENA`], unreachable within the 200k-row cap for any real cell.
+    ends: Vec<u32>,
+    arena: String,
+}
+
+impl ColumnData {
+    fn with_capacity(rows: usize) -> Self {
+        ColumnData {
+            ends: Vec::with_capacity(rows),
+            arena: String::new(),
+        }
+    }
+
+    /// Finalize the cell whose text has just been appended to `arena`, recording
+    /// its tag + end offset as one packed word. If the arena ever exceeds the
+    /// 29-bit ceiling (a single 512 MiB column — unreachable within the row cap),
+    /// it's truncated at a char boundary so an offset can never collide with the
+    /// tag bits; graceful capping, never corruption.
+    fn finish_cell(&mut self, tag: CellTag) {
+        if self.arena.len() > MAX_ARENA {
+            let mut cut = MAX_ARENA;
+            while !self.arena.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            self.arena.truncate(cut);
+        }
+        let end = self.arena.len() as u32;
+        self.ends.push((tag.to_bits() << OFFSET_BITS) | end);
+    }
+
+    /// Append one value: write its canonical text into the arena (nothing for
+    /// NULL) and record its tag. Numerics are written via `Display` — identical
+    /// to [`Value::display`] — so the stored text is exactly what the grid shows.
+    fn push(&mut self, v: &Value) {
+        use std::fmt::Write as _;
+        let tag = match v {
+            Value::Null => CellTag::Null,
+            Value::Int(n) => {
+                let _ = write!(self.arena, "{n}");
+                CellTag::Int
+            }
+            Value::UInt(n) => {
+                let _ = write!(self.arena, "{n}");
+                CellTag::UInt
+            }
+            Value::Float(f) => {
+                let _ = write!(self.arena, "{f}");
+                CellTag::Float
+            }
+            Value::Str(s) => {
+                self.arena.push_str(s);
+                CellTag::Str
+            }
+        };
+        self.finish_cell(tag);
+    }
+
+    /// Append a borrowed cell verbatim (tag + text) — copies a cell from one
+    /// column buffer into another (used when rebuilding a column on splice).
+    fn push_ref(&mut self, c: CellRef<'_>) {
+        self.arena.push_str(c.text);
+        self.finish_cell(c.tag);
+    }
+
+    fn cell(&self, row: usize) -> Option<CellRef<'_>> {
+        let packed = *self.ends.get(row)?;
+        let tag = CellTag::from_bits(packed >> OFFSET_BITS);
+        let end = (packed & OFFSET_MASK) as usize;
+        let start = if row == 0 {
+            0
+        } else {
+            (self.ends[row - 1] & OFFSET_MASK) as usize
+        };
+        Some(CellRef {
+            tag,
+            text: &self.arena[start..end],
+        })
+    }
+}
+
+/// A fully materialized result set, stored **columnar** (one [`ColumnData`] per
+/// column) rather than row-major. `schemaic_db::Db` loads rows into memory up to
+/// a caller-supplied row cap (`truncated` flags when more exist) via
+/// [`ResultBuilder`]; true streaming is a future change.
+///
+/// Cells are read through [`ResultSet::cell`] (a borrowed [`CellRef`]); the field
+/// is private so the columnar invariant (each column's packed `ends` words stay
+/// in lock-step with its `arena`) can't be violated from outside.
 #[derive(Clone, Debug, Default)]
 pub struct ResultSet {
     pub columns: Vec<Column>,
-    pub rows: Vec<Vec<Value>>,
+    cols: Vec<ColumnData>,
+    n_rows: usize,
     pub elapsed_ms: u128,
     /// True if the fetch stopped at the row cap (more rows may exist).
     pub truncated: bool,
@@ -127,11 +330,151 @@ pub struct ResultSet {
 }
 
 impl ResultSet {
+    /// Build a row-returning result from row-major data (columns + rows). Each
+    /// inner `Vec<Value>` is one row in column order; a row shorter than
+    /// `columns` is padded with NULL and extra cells are ignored. Used by tests
+    /// and the splice/refetch paths — the DB loader uses [`ResultBuilder`]
+    /// directly to avoid ever holding a row-major copy.
+    pub fn from_rows(columns: Vec<Column>, rows: Vec<Vec<Value>>) -> Self {
+        let mut b = ResultBuilder::with_capacity(columns, rows.len());
+        for row in &rows {
+            b.push_row(row);
+        }
+        b.finish()
+    }
+
+    /// Build a no-result-set outcome (UPDATE/INSERT/DELETE/DDL): the server's
+    /// reported affected-row count, no grid.
+    pub fn affected_rows(columns: Vec<Column>, n: u64) -> Self {
+        ResultSet {
+            columns,
+            affected: Some(n),
+            ..Default::default()
+        }
+    }
+
+    /// Builder-style setter for the query's elapsed time.
+    pub fn with_elapsed(mut self, ms: u128) -> Self {
+        self.elapsed_ms = ms;
+        self
+    }
+
+    /// Builder-style setter for the truncated (hit-the-row-cap) flag.
+    pub fn with_truncated(mut self, truncated: bool) -> Self {
+        self.truncated = truncated;
+        self
+    }
+
     pub fn row_count(&self) -> usize {
-        self.rows.len()
+        self.n_rows
     }
     pub fn col_count(&self) -> usize {
         self.columns.len()
+    }
+
+    /// Borrowed view of the cell at `(row, col)` in **data** (unsorted) order, or
+    /// `None` if either index is out of range.
+    pub fn cell(&self, row: usize, col: usize) -> Option<CellRef<'_>> {
+        self.cols.get(col)?.cell(row)
+    }
+
+    /// Replace whole data rows in place — `(data_row, new cells)` with cells
+    /// aligned to the columns — rebuilding each column buffer with the
+    /// substitutions applied. Used by the grid's in-place edit splice (post-commit
+    /// re-fetch), so scroll/selection survive without a full query re-run. Rows
+    /// not listed keep their existing cells; a replacement shorter than `columns`
+    /// leaves the missing columns' cells unchanged.
+    pub fn splice_rows(&mut self, rows: &[(usize, Vec<Value>)]) {
+        if rows.is_empty() {
+            return;
+        }
+        let repl: std::collections::HashMap<usize, &[Value]> =
+            rows.iter().map(|(di, v)| (*di, v.as_slice())).collect();
+        let n = self.n_rows;
+        for (ci, cd) in self.cols.iter_mut().enumerate() {
+            let mut nb = ColumnData::with_capacity(n);
+            for r in 0..n {
+                match repl.get(&r).and_then(|cells| cells.get(ci)) {
+                    Some(v) => nb.push(v),
+                    None => match cd.cell(r) {
+                        Some(c) => nb.push_ref(c),
+                        None => nb.push(&Value::Null),
+                    },
+                }
+            }
+            *cd = nb;
+        }
+    }
+}
+
+/// Assembles a columnar [`ResultSet`] one row at a time, so a large result never
+/// exists as a row-major `Vec<Vec<Value>>` in memory: the DB loader converts each
+/// wire row and pushes it straight into the per-column buffers.
+pub struct ResultBuilder {
+    columns: Vec<Column>,
+    cols: Vec<ColumnData>,
+    n_rows: usize,
+    elapsed_ms: u128,
+    truncated: bool,
+}
+
+impl ResultBuilder {
+    pub fn new(columns: Vec<Column>) -> Self {
+        Self::with_capacity(columns, 0)
+    }
+
+    pub fn with_capacity(columns: Vec<Column>, rows: usize) -> Self {
+        let cols = (0..columns.len())
+            .map(|_| ColumnData::with_capacity(rows))
+            .collect();
+        ResultBuilder {
+            columns,
+            cols,
+            n_rows: 0,
+            elapsed_ms: 0,
+            truncated: false,
+        }
+    }
+
+    /// The columns being built — the loader passes these to `convert_row`.
+    pub fn columns(&self) -> &[Column] {
+        &self.columns
+    }
+
+    /// Rows pushed so far (the loader compares this against the row cap).
+    pub fn row_count(&self) -> usize {
+        self.n_rows
+    }
+
+    /// Append one row of cells (column order). A row shorter than the column
+    /// count is padded with NULL; extra cells are ignored.
+    pub fn push_row(&mut self, cells: &[Value]) {
+        for (ci, cd) in self.cols.iter_mut().enumerate() {
+            match cells.get(ci) {
+                Some(v) => cd.push(v),
+                None => cd.push(&Value::Null),
+            }
+        }
+        self.n_rows += 1;
+    }
+
+    pub fn set_elapsed(&mut self, ms: u128) {
+        self.elapsed_ms = ms;
+    }
+
+    pub fn set_truncated(&mut self, truncated: bool) {
+        self.truncated = truncated;
+    }
+
+    pub fn finish(self) -> ResultSet {
+        ResultSet {
+            columns: self.columns,
+            cols: self.cols,
+            n_rows: self.n_rows,
+            elapsed_ms: self.elapsed_ms,
+            truncated: self.truncated,
+            affected: None,
+        }
     }
 }
 
@@ -345,20 +688,158 @@ mod tests {
 
     #[test]
     fn resultset_counts_reflect_dimensions() {
-        let rs = ResultSet {
-            columns: vec![col("INT"), col("TEXT")],
-            rows: vec![
+        let rs = ResultSet::from_rows(
+            vec![col("INT"), col("TEXT")],
+            vec![
                 vec![Value::Int(1), Value::Str("a".to_string())],
                 vec![Value::Int(2), Value::Str("b".to_string())],
                 vec![Value::Int(3), Value::Str("c".to_string())],
             ],
-            ..Default::default()
-        };
+        );
         assert_eq!(rs.row_count(), 3);
         assert_eq!(rs.col_count(), 2);
 
         let empty = ResultSet::default();
         assert_eq!(empty.row_count(), 0);
         assert_eq!(empty.col_count(), 0);
+    }
+
+    #[test]
+    fn columnar_cell_roundtrips_every_variant() {
+        let rs = ResultSet::from_rows(
+            vec![col("INT"), col("BIGINT"), col("DOUBLE"), col("TEXT")],
+            vec![
+                vec![
+                    Value::Int(-42),
+                    Value::UInt(18_446_744_073_709_551_615),
+                    Value::Float(1.5),
+                    Value::Str("héllo".to_string()),
+                ],
+                vec![Value::Null, Value::Null, Value::Null, Value::Null],
+            ],
+        );
+        // Tags survive; text is the canonical display; to_value round-trips.
+        let c = rs.cell(0, 0).unwrap();
+        assert_eq!(c.tag, CellTag::Int);
+        assert_eq!(c.display(), "-42");
+        assert!(matches!(c.to_value(), Value::Int(-42)));
+
+        let c = rs.cell(0, 1).unwrap();
+        assert_eq!(c.tag, CellTag::UInt);
+        assert!(matches!(
+            c.to_value(),
+            Value::UInt(18_446_744_073_709_551_615)
+        ));
+
+        let c = rs.cell(0, 2).unwrap();
+        assert_eq!(c.tag, CellTag::Float);
+        assert!(matches!(c.to_value(), Value::Float(f) if f == 1.5));
+
+        // Multi-byte UTF-8 slices at the right arena boundary.
+        let c = rs.cell(0, 3).unwrap();
+        assert_eq!(c.tag, CellTag::Str);
+        assert_eq!(c.display(), "héllo");
+        assert!(matches!(c.to_value(), Value::Str(s) if s == "héllo"));
+
+        // NULL: dim `NULL` for display, empty raw text, `Value::Null` typed.
+        let c = rs.cell(1, 0).unwrap();
+        assert!(c.is_null());
+        assert_eq!(c.display(), "NULL");
+        assert_eq!(c.text(), "");
+        assert!(c.to_value().is_null());
+    }
+
+    #[test]
+    fn packed_tag_does_not_corrupt_offsets() {
+        // Many cells of differing lengths: the tag packed into the high bits must
+        // not disturb the low-29-bit offsets, so every cell slices back exactly —
+        // including across a tag change (Str → Int) mid-column.
+        let rs = ResultSet::from_rows(
+            vec![col("MIXED")],
+            vec![
+                vec![Value::Str("a".to_string())],
+                vec![Value::Str("bbbbbbbbbb".to_string())],
+                vec![Value::Null],
+                vec![Value::Str(String::new())],
+                vec![Value::Int(1234567890)],
+                vec![Value::Str("tail".to_string())],
+            ],
+        );
+        assert_eq!(rs.cell(0, 0).unwrap().display(), "a");
+        assert_eq!(rs.cell(1, 0).unwrap().display(), "bbbbbbbbbb");
+        assert!(rs.cell(2, 0).unwrap().is_null());
+        assert_eq!(rs.cell(3, 0).unwrap().display(), "");
+        assert!(!rs.cell(3, 0).unwrap().is_null());
+        assert_eq!(rs.cell(4, 0).unwrap().display(), "1234567890");
+        assert_eq!(rs.cell(4, 0).unwrap().tag, CellTag::Int);
+        assert_eq!(rs.cell(5, 0).unwrap().display(), "tail");
+    }
+
+    #[test]
+    fn columnar_cell_out_of_range_is_none() {
+        let rs = ResultSet::from_rows(vec![col("INT")], vec![vec![Value::Int(1)]]);
+        assert!(rs.cell(0, 0).is_some());
+        assert!(rs.cell(1, 0).is_none()); // row past end
+        assert!(rs.cell(0, 1).is_none()); // col past end
+    }
+
+    #[test]
+    fn empty_string_cell_is_distinct_from_null() {
+        // Both have an empty arena span; the tag keeps them apart.
+        let rs = ResultSet::from_rows(
+            vec![col("TEXT"), col("TEXT")],
+            vec![vec![Value::Str(String::new()), Value::Null]],
+        );
+        let empty = rs.cell(0, 0).unwrap();
+        assert!(!empty.is_null());
+        assert_eq!(empty.display(), "");
+        let null = rs.cell(0, 1).unwrap();
+        assert!(null.is_null());
+        assert_eq!(null.display(), "NULL");
+    }
+
+    #[test]
+    fn short_row_is_padded_with_null() {
+        let rs = ResultSet::from_rows(
+            vec![col("INT"), col("TEXT")],
+            vec![vec![Value::Int(7)]], // only one cell for a two-column result
+        );
+        assert!(matches!(rs.cell(0, 0).unwrap().to_value(), Value::Int(7)));
+        assert!(rs.cell(0, 1).unwrap().is_null());
+    }
+
+    #[test]
+    fn splice_rows_replaces_only_listed_rows() {
+        let mut rs = ResultSet::from_rows(
+            vec![col("INT"), col("TEXT")],
+            vec![
+                vec![Value::Int(1), Value::Str("a".to_string())],
+                vec![Value::Int(2), Value::Str("b".to_string())],
+                vec![Value::Int(3), Value::Str("c".to_string())],
+            ],
+        );
+        rs.splice_rows(&[(1, vec![Value::Int(20), Value::Str("B".to_string())])]);
+        // Row 1 replaced; rows 0 and 2 untouched.
+        assert_eq!(rs.cell(0, 1).unwrap().display(), "a");
+        assert!(matches!(rs.cell(1, 0).unwrap().to_value(), Value::Int(20)));
+        assert_eq!(rs.cell(1, 1).unwrap().display(), "B");
+        assert_eq!(rs.cell(2, 1).unwrap().display(), "c");
+        assert_eq!(rs.row_count(), 3);
+    }
+
+    #[test]
+    fn builder_matches_from_rows_and_carries_flags() {
+        let mut b = ResultBuilder::new(vec![col("INT")]);
+        assert_eq!(b.row_count(), 0);
+        assert_eq!(b.columns().len(), 1);
+        b.push_row(&[Value::Int(1)]);
+        b.push_row(&[Value::Null]);
+        b.set_elapsed(12);
+        b.set_truncated(true);
+        let rs = b.finish();
+        assert_eq!(rs.row_count(), 2);
+        assert_eq!(rs.elapsed_ms, 12);
+        assert!(rs.truncated);
+        assert!(rs.affected.is_none());
     }
 }

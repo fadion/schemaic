@@ -22,7 +22,7 @@ use mysql_async::{Column as MyColumn, Conn, Row, Value as MyValue};
 use mysql_async::{OptsBuilder, Params, TxOpts};
 use schemaic_core::model::{
     Column, ColumnFlags as CoreColFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
-    ResultSet, RowDelete, RowEdit, RowInsert, Value,
+    ResultBuilder, ResultSet, RowDelete, RowEdit, RowInsert, Value,
 };
 use schemaic_core::schema::{ColumnInfo, DbSchema, IndexInfo, TableInfo};
 use tokio_util::sync::CancellationToken;
@@ -522,22 +522,21 @@ async fn collect_rows(
         let affected = result.affected_rows();
         // Drain the (empty) result so the connection is clean.
         let _ = result.collect::<Row>().await;
-        return Ok(ResultSet {
-            columns,
-            rows: Vec::new(),
-            elapsed_ms: start.elapsed().as_millis(),
-            truncated: false,
-            affected: Some(affected),
-        });
+        return Ok(
+            ResultSet::affected_rows(columns, affected).with_elapsed(start.elapsed().as_millis())
+        );
     }
 
-    let mut rows: Vec<Vec<Value>> = Vec::new();
+    // Assemble the result columnar, one row at a time, so we never hold a
+    // row-major `Vec<Vec<Value>>` copy alongside the final storage.
+    let mut builder = ResultBuilder::new(columns);
     let mut truncated = false;
     if let Some(mut stream) = result.stream::<Row>().await.map_err(qerr)? {
         while let Some(row) = stream.next().await {
             let row = row.map_err(qerr)?;
-            if rows.len() < row_cap {
-                rows.push(convert_row(&row, &columns));
+            if builder.row_count() < row_cap {
+                let cells = convert_row(&row, builder.columns());
+                builder.push_row(&cells);
             } else {
                 // A row beyond the cap exists → the result is truncated.
                 truncated = true;
@@ -549,13 +548,9 @@ async fn collect_rows(
         }
     }
 
-    Ok(ResultSet {
-        columns,
-        rows,
-        elapsed_ms: start.elapsed().as_millis(),
-        truncated,
-        affected: None,
-    })
+    builder.set_truncated(truncated);
+    builder.set_elapsed(start.elapsed().as_millis());
+    Ok(builder.finish())
 }
 
 /// Map a wire column definition to our [`Column`], capturing its origin
