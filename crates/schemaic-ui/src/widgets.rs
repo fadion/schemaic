@@ -738,11 +738,78 @@ pub(crate) fn verb_spinner(color: fn() -> floem::peniko::Color, font_size: f32) 
 /// outlive a `dyn_container` rebuild (same pattern as the AI elapsed timer).
 /// Rendered pixel width of `text` at `font_size` in the app's default font, via a
 /// throwaway `TextLayout` (same global `FontSystem` the label renders with).
+/// Trailing debounce: returns a signal that mirrors `src` but only settles
+/// `delay` after the last change. Bind the input widget to `src` (so typing stays
+/// responsive) and let the expensive consumers read the returned signal, so a
+/// large re-filter/re-layout fires once per burst, not per keystroke. The write is
+/// `try_update`-guarded so a timer that outlives the owning scope (panel closed
+/// mid-burst) is a no-op rather than a panic on a freed signal.
+pub(crate) fn debounced(src: RwSignal<String>, delay: std::time::Duration) -> RwSignal<String> {
+    let out = RwSignal::new(src.get_untracked());
+    let generation = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    floem::reactive::create_effect(move |_| {
+        let v = src.get(); // track every change
+        let g = generation.get() + 1;
+        generation.set(g);
+        let generation = generation.clone();
+        floem::action::exec_after(delay, move |_| {
+            if generation.get() == g {
+                let _ = out.try_update(|s| *s = v.clone());
+            }
+        });
+    });
+    out
+}
+
 pub(crate) fn measure_px(text: &str, font_size: f32) -> f64 {
     use floem::text::{Attrs, AttrsList, TextLayout};
     let mut layout = TextLayout::new();
     layout.set_text(text, AttrsList::new(Attrs::new().font_size(font_size)));
     layout.size().width
+}
+
+/// A wrapping text view that tints every case-insensitive occurrence of `term`
+/// with the search-match colour (bold), the rest in `base` — the same match rule
+/// (`text_ops::find_matches`) and colour as the global-search palette, but built on
+/// `rich_text` so the highlight survives line-wrapping (the palette's segment
+/// h-stack can't wrap). `term` empty / no match → plain text. Colours are read
+/// inside the layout closure so a live theme switch re-tints. Use `.style()` on the
+/// returned view for layout (width, clip, max-height).
+pub(crate) fn highlight_text(
+    full: String,
+    term: Option<String>,
+    font_size: f32,
+    base: impl Fn() -> floem::peniko::Color + 'static,
+    bold: bool,
+    line_height: f32,
+) -> floem::views::RichText {
+    use floem::text::{Attrs, AttrsList, FamilyOwned, LineHeightValue, TextLayout, Weight};
+    let base_weight = if bold { Weight::BOLD } else { Weight::NORMAL };
+    floem::views::rich_text(move || {
+        let sans = [FamilyOwned::Name("IBM Plex Sans".to_string())];
+        let lh = LineHeightValue::Normal(line_height);
+        let base_attrs = Attrs::new()
+            .family(&sans)
+            .font_size(font_size)
+            .color(base())
+            .weight(base_weight)
+            .line_height(lh);
+        let mut list = AttrsList::new(base_attrs);
+        if let Some(t) = term.as_deref().filter(|t| !t.is_empty()) {
+            let hit = Attrs::new()
+                .family(&sans)
+                .font_size(font_size)
+                .color(theme::match_highlight())
+                .weight(Weight::BOLD)
+                .line_height(lh);
+            for &start in schemaic_core::text_ops::find_matches(&full, t).iter() {
+                list.add_span(start..start + t.len(), hit);
+            }
+        }
+        let mut layout = TextLayout::new();
+        layout.set_text(&full, list);
+        layout
+    })
 }
 
 pub(crate) fn loading_dots(

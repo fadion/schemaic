@@ -108,6 +108,24 @@ impl TableInfo {
             lines.join(",\n")
         )
     }
+
+    /// Does any of this table's column names contain `needle_lower`
+    /// (case-insensitive)? `needle_lower` must already be lower-cased by the caller.
+    pub fn any_column_matches(&self, needle_lower: &str) -> bool {
+        self.columns
+            .iter()
+            .any(|c| c.name.to_lowercase().contains(needle_lower))
+    }
+
+    /// Does this table match a schema-search term — by its own name OR by any of
+    /// its column names? `needle_lower` must already be lower-cased. An empty
+    /// needle matches nothing (callers treat "no filter" separately).
+    pub fn matches_search(&self, needle_lower: &str) -> bool {
+        if needle_lower.is_empty() {
+            return false;
+        }
+        self.name.to_lowercase().contains(needle_lower) || self.any_column_matches(needle_lower)
+    }
 }
 
 /// The introspected schema of one database.
@@ -218,6 +236,31 @@ mod tests {
         assert_eq!(classify_column_type("varbinary(16)"), Binary);
         assert_eq!(classify_column_type("weird_custom_type"), Other);
         assert_eq!(classify_column_type(""), Other);
+    }
+
+    #[test]
+    fn matches_search_by_name_or_column() {
+        let t = TableInfo {
+            name: "orders".to_string(),
+            columns: vec![
+                col("id", "int", false, true),
+                col("customer_email", "varchar(255)", true, false),
+            ],
+            indexes: Vec::new(),
+            is_view: false,
+            view_definition: None,
+        };
+        // By table name (case-insensitive substring).
+        assert!(t.matches_search("ord"));
+        assert!(t.matches_search("orders"));
+        // By a column name, even when the table name doesn't match.
+        assert!(t.matches_search("email"));
+        assert!(t.any_column_matches("customer"));
+        // No match anywhere.
+        assert!(!t.matches_search("zzz"));
+        assert!(!t.any_column_matches("zzz"));
+        // Empty needle matches nothing (callers handle "no filter" separately).
+        assert!(!t.matches_search(""));
     }
 
     #[test]

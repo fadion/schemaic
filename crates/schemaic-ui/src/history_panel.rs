@@ -9,6 +9,7 @@
 //! shows only that connection's queries.
 
 use std::rc::Rc;
+use std::time::Duration;
 
 use floem::prelude::*;
 use floem::reactive::create_memo;
@@ -16,8 +17,9 @@ use floem::reactive::create_memo;
 use schemaic_core::db_color::DbColorRule;
 use schemaic_core::history::{self, HistoryEntry};
 
+use crate::consts::SEARCH_DEBOUNCE_MS;
 use crate::theme::{FONT_BODY, FONT_LABEL};
-use crate::widgets::{autohide, section_title, toolbar_icon};
+use crate::widgets::{autohide, debounced, highlight_text, section_title, toolbar_icon};
 use crate::{FieldCfg, Ui, db_color_dot, edit_field, icons, theme};
 
 /// Current wall-clock time, unix millis (for relative "x ago" labels).
@@ -38,7 +40,10 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
 
     // Panel-local search filter (matched against SQL / database / tab name). Local
     // to this panel build — resets when the History panel is re-opened.
-    let search = RwSignal::new(String::new());
+    // `search_input` is bound to the box (live); `search` is its debounced mirror
+    // that drives filtering + highlighting, so a burst of typing re-filters once.
+    let search_input = RwSignal::new(String::new());
+    let search = debounced(search_input, Duration::from_millis(SEARCH_DEBOUNCE_MS));
 
     // The active connection's entries, newest-first (already stored that way),
     // narrowed to the search filter.
@@ -53,12 +58,15 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
         })
     });
 
+    // Track the search term too (not just `visible`): typing more characters that
+    // still match the same set leaves `visible` unchanged (the memo dedups), but the
+    // highlight term must still update, so rebuild the rows when either changes.
     let list = dyn_container(
-        move || visible.get(),
-        move |rows| {
+        move || (visible.get(), search.get()),
+        move |(rows, q)| {
             if rows.is_empty() {
                 // Distinguish "nothing recorded" from "filtered everything out".
-                let msg = if search.get_untracked().trim().is_empty() {
+                let msg = if q.trim().is_empty() {
                     "No queries yet."
                 } else {
                     "No matching queries."
@@ -74,9 +82,13 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
             }
             let now = now_millis();
             let oh = open_history.clone();
+            let term = {
+                let t = q.trim();
+                (!t.is_empty()).then(|| t.to_string())
+            };
             let items = rows
                 .into_iter()
-                .map(move |e| history_row(e, now, oh.clone(), db_colors))
+                .map(move |e| history_row(e, now, oh.clone(), db_colors, term.clone()))
                 .collect::<Vec<_>>();
             v_stack_from_iter(items)
                 .style(|s| s.flex_col().width_full())
@@ -99,7 +111,7 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
         // each visually); spacers (not margins) so the flex-grow scroll's height
         // stays exact (a sibling's vertical margin isn't subtracted → overflow).
         empty().style(|s| s.height(5.0).flex_shrink(0.0_f32)),
-        history_search(search),
+        history_search(search_input),
         empty().style(|s| s.height(10.0).flex_shrink(0.0_f32)),
         scrolled,
     ))
@@ -136,6 +148,7 @@ fn history_row(
     now: u64,
     open_history: Rc<dyn Fn(HistoryEntry)>,
     db_colors: RwSignal<Vec<DbColorRule>>,
+    term: Option<String>,
 ) -> impl IntoView {
     // Full entry for the click handler — restores SQL + database + tab name.
     let entry_click = entry.clone();
@@ -149,25 +162,16 @@ fn history_row(
     // ~3 lines: FONT_BODY (13) × 1.4 line-height × 3, clipped.
     let max_h = (FONT_BODY as f64) * 1.4 * 3.0;
 
-    let preview_view = text(preview)
-        .style(move |s| {
-            s.font_size(FONT_BODY)
-                .color(theme::text())
-                .line_height(1.4)
-                .width_full()
-                .max_height(max_h)
-        })
+    let preview_view = highlight_text(preview, term.clone(), FONT_BODY, theme::text, false, 1.4)
+        .style(move |s| s.width_full().max_height(max_h))
         .clip();
 
     // Database name + its identity dot as a tight group, so the footer's `gap(8)`
     // applies only between this group and the timestamp — the dot's spacing from
     // the name is then purely its own `margin_left`.
     let db_group = h_stack((
-        text(db).style(|s| {
-            s.font_size(FONT_LABEL)
-                .color(theme::text_dim())
-                .min_width(0.0)
-        }),
+        highlight_text(db, term.clone(), FONT_LABEL, theme::text_dim, false, 1.0)
+            .style(|s| s.min_width(0.0)),
         // Identity dot next to the database name (colour set in the schema tree).
         db_color_dot(
             db_colors,
@@ -195,15 +199,14 @@ fn history_row(
     let named = entry.tab_name.clone().filter(|n| !n.trim().is_empty());
     let inner: floem::AnyView = match named {
         Some(n) => {
-            let capsule = text(n).style(|s| {
-                s.font_size(FONT_LABEL)
-                    .color(theme::text())
-                    .padding_horiz(7.0)
-                    .padding_vert(3.0)
-                    .background(theme::capsule_bg())
-                    .border_radius(4.0)
-                    .flex_shrink(0.0_f32)
-            });
+            let capsule = highlight_text(n, term.clone(), FONT_LABEL, theme::text, false, 1.0)
+                .style(|s| {
+                    s.padding_horiz(7.0)
+                        .padding_vert(3.0)
+                        .background(theme::capsule_bg())
+                        .border_radius(4.0)
+                        .flex_shrink(0.0_f32)
+                });
             // +2px over the v_stack's 4px gap → 6px between the table and the name.
             let name_row = h_stack((capsule,)).style(|s| s.width_full().margin_top(2.0));
             v_stack((preview_view, footer, name_row))
