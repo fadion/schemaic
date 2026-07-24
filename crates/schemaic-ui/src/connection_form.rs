@@ -22,6 +22,10 @@ use crate::widgets::{
 };
 use crate::{DraftSignals, FieldCfg, Ui, edit_field, icons, theme};
 
+// Fixed width for credential inputs (user/password + SSH user/password/passphrase)
+// — narrower than the full-width host/name fields, since credentials are short.
+const CONN_FIELD_W: f64 = 200.0;
+
 // ===== moved from lib.rs (connection form + password masking) =====
 // One labelled text field for the connection form.
 fn field(lbl: &'static str, sig: RwSignal<String>) -> impl IntoView {
@@ -95,7 +99,7 @@ fn key_pair_fields(draft: DraftSignals) -> impl IntoView {
 
     v_stack((
         key_row,
-        masked_field("Passphrase", draft.ssh_key_passphrase),
+        masked_field("Passphrase", draft.ssh_key_passphrase).style(|s| s.width(CONN_FIELD_W)),
     ))
     .style(|s| s.flex_col().gap(20.0).width_full())
 }
@@ -269,11 +273,7 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                         // `conn_list_sel_bg`.
                         .style(move |s| {
                             let selected = draft.id.get() == Some(id);
-                            let s = s
-                                .width_full()
-                                .padding_horiz(12.0)
-                                .padding_vert(11.0)
-                                .border_radius(5.0);
+                            let s = s.width_full().padding_horiz(12.0).padding_vert(11.0);
                             if selected {
                                 s.color(theme::conn_list_sel_text())
                                     .background(theme::conn_list_sel_bg())
@@ -411,9 +411,9 @@ fn conn_form(
             let auth_creds = dyn_container(
                 move || ssh_auth.get(),
                 move |auth| match auth {
-                    SshAuth::Password => {
-                        masked_field("SSH password", draft.ssh_password).into_any()
-                    }
+                    SshAuth::Password => masked_field("SSH password", draft.ssh_password)
+                        .style(|s| s.width(CONN_FIELD_W))
+                        .into_any(),
                     SshAuth::KeyPair => key_pair_fields(draft).into_any(),
                     SshAuth::Agent => text(
                         "Signing is delegated to your running SSH agent (OpenSSH \
@@ -431,7 +431,7 @@ fn conn_form(
 
             v_stack((
                 host_port_row("SSH host", draft.ssh_host, "SSH port", draft.ssh_port),
-                field("SSH user", draft.ssh_user),
+                field("SSH user", draft.ssh_user).style(|s| s.width(CONN_FIELD_W)),
                 auth_field,
                 auth_creds,
             ))
@@ -505,8 +505,8 @@ fn conn_form(
         read_only_toggle,
         type_field,
         host_port_row("Host", draft.host, "Port", draft.port),
-        field("User", draft.user),
-        masked_field("Password", draft.password),
+        field("User", draft.user).style(|s| s.width(CONN_FIELD_W)),
+        masked_field("Password", draft.password).style(|s| s.width(CONN_FIELD_W)),
         ssh_toggle,
         ssh_fields,
     ))
@@ -608,9 +608,9 @@ fn conn_form(
             .color(theme::conn_save())
             .hover(|s| s.color(theme::conn_save_hover()))
     });
-    // Test sits 30px to the left of Save.
+    // Test sits 15px to the left of Save.
     let right_actions =
-        h_stack((test_btn, save_btn)).style(|s| s.flex_row().items_center().gap(30.0));
+        h_stack((test_btn, save_btn)).style(|s| s.flex_row().items_center().gap(15.0));
     let buttons = h_stack((
         delete_btn,
         empty().style(|s| s.flex_grow(1.0_f32)),
