@@ -20,6 +20,7 @@ pub mod resource;
 pub mod schema;
 pub mod sql;
 pub mod sqlfmt;
+pub mod text;
 pub mod text_ops;
 pub mod transcript;
 
