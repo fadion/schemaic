@@ -299,8 +299,8 @@ struct GridState {
 }
 
 impl GridState {
-    fn new(rs: Arc<ResultSet>, gctx: &GridCtx) -> Self {
-        let widths = init_widths(&rs);
+    fn new(rs: Arc<ResultSet>, gctx: &GridCtx, key_map: &HashMap<String, ColKey>) -> Self {
+        let widths = init_widths(&rs, key_map);
         // Seed each column's display formatter from the persisted rules, keyed by
         // (conn_id, source table, column). Columns of an unsourced query (or with
         // no saved rule) start raw.
@@ -741,7 +741,7 @@ impl GridState {
 /// Exact rendered pixel width of `text` in the grid's cell font (the app default
 /// sans — IBM Plex Sans — at `FONT_BODY`), via a throwaway `TextLayout`. Used to
 /// Estimate a column's initial width from its header + a sample of cell values.
-fn init_widths(rs: &ResultSet) -> Vec<f64> {
+fn init_widths(rs: &ResultSet, key_map: &HashMap<String, ColKey>) -> Vec<f64> {
     let sample = rs.rows.len().min(200);
     rs.columns
         .iter()
@@ -754,24 +754,37 @@ fn init_widths(rs: &ResultSet) -> Vec<f64> {
                     chars = chars.max(v.display().chars().count().min(60));
                 }
             }
-            (chars as f64 * GRID_CHAR_W + 22.0).clamp(MIN_COL_W, MAX_COL_W_INIT)
+            // A key column's header carries a leading key icon; budget for it so the
+            // name/type line isn't squeezed (and clipped) by the icon + gap.
+            let icon = if key_map.contains_key(&col.name) {
+                HEADER_KEY_ICON_W
+            } else {
+                0.0
+            };
+            (chars as f64 * GRID_CHAR_W + 22.0 + icon).clamp(MIN_COL_W, MAX_COL_W_INIT)
         })
         .collect()
 }
 
 /// Auto-fit width for one column over the whole result (double-click a divider).
-fn autofit_width(rs: &ResultSet, ci: usize) -> f64 {
+/// `has_key` budgets for the header's leading key icon, and the type-name line is
+/// included so a long type (e.g. `INT UNSIGNED`) isn't clipped after auto-fit.
+fn autofit_width(rs: &ResultSet, ci: usize, has_key: bool) -> f64 {
     let mut chars = rs
         .columns
         .get(ci)
         .map(|c| c.name.chars().count() + 3)
         .unwrap_or(6);
+    if let Some(c) = rs.columns.get(ci) {
+        chars = chars.max(c.type_name.chars().count());
+    }
     for r in &rs.rows {
         if let Some(v) = r.get(ci) {
             chars = chars.max(v.display().chars().count().min(140));
         }
     }
-    (chars as f64 * GRID_CHAR_W + 22.0).clamp(MIN_COL_W, 900.0)
+    let icon = if has_key { HEADER_KEY_ICON_W } else { 0.0 };
+    (chars as f64 * GRID_CHAR_W + 22.0 + icon).clamp(MIN_COL_W, 900.0)
 }
 
 fn cell_in(bounds: Option<(usize, usize, usize, usize)>, i: usize, ci: usize) -> bool {
@@ -989,7 +1002,7 @@ fn pretty_json(s: &str) -> Option<String> {
 
 /// A draggable column-resize divider pinned to the right edge of a header cell.
 /// Drag adjusts that column's width; double-click auto-fits to content.
-fn col_resize_handle(gs: GridState, ci: usize) -> impl IntoView {
+fn col_resize_handle(gs: GridState, ci: usize, has_key: bool) -> impl IntoView {
     let dragging = RwSignal::new(false);
     let h = empty();
     let hid = h.id();
@@ -1037,7 +1050,7 @@ fn col_resize_handle(gs: GridState, ci: usize) -> impl IntoView {
     })
     .on_double_click_stop(move |_| {
         let rs = gs.rs.get_untracked();
-        let w = autofit_width(&rs, ci);
+        let w = autofit_width(&rs, ci, has_key);
         gs.widths.update(|ws| {
             if let Some(x) = ws.get_mut(ci) {
                 *x = w;
@@ -1464,7 +1477,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     let (connections, active_conn) = (gctx.connections, gctx.active_conn);
 
     // Interactive state, created once and shared across sort rebuilds.
-    let gs = GridState::new(rs.clone(), &gctx);
+    let gs = GridState::new(rs.clone(), &gctx, &key_map);
     // Editability: which columns can be written back, and each base table's
     // WHERE key — derived from the result's per-column provenance + schema. The
     // closure looks up a base table's schema from the live `db_nodes` signals.
@@ -2772,21 +2785,22 @@ fn header_cell(
     } else {
         container(label)
             .style(move |s| {
-                let s = s
-                    .height_full()
-                    .width_full()
-                    .items_center()
-                    .padding_horiz(10.0);
+                let s = s.height_full().width_full().items_center();
                 if numeric {
-                    s.justify_end()
+                    // Right-aligned: extra right padding so the value doesn't hug the
+                    // edge/border. Kept in sync with `data_cell` so the header lines
+                    // up over its column's values.
+                    s.padding_left(10.0)
+                        .padding_right(GRID_NUM_PAD_RIGHT)
+                        .justify_end()
                 } else {
-                    s.justify_start()
+                    s.padding_horiz(10.0).justify_start()
                 }
             })
             .into_any()
     };
 
-    stack((content, col_resize_handle(gs, ci)))
+    stack((content, col_resize_handle(gs, ci, key.is_some())))
         .on_click_stop(move |_| {
             gs.dismiss_overlays();
             cycle_sort(sort, ci);
@@ -2832,7 +2846,10 @@ fn header_cell(
                 s.background(theme::dropdown_active())
                     .hover(|s| s.background(theme::accent().multiply_alpha(0.10)))
             } else {
-                s.hover(|s| s.background(theme::accent().multiply_alpha(0.10)))
+                // Opaque header background (not transparent over the header row) so
+                // a live resize where header cells briefly overlap occludes cleanly.
+                s.background(theme::bg_header_row())
+                    .hover(|s| s.background(theme::accent().multiply_alpha(0.10)))
             };
             // Border on every column, last included, so a narrow table still shows
             // where the final column ends.
@@ -3225,16 +3242,15 @@ fn data_cell(
             let is_editing = gs.edit_cell.get() == Some((i, ci));
             // A real row marked for deletion (its edits were cleared when marked).
             let deleted = pending.is_none() && gs.del_rows.with(|d| d.contains(&data_idx));
-            let s = s
-                .width(w)
-                .height(ROW_H)
-                .flex_shrink(0.0_f32)
-                .padding_horiz(10.0)
-                .items_center();
+            let s = s.width(w).height(ROW_H).flex_shrink(0.0_f32).items_center();
+            // Right-aligned numeric cells get extra right padding (matching the
+            // header) so the value clears the edge/border; text cells stay at 10px.
             let s = if numeric {
-                s.justify_end()
+                s.padding_left(10.0)
+                    .padding_right(GRID_NUM_PAD_RIGHT)
+                    .justify_end()
             } else {
-                s.justify_start()
+                s.padding_horiz(10.0).justify_start()
             };
             let formatted = gs
                 .formats
@@ -3261,8 +3277,15 @@ fn data_cell(
             } else if formatted {
                 // At-a-glance cue this is a formatted (not raw DB) value.
                 s.background(theme::dropdown_active())
+            } else if i % 2 == 1 {
+                // Opaque zebra fill (matches the row's `zebra_bg`). Cells must carry
+                // their own background — not rely on the transparent-over-row-stripe
+                // trick — so a live column resize, where neighbouring cells briefly
+                // overlap before the flex row re-lays-out, occludes cleanly instead
+                // of painting text over text.
+                s.background(theme::bg_editor())
             } else {
-                s
+                s.background(theme::bg_results())
             };
             // Border on every column, last included, so a narrow table still shows
             // where the final column ends.
