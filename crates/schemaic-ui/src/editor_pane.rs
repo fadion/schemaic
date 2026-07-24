@@ -2792,10 +2792,21 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     },
                 )
                 .style(|s| s.width(52.0));
+                // Close ✕ — same glyph size, styling, and row gap as the
+                // find/replace bar's × (`icon_btn` there is a local closure).
+                let close_x = close.clone();
+                let close_btn = container(icons::icon(icons::X, 14.0))
+                    .on_click_stop(move |_| (close_x)())
+                    .style(|s| {
+                        s.items_center()
+                            .color(theme::text_dim())
+                            .hover(|s| s.color(theme::text()))
+                    });
                 h_stack((
                     text("Go to:")
                         .style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_dim())),
                     input,
+                    close_btn,
                 ))
                 .style(|s| {
                     s.items_center()
