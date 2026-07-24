@@ -92,11 +92,33 @@ pub(crate) const DIFF_MONO: &str = "IBM Plex Mono";
 
 // ── Panel resize handles ────────────────────────────────────────────────────
 
-/// Grab width of a panel-resize divider; the visible bar; the provisional floor
-/// so a panel can't be dragged to nothing (real min/max limits come later).
+/// Grab width of a panel-resize divider and the visible bar. Per-panel min/max
+/// drag limits live below (`SCHEMA_MIN_W`/`RIGHT_MIN_W`/`CENTER_MIN_W`/…).
 pub(crate) const RESIZE_HIT: f64 = 10.0;
 pub(crate) const RESIZE_BAR: f64 = 3.0;
-pub(crate) const RESIZE_MIN: f64 = 80.0;
+
+// ── Panel minimum dimensions + responsive breakpoints ───────────────────────
+
+/// Minimum panel widths so a dragged — or auto-shrunk — panel stays legible
+/// instead of squashing to a sliver. The center (query + results) is the
+/// priority: the side panels yield width to keep it ≥ `CENTER_MIN_W`.
+pub(crate) const SCHEMA_MIN_W: f64 = 250.0;
+pub(crate) const RIGHT_MIN_W: f64 = 250.0;
+pub(crate) const CENTER_MIN_W: f64 = 400.0;
+/// Minimum heights for the query editor and the results grid (drag + flex floor).
+pub(crate) const QUERY_MIN_H: f64 = 160.0;
+pub(crate) const RESULTS_MIN_H: f64 = 190.0;
+/// Responsive breakpoints on total window width. Below `PANELS_MIN_FULL_W` the
+/// right panel (AI/terminal/history) is force-hidden and its toggle locked;
+/// below `PANELS_MIN_SCHEMA_W` the schema panel is too. Each equals the summed
+/// min widths of the panels that must fit, so a panel is only locked away once
+/// there's genuinely no room for it beside the center.
+pub(crate) const PANELS_MIN_FULL_W: f64 = SCHEMA_MIN_W + CENTER_MIN_W + RIGHT_MIN_W; // 900
+pub(crate) const PANELS_MIN_SCHEMA_W: f64 = SCHEMA_MIN_W + CENTER_MIN_W; // 650
+/// A left status-bar segment auto-hides once its right edge comes within this
+/// many px of the footer's right-hand icon group (the AI icon's left edge), so
+/// the two clusters never collide on a narrow window.
+pub(crate) const FOOTER_COLLAPSE_GAP: f64 = 30.0;
 
 // ── Tab bar ─────────────────────────────────────────────────────────────────
 

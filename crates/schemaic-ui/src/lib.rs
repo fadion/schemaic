@@ -1163,27 +1163,33 @@ pub fn workspace(ui: Ui) -> impl IntoView {
                 if let Key::Character(c) = &ke.key.logical_key {
                     let c = c.as_str();
                     if m.shift() && c.eq_ignore_ascii_case("e") {
-                        schema_visible.update(|v| *v = !*v);
+                        if schema_panel_allowed() {
+                            schema_visible.update(|v| *v = !*v);
+                        }
                         return EventPropagation::Stop;
                     }
                     if m.shift() && c.eq_ignore_ascii_case("a") {
-                        right_panel.update(|p| {
-                            *p = if matches!(*p, RightPanel::Ai) {
-                                RightPanel::None
-                            } else {
-                                RightPanel::Ai
-                            };
-                        });
+                        if right_panel_allowed() {
+                            right_panel.update(|p| {
+                                *p = if matches!(*p, RightPanel::Ai) {
+                                    RightPanel::None
+                                } else {
+                                    RightPanel::Ai
+                                };
+                            });
+                        }
                         return EventPropagation::Stop;
                     }
                     if c == "`" {
-                        right_panel.update(|p| {
-                            *p = if matches!(*p, RightPanel::Terminal) {
-                                RightPanel::None
-                            } else {
-                                RightPanel::Terminal
-                            };
-                        });
+                        if right_panel_allowed() {
+                            right_panel.update(|p| {
+                                *p = if matches!(*p, RightPanel::Terminal) {
+                                    RightPanel::None
+                                } else {
+                                    RightPanel::Terminal
+                                };
+                            });
+                        }
                         return EventPropagation::Stop;
                     }
                 }
@@ -1525,14 +1531,40 @@ pub fn pick_connection_color(used: &[String]) -> String {
 // column) rather than `inset_left` (schema); `dim` is the width signal it drags,
 // with the boundary snapping to the pointer. Collapses to a 0-width no-op when the
 // panel is hidden.
+/// Whether the schema panel currently fits beside the center — window width ≥
+/// (schema + center) min widths. Reactive on `window_size`. Below this the panel
+/// is force-hidden and its toggle is a no-op. `(0,0)` (pre-first-resize) counts
+/// as allowed so nothing is locked at startup before the first resize fires.
+pub(crate) fn schema_panel_allowed() -> bool {
+    // Outside `[1, threshold)` = pre-first-resize `(0,0)` or wide enough.
+    let ww = window_size().get().0;
+    !(1.0..PANELS_MIN_SCHEMA_W).contains(&ww)
+}
+
+/// Whether the right (AI/terminal/history) panel currently fits beside the schema
+/// panel and the center — window width ≥ all three min widths. Reactive on
+/// `window_size`.
+pub(crate) fn right_panel_allowed() -> bool {
+    let ww = window_size().get().0;
+    !(1.0..PANELS_MIN_FULL_W).contains(&ww)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn h_resize_handle(
     from_right: bool,
     dim: RwSignal<f64>,
+    // Effective (clamped) panel width → where the handle sits. May be less than
+    // `dim` when the window is too narrow to honor the full intended width.
+    edge: impl Fn() -> f64 + Copy + 'static,
     visible: impl Fn() -> bool + Copy + 'static,
     // Owned by the caller so the panel wrapper can drop its width transition while
     // dragging (the transition is for the collapse slide; during a resize it just
     // makes the width lag the pointer).
     dragging: RwSignal<bool>,
+    // Drag clamp: floor `min_w`, ceiling `max_w()` (reactive — leaves the center +
+    // the opposite panel their minimums).
+    min_w: f64,
+    max_w: impl Fn() -> f64 + Copy + 'static,
     // Double-click resets `dim` to this default (animated, since not dragging).
     default: f64,
     // Persist the layout after a drag ends or a reset (debounced to gesture-end so
@@ -1559,7 +1591,7 @@ fn h_resize_handle(
                 .justify_center()
                 .cursor(CursorStyle::ColResize)
                 .width(if visible() { RESIZE_HIT } else { 0.0 });
-            let inset = dim.get() - RESIZE_HIT / 2.0;
+            let inset = edge() - RESIZE_HIT / 2.0;
             if from_right {
                 s.inset_right(inset)
             } else {
@@ -1587,17 +1619,10 @@ fn h_resize_handle(
                     // right column, which grows leftward).
                     let d = pe.pos.x - RESIZE_HIT / 2.0;
                     let d = if from_right { -d } else { d };
-                    // Floor at RESIZE_MIN; ceiling so a panel can't be dragged past
-                    // the window edge and swallow the center (leave ≥300px for it).
-                    // `window_size` is (0,0) until the first resize — skip the
-                    // ceiling then (§7.4).
-                    let ww = window_size().get_untracked().0;
-                    let hi = if ww > 1.0 {
-                        (ww - 300.0).max(RESIZE_MIN)
-                    } else {
-                        f64::INFINITY
-                    };
-                    dim.update(|w| *w = (*w + d).clamp(RESIZE_MIN, hi));
+                    // Floor at `min_w`; ceiling `max_w()` keeps the center (and the
+                    // opposite panel) at their minimums so a drag can't swallow them.
+                    let hi = max_w().max(min_w);
+                    dim.update(|w| *w = (*w + d).clamp(min_w, hi));
                 }
                 EventPropagation::Stop
             } else {
@@ -1629,6 +1654,10 @@ fn h_resize_handle(
 fn v_resize_handle(
     base_top: f64,
     dim: RwSignal<f64>,
+    // Drag clamp: floor `min_h` (query editor min), ceiling `max_h()` (reactive —
+    // leaves the results grid its minimum height).
+    min_h: f64,
+    max_h: impl Fn() -> f64 + Copy + 'static,
     default: f64,
     on_commit: Rc<dyn Fn()>,
 ) -> impl IntoView {
@@ -1670,7 +1699,7 @@ fn v_resize_handle(
             if dragging.get_untracked() {
                 if let Event::PointerMove(pe) = e {
                     let d = pe.pos.y - RESIZE_HIT / 2.0;
-                    dim.update(|h| *h = (*h + d).max(RESIZE_MIN));
+                    dim.update(|h| *h = (*h + d).clamp(min_h, max_h().max(min_h)));
                 }
                 EventPropagation::Stop
             } else {
@@ -1721,6 +1750,37 @@ fn body(
     let schema_dragging = RwSignal::new(false);
     let right_dragging = RwSignal::new(false);
 
+    // Effective panel widths: 0 when hidden or locked away by the responsive
+    // breakpoints, else the intended width clamped so the center keeps
+    // `CENTER_MIN_W` (the right panel yields against the schema *minimum*; the
+    // schema then yields against the right panel's *effective* width). The stored
+    // `schema_w`/`right_w` are the user's intent and never mutated here, so a panel
+    // restores to its full width when the window grows back.
+    let eff_right_w = move || {
+        if right_panel.get() == RightPanel::None || !right_panel_allowed() {
+            return 0.0;
+        }
+        let ww = window_size().get().0;
+        if ww < 1.0 {
+            return right_w.get();
+        }
+        right_w
+            .get()
+            .clamp(RIGHT_MIN_W, (ww - CENTER_MIN_W - SCHEMA_MIN_W).max(RIGHT_MIN_W))
+    };
+    let eff_schema_w = move || {
+        if !schema_visible.get() || !schema_panel_allowed() {
+            return 0.0;
+        }
+        let ww = window_size().get().0;
+        if ww < 1.0 {
+            return schema_w.get();
+        }
+        schema_w
+            .get()
+            .clamp(SCHEMA_MIN_W, (ww - CENTER_MIN_W - eff_right_w()).max(SCHEMA_MIN_W))
+    };
+
     // Left: the schema tree. Always mounted (it only reads signals; nothing is
     // spawned on build), so hiding is purely the width animation. `clip()` hides
     // the fixed-width content as the wrapper narrows.
@@ -1731,11 +1791,7 @@ fn body(
         } else {
             s.transition(Width, anim())
         };
-        if schema_visible.get() {
-            s.width(schema_w.get())
-        } else {
-            s.width(0.0)
-        }
+        s.width(eff_schema_w())
     });
 
     // Right: AI or Terminal. `right_content` sticks to the last non-None panel so
@@ -1766,11 +1822,7 @@ fn body(
         } else {
             s.transition(Width, anim())
         };
-        if right_panel.get() == RightPanel::None {
-            s.width(0.0)
-        } else {
-            s.width(right_w.get())
-        }
+        s.width(eff_right_w())
     });
 
     // Drag handles overlay the panel boundaries (absolute → no layout impact).
@@ -1780,8 +1832,12 @@ fn body(
     let schema_handle = h_resize_handle(
         false,
         schema_w,
-        move || schema_visible.get(),
+        eff_schema_w,
+        move || schema_visible.get() && schema_panel_allowed(),
         schema_dragging,
+        SCHEMA_MIN_W,
+        // Leave the center + the right panel's effective width.
+        move || window_size().get().0 - CENTER_MIN_W - eff_right_w(),
         theme::SCHEMA_W,
         commit,
     );
@@ -1789,8 +1845,12 @@ fn body(
     let right_handle = h_resize_handle(
         true,
         right_w,
-        move || right_panel.get() != RightPanel::None,
+        eff_right_w,
+        move || right_panel.get() != RightPanel::None && right_panel_allowed(),
         right_dragging,
+        RIGHT_MIN_W,
+        // Leave the center + the schema panel at its minimum (it yields as needed).
+        move || window_size().get().0 - CENTER_MIN_W - SCHEMA_MIN_W,
         theme::AI_W,
         commit,
     );
@@ -1847,6 +1907,12 @@ fn center(ui: Ui) -> impl IntoView {
     let popup_anchor = ui.overlay.popup_anchor;
     let popup_width = ui.overlay.popup_width;
     let editor_h = ui.layout.editor_h;
+    // A width persisted under an older, looser floor could be below the current
+    // query-editor minimum — lift it once on build (render clamps widths live, but
+    // the editor height has no such render-time clamp).
+    if editor_h.get_untracked() < QUERY_MIN_H {
+        editor_h.set(QUERY_MIN_H);
+    }
     // Reveal the AI panel + send a message (the grid cell "AI Summary" builds a
     // context-rich prompt itself, so this just reveals + forwards).
     let summarize: Rc<dyn Fn(String)> = {
@@ -1968,6 +2034,7 @@ fn center(ui: Ui) -> impl IntoView {
             .flex_shrink(0.0_f32)
             .flex_col()
             .min_width(0.0)
+            .min_height(QUERY_MIN_H)
     });
 
     // Results area: the active tab's grid. Deliberately NOT tied to `flashing`,
@@ -2020,13 +2087,28 @@ fn center(ui: Ui) -> impl IntoView {
         s.flex_grow(1.0_f32)
             .width_full()
             .flex_col()
-            .min_height(0.0)
+            .min_height(RESULTS_MIN_H)
             .min_width(0.0)
     });
 
     // Divider between editor and results, offset past the tab bar. Double-click
     // resets to the default editor height; drag-end/reset persists the layout.
-    let split_handle = v_resize_handle(TAB_BAR_H, editor_h, EDITOR_H, ui.persist_layout.clone());
+    // Ceiling leaves the results grid `RESULTS_MIN_H` within the editor+results
+    // region (window minus header/footer/tab-bar).
+    let split_handle = v_resize_handle(
+        TAB_BAR_H,
+        editor_h,
+        QUERY_MIN_H,
+        move || {
+            let wh = window_size().get().1;
+            if wh < 1.0 {
+                return f64::INFINITY;
+            }
+            wh - theme::HEADER_H - theme::FOOTER_H - TAB_BAR_H - RESULTS_MIN_H
+        },
+        EDITOR_H,
+        ui.persist_layout.clone(),
+    );
 
     // Identity-colour rule under the tab strip (drawn on the "prominent colour"
     // setting). Wrapping the tab bar in a `stack` pins the 2px line to the bar's
@@ -2042,7 +2124,7 @@ fn center(ui: Ui) -> impl IntoView {
             .height_full()
             .flex_col()
             .min_height(0.0)
-            .min_width(0.0)
+            .min_width(CENTER_MIN_W)
     })
 }
 
@@ -3285,6 +3367,47 @@ fn status_menu_seg(
     })
 }
 
+/// Wrap a left status-bar segment so it auto-hides once its right edge comes
+/// within `FOOTER_COLLAPSE_GAP` px of the right-hand icon group (`ai_x` = the AI
+/// icon's left edge, both in window coords). It tracks its own right edge, frozen
+/// while it's hidden (updates only while shown) so the show/hide test reads a
+/// stable full-layout position and can't oscillate. Segments hide right-to-left
+/// (the rightmost's edge is largest, so it crosses the threshold first) and
+/// reappear as the window widens.
+fn collapsing_seg(view: impl IntoView + 'static, ai_x: RwSignal<f64>) -> impl IntoView {
+    let x = RwSignal::new(0.0_f64);
+    let w = RwSignal::new(0.0_f64);
+    let edge = RwSignal::new(0.0_f64);
+    // Whether the segment is currently shown, read untracked in the geometry
+    // handlers so a hidden segment freezes its `edge` (no reactive cycle).
+    let is_shown = move || {
+        let ax = ai_x.get_untracked();
+        ax < 1.0 || edge.get_untracked() + FOOTER_COLLAPSE_GAP <= ax
+    };
+    container(view)
+        .on_move(move |p| {
+            x.set(p.x);
+            if w.get_untracked() > 0.0 && is_shown() {
+                edge.set(p.x + w.get_untracked());
+            }
+        })
+        .on_resize(move |r| {
+            let cw = r.width();
+            w.set(cw);
+            if cw > 0.0 && is_shown() {
+                edge.set(x.get_untracked() + cw);
+            }
+        })
+        .style(move |s| {
+            let ax = ai_x.get();
+            if ax >= 1.0 && edge.get() + FOOTER_COLLAPSE_GAP > ax {
+                s.hide()
+            } else {
+                s
+            }
+        })
+}
+
 fn footer(ui: Ui) -> impl IntoView {
     let schema_visible = ui.layout.schema_visible;
     let right_panel = ui.layout.right_panel;
@@ -3344,8 +3467,12 @@ fn footer(ui: Ui) -> impl IntoView {
     });
 
     // AI/Terminal toggles are mutually exclusive: turning one on replaces the
-    // other; clicking the active one hides it (right column freed).
+    // other; clicking the active one hides it (right column freed). A no-op while
+    // the window is too narrow for the right panel (it's locked hidden).
     let set_right = move |target: RightPanel| {
+        if !right_panel_allowed() {
+            return;
+        }
         right_panel.update(|r| {
             *r = if *r == target {
                 RightPanel::None
@@ -3357,26 +3484,38 @@ fn footer(ui: Ui) -> impl IntoView {
     // Left edge: the Schema (folder-tree) toggle — kept on the left so it reads as
     // opening the panel that lives on the left. Right edge: AI / History / Terminal
     // toggles, likewise under their right-column panels.
+    // Active state reflects *effective* visibility (intent AND the window is wide
+    // enough), so a panel locked away by a narrow window reads as inactive; its
+    // toggle is a no-op until the window grows back.
     let schema_icon = toggle_icon(
         icons::FOLDER_TREE,
-        move || schema_visible.get(),
-        move || schema_visible.update(|v| *v = !*v),
+        move || schema_visible.get() && schema_panel_allowed(),
+        move || {
+            if schema_panel_allowed() {
+                schema_visible.update(|v| *v = !*v);
+            }
+        },
     )
     .style(|s| s.margin_left(5.0));
+    // The AI icon's left edge (window x) is the reference the left cluster
+    // collapses against — it's the leftmost thing in the right-pinned group, so it
+    // marches left as the window narrows.
+    let ai_x = RwSignal::new(0.0_f64);
     let right_group = h_stack((
         toggle_icon_view(
             icons::icon_wh(icons::AI_LOGO, 16.0, 10.0).style(|s| s.flex_shrink(0.0_f32)),
-            move || right_panel.get() == RightPanel::Ai,
+            move || right_panel.get() == RightPanel::Ai && right_panel_allowed(),
             move || set_right(RightPanel::Ai),
-        ),
+        )
+        .on_move(move |p| ai_x.set(p.x)),
         toggle_icon(
             icons::TIMELINE,
-            move || right_panel.get() == RightPanel::History,
+            move || right_panel.get() == RightPanel::History && right_panel_allowed(),
             move || set_right(RightPanel::History),
         ),
         toggle_icon(
             icons::TERMINAL,
-            move || right_panel.get() == RightPanel::Terminal,
+            move || right_panel.get() == RightPanel::Terminal && right_panel_allowed(),
             move || set_right(RightPanel::Terminal),
         )
         .style(|s| s.margin_right(5.0)),
@@ -3619,17 +3758,19 @@ fn footer(ui: Ui) -> impl IntoView {
     )
     .style(|s| s.margin_left(15.0));
 
+    // The schema toggle always stays (it's a control, and leftmost); every status
+    // segment after it collapses right-to-left as the AI icon nears it.
     let left_group = h_stack((
         schema_icon,
-        cursor_seg,
-        tabs_seg,
-        wrap_seg,
-        warn_seg,
-        ro_seg,
-        model_seg,
-        effort_seg,
-        cpu_seg,
-        ram_seg,
+        collapsing_seg(cursor_seg, ai_x),
+        collapsing_seg(tabs_seg, ai_x),
+        collapsing_seg(wrap_seg, ai_x),
+        collapsing_seg(warn_seg, ai_x),
+        collapsing_seg(ro_seg, ai_x),
+        collapsing_seg(model_seg, ai_x),
+        collapsing_seg(effort_seg, ai_x),
+        collapsing_seg(cpu_seg, ai_x),
+        collapsing_seg(ram_seg, ai_x),
     ))
     .style(|s| s.flex_row().items_center().min_width(0.0));
 

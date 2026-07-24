@@ -1311,27 +1311,33 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         {
             let c = c.as_str();
             if mods.shift() && c.eq_ignore_ascii_case("e") {
-                schema_visible.update(|v| *v = !*v);
+                if crate::schema_panel_allowed() {
+                    schema_visible.update(|v| *v = !*v);
+                }
                 return CommandExecuted::Yes;
             }
             if mods.shift() && c.eq_ignore_ascii_case("a") {
-                right_panel.update(|p| {
-                    *p = if matches!(*p, RightPanel::Ai) {
-                        RightPanel::None
-                    } else {
-                        RightPanel::Ai
-                    };
-                });
+                if crate::right_panel_allowed() {
+                    right_panel.update(|p| {
+                        *p = if matches!(*p, RightPanel::Ai) {
+                            RightPanel::None
+                        } else {
+                            RightPanel::Ai
+                        };
+                    });
+                }
                 return CommandExecuted::Yes;
             }
             if c == "`" {
-                right_panel.update(|p| {
-                    *p = if matches!(*p, RightPanel::Terminal) {
-                        RightPanel::None
-                    } else {
-                        RightPanel::Terminal
-                    };
-                });
+                if crate::right_panel_allowed() {
+                    right_panel.update(|p| {
+                        *p = if matches!(*p, RightPanel::Terminal) {
+                            RightPanel::None
+                        } else {
+                            RightPanel::Terminal
+                        };
+                    });
+                }
                 return CommandExecuted::Yes;
             }
         }
