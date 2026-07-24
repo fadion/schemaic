@@ -1547,6 +1547,17 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         persist::save_connections(&file);
     };
 
+    // Flip a connection's read-only flag and persist (the status-bar shortcut).
+    // The `read_only` memo reads this reactively, so write-gating updates at once.
+    let toggle_read_only: Rc<dyn Fn(u64)> = Rc::new(move |id: u64| {
+        connections.update(|cs| {
+            if let Some(c) = cs.iter_mut().find(|c| c.id == id) {
+                c.read_only = !c.read_only;
+            }
+        });
+        persist_conns(Some(active_conn.get_untracked()));
+    });
+
     // Switch the active connection and reload its schema.
     let switch_conn: Rc<dyn Fn(u64)> = {
         let load_schema = load_schema.clone();
@@ -2358,6 +2369,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             select_conn,
             new_conn,
             save_conn,
+            toggle_read_only,
             delete_conn,
             test_conn,
         }),

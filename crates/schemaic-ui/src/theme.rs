@@ -356,6 +356,10 @@ pub fn status_text() -> Color {
 pub fn status_warn() -> Color {
     Color::rgb8(0xE0, 0x8A, 0x4B)
 }
+/// Brighter amber for hovering the write-mode status segment (`#FFA461`).
+pub fn status_warn_hover() -> Color {
+    Color::rgb8(0xFF, 0xA4, 0x61)
+}
 /// Green for the "no warnings" check (`#71C371`).
 pub fn status_ok() -> Color {
     Color::rgb8(0x71, 0xC3, 0x71)

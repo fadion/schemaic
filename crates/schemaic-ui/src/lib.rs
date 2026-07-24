@@ -721,6 +721,9 @@ pub struct ConnActions {
     pub select_conn: Rc<dyn Fn(u64)>,
     pub new_conn: Rc<dyn Fn()>,
     pub save_conn: Rc<dyn Fn()>,
+    /// Flip a connection's read-only flag by id and persist (status-bar shortcut
+    /// for the Manage-Connections toggle).
+    pub toggle_read_only: Rc<dyn Fn(u64)>,
     pub delete_conn: Rc<dyn Fn(u64)>,
     /// Test the draft's host + credentials (opens a throwaway connection/tunnel
     /// and pings); the result lands in [`ConnUi::conn_test`].
@@ -3211,6 +3214,7 @@ fn footer(ui: Ui) -> impl IntoView {
     let word_wrap = ui.layout.word_wrap;
     let popup_menu = ui.overlay.popup_menu;
     let popup_anchor = ui.overlay.popup_anchor;
+    let toggle_read_only = ui.conn_actions.toggle_read_only.clone();
     let resources = ui.resources;
     let ai_model = ui.ai.model;
     let ai_effort = ui.ai.effort;
@@ -3421,22 +3425,48 @@ fn footer(ui: Ui) -> impl IntoView {
         },
     )
     .style(|s| s.margin_left(40.0));
-    // Read-only vs write mode (from the active connection's setting). Text only:
-    // green for read-only (safe), amber for write mode (a heads-up).
+    // Read-only vs write mode (the active connection's setting). Read-only reads
+    // as normal status text; write mode is amber so it stands out. Click toggles
+    // it — a shortcut for the Manage-Connections read-only switch. Colour + hover
+    // sit on the container (state-dependent) so the label inherits both: read-only
+    // hovers to the shared accent, write mode to a brighter amber.
     let ro_seg = dyn_container(
         move || read_only.get(),
         move |ro| {
-            let (label, color) = if ro {
-                ("Read only", theme::status_ok as fn() -> Color)
-            } else {
-                ("Write mode", theme::status_warn as fn() -> Color)
-            };
-            text(label)
-                .style(move |s| s.color(color()).font_size(theme::FONT_STATUS))
+            text(if ro { "Read only" } else { "Write mode" })
+                .style(|s| s.font_size(theme::FONT_STATUS))
                 .into_any()
         },
     )
-    .style(|s| s.margin_left(15.0));
+    .on_click_stop(move |_| {
+        let id = active.get_untracked();
+        let cid = tabs.with_untracked(|v| {
+            v.iter()
+                .find(|t| t.id == id)
+                .map(|t| t.conn_id.get_untracked())
+        });
+        if let Some(cid) = cid {
+            toggle_read_only(cid);
+        }
+    })
+    .style(move |s| {
+        let ro = read_only.get();
+        // Called inside this closure so both follow a live theme switch.
+        let base = if ro {
+            theme::status_text()
+        } else {
+            theme::status_warn()
+        };
+        let hover = if ro {
+            theme::chip_active()
+        } else {
+            theme::status_warn_hover()
+        };
+        s.margin_left(15.0)
+            .items_center()
+            .color(base)
+            .hover(move |s| s.color(hover))
+    });
     let cpu_seg = dyn_container(
         move || resources.get().cpu_label(),
         move |c| footer_text(format!("CPU: {c}")),
