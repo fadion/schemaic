@@ -23,8 +23,8 @@ use crate::widgets::{
     MenuEntry, autohide, measure_text_px_at, menu_item_style, menu_panel, panel_style, window_size,
 };
 use crate::{
-    ConnNode, CtxKind, PopupAnchor, RightPanel, Ui, icons, right_panel_allowed, schema_panel_allowed,
-    search_box, status_color, theme,
+    ConnNode, CtxKind, PopupAnchor, RightPanel, Ui, icons, right_panel_allowed,
+    schema_panel_allowed, search_box, status_color, theme,
 };
 
 // ===== moved from lib.rs (overlays) =====
@@ -645,10 +645,11 @@ fn highlighted_primary(primary: &str, term: &Option<String>) -> AnyView {
             }
         })
     };
-    let m = term
-        .as_deref()
-        .filter(|t| !t.is_empty())
-        .and_then(|t| schemaic_core::text_ops::find_matches(primary, t).first().map(|&s| (s, s + t.len())));
+    let m = term.as_deref().filter(|t| !t.is_empty()).and_then(|t| {
+        schemaic_core::text_ops::find_matches(primary, t)
+            .first()
+            .map(|&s| (s, s + t.len()))
+    });
     match m {
         Some((start, end)) => h_stack((
             seg(&primary[..start], false),
@@ -672,7 +673,10 @@ enum CmdArg {
     /// No argument — runs on Enter.
     Instant(Rc<dyn Fn()>),
     /// Pick one of `(value, label)`; `run(value)`.
-    Options { list: OptionsFn, run: Rc<dyn Fn(String)> },
+    Options {
+        list: OptionsFn,
+        run: Rc<dyn Fn(String)>,
+    },
     /// A number clamped to `[min, max]`; `run(n)`. `empty` handles a missing arg.
     Number {
         min: i64,
@@ -772,8 +776,13 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                                         "history" => RightPanel::History,
                                         _ => RightPanel::Ai,
                                     };
-                                    right_panel
-                                        .update(|p| *p = if *p == target { RightPanel::None } else { target });
+                                    right_panel.update(|p| {
+                                        *p = if *p == target {
+                                            RightPanel::None
+                                        } else {
+                                            target
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -844,7 +853,8 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                         } else {
                             "\t".to_string()
                         };
-                        let out = schemaic_core::sqlfmt::format_sql(&t.query.get_untracked(), &unit);
+                        let out =
+                            schemaic_core::sqlfmt::format_sql(&t.query.get_untracked(), &unit);
                         t.query.set(out);
                     }
                 }),
@@ -915,7 +925,9 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                     let conn = active_conn.get_untracked();
                     entries.with_untracked(|v| {
                         v.iter()
-                            .filter(|e| e.conn_id == conn && schemaic_core::history::matches_query(e, arg))
+                            .filter(|e| {
+                                e.conn_id == conn && schemaic_core::history::matches_query(e, arg)
+                            })
                             .take(50)
                             .map(|e| {
                                 let entry = e.clone();
@@ -1225,7 +1237,9 @@ fn build_items(
             let f = f.trim().to_lowercase();
             commands
                 .iter()
-                .filter(|c| f.is_empty() || c.label.to_lowercase().contains(&f) || c.name.contains(&f))
+                .filter(|c| {
+                    f.is_empty() || c.label.to_lowercase().contains(&f) || c.name.contains(&f)
+                })
                 .map(|c| {
                     // Tab/ghost target: the command name, plus a trailing space for
                     // argument-commands so the caret lands ready for the argument.
@@ -1274,7 +1288,9 @@ fn build_items(
                     list()
                         .into_iter()
                         .filter(|(v, l)| {
-                            a.is_empty() || l.to_lowercase().contains(&a) || v.to_lowercase().contains(&a)
+                            a.is_empty()
+                                || l.to_lowercase().contains(&a)
+                                || v.to_lowercase().contains(&a)
                         })
                         .map(|(v, l)| {
                             let run = run.clone();
@@ -1396,7 +1412,10 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
 
             // Activate the selected row (Enter or click).
             let open_sel: Rc<dyn Fn()> = Rc::new(move || {
-                let act = items.with_untracked(|v| v.get(selected.get_untracked()).map(|it| it.activate.clone()));
+                let act = items.with_untracked(|v| {
+                    v.get(selected.get_untracked())
+                        .map(|it| it.activate.clone())
+                });
                 if let Some(act) = act {
                     (act)();
                 }
@@ -1404,8 +1423,10 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
             // Tab accepts the selected row's completion (the ghost): set the query
             // to it and move the caret to the end.
             let on_tab: Rc<dyn Fn()> = Rc::new(move || {
-                let comp = items
-                    .with_untracked(|v| v.get(selected.get_untracked()).and_then(|it| it.complete.clone()));
+                let comp = items.with_untracked(|v| {
+                    v.get(selected.get_untracked())
+                        .and_then(|it| it.complete.clone())
+                });
                 if let Some(c) = comp {
                     query.set(c);
                     caret_end.update(|n| *n += 1);
@@ -1450,7 +1471,11 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                         // default, tighter line box floated it ~4px too high). The
                         // placeholder colour keeps it a subtle hint, not competing
                         // with the typed text.
-                        .style(|s| s.color(theme::placeholder()).font_size(16.0).line_height(1.46))
+                        .style(|s| {
+                            s.color(theme::placeholder())
+                                .font_size(16.0)
+                                .line_height(1.46)
+                        })
                         .into_any(),
                     None => empty().into_any(),
                 },
@@ -1506,27 +1531,27 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                                 s
                             }
                         });
-                    // Keep the keyboard-selected row in view. The ends scroll fully to
-                    // the top / bottom (so the first row clears the input's 10px gap
-                    // and the last row reaches the end); middle rows reveal minimally
-                    // (deferred a tick so it clamps against settled layout).
-                    let row_id = row.id();
-                    create_effect(move |_| {
-                        if selected.get() != i {
-                            return;
-                        }
-                        if i == 0 {
-                            list_scroll.set(Some(floem::kurbo::Point::ZERO));
-                        } else if i + 1 == total {
-                            list_scroll.set(Some(floem::kurbo::Point::new(0.0, 1.0e7)));
-                        } else {
-                            list_scroll.set(None);
-                            floem::action::exec_after(std::time::Duration::ZERO, move |_| {
-                                row_id.scroll_to(None);
-                            });
-                        }
-                    });
-                    row
+                        // Keep the keyboard-selected row in view. The ends scroll fully to
+                        // the top / bottom (so the first row clears the input's 10px gap
+                        // and the last row reaches the end); middle rows reveal minimally
+                        // (deferred a tick so it clamps against settled layout).
+                        let row_id = row.id();
+                        create_effect(move |_| {
+                            if selected.get() != i {
+                                return;
+                            }
+                            if i == 0 {
+                                list_scroll.set(Some(floem::kurbo::Point::ZERO));
+                            } else if i + 1 == total {
+                                list_scroll.set(Some(floem::kurbo::Point::new(0.0, 1.0e7)));
+                            } else {
+                                list_scroll.set(None);
+                                floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+                                    row_id.scroll_to(None);
+                                });
+                            }
+                        });
+                        row
                     }))
                     // Right gutter clears the floating scrollbar (3px edge inset +
                     // 6px handle) so a row's highlight stops just before it rather

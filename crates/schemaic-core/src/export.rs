@@ -424,10 +424,7 @@ mod tests {
     fn export_html_escapes_entities_and_nulls_are_empty() {
         let rs = ResultSet {
             columns: vec![col("a<b>")],
-            rows: vec![
-                vec![Value::Str("x&y".to_string())],
-                vec![Value::Null],
-            ],
+            rows: vec![vec![Value::Str("x&y".to_string())], vec![Value::Null]],
             elapsed_ms: 0,
             truncated: false,
             affected: None,

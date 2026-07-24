@@ -185,7 +185,10 @@ mod tests {
         // "run" isn't an argument-command, so it never captures a following word;
         // the UI resolves/executes it from the filtered list instead.
         assert_eq!(parse(">run", ARGS), Parsed::Filter("run".into()));
-        assert_eq!(parse(">clear history", ARGS), Parsed::Filter("clear history".into()));
+        assert_eq!(
+            parse(">clear history", ARGS),
+            Parsed::Filter("clear history".into())
+        );
     }
 
     #[test]
