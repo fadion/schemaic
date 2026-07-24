@@ -3201,6 +3201,54 @@ fn footer_text(s: String) -> AnyView {
         .into_any()
 }
 
+/// A clickable status-bar segment that opens a `menu_panel` popup centred above
+/// it (the Tabs/Spaces, AI-model and AI-effort menus, which share the one popup
+/// channel). `owner` disambiguates which segment owns the open popup: a second
+/// click on the *same* segment toggles it shut, while clicking a different one
+/// switches menus. Its window rect is tracked (its x shifts as segments to its
+/// left change width) so the popup can centre on it.
+#[allow(clippy::too_many_arguments)]
+fn status_menu_seg(
+    label: impl Fn() -> String + 'static,
+    owner: u8,
+    build_entries: impl Fn() -> Vec<MenuEntry> + 'static,
+    menu_owner: RwSignal<u8>,
+    popup_menu: RwSignal<Option<Vec<MenuEntry>>>,
+    popup_anchor: RwSignal<Option<(f64, f64, f64, f64)>>,
+    margin: f64,
+) -> impl IntoView {
+    let origin: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
+    let size: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
+    let build = Rc::new(build_entries);
+    dyn_container(label, move |s| {
+        text(s)
+            .style(|s| s.font_size(theme::FONT_STATUS))
+            .into_any()
+    })
+    .on_move(move |p| origin.set((p.x, p.y)))
+    .on_resize(move |r| size.set((r.width(), r.height())))
+    // Stop the pointer-down so the workspace-root "close on down" handler doesn't
+    // fire for our own clicks (else down closes and up reopens — never toggling).
+    .on_event_stop(EventListener::PointerDown, |_| {})
+    .on_click_stop(move |_| {
+        if popup_menu.get_untracked().is_some() && menu_owner.get_untracked() == owner {
+            popup_menu.set(None);
+            return;
+        }
+        menu_owner.set(owner);
+        let (ox, oy) = origin.get_untracked();
+        let (sw, _sh) = size.get_untracked();
+        popup_anchor.set(Some((ox, ox + sw, oy, sw)));
+        popup_menu.set(Some((build)()));
+    })
+    .style(move |s| {
+        s.margin_left(margin)
+            .items_center()
+            .color(theme::status_text())
+            .hover(|s| s.color(theme::chip_active()))
+    })
+}
+
 fn footer(ui: Ui) -> impl IntoView {
     let schema_visible = ui.layout.schema_visible;
     let right_panel = ui.layout.right_panel;
@@ -3216,6 +3264,9 @@ fn footer(ui: Ui) -> impl IntoView {
     let popup_anchor = ui.overlay.popup_anchor;
     let toggle_read_only = ui.conn_actions.toggle_read_only.clone();
     let resources = ui.resources;
+    // Which status-bar segment owns the shared popup (0 none / 1 tabs / 2 model /
+    // 3 effort) — lets a second click on the same segment toggle it shut.
+    let menu_owner: RwSignal<u8> = RwSignal::new(0);
     let ai_model = ui.ai.model;
     let ai_effort = ui.ai.effort;
 
@@ -3326,65 +3377,51 @@ fn footer(ui: Ui) -> impl IntoView {
     // Tabs vs Spaces + width. Click opens a menu (centred above the segment): the
     // two indent styles, a separator, then sizes 1–6; the active style + size are
     // tinted (chip accent). Clicking again while open toggles it shut.
-    // `tab_origin`/`tab_size` track the segment's window rect so the popup can
-    // centre on it (its x shifts as the Ln/Col text to its left grows/shrinks).
-    let tab_origin: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
-    let tab_size: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
-    let tabs_seg = dyn_container(
-        move || (soft_tabs.get(), tab_width.get()),
-        move |(soft, w)| {
-            text(format!("{}: {}", if soft { "Spaces" } else { "Tabs" }, w))
-                .style(|s| s.font_size(theme::FONT_STATUS))
-                .into_any()
+    let tabs_seg = status_menu_seg(
+        move || {
+            format!(
+                "{}: {}",
+                if soft_tabs.get() { "Spaces" } else { "Tabs" },
+                tab_width.get()
+            )
         },
-    )
-    .on_move(move |p| tab_origin.set((p.x, p.y)))
-    .on_resize(move |r| tab_size.set((r.width(), r.height())))
-    // Stop the pointer-down so the workspace-root "close popup on down" handler
-    // doesn't fire for our own clicks — otherwise the down would close the menu
-    // and the up would immediately reopen it (never toggling shut).
-    .on_event_stop(EventListener::PointerDown, |_| {})
-    .on_click_stop(move |_| {
-        // Toggle: a second click on the segment closes the open menu.
-        if popup_menu.get_untracked().is_some() {
-            popup_menu.set(None);
-            return;
-        }
-        let soft = soft_tabs.get_untracked();
-        let w = tab_width.get_untracked();
-        let mut entries = vec![
-            if soft {
-                MenuEntry::action_colored("Spaces", theme::chip_active, move || soft_tabs.set(true))
-            } else {
-                MenuEntry::action("Spaces", move || soft_tabs.set(true))
-            },
-            if !soft {
-                MenuEntry::action_colored("Tabs", theme::chip_active, move || soft_tabs.set(false))
-            } else {
-                MenuEntry::action("Tabs", move || soft_tabs.set(false))
-            },
-            MenuEntry::Separator,
-        ];
-        for n in 1..=6usize {
-            entries.push(if n == w {
-                MenuEntry::action_colored(n.to_string(), theme::chip_active, move || {
-                    tab_width.set(n)
-                })
-            } else {
-                MenuEntry::action(n.to_string(), move || tab_width.set(n))
-            });
-        }
-        let (ox, oy) = tab_origin.get_untracked();
-        let (sw, _sh) = tab_size.get_untracked();
-        popup_anchor.set(Some((ox, ox + sw, oy, sw)));
-        popup_menu.set(Some(entries));
-    })
-    .style(|s| {
-        s.margin_left(15.0)
-            .items_center()
-            .color(theme::status_text())
-            .hover(|s| s.color(theme::chip_active()))
-    });
+        1,
+        move || {
+            let soft = soft_tabs.get_untracked();
+            let w = tab_width.get_untracked();
+            let mut entries = vec![
+                if soft {
+                    MenuEntry::action_colored("Spaces", theme::chip_active, move || {
+                        soft_tabs.set(true)
+                    })
+                } else {
+                    MenuEntry::action("Spaces", move || soft_tabs.set(true))
+                },
+                if !soft {
+                    MenuEntry::action_colored("Tabs", theme::chip_active, move || {
+                        soft_tabs.set(false)
+                    })
+                } else {
+                    MenuEntry::action("Tabs", move || soft_tabs.set(false))
+                },
+                MenuEntry::Separator,
+            ];
+            for n in 1..=6usize {
+                entries.push(if n == w {
+                    MenuEntry::action_colored(n.to_string(), theme::chip_active, move || {
+                        tab_width.set(n)
+                    })
+                } else {
+                    MenuEntry::action(n.to_string(), move || tab_width.set(n))
+                });
+            }
+            entries
+        },
+        menu_owner,
+        popup_menu,
+        popup_anchor,
+        15.0,
+    );
     // Word wrap — click toggles it.
     let wrap_seg = dyn_container(
         move || word_wrap.get(),
@@ -3467,24 +3504,63 @@ fn footer(ui: Ui) -> impl IntoView {
             .color(base)
             .hover(move |s| s.color(hover))
     });
+    // AI model + effort: click each to pick from the AI-panel options; the active
+    // one is tinted the chip accent. Placed right after read-only (15px), with CPU
+    // then RAM after (40px from effort).
+    let model_seg = status_menu_seg(
+        move || ai_model.get().label().to_string(),
+        2,
+        move || {
+            let cur = ai_model.get_untracked().cli();
+            AiModel::ALL
+                .into_iter()
+                .map(|m| {
+                    if m.cli() == cur {
+                        MenuEntry::action_colored(m.label(), theme::chip_active, move || {
+                            ai_model.set(m)
+                        })
+                    } else {
+                        MenuEntry::action(m.label(), move || ai_model.set(m))
+                    }
+                })
+                .collect()
+        },
+        menu_owner,
+        popup_menu,
+        popup_anchor,
+        15.0,
+    );
+    let effort_seg = status_menu_seg(
+        move || ai_effort.get().label().to_string(),
+        3,
+        move || {
+            let cur = ai_effort.get_untracked().cli();
+            AiEffort::ALL
+                .into_iter()
+                .map(|e| {
+                    if e.cli() == cur {
+                        MenuEntry::action_colored(e.label(), theme::chip_active, move || {
+                            ai_effort.set(e)
+                        })
+                    } else {
+                        MenuEntry::action(e.label(), move || ai_effort.set(e))
+                    }
+                })
+                .collect()
+        },
+        menu_owner,
+        popup_menu,
+        popup_anchor,
+        15.0,
+    );
     let cpu_seg = dyn_container(
         move || resources.get().cpu_label(),
         move |c| footer_text(format!("CPU: {c}")),
     )
-    .style(|s| s.margin_left(15.0));
+    .style(|s| s.margin_left(40.0));
     let ram_seg = dyn_container(
         move || resources.get().ram_label(),
         move |r| footer_text(format!("RAM: {r}")),
-    )
-    .style(|s| s.margin_left(15.0));
-    let model_seg = dyn_container(
-        move || ai_model.get().label(),
-        move |m| footer_text(m.to_string()),
-    )
-    .style(|s| s.margin_left(40.0));
-    let effort_seg = dyn_container(
-        move || ai_effort.get().label(),
-        move |e| footer_text(e.to_string()),
     )
     .style(|s| s.margin_left(15.0));
 
@@ -3495,10 +3571,10 @@ fn footer(ui: Ui) -> impl IntoView {
         wrap_seg,
         warn_seg,
         ro_seg,
-        cpu_seg,
-        ram_seg,
         model_seg,
         effort_seg,
+        cpu_seg,
+        ram_seg,
     ))
     .style(|s| s.flex_row().items_center().min_width(0.0));
 
