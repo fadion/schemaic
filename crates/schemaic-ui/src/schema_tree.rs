@@ -134,17 +134,9 @@ fn visible_nav_rows(
                     expanded: false,
                 });
             }
-            // PRIMARY first, matching the tree's key ordering (stable sort).
-            let mut ord: Vec<&IndexInfo> = t.indexes.iter().collect();
-            ord.sort_by_key(|ix| !ix.is_primary());
-            for ix in ord {
-                rows.push(NavRow {
-                    key: format!("idx:{}:{}:{}", n.database, t.name, ix.name),
-                    parent: Some(tbl_key.clone()),
-                    expandable: false,
-                    expanded: false,
-                });
-            }
+            // Key/index rows are intentionally *not* navigable: they open nowhere,
+            // so keyboard-selecting them would be a dead end (columns are the only
+            // leaf that acts on Enter/double-click).
         }
     }
     rows
@@ -851,7 +843,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
             let keys_block = v_stack_from_iter(
                 sorted_idxs
                     .into_iter()
-                    .map(move |ix| key_row(ix, context_menu, kdb.clone(), ktbl.clone(), nav)),
+                    .map(move |ix| key_row(ix, context_menu, kdb.clone(), ktbl.clone())),
             )
             .style(|s| s.flex_col());
             v_stack((counts, cols_block, keys_block))
@@ -1008,7 +1000,6 @@ fn key_row(
     context_menu: RwSignal<Option<CtxMenu>>,
     database: String,
     table: String,
-    nav: Nav,
 ) -> impl IntoView {
     let (color, tag) = if ix.is_primary() {
         (theme::key_primary(), "UNIQUE")
@@ -1023,8 +1014,7 @@ fn key_row(
     let cols = ix.columns.join(", ");
     let ctx_name = ix.name.clone();
     let label = format!("{} ({cols})", ix.name);
-    let nav_key = format!("idx:{database}:{table}:{}", ix.name);
-    let row = h_stack((
+    h_stack((
         icons::icon(icons::KEY_ROUND, SCHEMA_ICON as f32).style(move |s| {
             // 50%-alpha key colour, matching the column icons' quieter marker.
             s.color(color.multiply_alpha(0.5))
@@ -1038,9 +1028,9 @@ fn key_row(
                 .margin_left(12.0)
         }),
     ))
-    // Label + key glyph share the index's colour (gold PK / purple FK / blue);
-    // the trailing tag overrides to muted above.
-    .style(move |s| s.color(color).items_center())
+    // Label + key glyph both at 50% alpha (a quiet, non-actionable leaf); the
+    // trailing type tag stays full-strength (its own muted colour, above).
+    .style(move |s| s.color(color.multiply_alpha(0.5)).items_center())
     .on_secondary_click_stop(move |_| {
         let ai_prompt = format!(
             "In `{database}`.`{table}`, explain the `{ctx_name}` {kind} on ({cols}) — its \
@@ -1052,18 +1042,9 @@ fn key_row(
             ai_prompt,
         }));
     })
-    .style({
-        let hl = nav_key.clone();
-        move |s| {
-            let s = tree_row(s, COL_PAD);
-            if is_nav_selected(nav, &hl) {
-                s.background(theme::row_selected())
-            } else {
-                s
-            }
-        }
-    });
-    with_nav_scroll(row.into_any(), nav, nav_key)
+    // Non-interactive: static layout (no hover), and not in the nav sequence, so
+    // it never shows a selection highlight either — it opens nowhere.
+    .style(|s| tree_row_static(s, COL_PAD))
 }
 
 // A clickable disclosure chevron: chevron-down when expanded, chevron-right
@@ -1132,6 +1113,12 @@ fn tree_row_min_w() -> f64 {
 // `min_width`; long content still overflows and the sidebar gains a horizontal
 // scrollbar.
 fn tree_row(s: floem::style::Style, pad_left: f64) -> floem::style::Style {
+    tree_row_static(s, pad_left).hover(|s| s.background(theme::row_hover()))
+}
+
+// Row layout without the hover highlight — for non-interactive rows (keys/indexes,
+// which can't be opened, so a hover/selection affordance would mislead).
+fn tree_row_static(s: floem::style::Style, pad_left: f64) -> floem::style::Style {
     s.min_width(tree_row_min_w())
         .height(TREE_ROW_H)
         .min_height(TREE_ROW_H)
@@ -1140,7 +1127,6 @@ fn tree_row(s: floem::style::Style, pad_left: f64) -> floem::style::Style {
         .padding_left(pad_left)
         .padding_right(8.0)
         .font_size(theme::FONT_BODY)
-        .hover(|s| s.background(theme::row_hover()))
 }
 
 // A non-interactive status line inside the tree (Loading / error / empty).
