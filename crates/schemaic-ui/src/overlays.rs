@@ -650,6 +650,51 @@ struct PaletteItem {
     /// Substring of `primary` to bold-highlight (the matched search/filter term),
     /// or `None` for rows with no meaningful match to show.
     match_term: Option<String>,
+    /// A schema-style leading icon (table/column search hits); `None` for command
+    /// rows, which show no icon.
+    icon: Option<ResultIcon>,
+}
+
+/// The schema-style leading icon for a Find-Anywhere hit — mirrors the schema
+/// tree: a table/view glyph in its icon colour, or a column's type-family glyph
+/// tinted by its key role (PK / FK / plain) at half alpha. The row's text keeps
+/// its normal colour.
+#[derive(Clone, Copy)]
+enum ResultIcon {
+    Table,
+    View,
+    Column(schemaic_core::schema::ColumnTypeClass, ColKeyRole),
+}
+
+#[derive(Clone, Copy)]
+enum ColKeyRole {
+    Primary,
+    Foreign,
+    Plain,
+}
+
+impl ResultIcon {
+    fn glyph(self) -> &'static str {
+        match self {
+            ResultIcon::Table => icons::TABLE,
+            ResultIcon::View => icons::TABLE_CELLS_MERGE,
+            ResultIcon::Column(class, _) => crate::schema_tree::column_type_icon(class),
+        }
+    }
+    fn color(self) -> floem::peniko::Color {
+        match self {
+            ResultIcon::Table => theme::table_icon(),
+            ResultIcon::View => theme::view_icon(),
+            ResultIcon::Column(_, role) => {
+                let base = match role {
+                    ColKeyRole::Primary => theme::key_primary(),
+                    ColKeyRole::Foreign => theme::key_foreign(),
+                    ColKeyRole::Plain => theme::text(),
+                };
+                base.multiply_alpha(0.5)
+            }
+        }
+    }
 }
 
 /// Render `primary` with the first case-insensitive occurrence of `term` bolded +
@@ -962,6 +1007,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                                     }),
                                     complete: None,
                                     match_term: Some(arg.to_string()),
+                                    icon: None,
                                 }
                             })
                             .collect()
@@ -1001,6 +1047,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                         }),
                         complete: None,
                         match_term: None,
+                        icon: None,
                     }]
                 })
             }),
@@ -1031,6 +1078,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                         }),
                         complete: None,
                         match_term: None,
+                        icon: None,
                     }]
                 })
             }),
@@ -1200,6 +1248,7 @@ fn hint_item(primary: &str, secondary: &str) -> PaletteItem {
         activate: Rc::new(|| {}),
         complete: None,
         match_term: None,
+        icon: None,
     }
 }
 
@@ -1212,13 +1261,16 @@ fn build_items(
     db_nodes: RwSignal<Vec<ConnNode>>,
     hidden: RwSignal<HashSet<String>>,
     open_table: &Rc<dyn Fn(String, String)>,
+    open_table_col: &Rc<dyn Fn(String, String, String)>,
     close: &Rc<dyn Fn()>,
     query: RwSignal<String>,
     caret_end: RwSignal<u64>,
 ) -> Vec<PaletteItem> {
     use schemaic_core::palette::Parsed;
     match parsed {
-        // Default table/column search (unchanged behaviour): open the table.
+        // Default table/column search: a table hit opens the table; a column hit
+        // opens the table AND selects + scrolls to that column (same as a schema-tree
+        // column double-click). Each row carries a schema-style icon.
         Parsed::Search(q) => {
             let q = q.trim().to_lowercase();
             if q.is_empty() {
@@ -1235,18 +1287,25 @@ fn build_items(
                     // hit, else the table). The ghost only paints when the query is a
                     // true prefix of it, so a mid-string match shows nothing.
                     let complete = hit.column.clone().unwrap_or_else(|| hit.table.clone());
-                    let (db, table) = (hit.db.clone(), hit.table.clone());
+                    let (db, table, column) =
+                        (hit.db.clone(), hit.table.clone(), hit.column.clone());
+                    let icon = hit.icon;
                     let open_table = open_table.clone();
+                    let open_table_col = open_table_col.clone();
                     let close = close.clone();
                     PaletteItem {
                         primary,
                         secondary: hit.db,
                         activate: Rc::new(move || {
-                            (open_table)(db.clone(), table.clone());
+                            match &column {
+                                Some(c) => (open_table_col)(db.clone(), table.clone(), c.clone()),
+                                None => (open_table)(db.clone(), table.clone()),
+                            }
                             (close)();
                         }),
                         complete: Some(complete),
                         match_term: Some(q.clone()),
+                        icon: Some(icon),
                     }
                 })
                 .collect()
@@ -1286,6 +1345,7 @@ fn build_items(
                         activate,
                         complete: Some(complete),
                         match_term: Some(f.clone()),
+                        icon: None,
                     }
                 })
                 .collect()
@@ -1302,6 +1362,7 @@ fn build_items(
                     activate: run.clone(),
                     complete: None,
                     match_term: None,
+                    icon: None,
                 }],
                 CmdArg::Options { list, run } => {
                     let a = arg.trim().to_lowercase();
@@ -1322,6 +1383,7 @@ fn build_items(
                                 // Tab fills the argument with this option's value.
                                 complete: Some(format!(">{} {}", c.name, v)),
                                 match_term: Some(a.clone()),
+                                icon: None,
                             }
                         })
                         .collect()
@@ -1341,6 +1403,7 @@ fn build_items(
                                 activate: e.clone(),
                                 complete: None,
                                 match_term: None,
+                                icon: None,
                             }],
                             None => vec![hint_item(c.label, c.hint)],
                         };
@@ -1355,6 +1418,7 @@ fn build_items(
                                 activate: Rc::new(move || (run)(clamped)),
                                 complete: None,
                                 match_term: None,
+                                icon: None,
                             }]
                         }
                         Err(_) => vec![hint_item(c.label, "Enter a number")],
@@ -1374,6 +1438,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
     let db_nodes = ui.schema.db_nodes;
     let hidden = ui.schema.hidden_dbs;
     let open_table = ui.tab_actions.open_table.clone();
+    let open_table_col = ui.tab_actions.open_table_col.clone();
     let ui_reg = ui.clone(); // for building the command registry per open
 
     dyn_container(
@@ -1412,6 +1477,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
             {
                 let commands = commands.clone();
                 let open_table = open_table.clone();
+                let open_table_col = open_table_col.clone();
                 let close = close.clone();
                 create_effect(move |_| {
                     let raw = query.get();
@@ -1422,6 +1488,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                         db_nodes,
                         hidden,
                         &open_table,
+                        &open_table_col,
                         &close,
                         query,
                         caret_end,
@@ -1533,24 +1600,36 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                     let total = list.len();
                     v_stack_from_iter(list.into_iter().enumerate().map(move |(i, item)| {
                         let activate = item.activate.clone();
-                        let row = h_stack((
-                            highlighted_primary(&item.primary, &item.match_term),
+                        // Schema-style leading icon for table/column hits (commands
+                        // carry none). Text keeps its normal colour.
+                        let mut cells: Vec<AnyView> = Vec::new();
+                        if let Some(ic) = item.icon {
+                            cells.push(
+                                icons::icon(ic.glyph(), 16.0)
+                                    .style(move |s| s.color(ic.color()).flex_shrink(0.0_f32))
+                                    .into_any(),
+                            );
+                        }
+                        cells.push(highlighted_primary(&item.primary, &item.match_term).into_any());
+                        cells.push(
                             text(item.secondary.clone())
-                                .style(|s| s.color(theme::text_muted()).font_size(14.0)),
-                        ))
-                        .on_click_stop(move |_| {
-                            selected.set(i);
-                            (activate)();
-                        })
-                        .style(move |s| {
-                            // +3px over menu_item_style's 6px vertical padding.
-                            let s = menu_item_style(s).padding_vert(9.0);
-                            if selected.get() == i {
-                                s.background(theme::row_selected())
-                            } else {
-                                s
-                            }
-                        });
+                                .style(|s| s.color(theme::text_muted()).font_size(14.0))
+                                .into_any(),
+                        );
+                        let row = h_stack_from_iter(cells)
+                            .on_click_stop(move |_| {
+                                selected.set(i);
+                                (activate)();
+                            })
+                            .style(move |s| {
+                                // +3px over menu_item_style's 6px vertical padding.
+                                let s = menu_item_style(s).padding_vert(9.0);
+                                if selected.get() == i {
+                                    s.background(theme::row_selected())
+                                } else {
+                                    s
+                                }
+                            });
                         // Keep the keyboard-selected row in view. The ends scroll fully to
                         // the top / bottom (so the first row clears the input's 10px gap
                         // and the last row reaches the end); middle rows reveal minimally
@@ -1730,6 +1809,8 @@ struct FindHit {
     db: String,
     table: String,
     column: Option<String>,
+    /// The schema-style icon for this hit (table/view or column-by-type+key).
+    icon: ResultIcon,
 }
 
 fn find_matches(
@@ -1753,6 +1834,11 @@ fn find_matches(
                         db: node.database.clone(),
                         table: t.name.clone(),
                         column: None,
+                        icon: if t.is_view {
+                            ResultIcon::View
+                        } else {
+                            ResultIcon::Table
+                        },
                     });
                     if out.len() >= limit {
                         return out;
@@ -1761,10 +1847,21 @@ fn find_matches(
                 if !q.is_empty() {
                     for c in &t.columns {
                         if c.name.to_lowercase().contains(q) {
+                            // Match the schema tree: type-family glyph, tinted by the
+                            // column's key role (PK / FK / plain).
+                            let role = if c.primary_key {
+                                ColKeyRole::Primary
+                            } else if t.fk_for_column(&c.name).is_some() {
+                                ColKeyRole::Foreign
+                            } else {
+                                ColKeyRole::Plain
+                            };
+                            let class = schemaic_core::schema::classify_column_type(&c.type_name);
                             out.push(FindHit {
                                 db: node.database.clone(),
                                 table: t.name.clone(),
                                 column: Some(c.name.clone()),
+                                icon: ResultIcon::Column(class, role),
                             });
                             if out.len() >= limit {
                                 return out;

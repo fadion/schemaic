@@ -904,8 +904,9 @@ impl ColKey {
     }
 }
 
-/// The schema-tree glyph for a column type family.
-fn column_type_icon(class: ColumnTypeClass) -> &'static str {
+/// The schema-tree glyph for a column type family. Reused by the Find-Anywhere
+/// search results so they mirror the schema tree.
+pub(crate) fn column_type_icon(class: ColumnTypeClass) -> &'static str {
     match class {
         ColumnTypeClass::Text => icons::TYPE,
         ColumnTypeClass::Numeric => icons::HASH,
