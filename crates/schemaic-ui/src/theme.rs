@@ -369,6 +369,10 @@ pub fn status_warn_hover() -> Color {
 pub fn status_ok() -> Color {
     Color::rgb8(0x71, 0xC3, 0x71)
 }
+/// Green CTA for the AI "Seed rows" popover Generate button (`#71C371`).
+pub fn seed_button() -> Color {
+    Color::rgb8(0x71, 0xC3, 0x71)
+}
 
 // Connection status: reachable (unreachable reuses `reject_bg`).
 pub fn conn_ok() -> Color {

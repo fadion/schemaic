@@ -237,6 +237,78 @@ fn inline_outcome(success: bool, stdout: &[u8], stderr: &[u8]) -> InlineAiState 
     }
 }
 
+/// Convert a fetched sample `ResultSet` into seed `Row`s (col name → value; SQL
+/// NULL → `None`) for the AI seed-data prompts. Shared by the fill + seed callbacks.
+fn sample_rows(rs: &schemaic_core::model::ResultSet) -> Vec<schemaic_core::seed::Row> {
+    let names: Vec<String> = rs.columns.iter().map(|c| c.name.clone()).collect();
+    (0..rs.row_count())
+        .map(|r| {
+            (0..rs.col_count())
+                .map(|c| {
+                    let v = rs
+                        .cell(r, c)
+                        .and_then(|cell| (!cell.is_null()).then(|| cell.display().to_string()));
+                    (names[c].clone(), v)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Look up a base table in the loaded schema, returning its `CREATE TABLE`
+/// skeleton (prompt structure) + its primary-key column names (to order the
+/// bottom-sample). Empty/`([], "")` when the schema hasn't been introspected yet.
+fn table_ddl_and_pk(
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    database: &str,
+    table: &str,
+) -> (String, Vec<String>) {
+    db_nodes
+        .with_untracked(|nodes| {
+            nodes
+                .iter()
+                .find(|n| n.database == database)
+                .and_then(|n| match n.schema.get_untracked() {
+                    schemaic_core::schema::SchemaState::Loaded(s) => s
+                        .tables
+                        .iter()
+                        .find(|t| t.name == table)
+                        .map(|t| {
+                            let pk = t
+                                .columns
+                                .iter()
+                                .filter(|c| c.primary_key)
+                                .map(|c| c.name.clone())
+                                .collect();
+                            (t.create_ddl(), pk)
+                        }),
+                    _ => None,
+                })
+        })
+        .unwrap_or_default()
+}
+
+/// The bottom-sample query for AI seed data: most-recent rows by primary key
+/// (`ORDER BY <pk> DESC`) so enums/sequences/FK values are representative. Falls
+/// back to an unordered `LIMIT` when the PK is unknown (schema not loaded).
+fn sample_sql(database: &str, table: &str, pk_cols: &[String]) -> String {
+    let order = if pk_cols.is_empty() {
+        String::new()
+    } else {
+        let cols = pk_cols
+            .iter()
+            .map(|c| schemaic_core::export::ident_sql(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" ORDER BY {cols} DESC")
+    };
+    format!(
+        "SELECT * FROM {}.{}{order} LIMIT 20",
+        schemaic_core::export::ident_sql(database),
+        schemaic_core::export::ident_sql(table),
+    )
+}
+
 /// A throwaway shell that just prints `msg` and stays open — used to surface "no
 /// client found" in the terminal rather than spawning a broken session.
 fn message_shell(msg: &str) -> schemaic_term::ShellConfig {
@@ -2104,6 +2176,148 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         })
     };
 
+    // AI-fill a single grid cell: bottom-sample the base table, build a prompt from
+    // its DDL + sample + the row's other cells, run a one-shot `claude -p` call, and
+    // report the parsed value back for the grid to stage (never auto-committed).
+    let ai_fill: schemaic_ui::AiFillFn = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(
+            move |req: schemaic_ui::AiFillRequest, done: schemaic_ui::AiFillDoneFn| {
+                use schemaic_ui::AiFillResult;
+                let db = match db_for(req.conn_id) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        (done)(AiFillResult::Failed(e));
+                        return;
+                    }
+                };
+                // DDL skeleton + PK columns from the loaded schema (empty if
+                // introspection hasn't run — the sample still carries conventions).
+                let (ddl, pk_cols) = table_ddl_and_pk(db_nodes, &req.database, &req.table);
+                let bin = claude_bin(&ai_cli_path.get_untracked());
+                let model = ai_model.get_untracked().cli().to_string();
+                let finish = create_ext_action(cx, move |res: AiFillResult| (done)(res));
+                let schemaic_ui::AiFillRequest {
+                    database,
+                    table,
+                    column,
+                    row_context,
+                    ..
+                } = req;
+                handle.spawn(async move {
+                    let token = CancellationToken::new();
+                    // Bottom-sample the base table for enum/format/FK inference.
+                    let sql = sample_sql(&database, &table, &pk_cols);
+                    let sample = match db.fetch_query(Some(&database), &sql, 20, token).await {
+                        Ok(rs) => sample_rows(&rs),
+                        Err(_) => Vec::new(), // empty/unsampleable → DDL-only prompt
+                    };
+                    let prompt = schemaic_core::seed::build_fill_prompt(
+                        &format!("{database}.{table}"),
+                        &column,
+                        &ddl,
+                        &sample,
+                        &row_context,
+                    );
+                    let system = "You output only the requested raw value — no quotes, \
+                                  no markdown, no prose.";
+                    let out = Command::new(bin)
+                        .args(schemaic_ai::inline_args(&prompt, system, &model))
+                        .kill_on_drop(true)
+                        .output()
+                        .await;
+                    let res = match out {
+                        Ok(o) if o.status.success() => {
+                            let stdout = String::from_utf8_lossy(&o.stdout);
+                            match schemaic_core::seed::parse_fill_response(&stdout) {
+                                schemaic_core::seed::FillOutcome::Value(v) => {
+                                    AiFillResult::Value(v)
+                                }
+                                schemaic_core::seed::FillOutcome::Null => AiFillResult::Null,
+                                schemaic_core::seed::FillOutcome::Empty => {
+                                    AiFillResult::Failed("The AI returned no value.".into())
+                                }
+                            }
+                        }
+                        Ok(o) => AiFillResult::Failed(
+                            String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                        ),
+                        Err(e) => AiFillResult::Failed(e.to_string()),
+                    };
+                    finish(res);
+                });
+            },
+        )
+    };
+
+    // AI-generate seed rows (Insert Row = 1, Seed Table = N): bottom-sample the base
+    // table, prompt for a JSON array of rows over the given columns, parse, and hand
+    // the rows back for the grid to stage as pending rows (never auto-committed).
+    let ai_seed: schemaic_ui::AiSeedFn = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(
+            move |req: schemaic_ui::AiSeedRequest, done: schemaic_ui::AiSeedDoneFn| {
+                use schemaic_ui::AiSeedResult;
+                let db = match db_for(req.conn_id) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        (done)(AiSeedResult::Failed(e));
+                        return;
+                    }
+                };
+                let (ddl, pk_cols) = table_ddl_and_pk(db_nodes, &req.database, &req.table);
+                let bin = claude_bin(&ai_cli_path.get_untracked());
+                let model = ai_model.get_untracked().cli().to_string();
+                let finish = create_ext_action(cx, move |res: AiSeedResult| (done)(res));
+                let schemaic_ui::AiSeedRequest {
+                    database,
+                    table,
+                    fill_columns,
+                    count,
+                    ..
+                } = req;
+                handle.spawn(async move {
+                    let token = CancellationToken::new();
+                    let sql = sample_sql(&database, &table, &pk_cols);
+                    let sample = match db.fetch_query(Some(&database), &sql, 20, token).await {
+                        Ok(rs) => sample_rows(&rs),
+                        Err(_) => Vec::new(), // empty/unsampleable → DDL-only prompt
+                    };
+                    let prompt = schemaic_core::seed::build_seed_prompt(
+                        &format!("{database}.{table}"),
+                        &ddl,
+                        &fill_columns,
+                        &sample,
+                        count,
+                    );
+                    let system = "You output only a JSON array of row objects — no \
+                                  markdown, no prose.";
+                    let out = Command::new(bin)
+                        .args(schemaic_ai::inline_args(&prompt, system, &model))
+                        .kill_on_drop(true)
+                        .output()
+                        .await;
+                    let res = match out {
+                        Ok(o) if o.status.success() => {
+                            let stdout = String::from_utf8_lossy(&o.stdout);
+                            match schemaic_core::seed::parse_seed_response(&stdout) {
+                                Ok(rows) => AiSeedResult::Rows(rows),
+                                Err(e) => AiSeedResult::Failed(e.to_string()),
+                            }
+                        }
+                        Ok(o) => AiSeedResult::Failed(
+                            String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                        ),
+                        Err(e) => AiSeedResult::Failed(e.to_string()),
+                    };
+                    finish(res);
+                });
+            },
+        )
+    };
+
     // Keep `active_table` in sync with the active tab's source (for highlight).
     create_effect(move |_| {
         let id = active.get();
@@ -2474,6 +2688,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             open_db_cli,
             run_plan,
             open_monitor,
+            ai_fill,
+            ai_seed,
         }),
         overlay: OverlayUi {
             context_menu,
