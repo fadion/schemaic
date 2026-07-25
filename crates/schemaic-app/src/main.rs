@@ -32,7 +32,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use floem::Application;
 use floem::IntoView;
@@ -45,7 +45,9 @@ use floem::reactive::{
 };
 use floem::window::{Icon, WindowConfig};
 use schemaic_core::connection::{ConnStatus, Connection};
-use schemaic_core::model::{CommitDone, GridWrite, QueryState, RefetchRequest};
+use schemaic_core::edit::analyze_edit;
+use schemaic_core::model::{CommitDone, GridWrite, QueryState, RefetchRequest, ResultSet};
+use schemaic_core::monitor::{Snapshot, diff_snapshots};
 
 /// Outcome of a background connect + schema-load task: `(tunnel port, tunnel
 /// handle, database names)` on success, or an error message.
@@ -67,7 +69,8 @@ use schemaic_db::{Db, DbError};
 use schemaic_ui::theme::{EditorThemeKind, UiThemeKind};
 use schemaic_ui::{
     AiActions, AiEffort, AiModel, AiUi, ChatMessage, ConnActions, ConnNode, ConnUi, CtxMenu,
-    DraftSignals, HistoryActions, HistoryUi, InlineAiRequest, InlineAiState, LayoutUi, OverlayUi,
+    DraftSignals, HistoryActions, HistoryUi, InlineAiRequest, InlineAiState, LayoutUi, MonitorEntry,
+    OverlayUi,
     PlanState, ResultPanel, RightPanel, Role, SchemaActions, SchemaScope, SchemaUi, Tab,
     TabsActions, TabsUi, TermActions, TermCursor, TermUi, TestState, Ui, pick_connection_color,
 };
@@ -535,6 +538,13 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let plan_state = RwSignal::new(PlanState::Idle);
     let plan_sql = RwSignal::new(String::new());
     let plan_analyze = RwSignal::new(false);
+    // Live Monitor modal state (rendered by `schemaic_ui::monitor_view`; polled by
+    // the `open_monitor` action + `monitor_tick` loop below).
+    let monitor_open = RwSignal::new(false);
+    let monitor_title: RwSignal<Option<String>> = RwSignal::new(None);
+    let monitor_cols: RwSignal<Vec<String>> = RwSignal::new(Vec::new());
+    let monitor_log: RwSignal<Vec<MonitorEntry>> = RwSignal::new(Vec::new());
+    let monitor_error: RwSignal<Option<String>> = RwSignal::new(None);
 
     // AI panel state. `ai_session` holds the live CLI conversation (bound to a
     // connection); the reader task streams transcript snapshots over a channel
@@ -714,6 +724,51 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 };
                 send(st);
             });
+        })
+    };
+
+    // Live Monitor: poll a table on an interval, diffing each snapshot against the
+    // previous to log inserts/updates/deletes (poll-only-while-open — closing the
+    // modal sets `monitor_open` false, which stops the loop). This state persists
+    // across ticks and reopens: `monitor_gen` supersedes a stale in-flight fetch on
+    // reopen, `monitor_prev` is the last snapshot, `monitor_key_cols` the identity.
+    let monitor_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+    let monitor_prev: Rc<RefCell<Option<Snapshot>>> = Rc::new(RefCell::new(None));
+    let monitor_key_cols: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
+    let open_monitor: Rc<dyn Fn(u64, String, String)> = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        let monitor_gen = monitor_gen.clone();
+        let monitor_prev = monitor_prev.clone();
+        let monitor_key_cols = monitor_key_cols.clone();
+        Rc::new(move |conn_id: u64, database: String, table: String| {
+            // Fresh session: bump the generation (kills any stale tick), reset state,
+            // reveal the modal.
+            let g = monitor_gen.get().wrapping_add(1);
+            monitor_gen.set(g);
+            *monitor_prev.borrow_mut() = None;
+            *monitor_key_cols.borrow_mut() = Vec::new();
+            monitor_log.set(Vec::new());
+            monitor_cols.set(Vec::new());
+            monitor_error.set(None);
+            monitor_title.set(Some(format!("{database}.{table}")));
+            monitor_open.set(true);
+            let ctx = MonitorCtx {
+                handle: handle.clone(),
+                db_for: db_for.clone(),
+                db_nodes,
+                cx,
+                open: monitor_open,
+                cols: monitor_cols,
+                log: monitor_log,
+                error: monitor_error,
+                prev: monitor_prev.clone(),
+                key_cols: monitor_key_cols.clone(),
+                generation: monitor_gen.clone(),
+                started: Instant::now(),
+                target: (conn_id, database, table),
+            };
+            monitor_tick(ctx, g);
         })
     };
 
@@ -2416,6 +2471,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             set_active_db,
             open_db_cli,
             run_plan,
+            open_monitor,
         }),
         overlay: OverlayUi {
             context_menu,
@@ -2431,6 +2487,11 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             plan_state,
             plan_sql,
             plan_analyze,
+            monitor_open,
+            monitor_title,
+            monitor_cols,
+            monitor_log,
+            monitor_error,
         },
         schema: SchemaUi {
             db_nodes,
@@ -2549,6 +2610,148 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         resources,
     };
     schemaic_ui::workspace(ui)
+}
+
+/// Live Monitor tuning: poll interval, per-poll row cap (the monitor is bounded by
+/// construction — it never polls an unbounded table), and the max change-log
+/// length kept in memory (older entries drop off the top).
+const MONITOR_INTERVAL_SECS: u64 = 2;
+const MONITOR_LIMIT: usize = 1000;
+const MONITOR_LOG_MAX: usize = 1000;
+
+/// Everything a Live Monitor poll tick needs, so it can re-arm itself across ticks
+/// (all fields cheap to clone: `Copy` signals, `Rc`s, a `Handle`). See the
+/// `open_monitor` action that builds it.
+#[derive(Clone)]
+struct MonitorCtx {
+    handle: tokio::runtime::Handle,
+    db_for: Rc<dyn Fn(u64) -> Result<Db, String>>,
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    cx: Scope,
+    open: RwSignal<bool>,
+    cols: RwSignal<Vec<String>>,
+    log: RwSignal<Vec<MonitorEntry>>,
+    error: RwSignal<Option<String>>,
+    prev: Rc<RefCell<Option<Snapshot>>>,
+    key_cols: Rc<RefCell<Vec<usize>>>,
+    generation: Rc<Cell<u64>>,
+    started: Instant,
+    target: (u64, String, String),
+}
+
+/// One Live Monitor poll: fetch the watched table (bounded), then hand the result
+/// to [`monitor_apply`] on the UI thread. Stops silently if the modal was closed
+/// (`open` false) or a newer session superseded this one (`generation` bumped).
+fn monitor_tick(ctx: MonitorCtx, my_gen: u64) {
+    if ctx.open.try_get_untracked() != Some(true) || ctx.generation.get() != my_gen {
+        return;
+    }
+    let (conn_id, database, table) = ctx.target.clone();
+    let db = match (ctx.db_for)(conn_id) {
+        Ok(db) => db,
+        Err(e) => {
+            ctx.error.set(Some(e));
+            monitor_reschedule(ctx, my_gen);
+            return;
+        }
+    };
+    let ctx2 = ctx.clone();
+    let send = create_ext_action(ctx.cx, move |out: Result<ResultSet, String>| {
+        monitor_apply(ctx2.clone(), my_gen, out);
+    });
+    ctx.handle.spawn(async move {
+        let out = db
+            .fetch_table(&database, &table, MONITOR_LIMIT, CancellationToken::new())
+            .await
+            .map_err(|e| e.to_string());
+        send(out);
+    });
+}
+
+/// UI-thread half of a poll: on the first result, record the columns + resolve the
+/// row-identity key (via `analyze_edit`); thereafter diff each snapshot against the
+/// previous one and append any changes to the log. Then re-arm the next tick.
+fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
+    if ctx.open.try_get_untracked() != Some(true) || ctx.generation.get() != my_gen {
+        return;
+    }
+    match out {
+        Err(e) => ctx.error.set(Some(e)),
+        Ok(rs) => {
+            if ctx.prev.borrow().is_none() {
+                // Baseline poll: capture columns + resolve the identity key once.
+                ctx.cols.set(rs.columns.iter().map(|c| c.name.clone()).collect());
+                let db_nodes = ctx.db_nodes;
+                let model = analyze_edit(&rs, |db, table| {
+                    db_nodes.with_untracked(|nodes| {
+                        nodes.iter().find(|n| n.database == db).and_then(|n| {
+                            match n.schema.get_untracked() {
+                                SchemaState::Loaded(s) => {
+                                    s.tables.iter().find(|t| t.name == table).cloned()
+                                }
+                                _ => None,
+                            }
+                        })
+                    })
+                });
+                match model.insert_target() {
+                    Some(t) if !t.key_cols.is_empty() => {
+                        *ctx.key_cols.borrow_mut() = t.key_cols.clone();
+                    }
+                    _ => {
+                        ctx.error.set(Some(
+                            "No row key for this table — changes can't be tracked.".to_string(),
+                        ));
+                        return; // nothing meaningful to poll; leave the modal open on the message
+                    }
+                }
+            }
+            ctx.error.set(None);
+            let key_cols = ctx.key_cols.borrow().clone();
+            let snap = Snapshot::from_result(&rs, &key_cols);
+            if let Some(prev) = ctx.prev.borrow().as_ref() {
+                let changes = diff_snapshots(prev, &snap);
+                if !changes.is_empty() {
+                    let at = fmt_elapsed(ctx.started.elapsed().as_secs());
+                    ctx.log.update(|log| {
+                        for change in changes {
+                            log.push(MonitorEntry {
+                                at: at.clone(),
+                                change,
+                            });
+                        }
+                        if log.len() > MONITOR_LOG_MAX {
+                            let drop = log.len() - MONITOR_LOG_MAX;
+                            log.drain(0..drop);
+                        }
+                    });
+                }
+            }
+            *ctx.prev.borrow_mut() = Some(snap);
+        }
+    }
+    monitor_reschedule(ctx, my_gen);
+}
+
+/// Re-arm the next poll in `MONITOR_INTERVAL_SECS`, unless the monitor was closed
+/// or superseded (checked again inside `monitor_tick`).
+fn monitor_reschedule(ctx: MonitorCtx, my_gen: u64) {
+    if ctx.open.try_get_untracked() != Some(true) || ctx.generation.get() != my_gen {
+        return;
+    }
+    floem::action::exec_after(Duration::from_secs(MONITOR_INTERVAL_SECS), move |_| {
+        monitor_tick(ctx, my_gen);
+    });
+}
+
+/// Format elapsed seconds since monitoring started as `MM:SS` (or `H:MM:SS`).
+fn fmt_elapsed(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
 }
 
 /// Sample the app process's own CPU/RAM on a self-rescheduling ~1s timer and

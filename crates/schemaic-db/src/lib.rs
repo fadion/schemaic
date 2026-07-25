@@ -159,6 +159,26 @@ impl Db {
         let _ = conn.disconnect().await;
         outcome
     }
+
+    /// Fetch up to `limit` rows of a single table for the Live Monitor:
+    /// `SELECT * FROM `db`.`table` LIMIT n`. Bounded by construction — the monitor
+    /// never polls an unbounded table. Column provenance is populated as for any
+    /// query, so the caller derives the row-identity key via `analyze_edit`.
+    pub async fn fetch_table(
+        &self,
+        database: &str,
+        table: &str,
+        limit: usize,
+        cancel: CancellationToken,
+    ) -> Result<ResultSet, DbError> {
+        let sql = format!(
+            "SELECT * FROM {}.{} LIMIT {}",
+            ident(database),
+            ident(table),
+            limit
+        );
+        self.fetch_query(Some(database), &sql, limit, cancel).await
+    }
 }
 
 /// A plan's row count is tiny (classic EXPLAIN) or one big row (tree-format
