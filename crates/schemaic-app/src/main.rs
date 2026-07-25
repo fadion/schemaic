@@ -473,6 +473,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let schema_w: RwSignal<f64> = RwSignal::new(ui_state.schema_w);
     let right_w: RwSignal<f64> = RwSignal::new(ui_state.right_w);
     let editor_h: RwSignal<f64> = RwSignal::new(ui_state.editor_h);
+    // Editor-collapse toggle (RESULTS "expand" icon). Session-only — always starts
+    // expanded. `editor_h` is the restore height; collapsing sets the editor height
+    // to 0 (instant).
+    let editor_collapsed: RwSignal<bool> = RwSignal::new(false);
     // AI Assistant settings (gear → modal), restored from disk.
     let ai_settings_open = RwSignal::new(false);
     let ai_cli_path = RwSignal::new(ui_state.ai_cli_path.clone());
@@ -2524,6 +2528,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             schema_w,
             right_w,
             editor_h,
+            editor_collapsed,
             theme_settings_open,
             help_open,
             ui_theme,

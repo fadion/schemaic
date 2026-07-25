@@ -786,6 +786,11 @@ pub struct LayoutUi {
     pub schema_w: RwSignal<f64>,
     pub right_w: RwSignal<f64>,
     pub editor_h: RwSignal<f64>,
+    /// Editor collapsed (RESULTS "expand" toggle): session-only flag driving the
+    /// toolbar icon (expand ↔ shrink) and the editor's collapsed height (0 vs
+    /// `editor_h`, instant). `editor_h` stays the restore height, so un-collapsing
+    /// returns the editor to exactly where it was.
+    pub editor_collapsed: RwSignal<bool>,
     /// Whether the theme settings modal is open.
     pub theme_settings_open: RwSignal<bool>,
     /// Whether the keyboard-shortcuts modal is open.
@@ -1933,12 +1938,19 @@ fn center(ui: Ui) -> impl IntoView {
     let popup_anchor = ui.overlay.popup_anchor;
     let popup_width = ui.overlay.popup_width;
     let editor_h = ui.layout.editor_h;
+    let editor_collapsed = ui.layout.editor_collapsed;
     // A width persisted under an older, looser floor could be below the current
     // query-editor minimum — lift it once on build (render clamps widths live, but
     // the editor height has no such render-time clamp).
     if editor_h.get_untracked() < QUERY_MIN_H {
         editor_h.set(QUERY_MIN_H);
     }
+    // RESULTS "expand" toggle: flip the collapsed flag (editor height 0↔`editor_h`,
+    // instant — an animated in-flow height reflows the whole grid per frame, which
+    // never stayed smooth; not worth it).
+    let toggle_collapse: Rc<dyn Fn()> = Rc::new(move || {
+        editor_collapsed.set(!editor_collapsed.get_untracked());
+    });
     // Reveal the AI panel + send a message (the grid cell "AI Summary" builds a
     // context-rich prompt itself, so this just reveals + forwards).
     let summarize: Rc<dyn Fn(String)> = {
@@ -2020,7 +2032,7 @@ fn center(ui: Ui) -> impl IntoView {
         move || (active.get(), flashing.get() == Some(active.get())),
         move |(id, is_flashing)| {
             if is_flashing {
-                return editor_placeholder(editor_h).into_any();
+                return editor_placeholder(editor_h, editor_collapsed).into_any();
             }
             match tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied()) {
                 Some(tab) => query_pane(QueryPaneParams {
@@ -2041,6 +2053,7 @@ fn center(ui: Ui) -> impl IntoView {
                     ai_send: ai_send.clone(),
                     context_menu,
                     editor_h,
+                    editor_collapsed,
                     active_db,
                     active_db_menu_open,
                     active_db_anchor,
@@ -2053,16 +2066,19 @@ fn center(ui: Ui) -> impl IntoView {
                     nav: navkeys.clone(),
                 })
                 .into_any(),
-                None => editor_placeholder(editor_h).into_any(),
+                None => editor_placeholder(editor_h, editor_collapsed).into_any(),
             }
         },
     )
     .style(|s| {
+        // No floor here — the child `query_pane` pins its own height (`editor_h`, or
+        // 0 when collapsed) and is `flex_shrink(0)`, so this wrapper hugs it and can
+        // reach 0 on collapse. (The divider clamps `editor_h ≥ QUERY_MIN_H` when open.)
         s.width_full()
             .flex_shrink(0.0_f32)
             .flex_col()
             .min_width(0.0)
-            .min_height(QUERY_MIN_H)
+            .min_height(0.0)
     });
 
     // Results area: the active tab's grid. Deliberately NOT tied to `flashing`,
@@ -2075,6 +2091,8 @@ fn center(ui: Ui) -> impl IntoView {
                 tab.result_tabs,
                 tab.active_result,
                 cancel.clone(),
+                editor_collapsed,
+                toggle_collapse.clone(),
                 GridCtx {
                     source: tab.source,
                     highlight_col: tab.highlight_col,
@@ -2139,6 +2157,16 @@ fn center(ui: Ui) -> impl IntoView {
         EDITOR_H,
         ui.persist_layout.clone(),
     );
+    // Hide the divider while the editor is collapsed — there's nothing to resize,
+    // and its position tracks `editor_h` (unchanged during collapse), so it'd
+    // otherwise float over the grid.
+    let split_handle = split_handle.style(move |s| {
+        if editor_collapsed.get() {
+            s.hide()
+        } else {
+            s
+        }
+    });
 
     // Identity-colour rule under the tab strip (drawn on the "prominent colour"
     // setting). Wrapping the tab bar in a `stack` pins the 2px line to the bar's
@@ -2161,11 +2189,16 @@ fn center(ui: Ui) -> impl IntoView {
 // The RESULTS pane for one tab. Single runs use the legacy single-grid view
 // (`results`); a Run Everything batch shows a result-tab strip over the active
 // statement's grid (`result_tabs` non-empty).
+#[allow(clippy::too_many_arguments)]
 fn results_section(
     results: RwSignal<QueryState>,
     result_tabs: RwSignal<Vec<ResultPanel>>,
     active_result: RwSignal<usize>,
     cancel: Rc<dyn Fn()>,
+    // Editor-collapse toggle: the intent flag (drives the expand/shrink icon) and
+    // the action that flips it + kicks off the tween.
+    editor_collapsed: RwSignal<bool>,
+    toggle_collapse: Rc<dyn Fn()>,
     gctx: GridCtx,
 ) -> impl IntoView {
     // Find-bar + error-bar signals (Copy) — captured before `gctx` moves into `body`.
@@ -2190,7 +2223,26 @@ fn results_section(
             .min_width(0.0)
     });
 
-    let panel = v_stack((section_title("RESULTS"), body)).style(|s| {
+    // Title row: "RESULTS" left; an expand/shrink toggle right (same widget +
+    // spacing as the Schema/AI title-bar icons). The icon swaps via `dyn_container`
+    // (a transform-transition on a small svg is unreliable — see themes gotchas).
+    let toggle_btn = dyn_container(
+        move || editor_collapsed.get(),
+        move |collapsed| {
+            let markup = if collapsed {
+                icons::SHRINK
+            } else {
+                icons::EXPAND
+            };
+            let t = toggle_collapse.clone();
+            toolbar_icon(markup, 5.0, 7.0, || true, move || (t)()).into_any()
+        },
+    )
+    .style(|s| s.flex_row().items_start().flex_shrink(0.0_f32));
+    let title_row = h_stack((section_title("RESULTS"), toggle_btn))
+        .style(|s| s.width_full().flex_row().items_start().justify_between());
+
+    let panel = v_stack((title_row, body)).style(|s| {
         s.width_full()
             .flex_grow(1.0_f32)
             .flex_col()

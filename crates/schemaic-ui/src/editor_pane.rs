@@ -57,16 +57,26 @@ use crate::{
 // Stand-in shown where the query editor sits while a tab flashes closed. Same
 // footprint as `query_pane`'s outer box (see EDITOR_H there) — just the editor
 // surface color — so the results grid below never moves.
-pub(crate) fn editor_placeholder(editor_h: RwSignal<f64>) -> impl IntoView {
+pub(crate) fn editor_placeholder(
+    editor_h: RwSignal<f64>,
+    editor_collapsed: RwSignal<bool>,
+) -> impl IntoView {
     empty().style(move |s| {
-        s.width_full()
-            .height(editor_h.get())
-            .min_height(editor_h.get())
+        let collapsed = editor_collapsed.get();
+        let h = if collapsed { 0.0 } else { editor_h.get() };
+        let s = s
+            .width_full()
+            .height(h)
+            .min_height(h)
             .min_width(0.0)
             .flex_shrink(0.0_f32)
             .background(theme::bg_editor())
-            .border_bottom(1.0)
-            .border_color(theme::border())
+            .border_color(theme::border());
+        if collapsed {
+            s.border_bottom(0.0)
+        } else {
+            s.border_bottom(1.0)
+        }
     })
 }
 
@@ -754,6 +764,9 @@ pub(crate) struct QueryPaneParams {
     pub ai_send: Rc<dyn Fn(String)>,
     pub context_menu: RwSignal<Option<CtxMenu>>,
     pub editor_h: RwSignal<f64>,
+    /// Collapsed → the pane renders at height 0 (instant) so the RESULTS grid takes
+    /// the whole region; `editor_h` stays the restore height. See `LayoutUi`.
+    pub editor_collapsed: RwSignal<bool>,
     pub active_db: Memo<Option<String>>,
     pub active_db_menu_open: RwSignal<bool>,
     pub active_db_anchor: RwSignal<Point>,
@@ -785,6 +798,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         ai_send,
         context_menu,
         editor_h,
+        editor_collapsed,
         active_db,
         active_db_menu_open,
         active_db_anchor,
@@ -2418,8 +2432,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             hovered.set(false);
             EventPropagation::Continue
         })
-        .style(|s| {
-            s.absolute()
+        .style(move |s| {
+            let s = s
+                .absolute()
                 .inset_right(7.0)
                 .inset_bottom(7.0)
                 .items_center()
@@ -2428,7 +2443,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 .padding_right(8.0)
                 .padding_vert(8.0)
                 .background(theme::bg_chrome())
-                .border_radius(5.0)
+                .border_radius(5.0);
+            // The overlay is anchored to the editor's bottom edge; when the editor is
+            // collapsed to height 0 it would otherwise paint a sliver over the panel
+            // separator, so drop it from layout entirely.
+            if editor_collapsed.get() {
+                s.hide()
+            } else {
+                s
+            }
         })
     };
 
@@ -2946,17 +2969,28 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // flexbox can't collapse the bar under the grid's huge intrinsic height, and
     // the results grid below flex-grows into the remaining space.
     v_stack((toolbar, editor_wrap)).style(move |s| {
-        s.width_full()
-            .height(editor_h.get())
-            .min_height(editor_h.get())
+        // Collapsed → height 0 so the RESULTS grid takes the whole region (instant,
+        // no animation). `editor_h` is unchanged — the restore height for un-collapse.
+        let collapsed = editor_collapsed.get();
+        let h = if collapsed { 0.0 } else { editor_h.get() };
+        let s = s
+            .width_full()
+            .height(h)
+            .min_height(h)
             .min_width(0.0)
             .flex_shrink(0.0_f32)
             .flex_col()
             // No inter-row gap: the editor's 7px top inset is `editor_wrap`'s
             // own `padding_top`.
             .background(theme::bg_editor())
-            .border_bottom(1.0)
-            .border_color(theme::border())
+            .border_color(theme::border());
+        // Drop the 1px bottom border when collapsed so the RESULTS panel covers the
+        // region seamlessly (no leftover hairline above the grid).
+        if collapsed {
+            s.border_bottom(0.0)
+        } else {
+            s.border_bottom(1.0)
+        }
     })
 }
 
