@@ -545,6 +545,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let monitor_cols: RwSignal<Vec<String>> = RwSignal::new(Vec::new());
     let monitor_log: RwSignal<Vec<MonitorEntry>> = RwSignal::new(Vec::new());
     let monitor_error: RwSignal<Option<String>> = RwSignal::new(None);
+    let monitor_interval: RwSignal<u64> = RwSignal::new(MONITOR_INTERVAL_SECS);
 
     // AI panel state. `ai_session` holds the live CLI conversation (bound to a
     // connection); the reader task streams transcript snapshots over a channel
@@ -767,6 +768,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 generation: monitor_gen.clone(),
                 started: Instant::now(),
                 target: (conn_id, database, table),
+                interval: monitor_interval,
             };
             monitor_tick(ctx, g);
         })
@@ -2492,6 +2494,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             monitor_cols,
             monitor_log,
             monitor_error,
+            monitor_interval,
         },
         schema: SchemaUi {
             db_nodes,
@@ -2637,6 +2640,9 @@ struct MonitorCtx {
     generation: Rc<Cell<u64>>,
     started: Instant,
     target: (u64, String, String),
+    /// Poll interval (seconds), read fresh on each re-arm so the popup's dropdown
+    /// takes effect on the next tick.
+    interval: RwSignal<u64>,
 }
 
 /// One Live Monitor poll: fetch the watched table (bounded), then hand the result
@@ -2739,7 +2745,10 @@ fn monitor_reschedule(ctx: MonitorCtx, my_gen: u64) {
     if ctx.open.try_get_untracked() != Some(true) || ctx.generation.get() != my_gen {
         return;
     }
-    floem::action::exec_after(Duration::from_secs(MONITOR_INTERVAL_SECS), move |_| {
+    // Read the interval fresh each re-arm so the popup's dropdown takes effect on
+    // the next tick. Clamp to a sane floor in case of a stray value.
+    let secs = ctx.interval.get_untracked().max(1);
+    floem::action::exec_after(Duration::from_secs(secs), move |_| {
         monitor_tick(ctx, my_gen);
     });
 }

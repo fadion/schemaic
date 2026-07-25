@@ -878,6 +878,9 @@ pub struct OverlayUi {
     pub monitor_cols: RwSignal<Vec<String>>,
     pub monitor_log: RwSignal<Vec<MonitorEntry>>,
     pub monitor_error: RwSignal<Option<String>>,
+    /// Poll interval in seconds (the popup's dropdown). Read by the poll loop on
+    /// each re-arm, so a change takes effect on the next tick. Session-only.
+    pub monitor_interval: RwSignal<u64>,
 }
 
 /// One entry in the Live Monitor's change log: a detected [`RowChange`] plus the

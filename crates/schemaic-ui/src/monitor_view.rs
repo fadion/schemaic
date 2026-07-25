@@ -21,6 +21,7 @@ use floem::reactive::create_effect;
 
 use schemaic_core::monitor::{ChangeKind, RowChange};
 
+use crate::settings::settings_dropdown;
 use crate::theme::{FONT_BODY, FONT_LABEL};
 use crate::widgets::{autohide_state, loading_dots, panel_style, shift_hscroll, thin_scroll};
 use crate::{MonitorEntry, Ui, icons, theme};
@@ -50,6 +51,7 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
     let cols = ui.overlay.monitor_cols;
     let log = ui.overlay.monitor_log;
     let error = ui.overlay.monitor_error;
+    let interval = ui.overlay.monitor_interval;
 
     dyn_container(
         move || open.get(),
@@ -119,8 +121,10 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                     .border_color(theme::border())
             });
 
-            // Sub-line under the separator: a live note, or the latest poll error.
-            let status = dyn_container(
+            // Sub-line under the separator: a live note (or the latest poll error)
+            // on the left, and the poll-interval dropdown on the right — inline with
+            // the subtitle, below the header's X.
+            let status_text = dyn_container(
                 move || error.get(),
                 move |err| match err {
                     Some(msg) => text(msg)
@@ -131,8 +135,14 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                         .into_any(),
                 },
             )
-            .style(|s| {
+            .style(|s| s.flex_grow(1.0_f32).min_width(0.0));
+            let interval_dd = container(settings_dropdown(interval, [1u64, 2, 5, 10], interval_label))
+                .style(|s| s.width(84.0).flex_shrink(0.0_f32));
+            let status = h_stack((status_text, interval_dd)).style(|s| {
                 s.width_full()
+                    .flex_row()
+                    .items_center()
+                    .gap(10.0)
                     .padding_horiz(14.0)
                     .padding_top(10.0)
                     // 20px gap down to the table (or the empty-state message).
@@ -346,6 +356,17 @@ fn data_view(change: &RowChange, cols: &[String]) -> impl IntoView + use<> {
         ChangeKind::Delete => {}
     }
     h_stack_from_iter(spans).style(|s| s.flex_row().items_center().flex_shrink(0.0_f32))
+}
+
+/// Poll-interval option labels for the dropdown.
+fn interval_label(secs: u64) -> &'static str {
+    match secs {
+        1 => "1s",
+        2 => "2s",
+        5 => "5s",
+        10 => "10s",
+        _ => "—",
+    }
 }
 
 /// Render one cell value: `NULL` for a missing value, the text otherwise.
