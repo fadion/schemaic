@@ -1390,6 +1390,10 @@ pub(crate) struct GridCtx {
     /// Follow a foreign key: open the referenced `(database, table)` in a new tab
     /// running the given filter `sql` (built by the grid from a FK + the row).
     pub(crate) follow_fk: FollowFn,
+    /// Open the Live Monitor for `(conn_id, database, table)` — watch the result's
+    /// base table for row changes. Offered only when the result has a single
+    /// writable base table (`insert_target`), same as the row-action group.
+    pub(crate) open_monitor: crate::MonitorFn,
     /// Close any open popup / schema context menu (so a grid click dismisses them
     /// — grid cells consume the pointer-down, so the root handler never fires).
     pub(crate) dismiss: Rc<dyn Fn()>,

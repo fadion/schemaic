@@ -146,6 +146,9 @@ pub const TRASH_2: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" 
 /// other icons.
 pub const AI_LOGO: &str = r#"<svg viewBox="0 0 16 10" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M9.23453 9.772V8.582H11.5305V1.19H9.23453V0H15.3945V1.19H13.0985V8.582H15.3945V9.772H9.23453Z" fill="currentColor"/><path d="M6.188 9.772L5.446 7.168H2.338L1.596 9.772H0L2.856 0H4.998L7.854 9.772H6.188ZM3.948 1.582H3.836L2.632 5.866H5.152L3.948 1.582Z" fill="currentColor"/></svg>"#;
 
+/// Lucide `activity` (Live Monitor — a heartbeat/pulse line, "live" changes).
+pub const ACTIVITY: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/></svg>"#;
+
 /// Lucide `expand` (results panel → collapse the editor, take full height).
 pub const EXPAND: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 15 6 6"/><path d="m15 9 6-6"/><path d="M21 16v5h-5"/><path d="M21 8V3h-5"/><path d="M3 16v5h5"/><path d="m3 21 6-6"/><path d="M3 8V3h5"/><path d="M9 9 3 3"/></svg>"#;
 

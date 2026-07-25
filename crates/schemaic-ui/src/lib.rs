@@ -17,6 +17,7 @@ mod grid;
 mod history_panel;
 pub mod icons;
 mod markdown;
+mod monitor_view;
 mod overlays;
 mod plan_view;
 mod schema_tree;
@@ -37,6 +38,7 @@ use overlays::{
     active_db_menu_overlay, conn_menu_overlay, context_menu_overlay, db_visibility_overlay,
     error_modal_overlay, find_overlay, popup_menu_overlay, schema_settings_overlay,
 };
+use monitor_view::monitor_overlay;
 use plan_view::plan_overlay;
 use schema_tree::schema_panel;
 use settings::{ai_settings_overlay, help_overlay, term_settings_overlay, theme_settings_overlay};
@@ -577,6 +579,9 @@ pub struct TabsActions {
     /// Run `EXPLAIN` (or `EXPLAIN ANALYZE` when arg 2 is true) for a statement,
     /// filling the plan modal's state. Targets the active tab's connection/db.
     pub run_plan: Rc<dyn Fn(String, bool)>,
+    /// Open the Live Monitor for a `(conn_id, database, table)`: start polling
+    /// that table on an interval and reveal the change-log modal.
+    pub open_monitor: MonitorFn,
 }
 
 /// The global navigation keys — handled at BOTH the workspace root and inside the
@@ -863,7 +868,29 @@ pub struct OverlayUi {
     pub plan_state: RwSignal<PlanState>,
     pub plan_sql: RwSignal<String>,
     pub plan_analyze: RwSignal<bool>,
+    /// Live Monitor modal: open flag, the watched `database.table` label, the
+    /// polled result's column names (for rendering field diffs), the timestamped
+    /// change log (oldest-first), and the latest poll error (if any). The poll
+    /// loop lives in the app; the modal only renders these + closing sets
+    /// `monitor_open` false, which stops the loop.
+    pub monitor_open: RwSignal<bool>,
+    pub monitor_title: RwSignal<Option<String>>,
+    pub monitor_cols: RwSignal<Vec<String>>,
+    pub monitor_log: RwSignal<Vec<MonitorEntry>>,
+    pub monitor_error: RwSignal<Option<String>>,
 }
+
+/// One entry in the Live Monitor's change log: a detected [`RowChange`] plus the
+/// elapsed-since-start timestamp (`M:SS`) at which the monitor observed it.
+#[derive(Clone, Debug)]
+pub struct MonitorEntry {
+    pub at: String,
+    pub change: schemaic_core::monitor::RowChange,
+}
+
+/// Open the Live Monitor for a `(conn_id, database, table)` — starts polling that
+/// table and reveals the modal. Built in the app, invoked from the grid toolbar.
+pub type MonitorFn = Rc<dyn Fn(u64, String, String)>;
 
 /// All app state + callbacks the UI needs, bundled so views take one argument.
 /// The app (schemaic-app) owns the signals and provides the `Rc<dyn Fn>`
@@ -1155,6 +1182,7 @@ pub fn workspace(ui: Ui) -> impl IntoView {
         find_overlay(ui.clone()),
         error_modal_overlay(ui.clone()),
         plan_overlay(ui.clone()),
+        monitor_overlay(ui.clone()),
         term_settings_overlay(ui.clone()),
         ai_settings_overlay(ui.clone()),
         theme_settings_overlay(ui.clone()),
@@ -1992,6 +2020,7 @@ fn center(ui: Ui) -> impl IntoView {
     });
     let commit_edits = ui.tab_actions.commit_edits.clone();
     let follow_fk = ui.tab_actions.open_table_filtered.clone();
+    let open_monitor = ui.tab_actions.open_monitor.clone();
     let active_db = ui.tabs_ui.active_db;
     let active_db_menu_open = ui.tabs_ui.active_db_menu_open;
     let active_db_anchor = ui.tabs_ui.active_db_anchor;
@@ -2104,6 +2133,7 @@ fn center(ui: Ui) -> impl IntoView {
                     popup_width,
                     summarize: summarize.clone(),
                     follow_fk: follow_fk.clone(),
+                    open_monitor: open_monitor.clone(),
                     dismiss: dismiss_menus.clone(),
                     commit: commit_edits.clone(),
                     // `results_view` fills this in for the single-result path; the
@@ -2205,6 +2235,9 @@ fn results_section(
     let (find_open, find_query, find_step) = (gctx.find_open, gctx.find_query, gctx.find_step);
     let (find_total, find_pos, find_more) = (gctx.find_total, gctx.find_pos, gctx.find_more);
     let (commit_err, error_open, error_text) = (gctx.commit_err, gctx.error_open, gctx.error_text);
+    // Live Monitor: watch the tab's source table. Captured before `gctx` moves.
+    let open_monitor = gctx.open_monitor.clone();
+    let (monitor_source, monitor_conn) = (gctx.source, gctx.conn_id);
     let body = dyn_container(
         move || !result_tabs.with(|v| v.is_empty()),
         move |multi| {
@@ -2223,9 +2256,20 @@ fn results_section(
             .min_width(0.0)
     });
 
-    // Title row: "RESULTS" left; an expand/shrink toggle right (same widget +
-    // spacing as the Schema/AI title-bar icons). The icon swaps via `dyn_container`
-    // (a transform-transition on a small svg is unreliable — see themes gotchas).
+    // Title row: "RESULTS" left; a Live-Monitor button + expand/shrink toggle right
+    // (same widget + spacing as the Schema/AI title-bar icons — monitor `mr=2`,
+    // toggle `mr=7` gives the 12px inter-icon gap and 12px edge inset). The toggle
+    // swaps its glyph via `dyn_container` (a transform-transition on a small svg is
+    // unreliable — see themes gotchas).
+    let monitor_btn = {
+        let open_monitor = open_monitor.clone();
+        let enabled = move || monitor_source.get().is_some();
+        toolbar_icon(icons::ACTIVITY, 5.0, 2.0, enabled, move || {
+            if let Some((db, table)) = monitor_source.get_untracked() {
+                (open_monitor)(monitor_conn.get_untracked(), db, table);
+            }
+        })
+    };
     let toggle_btn = dyn_container(
         move || editor_collapsed.get(),
         move |collapsed| {
@@ -2237,9 +2281,10 @@ fn results_section(
             let t = toggle_collapse.clone();
             toolbar_icon(markup, 5.0, 7.0, || true, move || (t)()).into_any()
         },
-    )
-    .style(|s| s.flex_row().items_start().flex_shrink(0.0_f32));
-    let title_row = h_stack((section_title("RESULTS"), toggle_btn))
+    );
+    let icons_group = h_stack((monitor_btn, toggle_btn))
+        .style(|s| s.flex_row().items_start().flex_shrink(0.0_f32));
+    let title_row = h_stack((section_title("RESULTS"), icons_group))
         .style(|s| s.width_full().flex_row().items_start().justify_between());
 
     let panel = v_stack((title_row, body)).style(|s| {

@@ -1,9 +1,10 @@
 //! Core domain types + pure logic for Schemaic — no UI, and (except for
 //! [`persist`], which reads/writes the JSON config files) no IO.
 //!
-//! The result-set model lives in [`model`]; the pure SQL/edit/export/diff/plan
-//! logic in [`sql`]/[`edit`]/[`export`]/[`diff`]/[`plan`]; connection + schema
-//! models in [`connection`]/[`schema`]; and config persistence in [`persist`].
+//! The result-set model lives in [`model`]; the pure SQL/edit/export/diff/plan/
+//! monitor logic in [`sql`]/[`edit`]/[`export`]/[`diff`]/[`plan`]/[`monitor`];
+//! connection + schema models in [`connection`]/[`schema`]; and config
+//! persistence in [`persist`].
 
 pub mod connection;
 pub mod db_color;
@@ -13,6 +14,7 @@ pub mod export;
 pub mod format;
 pub mod history;
 pub mod model;
+pub mod monitor;
 pub mod palette;
 pub mod persist;
 pub mod plan;
