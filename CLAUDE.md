@@ -161,6 +161,10 @@ bug fixes start with a failing test, then the code that makes it pass. Concretel
 - **Colors live in `theme.rs`** as named fns — add one rather than inlining a hex literal. They read
   the *active* theme from `themes.rs` (reactive), so calling one inside a `.style(…)` closure follows
   a live theme switch for free.
+  - **Reuse a theme color only when the shared scope makes sense** (the two spots are the same role and
+    should always change together). Otherwise extract a separate named fn — even if it starts at the
+    same hex — so each can be retuned independently (e.g. `seed_button()` alongside the identical
+    `status_ok()`).
 - **Theming (`themes.rs`)**: two independent axes — `UiTheme` (chrome: dark/light) and `EditorTheme`
   (editor surface + syntax tokens: One Dark Pro / Tokyo Night / Catppuccin Latte). A theme is a flat
   struct of named colour roles (hex). Active themes live in `Scope`-owned global `RwSignal`s;
