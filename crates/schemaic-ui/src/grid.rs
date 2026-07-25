@@ -331,6 +331,27 @@ struct GridState {
     /// Open the referenced table filtered to the followed row (wrapped so
     /// `GridState` stays `Copy`).
     follow_fk: RwSignal<Option<FollowFn>>,
+    /// AI-fill a single cell (wrapped so `GridState` stays `Copy`).
+    ai_fill: RwSignal<Option<crate::AiFillFn>>,
+    /// AI-generate seed rows (wrapped so `GridState` stays `Copy`).
+    ai_seed: RwSignal<Option<crate::AiSeedFn>>,
+    /// True while an AI seed-data action is in flight — disables the sparkle icon
+    /// and runs the pulse clock (`ai_pulse`).
+    ai_busy: RwSignal<bool>,
+    /// Real-row cells `(data_idx, col)` currently being AI-generated — painted with
+    /// the pulsing purple "generating" wash (Fill Value).
+    ai_gen: RwSignal<HashSet<(usize, usize)>>,
+    /// Pending new-row indices currently being AI-generated — the whole row pulses
+    /// purple (Insert Row / Seed Table).
+    ai_gen_rows: RwSignal<HashSet<usize>>,
+    /// Pulse phase (radians) advanced by a ~45ms tick while `ai_busy`; the
+    /// generating cells read it to breathe their wash. `pulse_running` guards
+    /// against starting a second tick loop.
+    ai_pulse: RwSignal<f64>,
+    pulse_running: RwSignal<bool>,
+    /// "AI Seed Table…" count popover: whether it's open + its (text) row count.
+    seed_open: RwSignal<bool>,
+    seed_buf: RwSignal<String>,
 }
 
 impl GridState {
@@ -397,6 +418,15 @@ impl GridState {
             // Empty until `grid_view` resolves the source table's FKs into it.
             follow: RwSignal::new(Rc::new(HashMap::new())),
             follow_fk: RwSignal::new(Some(gctx.follow_fk.clone())),
+            ai_fill: RwSignal::new(Some(gctx.ai_fill.clone())),
+            ai_seed: RwSignal::new(Some(gctx.ai_seed.clone())),
+            ai_busy: RwSignal::new(false),
+            ai_gen: RwSignal::new(HashSet::new()),
+            ai_gen_rows: RwSignal::new(HashSet::new()),
+            ai_pulse: RwSignal::new(0.0),
+            pulse_running: RwSignal::new(false),
+            seed_open: RwSignal::new(false),
+            seed_buf: RwSignal::new(String::new()),
         }
     }
 
@@ -1394,6 +1424,10 @@ pub(crate) struct GridCtx {
     /// base table for row changes. Offered only when the result has a single
     /// writable base table (`insert_target`), same as the row-action group.
     pub(crate) open_monitor: crate::MonitorFn,
+    /// AI-fill a single cell (sample base table → one-shot AI → stage the result).
+    pub(crate) ai_fill: crate::AiFillFn,
+    /// AI-generate seed rows (Insert Row / Seed Table) → stage pending rows.
+    pub(crate) ai_seed: crate::AiSeedFn,
     /// Close any open popup / schema context menu (so a grid click dismisses them
     /// — grid cells consume the pointer-down, so the root handler never fires).
     pub(crate) dismiss: Rc<dyn Fn()>,
@@ -2013,7 +2047,12 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             .min_height(120.0)
             .min_width(0.0)
     });
-    v_stack((toolbar, grid_boxed, value_viewer(gs, viewer_max)))
+    v_stack((
+        toolbar,
+        grid_boxed,
+        value_viewer(gs, viewer_max),
+        seed_popover(gs),
+    ))
         .on_resize(move |r| {
             // Cap so the viewer leaves the grid its `min_height` (~120) + toolbar
             // (~26) + the viewer's own header (~26): rows ≈ (panel − 172) / 19.
@@ -2214,6 +2253,397 @@ fn add_pending_row(gs: GridState) {
             gs.anchor.set(Some((disp, 0)));
         }
     }
+}
+
+// AI seed-data actions (toolbar sparkle menu). Each will drive the one-shot AI
+// pipeline — bottom-sample the base table → build a prompt from the DDL + sample →
+// `inline_args` one-shot call → parse → stage as green pending edits (never
+// auto-committed). Stubbed for now; the toolbar menu + wiring land first.
+/// Start the "generating" pulse clock if it isn't already running. A single
+/// self-rescheduling tick advances `ai_pulse` while `ai_busy`; the generating
+/// cells read the phase to breathe their purple wash. Reused by every AI seed-data
+/// action.
+fn start_ai_pulse(gs: GridState) {
+    if gs.pulse_running.get_untracked() {
+        return;
+    }
+    gs.pulse_running.set(true);
+    ai_pulse_tick(gs);
+}
+
+/// One pulse step. Stops (and clears `pulse_running`) once nothing is generating,
+/// and bails silently if the result-set scope has been disposed — per the
+/// perpetual-`exec_after` rule, every read is a `try_*` so a late tick after
+/// shutdown can't panic on a freed signal.
+fn ai_pulse_tick(gs: GridState) {
+    if !matches!(gs.ai_busy.try_get_untracked(), Some(true)) {
+        let _ = gs.pulse_running.try_update(|v| *v = false);
+        return;
+    }
+    if gs.ai_pulse.try_update(|p| *p += 0.2).is_none() {
+        return; // scope disposed
+    }
+    floem::action::exec_after(std::time::Duration::from_millis(45), move |_| ai_pulse_tick(gs));
+}
+
+/// Stage an AI-filled value into the active cell — a real row (`dirty`) or a
+/// pending new row (`new_rows`), matching the double-click edit path.
+fn stage_fill(gs: GridState, disp: usize, ci: usize, pending: Option<usize>, val: Option<String>) {
+    match pending {
+        Some(p) => gs.stage_new(p, ci, val),
+        None => {
+            let di = gs.order.get_untracked().get(disp).copied().unwrap_or(disp);
+            gs.stage(di, ci, val);
+        }
+    }
+}
+
+/// AI-fill the active editable cell: gather the target table/column + the rest of
+/// this row (for coherence), hand the request to the app (which samples the base
+/// table + runs the one-shot AI call), and stage the parsed result as a normal
+/// green edit. Nothing auto-commits. A no-op unless an editable cell is selected.
+fn ai_fill_value(gs: GridState) {
+    if gs.ai_busy.get_untracked() {
+        return;
+    }
+    let Some((disp, ci)) = gs.active.get_untracked() else {
+        return;
+    };
+    let model = gs.edit_model.get_untracked();
+    if !model.editable(ci) {
+        return;
+    }
+    let Some(ti) = model.table_index(ci) else {
+        return;
+    };
+    let Some(et) = model.table(ti) else {
+        return;
+    };
+    let (database, table) = (et.database.clone(), et.table.clone());
+    let rs = gs.rs.get_untracked();
+    let ncols = rs.col_count();
+    let nrows = rs.row_count();
+    let pending = (disp >= nrows).then(|| disp - nrows);
+    // Real column name (provenance), falling back to the result column name.
+    let col_name = |cj: usize| -> String {
+        rs.columns
+            .get(cj)
+            .map(|c| {
+                c.origin
+                    .as_ref()
+                    .map(|o| o.column.clone())
+                    .unwrap_or_else(|| c.name.clone())
+            })
+            .unwrap_or_default()
+    };
+    let column = col_name(ci);
+    // Row context: the current value of every *other* column belonging to the
+    // same base table (staged edit wins over the stored cell).
+    let order = gs.order.get_untracked();
+    let mut row_context: Vec<(String, Option<String>)> = Vec::new();
+    for cj in 0..ncols {
+        if cj == ci || model.table_index(cj) != Some(ti) {
+            continue;
+        }
+        let val: Option<String> = match pending {
+            Some(p) => gs
+                .new_rows
+                .with_untracked(|rows| rows.get(p).and_then(|r| r.get(&cj).cloned()).flatten()),
+            None => {
+                let di = order.get(disp).copied().unwrap_or(disp);
+                match gs.dirty.with_untracked(|d| d.get(&(di, cj)).cloned()) {
+                    Some(v) => v, // staged edit
+                    None => rs
+                        .cell(di, cj)
+                        .and_then(|c| (!c.is_null()).then(|| c.display().to_string())),
+                }
+            }
+        };
+        row_context.push((col_name(cj), val));
+    }
+    let Some(cb) = gs.ai_fill.get_untracked() else {
+        return;
+    };
+    // Mark the target real-row cell "generating" (purple pulse); a pending-row
+    // cell is left unmarked for now — Insert Row / Seed Table will mark their rows.
+    let gen_cell: Option<(usize, usize)> =
+        pending.is_none().then(|| (order.get(disp).copied().unwrap_or(disp), ci));
+    if let Some(cell) = gen_cell {
+        gs.ai_gen.update(|g| {
+            g.insert(cell);
+        });
+    }
+    gs.ai_busy.set(true);
+    gs.commit_err.set(None);
+    start_ai_pulse(gs);
+    let req = crate::AiFillRequest {
+        conn_id: gs.conn_id.get_untracked(),
+        database,
+        table,
+        column,
+        row_context,
+    };
+    let done: crate::AiFillDoneFn = Rc::new(move |res| {
+        // The result-set scope may have been disposed (tab switched / re-run) while
+        // the request was in flight — `try_update` no-ops instead of panicking.
+        if gs.ai_busy.try_update(|b| *b = false).is_none() {
+            return;
+        }
+        if let Some(cell) = gen_cell {
+            gs.ai_gen.try_update(|g| {
+                g.remove(&cell);
+            });
+        }
+        match res {
+            crate::AiFillResult::Value(v) => stage_fill(gs, disp, ci, pending, Some(v)),
+            crate::AiFillResult::Null => stage_fill(gs, disp, ci, pending, None),
+            crate::AiFillResult::Failed(e) => gs.commit_err.set(Some(e)),
+        }
+    });
+    (cb)(req, done);
+}
+
+fn ai_insert_row(gs: GridState) {
+    ai_seed_rows(gs, 1);
+}
+
+/// Shared core of Insert Row (count = 1) and Seed Table (count = N): append
+/// `count` blank pending rows, mark them generating (pulsing purple), ask the app
+/// to AI-generate the rows, then stage each returned row's values into its pending
+/// row. On failure the skeleton rows are rolled back and the error surfaced.
+/// Nothing auto-commits — the staged rows commit like any manual `+ Row`.
+fn ai_seed_rows(gs: GridState, count: usize) {
+    if gs.ai_busy.get_untracked() || count == 0 {
+        return;
+    }
+    let model = gs.edit_model.get_untracked();
+    let Some(et) = model.insert_target() else {
+        return;
+    };
+    let (database, table) = (et.database.clone(), et.table.clone());
+    let rs = gs.rs.get_untracked();
+    let ncols = rs.col_count();
+    // Columns the model should fill (editable, non-auto-increment) + a name→ci map
+    // to stage the reply back. Auto-increment/expression columns are left to the
+    // server default.
+    let mut fill_columns: Vec<String> = Vec::new();
+    let mut name_to_ci: HashMap<String, usize> = HashMap::new();
+    for cj in 0..ncols {
+        if !model.editable(cj) {
+            continue;
+        }
+        let Some(col) = rs.columns.get(cj) else {
+            continue;
+        };
+        let auto = col
+            .origin
+            .as_ref()
+            .map(|o| o.flags.auto_increment)
+            .unwrap_or(false);
+        if auto {
+            continue;
+        }
+        let name = col
+            .origin
+            .as_ref()
+            .map(|o| o.column.clone())
+            .unwrap_or_else(|| col.name.clone());
+        name_to_ci.insert(name.clone(), cj);
+        fill_columns.push(name);
+    }
+    let Some(cb) = gs.ai_seed.get_untracked() else {
+        return;
+    };
+    // Append the skeleton rows + mark them generating; bring the first into view.
+    let pidxs: Vec<usize> = (0..count).map(|_| gs.add_new_row()).collect();
+    gs.ai_gen_rows.update(|s| {
+        for &p in &pidxs {
+            s.insert(p);
+        }
+    });
+    gs.ai_busy.set(true);
+    gs.commit_err.set(None);
+    start_ai_pulse(gs);
+    if let Some(&p0) = pidxs.first() {
+        scroll_active_into_view(gs, rs.row_count() + p0, 0);
+    }
+    let req = crate::AiSeedRequest {
+        conn_id: gs.conn_id.get_untracked(),
+        database,
+        table,
+        fill_columns,
+        count,
+    };
+    let done: crate::AiSeedDoneFn = Rc::new(move |res| {
+        if gs.ai_busy.try_update(|b| *b = false).is_none() {
+            return; // scope disposed
+        }
+        gs.ai_gen_rows.try_update(|s| {
+            for &p in &pidxs {
+                s.remove(&p);
+            }
+        });
+        match res {
+            crate::AiSeedResult::Rows(rows) => {
+                for (i, &pidx) in pidxs.iter().enumerate() {
+                    let Some(row) = rows.get(i) else { continue };
+                    for (name, val) in row {
+                        if let Some(&ci) = name_to_ci.get(name) {
+                            gs.stage_new(pidx, ci, val.clone());
+                        }
+                    }
+                }
+                // A short reply leaves the extra skeleton rows blank to fill/discard.
+            }
+            crate::AiSeedResult::Failed(e) => {
+                remove_pending_rows(gs, &pidxs);
+                gs.commit_err.set(Some(e));
+            }
+        }
+    });
+    (cb)(req, done);
+}
+
+/// Remove specific pending rows by index — rolls back the skeleton rows when an AI
+/// seed request fails. Removes high indices first so the lower ones stay valid, and
+/// bounds-checks in case the rows were cleared meanwhile (discard).
+fn remove_pending_rows(gs: GridState, pidxs: &[usize]) {
+    gs.new_rows.try_update(|rows| {
+        let mut idxs: Vec<usize> = pidxs.to_vec();
+        idxs.sort_unstable_by(|a, b| b.cmp(a));
+        for p in idxs {
+            if p < rows.len() {
+                rows.remove(p);
+            }
+        }
+    });
+}
+
+/// Open the "AI Seed Table" count popover, seeding the input with a default of 10.
+fn open_seed_popover(gs: GridState) {
+    if gs.ai_busy.get_untracked() {
+        return;
+    }
+    gs.seed_buf.set("10".to_string());
+    gs.seed_open.set(true);
+}
+
+/// Max rows a single Seed Table request will generate (no point in hundreds here).
+const SEED_ROW_CAP: usize = 50;
+
+/// The "AI Seed Table" count popover: a small panel (numeric field + preset chips
+/// + Generate) anchored under the toolbar, over a click-catcher backdrop. Kick a
+/// seed with `n` rows (clamped 1..=SEED_ROW_CAP) and close. Mounted last in
+/// `grid_view`'s stack so it draws over the grid; hidden unless `seed_open`.
+fn seed_popover(gs: GridState) -> impl IntoView {
+    dyn_container(
+        move || gs.seed_open.get(),
+        move |open| {
+            if !open {
+                return empty().into_any();
+            }
+            // Parse the field, clamp, close, and generate.
+            let go: Rc<dyn Fn()> = Rc::new(move || {
+                let n = gs
+                    .seed_buf
+                    .get_untracked()
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap_or(0)
+                    .clamp(1, SEED_ROW_CAP);
+                gs.seed_open.set(false);
+                ai_seed_rows(gs, n);
+            });
+            // Preset chips generate immediately; the field is for a custom count.
+            let preset = |n: usize, go: Rc<dyn Fn()>, gs: GridState| {
+                container(text(format!("{n}")).style(|s| s.font_size(theme::FONT_LABEL)))
+                    .on_click_stop(move |_| {
+                        gs.seed_buf.set(n.to_string());
+                        (go)();
+                    })
+                    .style(|s| {
+                        s.padding_horiz(10.0)
+                            .padding_vert(4.0)
+                            .border(1.0)
+                            .border_color(theme::border())
+                            .border_radius(6.0)
+                            .cursor(CursorStyle::Default)
+                            .hover(|s| s.background(theme::accent().multiply_alpha(0.15)))
+                    })
+            };
+            let field = {
+                let go = go.clone();
+                let esc = move || gs.seed_open.set(false);
+                edit_field(
+                    gs.seed_buf,
+                    FieldCfg {
+                        autofocus: true,
+                        height: Some(30.0),
+                        on_submit: Some(go),
+                        on_escape: Some(Rc::new(esc)),
+                        ..FieldCfg::default()
+                    },
+                )
+                .style(|s| s.width(70.0))
+            };
+            let go_btn = go.clone();
+            let panel = v_stack((
+                text("Seed rows").style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_muted())),
+                h_stack((
+                    field,
+                    container(text("Generate").style(|s| s.font_size(theme::FONT_BODY)))
+                        .on_click_stop(move |_| (go_btn)())
+                        .style(|s| {
+                            s.padding_horiz(12.0)
+                                .padding_vert(6.0)
+                                .border_radius(6.0)
+                                .color(floem::peniko::Color::WHITE)
+                                .background(theme::seed_button())
+                                .cursor(CursorStyle::Default)
+                                .hover(|s| s.background(theme::seed_button().multiply_alpha(0.85)))
+                        }),
+                ))
+                .style(|s| s.gap(6.0).items_center()),
+                h_stack((
+                    preset(5, go.clone(), gs),
+                    preset(10, go.clone(), gs),
+                    preset(25, go.clone(), gs),
+                    preset(50, go.clone(), gs),
+                ))
+                .style(|s| s.gap(6.0)),
+            ))
+            .style(|s| {
+                crate::widgets::panel_style(s)
+                    .absolute()
+                    .inset_top(30.0) // just below the 28px toolbar
+                    .inset_right(8.0)
+                    .background(theme::bg_chrome())
+                    .padding(12.0)
+                    .gap(8.0)
+            })
+            .on_event_stop(EventListener::PointerDown, |_| {});
+            // Backdrop: an outside click closes the popover.
+            stack((
+                empty()
+                    .style(|s| s.absolute().inset(0.0))
+                    .on_click_stop(move |_| gs.seed_open.set(false)),
+                panel,
+            ))
+            .style(|s| s.absolute().inset(0.0))
+            .into_any()
+        },
+    )
+    // The `dyn_container` must itself fill the grid area when open — its child is
+    // absolute (out of flow), so without this it collapses to 0×0 and the panel's
+    // insets resolve against nothing. Closed → in-flow + empty, so it takes no space
+    // and never intercepts clicks.
+    .style(move |s| {
+        if gs.seed_open.get() {
+            s.absolute().inset(0.0)
+        } else {
+            s
+        }
+    })
 }
 
 /// Discard all staged changes — cell edits, pending new rows, and pending row
@@ -2634,10 +3064,92 @@ fn grid_toolbar(
             .cursor(CursorStyle::Default)
     });
 
+    // AI seed-data menu → purple-sparkle actions (Fill Value / Insert Row / Seed
+    // Table). Gated on a single writable table, like the row actions above. The
+    // trigger is a neutral toolbar sparkle (same styling as the copy icon); the
+    // *menu items* carry the purple sparkle, matching "AI Summary" / "Ask AI". The
+    // menu anchors below the icon via the shared `ui.popup_menu` channel. Actions
+    // are stubbed pending the one-shot AI pipeline.
+    let ai_menu = dyn_container(
+        move || gs.edit_model.get().insert_target().is_some(),
+        move |show| {
+            if !show {
+                return empty().into_any();
+            }
+            let ai_origin = RwSignal::new(Point::ZERO);
+            let ai_hov = RwSignal::new(false);
+            container(
+                icons::icon(icons::SPARKLES, 16.0)
+                    .on_move(move |p| ai_origin.set(p))
+                    .style(move |s| {
+                        // Dimmed + inert while a request is in flight.
+                        let c = if gs.ai_busy.get() {
+                            theme::text_muted().multiply_alpha(0.3)
+                        } else if ai_hov.get() {
+                            theme::text()
+                        } else {
+                            theme::text_muted()
+                        };
+                        s.color(c).flex_shrink(0.0_f32)
+                    }),
+            )
+            .on_click_stop(move |_| {
+                if gs.ai_busy.get_untracked() {
+                    return; // a generation is already running
+                }
+                // Mutually exclusive with the other toolbar/schema menus.
+                if let Some(d) = gs.dismiss.get_untracked() {
+                    (d)();
+                }
+                let o = ai_origin.get_untracked();
+                let sz = 16.0; // the SPARKLES glyph size above
+                gs.popup_width.set(GRID_COPY_MENU_W);
+                gs.popup_anchor
+                    .set(Some(PopupAnchor::BelowIcon(o.x, o.x + sz, o.y + sz)));
+                // AI Fill Value targets the active cell — enabled only when an
+                // editable cell is selected (a read-only/expression cell can't be
+                // filled).
+                let fill_enabled = gs
+                    .active
+                    .get_untracked()
+                    .map(|(_, ci)| gs.edit_model.get_untracked().editable(ci))
+                    .unwrap_or(false);
+                gs.popup.set(Some(vec![
+                    MenuEntry::action_icon(
+                        "AI Fill Value",
+                        (icons::SPARKLES, theme::key_foreign),
+                        move || ai_fill_value(gs),
+                    )
+                    .disabled(!fill_enabled),
+                    MenuEntry::action_icon(
+                        "AI Insert Row",
+                        (icons::SPARKLES, theme::key_foreign),
+                        move || ai_insert_row(gs),
+                    ),
+                    MenuEntry::action_icon(
+                        "AI Seed Table…",
+                        (icons::SPARKLES, theme::key_foreign),
+                        move || open_seed_popover(gs),
+                    ),
+                ]));
+            })
+            .on_event_cont(EventListener::PointerEnter, move |_| ai_hov.set(true))
+            .on_event_cont(EventListener::PointerLeave, move |_| ai_hov.set(false))
+            .on_event_stop(EventListener::PointerDown, |_| {})
+            .style(|s| {
+                s.items_center()
+                    .padding_vert(3.0)
+                    .padding_horiz(5.0)
+                    .cursor(CursorStyle::Default)
+            })
+            .into_any()
+        },
+    );
+
     // The icon cluster — 3px between icons (on top of each icon's padded hitbox),
     // separators pushed further out by their own margin:
-    // [commit ✓][discard ✗] │ [＋][－][clone] │ [copy].
-    let icons_cluster = h_stack((commit_ctrl, row_actions, copy_menu))
+    // [commit ✓][discard ✗] │ [＋][－][clone] │ [✦ AI][copy].
+    let icons_cluster = h_stack((commit_ctrl, row_actions, ai_menu, copy_menu))
         .style(|s| s.items_center().flex_row().gap(3.0));
 
     h_stack((
@@ -3410,6 +3922,13 @@ fn data_cell(
             let is_editing = gs.edit_cell.get() == Some((i, ci));
             // A real row marked for deletion (its edits were cleared when marked).
             let deleted = pending.is_none() && gs.del_rows.with(|d| d.contains(&data_idx));
+            // This cell is currently being AI-generated — breathe a purple wash. A
+            // real cell (Fill Value) is keyed by `(data_idx, ci)`; a pending row
+            // (Insert Row / Seed Table) pulses whole-row.
+            let generating = match pending {
+                Some(p) => gs.ai_gen_rows.with(|s| s.contains(&p)),
+                None => gs.ai_gen.with(|g| g.contains(&(data_idx, ci))),
+            };
             let s = s.width(w).height(ROW_H).flex_shrink(0.0_f32).items_center();
             // Right-aligned numeric cells get extra right padding (matching the
             // header) so the value clears the edge/border; text cells stay at 10px.
@@ -3423,7 +3942,13 @@ fn data_cell(
             let formatted = gs
                 .formats
                 .with(|f| f.get(ci).map(|x| *x != ColumnFormat::None).unwrap_or(false));
-            let s = if is_editing {
+            let s = if generating {
+                // Dark purple wash that breathes via the pulse phase (key_foreign =
+                // the sparkle purple). Reading `ai_pulse` here (and only here)
+                // subscribes just the generating cells to the tick.
+                let t = 0.5 + 0.5 * gs.ai_pulse.get().sin();
+                s.background(theme::key_foreign().multiply_alpha((0.18 + 0.20 * t) as f32))
+            } else if is_editing {
                 // No highlight while editing, so the chromeless in-place editor
                 // sits over the plain cell and reads as editing the cell itself.
                 s
@@ -3455,9 +3980,14 @@ fn data_cell(
             } else {
                 s.background(theme::bg_results())
             };
-            // Border on every column, last included, so a narrow table still shows
-            // where the final column ends.
-            s.border_right(1.0).border_color(theme::border())
+            // A generating cell gets a full purple frame (matching the sparkle);
+            // otherwise the usual right divider so a narrow table still shows where
+            // the final column ends.
+            if generating {
+                s.border(1.0).border_color(theme::key_foreign())
+            } else {
+                s.border_right(1.0).border_color(theme::border())
+            }
         })
         // Clip so a value wider than the column doesn't spill over neighbours.
         .clip()

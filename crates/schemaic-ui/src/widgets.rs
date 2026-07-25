@@ -184,6 +184,9 @@ pub enum MenuEntry {
         /// Optional label tint (a `fn` so it follows theme switches); `None` uses
         /// the default text colour. Used to mark a selected option.
         label_color: Option<fn() -> floem::peniko::Color>,
+        /// Dimmed + inert (no click, no hover) — for an action that isn't currently
+        /// applicable (e.g. "AI Fill Value" with no cell selected).
+        disabled: bool,
         action: Rc<dyn Fn()>,
     },
     Sub {
@@ -200,6 +203,7 @@ impl MenuEntry {
             label: label.into(),
             icon: None,
             label_color: None,
+            disabled: false,
             action: Rc::new(action),
         }
     }
@@ -212,6 +216,7 @@ impl MenuEntry {
             label: label.into(),
             icon: Some(icon),
             label_color: None,
+            disabled: false,
             action: Rc::new(action),
         }
     }
@@ -225,8 +230,16 @@ impl MenuEntry {
             label: label.into(),
             icon: None,
             label_color: Some(color),
+            disabled: false,
             action: Rc::new(action),
         }
+    }
+    /// Mark this entry disabled (dimmed + inert). No-op on `Sub`/`Separator`.
+    pub(crate) fn disabled(mut self, yes: bool) -> Self {
+        if let MenuEntry::Action { disabled, .. } = &mut self {
+            *disabled = yes;
+        }
+        self
     }
     pub(crate) fn sub(label: impl Into<String>, children: Vec<MenuEntry>) -> Self {
         MenuEntry::Sub {
@@ -245,18 +258,33 @@ fn menu_row(
     label: String,
     label_color: Option<fn() -> floem::peniko::Color>,
     chevron: bool,
+    disabled: bool,
 ) -> impl IntoView {
     let mut kids: Vec<AnyView> = Vec::new();
     if let Some((svg, color)) = icon {
         kids.push(
             icons::icon(svg, 16.0)
-                .style(move |s| s.color(color()).flex_shrink(0.0_f32))
+                .style(move |s| {
+                    let c = if disabled {
+                        theme::text_muted().multiply_alpha(0.3)
+                    } else {
+                        color()
+                    };
+                    s.color(c).flex_shrink(0.0_f32)
+                })
                 .into_any(),
         );
     }
     kids.push(
         text(label)
-            .style(move |s| s.color(label_color.map(|c| c()).unwrap_or_else(theme::text)))
+            .style(move |s| {
+                let c = if disabled {
+                    theme::text_muted().multiply_alpha(0.3)
+                } else {
+                    label_color.map(|c| c()).unwrap_or_else(theme::text)
+                };
+                s.color(c)
+            })
             .into_any(),
     );
     if chevron {
@@ -273,7 +301,15 @@ fn menu_row(
     }
     h_stack_from_iter(kids)
         .style(menu_item_style)
-        .style(|s| s.padding_vert(8.0))
+        .style(move |s| {
+            let s = s.padding_vert(8.0);
+            // A disabled row suppresses the hover highlight so it reads as inert.
+            if disabled {
+                s.hover(|h| h.background(floem::peniko::Color::TRANSPARENT))
+            } else {
+                s
+            }
+        })
 }
 
 /// Render one entry. `open_sub` is this level's "which sibling submenu is open"
@@ -299,9 +335,13 @@ fn menu_entry_view(
             label,
             icon,
             label_color,
+            disabled,
             action,
-        } => menu_row(icon, label, label_color, false)
+        } => menu_row(icon, label, label_color, false, disabled)
             .on_click_stop(move |_| {
+                if disabled {
+                    return; // inert; the stop keeps the menu open
+                }
                 (action)();
                 (close)();
             })
@@ -349,7 +389,7 @@ fn menu_entry_view(
                     s.inset_left_pct(100.0)
                 }
             });
-            stack((menu_row(icon, label, None, true), sub_wrap))
+            stack((menu_row(icon, label, None, true, false), sub_wrap))
                 .on_move(move |p| row_origin.set(p))
                 .on_resize(move |r| row_w.set(r.width()))
                 .on_event(EventListener::PointerEnter, move |_| {

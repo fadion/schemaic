@@ -20,6 +20,7 @@ pub mod persist;
 pub mod plan;
 pub mod resource;
 pub mod schema;
+pub mod seed;
 pub mod sql;
 pub mod sqlfmt;
 pub mod text;

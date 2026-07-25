@@ -78,6 +78,54 @@ pub type CommitDoneFn = Rc<dyn Fn(CommitDone)>;
 /// re-fetch (`Some` ⇒ splice the edited rows in place), then report via
 /// [`CommitDoneFn`]. Aliased to keep the field/signal types below readable.
 pub type CommitFn = Rc<dyn Fn(GridWrite, Option<RefetchRequest>, CommitDoneFn)>;
+
+/// A grid → app request to AI-fill a single cell. The app bottom-samples the base
+/// table, builds a prompt (DDL + sample + this row's context), runs a one-shot
+/// `claude -p` call, parses the reply, and reports back via [`AiFillDoneFn`].
+pub struct AiFillRequest {
+    pub conn_id: u64,
+    pub database: String,
+    pub table: String,
+    /// The real column name being filled.
+    pub column: String,
+    /// The row being filled, as `(column_name, value)` for the same base table —
+    /// so the model keeps the generated value coherent with the rest of the row.
+    pub row_context: Vec<(String, Option<String>)>,
+}
+/// The outcome the grid stages: a value, an explicit SQL `NULL`, or a failure
+/// (DB/CLI error or an empty reply) to surface in the error bar.
+pub enum AiFillResult {
+    Value(String),
+    Null,
+    Failed(String),
+}
+/// Report an [`AiFillRequest`]'s outcome — invoked on the UI thread.
+pub type AiFillDoneFn = Rc<dyn Fn(AiFillResult)>;
+/// AI-fill a single cell (grid → app), reporting via [`AiFillDoneFn`].
+pub type AiFillFn = Rc<dyn Fn(AiFillRequest, AiFillDoneFn)>;
+
+/// A grid → app request to AI-generate `count` seed rows (Insert Row = 1, Seed
+/// Table = N). The app samples the base table, builds a prompt, runs the one-shot
+/// call, parses a JSON array of rows, and reports back via [`AiSeedDoneFn`].
+pub struct AiSeedRequest {
+    pub conn_id: u64,
+    pub database: String,
+    pub table: String,
+    /// The columns the model should fill (editable, non-auto-increment). The grid
+    /// stages only these back, so a stray column in the reply is ignored.
+    pub fill_columns: Vec<String>,
+    pub count: usize,
+}
+/// The outcome: the generated rows (`(column_name, value)` per row) or a failure
+/// (DB/CLI error, empty/invalid reply) to surface in the error bar.
+pub enum AiSeedResult {
+    Rows(Vec<Vec<(String, Option<String>)>>),
+    Failed(String),
+}
+/// Report an [`AiSeedRequest`]'s outcome — invoked on the UI thread.
+pub type AiSeedDoneFn = Rc<dyn Fn(AiSeedResult)>;
+/// AI-generate seed rows (grid → app), reporting via [`AiSeedDoneFn`].
+pub type AiSeedFn = Rc<dyn Fn(AiSeedRequest, AiSeedDoneFn)>;
 use schemaic_core::schema::SchemaState;
 use schemaic_core::transcript::{Seg, TurnStats};
 use schemaic_term::Screen;
@@ -582,6 +630,10 @@ pub struct TabsActions {
     /// Open the Live Monitor for a `(conn_id, database, table)`: start polling
     /// that table on an interval and reveal the change-log modal.
     pub open_monitor: MonitorFn,
+    /// AI-fill a single grid cell (sample the base table → one-shot AI → stage).
+    pub ai_fill: AiFillFn,
+    /// AI-generate seed rows (Insert Row / Seed Table) → stage pending rows.
+    pub ai_seed: AiSeedFn,
 }
 
 /// The global navigation keys — handled at BOTH the workspace root and inside the
@@ -2024,6 +2076,8 @@ fn center(ui: Ui) -> impl IntoView {
     let commit_edits = ui.tab_actions.commit_edits.clone();
     let follow_fk = ui.tab_actions.open_table_filtered.clone();
     let open_monitor = ui.tab_actions.open_monitor.clone();
+    let ai_fill = ui.tab_actions.ai_fill.clone();
+    let ai_seed = ui.tab_actions.ai_seed.clone();
     let active_db = ui.tabs_ui.active_db;
     let active_db_menu_open = ui.tabs_ui.active_db_menu_open;
     let active_db_anchor = ui.tabs_ui.active_db_anchor;
@@ -2137,6 +2191,8 @@ fn center(ui: Ui) -> impl IntoView {
                     summarize: summarize.clone(),
                     follow_fk: follow_fk.clone(),
                     open_monitor: open_monitor.clone(),
+                    ai_fill: ai_fill.clone(),
+                    ai_seed: ai_seed.clone(),
                     dismiss: dismiss_menus.clone(),
                     commit: commit_edits.clone(),
                     // `results_view` fills this in for the single-result path; the
