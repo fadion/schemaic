@@ -2447,11 +2447,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             // The overlay is anchored to the editor's bottom edge; when the editor is
             // collapsed to height 0 it would otherwise paint a sliver over the panel
             // separator, so drop it from layout entirely.
-            if editor_collapsed.get() {
-                s.hide()
-            } else {
-                s
-            }
+            if editor_collapsed.get() { s.hide() } else { s }
         })
     };
 

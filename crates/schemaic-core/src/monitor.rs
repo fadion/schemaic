@@ -49,7 +49,11 @@ impl Snapshot {
                 .collect();
             let key = key_cols
                 .iter()
-                .map(|&kc| rs.cell(r, kc).map(|cr| cr.display().to_string()).unwrap_or_default())
+                .map(|&kc| {
+                    rs.cell(r, kc)
+                        .map(|cr| cr.display().to_string())
+                        .unwrap_or_default()
+                })
                 .collect();
             rows.push(SnapshotRow { key, cells });
         }
@@ -171,10 +175,7 @@ mod tests {
     fn row(key: &str, cells: &[Option<&str>]) -> SnapshotRow {
         SnapshotRow {
             key: vec![key.to_string()],
-            cells: cells
-                .iter()
-                .map(|c| c.map(|s| s.to_string()))
-                .collect(),
+            cells: cells.iter().map(|c| c.map(|s| s.to_string())).collect(),
         }
     }
 
@@ -243,7 +244,11 @@ mod tests {
         );
         assert_eq!(
             out[0].cells,
-            vec![Some("A".to_string()), Some("x".to_string()), Some("keep".to_string())]
+            vec![
+                Some("A".to_string()),
+                Some("x".to_string()),
+                Some("keep".to_string())
+            ]
         );
     }
 

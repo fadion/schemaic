@@ -130,14 +130,20 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                     Some(msg) => text(msg)
                         .style(|s| s.color(theme::reject_text()).font_size(FONT_LABEL))
                         .into_any(),
-                    None => text("Watching for inserts, updates and deletes — newest at the bottom.")
-                        .style(|s| s.color(theme::text_dim()).font_size(FONT_LABEL))
-                        .into_any(),
+                    None => {
+                        text("Watching for inserts, updates and deletes — newest at the bottom.")
+                            .style(|s| s.color(theme::text_dim()).font_size(FONT_LABEL))
+                            .into_any()
+                    }
                 },
             )
             .style(|s| s.flex_grow(1.0_f32).min_width(0.0));
-            let interval_dd = container(settings_dropdown(interval, [1u64, 2, 5, 10], interval_label))
-                .style(|s| s.width(84.0).flex_shrink(0.0_f32));
+            let interval_dd = container(settings_dropdown(
+                interval,
+                [1u64, 2, 5, 10],
+                interval_label,
+            ))
+            .style(|s| s.width(84.0).flex_shrink(0.0_f32));
             let status = h_stack((status_text, interval_dd)).style(|s| {
                 s.width_full()
                     .flex_row()
@@ -216,9 +222,7 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                             })
                             .style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0));
                     v_stack((table_header, list_scroll))
-                        .style(|s| {
-                            s.flex_col().flex_grow(1.0_f32).width_full().min_height(0.0)
-                        })
+                        .style(|s| s.flex_col().flex_grow(1.0_f32).width_full().min_height(0.0))
                         .into_any()
                 },
             )

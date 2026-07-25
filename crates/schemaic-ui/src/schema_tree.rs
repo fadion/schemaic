@@ -917,6 +917,7 @@ fn column_type_icon(class: ColumnTypeClass) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn column_row(
     c: ColumnInfo,
     kind: ColKey,

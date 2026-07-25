@@ -2053,23 +2053,23 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         value_viewer(gs, viewer_max),
         seed_popover(gs),
     ))
-        .on_resize(move |r| {
-            // Cap so the viewer leaves the grid its `min_height` (~120) + toolbar
-            // (~26) + the viewer's own header (~26): rows ≈ (panel − 172) / 19.
-            // Hard ceiling of 8 rows keeps the whole inspector ≤ 200px
-            // (header 26 + border 1 + field 8*19+15 ≈ 194).
-            let rows = (((r.height() - 172.0) / 19.0).floor() as i64).clamp(1, 8) as usize;
-            if viewer_max.get_untracked() != rows {
-                viewer_max.set(rows);
-            }
-        })
-        .style(|s| {
-            s.flex_grow(1.0_f32)
-                .width_full()
-                .flex_col()
-                .min_height(0.0)
-                .min_width(0.0)
-        })
+    .on_resize(move |r| {
+        // Cap so the viewer leaves the grid its `min_height` (~120) + toolbar
+        // (~26) + the viewer's own header (~26): rows ≈ (panel − 172) / 19.
+        // Hard ceiling of 8 rows keeps the whole inspector ≤ 200px
+        // (header 26 + border 1 + field 8*19+15 ≈ 194).
+        let rows = (((r.height() - 172.0) / 19.0).floor() as i64).clamp(1, 8) as usize;
+        if viewer_max.get_untracked() != rows {
+            viewer_max.set(rows);
+        }
+    })
+    .style(|s| {
+        s.flex_grow(1.0_f32)
+            .width_full()
+            .flex_col()
+            .min_height(0.0)
+            .min_width(0.0)
+    })
 }
 
 /// Handle a key press while the grid body is focused: move the active cell,
@@ -2283,7 +2283,9 @@ fn ai_pulse_tick(gs: GridState) {
     if gs.ai_pulse.try_update(|p| *p += 0.2).is_none() {
         return; // scope disposed
     }
-    floem::action::exec_after(std::time::Duration::from_millis(45), move |_| ai_pulse_tick(gs));
+    floem::action::exec_after(std::time::Duration::from_millis(45), move |_| {
+        ai_pulse_tick(gs)
+    });
 }
 
 /// Stage an AI-filled value into the active cell — a real row (`dirty`) or a
@@ -2366,8 +2368,9 @@ fn ai_fill_value(gs: GridState) {
     };
     // Mark the target real-row cell "generating" (purple pulse); a pending-row
     // cell is left unmarked for now — Insert Row / Seed Table will mark their rows.
-    let gen_cell: Option<(usize, usize)> =
-        pending.is_none().then(|| (order.get(disp).copied().unwrap_or(disp), ci));
+    let gen_cell: Option<(usize, usize)> = pending
+        .is_none()
+        .then(|| (order.get(disp).copied().unwrap_or(disp), ci));
     if let Some(cell) = gen_cell {
         gs.ai_gen.update(|g| {
             g.insert(cell);
@@ -2531,9 +2534,9 @@ fn open_seed_popover(gs: GridState) {
 /// Max rows a single Seed Table request will generate (no point in hundreds here).
 const SEED_ROW_CAP: usize = 50;
 
-/// The "AI Seed Table" count popover: a small panel (numeric field + preset chips
-/// + Generate) anchored under the toolbar, over a click-catcher backdrop. Kick a
-/// seed with `n` rows (clamped 1..=SEED_ROW_CAP) and close. Mounted last in
+/// The "AI Seed Table" count popover: a small panel (numeric field, preset chips,
+/// Generate button) anchored under the toolbar, over a click-catcher backdrop.
+/// Kick a seed with `n` rows (clamped 1..=SEED_ROW_CAP) and close. Mounted last in
 /// `grid_view`'s stack so it draws over the grid; hidden unless `seed_open`.
 fn seed_popover(gs: GridState) -> impl IntoView {
     dyn_container(
@@ -2588,7 +2591,8 @@ fn seed_popover(gs: GridState) -> impl IntoView {
             };
             let go_btn = go.clone();
             let panel = v_stack((
-                text("Seed rows").style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_muted())),
+                text("Seed rows")
+                    .style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_muted())),
                 h_stack((
                     field,
                     container(text("Generate").style(|s| s.font_size(theme::FONT_BODY)))
