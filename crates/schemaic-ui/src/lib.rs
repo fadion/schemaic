@@ -34,11 +34,11 @@ use consts::*;
 use editor_pane::{QueryPaneParams, editor_placeholder, query_pane};
 use grid::{GridCtx, grid_error_bar, grid_find_bar, loaded_view, results_view, running_view};
 use history_panel::history_panel;
+use monitor_view::monitor_overlay;
 use overlays::{
     active_db_menu_overlay, conn_menu_overlay, context_menu_overlay, db_visibility_overlay,
     error_modal_overlay, find_overlay, popup_menu_overlay, schema_settings_overlay,
 };
-use monitor_view::monitor_overlay;
 use plan_view::plan_overlay;
 use schema_tree::schema_panel;
 use settings::{ai_settings_overlay, help_overlay, term_settings_overlay, theme_settings_overlay};
@@ -2249,13 +2249,8 @@ fn center(ui: Ui) -> impl IntoView {
     // Hide the divider while the editor is collapsed — there's nothing to resize,
     // and its position tracks `editor_h` (unchanged during collapse), so it'd
     // otherwise float over the grid.
-    let split_handle = split_handle.style(move |s| {
-        if editor_collapsed.get() {
-            s.hide()
-        } else {
-            s
-        }
-    });
+    let split_handle =
+        split_handle.style(move |s| if editor_collapsed.get() { s.hide() } else { s });
 
     // Identity-colour rule under the tab strip (drawn on the "prominent colour"
     // setting). Wrapping the tab bar in a `stack` pins the 2px line to the bar's

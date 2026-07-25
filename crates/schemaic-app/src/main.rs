@@ -69,10 +69,10 @@ use schemaic_db::{Db, DbError};
 use schemaic_ui::theme::{EditorThemeKind, UiThemeKind};
 use schemaic_ui::{
     AiActions, AiEffort, AiModel, AiUi, ChatMessage, ConnActions, ConnNode, ConnUi, CtxMenu,
-    DraftSignals, HistoryActions, HistoryUi, InlineAiRequest, InlineAiState, LayoutUi, MonitorEntry,
-    OverlayUi,
-    PlanState, ResultPanel, RightPanel, Role, SchemaActions, SchemaScope, SchemaUi, Tab,
-    TabsActions, TabsUi, TermActions, TermCursor, TermUi, TestState, Ui, pick_connection_color,
+    DraftSignals, HistoryActions, HistoryUi, InlineAiRequest, InlineAiState, LayoutUi,
+    MonitorEntry, OverlayUi, PlanState, ResultPanel, RightPanel, Role, SchemaActions, SchemaScope,
+    SchemaUi, Tab, TabsActions, TabsUi, TermActions, TermCursor, TermUi, TestState, Ui,
+    pick_connection_color,
 };
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -265,15 +265,10 @@ fn table_ddl_and_pk(
 ) -> (String, Vec<String>) {
     db_nodes
         .with_untracked(|nodes| {
-            nodes
-                .iter()
-                .find(|n| n.database == database)
-                .and_then(|n| match n.schema.get_untracked() {
-                    schemaic_core::schema::SchemaState::Loaded(s) => s
-                        .tables
-                        .iter()
-                        .find(|t| t.name == table)
-                        .map(|t| {
+            nodes.iter().find(|n| n.database == database).and_then(|n| {
+                match n.schema.get_untracked() {
+                    schemaic_core::schema::SchemaState::Loaded(s) => {
+                        s.tables.iter().find(|t| t.name == table).map(|t| {
                             let pk = t
                                 .columns
                                 .iter()
@@ -281,9 +276,11 @@ fn table_ddl_and_pk(
                                 .map(|c| c.name.clone())
                                 .collect();
                             (t.create_ddl(), pk)
-                        }),
+                        })
+                    }
                     _ => None,
-                })
+                }
+            })
         })
         .unwrap_or_default()
 }
@@ -2902,7 +2899,8 @@ fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
         Ok(rs) => {
             if ctx.prev.borrow().is_none() {
                 // Baseline poll: capture columns + resolve the identity key once.
-                ctx.cols.set(rs.columns.iter().map(|c| c.name.clone()).collect());
+                ctx.cols
+                    .set(rs.columns.iter().map(|c| c.name.clone()).collect());
                 let db_nodes = ctx.db_nodes;
                 let model = analyze_edit(&rs, |db, table| {
                     db_nodes.with_untracked(|nodes| {
