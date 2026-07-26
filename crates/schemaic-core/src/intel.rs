@@ -3203,6 +3203,128 @@ fn join_targets_for(scope: &[TableRef], catalog: &Catalog) -> Vec<JoinTarget> {
     out
 }
 
+/// A `SELECT *` / `t.*` expansion: the byte range of the star (or `qualifier.*`) and
+/// the explicit column list to replace it with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StarExpansion {
+    /// Byte range to replace (the `*`, or `t.*` for a qualified star).
+    pub range: (usize, usize),
+    /// The comma-separated column list, e.g. `id, name` or `e.id, e.name, d.id`.
+    pub replacement: String,
+}
+
+/// If the caret sits right after a projection `*` (or `t.*`), return the explicit
+/// column list to expand it to. Columns are qualified by alias/table name when more
+/// than one table is in scope (or the star is qualified), unqualified for a single
+/// table. Conservative: only a genuine projection star expands — a `COUNT(*)`
+/// argument, a multiplication (`a * b`), or a star outside the SELECT list is left
+/// alone; an in-scope table with unknown (unloaded) columns aborts the whole
+/// expansion rather than emit a partial list.
+pub fn expand_star(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    caret: usize,
+    catalog: &Catalog,
+) -> Option<StarExpansion> {
+    let b = sql.as_bytes();
+    // The caret must sit right after a `*` (trailing whitespace allowed).
+    let mut p = caret.min(hi);
+    while p > lo && matches!(b[p - 1], b' ' | b'\t' | b'\n' | b'\r') {
+        p -= 1;
+    }
+    if p == lo || b[p - 1] != b'*' {
+        return None;
+    }
+    let star_end = p;
+    let star = p - 1;
+    // A `qualifier.` immediately before the star → a qualified `t.*`.
+    let (range_start, qualifier) = if star > lo && b[star - 1] == b'.' {
+        let dot = star - 1;
+        let mut s = dot;
+        while s > lo && is_word_byte(b[s - 1]) {
+            s -= 1;
+        }
+        if s < dot {
+            (s, Some(sql[s..dot].to_string()))
+        } else {
+            (star, None)
+        }
+    } else {
+        (star, None)
+    };
+    let toks = tokenize_range(sql, lo, hi);
+    // Must be in the SELECT projection clause.
+    let mut last_kw = None;
+    for t in &toks {
+        if t.at >= star {
+            break;
+        }
+        if let TkKind::Word(w) = &t.kind
+            && CLAUSE_KEYWORDS.contains(&w.to_ascii_uppercase().as_str())
+        {
+            last_kw = Some(w.to_ascii_uppercase());
+        }
+    }
+    if last_kw.as_deref() != Some("SELECT") {
+        return None;
+    }
+    // For a plain star, the immediately-preceding token must be `SELECT`/`DISTINCT`
+    // or a comma — otherwise it's an operator (`a * b`) or a function arg (`COUNT(*)`).
+    if qualifier.is_none() {
+        let prev = toks.iter().rfind(|t| t.at < star);
+        let standalone = match prev.map(|t| &t.kind) {
+            Some(TkKind::Word(w)) => {
+                w.eq_ignore_ascii_case("SELECT") || w.eq_ignore_ascii_case("DISTINCT")
+            }
+            Some(TkKind::Comma) => true,
+            _ => false,
+        };
+        if !standalone {
+            return None;
+        }
+    }
+    let scope = statement_scope(sql, lo, hi, caret, SqlDialect::MySql).tables;
+    if scope.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    match &qualifier {
+        Some(qual) => {
+            let tref = scope.iter().find(|r| {
+                r.alias
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(qual))
+                    || (r.alias.is_none() && r.name.eq_ignore_ascii_case(qual))
+            })?;
+            for c in catalog.columns_of(tref)? {
+                parts.push(format!("{qual}.{c}"));
+            }
+        }
+        None => {
+            let multi = scope.len() > 1;
+            for r in &scope {
+                let cols = catalog.columns_of(r)?; // any unknown → bail (conservative)
+                let qual = r.alias.clone().unwrap_or_else(|| r.name.clone());
+                for c in cols {
+                    if multi {
+                        parts.push(format!("{qual}.{c}"));
+                    } else {
+                        parts.push(c.clone());
+                    }
+                }
+            }
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(StarExpansion {
+        range: (range_start, star_end),
+        replacement: parts.join(", "),
+    })
+}
+
 // ── DB-validated diagnostics (Tier 2) ────────────────────────────────────────
 
 /// Does `stmt` parse cleanly as SQL in `dialect`? The live DB validation gates on
@@ -4586,6 +4708,52 @@ mod tests {
         // `customers` already joined → don't re-suggest it.
         let ts = jt("SELECT * FROM orders o JOIN customers c JOIN ");
         assert!(!ts.iter().any(|t| t.table == "customers"));
+    }
+
+    // ── SELECT * expansion ────────────────────────────────────────────────────
+
+    fn expand(sql: &str, caret: usize) -> Option<StarExpansion> {
+        let (schema, db) = sample_catalog();
+        let cat = Catalog::build(&[(db, &schema)], Some(db));
+        expand_star(sql, 0, sql.len(), caret, &cat)
+    }
+
+    #[test]
+    fn expand_star_single_table_unqualified() {
+        let sql = "SELECT * FROM employees";
+        let e = expand(sql, 8).unwrap(); // caret right after `*`
+        assert_eq!(&sql[e.range.0..e.range.1], "*");
+        assert_eq!(e.replacement, "id, name, salary, dept_id");
+    }
+
+    #[test]
+    fn expand_star_multi_table_qualifies_by_alias() {
+        let sql = "SELECT * FROM employees e JOIN departments d ON e.dept_id = d.id";
+        let e = expand(sql, 8).unwrap();
+        assert_eq!(
+            e.replacement,
+            "e.id, e.name, e.salary, e.dept_id, d.id, d.name"
+        );
+    }
+
+    #[test]
+    fn expand_qualified_star() {
+        let sql = "SELECT e.* FROM employees e";
+        let e = expand(sql, 10).unwrap(); // right after the `*` in `e.*`
+        assert_eq!(&sql[e.range.0..e.range.1], "e.*");
+        assert_eq!(e.replacement, "e.id, e.name, e.salary, e.dept_id");
+    }
+
+    #[test]
+    fn expand_star_ignores_non_projection_stars() {
+        // COUNT(*) argument.
+        assert!(expand("SELECT COUNT(*) FROM employees", 14).is_none());
+        // Multiplication in an expression, not a projection star.
+        assert!(expand("SELECT salary * dept_id FROM employees", 15).is_none());
+        // No star at the caret.
+        assert!(expand("SELECT id FROM employees", 9).is_none());
+        // No FROM/scope → nothing to expand.
+        assert!(expand("SELECT * ", 8).is_none());
     }
 
     // ── DB-validated diagnostics ──────────────────────────────────────────────

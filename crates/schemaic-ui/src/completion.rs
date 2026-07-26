@@ -94,6 +94,9 @@ pub(crate) struct Suggestion {
     /// displays `orders` but inserts `orders ON o.customer_id = orders.id`. `None`
     /// inserts `text` verbatim.
     insert: Option<String>,
+    /// Absolute byte range to replace on accept, overriding the default word range —
+    /// used by `SELECT *` expansion to swap the `*` (or `t.*`) for the column list.
+    replace: Option<(usize, usize)>,
 }
 
 fn is_word_byte(b: u8) -> bool {
@@ -327,6 +330,8 @@ struct Cand {
     tier: u8,
     /// Splice-on-accept override (see [`Suggestion::insert`]).
     insert: Option<String>,
+    /// Replace-range override (see [`Suggestion::replace`]).
+    replace: Option<(usize, usize)>,
 }
 
 /// Recompute context-aware suggestions for the word at the caret. Ranks the most
@@ -386,6 +391,7 @@ pub(crate) fn recompute_completions(
                 icon: icons::KEY_SQUARE,
                 key: KeyKind::Foreign,
                 insert: None,
+                replace: None,
             }]);
             comp.sel.set(0);
             comp.open.set(true);
@@ -430,6 +436,7 @@ pub(crate) fn recompute_completions(
             key: KeyKind::None,
             tier,
             insert: None,
+            replace: None,
         });
     };
     // The detail string for a column typed against its own metadata: the type,
@@ -472,6 +479,7 @@ pub(crate) fn recompute_completions(
             key,
             tier,
             insert: None,
+            replace: None,
         });
     };
     let cols_of = |name: &str| -> Vec<ColMeta> {
@@ -558,6 +566,7 @@ pub(crate) fn recompute_completions(
                     key: KeyKind::Foreign,
                     tier: 0,
                     insert: Some(format!("{} ON {}", jt.table, jt.predicate)),
+                    replace: None,
                 });
             }
             // With FK targets present, keep them strictly above the plain table list.
@@ -681,6 +690,25 @@ pub(crate) fn recompute_completions(
         }
     }
 
+    // SELECT * expansion: when the caret sits right after a projection `*`/`t.*`,
+    // offer an item that rewrites it into the explicit column list (shown when the
+    // popup opens here — e.g. via Ctrl+Space, since the list doesn't auto-open on `*`).
+    if let Some(exp) = star_expansion(&text, lo, hi, offset, db_nodes, active_db) {
+        let ncols = exp.replacement.matches(',').count() + 1;
+        cands.push(Cand {
+            text: "expand *".to_string(),
+            kind: SuggestKind::Column,
+            detail: format!("{ncols} columns"),
+            table: String::new(),
+            alias: String::new(),
+            icon: icons::TABLE,
+            key: KeyKind::None,
+            tier: 0,
+            insert: Some(exp.replacement),
+            replace: Some(exp.range),
+        });
+    }
+
     // Identifiers already written in this statement rank a little higher (recency):
     // you tend to reference the same columns/tables again.
     let used = statement_identifiers(&text, lo, hi, (word_lo, offset));
@@ -711,6 +739,7 @@ pub(crate) fn recompute_completions(
             icon: c.icon,
             key: c.key,
             insert: c.insert,
+            replace: c.replace,
         })
         .collect();
 
@@ -732,14 +761,14 @@ pub(crate) fn accept_completion(ed: &Editor, comp: Completion) {
     let text = doc.text().to_string();
     let start = word_start(&text, offset);
     let idx = comp.sel.get_untracked();
-    if let Some((word, kind, over)) = comp.items.with_untracked(|v| {
+    if let Some((word, kind, over, replace)) = comp.items.with_untracked(|v| {
         v.get(idx)
-            .map(|s| (s.text.clone(), s.kind, s.insert.clone()))
+            .map(|s| (s.text.clone(), s.kind, s.insert.clone(), s.replace))
     }) {
         comp.suppress.set(true);
         let (insert, caret) = if let Some(over) = over {
-            // An explicit splice override (e.g. an FK JOIN target: `orders ON …`);
-            // caret lands at its end.
+            // An explicit splice override (e.g. an FK JOIN target: `orders ON …`, or a
+            // `SELECT *` expansion); caret lands at its end.
             let len = over.len();
             (over, len)
         } else {
@@ -748,17 +777,39 @@ pub(crate) fn accept_completion(ed: &Editor, comp: Completion) {
             let followed_by_paren = text[offset..].trim_start().starts_with('(');
             completion_insertion(&word, kind == SuggestKind::Function, followed_by_paren)
         };
-        doc.edit_single(
-            Selection::region(start, offset),
-            &insert,
-            EditType::Completion,
-        );
+        // Most completions replace the word being typed; a `replace` override (star
+        // expansion) swaps a specific range instead (the `*` / `t.*`).
+        let (from, to) = replace.unwrap_or((start, offset));
+        doc.edit_single(Selection::region(from, to), &insert, EditType::Completion);
         // `edit_single` doesn't move the caret, so place it explicitly.
         ed.cursor
-            .update(|c| c.set_offset(start + caret, false, false));
+            .update(|c| c.set_offset(from + caret, false, false));
     }
     comp.open.set(false);
     comp.items.set(Vec::new());
+}
+
+/// `SELECT *` expansion for the candidate at the caret, or `None`. Cheap-guards on
+/// the caret sitting right after a `*` before building the catalog + delegating to
+/// `intel::expand_star`, so the common keystroke path stays allocation-free.
+fn star_expansion(
+    text: &str,
+    lo: usize,
+    hi: usize,
+    offset: usize,
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    active_db: Option<&str>,
+) -> Option<intel::StarExpansion> {
+    let b = text.as_bytes();
+    let mut p = offset.min(hi);
+    while p > lo && matches!(b.get(p - 1), Some(b' ') | Some(b'\t')) {
+        p -= 1;
+    }
+    if p <= lo || b.get(p - 1) != Some(&b'*') {
+        return None;
+    }
+    let catalog = build_catalog(db_nodes, active_db);
+    intel::expand_star(text, lo, hi, offset, &catalog)
 }
 
 /// The text to splice for an accepted completion and the caret offset *within* that
@@ -840,6 +891,7 @@ pub(crate) fn completion_popup(comp: Completion) -> impl IntoView {
                         icon,
                         key,
                         insert: _,
+                        replace: _,
                     } = item;
                     let color = suggest_color(kind);
                     // Schema-style leading glyph, coloured by kind/key (see
