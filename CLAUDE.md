@@ -15,10 +15,13 @@ Zed-inspired, aiming to replace DataGrip.
     *complete* statement with a real per-dialect AST (`sqlparser`; `SqlDialect` seam — MySQL wired,
     Postgres/SQLite are future arms) and answers what a token stream can't: `statement_scope`
     (tables/aliases/CTEs/derived-tables in scope, AST-backed with a `skip_noncode` lexer fallback for
-    mid-edit), `clause_context` (caret context for completion), and `diagnostics` → `Vec<Diagnostic>`
-    (catalog-aware unknown-table / unknown-`alias.col`, syntax errors on completed statements, and
-    keyword-typo warnings). **AST for classification, `skip_noncode` for byte positions** (sqlparser
-    spans are still maturing) — squiggle placement stays exact. `Catalog` is the case-folded view over
+    mid-edit), `clause_context`/`clause_continuation` (caret context + expected-token model for
+    completion), and `diagnostics` → `Vec<Diagnostic>` (catalog-aware unknown-table, unknown-column via
+    the per-scope resolver `colres` — qualified *and* unqualified, across subqueries/derived-tables/CTEs
+    with correlation — reserved-keyword-alias errors, syntax errors on completed statements, and
+    keyword-typo warnings). **AST for classification, `skip_noncode` for byte positions by default** —
+    except `colres`, which uses sqlparser 0.62's now-accurate per-identifier *spans* (verified) so the
+    same column name in an inner vs outer scope is placed independently. `Catalog` is the case-folded view over
     the introspected `DbSchema`s (columns + FK edges). Hosts the shared `SQL_KEYWORDS`/`SQL_FUNCTIONS`/
     `STMT_KEYWORDS` (the UI's completion + editor build on these). Also `join_condition` (FK-aware
     `JOIN … ON` auto-fill), `db_error_diagnostic` (positions a live DB error within the statement), and
@@ -105,7 +108,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   `sqlparser` AST (with a `skip_noncode` fallback for mid-edit); the **DB stays the semantic
   authority** (don't hand-roll type checking / name resolution — that's a planned PREPARE/EXPLAIN
   tier). New dialects are a `SqlDialect` arm, not a parallel analyzer. Use the AST for classification
-  and `skip_noncode` byte offsets for positions (AST spans are still maturing upstream).
+  and `skip_noncode` byte offsets for positions by default; the exception is the per-scope column
+  resolver (`intel::colres`), which relies on sqlparser 0.62's per-identifier spans (accurate — verified)
+  because per-occurrence positions can't come from the lexer. Name resolution here is deliberately
+  conservative: an unenumerable source (unloaded/unknown table, `SELECT *` derived/CTE) is *open* so
+  uncertainty never yields a false positive; the DB stays the authority for type checking.
 - **Connection identity is the `Db` handle / `conn_id`, never a `mysql://user:pass@host/db` URL.**
   Credentials go through `OptsBuilder`; never in a URL, argv, or log. The MCP subprocess gets its
   endpoint via a temp `--mcp-config` file, not argv. Don't add new plaintext-secret surfaces.
