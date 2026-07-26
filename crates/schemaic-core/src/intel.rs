@@ -1024,6 +1024,9 @@ pub struct Catalog {
     /// table_lower → its foreign-key edges (active-db scoped), for the FK-aware
     /// `JOIN … ON` completion.
     fks: HashMap<String, Vec<FkEdge>>,
+    /// table_lower → its primary-key column names (lower, active-db scoped), for
+    /// the `only_full_group_by` functional-dependency exemption.
+    pks: HashMap<String, Vec<String>>,
     /// Loaded database names (lower).
     loaded_dbs: HashSet<String>,
     /// The active database (lower), if any.
@@ -1050,6 +1053,7 @@ impl Catalog {
         let mut qualified = HashMap::new();
         let mut unqualified: HashMap<String, Vec<String>> = HashMap::new();
         let mut fks: HashMap<String, Vec<FkEdge>> = HashMap::new();
+        let mut pks: HashMap<String, Vec<String>> = HashMap::new();
         let mut loaded_dbs = HashSet::new();
         let mut known_idents = HashSet::new();
         let active_lower = active_db.map(|d| d.to_ascii_lowercase());
@@ -1077,6 +1081,15 @@ impl Catalog {
                             entry.push(c);
                         }
                     }
+                    let pk: Vec<String> = t
+                        .columns
+                        .iter()
+                        .filter(|c| c.primary_key)
+                        .map(|c| c.name.to_ascii_lowercase())
+                        .collect();
+                    if !pk.is_empty() {
+                        pks.insert(t.name.to_ascii_lowercase(), pk);
+                    }
                     if !t.foreign_keys.is_empty() {
                         fks.entry(t.name.to_ascii_lowercase()).or_default().extend(
                             t.foreign_keys.iter().map(|fk| FkEdge {
@@ -1093,10 +1106,16 @@ impl Catalog {
             qualified,
             unqualified,
             fks,
+            pks,
             loaded_dbs,
             active_db: active_lower,
             known_idents,
         }
+    }
+
+    /// The primary-key columns (lower) of an active-db table, if known and non-empty.
+    fn pk_of(&self, table_lower: &str) -> Option<&Vec<String>> {
+        self.pks.get(table_lower)
     }
 
     /// The database whose schema decides an unqualified reference: the active db,
@@ -1896,8 +1915,8 @@ mod colres {
     use std::ops::ControlFlow;
 
     use sqlparser::ast::{
-        Cte, Expr, JoinConstraint, JoinOperator, Query, Select, SelectItem, SetExpr, Spanned,
-        Statement, TableAlias, TableFactor, TableWithJoins, Visit, Visitor,
+        Cte, Expr, GroupByExpr, JoinConstraint, JoinOperator, Query, Select, SelectItem, SetExpr,
+        Spanned, Statement, TableAlias, TableFactor, TableWithJoins, Visit, Visitor,
     };
     use sqlparser::tokenizer::Span;
 
@@ -1956,6 +1975,7 @@ mod colres {
             ctes: HashMap::new(),
             scopes: Vec::new(),
             refs: Vec::new(),
+            gb: Vec::new(),
         };
         let _ = ast.visit(&mut c);
         for r in &c.refs {
@@ -1963,6 +1983,7 @@ mod colres {
                 out.push(d);
             }
         }
+        out.append(&mut c.gb);
     }
 
     struct Collector<'a> {
@@ -1973,6 +1994,8 @@ mod colres {
         ctes: HashMap<String, Cols>,
         scopes: Vec<Scope>,
         refs: Vec<Ref>,
+        /// `only_full_group_by` warnings collected per SELECT scope as it's pushed.
+        gb: Vec<Diagnostic>,
     }
 
     impl Visitor for Collector<'_> {
@@ -2043,6 +2066,14 @@ mod colres {
         fn push_scope(&mut self, range: (usize, usize), sel: &Select) {
             let (sources, proj_aliases) = build_sources(sel, self.catalog, &self.ctes);
             let (coalesced, natural) = coalesced_cols(sel);
+            group_by_check(
+                sel,
+                &sources,
+                self.catalog,
+                self.stmt,
+                self.lo,
+                &mut self.gb,
+            );
             self.scopes.push(Scope {
                 range,
                 sources,
@@ -2168,6 +2199,81 @@ mod colres {
             }
         }
         (sources, proj_aliases(sel))
+    }
+
+    /// `only_full_group_by`: with a `GROUP BY`, every projected column must be a
+    /// grouping column or live inside an aggregate. Deliberately conservative — it
+    /// fires only for a *single, fully-known base table* (multi-source / derived /
+    /// unloaded FROMs are skipped), skips non-column grouping expressions and
+    /// wildcards, and exempts the whole query when the grouping set contains the
+    /// table's full primary key (functional dependency, MySQL's own exemption).
+    fn group_by_check(
+        sel: &Select,
+        sources: &[Src],
+        catalog: &Catalog,
+        stmt: &str,
+        lo: usize,
+        out: &mut Vec<Diagnostic>,
+    ) {
+        let GroupByExpr::Expressions(exprs, _) = &sel.group_by else {
+            return;
+        };
+        if exprs.is_empty() {
+            return;
+        }
+        // The grouping set, as simple column names. A non-column grouping expression
+        // (e.g. `GROUP BY YEAR(hired)`) is too complex to reason about → bail.
+        let mut grouped: HashSet<String> = HashSet::new();
+        for e in exprs {
+            match e {
+                Expr::Identifier(id) => {
+                    grouped.insert(id.value.to_ascii_lowercase());
+                }
+                Expr::CompoundIdentifier(parts) if !parts.is_empty() => {
+                    grouped.insert(parts[parts.len() - 1].value.to_ascii_lowercase());
+                }
+                _ => return,
+            }
+        }
+        // Need exactly one base table with a known column set to judge safely.
+        let [src] = sources else { return };
+        let Cols::Known(known) = &src.cols else {
+            return;
+        };
+        let Some(table) = &src.table else { return };
+        // Grouping by the full primary key functionally determines every column.
+        if let Some(pk) = catalog.pk_of(&table.to_ascii_lowercase())
+            && pk.iter().all(|k| grouped.contains(k))
+        {
+            return;
+        }
+        for item in &sel.projection {
+            let expr = match item {
+                SelectItem::UnnamedExpr(e) => e,
+                SelectItem::ExprWithAlias { expr, .. } => expr,
+                _ => continue, // `*` / `t.*` → can't enumerate, skip
+            };
+            let (name, span) = match expr {
+                Expr::Identifier(id) => (id.value.to_ascii_lowercase(), id.span),
+                Expr::CompoundIdentifier(parts) if !parts.is_empty() => {
+                    let last = &parts[parts.len() - 1];
+                    (last.value.to_ascii_lowercase(), last.span)
+                }
+                _ => continue, // aggregate / expression / literal → not a bare column
+            };
+            if grouped.contains(&name) || !known.contains(&name) {
+                // Grouped (fine) or not a real column of this table (an
+                // unknown-column error already covers it — don't double-flag).
+                continue;
+            }
+            out.push(Diagnostic {
+                range: to_range(stmt, lo, span),
+                severity: Severity::Warning,
+                message: format!(
+                    "Column `{name}` must appear in GROUP BY or be used in an aggregate"
+                ),
+            });
+        }
     }
 
     /// Columns coalesced by a `USING(...)` join in this SELECT's FROM (lowercased),
@@ -3174,6 +3280,89 @@ mod tests {
         );
         // A single table is never ambiguous.
         assert!(col_errors("SELECT id FROM employees").is_empty());
+    }
+
+    // ── only_full_group_by ─────────────────────────────────────────────────────
+
+    fn gb_warnings(sql: &str) -> Vec<String> {
+        diag(sql)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Warning && d.message.contains("GROUP BY"))
+            .map(|d| d.message)
+            .collect()
+    }
+
+    /// Like `diag`, but with `employees.id` marked as the primary key.
+    fn diag_pk(sql: &str) -> Vec<Diagnostic> {
+        let mut emp = tbl("employees", &["id", "name", "salary", "dept_id"]);
+        emp.columns[0].primary_key = true;
+        let schema = DbSchema {
+            tables: vec![emp, tbl("departments", &["id", "name"])],
+        };
+        let cat = Catalog::build(&[("company", &schema)], Some("company"));
+        diagnostics(sql, &cat, SqlDialect::MySql)
+    }
+
+    #[test]
+    fn diag_only_full_group_by_flags_ungrouped_column() {
+        // `name` is neither grouped nor aggregated → warning on the column itself.
+        let sql = "SELECT dept_id, name FROM employees GROUP BY dept_id";
+        let w: Vec<_> = diag(sql)
+            .into_iter()
+            .filter(|x| x.severity == Severity::Warning && x.message.contains("GROUP BY"))
+            .collect();
+        assert_eq!(w.len(), 1);
+        assert_eq!(&sql[w[0].range.0..w[0].range.1], "name");
+    }
+
+    #[test]
+    fn diag_only_full_group_by_clean_cases() {
+        for sql in [
+            "SELECT dept_id, COUNT(*) FROM employees GROUP BY dept_id",
+            "SELECT dept_id, SUM(salary) FROM employees GROUP BY dept_id",
+            "SELECT dept_id FROM employees GROUP BY dept_id HAVING COUNT(*) > 1",
+            "SELECT COUNT(*) FROM employees", // no GROUP BY at all
+            "SELECT name, salary FROM employees GROUP BY name, salary", // all grouped
+            "SELECT * FROM employees GROUP BY dept_id", // wildcard → skip
+        ] {
+            assert!(gb_warnings(sql).is_empty(), "false positive: {sql}");
+        }
+    }
+
+    #[test]
+    fn diag_only_full_group_by_pk_functional_dependency() {
+        // Grouping by the primary key determines every column → no violation.
+        assert!(
+            diag_pk("SELECT id, name, salary FROM employees GROUP BY id")
+                .iter()
+                .all(|d| !d.message.contains("GROUP BY"))
+        );
+        // Grouping by a non-PK column still flags the ungrouped projection.
+        assert!(
+            diag_pk("SELECT id, name FROM employees GROUP BY dept_id")
+                .iter()
+                .any(|d| d.message.contains("GROUP BY"))
+        );
+    }
+
+    #[test]
+    fn diag_only_full_group_by_conservative_on_multi_source() {
+        // Multiple sources → skipped (avoid false positives across functional deps).
+        assert!(
+            gb_warnings(
+                "SELECT e.name, d.name FROM employees e JOIN departments d ON e.dept_id = d.id GROUP BY e.dept_id"
+            )
+            .is_empty()
+        );
+        // A non-column grouping expression → skipped.
+        assert!(gb_warnings("SELECT name FROM employees GROUP BY UPPER(name)").is_empty());
+    }
+
+    #[test]
+    fn diag_only_full_group_by_inside_subquery() {
+        // The rule applies to a derived table's own SELECT too.
+        let sql = "SELECT * FROM (SELECT dept_id, name FROM employees GROUP BY dept_id) d";
+        assert!(gb_warnings(sql).iter().any(|m| m.contains("`name`")));
     }
 
     #[test]
