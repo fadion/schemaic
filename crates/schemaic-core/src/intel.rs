@@ -348,6 +348,398 @@ pub fn clause_context(sql: &str, lo: usize, word_lo: usize) -> ClauseCtx {
     }
 }
 
+// ── Expected-token continuation model ────────────────────────────────────────
+// Beyond "which clause are we in" ([`clause_context`], which schema *candidates* to
+// rank), the completion popup needs "which *keyword* comes next" from SQL's fixed
+// clause grammar — so `WHERE` outranks the generic keyword bag after a complete
+// table ref, `FROM` is #1 after the projection, and multi-word phrases (`GROUP BY`,
+// `LEFT JOIN`, `IS NOT NULL`) are single suggestions. SQL's clause order is small +
+// stable, so a hand table (grown case-by-case, each with a test) beats a generic
+// parser here and stays dialect-perfect.
+
+/// The leading statement kind, which decides the clause grammar to follow.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StmtKind {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Other,
+}
+
+/// The clause the caret currently sits in, tracked by [`scan_clauses`]. Multi-word
+/// clauses have both an incomplete arm (`Group` = `GROUP` typed, `BY` expected) and
+/// a complete one (`GroupBy`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Clause {
+    None,
+    Select,
+    From,
+    JoinMod, // a bare `LEFT`/`INNER`/… — `JOIN` still expected
+    Join,
+    On,
+    Using,
+    Where,
+    Group,
+    GroupBy,
+    Having,
+    Order,
+    OrderBy,
+    Limit,
+    Offset,
+    Update,
+    Set,
+    Insert,
+    Into,
+    Values,
+}
+
+/// Ranked keyword/phrase continuations the SQL grammar expects at the caret, plus
+/// whether the completion popup should auto-open on an empty prefix here. Feeds the
+/// **top tier** of the completion popup so a legal next clause keyword outranks the
+/// generic keyword bag (and, after a complete table ref, the schema table names).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Continuation {
+    /// Expected next keyword/phrase suggestions, best first.
+    pub keywords: Vec<String>,
+    /// True when the caret sits right after a clause keyword (or comma) that takes
+    /// an operand — `WHERE`/`ON`/`SET`/`ORDER BY`/`FROM`/… — so the popup opens
+    /// without a typed prefix (DataGrip-style: columns after `WHERE`, tables after
+    /// `FROM`).
+    pub auto_show: bool,
+}
+
+/// The byte offset to start scanning the caret's local clause sequence from: just
+/// inside the innermost unclosed `(` before the caret (so a subquery's clauses
+/// don't bleed in from the outer query), else `lo`.
+fn local_scope_start(sql: &str, lo: usize, caret: usize) -> usize {
+    let toks = tokenize_range(sql, lo, caret);
+    let mut stack: Vec<usize> = Vec::new();
+    for t in &toks {
+        match t.kind {
+            TkKind::LParen => stack.push(t.at),
+            TkKind::RParen => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    stack.last().map(|&at| at + 1).unwrap_or(lo)
+}
+
+/// Reduce the top-level token sequence before the caret into the current clause,
+/// how much of its operand slot is filled, and which clauses have already appeared.
+/// Returns `(kind, current_clause, operand_count, seen, select_has_content,
+/// select_has_star, distinct_seen)`. `operand_count` resets at each clause keyword
+/// *and* comma, so it answers "is the current slot non-empty" (a trailing comma →
+/// empty again); `select_has_content` persists across commas (any projection item
+/// ever seen), so DISTINCT is only offered before the very first one.
+fn scan_clauses(
+    sql: &str,
+    toks: &[Token],
+    scan_end: usize,
+) -> (StmtKind, Clause, usize, Vec<Clause>, bool, bool, bool) {
+    let word_up = |t: &Token| -> Option<String> {
+        if let TkKind::Word(w) = &t.kind {
+            Some(w.to_ascii_uppercase())
+        } else {
+            None
+        }
+    };
+    let mut kind = StmtKind::Other;
+    let mut cur = Clause::None;
+    let mut operand = 0usize;
+    let mut seen: Vec<Clause> = Vec::new();
+    let mut select_has_content = false;
+    let mut distinct_seen = false;
+    let mut select_kw_end = 0usize;
+    let mut first = true;
+    let push_seen = |seen: &mut Vec<Clause>, c: Clause| {
+        if !seen.contains(&c) {
+            seen.push(c);
+        }
+    };
+    let mut i = 0;
+    while i < toks.len() {
+        if let Some(up) = word_up(&toks[i]) {
+            if first {
+                kind = match up.as_str() {
+                    "SELECT" | "WITH" => StmtKind::Select,
+                    "INSERT" | "REPLACE" => StmtKind::Insert,
+                    "UPDATE" => StmtKind::Update,
+                    "DELETE" => StmtKind::Delete,
+                    _ => StmtKind::Other,
+                };
+                first = false;
+            }
+            match up.as_str() {
+                "SELECT" => {
+                    cur = Clause::Select;
+                    operand = 0;
+                    select_kw_end = toks[i].at + 6;
+                    push_seen(&mut seen, Clause::Select);
+                }
+                "FROM" => {
+                    cur = Clause::From;
+                    operand = 0;
+                    push_seen(&mut seen, Clause::From);
+                }
+                "WHERE" => {
+                    cur = Clause::Where;
+                    operand = 0;
+                    push_seen(&mut seen, Clause::Where);
+                }
+                "HAVING" => {
+                    cur = Clause::Having;
+                    operand = 0;
+                    push_seen(&mut seen, Clause::Having);
+                }
+                "LIMIT" => {
+                    cur = Clause::Limit;
+                    operand = 0;
+                    push_seen(&mut seen, Clause::Limit);
+                }
+                "OFFSET" => {
+                    cur = Clause::Offset;
+                    operand = 0;
+                    push_seen(&mut seen, Clause::Offset);
+                }
+                "SET" => {
+                    cur = Clause::Set;
+                    operand = 0;
+                    push_seen(&mut seen, Clause::Set);
+                }
+                "VALUES" => {
+                    cur = Clause::Values;
+                    operand = 0;
+                }
+                "ON" => {
+                    cur = Clause::On;
+                    operand = 0;
+                }
+                "USING" => {
+                    cur = Clause::Using;
+                    operand = 0;
+                }
+                "JOIN" | "STRAIGHT_JOIN" => {
+                    cur = Clause::Join;
+                    operand = 0;
+                    push_seen(&mut seen, Clause::Join);
+                }
+                "LEFT" | "RIGHT" | "INNER" | "OUTER" | "CROSS" | "FULL" => {
+                    cur = Clause::JoinMod;
+                    operand = 0;
+                }
+                "UPDATE" => {
+                    cur = Clause::Update;
+                    operand = 0;
+                }
+                "INSERT" | "REPLACE" => {
+                    cur = Clause::Insert;
+                    operand = 0;
+                }
+                "INTO" => {
+                    cur = Clause::Into;
+                    operand = 0;
+                }
+                "GROUP" => {
+                    if toks
+                        .get(i + 1)
+                        .and_then(&word_up)
+                        .as_deref()
+                        .is_some_and(|w| w == "BY")
+                    {
+                        cur = Clause::GroupBy;
+                        push_seen(&mut seen, Clause::GroupBy);
+                        i += 1;
+                    } else {
+                        cur = Clause::Group;
+                    }
+                    operand = 0;
+                }
+                "ORDER" => {
+                    if toks
+                        .get(i + 1)
+                        .and_then(&word_up)
+                        .as_deref()
+                        .is_some_and(|w| w == "BY")
+                    {
+                        cur = Clause::OrderBy;
+                        push_seen(&mut seen, Clause::OrderBy);
+                        i += 1;
+                    } else {
+                        cur = Clause::Order;
+                    }
+                    operand = 0;
+                }
+                "BY" => {
+                    // A `BY` reached on its own (e.g. `GROUP  BY` with extra space):
+                    // complete whichever partial clause preceded it.
+                    cur = match cur {
+                        Clause::Group => {
+                            push_seen(&mut seen, Clause::GroupBy);
+                            Clause::GroupBy
+                        }
+                        Clause::Order => {
+                            push_seen(&mut seen, Clause::OrderBy);
+                            Clause::OrderBy
+                        }
+                        other => other,
+                    };
+                    operand = 0;
+                }
+                // Boolean connectives keep us in the current clause but reopen the
+                // operand slot (a new column/value is expected after them).
+                "AND" | "OR" => operand = 0,
+                // Modifiers that don't fill the operand slot on their own.
+                "AS" | "NOT" | "ALL" | "ASC" | "DESC" => {}
+                "DISTINCT" => distinct_seen = true,
+                _ => {
+                    operand += 1;
+                    if cur == Clause::Select {
+                        select_has_content = true;
+                    }
+                }
+            }
+        } else if matches!(toks[i].kind, TkKind::Comma) {
+            // A new list item (projection / FROM list / ORDER BY / VALUES) reopens
+            // the operand slot.
+            operand = 0;
+        }
+        i += 1;
+    }
+    // `*` (and `count(*)`) is a projection but the tokenizer drops it, so scan the
+    // raw SELECT-clause span (up to the caret's word) for one to know the projection
+    // is non-empty.
+    let select_has_star = matches!(cur, Clause::Select)
+        && sql
+            .get(select_kw_end..scan_end)
+            .is_some_and(|s| s.contains('*'));
+    (
+        kind,
+        cur,
+        operand,
+        seen,
+        select_has_content,
+        select_has_star,
+        distinct_seen,
+    )
+}
+
+/// The keyword/phrase continuations SQL grammar expects at the caret, and whether
+/// the popup should auto-open on an empty prefix. `word_lo` is the byte offset where
+/// the caret's current (possibly empty) word begins; only tokens strictly before it
+/// are considered, so a phrase like `GROUP BY` is offered while `GROUP` is still
+/// being typed. Lexer-based (correct mid-edit) and microsecond-cheap — it runs every
+/// keystroke.
+pub fn clause_continuation(sql: &str, lo: usize, word_lo: usize) -> Continuation {
+    let start = local_scope_start(sql, lo, word_lo);
+    let toks = tokenize_range(sql, start, word_lo);
+    let (kind, cur, operand, seen, select_has_content, select_has_star, distinct_seen) =
+        scan_clauses(sql, &toks, word_lo);
+    let filled = operand >= 1;
+    let has = |c: Clause| seen.contains(&c);
+    let mut kws: Vec<&str> = Vec::new();
+
+    // The downstream single-statement clauses, in canonical order, each offered only
+    // if not already present — shared by the several "after a complete operand"
+    // positions (post table ref, post-condition, …).
+    let downstream = |kws: &mut Vec<&str>, from_where: bool| {
+        if from_where && !has(Clause::Where) {
+            kws.push("WHERE");
+        }
+        if !has(Clause::GroupBy) {
+            kws.push("GROUP BY");
+        }
+        if !has(Clause::Having) {
+            kws.push("HAVING");
+        }
+        if !has(Clause::OrderBy) {
+            kws.push("ORDER BY");
+        }
+        if !has(Clause::Limit) {
+            kws.push("LIMIT");
+        }
+    };
+
+    match (kind, cur) {
+        (StmtKind::Delete, Clause::None) => kws.push("FROM"),
+        (_, Clause::Select) => {
+            // FROM once the *current* projection item is complete (a column typed,
+            // or `*`); a trailing comma reopens the slot (`filled` false → no FROM).
+            if filled || select_has_star {
+                kws.push("FROM");
+            } else if !select_has_content && !distinct_seen {
+                // Only right after SELECT with nothing projected yet.
+                kws.push("DISTINCT");
+            }
+        }
+        (_, Clause::From) if filled => {
+            downstream(&mut kws, true);
+            kws.extend(["JOIN", "LEFT JOIN", "RIGHT JOIN", "INNER JOIN", "AS"]);
+        }
+        (_, Clause::JoinMod) => kws.extend(["JOIN", "OUTER JOIN"]),
+        (_, Clause::Join) if filled => {
+            kws.extend(["ON", "USING", "AS"]);
+            downstream(&mut kws, true);
+        }
+        (_, Clause::On | Clause::Using) if filled => {
+            kws.extend(["AND", "OR"]);
+            kws.extend(["JOIN", "LEFT JOIN", "RIGHT JOIN", "INNER JOIN"]);
+            downstream(&mut kws, true);
+        }
+        (_, Clause::Where) if filled => {
+            kws.extend([
+                "AND",
+                "OR",
+                "IS NULL",
+                "IS NOT NULL",
+                "LIKE",
+                "IN",
+                "BETWEEN",
+            ]);
+            downstream(&mut kws, false);
+        }
+        (_, Clause::Group) | (_, Clause::Order) => kws.push("BY"),
+        (_, Clause::GroupBy) if filled => downstream(&mut kws, false),
+        (_, Clause::Having) if filled => {
+            kws.extend(["AND", "OR"]);
+            downstream(&mut kws, false);
+        }
+        (_, Clause::OrderBy) if filled => kws.extend(["ASC", "DESC", "LIMIT"]),
+        (_, Clause::Limit) if filled => kws.push("OFFSET"),
+        (StmtKind::Update, Clause::Update) if filled => kws.push("SET"),
+        (StmtKind::Update, Clause::Set) if filled => kws.push("WHERE"),
+        (StmtKind::Insert, Clause::Insert) if !filled => kws.push("INTO"),
+        (StmtKind::Insert, Clause::Into) if filled => kws.push("VALUES"),
+        _ => {}
+    }
+
+    // Auto-open on an empty prefix right after a clause keyword (or comma) that
+    // takes an operand — columns after WHERE/ON/BY/SET/HAVING/SELECT, tables after
+    // FROM/JOIN/INTO. Not after LIMIT/OFFSET (a bare number) or a filled slot.
+    let auto_show = !filled
+        && matches!(
+            cur,
+            Clause::Select
+                | Clause::From
+                | Clause::Join
+                | Clause::On
+                | Clause::Using
+                | Clause::Where
+                | Clause::GroupBy
+                | Clause::Having
+                | Clause::OrderBy
+                | Clause::Set
+                | Clause::Into
+        );
+
+    Continuation {
+        keywords: kws.into_iter().map(|s| s.to_string()).collect(),
+        auto_show,
+    }
+}
+
 /// Parse the tables (and aliases) visible at `caret` using the byte-position
 /// lexer + paren-scope chain — the fallback used when the statement doesn't parse
 /// as a complete AST. Handles `db.table`, `AS alias`, implicit `table alias`, and
@@ -389,7 +781,7 @@ fn lexer_scope(sql: &str, lo: usize, hi: usize, caret: usize) -> Vec<TableRef> {
                 let scope = *open.last().unwrap_or(&0);
                 i += 1;
                 while let Some(mut name) = toks.get(i).and_then(|t| word(&t.kind)) {
-                    if is_sql_keyword(&name) {
+                    if is_reserved_word(&name) {
                         break;
                     }
                     let mut db = None;
@@ -405,11 +797,16 @@ fn lexer_scope(sql: &str, lo: usize, hi: usize, caret: usize) -> Vec<TableRef> {
                     match toks.get(i).map(|t| &t.kind) {
                         Some(TkKind::Word(a)) if a.eq_ignore_ascii_case("AS") => {
                             if let Some(al) = toks.get(i + 1).and_then(|t| word(&t.kind)) {
-                                alias = Some(al);
+                                // A reserved keyword after AS isn't a valid alias
+                                // (needs backticks) — don't register it, matching the
+                                // implicit-alias arm below. Still consume both tokens.
+                                if !is_reserved_word(&al) {
+                                    alias = Some(al);
+                                }
                                 i += 2;
                             }
                         }
-                        Some(TkKind::Word(a)) if !is_sql_keyword(a) => {
+                        Some(TkKind::Word(a)) if !is_reserved_word(a) => {
                             alias = Some(a.clone());
                             i += 1;
                         }
@@ -864,7 +1261,7 @@ fn table_refs_with_pos(sql: &str, lo: usize, hi: usize) -> Vec<(TableRef, (usize
         }
         i += 1;
         while let Some(mut name) = toks.get(i).and_then(|t| word(&t.kind)) {
-            if is_sql_keyword(&name) {
+            if is_reserved_word(&name) {
                 break;
             }
             let mut pos = (toks[i].at, toks[i].at + name.len());
@@ -882,11 +1279,15 @@ fn table_refs_with_pos(sql: &str, lo: usize, hi: usize) -> Vec<(TableRef, (usize
             match toks.get(i).map(|t| &t.kind) {
                 Some(TkKind::Word(a)) if a.eq_ignore_ascii_case("AS") => {
                     if let Some(al) = toks.get(i + 1).and_then(|t| word(&t.kind)) {
-                        alias = Some(al);
+                        // A reserved keyword after AS isn't a valid alias — don't
+                        // register it (matches the implicit arm + `lexer_scope`).
+                        if !is_reserved_word(&al) {
+                            alias = Some(al);
+                        }
                         i += 2;
                     }
                 }
-                Some(TkKind::Word(a)) if !is_sql_keyword(a) => {
+                Some(TkKind::Word(a)) if !is_reserved_word(a) => {
                     alias = Some(a.clone());
                     i += 1;
                 }
@@ -942,7 +1343,12 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
         let terminated = sql.as_bytes().get(hi - 1) == Some(&b';');
         let is_typing_tail = idx == last && !terminated;
         match sqlparser::parser::Parser::parse_sql(&*dialect.parser(), stmt) {
-            Ok(_) => catalog_checks(sql, lo, hi, catalog, &mut out),
+            Ok(asts) => {
+                catalog_checks(sql, lo, hi, catalog, &mut out);
+                if let [ast] = asts.as_slice() {
+                    unqualified_column_checks(sql, lo, hi, catalog, ast, dialect, &mut out);
+                }
+            }
             Err(e) => {
                 // Don't nag about the fragment the user is still typing.
                 if !is_typing_tail {
@@ -963,8 +1369,447 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
             }
         }
         typo_checks(sql, lo, hi, catalog, &mut out);
+        // Reserved-keyword aliases (`orders AS or`, `orders or`) run unconditionally:
+        // sqlparser is laxer than MySQL here (it *accepts* `AS or`), so gating on a
+        // parse failure would miss the very case we want to flag.
+        alias_checks(sql, lo, hi, &mut out);
     }
     dedup_diagnostics(out)
+}
+
+/// Keywords that legitimately follow `AS` without being an alias: a query/CTAS body
+/// (`CREATE TABLE t AS SELECT …`, `CREATE VIEW v AS SELECT …`, `cte AS (SELECT …)`).
+fn is_query_body_keyword(word: &str) -> bool {
+    let up = word.to_ascii_uppercase();
+    matches!(up.as_str(), "SELECT" | "WITH" | "VALUES")
+}
+
+/// MySQL/MariaDB **reserved** words — those that can't be used as a bare (unquoted)
+/// identifier (table/column/alias) without backticks. This is the authoritative list
+/// for [`is_reserved_word`] (the alias check + scope's alias resolution); it's a
+/// superset of the small [`SQL_KEYWORDS`] completion set and deliberately excludes
+/// non-reserved keywords (`OFFSET`, `VIEW`, `TRUNCATE`, …), which *are* legal aliases.
+/// Sourced from MySQL 8.0's "Keywords and Reserved Words" (the `(R)` entries), plus
+/// `INTERSECT`. When Postgres joins the [`SqlDialect`] seam this becomes per-dialect.
+const MYSQL_RESERVED: &[&str] = &[
+    "ACCESSIBLE",
+    "ADD",
+    "ALL",
+    "ALTER",
+    "ANALYZE",
+    "AND",
+    "AS",
+    "ASC",
+    "ASENSITIVE",
+    "BEFORE",
+    "BETWEEN",
+    "BIGINT",
+    "BINARY",
+    "BLOB",
+    "BOTH",
+    "BY",
+    "CALL",
+    "CASCADE",
+    "CASE",
+    "CHANGE",
+    "CHAR",
+    "CHARACTER",
+    "CHECK",
+    "COLLATE",
+    "COLUMN",
+    "CONDITION",
+    "CONSTRAINT",
+    "CONTINUE",
+    "CONVERT",
+    "CREATE",
+    "CROSS",
+    "CUBE",
+    "CUME_DIST",
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "CURRENT_USER",
+    "CURSOR",
+    "DATABASE",
+    "DATABASES",
+    "DAY_HOUR",
+    "DAY_MICROSECOND",
+    "DAY_MINUTE",
+    "DAY_SECOND",
+    "DEC",
+    "DECIMAL",
+    "DECLARE",
+    "DEFAULT",
+    "DELAYED",
+    "DELETE",
+    "DENSE_RANK",
+    "DESC",
+    "DESCRIBE",
+    "DETERMINISTIC",
+    "DISTINCT",
+    "DISTINCTROW",
+    "DIV",
+    "DOUBLE",
+    "DROP",
+    "DUAL",
+    "EACH",
+    "ELSE",
+    "ELSEIF",
+    "EMPTY",
+    "ENCLOSED",
+    "ESCAPED",
+    "EXCEPT",
+    "EXISTS",
+    "EXIT",
+    "EXPLAIN",
+    "FALSE",
+    "FETCH",
+    "FIRST_VALUE",
+    "FLOAT",
+    "FLOAT4",
+    "FLOAT8",
+    "FOR",
+    "FORCE",
+    "FOREIGN",
+    "FROM",
+    "FULLTEXT",
+    "FUNCTION",
+    "GENERATED",
+    "GET",
+    "GRANT",
+    "GROUP",
+    "GROUPING",
+    "GROUPS",
+    "HAVING",
+    "HIGH_PRIORITY",
+    "HOUR_MICROSECOND",
+    "HOUR_MINUTE",
+    "HOUR_SECOND",
+    "IF",
+    "IGNORE",
+    "IN",
+    "INDEX",
+    "INFILE",
+    "INNER",
+    "INOUT",
+    "INSENSITIVE",
+    "INSERT",
+    "INT",
+    "INT1",
+    "INT2",
+    "INT3",
+    "INT4",
+    "INT8",
+    "INTEGER",
+    "INTERSECT",
+    "INTERVAL",
+    "INTO",
+    "IO_AFTER_GTIDS",
+    "IO_BEFORE_GTIDS",
+    "IS",
+    "ITERATE",
+    "JOIN",
+    "JSON_TABLE",
+    "KEY",
+    "KEYS",
+    "KILL",
+    "LAG",
+    "LAST_VALUE",
+    "LATERAL",
+    "LEAD",
+    "LEADING",
+    "LEAVE",
+    "LEFT",
+    "LIKE",
+    "LIMIT",
+    "LINEAR",
+    "LINES",
+    "LOAD",
+    "LOCALTIME",
+    "LOCALTIMESTAMP",
+    "LOCK",
+    "LONG",
+    "LONGBLOB",
+    "LONGTEXT",
+    "LOOP",
+    "LOW_PRIORITY",
+    "MASTER_BIND",
+    "MASTER_SSL_VERIFY_SERVER_CERT",
+    "MATCH",
+    "MAXVALUE",
+    "MEDIUMBLOB",
+    "MEDIUMINT",
+    "MEDIUMTEXT",
+    "MIDDLEINT",
+    "MINUTE_MICROSECOND",
+    "MINUTE_SECOND",
+    "MOD",
+    "MODIFIES",
+    "NATURAL",
+    "NOT",
+    "NO_WRITE_TO_BINLOG",
+    "NTH_VALUE",
+    "NTILE",
+    "NULL",
+    "NUMERIC",
+    "OF",
+    "ON",
+    "OPTIMIZE",
+    "OPTIMIZER_COSTS",
+    "OPTION",
+    "OPTIONALLY",
+    "OR",
+    "ORDER",
+    "OUT",
+    "OUTER",
+    "OUTFILE",
+    "OVER",
+    "PARTITION",
+    "PERCENT_RANK",
+    "PRECISION",
+    "PRIMARY",
+    "PROCEDURE",
+    "PURGE",
+    "RANGE",
+    "RANK",
+    "READ",
+    "READS",
+    "READ_WRITE",
+    "REAL",
+    "RECURSIVE",
+    "REFERENCES",
+    "REGEXP",
+    "RELEASE",
+    "RENAME",
+    "REPEAT",
+    "REPLACE",
+    "REQUIRE",
+    "RESIGNAL",
+    "RESTRICT",
+    "RETURN",
+    "REVOKE",
+    "RIGHT",
+    "RLIKE",
+    "ROW",
+    "ROWS",
+    "ROW_NUMBER",
+    "SCHEMA",
+    "SCHEMAS",
+    "SECOND_MICROSECOND",
+    "SELECT",
+    "SENSITIVE",
+    "SEPARATOR",
+    "SET",
+    "SHOW",
+    "SIGNAL",
+    "SMALLINT",
+    "SPATIAL",
+    "SPECIFIC",
+    "SQL",
+    "SQLEXCEPTION",
+    "SQLSTATE",
+    "SQLWARNING",
+    "SQL_BIG_RESULT",
+    "SQL_CALC_FOUND_ROWS",
+    "SQL_SMALL_RESULT",
+    "SSL",
+    "STARTING",
+    "STORED",
+    "STRAIGHT_JOIN",
+    "SYSTEM",
+    "TABLE",
+    "TERMINATED",
+    "THEN",
+    "TINYBLOB",
+    "TINYINT",
+    "TINYTEXT",
+    "TO",
+    "TRAILING",
+    "TRIGGER",
+    "TRUE",
+    "UNDO",
+    "UNION",
+    "UNIQUE",
+    "UNLOCK",
+    "UNSIGNED",
+    "UPDATE",
+    "USAGE",
+    "USE",
+    "USING",
+    "UTC_DATE",
+    "UTC_TIME",
+    "UTC_TIMESTAMP",
+    "VALUES",
+    "VARBINARY",
+    "VARCHAR",
+    "VARCHARACTER",
+    "VARYING",
+    "VIRTUAL",
+    "WHEN",
+    "WHERE",
+    "WHILE",
+    "WINDOW",
+    "WITH",
+    "WRITE",
+    "XOR",
+    "YEAR_MONTH",
+    "ZEROFILL",
+];
+
+/// A word that can't be a bare (unquoted) identifier/alias in MySQL — reserved.
+/// Backs the alias diagnostic and the scope's alias resolution so they agree on what
+/// counts as a valid alias. See [`MYSQL_RESERVED`].
+pub(crate) fn is_reserved_word(word: &str) -> bool {
+    let up = word.to_ascii_uppercase();
+    MYSQL_RESERVED.contains(&up.as_str())
+}
+
+/// Keywords that legitimately follow a *table reference* (so a reserved keyword here
+/// is a clause/join continuation, not a botched implicit alias): the join family,
+/// the clause boundaries, set operations, MySQL locking/index-hint words, `WINDOW`,
+/// and `AS` itself. Anything else reserved in that slot (`OR`, `AND`, `IN`, …) was
+/// meant as an alias.
+fn is_table_ref_continuation(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "JOIN"
+            | "INNER"
+            | "LEFT"
+            | "RIGHT"
+            | "OUTER"
+            | "CROSS"
+            | "FULL"
+            | "NATURAL"
+            | "STRAIGHT_JOIN"
+            | "ON"
+            | "USING"
+            | "WHERE"
+            | "GROUP"
+            | "ORDER"
+            | "HAVING"
+            | "LIMIT"
+            | "OFFSET"
+            | "UNION"
+            | "EXCEPT"
+            | "INTERSECT"
+            | "FOR"
+            | "LOCK"
+            | "USE"
+            | "FORCE"
+            | "IGNORE"
+            | "PARTITION"
+            | "WINDOW"
+            | "AS"
+    )
+}
+
+/// Flag a reserved keyword used as an alias — explicit (`orders AS or`, `id AS key`)
+/// or implicit (`orders or`) — a syntax error unless backtick-quoted. Runs
+/// unconditionally: sqlparser is laxer than MySQL here (it *accepts* `AS or`), so
+/// gating on a parse failure would miss it. Only genuinely-reserved words are flagged
+/// ([`is_reserved_word`]) and only where an alias is actually expected, so well-formed
+/// SQL isn't squiggled.
+fn alias_checks(sql: &str, lo: usize, hi: usize, out: &mut Vec<Diagnostic>) {
+    let toks = tokenize_range(sql, lo, hi);
+    let flag = |out: &mut Vec<Diagnostic>, at: usize, kw: &str| {
+        out.push(Diagnostic {
+            range: (at, at + kw.len()),
+            severity: Severity::Error,
+            message: format!(
+                "`{kw}` is a reserved keyword and can't be used as an alias (quote it with backticks)"
+            ),
+        });
+    };
+    // Only a CTAS / view (`CREATE … AS SELECT`) legitimately puts a query *body*
+    // after `AS`; in a plain SELECT, `col AS select` is a reserved-word alias mistake.
+    let is_create = toks
+        .iter()
+        .find_map(|t| match &t.kind {
+            TkKind::Word(w) => Some(w.to_ascii_uppercase()),
+            _ => None,
+        })
+        .is_some_and(|w| w == "CREATE");
+    // Explicit `AS <reserved>` — table OR column alias, anywhere.
+    for w in toks.windows(2) {
+        let (TkKind::Word(a), TkKind::Word(b)) = (&w[0].kind, &w[1].kind) else {
+            continue;
+        };
+        if !a.eq_ignore_ascii_case("AS") || !is_reserved_word(b) {
+            continue;
+        }
+        // A CTAS/view body isn't an alias (`CREATE TABLE t AS SELECT …`).
+        if is_create && is_query_body_keyword(b) {
+            continue;
+        }
+        // The alias must sit immediately after AS (whitespace only between). A skipped
+        // backtick/quote/comment in the gap means the alias was quoted (`AS `select``)
+        // and `b` is the *following* token (e.g. FROM) — never flag that.
+        let as_end = w[0].at + a.len();
+        if sql
+            .get(as_end..w[1].at)
+            .is_some_and(|g| g.trim().is_empty())
+        {
+            flag(out, w[1].at, b);
+        }
+    }
+    // Implicit `<table> <reserved>` in a FROM / JOIN ref position. Restricted to
+    // FROM/JOIN (where implicit aliases are idiomatic — not INSERT INTO / UPDATE,
+    // whose VALUES/SET/SELECT would false-trigger) and to keywords that aren't a
+    // legitimate table-ref continuation, so `WHERE`/`ORDER`/`ON`/`JOIN`/… are safe.
+    let word = |k: &TkKind| -> Option<String> {
+        if let TkKind::Word(w) = k {
+            Some(w.clone())
+        } else {
+            None
+        }
+    };
+    let mut i = 0;
+    while i < toks.len() {
+        let Some(kw) = word(&toks[i].kind) else {
+            i += 1;
+            continue;
+        };
+        if !matches!(kw.to_ascii_uppercase().as_str(), "FROM" | "JOIN") {
+            i += 1;
+            continue;
+        }
+        let is_from = kw.eq_ignore_ascii_case("FROM");
+        i += 1;
+        while let Some(name) = toks.get(i).and_then(|t| word(&t.kind)) {
+            if is_reserved_word(&name) {
+                break; // a clause keyword, not a table name (`FROM WHERE …` etc.)
+            }
+            i += 1;
+            // Optional `db.table`.
+            if matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::Dot))
+                && toks.get(i + 1).and_then(|t| word(&t.kind)).is_some()
+            {
+                i += 2;
+            }
+            // The alias slot right after the table name.
+            match toks.get(i).map(|t| &t.kind) {
+                Some(TkKind::Word(a)) if a.eq_ignore_ascii_case("AS") => {
+                    // Handled by the `AS` scan above; consume `AS` + the next token.
+                    i += toks.get(i + 1).map_or(1, |_| 2);
+                }
+                // A clause/join keyword ends this ref — not an alias (check before
+                // `is_reserved_word`, since these are reserved too).
+                Some(TkKind::Word(a)) if is_table_ref_continuation(a) => break,
+                Some(TkKind::Word(a)) if is_reserved_word(a) => {
+                    flag(out, toks[i].at, a);
+                    break;
+                }
+                Some(TkKind::Word(_)) => i += 1, // a valid alias (identifier or non-reserved word)
+                _ => {}
+            }
+            // A comma continues the FROM list with another table reference.
+            if is_from && matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::Comma)) {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+    }
 }
 
 /// Table-existence + qualified-column checks for a cleanly-parsed statement.
@@ -1004,6 +1849,137 @@ fn catalog_checks(sql: &str, lo: usize, hi: usize, catalog: &Catalog, out: &mut 
                 message: format!("Column `{col}` not found in `{}`", table.name),
             });
         }
+    }
+}
+
+/// True if the statement contains a nested query — a derived table, subquery, or
+/// CTE — detected from tokens: a leading `WITH`, or a `(` immediately followed by
+/// SELECT/WITH. Used to bail out of the unqualified-column check, whose "flat union
+/// of the FROM tables' columns" model doesn't hold across nested scopes.
+fn has_nested_query(sql: &str, lo: usize, hi: usize) -> bool {
+    let toks = tokenize_range(sql, lo, hi);
+    let first_word = toks.iter().find_map(|t| match &t.kind {
+        TkKind::Word(w) => Some(w),
+        _ => None,
+    });
+    if first_word.is_some_and(|w| w.eq_ignore_ascii_case("WITH")) {
+        return true;
+    }
+    toks.windows(2).any(|w| {
+        matches!(w[0].kind, TkKind::LParen)
+            && matches!(&w[1].kind,
+                TkKind::Word(k) if k.eq_ignore_ascii_case("SELECT") || k.eq_ignore_ascii_case("WITH"))
+    })
+}
+
+/// Unqualified unknown-column diagnostic: flag a bare column reference that exists in
+/// none of the statement's FROM tables. **Heavily gated** so it never squiggles valid
+/// SQL — it runs only for a plain single `SELECT` (no CTE / set-op) with no nested
+/// query, and only when every FROM table's columns are known (loaded + found). The
+/// set of valid bare identifiers is the union of those tables' columns, their names/
+/// aliases, and the projection's output aliases; anything else used as an
+/// `Expr::Identifier` (taken from the AST — so function names, interval units,
+/// qualified `a.b` refs, and literals are all excluded) is unknown. Byte positions
+/// come from the lexer (AST spans are still maturing upstream).
+fn unqualified_column_checks(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    catalog: &Catalog,
+    ast: &sqlparser::ast::Statement,
+    dialect: SqlDialect,
+    out: &mut Vec<Diagnostic>,
+) {
+    use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement};
+
+    // Only a plain single SELECT (no CTE, no UNION/… set-op) with no nested query.
+    let Statement::Query(query) = ast else {
+        return;
+    };
+    if query.with.is_some() {
+        return;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return;
+    };
+    if has_nested_query(sql, lo, hi) {
+        return;
+    }
+
+    // Every FROM table must be known (loaded + found), else existence is unjudgeable.
+    let tables = statement_scope(sql, lo, hi, lo, dialect).tables;
+    if tables.is_empty()
+        || !tables
+            .iter()
+            .all(|t| matches!(catalog.table_status(t), TableStatus::Found))
+    {
+        return;
+    }
+
+    // Valid bare identifiers: the union of the tables' columns, their names/aliases,
+    // and the projection's output aliases (referenceable in ORDER BY / HAVING).
+    let mut valid: HashSet<String> = HashSet::new();
+    for t in &tables {
+        if let Some(cols) = catalog.columns_of(t) {
+            valid.extend(cols.iter().map(|c| c.to_ascii_lowercase()));
+        }
+        valid.insert(t.name.to_ascii_lowercase());
+        if let Some(a) = &t.alias {
+            valid.insert(a.to_ascii_lowercase());
+        }
+    }
+    for item in &select.projection {
+        match item {
+            SelectItem::ExprWithAlias { alias, .. } => {
+                valid.insert(alias.value.to_ascii_lowercase());
+            }
+            SelectItem::ExprWithAliases { aliases, .. } => {
+                valid.extend(aliases.iter().map(|a| a.value.to_ascii_lowercase()));
+            }
+            _ => {}
+        }
+    }
+
+    // Unqualified column identifiers actually referenced (AST classification).
+    let mut unknown: HashSet<String> = HashSet::new();
+    let _ = sqlparser::ast::visit_expressions(ast, |expr| {
+        if let Expr::Identifier(id) = expr {
+            let lc = id.value.to_ascii_lowercase();
+            if !valid.contains(&lc) {
+                unknown.insert(lc);
+            }
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    if unknown.is_empty() {
+        return;
+    }
+
+    let where_tbl = if tables.len() == 1 {
+        format!(" in `{}`", tables[0].name)
+    } else {
+        String::new()
+    };
+    // Position each unknown reference via the lexer: every bare word token (not a
+    // `a.col` part, not a `fn(` call) whose name is unknown.
+    let toks = tokenize_range(sql, lo, hi);
+    for (i, t) in toks.iter().enumerate() {
+        let TkKind::Word(w) = &t.kind else {
+            continue;
+        };
+        if !unknown.contains(&w.to_ascii_lowercase()) {
+            continue;
+        }
+        let prev_dot = i > 0 && matches!(toks[i - 1].kind, TkKind::Dot);
+        let next = toks.get(i + 1).map(|t| &t.kind);
+        if prev_dot || matches!(next, Some(TkKind::Dot)) || matches!(next, Some(TkKind::LParen)) {
+            continue;
+        }
+        out.push(Diagnostic {
+            range: (t.at, t.at + w.len()),
+            severity: Severity::Error,
+            message: format!("Column `{w}` not found{where_tbl}"),
+        });
     }
 }
 
@@ -1473,6 +2449,147 @@ mod tests {
         );
     }
 
+    // ── clause_continuation (expected-token model) ────────────────────────────
+
+    fn cont_at(sql: &str, caret: usize) -> Continuation {
+        let word_lo = word_start(sql, caret);
+        clause_continuation(sql, 0, word_lo)
+    }
+    fn cont(sql: &str) -> Continuation {
+        cont_at(sql, sql.len())
+    }
+    fn kws(sql: &str) -> Vec<String> {
+        cont(sql).keywords
+    }
+
+    #[test]
+    fn continuation_from_ranks_after_projection() {
+        // `select * f` → FROM is the expected continuation (the projection is
+        // complete via `*`), so the ranker can lift it to #1.
+        assert_eq!(kws("SELECT * f"), vec!["FROM"]);
+        // A named projection column, mid-typing the next keyword.
+        assert_eq!(kws("SELECT id f"), vec!["FROM"]);
+    }
+
+    #[test]
+    fn continuation_distinct_right_after_select() {
+        // Right after SELECT (nothing projected yet) → DISTINCT, not FROM.
+        assert_eq!(kws("SELECT d"), vec!["DISTINCT"]);
+        // Already `DISTINCT` typed → don't re-offer it (and no complete projection
+        // yet, so no FROM either).
+        assert!(!kws("SELECT DISTINCT ").contains(&"DISTINCT".to_string()));
+        // Once a projection column is complete, FROM follows (even with DISTINCT).
+        assert_eq!(kws("SELECT DISTINCT id f"), vec!["FROM"]);
+    }
+
+    #[test]
+    fn continuation_no_from_mid_projection_list() {
+        // A trailing comma reopens the projection slot → don't offer FROM (the user
+        // is adding another column); auto-show columns instead.
+        let c = cont("SELECT id, ");
+        assert!(
+            !c.keywords.contains(&"FROM".to_string()),
+            "got {:?}",
+            c.keywords
+        );
+        assert!(c.auto_show);
+    }
+
+    #[test]
+    fn continuation_where_after_complete_table_ref() {
+        // `select * from table w` → WHERE must be an expected continuation (today's
+        // known miss: context stayed in "table" mode).
+        let k = kws("SELECT * FROM users w");
+        assert!(k.contains(&"WHERE".to_string()), "got {k:?}");
+        assert!(k.contains(&"GROUP BY".to_string()));
+        assert!(k.contains(&"ORDER BY".to_string()));
+        assert!(k.contains(&"LIMIT".to_string()));
+        // An alias'd ref is just as "complete".
+        assert!(kws("SELECT * FROM users u w").contains(&"WHERE".to_string()));
+    }
+
+    #[test]
+    fn continuation_no_keywords_immediately_after_from() {
+        // Right after FROM (no table yet) → no keyword continuations (tables come
+        // from the schema), but auto-show so the table list opens.
+        let c = cont("SELECT * FROM ");
+        assert!(c.keywords.is_empty(), "got {:?}", c.keywords);
+        assert!(c.auto_show);
+    }
+
+    #[test]
+    fn continuation_group_by_is_one_phrase() {
+        // Typing `GROUP` after a complete FROM → offer `GROUP BY` as one item.
+        assert!(kws("SELECT * FROM t GROUP").contains(&"GROUP BY".to_string()));
+        // After `GROUP ` (space) the partial clause expects `BY`.
+        assert_eq!(kws("SELECT * FROM t GROUP "), vec!["BY"]);
+    }
+
+    #[test]
+    fn continuation_order_by_offers_columns_then_direction() {
+        // `order by ` (trailing space) → auto-show columns (no keyword clutter).
+        let c = cont("SELECT * FROM t ORDER BY ");
+        assert!(c.auto_show);
+        assert!(c.keywords.is_empty(), "got {:?}", c.keywords);
+        // After a sort column → ASC/DESC/LIMIT.
+        let k = kws("SELECT * FROM t ORDER BY name ");
+        assert!(k.contains(&"ASC".to_string()) && k.contains(&"DESC".to_string()));
+        assert!(k.contains(&"LIMIT".to_string()));
+    }
+
+    #[test]
+    fn continuation_where_condition_offers_connectives() {
+        let k = kws("SELECT * FROM t WHERE id = 1 ");
+        assert!(k.contains(&"AND".to_string()) && k.contains(&"OR".to_string()));
+        assert!(k.contains(&"ORDER BY".to_string()));
+        // A completed WHERE isn't re-offered downstream.
+        assert!(!k.contains(&"WHERE".to_string()));
+    }
+
+    #[test]
+    fn continuation_join_then_on() {
+        // After the joined table name → ON/USING.
+        let k = kws("SELECT * FROM a JOIN b ");
+        assert!(k.contains(&"ON".to_string()) && k.contains(&"USING".to_string()));
+        // A bare join modifier still expects JOIN.
+        assert_eq!(kws("SELECT * FROM a LEFT "), vec!["JOIN", "OUTER JOIN"]);
+    }
+
+    #[test]
+    fn continuation_auto_show_after_operand_keywords() {
+        // Columns auto-show after WHERE/SET/ON and after a comma in a list.
+        assert!(cont("SELECT * FROM t WHERE ").auto_show);
+        assert!(cont("SELECT * FROM t ORDER BY a, ").auto_show);
+        assert!(cont("UPDATE t SET ").auto_show);
+        // But not after a filled slot (a plain trailing space post-table-ref).
+        assert!(!cont("SELECT * FROM t ").auto_show);
+        // And not after LIMIT (a bare number is expected, not a suggestion).
+        assert!(!cont("SELECT * FROM t LIMIT ").auto_show);
+    }
+
+    #[test]
+    fn continuation_update_and_insert_and_delete() {
+        assert!(kws("UPDATE employees ").contains(&"SET".to_string()));
+        assert!(kws("UPDATE employees SET salary = 1 ").contains(&"WHERE".to_string()));
+        assert!(kws("INSERT ").contains(&"INTO".to_string()));
+        assert!(kws("INSERT INTO t ").contains(&"VALUES".to_string()));
+        assert!(kws("DELETE ").contains(&"FROM".to_string()));
+    }
+
+    #[test]
+    fn continuation_scopes_to_subquery() {
+        // The caret inside a subquery shouldn't inherit the outer query's FROM as a
+        // completed slot — here the inner `SELECT * ` still expects FROM.
+        let sql = "SELECT * FROM (SELECT * f";
+        assert_eq!(kws(sql), vec!["FROM"]);
+    }
+
+    #[test]
+    fn continuation_empty_for_non_dml() {
+        // A statement start / DDL we don't model → no continuations, no auto-show.
+        assert_eq!(cont("CREATE TABLE t "), Continuation::default());
+    }
+
     // ── diagnostics ───────────────────────────────────────────────────────────
 
     use crate::schema::{ColumnInfo, DbSchema, TableInfo};
@@ -1557,6 +2674,101 @@ mod tests {
         assert!(diag("SELECT employees.name FROM employees").is_empty());
     }
 
+    // ── unqualified unknown columns ────────────────────────────────────────────
+
+    fn col_errors(sql: &str) -> Vec<String> {
+        diag(sql)
+            .into_iter()
+            .filter(|d| d.message.starts_with("Column "))
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn diag_unqualified_unknown_column_flagged() {
+        let d = diag("SELECT salery FROM employees");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].severity, Severity::Error);
+        assert!(
+            d[0].message
+                .contains("Column `salery` not found in `employees`")
+        );
+        assert_eq!(
+            &"SELECT salery FROM employees"[d[0].range.0..d[0].range.1],
+            "salery"
+        );
+    }
+
+    #[test]
+    fn diag_unqualified_unknown_in_where_and_order() {
+        // Multiple positions, WHERE + ORDER BY.
+        assert!(col_errors("SELECT id FROM employees WHERE nope = 1").len() == 1);
+        assert!(col_errors("SELECT id FROM employees ORDER BY nope").len() == 1);
+        // Every occurrence squiggles.
+        assert_eq!(col_errors("SELECT nope, nope FROM employees").len(), 2);
+    }
+
+    #[test]
+    fn diag_unqualified_known_columns_clean() {
+        for sql in [
+            "SELECT id, name, salary, dept_id FROM employees",
+            "SELECT name FROM employees WHERE salary > 100 ORDER BY name",
+            "SELECT dept_id FROM employees GROUP BY dept_id HAVING COUNT(*) > 1",
+            // Union across a join (existence, either table).
+            "SELECT name FROM employees e JOIN departments d ON e.dept_id = d.id",
+            "SELECT id FROM employees, departments",
+            // Projection alias referenced downstream is valid.
+            "SELECT salary AS s FROM employees ORDER BY s",
+            // Functions / interval units are not columns (must not false-positive).
+            "SELECT COUNT(*), MAX(salary) FROM employees",
+            "SELECT DATE_ADD(id, INTERVAL 1 DAY) FROM employees",
+            // Columns nested in CASE / functions / arithmetic / operators.
+            "SELECT CASE WHEN salary > 100 THEN name ELSE dept_id END FROM employees",
+            "SELECT UPPER(TRIM(name)) FROM employees",
+            "SELECT id + salary AS total FROM employees ORDER BY total",
+            "SELECT id FROM employees WHERE name LIKE '%a%' AND salary BETWEEN 1 AND 2",
+            "SELECT id FROM employees WHERE name IS NOT NULL",
+            // Mixed qualified + unqualified reference to the same column.
+            "SELECT id FROM employees e WHERE e.salary > salary",
+        ] {
+            assert!(
+                col_errors(sql).is_empty(),
+                "false positive: {sql} -> {:?}",
+                col_errors(sql)
+            );
+        }
+    }
+
+    #[test]
+    fn diag_unqualified_column_bails_on_uncertainty() {
+        // Each of these has an unknown-looking bare name, but we can't be sure of the
+        // full column set → no column error (conservative).
+        for sql in [
+            // Subquery in WHERE.
+            "SELECT nope FROM employees WHERE id IN (SELECT id FROM departments)",
+            // Derived table.
+            "SELECT nope FROM (SELECT id FROM employees) sub",
+            // CTE.
+            "WITH c AS (SELECT id FROM employees) SELECT nope FROM c",
+            // Unknown table (its columns are unknowable) — flagged as a table, not col.
+            "SELECT nope FROM nonexistent",
+        ] {
+            assert!(
+                col_errors(sql).is_empty(),
+                "should have bailed: {sql} -> {:?}",
+                col_errors(sql)
+            );
+        }
+    }
+
+    #[test]
+    fn diag_unqualified_column_needs_loaded_schema() {
+        // No loaded schema → can't judge columns → no false positives.
+        let cat = Catalog::build(&[], Some("company"));
+        let d = diagnostics("SELECT whatever FROM anything", &cat, SqlDialect::MySql);
+        assert!(!d.iter().any(|x| x.message.starts_with("Column ")));
+    }
+
     #[test]
     fn diag_syntax_error_on_terminated_statement() {
         // A completed (`;`-terminated) broken statement → a syntax error.
@@ -1607,6 +2819,296 @@ mod tests {
     fn diag_qualified_unloaded_db_not_flagged() {
         // `otherdb.t` — that db isn't loaded, so no unknown-table false positive.
         assert!(diag("SELECT * FROM otherdb.things t").is_empty());
+    }
+
+    // ── reserved-keyword aliases ───────────────────────────────────────────────
+
+    fn has_reserved_alias(d: &[Diagnostic], sql: &str, tok: &str) -> bool {
+        d.iter().any(|x| {
+            x.severity == Severity::Error
+                && &sql[x.range.0..x.range.1] == tok
+                && x.message.contains("reserved keyword")
+        })
+    }
+
+    #[test]
+    fn diag_reserved_keyword_table_alias_flagged() {
+        // `AS or` — OR is reserved, so it can't be a bare alias → error on `or`.
+        let sql = "SELECT * FROM employees AS or";
+        assert!(has_reserved_alias(&diag(sql), sql, "or"));
+    }
+
+    #[test]
+    fn diag_reserved_keyword_column_alias_flagged() {
+        // Column aliases can't be reserved words either.
+        let sql = "SELECT id AS or FROM employees";
+        assert!(has_reserved_alias(&diag(sql), sql, "or"));
+    }
+
+    #[test]
+    fn diag_implicit_reserved_keyword_alias_flagged() {
+        // The shorthand form `orders or` must squiggle `or` too — parity with the
+        // explicit `AS or` (this was the reported gap).
+        let sql = "SELECT * FROM employees or";
+        assert!(has_reserved_alias(&diag(sql), sql, "or"));
+    }
+
+    #[test]
+    fn diag_implicit_alias_parity_with_as_form() {
+        for sql in [
+            "SELECT * FROM employees or",
+            "SELECT * FROM employees AS or",
+        ] {
+            assert!(
+                diag(sql).iter().any(|x| {
+                    &sql[x.range.0..x.range.1] == "or" && x.message.contains("reserved keyword")
+                }),
+                "missed: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn diag_clause_keywords_after_table_not_flagged() {
+        // Legitimate continuations after a table ref aren't alias mistakes.
+        for sql in [
+            "SELECT * FROM employees WHERE id = 1",
+            "SELECT * FROM employees GROUP BY id",
+            "SELECT * FROM employees ORDER BY id",
+            "SELECT * FROM employees LIMIT 5",
+            "SELECT * FROM employees e JOIN departments d ON e.dept_id = d.id",
+            "SELECT * FROM employees, departments",
+        ] {
+            assert!(
+                !diag(sql)
+                    .iter()
+                    .any(|x| x.message.contains("reserved keyword")),
+                "false positive: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn diag_reserved_word_outside_small_keyword_set_flagged() {
+        // Words reserved in MySQL but NOT in the small `SQL_KEYWORDS` completion set
+        // (`RANK`, `OVER`, `SYSTEM`) — the full reserved list now catches them.
+        for sql in [
+            "SELECT id AS rank FROM employees",
+            "SELECT * FROM employees AS system",
+            "SELECT * FROM employees over",
+        ] {
+            assert!(
+                diag(sql)
+                    .iter()
+                    .any(|x| x.message.contains("reserved keyword")),
+                "missed reserved word: {sql}"
+            );
+        }
+    }
+
+    // ── Broad corpus: false-positive / false-negative sweep ────────────────────
+    // A wide net of queries to surface anything the diagnostics get wrong. Valid SQL
+    // must stay clean; known-bad SQL must be flagged. Uses an *empty* catalog so the
+    // unknown-table/column checks are inert — this isolates syntax / alias / typo
+    // reporting (the catalog checks have their own focused tests above).
+
+    fn diag_bare(sql: &str) -> Vec<Diagnostic> {
+        let cat = Catalog::build(&[], None);
+        diagnostics(sql, &cat, SqlDialect::MySql)
+    }
+
+    #[test]
+    fn corpus_valid_queries_produce_no_diagnostics() {
+        let valid = [
+            // Basics.
+            "SELECT 1;",
+            "SELECT * FROM employees;",
+            "SELECT id, name FROM employees;",
+            "SELECT id, name FROM employees WHERE salary > 100;",
+            "SELECT * FROM employees WHERE name IS NULL;",
+            "SELECT * FROM employees WHERE name IS NOT NULL;",
+            "SELECT * FROM employees WHERE name LIKE '%a%';",
+            "SELECT * FROM employees WHERE id IN (1, 2, 3);",
+            "SELECT * FROM employees WHERE salary BETWEEN 100 AND 200;",
+            "SELECT * FROM employees WHERE dept_id = 1 AND salary > 100 OR name = 'x';",
+            "SELECT DISTINCT dept_id FROM employees;",
+            // Aliases (explicit, implicit, non-reserved keyword, backtick-quoted).
+            "SELECT e.id FROM employees e;",
+            "SELECT e.id FROM employees AS e;",
+            "SELECT id AS offset FROM employees;",
+            // NOTE: `SELECT * FROM employees view` (VIEW as an implicit alias) is valid
+            // MySQL but sqlparser rejects it, so our syntax diagnostic false-positives
+            // on it — a known upstream-parser gap, not our bug. Omitted here.
+            "SELECT id AS `select` FROM employees;",
+            "SELECT `order`, `group` FROM employees;",
+            // Ordering / grouping / limits.
+            "SELECT * FROM employees ORDER BY name;",
+            "SELECT * FROM employees ORDER BY name DESC, id ASC;",
+            "SELECT dept_id, COUNT(*) FROM employees GROUP BY dept_id;",
+            "SELECT dept_id, COUNT(*) c FROM employees GROUP BY dept_id HAVING c > 5;",
+            "SELECT * FROM employees LIMIT 10;",
+            "SELECT * FROM employees LIMIT 10 OFFSET 5;",
+            "SELECT * FROM employees LIMIT 5, 10;",
+            // Joins.
+            "SELECT e.name, d.name FROM employees e JOIN departments d ON e.dept_id = d.id;",
+            "SELECT * FROM employees e LEFT JOIN departments d ON e.dept_id = d.id;",
+            "SELECT * FROM employees e INNER JOIN departments d ON e.dept_id = d.id;",
+            "SELECT * FROM employees, departments;",
+            "SELECT * FROM employees e, departments d WHERE e.dept_id = d.id;",
+            // Subqueries / derived / CTE / set ops.
+            "SELECT * FROM (SELECT id FROM employees) AS sub;",
+            "SELECT * FROM (SELECT id FROM employees) sub;",
+            "WITH recent AS (SELECT * FROM employees) SELECT * FROM recent;",
+            "SELECT id FROM employees UNION SELECT id FROM departments;",
+            "SELECT id FROM employees UNION ALL SELECT id FROM departments;",
+            "SELECT id FROM employees e WHERE EXISTS (SELECT 1 FROM departments d WHERE d.id = e.dept_id);",
+            "SELECT * FROM employees WHERE salary > (SELECT AVG(salary) FROM employees);",
+            // Expressions / functions / CASE.
+            "SELECT CASE WHEN salary > 100 THEN 'high' ELSE 'low' END FROM employees;",
+            "SELECT COALESCE(name, 'n/a') FROM employees;",
+            "SELECT COUNT(*), MAX(salary), MIN(salary), AVG(salary) FROM employees;",
+            "SELECT NOW();",
+            "SELECT 'it''s a test' FROM employees;",
+            // DML / DDL.
+            "INSERT INTO employees (id, name) VALUES (1, 'a');",
+            "INSERT INTO employees VALUES (1, 'a', 100, 2);",
+            "INSERT INTO employees SELECT * FROM employees;",
+            "UPDATE employees SET salary = 200 WHERE id = 1;",
+            "DELETE FROM employees WHERE id = 1;",
+            "CREATE VIEW v AS SELECT id FROM employees;",
+            "CREATE TABLE t2 AS SELECT id FROM employees;",
+            // Comments, strings containing keywords, multi-statement.
+            "SELECT /* block */ id FROM employees;",
+            "SELECT id FROM employees WHERE id = 1; SELECT 2;",
+            "SELECT 'FROM WHERE OR AS' AS lit FROM employees;",
+            // Reserved words, correctly backtick-quoted as identifiers.
+            "SELECT * FROM `order`;",
+            "SELECT t.`order` FROM employees t;",
+            "SELECT `select` FROM employees;",
+            // More joins / CTEs / set positions.
+            "SELECT * FROM employees e CROSS JOIN departments d;",
+            "SELECT * FROM employees e RIGHT JOIN departments d ON e.dept_id = d.id;",
+            "WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS y) SELECT * FROM a JOIN b ON a.x = b.y;",
+            "SELECT * FROM employees e JOIN departments d ON e.dept_id = d.id WHERE d.id > 1;",
+        ];
+        let failures: Vec<String> = valid
+            .iter()
+            .filter_map(|q| {
+                let d = diag_bare(q);
+                (!d.is_empty()).then(|| {
+                    let msgs: Vec<&str> = d.iter().map(|x| x.message.as_str()).collect();
+                    format!("  {q}\n      -> {msgs:?}")
+                })
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "false positives on valid SQL ({} of {}):\n{}",
+            failures.len(),
+            valid.len(),
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn corpus_invalid_queries_are_flagged() {
+        // Each must produce at least one Error diagnostic.
+        let invalid = [
+            "SELECT * FROM employees AS or;",
+            "SELECT * FROM employees or;",
+            "SELECT id AS select FROM employees;",
+            "SELECT id AS rank FROM employees;",
+            "SELECT * FROM employees AS and;",
+            "SELECT * FROM employees e JOIN departments or ON 1 = 1;",
+            "SELECT FROM WHERE;",
+            "SELECT * FROM;",
+            "SELECT * FROM employees WHERE;",
+            "SELECT * FROM employees GROUP BY;",
+            "SELECT a, FROM employees;",
+        ];
+        let misses: Vec<&str> = invalid
+            .iter()
+            .copied()
+            .filter(|q| !diag_bare(q).iter().any(|x| x.severity == Severity::Error))
+            .collect();
+        assert!(
+            misses.is_empty(),
+            "missed errors on invalid SQL:\n{misses:#?}"
+        );
+    }
+
+    #[test]
+    fn diag_nonreserved_keyword_alias_not_flagged() {
+        // `OFFSET`/`VIEW` are non-reserved in MySQL — legal as bare aliases, so no
+        // squiggle (explicit or implicit).
+        for sql in [
+            "SELECT id AS offset FROM employees",
+            "SELECT * FROM employees view",
+        ] {
+            assert!(
+                !diag(sql)
+                    .iter()
+                    .any(|x| x.message.contains("reserved keyword")),
+                "false positive: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn diag_insert_and_update_bodies_not_flagged() {
+        // INSERT/UPDATE aren't checked for implicit aliases → VALUES/SET are safe.
+        for sql in [
+            "INSERT INTO employees VALUES (1)",
+            "UPDATE employees SET id = 1",
+        ] {
+            assert!(
+                !diag(sql)
+                    .iter()
+                    .any(|x| x.message.contains("reserved keyword")),
+                "false positive: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn diag_valid_alias_not_flagged() {
+        // A non-keyword alias is fine (explicit and implicit).
+        assert!(
+            !diag("SELECT id AS ord FROM employees")
+                .iter()
+                .any(|x| x.message.contains("reserved keyword"))
+        );
+        assert!(
+            !diag("SELECT * FROM employees emp")
+                .iter()
+                .any(|x| x.message.contains("reserved keyword"))
+        );
+    }
+
+    #[test]
+    fn diag_ctas_and_view_body_not_flagged() {
+        // `AS SELECT` / `AS (SELECT …)` bodies aren't aliases.
+        for sql in [
+            "CREATE TABLE t AS SELECT id FROM employees",
+            "CREATE VIEW v AS SELECT id FROM employees",
+        ] {
+            assert!(
+                !diag(sql)
+                    .iter()
+                    .any(|x| x.message.contains("reserved keyword")),
+                "false positive on: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn scope_rejects_reserved_keyword_alias_after_as() {
+        // `orders AS or` must NOT resolve `or` as an alias (parity with the implicit
+        // form `orders or`) — so completion won't offer `or.`'s columns for it.
+        let sql = "SELECT or. FROM employees AS or WHERE ";
+        let s = statement_scope(sql, 0, sql.len(), 10, SqlDialect::MySql);
+        let emp = s.tables.iter().find(|t| t.name == "employees").unwrap();
+        assert_eq!(emp.alias, None);
     }
 
     #[test]

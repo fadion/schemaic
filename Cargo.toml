@@ -51,8 +51,9 @@ sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 # SQL parsing. Pure-Rust, per-dialect AST (MySqlDialect now; Postgres/SQLite are
 # dialect swaps for the multi-DB future). Drives the editor's structure-aware
 # completion + catalog diagnostics; the hand-built `skip_noncode` lexer stays for
-# byte positions + mid-edit fallback (sqlparser isn't error-tolerant).
-sqlparser = "0.62"
+# byte positions + mid-edit fallback (sqlparser isn't error-tolerant). The `visitor`
+# feature powers the unqualified-column diagnostic (walking the AST for column refs).
+sqlparser = { version = "0.62", features = ["visitor"] }
 
 # Errors / logging / serde
 thiserror = "2"
