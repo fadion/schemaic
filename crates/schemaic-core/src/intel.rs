@@ -1896,8 +1896,8 @@ mod colres {
     use std::ops::ControlFlow;
 
     use sqlparser::ast::{
-        Cte, Expr, Query, Select, SelectItem, SetExpr, Spanned, Statement, TableAlias, TableFactor,
-        Visit, Visitor,
+        Cte, Expr, JoinConstraint, JoinOperator, Query, Select, SelectItem, SetExpr, Spanned,
+        Statement, TableAlias, TableFactor, TableWithJoins, Visit, Visitor,
     };
     use sqlparser::tokenizer::Span;
 
@@ -1924,6 +1924,12 @@ mod colres {
         range: (usize, usize),
         sources: Vec<Src>,
         proj_aliases: HashSet<String>,
+        /// Columns coalesced by a `USING(...)` join — an unqualified reference to
+        /// one is unambiguous even when several sources expose it.
+        coalesced: HashSet<String>,
+        /// A `NATURAL` join is present → its coalesced (common) columns can't be
+        /// enumerated cheaply, so ambiguity checks are suppressed for this scope.
+        natural: bool,
     }
 
     /// A column reference to resolve, positioned by its identifier span.
@@ -2036,10 +2042,13 @@ mod colres {
         /// against the catalog + the CTEs registered so far.
         fn push_scope(&mut self, range: (usize, usize), sel: &Select) {
             let (sources, proj_aliases) = build_sources(sel, self.catalog, &self.ctes);
+            let (coalesced, natural) = coalesced_cols(sel);
             self.scopes.push(Scope {
                 range,
                 sources,
                 proj_aliases,
+                coalesced,
+                natural,
             });
         }
     }
@@ -2096,17 +2105,35 @@ mod colres {
                 None
             }
             None => {
+                // Resolve innermost-first (MySQL name resolution): the first scope
+                // that supplies the column wins. Within that scope, two *concrete*
+                // sources exposing it is an ambiguity error; an unenumerable (`Open`)
+                // source means we can't judge, so we stay silent.
                 for s in &chain {
+                    let mut known_matches = 0usize;
+                    let mut has_open = false;
                     for src in &s.sources {
                         match &src.cols {
-                            Cols::Open => return None,
-                            Cols::Known(cols) if cols.contains(&r.col) => return None,
+                            Cols::Open => has_open = true,
+                            Cols::Known(cols) if cols.contains(&r.col) => known_matches += 1,
                             Cols::Known(_) => {}
                         }
+                    }
+                    // Two known sources with the column → ambiguous, unless a
+                    // `USING`/`NATURAL` join coalesced it into a single output column.
+                    if known_matches >= 2 && !s.natural && !s.coalesced.contains(&r.col) {
+                        return Some(err(r, &format!("Column `{}` is ambiguous", r.col)));
+                    }
+                    if known_matches >= 1 {
+                        return None; // resolved unambiguously in this scope
+                    }
+                    if has_open {
+                        return None; // an unenumerable source might provide it
                     }
                     if s.proj_aliases.contains(&r.col) {
                         return None;
                     }
+                    // Not in this scope → try the enclosing (correlated) scope.
                 }
                 // Not found and no open source anywhere in the chain → flag. Name the
                 // table only when the innermost scope has a single base-table source.
@@ -2141,6 +2168,60 @@ mod colres {
             }
         }
         (sources, proj_aliases(sel))
+    }
+
+    /// Columns coalesced by a `USING(...)` join in this SELECT's FROM (lowercased),
+    /// plus whether a `NATURAL` join is present. A reference to a coalesced column is
+    /// unambiguous even when several sources expose it; NATURAL suppresses the check
+    /// entirely (its common-column set isn't enumerated here).
+    fn coalesced_cols(sel: &Select) -> (HashSet<String>, bool) {
+        let mut cols = HashSet::new();
+        let mut natural = false;
+        fn walk(twj: &TableWithJoins, cols: &mut HashSet<String>, natural: &mut bool) {
+            walk_factor(&twj.relation, cols, natural);
+            for join in &twj.joins {
+                walk_factor(&join.relation, cols, natural);
+                constraint(&join.join_operator, cols, natural);
+            }
+        }
+        fn walk_factor(f: &TableFactor, cols: &mut HashSet<String>, natural: &mut bool) {
+            if let TableFactor::NestedJoin {
+                table_with_joins, ..
+            } = f
+            {
+                walk(table_with_joins, cols, natural);
+            }
+        }
+        fn constraint(op: &JoinOperator, cols: &mut HashSet<String>, natural: &mut bool) {
+            match join_constraint(op) {
+                Some(JoinConstraint::Using(names)) => {
+                    for n in names {
+                        if let Some(id) = n.0.last().and_then(|p| p.as_ident()) {
+                            cols.insert(id.value.to_ascii_lowercase());
+                        }
+                    }
+                }
+                Some(JoinConstraint::Natural) => *natural = true,
+                _ => {}
+            }
+        }
+        for twj in &sel.from {
+            walk(twj, &mut cols, &mut natural);
+        }
+        (cols, natural)
+    }
+
+    /// The `JoinConstraint` carried by a join operator, if any (the `APPLY`/`ARRAY
+    /// JOIN` forms carry none).
+    fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
+        use JoinOperator::*;
+        match op {
+            Join(c) | Inner(c) | Left(c) | LeftOuter(c) | Right(c) | RightOuter(c)
+            | FullOuter(c) | CrossJoin(c) | Semi(c) | LeftSemi(c) | RightSemi(c) | Anti(c)
+            | LeftAnti(c) | RightAnti(c) | StraightJoin(c) => Some(c),
+            AsOf { constraint, .. } => Some(constraint),
+            CrossApply | OuterApply | ArrayJoin | LeftArrayJoin | InnerArrayJoin => None,
+        }
     }
 
     fn add_source(
@@ -3027,9 +3108,9 @@ mod tests {
             "SELECT id, name, salary, dept_id FROM employees",
             "SELECT name FROM employees WHERE salary > 100 ORDER BY name",
             "SELECT dept_id FROM employees GROUP BY dept_id HAVING COUNT(*) > 1",
-            // Union across a join (existence, either table).
-            "SELECT name FROM employees e JOIN departments d ON e.dept_id = d.id",
-            "SELECT id FROM employees, departments",
+            // A column unique to one joined table resolves (and isn't ambiguous).
+            "SELECT salary FROM employees e JOIN departments d ON e.dept_id = d.id",
+            "SELECT salary FROM employees, departments",
             // Projection alias referenced downstream is valid.
             "SELECT salary AS s FROM employees ORDER BY s",
             // Functions / interval units are not columns (must not false-positive).
@@ -3050,6 +3131,49 @@ mod tests {
                 col_errors(sql)
             );
         }
+    }
+
+    #[test]
+    fn diag_ambiguous_unqualified_column() {
+        // `name` exists in BOTH joined tables → ambiguous (MySQL errors here).
+        let sql = "SELECT name FROM employees e JOIN departments d ON e.dept_id = d.id";
+        let d = diag(sql);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].severity, Severity::Error);
+        assert!(d[0].message.contains("ambiguous"), "{}", d[0].message);
+        // The squiggle covers the offending column.
+        assert_eq!(&sql[d[0].range.0..d[0].range.1], "name");
+        // Comma-join is the same shape.
+        assert!(
+            col_errors("SELECT id FROM employees, departments")
+                .iter()
+                .any(|m| m.contains("ambiguous"))
+        );
+        // A column unique to one side resolves cleanly.
+        assert!(
+            col_errors("SELECT salary FROM employees e JOIN departments d ON e.dept_id = d.id")
+                .is_empty()
+        );
+        // A qualified reference is never ambiguous.
+        assert!(
+            col_errors("SELECT e.name FROM employees e JOIN departments d ON e.dept_id = d.id")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn diag_ambiguous_suppressed_when_coalesced_or_uncertain() {
+        // `USING(id)` coalesces `id` into one output column → unambiguous.
+        assert!(col_errors("SELECT id FROM employees e JOIN departments d USING (id)").is_empty());
+        // Both sources unenumerable (`SELECT *`) → can't prove ambiguity → silent.
+        assert!(
+            col_errors(
+                "SELECT id FROM (SELECT * FROM employees) a JOIN (SELECT * FROM departments) b ON a.id = b.id"
+            )
+            .is_empty()
+        );
+        // A single table is never ambiguous.
+        assert!(col_errors("SELECT id FROM employees").is_empty());
     }
 
     #[test]
