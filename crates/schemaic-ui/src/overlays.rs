@@ -653,6 +653,9 @@ struct PaletteItem {
     /// A schema-style leading icon (table/column search hits); `None` for command
     /// rows, which show no icon.
     icon: Option<ResultIcon>,
+    /// A trailing (right-aligned) icon glyph — the rotate-ccw-clock on search-history
+    /// rows; `None` for everything else.
+    right_icon: Option<&'static str>,
 }
 
 /// The schema-style leading icon for a Find-Anywhere hit — mirrors the schema
@@ -694,6 +697,110 @@ impl ResultIcon {
                 base.multiply_alpha(0.5)
             }
         }
+    }
+}
+
+/// The result icon for a table/view (schema-tree parity).
+fn table_result_icon(t: &schemaic_core::schema::TableInfo) -> ResultIcon {
+    if t.is_view {
+        ResultIcon::View
+    } else {
+        ResultIcon::Table
+    }
+}
+
+/// The result icon for a column: its type family, tinted by key role (PK / FK /
+/// plain) — mirrors the schema tree.
+fn column_result_icon(
+    t: &schemaic_core::schema::TableInfo,
+    c: &schemaic_core::schema::ColumnInfo,
+) -> ResultIcon {
+    let role = if c.primary_key {
+        ColKeyRole::Primary
+    } else if t.fk_for_column(&c.name).is_some() {
+        ColKeyRole::Foreign
+    } else {
+        ColKeyRole::Plain
+    };
+    ResultIcon::Column(
+        schemaic_core::schema::classify_column_type(&c.type_name),
+        role,
+    )
+}
+
+/// Re-derive a history entry's icon from the live schema (its type/key info isn't
+/// persisted). `None` if the schema isn't loaded or the table/column is gone.
+fn lookup_result_icon(
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    db: &str,
+    table: &str,
+    column: Option<&str>,
+) -> Option<ResultIcon> {
+    db_nodes.with_untracked(|nodes| {
+        let node = nodes.iter().find(|n| n.database == db)?;
+        let SchemaState::Loaded(schema) = node.schema.get_untracked() else {
+            return None;
+        };
+        let t = schema.tables.iter().find(|t| t.name == table)?;
+        match column {
+            None => Some(table_result_icon(t)),
+            Some(col) => t
+                .columns
+                .iter()
+                .find(|c| c.name == col)
+                .map(|c| column_result_icon(t, c)),
+        }
+    })
+}
+
+/// Build one search/history result row: records the activation to search history
+/// (bubbling it to the top), then opens the table — selecting + scrolling to the
+/// column for a column hit (same as a schema-tree column double-click). `history`
+/// adds the trailing rotate-ccw-clock marker.
+#[allow(clippy::too_many_arguments)]
+fn search_result_item(
+    db: String,
+    table: String,
+    column: Option<String>,
+    left_icon: Option<ResultIcon>,
+    history: bool,
+    match_term: Option<String>,
+    active_conn: RwSignal<u64>,
+    search_history: RwSignal<Vec<schemaic_core::search_history::SearchEntry>>,
+    open_table: Rc<dyn Fn(String, String)>,
+    open_table_col: Rc<dyn Fn(String, String, String)>,
+    close: Rc<dyn Fn()>,
+) -> PaletteItem {
+    let primary = match &column {
+        Some(c) => format!("{table}.{c}"),
+        None => table.clone(),
+    };
+    let complete = column.clone().unwrap_or_else(|| table.clone());
+    PaletteItem {
+        primary,
+        secondary: db.clone(),
+        activate: Rc::new(move || {
+            search_history.update(|v| {
+                schemaic_core::search_history::push(
+                    v,
+                    schemaic_core::search_history::SearchEntry {
+                        conn_id: active_conn.get_untracked(),
+                        database: db.clone(),
+                        table: table.clone(),
+                        column: column.clone(),
+                    },
+                );
+            });
+            match &column {
+                Some(c) => (open_table_col)(db.clone(), table.clone(), c.clone()),
+                None => (open_table)(db.clone(), table.clone()),
+            }
+            (close)();
+        }),
+        complete: Some(complete),
+        match_term,
+        icon: left_icon,
+        right_icon: history.then_some(icons::ROTATE_CCW_CLOCK),
     }
 }
 
@@ -1008,6 +1115,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                                     complete: None,
                                     match_term: Some(arg.to_string()),
                                     icon: None,
+                                    right_icon: None,
                                 }
                             })
                             .collect()
@@ -1048,6 +1156,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                         complete: None,
                         match_term: None,
                         icon: None,
+                        right_icon: None,
                     }]
                 })
             }),
@@ -1079,6 +1188,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                         complete: None,
                         match_term: None,
                         icon: None,
+                        right_icon: None,
                     }]
                 })
             }),
@@ -1249,6 +1359,7 @@ fn hint_item(primary: &str, secondary: &str) -> PaletteItem {
         complete: None,
         match_term: None,
         icon: None,
+        right_icon: None,
     }
 }
 
@@ -1260,6 +1371,8 @@ fn build_items(
     commands: &[Command],
     db_nodes: RwSignal<Vec<ConnNode>>,
     hidden: RwSignal<HashSet<String>>,
+    active_conn: RwSignal<u64>,
+    search_history: RwSignal<Vec<schemaic_core::search_history::SearchEntry>>,
     open_table: &Rc<dyn Fn(String, String)>,
     open_table_col: &Rc<dyn Fn(String, String, String)>,
     close: &Rc<dyn Fn()>,
@@ -1270,43 +1383,56 @@ fn build_items(
     match parsed {
         // Default table/column search: a table hit opens the table; a column hit
         // opens the table AND selects + scrolls to that column (same as a schema-tree
-        // column double-click). Each row carries a schema-style icon.
+        // column double-click). Each row carries a schema-style icon. With an EMPTY
+        // query we instead show this connection's recent activations (search history),
+        // each marked with a trailing rotate-ccw-clock — they vanish once you type.
         Parsed::Search(q) => {
             let q = q.trim().to_lowercase();
             if q.is_empty() {
-                return Vec::new();
+                let conn = active_conn.get_untracked();
+                let recent = search_history
+                    .with_untracked(|v| schemaic_core::search_history::recent(v, conn));
+                return recent
+                    .into_iter()
+                    .map(|e| {
+                        let left = lookup_result_icon(
+                            db_nodes,
+                            &e.database,
+                            &e.table,
+                            e.column.as_deref(),
+                        );
+                        search_result_item(
+                            e.database,
+                            e.table,
+                            e.column,
+                            left,
+                            true, // history row → trailing clock marker
+                            None, // nothing to highlight (empty query)
+                            active_conn,
+                            search_history,
+                            open_table.clone(),
+                            open_table_col.clone(),
+                            close.clone(),
+                        )
+                    })
+                    .collect();
             }
             find_matches(db_nodes, hidden, &q, 80)
                 .into_iter()
                 .map(|hit| {
-                    let primary = match &hit.column {
-                        Some(c) => format!("{}.{c}", hit.table),
-                        None => hit.table.clone(),
-                    };
-                    // Ghost/Tab target: the matched name (column when it's a column
-                    // hit, else the table). The ghost only paints when the query is a
-                    // true prefix of it, so a mid-string match shows nothing.
-                    let complete = hit.column.clone().unwrap_or_else(|| hit.table.clone());
-                    let (db, table, column) =
-                        (hit.db.clone(), hit.table.clone(), hit.column.clone());
-                    let icon = hit.icon;
-                    let open_table = open_table.clone();
-                    let open_table_col = open_table_col.clone();
-                    let close = close.clone();
-                    PaletteItem {
-                        primary,
-                        secondary: hit.db,
-                        activate: Rc::new(move || {
-                            match &column {
-                                Some(c) => (open_table_col)(db.clone(), table.clone(), c.clone()),
-                                None => (open_table)(db.clone(), table.clone()),
-                            }
-                            (close)();
-                        }),
-                        complete: Some(complete),
-                        match_term: Some(q.clone()),
-                        icon: Some(icon),
-                    }
+                    search_result_item(
+                        hit.db,
+                        hit.table,
+                        hit.column,
+                        Some(hit.icon),
+                        false,
+                        Some(q.clone()),
+                        active_conn,
+                        search_history,
+                        open_table.clone(),
+                        open_table_col.clone(),
+                        close.clone(),
+                    )
                 })
                 .collect()
         }
@@ -1346,6 +1472,7 @@ fn build_items(
                         complete: Some(complete),
                         match_term: Some(f.clone()),
                         icon: None,
+                        right_icon: None,
                     }
                 })
                 .collect()
@@ -1363,6 +1490,7 @@ fn build_items(
                     complete: None,
                     match_term: None,
                     icon: None,
+                    right_icon: None,
                 }],
                 CmdArg::Options { list, run } => {
                     let a = arg.trim().to_lowercase();
@@ -1384,6 +1512,7 @@ fn build_items(
                                 complete: Some(format!(">{} {}", c.name, v)),
                                 match_term: Some(a.clone()),
                                 icon: None,
+                                right_icon: None,
                             }
                         })
                         .collect()
@@ -1404,6 +1533,7 @@ fn build_items(
                                 complete: None,
                                 match_term: None,
                                 icon: None,
+                                right_icon: None,
                             }],
                             None => vec![hint_item(c.label, c.hint)],
                         };
@@ -1419,6 +1549,7 @@ fn build_items(
                                 complete: None,
                                 match_term: None,
                                 icon: None,
+                                right_icon: None,
                             }]
                         }
                         Err(_) => vec![hint_item(c.label, "Enter a number")],
@@ -1439,6 +1570,8 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
     let hidden = ui.schema.hidden_dbs;
     let open_table = ui.tab_actions.open_table.clone();
     let open_table_col = ui.tab_actions.open_table_col.clone();
+    let active_conn = ui.conn.active_conn;
+    let search_history = ui.overlay.search_history;
     let ui_reg = ui.clone(); // for building the command registry per open
 
     dyn_container(
@@ -1487,6 +1620,8 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                         &commands,
                         db_nodes,
                         hidden,
+                        active_conn,
+                        search_history,
                         &open_table,
                         &open_table_col,
                         &close,
@@ -1576,14 +1711,16 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
             .pointer_events(|| false);
             let input = stack((field, ghost)).style(|s| s.width_full());
 
-            // Suggestions appear only once something is typed (empty → just the box).
+            // Suggestions: live search results while typing, or this connection's
+            // recent history when the query is empty. Empty query AND no history →
+            // just the box; a typed query with no matches → "Nothing found".
             let results = dyn_container(
                 move || items.get(),
                 move |list| {
-                    if query.with_untracked(|q| q.is_empty()) {
-                        return empty().into_any();
-                    }
                     if list.is_empty() {
+                        if query.with_untracked(|q| q.is_empty()) {
+                            return empty().into_any(); // nothing typed, no history
+                        }
                         // Left-aligned like a normal result row (same padding), 13px.
                         return text("Nothing found")
                             .style(|s| {
@@ -1616,6 +1753,15 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                                 .style(|s| s.color(theme::text_muted()).font_size(14.0))
                                 .into_any(),
                         );
+                        // Trailing history marker, pushed to the far right by a spacer.
+                        if let Some(ri) = item.right_icon {
+                            cells.push(empty().style(|s| s.flex_grow(1.0_f32)).into_any());
+                            cells.push(
+                                icons::icon(ri, 15.0)
+                                    .style(|s| s.color(theme::text_faint()).flex_shrink(0.0_f32))
+                                    .into_any(),
+                            );
+                        }
                         let row = h_stack_from_iter(cells)
                             .on_click_stop(move |_| {
                                 selected.set(i);
@@ -1663,18 +1809,20 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
             // (and each row's highlight) spans edge to edge, not just content width.
             .style(|s| s.width_full());
 
-            // Panel: 400px input + 15px padding all around (→ 430px wide), results
-            // below. Sizes to content; the results scroll caps its height.
+            // Panel: 550px input + 15px padding all around (→ 580px wide), results
+            // below. Sizes to content; the results scroll caps its height. (Widened
+            // from 430 so long `table.column` rows + the history clock don't clip.)
             let panel = v_stack((
                 input,
                 autohide(scroll(results).scroll_to(move || list_scroll.get()))
                     // 10px gap here (not inside the content) so the scrollbar clears
                     // the input too, and the first row keeps the gap when scrolled up.
-                    // Only when there's something to show — an empty query collapses
-                    // the container, so the panel's padding stays even around the box.
+                    // Only when there's something to show (search results or history) —
+                    // an empty list collapses the container, so the panel's padding
+                    // stays even around the bare box.
                     .style(move |s| {
                         let s = s.width_full().max_height(360.0);
-                        if query.with(|q| q.is_empty()) {
+                        if items.with(|l| l.is_empty()) {
                             s
                         } else {
                             s.margin_top(10.0)
@@ -1684,7 +1832,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
             .on_click_stop(|_| {})
             .style(|s| {
                 panel_style(s)
-                    .width(430.0)
+                    .width(580.0)
                     .padding(15.0)
                     .margin_top(80.0)
                     .border_color(theme::modal_border())
@@ -1834,11 +1982,7 @@ fn find_matches(
                         db: node.database.clone(),
                         table: t.name.clone(),
                         column: None,
-                        icon: if t.is_view {
-                            ResultIcon::View
-                        } else {
-                            ResultIcon::Table
-                        },
+                        icon: table_result_icon(t),
                     });
                     if out.len() >= limit {
                         return out;
@@ -1847,21 +1991,11 @@ fn find_matches(
                 if !q.is_empty() {
                     for c in &t.columns {
                         if c.name.to_lowercase().contains(q) {
-                            // Match the schema tree: type-family glyph, tinted by the
-                            // column's key role (PK / FK / plain).
-                            let role = if c.primary_key {
-                                ColKeyRole::Primary
-                            } else if t.fk_for_column(&c.name).is_some() {
-                                ColKeyRole::Foreign
-                            } else {
-                                ColKeyRole::Plain
-                            };
-                            let class = schemaic_core::schema::classify_column_type(&c.type_name);
                             out.push(FindHit {
                                 db: node.database.clone(),
                                 table: t.name.clone(),
                                 column: Some(c.name.clone()),
-                                icon: ResultIcon::Column(class, role),
+                                icon: column_result_icon(t, c),
                             });
                             if out.len() >= limit {
                                 return out;

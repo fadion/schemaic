@@ -572,6 +572,7 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
     let editor_font = ui.layout.editor_font;
     let row_limit = ui.layout.row_limit;
     let confirm_writes = ui.layout.confirm_writes;
+    let live_validate = ui.layout.live_validate;
     let restore_tabs = ui.layout.restore_tabs;
 
     dyn_container(
@@ -609,8 +610,20 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
                 "Ask before executing any statement that modifies data or schema.",
                 confirm_writes,
             );
-            let query_group = v_stack((settings_section_header("Query"), row_section, confirm_row))
-                .style(|s| s.flex_col().gap(16.0));
+            let validate_row = settings_toggle_row(
+                "Live database validation",
+                "Check the statement under the cursor against the database as you type \
+                 (a non-executing PREPARE) to surface exact errors. Adds a DB round-trip \
+                 on each pause.",
+                live_validate,
+            );
+            let query_group = v_stack((
+                settings_section_header("Query"),
+                row_section,
+                confirm_row,
+                validate_row,
+            ))
+            .style(|s| s.flex_col().gap(16.0));
 
             // Theme group.
             let ui_dd =

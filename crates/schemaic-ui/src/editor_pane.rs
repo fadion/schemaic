@@ -2,8 +2,9 @@
 //! layered over it — the Ctrl+K inline-AI popup (`cmdk_popup`), the run/AI anchored
 //! menus, the statement-highlight + syntax-squiggle overlays and their geometry
 //! helpers (`underline_seg`/`highlight_pick`/`statement_line_boxes`/`wavy_svg`),
-//! the typo checker (`syntax_errors`/`is_probable_typo`/`edit_distance`), and the
-//! custom overlay scrollbars. `query_pane` is the entry point wired into `center`;
+//! the catalog-aware diagnostics bridge (`compute_diagnostics` → `schemaic_core::
+//! intel`), and the custom overlay scrollbars. `query_pane` is the entry point
+//! wired into `center`;
 //! `editor_placeholder` is the no-tab fallback. Autocomplete lives in
 //! `completion`, the diff preview in `diff_view`, statement/guard logic in
 //! `schemaic_core::sql`.
@@ -31,26 +32,23 @@ use floem::views::editor::text::WrapMethod;
 use floem::views::scroll::{Handle, Thickness};
 
 use schemaic_core::diff::{DiffTag, build_diff_rows, line_diff};
+use schemaic_core::intel::{self, Diagnostic, Severity, SqlDialect};
 use schemaic_core::model::QueryState;
-use schemaic_core::schema::SchemaState;
 use schemaic_core::sql::{
-    contains_write, first_unsafe, skip_noncode, statement_range, statement_ranges, unsafe_reason,
+    contains_write, first_unsafe, statement_range, statement_ranges, unsafe_reason,
 };
 use schemaic_core::text_ops::{
     find_matches, offset_of_line, replace_all, soft_tab_indent, soft_tab_outdent,
     toggle_line_comment,
 };
 
-use crate::completion::{
-    Completion, SQL_FUNCTIONS, SQL_KEYWORDS, accept_completion, completion_popup,
-    recompute_completions,
-};
+use crate::completion::{Completion, accept_completion, completion_popup, recompute_completions};
 use crate::consts::*;
 use crate::diff_view::diff_view;
 use crate::widgets::*;
 use crate::{
     ConnNode, CtxMenu, FieldCfg, InlineAiRequest, InlineAiState, NavKeys, PopupAnchor, RightPanel,
-    bg_transparent, edit_field, icons, sql_highlight, theme, thumb_len,
+    ValidateDoneFn, ValidateFn, bg_transparent, edit_field, icons, sql_highlight, theme, thumb_len,
 };
 
 // ===== moved from lib.rs (editor pane) =====
@@ -534,107 +532,23 @@ struct Guard {
     pending: Option<Pending>,
 }
 
-// ── Syntax check (misspelled keywords) ───────────────────────────────────────
+// ── Diagnostics (catalog-aware) ──────────────────────────────────────────────
 
-/// Bounded Levenshtein edit distance between two ASCII strings.
-fn edit_distance(a: &str, b: &str) -> usize {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    let mut cur = vec![0usize; b.len() + 1];
-    for i in 1..=a.len() {
-        cur[0] = i;
-        for j in 1..=b.len() {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
-        }
-        std::mem::swap(&mut prev, &mut cur);
-    }
-    prev[b.len()]
-}
-
-/// Is `word` a likely misspelled SQL keyword? True when it's not a known word
-/// (keyword or schema identifier) but IS a near-miss of a keyword. Conservative
-/// by design (short words and distant matches are ignored) to avoid flagging
-/// legitimate identifiers. `known` is a lowercase set of keywords + identifiers.
-fn is_probable_typo(word: &str, known: &std::collections::HashSet<String>) -> bool {
-    // Too short to disambiguate a typo from an intentional short identifier.
-    if word.len() < 4 {
-        return false;
-    }
-    let lw = word.to_ascii_lowercase();
-    if known.contains(&lw) {
-        return false;
-    }
-    let up = word.to_ascii_uppercase();
-    // Allow distance 2 only for longer words; distance 1 otherwise.
-    let thresh = if word.len() >= 7 { 2 } else { 1 };
-    SQL_KEYWORDS.iter().any(|kw| {
-        (kw.len() as isize - up.len() as isize).unsigned_abs() <= thresh
-            && edit_distance(&up, kw) <= thresh
-    })
-}
-
-/// Byte ranges of probable misspelled keywords in `sql` (skips strings,
-/// comments, and the identifier after a `.` — a qualified `db.table` part).
-/// `pub(crate)` so the status bar can report a live warning count from the same
-/// analysis that drives the editor squiggles.
-pub(crate) fn syntax_errors(sql: &str, db_nodes: RwSignal<Vec<ConnNode>>) -> Vec<(usize, usize)> {
-    // Known words that must NOT be flagged: keywords + functions + all schema
-    // identifiers. Functions are a separate list from keywords (§7.5 dedup), so
-    // include them here too or `COUNT(…)` would squiggle as a typo.
-    let mut known: std::collections::HashSet<String> = SQL_KEYWORDS
-        .iter()
-        .chain(SQL_FUNCTIONS.iter())
-        .map(|k| k.to_ascii_lowercase())
-        .collect();
-    for node in db_nodes.get_untracked() {
-        known.insert(node.database.to_ascii_lowercase());
-        if let SchemaState::Loaded(schema) = node.schema.get_untracked() {
-            for t in &schema.tables {
-                known.insert(t.name.to_ascii_lowercase());
-                for c in &t.columns {
-                    known.insert(c.name.to_ascii_lowercase());
-                }
-                for ix in &t.indexes {
-                    known.insert(ix.name.to_ascii_lowercase());
-                }
-            }
-        }
-    }
-
-    let b = sql.as_bytes();
-    let n = b.len();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < n {
-        // Strings, backtick identifiers, and comments (incl. `#`) are skipped via
-        // the shared primitive — a backtick-quoted or commented word is never a
-        // "typo". `skip_noncode` always advances past `i`.
-        if let Some(j) = skip_noncode(b, i) {
-            i = j;
-            continue;
-        }
-        let c = b[i];
-        // Non-ASCII (UTF-8) bytes count as word bytes so a Unicode identifier
-        // scans whole and isn't mis-flagged as a typo on its ASCII prefix (B6).
-        if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 {
-            let s = i;
-            let mut j = i + 1;
-            while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'_' || b[j] >= 0x80) {
-                j += 1;
-            }
-            // Skip the identifier after a `.` (e.g. the `actor` in `sakila.actor`).
-            let qualified = s > 0 && b[s - 1] == b'.';
-            if !qualified && is_probable_typo(&sql[s..j], &known) {
-                out.push((s, j));
-            }
-            i = j;
-            continue;
-        }
-        i += 1;
-    }
-    out
+/// Compute the editor's diagnostics for `sql`: catalog-aware unknown-table /
+/// unknown-column errors, syntax errors on completed statements, and probable
+/// keyword-typo warnings — all from the pure `schemaic_core::intel` engine, which
+/// parses each statement with a real dialect AST and resolves references against
+/// the introspected schema. `active_db` scopes unqualified references (a tab's
+/// selected database); the whole `db_nodes` catalog is still available so an
+/// explicit `otherdb.table` resolves. `pub(crate)` so the status bar reports a
+/// live count from the same analysis that draws the squiggles.
+pub(crate) fn compute_diagnostics(
+    sql: &str,
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    active_db: Option<&str>,
+) -> Vec<Diagnostic> {
+    let catalog = crate::completion::build_catalog(db_nodes, active_db);
+    intel::diagnostics(sql, &catalog, SqlDialect::MySql)
 }
 
 /// An inline SVG wavy line `width` px wide and [`WAVE_H`] tall — a smooth sine
@@ -772,6 +686,11 @@ pub(crate) struct QueryPaneParams {
     pub active_db_anchor: RwSignal<Point>,
     pub read_only: Memo<bool>,
     pub confirm_writes: RwSignal<bool>,
+    /// Whether to validate the statement under the cursor against the live DB as
+    /// you type (Tier-2 diagnostics). Persisted setting.
+    pub live_validate: RwSignal<bool>,
+    /// Requests a debounced DB validation of the statement under the cursor.
+    pub validate_stmt: ValidateFn,
     pub popup_menu: RwSignal<Option<Vec<MenuEntry>>>,
     pub popup_anchor: RwSignal<Option<PopupAnchor>>,
     pub popup_width: RwSignal<f64>,
@@ -804,6 +723,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         active_db_anchor,
         read_only,
         confirm_writes,
+        live_validate,
+        validate_stmt,
         popup_menu,
         popup_anchor,
         popup_width,
@@ -890,11 +811,25 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     });
 
     // Unsafe-statement guard: when set, a red bar warns and holds back the run
-    // until "Run anyway". Byte ranges of probable misspelled keywords (the orange
-    // squiggles) — recomputed on every edit, seeded from the initial text.
+    // until "Run anyway". Catalog-aware diagnostics (the squiggles) — recomputed on
+    // every edit, seeded from the initial text.
     let guard: RwSignal<Option<Guard>> = RwSignal::new(None);
-    let syntax: RwSignal<Vec<(usize, usize)>> =
-        RwSignal::new(syntax_errors(&query.get_untracked(), db_nodes));
+    let syntax: RwSignal<Vec<Diagnostic>> = RwSignal::new(compute_diagnostics(
+        &query.get_untracked(),
+        db_nodes,
+        active_db.get_untracked().as_deref(),
+    ));
+    // Tier-2 (DB-validated) diagnostics for the statement under the cursor, when
+    // `live_validate` is on. Debounced: each edit bumps `val_gen`, and only the
+    // latest generation's deferred round-trip fires (and its result is accepted).
+    let db_diag: RwSignal<Vec<Diagnostic>> = RwSignal::new(Vec::new());
+    let val_gen: Rc<std::cell::Cell<u64>> = Rc::new(std::cell::Cell::new(0));
+    // Turning validation off clears any lingering DB squiggle.
+    create_effect(move |_| {
+        if !live_validate.get() {
+            db_diag.set(Vec::new());
+        }
+    });
 
     // Run entry points go through these: a DELETE/UPDATE with no WHERE sets the
     // guard (nothing runs) instead of executing. "Run anyway" replays via the raw
@@ -1701,8 +1636,47 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     recompute_completions(&ed, db_nodes, comp, adb.as_deref(), false);
                 });
             }
-            // Re-check for misspelled keywords (drives the orange squiggles).
-            syntax.set(syntax_errors(&text, db_nodes));
+            // Re-run catalog-aware diagnostics (drives the squiggles).
+            syntax.set(compute_diagnostics(
+                &text,
+                db_nodes,
+                active_db.get_untracked().as_deref(),
+            ));
+            // Tier-2: debounced live DB validation of the statement under the
+            // cursor. Clear any stale DB squiggle immediately, then (if enabled)
+            // schedule a round-trip that fires only if this is still the latest edit
+            // and the statement parses cleanly (never nag a half-typed fragment).
+            db_diag.set(Vec::new());
+            if live_validate.get_untracked() {
+                let g = val_gen.get().wrapping_add(1);
+                val_gen.set(g);
+                let text2 = text.clone();
+                let ed2 = ed.clone();
+                let validate = validate_stmt.clone();
+                let vgen = val_gen.clone();
+                floem::action::exec_after(std::time::Duration::from_millis(500), move |_| {
+                    if vgen.get() != g {
+                        return;
+                    }
+                    let caret = match ed2.cursor.try_get_untracked() {
+                        Some(c) => c.offset(),
+                        None => return, // pane disposed
+                    };
+                    let (lo, hi) = statement_range(&text2, caret);
+                    if lo >= hi || !intel::parses(&text2[lo..hi], SqlDialect::MySql) {
+                        return;
+                    }
+                    let vgen2 = vgen.clone();
+                    let on_done: ValidateDoneFn = Rc::new(move |diags| {
+                        // Ignore a result the user has already typed past, and skip
+                        // if the pane was disposed while the round-trip was in flight.
+                        if vgen2.get() == g && db_diag.try_get_untracked().is_some() {
+                            db_diag.set(diags);
+                        }
+                    });
+                    validate(text2.clone(), lo, hi, on_done);
+                });
+            }
             // Any edit (typing, or the AI-fix Approve) dismisses a stale error
             // bar — the error no longer describes the current text.
             if matches!(results.get_untracked(), QueryState::Failed(_)) {
@@ -2362,31 +2336,53 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         .pointer_events(|| false)
     };
 
-    // Orange wavy underlines under probable misspelled keywords. Click-through
-    // overlay (like `highlight_view`); one SVG squiggle per flagged word, drawn
-    // just below the glyphs so it reads as an underline.
+    // Wavy underlines under diagnostics: red for definite errors (unknown table/
+    // column, syntax), amber for probable keyword typos. Overlay laid over the
+    // editor; each squiggle carries a hover tooltip with the diagnostic message.
+    // The container is click-through (`pointer_events(false)`) so text selection is
+    // unaffected — only the individual squiggle strips re-enable pointer events so
+    // hovering the underline (drawn in the descender gap, below the glyphs) reveals
+    // the message without stealing clicks meant for the text.
     let syntax_view = {
         let ed = ed_syntax;
         dyn_container(
-            move || syntax.get(),
-            move |ranges| {
-                if ranges.is_empty() {
+            move || {
+                // Offline diagnostics + live DB-validation diagnostics, merged.
+                let mut d = syntax.get();
+                d.extend(db_diag.get());
+                d
+            },
+            move |diags| {
+                if diags.is_empty() {
                     return empty().into_any();
                 }
                 let sql = query.get_untracked();
-                let segs: Vec<(f64, f64, f64)> = ranges
+                let segs: Vec<(f64, f64, f64, Severity, String)> = diags
                     .iter()
-                    .map(|&(lo, hi)| underline_seg(&sql, &ed, lo, hi))
-                    .collect();
-                v_stack_from_iter(segs.into_iter().map(|(x, y, w)| {
-                    floem::views::svg(wavy_svg(w)).style(move |s| {
-                        s.absolute()
-                            .inset_left(x)
-                            .inset_top(y)
-                            .width(w)
-                            .height(WAVE_H)
-                            .color(theme::syntax_underline())
+                    .map(|d| {
+                        let (x, y, w) = underline_seg(&sql, &ed, d.range.0, d.range.1);
+                        (x, y, w, d.severity, d.message.clone())
                     })
+                    .collect();
+                v_stack_from_iter(segs.into_iter().map(|(x, y, w, sev, msg)| {
+                    floem::views::svg(wavy_svg(w))
+                        .style(move |s| {
+                            s.absolute()
+                                .inset_left(x)
+                                .inset_top(y)
+                                // A slightly taller hit area than the wave so the
+                                // hover is catchable, still within the descender gap.
+                                .height(WAVE_H + 4.0)
+                                .width(w)
+                                .color(match sev {
+                                    Severity::Error => theme::diag_error(),
+                                    Severity::Warning => theme::syntax_underline(),
+                                })
+                        })
+                        .pointer_events(|| true)
+                        .tooltip(move || {
+                            text(msg.clone()).style(|s| s.font_size(12.0).max_width(360.0))
+                        })
                 }))
                 .style(|s| s.absolute().inset(0.0))
                 .into_any()

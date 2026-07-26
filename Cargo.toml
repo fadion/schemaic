@@ -48,6 +48,12 @@ ssh-key = "=0.7.0-rc.11"
 # CPU/memory/process reader, no disk/network/component/user probes.
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
+# SQL parsing. Pure-Rust, per-dialect AST (MySqlDialect now; Postgres/SQLite are
+# dialect swaps for the multi-DB future). Drives the editor's structure-aware
+# completion + catalog diagnostics; the hand-built `skip_noncode` lexer stays for
+# byte positions + mid-edit fallback (sqlparser isn't error-tolerant).
+sqlparser = "0.62"
+
 # Errors / logging / serde
 thiserror = "2"
 anyhow = "1"

@@ -79,6 +79,14 @@ pub type CommitDoneFn = Rc<dyn Fn(CommitDone)>;
 /// [`CommitDoneFn`]. Aliased to keep the field/signal types below readable.
 pub type CommitFn = Rc<dyn Fn(GridWrite, Option<RefetchRequest>, CommitDoneFn)>;
 
+/// Delivers the Tier-2 (DB-validated) diagnostics for the statement under the
+/// cursor back onto the UI thread.
+pub type ValidateDoneFn = Rc<dyn Fn(Vec<schemaic_core::intel::Diagnostic>)>;
+/// A query-pane → app request to validate the statement `sql[lo..hi]` against the
+/// live database (non-executing PREPARE) and report back via [`ValidateDoneFn`].
+/// Targets the active tab's connection/database.
+pub type ValidateFn = Rc<dyn Fn(String, usize, usize, ValidateDoneFn)>;
+
 /// A grid → app request to AI-fill a single cell. The app bottom-samples the base
 /// table, builds a prompt (DDL + sample + this row's context), runs a one-shot
 /// `claude -p` call, parses the reply, and reports back via [`AiFillDoneFn`].
@@ -627,6 +635,9 @@ pub struct TabsActions {
     /// Run `EXPLAIN` (or `EXPLAIN ANALYZE` when arg 2 is true) for a statement,
     /// filling the plan modal's state. Targets the active tab's connection/db.
     pub run_plan: Rc<dyn Fn(String, bool)>,
+    /// Validate the statement `sql[lo..hi]` against the live DB (non-executing
+    /// PREPARE) and deliver Tier-2 diagnostics back. Targets the active tab.
+    pub validate_stmt: ValidateFn,
     /// Open the Live Monitor for a `(conn_id, database, table)`: start polling
     /// that table on an interval and reveal the change-log modal.
     pub open_monitor: MonitorFn,
@@ -870,6 +881,9 @@ pub struct LayoutUi {
     pub confirm_writes: RwSignal<bool>,
     /// Reopen the previous session's query tabs on startup.
     pub restore_tabs: RwSignal<bool>,
+    /// Validate the statement under the cursor against the live DB (non-executing
+    /// PREPARE) as you type. Drives the editor's Tier-2 diagnostics.
+    pub live_validate: RwSignal<bool>,
 }
 
 /// Where the shared `popup_menu` anchors when it's *not* opened at the cursor.
@@ -908,6 +922,9 @@ pub struct OverlayUi {
     pub last_mouse: RwSignal<(f64, f64)>,
     pub find_open: RwSignal<bool>,
     pub find_query: RwSignal<String>,
+    /// Per-connection Find-Anywhere search history (recorded on activation, shown
+    /// on open with an empty query). Persisted to `search_history.json` by the app.
+    pub search_history: RwSignal<Vec<schemaic_core::search_history::SearchEntry>>,
     /// "View" modal for an error bar. When `error_modal_text` is `Some`, the modal
     /// shows that text (the grid's commit error); otherwise it falls back to the
     /// active tab's full query error (the editor error bar).
@@ -2004,6 +2021,8 @@ fn center(ui: Ui) -> impl IntoView {
         }
     });
     let confirm_writes = ui.layout.confirm_writes;
+    let live_validate = ui.layout.live_validate;
+    let validate_stmt = ui.tab_actions.validate_stmt.clone();
     let run = ui.tab_actions.run.clone();
     let run_all = ui.tab_actions.run_all.clone();
     let cancel = ui.tab_actions.cancel.clone();
@@ -2145,6 +2164,8 @@ fn center(ui: Ui) -> impl IntoView {
                     active_db_anchor,
                     read_only,
                     confirm_writes,
+                    live_validate,
+                    validate_stmt: validate_stmt.clone(),
                     popup_menu: popup,
                     popup_anchor,
                     popup_width,
@@ -3669,14 +3690,18 @@ fn footer(ui: Ui) -> impl IntoView {
         })
         .unwrap_or((1, 1))
     });
-    // Live count of probable-typo warnings in the active tab's SQL (same analysis
-    // as the editor squiggles). Tracks the query text and the schema list.
+    // Live count of diagnostics in the active tab's SQL (same analysis as the
+    // editor squiggles). Tracks the query text and the schema list.
     let warn_count = create_memo(move |_| {
         let id = active.get();
         db_nodes.track();
-        let q = tabs.with(|v| v.iter().find(|t| t.id == id).map(|t| t.query.get()));
-        match q {
-            Some(q) => editor_pane::syntax_errors(&q, db_nodes).len(),
+        let tab = tabs.with(|v| {
+            v.iter()
+                .find(|t| t.id == id)
+                .map(|t| (t.query.get(), t.database.get()))
+        });
+        match tab {
+            Some((q, adb)) => editor_pane::compute_diagnostics(&q, db_nodes, adb.as_deref()).len(),
             None => 0,
         }
     });
@@ -3860,13 +3885,16 @@ fn footer(ui: Ui) -> impl IntoView {
         },
     )
     .on_click_stop(move |_| {
-        // Jump the editor to the first warning (no-op when there are none).
+        // Jump the editor to the first diagnostic (no-op when there are none).
         let id = active.get_untracked();
         tabs.with_untracked(|v| {
             if let Some(t) = v.iter().find(|t| t.id == id) {
                 let q = t.query.get_untracked();
-                if let Some(&(start, _)) = editor_pane::syntax_errors(&q, db_nodes).first() {
-                    t.jump_offset.set(Some(start));
+                let adb = t.database.get_untracked();
+                if let Some(d) =
+                    editor_pane::compute_diagnostics(&q, db_nodes, adb.as_deref()).first()
+                {
+                    t.jump_offset.set(Some(d.range.0));
                 }
             }
         });

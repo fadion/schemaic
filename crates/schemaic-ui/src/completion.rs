@@ -5,9 +5,10 @@
 //! `SchemaIndex`, plus keyword/function tables) by a fuzzy score within
 //! context tiers, and drives the `Completion` state that `completion_popup`
 //! renders below the caret. `accept_completion` writes the picked word back into
-//! the editor. Only `Completion`/`recompute_completions`/`accept_completion`/
-//! `completion_popup` (and `SQL_KEYWORDS`, reused by the editor's typo squiggles)
-//! are `pub(crate)`; the rest is internal.
+//! the editor. Scope/context resolution now comes from the shared
+//! `schemaic_core::intel` engine (AST-backed, with a lexer fallback); this module
+//! is the ranking + popup layer over it. Only `Completion`/`recompute_completions`/
+//! `accept_completion`/`completion_popup` are `pub(crate)`; the rest is internal.
 
 use std::collections::{HashMap, HashSet};
 
@@ -18,78 +19,22 @@ use floem::views::editor::core::cursor::CursorAffinity;
 use floem::views::editor::core::editor::EditType;
 use floem::views::editor::core::selection::Selection;
 
-use schemaic_core::schema::SchemaState;
-use schemaic_core::sql::{skip_noncode, statement_range};
+use schemaic_core::intel::{self, ClauseCtx, SqlDialect};
+use schemaic_core::schema::{DbSchema, SchemaState};
+use schemaic_core::sql::statement_range;
+
+// The keyword/function sets now live in `schemaic_core::intel` (so the core
+// analysis + diagnostics share one authoritative copy); used here to seed the
+// suggestion pool.
+use schemaic_core::intel::{SQL_FUNCTIONS, SQL_KEYWORDS, STMT_KEYWORDS};
+
+use floem::AnyView;
 
 use crate::consts::*;
-use crate::{ConnNode, theme};
+use crate::{ConnNode, icons, theme};
 
 // ===== moved from lib.rs (autocomplete) =====
 // ── Autocomplete ────────────────────────────────────────────────────────────
-
-/// Common SQL keywords offered by autocomplete (identifiers come from the
-/// introspected schema).
-pub(crate) const SQL_KEYWORDS: &[&str] = &[
-    "SELECT",
-    "FROM",
-    "WHERE",
-    "AND",
-    "OR",
-    "NOT",
-    "NULL",
-    "IS",
-    "IN",
-    "LIKE",
-    "BETWEEN",
-    "AS",
-    "JOIN",
-    "INNER",
-    "LEFT",
-    "RIGHT",
-    "OUTER",
-    "CROSS",
-    "ON",
-    "USING",
-    "GROUP",
-    "ORDER",
-    "BY",
-    "HAVING",
-    "LIMIT",
-    "OFFSET",
-    "DISTINCT",
-    "UNION",
-    "ALL",
-    "EXISTS",
-    "CASE",
-    "WHEN",
-    "THEN",
-    "ELSE",
-    "END",
-    "ASC",
-    "DESC",
-    // COUNT/SUM/AVG/MIN/MAX intentionally live only in `SQL_FUNCTIONS` (they're
-    // functions, not keywords) — deduped to remove the tier ambiguity (§7.5).
-    "INSERT",
-    "INTO",
-    "VALUES",
-    "UPDATE",
-    "SET",
-    "DELETE",
-    "CREATE",
-    "TABLE",
-    "VIEW",
-    "INDEX",
-    "ALTER",
-    "DROP",
-    "TRUNCATE",
-    "PRIMARY",
-    "KEY",
-    "FOREIGN",
-    "REFERENCES",
-    "DEFAULT",
-    "AUTO_INCREMENT",
-    "UNIQUE",
-];
 
 /// Autocomplete popup state, shared between the editor key handler, the
 /// per-edit recompute, and the popup view.
@@ -115,13 +60,15 @@ pub(crate) enum SuggestKind {
     Database,
 }
 
-/// One ranked autocomplete row: the text inserted, its kind, and a dim detail
-/// (a column's type, or a table's database).
+/// One ranked autocomplete row: the text inserted, its kind, a dim detail (a
+/// column's type + nullability, or a table's database), and whether it's a primary
+/// key (drives the gold key glyph on column rows).
 #[derive(Clone)]
 pub(crate) struct Suggestion {
     text: String,
     kind: SuggestKind,
     detail: String,
+    pk: bool,
 }
 
 fn is_word_byte(b: u8) -> bool {
@@ -140,63 +87,33 @@ fn word_start(text: &str, offset: usize) -> usize {
     start
 }
 
-/// SQL functions offered in value/column position (kind [`SuggestKind::Function`]).
-/// `pub(crate)` so the editor's typo-squiggle checker can treat them as known
-/// words (they're no longer in `SQL_KEYWORDS`).
-pub(crate) const SQL_FUNCTIONS: &[&str] = &[
-    "COUNT",
-    "SUM",
-    "AVG",
-    "MIN",
-    "MAX",
-    "COALESCE",
-    "IFNULL",
-    "NULLIF",
-    "CONCAT",
-    "CONCAT_WS",
-    "GROUP_CONCAT",
-    "LENGTH",
-    "CHAR_LENGTH",
-    "LOWER",
-    "UPPER",
-    "TRIM",
-    "LTRIM",
-    "RTRIM",
-    "SUBSTRING",
-    "REPLACE",
-    "ROUND",
-    "FLOOR",
-    "CEIL",
-    "ABS",
-    "MOD",
-    "NOW",
-    "CURDATE",
-    "CURTIME",
-    "DATE",
-    "YEAR",
-    "MONTH",
-    "DAY",
-    "HOUR",
-    "DATE_FORMAT",
-    "DATEDIFF",
-    "CAST",
-    "CONVERT",
-    "IF",
-    "GREATEST",
-    "LEAST",
-];
+/// Build the `schemaic_core::intel::Catalog` from the loaded connection schemas
+/// and the tab's active database. Shared by the FK-aware `JOIN … ON` completion
+/// and the editor's diagnostics (`editor_pane::compute_diagnostics`), so both read
+/// the same catalog view.
+pub(crate) fn build_catalog(
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    active_db: Option<&str>,
+) -> intel::Catalog {
+    let loaded: Vec<(String, DbSchema)> = db_nodes
+        .get_untracked()
+        .into_iter()
+        .filter_map(|node| match node.schema.get_untracked() {
+            SchemaState::Loaded(schema) => Some((node.database, schema)),
+            _ => None,
+        })
+        .collect();
+    let refs: Vec<(&str, &DbSchema)> = loaded.iter().map(|(d, s)| (d.as_str(), s)).collect();
+    intel::Catalog::build(&refs, active_db)
+}
 
-/// Keywords that begin a statement (offered at statement start).
-const STMT_KEYWORDS: &[&str] = &[
-    "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TRUNCATE", "WITH", "SHOW",
-    "EXPLAIN", "DESCRIBE", "USE", "REPLACE", "CALL",
-];
-
-/// Case-insensitive membership in the SQL keyword set (used to reject a keyword
-/// as an implicit table alias).
-fn is_sql_keyword(word: &str) -> bool {
-    let up = word.to_ascii_uppercase();
-    SQL_KEYWORDS.iter().any(|k| *k == up)
+/// One column's completion-relevant metadata.
+#[derive(Clone)]
+struct ColMeta {
+    name: String,
+    type_name: String,
+    nullable: bool,
+    primary_key: bool,
 }
 
 /// A schema view built once per recompute: which databases/tables exist and each
@@ -206,8 +123,8 @@ struct SchemaIndex {
     databases: Vec<String>,
     /// (table name, database it lives in).
     tables: Vec<(String, String)>,
-    /// table name (lowercase) → its columns `(name, type)`.
-    columns: HashMap<String, Vec<(String, String)>>,
+    /// table name (lowercase) → its columns.
+    columns: HashMap<String, Vec<ColMeta>>,
     /// database name (lowercase) → its table names.
     tables_by_db: HashMap<String, Vec<String>>,
 }
@@ -221,7 +138,7 @@ impl SchemaIndex {
     fn build(db_nodes: RwSignal<Vec<ConnNode>>, active_db: Option<&str>) -> SchemaIndex {
         let mut databases = Vec::new();
         let mut tables = Vec::new();
-        let mut columns: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut columns: HashMap<String, Vec<ColMeta>> = HashMap::new();
         let mut tables_by_db: HashMap<String, Vec<String>> = HashMap::new();
         for node in db_nodes.get_untracked() {
             if !databases
@@ -244,8 +161,13 @@ impl SchemaIndex {
                         tables.push((t.name.clone(), node.database.clone()));
                         let entry = columns.entry(t.name.to_ascii_lowercase()).or_default();
                         for c in &t.columns {
-                            if !entry.iter().any(|(n, _)| n.eq_ignore_ascii_case(&c.name)) {
-                                entry.push((c.name.clone(), c.type_name.clone()));
+                            if !entry.iter().any(|m| m.name.eq_ignore_ascii_case(&c.name)) {
+                                entry.push(ColMeta {
+                                    name: c.name.clone(),
+                                    type_name: c.type_name.clone(),
+                                    nullable: c.nullable,
+                                    primary_key: c.primary_key,
+                                });
                             }
                         }
                     }
@@ -259,184 +181,6 @@ impl SchemaIndex {
             tables_by_db,
         }
     }
-}
-
-/// A table reference parsed from a statement's FROM/JOIN/UPDATE/INTO clause.
-struct TableRef {
-    alias: Option<String>,
-    name: String,
-}
-
-/// Lightweight SQL token used by the context analysis (words + the punctuation
-/// that matters for it). Strings and comments are skipped by the tokenizer.
-#[derive(Clone)]
-enum TkKind {
-    Word(String),
-    Dot,
-    Comma,
-    LParen,
-    RParen,
-}
-
-/// A token plus its absolute byte offset in `sql` (offsets drive the caret's
-/// paren-scope lookup).
-struct Token {
-    at: usize,
-    kind: TkKind,
-}
-
-/// Tokenize `sql[lo..hi]` into words + `. , ( )`, skipping string literals,
-/// backtick identifiers, and comments via the shared [`skip_noncode`] primitive
-/// (so it agrees with the statement splitter / WHERE guard on those boundaries).
-fn tokenize_range(sql: &str, lo: usize, hi: usize) -> Vec<Token> {
-    let b = sql.as_bytes();
-    let mut out = Vec::new();
-    let mut i = lo;
-    let push = |out: &mut Vec<Token>, at: usize, kind: TkKind| out.push(Token { at, kind });
-    while i < hi {
-        if let Some(j) = skip_noncode(b, i) {
-            // A construct can run to the buffer end (unterminated string); clamp
-            // to this range's `hi`. `skip_noncode` always advances past `i`.
-            i = j.min(hi);
-            continue;
-        }
-        let c = b[i];
-        // A word starts on an ASCII letter/`_` or any non-ASCII (UTF-8) byte, and
-        // runs over word bytes — so Unicode identifiers tokenize whole (review B6).
-        if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 {
-            let s = i;
-            let mut j = i + 1;
-            while j < hi && is_word_byte(b[j]) {
-                j += 1;
-            }
-            push(&mut out, s, TkKind::Word(sql[s..j].to_string()));
-            i = j;
-            continue;
-        }
-        match c {
-            b'.' => push(&mut out, i, TkKind::Dot),
-            b',' => push(&mut out, i, TkKind::Comma),
-            b'(' => push(&mut out, i, TkKind::LParen),
-            b')' => push(&mut out, i, TkKind::RParen),
-            _ => {}
-        }
-        i += 1;
-    }
-    out
-}
-
-/// The set of paren-scope ids open at `caret` (each `(` is numbered by encounter
-/// order; `0` is the top level and is always included). A table declared in one
-/// of these scopes — the caret's own query or an enclosing one — is visible;
-/// tables in sibling/deeper subqueries are not. Same numbering as
-/// [`tables_in_scope`], so the ids line up.
-fn caret_scope_chain(toks: &[Token], caret: usize) -> HashSet<usize> {
-    let mut next_id = 1usize;
-    let mut open: Vec<usize> = Vec::new();
-    for t in toks {
-        if t.at >= caret {
-            break;
-        }
-        match t.kind {
-            TkKind::LParen => {
-                open.push(next_id);
-                next_id += 1;
-            }
-            TkKind::RParen => {
-                open.pop();
-            }
-            _ => {}
-        }
-    }
-    let mut chain: HashSet<usize> = open.into_iter().collect();
-    chain.insert(0);
-    chain
-}
-
-/// Parse the tables (and aliases) visible at `caret` — those in the caret's
-/// query scope or an enclosing one (correlation), not sibling/inner subqueries.
-/// Handles `db.table`, `AS alias`, implicit `table alias`, and comma FROM-lists.
-fn tables_in_scope(sql: &str, lo: usize, hi: usize, caret: usize) -> Vec<TableRef> {
-    let toks = tokenize_range(sql, lo, hi);
-    let chain = caret_scope_chain(&toks, caret);
-    let word = |k: &TkKind| -> Option<String> {
-        if let TkKind::Word(w) = k {
-            Some(w.clone())
-        } else {
-            None
-        }
-    };
-    let mut out = Vec::new();
-    let mut next_id = 1usize;
-    let mut open: Vec<usize> = Vec::new();
-    let mut i = 0;
-    while i < toks.len() {
-        match &toks[i].kind {
-            TkKind::LParen => {
-                open.push(next_id);
-                next_id += 1;
-                i += 1;
-                continue;
-            }
-            TkKind::RParen => {
-                open.pop();
-                i += 1;
-                continue;
-            }
-            TkKind::Word(w) => {
-                let up = w.to_ascii_uppercase();
-                let is_from = up == "FROM";
-                if !matches!(up.as_str(), "FROM" | "JOIN" | "INTO" | "UPDATE") {
-                    i += 1;
-                    continue;
-                }
-                let scope = *open.last().unwrap_or(&0);
-                i += 1;
-                // A table name: `word` or `word . word` (db.table → table part).
-                while let Some(mut name) = toks.get(i).and_then(|t| word(&t.kind)) {
-                    // A keyword here (e.g. `FROM (SELECT…`) isn't a table name.
-                    if is_sql_keyword(&name) {
-                        break;
-                    }
-                    i += 1;
-                    if matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::Dot))
-                        && let Some(second) = toks.get(i + 1).and_then(|t| word(&t.kind))
-                    {
-                        name = second;
-                        i += 2;
-                    }
-                    // Optional alias: `AS x` or a bare non-keyword word.
-                    let mut alias = None;
-                    match toks.get(i).map(|t| &t.kind) {
-                        Some(TkKind::Word(a)) if a.eq_ignore_ascii_case("AS") => {
-                            if let Some(al) = toks.get(i + 1).and_then(|t| word(&t.kind)) {
-                                alias = Some(al);
-                                i += 2;
-                            }
-                        }
-                        Some(TkKind::Word(a)) if !is_sql_keyword(a) => {
-                            alias = Some(a.clone());
-                            i += 1;
-                        }
-                        _ => {}
-                    }
-                    if chain.contains(&scope) {
-                        out.push(TableRef { alias, name });
-                    }
-                    // FROM allows a comma list of tables; otherwise one per intro.
-                    if is_from && matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::Comma)) {
-                        i += 1;
-                        continue;
-                    }
-                    break;
-                }
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-    out
 }
 
 /// Fuzzy subsequence score of `query` against `cand` (case-insensitive), or None
@@ -495,74 +239,8 @@ struct Cand {
     kind: SuggestKind,
     detail: String,
     tier: u8,
+    pk: bool,
 }
-
-/// What kind of token is expected at the caret, deciding which suggestions to
-/// rank first.
-enum CompCtx {
-    /// Start of a statement → statement keywords.
-    Start,
-    /// After SELECT / WHERE / ON / SET / … → columns, functions, keywords.
-    Column,
-    /// After FROM / JOIN / UPDATE / INTO → tables, databases.
-    Table,
-    /// Right after `qualifier.` → that table's columns (or that db's tables).
-    Qualified(String),
-    /// Anything else → the full mixed list (keywords + tables + columns).
-    Other,
-}
-
-/// Classify the caret context from the statement `sql[lo..hi]`. `word_lo` is the
-/// byte offset where the caret's current word begins (so we look only at tokens
-/// before it).
-fn completion_context(sql: &str, lo: usize, _hi: usize, word_lo: usize) -> CompCtx {
-    // Qualified reference: the char just before the word is a `.`.
-    if word_lo > lo && sql.as_bytes()[word_lo - 1] == b'.' {
-        let q_start = word_start(sql, word_lo - 1);
-        let qualifier = sql.get(q_start..word_lo - 1).unwrap_or("").to_string();
-        if !qualifier.is_empty() {
-            return CompCtx::Qualified(qualifier);
-        }
-    }
-    // The last clause keyword strictly before the caret's word decides the rest.
-    let toks = tokenize_range(sql, lo, word_lo);
-    let mut last_kw: Option<String> = None;
-    for t in &toks {
-        if let TkKind::Word(w) = &t.kind {
-            let up = w.to_ascii_uppercase();
-            if CLAUSE_KEYWORDS.contains(&up.as_str()) {
-                last_kw = Some(up);
-            }
-        }
-    }
-    match last_kw.as_deref() {
-        None => {
-            // No clause keyword yet: statement start if there are no words at all,
-            // otherwise a mixed context.
-            if toks.iter().any(|t| matches!(t.kind, TkKind::Word(_))) {
-                CompCtx::Other
-            } else {
-                CompCtx::Start
-            }
-        }
-        Some("FROM" | "JOIN" | "INTO" | "UPDATE" | "TABLE" | "TRUNCATE" | "DESCRIBE") => {
-            CompCtx::Table
-        }
-        Some(
-            "SELECT" | "WHERE" | "ON" | "AND" | "OR" | "HAVING" | "SET" | "USING" | "BY" | "GROUP"
-            | "ORDER" | "DISTINCT" | "WHEN" | "THEN" | "ELSE",
-        ) => CompCtx::Column,
-        _ => CompCtx::Other,
-    }
-}
-
-/// Clause keywords that determine the completion context (see
-/// [`completion_context`]).
-const CLAUSE_KEYWORDS: &[&str] = &[
-    "SELECT", "FROM", "WHERE", "JOIN", "ON", "AND", "OR", "HAVING", "SET", "USING", "BY", "GROUP",
-    "ORDER", "DISTINCT", "INTO", "UPDATE", "TABLE", "TRUNCATE", "DESCRIBE", "VALUES", "LIMIT",
-    "OFFSET", "WHEN", "THEN", "ELSE",
-];
 
 /// Recompute context-aware suggestions for the word at the caret. Ranks the most
 /// relevant kind first (columns of the in-scope tables after SELECT/WHERE, tables
@@ -591,8 +269,32 @@ pub(crate) fn recompute_completions(
     let prefix = text.get(word_lo..offset).unwrap_or("").to_string();
 
     let (lo, hi) = statement_range(&text, offset);
-    let ctx = completion_context(&text, lo, hi, word_lo);
-    let qualified = matches!(ctx, CompCtx::Qualified(_));
+    // Context is lexer-based (correct mid-edit); scope prefers the real AST
+    // (robust CTE/alias/derived-table resolution), falling back to the lexer.
+    let ctx = intel::clause_context(&text, lo, word_lo);
+    let qualified = matches!(ctx, ClauseCtx::Qualified(_));
+
+    // FK-aware auto-join: right after a fresh `JOIN … ON `, offer the foreign-key
+    // join predicate as a single, ready-to-insert suggestion (DataGrip-style). Only
+    // on an empty ON expression (`prefix` empty, in a column/ON context), so it
+    // never fights manual typing.
+    if prefix.is_empty() && matches!(ctx, ClauseCtx::Column) {
+        let catalog = build_catalog(db_nodes, active_db);
+        if let Some(pred) = intel::join_condition(&text, lo, hi, offset, &catalog) {
+            let mut cpoint = ed.points_of_offset(offset, CursorAffinity::Backward).1;
+            cpoint.y += EDITOR_PAD_TOP;
+            comp.point.set(cpoint);
+            comp.items.set(vec![Suggestion {
+                text: pred,
+                kind: SuggestKind::Column,
+                detail: "foreign key".to_string(),
+                pk: false,
+            }]);
+            comp.sel.set(0);
+            comp.open.set(true);
+            return;
+        }
+    }
 
     // Don't pop the list on every space: an empty prefix only shows suggestions
     // right after a `.` or when explicitly requested (Ctrl+Space).
@@ -603,7 +305,7 @@ pub(crate) fn recompute_completions(
     }
 
     let schema = SchemaIndex::build(db_nodes, active_db);
-    let scope = tables_in_scope(&text, lo, hi, offset);
+    let scope = intel::statement_scope(&text, lo, hi, offset, SqlDialect::MySql).tables;
     let pl = prefix.to_ascii_lowercase();
 
     // Collect raw candidates (dedup by text, first/lowest tier wins), then score.
@@ -624,9 +326,39 @@ pub(crate) fn recompute_completions(
             kind,
             detail,
             tier,
+            pk: false,
         });
     };
-    let cols_of = |name: &str| -> Vec<(String, String)> {
+    // Column candidates carry PK + nullability. `detail` shows the type, suffixed
+    // with a dim `· NULL` for nullable columns (NOT NULL stays clean); PK columns
+    // get the gold key glyph via `Cand.pk` (and don't repeat the type detail when
+    // `type_detail` is false — e.g. the no-FROM pool shows the owning table instead).
+    let add_col = |cands: &mut Vec<Cand>,
+                   seen: &mut HashSet<String>,
+                   c: &ColMeta,
+                   detail: String,
+                   tier: u8| {
+        let tl = c.name.to_ascii_lowercase();
+        if tl == pl || !seen.insert(tl) {
+            return;
+        }
+        cands.push(Cand {
+            text: c.name.clone(),
+            kind: SuggestKind::Column,
+            detail,
+            tier,
+            pk: c.primary_key,
+        });
+    };
+    // The detail string for a column typed against its own metadata.
+    let col_type_detail = |c: &ColMeta| -> String {
+        if c.nullable {
+            format!("{} · NULL", c.type_name)
+        } else {
+            c.type_name.clone()
+        }
+    };
+    let cols_of = |name: &str| -> Vec<ColMeta> {
         schema
             .columns
             .get(&name.to_ascii_lowercase())
@@ -651,10 +383,11 @@ pub(crate) fn recompute_completions(
     };
 
     match &ctx {
-        CompCtx::Qualified(q) => {
+        ClauseCtx::Qualified(q) => {
             if let Some(table) = resolve(q) {
-                for (n, ty) in cols_of(&table) {
-                    add(&mut cands, &mut seen, &n, SuggestKind::Column, ty, 0);
+                for c in cols_of(&table) {
+                    let d = col_type_detail(&c);
+                    add_col(&mut cands, &mut seen, &c, d, 0);
                 }
             } else if let Some(tbls) = schema.tables_by_db.get(&q.to_ascii_lowercase()) {
                 for t in tbls {
@@ -662,7 +395,7 @@ pub(crate) fn recompute_completions(
                 }
             }
         }
-        CompCtx::Table => {
+        ClauseCtx::Table => {
             for (name, db) in &schema.tables {
                 add(
                     &mut cands,
@@ -684,26 +417,20 @@ pub(crate) fn recompute_completions(
                 );
             }
         }
-        CompCtx::Column => {
+        ClauseCtx::Column => {
             if scope.is_empty() {
                 // No FROM yet: offer every column, disambiguated by its table
                 // (shown as the detail) so the broader list stays navigable.
                 for (name, _) in &schema.tables {
-                    for (n, _) in cols_of(name) {
-                        add(
-                            &mut cands,
-                            &mut seen,
-                            &n,
-                            SuggestKind::Column,
-                            name.clone(),
-                            1,
-                        );
+                    for c in cols_of(name) {
+                        add_col(&mut cands, &mut seen, &c, name.clone(), 1);
                     }
                 }
             } else {
                 for r in &scope {
-                    for (n, ty) in cols_of(&r.name) {
-                        add(&mut cands, &mut seen, &n, SuggestKind::Column, ty, 0);
+                    for c in cols_of(&r.name) {
+                        let d = col_type_detail(&c);
+                        add_col(&mut cands, &mut seen, &c, d, 0);
                     }
                 }
             }
@@ -728,7 +455,7 @@ pub(crate) fn recompute_completions(
                 );
             }
         }
-        CompCtx::Start => {
+        ClauseCtx::Start => {
             for &k in STMT_KEYWORDS {
                 add(
                     &mut cands,
@@ -750,10 +477,11 @@ pub(crate) fn recompute_completions(
                 );
             }
         }
-        CompCtx::Other => {
+        ClauseCtx::Other => {
             for r in &scope {
-                for (n, ty) in cols_of(&r.name) {
-                    add(&mut cands, &mut seen, &n, SuggestKind::Column, ty, 0);
+                for c in cols_of(&r.name) {
+                    let d = col_type_detail(&c);
+                    add_col(&mut cands, &mut seen, &c, d, 0);
                 }
             }
             for (name, db) in &schema.tables {
@@ -797,6 +525,7 @@ pub(crate) fn recompute_completions(
             text: c.text,
             kind: c.kind,
             detail: c.detail,
+            pk: c.pk,
         })
         .collect();
 
@@ -862,12 +591,23 @@ pub(crate) fn completion_popup(comp: Completion) -> impl IntoView {
                     text: name,
                     kind,
                     detail,
+                    pk,
                 } = item;
                 let color = suggest_color(kind);
-                // Name (kind-tinted) on the left; the dim detail (a column's type,
-                // a table's database) right-aligned. The selected/hovered
-                // background spans the full row width. 14px matches the editor.
+                // A gold key glyph marks a primary-key column (same colour as the
+                // schema tree); other rows get no leading slot.
+                let lead: AnyView = if pk {
+                    icons::icon(icons::KEY_ROUND, 12.0)
+                        .style(|s| s.color(theme::key_primary()).margin_right(5.0))
+                        .into_any()
+                } else {
+                    empty().into_any()
+                };
+                // Name (kind-tinted) on the left; the dim detail (a column's type +
+                // nullability, a table's database) right-aligned. The selected/
+                // hovered background spans the full row width. 14px matches the editor.
                 h_stack((
+                    lead,
                     text(name).style(move |s| s.font_size(14.0).color(color)),
                     empty().style(|s| s.flex_grow(1.0_f32)),
                     text(detail)
