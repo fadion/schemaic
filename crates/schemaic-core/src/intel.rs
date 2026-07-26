@@ -85,7 +85,7 @@ pub const SQL_KEYWORDS: &[&str] = &[
     "END",
     "ASC",
     "DESC",
-    // COUNT/SUM/AVG/MIN/MAX intentionally live only in `SQL_FUNCTIONS` (they're
+    // COUNT/SUM/AVG/MIN/MAX intentionally live only in `FUNCTIONS` (they're
     // functions, not keywords) — deduped to remove the tier ambiguity.
     "INSERT",
     "INTO",
@@ -109,295 +109,804 @@ pub const SQL_KEYWORDS: &[&str] = &[
     "UNIQUE",
 ];
 
-/// SQL functions offered in value/column position. Kept distinct from keywords so
-/// the editor's typo checker treats them as known words.
-pub const SQL_FUNCTIONS: &[&str] = &[
-    "COUNT",
-    "SUM",
-    "AVG",
-    "MIN",
-    "MAX",
-    "COALESCE",
-    "IFNULL",
-    "NULLIF",
-    "CONCAT",
-    "CONCAT_WS",
-    "GROUP_CONCAT",
-    "LENGTH",
-    "CHAR_LENGTH",
-    "LOWER",
-    "UPPER",
-    "TRIM",
-    "LTRIM",
-    "RTRIM",
-    "SUBSTRING",
-    "REPLACE",
-    "ROUND",
-    "FLOOR",
-    "CEIL",
-    "ABS",
-    "MOD",
-    "NOW",
-    "CURDATE",
-    "CURTIME",
-    "DATE",
-    "YEAR",
-    "MONTH",
-    "DAY",
-    "HOUR",
-    "DATE_FORMAT",
-    "DATEDIFF",
-    "CAST",
-    "CONVERT",
-    "IF",
-    "GREATEST",
-    "LEAST",
+/// A built-in SQL function: its name, a display signature (parameters), and a one-
+/// line summary. Backs autocomplete (the signature is shown as the row detail) and
+/// the "misspelled function" diagnostic (a near-miss of a real name isn't flagged).
+#[derive(Clone, Copy)]
+pub struct SqlFunction {
+    /// Upper-case function name.
+    pub name: &'static str,
+    /// Display signature including the parameter list, e.g. `POWER(X, Y)`.
+    pub signature: &'static str,
+    /// Short description of what it returns.
+    pub summary: &'static str,
+}
+
+const fn f(name: &'static str, signature: &'static str, summary: &'static str) -> SqlFunction {
+    SqlFunction {
+        name,
+        signature,
+        summary,
+    }
+}
+
+/// The authoritative catalog of MySQL/MariaDB built-in functions offered by
+/// autocomplete and trusted by the typo checker. Grouped by family; each carries its
+/// parameter signature so the completion popup can show it. (Aggregate/window
+/// functions are included — they complete in value position like any other call.)
+pub const FUNCTIONS: &[SqlFunction] = &[
+    // ── Aggregate ────────────────────────────────────────────────────────────
+    f(
+        "COUNT",
+        "COUNT(expr)",
+        "Count of non-NULL rows (COUNT(*) counts all)",
+    ),
+    f("SUM", "SUM(expr)", "Sum of values"),
+    f("AVG", "AVG(expr)", "Average of values"),
+    f("MIN", "MIN(expr)", "Minimum value"),
+    f("MAX", "MAX(expr)", "Maximum value"),
+    f(
+        "GROUP_CONCAT",
+        "GROUP_CONCAT(expr [ORDER BY ...] [SEPARATOR s])",
+        "Concatenate group values",
+    ),
+    f("STD", "STD(expr)", "Population standard deviation"),
+    f("STDDEV", "STDDEV(expr)", "Population standard deviation"),
+    f(
+        "STDDEV_POP",
+        "STDDEV_POP(expr)",
+        "Population standard deviation",
+    ),
+    f(
+        "STDDEV_SAMP",
+        "STDDEV_SAMP(expr)",
+        "Sample standard deviation",
+    ),
+    f("VARIANCE", "VARIANCE(expr)", "Population variance"),
+    f("VAR_POP", "VAR_POP(expr)", "Population variance"),
+    f("VAR_SAMP", "VAR_SAMP(expr)", "Sample variance"),
+    f("BIT_AND", "BIT_AND(expr)", "Bitwise AND over the group"),
+    f("BIT_OR", "BIT_OR(expr)", "Bitwise OR over the group"),
+    f("BIT_XOR", "BIT_XOR(expr)", "Bitwise XOR over the group"),
+    // ── Window ───────────────────────────────────────────────────────────────
+    f(
+        "ROW_NUMBER",
+        "ROW_NUMBER() OVER (...)",
+        "Sequential row number within a partition",
+    ),
+    f("RANK", "RANK() OVER (...)", "Rank with gaps for ties"),
+    f(
+        "DENSE_RANK",
+        "DENSE_RANK() OVER (...)",
+        "Rank without gaps for ties",
+    ),
+    f(
+        "PERCENT_RANK",
+        "PERCENT_RANK() OVER (...)",
+        "Relative rank in [0,1]",
+    ),
+    f(
+        "CUME_DIST",
+        "CUME_DIST() OVER (...)",
+        "Cumulative distribution",
+    ),
+    f("NTILE", "NTILE(n) OVER (...)", "Bucket number of n buckets"),
+    f(
+        "LAG",
+        "LAG(expr [, offset [, default]]) OVER (...)",
+        "Value from a preceding row",
+    ),
+    f(
+        "LEAD",
+        "LEAD(expr [, offset [, default]]) OVER (...)",
+        "Value from a following row",
+    ),
+    f(
+        "FIRST_VALUE",
+        "FIRST_VALUE(expr) OVER (...)",
+        "First value in the window frame",
+    ),
+    f(
+        "LAST_VALUE",
+        "LAST_VALUE(expr) OVER (...)",
+        "Last value in the window frame",
+    ),
+    f(
+        "NTH_VALUE",
+        "NTH_VALUE(expr, n) OVER (...)",
+        "Nth value in the window frame",
+    ),
+    // ── String ───────────────────────────────────────────────────────────────
+    f(
+        "ASCII",
+        "ASCII(str)",
+        "Numeric code of the leftmost character",
+    ),
+    f("BIN", "BIN(n)", "Binary string representation of n"),
+    f("BIT_LENGTH", "BIT_LENGTH(str)", "Length of str in bits"),
+    f(
+        "CHAR",
+        "CHAR(n, ...)",
+        "Characters for the given code points",
+    ),
+    f(
+        "CHAR_LENGTH",
+        "CHAR_LENGTH(str)",
+        "Length of str in characters",
+    ),
+    f(
+        "CHARACTER_LENGTH",
+        "CHARACTER_LENGTH(str)",
+        "Length of str in characters",
+    ),
+    f("CONCAT", "CONCAT(str, ...)", "Concatenate strings"),
+    f(
+        "CONCAT_WS",
+        "CONCAT_WS(sep, str, ...)",
+        "Concatenate with a separator",
+    ),
+    f("ELT", "ELT(n, str1, str2, ...)", "The nth string argument"),
+    f(
+        "EXPORT_SET",
+        "EXPORT_SET(bits, on, off [, sep [, n]])",
+        "String of on/off per bit",
+    ),
+    f(
+        "FIELD",
+        "FIELD(str, s1, s2, ...)",
+        "Index of str in the argument list",
+    ),
+    f(
+        "FIND_IN_SET",
+        "FIND_IN_SET(str, strlist)",
+        "Index of str in a comma list",
+    ),
+    f(
+        "FORMAT",
+        "FORMAT(x, d)",
+        "Format number with d decimals and grouping",
+    ),
+    f("FROM_BASE64", "FROM_BASE64(str)", "Decode a base-64 string"),
+    f("HEX", "HEX(n_or_str)", "Hexadecimal representation"),
+    f(
+        "INSERT",
+        "INSERT(str, pos, len, newstr)",
+        "Replace a substring by position",
+    ),
+    f(
+        "INSTR",
+        "INSTR(str, substr)",
+        "Position of the first occurrence of substr",
+    ),
+    f("LCASE", "LCASE(str)", "Lower-case (alias of LOWER)"),
+    f("LEFT", "LEFT(str, len)", "Leftmost len characters"),
+    f("LENGTH", "LENGTH(str)", "Length of str in bytes"),
+    f(
+        "LOCATE",
+        "LOCATE(substr, str [, pos])",
+        "Position of substr, optionally from pos",
+    ),
+    f("LOWER", "LOWER(str)", "Lower-case the string"),
+    f(
+        "LPAD",
+        "LPAD(str, len, pad)",
+        "Left-pad str to len with pad",
+    ),
+    f("LTRIM", "LTRIM(str)", "Trim leading spaces"),
+    f(
+        "MAKE_SET",
+        "MAKE_SET(bits, str, ...)",
+        "Set of strings selected by bits",
+    ),
+    f(
+        "MID",
+        "MID(str, pos, len)",
+        "Substring (alias of SUBSTRING)",
+    ),
+    f("OCT", "OCT(n)", "Octal string representation of n"),
+    f(
+        "OCTET_LENGTH",
+        "OCTET_LENGTH(str)",
+        "Length of str in bytes",
+    ),
+    f(
+        "ORD",
+        "ORD(str)",
+        "Code of the leftmost (multi-byte) character",
+    ),
+    f(
+        "POSITION",
+        "POSITION(substr IN str)",
+        "Position of substr in str",
+    ),
+    f("QUOTE", "QUOTE(str)", "Escape and quote str for SQL"),
+    f(
+        "REGEXP_INSTR",
+        "REGEXP_INSTR(str, pattern [, pos [, occ [, ret [, mt]]]])",
+        "Position of a regex match",
+    ),
+    f(
+        "REGEXP_LIKE",
+        "REGEXP_LIKE(str, pattern [, match_type])",
+        "Whether str matches the pattern",
+    ),
+    f(
+        "REGEXP_REPLACE",
+        "REGEXP_REPLACE(str, pattern, replace [, pos [, occ [, mt]]])",
+        "Replace regex matches",
+    ),
+    f(
+        "REGEXP_SUBSTR",
+        "REGEXP_SUBSTR(str, pattern [, pos [, occ [, mt]]])",
+        "The matching substring",
+    ),
+    f("REPEAT", "REPEAT(str, count)", "Repeat str count times"),
+    f(
+        "REPLACE",
+        "REPLACE(str, from_str, to_str)",
+        "Replace all occurrences",
+    ),
+    f("REVERSE", "REVERSE(str)", "Reverse the characters"),
+    f("RIGHT", "RIGHT(str, len)", "Rightmost len characters"),
+    f(
+        "RPAD",
+        "RPAD(str, len, pad)",
+        "Right-pad str to len with pad",
+    ),
+    f("RTRIM", "RTRIM(str)", "Trim trailing spaces"),
+    f("SOUNDEX", "SOUNDEX(str)", "Soundex phonetic key"),
+    f("SPACE", "SPACE(n)", "A string of n spaces"),
+    f(
+        "STRCMP",
+        "STRCMP(str1, str2)",
+        "Compare two strings (-1/0/1)",
+    ),
+    f(
+        "SUBSTR",
+        "SUBSTR(str, pos [, len])",
+        "Substring (alias of SUBSTRING)",
+    ),
+    f(
+        "SUBSTRING",
+        "SUBSTRING(str, pos [, len])",
+        "Substring from pos",
+    ),
+    f(
+        "SUBSTRING_INDEX",
+        "SUBSTRING_INDEX(str, delim, count)",
+        "Substring before the count-th delimiter",
+    ),
+    f("TO_BASE64", "TO_BASE64(str)", "Base-64 encode"),
+    f(
+        "TRIM",
+        "TRIM([{BOTH|LEADING|TRAILING} [rem] FROM] str)",
+        "Trim characters from a string",
+    ),
+    f("UCASE", "UCASE(str)", "Upper-case (alias of UPPER)"),
+    f("UNHEX", "UNHEX(str)", "Bytes for a hexadecimal string"),
+    f("UPPER", "UPPER(str)", "Upper-case the string"),
+    f(
+        "WEIGHT_STRING",
+        "WEIGHT_STRING(str)",
+        "Collation weight string",
+    ),
+    // ── Numeric ──────────────────────────────────────────────────────────────
+    f("ABS", "ABS(x)", "Absolute value"),
+    f("ACOS", "ACOS(x)", "Arc cosine"),
+    f("ASIN", "ASIN(x)", "Arc sine"),
+    f("ATAN", "ATAN(x)", "Arc tangent"),
+    f("ATAN2", "ATAN2(y, x)", "Arc tangent of y/x"),
+    f("CEIL", "CEIL(x)", "Smallest integer >= x"),
+    f("CEILING", "CEILING(x)", "Smallest integer >= x"),
+    f(
+        "CONV",
+        "CONV(n, from_base, to_base)",
+        "Convert a number between bases",
+    ),
+    f("COS", "COS(x)", "Cosine"),
+    f("COT", "COT(x)", "Cotangent"),
+    f("CRC32", "CRC32(str)", "Cyclic redundancy check value"),
+    f("DEGREES", "DEGREES(x)", "Radians to degrees"),
+    f("EXP", "EXP(x)", "e raised to the power x"),
+    f("FLOOR", "FLOOR(x)", "Largest integer <= x"),
+    f("GREATEST", "GREATEST(x, ...)", "Largest argument"),
+    f("LEAST", "LEAST(x, ...)", "Smallest argument"),
+    f("LN", "LN(x)", "Natural logarithm"),
+    f(
+        "LOG",
+        "LOG([base,] x)",
+        "Logarithm (natural, or to the given base)",
+    ),
+    f("LOG10", "LOG10(x)", "Base-10 logarithm"),
+    f("LOG2", "LOG2(x)", "Base-2 logarithm"),
+    f("MOD", "MOD(n, m)", "Remainder of n / m"),
+    f("PI", "PI()", "The value of pi"),
+    f("POW", "POW(x, y)", "x raised to the power y"),
+    f("POWER", "POWER(x, y)", "x raised to the power y"),
+    f("RADIANS", "RADIANS(x)", "Degrees to radians"),
+    f("RAND", "RAND([seed])", "Random float in [0,1)"),
+    f("ROUND", "ROUND(x [, d])", "Round to d decimals"),
+    f("SIGN", "SIGN(x)", "Sign of x (-1/0/1)"),
+    f("SIN", "SIN(x)", "Sine"),
+    f("SQRT", "SQRT(x)", "Square root"),
+    f("TAN", "TAN(x)", "Tangent"),
+    f(
+        "TRUNCATE",
+        "TRUNCATE(x, d)",
+        "Truncate to d decimals (no rounding)",
+    ),
+    // ── Date & time ──────────────────────────────────────────────────────────
+    f(
+        "ADDDATE",
+        "ADDDATE(date, INTERVAL expr unit)",
+        "Add an interval to a date",
+    ),
+    f(
+        "ADDTIME",
+        "ADDTIME(expr1, expr2)",
+        "Add two time/datetime values",
+    ),
+    f(
+        "CONVERT_TZ",
+        "CONVERT_TZ(dt, from_tz, to_tz)",
+        "Convert a datetime between time zones",
+    ),
+    f("CURDATE", "CURDATE()", "Current date"),
+    f("CURRENT_DATE", "CURRENT_DATE()", "Current date"),
+    f("CURRENT_TIME", "CURRENT_TIME()", "Current time"),
+    f(
+        "CURRENT_TIMESTAMP",
+        "CURRENT_TIMESTAMP()",
+        "Current date and time",
+    ),
+    f("CURTIME", "CURTIME()", "Current time"),
+    f("DATE", "DATE(expr)", "Date part of a datetime"),
+    f(
+        "DATE_ADD",
+        "DATE_ADD(date, INTERVAL expr unit)",
+        "Add an interval to a date",
+    ),
+    f(
+        "DATE_FORMAT",
+        "DATE_FORMAT(date, format)",
+        "Format a date by a pattern",
+    ),
+    f(
+        "DATE_SUB",
+        "DATE_SUB(date, INTERVAL expr unit)",
+        "Subtract an interval from a date",
+    ),
+    f(
+        "DATEDIFF",
+        "DATEDIFF(expr1, expr2)",
+        "Days between two dates",
+    ),
+    f("DAY", "DAY(date)", "Day of the month"),
+    f("DAYNAME", "DAYNAME(date)", "Weekday name"),
+    f("DAYOFMONTH", "DAYOFMONTH(date)", "Day of the month (0-31)"),
+    f("DAYOFWEEK", "DAYOFWEEK(date)", "Weekday index (1=Sunday)"),
+    f("DAYOFYEAR", "DAYOFYEAR(date)", "Day of the year (1-366)"),
+    f(
+        "EXTRACT",
+        "EXTRACT(unit FROM date)",
+        "Extract a part of a date",
+    ),
+    f("FROM_DAYS", "FROM_DAYS(n)", "Date from a day number"),
+    f(
+        "FROM_UNIXTIME",
+        "FROM_UNIXTIME(ts [, format])",
+        "Datetime from a Unix timestamp",
+    ),
+    f(
+        "GET_FORMAT",
+        "GET_FORMAT({DATE|TIME|DATETIME}, 'format')",
+        "A standard format string",
+    ),
+    f("HOUR", "HOUR(time)", "Hour of a time"),
+    f("LAST_DAY", "LAST_DAY(date)", "Last day of the month"),
+    f("LOCALTIME", "LOCALTIME()", "Current date and time"),
+    f(
+        "LOCALTIMESTAMP",
+        "LOCALTIMESTAMP()",
+        "Current date and time",
+    ),
+    f(
+        "MAKEDATE",
+        "MAKEDATE(year, dayofyear)",
+        "Date from year and day-of-year",
+    ),
+    f(
+        "MAKETIME",
+        "MAKETIME(hour, minute, second)",
+        "Time from components",
+    ),
+    f("MICROSECOND", "MICROSECOND(expr)", "Microseconds of a time"),
+    f("MINUTE", "MINUTE(time)", "Minute of a time"),
+    f("MONTH", "MONTH(date)", "Month number (1-12)"),
+    f("MONTHNAME", "MONTHNAME(date)", "Month name"),
+    f("NOW", "NOW()", "Current date and time"),
+    f(
+        "PERIOD_ADD",
+        "PERIOD_ADD(period, n)",
+        "Add n months to a YYYYMM period",
+    ),
+    f(
+        "PERIOD_DIFF",
+        "PERIOD_DIFF(p1, p2)",
+        "Months between two YYYYMM periods",
+    ),
+    f("QUARTER", "QUARTER(date)", "Quarter of the year (1-4)"),
+    f(
+        "SEC_TO_TIME",
+        "SEC_TO_TIME(seconds)",
+        "Time from a number of seconds",
+    ),
+    f("SECOND", "SECOND(time)", "Second of a time"),
+    f(
+        "STR_TO_DATE",
+        "STR_TO_DATE(str, format)",
+        "Parse a string into a date",
+    ),
+    f(
+        "SUBDATE",
+        "SUBDATE(date, INTERVAL expr unit)",
+        "Subtract an interval from a date",
+    ),
+    f(
+        "SUBTIME",
+        "SUBTIME(expr1, expr2)",
+        "Subtract two time/datetime values",
+    ),
+    f(
+        "SYSDATE",
+        "SYSDATE()",
+        "Time at which the function executes",
+    ),
+    f("TIME", "TIME(expr)", "Time part of a datetime"),
+    f(
+        "TIME_FORMAT",
+        "TIME_FORMAT(time, format)",
+        "Format a time by a pattern",
+    ),
+    f("TIME_TO_SEC", "TIME_TO_SEC(time)", "Seconds since midnight"),
+    f(
+        "TIMEDIFF",
+        "TIMEDIFF(expr1, expr2)",
+        "Difference between two times",
+    ),
+    f(
+        "TIMESTAMP",
+        "TIMESTAMP(expr [, time])",
+        "Datetime, optionally adding a time",
+    ),
+    f(
+        "TIMESTAMPADD",
+        "TIMESTAMPADD(unit, interval, datetime)",
+        "Add an interval to a datetime",
+    ),
+    f(
+        "TIMESTAMPDIFF",
+        "TIMESTAMPDIFF(unit, dt1, dt2)",
+        "Difference between datetimes in unit",
+    ),
+    f("TO_DAYS", "TO_DAYS(date)", "Day number of a date"),
+    f("TO_SECONDS", "TO_SECONDS(expr)", "Seconds since year 0"),
+    f(
+        "UNIX_TIMESTAMP",
+        "UNIX_TIMESTAMP([date])",
+        "Unix timestamp (now or of date)",
+    ),
+    f("UTC_DATE", "UTC_DATE()", "Current UTC date"),
+    f("UTC_TIME", "UTC_TIME()", "Current UTC time"),
+    f(
+        "UTC_TIMESTAMP",
+        "UTC_TIMESTAMP()",
+        "Current UTC date and time",
+    ),
+    f("WEEK", "WEEK(date [, mode])", "Week number of the year"),
+    f("WEEKDAY", "WEEKDAY(date)", "Weekday index (0=Monday)"),
+    f("WEEKOFYEAR", "WEEKOFYEAR(date)", "Calendar week (1-53)"),
+    f("YEAR", "YEAR(date)", "Year of a date"),
+    f("YEARWEEK", "YEARWEEK(date [, mode])", "Year and week"),
+    // ── Flow control & comparison ─────────────────────────────────────────────
+    f(
+        "COALESCE",
+        "COALESCE(value, ...)",
+        "First non-NULL argument",
+    ),
+    f("IF", "IF(cond, if_true, if_false)", "Conditional value"),
+    f(
+        "IFNULL",
+        "IFNULL(expr1, expr2)",
+        "expr1, or expr2 when expr1 is NULL",
+    ),
+    f("ISNULL", "ISNULL(expr)", "1 if expr is NULL, else 0"),
+    f(
+        "NULLIF",
+        "NULLIF(expr1, expr2)",
+        "NULL if the two are equal, else expr1",
+    ),
+    f(
+        "INTERVAL",
+        "INTERVAL(n, n1, n2, ...)",
+        "Index of the last value <= n",
+    ),
+    // ── Cast ─────────────────────────────────────────────────────────────────
+    f(
+        "CAST",
+        "CAST(expr AS type)",
+        "Convert a value to another type",
+    ),
+    f(
+        "CONVERT",
+        "CONVERT(expr, type)",
+        "Convert a value (or USING charset)",
+    ),
+    // ── JSON ─────────────────────────────────────────────────────────────────
+    f("JSON_ARRAY", "JSON_ARRAY(val, ...)", "Build a JSON array"),
+    f(
+        "JSON_ARRAYAGG",
+        "JSON_ARRAYAGG(expr)",
+        "Aggregate values into a JSON array",
+    ),
+    f(
+        "JSON_ARRAY_APPEND",
+        "JSON_ARRAY_APPEND(json, path, val, ...)",
+        "Append to arrays at paths",
+    ),
+    f(
+        "JSON_ARRAY_INSERT",
+        "JSON_ARRAY_INSERT(json, path, val, ...)",
+        "Insert into arrays at paths",
+    ),
+    f(
+        "JSON_CONTAINS",
+        "JSON_CONTAINS(target, candidate [, path])",
+        "Whether target contains candidate",
+    ),
+    f(
+        "JSON_CONTAINS_PATH",
+        "JSON_CONTAINS_PATH(json, one_or_all, path, ...)",
+        "Whether any/all paths exist",
+    ),
+    f(
+        "JSON_DEPTH",
+        "JSON_DEPTH(json)",
+        "Maximum depth of a JSON document",
+    ),
+    f(
+        "JSON_EXTRACT",
+        "JSON_EXTRACT(json, path, ...)",
+        "Value(s) at the given path(s)",
+    ),
+    f(
+        "JSON_INSERT",
+        "JSON_INSERT(json, path, val, ...)",
+        "Insert values without overwriting",
+    ),
+    f(
+        "JSON_KEYS",
+        "JSON_KEYS(json [, path])",
+        "Keys of a JSON object",
+    ),
+    f(
+        "JSON_LENGTH",
+        "JSON_LENGTH(json [, path])",
+        "Number of elements",
+    ),
+    f(
+        "JSON_MERGE_PATCH",
+        "JSON_MERGE_PATCH(json, ...)",
+        "RFC 7386 merge of documents",
+    ),
+    f(
+        "JSON_MERGE_PRESERVE",
+        "JSON_MERGE_PRESERVE(json, ...)",
+        "Merge, preserving duplicate keys",
+    ),
+    f(
+        "JSON_OBJECT",
+        "JSON_OBJECT(key, val, ...)",
+        "Build a JSON object",
+    ),
+    f(
+        "JSON_OBJECTAGG",
+        "JSON_OBJECTAGG(key, value)",
+        "Aggregate pairs into a JSON object",
+    ),
+    f(
+        "JSON_OVERLAPS",
+        "JSON_OVERLAPS(json1, json2)",
+        "Whether two documents share elements",
+    ),
+    f(
+        "JSON_PRETTY",
+        "JSON_PRETTY(json)",
+        "Pretty-print a JSON document",
+    ),
+    f(
+        "JSON_QUOTE",
+        "JSON_QUOTE(string)",
+        "Quote a string as a JSON value",
+    ),
+    f(
+        "JSON_REMOVE",
+        "JSON_REMOVE(json, path, ...)",
+        "Remove elements at paths",
+    ),
+    f(
+        "JSON_REPLACE",
+        "JSON_REPLACE(json, path, val, ...)",
+        "Replace existing values",
+    ),
+    f(
+        "JSON_SEARCH",
+        "JSON_SEARCH(json, one_or_all, search [, esc [, path]])",
+        "Path(s) to a matching string",
+    ),
+    f(
+        "JSON_SET",
+        "JSON_SET(json, path, val, ...)",
+        "Insert or update values",
+    ),
+    f("JSON_TYPE", "JSON_TYPE(json)", "Type of a JSON value"),
+    f(
+        "JSON_UNQUOTE",
+        "JSON_UNQUOTE(json)",
+        "Unquote a JSON string value",
+    ),
+    f(
+        "JSON_VALID",
+        "JSON_VALID(val)",
+        "Whether a value is valid JSON",
+    ),
+    f(
+        "JSON_STORAGE_SIZE",
+        "JSON_STORAGE_SIZE(json)",
+        "Bytes used to store the document",
+    ),
+    // ── Information ───────────────────────────────────────────────────────────
+    f(
+        "BENCHMARK",
+        "BENCHMARK(count, expr)",
+        "Evaluate expr count times (timing)",
+    ),
+    f("CHARSET", "CHARSET(str)", "Character set of a string"),
+    f(
+        "COERCIBILITY",
+        "COERCIBILITY(str)",
+        "Collation coercibility",
+    ),
+    f("COLLATION", "COLLATION(str)", "Collation of a string"),
+    f("CONNECTION_ID", "CONNECTION_ID()", "The connection's id"),
+    f("CURRENT_ROLE", "CURRENT_ROLE()", "The active roles"),
+    f(
+        "CURRENT_USER",
+        "CURRENT_USER()",
+        "Authenticated user for the session",
+    ),
+    f("DATABASE", "DATABASE()", "The current database name"),
+    f(
+        "FOUND_ROWS",
+        "FOUND_ROWS()",
+        "Rows the last statement would have returned",
+    ),
+    f(
+        "LAST_INSERT_ID",
+        "LAST_INSERT_ID([expr])",
+        "Last AUTO_INCREMENT value",
+    ),
+    f(
+        "ROW_COUNT",
+        "ROW_COUNT()",
+        "Rows affected by the last statement",
+    ),
+    f("SCHEMA", "SCHEMA()", "The current database name"),
+    f("SESSION_USER", "SESSION_USER()", "The session user"),
+    f("SYSTEM_USER", "SYSTEM_USER()", "The session user"),
+    f("USER", "USER()", "The connected user and host"),
+    f("VERSION", "VERSION()", "The server version string"),
+    // ── Encryption, encoding & misc ───────────────────────────────────────────
+    f(
+        "AES_DECRYPT",
+        "AES_DECRYPT(crypt, key [, iv])",
+        "AES-decrypt a value",
+    ),
+    f(
+        "AES_ENCRYPT",
+        "AES_ENCRYPT(str, key [, iv])",
+        "AES-encrypt a value",
+    ),
+    f("COMPRESS", "COMPRESS(str)", "Compress a string"),
+    f(
+        "UNCOMPRESS",
+        "UNCOMPRESS(str)",
+        "Uncompress a compressed string",
+    ),
+    f(
+        "UNCOMPRESSED_LENGTH",
+        "UNCOMPRESSED_LENGTH(str)",
+        "Original length of compressed data",
+    ),
+    f("MD5", "MD5(str)", "MD5 128-bit checksum (hex)"),
+    f("SHA1", "SHA1(str)", "SHA-1 160-bit checksum (hex)"),
+    f("SHA", "SHA(str)", "SHA-1 checksum (alias of SHA1)"),
+    f(
+        "SHA2",
+        "SHA2(str, hash_length)",
+        "SHA-2 checksum (224/256/384/512)",
+    ),
+    f("RANDOM_BYTES", "RANDOM_BYTES(len)", "len random bytes"),
+    f("UUID", "UUID()", "A version-1 UUID string"),
+    f("UUID_SHORT", "UUID_SHORT()", "A 64-bit unique integer"),
+    f(
+        "UUID_TO_BIN",
+        "UUID_TO_BIN(uuid [, swap_flag])",
+        "Binary form of a UUID",
+    ),
+    f(
+        "BIN_TO_UUID",
+        "BIN_TO_UUID(bin [, swap_flag])",
+        "UUID string from binary",
+    ),
+    f(
+        "IS_UUID",
+        "IS_UUID(str)",
+        "Whether a string is a valid UUID",
+    ),
+    f("INET_ATON", "INET_ATON(ip)", "Integer for an IPv4 address"),
+    f("INET_NTOA", "INET_NTOA(n)", "IPv4 address from an integer"),
+    f(
+        "INET6_ATON",
+        "INET6_ATON(ip)",
+        "Binary for an IPv4/IPv6 address",
+    ),
+    f("INET6_NTOA", "INET6_NTOA(bin)", "IP address from binary"),
+    f("IS_IPV4", "IS_IPV4(ip)", "Whether a string is IPv4"),
+    f("IS_IPV6", "IS_IPV6(ip)", "Whether a string is IPv6"),
+    f(
+        "IS_IPV4_COMPAT",
+        "IS_IPV4_COMPAT(ip)",
+        "Whether an IPv6 is IPv4-compatible",
+    ),
+    f(
+        "IS_IPV4_MAPPED",
+        "IS_IPV4_MAPPED(ip)",
+        "Whether an IPv6 is IPv4-mapped",
+    ),
+    f("SLEEP", "SLEEP(seconds)", "Pause for the given seconds"),
+    f(
+        "GET_LOCK",
+        "GET_LOCK(name, timeout)",
+        "Acquire a named advisory lock",
+    ),
+    f(
+        "RELEASE_LOCK",
+        "RELEASE_LOCK(name)",
+        "Release a named advisory lock",
+    ),
+    f(
+        "IS_FREE_LOCK",
+        "IS_FREE_LOCK(name)",
+        "Whether a named lock is free",
+    ),
+    f(
+        "IS_USED_LOCK",
+        "IS_USED_LOCK(name)",
+        "Connection id holding a named lock",
+    ),
+    f(
+        "NAME_CONST",
+        "NAME_CONST(name, value)",
+        "A column with the given name and value",
+    ),
+    f("BIT_COUNT", "BIT_COUNT(n)", "Number of set bits"),
 ];
 
-/// A broad set of MySQL/MariaDB built-in function names (upper-case) — the
-/// authority for the "unknown function" typo check. It is intentionally *much*
-/// larger than [`SQL_FUNCTIONS`] (the small suggestion set): a call like `POWR(x)`
-/// is only flagged when its name is a near-miss of some entry here and isn't itself
-/// one, so real builtins outside the suggestion set (e.g. `POWER`, `COALESCE`,
-/// `JSON_EXTRACT`) never false-positive. Not used for completion.
-pub(crate) const KNOWN_FUNCTIONS: &[&str] = &[
-    // Aggregate / window.
-    "COUNT",
-    "SUM",
-    "AVG",
-    "MIN",
-    "MAX",
-    "GROUP_CONCAT",
-    "STD",
-    "STDDEV",
-    "STDDEV_POP",
-    "STDDEV_SAMP",
-    "VARIANCE",
-    "VAR_POP",
-    "VAR_SAMP",
-    "BIT_AND",
-    "BIT_OR",
-    "BIT_XOR",
-    "JSON_ARRAYAGG",
-    "JSON_OBJECTAGG",
-    "ROW_NUMBER",
-    "RANK",
-    "DENSE_RANK",
-    "PERCENT_RANK",
-    "CUME_DIST",
-    "NTILE",
-    "LAG",
-    "LEAD",
-    "FIRST_VALUE",
-    "LAST_VALUE",
-    "NTH_VALUE",
-    // String.
-    "CONCAT",
-    "CONCAT_WS",
-    "LENGTH",
-    "OCTET_LENGTH",
-    "CHAR_LENGTH",
-    "CHARACTER_LENGTH",
-    "LOWER",
-    "LCASE",
-    "UPPER",
-    "UCASE",
-    "TRIM",
-    "LTRIM",
-    "RTRIM",
-    "SUBSTRING",
-    "SUBSTR",
-    "MID",
-    "SUBSTRING_INDEX",
-    "REPLACE",
-    "REVERSE",
-    "REPEAT",
-    "LEFT",
-    "RIGHT",
-    "LPAD",
-    "RPAD",
-    "LOCATE",
-    "POSITION",
-    "INSTR",
-    "FIELD",
-    "FIND_IN_SET",
-    "SPACE",
-    "ELT",
-    "ORD",
-    "ASCII",
-    "CHAR",
-    "HEX",
-    "UNHEX",
-    "BIN",
-    "OCT",
-    "FORMAT",
-    "QUOTE",
-    "SOUNDEX",
-    "TO_BASE64",
-    "FROM_BASE64",
-    "REGEXP_REPLACE",
-    "REGEXP_SUBSTR",
-    "REGEXP_INSTR",
-    "REGEXP_LIKE",
-    "MAKE_SET",
-    "EXPORT_SET",
-    // Numeric.
-    "ABS",
-    "CEIL",
-    "CEILING",
-    "FLOOR",
-    "ROUND",
-    "TRUNCATE",
-    "MOD",
-    "POW",
-    "POWER",
-    "SQRT",
-    "EXP",
-    "LN",
-    "LOG",
-    "LOG2",
-    "LOG10",
-    "SIGN",
-    "RAND",
-    "PI",
-    "DEGREES",
-    "RADIANS",
-    "SIN",
-    "COS",
-    "TAN",
-    "ASIN",
-    "ACOS",
-    "ATAN",
-    "ATAN2",
-    "COT",
-    "CRC32",
-    "CONV",
-    "GREATEST",
-    "LEAST",
-    // Date / time.
-    "NOW",
-    "CURDATE",
-    "CURRENT_DATE",
-    "CURTIME",
-    "CURRENT_TIME",
-    "CURRENT_TIMESTAMP",
-    "SYSDATE",
-    "UTC_DATE",
-    "UTC_TIME",
-    "UTC_TIMESTAMP",
-    "DATE",
-    "TIME",
-    "YEAR",
-    "MONTH",
-    "DAY",
-    "DAYOFMONTH",
-    "HOUR",
-    "MINUTE",
-    "SECOND",
-    "MICROSECOND",
-    "WEEK",
-    "WEEKDAY",
-    "WEEKOFYEAR",
-    "DAYOFWEEK",
-    "DAYOFYEAR",
-    "DAYNAME",
-    "MONTHNAME",
-    "QUARTER",
-    "LAST_DAY",
-    "DATE_FORMAT",
-    "TIME_FORMAT",
-    "STR_TO_DATE",
-    "DATE_ADD",
-    "DATE_SUB",
-    "ADDDATE",
-    "SUBDATE",
-    "ADDTIME",
-    "SUBTIME",
-    "DATEDIFF",
-    "TIMEDIFF",
-    "TIMESTAMP",
-    "TIMESTAMPADD",
-    "TIMESTAMPDIFF",
-    "EXTRACT",
-    "MAKEDATE",
-    "MAKETIME",
-    "PERIOD_ADD",
-    "PERIOD_DIFF",
-    "SEC_TO_TIME",
-    "TIME_TO_SEC",
-    "TO_DAYS",
-    "FROM_DAYS",
-    "TO_SECONDS",
-    "UNIX_TIMESTAMP",
-    "FROM_UNIXTIME",
-    "CONVERT_TZ",
-    "GET_FORMAT",
-    // Control / cast / null.
-    "IF",
-    "IFNULL",
-    "NULLIF",
-    "COALESCE",
-    "CAST",
-    "CONVERT",
-    "ISNULL",
-    "NANVL",
-    // JSON.
-    "JSON_EXTRACT",
-    "JSON_OBJECT",
-    "JSON_ARRAY",
-    "JSON_VALID",
-    "JSON_TYPE",
-    "JSON_KEYS",
-    "JSON_LENGTH",
-    "JSON_CONTAINS",
-    "JSON_CONTAINS_PATH",
-    "JSON_SET",
-    "JSON_INSERT",
-    "JSON_REPLACE",
-    "JSON_REMOVE",
-    "JSON_MERGE",
-    "JSON_MERGE_PATCH",
-    "JSON_MERGE_PRESERVE",
-    "JSON_UNQUOTE",
-    "JSON_QUOTE",
-    "JSON_SEARCH",
-    "JSON_DEPTH",
-    "JSON_PRETTY",
-    // Info / misc.
-    "DATABASE",
-    "SCHEMA",
-    "USER",
-    "CURRENT_USER",
-    "SESSION_USER",
-    "SYSTEM_USER",
-    "VERSION",
-    "CONNECTION_ID",
-    "LAST_INSERT_ID",
-    "ROW_COUNT",
-    "FOUND_ROWS",
-    "UUID",
-    "UUID_SHORT",
-    "MD5",
-    "SHA",
-    "SHA1",
-    "SHA2",
-    "PASSWORD",
-    "AES_ENCRYPT",
-    "AES_DECRYPT",
-    "COMPRESS",
-    "UNCOMPRESS",
-    "BENCHMARK",
-    "SLEEP",
-    "INET_ATON",
-    "INET_NTOA",
-    "INET6_ATON",
-    "INET6_NTOA",
-    "IS_IPV4",
-    "IS_IPV6",
-    "NULLIF",
-    "BIT_COUNT",
-    "BIT_LENGTH",
-];
+/// The function names (upper-case), for the typo checker and keyword-set membership.
+pub fn function_names() -> impl Iterator<Item = &'static str> {
+    FUNCTIONS.iter().map(|f| f.name)
+}
 
 /// Keywords that begin a statement (offered at statement start).
 pub const STMT_KEYWORDS: &[&str] = &[
@@ -2811,9 +3320,9 @@ fn resolve_qualifier(q: &str, refs: &[(TableRef, (usize, usize))]) -> Option<Tab
 fn typo_checks(sql: &str, lo: usize, hi: usize, catalog: &Catalog, out: &mut Vec<Diagnostic>) {
     let mut known: HashSet<String> = SQL_KEYWORDS
         .iter()
-        .chain(SQL_FUNCTIONS.iter())
         .chain(STMT_KEYWORDS.iter())
         .map(|k| k.to_ascii_lowercase())
+        .chain(function_names().map(|f| f.to_ascii_lowercase()))
         .collect();
     known.extend(catalog.known_idents.iter().cloned());
 
@@ -2849,9 +3358,9 @@ fn typo_checks(sql: &str, lo: usize, hi: usize, catalog: &Catalog, out: &mut Vec
 /// Flag a word in **function-call position** (`word(`) that is a near-miss of a
 /// known builtin but isn't itself one — a probable typo like `COUTN(...)` for
 /// `COUNT(...)`. Conservative: the name must be within edit distance of an entry in
-/// [`KNOWN_FUNCTIONS`] (the broad builtin set), so user-defined functions and
-/// unlisted builtins pass through untouched; qualified calls (`pkg.func(`) and real
-/// schema identifiers are skipped too.
+/// the [`FUNCTIONS`] catalog, so user-defined functions and unlisted builtins pass
+/// through untouched; qualified calls (`pkg.func(`) and real schema identifiers are
+/// skipped too.
 fn function_typo_checks(
     sql: &str,
     lo: usize,
@@ -2903,11 +3412,9 @@ fn function_typo_checks(
     }
 }
 
-/// Case-insensitive membership in the broad builtin set.
+/// Case-insensitive membership in the builtin function catalog.
 fn is_known_function(word_lower: &str) -> bool {
-    KNOWN_FUNCTIONS
-        .iter()
-        .any(|f| f.eq_ignore_ascii_case(word_lower))
+    function_names().any(|f| f.eq_ignore_ascii_case(word_lower))
 }
 
 /// Is `word` a near-miss of a known builtin function name? A near-miss is a small
@@ -2922,7 +3429,7 @@ fn is_probable_function_typo(word: &str) -> bool {
     }
     let up = word.to_ascii_uppercase();
     let thresh = if word.len() >= 7 { 2 } else { 1 };
-    KNOWN_FUNCTIONS.iter().any(|f| {
+    function_names().any(|f| {
         let close = (f.len() as isize - up.len() as isize).unsigned_abs() <= thresh
             && crate::sql::edit_distance(&up, f) <= thresh;
         close || is_adjacent_transposition(up.as_bytes(), f.as_bytes())
@@ -4277,7 +4784,7 @@ mod tests {
     fn diag_function_typo_no_false_positives() {
         for sql in [
             "SELECT COUNT(*) FROM employees",         // correct
-            "SELECT POWER(salary, 2) FROM employees", // real builtin, not in suggestion set
+            "SELECT POWER(salary, 2) FROM employees", // real builtin
             "SELECT JSON_EXTRACT(name, '$.a') FROM employees",
             "SELECT COALESCE(name, 'x') FROM employees",
             "SELECT my_custom_func(id) FROM employees", // UDF, not near a builtin
@@ -4291,6 +4798,37 @@ mod tests {
                 .map(|x| x.message)
                 .collect();
             assert!(msgs.is_empty(), "false positive: {sql} -> {msgs:?}");
+        }
+    }
+
+    #[test]
+    fn function_catalog_is_sane() {
+        use std::collections::HashSet;
+        // A builtin that used to be missing from the suggestion set is now present
+        // and trusted by the typo checker.
+        assert!(function_names().any(|f| f == "POWER"));
+        assert!(is_known_function("power"));
+        // A comprehensive catalog.
+        assert!(FUNCTIONS.len() > 150, "only {} functions", FUNCTIONS.len());
+        // Each entry is well-formed: unique upper-case name, signature leads with the
+        // name, non-empty summary.
+        let mut seen = HashSet::new();
+        for func in FUNCTIONS {
+            assert!(seen.insert(func.name), "duplicate function: {}", func.name);
+            assert!(
+                func.name
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'),
+                "non-canonical name: {}",
+                func.name
+            );
+            assert!(
+                func.signature.starts_with(func.name),
+                "signature {} doesn't lead with {}",
+                func.signature,
+                func.name
+            );
+            assert!(!func.summary.is_empty(), "empty summary for {}", func.name);
         }
     }
 

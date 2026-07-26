@@ -28,7 +28,7 @@ use crate::schema_tree::column_type_icon;
 // The keyword/function sets now live in `schemaic_core::intel` (so the core
 // analysis + diagnostics share one authoritative copy); used here to seed the
 // suggestion pool.
-use schemaic_core::intel::{SQL_FUNCTIONS, SQL_KEYWORDS, STMT_KEYWORDS};
+use schemaic_core::intel::{FUNCTIONS, SQL_KEYWORDS, STMT_KEYWORDS};
 
 use floem::AnyView;
 
@@ -700,13 +700,13 @@ pub(crate) fn recompute_completions(
                     }
                 }
             }
-            for &f in SQL_FUNCTIONS {
+            for fun in FUNCTIONS {
                 add(
                     &mut cands,
                     &mut seen,
-                    f,
+                    fun.name,
                     SuggestKind::Function,
-                    String::new(),
+                    fun.signature.to_string(),
                     2,
                 );
             }
