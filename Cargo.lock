@@ -4434,7 +4434,7 @@ checksum = "ece8e78b2f38ec51c51f5d475df0a7187ba5111b2a28bdc761ee05b075d40a71"
 
 [[package]]
 name = "schemaic-ai"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "schemaic-core",
  "serde_json",
@@ -4442,7 +4442,7 @@ dependencies = [
 
 [[package]]
 name = "schemaic-app"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "crossbeam-channel",
  "floem",
@@ -4463,7 +4463,7 @@ dependencies = [
 
 [[package]]
 name = "schemaic-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4473,7 +4473,7 @@ dependencies = [
 
 [[package]]
 name = "schemaic-db"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "futures-util",
  "mysql_async",
@@ -4488,7 +4488,7 @@ dependencies = [
 
 [[package]]
 name = "schemaic-term"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4499,7 +4499,7 @@ dependencies = [
 
 [[package]]
 name = "schemaic-ui"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "floem",
  "pulldown-cmark",
