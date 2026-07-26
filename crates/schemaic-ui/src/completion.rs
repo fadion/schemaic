@@ -633,22 +633,39 @@ pub(crate) fn accept_completion(ed: &Editor, comp: Completion) {
     let text = doc.text().to_string();
     let start = word_start(&text, offset);
     let idx = comp.sel.get_untracked();
-    if let Some(word) = comp
+    if let Some((word, kind)) = comp
         .items
-        .with_untracked(|v| v.get(idx).map(|s| s.text.clone()))
+        .with_untracked(|v| v.get(idx).map(|s| (s.text.clone(), s.kind)))
     {
         comp.suppress.set(true);
+        // A function inserts `name()` with the caret between the parens — unless the
+        // call parens are already there just ahead (re-accepting over a call).
+        let followed_by_paren = text[offset..].trim_start().starts_with('(');
+        let (insert, caret) =
+            completion_insertion(&word, kind == SuggestKind::Function, followed_by_paren);
         doc.edit_single(
             Selection::region(start, offset),
-            &word,
+            &insert,
             EditType::Completion,
         );
-        // `edit_single` doesn't move the caret, so place it after the insert.
-        let new_offset = start + word.len();
-        ed.cursor.update(|c| c.set_offset(new_offset, false, false));
+        // `edit_single` doesn't move the caret, so place it explicitly.
+        ed.cursor
+            .update(|c| c.set_offset(start + caret, false, false));
     }
     comp.open.set(false);
     comp.items.set(Vec::new());
+}
+
+/// The text to splice for an accepted completion and the caret offset *within* that
+/// text afterwards. A function becomes `name()` with the caret between the parens,
+/// unless the call parens are already present just ahead; everything else is the
+/// word verbatim with the caret at its end.
+fn completion_insertion(word: &str, is_function: bool, followed_by_paren: bool) -> (String, usize) {
+    if is_function && !followed_by_paren {
+        (format!("{word}()"), word.len() + 1)
+    } else {
+        (word.to_string(), word.len())
+    }
 }
 
 /// Row text color for a suggestion kind (columns stay neutral; the rest are
@@ -822,4 +839,31 @@ pub(crate) fn completion_popup(comp: Completion) -> impl IntoView {
             s
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::completion_insertion;
+
+    #[test]
+    fn function_completion_adds_parens_and_places_caret_inside() {
+        let (s, c) = completion_insertion("COUNT", true, false);
+        assert_eq!(s, "COUNT()");
+        assert_eq!(c, 6); // between `(` and `)`
+        assert_eq!(&s[..c], "COUNT(");
+    }
+
+    #[test]
+    fn function_completion_skips_parens_when_already_present() {
+        let (s, c) = completion_insertion("COUNT", true, true);
+        assert_eq!(s, "COUNT");
+        assert_eq!(c, 5);
+    }
+
+    #[test]
+    fn non_function_completion_is_verbatim() {
+        let (s, c) = completion_insertion("orders", false, false);
+        assert_eq!(s, "orders");
+        assert_eq!(c, 6);
+    }
 }
