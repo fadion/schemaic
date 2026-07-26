@@ -136,6 +136,11 @@ pub struct UiState {
     /// Reopen the previous session's query tabs on startup. Default: on.
     #[serde(default = "default_true")]
     pub restore_tabs: bool,
+    /// Validate the statement under the cursor against the live database
+    /// (non-executing PREPARE) as you type, surfacing dialect-exact errors as
+    /// squiggles. Adds a debounced DB round-trip per edit pause. Default: off.
+    #[serde(default)]
+    pub live_validate: bool,
 }
 
 // Manual `Default` (not derived) so a missing file defaults `schema_visible` to
@@ -165,6 +170,7 @@ impl Default for UiState {
             soft_tabs: true,
             word_wrap: false,
             restore_tabs: true,
+            live_validate: false,
         }
     }
 }

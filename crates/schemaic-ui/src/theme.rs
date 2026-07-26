@@ -69,9 +69,17 @@ pub fn suggest_database() -> Color {
     editor().constant
 }
 
-// Wavy underline under a misspelled keyword.
+// Wavy underline under a probable keyword typo (a heuristic warning). Amber,
+// editor-themed so it follows the syntax palette.
 pub fn syntax_underline() -> Color {
     editor().underline
+}
+
+// Wavy underline under a definite diagnostic error (unknown table/column, a
+// syntax error). A fixed red accent — semantic like the status-bar colours, so it
+// reads the same across editor themes and stands apart from the amber warning.
+pub fn diag_error() -> Color {
+    Color::rgb8(0xE0, 0x5A, 0x5A)
 }
 
 // AI-panel message send/stop icon (inside the message field).

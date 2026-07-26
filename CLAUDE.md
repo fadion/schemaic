@@ -8,8 +8,23 @@ Zed-inspired, aiming to replace DataGrip.
 - `schemaic-core` — models, persisted UI state (`persist.rs`), transcript types, and the pure,
   unit-tested SQL/edit/export logic (UI/app keep thin wrappers; regression tests live here):
   - `sql.rs` — one `skip_noncode` tokenizer → statement splitting, unsafe-statement guard, AI
-    read-only gate. The *single* SQL boundary lexer; `tokenize_range`/`syntax_errors`/`sql_highlight`
-    all build on it so string/`#`/`--`/`/* */`/backtick boundaries agree by construction.
+    read-only gate, `edit_distance`. The *single* SQL boundary lexer; `intel` (scope/context/
+    diagnostics)/`sql_highlight`/`sqlfmt` all build on it so string/`#`/`--`/`/* */`/backtick
+    boundaries agree by construction.
+  - `intel.rs` — the **SQL intelligence** layer (structure-aware, dialect-pluggable). Parses a
+    *complete* statement with a real per-dialect AST (`sqlparser`; `SqlDialect` seam — MySQL wired,
+    Postgres/SQLite are future arms) and answers what a token stream can't: `statement_scope`
+    (tables/aliases/CTEs/derived-tables in scope, AST-backed with a `skip_noncode` lexer fallback for
+    mid-edit), `clause_context` (caret context for completion), and `diagnostics` → `Vec<Diagnostic>`
+    (catalog-aware unknown-table / unknown-`alias.col`, syntax errors on completed statements, and
+    keyword-typo warnings). **AST for classification, `skip_noncode` for byte positions** (sqlparser
+    spans are still maturing) — squiggle placement stays exact. `Catalog` is the case-folded view over
+    the introspected `DbSchema`s (columns + FK edges). Hosts the shared `SQL_KEYWORDS`/`SQL_FUNCTIONS`/
+    `STMT_KEYWORDS` (the UI's completion + editor build on these). Also `join_condition` (FK-aware
+    `JOIN … ON` auto-fill), `db_error_diagnostic` (positions a live DB error within the statement), and
+    `parses` (Tier-2 gate). The live DB stays the semantic authority: **Tier-2 live validation**
+    PREPAREs the statement under the cursor (`Db::prepare_check`, non-executing) behind the
+    `live_validate` setting (off by default), merging dialect-exact errors into the editor squiggles.
   - `edit.rs` — `analyze_edit` → `EditModel` (write-back updatability analysis).
   - `export.rs` — CSV/JSON/SQL/Markdown/HTML export (incl. CSV formula-injection guard;
     Markdown pipe/backslash escaping; HTML entity escaping).
@@ -30,8 +45,9 @@ Zed-inspired, aiming to replace DataGrip.
   `origin` (real table/column + key flags) from the wire protocol. Connection **identity** is the
   `Db` handle (`Db::connect(&Connection, tunnel_port)`), not a `mysql://…` URL — credentials go
   through `OptsBuilder` (passwords with `@ / # ? %` need no escaping; no plaintext URL anywhere).
-  `fetch_query`/`run_batch`/`fetch_schema`/`ping`/`commit_writes`/`refetch_rows` are `Db` methods
-  taking the target DB per call. SSH tunnels return a `TunnelHandle` (drop → port freed) with
+  `fetch_query`/`run_batch`/`fetch_schema`/`ping`/`commit_writes`/`refetch_rows`/`prepare_check`
+  (non-executing `PREPARE` for the editor's live validation) are `Db` methods taking the target DB
+  per call. SSH tunnels return a `TunnelHandle` (drop → port freed) with
   keepalives + TOFU host-key verification (`ssh_known_hosts.json`).
 - `schemaic-ai` — persistent `claude` CLI session (stream-json), turn parsing.
 - `schemaic-term` — terminal panel + shell.
@@ -54,11 +70,14 @@ Zed-inspired, aiming to replace DataGrip.
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context
     menu, generic grid popup, Find-Anywhere, error modal.
   - `schema_tree.rs` — SCHEMA sidebar (`schema_panel` + db/table/column/key row builders + keyboard
-    nav). `completion.rs` — SQL autocomplete (`recompute_completions`/`accept_completion`/
-    `completion_popup` + context engine; `SQL_KEYWORDS` pub(crate)).
+    nav). `completion.rs` — SQL autocomplete: the ranking + popup layer
+    (`recompute_completions`/`accept_completion`/`completion_popup` + `SchemaIndex`/`fuzzy_score`)
+    over `schemaic_core::intel`'s scope/context engine.
   - `tabs.rs` — query-tab strip. `grid.rs` — the whole results grid (`GridState`/`GridCtx`;
     `results_view`/`loaded_view` are the entry points). `editor_pane.rs` — SQL editor pane
-    (`query_pane` + Ctrl+K popup, typo squiggles, statement highlight, custom scrollbars).
+    (`query_pane` + Ctrl+K popup, statement highlight, custom scrollbars). `compute_diagnostics`
+    bridges the tab's schema/active-db to `intel::diagnostics`; `syntax_view` draws severity-coloured
+    squiggles (red errors / amber typo warnings) with hover tooltips.
   - `theme.rs`/`themes.rs`/`icons.rs`/`fonts.rs`/`sql_highlight.rs`.
   - `lib.rs` (~3.2k lines, being split further) — the `Ui` struct + bundles, shared model/state
     types, `workspace`/`body`/`center`/`header`/`footer`, resize handles, `edit_field`/`FieldCfg`,
@@ -79,8 +98,14 @@ Re-introducing the anti-patterns these guard against is a regression:
 
 - **One SQL boundary lexer.** Any code scanning SQL for string / `-- ` / `#` / `/* */` / backtick
   boundaries MUST build on `schemaic_core::sql::skip_noncode` (statement split, WHERE guard, AI
-  read-only gate, `tokenize_range`, `syntax_errors`, `sql_highlight`). Never hand-roll a second
+  read-only gate, `intel`'s tokenizer, `sql_highlight`, `sqlfmt`). Never hand-roll a second
   scanner — five drifting copies was the original bug.
+- **Structure-aware SQL analysis goes through `schemaic_core::intel` (real per-dialect AST), not new
+  hand-rolled scanners.** Scope resolution, completion context, and diagnostics build on the
+  `sqlparser` AST (with a `skip_noncode` fallback for mid-edit); the **DB stays the semantic
+  authority** (don't hand-roll type checking / name resolution — that's a planned PREPARE/EXPLAIN
+  tier). New dialects are a `SqlDialect` arm, not a parallel analyzer. Use the AST for classification
+  and `skip_noncode` byte offsets for positions (AST spans are still maturing upstream).
 - **Connection identity is the `Db` handle / `conn_id`, never a `mysql://user:pass@host/db` URL.**
   Credentials go through `OptsBuilder`; never in a URL, argv, or log. The MCP subprocess gets its
   endpoint via a temp `--mcp-config` file, not argv. Don't add new plaintext-secret surfaces.

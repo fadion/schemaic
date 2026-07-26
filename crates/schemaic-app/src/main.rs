@@ -411,6 +411,22 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         persist::load_json::<schemaic_core::history::HistoryFile>("history.json").entries,
     );
 
+    // Find-Anywhere per-connection search history. The overlay records activations
+    // and reads recents directly on the signal; this effect persists on change.
+    let search_history = RwSignal::new(
+        persist::load_json::<schemaic_core::search_history::SearchHistoryFile>(
+            "search_history.json",
+        )
+        .entries,
+    );
+    create_effect(move |_| {
+        let entries = search_history.get();
+        persist::save_json(
+            "search_history.json",
+            &schemaic_core::search_history::SearchHistoryFile { entries },
+        );
+    });
+
     // Per-column display formatters (persisted, keyed by connection+table+column;
     // read + upserted by the results grid's "Format as" menu).
     let formats = RwSignal::new(
@@ -576,6 +592,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let word_wrap = RwSignal::new(ui_state.word_wrap);
     let row_limit = RwSignal::new(ui_state.row_limit);
     let confirm_writes = RwSignal::new(ui_state.confirm_writes);
+    let live_validate = RwSignal::new(ui_state.live_validate);
     let restore_tabs = RwSignal::new(ui_state.restore_tabs);
     schemaic_ui::theme::set_editor_font(editor_font.get_untracked());
     schemaic_ui::theme::set_editor_tab_width(tab_width.get_untracked());
@@ -795,6 +812,46 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 send(st);
             });
         })
+    };
+
+    // Tier-2 live validation: PREPARE the statement under the cursor against the
+    // real DB (no execution) and hand back the diagnostics. Staleness is handled
+    // caller-side (the editor's debounce generation), so no cancellation token is
+    // needed here — a superseded result is simply ignored by the caller.
+    let validate_stmt: schemaic_ui::ValidateFn = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(
+            move |sql: String, lo: usize, hi: usize, on_done: schemaic_ui::ValidateDoneFn| {
+                let id = active.get_untracked();
+                let Some(tab) = tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied())
+                else {
+                    return;
+                };
+                let db = match db_for(tab.conn_id.get_untracked()) {
+                    Ok(db) => db,
+                    Err(_) => return, // can't resolve a connection → skip silently
+                };
+                let database = tab.database.get_untracked();
+                let send =
+                    create_ext_action(cx, move |diags: Vec<schemaic_core::intel::Diagnostic>| {
+                        on_done(diags)
+                    });
+                handle.spawn(async move {
+                    let stmt = sql.get(lo..hi).unwrap_or("").to_string();
+                    let diags = match db.prepare_check(database.as_deref(), &stmt).await {
+                        Ok(()) => Vec::new(),
+                        Err(e) => vec![schemaic_core::intel::db_error_diagnostic(
+                            &sql,
+                            lo,
+                            hi,
+                            &e.to_string(),
+                        )],
+                    };
+                    send(diags);
+                });
+            },
+        )
     };
 
     // Live Monitor: poll a table on an interval, diffing each snapshot against the
@@ -1414,6 +1471,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             soft_tabs: soft_tabs.get_untracked(),
             word_wrap: word_wrap.get_untracked(),
             restore_tabs: restore_tabs.get_untracked(),
+            live_validate: live_validate.get_untracked(),
         });
     });
 
@@ -1450,6 +1508,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             row_limit.get();
             confirm_writes.get();
             restore_tabs.get();
+            live_validate.get();
             save_ui();
         });
     }
@@ -2684,6 +2743,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             set_active_db,
             open_db_cli,
             run_plan,
+            validate_stmt,
             open_monitor,
             ai_fill,
             ai_seed,
@@ -2696,6 +2756,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             last_mouse,
             find_open,
             find_query,
+            search_history,
             error_modal_open,
             error_modal_text: RwSignal::new(None),
             plan_open,
@@ -2817,6 +2878,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             row_limit,
             confirm_writes,
             restore_tabs,
+            live_validate,
         },
         persist_layout: save_ui.clone(),
         formats,

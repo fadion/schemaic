@@ -218,6 +218,45 @@ impl Db {
             other => other,
         }
     }
+
+    /// Validate `sql` against the server **without executing it**: prepare it via
+    /// the binary protocol (`PREPARE`), then deallocate. The server checks syntax,
+    /// object names, and types but runs nothing — safe even for `UPDATE`/`DELETE`.
+    /// Returns the server's error text on failure, `Ok(())` on a clean prepare.
+    ///
+    /// Statements the prepared-statement protocol doesn't support (server error
+    /// 1295 — e.g. some `SHOW`/admin forms) can't be validated this way, so they're
+    /// treated as `Ok` rather than surfacing a spurious error. A trailing `;` is
+    /// trimmed (the protocol prepares a single statement).
+    pub async fn prepare_check(&self, database: Option<&str>, sql: &str) -> Result<(), DbError> {
+        let stmt = sql.trim().trim_end_matches(';').trim_end();
+        if stmt.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.open(database, false).await?;
+        let result = match conn.prep(stmt).await {
+            Ok(prepared) => {
+                let _ = conn.close(prepared).await;
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // 1295 = "not supported in the prepared statement protocol": we
+                // can't validate it, so don't flag a false error.
+                if msg.contains("1295")
+                    || msg
+                        .to_ascii_lowercase()
+                        .contains("prepared statement protocol")
+                {
+                    Ok(())
+                } else {
+                    Err(DbError::Query(msg))
+                }
+            }
+        };
+        let _ = conn.disconnect().await;
+        result
+    }
 }
 
 /// The `EXPLAIN`/`ANALYZE` command(s) for `sql`: the statement is trimmed of a
