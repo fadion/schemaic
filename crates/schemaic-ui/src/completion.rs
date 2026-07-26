@@ -20,8 +20,10 @@ use floem::views::editor::core::editor::EditType;
 use floem::views::editor::core::selection::Selection;
 
 use schemaic_core::intel::{self, ClauseCtx, SqlDialect};
-use schemaic_core::schema::{DbSchema, SchemaState};
+use schemaic_core::schema::{DbSchema, SchemaState, classify_column_type};
 use schemaic_core::sql::statement_range;
+
+use crate::schema_tree::column_type_icon;
 
 // The keyword/function sets now live in `schemaic_core::intel` (so the core
 // analysis + diagnostics share one authoritative copy); used here to seed the
@@ -31,6 +33,7 @@ use schemaic_core::intel::{SQL_FUNCTIONS, SQL_KEYWORDS, STMT_KEYWORDS};
 use floem::AnyView;
 
 use crate::consts::*;
+use crate::widgets::autohide;
 use crate::{ConnNode, icons, theme};
 
 // ===== moved from lib.rs (autocomplete) =====
@@ -60,15 +63,33 @@ pub(crate) enum SuggestKind {
     Database,
 }
 
+/// Whether a column suggestion participates in a key — tints its leading icon gold
+/// (PK) / purple (FK), mirroring the schema tree. Non-columns are always `None`.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum KeyKind {
+    None,
+    Primary,
+    Foreign,
+}
+
 /// One ranked autocomplete row: the text inserted, its kind, a dim detail (a
-/// column's type + nullability, or a table's database), and whether it's a primary
-/// key (drives the gold key glyph on column rows).
+/// column's type + nullability, or a table's database), the owning table + in-scope
+/// alias for a column (so a column row reads `id   orders o   int`), and whether
+/// it's a primary key (drives the gold key glyph on column rows).
 #[derive(Clone)]
 pub(crate) struct Suggestion {
     text: String,
     kind: SuggestKind,
     detail: String,
-    pk: bool,
+    /// Owning table of a column suggestion (empty otherwise) — the mid annotation.
+    table: String,
+    /// In-scope alias of that table, if any (empty otherwise).
+    alias: String,
+    /// The leading schema-style glyph (a column's type family, a table/db icon, or
+    /// the `square-function` mark for keywords/functions).
+    icon: &'static str,
+    /// Key membership — tints a column's icon gold/purple like the schema tree.
+    key: KeyKind,
 }
 
 fn is_word_byte(b: u8) -> bool {
@@ -114,6 +135,7 @@ struct ColMeta {
     type_name: String,
     nullable: bool,
     primary_key: bool,
+    foreign_key: bool,
 }
 
 /// A schema view built once per recompute: which databases/tables exist and each
@@ -159,6 +181,13 @@ impl SchemaIndex {
                 if in_scope {
                     for t in &schema.tables {
                         tables.push((t.name.clone(), node.database.clone()));
+                        // Columns covered by a foreign key (case-folded) → the FK tint.
+                        let fk_cols: HashSet<String> = t
+                            .foreign_keys
+                            .iter()
+                            .flat_map(|fk| fk.columns.iter())
+                            .map(|c| c.to_ascii_lowercase())
+                            .collect();
                         let entry = columns.entry(t.name.to_ascii_lowercase()).or_default();
                         for c in &t.columns {
                             if !entry.iter().any(|m| m.name.eq_ignore_ascii_case(&c.name)) {
@@ -167,6 +196,7 @@ impl SchemaIndex {
                                     type_name: c.type_name.clone(),
                                     nullable: c.nullable,
                                     primary_key: c.primary_key,
+                                    foreign_key: fk_cols.contains(&c.name.to_ascii_lowercase()),
                                 });
                             }
                         }
@@ -238,8 +268,11 @@ struct Cand {
     text: String,
     kind: SuggestKind,
     detail: String,
+    table: String,
+    alias: String,
+    icon: &'static str,
+    key: KeyKind,
     tier: u8,
-    pk: bool,
 }
 
 /// Recompute context-aware suggestions for the word at the caret. Ranks the most
@@ -273,6 +306,11 @@ pub(crate) fn recompute_completions(
     // (robust CTE/alias/derived-table resolution), falling back to the lexer.
     let ctx = intel::clause_context(&text, lo, word_lo);
     let qualified = matches!(ctx, ClauseCtx::Qualified(_));
+    // Expected next keyword/phrase continuations from SQL clause grammar (the
+    // `WHERE` after a complete table ref, `FROM` after the projection, `GROUP BY`
+    // as one item). These seed the top suggestion tier; `auto_show` opens the popup
+    // on an empty prefix right after an operand-taking clause keyword.
+    let cont = intel::clause_continuation(&text, lo, word_lo);
 
     // FK-aware auto-join: right after a fresh `JOIN … ON `, offer the foreign-key
     // join predicate as a single, ready-to-insert suggestion (DataGrip-style). Only
@@ -288,7 +326,11 @@ pub(crate) fn recompute_completions(
                 text: pred,
                 kind: SuggestKind::Column,
                 detail: "foreign key".to_string(),
-                pk: false,
+                table: String::new(),
+                alias: String::new(),
+                // A purple key-square marks the ready-to-insert FK join predicate.
+                icon: icons::KEY_SQUARE,
+                key: KeyKind::Foreign,
             }]);
             comp.sel.set(0);
             comp.open.set(true);
@@ -297,8 +339,10 @@ pub(crate) fn recompute_completions(
     }
 
     // Don't pop the list on every space: an empty prefix only shows suggestions
-    // right after a `.` or when explicitly requested (Ctrl+Space).
-    if prefix.is_empty() && !qualified && !force {
+    // right after a `.`, right after an operand-taking clause keyword (`cont.
+    // auto_show` — columns after WHERE/ON/BY/SET, tables after FROM), or when
+    // explicitly requested (Ctrl+Space).
+    if prefix.is_empty() && !qualified && !force && !cont.auto_show {
         comp.open.set(false);
         comp.items.set(Vec::new());
         return;
@@ -325,38 +369,53 @@ pub(crate) fn recompute_completions(
             text: text.to_string(),
             kind,
             detail,
+            table: String::new(),
+            alias: String::new(),
+            icon: kind_icon(kind),
+            key: KeyKind::None,
             tier,
-            pk: false,
         });
     };
-    // Column candidates carry PK + nullability. `detail` shows the type, suffixed
-    // with a dim `· NULL` for nullable columns (NOT NULL stays clean); PK columns
-    // get the gold key glyph via `Cand.pk` (and don't repeat the type detail when
-    // `type_detail` is false — e.g. the no-FROM pool shows the owning table instead).
-    let add_col = |cands: &mut Vec<Cand>,
-                   seen: &mut HashSet<String>,
-                   c: &ColMeta,
-                   detail: String,
-                   tier: u8| {
-        let tl = c.name.to_ascii_lowercase();
-        if tl == pl || !seen.insert(tl) {
-            return;
-        }
-        cands.push(Cand {
-            text: c.name.clone(),
-            kind: SuggestKind::Column,
-            detail,
-            tier,
-            pk: c.primary_key,
-        });
-    };
-    // The detail string for a column typed against its own metadata.
+    // The detail string for a column typed against its own metadata: the type,
+    // suffixed with a dim `· NULL` for nullable columns (NOT NULL stays clean).
     let col_type_detail = |c: &ColMeta| -> String {
         if c.nullable {
             format!("{} · NULL", c.type_name)
         } else {
             c.type_name.clone()
         }
+    };
+    // Column candidates carry their owning `table` (+ in-scope `alias`) as the mid
+    // annotation and the type as `detail`. The leading glyph is the column's *type
+    // family* (schema-tree style), tinted gold (PK) / purple (FK) via `key`. Deduped
+    // by column name (first table in scope wins).
+    let add_col = |cands: &mut Vec<Cand>,
+                   seen: &mut HashSet<String>,
+                   c: &ColMeta,
+                   table: &str,
+                   alias: Option<&str>,
+                   tier: u8| {
+        let tl = c.name.to_ascii_lowercase();
+        if tl == pl || !seen.insert(tl) {
+            return;
+        }
+        let key = if c.primary_key {
+            KeyKind::Primary
+        } else if c.foreign_key {
+            KeyKind::Foreign
+        } else {
+            KeyKind::None
+        };
+        cands.push(Cand {
+            text: c.name.clone(),
+            kind: SuggestKind::Column,
+            detail: col_type_detail(c),
+            table: table.to_string(),
+            alias: alias.unwrap_or("").to_string(),
+            icon: column_type_icon(classify_column_type(&c.type_name)),
+            key,
+            tier,
+        });
     };
     let cols_of = |name: &str| -> Vec<ColMeta> {
         schema
@@ -365,29 +424,55 @@ pub(crate) fn recompute_completions(
             .cloned()
             .unwrap_or_default()
     };
-    // A qualifier resolves to a table via an in-scope alias, else a bare table
-    // name (whether or not it's in FROM).
-    let resolve = |q: &str| -> Option<String> {
+    // Expected clause-keyword continuations go in the *top* tier (above columns,
+    // functions, and — after a complete table ref — schema table names), so the
+    // legal next keyword the grammar predicts wins ties. Added before the
+    // per-context candidates so they claim tier 0 (dedup keeps the first entry).
+    // Skipped after a `qualifier.` (there we want only that table's columns).
+    if !qualified {
+        for kw in &cont.keywords {
+            add(
+                &mut cands,
+                &mut seen,
+                kw,
+                SuggestKind::Keyword,
+                String::new(),
+                0,
+            );
+        }
+    }
+    // Once a clause continuation is expected (a complete table ref sits before the
+    // caret), the schema table names are no longer the primary suggestion — demote
+    // them below the keyword continuations.
+    let table_tier: u8 = if cont.keywords.is_empty() { 0 } else { 1 };
+
+    // A qualifier resolves to a table (+ the alias to annotate with) via an in-scope
+    // alias, else a bare table name (whether or not it's in FROM).
+    let resolve = |q: &str| -> Option<(String, Option<String>)> {
         for r in &scope {
             if r.alias
                 .as_deref()
                 .is_some_and(|a| a.eq_ignore_ascii_case(q))
             {
-                return Some(r.name.clone());
+                return Some((r.name.clone(), r.alias.clone()));
+            }
+        }
+        for r in &scope {
+            if r.alias.is_none() && r.name.eq_ignore_ascii_case(q) {
+                return Some((r.name.clone(), None));
             }
         }
         if schema.columns.contains_key(&q.to_ascii_lowercase()) {
-            return Some(q.to_string());
+            return Some((q.to_string(), None));
         }
         None
     };
 
     match &ctx {
         ClauseCtx::Qualified(q) => {
-            if let Some(table) = resolve(q) {
+            if let Some((table, alias)) = resolve(q) {
                 for c in cols_of(&table) {
-                    let d = col_type_detail(&c);
-                    add_col(&mut cands, &mut seen, &c, d, 0);
+                    add_col(&mut cands, &mut seen, &c, &table, alias.as_deref(), 0);
                 }
             } else if let Some(tbls) = schema.tables_by_db.get(&q.to_ascii_lowercase()) {
                 for t in tbls {
@@ -403,7 +488,7 @@ pub(crate) fn recompute_completions(
                     name,
                     SuggestKind::Table,
                     db.clone(),
-                    0,
+                    table_tier,
                 );
             }
             for db in &schema.databases {
@@ -413,24 +498,23 @@ pub(crate) fn recompute_completions(
                     db,
                     SuggestKind::Database,
                     String::new(),
-                    1,
+                    table_tier + 1,
                 );
             }
         }
         ClauseCtx::Column => {
             if scope.is_empty() {
-                // No FROM yet: offer every column, disambiguated by its table
-                // (shown as the detail) so the broader list stays navigable.
+                // No FROM yet: offer every column, annotated by its owning table so
+                // the broader list stays navigable.
                 for (name, _) in &schema.tables {
                     for c in cols_of(name) {
-                        add_col(&mut cands, &mut seen, &c, name.clone(), 1);
+                        add_col(&mut cands, &mut seen, &c, name, None, 1);
                     }
                 }
             } else {
                 for r in &scope {
                     for c in cols_of(&r.name) {
-                        let d = col_type_detail(&c);
-                        add_col(&mut cands, &mut seen, &c, d, 0);
+                        add_col(&mut cands, &mut seen, &c, &r.name, r.alias.as_deref(), 0);
                     }
                 }
             }
@@ -480,8 +564,7 @@ pub(crate) fn recompute_completions(
         ClauseCtx::Other => {
             for r in &scope {
                 for c in cols_of(&r.name) {
-                    let d = col_type_detail(&c);
-                    add_col(&mut cands, &mut seen, &c, d, 0);
+                    add_col(&mut cands, &mut seen, &c, &r.name, r.alias.as_deref(), 0);
                 }
             }
             for (name, db) in &schema.tables {
@@ -525,7 +608,10 @@ pub(crate) fn recompute_completions(
             text: c.text,
             kind: c.kind,
             detail: c.detail,
-            pk: c.pk,
+            table: c.table,
+            alias: c.alias,
+            icon: c.icon,
+            key: c.key,
         })
         .collect();
 
@@ -577,83 +663,161 @@ fn suggest_color(kind: SuggestKind) -> floem::peniko::Color {
     }
 }
 
+/// The default leading glyph for a non-column suggestion kind (columns pick a
+/// type-family glyph in `add_col`). Keywords/functions get Lucide `square-function`.
+fn kind_icon(kind: SuggestKind) -> &'static str {
+    match kind {
+        SuggestKind::Keyword | SuggestKind::Function => icons::SQUARE_FUNCTION,
+        SuggestKind::Table => icons::TABLE,
+        SuggestKind::Database => icons::DATABASE,
+        SuggestKind::Column => icons::TYPE,
+    }
+}
+
+/// Leading-icon color, matching the schema tree: db/table icons keep their schema
+/// tint; a column's icon is a quiet 50%-alpha version of its key colour (gold PK /
+/// purple FK / neutral); keywords are muted, functions keep the function tint.
+fn suggest_icon_color(kind: SuggestKind, key: KeyKind) -> floem::peniko::Color {
+    match kind {
+        SuggestKind::Column => {
+            let base = match key {
+                KeyKind::Primary => theme::key_primary(),
+                KeyKind::Foreign => theme::key_foreign(),
+                KeyKind::None => theme::text(),
+            };
+            base.multiply_alpha(0.5)
+        }
+        SuggestKind::Table => theme::table_icon(),
+        SuggestKind::Database => theme::db_icon(),
+        SuggestKind::Keyword => theme::text_muted(),
+        SuggestKind::Function => theme::suggest_function(),
+    }
+}
+
 // Floating suggestion list, positioned just below the caret.
 pub(crate) fn completion_popup(comp: Completion) -> impl IntoView {
     dyn_container(
-        move || (comp.open.get(), comp.items.get(), comp.sel.get()),
-        move |(open, items, sel)| {
+        // Keyed on open/items only — NOT `sel`. The selection highlight reads
+        // `comp.sel` reactively per row (below), so moving the selection repaints in
+        // place instead of rebuilding the list (which would reset the scroll offset).
+        move || (comp.open.get(), comp.items.get()),
+        move |(open, items)| {
             if !open || items.is_empty() {
                 return empty().into_any();
             }
-            let rows = items.into_iter().enumerate().map(move |(i, item)| {
-                let selected = i == sel;
-                let Suggestion {
-                    text: name,
-                    kind,
-                    detail,
-                    pk,
-                } = item;
-                let color = suggest_color(kind);
-                // A gold key glyph marks a primary-key column (same colour as the
-                // schema tree); other rows get no leading slot.
-                let lead: AnyView = if pk {
-                    icons::icon(icons::KEY_ROUND, 12.0)
-                        .style(|s| s.color(theme::key_primary()).margin_right(5.0))
-                        .into_any()
-                } else {
-                    empty().into_any()
-                };
-                // Name (kind-tinted) on the left; the dim detail (a column's type +
-                // nullability, a table's database) right-aligned. The selected/
-                // hovered background spans the full row width. 14px matches the editor.
-                h_stack((
-                    lead,
-                    text(name).style(move |s| s.font_size(14.0).color(color)),
-                    empty().style(|s| s.flex_grow(1.0_f32)),
-                    text(detail)
-                        .style(|s| s.font_size(12.0).color(theme::text_dim()).margin_left(16.0)),
-                ))
-                .style(move |s| {
-                    let s = s
-                        .flex_row()
-                        .items_center()
-                        .width_full()
-                        .padding_horiz(10.0)
-                        .padding_vert(5.0)
-                        .hover(|s| s.background(theme::completion_active()));
-                    if selected {
-                        s.background(theme::completion_active())
+            let rows: Vec<AnyView> = items
+                .into_iter()
+                .enumerate()
+                .map(move |(i, item)| {
+                    let Suggestion {
+                        text: name,
+                        kind,
+                        detail,
+                        table,
+                        alias,
+                        icon,
+                        key,
+                    } = item;
+                    let color = suggest_color(kind);
+                    // Schema-style leading glyph, coloured by kind/key (see
+                    // `suggest_icon_color`): a column's type family tinted gold (PK) /
+                    // purple (FK), a table/db icon, or the muted `square-function`
+                    // mark for keywords/functions.
+                    let lead: AnyView = icons::icon(icon, 13.0)
+                        .style(move |s| {
+                            s.color(suggest_icon_color(kind, key))
+                                .margin_right(7.0)
+                                .flex_shrink(0.0_f32)
+                        })
+                        .into_any();
+                    // Right-side annotation. For a column: its owning table (+
+                    // in-scope alias) in a muted colour, then the type — so a row
+                    // reads `id      orders o      int`, making the column's origin
+                    // obvious. For everything else: the single dim detail (a table's
+                    // database, etc.).
+                    let table_ref = if table.is_empty() {
+                        empty().into_any()
                     } else {
-                        s
-                    }
+                        let label = if alias.is_empty() {
+                            table
+                        } else {
+                            format!("{table} {alias}")
+                        };
+                        text(label)
+                            .style(|s| s.font_size(12.0).color(theme::text_dim()))
+                            .into_any()
+                    };
+                    // Name (kind-tinted) on the left; annotations right-aligned. The
+                    // selected/hovered background spans the full row width. 14px
+                    // matches the editor.
+                    h_stack((
+                        lead,
+                        text(name).style(move |s| s.font_size(14.0).color(color)),
+                        empty().style(|s| s.flex_grow(1.0_f32).min_width(24.0)),
+                        table_ref,
+                        text(detail).style(|s| {
+                            s.font_size(12.0)
+                                .color(theme::text_muted())
+                                .margin_left(18.0)
+                        }),
+                    ))
+                    .style(move |s| {
+                        let s = s
+                            .flex_row()
+                            .items_center()
+                            .width_full()
+                            .padding_horiz(10.0)
+                            .padding_vert(5.0)
+                            .hover(|s| s.background(theme::completion_active()));
+                        // Selection highlight, read reactively so keyboard nav
+                        // repaints without rebuilding (and resetting the scroll).
+                        if comp.sel.get() == i {
+                            s.background(theme::completion_active())
+                        } else {
+                            s
+                        }
+                    })
+                    .into_any()
                 })
-            });
-            // The surface (bg #14151A, #373942 outline, rounded) lives on the
-            // inner box, and `.clip()` rounds the full-width row highlights to the
-            // corners — the outer container only positions (absolute), so clipping
-            // here doesn't disturb the anchor.
-            v_stack_from_iter(rows)
-                .style(|s| {
-                    s.flex_col()
-                        .width_full()
-                        .max_height(260.0)
-                        .background(theme::bg_deepest())
-                        .border(1.0)
-                        .border_color(theme::completion_border())
-                        .border_radius(6.0)
-                })
-                .clip()
-                .into_any()
+                .collect();
+            // Each row's id, so the scroll can follow the keyboard selection.
+            let row_ids: Vec<floem::ViewId> = rows.iter().map(|v| v.id()).collect();
+            let list = v_stack_from_iter(rows).style(|s| s.flex_col().width_full());
+            // The scroll makes an overflowing list navigable by wheel; `scroll_to_view`
+            // keeps the keyboard-selected row visible. `autohide` gives it the shared
+            // thin, auto-hiding scrollbar (same as the schema tree / history / etc.).
+            // The surface (bg #14151A, #373942 outline, rounded) + `.clip()` live on
+            // the wrapping container so the full-width row highlights round to the
+            // corners.
+            container(
+                autohide(scroll(list).scroll_to_view(move || row_ids.get(comp.sel.get()).copied()))
+                    .style(|s| s.width_full().max_height(260.0)),
+            )
+            .style(|s| {
+                s.width_full()
+                    .background(theme::bg_deepest())
+                    .border(1.0)
+                    .border_color(theme::completion_border())
+                    .border_radius(6.0)
+            })
+            .clip()
+            .into_any()
         },
     )
     .style(move |s| {
+        // A high z-index lifts the popup above the results pane below it: the popup
+        // overflows the (unclipped) editor pane and, without this, the later-painted
+        // results grid draws over it (paint order = tree order). z-index gives the
+        // vger renderer a global ordering so the popup composites last. Set
+        // unconditionally so it applies whenever the popup is shown.
+        let s = s.z_index(1000);
         if comp.open.get() {
             let p = comp.point.get();
             s.absolute()
                 .inset_left(COMPLETION_GUTTER + p.x)
                 .inset_top(p.y + COMPLETION_LINE_H)
-                .min_width(240.0)
-                .max_width(460.0)
+                .min_width(320.0)
+                .max_width(640.0)
         } else {
             s
         }
