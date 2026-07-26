@@ -266,6 +266,54 @@ fn fuzzy_score(cand: &str, query: &str) -> Option<i32> {
     Some(score)
 }
 
+/// Lowercased identifier words already present in `text[lo..hi]`, excluding the
+/// word being typed at `skip` — a recency signal for ranking (you tend to reference
+/// the same columns/tables again in a statement). Strings/comments aren't filtered
+/// out; a stray hit only mildly reorders suggestions, never changes correctness.
+fn statement_identifiers(
+    text: &str,
+    lo: usize,
+    hi: usize,
+    skip: (usize, usize),
+) -> HashSet<String> {
+    let b = text.as_bytes();
+    let mut out = HashSet::new();
+    let mut i = lo;
+    while i < hi {
+        let c = b[i];
+        if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 {
+            let s = i;
+            let mut j = i + 1;
+            while j < hi && is_word_byte(b[j]) {
+                j += 1;
+            }
+            if (s, j) != skip {
+                out.insert(text[s..j].to_ascii_lowercase());
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Ranking bonus for a candidate identifier (table/column/database) already used
+/// elsewhere in the statement. Keywords/functions don't get it — repeating `SELECT`
+/// or `COUNT` isn't a relevance signal. Modest, so a strong prefix match on a fresh
+/// name still wins.
+fn recency_bonus(text: &str, kind: SuggestKind, used: &HashSet<String>) -> i32 {
+    let is_ident = matches!(
+        kind,
+        SuggestKind::Table | SuggestKind::Column | SuggestKind::Database
+    );
+    if is_ident && used.contains(&text.to_ascii_lowercase()) {
+        18
+    } else {
+        0
+    }
+}
+
 /// A raw completion candidate before scoring: `tier` is its context priority
 /// (lower ranks higher; ties break by fuzzy score then length).
 struct Cand {
@@ -633,11 +681,18 @@ pub(crate) fn recompute_completions(
         }
     }
 
-    // Score by fuzzy match; sort by tier (context priority), then score, then a
-    // shorter candidate. Non-matches drop out.
+    // Identifiers already written in this statement rank a little higher (recency):
+    // you tend to reference the same columns/tables again.
+    let used = statement_identifiers(&text, lo, hi, (word_lo, offset));
+
+    // Score by fuzzy match (+ recency bonus); sort by tier (context priority), then
+    // score, then a shorter candidate. Non-matches drop out.
     let mut scored: Vec<(u8, i32, Cand)> = cands
         .into_iter()
-        .filter_map(|c| fuzzy_score(&c.text, &prefix).map(|s| (c.tier, s, c)))
+        .filter_map(|c| {
+            fuzzy_score(&c.text, &prefix)
+                .map(|s| (c.tier, s + recency_bonus(&c.text, c.kind, &used), c))
+        })
         .collect();
     scored.sort_by(|a, b| {
         a.0.cmp(&b.0)
@@ -894,7 +949,31 @@ pub(crate) fn completion_popup(comp: Completion) -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use super::completion_insertion;
+    use super::{SuggestKind, completion_insertion, recency_bonus, statement_identifiers};
+    use std::collections::HashSet;
+
+    #[test]
+    fn statement_identifiers_collects_words_excluding_the_prefix() {
+        let sql = "SELECT customer_id, total FROM orders WHERE cust";
+        // The word being typed (`cust`, the last 4 bytes) is excluded.
+        let skip = (sql.len() - 4, sql.len());
+        let ids = statement_identifiers(sql, 0, sql.len(), skip);
+        assert!(ids.contains("customer_id"));
+        assert!(ids.contains("total"));
+        assert!(ids.contains("orders"));
+        assert!(!ids.contains("cust")); // the prefix is skipped
+    }
+
+    #[test]
+    fn recency_bonus_only_boosts_used_identifiers() {
+        let used: HashSet<String> = ["customer_id".to_string()].into_iter().collect();
+        assert_eq!(recency_bonus("customer_id", SuggestKind::Column, &used), 18);
+        assert_eq!(recency_bonus("CUSTOMER_ID", SuggestKind::Column, &used), 18); // case-insensitive
+        assert_eq!(recency_bonus("name", SuggestKind::Column, &used), 0); // not used
+        // Keywords/functions never get the boost, even if present.
+        let kw: HashSet<String> = ["select".to_string()].into_iter().collect();
+        assert_eq!(recency_bonus("SELECT", SuggestKind::Keyword, &kw), 0);
+    }
 
     #[test]
     fn function_completion_adds_parens_and_places_caret_inside() {
