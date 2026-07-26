@@ -1344,9 +1344,15 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
         let is_typing_tail = idx == last && !terminated;
         match sqlparser::parser::Parser::parse_sql(&*dialect.parser(), stmt) {
             Ok(asts) => {
-                catalog_checks(sql, lo, hi, catalog, &mut out);
-                if let [ast] = asts.as_slice() {
-                    unqualified_column_checks(sql, lo, hi, catalog, ast, dialect, &mut out);
+                table_existence_checks(sql, lo, hi, catalog, &mut out);
+                match asts.as_slice() {
+                    // A single SELECT/query → per-scope column resolution (aware of
+                    // subqueries / derived tables / CTEs; qualified + unqualified).
+                    [ast @ sqlparser::ast::Statement::Query(_)] => {
+                        colres::check(sql, lo, hi, catalog, ast, &mut out)
+                    }
+                    // Other statements (UPDATE/DELETE/…) → the flat qualified scan.
+                    _ => qualified_column_checks(sql, lo, hi, catalog, &mut out),
                 }
             }
             Err(e) => {
@@ -1812,24 +1818,41 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, out: &mut Vec<Diagnostic>) {
     }
 }
 
-/// Table-existence + qualified-column checks for a cleanly-parsed statement.
-fn catalog_checks(sql: &str, lo: usize, hi: usize, catalog: &Catalog, out: &mut Vec<Diagnostic>) {
-    let refs = table_refs_with_pos(sql, lo, hi);
-    for (r, pos) in &refs {
-        if let TableStatus::NotFound = catalog.table_status(r) {
+/// Unknown-table checks: flag a FROM/JOIN/UPDATE/INTO table reference the catalog
+/// definitively doesn't contain (only when the relevant database is loaded).
+fn table_existence_checks(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    catalog: &Catalog,
+    out: &mut Vec<Diagnostic>,
+) {
+    for (r, pos) in table_refs_with_pos(sql, lo, hi) {
+        if let TableStatus::NotFound = catalog.table_status(&r) {
             let where_db =
                 r.db.as_deref()
                     .map(|d| format!(" in `{d}`"))
                     .unwrap_or_default();
             out.push(Diagnostic {
-                range: *pos,
+                range: pos,
                 severity: Severity::Error,
                 message: format!("Table `{}` not found{where_db}", r.name),
             });
         }
     }
-    // Qualified `alias.col` / `table.col`: flag a column that definitively isn't
-    // in the resolved table (only when we know that table's columns).
+}
+
+/// Flat qualified-column check (`alias.col` / `table.col`): flag a column that
+/// definitively isn't in the resolved table. Used for non-SELECT statements
+/// (UPDATE/DELETE/…); a SELECT goes through the per-scope resolver instead.
+fn qualified_column_checks(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    catalog: &Catalog,
+    out: &mut Vec<Diagnostic>,
+) {
+    let refs = table_refs_with_pos(sql, lo, hi);
     let toks = tokenize_range(sql, lo, hi);
     for w in toks.windows(3) {
         let (TkKind::Word(q), TkKind::Dot, TkKind::Word(col)) =
@@ -1852,134 +1875,391 @@ fn catalog_checks(sql: &str, lo: usize, hi: usize, catalog: &Catalog, out: &mut 
     }
 }
 
-/// True if the statement contains a nested query — a derived table, subquery, or
-/// CTE — detected from tokens: a leading `WITH`, or a `(` immediately followed by
-/// SELECT/WITH. Used to bail out of the unqualified-column check, whose "flat union
-/// of the FROM tables' columns" model doesn't hold across nested scopes.
-fn has_nested_query(sql: &str, lo: usize, hi: usize) -> bool {
-    let toks = tokenize_range(sql, lo, hi);
-    let first_word = toks.iter().find_map(|t| match &t.kind {
-        TkKind::Word(w) => Some(w),
-        _ => None,
-    });
-    if first_word.is_some_and(|w| w.eq_ignore_ascii_case("WITH")) {
-        return true;
-    }
-    toks.windows(2).any(|w| {
-        matches!(w[0].kind, TkKind::LParen)
-            && matches!(&w[1].kind,
-                TkKind::Word(k) if k.eq_ignore_ascii_case("SELECT") || k.eq_ignore_ascii_case("WITH"))
-    })
-}
+/// Per-scope unknown-column resolver for a `SELECT`. Unlike the flat
+/// [`qualified_column_checks`], this walks the query's scope tree (subqueries,
+/// derived tables, CTEs each get their own scope) and resolves every column
+/// reference — qualified *and* unqualified — against the sources visible at that
+/// point, honouring correlation (an inner scope can see outer columns).
+///
+/// Design (kept conservative — never squiggle valid SQL):
+/// - **AST for classification, spans for position.** sqlparser 0.62 emits accurate
+///   per-identifier spans; each column ref is positioned by its own span (so the same
+///   name in an inner vs outer scope is placed independently) — a step past the older
+///   "lexer for positions" note now that spans are reliable.
+/// - Each `Query` node becomes a scope keyed by its byte range; a column ref is
+///   resolved against the innermost containing scope and its ancestors.
+/// - A source whose columns can't be fully enumerated (unloaded/unknown base table,
+///   a derived table / CTE projecting `*` or an unnamed expression) is **open** — any
+///   column against it is allowed, so uncertainty never yields a false positive.
+mod colres {
+    use std::collections::{HashMap, HashSet};
+    use std::ops::ControlFlow;
 
-/// Unqualified unknown-column diagnostic: flag a bare column reference that exists in
-/// none of the statement's FROM tables. **Heavily gated** so it never squiggles valid
-/// SQL — it runs only for a plain single `SELECT` (no CTE / set-op) with no nested
-/// query, and only when every FROM table's columns are known (loaded + found). The
-/// set of valid bare identifiers is the union of those tables' columns, their names/
-/// aliases, and the projection's output aliases; anything else used as an
-/// `Expr::Identifier` (taken from the AST — so function names, interval units,
-/// qualified `a.b` refs, and literals are all excluded) is unknown. Byte positions
-/// come from the lexer (AST spans are still maturing upstream).
-fn unqualified_column_checks(
-    sql: &str,
-    lo: usize,
-    hi: usize,
-    catalog: &Catalog,
-    ast: &sqlparser::ast::Statement,
-    dialect: SqlDialect,
-    out: &mut Vec<Diagnostic>,
-) {
-    use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement};
-
-    // Only a plain single SELECT (no CTE, no UNION/… set-op) with no nested query.
-    let Statement::Query(query) = ast else {
-        return;
+    use sqlparser::ast::{
+        Cte, Expr, Ident, Query, Select, SelectItem, SetExpr, Spanned, Statement, TableAlias,
+        TableFactor, Visit, Visitor,
     };
-    if query.with.is_some() {
-        return;
-    }
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return;
-    };
-    if has_nested_query(sql, lo, hi) {
-        return;
+
+    use super::{Catalog, Diagnostic, Severity, TableRef, TableStatus, offset_of_line_col};
+
+    /// The columns a FROM source exposes, or `Open` when they can't be enumerated.
+    #[derive(Clone)]
+    enum Cols {
+        Known(HashSet<String>),
+        Open,
     }
 
-    // Every FROM table must be known (loaded + found), else existence is unjudgeable.
-    let tables = statement_scope(sql, lo, hi, lo, dialect).tables;
-    if tables.is_empty()
-        || !tables
-            .iter()
-            .all(|t| matches!(catalog.table_status(t), TableStatus::Found))
-    {
-        return;
+    /// One FROM source: the names it can be qualified by (alias / table name, lower),
+    /// its columns, and the base-table name for the diagnostic message (if any).
+    struct Src {
+        quals: Vec<String>,
+        cols: Cols,
+        table: Option<String>,
     }
 
-    // Valid bare identifiers: the union of the tables' columns, their names/aliases,
-    // and the projection's output aliases (referenceable in ORDER BY / HAVING).
-    let mut valid: HashSet<String> = HashSet::new();
-    for t in &tables {
-        if let Some(cols) = catalog.columns_of(t) {
-            valid.extend(cols.iter().map(|c| c.to_ascii_lowercase()));
-        }
-        valid.insert(t.name.to_ascii_lowercase());
-        if let Some(a) = &t.alias {
-            valid.insert(a.to_ascii_lowercase());
-        }
-    }
-    for item in &select.projection {
-        match item {
-            SelectItem::ExprWithAlias { alias, .. } => {
-                valid.insert(alias.value.to_ascii_lowercase());
-            }
-            SelectItem::ExprWithAliases { aliases, .. } => {
-                valid.extend(aliases.iter().map(|a| a.value.to_ascii_lowercase()));
-            }
-            _ => {}
-        }
+    /// A resolution scope: the byte range it spans, its FROM sources, and the output
+    /// aliases of its projection (referenceable unqualified in ORDER BY / HAVING).
+    struct Scope {
+        range: (usize, usize),
+        sources: Vec<Src>,
+        proj_aliases: HashSet<String>,
     }
 
-    // Unqualified column identifiers actually referenced (AST classification).
-    let mut unknown: HashSet<String> = HashSet::new();
-    let _ = sqlparser::ast::visit_expressions(ast, |expr| {
-        if let Expr::Identifier(id) = expr {
-            let lc = id.value.to_ascii_lowercase();
-            if !valid.contains(&lc) {
-                unknown.insert(lc);
-            }
-        }
-        std::ops::ControlFlow::<()>::Continue(())
-    });
-    if unknown.is_empty() {
-        return;
+    /// A column reference to resolve, positioned by its identifier span.
+    struct Ref {
+        qualifier: Option<String>,
+        col: String,
+        range: (usize, usize),
     }
 
-    let where_tbl = if tables.len() == 1 {
-        format!(" in `{}`", tables[0].name)
-    } else {
-        String::new()
-    };
-    // Position each unknown reference via the lexer: every bare word token (not a
-    // `a.col` part, not a `fn(` call) whose name is unknown.
-    let toks = tokenize_range(sql, lo, hi);
-    for (i, t) in toks.iter().enumerate() {
-        let TkKind::Word(w) = &t.kind else {
-            continue;
+    /// Entry point: resolve every column ref in the parsed `SELECT` statement.
+    pub(super) fn check(
+        sql: &str,
+        lo: usize,
+        hi: usize,
+        catalog: &Catalog,
+        ast: &Statement,
+        out: &mut Vec<Diagnostic>,
+    ) {
+        let stmt = &sql[lo..hi];
+        let mut c = Collector {
+            stmt,
+            lo,
+            catalog,
+            ctes: HashMap::new(),
+            scopes: Vec::new(),
+            refs: Vec::new(),
         };
-        if !unknown.contains(&w.to_ascii_lowercase()) {
-            continue;
+        let _ = ast.visit(&mut c);
+        for r in &c.refs {
+            if let Some(d) = resolve(r, &c.scopes) {
+                out.push(d);
+            }
         }
-        let prev_dot = i > 0 && matches!(toks[i - 1].kind, TkKind::Dot);
-        let next = toks.get(i + 1).map(|t| &t.kind);
-        if prev_dot || matches!(next, Some(TkKind::Dot)) || matches!(next, Some(TkKind::LParen)) {
-            continue;
+    }
+
+    struct Collector<'a> {
+        stmt: &'a str,
+        lo: usize,
+        catalog: &'a Catalog,
+        /// CTE name (lower) → its output columns. Populated as queries are visited.
+        ctes: HashMap<String, Cols>,
+        scopes: Vec<Scope>,
+        refs: Vec<Ref>,
+    }
+
+    impl Visitor for Collector<'_> {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            // Register this query's CTEs first (visible to its own FROM + siblings).
+            if let Some(with) = &q.with {
+                for cte in &with.cte_tables {
+                    let cols = cte_cols(cte);
+                    self.ctes
+                        .insert(cte.alias.name.value.to_ascii_lowercase(), cols);
+                }
+            }
+            let range = span_range(self.stmt, self.lo, q);
+            let (sources, proj_aliases) = build_scope(q, self.catalog, &self.ctes);
+            self.scopes.push(Scope {
+                range,
+                sources,
+                proj_aliases,
+            });
+            ControlFlow::Continue(())
         }
-        out.push(Diagnostic {
-            range: (t.at, t.at + w.len()),
+
+        fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+            match e {
+                Expr::Identifier(id) => self.refs.push(Ref {
+                    qualifier: None,
+                    col: id.value.to_ascii_lowercase(),
+                    range: ident_range(self.stmt, self.lo, id),
+                }),
+                Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+                    let col = &parts[parts.len() - 1];
+                    let qual = &parts[parts.len() - 2];
+                    self.refs.push(Ref {
+                        qualifier: Some(qual.value.to_ascii_lowercase()),
+                        col: col.value.to_ascii_lowercase(),
+                        range: ident_range(self.stmt, self.lo, col),
+                    });
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    /// Resolve one column ref against the scopes containing its position (innermost
+    /// first). Returns a diagnostic only when the column definitively doesn't exist.
+    fn resolve(r: &Ref, scopes: &[Scope]) -> Option<Diagnostic> {
+        // Scopes whose range contains this ref, smallest (innermost) first.
+        let mut chain: Vec<&Scope> = scopes
+            .iter()
+            .filter(|s| s.range.0 <= r.range.0 && r.range.1 <= s.range.1)
+            .collect();
+        chain.sort_by_key(|s| s.range.1 - s.range.0);
+        if chain.is_empty() {
+            return None;
+        }
+
+        match &r.qualifier {
+            Some(q) => {
+                // Find the source this qualifier names, in this or an enclosing scope.
+                for s in &chain {
+                    for src in &s.sources {
+                        if src.quals.iter().any(|x| x == q) {
+                            return match &src.cols {
+                                Cols::Open => None,
+                                Cols::Known(cols) if cols.contains(&r.col) => None,
+                                Cols::Known(_) => Some(err(
+                                    r,
+                                    &format!(
+                                        "Column `{}` not found in `{}`",
+                                        r.col,
+                                        src.table.clone().unwrap_or_else(|| q.clone())
+                                    ),
+                                )),
+                            };
+                        }
+                    }
+                }
+                // Unknown qualifier (db-qualified, or an outer name we didn't model) —
+                // don't flag; the table-existence check covers a bad table name.
+                None
+            }
+            None => {
+                for s in &chain {
+                    for src in &s.sources {
+                        match &src.cols {
+                            Cols::Open => return None,
+                            Cols::Known(cols) if cols.contains(&r.col) => return None,
+                            Cols::Known(_) => {}
+                        }
+                    }
+                    if s.proj_aliases.contains(&r.col) {
+                        return None;
+                    }
+                }
+                // Not found and no open source anywhere in the chain → flag. Name the
+                // table only when the innermost scope has a single base-table source.
+                let where_tbl = match chain[0].sources.as_slice() {
+                    [Src { table: Some(t), .. }] => format!(" in `{t}`"),
+                    _ => String::new(),
+                };
+                Some(err(r, &format!("Column `{}` not found{where_tbl}", r.col)))
+            }
+        }
+    }
+
+    fn err(r: &Ref, message: &str) -> Diagnostic {
+        Diagnostic {
+            range: r.range,
             severity: Severity::Error,
-            message: format!("Column `{w}` not found{where_tbl}"),
-        });
+            message: message.to_string(),
+        }
+    }
+
+    /// Build a query's FROM sources + projection output aliases. A non-`SELECT` body
+    /// (UNION/… set-op) becomes a single open source, so nothing in it is flagged.
+    fn build_scope(
+        q: &Query,
+        catalog: &Catalog,
+        ctes: &HashMap<String, Cols>,
+    ) -> (Vec<Src>, HashSet<String>) {
+        let SetExpr::Select(sel) = q.body.as_ref() else {
+            return (vec![open_src()], HashSet::new());
+        };
+        let mut sources = Vec::new();
+        for twj in &sel.from {
+            add_source(&twj.relation, &mut sources, catalog, ctes);
+            for join in &twj.joins {
+                add_source(&join.relation, &mut sources, catalog, ctes);
+            }
+        }
+        (sources, proj_aliases(sel))
+    }
+
+    fn add_source(
+        factor: &TableFactor,
+        sources: &mut Vec<Src>,
+        catalog: &Catalog,
+        ctes: &HashMap<String, Cols>,
+    ) {
+        match factor {
+            TableFactor::Table {
+                name, alias, args, ..
+            } => {
+                // A table-valued function's columns are unknowable → open.
+                if args.is_some() {
+                    sources.push(open_src());
+                    return;
+                }
+                let parts: Vec<String> = name.0.iter().map(|p| p.to_string()).collect();
+                let (db, tname) = match parts.as_slice() {
+                    [t] => (None, t.clone()),
+                    [.., d, t] => (Some(d.clone()), t.clone()),
+                    [] => return,
+                };
+                let alias_name = alias.as_ref().map(|a| a.name.value.clone());
+                let quals: Vec<String> = std::iter::once(&tname)
+                    .chain(alias_name.as_ref())
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect();
+                // A bare name matching a CTE resolves to the CTE's columns.
+                if db.is_none()
+                    && let Some(cols) = ctes.get(&tname.to_ascii_lowercase())
+                {
+                    sources.push(Src {
+                        quals,
+                        cols: cols.clone(),
+                        table: None,
+                    });
+                    return;
+                }
+                let tref = TableRef {
+                    name: tname.clone(),
+                    alias: alias_name,
+                    db,
+                };
+                let cols = match catalog.table_status(&tref) {
+                    TableStatus::Found => catalog
+                        .columns_of(&tref)
+                        .map(|c| Cols::Known(c.iter().map(|s| s.to_ascii_lowercase()).collect()))
+                        .unwrap_or(Cols::Open),
+                    _ => Cols::Open, // not loaded / not found → can't judge its columns
+                };
+                sources.push(Src {
+                    quals,
+                    cols,
+                    table: Some(tname),
+                });
+            }
+            TableFactor::Derived {
+                subquery, alias, ..
+            } => {
+                let quals = alias
+                    .as_ref()
+                    .map(|a| vec![a.name.value.to_ascii_lowercase()])
+                    .unwrap_or_default();
+                sources.push(Src {
+                    quals,
+                    cols: output_cols(subquery),
+                    table: None,
+                });
+            }
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
+                add_source(&table_with_joins.relation, sources, catalog, ctes);
+                for join in &table_with_joins.joins {
+                    add_source(&join.relation, sources, catalog, ctes);
+                }
+            }
+            _ => sources.push(open_src()),
+        }
+    }
+
+    /// The output column names of a subquery/CTE body, or `Open` when they can't be
+    /// cleanly enumerated (`SELECT *`, a set-op, or an unnamed non-column expression).
+    fn output_cols(q: &Query) -> Cols {
+        let SetExpr::Select(sel) = q.body.as_ref() else {
+            return Cols::Open;
+        };
+        let mut names = HashSet::new();
+        for item in &sel.projection {
+            match item {
+                SelectItem::UnnamedExpr(Expr::Identifier(id)) => {
+                    names.insert(id.value.to_ascii_lowercase());
+                }
+                SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if !parts.is_empty() => {
+                    names.insert(parts[parts.len() - 1].value.to_ascii_lowercase());
+                }
+                SelectItem::ExprWithAlias { alias, .. } => {
+                    names.insert(alias.value.to_ascii_lowercase());
+                }
+                // `*`, `t.*`, multi-alias, or an unnamed expression → can't enumerate.
+                _ => return Cols::Open,
+            }
+        }
+        Cols::Known(names)
+    }
+
+    /// A CTE's output columns: its explicit column list if given, else its body's.
+    fn cte_cols(cte: &Cte) -> Cols {
+        let TableAlias { columns, .. } = &cte.alias;
+        if !columns.is_empty() {
+            return Cols::Known(
+                columns
+                    .iter()
+                    .map(|c| c.name.value.to_ascii_lowercase())
+                    .collect(),
+            );
+        }
+        output_cols(&cte.query)
+    }
+
+    fn proj_aliases(sel: &Select) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for item in &sel.projection {
+            match item {
+                SelectItem::ExprWithAlias { alias, .. } => {
+                    out.insert(alias.value.to_ascii_lowercase());
+                }
+                SelectItem::ExprWithAliases { aliases, .. } => {
+                    out.extend(aliases.iter().map(|a| a.value.to_ascii_lowercase()));
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn open_src() -> Src {
+        Src {
+            quals: Vec::new(),
+            cols: Cols::Open,
+            table: None,
+        }
+    }
+
+    /// Absolute byte range of an identifier from its span (relative to `stmt`, +`lo`).
+    fn ident_range(stmt: &str, lo: usize, id: &Ident) -> (usize, usize) {
+        let s = id.span;
+        (
+            lo + offset_of_line_col(stmt, s.start.line, s.start.column),
+            lo + offset_of_line_col(stmt, s.end.line, s.end.column),
+        )
+    }
+
+    fn span_range(stmt: &str, lo: usize, q: &Query) -> (usize, usize) {
+        let s = q.span();
+        (
+            lo + offset_of_line_col(stmt, s.start.line, s.start.column),
+            lo + offset_of_line_col(stmt, s.end.line, s.end.column),
+        )
     }
 }
 
@@ -2740,25 +3020,114 @@ mod tests {
     }
 
     #[test]
-    fn diag_unqualified_column_bails_on_uncertainty() {
-        // Each of these has an unknown-looking bare name, but we can't be sure of the
-        // full column set → no column error (conservative).
+    fn diag_column_per_scope_subquery() {
+        // Unknown in the OUTER scope is flagged; the inner subquery resolves against
+        // its own table.
+        assert_eq!(
+            col_errors("SELECT nope FROM employees WHERE id IN (SELECT id FROM departments)"),
+            vec!["Column `nope` not found in `employees`"]
+        );
+        // Unknown INSIDE the subquery is flagged (positioned within it).
+        let sql = "SELECT id FROM employees WHERE id IN (SELECT bogus FROM departments)";
+        let d = diag(sql);
+        assert!(d.iter().any(|x| x.message.contains("`bogus`")));
+        assert_eq!(&sql[d[0].range.0..d[0].range.1], "bogus");
+        // A clean nested query has no errors.
+        assert!(
+            col_errors("SELECT id FROM employees WHERE id IN (SELECT id FROM departments)")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn diag_column_correlated_subquery_sees_outer() {
+        // The inner subquery may reference an outer table's column (correlation).
+        assert!(
+            col_errors(
+                "SELECT id FROM employees e WHERE EXISTS \
+                 (SELECT 1 FROM departments d WHERE d.id = e.dept_id)"
+            )
+            .is_empty()
+        );
+        // …but a genuinely unknown correlated column is still flagged.
+        assert!(
+            col_errors(
+                "SELECT id FROM employees e WHERE EXISTS \
+                 (SELECT 1 FROM departments d WHERE d.id = e.nope)"
+            )
+            .iter()
+            .any(|m| m.contains("`nope`"))
+        );
+    }
+
+    #[test]
+    fn diag_column_derived_table() {
+        // A derived table's columns are its projection's outputs.
+        assert!(col_errors("SELECT x FROM (SELECT id AS x FROM employees) sub").is_empty());
+        assert!(col_errors("SELECT sub.x FROM (SELECT id AS x FROM employees) sub").is_empty());
+        assert!(
+            col_errors("SELECT nope FROM (SELECT id AS x FROM employees) sub")
+                .iter()
+                .any(|m| m.contains("`nope`"))
+        );
+        assert!(
+            col_errors("SELECT sub.nope FROM (SELECT id AS x FROM employees) sub")
+                .iter()
+                .any(|m| m.contains("`nope`"))
+        );
+        // A `*` projection makes the derived table open → no false positives.
+        assert!(col_errors("SELECT anything FROM (SELECT * FROM employees) sub").is_empty());
+    }
+
+    #[test]
+    fn diag_column_cte() {
+        assert!(
+            col_errors("WITH c AS (SELECT id, name FROM employees) SELECT id, name FROM c")
+                .is_empty()
+        );
+        assert!(
+            col_errors("WITH c AS (SELECT id FROM employees) SELECT nope FROM c")
+                .iter()
+                .any(|m| m.contains("`nope`"))
+        );
+        // Explicit CTE column list defines the output names.
+        assert!(
+            col_errors("WITH c (a, b) AS (SELECT id, name FROM employees) SELECT a, b FROM c")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn diag_column_nested_valid_stays_clean() {
+        // False-positive sweep over valid nested queries.
         for sql in [
-            // Subquery in WHERE.
-            "SELECT nope FROM employees WHERE id IN (SELECT id FROM departments)",
-            // Derived table.
-            "SELECT nope FROM (SELECT id FROM employees) sub",
-            // CTE.
-            "WITH c AS (SELECT id FROM employees) SELECT nope FROM c",
-            // Unknown table (its columns are unknowable) — flagged as a table, not col.
-            "SELECT nope FROM nonexistent",
+            "SELECT id, (SELECT COUNT(*) FROM departments) AS cnt FROM employees",
+            "SELECT e.name FROM employees e WHERE e.dept_id IN (SELECT id FROM departments)",
+            "SELECT name FROM employees WHERE salary > (SELECT AVG(salary) FROM employees)",
+            "SELECT sub.total FROM (SELECT dept_id, SUM(salary) AS total FROM employees GROUP BY dept_id) sub",
+            "WITH d AS (SELECT id FROM departments) SELECT id FROM employees WHERE dept_id IN (SELECT id FROM d)",
+            "WITH a AS (SELECT id FROM employees), b AS (SELECT id FROM departments) SELECT a.id FROM a JOIN b ON a.id = b.id",
+            "SELECT e.name, d.name FROM employees e JOIN departments d ON e.dept_id = d.id WHERE e.salary > 100",
         ] {
             assert!(
                 col_errors(sql).is_empty(),
-                "should have bailed: {sql} -> {:?}",
+                "false positive: {sql} -> {:?}",
                 col_errors(sql)
             );
         }
+    }
+
+    #[test]
+    fn diag_column_open_on_unknown_source() {
+        // Unknown table → open → columns unjudgeable (only the table error surfaces).
+        let d = diag("SELECT nope FROM nonexistent");
+        assert!(
+            d.iter()
+                .any(|x| x.message.contains("Table `nonexistent` not found"))
+        );
+        assert!(!d.iter().any(|x| x.message.starts_with("Column ")));
+        // A derived table over an unknown table is likewise open.
+        assert!(col_errors("SELECT whatever FROM (SELECT * FROM mystery) sub").is_empty());
     }
 
     #[test]
