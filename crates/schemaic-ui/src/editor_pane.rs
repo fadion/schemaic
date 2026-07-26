@@ -42,7 +42,10 @@ use schemaic_core::text_ops::{
     toggle_line_comment,
 };
 
-use crate::completion::{Completion, accept_completion, completion_popup, recompute_completions};
+use crate::completion::{
+    Completion, accept_completion, completion_popup, recompute_completions, signature_popup,
+    update_signature_help,
+};
 use crate::consts::*;
 use crate::diff_view::diff_view;
 use crate::widgets::*;
@@ -737,6 +740,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         open: RwSignal::new(false),
         point: RwSignal::new(Point::ZERO),
         suppress: RwSignal::new(false),
+        sig: RwSignal::new(None),
+        sig_point: RwSignal::new(Point::ZERO),
     };
     let cmdk = CmdK {
         open: RwSignal::new(false),
@@ -974,6 +979,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             goto_query.set(String::new());
             return CommandExecuted::Yes;
         }
+        // Escape dismisses the suggestion list and/or signature help, whichever is
+        // showing (consuming the key only when it actually dismissed something).
+        if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Escape), _)) {
+            let had_sig = comp.sig.get_untracked().is_some();
+            let had_list = comp.open.get_untracked();
+            comp.sig.set(None);
+            comp.open.set(false);
+            if had_sig || had_list {
+                return CommandExecuted::Yes;
+            }
+        }
         if comp.open.get_untracked() {
             let len = comp.items.with_untracked(|v| v.len());
             if len > 0 {
@@ -986,10 +1002,6 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 }
                 if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::ArrowUp), _)) {
                     comp.sel.update(|i| *i = (*i + len - 1) % len);
-                    return CommandExecuted::Yes;
-                }
-                if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Escape), _)) {
-                    comp.open.set(false);
                     return CommandExecuted::Yes;
                 }
                 let accept_enter = !mods.control()
@@ -1539,8 +1551,22 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             ed_blur.editor_view_focus_lost.track();
             editor_focused.set(false);
             // Clicking away from the editor (schema panel, terminal, another tab)
-            // dismisses a stray completion popup too (TODO).
+            // dismisses a stray completion popup + signature help too.
             comp.open.set(false);
+            comp.sig.set(None);
+        });
+        // Signature help follows the *caret*, not just edits: recompute on every
+        // cursor change (typing, arrow keys, click) so it tracks the active parameter
+        // and hides the moment the caret leaves the call's parentheses. Focus is read
+        // untracked so a programmatic cursor change on an unfocused editor can't pop a
+        // phantom hint (blur clears it separately).
+        let ed_caret = ed.clone();
+        create_effect(move |_| {
+            ed_caret.cursor.track();
+            query.track(); // also on text edits that don't move the caret (forward-delete)
+            if editor_focused.get_untracked() {
+                update_signature_help(&ed_caret, comp);
+            }
         });
     }
     // Floem's editor over-reports its content width on the first layout, so a
@@ -2868,6 +2894,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         highlight_view,
         run_overlay,
         completion_popup(comp),
+        signature_popup(comp),
         error_bar,
         guard_bar,
         cmdk_view,
