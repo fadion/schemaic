@@ -549,9 +549,15 @@ pub(crate) fn recompute_completions(
                     }
                 }
             } else {
-                for r in &scope {
+                // Bias toward the most recently added (last) table in the FROM/JOIN
+                // list — the one you're most likely about to reference: its columns
+                // rank first (tier 0) and claim shared names; earlier tables fall to
+                // tier 1 (still above functions/keywords).
+                let last = scope.len() - 1;
+                for (i, r) in scope.iter().enumerate().rev() {
+                    let tier = if i == last { 0 } else { 1 };
                     for c in cols_of(&r.name) {
-                        add_col(&mut cands, &mut seen, &c, &r.name, r.alias.as_deref(), 0);
+                        add_col(&mut cands, &mut seen, &c, &r.name, r.alias.as_deref(), tier);
                     }
                 }
             }
