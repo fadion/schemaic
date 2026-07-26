@@ -510,6 +510,39 @@ pub(crate) fn recompute_completions(
             replace: None,
         });
     };
+    // In-scope table references as qualifier candidates: an alias (`ac`, tag icon,
+    // detail = the table it stands for) or, for an unaliased table, its name (table
+    // icon). Offered in column contexts so `ON a` suggests `ac` before you type `.`.
+    let add_aliases = |cands: &mut Vec<Cand>, seen: &mut HashSet<String>| {
+        for r in &scope {
+            let qtext = r.alias.as_deref().unwrap_or(&r.name);
+            let tl = qtext.to_ascii_lowercase();
+            if tl == pl || !seen.insert(tl) {
+                continue;
+            }
+            let detail = match (&r.alias, &r.db) {
+                (Some(_), Some(db)) => format!("{db}.{}", r.name),
+                (Some(_), None) => r.name.clone(),
+                (None, _) => String::new(),
+            };
+            cands.push(Cand {
+                text: qtext.to_string(),
+                kind: SuggestKind::Table,
+                detail,
+                table: String::new(),
+                alias: String::new(),
+                icon: if r.alias.is_some() {
+                    icons::TAG
+                } else {
+                    icons::TABLE
+                },
+                key: KeyKind::None,
+                tier: 0,
+                insert: None,
+                replace: None,
+            });
+        }
+    };
     // A table's columns: keyed by (db, table) when the table is database-qualified
     // (incl. a cross-database one), else the active-database unqualified pool.
     let cols_of = |db: Option<&str>, name: &str| -> Vec<ColMeta> {
@@ -653,6 +686,8 @@ pub(crate) fn recompute_completions(
                     }
                 }
             } else {
+                // In-scope aliases/table names as qualifier candidates (`ac`, `ord`).
+                add_aliases(&mut cands, &mut seen);
                 // Bias toward the most recently added (last) table in the FROM/JOIN
                 // list — the one you're most likely about to reference: its columns
                 // rank first (tier 0) and claim shared names; earlier tables fall to
@@ -709,6 +744,7 @@ pub(crate) fn recompute_completions(
             }
         }
         ClauseCtx::Other => {
+            add_aliases(&mut cands, &mut seen);
             for r in &scope {
                 for c in cols_of(r.db.as_deref(), &r.name) {
                     add_col(&mut cands, &mut seen, &c, &r.name, r.alias.as_deref(), 0);
