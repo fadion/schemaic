@@ -2320,6 +2320,7 @@ mod colres {
                 self.lo,
                 &mut self.gb,
             );
+            cartesian_check(sel, self.stmt, self.lo, &mut self.gb);
             self.scopes.push(Scope {
                 range,
                 sources,
@@ -2445,6 +2446,53 @@ mod colres {
             }
         }
         (sources, proj_aliases(sel))
+    }
+
+    /// Warn on an inner `JOIN`/`INNER JOIN`/`STRAIGHT_JOIN` with no `ON`/`USING`
+    /// condition — MySQL treats it as a cross join (every row combined), almost
+    /// always an accident. An explicit `CROSS JOIN` (a distinct operator) and a
+    /// comma-join (a separate `TableWithJoins`, no join node) are intentional and
+    /// left alone. Squiggles the joined relation.
+    fn cartesian_check(sel: &Select, stmt: &str, lo: usize, out: &mut Vec<Diagnostic>) {
+        fn walk(twj: &TableWithJoins, stmt: &str, lo: usize, out: &mut Vec<Diagnostic>) {
+            walk_factor(&twj.relation, stmt, lo, out);
+            for join in &twj.joins {
+                walk_factor(&join.relation, stmt, lo, out);
+                if is_unconstrained_inner_join(&join.join_operator) {
+                    out.push(Diagnostic {
+                        range: to_range(stmt, lo, join.relation.span()),
+                        severity: Severity::Warning,
+                        message: "JOIN has no ON/USING condition — this is a cross join; \
+                                  use CROSS JOIN if that's intended"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+        fn walk_factor(f: &TableFactor, stmt: &str, lo: usize, out: &mut Vec<Diagnostic>) {
+            if let TableFactor::NestedJoin {
+                table_with_joins, ..
+            } = f
+            {
+                walk(table_with_joins, stmt, lo, out);
+            }
+        }
+        for twj in &sel.from {
+            walk(twj, stmt, lo, out);
+        }
+    }
+
+    /// A `JOIN`/`INNER JOIN`/`STRAIGHT_JOIN` carrying no constraint (the valid-but-
+    /// cartesian forms). `CROSS JOIN` is a separate operator; outer joins without a
+    /// constraint don't parse in MySQL, so they never reach here.
+    fn is_unconstrained_inner_join(op: &JoinOperator) -> bool {
+        use JoinOperator::*;
+        matches!(
+            op,
+            Join(JoinConstraint::None)
+                | Inner(JoinConstraint::None)
+                | StraightJoin(JoinConstraint::None)
+        )
     }
 
     /// `only_full_group_by`: with a `GROUP BY`, every projected column must be a
@@ -3704,6 +3752,42 @@ mod tests {
         // The rule applies to a derived table's own SELECT too.
         let sql = "SELECT * FROM (SELECT dept_id, name FROM employees GROUP BY dept_id) d";
         assert!(gb_warnings(sql).iter().any(|m| m.contains("`name`")));
+    }
+
+    // ── cartesian joins ────────────────────────────────────────────────────────
+
+    fn cross_warnings(sql: &str) -> Vec<Diagnostic> {
+        diag(sql)
+            .into_iter()
+            .filter(|d| d.message.contains("cross join"))
+            .collect()
+    }
+
+    #[test]
+    fn diag_unconstrained_join_flagged() {
+        let sql = "SELECT * FROM employees e JOIN departments d";
+        let w = cross_warnings(sql);
+        assert_eq!(w.len(), 1, "{:?}", diag(sql));
+        assert_eq!(w[0].severity, Severity::Warning);
+        assert_eq!(&sql[w[0].range.0..w[0].range.1], "departments d");
+        // `INNER JOIN` with no ON is the same.
+        assert_eq!(
+            cross_warnings("SELECT * FROM employees INNER JOIN departments").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn diag_cross_join_and_conditioned_joins_clean() {
+        for sql in [
+            "SELECT * FROM employees e CROSS JOIN departments d", // explicit → intended
+            "SELECT * FROM employees e JOIN departments d ON e.dept_id = d.id",
+            "SELECT * FROM employees e JOIN departments d USING (id)",
+            "SELECT * FROM employees, departments", // comma-join → not flagged
+            "SELECT * FROM employees",
+        ] {
+            assert!(cross_warnings(sql).is_empty(), "false positive: {sql}");
+        }
     }
 
     #[test]
