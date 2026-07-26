@@ -2975,6 +2975,12 @@ impl Catalog {
     fn fks_of(&self, table: &str) -> Option<&Vec<FkEdge>> {
         self.fks.get(&table.to_ascii_lowercase())
     }
+
+    /// All FK entries (`table_lower` → its edges) — for enumerating *reverse* FK
+    /// relationships (a table that references one already in scope).
+    fn all_fks(&self) -> impl Iterator<Item = (&String, &Vec<FkEdge>)> {
+        self.fks.iter()
+    }
 }
 
 /// The qualifier to write for a table reference in a predicate: its alias if it
@@ -3089,6 +3095,112 @@ pub fn join_condition(
         }
     }
     None
+}
+
+/// A foreign-key-connected table to offer at a `JOIN` slot: the table to insert and
+/// the ready-to-write `ON` predicate linking it to a table already in scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JoinTarget {
+    /// Candidate table name to join.
+    pub table: String,
+    /// The `ON` predicate (without the `ON` keyword), e.g. `orders.customer_id = c.id`.
+    pub predicate: String,
+}
+
+/// FK-aware JOIN targets for completion. When the caret sits at a `JOIN` table slot
+/// (the last clause keyword before the partial name is `JOIN`, nothing else typed),
+/// returns every table connected by a foreign key — in either direction — to a table
+/// already in scope, each with a ready-to-insert `ON` predicate. The completion layer
+/// offers these at the top of the table list, inserting `table ON <predicate>`.
+/// Empty when the caret isn't at a JOIN slot or nothing is FK-connected.
+pub fn join_targets(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    caret: usize,
+    catalog: &Catalog,
+) -> Vec<JoinTarget> {
+    let toks = tokenize_range(sql, lo, hi);
+    let word_lo = word_start(sql, caret);
+    // The last clause keyword strictly before the partial table name must be `JOIN`.
+    let mut join_idx = None;
+    for (i, t) in toks.iter().enumerate() {
+        if t.at >= word_lo {
+            break;
+        }
+        if let TkKind::Word(w) = &t.kind
+            && CLAUSE_KEYWORDS.contains(&w.to_ascii_uppercase().as_str())
+        {
+            join_idx = w.eq_ignore_ascii_case("JOIN").then_some(i);
+        }
+    }
+    let Some(join_idx) = join_idx else {
+        return Vec::new();
+    };
+    // No complete table already typed between `JOIN` and the partial prefix.
+    for t in &toks[join_idx + 1..] {
+        if t.at >= word_lo {
+            break;
+        }
+        if matches!(t.kind, TkKind::Word(_)) {
+            return Vec::new();
+        }
+    }
+    let scope = statement_scope(sql, lo, hi, caret, SqlDialect::MySql).tables;
+    join_targets_for(&scope, catalog)
+}
+
+/// The FK-connected join candidates for a set of in-scope tables (both edge
+/// directions), deduped by candidate table.
+fn join_targets_for(scope: &[TableRef], catalog: &Catalog) -> Vec<JoinTarget> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let in_scope = |name: &str| scope.iter().any(|s| s.name.eq_ignore_ascii_case(name));
+    // Forward: an in-scope table's FK references candidate `T`.
+    for s in scope {
+        if let Some(edges) = catalog.fks_of(&s.name) {
+            for e in edges {
+                if in_scope(&e.ref_table) || !seen.insert(e.ref_table.to_ascii_lowercase()) {
+                    continue;
+                }
+                let cand = TableRef {
+                    name: e.ref_table.clone(),
+                    alias: None,
+                    db: None,
+                };
+                out.push(JoinTarget {
+                    table: e.ref_table.clone(),
+                    predicate: build_predicate(s, &e.columns, &cand, &e.ref_columns),
+                });
+            }
+        }
+    }
+    // Reverse: a candidate table `T` has an FK referencing an in-scope table.
+    for (t, edges) in catalog.all_fks() {
+        if in_scope(t) || seen.contains(t) {
+            continue;
+        }
+        for e in edges {
+            if let Some(s) = scope
+                .iter()
+                .find(|s| e.ref_table.eq_ignore_ascii_case(&s.name))
+            {
+                let cand = TableRef {
+                    name: t.clone(),
+                    alias: None,
+                    db: None,
+                };
+                if seen.insert(t.clone()) {
+                    out.push(JoinTarget {
+                        table: t.clone(),
+                        predicate: build_predicate(&cand, &e.columns, s, &e.ref_columns),
+                    });
+                }
+                break;
+            }
+        }
+    }
+    out
 }
 
 // ── DB-validated diagnostics (Tier 2) ────────────────────────────────────────
@@ -4421,6 +4533,59 @@ mod tests {
         // Caret in the projection, not an ON clause.
         let sql = "SELECT  FROM orders o JOIN customers c ON x";
         assert_eq!(join_at(sql, 7), None);
+    }
+
+    // ── FK-aware JOIN completion targets ──────────────────────────────────────
+
+    fn jt(sql: &str) -> Vec<JoinTarget> {
+        let (schema, db) = fk_catalog();
+        let cat = Catalog::build(&[(db, &schema)], Some(db));
+        join_targets(sql, 0, sql.len(), sql.len(), &cat)
+    }
+
+    #[test]
+    fn join_targets_offers_fk_table_and_predicate() {
+        // After `FROM orders o JOIN `, `customers` is FK-connected (forward) and
+        // `line_items` is FK-connected (reverse).
+        let ts = jt("SELECT * FROM orders o JOIN ");
+        let names: Vec<&str> = ts.iter().map(|t| t.table.as_str()).collect();
+        assert!(names.contains(&"customers"), "{names:?}");
+        assert!(names.contains(&"line_items"), "{names:?}");
+        let cust = ts.iter().find(|t| t.table == "customers").unwrap();
+        assert_eq!(cust.predicate, "o.customer_id = customers.id");
+    }
+
+    #[test]
+    fn join_targets_reverse_edge_predicate() {
+        // `line_items.order_id → orders.id`; joining onto in-scope `orders o`.
+        let ts = jt("SELECT * FROM orders o JOIN ");
+        let li = ts.iter().find(|t| t.table == "line_items").unwrap();
+        assert_eq!(li.predicate, "line_items.order_id = o.id");
+    }
+
+    #[test]
+    fn join_targets_partial_prefix_still_offered() {
+        // A partial table name being typed doesn't disable the suggestions.
+        let ts = jt("SELECT * FROM orders o JOIN cust");
+        assert!(ts.iter().any(|t| t.table == "customers"));
+    }
+
+    #[test]
+    fn join_targets_empty_outside_join_slot() {
+        // A FROM slot (not JOIN) → no ON-predicate suggestions.
+        assert!(jt("SELECT * FROM ").is_empty());
+        // After the table is fully typed and an ON is expected, not a table slot.
+        let (schema, db) = fk_catalog();
+        let cat = Catalog::build(&[(db, &schema)], Some(db));
+        let sql = "SELECT * FROM orders o JOIN customers c ";
+        assert!(join_targets(sql, 0, sql.len(), sql.len(), &cat).is_empty());
+    }
+
+    #[test]
+    fn join_targets_excludes_already_in_scope() {
+        // `customers` already joined → don't re-suggest it.
+        let ts = jt("SELECT * FROM orders o JOIN customers c JOIN ");
+        assert!(!ts.iter().any(|t| t.table == "customers"));
     }
 
     // ── DB-validated diagnostics ──────────────────────────────────────────────
