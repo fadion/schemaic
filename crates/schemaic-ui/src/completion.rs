@@ -152,8 +152,12 @@ struct SchemaIndex {
     databases: Vec<String>,
     /// (table name, database it lives in).
     tables: Vec<(String, String)>,
-    /// table name (lowercase) → its columns.
+    /// table name (lowercase) → its columns — the *active-database* unqualified pool.
     columns: HashMap<String, Vec<ColMeta>>,
+    /// (database, table) (both lowercase) → its columns, for *every* loaded database.
+    /// Backs qualified completion of a cross-database table (`otherdb.t` or an alias
+    /// pointing at one), which the active-db-only `columns` map can't answer.
+    columns_by_db: HashMap<(String, String), Vec<ColMeta>>,
     /// database name (lowercase) → its table names.
     tables_by_db: HashMap<String, Vec<String>>,
 }
@@ -169,6 +173,7 @@ impl SchemaIndex {
         let mut databases = Vec::new();
         let mut tables = Vec::new();
         let mut columns: HashMap<String, Vec<ColMeta>> = HashMap::new();
+        let mut columns_by_db: HashMap<(String, String), Vec<ColMeta>> = HashMap::new();
         let mut tables_by_db: HashMap<String, Vec<String>> = HashMap::new();
         for node in db_nodes.get_untracked() {
             if !databases
@@ -178,34 +183,42 @@ impl SchemaIndex {
                 databases.push(node.database.clone());
             }
             if let SchemaState::Loaded(schema) = node.schema.get_untracked() {
-                let by_db = tables_by_db
-                    .entry(node.database.to_ascii_lowercase())
-                    .or_default();
-                for t in &schema.tables {
-                    by_db.push(t.name.clone());
-                }
+                let db_lower = node.database.to_ascii_lowercase();
+                let by_db = tables_by_db.entry(db_lower.clone()).or_default();
                 // Unqualified pool: only the selected database (or all, if none).
                 let in_scope = active_db.is_none_or(|db| db.eq_ignore_ascii_case(&node.database));
-                if in_scope {
-                    for t in &schema.tables {
+                for t in &schema.tables {
+                    by_db.push(t.name.clone());
+                    // Columns covered by a foreign key (case-folded) → the FK tint.
+                    let fk_cols: HashSet<String> = t
+                        .foreign_keys
+                        .iter()
+                        .flat_map(|fk| fk.columns.iter())
+                        .map(|c| c.to_ascii_lowercase())
+                        .collect();
+                    let metas: Vec<ColMeta> = t
+                        .columns
+                        .iter()
+                        .map(|c| ColMeta {
+                            name: c.name.clone(),
+                            type_name: c.type_name.clone(),
+                            nullable: c.nullable,
+                            primary_key: c.primary_key,
+                            foreign_key: fk_cols.contains(&c.name.to_ascii_lowercase()),
+                        })
+                        .collect();
+                    // Every database's columns are keyed by (db, table) for qualified
+                    // (incl. cross-database) completion.
+                    columns_by_db.insert(
+                        (db_lower.clone(), t.name.to_ascii_lowercase()),
+                        metas.clone(),
+                    );
+                    if in_scope {
                         tables.push((t.name.clone(), node.database.clone()));
-                        // Columns covered by a foreign key (case-folded) → the FK tint.
-                        let fk_cols: HashSet<String> = t
-                            .foreign_keys
-                            .iter()
-                            .flat_map(|fk| fk.columns.iter())
-                            .map(|c| c.to_ascii_lowercase())
-                            .collect();
                         let entry = columns.entry(t.name.to_ascii_lowercase()).or_default();
-                        for c in &t.columns {
-                            if !entry.iter().any(|m| m.name.eq_ignore_ascii_case(&c.name)) {
-                                entry.push(ColMeta {
-                                    name: c.name.clone(),
-                                    type_name: c.type_name.clone(),
-                                    nullable: c.nullable,
-                                    primary_key: c.primary_key,
-                                    foreign_key: fk_cols.contains(&c.name.to_ascii_lowercase()),
-                                });
+                        for m in metas {
+                            if !entry.iter().any(|e| e.name.eq_ignore_ascii_case(&m.name)) {
+                                entry.push(m);
                             }
                         }
                     }
@@ -216,6 +229,7 @@ impl SchemaIndex {
             databases,
             tables,
             columns,
+            columns_by_db,
             tables_by_db,
         }
     }
@@ -357,16 +371,20 @@ pub(crate) fn recompute_completions(
     active_db: Option<&str>,
     force: bool,
 ) {
+    let offset = ed.cursor.get_untracked().offset();
+    let text = ed.doc().text().to_string();
+    // A `.` just typed is a qualifier trigger — reveal the qualifier's members even
+    // right after accepting it (otherwise `suppress`, set by the accept, would swallow
+    // the very next keystroke and the popup wouldn't reopen until another char).
+    let after_dot = offset > 0 && text.as_bytes().get(offset - 1) == Some(&b'.');
     if comp.suppress.get_untracked() {
         comp.suppress.set(false);
-        if !force {
+        if !force && !after_dot {
             comp.open.set(false);
             comp.items.set(Vec::new());
             return;
         }
     }
-    let offset = ed.cursor.get_untracked().offset();
-    let text = ed.doc().text().to_string();
     let word_lo = word_start(&text, offset);
     let prefix = text.get(word_lo..offset).unwrap_or("").to_string();
 
@@ -492,12 +510,21 @@ pub(crate) fn recompute_completions(
             replace: None,
         });
     };
-    let cols_of = |name: &str| -> Vec<ColMeta> {
-        schema
-            .columns
-            .get(&name.to_ascii_lowercase())
-            .cloned()
-            .unwrap_or_default()
+    // A table's columns: keyed by (db, table) when the table is database-qualified
+    // (incl. a cross-database one), else the active-database unqualified pool.
+    let cols_of = |db: Option<&str>, name: &str| -> Vec<ColMeta> {
+        match db {
+            Some(db) => schema
+                .columns_by_db
+                .get(&(db.to_ascii_lowercase(), name.to_ascii_lowercase()))
+                .cloned()
+                .unwrap_or_default(),
+            None => schema
+                .columns
+                .get(&name.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_default(),
+        }
     };
     // Expected clause-keyword continuations go in the *top* tier (above columns,
     // functions, and — after a complete table ref — schema table names), so the
@@ -521,32 +548,37 @@ pub(crate) fn recompute_completions(
     // them below the keyword continuations.
     let table_tier: u8 = if cont.keywords.is_empty() { 0 } else { 1 };
 
-    // A qualifier resolves to a table (+ the alias to annotate with) via an in-scope
-    // alias, else a bare table name (whether or not it's in FROM).
-    let resolve = |q: &str| -> Option<(String, Option<String>)> {
+    // A qualifier resolves to a table — (name, its database, the alias to annotate
+    // with) — via an in-scope alias, else a bare table name (whether or not it's in
+    // FROM). The database is carried so a cross-database table's columns resolve.
+    let resolve = |q: &str| -> Option<(String, Option<String>, Option<String>)> {
         for r in &scope {
             if r.alias
                 .as_deref()
                 .is_some_and(|a| a.eq_ignore_ascii_case(q))
             {
-                return Some((r.name.clone(), r.alias.clone()));
+                return Some((r.name.clone(), r.db.clone(), r.alias.clone()));
             }
         }
         for r in &scope {
             if r.alias.is_none() && r.name.eq_ignore_ascii_case(q) {
-                return Some((r.name.clone(), None));
+                return Some((r.name.clone(), r.db.clone(), None));
             }
         }
         if schema.columns.contains_key(&q.to_ascii_lowercase()) {
-            return Some((q.to_string(), None));
+            return Some((q.to_string(), None, None));
         }
         None
     };
 
     match &ctx {
         ClauseCtx::Qualified(q) => {
-            if let Some((table, alias)) = resolve(q) {
-                for c in cols_of(&table) {
+            // A qualifier is either a table/alias (→ its columns) or a database name
+            // (→ its tables, for `db.table`). The scope resolver no longer misparses a
+            // dangling `db.` as a table (fixed in `intel::lexer_scope`), so the natural
+            // table-first order is safe.
+            if let Some((table, db, alias)) = resolve(q) {
+                for c in cols_of(db.as_deref(), &table) {
                     add_col(&mut cands, &mut seen, &c, &table, alias.as_deref(), 0);
                 }
             } else if let Some(tbls) = schema.tables_by_db.get(&q.to_ascii_lowercase()) {
@@ -616,7 +648,7 @@ pub(crate) fn recompute_completions(
                 // No FROM yet: offer every column, annotated by its owning table so
                 // the broader list stays navigable.
                 for (name, _) in &schema.tables {
-                    for c in cols_of(name) {
+                    for c in cols_of(None, name) {
                         add_col(&mut cands, &mut seen, &c, name, None, 1);
                     }
                 }
@@ -628,7 +660,7 @@ pub(crate) fn recompute_completions(
                 let last = scope.len() - 1;
                 for (i, r) in scope.iter().enumerate().rev() {
                     let tier = if i == last { 0 } else { 1 };
-                    for c in cols_of(&r.name) {
+                    for c in cols_of(r.db.as_deref(), &r.name) {
                         add_col(&mut cands, &mut seen, &c, &r.name, r.alias.as_deref(), tier);
                     }
                 }
@@ -678,7 +710,7 @@ pub(crate) fn recompute_completions(
         }
         ClauseCtx::Other => {
             for r in &scope {
-                for c in cols_of(&r.name) {
+                for c in cols_of(r.db.as_deref(), &r.name) {
                     add_col(&mut cands, &mut seen, &c, &r.name, r.alias.as_deref(), 0);
                 }
             }
