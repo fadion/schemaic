@@ -90,6 +90,10 @@ pub(crate) struct Suggestion {
     icon: &'static str,
     /// Key membership — tints a column's icon gold/purple like the schema tree.
     key: KeyKind,
+    /// Text spliced on accept when it differs from `text` — e.g. an FK JOIN target
+    /// displays `orders` but inserts `orders ON o.customer_id = orders.id`. `None`
+    /// inserts `text` verbatim.
+    insert: Option<String>,
 }
 
 fn is_word_byte(b: u8) -> bool {
@@ -273,6 +277,8 @@ struct Cand {
     icon: &'static str,
     key: KeyKind,
     tier: u8,
+    /// Splice-on-accept override (see [`Suggestion::insert`]).
+    insert: Option<String>,
 }
 
 /// Recompute context-aware suggestions for the word at the caret. Ranks the most
@@ -331,6 +337,7 @@ pub(crate) fn recompute_completions(
                 // A purple key-square marks the ready-to-insert FK join predicate.
                 icon: icons::KEY_SQUARE,
                 key: KeyKind::Foreign,
+                insert: None,
             }]);
             comp.sel.set(0);
             comp.open.set(true);
@@ -374,6 +381,7 @@ pub(crate) fn recompute_completions(
             icon: kind_icon(kind),
             key: KeyKind::None,
             tier,
+            insert: None,
         });
     };
     // The detail string for a column typed against its own metadata: the type,
@@ -415,6 +423,7 @@ pub(crate) fn recompute_completions(
             icon: column_type_icon(classify_column_type(&c.type_name)),
             key,
             tier,
+            insert: None,
         });
     };
     let cols_of = |name: &str| -> Vec<ColMeta> {
@@ -481,6 +490,34 @@ pub(crate) fn recompute_completions(
             }
         }
         ClauseCtx::Table => {
+            // FK-aware JOIN targets first (top tier): a table connected by a foreign
+            // key to something in scope, inserting `table ON <predicate>` in one go.
+            let catalog = build_catalog(db_nodes, active_db);
+            let mut fk_added = false;
+            for jt in intel::join_targets(&text, lo, hi, offset, &catalog) {
+                let tl = jt.table.to_ascii_lowercase();
+                if tl == pl || !seen.insert(tl) {
+                    continue;
+                }
+                fk_added = true;
+                cands.push(Cand {
+                    text: jt.table.clone(),
+                    kind: SuggestKind::Table,
+                    detail: "foreign key".to_string(),
+                    table: String::new(),
+                    alias: String::new(),
+                    icon: icons::KEY_SQUARE,
+                    key: KeyKind::Foreign,
+                    tier: 0,
+                    insert: Some(format!("{} ON {}", jt.table, jt.predicate)),
+                });
+            }
+            // With FK targets present, keep them strictly above the plain table list.
+            let plain_tier = if fk_added {
+                table_tier.max(1)
+            } else {
+                table_tier
+            };
             for (name, db) in &schema.tables {
                 add(
                     &mut cands,
@@ -488,7 +525,7 @@ pub(crate) fn recompute_completions(
                     name,
                     SuggestKind::Table,
                     db.clone(),
-                    table_tier,
+                    plain_tier,
                 );
             }
             for db in &schema.databases {
@@ -612,6 +649,7 @@ pub(crate) fn recompute_completions(
             alias: c.alias,
             icon: c.icon,
             key: c.key,
+            insert: c.insert,
         })
         .collect();
 
@@ -633,16 +671,22 @@ pub(crate) fn accept_completion(ed: &Editor, comp: Completion) {
     let text = doc.text().to_string();
     let start = word_start(&text, offset);
     let idx = comp.sel.get_untracked();
-    if let Some((word, kind)) = comp
-        .items
-        .with_untracked(|v| v.get(idx).map(|s| (s.text.clone(), s.kind)))
-    {
+    if let Some((word, kind, over)) = comp.items.with_untracked(|v| {
+        v.get(idx)
+            .map(|s| (s.text.clone(), s.kind, s.insert.clone()))
+    }) {
         comp.suppress.set(true);
-        // A function inserts `name()` with the caret between the parens — unless the
-        // call parens are already there just ahead (re-accepting over a call).
-        let followed_by_paren = text[offset..].trim_start().starts_with('(');
-        let (insert, caret) =
-            completion_insertion(&word, kind == SuggestKind::Function, followed_by_paren);
+        let (insert, caret) = if let Some(over) = over {
+            // An explicit splice override (e.g. an FK JOIN target: `orders ON …`);
+            // caret lands at its end.
+            let len = over.len();
+            (over, len)
+        } else {
+            // A function inserts `name()` with the caret between the parens — unless
+            // the call parens are already there just ahead (re-accepting over a call).
+            let followed_by_paren = text[offset..].trim_start().starts_with('(');
+            completion_insertion(&word, kind == SuggestKind::Function, followed_by_paren)
+        };
         doc.edit_single(
             Selection::region(start, offset),
             &insert,
@@ -734,6 +778,7 @@ pub(crate) fn completion_popup(comp: Completion) -> impl IntoView {
                         alias,
                         icon,
                         key,
+                        insert: _,
                     } = item;
                     let color = suggest_color(kind);
                     // Schema-style leading glyph, coloured by kind/key (see
