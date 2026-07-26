@@ -154,6 +154,251 @@ pub const SQL_FUNCTIONS: &[&str] = &[
     "LEAST",
 ];
 
+/// A broad set of MySQL/MariaDB built-in function names (upper-case) — the
+/// authority for the "unknown function" typo check. It is intentionally *much*
+/// larger than [`SQL_FUNCTIONS`] (the small suggestion set): a call like `POWR(x)`
+/// is only flagged when its name is a near-miss of some entry here and isn't itself
+/// one, so real builtins outside the suggestion set (e.g. `POWER`, `COALESCE`,
+/// `JSON_EXTRACT`) never false-positive. Not used for completion.
+pub(crate) const KNOWN_FUNCTIONS: &[&str] = &[
+    // Aggregate / window.
+    "COUNT",
+    "SUM",
+    "AVG",
+    "MIN",
+    "MAX",
+    "GROUP_CONCAT",
+    "STD",
+    "STDDEV",
+    "STDDEV_POP",
+    "STDDEV_SAMP",
+    "VARIANCE",
+    "VAR_POP",
+    "VAR_SAMP",
+    "BIT_AND",
+    "BIT_OR",
+    "BIT_XOR",
+    "JSON_ARRAYAGG",
+    "JSON_OBJECTAGG",
+    "ROW_NUMBER",
+    "RANK",
+    "DENSE_RANK",
+    "PERCENT_RANK",
+    "CUME_DIST",
+    "NTILE",
+    "LAG",
+    "LEAD",
+    "FIRST_VALUE",
+    "LAST_VALUE",
+    "NTH_VALUE",
+    // String.
+    "CONCAT",
+    "CONCAT_WS",
+    "LENGTH",
+    "OCTET_LENGTH",
+    "CHAR_LENGTH",
+    "CHARACTER_LENGTH",
+    "LOWER",
+    "LCASE",
+    "UPPER",
+    "UCASE",
+    "TRIM",
+    "LTRIM",
+    "RTRIM",
+    "SUBSTRING",
+    "SUBSTR",
+    "MID",
+    "SUBSTRING_INDEX",
+    "REPLACE",
+    "REVERSE",
+    "REPEAT",
+    "LEFT",
+    "RIGHT",
+    "LPAD",
+    "RPAD",
+    "LOCATE",
+    "POSITION",
+    "INSTR",
+    "FIELD",
+    "FIND_IN_SET",
+    "SPACE",
+    "ELT",
+    "ORD",
+    "ASCII",
+    "CHAR",
+    "HEX",
+    "UNHEX",
+    "BIN",
+    "OCT",
+    "FORMAT",
+    "QUOTE",
+    "SOUNDEX",
+    "TO_BASE64",
+    "FROM_BASE64",
+    "REGEXP_REPLACE",
+    "REGEXP_SUBSTR",
+    "REGEXP_INSTR",
+    "REGEXP_LIKE",
+    "MAKE_SET",
+    "EXPORT_SET",
+    // Numeric.
+    "ABS",
+    "CEIL",
+    "CEILING",
+    "FLOOR",
+    "ROUND",
+    "TRUNCATE",
+    "MOD",
+    "POW",
+    "POWER",
+    "SQRT",
+    "EXP",
+    "LN",
+    "LOG",
+    "LOG2",
+    "LOG10",
+    "SIGN",
+    "RAND",
+    "PI",
+    "DEGREES",
+    "RADIANS",
+    "SIN",
+    "COS",
+    "TAN",
+    "ASIN",
+    "ACOS",
+    "ATAN",
+    "ATAN2",
+    "COT",
+    "CRC32",
+    "CONV",
+    "GREATEST",
+    "LEAST",
+    // Date / time.
+    "NOW",
+    "CURDATE",
+    "CURRENT_DATE",
+    "CURTIME",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "SYSDATE",
+    "UTC_DATE",
+    "UTC_TIME",
+    "UTC_TIMESTAMP",
+    "DATE",
+    "TIME",
+    "YEAR",
+    "MONTH",
+    "DAY",
+    "DAYOFMONTH",
+    "HOUR",
+    "MINUTE",
+    "SECOND",
+    "MICROSECOND",
+    "WEEK",
+    "WEEKDAY",
+    "WEEKOFYEAR",
+    "DAYOFWEEK",
+    "DAYOFYEAR",
+    "DAYNAME",
+    "MONTHNAME",
+    "QUARTER",
+    "LAST_DAY",
+    "DATE_FORMAT",
+    "TIME_FORMAT",
+    "STR_TO_DATE",
+    "DATE_ADD",
+    "DATE_SUB",
+    "ADDDATE",
+    "SUBDATE",
+    "ADDTIME",
+    "SUBTIME",
+    "DATEDIFF",
+    "TIMEDIFF",
+    "TIMESTAMP",
+    "TIMESTAMPADD",
+    "TIMESTAMPDIFF",
+    "EXTRACT",
+    "MAKEDATE",
+    "MAKETIME",
+    "PERIOD_ADD",
+    "PERIOD_DIFF",
+    "SEC_TO_TIME",
+    "TIME_TO_SEC",
+    "TO_DAYS",
+    "FROM_DAYS",
+    "TO_SECONDS",
+    "UNIX_TIMESTAMP",
+    "FROM_UNIXTIME",
+    "CONVERT_TZ",
+    "GET_FORMAT",
+    // Control / cast / null.
+    "IF",
+    "IFNULL",
+    "NULLIF",
+    "COALESCE",
+    "CAST",
+    "CONVERT",
+    "ISNULL",
+    "NANVL",
+    // JSON.
+    "JSON_EXTRACT",
+    "JSON_OBJECT",
+    "JSON_ARRAY",
+    "JSON_VALID",
+    "JSON_TYPE",
+    "JSON_KEYS",
+    "JSON_LENGTH",
+    "JSON_CONTAINS",
+    "JSON_CONTAINS_PATH",
+    "JSON_SET",
+    "JSON_INSERT",
+    "JSON_REPLACE",
+    "JSON_REMOVE",
+    "JSON_MERGE",
+    "JSON_MERGE_PATCH",
+    "JSON_MERGE_PRESERVE",
+    "JSON_UNQUOTE",
+    "JSON_QUOTE",
+    "JSON_SEARCH",
+    "JSON_DEPTH",
+    "JSON_PRETTY",
+    // Info / misc.
+    "DATABASE",
+    "SCHEMA",
+    "USER",
+    "CURRENT_USER",
+    "SESSION_USER",
+    "SYSTEM_USER",
+    "VERSION",
+    "CONNECTION_ID",
+    "LAST_INSERT_ID",
+    "ROW_COUNT",
+    "FOUND_ROWS",
+    "UUID",
+    "UUID_SHORT",
+    "MD5",
+    "SHA",
+    "SHA1",
+    "SHA2",
+    "PASSWORD",
+    "AES_ENCRYPT",
+    "AES_DECRYPT",
+    "COMPRESS",
+    "UNCOMPRESS",
+    "BENCHMARK",
+    "SLEEP",
+    "INET_ATON",
+    "INET_NTOA",
+    "INET6_ATON",
+    "INET6_NTOA",
+    "IS_IPV4",
+    "IS_IPV6",
+    "NULLIF",
+    "BIT_COUNT",
+    "BIT_LENGTH",
+];
+
 /// Keywords that begin a statement (offered at statement start).
 pub const STMT_KEYWORDS: &[&str] = &[
     "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TRUNCATE", "WITH", "SHOW",
@@ -1394,6 +1639,7 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
             }
         }
         typo_checks(sql, lo, hi, catalog, &mut out);
+        function_typo_checks(sql, lo, hi, catalog, &mut out);
         // Reserved-keyword aliases (`orders AS or`, `orders or`) run unconditionally:
         // sqlparser is laxer than MySQL here (it *accepts* `AS or`), so gating on a
         // parse failure would miss the very case we want to flag.
@@ -2542,6 +2788,101 @@ fn typo_checks(sql: &str, lo: usize, hi: usize, catalog: &Catalog, out: &mut Vec
     }
 }
 
+/// Flag a word in **function-call position** (`word(`) that is a near-miss of a
+/// known builtin but isn't itself one — a probable typo like `COUTN(...)` for
+/// `COUNT(...)`. Conservative: the name must be within edit distance of an entry in
+/// [`KNOWN_FUNCTIONS`] (the broad builtin set), so user-defined functions and
+/// unlisted builtins pass through untouched; qualified calls (`pkg.func(`) and real
+/// schema identifiers are skipped too.
+fn function_typo_checks(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    catalog: &Catalog,
+    out: &mut Vec<Diagnostic>,
+) {
+    let b = sql.as_bytes();
+    let mut i = lo;
+    while i < hi {
+        if let Some(j) = skip_noncode(b, i) {
+            i = j.min(hi);
+            continue;
+        }
+        let c = b[i];
+        if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 {
+            let s = i;
+            let mut j = i + 1;
+            while j < hi && is_word_byte(b[j]) {
+                j += 1;
+            }
+            // A call only if the next non-blank byte is `(`.
+            let mut k = j;
+            while k < hi && (b[k] == b' ' || b[k] == b'\t') {
+                k += 1;
+            }
+            let is_call = k < hi && b[k] == b'(';
+            let word = &sql[s..j];
+            let lw = word.to_ascii_lowercase();
+            let qualified = s > lo && b[s - 1] == b'.';
+            if is_call
+                && !qualified
+                && !is_known_function(&lw)
+                && !is_sql_keyword(word)
+                && !STMT_KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(word))
+                && !catalog.known_idents.contains(&lw)
+                && is_probable_function_typo(word)
+            {
+                out.push(Diagnostic {
+                    range: (s, j),
+                    severity: Severity::Warning,
+                    message: format!("`{word}` looks like a misspelled function"),
+                });
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// Case-insensitive membership in the broad builtin set.
+fn is_known_function(word_lower: &str) -> bool {
+    KNOWN_FUNCTIONS
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(word_lower))
+}
+
+/// Is `word` a near-miss of a known builtin function name? A near-miss is a small
+/// Levenshtein distance (1, or 2 for longer names) *or* a single adjacent
+/// transposition (`COUTN`↔`COUNT`) — the latter is distance 2 under plain
+/// Levenshtein but by far the most common typo, so it's matched explicitly rather
+/// than by loosening the distance threshold (which would flag names like
+/// `format_x` as a typo of `FORMAT`).
+fn is_probable_function_typo(word: &str) -> bool {
+    if word.len() < 4 {
+        return false;
+    }
+    let up = word.to_ascii_uppercase();
+    let thresh = if word.len() >= 7 { 2 } else { 1 };
+    KNOWN_FUNCTIONS.iter().any(|f| {
+        let close = (f.len() as isize - up.len() as isize).unsigned_abs() <= thresh
+            && crate::sql::edit_distance(&up, f) <= thresh;
+        close || is_adjacent_transposition(up.as_bytes(), f.as_bytes())
+    })
+}
+
+/// True when `a` becomes `b` by swapping exactly one adjacent pair of characters.
+fn is_adjacent_transposition(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let diffs: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
+    diffs.len() == 2
+        && diffs[1] == diffs[0] + 1
+        && a[diffs[0]] == b[diffs[1]]
+        && a[diffs[1]] == b[diffs[0]]
+}
+
 /// Tidy a raw `sqlparser` error into a short editor message.
 fn friendly_syntax_message(msg: &str) -> String {
     let m = msg
@@ -3558,6 +3899,52 @@ mod tests {
                 x.severity == Severity::Warning && &sql[x.range.0..x.range.1] == "SELCT"
             })
         );
+    }
+
+    #[test]
+    fn diag_function_typo_flagged() {
+        // Transposition (`COUTN` ↔ `COUNT`) and insertion (`LENGHT`... transposition of
+        // `LENGTH`) are both caught, and pinpoint the call name.
+        let sql = "SELECT COUTN(*) FROM employees";
+        let w: Vec<_> = diag(sql)
+            .into_iter()
+            .filter(|x| x.message.contains("misspelled function"))
+            .collect();
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].severity, Severity::Warning);
+        assert_eq!(&sql[w[0].range.0..w[0].range.1], "COUTN");
+        assert!(
+            diag("SELECT LENGHT(name) FROM employees")
+                .iter()
+                .any(|x| x.message.contains("misspelled function"))
+        );
+        // A dropped letter (`SUBSTRIN`) too.
+        assert!(
+            diag("SELECT SUBSTRIN(name, 1) FROM employees")
+                .iter()
+                .any(|x| x.message.contains("misspelled function"))
+        );
+    }
+
+    #[test]
+    fn diag_function_typo_no_false_positives() {
+        for sql in [
+            "SELECT COUNT(*) FROM employees",         // correct
+            "SELECT POWER(salary, 2) FROM employees", // real builtin, not in suggestion set
+            "SELECT JSON_EXTRACT(name, '$.a') FROM employees",
+            "SELECT COALESCE(name, 'x') FROM employees",
+            "SELECT my_custom_func(id) FROM employees", // UDF, not near a builtin
+            "SELECT id FROM employees WHERE id IN (1, 2)", // `IN (` is a keyword
+            "SELECT * FROM employees e JOIN departments d ON e.dept_id = d.id",
+            "SELECT db.helper(id) FROM employees", // qualified call → skip
+        ] {
+            let msgs: Vec<String> = diag(sql)
+                .into_iter()
+                .filter(|x| x.message.contains("misspelled function"))
+                .map(|x| x.message)
+                .collect();
+            assert!(msgs.is_empty(), "false positive: {sql} -> {msgs:?}");
+        }
     }
 
     #[test]
