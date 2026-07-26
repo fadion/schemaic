@@ -824,6 +824,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // latest generation's deferred round-trip fires (and its result is accepted).
     let db_diag: RwSignal<Vec<Diagnostic>> = RwSignal::new(Vec::new());
     let val_gen: Rc<std::cell::Cell<u64>> = Rc::new(std::cell::Cell::new(0));
+    // Offline diagnostics are likewise debounced: a burst of keystrokes bumps
+    // `diag_gen` and only the latest generation's deferred pass re-parses, so we
+    // don't re-parse the whole document on every character.
+    let diag_gen: Rc<std::cell::Cell<u64>> = Rc::new(std::cell::Cell::new(0));
     // Turning validation off clears any lingering DB squiggle.
     create_effect(move |_| {
         if !live_validate.get() {
@@ -1636,12 +1640,25 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     recompute_completions(&ed, db_nodes, comp, adb.as_deref(), false);
                 });
             }
-            // Re-run catalog-aware diagnostics (drives the squiggles).
-            syntax.set(compute_diagnostics(
-                &text,
-                db_nodes,
-                active_db.get_untracked().as_deref(),
-            ));
+            // Re-run catalog-aware diagnostics (drives the squiggles), debounced so
+            // rapid typing coalesces into a single parse. Only the latest generation
+            // applies; the disposed-signal guard covers a tab closed within the tick.
+            {
+                let g = diag_gen.get().wrapping_add(1);
+                diag_gen.set(g);
+                let text = text.clone();
+                let dgen = diag_gen.clone();
+                floem::action::exec_after(std::time::Duration::from_millis(120), move |_| {
+                    if dgen.get() != g || syntax.try_get_untracked().is_none() {
+                        return;
+                    }
+                    syntax.set(compute_diagnostics(
+                        &text,
+                        db_nodes,
+                        active_db.get_untracked().as_deref(),
+                    ));
+                });
+            }
             // Tier-2: debounced live DB validation of the statement under the
             // cursor. Clear any stale DB squiggle immediately, then (if enabled)
             // schedule a round-trip that fires only if this is still the latest edit
