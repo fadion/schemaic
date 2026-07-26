@@ -3842,6 +3842,102 @@ pub fn expand_star(
     })
 }
 
+// ── Signature help ───────────────────────────────────────────────────────────
+
+/// Signature help for the function call enclosing the caret: its name, parameter
+/// signature, summary, the zero-based index of the argument being typed, and the
+/// byte range of that parameter within `signature` (for emphasis).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignatureHelp {
+    pub name: &'static str,
+    pub signature: &'static str,
+    pub summary: &'static str,
+    pub active_arg: usize,
+    pub active_range: Option<(usize, usize)>,
+}
+
+/// If the caret sits inside a built-in function call's parentheses, return its
+/// signature help. Resolves the *innermost* enclosing call (so `POWER(a, FLOOR(b|`
+/// describes `FLOOR`), counts top-level commas to find the active argument, and
+/// ignores grouping parens / non-function calls (`(a+b)`, `IN (…)`, subqueries).
+pub fn signature_help(sql: &str, lo: usize, hi: usize, caret: usize) -> Option<SignatureHelp> {
+    let toks = tokenize_range(sql, lo, hi);
+    // Stack of open parens up to the caret, each with its top-level comma count.
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for (idx, t) in toks.iter().enumerate() {
+        if t.at >= caret {
+            break;
+        }
+        match t.kind {
+            TkKind::LParen => stack.push((idx, 0)),
+            TkKind::RParen => {
+                stack.pop();
+            }
+            TkKind::Comma => {
+                if let Some(top) = stack.last_mut() {
+                    top.1 += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    let &(paren_idx, comma_count) = stack.last()?;
+    if paren_idx == 0 {
+        return None;
+    }
+    // The token immediately before the `(` must be a known function name.
+    let TkKind::Word(name) = &toks[paren_idx - 1].kind else {
+        return None;
+    };
+    let func = FUNCTIONS
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case(name))?;
+    Some(SignatureHelp {
+        name: func.name,
+        signature: func.signature,
+        summary: func.summary,
+        active_arg: comma_count,
+        active_range: active_param_range(func.signature, comma_count),
+    })
+}
+
+/// The byte range within `signature` of the `active_arg`-th parameter (top-level,
+/// comma-separated, respecting nested `()`/`[]`), for emphasis. Clamps to the last
+/// parameter (varargs), and returns `None` for a parameterless signature.
+fn active_param_range(signature: &str, active_arg: usize) -> Option<(usize, usize)> {
+    let b = signature.as_bytes();
+    let open = signature.find('(')?;
+    // Only parentheses nest; `[optional]` brackets are transparent so a comma inside
+    // them still separates arguments (matching how the args are actually counted).
+    let mut depth = 0i32;
+    let mut params: Vec<(usize, usize)> = Vec::new();
+    let mut start = open + 1;
+    for (i, &c) in b.iter().enumerate().skip(open) {
+        match c {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    params.push((start, i));
+                    break;
+                }
+            }
+            b',' if depth == 1 => {
+                params.push((start, i));
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let (s, e) = *params.get(active_arg.min(params.len().checked_sub(1)?))?;
+    // Trim whitespace and the optional-argument brackets around the parameter.
+    let trim = |c: char| c.is_whitespace() || c == '[' || c == ']';
+    let sub = &signature[s..e];
+    let ts = s + (sub.len() - sub.trim_start_matches(trim).len());
+    let te = e - (sub.len() - sub.trim_end_matches(trim).len());
+    (ts < te).then_some((ts, te))
+}
+
 // ── DB-validated diagnostics (Tier 2) ────────────────────────────────────────
 
 /// Does `stmt` parse cleanly as SQL in `dialect`? The live DB validation gates on
@@ -5321,6 +5417,53 @@ mod tests {
         assert!(expand("SELECT id FROM employees", 9).is_none());
         // No FROM/scope → nothing to expand.
         assert!(expand("SELECT * ", 8).is_none());
+    }
+
+    // ── signature help ────────────────────────────────────────────────────────
+
+    fn sig(sql: &str) -> Option<SignatureHelp> {
+        signature_help(sql, 0, sql.len(), sql.len())
+    }
+
+    #[test]
+    fn signature_help_tracks_active_argument() {
+        let h = sig("SELECT POWER(salary, ").unwrap();
+        assert_eq!(h.name, "POWER");
+        assert_eq!(h.active_arg, 1); // past the first comma → second parameter
+        let (s, e) = h.active_range.unwrap();
+        assert_eq!(&h.signature[s..e], "y");
+        // First argument, no comma yet.
+        let h0 = sig("SELECT ROUND(x").unwrap();
+        assert_eq!(h0.name, "ROUND");
+        assert_eq!(h0.active_arg, 0);
+        assert_eq!(
+            &h0.signature[h0.active_range.unwrap().0..h0.active_range.unwrap().1],
+            "x"
+        );
+    }
+
+    #[test]
+    fn signature_help_resolves_innermost_call() {
+        let h = sig("SELECT POWER(a, FLOOR(b").unwrap();
+        assert_eq!(h.name, "FLOOR");
+        assert_eq!(h.active_arg, 0);
+    }
+
+    #[test]
+    fn signature_help_none_outside_a_function_call() {
+        assert!(sig("SELECT id FROM t WHERE ").is_none());
+        assert!(sig("SELECT (a + b").is_none()); // grouping paren
+        assert!(sig("SELECT id FROM t WHERE id IN (1, 2").is_none()); // IN isn't a function
+        assert!(sig("SELECT POWER(a, b) FROM t").is_none()); // call already closed
+    }
+
+    #[test]
+    fn active_param_range_varargs_and_noargs() {
+        // Varargs clamp to the last shown parameter.
+        let r = active_param_range("CONCAT(str, ...)", 5).unwrap();
+        assert_eq!(&"CONCAT(str, ...)"[r.0..r.1], "...");
+        // A parameterless signature has no active range.
+        assert!(active_param_range("NOW()", 0).is_none());
     }
 
     // ── DB-validated diagnostics ──────────────────────────────────────────────

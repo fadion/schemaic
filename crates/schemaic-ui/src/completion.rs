@@ -51,6 +51,12 @@ pub(crate) struct Completion {
     /// Set right after accepting, so the edit that follows doesn't re-open the
     /// popup on the just-inserted word.
     pub(crate) suppress: RwSignal<bool>,
+    /// Signature help for the function call enclosing the caret (independent of the
+    /// suggestion list — shown whenever the caret is inside a builtin's parens).
+    pub(crate) sig: RwSignal<Option<intel::SignatureHelp>>,
+    /// Caret-anchored point for the signature-help popup (its bottom-left; the popup
+    /// sits just *above* the caret so it doesn't collide with the suggestion list).
+    pub(crate) sig_point: RwSignal<Point>,
 }
 
 /// What an autocomplete row represents (drives its color + the detail shown).
@@ -356,6 +362,23 @@ struct Cand {
     insert: Option<String>,
     /// Replace-range override (see [`Suggestion::replace`]).
     replace: Option<(usize, usize)>,
+}
+
+/// Update the signature-help state for the caret. Independent of the suggestion
+/// list — runs on every edit so it appears the moment the caret enters a builtin's
+/// parentheses (including right after accepting `func()`), and clears when it leaves.
+pub(crate) fn update_signature_help(ed: &Editor, comp: Completion) {
+    let offset = ed.cursor.get_untracked().offset();
+    let text = ed.doc().text().to_string();
+    let (lo, hi) = statement_range(&text, offset);
+    let help = intel::signature_help(&text, lo, hi, offset);
+    if help.is_some() {
+        // `.0` is the point at the *top* of the caret's line; the popup sits above it.
+        let mut p = ed.points_of_offset(offset, CursorAffinity::Backward).0;
+        p.y += EDITOR_PAD_TOP;
+        comp.sig_point.set(p);
+    }
+    comp.sig.set(help);
 }
 
 /// Recompute context-aware suggestions for the word at the caret. Ranks the most
@@ -1076,6 +1099,71 @@ pub(crate) fn completion_popup(comp: Completion) -> impl IntoView {
                 .inset_top(p.y + COMPLETION_LINE_H)
                 .min_width(320.0)
                 .max_width(640.0)
+        } else {
+            s
+        }
+    })
+}
+
+/// Signature-help popup: the enclosing function's signature (active parameter
+/// emphasised in the function tint) over its dim summary, anchored just above and
+/// right of the caret. Hidden while the suggestion list is open so the two never
+/// stack — the hint returns the moment the list closes (empty arg slot, a literal,
+/// or nothing left to complete). The suggestion list stays useful for column args.
+pub(crate) fn signature_popup(comp: Completion) -> impl IntoView {
+    const SIG_HELP_H: f64 = 48.0;
+    // Nudged right of the caret so it doesn't sit on top of the cursor.
+    const SIG_HELP_DX: f64 = 30.0;
+    dyn_container(
+        move || (comp.sig.get(), comp.open.get()),
+        move |(sig, open)| {
+            let Some(sig) = sig.filter(|_| !open) else {
+                return empty().into_any();
+            };
+            let sig_line: AnyView = match sig.active_range {
+                Some((s, e)) => h_stack((
+                    text(sig.signature[..s].to_string()).style(|s| s.color(theme::text())),
+                    text(sig.signature[s..e].to_string())
+                        .style(|s| s.color(theme::suggest_function()).font_bold()),
+                    text(sig.signature[e..].to_string()).style(|s| s.color(theme::text())),
+                ))
+                .style(|s| s.font_size(13.0))
+                .into_any(),
+                None => text(sig.signature.to_string())
+                    .style(|s| s.font_size(13.0).color(theme::text()))
+                    .into_any(),
+            };
+            // Same size as the signature — the dim colour alone distinguishes it.
+            let summary = text(sig.summary.to_string())
+                .style(|s| s.font_size(13.0).margin_top(2.0).color(theme::text_dim()));
+            container(v_stack((sig_line, summary)))
+                .style(|s| {
+                    // Padding matches the autocomplete rows.
+                    s.flex_col()
+                        .padding_horiz(10.0)
+                        .padding_vert(5.0)
+                        .background(theme::bg_deepest())
+                        .border(1.0)
+                        .border_color(theme::completion_border())
+                        .border_radius(6.0)
+                })
+                .into_any()
+        },
+    )
+    .style(move |s| {
+        let s = s.z_index(1001);
+        if comp.sig.get().is_some() && !comp.open.get() {
+            let p = comp.sig_point.get();
+            // Above the caret when there's room; otherwise below the line (near line 1).
+            let top = if p.y >= SIG_HELP_H {
+                p.y - SIG_HELP_H
+            } else {
+                p.y + COMPLETION_LINE_H
+            };
+            s.absolute()
+                .inset_left(COMPLETION_GUTTER + p.x + SIG_HELP_DX)
+                .inset_top(top)
+                .max_width(560.0)
         } else {
             s
         }
