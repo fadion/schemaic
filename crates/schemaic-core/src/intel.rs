@@ -1031,12 +1031,22 @@ fn lexer_scope(sql: &str, lo: usize, hi: usize, caret: usize) -> Vec<TableRef> {
                     }
                     let mut db = None;
                     i += 1;
-                    if matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::Dot))
-                        && let Some(second) = toks.get(i + 1).and_then(|t| word(&t.kind))
-                    {
-                        db = Some(name);
-                        name = second;
-                        i += 2;
+                    if matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::Dot)) {
+                        match toks.get(i + 1).and_then(|t| word(&t.kind)) {
+                            Some(second) => {
+                                db = Some(name);
+                                name = second;
+                                i += 2;
+                            }
+                            // `name.` with no table after the dot — a `db.` qualifier
+                            // still being typed. Don't register `name` as a table (that
+                            // spurious entry shadowed database-qualified completion);
+                            // consume the dot and stop this FROM-list.
+                            None => {
+                                i += 1;
+                                break;
+                            }
+                        }
                     }
                     let mut alias = None;
                     match toks.get(i).map(|t| &t.kind) {
@@ -3544,6 +3554,25 @@ mod tests {
             s.tables
                 .iter()
                 .any(|t| t.name == "employees" && t.alias.as_deref() == Some("e"))
+        );
+    }
+
+    #[test]
+    fn scope_ignores_dangling_db_qualifier() {
+        // While typing `db.` the trailing qualifier must NOT register as a table:
+        // a spurious entry there used to shadow database-qualified completion.
+        let s = scope("SELECT * FROM orders o JOIN sakila.");
+        let n = names(&s);
+        assert!(n.contains(&"orders".to_string()), "{n:?}");
+        assert!(!n.iter().any(|t| t == "sakila"), "{n:?}");
+        // A dangling qualifier as the only source → no tables at all.
+        assert!(scope("SELECT * FROM sakila.").tables.is_empty());
+        // A *complete* `db.table` still resolves (with its db).
+        let c = scope("SELECT * FROM sakila.actor a");
+        assert!(
+            c.tables
+                .iter()
+                .any(|t| t.name == "actor" && t.db.as_deref() == Some("sakila"))
         );
     }
 
