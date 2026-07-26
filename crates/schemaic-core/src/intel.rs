@@ -1896,9 +1896,10 @@ mod colres {
     use std::ops::ControlFlow;
 
     use sqlparser::ast::{
-        Cte, Expr, Ident, Query, Select, SelectItem, SetExpr, Spanned, Statement, TableAlias,
-        TableFactor, Visit, Visitor,
+        Cte, Expr, Query, Select, SelectItem, SetExpr, Spanned, Statement, TableAlias, TableFactor,
+        Visit, Visitor,
     };
+    use sqlparser::tokenizer::Span;
 
     use super::{Catalog, Diagnostic, Severity, TableRef, TableStatus, offset_of_line_col};
 
@@ -1980,13 +1981,31 @@ mod colres {
                         .insert(cte.alias.name.value.to_ascii_lowercase(), cols);
                 }
             }
-            let range = span_range(self.stmt, self.lo, q);
-            let (sources, proj_aliases) = build_scope(q, self.catalog, &self.ctes);
-            self.scopes.push(Scope {
-                range,
-                sources,
-                proj_aliases,
-            });
+            match q.body.as_ref() {
+                // A single SELECT body: the scope spans the whole *query*, so its
+                // ORDER BY / LIMIT (which hang off the Query, not the Select) are
+                // covered, with the SELECT's sources.
+                SetExpr::Select(sel) => {
+                    let range = to_range(self.stmt, self.lo, q.span());
+                    self.push_scope(range, sel);
+                }
+                // A set operation (UNION/EXCEPT/INTERSECT): each branch SELECT is its
+                // own scope, keyed by its own (disjoint) span, so a column resolves
+                // against the branch it sits in. The union's own ORDER BY (which
+                // references the *output* columns, positioned past every branch) falls
+                // outside all branch scopes → left unchecked, safely.
+                body @ SetExpr::SetOperation { .. } => {
+                    let mut selects = Vec::new();
+                    collect_selects(body, &mut selects);
+                    for sel in selects {
+                        let range = to_range(self.stmt, self.lo, sel.span());
+                        self.push_scope(range, sel);
+                    }
+                }
+                // A parenthesized inner query self-handles via its own
+                // pre_visit_query; VALUES/… have no columns to resolve.
+                _ => {}
+            }
             ControlFlow::Continue(())
         }
 
@@ -1995,7 +2014,7 @@ mod colres {
                 Expr::Identifier(id) => self.refs.push(Ref {
                     qualifier: None,
                     col: id.value.to_ascii_lowercase(),
-                    range: ident_range(self.stmt, self.lo, id),
+                    range: to_range(self.stmt, self.lo, id.span),
                 }),
                 Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
                     let col = &parts[parts.len() - 1];
@@ -2003,12 +2022,38 @@ mod colres {
                     self.refs.push(Ref {
                         qualifier: Some(qual.value.to_ascii_lowercase()),
                         col: col.value.to_ascii_lowercase(),
-                        range: ident_range(self.stmt, self.lo, col),
+                        range: to_range(self.stmt, self.lo, col.span),
                     });
                 }
                 _ => {}
             }
             ControlFlow::Continue(())
+        }
+    }
+
+    impl Collector<'_> {
+        /// Record a scope for `sel` covering byte `range`, resolving its FROM sources
+        /// against the catalog + the CTEs registered so far.
+        fn push_scope(&mut self, range: (usize, usize), sel: &Select) {
+            let (sources, proj_aliases) = build_sources(sel, self.catalog, &self.ctes);
+            self.scopes.push(Scope {
+                range,
+                sources,
+                proj_aliases,
+            });
+        }
+    }
+
+    /// Gather the leaf SELECTs of a set-expression tree (UNION/EXCEPT/INTERSECT). A
+    /// parenthesized branch (`SetExpr::Query`) is left for its own `pre_visit_query`.
+    fn collect_selects<'a>(body: &'a SetExpr, out: &mut Vec<&'a Select>) {
+        match body {
+            SetExpr::Select(s) => out.push(s),
+            SetExpr::SetOperation { left, right, .. } => {
+                collect_selects(left, out);
+                collect_selects(right, out);
+            }
+            _ => {}
         }
     }
 
@@ -2082,16 +2127,12 @@ mod colres {
         }
     }
 
-    /// Build a query's FROM sources + projection output aliases. A non-`SELECT` body
-    /// (UNION/… set-op) becomes a single open source, so nothing in it is flagged.
-    fn build_scope(
-        q: &Query,
+    /// A SELECT's FROM sources + projection output aliases.
+    fn build_sources(
+        sel: &Select,
         catalog: &Catalog,
         ctes: &HashMap<String, Cols>,
     ) -> (Vec<Src>, HashSet<String>) {
-        let SetExpr::Select(sel) = q.body.as_ref() else {
-            return (vec![open_src()], HashSet::new());
-        };
         let mut sources = Vec::new();
         for twj in &sel.from {
             add_source(&twj.relation, &mut sources, catalog, ctes);
@@ -2245,17 +2286,9 @@ mod colres {
         }
     }
 
-    /// Absolute byte range of an identifier from its span (relative to `stmt`, +`lo`).
-    fn ident_range(stmt: &str, lo: usize, id: &Ident) -> (usize, usize) {
-        let s = id.span;
-        (
-            lo + offset_of_line_col(stmt, s.start.line, s.start.column),
-            lo + offset_of_line_col(stmt, s.end.line, s.end.column),
-        )
-    }
-
-    fn span_range(stmt: &str, lo: usize, q: &Query) -> (usize, usize) {
-        let s = q.span();
+    /// A sqlparser span (line/col, relative to `stmt`) → absolute byte range in the
+    /// buffer. Spans are 1-based, end-exclusive; `offset_of_line_col` clamps.
+    fn to_range(stmt: &str, lo: usize, s: Span) -> (usize, usize) {
         (
             lo + offset_of_line_col(stmt, s.start.line, s.start.column),
             lo + offset_of_line_col(stmt, s.end.line, s.end.column),
@@ -3115,6 +3148,36 @@ mod tests {
                 col_errors(sql)
             );
         }
+    }
+
+    #[test]
+    fn diag_column_union_branches() {
+        // Each branch resolves against its own FROM — a clean union is clean.
+        assert!(col_errors("SELECT id FROM employees UNION SELECT id FROM departments").is_empty());
+        assert!(
+            col_errors("SELECT name FROM employees UNION ALL SELECT name FROM departments")
+                .is_empty()
+        );
+        // An unknown column in the FIRST branch is flagged there.
+        let a = "SELECT nope FROM employees UNION SELECT id FROM departments";
+        let da = diag(a);
+        assert!(da.iter().any(|x| x.message.contains("`nope`")));
+        assert_eq!(&a[da[0].range.0..da[0].range.1], "nope");
+        // …and in the SECOND branch, positioned within it.
+        let b = "SELECT id FROM employees UNION SELECT bogus FROM departments";
+        let db = diag(b);
+        assert!(db.iter().any(|x| x.message.contains("`bogus`")));
+        assert_eq!(&b[db[0].range.0..db[0].range.1], "bogus");
+        // A column valid in one branch's table but not the other is only flagged in
+        // the branch where it's actually unknown (`salary` ∈ employees, ∉ departments).
+        let c = "SELECT salary FROM employees UNION SELECT salary FROM departments";
+        let dc = diag(c);
+        assert_eq!(
+            dc.iter().filter(|x| x.message.contains("`salary`")).count(),
+            1
+        );
+        assert_eq!(&c[dc[0].range.0..dc[0].range.1], "salary");
+        assert!(dc[0].range.0 > c.find("UNION").unwrap()); // the second occurrence
     }
 
     #[test]
