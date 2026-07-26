@@ -160,10 +160,11 @@ struct SchemaIndex {
 
 impl SchemaIndex {
     /// Build the completion index. When `active_db` is `Some`, the *unqualified*
-    /// suggestion pool (`tables`/`columns`) is scoped to that database — now that
-    /// a tab has a selected database, suggestions shouldn't be polluted by every
-    /// other database on the connection (TODO). `databases` and `tables_by_db`
-    /// stay complete so an explicit `otherdb.table` qualifier still completes.
+    /// suggestion pool (`tables`/`columns`) is scoped to that database, so a tab with
+    /// a selected database isn't polluted by every other database's tables.
+    /// `databases`/`tables_by_db` stay complete so an explicit `otherdb.table`
+    /// qualifier still completes — and `database_suggestion_visible` keeps the other
+    /// database *names* out of the table list until a prefix is typed.
     fn build(db_nodes: RwSignal<Vec<ConnNode>>, active_db: Option<&str>) -> SchemaIndex {
         let mut databases = Vec::new();
         let mut tables = Vec::new();
@@ -299,6 +300,15 @@ fn statement_identifiers(
         }
     }
     out
+}
+
+/// Whether a database name should be offered at a table position. Only once the
+/// user has typed a prefix — so an empty `FROM`/`JOIN` list stays tables-only — and
+/// never the database already in use (qualifying a table with the current database is
+/// redundant). Cross-database `otherdb.table` completion stays reachable: start
+/// typing the other database's name and it surfaces.
+fn database_suggestion_visible(db: &str, prefix: &str, active_db: Option<&str>) -> bool {
+    !prefix.is_empty() && active_db.is_none_or(|a| !a.eq_ignore_ascii_case(db))
 }
 
 /// Ranking bonus for a candidate identifier (table/column/database) already used
@@ -585,15 +595,20 @@ pub(crate) fn recompute_completions(
                     plain_tier,
                 );
             }
+            // Databases are offered only once a prefix is typed (so an empty
+            // FROM/JOIN list stays tables-only) and never the active one — cross-db
+            // `otherdb.table` stays reachable by typing the other database's name.
             for db in &schema.databases {
-                add(
-                    &mut cands,
-                    &mut seen,
-                    db,
-                    SuggestKind::Database,
-                    String::new(),
-                    table_tier + 1,
-                );
+                if database_suggestion_visible(db, &prefix, active_db) {
+                    add(
+                        &mut cands,
+                        &mut seen,
+                        db,
+                        SuggestKind::Database,
+                        String::new(),
+                        table_tier + 1,
+                    );
+                }
             }
         }
         ClauseCtx::Column => {
@@ -1001,8 +1016,36 @@ pub(crate) fn completion_popup(comp: Completion) -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use super::{SuggestKind, completion_insertion, recency_bonus, statement_identifiers};
+    use super::{
+        SuggestKind, completion_insertion, database_suggestion_visible, recency_bonus,
+        statement_identifiers,
+    };
     use std::collections::HashSet;
+
+    #[test]
+    fn databases_hidden_until_prefix_and_never_the_active_one() {
+        // Empty prefix → no databases (keeps the FROM/JOIN list tables-only).
+        assert!(!database_suggestion_visible(
+            "sakila",
+            "",
+            Some("classicmodels")
+        ));
+        // Typed prefix → other databases surface for cross-db `otherdb.table`.
+        assert!(database_suggestion_visible(
+            "sakila",
+            "sak",
+            Some("classicmodels")
+        ));
+        // The active database is never suggested (qualifying with it is redundant),
+        // case-insensitively.
+        assert!(!database_suggestion_visible(
+            "classicmodels",
+            "clas",
+            Some("ClassicModels")
+        ));
+        // No active database → any database shows once a prefix is typed.
+        assert!(database_suggestion_visible("world", "wo", None));
+    }
 
     #[test]
     fn statement_identifiers_collects_words_excluding_the_prefix() {
