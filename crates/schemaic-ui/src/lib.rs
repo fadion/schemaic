@@ -200,6 +200,12 @@ pub struct Tab {
     /// then clear. Set by double-clicking a column row in the schema tree (open the
     /// table, highlight the column); the grid consumes it reactively (`grid_view`).
     pub highlight_col: RwSignal<Option<String>>,
+    /// Whether the RESULTS panel is maximized (editor collapsed to height 0) for
+    /// *this* tab. Per-tab so maximizing in one tab doesn't affect others; the live
+    /// render flag (`LayoutUi::editor_collapsed`) mirrors the active tab's value,
+    /// loaded on tab switch and written back by the expand/shrink toggle. Session-only
+    /// (starts un-maximized), matching the pre-per-tab behaviour.
+    pub results_maximized: RwSignal<bool>,
 }
 
 impl Tab {
@@ -232,6 +238,7 @@ impl Tab {
             goto_open: cx.create_rw_signal(false),
             jump_offset: cx.create_rw_signal(None),
             highlight_col: cx.create_rw_signal(None),
+            results_maximized: cx.create_rw_signal(false),
         }
     }
 
@@ -2065,11 +2072,36 @@ fn center(ui: Ui) -> impl IntoView {
     if editor_h.get_untracked() < QUERY_MIN_H {
         editor_h.set(QUERY_MIN_H);
     }
+    // The active tab, resolved on demand (`Tab` is `Copy`).
+    let active_tab = move || {
+        let id = active.get_untracked();
+        tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied())
+    };
     // RESULTS "expand" toggle: flip the collapsed flag (editor height 0↔`editor_h`,
     // instant — an animated in-flow height reflows the whole grid per frame, which
-    // never stayed smooth; not worth it).
+    // never stayed smooth; not worth it). Maximize is per-tab: flip the live mirror
+    // AND persist it onto the active tab so switching tabs restores each one's state.
     let toggle_collapse: Rc<dyn Fn()> = Rc::new(move || {
-        editor_collapsed.set(!editor_collapsed.get_untracked());
+        let v = !editor_collapsed.get_untracked();
+        editor_collapsed.set(v);
+        if let Some(tab) = active_tab() {
+            tab.results_maximized.set(v);
+        }
+    });
+    // On tab switch, mirror the newly-active tab's stored maximize state into the
+    // live render flag. Tracks `active` only (the toggle writes both, so this doesn't
+    // need to react to `results_maximized`); guarded so a redundant set doesn't churn
+    // the collapse-dependent views.
+    create_effect(move |_| {
+        let id = active.get();
+        let stored =
+            tabs.with_untracked(|v| v.iter().find(|t| t.id == id).map(|t| t.results_maximized));
+        if let Some(sig) = stored {
+            let m = sig.get_untracked();
+            if editor_collapsed.get_untracked() != m {
+                editor_collapsed.set(m);
+            }
+        }
     });
     // Reveal the AI panel + send a message (the grid cell "AI Summary" builds a
     // context-rich prompt itself, so this just reveals + forwards).
