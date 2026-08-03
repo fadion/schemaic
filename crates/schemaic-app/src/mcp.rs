@@ -119,8 +119,14 @@ async fn run_query(db: &Db, database: Option<&str>, sql: &str) -> (String, bool)
         return ("Empty query.".to_string(), true);
     };
     // Read-only gate (comment/string/identifier-aware) lives in schemaic-core,
-    // where it's unit-tested alongside the other SQL analysis.
-    if let Err(reason) = schemaic_core::sql::read_only_reason(stmt) {
+    // where it's unit-tested alongside the other SQL analysis. Gate in the
+    // connection's dialect so PG `#`-operators aren't mistaken for comments.
+    let dialect = if db.engine() == schemaic_db::Engine::Postgres {
+        schemaic_core::intel::SqlDialect::Postgres
+    } else {
+        schemaic_core::intel::SqlDialect::MySql
+    };
+    if let Err(reason) = schemaic_core::sql::read_only_reason(stmt, dialect) {
         return (format!("Rejected: {reason}."), true);
     }
     // Run with a deadline; on timeout, cancel so the query is killed server-side

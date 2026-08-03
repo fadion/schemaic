@@ -367,10 +367,10 @@ struct Cand {
 /// Update the signature-help state for the caret. Independent of the suggestion
 /// list — runs on every edit so it appears the moment the caret enters a builtin's
 /// parentheses (including right after accepting `func()`), and clears when it leaves.
-pub(crate) fn update_signature_help(ed: &Editor, comp: Completion) {
+pub(crate) fn update_signature_help(ed: &Editor, comp: Completion, dialect: SqlDialect) {
     let offset = ed.cursor.get_untracked().offset();
     let text = ed.doc().text().to_string();
-    let (lo, hi) = statement_range(&text, offset);
+    let (lo, hi) = statement_range(&text, offset, dialect);
     let help = intel::signature_help(&text, lo, hi, offset);
     if help.is_some() {
         // `.0` is the point at the *top* of the caret's line; the popup sits above it.
@@ -392,6 +392,7 @@ pub(crate) fn recompute_completions(
     db_nodes: RwSignal<Vec<ConnNode>>,
     comp: Completion,
     active_db: Option<&str>,
+    dialect: SqlDialect,
     force: bool,
 ) {
     let offset = ed.cursor.get_untracked().offset();
@@ -411,7 +412,7 @@ pub(crate) fn recompute_completions(
     let word_lo = word_start(&text, offset);
     let prefix = text.get(word_lo..offset).unwrap_or("").to_string();
 
-    let (lo, hi) = statement_range(&text, offset);
+    let (lo, hi) = statement_range(&text, offset, dialect);
     // Context is lexer-based (correct mid-edit); scope prefers the real AST
     // (robust CTE/alias/derived-table resolution), falling back to the lexer.
     let ctx = intel::clause_context(&text, lo, word_lo);
@@ -461,7 +462,7 @@ pub(crate) fn recompute_completions(
     }
 
     let schema = SchemaIndex::build(db_nodes, active_db);
-    let scope = intel::statement_scope(&text, lo, hi, offset, SqlDialect::MySql).tables;
+    let scope = intel::statement_scope(&text, lo, hi, offset, dialect).tables;
     let pl = prefix.to_ascii_lowercase();
 
     // Collect raw candidates (dedup by text, first/lowest tier wins), then score.

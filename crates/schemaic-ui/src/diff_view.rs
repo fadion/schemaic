@@ -6,6 +6,7 @@
 use floem::AnyView;
 use floem::prelude::*;
 use schemaic_core::diff::{DiffRow, DiffTag};
+use schemaic_core::intel::SqlDialect;
 
 use crate::consts::DIFF_MONO;
 use crate::{sql_highlight, theme};
@@ -15,12 +16,12 @@ use crate::{sql_highlight, theme};
 /// shared `sql_highlight` lexer gives colored byte-spans, which we render as a
 /// row of colored segments (uncolored gaps use the default text color). Kept as
 /// one line — the row's parent stack decides width/overflow.
-fn diff_line(line: String) -> impl IntoView {
+fn diff_line(line: String, dialect: SqlDialect) -> impl IntoView {
     let mono = |st: floem::style::Style| {
         st.font_family(DIFF_MONO.to_string())
             .font_size(theme::FONT_TITLE)
     };
-    let spans = sql_highlight::highlight_spans(&line);
+    let spans = sql_highlight::highlight_spans(&line, dialect);
     let mut segs: Vec<AnyView> = Vec::new();
     let mut push = |txt: &str, color: floem::peniko::Color| {
         if txt.is_empty() {
@@ -52,7 +53,7 @@ fn diff_line(line: String) -> impl IntoView {
 /// Renders the hunked diff rows (see [`build_diff_rows`]): each line carries its
 /// document line number, a +/- (or blank) marker, and syntax-highlighted text
 /// over a tinted background; gaps render as a faint "⋯ N unchanged lines" row.
-pub(crate) fn diff_view(rows: Vec<DiffRow>) -> impl IntoView {
+pub(crate) fn diff_view(rows: Vec<DiffRow>, dialect: SqlDialect) -> impl IntoView {
     let mono = |s: floem::style::Style| {
         s.font_family(DIFF_MONO.to_string())
             .font_size(theme::FONT_TITLE)
@@ -97,7 +98,7 @@ pub(crate) fn diff_view(rows: Vec<DiffRow>) -> impl IntoView {
                     }),
                 text(marker.to_string())
                     .style(move |s| mono(s).width(14.0).flex_shrink(0.0_f32).color(mcolor)),
-                diff_line(line),
+                diff_line(line, dialect),
             ))
             // No explicit width: the row sizes to its content (gutter + marker +
             // the non-shrinking line). The parent v_stack is `min_width_full` with

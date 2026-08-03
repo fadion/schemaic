@@ -8,6 +8,7 @@ license.workspace = true
 schemaic-core = { workspace = true }
 thiserror = { workspace = true }
 mysql_async = { workspace = true }
+tokio-postgres = { workspace = true }
 futures-util = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

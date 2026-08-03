@@ -99,10 +99,16 @@ Zed-inspired, aiming to replace DataGrip.
 
 Re-introducing the anti-patterns these guard against is a regression:
 
-- **One SQL boundary lexer.** Any code scanning SQL for string / `-- ` / `#` / `/* */` / backtick
-  boundaries MUST build on `schemaic_core::sql::skip_noncode` (statement split, WHERE guard, AI
+- **One SQL boundary lexer.** Any code scanning SQL for string / `-- ` / `#` / `/* */` / backtick /
+  `$tag$` boundaries MUST build on `schemaic_core::sql::skip_noncode` (statement split, WHERE guard, AI
   read-only gate, `intel`'s tokenizer, `sql_highlight`, `sqlfmt`). Never hand-roll a second
-  scanner — five drifting copies was the original bug.
+  scanner — five drifting copies was the original bug. **It's dialect-aware:** `skip_noncode`/
+  `skip_comment` (and the `sql.rs` helpers built on them — `statement_bounds`/`ranges`/`range`,
+  `read_only_reason`, `has_top_level_where`/`unsafe_reason`/`first_unsafe`/`contains_write`) take a
+  `SqlDialect`, so pass the connection's dialect (Postgres `#` is an operator not a comment, `$tag$…$tag$`
+  is a string, `"…"` an identifier, `\`-escapes only in MySQL / PG `E'…'`). The one exception is
+  `intel::tokenize_range` (the mid-edit byte-position *fallback*), which stays MySQL-flavored on purpose
+  — the per-dialect AST is the primary, dialect-correct path.
 - **Structure-aware SQL analysis goes through `schemaic_core::intel` (real per-dialect AST), not new
   hand-rolled scanners.** Scope resolution, completion context, and diagnostics build on the
   `sqlparser` AST (with a `skip_noncode` fallback for mid-edit); the **DB stays the semantic

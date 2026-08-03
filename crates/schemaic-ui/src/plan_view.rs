@@ -37,6 +37,18 @@ pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
     let run_plan = ui.tab_actions.run_plan.clone();
     let ai_send = ui.ai_actions.send.clone();
     let right_panel = ui.layout.right_panel;
+    // The active connection's dialect, so the write-check (which gates offering
+    // EXPLAIN ANALYZE) parses the statement in the right dialect.
+    let (connections, active_conn) = (ui.conn.connections, ui.conn.active_conn);
+    let plan_dialect = move || {
+        connections
+            .with_untracked(|cs| {
+                cs.iter()
+                    .find(|c| c.id == active_conn.get_untracked())
+                    .map(|c| schemaic_core::intel::SqlDialect::from_db_type(&c.db_type))
+            })
+            .unwrap_or_default()
+    };
 
     dyn_container(
         move || plan_open.get(),
@@ -65,7 +77,8 @@ pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
 
             // Statements that write can't be safely ANALYZE'd (it would execute
             // them), so the toggle is offered only for read-only statements.
-            let is_write = schemaic_core::sql::contains_write(&plan_sql.get_untracked());
+            let is_write =
+                schemaic_core::sql::contains_write(&plan_sql.get_untracked(), plan_dialect());
 
             let analyze_control = if is_write {
                 text("Analyze unavailable (statement writes data)")

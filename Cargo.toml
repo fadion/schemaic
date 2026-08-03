@@ -36,6 +36,11 @@ tokio-util = "0.7"
 # `minimal` = no TLS/compression (the app connects over localhost SSH tunnels /
 # plain TCP, matching the old sqlx config which enabled no TLS either).
 mysql_async = { version = "0.34", default-features = false, features = ["minimal"] }
+# Async PostgreSQL driver (second engine). `NoTls` — the app reaches Postgres over
+# localhost / SSH tunnels / plain TCP, matching the MySQL driver's no-TLS config.
+# Result values come back over the simple-query (text) protocol, so NUMERIC and any
+# exotic type round-trip losslessly as their text form (mirrors the MySQL text path).
+tokio-postgres = "0.7"
 futures-util = "0.3"
 # SSH tunnelling. Use the `ring` crypto backend instead of the default
 # `aws-lc-rs` to avoid the aws-lc-sys C/cmake build.

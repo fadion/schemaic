@@ -91,6 +91,28 @@ pub fn inline_args(intent: &str, system: &str, model: &str) -> Vec<String> {
     ]
 }
 
+/// Build a legible error message for a failed one-shot `claude` invocation.
+///
+/// The CLI writes some fatal errors — notably `Failed to authenticate: OAuth
+/// session expired …` — to **stdout**, not stderr, and often with an empty
+/// stderr. Surfacing stderr alone therefore yields a blank error, so prefer
+/// stderr, fall back to stdout, and finally to the exit status. Pure so it's
+/// unit-tested; both AI grid callbacks (fill / seed) use it.
+pub fn cli_failure_message(code: Option<i32>, stdout: &str, stderr: &str) -> String {
+    let err = stderr.trim();
+    if !err.is_empty() {
+        return err.to_string();
+    }
+    let out = stdout.trim();
+    if !out.is_empty() {
+        return out.to_string();
+    }
+    match code {
+        Some(c) => format!("the claude CLI exited with status {c}"),
+        None => "the claude CLI was terminated by a signal".to_string(),
+    }
+}
+
 /// Encode a user turn as a `stream-json` stdin line (newline-terminated).
 pub fn user_message_line(text: &str) -> String {
     let v = serde_json::json!({
@@ -478,6 +500,33 @@ mod tests {
         assert!(al < dis, "allowed before disallowed");
         assert!(a[al + 1..dis].contains(&"mcp__schemaic__run_query".to_string()));
         assert!(a[al + 1..dis].contains(&"mcp__schemaic__list_schema".to_string()));
+    }
+
+    #[test]
+    fn cli_failure_prefers_stderr_then_stdout_then_status() {
+        // stderr wins when present.
+        assert_eq!(
+            cli_failure_message(Some(1), "out", "boom"),
+            "boom"
+        );
+        // The real-world case: auth error on stdout, empty stderr → show stdout.
+        assert_eq!(
+            cli_failure_message(
+                Some(1),
+                "Failed to authenticate: OAuth session expired and could not be refreshed\n",
+                "   "
+            ),
+            "Failed to authenticate: OAuth session expired and could not be refreshed"
+        );
+        // Both empty → fall back to the exit status (never a blank message).
+        assert_eq!(
+            cli_failure_message(Some(2), "", ""),
+            "the claude CLI exited with status 2"
+        );
+        assert_eq!(
+            cli_failure_message(None, "", ""),
+            "the claude CLI was terminated by a signal"
+        );
     }
 
     #[test]
