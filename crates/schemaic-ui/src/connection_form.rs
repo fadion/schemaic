@@ -151,6 +151,19 @@ fn mask_of_len(n: usize) -> String {
     std::iter::repeat_n(MASK_CH, n).collect()
 }
 
+/// A small identity-colour dot for the connection list (`[dot] [name]`). An 8px
+/// circle filled with the connection's `#rrggbb`; a missing/unparsable colour
+/// renders as a same-size transparent spacer so names stay aligned.
+fn conn_color_dot(color: Option<String>) -> impl IntoView {
+    empty().style(move |s| {
+        let s = s.size(8.0, 8.0).flex_shrink(0.0_f32).border_radius(4.0);
+        match color.as_deref().and_then(theme::parse_hex) {
+            Some(c) => s.background(c),
+            None => s,
+        }
+    })
+}
+
 /// A row of colour swatches that sets the draft's identity colour. Every
 /// connection has a colour (new ones are auto-assigned), so there's no "none"
 /// option; the selected swatch gets a 2px border in `text()`.
@@ -295,6 +308,10 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
     let delete_conn = ui.conn_actions.delete_conn.clone();
     let test_conn = ui.conn_actions.test_conn.clone();
     let conn_test = ui.conn.conn_test;
+    // Transient "saved" confirmation for the Save button (checkmark for ~1.2s).
+    // Created here (once, in the stable workspace scope), not inside the open/close
+    // `dyn_container`, so the deferred reset never fires on a disposed signal.
+    let save_flash = RwSignal::new(false);
 
     dyn_container(
         move || open.get(),
@@ -309,7 +326,31 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                 move |c| {
                     let id = c.id;
                     let select = select.clone();
-                    container(text(c.name.clone()).style(|s| s.font_size(theme::FONT_BODY)))
+                    // `[colour dot] [name]`, reflecting this connection's *stored*
+                    // name/colour. Reads `connections` (not the draft) so the row
+                    // refreshes only when Save writes the edit back — never live while
+                    // the form is being typed (which would falsely imply a real-time
+                    // update). Reactive because `dyn_stack` reuses a row's view for an
+                    // unchanged id, so a static label would go stale after Save.
+                    let label = dyn_container(
+                        move || {
+                            connections.with(|cs| {
+                                cs.iter()
+                                    .find(|c| c.id == id)
+                                    .map(|c| (c.name.clone(), c.color.clone()))
+                                    .unwrap_or_default()
+                            })
+                        },
+                        |(name, color)| {
+                            h_stack((
+                                conn_color_dot(color),
+                                text(name).style(|s| s.font_size(theme::FONT_BODY)),
+                            ))
+                            .style(|s| s.flex_row().items_center().gap(8.0))
+                            .into_any()
+                        },
+                    );
+                    container(label)
                         .on_click_stop(move |_| (select)(id))
                         // Full-width row: resting `conn_list_text`, hover text
                         // brightens (no bg), selected = bright text on a full-width
@@ -362,6 +403,7 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                 delete_conn.clone(),
                 test_conn.clone(),
                 conn_test,
+                save_flash,
             );
 
             let body = h_stack((left, right))
@@ -407,6 +449,7 @@ fn conn_form(
     delete_conn: Rc<dyn Fn(u64)>,
     test_conn: Rc<dyn Fn()>,
     conn_test: RwSignal<crate::TestState>,
+    save_flash: RwSignal<bool>,
 ) -> impl IntoView {
     // Editing any connection parameter invalidates a prior Test result, so reset
     // the indicator whenever host/port/user/password or the SSH fields change.
@@ -641,14 +684,55 @@ fn conn_form(
             .hover(|s| s.color(theme::conn_test_hover()))
     });
 
+    // Save button: on click it saves, then flashes a `✓ Saved` confirmation for
+    // ~1.2s (the write is otherwise silent). The click handler sits on the stable
+    // outer container so it works in either state; the label swaps via
+    // `dyn_container` (like the Test button's icon slot).
     let save = save_conn.clone();
-    let save_btn = text("Save").on_click_stop(move |_| (save)()).style(|s| {
-        s.font_size(theme::FONT_BODY)
+    // Fixed width sized for the widest state ("✓ Saved": 15px icon + 6px gap +
+    // text), with the content right-aligned, so swapping in the confirm icon never
+    // widens the button and shifts the Test button sitting to its left.
+    let saved_w = 15.0 + 6.0 + measure_px("Saved", theme::FONT_BODY) + 2.0;
+    let save_btn = container(dyn_container(
+        move || save_flash.get(),
+        move |flashed| {
+            if flashed {
+                h_stack((
+                    icons::icon(icons::CIRCLE_CHECK, 15.0)
+                        .style(|s| s.color(theme::conn_test_ok())),
+                    text("Saved")
+                        .style(move |s| s.font_size(theme::FONT_BODY).color(theme::conn_test_ok())),
+                ))
+                .style(|s| s.flex_row().items_center().gap(6.0))
+                .into_any()
+            } else {
+                text("Save")
+                    .style(move |s| {
+                        s.font_size(theme::FONT_BODY)
+                            .color(theme::conn_save())
+                            .hover(|s| s.color(theme::conn_save_hover()))
+                    })
+                    .into_any()
+            }
+        },
+    ))
+    .on_click_stop(move |_| {
+        (save)();
+        save_flash.set(true);
+        floem::action::exec_after(std::time::Duration::from_millis(1200), move |_| {
+            save_flash.set(false);
+        });
+    })
+    .style(move |s| {
+        s.width(saved_w)
+            .flex_row()
+            .items_center()
+            .justify_end()
             .padding_horiz(6.0)
             .padding_vert(4.0)
             .border_radius(6.0)
-            .color(theme::conn_save())
-            .hover(|s| s.color(theme::conn_save_hover()))
+            // Nudge the whole button 10px in from the right edge.
+            .margin_right(10.0)
     });
     // Test sits 15px to the left of Save.
     let right_actions =
