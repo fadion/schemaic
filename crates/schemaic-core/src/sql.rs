@@ -527,7 +527,10 @@ mod tests {
         let s = "$$a;b$$ rest";
         let end = super::skip_noncode(s.as_bytes(), 0, PG).unwrap();
         assert_eq!(&s[..end], "$$a;b$$");
-        assert_eq!(super::statement_ranges("SELECT $$a;b$$; SELECT 2", PG).len(), 2);
+        assert_eq!(
+            super::statement_ranges("SELECT $$a;b$$; SELECT 2", PG).len(),
+            2
+        );
         // A tagged dollar-quote too.
         let t = "$tag$x;y$tag$ z";
         let end = super::skip_noncode(t.as_bytes(), 0, PG).unwrap();
@@ -543,7 +546,10 @@ mod tests {
         let s = "\"we;ird\" rest";
         let end = super::skip_noncode(s.as_bytes(), 0, PG).unwrap();
         assert_eq!(&s[..end], "\"we;ird\"");
-        assert_eq!(super::statement_ranges("SELECT \"a;b\" FROM t", PG).len(), 1);
+        assert_eq!(
+            super::statement_ranges("SELECT \"a;b\" FROM t", PG).len(),
+            1
+        );
     }
 
     #[test]

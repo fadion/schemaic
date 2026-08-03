@@ -63,9 +63,9 @@ type ConnectResult = Result<
 type BlinkTick = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 /// Record one executed query into history: `(conn_id, database, sql, tab_name)`.
 type RecordHistoryFn = Rc<dyn Fn(u64, Option<String>, String, Option<String>)>;
+use schemaic_core::intel::SqlDialect;
 use schemaic_core::persist::{self, ConnectionsFile, UiState};
 use schemaic_core::schema::SchemaState;
-use schemaic_core::intel::SqlDialect;
 use schemaic_db::{Db, DbError};
 use schemaic_ui::theme::{EditorThemeKind, UiThemeKind};
 use schemaic_ui::{
@@ -2280,7 +2280,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 };
                 // DDL skeleton + PK columns from the loaded schema (empty if
                 // introspection hasn't run — the sample still carries conventions).
-                let (ddl, pk_cols) = table_ddl_and_pk(db_nodes, &req.database, &req.table, dialect_of(&db));
+                let (ddl, pk_cols) =
+                    table_ddl_and_pk(db_nodes, &req.database, &req.table, dialect_of(&db));
                 let bin = claude_bin(&ai_cli_path.get_untracked());
                 let model = ai_model.get_untracked().cli().to_string();
                 let finish = create_ext_action(cx, move |res: AiFillResult| (done)(res));
@@ -2358,7 +2359,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         return;
                     }
                 };
-                let (ddl, pk_cols) = table_ddl_and_pk(db_nodes, &req.database, &req.table, dialect_of(&db));
+                let (ddl, pk_cols) =
+                    table_ddl_and_pk(db_nodes, &req.database, &req.table, dialect_of(&db));
                 let bin = claude_bin(&ai_cli_path.get_untracked());
                 let model = ai_model.get_untracked().cli().to_string();
                 let finish = create_ext_action(cx, move |res: AiSeedResult| (done)(res));

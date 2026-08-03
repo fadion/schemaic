@@ -369,7 +369,11 @@ impl GridState {
         // This tab's SQL dialect, from its connection's engine (drives Follow-FK SQL).
         let dialect = gctx
             .connections
-            .with_untracked(|cs| cs.iter().find(|c| c.id == conn).map(|c| SqlDialect::from_db_type(&c.db_type)))
+            .with_untracked(|cs| {
+                cs.iter()
+                    .find(|c| c.id == conn)
+                    .map(|c| SqlDialect::from_db_type(&c.db_type))
+            })
             .unwrap_or_default();
         let formats: Vec<ColumnFormat> = (0..rs.col_count())
             .map(|ci| {

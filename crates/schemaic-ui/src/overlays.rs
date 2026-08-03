@@ -1027,9 +1027,11 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                         };
                         let dialect = connections
                             .with_untracked(|cs| {
-                                cs.iter().find(|c| c.id == t.conn_id.get_untracked()).map(|c| {
-                                    schemaic_core::intel::SqlDialect::from_db_type(&c.db_type)
-                                })
+                                cs.iter()
+                                    .find(|c| c.id == t.conn_id.get_untracked())
+                                    .map(|c| {
+                                        schemaic_core::intel::SqlDialect::from_db_type(&c.db_type)
+                                    })
                             })
                             .unwrap_or_default();
                         let out = schemaic_core::sqlfmt::format_sql(
@@ -1053,9 +1055,11 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                         let q = t.query.get_untracked();
                         let dialect = connections
                             .with_untracked(|cs| {
-                                cs.iter().find(|c| c.id == t.conn_id.get_untracked()).map(|c| {
-                                    schemaic_core::intel::SqlDialect::from_db_type(&c.db_type)
-                                })
+                                cs.iter()
+                                    .find(|c| c.id == t.conn_id.get_untracked())
+                                    .map(|c| {
+                                        schemaic_core::intel::SqlDialect::from_db_type(&c.db_type)
+                                    })
                             })
                             .unwrap_or_default();
                         let stmts: Vec<String> = schemaic_core::sql::statement_ranges(&q, dialect)

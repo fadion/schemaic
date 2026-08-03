@@ -601,8 +601,13 @@ mod tests {
 
     #[test]
     fn endpoint_json_serializes_parts_and_database() {
-        let db =
-            Db::from_parts(schemaic_db::Engine::Postgres, "h".into(), 3307, "u".into(), "p".into());
+        let db = Db::from_parts(
+            schemaic_db::Engine::Postgres,
+            "h".into(),
+            3307,
+            "u".into(),
+            "p".into(),
+        );
         let out = endpoint_json(&db, Some("shop"));
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["host"], "h");
