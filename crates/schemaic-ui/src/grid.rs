@@ -31,6 +31,7 @@ use schemaic_core::model::{
     CellRef, CellTag, CommitDone, GridWrite, QueryState, RefetchRequest, RefetchRow, ResultSet,
     RowDelete, RowEdit, RowInsert, Value,
 };
+use schemaic_core::rowjson::{self, ColSpec};
 use schemaic_core::schema::{ForeignKeyInfo, SchemaState};
 use schemaic_core::text::plural;
 use schemaic_core::text_ops::contains_ignore_ascii_case;
@@ -40,7 +41,7 @@ use crate::widgets::{
     MenuEntry, autohide_state, centered_msg, measure_text_px, shift_hscroll, thin_scroll,
     toolbar_icon, verb_spinner,
 };
-use crate::{ConnNode, FieldCfg, PopupAnchor, bg_transparent, edit_field, icons, theme};
+use crate::{ConnNode, FieldCfg, PopupAnchor, edit_field, icons, theme};
 
 // ===== moved from lib.rs (results grid) =====
 /// The lifecycle phase of a [`QueryState`], without its payload — a deduped key
@@ -260,7 +261,6 @@ struct GridState {
     widths: RwSignal<Vec<f64>>,
     active: RwSignal<Option<(usize, usize)>>,
     anchor: RwSignal<Option<(usize, usize)>>,
-    viewer: RwSignal<bool>,
     /// The frozen column: its *absolute* index, pinned to the left of the grid
     /// (`None` = nothing frozen). Set from the header right-click menu.
     frozen: RwSignal<Option<usize>>,
@@ -356,6 +356,14 @@ struct GridState {
     /// "AI Seed Table…" count popover: whether it's open + its (text) row count.
     seed_open: RwSignal<bool>,
     seed_buf: RwSignal<String>,
+    /// "Edit Row" whole-row JSON panel: open flag, the target data-row, the editable
+    /// JSON buffer, an inline validation/commit error, and an in-flight guard. Commits
+    /// immediately on Save (its own path, not the staged `dirty` batch).
+    edit_row_open: RwSignal<bool>,
+    edit_row_di: RwSignal<Option<usize>>,
+    edit_row_buf: RwSignal<String>,
+    edit_row_err: RwSignal<Option<String>>,
+    edit_row_saving: RwSignal<bool>,
 }
 
 impl GridState {
@@ -399,7 +407,6 @@ impl GridState {
             widths: RwSignal::new(widths),
             active: RwSignal::new(None),
             anchor: RwSignal::new(None),
-            viewer: RwSignal::new(false),
             frozen: RwSignal::new(None),
             scroll_to: RwSignal::new(None),
             vp: RwSignal::new(Rect::ZERO),
@@ -441,6 +448,11 @@ impl GridState {
             pulse_running: RwSignal::new(false),
             seed_open: RwSignal::new(false),
             seed_buf: RwSignal::new(String::new()),
+            edit_row_open: RwSignal::new(false),
+            edit_row_di: RwSignal::new(None),
+            edit_row_buf: RwSignal::new(String::new()),
+            edit_row_err: RwSignal::new(None),
+            edit_row_saving: RwSignal::new(false),
         }
     }
 
@@ -665,6 +677,78 @@ impl GridState {
             });
         }
         edits
+    }
+
+    /// Like [`build_edits`], but for one data row `di` from an explicit change set
+    /// (result-column index → new value, `None` = SQL NULL) rather than the staged
+    /// `dirty` map — used by the whole-row JSON editor, which commits immediately.
+    /// A join row edits >1 base table, so this may return several `RowEdit`s; the
+    /// WHERE key comes from the ORIGINAL row (PK columns are read-only in the editor).
+    fn build_row_edits(&self, di: usize, changes: &[(usize, Option<String>)]) -> Vec<RowEdit> {
+        let model = self.edit_model.get_untracked();
+        let rs = self.rs.get_untracked();
+        let real_col = |ci: usize| -> String {
+            rs.columns
+                .get(ci)
+                .and_then(|c| c.origin.as_ref())
+                .map(|o| o.column.clone())
+                .unwrap_or_default()
+        };
+        // Group changed columns by their base table (deterministic SQL via BTreeMap).
+        let mut groups: BTreeMap<usize, Vec<(usize, Option<String>)>> = BTreeMap::new();
+        for (ci, v) in changes {
+            if let Some(ti) = model.table_index(*ci) {
+                groups.entry(ti).or_default().push((*ci, v.clone()));
+            }
+        }
+        let mut edits = Vec::with_capacity(groups.len());
+        for (ti, mut sets) in groups {
+            let Some(tbl) = model.table(ti) else { continue };
+            sets.sort_by_key(|(ci, _)| *ci);
+            let set: Vec<(String, Option<String>)> =
+                sets.into_iter().map(|(ci, v)| (real_col(ci), v)).collect();
+            let key: Vec<(String, Value)> = tbl
+                .key_cols
+                .iter()
+                .map(|&kci| {
+                    let val = rs
+                        .cell(di, kci)
+                        .map(|c| c.to_value())
+                        .unwrap_or(Value::Null);
+                    (real_col(kci), val)
+                })
+                .collect();
+            edits.push(RowEdit {
+                database: tbl.database.clone(),
+                table: tbl.table.clone(),
+                set,
+                key,
+            });
+        }
+        edits
+    }
+
+    /// A single-row refetch (splice in place after the whole-row edit commits). Key
+    /// from the original row — the editor blocks PK edits, so it's unchanged. `None`
+    /// when the result isn't spliceable (multi-result path / no clean template).
+    fn build_row_refetch(&self, di: usize) -> Option<RefetchRequest> {
+        self.sync_canonical.get_untracked()?;
+        let rs = self.rs.get_untracked();
+        let model = self.edit_model.get_untracked();
+        let template = refetch_template(&rs, &model)?;
+        let key = template
+            .key_cols
+            .iter()
+            .map(|&kci| {
+                rs.cell(di, kci)
+                    .map(|c| c.to_value())
+                    .unwrap_or(Value::Null)
+            })
+            .collect();
+        Some(RefetchRequest {
+            template,
+            rows: vec![RefetchRow { data_row: di, key }],
+        })
     }
 
     /// Turn the staged `new_rows` into one [`RowInsert`] each, targeting the
@@ -1079,17 +1163,6 @@ fn export_inserts(gs: GridState) -> String {
     )
 }
 
-/// Pretty-print a cell value if it's JSON, else `None`.
-fn pretty_json(s: &str) -> Option<String> {
-    let t = s.trim_start();
-    if !(t.starts_with('{') || t.starts_with('[')) {
-        return None;
-    }
-    serde_json::from_str::<serde_json::Value>(s)
-        .ok()
-        .and_then(|v| serde_json::to_string_pretty(&v).ok())
-}
-
 /// A draggable column-resize divider pinned to the right edge of a header cell.
 /// Drag adjusts that column's width; double-click auto-fits to content.
 fn col_resize_handle(gs: GridState, ci: usize, has_key: bool) -> impl IntoView {
@@ -1153,113 +1226,6 @@ fn col_resize_handle(gs: GridState, ci: usize, has_key: bool) -> impl IntoView {
                 *x = w;
             }
         });
-    })
-}
-
-/// Bottom detail strip showing the focused cell's full value (pretty-printed if
-/// JSON) in a read-only, word-wrapped, auto-growing field — small for short
-/// values, growing up to `max_rows` (the results-panel height) then scrolling.
-/// Shown only while `viewer` is on; follows the active cell live.
-fn value_viewer(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
-    let text_sig = RwSignal::new(String::new());
-    let raw_sig = RwSignal::new(String::new());
-    let title_sig = RwSignal::new("No cell selected".to_string());
-
-    // Mirror the focused cell into the field whenever it (or the result) changes
-    // while the viewer is open.
-    create_effect(move |_| {
-        if !gs.viewer.get() {
-            return;
-        }
-        let rs = gs.rs.get();
-        let order = gs.order.get();
-        match gs.active.get() {
-            Some((i, ci)) => {
-                let di = order.get(i).copied().unwrap_or(i);
-                let col = rs.columns.get(ci);
-                let name = col.map(|c| c.name.clone()).unwrap_or_default();
-                let ty = col.map(|c| c.type_name.clone()).unwrap_or_default();
-                let raw = rs
-                    .cell(di, ci)
-                    .map(|c| c.display().to_string())
-                    .unwrap_or_default();
-                title_sig.set(format!("{name}  ·  {ty}  ·  Row {}", i + 1));
-                text_sig.set(pretty_json(&raw).unwrap_or_else(|| raw.clone()));
-                raw_sig.set(raw);
-            }
-            None => {
-                title_sig.set("No cell selected".to_string());
-                text_sig.set(String::new());
-                raw_sig.set(String::new());
-            }
-        }
-    });
-
-    let copy_btn = container(icons::icon(icons::COPY, 14.0))
-        .on_click_stop(move |_| {
-            let _ = floem::Clipboard::set_contents(raw_sig.get_untracked());
-        })
-        .style(|s| {
-            s.padding(4.0)
-                .border_radius(4.0)
-                .color(theme::text_dim())
-                .hover(|s| s.background(theme::row_hover()).color(theme::text()))
-        });
-    let close_btn = container(icons::icon(icons::X, 14.0))
-        .on_click_stop(move |_| gs.viewer.set(false))
-        .style(|s| {
-            s.padding(4.0)
-                .border_radius(4.0)
-                .color(theme::text_dim())
-                .hover(|s| s.background(theme::row_hover()).color(theme::text()))
-        });
-    let head = h_stack((
-        dyn_container(
-            move || title_sig.get(),
-            move |t| {
-                text(t)
-                    .style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_dim()))
-                    .into_any()
-            },
-        ),
-        empty().style(|s| s.flex_grow(1.0_f32)),
-        copy_btn,
-        close_btn,
-    ))
-    .style(|s| {
-        s.width_full()
-            .items_center()
-            .gap(4.0)
-            .padding_horiz(10.0)
-            .height(26.0)
-            .flex_shrink(0.0_f32)
-    });
-
-    // Read-only, wrapping, auto-growing field (like the message box) — capped at
-    // `max_rows` (the panel height). Transparent border/bg so it reads as text.
-    let field = edit_field(
-        text_sig,
-        FieldCfg {
-            multiline: true,
-            read_only: true,
-            max_rows: Some(max_rows),
-            background: theme::bg_panel,
-            border_color: Some(bg_transparent),
-            ..Default::default()
-        },
-    )
-    // Bound the width so the editor wraps (its box is content-sized otherwise).
-    .style(|s| s.width_full());
-
-    v_stack((head, field)).style(move |s| {
-        let s = s
-            .width_full()
-            .flex_shrink(0.0_f32)
-            .flex_col()
-            .border_top(1.0)
-            .border_color(theme::border())
-            .background(theme::bg_panel());
-        if gs.viewer.get() { s } else { s.hide() }
     })
 }
 
@@ -2058,10 +2024,9 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         find_pos.set(pos);
     });
 
-    // The viewer's auto-grow cap = how many rows fit in the results panel (so it
-    // can expand, then scroll), but never taller than ~200px total. Derived from
-    // the panel height tracked on the root `on_resize` below (~19px/row).
-    let viewer_max = RwSignal::new(6usize);
+    // Auto-grow cap for the row view/edit JSON field (≈80% of the panel), derived
+    // from the panel height on the root `on_resize` below (~19px/row).
+    let edit_row_max = RwSignal::new(20usize);
     // Wrap the grid so a 2px identity-colour rule can pin to its top edge (right
     // below the toolbar) without taking layout space — the "prominent colour"
     // setting. The box inherits the grid's growth so the table still fills.
@@ -2080,17 +2045,14 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     v_stack((
         toolbar,
         grid_boxed,
-        value_viewer(gs, viewer_max),
         seed_popover(gs),
+        edit_row_panel(gs, edit_row_max),
     ))
     .on_resize(move |r| {
-        // Cap so the viewer leaves the grid its `min_height` (~120) + toolbar
-        // (~26) + the viewer's own header (~26): rows ≈ (panel − 172) / 19.
-        // Hard ceiling of 8 rows keeps the whole inspector ≤ 200px
-        // (header 26 + border 1 + field 8*19+15 ≈ 194).
-        let rows = (((r.height() - 172.0) / 19.0).floor() as i64).clamp(1, 8) as usize;
-        if viewer_max.get_untracked() != rows {
-            viewer_max.set(rows);
+        // The row view/edit field fills ~80% of the panel (minus header/error chrome).
+        let erows = (((r.height() * 0.8 - 110.0) / 19.0).floor() as i64).clamp(4, 80) as usize;
+        if edit_row_max.get_untracked() != erows {
+            edit_row_max.set(erows);
         }
     })
     .style(|s| {
@@ -2199,6 +2161,92 @@ fn commit_grid(gs: GridState) {
             // The app re-ran the query; the grid is rebuilt fresh, nothing to do.
             CommitDone::FullReran => {}
             CommitDone::Failed(msg) => gs.commit_err.set(Some(msg)),
+        }
+    });
+    (commit)(write, refetch, done);
+}
+
+/// Per-column context for the whole-row JSON editor: name, editability (PK /
+/// expression / binary → read-only), nullability, and the row's original value.
+fn row_colspecs(gs: GridState, di: usize) -> Vec<ColSpec> {
+    let rs = gs.rs.get_untracked();
+    let model = gs.edit_model.get_untracked();
+    rs.columns
+        .iter()
+        .enumerate()
+        .map(|(ci, c)| ColSpec {
+            name: c.name.clone(),
+            editable: model.editable(ci),
+            nullable: c
+                .origin
+                .as_ref()
+                .map(|o| !o.flags.not_null)
+                .unwrap_or(false),
+            value: rs
+                .cell(di, ci)
+                .map(|cell| cell.to_value())
+                .unwrap_or(Value::Null),
+        })
+        .collect()
+}
+
+/// Open the row view/edit panel for real data row `di`: serialize the whole row to
+/// JSON (all columns, read-only ones included for context) and reveal the panel.
+fn open_edit_row(gs: GridState, di: usize) {
+    gs.edit_row_buf
+        .set(rowjson::row_to_json(&row_colspecs(gs, di)));
+    gs.edit_row_di.set(Some(di));
+    gs.edit_row_err.set(None);
+    gs.seed_open.set(false);
+    gs.edit_row_open.set(true);
+}
+
+/// Validate the edited JSON and commit the changed editable columns for this row as
+/// an `UPDATE`, immediately (its own path — not the staged `dirty` batch). On a
+/// parse/validation error or DB failure the message shows in the panel and it stays
+/// open; on success the panel closes and the row splices in place.
+fn save_edit_row(gs: GridState) {
+    if gs.edit_row_saving.get_untracked() || gs.commit_busy.get_untracked() {
+        return;
+    }
+    let Some(di) = gs.edit_row_di.get_untracked() else {
+        return;
+    };
+    let cols = row_colspecs(gs, di);
+    let changes = match rowjson::parse_row_edit(&cols, &gs.edit_row_buf.get_untracked()) {
+        Ok(c) => c,
+        Err(msg) => {
+            gs.edit_row_err.set(Some(msg));
+            return;
+        }
+    };
+    let updates = gs.build_row_edits(di, &changes);
+    if updates.is_empty() {
+        gs.edit_row_open.set(false); // nothing changed
+        return;
+    }
+    let Some(commit) = gs.commit.get_untracked() else {
+        return;
+    };
+    let write = GridWrite {
+        updates,
+        inserts: Vec::new(),
+        deletes: Vec::new(),
+    };
+    let refetch = gs.build_row_refetch(di);
+    gs.edit_row_saving.set(true);
+    gs.commit_busy.set(true);
+    gs.edit_row_err.set(None);
+    let done: Rc<dyn Fn(CommitDone)> = Rc::new(move |outcome| {
+        gs.commit_busy.set(false);
+        gs.edit_row_saving.set(false);
+        match outcome {
+            CommitDone::Spliced(rows) => {
+                gs.apply_splice(rows);
+                gs.edit_row_open.set(false);
+            }
+            CommitDone::FullReran => gs.edit_row_open.set(false),
+            CommitDone::Failed(msg) => gs.edit_row_err.set(Some(msg)),
         }
     });
     (commit)(write, refetch, done);
@@ -2682,6 +2730,127 @@ fn seed_popover(gs: GridState) -> impl IntoView {
     })
 }
 
+/// The "Edit Row" panel — an in-flow strip at the bottom of the results area (like
+/// the "View" value viewer), integrated with the grid rather than a floating popup.
+/// Shows the whole row as editable JSON with an inline error line + Cancel / Save;
+/// Save validates + commits immediately (`save_edit_row`). The field grows to
+/// `max_rows` (≈80% of the panel) then scrolls, and the grid above shrinks to fit.
+fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
+    dyn_container(
+        move || gs.edit_row_open.get(),
+        move |open| {
+            if !open {
+                return empty().into_any();
+            }
+            let close: Rc<dyn Fn()> = Rc::new(move || gs.edit_row_open.set(false));
+            // Display row number (the grid gutter number): the data row's position in
+            // the current sort order, 1-based; unsorted → the data index itself.
+            let row_no = match gs.edit_row_di.get_untracked() {
+                Some(di) => {
+                    gs.order
+                        .get_untracked()
+                        .iter()
+                        .position(|&d| d == di)
+                        .unwrap_or(di)
+                        + 1
+                }
+                None => 0,
+            };
+            let title = match gs.source.get_untracked() {
+                Some((_, t)) if !t.is_empty() => format!("Row {row_no}  ·  {t}"),
+                _ => format!("Row {row_no}"),
+            };
+            // Show the Save (✓) action only when the result has editable columns;
+            // otherwise the panel is a read-only row viewer (Close only).
+            let any_editable = {
+                let rs = gs.rs.get_untracked();
+                let model = gs.edit_model.get_untracked();
+                (0..rs.columns.len()).any(|c| model.editable(c))
+            };
+            // Header icons — Save (✓, when editable) then Close (✕), styled like the
+            // former value viewer's header icons. Save commits immediately; Close
+            // cancels (no bottom button row eating vertical space).
+            let close_x = close.clone();
+            let close_btn = container(icons::icon(icons::X, 14.0))
+                .on_click_stop(move |_| (close_x)())
+                .style(|s| {
+                    s.padding(4.0)
+                        .border_radius(4.0)
+                        .color(theme::text_dim())
+                        .hover(|s| s.background(theme::row_hover()).color(theme::text()))
+                });
+            let trailing = if any_editable {
+                let save_btn = container(icons::icon(icons::CHECK, 14.0))
+                    .on_click_stop(move |_| save_edit_row(gs))
+                    .style(|s| {
+                        s.padding(4.0)
+                            .border_radius(4.0)
+                            .color(theme::text_dim())
+                            .hover(|s| s.background(theme::row_hover()).color(theme::text()))
+                    });
+                h_stack((save_btn, close_btn))
+                    .style(|s| s.flex_row().items_center().gap(4.0))
+                    .into_any()
+            } else {
+                close_btn.into_any()
+            };
+            let head = h_stack((
+                text(title).style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_dim())),
+                empty().style(|s| s.flex_grow(1.0_f32)),
+                trailing,
+            ))
+            .style(|s| {
+                s.width_full()
+                    .items_center()
+                    .gap(4.0)
+                    .height(24.0)
+                    .flex_shrink(0.0_f32)
+            });
+
+            let esc = close.clone();
+            let field = edit_field(
+                gs.edit_row_buf,
+                FieldCfg {
+                    multiline: true,
+                    autofocus: true,
+                    max_rows: Some(max_rows),
+                    background: theme::bg_editor,
+                    on_escape: Some(Rc::new(move || (esc)())),
+                    ..Default::default()
+                },
+            )
+            .style(|s| s.width_full());
+
+            let err_line = dyn_container(
+                move || gs.edit_row_err.get(),
+                move |e| match e {
+                    Some(msg) => text(msg)
+                        .style(|s| s.font_size(theme::FONT_LABEL).color(theme::conn_delete()))
+                        .into_any(),
+                    None => empty().into_any(),
+                },
+            )
+            .style(|s| s.width_full());
+
+            // In-flow strip attached to the grid's bottom edge (border_top +
+            // panel background), not a floating overlay.
+            v_stack((head, field, err_line))
+                .style(|s| {
+                    s.width_full()
+                        .flex_col()
+                        .gap(8.0)
+                        .padding_horiz(10.0)
+                        .padding_vert(8.0)
+                        .border_top(1.0)
+                        .border_color(theme::border())
+                        .background(theme::bg_panel())
+                })
+                .into_any()
+        },
+    )
+    .style(|s| s.width_full().flex_shrink(0.0_f32))
+}
+
 /// Discard all staged changes — cell edits, pending new rows, and pending row
 /// deletions (the toolbar ✗) — closing any open in-cell editor.
 fn discard_edits(gs: GridState) {
@@ -2840,13 +3009,13 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
         Key::Named(NamedKey::PageUp) => set_active(gs, r.saturating_sub(page), c, shift),
         Key::Named(NamedKey::Escape) => {
             // Esc closes the find bar first (so it closes from anywhere in the grid,
-            // not only when its input is focused), then the value viewer, then the
-            // selection.
+            // not only when its input is focused), then the row view/edit panel, then
+            // the selection.
             if gs.find_open.get_untracked() {
                 gs.find_open.set(false);
                 gs.find_query.set(String::new());
-            } else if gs.viewer.get_untracked() {
-                gs.viewer.set(false);
+            } else if gs.edit_row_open.get_untracked() {
+                gs.edit_row_open.set(false);
             } else {
                 gs.active.set(None);
                 gs.anchor.set(None);
@@ -3885,13 +4054,15 @@ fn data_cell(
                  If you can infer a pattern, format, or meaning from it, note that too."
             );
 
-            let mut entries = vec![MenuEntry::action("View", move || {
-                gs.viewer.set(true);
-                // Keep focus on the grid so Esc closes the viewer.
-                if let Some(f) = gs.focus_id.get_untracked() {
-                    f.request_focus();
-                }
-            })];
+            // "View" opens the whole-row view/edit JSON panel (read-only fields shown
+            // for context, editable ones editable). Real rows only — a pending new row
+            // has no committed row to serialize (it's filled via inline cell edits).
+            let mut entries: Vec<MenuEntry> = Vec::new();
+            if pending.is_none() {
+                entries.push(MenuEntry::action("View", move || {
+                    open_edit_row(gs, data_idx)
+                }));
+            }
             // A row marked for deletion isn't editable (it's going away) — only
             // View / Copy / Undo delete / AI Summary.
             if editable && !deleted {
