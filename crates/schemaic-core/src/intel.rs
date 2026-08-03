@@ -1523,7 +1523,13 @@ pub fn clause_continuation(sql: &str, lo: usize, word_lo: usize) -> Continuation
 /// lexer + paren-scope chain — the fallback used when the statement doesn't parse
 /// as a complete AST. Handles `db.table`, `AS alias`, implicit `table alias`, and
 /// comma FROM-lists; scopes to the caret's query or an enclosing one.
-fn lexer_scope(sql: &str, lo: usize, hi: usize, caret: usize) -> Vec<TableRef> {
+fn lexer_scope(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    caret: usize,
+    dialect: SqlDialect,
+) -> Vec<TableRef> {
     let toks = tokenize_range(sql, lo, hi);
     let chain = caret_scope_chain(&toks, caret);
     let word = |k: &TkKind| -> Option<String> {
@@ -1560,7 +1566,7 @@ fn lexer_scope(sql: &str, lo: usize, hi: usize, caret: usize) -> Vec<TableRef> {
                 let scope = *open.last().unwrap_or(&0);
                 i += 1;
                 while let Some(mut name) = toks.get(i).and_then(|t| word(&t.kind)) {
-                    if is_reserved_word(&name) {
+                    if is_reserved_word(&name, dialect) {
                         break;
                     }
                     let mut db = None;
@@ -1589,13 +1595,13 @@ fn lexer_scope(sql: &str, lo: usize, hi: usize, caret: usize) -> Vec<TableRef> {
                                 // A reserved keyword after AS isn't a valid alias
                                 // (needs backticks) — don't register it, matching the
                                 // implicit-alias arm below. Still consume both tokens.
-                                if !is_reserved_word(&al) {
+                                if !is_reserved_word(&al, dialect) {
                                     alias = Some(al);
                                 }
                                 i += 2;
                             }
                         }
-                        Some(TkKind::Word(a)) if !is_reserved_word(a) => {
+                        Some(TkKind::Word(a)) if !is_reserved_word(a, dialect) => {
                             alias = Some(a.clone());
                             i += 1;
                         }
@@ -1645,7 +1651,7 @@ pub fn statement_scope(
         }
     }
     Scope {
-        tables: lexer_scope(sql, lo, hi, caret),
+        tables: lexer_scope(sql, lo, hi, caret, dialect),
         ctes: Vec::new(),
     }
 }
@@ -2045,7 +2051,12 @@ fn word_range_at(sql: &str, off: usize) -> (usize, usize) {
 /// range of its *table-name* token (positions the AST can't reliably give). Unlike
 /// [`lexer_scope`] this ignores paren scoping — for a parsed statement we want
 /// every table reference in it.
-fn table_refs_with_pos(sql: &str, lo: usize, hi: usize) -> Vec<(TableRef, (usize, usize))> {
+fn table_refs_with_pos(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    dialect: SqlDialect,
+) -> Vec<(TableRef, (usize, usize))> {
     let toks = tokenize_range(sql, lo, hi);
     let word = |k: &TkKind| -> Option<String> {
         if let TkKind::Word(w) = k {
@@ -2069,7 +2080,7 @@ fn table_refs_with_pos(sql: &str, lo: usize, hi: usize) -> Vec<(TableRef, (usize
         }
         i += 1;
         while let Some(mut name) = toks.get(i).and_then(|t| word(&t.kind)) {
-            if is_reserved_word(&name) {
+            if is_reserved_word(&name, dialect) {
                 break;
             }
             let mut pos = (toks[i].at, toks[i].at + name.len());
@@ -2089,13 +2100,13 @@ fn table_refs_with_pos(sql: &str, lo: usize, hi: usize) -> Vec<(TableRef, (usize
                     if let Some(al) = toks.get(i + 1).and_then(|t| word(&t.kind)) {
                         // A reserved keyword after AS isn't a valid alias — don't
                         // register it (matches the implicit arm + `lexer_scope`).
-                        if !is_reserved_word(&al) {
+                        if !is_reserved_word(&al, dialect) {
                             alias = Some(al);
                         }
                         i += 2;
                     }
                 }
-                Some(TkKind::Word(a)) if !is_reserved_word(a) => {
+                Some(TkKind::Word(a)) if !is_reserved_word(a, dialect) => {
                     alias = Some(a.clone());
                     i += 1;
                 }
@@ -2152,7 +2163,7 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
         let is_typing_tail = idx == last && !terminated;
         match sqlparser::parser::Parser::parse_sql(&*dialect.parser(), stmt) {
             Ok(asts) => {
-                table_existence_checks(sql, lo, hi, catalog, &mut out);
+                table_existence_checks(sql, lo, hi, catalog, dialect, &mut out);
                 match asts.as_slice() {
                     // A single SELECT/query → per-scope column resolution (aware of
                     // subqueries / derived tables / CTEs; qualified + unqualified).
@@ -2160,7 +2171,7 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
                         colres::check(sql, lo, hi, catalog, ast, &mut out)
                     }
                     // Other statements (UPDATE/DELETE/…) → the flat qualified scan.
-                    _ => qualified_column_checks(sql, lo, hi, catalog, &mut out),
+                    _ => qualified_column_checks(sql, lo, hi, catalog, dialect, &mut out),
                 }
             }
             Err(e) => {
@@ -2187,7 +2198,7 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
         // Reserved-keyword aliases (`orders AS or`, `orders or`) run unconditionally:
         // sqlparser is laxer than MySQL here (it *accepts* `AS or`), so gating on a
         // parse failure would miss the very case we want to flag.
-        alias_checks(sql, lo, hi, &mut out);
+        alias_checks(sql, lo, hi, dialect, &mut out);
     }
     dedup_diagnostics(out)
 }
@@ -2205,7 +2216,8 @@ fn is_query_body_keyword(word: &str) -> bool {
 /// superset of the small [`SQL_KEYWORDS`] completion set and deliberately excludes
 /// non-reserved keywords (`OFFSET`, `VIEW`, `TRUNCATE`, …), which *are* legal aliases.
 /// Sourced from MySQL 8.0's "Keywords and Reserved Words" (the `(R)` entries), plus
-/// `INTERSECT`. When Postgres joins the [`SqlDialect`] seam this becomes per-dialect.
+/// `INTERSECT`. The Postgres counterpart is [`PG_RESERVED`]; [`is_reserved_word`]
+/// selects between them by [`SqlDialect`].
 const MYSQL_RESERVED: &[&str] = &[
     "ACCESSIBLE",
     "ADD",
@@ -2471,12 +2483,127 @@ const MYSQL_RESERVED: &[&str] = &[
     "ZEROFILL",
 ];
 
-/// A word that can't be a bare (unquoted) identifier/alias in MySQL — reserved.
+/// PostgreSQL **reserved** words — those that can't be a bare (unquoted)
+/// identifier/alias without double-quoting. The union of Postgres 16's "reserved"
+/// and "reserved (can be function or type name)" categories (Appendix C): both are
+/// unusable as a plain table/column *alias* (`FROM t inner`, `SELECT 1 AS user` are
+/// errors), which is what this list gates. Differs from [`MYSQL_RESERVED`] — e.g.
+/// PG reserves `USER`/`OFFSET`/`LATERAL` where MySQL doesn't, and MySQL reserves
+/// `UNSIGNED`/`RLIKE`/`DIV` where PG doesn't.
+const PG_RESERVED: &[&str] = &[
+    "ALL",
+    "ANALYSE",
+    "ANALYZE",
+    "AND",
+    "ANY",
+    "ARRAY",
+    "AS",
+    "ASC",
+    "ASYMMETRIC",
+    "AUTHORIZATION",
+    "BINARY",
+    "BOTH",
+    "CASE",
+    "CAST",
+    "CHECK",
+    "COLLATE",
+    "COLLATION",
+    "COLUMN",
+    "CONCURRENTLY",
+    "CONSTRAINT",
+    "CREATE",
+    "CROSS",
+    "CURRENT_CATALOG",
+    "CURRENT_DATE",
+    "CURRENT_ROLE",
+    "CURRENT_SCHEMA",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "CURRENT_USER",
+    "DEFAULT",
+    "DEFERRABLE",
+    "DESC",
+    "DISTINCT",
+    "DO",
+    "ELSE",
+    "END",
+    "EXCEPT",
+    "FALSE",
+    "FETCH",
+    "FOR",
+    "FOREIGN",
+    "FREEZE",
+    "FROM",
+    "FULL",
+    "GRANT",
+    "GROUP",
+    "HAVING",
+    "ILIKE",
+    "IN",
+    "INITIALLY",
+    "INNER",
+    "INTERSECT",
+    "INTO",
+    "IS",
+    "ISNULL",
+    "JOIN",
+    "LATERAL",
+    "LEADING",
+    "LEFT",
+    "LIKE",
+    "LIMIT",
+    "LOCALTIME",
+    "LOCALTIMESTAMP",
+    "NATURAL",
+    "NOT",
+    "NOTNULL",
+    "NULL",
+    "OFFSET",
+    "ON",
+    "ONLY",
+    "OR",
+    "ORDER",
+    "OUTER",
+    "OVERLAPS",
+    "PLACING",
+    "PRIMARY",
+    "REFERENCES",
+    "RETURNING",
+    "RIGHT",
+    "SELECT",
+    "SESSION_USER",
+    "SIMILAR",
+    "SOME",
+    "SYMMETRIC",
+    "SYSTEM_USER",
+    "TABLE",
+    "TABLESAMPLE",
+    "THEN",
+    "TO",
+    "TRAILING",
+    "TRUE",
+    "UNION",
+    "UNIQUE",
+    "USER",
+    "USING",
+    "VARIADIC",
+    "VERBOSE",
+    "WHEN",
+    "WHERE",
+    "WINDOW",
+    "WITH",
+];
+
+/// A word that can't be a bare (unquoted) identifier/alias in `dialect` — reserved.
 /// Backs the alias diagnostic and the scope's alias resolution so they agree on what
-/// counts as a valid alias. See [`MYSQL_RESERVED`].
-pub(crate) fn is_reserved_word(word: &str) -> bool {
+/// counts as a valid alias. See [`MYSQL_RESERVED`] / [`PG_RESERVED`].
+pub(crate) fn is_reserved_word(word: &str, dialect: SqlDialect) -> bool {
     let up = word.to_ascii_uppercase();
-    MYSQL_RESERVED.contains(&up.as_str())
+    let list = match dialect {
+        SqlDialect::MySql => MYSQL_RESERVED,
+        SqlDialect::Postgres => PG_RESERVED,
+    };
+    list.contains(&up.as_str())
 }
 
 /// Keywords that legitimately follow a *table reference* (so a reserved keyword here
@@ -2524,7 +2651,7 @@ fn is_table_ref_continuation(word: &str) -> bool {
 /// gating on a parse failure would miss it. Only genuinely-reserved words are flagged
 /// ([`is_reserved_word`]) and only where an alias is actually expected, so well-formed
 /// SQL isn't squiggled.
-fn alias_checks(sql: &str, lo: usize, hi: usize, out: &mut Vec<Diagnostic>) {
+fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut Vec<Diagnostic>) {
     let toks = tokenize_range(sql, lo, hi);
     let flag = |out: &mut Vec<Diagnostic>, at: usize, kw: &str| {
         out.push(Diagnostic {
@@ -2549,7 +2676,7 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, out: &mut Vec<Diagnostic>) {
         let (TkKind::Word(a), TkKind::Word(b)) = (&w[0].kind, &w[1].kind) else {
             continue;
         };
-        if !a.eq_ignore_ascii_case("AS") || !is_reserved_word(b) {
+        if !a.eq_ignore_ascii_case("AS") || !is_reserved_word(b, dialect) {
             continue;
         }
         // A CTAS/view body isn't an alias (`CREATE TABLE t AS SELECT …`).
@@ -2591,7 +2718,7 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, out: &mut Vec<Diagnostic>) {
         let is_from = kw.eq_ignore_ascii_case("FROM");
         i += 1;
         while let Some(name) = toks.get(i).and_then(|t| word(&t.kind)) {
-            if is_reserved_word(&name) {
+            if is_reserved_word(&name, dialect) {
                 break; // a clause keyword, not a table name (`FROM WHERE …` etc.)
             }
             i += 1;
@@ -2610,7 +2737,7 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, out: &mut Vec<Diagnostic>) {
                 // A clause/join keyword ends this ref — not an alias (check before
                 // `is_reserved_word`, since these are reserved too).
                 Some(TkKind::Word(a)) if is_table_ref_continuation(a) => break,
-                Some(TkKind::Word(a)) if is_reserved_word(a) => {
+                Some(TkKind::Word(a)) if is_reserved_word(a, dialect) => {
                     flag(out, toks[i].at, a);
                     break;
                 }
@@ -2634,9 +2761,10 @@ fn table_existence_checks(
     lo: usize,
     hi: usize,
     catalog: &Catalog,
+    dialect: SqlDialect,
     out: &mut Vec<Diagnostic>,
 ) {
-    for (r, pos) in table_refs_with_pos(sql, lo, hi) {
+    for (r, pos) in table_refs_with_pos(sql, lo, hi, dialect) {
         if let TableStatus::NotFound = catalog.table_status(&r) {
             let where_db =
                 r.db.as_deref()
@@ -2659,9 +2787,10 @@ fn qualified_column_checks(
     lo: usize,
     hi: usize,
     catalog: &Catalog,
+    dialect: SqlDialect,
     out: &mut Vec<Diagnostic>,
 ) {
-    let refs = table_refs_with_pos(sql, lo, hi);
+    let refs = table_refs_with_pos(sql, lo, hi, dialect);
     let toks = tokenize_range(sql, lo, hi);
     for w in toks.windows(3) {
         let (TkKind::Word(q), TkKind::Dot, TkKind::Word(col)) =
@@ -2733,6 +2862,11 @@ mod colres {
         range: (usize, usize),
         sources: Vec<Src>,
         proj_aliases: HashSet<String>,
+        /// Byte range of this scope's `WHERE` clause, if any. A projection alias may
+        /// be referenced in GROUP BY / HAVING / ORDER BY but **not** in WHERE (MySQL /
+        /// Postgres both reject it), so an alias-only match inside this range is an
+        /// error, not a resolution.
+        where_range: Option<(usize, usize)>,
         /// Columns coalesced by a `USING(...)` join — an unqualified reference to
         /// one is unambiguous even when several sources expose it.
         coalesced: HashSet<String>,
@@ -2810,15 +2944,38 @@ mod colres {
                 }
                 // A set operation (UNION/EXCEPT/INTERSECT): each branch SELECT is its
                 // own scope, keyed by its own (disjoint) span, so a column resolves
-                // against the branch it sits in. The union's own ORDER BY (which
-                // references the *output* columns, positioned past every branch) falls
-                // outside all branch scopes → left unchecked, safely.
+                // against the branch it sits in.
                 body @ SetExpr::SetOperation { .. } => {
                     let mut selects = Vec::new();
                     collect_selects(body, &mut selects);
-                    for sel in selects {
+                    let mut last_end = self.lo;
+                    for sel in &selects {
                         let range = to_range(self.stmt, self.lo, sel.span());
+                        last_end = last_end.max(range.1);
                         self.push_scope(range, sel);
+                    }
+                    // The union's own ORDER BY references the *output* columns (the
+                    // first branch's projection names/aliases) and is positioned past
+                    // every branch. Cover just that trailing region with a scope whose
+                    // single source exposes the output columns, so an unknown one is
+                    // flagged — while branch refs (which sit earlier, before `last_end`)
+                    // never fall through to it. `SELECT *` outputs are `Open` → unchecked.
+                    if q.order_by.is_some()
+                        && let Some(first) = selects.first()
+                    {
+                        let qrange = to_range(self.stmt, self.lo, q.span());
+                        self.scopes.push(Scope {
+                            range: (last_end, qrange.1),
+                            sources: vec![Src {
+                                quals: Vec::new(),
+                                cols: select_output_cols(first),
+                                table: None,
+                            }],
+                            proj_aliases: HashSet::new(),
+                            where_range: None,
+                            coalesced: HashSet::new(),
+                            natural: false,
+                        });
                     }
                 }
                 // A parenthesized inner query self-handles via its own
@@ -2865,10 +3022,15 @@ mod colres {
                 &mut self.gb,
             );
             cartesian_check(sel, self.stmt, self.lo, &mut self.gb);
+            let where_range = sel
+                .selection
+                .as_ref()
+                .map(|e| to_range(self.stmt, self.lo, e.span()));
             self.scopes.push(Scope {
                 range,
                 sources,
                 proj_aliases,
+                where_range,
                 coalesced,
                 natural,
             });
@@ -2952,7 +3114,15 @@ mod colres {
                     if has_open {
                         return None; // an unenumerable source might provide it
                     }
-                    if s.proj_aliases.contains(&r.col) {
+                    // A projection alias resolves an unqualified ref — except in the
+                    // WHERE clause, where an alias isn't in scope yet (only GROUP BY /
+                    // HAVING / ORDER BY may use it). An alias-only match inside WHERE
+                    // falls through to the not-found flag, matching MySQL / Postgres.
+                    if s.proj_aliases.contains(&r.col)
+                        && !s
+                            .where_range
+                            .is_some_and(|w| w.0 <= r.range.0 && r.range.1 <= w.1)
+                    {
                         return None;
                     }
                     // Not in this scope → try the enclosing (correlated) scope.
@@ -3251,9 +3421,16 @@ mod colres {
     /// The output column names of a subquery/CTE body, or `Open` when they can't be
     /// cleanly enumerated (`SELECT *`, a set-op, or an unnamed non-column expression).
     fn output_cols(q: &Query) -> Cols {
-        let SetExpr::Select(sel) = q.body.as_ref() else {
-            return Cols::Open;
-        };
+        match q.body.as_ref() {
+            SetExpr::Select(sel) => select_output_cols(sel),
+            _ => Cols::Open,
+        }
+    }
+
+    /// The output column names of a single `SELECT`'s projection — each item's alias,
+    /// or the bare column name for an unaliased identifier. `Open` when any item can't
+    /// be named (`*`, `t.*`, multi-alias, or an unnamed expression like `a + b`).
+    fn select_output_cols(sel: &Select) -> Cols {
         let mut names = HashSet::new();
         for item in &sel.projection {
             match item {
@@ -3585,6 +3762,7 @@ pub fn join_condition(
     hi: usize,
     caret: usize,
     catalog: &Catalog,
+    dialect: SqlDialect,
 ) -> Option<String> {
     let toks = tokenize_range(sql, lo, hi);
     // The last clause keyword strictly before the caret must be `ON`.
@@ -3621,7 +3799,7 @@ pub fn join_condition(
         .iter()
         .rposition(|t| matches!(&t.kind, TkKind::Word(w) if w.eq_ignore_ascii_case("JOIN")))?;
     let join_at = toks[join_idx].at;
-    let refs = table_refs_with_pos(sql, lo, hi);
+    let refs = table_refs_with_pos(sql, lo, hi, dialect);
     let joined = refs
         .iter()
         .filter(|(_, p)| p.0 > join_at)
@@ -4431,6 +4609,12 @@ mod tests {
         diagnostics(sql, &cat, SqlDialect::MySql)
     }
 
+    fn diag_d(sql: &str, dialect: SqlDialect) -> Vec<Diagnostic> {
+        let (schema, db) = sample_catalog();
+        let cat = Catalog::build(&[(db, &schema)], Some(db));
+        diagnostics(sql, &cat, dialect)
+    }
+
     #[test]
     fn diag_clean_query_has_none() {
         assert!(diag("SELECT id, name FROM employees WHERE salary > 100").is_empty());
@@ -4506,6 +4690,57 @@ mod tests {
         assert!(col_errors("SELECT id FROM employees ORDER BY nope").len() == 1);
         // Every occurrence squiggles.
         assert_eq!(col_errors("SELECT nope, nope FROM employees").len(), 2);
+    }
+
+    #[test]
+    fn diag_alias_in_where_flagged() {
+        // MySQL forbids referencing a SELECT alias in WHERE (only GROUP BY / HAVING /
+        // ORDER BY may). The alias resolves everywhere else, so this was a false neg.
+        let e = col_errors("SELECT salary AS s FROM employees WHERE s > 100");
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("`s`"));
+        // The same alias is legal in HAVING / ORDER BY, and a real column in WHERE is
+        // unaffected. (GROUP-BY/HAVING cases are chosen so they don't independently
+        // trip the `only_full_group_by` check.)
+        for sql in [
+            "SELECT salary AS s FROM employees ORDER BY s",
+            "SELECT dept_id AS d, COUNT(*) AS c FROM employees GROUP BY dept_id HAVING c > 1",
+            "SELECT salary AS s FROM employees WHERE salary > 100",
+        ] {
+            assert!(col_errors(sql).is_empty(), "false positive: {sql}");
+        }
+    }
+
+    #[test]
+    fn diag_union_order_by_checks_output_columns() {
+        // A union's own ORDER BY references the OUTPUT columns (positioned past every
+        // branch); an unknown one is flagged.
+        assert_eq!(
+            col_errors("SELECT id FROM employees UNION SELECT id FROM departments ORDER BY nope")
+                .len(),
+            1
+        );
+        // Output column name that isn't among the union outputs → flagged (MySQL/PG
+        // both forbid ordering a union by a non-output column).
+        assert_eq!(
+            col_errors(
+                "SELECT salary FROM employees UNION SELECT id FROM departments ORDER BY name"
+            )
+            .len(),
+            1
+        );
+        // Output column name, first-branch alias, and positional refs are all clean.
+        for sql in [
+            "SELECT id FROM employees UNION SELECT id FROM departments ORDER BY id",
+            "SELECT id AS x FROM employees UNION SELECT id FROM departments ORDER BY x",
+            "SELECT id FROM employees UNION SELECT id FROM departments ORDER BY 1",
+            // A `SELECT *` branch → outputs can't be enumerated → conservatively unchecked.
+            "SELECT * FROM employees UNION SELECT * FROM departments ORDER BY whatever",
+            // Branch-internal refs still resolve against their own branch, not the union.
+            "SELECT salary FROM employees WHERE name = 'x' UNION SELECT id, name FROM departments",
+        ] {
+            assert!(col_errors(sql).is_empty(), "false positive: {sql}");
+        }
     }
 
     #[test]
@@ -4990,6 +5225,48 @@ mod tests {
     }
 
     #[test]
+    fn reserved_alias_is_dialect_specific() {
+        // `UNSIGNED` is reserved in MySQL but a legal identifier in Postgres.
+        let s1 = "SELECT id AS unsigned FROM employees";
+        assert!(has_reserved_alias(
+            &diag_d(s1, SqlDialect::MySql),
+            s1,
+            "unsigned"
+        ));
+        assert!(!has_reserved_alias(
+            &diag_d(s1, SqlDialect::Postgres),
+            s1,
+            "unsigned"
+        ));
+        // `USER` is reserved in Postgres but non-reserved (legal) in MySQL.
+        let s2 = "SELECT id AS user FROM employees";
+        assert!(has_reserved_alias(
+            &diag_d(s2, SqlDialect::Postgres),
+            s2,
+            "user"
+        ));
+        assert!(!has_reserved_alias(
+            &diag_d(s2, SqlDialect::MySql),
+            s2,
+            "user"
+        ));
+    }
+
+    #[test]
+    fn reserved_word_lookup_per_dialect() {
+        assert!(is_reserved_word("unsigned", SqlDialect::MySql));
+        assert!(!is_reserved_word("unsigned", SqlDialect::Postgres));
+        assert!(is_reserved_word("user", SqlDialect::Postgres));
+        assert!(!is_reserved_word("user", SqlDialect::MySql));
+        // Words reserved in both dialects stay reserved either way.
+        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+            assert!(is_reserved_word("select", d));
+            assert!(is_reserved_word("where", d));
+            assert!(is_reserved_word("or", d));
+        }
+    }
+
+    #[test]
     fn diag_reserved_keyword_table_alias_flagged() {
         // `AS or` — OR is reserved, so it can't be a bare alias → error on `or`.
         let sql = "SELECT * FROM employees AS or";
@@ -5311,7 +5588,7 @@ mod tests {
     fn join_at(sql: &str, caret: usize) -> Option<String> {
         let (schema, db) = fk_catalog();
         let cat = Catalog::build(&[(db, &schema)], Some(db));
-        join_condition(sql, 0, sql.len(), caret, &cat)
+        join_condition(sql, 0, sql.len(), caret, &cat, SqlDialect::MySql)
     }
 
     #[test]
