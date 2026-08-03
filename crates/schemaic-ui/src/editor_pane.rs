@@ -34,6 +34,7 @@ use floem::views::scroll::{Handle, Thickness};
 use schemaic_core::diff::{DiffTag, build_diff_rows, line_diff};
 use schemaic_core::intel::{self, Diagnostic, Severity, SqlDialect};
 use schemaic_core::model::QueryState;
+use schemaic_core::pairs::{self, PairAction};
 use schemaic_core::sql::{
     contains_write, first_unsafe, statement_range, statement_ranges, unsafe_reason,
 };
@@ -585,6 +586,36 @@ fn wavy_svg(width: f64) -> String {
     )
 }
 
+/// The single `char` of `s`, or `None` if it isn't exactly one character.
+fn single_char(s: &str) -> Option<char> {
+    let mut it = s.chars();
+    match (it.next(), it.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
+    }
+}
+
+/// Pixel box `(x, y, w, h)` in `editor_area` coords around the single character
+/// at byte `pos`, for the bracket-matching highlight. Same gutter math as
+/// `statement_line_boxes`; subtracts the editor's scroll offset (`viewport`) so
+/// the box follows the caret when the editor is scrolled. The horizontal edges
+/// are **snapped to whole pixels** (floor left, ceil right) so the 1px border
+/// lands crisply on the device grid — otherwise a paren at a fractional x
+/// antialiases ~1px off (looked like the right box was biased right).
+fn char_box(sql: &str, ed: &Editor, pos: usize) -> (f64, f64, f64, f64) {
+    let total_lines = sql.bytes().filter(|&c| c == b'\n').count() + 1;
+    let digits = total_lines.to_string().len();
+    let content_x = HL_GUTTER + digits.saturating_sub(1) as f64 * HL_DIGIT_W;
+    let vp = ed.viewport.get();
+    let (top, bot) = ed.points_of_offset(pos, CursorAffinity::Backward);
+    let (end, _) = ed.points_of_offset(pos + 1, CursorAffinity::Backward);
+    let left = (content_x + top.x - vp.x0).floor();
+    let right = (content_x + end.x - vp.x0).ceil();
+    let w = (right - left).max(4.0);
+    let y = top.y + EDITOR_PAD_TOP - vp.y0;
+    (left, y, w, bot.y - top.y)
+}
+
 /// Pixel underline segment `(x, y, width)` in `editor_area` coords for the word
 /// `[lo, hi]` (assumed single-line). Same gutter math as `statement_line_boxes`.
 fn underline_seg(sql: &str, ed: &Editor, lo: usize, hi: usize) -> (f64, f64, f64) {
@@ -804,6 +835,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // edit or click in the editor (see below). Defined here (above the editor) so
     // the Ctrl+Enter key handler can set it.
     let highlight: RwSignal<Option<(usize, usize)>> = RwSignal::new(None);
+
+    // Bracket matching: the byte offsets of the paren adjacent to the caret and
+    // its partner (or None). Recomputed from caret + text below; drawn as two
+    // faint boxes by `bracket_match_view`.
+    let bracket_match: RwSignal<Option<(usize, usize)>> = RwSignal::new(None);
 
     // While the run menu is open, tie the statement highlight to the selection:
     // "Run Current" highlights the statement under the caret; "Run Everything"
@@ -1377,6 +1413,99 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             });
             return CommandExecuted::Yes;
         }
+        // Auto-close bracket/quote pairs, type-over an existing closer, and wrap a
+        // selection — via the pure, boundary-aware `core::pairs`. Plain character
+        // input only (Ctrl/Alt combos are handled above and never reach here).
+        //
+        // Floem's editor inserts a typed character *unconditionally* after this
+        // handler returns (it ignores our `CommandExecuted`), so when we take over
+        // we must suppress that built-in insert: we flip the editor's `read_only`
+        // true for the remainder of this key dispatch and restore it next tick.
+        // Nothing else reads `read_only` (the app gates writes elsewhere) and the
+        // handler → built-in-insert step is synchronous, so there's no race or
+        // flicker — the built-in `receive_char` sees `read_only` and no-ops.
+        if !mods.control()
+            && !mods.alt()
+            && let KeyInput::Keyboard(Key::Character(cs), _) = &kp.key
+            && let Some(ch) = single_char(cs)
+            && matches!(ch, '(' | ')' | '\'' | '"' | '`')
+        {
+            let dia = dialect.get_untracked();
+            let acted = editor_sig.with_untracked(|e| {
+                let doc = e.doc();
+                let full = doc.text().to_string();
+                let cur = e.cursor.get_untracked();
+                let off = cur.offset();
+                let (a, b) = cur.get_selection().unwrap_or((off, off));
+                let Some(action) = pairs::auto_pair(&full, a, b, ch, dia) else {
+                    return false;
+                };
+                // Suppress the built-in char insert for the rest of this dispatch.
+                let ro = e.read_only;
+                ro.set(true);
+                floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+                    if ro.try_get_untracked().is_some() {
+                        ro.set(false);
+                    }
+                });
+                match action {
+                    PairAction::Insert {
+                        start,
+                        end,
+                        insert,
+                        sel,
+                    } => {
+                        doc.edit_single(
+                            Selection::region(start, end),
+                            &insert,
+                            EditType::InsertChars,
+                        );
+                        e.cursor
+                            .update(|c| c.set_insert(Selection::region(sel.0, sel.1)));
+                    }
+                    PairAction::Skip { caret } => {
+                        e.cursor.update(|c| c.set_offset(caret, false, false));
+                    }
+                }
+                true
+            });
+            if acted {
+                return CommandExecuted::Yes;
+            }
+            // Otherwise fall through so the character inserts normally.
+        }
+        // Backspace between an empty auto-inserted pair (`(|)`, `'|'`, …) deletes
+        // both halves. Backspace is a Named key, so Floem's unconditional
+        // char-insert never fires for it — returning `Yes` just pre-empts the
+        // default DeleteBackward.
+        if !mods.control()
+            && !mods.alt()
+            && !mods.shift()
+            && matches!(
+                kp.key,
+                KeyInput::Keyboard(Key::Named(NamedKey::Backspace), _)
+            )
+        {
+            let dia = dialect.get_untracked();
+            let acted = editor_sig.with_untracked(|e| {
+                let cur = e.cursor.get_untracked();
+                if cur.get_selection().is_some_and(|(a, b)| a != b) {
+                    return false; // let the default delete a real selection
+                }
+                let off = cur.offset();
+                let full = e.doc().text().to_string();
+                let Some((s, en)) = pairs::backspace_pair(&full, off, dia) else {
+                    return false;
+                };
+                e.doc()
+                    .edit_single(Selection::region(s, en), "", EditType::Delete);
+                e.cursor.update(|c| c.set_offset(s, false, false));
+                true
+            });
+            if acted {
+                return CommandExecuted::Yes;
+            }
+        }
         default_key_handler(editor_sig)(kp, mods)
     });
     let ed = editor.editor().clone();
@@ -1386,6 +1515,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let ed_run = ed.clone(); // run menu: re-focus the editor after running
     let ed_hl = ed.clone(); // statement-highlight overlay geometry
     let ed_syntax = ed.clone(); // syntax-squiggle overlay geometry
+    let ed_bm = ed.clone(); // bracket-matching: recompute offsets on caret/text
+    let ed_bm2 = ed.clone(); // bracket-matching overlay geometry
     let ed_vbar = ed.clone(); // custom vertical scrollbar geometry
     let ed_hbar = ed.clone(); // custom horizontal scrollbar geometry
     let ed_vdrag = ed.clone(); // vertical scrollbar drag → scroll
@@ -1403,6 +1534,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // move / selection change; disposed with this pane when the tab closes.
     create_effect(move |_| {
         cursor_offset.set(ed_cursor.cursor.get().offset());
+    });
+
+    // Bracket matching: recompute the matched-paren offsets on every caret move
+    // (tracks `ed.cursor`) and edit (tracks `query`). Pure/boundary-aware via
+    // `core::pairs::match_paren`, so parens inside strings/comments are ignored.
+    create_effect(move |_| {
+        let caret = ed_bm.cursor.get().offset();
+        let sql = query.get();
+        bracket_match.set(pairs::match_paren(&sql, caret, dialect.get_untracked()));
     });
 
     // Jump the caret to a byte offset requested from outside (the status-bar
@@ -2436,6 +2576,52 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         .pointer_events(|| false)
     };
 
+    // Bracket matching: two faint boxes around the paren adjacent to the caret and
+    // its partner. Click-through like the other overlays; each box reads the editor
+    // `viewport` (inside `char_box`) so it tracks scroll.
+    let bracket_match_view = {
+        let ed = ed_bm2;
+        dyn_container(
+            move || bracket_match.get(),
+            move |m| match m {
+                None => empty().into_any(),
+                Some((p, q)) => {
+                    let sql = query.get_untracked();
+                    let (edp, edq) = (ed.clone(), ed.clone());
+                    let (sqp, sqq) = (sql.clone(), sql);
+                    v_stack((
+                        empty().style(move |s| {
+                            let (x, y, w, h) = char_box(&sqp, &edp, p);
+                            s.absolute()
+                                .inset_left(x)
+                                .inset_top(y)
+                                .width(w)
+                                .height(h)
+                                .border(1.0)
+                                .border_radius(2.0)
+                                .border_color(theme::bracket_match().multiply_alpha(0.5))
+                        }),
+                        empty().style(move |s| {
+                            let (x, y, w, h) = char_box(&sqq, &edq, q);
+                            s.absolute()
+                                .inset_left(x)
+                                .inset_top(y)
+                                .width(w)
+                                .height(h)
+                                .border(1.0)
+                                .border_radius(2.0)
+                                .border_color(theme::bracket_match().multiply_alpha(0.5))
+                        }),
+                    ))
+                    .style(|s| s.absolute().inset(0.0))
+                    .into_any()
+                }
+            },
+        )
+        .style(|s| s.absolute().inset(0.0))
+        .pointer_events(|| false)
+    };
+
     // Wavy underlines under diagnostics: red for definite errors (unknown table/
     // column, syntax), amber for probable keyword typos. Overlay laid over the
     // editor; each squiggle carries a hover tooltip with the diagnostic message.
@@ -2949,6 +3135,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         h_scrollbar,
         syntax_view,
         highlight_view,
+        bracket_match_view,
         run_overlay,
         completion_popup(comp),
         signature_popup(comp),

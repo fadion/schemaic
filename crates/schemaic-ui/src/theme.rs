@@ -143,6 +143,11 @@ pub fn query_highlight() -> Color {
     ui().query_highlight
 }
 
+/// Box around the paren matching the one under the caret (bracket matching).
+pub fn bracket_match() -> Color {
+    ui().bracket_match
+}
+
 /// Matched-substring highlight (bold) in the command palette / Find results.
 pub fn match_highlight() -> Color {
     ui().match_highlight
