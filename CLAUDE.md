@@ -50,6 +50,12 @@ Zed-inspired, aiming to replace DataGrip.
   - `sqlfmt.rs` — `format_sql` (Ctrl+Alt+L pretty-printer): re-flows whitespace/indent/line-breaks
     "block" style, **preserving keyword case**; built on `skip_noncode` so comments/strings/backtick
     idents pass through untouched; indent follows editor tab-width/soft-tabs.
+  - `pairs.rs` — editor auto-close pairs + bracket matching, boundary-aware via `skip_noncode`:
+    `auto_pair` (auto-close `()`/`''`/`""`/`` `` `` [MySQL] at code positions, wrap a selection,
+    type-over a closer/quote already at the caret — respects string/comment regions and word-adjacency
+    guards), `backspace_pair` (delete both halves of an empty pair), `match_paren` (the paren adjacent
+    to the caret + its partner, ignoring parens in strings/comments), and `region_at`
+    (`Code`/`Str`/`Comment` classification). Pure + unit-tested; dialect-aware (no backtick on PG).
 - `schemaic-db` — MySQL/MariaDB (`mysql_async`) + SSH tunnels. Populates each result column's
   `origin` (real table/column + key flags) from the wire protocol. Connection **identity** is the
   `Db` handle (`Db::connect(&Connection, tunnel_port)`), not a `mysql://…` URL — credentials go
@@ -310,6 +316,22 @@ bug fixes start with a failing test, then the code that makes it pass. Concretel
   `on_event(KeyDown)` never sees it. `edit_field` routes Escape to `on_escape` and focus-loss to
   `on_blur` (guarded to skip the mount run) — use it for discard-on-Escape / commit-on-blur (inline
   rename, find/replace).
+- **`text_editor_keys` inserts a typed char *unconditionally* — your handler's `CommandExecuted`
+  return is ignored for plain character keys.** Floem's `editor_content` KeyDown listener discards the
+  handler's result and then, if `mods` (minus SHIFT/ALTGR) is empty, calls `receive_char(c)` for any
+  `Key::Character`. So the existing custom edits (soft-tab, Ctrl+/, Ctrl+D…) only work because they're
+  on keys that *don't* trigger that path (Tab is `Named`; Ctrl-combos keep a modifier). To fully take
+  over a **plain character** (auto-close pairs), suppress the built-in insert by setting the editor's
+  own `ed.read_only` true for the rest of the dispatch and restoring it on the next tick via
+  `exec_after(ZERO)` — `receive_char` early-returns on `read_only`, nothing else reads it, and the
+  handler→`receive_char` step is synchronous so there's no race/flicker (see the auto-pair block in
+  `editor_pane`). Named keys (Backspace) never hit `receive_char`, so returning `Yes` is enough there.
+- **`Editor::points_of_offset` returns *content* coords, not viewport-relative** (`.y` is `vline_y`,
+  the absolute document y; the gutter view subtracts `viewport.y0` itself). Overlays pinned in
+  `editor_area` (which doesn't scroll) must subtract `ed.viewport.get()` `x0`/`y0` to follow scroll —
+  see `char_box` (bracket matching). The older `statement_line_boxes`/`underline_seg` overlays skip
+  this (they're transient / usually unscrolled), so they drift when the editor is scrolled; don't copy
+  that for anything persistent.
 
 ## Popup menus (`menu_panel`)
 

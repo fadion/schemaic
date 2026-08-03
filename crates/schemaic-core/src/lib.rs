@@ -16,6 +16,7 @@ pub mod history;
 pub mod intel;
 pub mod model;
 pub mod monitor;
+pub mod pairs;
 pub mod palette;
 pub mod persist;
 pub mod plan;
