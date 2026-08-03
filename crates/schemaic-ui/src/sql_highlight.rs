@@ -6,9 +6,11 @@
 //! / comments). It's deliberately behind this one function — a tree-sitter
 //! grammar could replace `lex_line` later without touching the editor wiring.
 //!
-//! Limitation: because lexing is per-line, a `/* ... */` block comment spanning
-//! multiple lines only colors the line(s) where the delimiters appear. Good
-//! enough for now; tree-sitter would fix it.
+//! Multi-line `/* … */` block comments are handled by a cheap cross-line pass
+//! (`starts_in_block_comment`): before lexing a line, we check whether the text
+//! before it ends inside an open block comment and, if so, colour the line's lead
+//! as a comment. A *string* spanning lines is still coloured per-line (the rarer
+//! case); a full tree-sitter grammar would generalize both.
 
 use std::borrow::Cow;
 use std::rc::Rc;
@@ -101,10 +103,46 @@ impl Styling for SqlStyling {
             return;
         }
         let content = rope.line_content(line);
-        for (start, end, tok) in lex_line(&content, self.dialect) {
+        // Does this line begin inside a `/* … */` opened on an earlier line?
+        let start_in_block = line > 0 && {
+            let start = rope.offset_of_line(line);
+            starts_in_block_comment(&rope.slice_to_cow(0..start), self.dialect)
+        };
+        for (start, end, tok) in lex_line(&content, self.dialect, start_in_block) {
             attrs.add_span(start..end, default.color(tok.color()));
         }
     }
+}
+
+/// Whether `prefix` (all the editor text before the line being highlighted) ends
+/// *inside* an unterminated `/* … */` block comment — so the next line starts in a
+/// comment and its lead must be coloured as one. Built on the shared
+/// `schemaic_core::sql::skip_noncode` primitive, so strings / line-comments /
+/// dollar-quotes are skipped (a `/*` inside a string never opens a comment) and the
+/// block boundary agrees with the rest of the SQL tooling.
+fn starts_in_block_comment(prefix: &str, dialect: SqlDialect) -> bool {
+    let b = prefix.as_bytes();
+    // Fast path: no `/*` anywhere → definitely not inside a block comment.
+    if !b.windows(2).any(|w| w == b"/*") {
+        return false;
+    }
+    let n = b.len();
+    let mut i = 0;
+    while i < n {
+        if let Some(end) = schemaic_core::sql::skip_noncode(b, i, dialect) {
+            // A block comment reaching `end` is *terminated* only if `end` sits right
+            // after a real `*/` (at least `/**/`, i.e. `end >= i + 4`, so the close
+            // doesn't overlap the opening `/*`). Otherwise it runs into the next line.
+            let is_block = b[i] == b'/' && b.get(i + 1) == Some(&b'*');
+            if is_block && !(end >= i + 4 && &b[end - 2..end] == b"*/") {
+                return true;
+            }
+            i = end.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 /// Public: color spans for a standalone SQL line (byte ranges + color), for
@@ -112,7 +150,9 @@ impl Styling for SqlStyling {
 /// colored segments rather than through the editor's `Styling` hook. Same lexer
 /// as the editor, so highlighting matches exactly.
 pub fn highlight_spans(line: &str, dialect: SqlDialect) -> Vec<(usize, usize, Color)> {
-    lex_line(line, dialect)
+    // Standalone line (Ctrl+K diff) — no document context, so no cross-line block
+    // state; a multi-line comment there stays coloured per-line.
+    lex_line(line, dialect, false)
         .into_iter()
         .map(|(s, e, tok)| (s, e, tok.color()))
         .collect()
@@ -125,13 +165,34 @@ pub fn highlight_spans(line: &str, dialect: SqlDialect) -> Vec<(usize, usize, Co
 /// `schemaic_core::sql::skip_noncode` primitive, so highlighting agrees with the
 /// statement splitter and the WHERE guard on where those constructs begin and
 /// end. Backtick identifiers keep the default color; comments and strings get
-/// their theme color. (Lexing is per-line, so a multi-line `/* … */` only colors
-/// the portion on each line — an unterminated construct runs to line end.)
-fn lex_line(line: &str, dialect: SqlDialect) -> Vec<(usize, usize, Tok)> {
+/// their theme color.
+///
+/// `start_in_block` = this line begins inside a `/* … */` block comment opened on
+/// an earlier line (see [`starts_in_block_comment`]): its leading text up to the
+/// closing `*/` (or the whole line, if it doesn't close here) is coloured as a
+/// comment before normal lexing resumes. (A string spanning lines is still handled
+/// per-line — the rarer case the TODO didn't call for.)
+fn lex_line(line: &str, dialect: SqlDialect, start_in_block: bool) -> Vec<(usize, usize, Tok)> {
     let b = line.as_bytes();
     let n = b.len();
     let mut out = Vec::new();
     let mut i = 0;
+
+    // Continuation of a block comment from a previous line: colour to the `*/`.
+    if start_in_block {
+        match line.find("*/") {
+            Some(p) => {
+                out.push((0, p + 2, Tok::Comment));
+                i = p + 2;
+            }
+            None => {
+                if n > 0 {
+                    out.push((0, n, Tok::Comment));
+                }
+                return out;
+            }
+        }
+    }
 
     while i < n {
         let c = b[i];
@@ -278,4 +339,54 @@ fn is_keyword(w: &str) -> bool {
             | "AUTO_INCREMENT"
             | "UNSIGNED"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn comment_spans(line: &str, start_in_block: bool) -> Vec<(usize, usize)> {
+        lex_line(line, SqlDialect::MySql, start_in_block)
+            .into_iter()
+            .filter(|(_, _, t)| matches!(t, Tok::Comment))
+            .map(|(s, e, _)| (s, e))
+            .collect()
+    }
+
+    #[test]
+    fn block_open_state_across_lines() {
+        let d = SqlDialect::MySql;
+        // Unterminated `/*` → the next line starts inside the comment.
+        assert!(starts_in_block_comment("SELECT 1; /* note", d));
+        // Closed on the same line → not inside.
+        assert!(!starts_in_block_comment("SELECT 1; /* note */", d));
+        // Opened on an earlier line and still open.
+        assert!(starts_in_block_comment("/* a\nb\n", d));
+        // Opened then closed across lines → not inside after the close.
+        assert!(!starts_in_block_comment("/* a\nb */\n", d));
+        // A `/*` inside a string literal does not open a comment.
+        assert!(!starts_in_block_comment("SELECT '/*';\n", d));
+        // No `/*` at all.
+        assert!(!starts_in_block_comment("SELECT 1;\n", d));
+    }
+
+    #[test]
+    fn continuation_line_colours_comment_then_lexes_code() {
+        // A line wholly inside a block comment → all comment.
+        assert_eq!(comment_spans("still a comment", true), vec![(0, 15)]);
+        // A line that closes the block partway → comment up to `*/`, then code.
+        let line = "end */ SELECT";
+        assert_eq!(comment_spans(line, true), vec![(0, 6)]); // "end */"
+        // The trailing SELECT is lexed as a keyword (not swallowed by the comment).
+        let kw = lex_line(line, SqlDialect::MySql, true)
+            .into_iter()
+            .find(|(_, _, t)| matches!(t, Tok::Keyword));
+        assert!(kw.is_some_and(|(s, e, _)| &line[s..e] == "SELECT"));
+    }
+
+    #[test]
+    fn line_not_in_block_is_unaffected() {
+        // start_in_block = false → leading text isn't forced to a comment.
+        assert!(comment_spans("SELECT 1", false).is_empty());
+    }
 }
