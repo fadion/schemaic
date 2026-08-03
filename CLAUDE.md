@@ -37,6 +37,12 @@ Zed-inspired, aiming to replace DataGrip.
   - `format.rs` — per-column display formatters (`ColumnFormat`/`apply`: epoch→datetime, bytes,
     bool). Display-only; edit/copy stay raw. Persisted to `format.json`.
   - `schema::TableInfo::create_ddl` — `CREATE TABLE`/`VIEW` skeleton.
+  - `rowjson.rs` — the grid's whole-row **view/edit panel** logic: `row_to_json` serializes a row to
+    a pretty JSON object (keys in column order, reusing `export::value_to_json`; DECIMAL/dates stay
+    quoted strings, join-duplicate names → `name#ci`), and `parse_row_edit` validates an edited object
+    back into the changed *editable* columns for an `UPDATE` (rejects bad JSON / non-object / unknown
+    key / read-only edit / NOT-NULL→null; untouched or omitted fields are no-ops via normalized-text
+    compare). Type-correctness stays the DB's job. Pure + unit-tested.
   - `plan.rs` — `QueryPlan::from_result` parses an `EXPLAIN` result into a table + heuristic
     warnings (full scan / filesort / temp table); `to_prompt_text` for the AI.
   - `text_ops.rs` — Ctrl+/ `toggle_line_comment` + `find_matches`/`replace_all`/
@@ -367,13 +373,19 @@ for keyboard nav.
 - **Menu dismissal**: grid cells consume the pointer-down (drag-select), so the root handler never
   fires inside the grid; cell/header/gutter click handlers call `gs.dismiss` (closes both
   `ui.popup_menu` and `ui.context_menu`, guarded).
-- **Value viewer**: no toolbar toggle — opened from the cell `View` item (or double-click / Enter),
-  closed by ✕ or Esc. A read-only, word-wrapped, auto-growing `edit_field` (`multiline` + `read_only`)
-  that follows the active cell via an effect → `text_sig`. Grows to a cap then scrolls; the cap is a
-  reactive `FieldCfg.max_rows` from the results-panel height (`(panel − 172) / 19` rows) while the
-  grid keeps `min_height(120)`. `edit_field` has `max_rows` + a `viewport`-tracking effect that
-  recomputes wrapped line count on layout (`.update` only fires on edits, so programmatic multiline
-  text would measure at zero width → one line). Wrapping needs a bounded width (`.width_full()`).
+- **Row view/edit panel** (`edit_row_panel`, replaced the old single-cell value viewer): the cell
+  `View` item opens an **integrated in-flow bottom strip** (not a popup — `border_top` + panel bg, like
+  the old viewer; the grid above shrinks) showing the **whole row as JSON** via `core::rowjson`. Header
+  = `Row {gutter#} · {table}` + a Save (✓) icon (shown only when the result has ≥1 editable column;
+  otherwise it's a read-only row viewer) then Close (✕). The editable `edit_field` (`multiline`, NOT
+  read-only, autofocus, `max_rows` ≈ 80% of the panel then scrolls) is bound to `gs.edit_row_buf`; an
+  inline red line shows the validation/DB error. **Save commits immediately** (its own path, not the
+  staged `dirty` batch): `parse_row_edit` → `build_row_edits` (one `RowEdit` per base table, WHERE key
+  from the *original* row) + a single-row `build_row_refetch` → the existing `CommitFn`; on success the
+  row splices in place and the panel closes, on failure the message stays inline. Read-only fields
+  (PK/expression/`binary`) are shown for context but edits to them are rejected. State on `GridState`:
+  `edit_row_open` / `edit_row_di` / `edit_row_buf` / `edit_row_err` / `edit_row_saving`. Real rows only
+  (a pending new row is filled via inline cells); Esc closes it (after the find bar).
 - **Inline edit writes back to the DB.** Per-column *provenance*: `schemaic-db` runs on
   **`mysql_async`** (sqlx's MySQL driver discards `org_table`/`org_name`/key flags), so each `Column`
   carries `origin: Option<ColumnOrigin>` — real `database`/`table`/`column` + `ColumnFlags`
