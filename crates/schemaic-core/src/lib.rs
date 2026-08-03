@@ -20,6 +20,7 @@ pub mod palette;
 pub mod persist;
 pub mod plan;
 pub mod resource;
+pub mod rowjson;
 pub mod schema;
 pub mod search_history;
 pub mod seed;
