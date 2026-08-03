@@ -505,10 +505,7 @@ mod tests {
     #[test]
     fn cli_failure_prefers_stderr_then_stdout_then_status() {
         // stderr wins when present.
-        assert_eq!(
-            cli_failure_message(Some(1), "out", "boom"),
-            "boom"
-        );
+        assert_eq!(cli_failure_message(Some(1), "out", "boom"), "boom");
         // The real-world case: auth error on stdout, empty stderr → show stdout.
         assert_eq!(
             cli_failure_message(

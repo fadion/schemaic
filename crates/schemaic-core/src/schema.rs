@@ -118,10 +118,19 @@ impl TableInfo {
         let non_pk = self.indexes.iter().filter(|ix| !ix.is_primary());
         if pg {
             // Postgres: indexes are separate statements after the table.
-            let mut out = format!("CREATE TABLE {} (\n{}\n);", q(&self.name), lines.join(",\n"));
+            let mut out = format!(
+                "CREATE TABLE {} (\n{}\n);",
+                q(&self.name),
+                lines.join(",\n")
+            );
             for ix in non_pk {
                 let uniq = if ix.unique { "UNIQUE " } else { "" };
-                let cols = ix.columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+                let cols = ix
+                    .columns
+                    .iter()
+                    .map(|c| q(c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 out.push_str(&format!(
                     "\nCREATE {uniq}INDEX {} ON {} ({cols});",
                     q(&ix.name),
@@ -133,10 +142,19 @@ impl TableInfo {
             // MySQL: inline KEY / UNIQUE KEY.
             for ix in non_pk {
                 let kw = if ix.unique { "UNIQUE KEY" } else { "KEY" };
-                let cols = ix.columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+                let cols = ix
+                    .columns
+                    .iter()
+                    .map(|c| q(c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 lines.push(format!("  {kw} {} ({cols})", q(&ix.name)));
             }
-            format!("CREATE TABLE {} (\n{}\n);", q(&self.name), lines.join(",\n"))
+            format!(
+                "CREATE TABLE {} (\n{}\n);",
+                q(&self.name),
+                lines.join(",\n")
+            )
         }
     }
 
@@ -490,7 +508,10 @@ mod tests {
             is_view: true,
             view_definition: Some("SELECT 1".to_string()),
         };
-        assert_eq!(t.create_ddl(crate::intel::SqlDialect::MySql), "CREATE OR REPLACE VIEW `v` AS\nSELECT 1;");
+        assert_eq!(
+            t.create_ddl(crate::intel::SqlDialect::MySql),
+            "CREATE OR REPLACE VIEW `v` AS\nSELECT 1;"
+        );
     }
 
     #[test]
@@ -618,9 +639,13 @@ mod tests {
         use crate::intel::SqlDialect;
         // Composite FK, backtick-y identifiers, a string value (escaped) and a NULL.
         let f = fk(&["a", "b"], None, "t`x", &["r`1", "r2"]);
-        let ft =
-            follow_target(&f, &[Value::Str("O'Hara".into()), Value::Null], "db", SqlDialect::MySql)
-                .unwrap();
+        let ft = follow_target(
+            &f,
+            &[Value::Str("O'Hara".into()), Value::Null],
+            "db",
+            SqlDialect::MySql,
+        )
+        .unwrap();
         assert_eq!(ft.table, "t`x");
         assert_eq!(
             ft.sql,
@@ -635,11 +660,19 @@ mod tests {
         // *current* database (default_schema); table is unqualified + double-quoted,
         // string escaped, NULL → IS NULL.
         let f = fk(&["cc"], Some("public"), "country", &["code"]);
-        let ft =
-            follow_target(&f, &[Value::Str("O'Hara".into())], "world", SqlDialect::Postgres).unwrap();
+        let ft = follow_target(
+            &f,
+            &[Value::Str("O'Hara".into())],
+            "world",
+            SqlDialect::Postgres,
+        )
+        .unwrap();
         assert_eq!(ft.database, "world"); // current DB, NOT the 'public' schema
         assert_eq!(ft.table, "country");
-        assert_eq!(ft.sql, "SELECT * FROM \"country\" WHERE \"code\" = 'O''Hara'");
+        assert_eq!(
+            ft.sql,
+            "SELECT * FROM \"country\" WHERE \"code\" = 'O''Hara'"
+        );
     }
 
     #[test]

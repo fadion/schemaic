@@ -18,8 +18,8 @@ use floem::text::{Attrs, AttrsList, FamilyOwned};
 use floem::views::editor::EditorStyle;
 use floem::views::editor::core::buffer::rope_text::RopeText;
 use floem::views::editor::id::EditorId;
-use schemaic_core::intel::SqlDialect;
 use floem::views::editor::text::{Document, Styling};
+use schemaic_core::intel::SqlDialect;
 
 #[derive(Clone, Copy)]
 enum Tok {

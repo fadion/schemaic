@@ -1434,7 +1434,13 @@ mod tests {
 
     #[test]
     fn db_from_parts_roundtrips() {
-        let db = Db::from_parts(Engine::Postgres, "h".into(), 3307, "user".into(), "pass".into());
+        let db = Db::from_parts(
+            Engine::Postgres,
+            "h".into(),
+            3307,
+            "user".into(),
+            "pass".into(),
+        );
         assert_eq!(db.parts(), ("h", 3307, "user", "pass"));
         assert_eq!(db.engine(), Engine::Postgres);
     }

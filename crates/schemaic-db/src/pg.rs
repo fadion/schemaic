@@ -731,7 +731,10 @@ fn build_insert(ins: &RowInsert) -> String {
         .map(|(_, v)| pg_opt_lit(v))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("INSERT INTO {} ({cols}) VALUES ({vals})", pg_ident(&ins.table))
+    format!(
+        "INSERT INTO {} ({cols}) VALUES ({vals})",
+        pg_ident(&ins.table)
+    )
 }
 
 /// `DELETE FROM "t" WHERE <key>`.
@@ -950,7 +953,10 @@ mod tests {
         assert_eq!(pg_type_name_str("numeric"), "NUMERIC");
         // The wire-type path routes through the string mapper → identical output.
         assert_eq!(pg_type_name(&Type::VARCHAR), pg_type_name_str("varchar"));
-        assert_eq!(pg_type_name(&Type::TIMESTAMP), pg_type_name_str("timestamp"));
+        assert_eq!(
+            pg_type_name(&Type::TIMESTAMP),
+            pg_type_name_str("timestamp")
+        );
     }
 
     #[test]
@@ -992,7 +998,10 @@ mod tests {
         assert_eq!(pg_str_lit("abc"), "'abc'");
         assert_eq!(pg_str_lit("O'Brien"), "'O''Brien'");
         // A classic injection attempt is neutralised by doubling the quote.
-        assert_eq!(pg_str_lit("x'; DROP TABLE t; --"), "'x''; DROP TABLE t; --'");
+        assert_eq!(
+            pg_str_lit("x'; DROP TABLE t; --"),
+            "'x''; DROP TABLE t; --'"
+        );
     }
 
     #[test]
@@ -1026,10 +1035,7 @@ mod tests {
         let ins = RowInsert {
             database: "world".into(),
             table: "country".into(),
-            cols: vec![
-                ("code".into(), Some("AAA".into())),
-                ("name".into(), None),
-            ],
+            cols: vec![("code".into(), Some("AAA".into())), ("name".into(), None)],
         };
         assert_eq!(
             build_insert(&ins),
