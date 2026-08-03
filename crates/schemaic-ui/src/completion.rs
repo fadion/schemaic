@@ -429,7 +429,7 @@ pub(crate) fn recompute_completions(
     // never fights manual typing.
     if prefix.is_empty() && matches!(ctx, ClauseCtx::Column) {
         let catalog = build_catalog(db_nodes, active_db);
-        if let Some(pred) = intel::join_condition(&text, lo, hi, offset, &catalog) {
+        if let Some(pred) = intel::join_condition(&text, lo, hi, offset, &catalog, dialect) {
             let mut cpoint = ed.points_of_offset(offset, CursorAffinity::Backward).1;
             cpoint.y += EDITOR_PAD_TOP;
             comp.point.set(cpoint);
