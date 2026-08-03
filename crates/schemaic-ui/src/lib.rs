@@ -69,6 +69,7 @@ use schemaic_core::connection::{ConnStatus, Connection, SshAuth};
 use schemaic_core::db_color::DbColorRule;
 use schemaic_core::format::ColumnFormatRule;
 use schemaic_core::history::HistoryEntry;
+use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{CommitDone, GridWrite, QueryState, RefetchRequest};
 use schemaic_core::resource::ResourceSample;
 
@@ -2020,6 +2021,23 @@ fn center(ui: Ui) -> impl IntoView {
             None => false,
         }
     });
+    // The active tab's SQL dialect (MySQL/PostgreSQL), from its connection's
+    // `db_type` — drives completion + diagnostics parsing. Same derivation shape as
+    // `read_only`.
+    let dialect = create_memo(move |_| {
+        let id = active.get();
+        let cid = tabs.with(|v| v.iter().find(|t| t.id == id).map(|t| t.conn_id.get()));
+        match cid {
+            Some(cid) => connections
+                .with(|cs| {
+                    cs.iter()
+                        .find(|c| c.id == cid)
+                        .map(|c| SqlDialect::from_db_type(&c.db_type))
+                })
+                .unwrap_or_default(),
+            None => SqlDialect::default(),
+        }
+    });
     let confirm_writes = ui.layout.confirm_writes;
     let live_validate = ui.layout.live_validate;
     let validate_stmt = ui.tab_actions.validate_stmt.clone();
@@ -2160,6 +2178,7 @@ fn center(ui: Ui) -> impl IntoView {
                     editor_h,
                     editor_collapsed,
                     active_db,
+                    dialect,
                     active_db_menu_open,
                     active_db_anchor,
                     read_only,
@@ -3698,10 +3717,19 @@ fn footer(ui: Ui) -> impl IntoView {
         let tab = tabs.with(|v| {
             v.iter()
                 .find(|t| t.id == id)
-                .map(|t| (t.query.get(), t.database.get()))
+                .map(|t| (t.query.get(), t.database.get(), t.conn_id.get()))
         });
         match tab {
-            Some((q, adb)) => editor_pane::compute_diagnostics(&q, db_nodes, adb.as_deref()).len(),
+            Some((q, adb, cid)) => {
+                let dialect = connections
+                    .with(|cs| {
+                        cs.iter()
+                            .find(|c| c.id == cid)
+                            .map(|c| SqlDialect::from_db_type(&c.db_type))
+                    })
+                    .unwrap_or_default();
+                editor_pane::compute_diagnostics(&q, db_nodes, adb.as_deref(), dialect).len()
+            }
             None => 0,
         }
     });
@@ -3891,8 +3919,16 @@ fn footer(ui: Ui) -> impl IntoView {
             if let Some(t) = v.iter().find(|t| t.id == id) {
                 let q = t.query.get_untracked();
                 let adb = t.database.get_untracked();
+                let cid = t.conn_id.get_untracked();
+                let dialect = connections
+                    .with_untracked(|cs| {
+                        cs.iter()
+                            .find(|c| c.id == cid)
+                            .map(|c| SqlDialect::from_db_type(&c.db_type))
+                    })
+                    .unwrap_or_default();
                 if let Some(d) =
-                    editor_pane::compute_diagnostics(&q, db_nodes, adb.as_deref()).first()
+                    editor_pane::compute_diagnostics(&q, db_nodes, adb.as_deref(), dialect).first()
                 {
                     t.jump_offset.set(Some(d.range.0));
                 }

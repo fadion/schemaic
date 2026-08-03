@@ -22,6 +22,49 @@ use crate::widgets::{
 };
 use crate::{DraftSignals, FieldCfg, Ui, edit_field, icons, theme};
 
+/// The engine choice in the connection form's **Type** picker. Backs a
+/// [`settings_dropdown`]; the selection is persisted into `Connection::db_type`
+/// (as the label string) and drives the DB layer's engine + the editor's SQL
+/// dialect via `schemaic_db::Engine::from_db_type` / `SqlDialect::from_db_type`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DbKind {
+    MySql,
+    Postgres,
+}
+
+impl DbKind {
+    const ALL: [DbKind; 2] = [DbKind::MySql, DbKind::Postgres];
+
+    fn label(self) -> &'static str {
+        match self {
+            DbKind::MySql => "MySQL",
+            DbKind::Postgres => "PostgreSQL",
+        }
+    }
+
+    /// The default TCP port for this engine (offered when switching engines).
+    fn default_port(self) -> u16 {
+        match self {
+            DbKind::MySql => 3306,
+            DbKind::Postgres => 5432,
+        }
+    }
+
+    /// Map a persisted `db_type` label back to a picker value (anything not
+    /// recognizably Postgres is MySQL — the historical default).
+    fn from_db_type(s: &str) -> DbKind {
+        let t = s.trim();
+        if t.eq_ignore_ascii_case("postgresql")
+            || t.eq_ignore_ascii_case("postgres")
+            || t.eq_ignore_ascii_case("pg")
+        {
+            DbKind::Postgres
+        } else {
+            DbKind::MySql
+        }
+    }
+}
+
 // Fixed width for credential inputs (user/password + SSH user/password/passphrase)
 // — narrower than the full-width host/name fields, since credentials are short.
 const CONN_FIELD_W: f64 = 200.0;
@@ -467,31 +510,30 @@ fn conn_form(
         draft.read_only,
     );
 
-    // Type: a dropdown-styled box (single "MySQL" value for now) — matches the
-    // settings dropdowns' closed-box look (dark field + chevron).
+    // Type: engine picker (MySQL / PostgreSQL). The selection drives `draft.db_type`;
+    // switching engine also swaps in that engine's default port — but only when the
+    // port is still the *other* engine's default (or empty), so a port the user typed
+    // is never clobbered. `create_effect`'s `prev` is `None` on the first (load) run,
+    // so opening an existing connection never rewrites its saved port.
+    let engine = RwSignal::new(DbKind::from_db_type(&draft.db_type.get_untracked()));
+    create_effect(move |prev: Option<DbKind>| {
+        let k = engine.get();
+        draft.db_type.set(k.label().to_string());
+        if let Some(prev) = prev
+            && prev != k
+        {
+            let cur = draft.port.get_untracked();
+            let c = cur.trim();
+            if c.is_empty() || c == prev.default_port().to_string() {
+                draft.port.set(k.default_port().to_string());
+            }
+        }
+        k
+    });
     let type_field = v_stack((
         text("Type").style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL)),
-        container(
-            h_stack((
-                label(move || draft.db_type.get())
-                    .style(|s| s.color(theme::text()).font_size(theme::FONT_BODY)),
-                empty().style(|s| s.flex_grow(1.0_f32)),
-                icons::icon(icons::CHEVRON_DOWN, 16.0)
-                    .style(|s| s.color(theme::text_dim()).flex_shrink(0.0_f32)),
-            ))
-            .style(|s| s.items_center().width_full().gap(8.0)),
-        )
-        .style(|s| {
-            // 150px wide (not full width), matching the settings dropdowns' look.
-            s.width(150.0)
-                .height(32.0)
-                .items_center()
-                .padding_horiz(10.0)
-                .background(theme::bg_editor())
-                .border(1.0)
-                .border_color(theme::field_border())
-                .border_radius(6.0)
-        }),
+        // 150px wide (not full width), matching the settings dropdowns' look.
+        container(settings_dropdown(engine, DbKind::ALL, DbKind::label)).style(|s| s.width(150.0)),
     ))
     .style(|s| s.flex_col().gap(6.0).width_full());
 

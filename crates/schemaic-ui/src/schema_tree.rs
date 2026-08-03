@@ -18,6 +18,7 @@ use floem::prelude::*;
 use floem::reactive::{Memo, create_effect};
 
 use schemaic_core::db_color::DbColorRule;
+use schemaic_core::intel::SqlDialect;
 use schemaic_core::schema::{
     ColumnInfo, ColumnTypeClass, IndexInfo, SchemaState, TableInfo, classify_column_type,
 };
@@ -178,6 +179,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     let active_table = ui.schema.active_table;
     let active_db = ui.tabs_ui.active_db;
     let active_conn = ui.conn.active_conn;
+    let connections = ui.conn.connections;
     let db_colors = ui.db_colors;
     let hidden_dbs = ui.schema.hidden_dbs;
     let db_menu_open = ui.schema.db_menu_open;
@@ -254,6 +256,15 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
         },
         |c: &ConnNode| c.id,
         move |c| {
+            // The active connection's dialect (drives engine-correct DDL). Rebuilt
+            // with the tree on a connection switch (db_nodes changes).
+            let dialect = connections
+                .with_untracked(|cs| {
+                    cs.iter()
+                        .find(|k| k.id == active_conn.get_untracked())
+                        .map(|k| SqlDialect::from_db_type(&k.db_type))
+                })
+                .unwrap_or_default();
             db_node(
                 c,
                 SchemaTreeCtx {
@@ -267,6 +278,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                     context_menu,
                     active_conn,
                     db_colors,
+                    dialect,
                     nav,
                 },
             )
@@ -512,6 +524,9 @@ struct SchemaTreeCtx {
     /// dot on database rows. (Schema-tree nodes all belong to the active connection.)
     active_conn: RwSignal<u64>,
     db_colors: RwSignal<Vec<DbColorRule>>,
+    /// The active connection's SQL dialect — for engine-correct `create_ddl`
+    /// (Copy/Generate DDL). All tree nodes belong to the active connection.
+    dialect: SqlDialect,
     nav: Nav,
 }
 
@@ -527,6 +542,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
         context_menu,
         active_conn,
         db_colors,
+        dialect,
         nav,
     } = ctx;
     let key = format!("db:{}", conn.database);
@@ -677,6 +693,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                                 context_menu,
                                 active_conn,
                                 db_colors,
+                                dialect,
                                 nav,
                             },
                         )
@@ -703,6 +720,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
         open_table_col,
         active_table,
         context_menu,
+        dialect,
         nav,
         ..
     } = ctx;
@@ -728,7 +746,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
     let key = format!("tbl:{}:{}", database, table.name);
     let col_count = table.columns.len();
     let key_count = table.indexes.len();
-    let ddl = table.create_ddl();
+    let ddl = table.create_ddl(dialect);
     // Views get a distinct glyph + tint; base tables keep the green table icon.
     let (glyph, glyph_color) = if table.is_view {
         (icons::TABLE_CELLS_MERGE, theme::view_icon())

@@ -105,6 +105,11 @@ fn is_blank(v: &str) -> bool {
 }
 
 fn analyze(columns: &[String], rows: &[Vec<String>]) -> Vec<PlanWarning> {
+    // Postgres `EXPLAIN` returns a single "QUERY PLAN" text column (one node/detail
+    // line per row) rather than MySQL's named columns — scan the text for smells.
+    if columns.len() == 1 && columns[0].eq_ignore_ascii_case("QUERY PLAN") {
+        return analyze_pg(rows);
+    }
     let type_i = col_idx(columns, "type");
     let table_i = col_idx(columns, "table");
     let key_i = col_idx(columns, "key");
@@ -160,6 +165,47 @@ fn analyze(columns: &[String], rows: &[Vec<String>]) -> Vec<PlanWarning> {
                     "Temporary table for {} (Extra: Using temporary)",
                     label(row)
                 ),
+            });
+        }
+    }
+    out
+}
+
+/// Heuristics for a Postgres text plan: each row is one plan line. Flags
+/// sequential scans (no usable index) and on-the-fly sort nodes. Detail lines
+/// (`Sort Key:`, `Filter:`, …) are skipped so only the plan *nodes* warn.
+fn analyze_pg(rows: &[Vec<String>]) -> Vec<PlanWarning> {
+    let mut out = Vec::new();
+    for (r, row) in rows.iter().enumerate() {
+        let line = row.first().map(|s| s.trim()).unwrap_or("");
+        // Strip the tree marker so a child node ("->  Seq Scan …") matches too.
+        let node = line.trim_start_matches("->").trim();
+        let lower = node.to_ascii_lowercase();
+        if lower.starts_with("seq scan") {
+            // Table name follows "on ".
+            let tbl = node
+                .split(" on ")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .unwrap_or("");
+            let label = if tbl.is_empty() {
+                "a table".to_string()
+            } else {
+                format!("`{tbl}`")
+            };
+            out.push(PlanWarning {
+                row: r,
+                kind: PlanWarningKind::FullScan,
+                message: format!("Sequential scan on {label} (no index used)"),
+            });
+        } else if lower.starts_with("sort")
+            && !lower.starts_with("sort key")
+            && !lower.starts_with("sort method")
+        {
+            out.push(PlanWarning {
+                row: r,
+                kind: PlanWarningKind::Filesort,
+                message: "Sort node — the query sorts rows on the fly".to_string(),
             });
         }
     }
@@ -278,6 +324,41 @@ mod tests {
         let plan = QueryPlan::from_result(&rs);
         assert!(plan.warnings.is_empty());
         assert_eq!(plan.columns, vec!["EXPLAIN".to_string()]);
+    }
+
+    #[test]
+    fn postgres_text_plan_flags_seq_scan_and_sort() {
+        // A Postgres `EXPLAIN` plan: single "QUERY PLAN" column, one line per row.
+        let rs = rs(
+            &["QUERY PLAN"],
+            &[
+                &["Sort  (cost=1.2..1.3 rows=239 width=52)"],
+                &["  Sort Key: population DESC"],
+                &["  ->  Seq Scan on country  (cost=0.00..7.39 rows=239 width=52)"],
+            ],
+        );
+        let plan = QueryPlan::from_result(&rs);
+        let kinds: Vec<_> = plan.warnings.iter().map(|w| w.kind).collect();
+        assert!(kinds.contains(&PlanWarningKind::FullScan));
+        assert!(kinds.contains(&PlanWarningKind::Filesort));
+        // "Sort Key:" is a detail line, not a node → must NOT double-flag.
+        assert_eq!(plan.warnings.len(), 2);
+        // The Seq Scan warning names the table.
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.message.contains("`country`"))
+        );
+    }
+
+    #[test]
+    fn postgres_clean_index_plan_has_no_warnings() {
+        let rs = rs(
+            &["QUERY PLAN"],
+            &[&["Index Scan using country_pkey on country  (cost=0.15..8.17 rows=1 width=52)"]],
+        );
+        let plan = QueryPlan::from_result(&rs);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
     }
 
     #[test]

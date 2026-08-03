@@ -1025,8 +1025,18 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                         } else {
                             "\t".to_string()
                         };
-                        let out =
-                            schemaic_core::sqlfmt::format_sql(&t.query.get_untracked(), &unit);
+                        let dialect = connections
+                            .with_untracked(|cs| {
+                                cs.iter().find(|c| c.id == t.conn_id.get_untracked()).map(|c| {
+                                    schemaic_core::intel::SqlDialect::from_db_type(&c.db_type)
+                                })
+                            })
+                            .unwrap_or_default();
+                        let out = schemaic_core::sqlfmt::format_sql(
+                            &t.query.get_untracked(),
+                            &unit,
+                            dialect,
+                        );
                         t.query.set(out);
                     }
                 }),
@@ -1041,7 +1051,14 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                 Rc::new(move || {
                     if let Some(t) = active_tab() {
                         let q = t.query.get_untracked();
-                        let stmts: Vec<String> = schemaic_core::sql::statement_ranges(&q)
+                        let dialect = connections
+                            .with_untracked(|cs| {
+                                cs.iter().find(|c| c.id == t.conn_id.get_untracked()).map(|c| {
+                                    schemaic_core::intel::SqlDialect::from_db_type(&c.db_type)
+                                })
+                            })
+                            .unwrap_or_default();
+                        let stmts: Vec<String> = schemaic_core::sql::statement_ranges(&q, dialect)
                             .into_iter()
                             .map(|(lo, hi)| q[lo..hi].to_string())
                             .filter(|s| !s.trim().is_empty())

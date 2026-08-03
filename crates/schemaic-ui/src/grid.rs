@@ -26,6 +26,7 @@ use floem::views::{VirtualDirection, VirtualItemSize, VirtualVector};
 use schemaic_core::connection::Connection;
 use schemaic_core::edit::{EditModel, analyze_edit, refetch_template};
 use schemaic_core::format::{self, ColumnFormat, ColumnFormatRule};
+use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
     CellRef, CellTag, CommitDone, GridWrite, QueryState, RefetchRequest, RefetchRow, ResultSet,
     RowDelete, RowEdit, RowInsert, Value,
@@ -315,6 +316,9 @@ struct GridState {
     formats: RwSignal<Vec<ColumnFormat>>,
     /// This tab's connection id (keys formatter rules with `source`).
     conn_id: RwSignal<u64>,
+    /// This tab's SQL dialect (from its connection's engine) — used to build
+    /// engine-correct SQL for grid actions like Follow-FK.
+    dialect: SqlDialect,
     /// App-wide formatter-rule store (upserted + persisted on a menu choice).
     fmt_rules: RwSignal<Vec<ColumnFormatRule>>,
     /// Persist the formatter rules (wrapped so `GridState` stays `Copy`).
@@ -362,6 +366,11 @@ impl GridState {
         // no saved rule) start raw.
         let conn = gctx.conn_id.get_untracked();
         let src = gctx.source.get_untracked();
+        // This tab's SQL dialect, from its connection's engine (drives Follow-FK SQL).
+        let dialect = gctx
+            .connections
+            .with_untracked(|cs| cs.iter().find(|c| c.id == conn).map(|c| SqlDialect::from_db_type(&c.db_type)))
+            .unwrap_or_default();
         let formats: Vec<ColumnFormat> = (0..rs.col_count())
             .map(|ci| {
                 let (name, ty) = rs
@@ -410,6 +419,7 @@ impl GridState {
             sync_canonical: RwSignal::new(gctx.sync_canonical.clone()),
             formats: RwSignal::new(formats),
             conn_id: gctx.conn_id,
+            dialect,
             fmt_rules: gctx.formats,
             save_formats: RwSignal::new(Some(gctx.save_formats.clone())),
             // Shared with the find bar (rendered up at the RESULTS-panel level).
@@ -450,6 +460,21 @@ impl GridState {
             }
         });
         // A fresh edit clears a stale commit error.
+        if self.commit_err.get_untracked().is_some() {
+            self.commit_err.set(None);
+        }
+    }
+
+    /// Stage an **explicit** value into a real cell, always recording it as an edit
+    /// even when it equals the original. Used by AI Fill Value: an AI fill is an
+    /// explicit "set this value" action, so the result is always visible (green) —
+    /// otherwise, when the model returns a value equal to the current one (common
+    /// when editing an already-coherent row), nothing would appear to happen.
+    /// Manual inline edits use [`stage`], which clears when typed back to original.
+    fn stage_set(&self, di: usize, ci: usize, val: Option<String>) {
+        self.dirty.update(|d| {
+            d.insert((di, ci), val);
+        });
         if self.commit_err.get_untracked().is_some() {
             self.commit_err.set(None);
         }
@@ -1387,7 +1412,8 @@ fn follow_relation(gs: GridState, data_idx: usize, spec: &FollowSpec) {
                 .unwrap_or(Value::Null)
         })
         .collect();
-    if let Some(ft) = schemaic_core::schema::follow_target(&spec.fk, &values, &spec.default_schema)
+    if let Some(ft) =
+        schemaic_core::schema::follow_target(&spec.fk, &values, &spec.default_schema, gs.dialect)
         && let Some(cb) = gs.follow_fk.get_untracked()
     {
         (cb)(ft.database, ft.table, ft.sql);
@@ -2295,7 +2321,9 @@ fn stage_fill(gs: GridState, disp: usize, ci: usize, pending: Option<usize>, val
         Some(p) => gs.stage_new(p, ci, val),
         None => {
             let di = gs.order.get_untracked().get(disp).copied().unwrap_or(disp);
-            gs.stage(di, ci, val);
+            // Force the edit (even if it equals the current value) so an AI fill is
+            // always visibly staged — see `stage_set`.
+            gs.stage_set(di, ci, val);
         }
     }
 }

@@ -75,59 +75,69 @@ pub struct TableInfo {
 impl TableInfo {
     /// A `CREATE TABLE`/`CREATE VIEW` skeleton from the introspected schema. Not
     /// a round-trip of the server's DDL (no FK references, engine, charset, or
-    /// column defaults — foreign keys appear as plain `KEY` indexes since we
-    /// don't introspect their references), but a valid, useful skeleton.
-    /// Identifiers are backtick-escaped.
-    pub fn create_ddl(&self) -> String {
+    /// column defaults), but a valid, useful skeleton in the connection's dialect:
+    /// MySQL backtick-quotes and inlines `KEY`/`UNIQUE KEY`; PostgreSQL
+    /// double-quotes and emits non-PK indexes as separate `CREATE INDEX`
+    /// statements (its `CREATE TABLE` can't inline them).
+    pub fn create_ddl(&self, dialect: crate::intel::SqlDialect) -> String {
+        let pg = dialect == crate::intel::SqlDialect::Postgres;
+        let q = |s: &str| -> String {
+            if pg {
+                format!("\"{}\"", s.replace('"', "\"\""))
+            } else {
+                ddl_ident(s)
+            }
+        };
         if self.is_view {
             return match &self.view_definition {
                 Some(def) => {
-                    format!(
-                        "CREATE OR REPLACE VIEW {} AS\n{};",
-                        ddl_ident(&self.name),
-                        def
-                    )
+                    format!("CREATE OR REPLACE VIEW {} AS\n{};", q(&self.name), def)
                 }
                 // View flagged but its definition wasn't readable (e.g. privileges).
                 None => format!(
                     "-- View definition for {} was not available.\nCREATE OR REPLACE VIEW {} AS\nSELECT ...;",
-                    ddl_ident(&self.name),
-                    ddl_ident(&self.name)
+                    q(&self.name),
+                    q(&self.name)
                 ),
             };
         }
         let mut lines: Vec<String> = Vec::new();
         for c in &self.columns {
             let null = if c.nullable { "" } else { " NOT NULL" };
-            lines.push(format!("  {} {}{}", ddl_ident(&c.name), c.type_name, null));
+            lines.push(format!("  {} {}{}", q(&c.name), c.type_name, null));
         }
         let pk: Vec<String> = self
             .columns
             .iter()
             .filter(|c| c.primary_key)
-            .map(|c| ddl_ident(&c.name))
+            .map(|c| q(&c.name))
             .collect();
         if !pk.is_empty() {
             lines.push(format!("  PRIMARY KEY ({})", pk.join(", ")));
         }
-        for ix in &self.indexes {
-            if ix.is_primary() {
-                continue;
+        let non_pk = self.indexes.iter().filter(|ix| !ix.is_primary());
+        if pg {
+            // Postgres: indexes are separate statements after the table.
+            let mut out = format!("CREATE TABLE {} (\n{}\n);", q(&self.name), lines.join(",\n"));
+            for ix in non_pk {
+                let uniq = if ix.unique { "UNIQUE " } else { "" };
+                let cols = ix.columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+                out.push_str(&format!(
+                    "\nCREATE {uniq}INDEX {} ON {} ({cols});",
+                    q(&ix.name),
+                    q(&self.name)
+                ));
             }
-            let kw = if ix.unique { "UNIQUE KEY" } else { "KEY" };
-            let cols = ix
-                .columns
-                .iter()
-                .map(|c| ddl_ident(c))
-                .collect::<Vec<_>>()
-                .join(", ");
-            lines.push(format!("  {kw} {} ({cols})", ddl_ident(&ix.name)));
+            out
+        } else {
+            // MySQL: inline KEY / UNIQUE KEY.
+            for ix in non_pk {
+                let kw = if ix.unique { "UNIQUE KEY" } else { "KEY" };
+                let cols = ix.columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+                lines.push(format!("  {kw} {} ({cols})", q(&ix.name)));
+            }
+            format!("CREATE TABLE {} (\n{}\n);", q(&self.name), lines.join(",\n"))
         }
-        format!(
-            "CREATE TABLE {} (\n{}\n);",
-            ddl_ident(&self.name),
-            lines.join(",\n")
-        )
     }
 
     /// Does any of this table's column names contain `needle_lower`
@@ -175,40 +185,76 @@ pub struct FollowTarget {
 /// (a same-database reference). Returns `None` if `values` doesn't cover every
 /// key column (can't build a safe, unambiguous `WHERE`).
 ///
-/// Identifiers are backtick-escaped and values rendered as SQL literals via the
-/// shared [`crate::export`] helpers, so the query is safe to run verbatim.
+/// Dialect-aware: on **MySQL** the query qualifies `` `db`.`table` `` (using the
+/// FK's `ref_schema` for a cross-database reference) and backtick-escapes idents.
+/// On **PostgreSQL** the referenced table lives in the *same* database (a FK can't
+/// cross databases; `ref_schema` there is a namespace like `public`), so the
+/// target database is `default_schema` and the table is unqualified + double-quoted
+/// (resolved via `search_path`, matching the write path). Values are rendered as
+/// safe SQL literals so the query runs verbatim.
 pub fn follow_target(
     fk: &ForeignKeyInfo,
     values: &[Value],
     default_schema: &str,
+    dialect: crate::intel::SqlDialect,
 ) -> Option<FollowTarget> {
     if fk.ref_columns.is_empty() || values.len() != fk.ref_columns.len() {
         return None;
     }
-    let database = fk
-        .ref_schema
-        .clone()
-        .unwrap_or_else(|| default_schema.to_string());
+    let postgres = dialect == crate::intel::SqlDialect::Postgres;
+    // Postgres: the reference is same-database; open the current DB, not the schema.
+    let database = if postgres {
+        default_schema.to_string()
+    } else {
+        fk.ref_schema
+            .clone()
+            .unwrap_or_else(|| default_schema.to_string())
+    };
     let table = fk.ref_table.clone();
+    let quote = |s: &str| {
+        if postgres {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            crate::export::ident_sql(s)
+        }
+    };
+    let literal = |v: &Value| -> String {
+        if postgres {
+            match v {
+                Value::Null => "NULL".to_string(),
+                Value::Int(i) => i.to_string(),
+                Value::UInt(u) => u.to_string(),
+                Value::Float(f) => f.to_string(),
+                Value::Str(s) => format!("'{}'", s.replace('\'', "''")),
+            }
+        } else {
+            crate::export::sql_literal(v)
+        }
+    };
     let where_sql = fk
         .ref_columns
         .iter()
         .zip(values)
         .map(|(col, v)| {
-            let ident = crate::export::ident_sql(col);
+            let ident = quote(col);
             if v.is_null() {
                 format!("{ident} IS NULL")
             } else {
-                format!("{ident} = {}", crate::export::sql_literal(v))
+                format!("{ident} = {}", literal(v))
             }
         })
         .collect::<Vec<_>>()
         .join(" AND ");
-    let sql = format!(
-        "SELECT * FROM {}.{} WHERE {where_sql}",
-        crate::export::ident_sql(&database),
-        crate::export::ident_sql(&table),
-    );
+    let sql = if postgres {
+        // Connected to `database` directly → unqualified table.
+        format!("SELECT * FROM {} WHERE {where_sql}", quote(&table))
+    } else {
+        format!(
+            "SELECT * FROM {}.{} WHERE {where_sql}",
+            crate::export::ident_sql(&database),
+            crate::export::ident_sql(&table),
+        )
+    };
     Some(FollowTarget {
         database,
         table,
@@ -387,7 +433,7 @@ mod tests {
             is_view: false,
             view_definition: None,
         };
-        let ddl = t.create_ddl();
+        let ddl = t.create_ddl(crate::intel::SqlDialect::MySql);
         assert!(ddl.starts_with("CREATE TABLE `users` ("));
         assert!(ddl.contains("`id` int NOT NULL"));
         assert!(ddl.contains("`email` varchar(255)\n") || ddl.contains("`email` varchar(255),"));
@@ -395,6 +441,43 @@ mod tests {
         assert!(ddl.contains("UNIQUE KEY `email_uq` (`email`)"));
         // The PRIMARY index is emitted via PRIMARY KEY(...), not repeated as KEY.
         assert!(!ddl.contains("KEY `PRIMARY`"));
+    }
+
+    #[test]
+    fn create_ddl_postgres_double_quotes_and_separate_indexes() {
+        let t = TableInfo {
+            name: "users".to_string(),
+            columns: vec![
+                col("id", "integer", false, true),
+                col("email", "text", false, false),
+            ],
+            indexes: vec![
+                IndexInfo {
+                    name: "PRIMARY".to_string(),
+                    columns: vec!["id".to_string()],
+                    unique: true,
+                    foreign: false,
+                },
+                IndexInfo {
+                    name: "email_uq".to_string(),
+                    columns: vec!["email".to_string()],
+                    unique: true,
+                    foreign: false,
+                },
+            ],
+            foreign_keys: Vec::new(),
+            is_view: false,
+            view_definition: None,
+        };
+        let ddl = t.create_ddl(crate::intel::SqlDialect::Postgres);
+        assert!(ddl.starts_with("CREATE TABLE \"users\" ("), "{ddl}");
+        assert!(ddl.contains("\"id\" integer NOT NULL"));
+        assert!(ddl.contains("PRIMARY KEY (\"id\")"));
+        // Non-PK index is a separate CREATE INDEX (not an inline KEY), double-quoted.
+        assert!(ddl.contains("CREATE UNIQUE INDEX \"email_uq\" ON \"users\" (\"email\");"));
+        // No MySQL-isms.
+        assert!(!ddl.contains('`'));
+        assert!(!ddl.contains("KEY `"));
     }
 
     #[test]
@@ -407,7 +490,7 @@ mod tests {
             is_view: true,
             view_definition: Some("SELECT 1".to_string()),
         };
-        assert_eq!(t.create_ddl(), "CREATE OR REPLACE VIEW `v` AS\nSELECT 1;");
+        assert_eq!(t.create_ddl(crate::intel::SqlDialect::MySql), "CREATE OR REPLACE VIEW `v` AS\nSELECT 1;");
     }
 
     #[test]
@@ -420,7 +503,7 @@ mod tests {
             is_view: false,
             view_definition: None,
         };
-        let ddl = t.create_ddl();
+        let ddl = t.create_ddl(crate::intel::SqlDialect::MySql);
         assert!(ddl.contains("CREATE TABLE `we``ird`"));
         assert!(ddl.contains("`a``b` int"));
     }
@@ -435,7 +518,7 @@ mod tests {
             is_view: true,
             view_definition: None,
         };
-        let ddl = t.create_ddl();
+        let ddl = t.create_ddl(crate::intel::SqlDialect::MySql);
         assert!(ddl.contains("-- View definition for `v` was not available."));
         assert!(ddl.contains("CREATE OR REPLACE VIEW `v` AS\nSELECT ...;"));
     }
@@ -510,8 +593,9 @@ mod tests {
 
     #[test]
     fn follow_target_single_column_uses_default_schema() {
+        use crate::intel::SqlDialect;
         let f = fk(&["customer_id"], None, "customers", &["id"]);
-        let ft = follow_target(&f, &[Value::Int(42)], "shop").unwrap();
+        let ft = follow_target(&f, &[Value::Int(42)], "shop", SqlDialect::MySql).unwrap();
         assert_eq!(ft.database, "shop"); // ref_schema None → default
         assert_eq!(ft.table, "customers");
         assert_eq!(ft.sql, "SELECT * FROM `shop`.`customers` WHERE `id` = 42");
@@ -519,8 +603,9 @@ mod tests {
 
     #[test]
     fn follow_target_honors_explicit_ref_schema() {
+        use crate::intel::SqlDialect;
         let f = fk(&["c"], Some("other_db"), "customers", &["id"]);
-        let ft = follow_target(&f, &[Value::UInt(7)], "shop").unwrap();
+        let ft = follow_target(&f, &[Value::UInt(7)], "shop", SqlDialect::MySql).unwrap();
         assert_eq!(ft.database, "other_db");
         assert_eq!(
             ft.sql,
@@ -530,9 +615,12 @@ mod tests {
 
     #[test]
     fn follow_target_escapes_idents_and_values_and_handles_null_composite() {
+        use crate::intel::SqlDialect;
         // Composite FK, backtick-y identifiers, a string value (escaped) and a NULL.
         let f = fk(&["a", "b"], None, "t`x", &["r`1", "r2"]);
-        let ft = follow_target(&f, &[Value::Str("O'Hara".into()), Value::Null], "db").unwrap();
+        let ft =
+            follow_target(&f, &[Value::Str("O'Hara".into()), Value::Null], "db", SqlDialect::MySql)
+                .unwrap();
         assert_eq!(ft.table, "t`x");
         assert_eq!(
             ft.sql,
@@ -541,12 +629,27 @@ mod tests {
     }
 
     #[test]
+    fn follow_target_postgres_same_db_unqualified_double_quoted() {
+        use crate::intel::SqlDialect;
+        // Postgres: ref_schema is a namespace ('public'), but the target opens the
+        // *current* database (default_schema); table is unqualified + double-quoted,
+        // string escaped, NULL → IS NULL.
+        let f = fk(&["cc"], Some("public"), "country", &["code"]);
+        let ft =
+            follow_target(&f, &[Value::Str("O'Hara".into())], "world", SqlDialect::Postgres).unwrap();
+        assert_eq!(ft.database, "world"); // current DB, NOT the 'public' schema
+        assert_eq!(ft.table, "country");
+        assert_eq!(ft.sql, "SELECT * FROM \"country\" WHERE \"code\" = 'O''Hara'");
+    }
+
+    #[test]
     fn follow_target_rejects_wrong_arity() {
+        use crate::intel::SqlDialect;
         // Fewer values than key columns → can't build a safe WHERE.
         let f = fk(&["a", "b"], None, "t", &["x", "y"]);
-        assert!(follow_target(&f, &[Value::Int(1)], "db").is_none());
+        assert!(follow_target(&f, &[Value::Int(1)], "db", SqlDialect::MySql).is_none());
         // A FK with no columns.
         let empty = fk(&[], None, "t", &[]);
-        assert!(follow_target(&empty, &[], "db").is_none());
+        assert!(follow_target(&empty, &[], "db", SqlDialect::MySql).is_none());
     }
 }

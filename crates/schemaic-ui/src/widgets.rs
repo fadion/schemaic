@@ -469,8 +469,15 @@ pub(crate) fn autohide_state() -> (RwSignal<bool>, Rc<dyn Fn()>) {
     let shown = RwSignal::new(false);
     let generation: RwSignal<u64> = RwSignal::new(0);
     let poke: Rc<dyn Fn()> = Rc::new(move || {
+        // A scroll can fire *after* this scope was disposed — e.g. Floem defers a
+        // `scroll_to` clamp and the pane rebuilt meanwhile (adding a grid row). The
+        // signals are gone by then, so bail instead of unwrapping a disposed
+        // `RwSignal` (`get_untracked` panics on `None`; `try_*` no-ops).
+        let Some(cur) = generation.try_get_untracked() else {
+            return;
+        };
         shown.set(true);
-        let g = generation.get_untracked().wrapping_add(1);
+        let g = cur.wrapping_add(1);
         generation.set(g);
         floem::action::exec_after(
             std::time::Duration::from_millis(SCROLL_HIDE_MS),

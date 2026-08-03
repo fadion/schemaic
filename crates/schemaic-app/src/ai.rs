@@ -93,7 +93,12 @@ fn endpoint_from_value(v: &serde_json::Value) -> (Db, Option<String>) {
         .get("database")
         .and_then(|x| x.as_str())
         .map(|s| s.to_string());
-    (Db::from_parts(host, port, user, pass), database)
+    // Engine tag (default MySQL for back-compat with older endpoint blobs) so the
+    // MCP subprocess talks the right driver to the DB.
+    let engine = schemaic_db::Engine::from_db_type(
+        v.get("engine").and_then(|x| x.as_str()).unwrap_or("mysql"),
+    );
+    (Db::from_parts(engine, host, port, user, pass), database)
 }
 
 /// Serialize a DB endpoint (host/port/user/pass + default database) as the JSON
@@ -101,7 +106,8 @@ fn endpoint_from_value(v: &serde_json::Value) -> (Db, Option<String>) {
 fn endpoint_json(db: &Db, database: Option<&str>) -> String {
     let (host, port, user, pass) = db.parts();
     serde_json::json!({
-        "host": host, "port": port, "user": user, "pass": pass, "database": database
+        "host": host, "port": port, "user": user, "pass": pass,
+        "database": database, "engine": db.engine().as_str()
     })
     .to_string()
 }
@@ -229,7 +235,10 @@ pub(crate) fn start_ai_session(
             .current_dir(std::env::temp_dir())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // Capture stderr (was discarded): a failing `claude` — e.g. an expired
+            // OAuth session — writes its reason here or to stdout, and we need it to
+            // surface a real error instead of an empty response.
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
         {
@@ -251,6 +260,25 @@ pub(crate) fn start_ai_session(
         let mut reader = BufReader::new(child.stdout.take().expect("stdout piped")).lines();
         let mut turn = schemaic_ai::TurnState::default();
 
+        // Drain stderr concurrently into a shared buffer so it's available if the
+        // session dies (reading it only on exit could deadlock a full pipe).
+        let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        if let Some(se) = child.stderr.take() {
+            let buf = stderr_buf.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(se).lines();
+                while let Ok(Some(l)) = lines.next_line().await {
+                    if let Ok(mut b) = buf.lock() {
+                        b.push_str(&l);
+                        b.push('\n');
+                    }
+                }
+            });
+        }
+        // Plain-text stdout lines that aren't stream-json (e.g. a fatal error the
+        // CLI prints before exiting) — kept as a fallback diagnostic.
+        let mut raw_output: Vec<String> = Vec::new();
+
         loop {
             tokio::select! {
                 maybe = rx.recv() => match maybe {
@@ -264,9 +292,18 @@ pub(crate) fn start_ai_session(
                 },
                 line = reader.next_line() => match line {
                     Ok(Some(l)) => {
+                        let events = schemaic_ai::parse_stream_line(&l);
+                        // A non-blank line that yields no events AND isn't valid JSON
+                        // is a plain-text diagnostic (e.g. the auth error) — keep it.
+                        if events.is_empty()
+                            && !l.trim().is_empty()
+                            && serde_json::from_str::<serde_json::Value>(l.trim()).is_err()
+                        {
+                            raw_output.push(l.trim().to_string());
+                        }
                         let mut changed = false;
                         let mut done: Option<(bool, schemaic_core::transcript::TurnStats)> = None;
-                        for ev in schemaic_ai::parse_stream_line(&l) {
+                        for ev in events {
                             match ev {
                                 schemaic_ai::StreamEvent::TurnDone { is_error, stats } => {
                                     done = Some((is_error, stats))
@@ -285,6 +322,7 @@ pub(crate) fn start_ai_session(
                                 stats: (!stats.is_empty()).then_some(stats),
                             });
                             turn = schemaic_ai::TurnState::default();
+                            raw_output.clear(); // a clean turn boundary — drop stale diagnostics
                         } else if changed {
                             let _ = ai_tx.send(AiStreamMsg {
                                 segs: turn.segments(),
@@ -294,7 +332,28 @@ pub(crate) fn start_ai_session(
                             });
                         }
                     }
-                    _ => break,
+                    // stdout closed → `claude` exited on its own (crash / auth failure
+                    // / etc.), not a normal turn end. Surface WHY instead of returning
+                    // an empty response: prefer stderr, then the plain-text stdout it
+                    // printed, then the exit status.
+                    _ => {
+                        let code = child.wait().await.ok().and_then(|s| s.code());
+                        let stderr_text = stderr_buf.lock().map(|b| b.clone()).unwrap_or_default();
+                        let raw = raw_output.join("\n");
+                        if code != Some(0) || !stderr_text.trim().is_empty() || !raw.trim().is_empty()
+                        {
+                            let why = schemaic_ai::cli_failure_message(code, &raw, &stderr_text);
+                            let _ = ai_tx.send(AiStreamMsg {
+                                segs: vec![schemaic_core::transcript::Seg::Text(format!(
+                                    "The AI session ended unexpectedly: {why}"
+                                ))],
+                                done: true,
+                                is_error: true,
+                                stats: None,
+                            });
+                        }
+                        break;
+                    }
                 },
             }
         }
@@ -542,7 +601,8 @@ mod tests {
 
     #[test]
     fn endpoint_json_serializes_parts_and_database() {
-        let db = Db::from_parts("h".into(), 3307, "u".into(), "p".into());
+        let db =
+            Db::from_parts(schemaic_db::Engine::Postgres, "h".into(), 3307, "u".into(), "p".into());
         let out = endpoint_json(&db, Some("shop"));
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["host"], "h");
@@ -550,6 +610,7 @@ mod tests {
         assert_eq!(v["user"], "u");
         assert_eq!(v["pass"], "p");
         assert_eq!(v["database"], "shop");
+        assert_eq!(v["engine"], "postgres"); // engine tag serialized
         // No default database → JSON null.
         let out = endpoint_json(&db, None);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -558,21 +619,29 @@ mod tests {
 
     #[test]
     fn endpoint_json_roundtrips_through_value_parser() {
-        // endpoint_json → endpoint_from_value reconstructs the same endpoint,
-        // with no environment access (so no `unsafe` set_var needed).
-        let db = Db::from_parts("host".into(), 3306, "user".into(), "pw".into());
+        // endpoint_json → endpoint_from_value reconstructs the same endpoint
+        // (incl. engine), with no environment access.
+        let db = Db::from_parts(
+            schemaic_db::Engine::Postgres,
+            "host".into(),
+            3306,
+            "user".into(),
+            "pw".into(),
+        );
         let json = endpoint_json(&db, Some("db1"));
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let (parsed, database) = endpoint_from_value(&v);
         assert_eq!(parsed.parts(), ("host", 3306, "user", "pw"));
+        assert_eq!(parsed.engine(), schemaic_db::Engine::Postgres);
         assert_eq!(database.as_deref(), Some("db1"));
     }
 
     #[test]
     fn endpoint_from_value_fills_defaults() {
-        // Empty/Null object → local defaults, no database.
+        // Empty/Null object → local defaults, no database, MySQL engine.
         let (db, database) = endpoint_from_value(&serde_json::Value::Null);
         assert_eq!(db.parts(), ("127.0.0.1", 3306, "", ""));
+        assert_eq!(db.engine(), schemaic_db::Engine::MySql);
         assert!(database.is_none());
         // Partial object → only the missing keys default.
         let v = serde_json::json!({ "host": "h", "user": "u" });

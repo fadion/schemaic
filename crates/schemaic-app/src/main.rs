@@ -65,6 +65,7 @@ type BlinkTick = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 type RecordHistoryFn = Rc<dyn Fn(u64, Option<String>, String, Option<String>)>;
 use schemaic_core::persist::{self, ConnectionsFile, UiState};
 use schemaic_core::schema::SchemaState;
+use schemaic_core::intel::SqlDialect;
 use schemaic_db::{Db, DbError};
 use schemaic_ui::theme::{EditorThemeKind, UiThemeKind};
 use schemaic_ui::{
@@ -258,10 +259,20 @@ fn sample_rows(rs: &schemaic_core::model::ResultSet) -> Vec<schemaic_core::seed:
 /// Look up a base table in the loaded schema, returning its `CREATE TABLE`
 /// skeleton (prompt structure) + its primary-key column names (to order the
 /// bottom-sample). Empty/`([], "")` when the schema hasn't been introspected yet.
+/// Map a resolved `Db`'s engine to the SQL dialect (for dialect-aware DDL).
+fn dialect_of(db: &Db) -> SqlDialect {
+    if db.engine() == schemaic_db::Engine::Postgres {
+        SqlDialect::Postgres
+    } else {
+        SqlDialect::MySql
+    }
+}
+
 fn table_ddl_and_pk(
     db_nodes: RwSignal<Vec<ConnNode>>,
     database: &str,
     table: &str,
+    dialect: SqlDialect,
 ) -> (String, Vec<String>) {
     db_nodes
         .with_untracked(|nodes| {
@@ -275,7 +286,7 @@ fn table_ddl_and_pk(
                                 .filter(|c| c.primary_key)
                                 .map(|c| c.name.clone())
                                 .collect();
-                            (t.create_ddl(), pk)
+                            (t.create_ddl(dialect), pk)
                         })
                     }
                     _ => None,
@@ -288,7 +299,26 @@ fn table_ddl_and_pk(
 /// The bottom-sample query for AI seed data: most-recent rows by primary key
 /// (`ORDER BY <pk> DESC`) so enums/sequences/FK values are representative. Falls
 /// back to an unordered `LIMIT` when the PK is unknown (schema not loaded).
-fn sample_sql(database: &str, table: &str, pk_cols: &[String]) -> String {
+///
+/// Dialect-aware: MySQL qualifies `` `db`.`table` `` (server-level connection);
+/// Postgres connects to `database` directly, so it uses the unqualified,
+/// double-quoted table name (resolved via `search_path`, like the write path).
+fn sample_sql(
+    engine: schemaic_db::Engine,
+    database: &str,
+    table: &str,
+    pk_cols: &[String],
+) -> String {
+    if engine == schemaic_db::Engine::Postgres {
+        let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        let order = if pk_cols.is_empty() {
+            String::new()
+        } else {
+            let cols = pk_cols.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+            format!(" ORDER BY {cols} DESC")
+        };
+        return format!("SELECT * FROM {}{order} LIMIT 20", q(table));
+    }
     let order = if pk_cols.is_empty() {
         String::new()
     } else {
@@ -2250,7 +2280,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 };
                 // DDL skeleton + PK columns from the loaded schema (empty if
                 // introspection hasn't run — the sample still carries conventions).
-                let (ddl, pk_cols) = table_ddl_and_pk(db_nodes, &req.database, &req.table);
+                let (ddl, pk_cols) = table_ddl_and_pk(db_nodes, &req.database, &req.table, dialect_of(&db));
                 let bin = claude_bin(&ai_cli_path.get_untracked());
                 let model = ai_model.get_untracked().cli().to_string();
                 let finish = create_ext_action(cx, move |res: AiFillResult| (done)(res));
@@ -2264,7 +2294,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 handle.spawn(async move {
                     let token = CancellationToken::new();
                     // Bottom-sample the base table for enum/format/FK inference.
-                    let sql = sample_sql(&database, &table, &pk_cols);
+                    let sql = sample_sql(db.engine(), &database, &table, &pk_cols);
                     let sample = match db.fetch_query(Some(&database), &sql, 20, token).await {
                         Ok(rs) => sample_rows(&rs),
                         Err(_) => Vec::new(), // empty/unsampleable → DDL-only prompt
@@ -2280,6 +2310,9 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                                   no markdown, no prose.";
                     let out = Command::new(bin)
                         .args(schemaic_ai::inline_args(&prompt, system, &model))
+                        // Close stdin so `claude -p` doesn't stall ~3s waiting for
+                        // piped input ("no stdin data received") before responding.
+                        .stdin(std::process::Stdio::null())
                         .kill_on_drop(true)
                         .output()
                         .await;
@@ -2296,9 +2329,11 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                                 }
                             }
                         }
-                        Ok(o) => AiFillResult::Failed(
-                            String::from_utf8_lossy(&o.stderr).trim().to_string(),
-                        ),
+                        Ok(o) => AiFillResult::Failed(schemaic_ai::cli_failure_message(
+                            o.status.code(),
+                            &String::from_utf8_lossy(&o.stdout),
+                            &String::from_utf8_lossy(&o.stderr),
+                        )),
                         Err(e) => AiFillResult::Failed(e.to_string()),
                     };
                     finish(res);
@@ -2323,7 +2358,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         return;
                     }
                 };
-                let (ddl, pk_cols) = table_ddl_and_pk(db_nodes, &req.database, &req.table);
+                let (ddl, pk_cols) = table_ddl_and_pk(db_nodes, &req.database, &req.table, dialect_of(&db));
                 let bin = claude_bin(&ai_cli_path.get_untracked());
                 let model = ai_model.get_untracked().cli().to_string();
                 let finish = create_ext_action(cx, move |res: AiSeedResult| (done)(res));
@@ -2336,7 +2371,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 } = req;
                 handle.spawn(async move {
                     let token = CancellationToken::new();
-                    let sql = sample_sql(&database, &table, &pk_cols);
+                    let sql = sample_sql(db.engine(), &database, &table, &pk_cols);
                     let sample = match db.fetch_query(Some(&database), &sql, 20, token).await {
                         Ok(rs) => sample_rows(&rs),
                         Err(_) => Vec::new(), // empty/unsampleable → DDL-only prompt
@@ -2352,6 +2387,9 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                                   markdown, no prose.";
                     let out = Command::new(bin)
                         .args(schemaic_ai::inline_args(&prompt, system, &model))
+                        // Close stdin so `claude -p` doesn't stall ~3s waiting for
+                        // piped input ("no stdin data received") before responding.
+                        .stdin(std::process::Stdio::null())
                         .kill_on_drop(true)
                         .output()
                         .await;
@@ -2363,9 +2401,11 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                                 Err(e) => AiSeedResult::Failed(e.to_string()),
                             }
                         }
-                        Ok(o) => AiSeedResult::Failed(
-                            String::from_utf8_lossy(&o.stderr).trim().to_string(),
-                        ),
+                        Ok(o) => AiSeedResult::Failed(schemaic_ai::cli_failure_message(
+                            o.status.code(),
+                            &String::from_utf8_lossy(&o.stdout),
+                            &String::from_utf8_lossy(&o.stderr),
+                        )),
                         Err(e) => AiSeedResult::Failed(e.to_string()),
                     };
                     finish(res);

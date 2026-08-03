@@ -18,6 +18,7 @@ use floem::text::{Attrs, AttrsList, FamilyOwned};
 use floem::views::editor::EditorStyle;
 use floem::views::editor::core::buffer::rope_text::RopeText;
 use floem::views::editor::id::EditorId;
+use schemaic_core::intel::SqlDialect;
 use floem::views::editor::text::{Document, Styling};
 
 #[derive(Clone, Copy)]
@@ -47,12 +48,17 @@ impl Tok {
 pub struct SqlStyling {
     doc: Rc<dyn Document>,
     family: Vec<FamilyOwned>,
+    /// The connection's SQL dialect — so `#`-operators / `$tag$` bodies aren't
+    /// coloured as comments on a PostgreSQL connection. Fixed at construction
+    /// (the editor is rebuilt when the tab's connection changes).
+    dialect: SqlDialect,
 }
 
 impl SqlStyling {
-    pub fn new(doc: Rc<dyn Document>) -> Self {
+    pub fn new(doc: Rc<dyn Document>, dialect: SqlDialect) -> Self {
         Self {
             doc,
+            dialect,
             // Explicit IBM Plex Mono (the bundled face) rather than the generic
             // `Monospace` — keeps the editor and the Ctrl+K diff on the exact
             // same family, not just both relying on the generic override.
@@ -95,7 +101,7 @@ impl Styling for SqlStyling {
             return;
         }
         let content = rope.line_content(line);
-        for (start, end, tok) in lex_line(&content) {
+        for (start, end, tok) in lex_line(&content, self.dialect) {
             attrs.add_span(start..end, default.color(tok.color()));
         }
     }
@@ -105,8 +111,8 @@ impl Styling for SqlStyling {
 /// callers outside the editor — e.g. the Ctrl+K diff, which renders each line as
 /// colored segments rather than through the editor's `Styling` hook. Same lexer
 /// as the editor, so highlighting matches exactly.
-pub fn highlight_spans(line: &str) -> Vec<(usize, usize, Color)> {
-    lex_line(line)
+pub fn highlight_spans(line: &str, dialect: SqlDialect) -> Vec<(usize, usize, Color)> {
+    lex_line(line, dialect)
         .into_iter()
         .map(|(s, e, tok)| (s, e, tok.color()))
         .collect()
@@ -121,7 +127,7 @@ pub fn highlight_spans(line: &str) -> Vec<(usize, usize, Color)> {
 /// end. Backtick identifiers keep the default color; comments and strings get
 /// their theme color. (Lexing is per-line, so a multi-line `/* … */` only colors
 /// the portion on each line — an unterminated construct runs to line end.)
-fn lex_line(line: &str) -> Vec<(usize, usize, Tok)> {
+fn lex_line(line: &str, dialect: SqlDialect) -> Vec<(usize, usize, Tok)> {
     let b = line.as_bytes();
     let n = b.len();
     let mut out = Vec::new();
@@ -130,8 +136,8 @@ fn lex_line(line: &str) -> Vec<(usize, usize, Tok)> {
     while i < n {
         let c = b[i];
 
-        // A string, backtick identifier, or comment: color by which one it is.
-        if let Some(end) = schemaic_core::sql::skip_noncode(b, i) {
+        // A string, identifier, dollar-quote, or comment: color by which one it is.
+        if let Some(end) = schemaic_core::sql::skip_noncode(b, i, dialect) {
             let end = end.min(n);
             match c {
                 b'`' => {} // quoted identifier: default color

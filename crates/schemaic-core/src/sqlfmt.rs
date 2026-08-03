@@ -13,12 +13,15 @@
 //! and clause keywords *inside* a function/expression paren stay inline. This is
 //! a deliberate first pass — solid and predictable, meant to be tuned later.
 
+use crate::intel::SqlDialect;
 use crate::sql::skip_noncode;
 
 /// Format `sql`, indenting each level with `indent_unit` (e.g. `"    "` or
 /// `"\t"`). Token text is preserved verbatim; only whitespace/layout changes.
-pub fn format_sql(sql: &str, indent_unit: &str) -> String {
-    let toks = tokenize(sql);
+/// `dialect` selects the boundary rules (comments/quotes/dollar-quotes) so
+/// PostgreSQL `#`-operators and `$tag$` bodies aren't mistaken for comments.
+pub fn format_sql(sql: &str, indent_unit: &str, dialect: SqlDialect) -> String {
+    let toks = tokenize(sql, dialect);
     let mut f = Fmt::new(indent_unit);
     f.run(&toks);
     f.out.trim_end().to_string()
@@ -44,7 +47,7 @@ const OPS: &[&str] = &[
     "->>", "<=>", "->", ">=", "<=", "<>", "!=", ":=", "||", "&&", "<<", ">>",
 ];
 
-fn tokenize(sql: &str) -> Vec<(Kind, &str)> {
+fn tokenize(sql: &str, dialect: SqlDialect) -> Vec<(Kind, &str)> {
     let b = sql.as_bytes();
     let n = b.len();
     let mut toks = Vec::new();
@@ -55,10 +58,10 @@ fn tokenize(sql: &str) -> Vec<(Kind, &str)> {
             i += 1;
             continue;
         }
-        // Strings / backtick identifiers / comments — one verbatim slice, keyed
-        // by the opening byte (`skip_noncode` only returns `Some` for a `--`/`/*`
-        // here when it really is a comment).
-        if let Some(j) = skip_noncode(b, i) {
+        // Strings / identifiers / dollar-quotes / comments — one verbatim slice,
+        // keyed by the opening byte (`skip_noncode` only returns `Some` for a
+        // `--`/`/*`/`#` here when it really is a comment in this dialect).
+        if let Some(j) = skip_noncode(b, i, dialect) {
             let kind = match c {
                 b'#' | b'-' => Kind::LineComment,
                 b'/' => Kind::BlockComment,
@@ -493,6 +496,12 @@ impl<'a> Fmt<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // These tests predate the dialect parameter and assert MySQL formatting; a thin
+    // MySQL-defaulting wrapper (shadowing the glob import) keeps them unchanged.
+    fn format_sql(sql: &str, indent_unit: &str) -> String {
+        super::format_sql(sql, indent_unit, SqlDialect::MySql)
+    }
 
     const IND: &str = "  ";
 

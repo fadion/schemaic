@@ -86,7 +86,7 @@ pub(crate) fn editor_placeholder(
 /// document; indentation follows the editor's tab-width / soft-tabs settings and
 /// keyword case is preserved. Applied as one `edit_single` (a single undo step);
 /// a no-op when the text is already formatted.
-fn format_editor(ed: &Editor) {
+fn format_editor(ed: &Editor, dialect: SqlDialect) {
     let doc = ed.doc();
     let full = doc.text().to_string();
     let (a, b) = ed.cursor.get_untracked().get_selection().unwrap_or((0, 0));
@@ -101,7 +101,7 @@ fn format_editor(ed: &Editor) {
     } else {
         "\t".to_string()
     };
-    let formatted = schemaic_core::sqlfmt::format_sql(&full[start..end], &unit);
+    let formatted = schemaic_core::sqlfmt::format_sql(&full[start..end], &unit, dialect);
     if formatted == full[start..end] {
         return;
     }
@@ -134,6 +134,7 @@ fn reject_button_style(s: floem::style::Style) -> floem::style::Style {
         .hover(|s| s.background(theme::reject_bg().multiply_alpha(0.85)))
 }
 
+#[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
 fn cmdk_popup(
     cmdk: CmdK,
     inline_ai: RwSignal<InlineAiState>,
@@ -145,6 +146,7 @@ fn cmdk_popup(
     // it exactly with an explicit `height` — needed because animating requires a
     // definite height (can't interpolate to `inset(0)`'s auto height).
     area_h: RwSignal<f64>,
+    dialect: SqlDialect,
 ) -> impl IntoView {
     // The editor's own view id, so closing the overlay can hand focus back to
     // the editor (else focus is left dangling after the input is torn down).
@@ -359,7 +361,7 @@ fn cmdk_popup(
                         // horizontal scroll. Buttons below always stay visible.
                         container(
                             container(
-                                autohide(shift_hscroll(diff_view(rows)))
+                                autohide(shift_hscroll(diff_view(rows, dialect)))
                                     .style(|s| s.height(CMDK_DIFF_H).width_full().min_width(0.0)),
                             )
                             .style(|s| s.width_full().border_radius(5.0))
@@ -549,9 +551,10 @@ pub(crate) fn compute_diagnostics(
     sql: &str,
     db_nodes: RwSignal<Vec<ConnNode>>,
     active_db: Option<&str>,
+    dialect: SqlDialect,
 ) -> Vec<Diagnostic> {
     let catalog = crate::completion::build_catalog(db_nodes, active_db);
-    intel::diagnostics(sql, &catalog, SqlDialect::MySql)
+    intel::diagnostics(sql, &catalog, dialect)
 }
 
 /// An inline SVG wavy line `width` px wide and [`WAVE_H`] tall — a smooth sine
@@ -685,6 +688,9 @@ pub(crate) struct QueryPaneParams {
     /// the whole region; `editor_h` stays the restore height. See `LayoutUi`.
     pub editor_collapsed: RwSignal<bool>,
     pub active_db: Memo<Option<String>>,
+    /// The SQL dialect of the active tab's connection (MySQL/PostgreSQL), driving
+    /// completion + diagnostics parsing. Reactive — follows the tab's `conn_id`.
+    pub dialect: Memo<SqlDialect>,
     pub active_db_menu_open: RwSignal<bool>,
     pub active_db_anchor: RwSignal<Point>,
     pub read_only: Memo<bool>,
@@ -722,6 +728,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         editor_h,
         editor_collapsed,
         active_db,
+        dialect,
         active_db_menu_open,
         active_db_anchor,
         read_only,
@@ -807,7 +814,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         if run_menu.get().is_some() {
             if run_sel.get() == 0 {
                 let sql = query.get_untracked();
-                let (lo, hi) = statement_range(&sql, run_menu_offset.get_untracked());
+                let (lo, hi) = statement_range(&sql, run_menu_offset.get_untracked(), dialect.get_untracked());
                 highlight_pick(&sql, lo, hi, highlight);
             } else {
                 highlight.set(None);
@@ -823,6 +830,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         &query.get_untracked(),
         db_nodes,
         active_db.get_untracked().as_deref(),
+        dialect.get_untracked(),
     ));
     // Tier-2 (DB-validated) diagnostics for the statement under the cursor, when
     // `live_validate` is on. Debounced: each edit bumps `val_gen`, and only the
@@ -847,14 +855,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         let run = run.clone();
         Rc::new(move |sql: String| {
             // Read-only connection: hard-block any write/DDL (no "Run anyway").
-            if read_only.get_untracked() && contains_write(&sql) {
+            if read_only.get_untracked() && contains_write(&sql, dialect.get_untracked()) {
                 guard.set(Some(Guard {
                     message: "Read-only connection.".to_string(),
                     pending: None,
                 }));
                 return;
             }
-            match first_unsafe(&sql) {
+            match first_unsafe(&sql, dialect.get_untracked()) {
                 Some(message) => guard.set(Some(Guard {
                     message,
                     pending: Some(Pending::Single(sql)),
@@ -862,7 +870,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // "Confirm before running writes": any write/DDL gets a soft
                 // confirm bar (with "Run anyway"), unless it was already flagged
                 // above as an unsafe missing-WHERE statement.
-                None if confirm_writes.get_untracked() && contains_write(&sql) => {
+                None if confirm_writes.get_untracked() && contains_write(&sql, dialect.get_untracked()) => {
                     guard.set(Some(Guard {
                         message: "This statement modifies data.".to_string(),
                         pending: Some(Pending::Single(sql)),
@@ -875,20 +883,20 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let guarded_run_all: Rc<dyn Fn(Vec<String>)> = {
         let run_all = run_all.clone();
         Rc::new(move |stmts: Vec<String>| {
-            if read_only.get_untracked() && stmts.iter().any(|s| contains_write(s)) {
+            if read_only.get_untracked() && stmts.iter().any(|s| contains_write(s, dialect.get_untracked())) {
                 guard.set(Some(Guard {
                     message: "Read-only connection.".to_string(),
                     pending: None,
                 }));
                 return;
             }
-            match stmts.iter().find_map(|s| unsafe_reason(s)) {
+            match stmts.iter().find_map(|s| unsafe_reason(s, dialect.get_untracked())) {
                 Some(message) => guard.set(Some(Guard {
                     message,
                     pending: Some(Pending::Batch(stmts)),
                 })),
                 None if confirm_writes.get_untracked()
-                    && stmts.iter().any(|s| contains_write(s)) =>
+                    && stmts.iter().any(|s| contains_write(s, dialect.get_untracked())) =>
                 {
                     guard.set(Some(Guard {
                         message: "These statements modify data.".to_string(),
@@ -1103,7 +1111,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             if space {
                 let adb = active_db.get_untracked();
                 editor_sig.with_untracked(|e| {
-                    recompute_completions(e, db_nodes, comp, adb.as_deref(), true)
+                    recompute_completions(e, db_nodes, comp, adb.as_deref(), dialect.get_untracked(), true)
                 });
                 return CommandExecuted::Yes;
             }
@@ -1151,7 +1159,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 kp.key,
                 KeyInput::Keyboard(_, PhysicalKey::Code(KeyCode::KeyL))
             ) {
-                editor_sig.with_untracked(format_editor);
+                editor_sig.with_untracked(|e| format_editor(e, dialect.get_untracked()));
                 return CommandExecuted::Yes;
             }
         }
@@ -1310,7 +1318,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let sql = query.get_untracked();
             editor_sig.with_untracked(|e| {
                 let offset = e.cursor.get_untracked().offset();
-                let (lo, hi) = statement_range(&sql, offset);
+                let (lo, hi) = statement_range(&sql, offset, dialect.get_untracked());
                 // Multiple statements → highlight the one under the caret and open
                 // the Run Current / Run Everything menu at the caret. A lone
                 // statement just runs (no menu, no highlight).
@@ -1428,7 +1436,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     (icons::SPARKLES, theme::key_foreign),
                     move || {
                         let sql = query.get_untracked();
-                        let (lo, hi) = statement_range(&sql, menu_offset.get_untracked());
+                        let (lo, hi) = statement_range(&sql, menu_offset.get_untracked(), dialect.get_untracked());
                         if let Some(stmt) = sql.get(lo..hi).filter(|s| !s.is_empty()) {
                             // Reveal the AI panel only if it isn't already showing — a
                             // redundant `set(Ai)` disposes the live panel mid-update.
@@ -1445,7 +1453,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     (icons::SPARKLES, theme::key_foreign),
                     move || {
                         let sql = query.get_untracked();
-                        let (lo, hi) = statement_range(&sql, menu_offset.get_untracked());
+                        let (lo, hi) = statement_range(&sql, menu_offset.get_untracked(), dialect.get_untracked());
                         if let Some(stmt) = sql.get(lo..hi).filter(|s| !s.is_empty()) {
                             let stmt = stmt.to_string();
                             cmdk.start.set(lo);
@@ -1468,13 +1476,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 MenuEntry::Separator,
                 MenuEntry::action("Plan", move || {
                     let sql = query.get_untracked();
-                    let (lo, hi) = statement_range(&sql, menu_offset.get_untracked());
+                    let (lo, hi) = statement_range(&sql, menu_offset.get_untracked(), dialect.get_untracked());
                     if let Some(stmt) = sql.get(lo..hi).filter(|s| !s.trim().is_empty()) {
                         (show_plan)(stmt.to_string());
                         highlight_pick(&sql, lo, hi, highlight);
                     }
                 }),
-                MenuEntry::action("Format", move || format_editor(&ed_format)),
+                MenuEntry::action("Format", move || {
+                    format_editor(&ed_format, dialect.get_untracked())
+                }),
             ]
         })
     };
@@ -1565,7 +1575,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             ed_caret.cursor.track();
             query.track(); // also on text edits that don't move the caret (forward-delete)
             if editor_focused.get_untracked() {
-                update_signature_help(&ed_caret, comp);
+                update_signature_help(&ed_caret, comp, dialect.get_untracked());
             }
         });
     }
@@ -1585,7 +1595,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     }
     let doc = editor.doc();
     let input = editor
-        .styling(sql_highlight::SqlStyling::new(doc))
+        .styling(sql_highlight::SqlStyling::new(doc, dialect.get_untracked()))
         // `smart_tab` makes Tab insert spaces to the next tab stop; without it
         // Tab inserts a literal '\t' while OutdentLine assumes space indentation,
         // so Shift+Tab removes ALL indentation instead of one level.
@@ -1663,7 +1673,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         return;
                     }
                     let adb = active_db.get_untracked();
-                    recompute_completions(&ed, db_nodes, comp, adb.as_deref(), false);
+                    recompute_completions(&ed, db_nodes, comp, adb.as_deref(), dialect.get_untracked(), false);
                 });
             }
             // Re-run catalog-aware diagnostics (drives the squiggles), debounced so
@@ -1682,6 +1692,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         &text,
                         db_nodes,
                         active_db.get_untracked().as_deref(),
+                        dialect.get_untracked(),
                     ));
                 });
             }
@@ -1697,6 +1708,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 let ed2 = ed.clone();
                 let validate = validate_stmt.clone();
                 let vgen = val_gen.clone();
+                // Snapshot the dialect now (plain value) — reading the memo inside the
+                // deferred closure could touch a disposed scope if the tab closed.
+                let dia = dialect.get_untracked();
                 floem::action::exec_after(std::time::Duration::from_millis(500), move |_| {
                     if vgen.get() != g {
                         return;
@@ -1705,8 +1719,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         Some(c) => c.offset(),
                         None => return, // pane disposed
                     };
-                    let (lo, hi) = statement_range(&text2, caret);
-                    if lo >= hi || !intel::parses(&text2[lo..hi], SqlDialect::MySql) {
+                    let (lo, hi) = statement_range(&text2, caret, dialect.get_untracked());
+                    if lo >= hi || !intel::parses(&text2[lo..hi], dia) {
                         return;
                     }
                     let vgen2 = vgen.clone();
@@ -2035,6 +2049,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         query,
         ed_cmdk,
         area_h,
+        dialect.get_untracked(),
     );
     // AI Fix: open the Ctrl+K overlay pre-filled with the error and auto-submit
     // a whole-query fix. Goes straight to Busy (skips the compact prompt); the
@@ -2251,7 +2266,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let refocus = refocus.clone();
                     Rc::new(move || {
                         let sql = query.get_untracked();
-                        let (lo, hi) = statement_range(&sql, run_menu_offset.get_untracked());
+                        let (lo, hi) = statement_range(&sql, run_menu_offset.get_untracked(), dialect.get_untracked());
                         if let Some(stmt) = sql.get(lo..hi).filter(|s| !s.trim().is_empty()) {
                             (run)(stmt.to_string());
                         }
@@ -2264,7 +2279,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let refocus = refocus.clone();
                     Rc::new(move || {
                         let sql = query.get_untracked();
-                        let stmts: Vec<String> = statement_ranges(&sql)
+                        let stmts: Vec<String> = statement_ranges(&sql, dialect.get_untracked())
                             .into_iter()
                             .filter_map(|(lo, hi)| sql.get(lo..hi).map(|s| s.to_string()))
                             .collect();

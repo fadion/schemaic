@@ -11,6 +11,7 @@
 //! sqlx's MySQL driver parses that packet but keeps only the alias name + type,
 //! so it can't tell which real table/column a result cell came from.
 
+pub mod pg;
 pub mod ssh;
 
 use std::collections::HashMap;
@@ -41,6 +42,42 @@ pub enum DbError {
 /// bytes (BLOB/BINARY/VARBINARY) rather than text.
 const BINARY_CHARSET: u16 = 63;
 
+/// Which database engine a [`Db`] speaks. Selected from the saved connection's
+/// `db_type` at [`Db::connect`] time; each public method dispatches to the
+/// engine-specific backend (MySQL bodies inline here, Postgres in [`pg`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Engine {
+    #[default]
+    MySql,
+    Postgres,
+}
+
+impl Engine {
+    /// A stable lowercase tag for this engine — used to serialize the engine into
+    /// the MCP endpoint JSON (round-trips through [`Engine::from_db_type`]).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Engine::MySql => "mysql",
+            Engine::Postgres => "postgres",
+        }
+    }
+
+    /// Map a saved connection's `db_type` label to an engine. Anything that isn't
+    /// recognizably Postgres falls back to MySQL (the historical default), so old
+    /// saved connections and the "MySQL"/"MariaDB" labels keep working.
+    pub fn from_db_type(db_type: &str) -> Engine {
+        let t = db_type.trim();
+        if t.eq_ignore_ascii_case("postgresql")
+            || t.eq_ignore_ascii_case("postgres")
+            || t.eq_ignore_ascii_case("pg")
+        {
+            Engine::Postgres
+        } else {
+            Engine::MySql
+        }
+    }
+}
+
 /// A resolved connection target — server coordinates + credentials, already
 /// pointed through any established SSH tunnel. Built once from a saved
 /// [`Connection`]; every operation derives a fresh `mysql_async` connection from
@@ -54,25 +91,30 @@ const BINARY_CHARSET: u16 = 63;
 /// leaked on a command line (review C6).
 #[derive(Clone, Debug)]
 pub struct Db {
-    host: String,
-    port: u16,
-    user: String,
-    pass: String,
+    pub(crate) engine: Engine,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) user: String,
+    pub(crate) pass: String,
 }
 
 impl Db {
     /// Resolve a saved connection into a `Db`. For an SSH connection, pass the
     /// established tunnel's local port and the target is rewritten to
-    /// `127.0.0.1:<port>`. Infallible — no URL is parsed.
+    /// `127.0.0.1:<port>`. Infallible — no URL is parsed. The engine is derived
+    /// from the connection's `db_type` (MySQL/MariaDB vs PostgreSQL).
     pub fn connect(conn: &schemaic_core::connection::Connection, tunnel_port: Option<u16>) -> Db {
+        let engine = Engine::from_db_type(&conn.db_type);
         match tunnel_port {
             Some(port) => Db {
+                engine,
                 host: "127.0.0.1".to_string(),
                 port,
                 user: conn.user.clone(),
                 pass: conn.password.clone(),
             },
             None => Db {
+                engine,
                 host: conn.host.clone(),
                 port: conn.port,
                 user: conn.user.clone(),
@@ -81,10 +123,12 @@ impl Db {
         }
     }
 
-    /// Reconstruct from raw parts — used by the MCP subprocess, which receives
-    /// the (already-tunnelled) endpoint over its environment.
-    pub fn from_parts(host: String, port: u16, user: String, pass: String) -> Db {
+    /// Reconstruct from raw parts + engine — used by the MCP subprocess, which
+    /// receives the (already-tunnelled) endpoint (incl. engine) over its
+    /// environment, so AI queries run against the right driver.
+    pub fn from_parts(engine: Engine, host: String, port: u16, user: String, pass: String) -> Db {
         Db {
+            engine,
             host,
             port,
             user,
@@ -96,6 +140,11 @@ impl Db {
     /// the endpoint for the MCP subprocess handoff.
     pub fn parts(&self) -> (&str, u16, &str, &str) {
         (&self.host, self.port, &self.user, &self.pass)
+    }
+
+    /// The engine this handle speaks.
+    pub fn engine(&self) -> Engine {
+        self.engine
     }
 
     /// Build connection options for a fresh connection, optionally with a default
@@ -142,6 +191,9 @@ impl Db {
         row_cap: usize,
         cancel: CancellationToken,
     ) -> Result<ResultSet, DbError> {
+        if self.engine == Engine::Postgres {
+            return pg::fetch_query(self, database, sql, row_cap, cancel).await;
+        }
         let mut conn = self.open(database, false).await?;
         // The connection id, so a second connection can KILL its in-flight query.
         let conn_id = conn.id();
@@ -171,6 +223,9 @@ impl Db {
         limit: usize,
         cancel: CancellationToken,
     ) -> Result<ResultSet, DbError> {
+        if self.engine == Engine::Postgres {
+            return pg::fetch_table(self, database, table, limit, cancel).await;
+        }
         let sql = format!(
             "SELECT * FROM {}.{} LIMIT {}",
             ident(database),
@@ -205,6 +260,9 @@ impl Db {
         analyze: bool,
         cancel: CancellationToken,
     ) -> Result<ResultSet, DbError> {
+        if self.engine == Engine::Postgres {
+            return pg::explain(self, database, sql, analyze, cancel).await;
+        }
         let (primary, fallback) = explain_commands(sql, analyze);
         match self
             .fetch_query(database, &primary, EXPLAIN_ROW_CAP, cancel.clone())
@@ -229,6 +287,9 @@ impl Db {
     /// treated as `Ok` rather than surfacing a spurious error. A trailing `;` is
     /// trimmed (the protocol prepares a single statement).
     pub async fn prepare_check(&self, database: Option<&str>, sql: &str) -> Result<(), DbError> {
+        if self.engine == Engine::Postgres {
+            return pg::prepare_check(self, database, sql).await;
+        }
         let stmt = sql.trim().trim_end_matches(';').trim_end();
         if stmt.is_empty() {
             return Ok(());
@@ -294,6 +355,10 @@ impl Db {
         cancel: CancellationToken,
         mut on_result: impl FnMut(usize, Result<ResultSet, DbError>),
     ) {
+        if self.engine == Engine::Postgres {
+            pg::run_batch(self, database, stmts, row_cap, cancel, on_result).await;
+            return;
+        }
         let mut conn = match self.open(database, false).await {
             Ok(c) => c,
             Err(e) => {
@@ -353,6 +418,9 @@ impl Db {
     /// `timeout` so a dead host/tunnel can't hang the caller. `Ok(())` means the
     /// server answered.
     pub async fn ping(&self, timeout: std::time::Duration) -> Result<(), DbError> {
+        if self.engine == Engine::Postgres {
+            return pg::ping(self, timeout).await;
+        }
         let check = async {
             let mut conn = self.open(None, false).await?;
             let r = conn
@@ -370,6 +438,9 @@ impl Db {
     /// List the user databases on a server (excludes the built-in system schemas),
     /// sorted by name. Connects at the server level (no specific database needed).
     pub async fn fetch_databases(&self) -> Result<Vec<String>, DbError> {
+        if self.engine == Engine::Postgres {
+            return pg::fetch_databases(self).await;
+        }
         let mut conn = self.open(None, false).await?;
         let out = conn
             .query_map(
@@ -389,6 +460,9 @@ impl Db {
     /// `information_schema` (ARCHITECTURE §11). Everything is `CAST` to a known type
     /// so the protocol never surprises us with a width mismatch.
     pub async fn fetch_schema(&self, database: &str) -> Result<DbSchema, DbError> {
+        if self.engine == Engine::Postgres {
+            return pg::fetch_schema(self, database).await;
+        }
         let mut conn = self.open(None, false).await?;
         let out = collect_schema(&mut conn, database).await;
         let _ = conn.disconnect().await;
@@ -502,7 +576,7 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
 /// ref_schema, ref_table, ref_column)`. The referenced fields are `Option` since
 /// the column is nullable in the catalogue (though non-null for the FK rows we
 /// select). Aliased to keep [`assemble_schema`]'s signature readable.
-type FkColRow = (
+pub(crate) type FkColRow = (
     String,
     String,
     String,
@@ -521,7 +595,7 @@ type FkColRow = (
 /// Rows referencing a table not in `table_rows` are dropped. `idx_rows` and
 /// `col_rows` are consumed in order, so callers must sort by
 /// `TABLE_NAME, SEQ_IN_INDEX` / `ORDINAL_POSITION` as the queries do.
-fn assemble_schema(
+pub(crate) fn assemble_schema(
     table_rows: &[(String, String)],
     col_rows: &[(String, String, String, String, String)],
     fk_col_rows: &[FkColRow],
@@ -888,6 +962,9 @@ impl Db {
         if write.is_empty() {
             return Ok(0);
         }
+        if self.engine == Engine::Postgres {
+            return pg::commit_writes(self, write, cancel).await;
+        }
         // `client_found_rows` so the 1-row guard counts matches, not changes.
         let mut conn = self.open(None, true).await?;
         let conn_id = conn.id();
@@ -986,6 +1063,9 @@ impl Db {
     ) -> Result<Vec<(usize, Vec<Value>)>, DbError> {
         if rows.is_empty() {
             return Ok(Vec::new());
+        }
+        if self.engine == Engine::Postgres {
+            return pg::refetch_rows(self, template, rows, cancel).await;
         }
         let sql = build_refetch_sql(template);
 
@@ -1150,7 +1230,7 @@ fn value_to_param(v: &Value) -> MyValue {
 /// Parse a text-protocol cell into a typed [`Value`] using the column's SQL
 /// type. Integers/floats become compact numeric variants; anything else stays
 /// an exact string. Any parse failure falls back to the string — never lossy.
-fn parse_typed(s: String, type_name: &str) -> Value {
+pub(crate) fn parse_typed(s: String, type_name: &str) -> Value {
     let t = type_name.to_ascii_uppercase();
     let is_integer = ["TINYINT", "SMALLINT", "MEDIUMINT", "INT", "BIGINT", "YEAR"]
         .iter()
@@ -1354,8 +1434,9 @@ mod tests {
 
     #[test]
     fn db_from_parts_roundtrips() {
-        let db = Db::from_parts("h".into(), 3307, "user".into(), "pass".into());
+        let db = Db::from_parts(Engine::Postgres, "h".into(), 3307, "user".into(), "pass".into());
         assert_eq!(db.parts(), ("h", 3307, "user", "pass"));
+        assert_eq!(db.engine(), Engine::Postgres);
     }
 
     #[test]

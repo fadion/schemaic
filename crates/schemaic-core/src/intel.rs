@@ -17,17 +17,22 @@
 //! cover the instant, catalog-only cases (unknown table/column); dialect-exact
 //! validation via PREPARE/EXPLAIN is a later, additive tier.
 
-use sqlparser::dialect::{Dialect, MySqlDialect};
+use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect};
 
 use crate::sql::skip_noncode;
 
-/// Which SQL dialect a connection speaks. Only [`SqlDialect::MySql`] is wired
-/// today; Postgres/SQLite are future arms — the point of the seam is that adding
-/// them is a dialect swap, not a rewrite (sqlparser already ships those dialects).
+/// Which SQL dialect a connection speaks. MySQL and PostgreSQL are wired; the
+/// point of the seam is that adding an engine is a dialect swap, not a rewrite
+/// (sqlparser already ships those dialects). The AST classification is
+/// dialect-exact here; the byte-position lexer (`crate::sql::skip_noncode`) is
+/// still MySQL-flavored for its comment/quote boundaries — dialect-aware
+/// tokenization (Postgres `#`-operator / `$$` / `"ident"` handling) is a tracked
+/// follow-up.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SqlDialect {
     #[default]
     MySql,
+    Postgres,
 }
 
 impl SqlDialect {
@@ -35,6 +40,22 @@ impl SqlDialect {
     pub(crate) fn parser(self) -> Box<dyn Dialect> {
         match self {
             SqlDialect::MySql => Box::new(MySqlDialect {}),
+            SqlDialect::Postgres => Box::new(PostgreSqlDialect {}),
+        }
+    }
+
+    /// Map a saved connection's `db_type` label to a dialect. Anything not
+    /// recognizably Postgres falls back to MySQL (the historical default), so old
+    /// saved connections keep parsing as before.
+    pub fn from_db_type(db_type: &str) -> SqlDialect {
+        let t = db_type.trim();
+        if t.eq_ignore_ascii_case("postgresql")
+            || t.eq_ignore_ascii_case("postgres")
+            || t.eq_ignore_ascii_case("pg")
+        {
+            SqlDialect::Postgres
+        } else {
+            SqlDialect::MySql
         }
     }
 }
@@ -964,7 +985,11 @@ fn tokenize_range(sql: &str, lo: usize, hi: usize) -> Vec<Token> {
     let mut i = lo;
     let push = |out: &mut Vec<Token>, at: usize, kind: TkKind| out.push(Token { at, kind });
     while i < hi {
-        if let Some(j) = skip_noncode(b, i) {
+        // Intel's byte-position tokenizer stays MySQL-flavored: it's the *fallback*
+        // (the per-dialect AST is the primary, dialect-correct analysis). A
+        // dialect-aware tokenizer here would cascade `dialect` through ~13 helpers
+        // for a narrow gain (PG `#`/`$$`/`"` boundaries in mid-edit positioning only).
+        if let Some(j) = skip_noncode(b, i, SqlDialect::MySql) {
             i = j.min(hi);
             continue;
         }
@@ -2118,7 +2143,7 @@ fn is_probable_typo(word: &str, known: &HashSet<String>) -> bool {
 /// Byte ranges come from the [`skip_noncode`] lexer, not AST spans (which are
 /// still maturing upstream), so squiggle placement is exact.
 pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Diagnostic> {
-    let ranges = crate::sql::statement_ranges(sql);
+    let ranges = crate::sql::statement_ranges(sql, dialect);
     let last = ranges.len().saturating_sub(1);
     let mut out: Vec<Diagnostic> = Vec::new();
     for (idx, &(lo, hi)) in ranges.iter().enumerate() {
@@ -3329,7 +3354,7 @@ fn typo_checks(sql: &str, lo: usize, hi: usize, catalog: &Catalog, out: &mut Vec
     let b = sql.as_bytes();
     let mut i = lo;
     while i < hi {
-        if let Some(j) = skip_noncode(b, i) {
+        if let Some(j) = skip_noncode(b, i, SqlDialect::MySql) {
             i = j.min(hi);
             continue;
         }
@@ -3371,7 +3396,7 @@ fn function_typo_checks(
     let b = sql.as_bytes();
     let mut i = lo;
     while i < hi {
-        if let Some(j) = skip_noncode(b, i) {
+        if let Some(j) = skip_noncode(b, i, SqlDialect::MySql) {
             i = j.min(hi);
             continue;
         }
@@ -4063,6 +4088,26 @@ pub fn db_error_diagnostic(sql: &str, lo: usize, hi: usize, message: &str) -> Di
 mod tests {
     use super::*;
     use sqlparser::parser::Parser;
+
+    #[test]
+    fn sql_dialect_from_db_type_maps_engines() {
+        assert_eq!(SqlDialect::from_db_type("PostgreSQL"), SqlDialect::Postgres);
+        assert_eq!(SqlDialect::from_db_type("postgres"), SqlDialect::Postgres);
+        assert_eq!(SqlDialect::from_db_type("pg"), SqlDialect::Postgres);
+        // Anything else — including MySQL/MariaDB and unknown/empty — is MySQL.
+        assert_eq!(SqlDialect::from_db_type("MySQL"), SqlDialect::MySql);
+        assert_eq!(SqlDialect::from_db_type("MariaDB"), SqlDialect::MySql);
+        assert_eq!(SqlDialect::from_db_type(""), SqlDialect::MySql);
+    }
+
+    #[test]
+    fn sqlparser_parses_a_postgres_statement() {
+        // The Postgres arm parses a `::` cast + double-quoted identifier — syntax
+        // the MySQL dialect wouldn't accept the same way.
+        let sql = r#"SELECT "id"::text FROM "users" WHERE created_at > now()"#;
+        let ok = Parser::parse_sql(&*SqlDialect::Postgres.parser(), sql).is_ok();
+        assert!(ok, "Postgres dialect should parse a ::cast + quoted idents");
+    }
 
     fn names(scope: &Scope) -> Vec<String> {
         let mut v: Vec<String> = scope.tables.iter().map(|t| t.name.clone()).collect();
