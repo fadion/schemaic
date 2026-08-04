@@ -1423,6 +1423,7 @@ mod tests {
             color: None,
             prominent_color: false,
             read_only: false,
+            environment: Default::default(),
         };
         // No tunnel → direct host/port passthrough.
         let direct = Db::connect(&conn, None);

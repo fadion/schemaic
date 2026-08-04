@@ -12,6 +12,7 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::create_effect;
 use schemaic_core::connection::Connection;
+use schemaic_core::connection::Environment;
 
 use schemaic_core::connection::SshAuth;
 
@@ -580,6 +581,18 @@ fn conn_form(
     ))
     .style(|s| s.flex_col().gap(6.0).width_full());
 
+    // Environment picker → the top-bar badge. Defaults to None (no badge).
+    let env_field = v_stack((
+        text("Environment").style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL)),
+        container(settings_dropdown(
+            draft.environment,
+            Environment::ALL,
+            Environment::label,
+        ))
+        .style(|s| s.width(150.0)),
+    ))
+    .style(|s| s.flex_col().gap(6.0).width_full());
+
     // Name + Colour sit closer together (20px) than the rest of the form (25px).
     let name_color = v_stack((field("Name", draft.name), color_picker(draft.color)))
         .style(|s| s.flex_col().gap(20.0).width_full());
@@ -588,6 +601,7 @@ fn conn_form(
         name_color,
         prominent_toggle,
         read_only_toggle,
+        env_field,
         type_field,
         host_port_row("Host", draft.host, "Port", draft.port),
         field("User", draft.user).style(|s| s.width(CONN_FIELD_W)),

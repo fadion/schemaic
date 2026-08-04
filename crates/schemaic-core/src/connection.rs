@@ -49,6 +49,57 @@ impl SshAuth {
     }
 }
 
+/// Which environment a connection points at, surfaced as a badge in the top bar
+/// so it's always obvious what you're working against.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum Environment {
+    /// No environment assigned — no badge is shown. The default.
+    #[default]
+    None,
+    /// A database running on the developer's own machine.
+    Local,
+    /// A shared development server.
+    Development,
+    /// A QA / test environment.
+    Testing,
+    /// A pre-production / staging environment.
+    Staging,
+    /// The live production environment.
+    Production,
+}
+
+impl Environment {
+    /// All variants, in dropdown order (unset first).
+    pub const ALL: [Environment; 6] = [
+        Environment::None,
+        Environment::Local,
+        Environment::Development,
+        Environment::Testing,
+        Environment::Staging,
+        Environment::Production,
+    ];
+
+    /// Human label for the picker.
+    pub fn label(self) -> &'static str {
+        match self {
+            Environment::None => "None",
+            Environment::Local => "Local",
+            Environment::Development => "Development",
+            Environment::Testing => "Testing",
+            Environment::Staging => "Staging",
+            Environment::Production => "Production",
+        }
+    }
+
+    /// The text shown on the top-bar badge, or `None` when no badge should show.
+    pub fn badge_label(self) -> Option<&'static str> {
+        match self {
+            Environment::None => None,
+            other => Some(other.label()),
+        }
+    }
+}
+
 /// Optional SSH tunnel for reaching a server that isn't directly routable.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SshTunnel {
@@ -111,6 +162,10 @@ pub struct Connection {
     /// any write/DDL statement in the editor is refused. Off by default.
     #[serde(default)]
     pub read_only: bool,
+    /// Which environment this connection points at (Development / Testing /
+    /// Production / …), shown as a badge in the top bar. Defaults to none.
+    #[serde(default)]
+    pub environment: Environment,
 }
 
 fn default_db_type() -> String {
@@ -148,6 +203,7 @@ mod tests {
             color: None,
             prominent_color: false,
             read_only: false,
+            environment: Environment::None,
         };
         assert_eq!(c.endpoint(), "db.example.com:3307");
     }
@@ -186,6 +242,19 @@ mod tests {
         assert_eq!(c.color, None);
         assert!(!c.prominent_color);
         assert!(!c.read_only);
+        assert_eq!(c.environment, Environment::None);
+    }
+
+    #[test]
+    fn environment_labels_and_all_cover_every_variant() {
+        assert_eq!(Environment::ALL.len(), 6);
+        assert_eq!(Environment::default(), Environment::None);
+        assert_eq!(Environment::None.label(), "None");
+        assert_eq!(Environment::Production.label(), "Production");
+        // The unset environment shows no badge; every real one does.
+        assert_eq!(Environment::None.badge_label(), None);
+        assert_eq!(Environment::Production.badge_label(), Some("Production"));
+        assert_eq!(Environment::Development.badge_label(), Some("Development"));
     }
 
     #[test]

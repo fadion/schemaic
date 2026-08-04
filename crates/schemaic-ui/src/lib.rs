@@ -65,7 +65,7 @@ use floem::views::editor::keypress::key::KeyInput;
 use floem::views::editor::text::{SimpleStyling, WrapMethod, default_dark_color};
 use floem::views::scroll::{Handle, Rounded, Thickness, Track};
 use floem::views::{Decorators, Delay, TextInputClass, TooltipClass, TooltipContainerClass};
-use schemaic_core::connection::{ConnStatus, Connection, SshAuth};
+use schemaic_core::connection::{ConnStatus, Connection, Environment, SshAuth};
 use schemaic_core::db_color::DbColorRule;
 use schemaic_core::favorite::FavoriteRule;
 use schemaic_core::format::ColumnFormatRule;
@@ -359,6 +359,9 @@ pub struct DraftSignals {
     pub prominent_color: RwSignal<bool>,
     /// Read-only guard-rail (off by default): disables cell edits + blocks writes.
     pub read_only: RwSignal<bool>,
+    /// Environment this connection points at, shown as a top-bar badge. Defaults
+    /// to `Environment::None` (no badge).
+    pub environment: RwSignal<Environment>,
 }
 
 impl DraftSignals {
@@ -382,6 +385,7 @@ impl DraftSignals {
             color: cx.create_rw_signal(None),
             prominent_color: cx.create_rw_signal(false),
             read_only: cx.create_rw_signal(false),
+            environment: cx.create_rw_signal(Environment::None),
         }
     }
 
@@ -405,6 +409,7 @@ impl DraftSignals {
         self.color.set(c.color.clone());
         self.prominent_color.set(c.prominent_color);
         self.read_only.set(c.read_only);
+        self.environment.set(c.environment);
     }
 
     /// Reset the form for a brand-new connection.
@@ -427,6 +432,7 @@ impl DraftSignals {
         self.color.set(None);
         self.prominent_color.set(false);
         self.read_only.set(false);
+        self.environment.set(Environment::None);
     }
 
     /// Build a `Connection` from the current form values (with the given id).
@@ -452,6 +458,7 @@ impl DraftSignals {
             color: self.color.get_untracked(),
             prominent_color: self.prominent_color.get_untracked(),
             read_only: self.read_only.get_untracked(),
+            environment: self.environment.get_untracked(),
         }
     }
 }
@@ -1507,12 +1514,37 @@ fn header(ui: Ui) -> impl IntoView {
         });
     let right = h_stack((search, help, settings)).style(|s| s.items_center());
 
-    // Left cluster (dot + switcher) and the right glyph cluster, pinned to
-    // opposite edges via `justify_between` (a lone flex-grow spacer under-fills —
-    // see the schema title-row note). The dot's own `margin_left(15)` sets the
-    // left inset.
-    let left =
-        h_stack((connection_dot(conn_status), switcher)).style(|s| s.flex_row().items_center());
+    // Environment badge: a capsule filled with the active connection's identity
+    // colour, sitting 20px right of the switcher and shown only when that
+    // connection has an environment set. Rebuilds when the environment changes; the
+    // fill re-reads the colour inside `.style` so a colour switch follows without a
+    // rebuild. The `margin_left` lives on the capsule (not the wrapper) so the
+    // empty/no-environment case leaves no gap after the switcher.
+    let badge = dyn_container(
+        move || active_conn_env(connections, active_conn),
+        move |env| match env.badge_label() {
+            Some(lbl) => container(text(lbl).style(|s| {
+                s.color(theme::env_badge_text())
+                    .font_size(theme::FONT_BODY)
+            }))
+            .style(move |s| {
+                s.margin_left(20.0)
+                    .padding_vert(5.0)
+                    .padding_horiz(10.0)
+                    .border_radius(5.0)
+                    .background(active_conn_color(connections, active_conn))
+            })
+            .into_any(),
+            None => empty().into_any(),
+        },
+    );
+
+    // Left cluster (dot + switcher + environment badge) and the right glyph
+    // cluster, pinned to opposite edges via `justify_between` (a lone flex-grow
+    // spacer under-fills — see the schema title-row note). The dot's own
+    // `margin_left(15)` sets the left inset.
+    let left = h_stack((connection_dot(conn_status), switcher, badge))
+        .style(|s| s.flex_row().items_center());
     h_stack((left, right)).style(|s| {
         s.width_full()
             .height(theme::HEADER_H)
@@ -1564,6 +1596,22 @@ pub(crate) fn active_conn_color(
                 .and_then(theme::parse_hex)
         })
         .unwrap_or_else(theme::text_dim)
+}
+
+/// The active connection's environment (its top-bar badge classification), or
+/// `Environment::None` when there's no active connection. Reactive — call inside
+/// a `.style(…)`/accessor closure so a connection or environment change re-runs it.
+pub(crate) fn active_conn_env(
+    connections: RwSignal<Vec<Connection>>,
+    active_conn: RwSignal<u64>,
+) -> Environment {
+    let id = active_conn.get();
+    connections.with(|cs| {
+        cs.iter()
+            .find(|c| c.id == id)
+            .map(|c| c.environment)
+            .unwrap_or_default()
+    })
 }
 
 /// The active connection's editor-frame colour: its identity colour when that
