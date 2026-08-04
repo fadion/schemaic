@@ -50,11 +50,13 @@ Zed-inspired, aiming to replace DataGrip.
   - `sqlfmt.rs` — `format_sql` (Ctrl+Alt+L pretty-printer): re-flows whitespace/indent/line-breaks
     "block" style, **preserving keyword case**; built on `skip_noncode` so comments/strings/backtick
     idents pass through untouched; indent follows editor tab-width/soft-tabs.
-  - `pairs.rs` — editor auto-close pairs + bracket matching, boundary-aware via `skip_noncode`:
-    `auto_pair` (auto-close `()`/`''`/`""`/`` `` `` [MySQL] at code positions, wrap a selection,
-    type-over a closer/quote already at the caret — respects string/comment regions and word-adjacency
-    guards), `backspace_pair` (delete both halves of an empty pair), `match_paren` (the paren adjacent
-    to the caret + its partner, ignoring parens in strings/comments), and `region_at`
+  - `pairs.rs` — caret-driven, boundary-aware editor highlights + auto-close pairs (via
+    `skip_noncode`): `auto_pair` (auto-close `()`/`''`/`""`/`` `` `` [MySQL] at code positions, wrap a
+    selection, type-over a closer/quote already at the caret — respects string/comment regions and
+    word-adjacency guards), `backspace_pair` (delete both halves of an empty pair), `match_paren` (the
+    paren adjacent to the caret + its partner, ignoring parens in strings/comments),
+    `identifier_occurrences` (every whole-word, ASCII-case-insensitive occurrence of the identifier
+    under the caret — excludes keywords/numbers/strings, needs ≥2 to fire), and `region_at`
     (`Code`/`Str`/`Comment` classification). Pure + unit-tested; dialect-aware (no backtick on PG).
 - `schemaic-db` — MySQL/MariaDB (`mysql_async`) + SSH tunnels. Populates each result column's
   `origin` (real table/column + key flags) from the wire protocol. Connection **identity** is the

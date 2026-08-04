@@ -595,20 +595,21 @@ fn single_char(s: &str) -> Option<char> {
     }
 }
 
-/// Pixel box `(x, y, w, h)` in `editor_area` coords around the single character
-/// at byte `pos`, for the bracket-matching highlight. Same gutter math as
-/// `statement_line_boxes`; subtracts the editor's scroll offset (`viewport`) so
-/// the box follows the caret when the editor is scrolled. The horizontal edges
-/// are **snapped to whole pixels** (floor left, ceil right) so the 1px border
-/// lands crisply on the device grid — otherwise a paren at a fractional x
-/// antialiases ~1px off (looked like the right box was biased right).
-fn char_box(sql: &str, ed: &Editor, pos: usize) -> (f64, f64, f64, f64) {
+/// Pixel box `(x, y, w, h)` in `editor_area` coords around the single-line byte
+/// span `[lo, hi]`, for the caret-driven highlight overlays (bracket matching,
+/// identifier occurrences). Same gutter math as `statement_line_boxes`; subtracts
+/// the editor's scroll offset (`viewport`) so the box follows the caret when the
+/// editor is scrolled. The horizontal edges are **snapped to whole pixels** (floor
+/// left, ceil right) so the 1px border lands crisply on the device grid —
+/// otherwise a glyph at a fractional x antialiases ~1px off (looked like the box
+/// was biased right).
+fn span_box(sql: &str, ed: &Editor, lo: usize, hi: usize) -> (f64, f64, f64, f64) {
     let total_lines = sql.bytes().filter(|&c| c == b'\n').count() + 1;
     let digits = total_lines.to_string().len();
     let content_x = HL_GUTTER + digits.saturating_sub(1) as f64 * HL_DIGIT_W;
     let vp = ed.viewport.get();
-    let (top, bot) = ed.points_of_offset(pos, CursorAffinity::Backward);
-    let (end, _) = ed.points_of_offset(pos + 1, CursorAffinity::Backward);
+    let (top, bot) = ed.points_of_offset(lo, CursorAffinity::Backward);
+    let (end, _) = ed.points_of_offset(hi, CursorAffinity::Backward);
     let left = (content_x + top.x - vp.x0).floor();
     let right = (content_x + end.x - vp.x0).ceil();
     let w = (right - left).max(4.0);
@@ -840,6 +841,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // its partner (or None). Recomputed from caret + text below; drawn as two
     // faint boxes by `bracket_match_view`.
     let bracket_match: RwSignal<Option<(usize, usize)>> = RwSignal::new(None);
+
+    // Highlight-all-occurrences: byte ranges of every occurrence of the identifier
+    // under the caret (empty when the caret isn't on a repeated identifier).
+    // Recomputed from caret + text below; drawn by `occurrences_view`.
+    let ident_occurrences: RwSignal<Vec<(usize, usize)>> = RwSignal::new(Vec::new());
 
     // While the run menu is open, tie the statement highlight to the selection:
     // "Run Current" highlights the statement under the caret; "Run Everything"
@@ -1517,6 +1523,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let ed_syntax = ed.clone(); // syntax-squiggle overlay geometry
     let ed_bm = ed.clone(); // bracket-matching: recompute offsets on caret/text
     let ed_bm2 = ed.clone(); // bracket-matching overlay geometry
+    let ed_occ = ed.clone(); // occurrences: recompute ranges on caret/text
+    let ed_occ2 = ed.clone(); // occurrences overlay geometry
     let ed_vbar = ed.clone(); // custom vertical scrollbar geometry
     let ed_hbar = ed.clone(); // custom horizontal scrollbar geometry
     let ed_vdrag = ed.clone(); // vertical scrollbar drag → scroll
@@ -1543,6 +1551,19 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         let caret = ed_bm.cursor.get().offset();
         let sql = query.get();
         bracket_match.set(pairs::match_paren(&sql, caret, dialect.get_untracked()));
+    });
+
+    // Highlight all occurrences of the identifier under the caret. Same triggers
+    // as bracket matching (caret + text); pure/boundary-aware via
+    // `core::pairs::identifier_occurrences` (keywords/numbers/strings excluded).
+    create_effect(move |_| {
+        let caret = ed_occ.cursor.get().offset();
+        let sql = query.get();
+        ident_occurrences.set(pairs::identifier_occurrences(
+            &sql,
+            caret,
+            dialect.get_untracked(),
+        ));
     });
 
     // Jump the caret to a byte offset requested from outside (the status-bar
@@ -2591,7 +2612,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let (sqp, sqq) = (sql.clone(), sql);
                     v_stack((
                         empty().style(move |s| {
-                            let (x, y, w, h) = char_box(&sqp, &edp, p);
+                            let (x, y, w, h) = span_box(&sqp, &edp, p, p + 1);
                             s.absolute()
                                 .inset_left(x)
                                 .inset_top(y)
@@ -2602,7 +2623,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                                 .border_color(theme::bracket_match().multiply_alpha(0.5))
                         }),
                         empty().style(move |s| {
-                            let (x, y, w, h) = char_box(&sqq, &edq, q);
+                            let (x, y, w, h) = span_box(&sqq, &edq, q, q + 1);
                             s.absolute()
                                 .inset_left(x)
                                 .inset_top(y)
@@ -2616,6 +2637,42 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     .style(|s| s.absolute().inset(0.0))
                     .into_any()
                 }
+            },
+        )
+        .style(|s| s.absolute().inset(0.0))
+        .pointer_events(|| false)
+    };
+
+    // Highlight all occurrences of the identifier under the caret: one faint box
+    // per occurrence, sharing the bracket-match colour + opacity. Click-through;
+    // each box reads the editor `viewport` (via `span_box`) so it tracks scroll.
+    let occurrences_view = {
+        let ed = ed_occ2;
+        dyn_container(
+            move || ident_occurrences.get(),
+            move |ranges| {
+                if ranges.is_empty() {
+                    return empty().into_any();
+                }
+                let sql = query.get_untracked();
+                let ed = ed.clone();
+                v_stack_from_iter(ranges.into_iter().map(move |(lo, hi)| {
+                    let ed = ed.clone();
+                    let sql = sql.clone();
+                    empty().style(move |s| {
+                        let (x, y, w, h) = span_box(&sql, &ed, lo, hi);
+                        s.absolute()
+                            .inset_left(x)
+                            .inset_top(y)
+                            .width(w)
+                            .height(h)
+                            .border(1.0)
+                            .border_radius(2.0)
+                            .border_color(theme::bracket_match().multiply_alpha(0.5))
+                    })
+                }))
+                .style(|s| s.absolute().inset(0.0))
+                .into_any()
             },
         )
         .style(|s| s.absolute().inset(0.0))
@@ -3136,6 +3193,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         syntax_view,
         highlight_view,
         bracket_match_view,
+        occurrences_view,
         run_overlay,
         completion_popup(comp),
         signature_popup(comp),

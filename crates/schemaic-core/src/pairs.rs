@@ -1,5 +1,6 @@
-//! Auto-close bracket/quote pairs, type-over, wrap-selection, and bracket
-//! matching for the SQL editor. Pure (`&str` → data, no UI) and **boundary-aware**
+//! Auto-close bracket/quote pairs, type-over, wrap-selection, bracket matching,
+//! and identifier-occurrence highlighting for the SQL editor. Pure (`&str` →
+//! data, no UI) and **boundary-aware**
 //! — every decision that must respect string / comment / identifier boundaries is
 //! built on the one shared lexer [`crate::sql::skip_noncode`], so it agrees with
 //! statement splitting, highlighting, and the intelligence layer by construction
@@ -279,6 +280,67 @@ pub fn match_paren(text: &str, caret: usize, dialect: SqlDialect) -> Option<(usi
     })
 }
 
+/// All byte ranges of the identifier under the caret, for "highlight all
+/// occurrences of the identifier under the caret." Returns empty unless the caret
+/// sits on an identifier in *code* (not a string/comment), the identifier is
+/// neither a bare number nor a SQL keyword, and it occurs at least twice.
+///
+/// Matching is whole-word and ASCII-case-insensitive (SQL identifiers fold for
+/// ASCII); occurrences inside strings/comments are skipped via the shared lexer.
+/// The occurrence under the caret is included in the result.
+pub fn identifier_occurrences(
+    text: &str,
+    caret: usize,
+    dialect: SqlDialect,
+) -> Vec<(usize, usize)> {
+    let b = text.as_bytes();
+    // The caret is "on" a word if the byte at it or just before it is a word byte.
+    let on_word = b.get(caret).is_some_and(|&c| is_word_byte(c))
+        || (caret > 0 && b.get(caret - 1).is_some_and(|&c| is_word_byte(c)));
+    if !on_word {
+        return Vec::new();
+    }
+    // Expand to the whole word straddling the caret.
+    let mut ws = caret;
+    while ws > 0 && is_word_byte(b[ws - 1]) {
+        ws -= 1;
+    }
+    let mut we = caret;
+    while we < b.len() && is_word_byte(b[we]) {
+        we += 1;
+    }
+    if ws == we || region_at(text, ws, dialect) != Region::Code {
+        return Vec::new();
+    }
+    let target = &text[ws..we];
+    // Skip bare numbers and keywords — highlighting every `select`/`123` is noise.
+    if target.bytes().all(|c| c.is_ascii_digit()) || crate::intel::is_sql_keyword(target) {
+        return Vec::new();
+    }
+    // Whole-word, case-insensitive matches in code regions only.
+    let mut hits = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            i = j.max(i + 1);
+            continue;
+        }
+        if is_word_byte(b[i]) {
+            let start = i;
+            while i < b.len() && is_word_byte(b[i]) {
+                i += 1;
+            }
+            if text[start..i].eq_ignore_ascii_case(target) {
+                hits.push((start, i));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    // A lone occurrence (only the one under the caret) isn't worth a box.
+    if hits.len() >= 2 { hits } else { Vec::new() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,5 +577,50 @@ mod tests {
     fn match_paren_none_when_not_adjacent() {
         assert_eq!(match_paren("abc", 1, MySql), None);
         assert_eq!(match_paren("", 0, MySql), None);
+    }
+
+    // --- identifier_occurrences -------------------------------------------
+
+    #[test]
+    fn occurrences_finds_all_matches() {
+        // "select id from t where id = 1" — caret on the first `id` (offset 8)
+        let sql = "select id from t where id = 1";
+        let hits = identifier_occurrences(sql, 8, MySql);
+        assert_eq!(hits, vec![(7, 9), (23, 25)]);
+    }
+
+    #[test]
+    fn occurrences_case_insensitive_whole_word() {
+        // `ID` matches `id`; `identity` must NOT match (whole word only)
+        let sql = "ID id identity";
+        let hits = identifier_occurrences(sql, 0, MySql);
+        assert_eq!(hits, vec![(0, 2), (3, 5)]);
+    }
+
+    #[test]
+    fn occurrences_caret_after_word_counts() {
+        // caret at offset 2 (just past `id`) still targets `id`
+        let sql = "id x id";
+        assert_eq!(identifier_occurrences(sql, 2, MySql), vec![(0, 2), (5, 7)]);
+    }
+
+    #[test]
+    fn occurrences_skips_keywords_numbers_and_strings() {
+        // keyword `from` → nothing even though it appears once
+        assert!(identifier_occurrences("from from", 0, MySql).is_empty());
+        // bare number
+        assert!(identifier_occurrences("1 + 1", 0, MySql).is_empty());
+        // caret inside a string literal
+        assert!(identifier_occurrences("'ab' ab", 2, MySql).is_empty());
+        // a matching word *inside* a string is not counted → only one real hit
+        assert!(identifier_occurrences("x 'x'", 0, MySql).is_empty());
+    }
+
+    #[test]
+    fn occurrences_empty_when_single_or_off_word() {
+        // single occurrence → no highlight
+        assert!(identifier_occurrences("alpha beta", 0, MySql).is_empty());
+        // caret on whitespace, not adjacent to any word
+        assert!(identifier_occurrences("a   a", 2, MySql).is_empty());
     }
 }
