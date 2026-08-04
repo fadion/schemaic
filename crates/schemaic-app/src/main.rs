@@ -760,13 +760,18 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     };
 
     // ── Run a query into the active tab (targets that tab's connection URL) ──
-    let run: Rc<dyn Fn(String)> = {
+    // Shared execution engine for both a manual run and a filter/sort re-run
+    // (`apply_view`). `is_view` distinguishes them: a manual run records history and
+    // drives the whole results pane (Running → Loaded/Failed), whereas a view re-run
+    // keeps the current table visible and, on error, surfaces the message in the
+    // grid's bottom bar (`tab.view_err`) instead of replacing the grid.
+    let run_query_core: Rc<dyn Fn(String, bool)> = {
         let handle = handle.clone();
         let tokens = tokens.clone();
         let run_gen = run_gen.clone();
         let db_for = db_for.clone();
         let record_history = record_history.clone();
-        Rc::new(move |sql: String| {
+        Rc::new(move |sql: String, is_view: bool| {
             if sql.trim().is_empty() {
                 return;
             }
@@ -775,22 +780,30 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 return;
             };
             let results = tab.results;
+            let view_err = tab.view_err;
+            let load_gen = tab.load_gen;
             // Resolve this tab's own connection (not necessarily the active one).
             let db = match db_for(tab.conn_id.get_untracked()) {
                 Ok(db) => db,
                 Err(e) => {
-                    tab.result_tabs.set(Vec::new());
-                    results.set(QueryState::Failed(e));
+                    if is_view {
+                        view_err.set(Some(e));
+                    } else {
+                        tab.result_tabs.set(Vec::new());
+                        results.set(QueryState::Failed(e));
+                    }
                     return;
                 }
             };
             let database = tab.database.get_untracked();
-            (record_history)(
-                tab.conn_id.get_untracked(),
-                database.clone(),
-                sql.clone(),
-                tab.name.get_untracked(),
-            );
+            if !is_view {
+                (record_history)(
+                    tab.conn_id.get_untracked(),
+                    database.clone(),
+                    sql.clone(),
+                    tab.name.get_untracked(),
+                );
+            }
 
             if let Some((_, old)) = tokens.borrow_mut().remove(&id) {
                 old.cancel();
@@ -799,10 +812,16 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             let generation = run_gen.get() + 1;
             run_gen.set(generation);
             tokens.borrow_mut().insert(id, (generation, token.clone()));
-            // A single run reverts the results pane to the one-grid view (any
-            // prior Run Everything tabs are cleared).
-            tab.result_tabs.set(Vec::new());
-            results.set(QueryState::Running);
+            if is_view {
+                // Keep the current table on screen during the re-run; a fresh attempt
+                // clears any prior filter error.
+                view_err.set(None);
+            } else {
+                // A single run reverts the results pane to the one-grid view (any
+                // prior Run Everything tabs are cleared).
+                tab.result_tabs.set(Vec::new());
+                results.set(QueryState::Running);
+            }
 
             let tokens_done = tokens.clone();
             let send = create_ext_action(cx, move |state: QueryState| {
@@ -812,7 +831,25 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     return;
                 }
                 tokens_done.borrow_mut().remove(&id);
-                results.set(state);
+                if is_view {
+                    match state {
+                        // Success → swap in the filtered result, then bump the load
+                        // nonce so the grid rebuilds despite Loaded→Loaded. Order
+                        // matters: the rebuild reads `results` untracked, so the new
+                        // Arc must already be in place before the nonce changes.
+                        QueryState::Loaded(_) => {
+                            results.set(state);
+                            load_gen.update(|g| *g = g.wrapping_add(1));
+                            view_err.set(None);
+                        }
+                        // Error → keep the current table, show the message in the bar.
+                        QueryState::Failed(m) => view_err.set(Some(m)),
+                        // Cancelled/superseded → leave the table + error untouched.
+                        _ => {}
+                    }
+                } else {
+                    results.set(state);
+                }
             });
             // Read the row cap on the UI thread (signals are single-threaded).
             let cap = row_limit.get_untracked();
@@ -840,6 +877,34 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 send(state);
             });
         })
+    };
+
+    // A manual run (Ctrl+Enter / Run): records history, captures the SQL as the
+    // grid filter/sort base, and clears any active filter/sort so the fresh result
+    // starts unfiltered.
+    let run: Rc<dyn Fn(String)> = {
+        let core = run_query_core.clone();
+        Rc::new(move |sql: String| {
+            if sql.trim().is_empty() {
+                return;
+            }
+            let id = active.get_untracked();
+            if let Some(tab) = tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied()) {
+                tab.base_sql.set(Some(sql.clone()));
+                tab.grid_query
+                    .set(schemaic_core::filter::GridQuery::default());
+                tab.view_err.set(None);
+            }
+            core(sql, false);
+        })
+    };
+
+    // A filter/sort re-run: keeps the current table until the filtered result lands
+    // (or an error shows in the grid's bottom bar), without recording history or
+    // disturbing `base_sql`/`grid_query` (the grid owns those).
+    let apply_view: Rc<dyn Fn(String)> = {
+        let core = run_query_core.clone();
+        Rc::new(move |sql: String| core(sql, true))
     };
 
     // ── Run EXPLAIN for the query-plan modal (targets the active tab's db) ──
@@ -2890,6 +2955,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         },
         tab_actions: Rc::new(TabsActions {
             run,
+            apply_view,
             run_all,
             cancel,
             commit_edits,

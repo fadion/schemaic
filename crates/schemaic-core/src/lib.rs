@@ -12,6 +12,7 @@ pub mod diff;
 pub mod edit;
 pub mod export;
 pub mod favorite;
+pub mod filter;
 pub mod format;
 pub mod history;
 pub mod intel;
