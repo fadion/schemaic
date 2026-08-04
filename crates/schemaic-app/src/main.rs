@@ -389,6 +389,18 @@ fn unique_name(base: &str, existing: &[String]) -> String {
     }
 }
 
+/// Smallest positive "Query N" number not present in `used` (a tab's display
+/// number, its `label`). New tabs pick the lowest free number so closing and
+/// opening keeps numbering compact instead of climbing forever — the display
+/// number is decoupled from the ever-incrementing tab `id`.
+fn smallest_free_label(used: &[usize]) -> usize {
+    let mut n = 1;
+    while used.contains(&n) {
+        n += 1;
+    }
+    n
+}
+
 /// The default connection created on first launch (matches the local WSL
 /// MariaDB used in development).
 fn seed_connection() -> Connection {
@@ -1173,7 +1185,12 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             let id = next_id.get();
             next_id.set(id + 1);
             let (conn_id, database) = default_tab_target();
-            tabs.update(|v| v.push(Tab::new(cx, id, "", conn_id, database)));
+            tabs.update(|v| {
+                let mut t = Tab::new(cx, id, "", conn_id, database);
+                let used: Vec<usize> = v.iter().map(|t| t.label).collect();
+                t.label = smallest_free_label(&used);
+                v.push(t);
+            });
             active.set(id);
         })
     };
@@ -1295,7 +1312,12 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 nt.label = v[pos].label;
                 v[pos] = nt;
             }
-            None => v.push(new_tab),
+            None => {
+                let mut nt = new_tab;
+                let used: Vec<usize> = v.iter().map(|t| t.label).collect();
+                nt.label = smallest_free_label(&used);
+                v.push(nt);
+            }
         });
         active.set(new_tab.id);
         // Deferred for the same reason as `close_tab`: let the center view rebuild
@@ -1344,6 +1366,9 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 src.database.get_untracked(),
             );
             tabs.update(|v| {
+                let mut nt = nt;
+                let used: Vec<usize> = v.iter().map(|t| t.label).collect();
+                nt.label = smallest_free_label(&used);
                 let boundary = v.iter().take_while(|t| t.pinned.get_untracked()).count();
                 let at = v
                     .iter()
@@ -3256,6 +3281,18 @@ mod app_tests {
         // Gaps are filled: "Query 1" free even though "Query"/"Query 2" taken.
         let existing = vec!["Query".to_string(), "Query 2".to_string()];
         assert_eq!(unique_name("Query", &existing), "Query 1");
+    }
+
+    #[test]
+    fn smallest_free_label_reuses_gaps() {
+        use super::smallest_free_label;
+        assert_eq!(smallest_free_label(&[]), 1);
+        assert_eq!(smallest_free_label(&[1, 2]), 3);
+        // A freed middle number is reused, not skipped.
+        assert_eq!(smallest_free_label(&[1, 3]), 2);
+        // Order-independent.
+        assert_eq!(smallest_free_label(&[3, 1]), 2);
+        assert_eq!(smallest_free_label(&[2, 3]), 1);
     }
 
     fn conn() -> Connection {
