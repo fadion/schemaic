@@ -34,7 +34,10 @@ pub(crate) fn tab_bar(ui: Ui) -> impl IntoView {
                 .filter(|t| flashing.get() != Some(t.id))
                 .collect::<Vec<_>>()
         },
-        |t: &Tab| t.id,
+        // Key on (id, label): the label is a plain field read at build time (not a
+        // signal), so including it makes a renumber (e.g. reopen-closed-tab
+        // restoring the original "Query N") rebuild the chip with the new number.
+        |t: &Tab| (t.id, t.label),
         move |t| tab_chip(t, chip_ui.clone()),
     )
     .style(|s| s.flex_row().height_full());

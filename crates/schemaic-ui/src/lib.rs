@@ -630,6 +630,9 @@ pub struct TabsActions {
     pub open_table_col: Rc<dyn Fn(String, String, String)>,
     /// Open a new query tab containing `sql` (does NOT run it).
     pub open_query: Rc<dyn Fn(String)>,
+    /// Reopen the most-recently-closed tab (Ctrl+Shift+T): restores its query,
+    /// connection/database, source, and name from a small ring. No-op when empty.
+    pub reopen_closed_tab: Rc<dyn Fn()>,
     /// (database, table, sql) → open a brand-new tab sourced from `(database,
     /// table)` (so its grid stays editable) running `sql`, and auto-run it. Used by
     /// the grid's "Follow foreign key" to land on the referenced table filtered to
@@ -657,8 +660,8 @@ pub struct TabsActions {
 
 /// The global navigation keys — handled at BOTH the workspace root and inside the
 /// editor (which `on_event_stop`s every KeyDown, so it can't rely on bubbling).
-/// Ctrl+P Find Anywhere · Ctrl+T new tab · Ctrl+W close tab · Ctrl+Tab cycle
-/// (Shift = reverse) · Ctrl+1..9 jump to the Nth tab.
+/// Ctrl+P Find Anywhere · Ctrl+T new tab · Ctrl+Shift+T reopen closed tab ·
+/// Ctrl+W close tab · Ctrl+Tab cycle (Shift = reverse) · Ctrl+1..9 jump to the Nth tab.
 #[derive(Clone)]
 pub(crate) struct NavKeys {
     pub tabs: RwSignal<Vec<Tab>>,
@@ -667,6 +670,7 @@ pub(crate) struct NavKeys {
     pub find_query: RwSignal<String>,
     pub add_tab: Rc<dyn Fn()>,
     pub close_tab: Rc<dyn Fn(usize)>,
+    pub reopen_closed: Rc<dyn Fn()>,
 }
 
 impl NavKeys {
@@ -686,6 +690,11 @@ impl NavKeys {
                 if !self.find_open.get_untracked() {
                     self.find_open.set(true);
                 }
+                return true;
+            }
+            // Ctrl+Shift+T → reopen the most-recently-closed tab.
+            if ch == Some("t") {
+                (self.reopen_closed)();
                 return true;
             }
             // Other Ctrl+Shift+<letter/digit> belong to the panel toggles, not us.
@@ -1237,6 +1246,7 @@ pub fn workspace(ui: Ui) -> impl IntoView {
         find_query: ui.overlay.find_query,
         add_tab: ui.tab_actions.add_tab.clone(),
         close_tab: ui.tab_actions.close_tab.clone(),
+        reopen_closed: ui.tab_actions.reopen_closed_tab.clone(),
     };
     let shell = v_stack((
         header(ui.clone()),
@@ -2161,6 +2171,7 @@ fn center(ui: Ui) -> impl IntoView {
         find_query: ui.overlay.find_query,
         add_tab: ui.tab_actions.add_tab.clone(),
         close_tab: ui.tab_actions.close_tab.clone(),
+        reopen_closed: ui.tab_actions.reopen_closed_tab.clone(),
     };
 
     // Open the query-plan modal for a statement (from the editor's "Plan" menu):

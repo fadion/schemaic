@@ -29,7 +29,7 @@ use ai::{
 use claude_cli::{claude_bin, claude_reachable, detect_claude_bin};
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -61,6 +61,19 @@ type ConnectResult = Result<
 >;
 /// Self-rescheduling cursor-blink tick — holds an `Rc` to itself so it can re-arm.
 type BlinkTick = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+
+/// A closed tab's restorable state — plain data (no signals), so it outlives the
+/// tab's disposed scope and can rebuild the tab on Ctrl+Shift+T.
+#[derive(Clone)]
+struct ClosedTab {
+    query: String,
+    conn_id: u64,
+    database: Option<String>,
+    source: Option<(String, String)>,
+    name: Option<String>,
+    /// The original "Query N" number, restored on reopen when no live tab claims it.
+    label: usize,
+}
 /// Record one executed query into history: `(conn_id, database, sql, tab_name)`.
 type RecordHistoryFn = Rc<dyn Fn(u64, Option<String>, String, Option<String>)>;
 use schemaic_core::intel::SqlDialect;
@@ -532,6 +545,9 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let tabs = RwSignal::new(initial_tabs);
     let active = RwSignal::new(initial_active);
     let next_id = Rc::new(Cell::new(first_free_id));
+    // Ring of recently-closed tabs (most-recent first, capped) for Ctrl+Shift+T.
+    // Plain `ClosedTab` data so entries survive the closed tab's scope disposal.
+    let recently_closed: Rc<RefCell<VecDeque<ClosedTab>>> = Rc::new(RefCell::new(VecDeque::new()));
     let flashing: RwSignal<Option<usize>> = RwSignal::new(None);
     // Per-tab in-flight query token, tagged with a monotonic run generation so a
     // completing run can tell whether it still owns the tab's slot (a newer run
@@ -1166,7 +1182,30 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // (design keeps ≥1 tab); other tabs activate a neighbor.
     let close_tab: Rc<dyn Fn(usize)> = {
         let tokens = tokens.clone();
+        let recently_closed = recently_closed.clone();
         Rc::new(move |id: usize| {
+            // Snapshot a closing tab into the reopen ring (most-recent first,
+            // capped at 10) — but only if it holds something worth restoring.
+            let record = |tab: &Tab| {
+                let query = tab.query.get_untracked();
+                let source = tab.source.get_untracked();
+                let name = tab.name.get_untracked();
+                if query.trim().is_empty() && source.is_none() && name.is_none() {
+                    return;
+                }
+                let mut ring = recently_closed.borrow_mut();
+                if ring.len() >= 10 {
+                    ring.pop_back();
+                }
+                ring.push_front(ClosedTab {
+                    query,
+                    conn_id: tab.conn_id.get_untracked(),
+                    database: tab.database.get_untracked(),
+                    source,
+                    name,
+                    label: tab.label,
+                });
+            };
             // Pinned tabs aren't closable — this is the single choke point for
             // every close path (× click, middle-click, Ctrl+W), so gating here
             // covers them all. Unpin first to close.
@@ -1191,6 +1230,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 else {
                     return;
                 };
+                record(&tab);
                 tab.query.set(String::new());
                 tab.source.set(None);
                 // Also reset the results pane so the reopened tab is fully fresh
@@ -1209,9 +1249,13 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     v[ni].id
                 })
             });
-            // Grab this tab's scope before dropping it from the list, so we can
-            // free its signals (C14).
-            let closed_cx = tabs.with_untracked(|v| v.iter().find(|t| t.id == id).map(|t| t.cx));
+            // Grab this tab before dropping it from the list: snapshot it for the
+            // reopen ring and keep its scope so we can free its signals (C14).
+            let closed = tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied());
+            if let Some(tab) = &closed {
+                record(tab);
+            }
+            let closed_cx = closed.map(|t| t.cx);
             tabs.update(|v| v.retain(|t| t.id != id));
             if was_active && let Some(n) = neighbor {
                 active.set(n);
@@ -1472,6 +1516,41 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             let tab = Tab::new(cx, id, &entry.sql, entry.conn_id, entry.database);
             tab.name.set(entry.tab_name);
             (place_tab)(tab);
+        })
+    };
+
+    // Reopen the most-recently-closed tab (Ctrl+Shift+T): pop the ring and rebuild
+    // the tab from the snapshot — its own connection/database, query, source (so it
+    // stays editable if it was a table view), and name. No-op when the ring's empty.
+    let reopen_closed_tab: Rc<dyn Fn()> = {
+        let next_id = next_id.clone();
+        let place_tab = place_tab.clone();
+        let recently_closed = recently_closed.clone();
+        Rc::new(move || {
+            let Some(snap) = recently_closed.borrow_mut().pop_front() else {
+                return;
+            };
+            let id = next_id.get();
+            next_id.set(id + 1);
+            // Named tabs already restore their name; for unnamed ones, restore the
+            // original "Query N" number too (unless a live tab now claims it).
+            let orig_label = snap.label;
+            let restore_label = snap.name.is_none();
+            let tab = Tab::new(cx, id, &snap.query, snap.conn_id, snap.database);
+            tab.source.set(snap.source);
+            tab.name.set(snap.name);
+            (place_tab)(tab);
+            if restore_label {
+                let clash =
+                    tabs.with_untracked(|v| v.iter().any(|t| t.id != id && t.label == orig_label));
+                if !clash {
+                    tabs.update(|v| {
+                        if let Some(t) = v.iter_mut().find(|t| t.id == id) {
+                            t.label = orig_label;
+                        }
+                    });
+                }
+            }
         })
     };
 
@@ -2781,6 +2860,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             open_table_new,
             open_table_col,
             open_query,
+            reopen_closed_tab,
             open_table_filtered,
             set_active_db,
             open_db_cli,
