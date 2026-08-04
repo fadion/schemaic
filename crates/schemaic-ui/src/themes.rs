@@ -145,6 +145,8 @@ pub struct UiTheme {
     pub key_primary: Color,
     pub key_index: Color,
     pub key_foreign: Color,
+    /// Gold star marking a favorited database in the schema tree.
+    pub favorite_star: Color,
     /// Results grid: background of a column header whose column is selected.
     pub grid_col_sel: Color,
     /// Results grid: background of a cell with a staged (uncommitted) edit.
@@ -247,6 +249,7 @@ impl UiTheme {
             key_primary: c("#F9C24A"),
             key_index: c("#8394FF"),
             key_foreign: c("#B677EE"),
+            favorite_star: c("#F9C24A"),
             grid_col_sel: c("#292D3E"),
             grid_edit_staged: c("#509950"),
             grid_edit_staged_hover: c("#93FF93"),
@@ -343,6 +346,7 @@ impl UiTheme {
             key_primary: c("#D99400"),
             key_index: c("#5A6EE0"),
             key_foreign: c("#9450D6"),
+            favorite_star: c("#C68A1A"),
             grid_col_sel: c("#DCE3F2"),
             grid_edit_staged: c("#509950"),
             grid_edit_staged_hover: c("#93FF93"),

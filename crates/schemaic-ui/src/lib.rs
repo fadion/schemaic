@@ -67,6 +67,7 @@ use floem::views::scroll::{Handle, Rounded, Thickness, Track};
 use floem::views::{Decorators, Delay, TextInputClass, TooltipClass, TooltipContainerClass};
 use schemaic_core::connection::{ConnStatus, Connection, SshAuth};
 use schemaic_core::db_color::DbColorRule;
+use schemaic_core::favorite::FavoriteRule;
 use schemaic_core::format::ColumnFormatRule;
 use schemaic_core::history::HistoryEntry;
 use schemaic_core::intel::SqlDialect;
@@ -1026,6 +1027,12 @@ pub struct Ui {
     pub db_colors: RwSignal<Vec<DbColorRule>>,
     /// Persist the database-colour rules to disk (after a menu upsert).
     pub save_db_colors: Rc<dyn Fn()>,
+    /// Favorited (bookmarked) databases (persisted to `favorites.json`), keyed by
+    /// `(conn_id, database)` in favorite order (oldest first); set from the schema
+    /// tree's right-click menu, shown as a gold star and sorted to the top.
+    pub db_favorites: RwSignal<Vec<FavoriteRule>>,
+    /// Persist the favorites to disk (after a menu toggle).
+    pub save_db_favorites: Rc<dyn Fn()>,
     /// The app process's own CPU/RAM usage, sampled on a timer at the app
     /// boundary and shown in the status bar. Transient (never persisted).
     pub resources: RwSignal<ResourceSample>,
@@ -1631,6 +1638,43 @@ pub(crate) fn db_color_dot(
                 })
                 .into_any(),
             None => empty().into_any(),
+        },
+    )
+}
+
+/// A gold star for a favorited database, or a zero-footprint `empty()` when it
+/// isn't favorited (so un-favorited rows render exactly as before). `key` yields
+/// the `(conn_id, database)` to look up reactively; `ml`/`mr` are the star's left/
+/// right margins (applied only when drawn). Rebuilds when the favorite state or
+/// key changes. The star colour is themable, so it's read inside the style closure.
+pub(crate) fn favorite_star(
+    db_favorites: RwSignal<Vec<FavoriteRule>>,
+    key: impl Fn() -> Option<(u64, String)> + 'static,
+    size: f32,
+    ml: f64,
+    mr: f64,
+) -> impl IntoView {
+    dyn_container(
+        move || {
+            key()
+                .map(|(cid, db)| {
+                    db_favorites.with(|r| schemaic_core::favorite::is_favorite(r, cid, &db))
+                })
+                .unwrap_or(false)
+        },
+        move |fav| {
+            if fav {
+                icons::icon(icons::STAR, size)
+                    .style(move |s| {
+                        s.color(theme::favorite_star())
+                            .flex_shrink(0.0_f32)
+                            .margin_left(ml)
+                            .margin_right(mr)
+                    })
+                    .into_any()
+            } else {
+                empty().into_any()
+            }
         },
     )
 }

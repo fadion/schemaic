@@ -387,6 +387,8 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
     let ai_send = ui.ai_actions.send.clone();
     let db_colors = ui.db_colors;
     let save_db_colors = ui.save_db_colors.clone();
+    let db_favorites = ui.db_favorites;
+    let save_db_favorites = ui.save_db_favorites.clone();
 
     dyn_container(
         move || ctx.get(),
@@ -450,6 +452,26 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         }));
                     }
                     entries.push(MenuEntry::sub("Colour", swatches));
+                    // Favorite / unfavorite: a favorited database gets a gold star
+                    // and sorts to the top of the tree (oldest favorite highest).
+                    let fav_now = schemaic_core::favorite::is_favorite(
+                        &db_favorites.get_untracked(),
+                        active_conn.get_untracked(),
+                        &menu.name,
+                    );
+                    {
+                        let dbf = db_favorites;
+                        let save = save_db_favorites.clone();
+                        let db = menu.name.clone();
+                        let label = if fav_now { "Unfavorite" } else { "Favorite" };
+                        entries.push(MenuEntry::action(label, move || {
+                            let cid = active_conn.get_untracked();
+                            dbf.update(|r| {
+                                schemaic_core::favorite::toggle(r, cid, &db);
+                            });
+                            (save)();
+                        }));
+                    }
                 }
                 CtxKind::Table {
                     database,

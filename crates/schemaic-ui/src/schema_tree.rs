@@ -18,6 +18,7 @@ use floem::prelude::*;
 use floem::reactive::{Memo, create_effect};
 
 use schemaic_core::db_color::DbColorRule;
+use schemaic_core::favorite::FavoriteRule;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::schema::{
     ColumnInfo, ColumnTypeClass, IndexInfo, SchemaState, TableInfo, classify_column_type,
@@ -28,7 +29,9 @@ use crate::consts::*;
 use crate::widgets::{
     autohide, debounced, highlight_text, loading_dots, section_title, shift_hscroll,
 };
-use crate::{ConnNode, CtxKind, CtxMenu, FieldCfg, Ui, db_color_dot, edit_field, icons, theme};
+use crate::{
+    ConnNode, CtxKind, CtxMenu, FieldCfg, Ui, db_color_dot, edit_field, favorite_star, icons, theme,
+};
 
 // ===== moved from lib.rs (schema tree) =====
 // Keyboard-navigation state for the schema tree. `focused` = the panel has nav
@@ -60,6 +63,18 @@ struct NavRow {
     expanded: bool,
 }
 
+// Reorder databases so favorited ones come first (oldest favorite highest); the
+// rest keep their natural order. Stable, so within each group the original order
+// is preserved. Shared by the tree render and keyboard-nav row list so the two
+// agree.
+fn sort_favorites_first(nodes: &mut [ConnNode], favorites: &[FavoriteRule], conn_id: u64) {
+    nodes.sort_by_key(|c| {
+        schemaic_core::favorite::rank(favorites, conn_id, &c.database)
+            .map(|r| (0usize, r))
+            .unwrap_or((1, 0))
+    });
+}
+
 // Build the visible-row list in display order. Mirrors the tree's own render
 // rules: hidden DBs dropped; a non-empty filter force-expands DBs and narrows
 // their tables to name matches; only expanded tables contribute columns+keys.
@@ -68,13 +83,21 @@ fn visible_nav_rows(
     expanded: RwSignal<HashSet<String>>,
     hidden_dbs: RwSignal<HashSet<String>>,
     filter: RwSignal<String>,
+    db_favorites: RwSignal<Vec<FavoriteRule>>,
+    active_conn: RwSignal<u64>,
 ) -> Vec<NavRow> {
     let filt = filter.get_untracked().trim().to_lowercase();
     let filtering = !filt.is_empty();
     let exp = expanded.get_untracked();
     let hidden = hidden_dbs.get_untracked();
     let mut rows = Vec::new();
-    for n in db_nodes.get_untracked() {
+    let mut nodes = db_nodes.get_untracked();
+    sort_favorites_first(
+        &mut nodes,
+        &db_favorites.get_untracked(),
+        active_conn.get_untracked(),
+    );
+    for n in nodes {
         if hidden.contains(&n.database) {
             continue;
         }
@@ -181,6 +204,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     let active_conn = ui.conn.active_conn;
     let connections = ui.conn.connections;
     let db_colors = ui.db_colors;
+    let db_favorites = ui.db_favorites;
     let hidden_dbs = ui.schema.hidden_dbs;
     let db_menu_open = ui.schema.db_menu_open;
     let schema_menu_open = ui.schema.schema_menu_open;
@@ -236,7 +260,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
         move || {
             let filt = filter.get();
             let filt = filt.trim().to_lowercase();
-            db_nodes
+            let mut list = db_nodes
                 .get()
                 .into_iter()
                 .filter(|c| !hidden_dbs.get().contains(&c.database))
@@ -252,7 +276,11 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                         _ => true,
                     }
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            // Favorited databases sort to the top (oldest favorite first); re-runs
+            // when a favorite is toggled (`db_favorites`) or the connection changes.
+            sort_favorites_first(&mut list, &db_favorites.get(), active_conn.get());
+            list
         },
         |c: &ConnNode| c.id,
         move |c| {
@@ -278,6 +306,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                     context_menu,
                     active_conn,
                     db_colors,
+                    db_favorites,
                     dialect,
                     nav,
                 },
@@ -303,7 +332,14 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
             // otherwise resume wherever the cursor last was.
             if let Some((db, tbl)) = active_table.get_untracked() {
                 let k = format!("tbl:{db}:{tbl}");
-                let rows = visible_nav_rows(db_nodes, expanded, hidden_dbs, filter);
+                let rows = visible_nav_rows(
+                    db_nodes,
+                    expanded,
+                    hidden_dbs,
+                    filter,
+                    db_favorites,
+                    active_conn,
+                );
                 if rows.iter().any(|r| r.key == k) {
                     nav.selected.set(Some(k));
                 }
@@ -357,7 +393,14 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                 Key::Named(NamedKey::ArrowLeft) => -2,
                 _ => return EventPropagation::Continue,
             };
-            let rows = visible_nav_rows(db_nodes, expanded, hidden_dbs, filter);
+            let rows = visible_nav_rows(
+                db_nodes,
+                expanded,
+                hidden_dbs,
+                filter,
+                db_favorites,
+                active_conn,
+            );
             if rows.is_empty() {
                 return EventPropagation::Stop;
             }
@@ -524,6 +567,7 @@ struct SchemaTreeCtx {
     /// dot on database rows. (Schema-tree nodes all belong to the active connection.)
     active_conn: RwSignal<u64>,
     db_colors: RwSignal<Vec<DbColorRule>>,
+    db_favorites: RwSignal<Vec<FavoriteRule>>,
     /// The active connection's SQL dialect — for engine-correct `create_ddl`
     /// (Copy/Generate DDL). All tree nodes belong to the active connection.
     dialect: SqlDialect,
@@ -542,6 +586,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
         context_menu,
         active_conn,
         db_colors,
+        db_favorites,
         dialect,
         nav,
     } = ctx;
@@ -552,6 +597,9 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
     let key_row = key.clone();
     let ctx_db = conn.database.clone();
     let dot_db = conn.database.clone();
+    let star_db = conn.database.clone();
+    let icon_fav_db = conn.database.clone();
+    let name_fav_db = conn.database.clone();
     // The database name, highlighting the search term. Wrapped in a `dyn_container`
     // on `filter` so the highlight tracks the search without rebuilding the node
     // (`dyn_stack` keys DB nodes by id and won't rebuild a surviving one).
@@ -561,24 +609,43 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
         move |f| {
             let f = f.trim();
             let term = (!f.is_empty()).then(|| f.to_string());
-            highlight_text(
-                name_disp.clone(),
-                term,
-                theme::FONT_BODY,
-                theme::text,
-                true,
-                1.0,
-            )
-            .into_any()
+            // Favorited → the name is gold. Read reactively inside `rich_text`, so a
+            // favorite toggle recolours it without rebuilding the node.
+            let fav_db = name_fav_db.clone();
+            let base = move || {
+                if db_favorites
+                    .with(|r| schemaic_core::favorite::is_favorite(r, active_conn.get(), &fav_db))
+                {
+                    theme::favorite_star()
+                } else {
+                    theme::text()
+                }
+            };
+            highlight_text(name_disp.clone(), term, theme::FONT_BODY, base, true, 1.0).into_any()
         },
     );
     let header = h_stack((
         chevron(expanded, key.clone(), on_toggle.clone()),
-        icons::icon(icons::DATABASE, SCHEMA_ICON as f32).style(|s| {
-            s.color(theme::db_icon())
-                .margin_left(CHEVRON_GAP)
-                .margin_right(ICON_GAP)
-                .flex_shrink(0.0_f32)
+        // Gold star before the DB icon (only when this database is favorited).
+        favorite_star(
+            db_favorites,
+            move || Some((active_conn.get(), star_db.clone())),
+            13.0,
+            CHEVRON_GAP,
+            0.0,
+        ),
+        icons::icon(icons::DATABASE, SCHEMA_ICON as f32).style(move |s| {
+            // Favorited → gold icon (matching the gold name), else the default.
+            let fav = db_favorites
+                .with(|r| schemaic_core::favorite::is_favorite(r, active_conn.get(), &icon_fav_db));
+            s.color(if fav {
+                theme::favorite_star()
+            } else {
+                theme::db_icon()
+            })
+            .margin_left(CHEVRON_GAP)
+            .margin_right(ICON_GAP)
+            .flex_shrink(0.0_f32)
         }),
         db_name,
         // Identity dot after the name (only when this database has a colour).
@@ -693,6 +760,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                                 context_menu,
                                 active_conn,
                                 db_colors,
+                                db_favorites,
                                 dialect,
                                 nav,
                             },
