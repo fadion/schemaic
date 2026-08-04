@@ -341,6 +341,10 @@ pub fn key_index() -> Color {
 pub fn key_foreign() -> Color {
     ui().key_foreign
 }
+/// Gold star marking a favorited database in the schema tree.
+pub fn favorite_star() -> Color {
+    ui().favorite_star
+}
 
 // Schema search placeholder / faint input text.
 pub fn search_hint() -> Color {

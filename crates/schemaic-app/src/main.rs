@@ -510,6 +510,18 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             },
         );
     });
+    // Favorited (bookmarked) databases — same standalone-file pattern as colours.
+    let db_favorites = RwSignal::new(
+        persist::load_json::<schemaic_core::favorite::FavoritesFile>("favorites.json").rules,
+    );
+    let save_db_favorites: Rc<dyn Fn()> = Rc::new(move || {
+        persist::save_json(
+            "favorites.json",
+            &schemaic_core::favorite::FavoritesFile {
+                rules: db_favorites.get_untracked(),
+            },
+        );
+    });
 
     // Persisted UI state (loaded here so tab restore below can read `restore_tabs`).
     let ui_state = persist::load_ui_state();
@@ -3032,6 +3044,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         save_formats,
         db_colors,
         save_db_colors,
+        db_favorites,
+        save_db_favorites,
         resources,
     };
     schemaic_ui::workspace(ui)
