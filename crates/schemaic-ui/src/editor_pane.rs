@@ -39,7 +39,7 @@ use schemaic_core::sql::{
     contains_write, first_unsafe, statement_range, statement_ranges, unsafe_reason,
 };
 use schemaic_core::text_ops::{
-    find_matches, offset_of_line, replace_all, soft_tab_indent, soft_tab_outdent,
+    find_matches, move_line, offset_of_line, replace_all, soft_tab_indent, soft_tab_outdent,
     toggle_line_comment,
 };
 
@@ -1416,6 +1416,37 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let cmd = Command::Edit(EditCommand::OutdentLine);
             editor_sig.with_untracked(|editor| {
                 editor.doc().run_command(editor, &cmd, Some(1), mods);
+            });
+            return CommandExecuted::Yes;
+        }
+        // Alt+Up / Alt+Down: move the current line(s) up/down. Overrides Floem's
+        // built-in MoveLineUp/Down, which slices line ranges assuming a trailing
+        // `\n` and so merges the newline-less last line into its neighbour.
+        // Computed in `core::text_ops::move_line`, applied as one full-buffer edit.
+        if mods.alt()
+            && !mods.control()
+            && !mods.shift()
+            && matches!(
+                kp.key,
+                KeyInput::Keyboard(Key::Named(NamedKey::ArrowUp | NamedKey::ArrowDown), _)
+            )
+        {
+            let up = matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::ArrowUp), _));
+            editor_sig.with_untracked(|e| {
+                let doc = e.doc();
+                let full = doc.text().to_string();
+                let cur = e.cursor.get_untracked();
+                let off = cur.offset();
+                let (a, b) = cur.get_selection().unwrap_or((off, off));
+                if let Some(edit) = move_line(&full, a.min(b), a.max(b), up) {
+                    doc.edit_single(
+                        Selection::region(0, full.len()),
+                        &edit.text,
+                        EditType::MoveLine,
+                    );
+                    e.cursor
+                        .update(|c| c.set_insert(Selection::region(edit.sel.0, edit.sel.1)));
+                }
             });
             return CommandExecuted::Yes;
         }
