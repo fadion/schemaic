@@ -25,6 +25,7 @@ use floem::views::{VirtualDirection, VirtualItemSize, VirtualVector};
 
 use schemaic_core::connection::Connection;
 use schemaic_core::edit::{EditModel, analyze_edit, refetch_template};
+use schemaic_core::filter::{FilterError, build_query, eq_condition};
 use schemaic_core::format::{self, ColumnFormat, ColumnFormatRule};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
@@ -71,11 +72,13 @@ pub(crate) fn results_view(
     cancel: Rc<dyn Fn()>,
     gctx: GridCtx,
 ) -> impl IntoView {
-    // Key the container on the *phase* (a deduped Memo), not the whole QueryState.
-    // A commit splice replaces the loaded Arc (Loaded→Loaded) — the phase is
-    // unchanged, so the grid is NOT rebuilt and scroll/selection survive. A real
-    // query still goes …→Running→Loaded, changing the phase and rebuilding fresh.
-    let phase = create_memo(move |_| results.with(phase_of));
+    // Key the container on the *phase* + a fresh-load nonce (a deduped Memo), not
+    // the whole QueryState. A commit splice replaces the loaded Arc (Loaded→Loaded)
+    // *without* bumping the nonce — the key is unchanged, so the grid is NOT rebuilt
+    // and scroll/selection survive. A real query (…→Running→Loaded) changes the
+    // phase, and a filter/sort re-run (Loaded→Loaded) bumps the nonce; both rebuild.
+    let load_gen = gctx.load_gen;
+    let phase = create_memo(move |_| (results.with(phase_of), load_gen.get()));
     // Splice sink handed to the grid: replace the canonical result set in place.
     // The phase Memo dedups, so this Loaded→Loaded set doesn't rebuild the grid;
     // it only refreshes the canonical for a later rebuild (tab switch away/back).
@@ -83,7 +86,7 @@ pub(crate) fn results_view(
         Rc::new(move |rs: Arc<ResultSet>| results.set(QueryState::Loaded(rs)));
     dyn_container(
         move || phase.get(),
-        move |ph| match ph {
+        move |(ph, _gen)| match ph {
             Phase::Idle => {
                 centered_msg("Run a query  (Ctrl+Enter)", theme::text_muted()).into_any()
             }
@@ -245,6 +248,9 @@ type SyncCanonicalFn = Rc<dyn Fn(Arc<ResultSet>)>;
 /// "Follow foreign key" callback: open the referenced `(database, table)` in a new
 /// tab running the given filter `sql`. The grid builds the SQL from a FK + row.
 type FollowFn = Rc<dyn Fn(String, String, String)>;
+/// Re-run the active tab with a rewritten (filtered/sorted) statement — the
+/// server-side filter/sort callback (`TabsActions::apply_view`).
+type ApplyViewFn = Rc<dyn Fn(String)>;
 /// Staged cell edits grouped `(table_idx, data_row) → [(result_ci, new_value)]`,
 /// ordered (BTreeMap) so a failing commit reproduces identically.
 type EditGroups = BTreeMap<(usize, usize), Vec<(usize, Option<String>)>>;
@@ -319,6 +325,16 @@ struct GridState {
     /// This tab's SQL dialect (from its connection's engine) — used to build
     /// engine-correct SQL for grid actions like Follow-FK.
     dialect: SqlDialect,
+    /// Server-side filter/sort: the base SQL to splice into, the active
+    /// filter/sort state (persists across result reloads), and the re-run callback
+    /// (wrapped so `GridState` stays `Copy`). See `schemaic_core::filter`.
+    base_sql: RwSignal<Option<String>>,
+    grid_query: RwSignal<schemaic_core::filter::GridQuery>,
+    apply_view: RwSignal<Option<ApplyViewFn>>,
+    /// A filter/sort error — a bad WHERE fragment / un-rewritable base (client-side)
+    /// or a live DB error from the re-run (tab-level). Rendered in the grid's bottom
+    /// bar; cleared on any table click (`dismiss_overlays`) or a new run.
+    view_err: RwSignal<Option<String>>,
     /// App-wide formatter-rule store (upserted + persisted on a menu choice).
     fmt_rules: RwSignal<Vec<ColumnFormatRule>>,
     /// Persist the formatter rules (wrapped so `GridState` stays `Copy`).
@@ -431,6 +447,10 @@ impl GridState {
             formats: RwSignal::new(formats),
             conn_id: gctx.conn_id,
             dialect,
+            base_sql: gctx.base_sql,
+            grid_query: gctx.grid_query,
+            apply_view: RwSignal::new(Some(gctx.apply_view.clone())),
+            view_err: gctx.view_err,
             fmt_rules: gctx.formats,
             save_formats: RwSignal::new(Some(gctx.save_formats.clone())),
             // Shared with the find bar (rendered up at the RESULTS-panel level).
@@ -454,6 +474,92 @@ impl GridState {
             edit_row_err: RwSignal::new(None),
             edit_row_saving: RwSignal::new(false),
         }
+    }
+
+    /// Whether this result supports server-side filter/sort: it was produced by a
+    /// manual run we captured (`base_sql`) *and* came from a single writable base
+    /// table (`insert_target`), so we can splice a WHERE/ORDER BY into the base SQL
+    /// and re-run. Mirrors the row-action eligibility gate.
+    fn filterable(&self) -> bool {
+        self.base_sql.get_untracked().is_some()
+            && self.edit_model.get_untracked().insert_target().is_some()
+    }
+
+    /// The real column name for display column `ci` (its wire origin), used to build
+    /// filter conditions / ORDER BY against the base table. `None` for an expression
+    /// column (no origin) or an out-of-range index.
+    fn real_col(&self, ci: usize) -> Option<String> {
+        self.rs
+            .get_untracked()
+            .columns
+            .get(ci)
+            .and_then(|c| c.origin.as_ref())
+            .map(|o| o.column.clone())
+    }
+
+    /// Rebuild the tab's statement from `base_sql` + the current `grid_query` and
+    /// re-run it (server-side filter/sort). A bad-condition / un-rewritable message
+    /// goes to the bottom error bar (`view_err`), same place as a live DB error; a
+    /// successful re-run clears it (via `apply_view`).
+    fn apply_grid_query(&self) {
+        let Some(base) = self.base_sql.get_untracked() else {
+            return;
+        };
+        let gq = self.grid_query.get_untracked();
+        match build_query(&base, &gq.filter, &gq.sort, self.dialect) {
+            Ok(Some(sql)) => {
+                if let Some(run) = self.apply_view.get_untracked() {
+                    run(sql);
+                }
+            }
+            Ok(None) => self.view_err.set(Some(
+                "Can't filter this query — not a simple single-table SELECT".into(),
+            )),
+            Err(FilterError::BadCondition(msg)) => self.view_err.set(Some(msg)),
+        }
+    }
+
+    /// Append a cell-derived condition (`col = 'val'` / `IS NULL` / negated) to the
+    /// filter with ` AND `, then apply. Used by the cell "Filter by / Exclude" menu.
+    fn add_filter_condition(&self, ci: usize, value: Option<&str>, negate: bool) {
+        let Some(col) = self.real_col(ci) else {
+            return;
+        };
+        let cond = eq_condition(&col, value, negate, self.dialect);
+        self.grid_query.update(|gq| {
+            if gq.filter.trim().is_empty() {
+                gq.filter = cond;
+            } else {
+                gq.filter = format!("{} AND {}", gq.filter.trim(), cond);
+            }
+        });
+        self.apply_grid_query();
+    }
+
+    /// Cycle server-side sort on display column `ci` (unsorted/other → ASC → DESC →
+    /// unsorted), replacing any prior sort, then apply. No-op if the column has no
+    /// real origin.
+    fn cycle_server_sort(&self, ci: usize) {
+        let Some(col) = self.real_col(ci) else {
+            return;
+        };
+        self.grid_query.update(|gq| {
+            let next = match gq.sort.first() {
+                Some((c, true)) if *c == col => Some((col.clone(), false)), // ASC → DESC
+                Some((c, false)) if *c == col => None,                      // DESC → off
+                _ => Some((col.clone(), true)),                             // → ASC
+            };
+            gq.sort = next.into_iter().collect();
+        });
+        self.apply_grid_query();
+    }
+
+    /// The active server-side sort direction for display column `ci`, if any —
+    /// drives the header chevron/label styling for eligible results.
+    fn server_sort_dir(&self, ci: usize) -> Option<bool> {
+        let col = self.real_col(ci)?;
+        self.grid_query
+            .with(|gq| gq.sort.iter().find(|(c, _)| *c == col).map(|(_, asc)| *asc))
     }
 
     /// Stage a value for data-row `di`, column `ci` (`None` = SQL NULL). If it
@@ -606,6 +712,10 @@ impl GridState {
         }
         if self.commit_err.get_untracked().is_some() {
             self.commit_err.set(None);
+        }
+        // A click anywhere on the table also dismisses a filter/sort error bar.
+        if self.view_err.get_untracked().is_some() {
+            self.view_err.set(None);
         }
     }
 
@@ -1400,6 +1510,22 @@ pub(crate) struct GridCtx {
     /// (schema-tree column double-click → open table + highlight column). The grid
     /// consumes it via an effect, so re-requesting on an already-loaded tab works.
     pub(crate) highlight_col: RwSignal<Option<String>>,
+    /// The exact SQL last run manually — the base the server-side filter/sort
+    /// splice into (`schemaic_core::filter::build_query`). `None` until first run.
+    pub(crate) base_sql: RwSignal<Option<String>>,
+    /// The active server-side filter/sort for this result (persists across result
+    /// reloads; reset on a fresh manual run).
+    pub(crate) grid_query: RwSignal<schemaic_core::filter::GridQuery>,
+    /// A filter/sort re-run's DB error (tab-level) — rendered in the grid's bottom
+    /// bar so the current table stays put. Cleared on a table click / new run.
+    pub(crate) view_err: RwSignal<Option<String>>,
+    /// Fresh-load nonce (tab-level): part of the results-view container key so a
+    /// `Loaded`→`Loaded` filter/sort re-run rebuilds the grid, while an in-place
+    /// commit splice (which doesn't bump it) still skips the rebuild.
+    pub(crate) load_gen: RwSignal<u64>,
+    /// Re-run the active tab with a rewritten (filtered/sorted) statement — no
+    /// history, preserves `base_sql`/`grid_query` (see `TabsActions::apply_view`).
+    pub(crate) apply_view: ApplyViewFn,
     pub(crate) db_nodes: RwSignal<Vec<ConnNode>>,
     /// Saved connections + the active id, for the identity-colour rule drawn at
     /// the table's top edge (the "prominent colour" setting).
@@ -1477,52 +1603,53 @@ pub(crate) struct GridCtx {
 /// (via a text override). Absolute → overlays the panel out of flow.
 pub(crate) fn grid_error_bar(
     commit_err: RwSignal<Option<String>>,
+    view_err: RwSignal<Option<String>>,
     error_open: RwSignal<bool>,
     error_text: RwSignal<Option<String>>,
 ) -> impl IntoView {
-    dyn_container(
-        move || commit_err.get(),
-        move |err| {
-            let Some(msg) = err else {
-                return empty().into_any();
-            };
-            // Collapse to a single line (a multi-line server error would spill out
-            // the top); the full text stays available in the View modal.
-            let one_line = msg.split_whitespace().collect::<Vec<_>>().join(" ");
-            let full = msg;
-            h_stack((
-                text(one_line).style(|s| {
-                    s.color(theme::reject_text())
+    // Shows a commit write-back error or a filter/sort re-run error (commit first).
+    // Both use the same style/position + View → full text in the shared modal.
+    let current = move || commit_err.get().or_else(|| view_err.get());
+    dyn_container(current, move |err| {
+        let Some(msg) = err else {
+            return empty().into_any();
+        };
+        // Collapse to a single line (a multi-line server error would spill out
+        // the top); the full text stays available in the View modal.
+        let one_line = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+        let full = msg;
+        h_stack((
+            text(one_line).style(|s| {
+                s.color(theme::reject_text())
+                    .font_size(theme::FONT_BODY)
+                    .max_width_pct(80.0)
+                    .text_ellipsis()
+                    .margin_left(8.0)
+            }),
+            empty().style(|s| s.flex_grow(1.0_f32)),
+            text("View")
+                .on_click_stop(move |_| {
+                    error_text.set(Some(full.clone()));
+                    error_open.set(true);
+                })
+                .style(|s| {
+                    s.color(theme::err_fix_btn())
                         .font_size(theme::FONT_BODY)
-                        .max_width_pct(80.0)
-                        .text_ellipsis()
-                        .margin_left(8.0)
+                        .margin_right(8.0)
                 }),
-                empty().style(|s| s.flex_grow(1.0_f32)),
-                text("View")
-                    .on_click_stop(move |_| {
-                        error_text.set(Some(full.clone()));
-                        error_open.set(true);
-                    })
-                    .style(|s| {
-                        s.color(theme::err_fix_btn())
-                            .font_size(theme::FONT_BODY)
-                            .margin_right(8.0)
-                    }),
-            ))
-            .style(|s| {
-                s.flex_row()
-                    .items_center()
-                    .width_full()
-                    .height_full()
-                    .background(theme::reject_bg())
-                    .border_radius(5.0)
-            })
-            .into_any()
-        },
-    )
+        ))
+        .style(|s| {
+            s.flex_row()
+                .items_center()
+                .width_full()
+                .height_full()
+                .background(theme::reject_bg())
+                .border_radius(5.0)
+        })
+        .into_any()
+    })
     .style(move |s| {
-        if commit_err.get().is_some() {
+        if commit_err.get().is_some() || view_err.get().is_some() {
             s.absolute()
                 .inset_left(5.0)
                 .inset_right(5.0)
@@ -2044,6 +2171,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     });
     v_stack((
         toolbar,
+        filter_bar(gs),
         grid_boxed,
         seed_popover(gs),
         edit_row_panel(gs, edit_row_max),
@@ -3141,6 +3269,91 @@ fn toolbar_sep() -> impl IntoView {
 
 /// Toolbar above the grid: row/col/timing stats (+ a caveat when a sort is
 /// applied to a capped result), plus the row-action / commit / copy icons.
+/// DataGrip-style server-side filter field for the toolbar. Shown only for
+/// filter/sort-eligible results (a single writable base table we can re-query);
+/// hidden otherwise so we never imply a full-table filter we can't deliver. The
+/// typed `WHERE` fragment is spliced into the base statement and re-run on Enter;
+/// a clear ✕ (when a filter is active) and an inline red error round it out.
+fn filter_bar(gs: GridState) -> impl IntoView {
+    dyn_container(
+        move || gs.base_sql.get().is_some() && gs.edit_model.get().insert_target().is_some(),
+        move |eligible| {
+            if !eligible {
+                return empty().into_any();
+            }
+            // Local buffer, seeded from the persisted filter (which survives the
+            // result reloads a filter/sort re-run triggers).
+            let buf = RwSignal::new(gs.grid_query.with_untracked(|q| q.filter.clone()));
+            let apply = move || {
+                let text = buf.get_untracked().trim().to_string();
+                gs.grid_query.update(|q| q.filter = text);
+                gs.apply_grid_query();
+            };
+            let field = edit_field(
+                buf,
+                FieldCfg {
+                    placeholder: "WHERE",
+                    background: theme::bg_deepest,
+                    font_size: theme::FONT_LABEL,
+                    // Borderless + square: the field's background is the row's, so
+                    // the whole row reads as one input.
+                    border_color: Some(crate::bg_transparent),
+                    border_radius: 0.0,
+                    on_submit: Some(Rc::new(apply)),
+                    ..Default::default()
+                },
+            )
+            .style(|s| s.flex_grow(1.0_f32).height_full());
+            // Clear ✕ — only while a filter is actually applied. Empties the field
+            // and re-runs unfiltered.
+            let clear = dyn_container(
+                move || gs.grid_query.with(|q| !q.filter.trim().is_empty()),
+                move |active| {
+                    if !active {
+                        return empty().into_any();
+                    }
+                    container(icons::icon(icons::X, 16.0).style(|s| s.color(theme::text())))
+                        .on_click_stop(move |_| {
+                            buf.set(String::new());
+                            gs.grid_query.update(|q| q.filter.clear());
+                            gs.view_err.set(None);
+                            gs.apply_grid_query();
+                        })
+                        // Match the Schema search field's clear ×.
+                        .style(|s| {
+                            s.flex_shrink(0.0_f32)
+                                .items_center()
+                                .margin_left(6.0)
+                                .color(theme::text())
+                                .cursor(CursorStyle::Default)
+                                .hover(|s| s.color(theme::text_dim()))
+                        })
+                        .into_any()
+                },
+            );
+            // The whole row is the field: it fills full width + height, sharing the
+            // field's background, with the clear ✕ sitting flush on the right. Filter
+            // errors surface in the grid's bottom bar, not inline here.
+            h_stack((field, clear))
+                // Interacting with the filter field also dismisses the error bar.
+                .on_event_cont(EventListener::PointerDown, move |_| gs.view_err.set(None))
+                .style(|s| {
+                    s.items_center()
+                        .flex_row()
+                        .gap(4.0)
+                        .width_full()
+                        .height(34.0)
+                        .flex_shrink(0.0_f32)
+                        .background(theme::bg_deepest())
+                        .padding_right(10.0)
+                        .border_bottom(1.0)
+                        .border_color(theme::border())
+                })
+                .into_any()
+        },
+    )
+}
+
 fn grid_toolbar(
     gs: GridState,
     nrows: usize,
@@ -3637,8 +3850,15 @@ fn header_cell(
     let name = col.map(|c| c.name.clone()).unwrap_or_default();
     let type_name = col.map(|c| c.type_name.clone()).unwrap_or_default();
     let numeric = col.map(|c| c.is_numeric()).unwrap_or(false);
-    let sorted = matches!(sort_val, Some((c, _)) if c == ci);
-    let asc = matches!(sort_val, Some((c, true)) if c == ci);
+    // Sort indicator: for filter/sort-eligible results the order lives in the
+    // server-side `grid_query` (real column name); otherwise it's the client sort.
+    // The two are mutually exclusive (eligible results never client-sort).
+    let server_dir = gs.server_sort_dir(ci);
+    let sorted = server_dir.is_some() || matches!(sort_val, Some((c, _)) if c == ci);
+    let asc = match server_dir {
+        Some(a) => a,
+        None => matches!(sort_val, Some((c, true)) if c == ci),
+    };
     let key = key_map.get(&name).copied();
 
     // Name + (when sorted) a chevron 7px to its right, both in the sort colour.
@@ -3726,7 +3946,13 @@ fn header_cell(
     stack((content, col_resize_handle(gs, ci, key.is_some())))
         .on_click_stop(move |_| {
             gs.dismiss_overlays();
-            cycle_sort(sort, ci);
+            // Eligible results sort server-side (full-table ORDER BY re-run); others
+            // fall back to today's in-memory sort of the loaded page.
+            if gs.filterable() {
+                gs.cycle_server_sort(ci);
+            } else {
+                cycle_sort(sort, ci);
+            }
         })
         // Right-click → Freeze this column (pin left) · Copy its values.
         .on_secondary_click_stop(move |_| {
@@ -4115,6 +4341,14 @@ fn data_cell(
                     .and_then(|c| c.origin.as_ref())
                     .map(|o| !o.flags.not_null)
                     .unwrap_or(false);
+            // Server-side "Filter by / Exclude this value" — real rows of a
+            // filter-eligible result whose column maps to a real base-table column.
+            // `filter_val` is the cell's raw (unformatted) value, or `None` for NULL
+            // (→ `IS NULL` / `IS NOT NULL`).
+            let can_filter = pending.is_none() && gs.filterable() && gs.real_col(ci).is_some();
+            let filter_val: Option<String> = rs
+                .cell(data_idx, ci)
+                .and_then(|c| (!c.is_null()).then(|| c.display().to_string()));
             // Context for the AI: the source table (if known) + this column.
             let from = match gs.source.get_untracked() {
                 Some((db, table)) => format!(" from the `{db}.{table}` table"),
@@ -4146,6 +4380,19 @@ fn data_cell(
             if fmt != ColumnFormat::None {
                 entries.push(MenuEntry::action("Copy formatted", move || {
                     let _ = floem::Clipboard::set_contents(formatted_val.clone());
+                }));
+            }
+            // Server-side filter: splice this value into the base query's WHERE and
+            // re-run (full table). NULL cells become IS NULL / IS NOT NULL.
+            if can_filter {
+                entries.push(MenuEntry::Separator);
+                let v1 = filter_val.clone();
+                entries.push(MenuEntry::action("Filter by this value", move || {
+                    gs.add_filter_condition(ci, v1.as_deref(), false);
+                }));
+                let v2 = filter_val.clone();
+                entries.push(MenuEntry::action("Exclude this value", move || {
+                    gs.add_filter_condition(ci, v2.as_deref(), true);
                 }));
             }
             // "Follow relation" — this cell's column is a foreign key with a known

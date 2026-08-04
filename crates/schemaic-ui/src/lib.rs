@@ -211,6 +211,22 @@ pub struct Tab {
     /// `None` follows the user's configured font size. Session-only, per-tab, not
     /// persisted; Ctrl+middle-click resets it to `None`. Useful for screen-sharing.
     pub font_zoom: RwSignal<Option<f32>>,
+    /// The exact SQL last run **manually** (Ctrl+Enter / Run) — the base the grid's
+    /// server-side filter/sort splice into and re-run. `None` until the first run.
+    /// Decoupled from `query` (the live editor buffer), which drifts after edits.
+    pub base_sql: RwSignal<Option<String>>,
+    /// The active server-side filter/sort for this tab's result (persists across
+    /// result reloads; reset on a fresh manual run). Session-only.
+    pub grid_query: RwSignal<schemaic_core::filter::GridQuery>,
+    /// A filter/sort re-run's DB error, shown as a dismissible bar at the bottom of
+    /// the *table* (the previous results stay put — unlike a manual run, which
+    /// replaces the grid with the error). Cleared on a table click / new run.
+    pub view_err: RwSignal<Option<String>>,
+    /// Bumped on every fresh full result load (including a filter/sort re-run) so
+    /// the results grid rebuilds even on a `Loaded`→`Loaded` transition — an
+    /// in-place commit splice deliberately does NOT bump it, so it still avoids a
+    /// rebuild. Part of the results-view container key.
+    pub load_gen: RwSignal<u64>,
 }
 
 impl Tab {
@@ -245,6 +261,10 @@ impl Tab {
             highlight_col: cx.create_rw_signal(None),
             results_maximized: cx.create_rw_signal(false),
             font_zoom: cx.create_rw_signal(None),
+            base_sql: cx.create_rw_signal(None),
+            grid_query: cx.create_rw_signal(schemaic_core::filter::GridQuery::default()),
+            view_err: cx.create_rw_signal(None),
+            load_gen: cx.create_rw_signal(0),
         }
     }
 
@@ -615,6 +635,12 @@ pub struct TabsUi {
 /// Tabs / query callbacks (owned by the app).
 pub struct TabsActions {
     pub run: Rc<dyn Fn(String)>,
+    /// Re-run the active tab with a server-side filter/sort view applied (the grid
+    /// filter bar / header sort). Unlike `run`, this does NOT record history, does
+    /// NOT touch `tab.base_sql`, and does NOT reset `tab.grid_query` — so the base
+    /// statement and the active filter/sort survive the re-run. `sql` is the
+    /// already-rewritten statement (see `schemaic_core::filter::build_query`).
+    pub apply_view: Rc<dyn Fn(String)>,
     /// Run several statements in order (Run Everything): one result tab each.
     pub run_all: Rc<dyn Fn(Vec<String>)>,
     pub cancel: Rc<dyn Fn()>,
@@ -1523,10 +1549,9 @@ fn header(ui: Ui) -> impl IntoView {
     let badge = dyn_container(
         move || active_conn_env(connections, active_conn),
         move |env| match env.badge_label() {
-            Some(lbl) => container(text(lbl).style(|s| {
-                s.color(theme::env_badge_text())
-                    .font_size(theme::FONT_BODY)
-            }))
+            Some(lbl) => container(
+                text(lbl).style(|s| s.color(theme::env_badge_text()).font_size(theme::FONT_BODY)),
+            )
             .style(move |s| {
                 s.margin_left(20.0)
                     .padding_vert(5.0)
@@ -2250,6 +2275,7 @@ fn center(ui: Ui) -> impl IntoView {
         }
     });
     let commit_edits = ui.tab_actions.commit_edits.clone();
+    let apply_view = ui.tab_actions.apply_view.clone();
     let follow_fk = ui.tab_actions.open_table_filtered.clone();
     let open_monitor = ui.tab_actions.open_monitor.clone();
     let ai_fill = ui.tab_actions.ai_fill.clone();
@@ -2363,6 +2389,11 @@ fn center(ui: Ui) -> impl IntoView {
                 GridCtx {
                     source: tab.source,
                     highlight_col: tab.highlight_col,
+                    base_sql: tab.base_sql,
+                    grid_query: tab.grid_query,
+                    view_err: tab.view_err,
+                    load_gen: tab.load_gen,
+                    apply_view: apply_view.clone(),
                     db_nodes,
                     connections,
                     active_conn,
@@ -2470,6 +2501,7 @@ fn results_section(
     let (find_open, find_query, find_step) = (gctx.find_open, gctx.find_query, gctx.find_step);
     let (find_total, find_pos, find_more) = (gctx.find_total, gctx.find_pos, gctx.find_more);
     let (commit_err, error_open, error_text) = (gctx.commit_err, gctx.error_open, gctx.error_text);
+    let view_err = gctx.view_err;
     // Live Monitor: watch the tab's source table. Captured before `gctx` moves.
     let open_monitor = gctx.open_monitor.clone();
     let (monitor_source, monitor_conn) = (gctx.source, gctx.conn_id);
@@ -2537,7 +2569,7 @@ fn results_section(
         grid_find_bar(
             find_open, find_query, find_step, find_total, find_pos, find_more,
         ),
-        grid_error_bar(commit_err, error_open, error_text),
+        grid_error_bar(commit_err, view_err, error_open, error_text),
     ))
     .style(|s| {
         s.width_full()
