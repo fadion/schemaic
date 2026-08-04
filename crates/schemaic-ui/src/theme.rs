@@ -14,9 +14,9 @@ use crate::themes::{editor, ui};
 
 // Re-export the switching API + kinds so callers use a single `theme::` surface.
 pub use crate::themes::{
-    EditorThemeKind, UiThemeKind, editor_font_size, editor_generation, editor_soft_tabs,
-    editor_tab_width, editor_word_wrap, init, parse_hex, set_editor, set_editor_font,
-    set_editor_soft_tabs, set_editor_tab_width, set_editor_word_wrap, set_ui,
+    EditorThemeKind, UiThemeKind, bump_editor_generation, editor_font_size, editor_generation,
+    editor_soft_tabs, editor_tab_width, editor_word_wrap, init, parse_hex, set_editor,
+    set_editor_font, set_editor_soft_tabs, set_editor_tab_width, set_editor_word_wrap, set_ui,
 };
 
 /// The active editor theme struct (surface + token palette) — for the SQL editor

@@ -55,6 +55,11 @@ use crate::{
     ValidateDoneFn, ValidateFn, bg_transparent, edit_field, icons, sql_highlight, theme, thumb_len,
 };
 
+/// Editor font-zoom (Ctrl+scroll): px bounds + per-notch step. Temporary, per-tab.
+const ZOOM_MIN: f32 = 6.0;
+const ZOOM_MAX: f32 = 48.0;
+const ZOOM_STEP: f32 = 1.0;
+
 // ===== moved from lib.rs (editor pane) =====
 // Stand-in shown where the query editor sits while a tab flashes closed. Same
 // footprint as `query_pane`'s outer box (see EDITOR_H there) — just the editor
@@ -737,6 +742,9 @@ pub(crate) struct QueryPaneParams {
     pub popup_width: RwSignal<f64>,
     pub open_plan: Rc<dyn Fn(String)>,
     pub nav: NavKeys,
+    /// This tab's temporary font-size override (px) for Ctrl+scroll zoom; `None`
+    /// follows the user's configured size. Driven here, read by `SqlStyling`.
+    pub zoom: RwSignal<Option<f32>>,
 }
 
 pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
@@ -772,6 +780,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         popup_width,
         open_plan,
         nav,
+        zoom,
     } = p;
     let comp = Completion {
         items: RwSignal::new(Vec::new()),
@@ -1723,19 +1732,39 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         scroll_id.add_event_listener(
             EventListener::PointerWheel,
             Box::new(move |e| {
-                if let Event::PointerWheel(pe) = e
-                    && pe.modifiers.shift()
-                {
-                    // Windows delivers shift+wheel as a vertical delta; map it to x.
-                    let dx = if pe.delta.x != 0.0 {
-                        pe.delta.x
-                    } else {
-                        pe.delta.y
-                    };
-                    if dx != 0.0 {
-                        ed_wheel.scroll_delta.set(floem::kurbo::Vec2::new(dx, 0.0));
+                if let Event::PointerWheel(pe) = e {
+                    // Ctrl+wheel zooms the editor font (temporary, per-tab). Checked
+                    // before shift so it wins; scroll up = zoom in.
+                    if pe.modifiers.control() {
+                        let dy = pe.delta.y;
+                        if dy != 0.0 {
+                            let cur = zoom
+                                .get_untracked()
+                                .unwrap_or_else(theme::editor_font_size);
+                            let next = (cur + if dy < 0.0 { ZOOM_STEP } else { -ZOOM_STEP })
+                                .clamp(ZOOM_MIN, ZOOM_MAX);
+                            if Some(next) != zoom.get_untracked() {
+                                zoom.set(Some(next));
+                                // Invalidate the editor's cached layout so the new
+                                // size takes effect now (same lever as the font
+                                // setting; only the active tab's editor is mounted).
+                                theme::bump_editor_generation();
+                            }
+                        }
+                        return EventPropagation::Stop;
                     }
-                    return EventPropagation::Stop;
+                    if pe.modifiers.shift() {
+                        // Windows delivers shift+wheel as a vertical delta; map it to x.
+                        let dx = if pe.delta.x != 0.0 {
+                            pe.delta.x
+                        } else {
+                            pe.delta.y
+                        };
+                        if dx != 0.0 {
+                            ed_wheel.scroll_delta.set(floem::kurbo::Vec2::new(dx, 0.0));
+                        }
+                        return EventPropagation::Stop;
+                    }
                 }
                 EventPropagation::Continue
             }),
@@ -1818,7 +1847,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     }
     let doc = editor.doc();
     let input = editor
-        .styling(sql_highlight::SqlStyling::new(doc, dialect.get_untracked()))
+        .styling(sql_highlight::SqlStyling::new(
+            doc,
+            dialect.get_untracked(),
+            zoom,
+        ))
         // `smart_tab` makes Tab insert spaces to the next tab stop; without it
         // Tab inserts a literal '\t' while OutdentLine assumes space indentation,
         // so Shift+Tab removes ALL indentation instead of one level.
@@ -2008,6 +2041,14 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 highlight.set(None);
                 if guard.get_untracked().is_some() {
                     guard.set(None);
+                }
+                // Ctrl+middle-click resets the temporary font zoom to the user's size.
+                if pe.button.is_auxiliary() && pe.modifiers.control() {
+                    if zoom.get_untracked().is_some() {
+                        zoom.set(None);
+                        theme::bump_editor_generation();
+                    }
+                    return EventPropagation::Stop;
                 }
                 if pe.button.is_secondary() {
                     let off = ed_menu.cursor.get_untracked().offset();

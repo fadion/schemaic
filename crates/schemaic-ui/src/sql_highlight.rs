@@ -16,6 +16,7 @@ use std::borrow::Cow;
 use std::rc::Rc;
 
 use floem::peniko::Color;
+use floem::reactive::{RwSignal, SignalGet};
 use floem::text::{Attrs, AttrsList, FamilyOwned};
 use floem::views::editor::EditorStyle;
 use floem::views::editor::core::buffer::rope_text::RopeText;
@@ -54,18 +55,32 @@ pub struct SqlStyling {
     /// coloured as comments on a PostgreSQL connection. Fixed at construction
     /// (the editor is rebuilt when the tab's connection changes).
     dialect: SqlDialect,
+    /// This tab's temporary font-size override (px) for Ctrl+scroll zoom; `None`
+    /// follows the user's configured size. Per-tab, so zooming one editor doesn't
+    /// touch others.
+    zoom: RwSignal<Option<f32>>,
 }
 
 impl SqlStyling {
-    pub fn new(doc: Rc<dyn Document>, dialect: SqlDialect) -> Self {
+    pub fn new(doc: Rc<dyn Document>, dialect: SqlDialect, zoom: RwSignal<Option<f32>>) -> Self {
         Self {
             doc,
             dialect,
+            zoom,
             // Explicit IBM Plex Mono (the bundled face) rather than the generic
             // `Monospace` — keeps the editor and the Ctrl+K diff on the exact
             // same family, not just both relying on the generic override.
             family: vec![FamilyOwned::Name("IBM Plex Mono".to_string())],
         }
+    }
+
+    /// The effective editor font size (px): the tab's zoom override, else the
+    /// user's configured size. Both reads are reactive so `id()`/`font_size()`
+    /// re-run when either changes.
+    fn effective_px(&self) -> f32 {
+        self.zoom
+            .get()
+            .unwrap_or_else(crate::theme::editor_font_size)
     }
 }
 
@@ -75,11 +90,14 @@ impl Styling for SqlStyling {
     // palette. (A per-line lexer has no cross-line state, so edited lines are
     // re-highlighted on relayout regardless.)
     fn id(&self) -> u64 {
-        crate::theme::editor_generation()
+        // Fold the effective font size into the cache key so a per-tab zoom (or a
+        // settings font-size change) invalidates this editor's layout and re-lays
+        // out at the new size — the generation covers theme/tab-width changes.
+        (crate::theme::editor_generation() << 8) | (self.effective_px().round() as u64 & 0xFF)
     }
 
     fn font_size(&self, _edid: EditorId, _line: usize) -> usize {
-        crate::theme::editor_font_size().round() as usize
+        self.effective_px().round() as usize
     }
 
     fn tab_width(&self, _edid: EditorId, _line: usize) -> usize {
