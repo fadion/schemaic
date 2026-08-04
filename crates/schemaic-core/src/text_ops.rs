@@ -100,6 +100,60 @@ pub fn toggle_line_comment(text: &str, sel_start: usize, sel_end: usize) -> Line
     }
 }
 
+/// Move the line(s) spanned by the byte range `[sel_start, sel_end]` up (`up =
+/// true`) or down by one line, returning the new full document text plus the
+/// selection to reapply (the moved block, shifted by the swapped line). Returns
+/// `None` when the move isn't possible — the block is already at the top (`up`)
+/// or the bottom (`down`).
+///
+/// Reorders whole line *segments* (`split('\n')`) and rejoins with `\n`, so the
+/// last line having no trailing newline is handled correctly. (Floem's built-in
+/// `MoveLineUp`/`MoveLineDown` slices `line_start..next_line_start` assuming a
+/// trailing `\n`, so moving the newline-less last line merges it into its
+/// neighbour.) Applied by the UI as one full-buffer edit (a single undo step).
+pub fn move_line(text: &str, sel_start: usize, sel_end: usize, up: bool) -> Option<LineEdit> {
+    let len = text.len();
+    let lo = sel_start.min(sel_end).min(len);
+    let hi = sel_start.max(sel_end).min(len);
+
+    let starts = line_start_offsets(text);
+    let first = line_index_of(&starts, lo);
+    let mut last = line_index_of(&starts, hi);
+    // A selection ending exactly at a line's start doesn't pull that line in.
+    if last > first && hi == starts[last] {
+        last -= 1;
+    }
+
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    let n = lines.len();
+
+    // Shift = the swapped neighbour segment's length + its one `\n`. Total text
+    // length is invariant under reorder+rejoin, so the moved block just slides by
+    // this amount; the selection follows.
+    let (new_lo, new_hi) = if up {
+        if first == 0 {
+            return None;
+        }
+        let shift = lines[first - 1].len() + 1;
+        let prev = lines.remove(first - 1);
+        lines.insert(last, prev); // block is now at [first-1..=last-1]
+        (lo - shift, hi - shift)
+    } else {
+        if last + 1 >= n {
+            return None;
+        }
+        let shift = lines[last + 1].len() + 1;
+        let next = lines.remove(last + 1);
+        lines.insert(first, next);
+        (lo + shift, hi + shift)
+    };
+
+    Some(LineEdit {
+        text: lines.join("\n"),
+        sel: (new_lo, new_hi),
+    })
+}
+
 /// Byte offsets of every (non-overlapping) ASCII-case-insensitive occurrence of
 /// `needle` in `hay`. Offsets index into `hay` directly (the search is byte-wise
 /// and boundary-checked, so no `to_lowercase` reallocation shifts them). Empty
@@ -725,5 +779,65 @@ mod tests {
         let out = soft_tab_outdent(&indented, ind.sel.0, ind.sel.1, 4);
         assert_eq!(out.text, "x");
         assert_eq!(out.sel, (0, 0));
+    }
+
+    // --- move_line ---------------------------------------------------------
+
+    #[test]
+    fn move_line_up_swaps_with_previous() {
+        // caret on line "b" (offset 2) → moves above "a"
+        let e = move_line("a\nb\nc", 2, 2, true).unwrap();
+        assert_eq!(e.text, "b\na\nc");
+        assert_eq!(e.sel, (0, 0)); // caret followed "b" up by len("a")+1 = 2
+    }
+
+    #[test]
+    fn move_line_down_swaps_with_next() {
+        // caret on line "a" (offset 0) → moves below "b"
+        let e = move_line("a\nb\nc", 0, 0, false).unwrap();
+        assert_eq!(e.text, "b\na\nc");
+        assert_eq!(e.sel, (2, 2));
+    }
+
+    #[test]
+    fn move_last_line_up_keeps_newline() {
+        // The reported bug: last line has no trailing newline; moving it up must
+        // NOT merge the previous line into it.
+        let e = move_line("s1;\ns2;\ns3;", 8, 8, true).unwrap();
+        assert_eq!(e.text, "s1;\ns3;\ns2;");
+        // caret was at start of "s3;" (offset 8) → follows up by len("s2;")+1 = 4
+        assert_eq!(e.sel, (4, 4));
+    }
+
+    #[test]
+    fn move_second_last_line_down_keeps_newline() {
+        // The mirror case: moving the second-to-last line down past the
+        // newline-less last line must not merge them either.
+        let e = move_line("s1;\ns2;\ns3;", 4, 4, false).unwrap();
+        assert_eq!(e.text, "s1;\ns3;\ns2;");
+        assert_eq!(e.sel, (8, 8));
+    }
+
+    #[test]
+    fn move_line_at_edges_is_noop() {
+        assert!(move_line("a\nb", 0, 0, true).is_none()); // first line up
+        assert!(move_line("a\nb", 2, 2, false).is_none()); // last line down
+    }
+
+    #[test]
+    fn move_multiline_selection_up() {
+        // Select lines "b" and "c" (offsets 2..5) → whole block moves above "a".
+        let e = move_line("a\nb\nc\nd", 2, 5, true).unwrap();
+        assert_eq!(e.text, "b\nc\na\nd");
+        assert_eq!(e.sel, (0, 3)); // block shifted up by len("a")+1 = 2
+    }
+
+    #[test]
+    fn move_selection_ending_at_line_start_excludes_that_line() {
+        // Selection covers "a" and ends exactly at the start of "b" → only "a"
+        // moves down (not "b").
+        let e = move_line("a\nb\nc", 0, 2, false).unwrap();
+        assert_eq!(e.text, "b\na\nc");
+        assert_eq!(e.sel, (2, 4));
     }
 }
