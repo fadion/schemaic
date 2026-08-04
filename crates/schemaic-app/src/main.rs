@@ -416,6 +416,7 @@ fn seed_connection() -> Connection {
         color: None,
         prominent_color: false,
         read_only: false,
+        environment: Default::default(),
     }
 }
 
@@ -3325,6 +3326,7 @@ mod app_tests {
             color: None,
             prominent_color: false,
             read_only: false,
+            environment: Default::default(),
         }
     }
 

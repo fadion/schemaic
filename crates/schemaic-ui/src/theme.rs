@@ -82,6 +82,12 @@ pub fn diag_error() -> Color {
     Color::rgb8(0xE0, 0x5A, 0x5A)
 }
 
+/// Text on the top-bar environment badge — always white; it sits on the
+/// connection's identity colour, so it reads the same across UI themes.
+pub fn env_badge_text() -> Color {
+    Color::rgb8(0xFF, 0xFF, 0xFF)
+}
+
 // AI-panel message send/stop icon (inside the message field).
 pub fn ai_send_icon() -> Color {
     ui().ai_send_icon
