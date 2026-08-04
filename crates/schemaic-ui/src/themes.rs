@@ -614,6 +614,13 @@ pub fn editor_generation() -> u64 {
     with_state(|st| st.editor_gen.get())
 }
 
+/// Bump the editor generation without changing any setting — invalidates the
+/// mounted editor's cached layout so a per-tab font zoom (which doesn't go
+/// through `set_editor_font`) takes effect immediately.
+pub fn bump_editor_generation() {
+    with_state(|st| st.editor_gen.update(|g| *g += 1));
+}
+
 /// The SQL-editor font size (px). Read by `SqlStyling::font_size`.
 pub fn editor_font_size() -> f32 {
     with_state(|st| st.editor_font.get())

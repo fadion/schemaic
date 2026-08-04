@@ -207,6 +207,10 @@ pub struct Tab {
     /// loaded on tab switch and written back by the expand/shrink toggle. Session-only
     /// (starts un-maximized), matching the pre-per-tab behaviour.
     pub results_maximized: RwSignal<bool>,
+    /// Temporary per-tab editor font-size override (px) for Ctrl+scroll zoom —
+    /// `None` follows the user's configured font size. Session-only, per-tab, not
+    /// persisted; Ctrl+middle-click resets it to `None`. Useful for screen-sharing.
+    pub font_zoom: RwSignal<Option<f32>>,
 }
 
 impl Tab {
@@ -240,6 +244,7 @@ impl Tab {
             jump_offset: cx.create_rw_signal(None),
             highlight_col: cx.create_rw_signal(None),
             results_maximized: cx.create_rw_signal(false),
+            font_zoom: cx.create_rw_signal(None),
         }
     }
 
@@ -2277,6 +2282,7 @@ fn center(ui: Ui) -> impl IntoView {
                     popup_width,
                     open_plan: open_plan.clone(),
                     nav: navkeys.clone(),
+                    zoom: tab.font_zoom,
                 })
                 .into_any(),
                 None => editor_placeholder(editor_h, editor_collapsed).into_any(),

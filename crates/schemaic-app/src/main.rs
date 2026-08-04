@@ -1267,6 +1267,9 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 tab.results.set(QueryState::Idle);
                 tab.result_tabs.set(Vec::new());
                 tab.active_result.set(0);
+                // Drop any temporary font zoom so the respawned tab starts at the
+                // user's configured size (the post-flash rebuild reads this).
+                tab.font_zoom.set(None);
                 flashing.set(Some(id));
                 exec_after(Duration::from_millis(150), move |_| flashing.set(None));
                 return;
