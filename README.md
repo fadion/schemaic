@@ -1,10 +1,10 @@
 # Schemaic
 
-A fast, native SQL editor for MySQL and MariaDB — written in Rust, Zed-inspired,
-built to feel instant.
+A fast, native SQL editor for MySQL, MariaDB, and PostgreSQL — written in Rust,
+with an editable results grid and schema-aware intelligence, built to feel instant.
 
 <p align="center">
-  <img src="assets/screenshot.png" alt="Schemaic — query results grid" width="820">
+  <img src="assets/screenshot.png" alt="Schemaic — SQL editor and results grid" width="820">
 </p>
 
 ## Notice
@@ -24,14 +24,21 @@ Encrypting them (via the OS keyring) is a planned fix in the near future.
 
 ## Features
 
-- SQL editor with syntax highlighting, schema-aware autocomplete, and one-key
-  formatting.
-- Results grid with inline editing that writes back to the database
-  (transactional, with a per-row safety net), plus sort, freeze, and export
-  (CSV / JSON / SQL).
-- Schema browser, query history, and a global "find anywhere" for schema objects.
-- Secure connections over SSH tunnels.
-- Built-in AI assistant (pass-through to the `claude` CLI).
+- **SQL editor** — syntax highlighting, schema-aware autocomplete, structure-aware
+  diagnostics (unknown tables/columns, syntax errors, typo hints) from a real
+  per-dialect parser, one-key formatting, auto-closing pairs, and bracket matching.
+- **Results grid** — inline editing that writes back to the database
+  (transactional, with a per-row safety net); add / duplicate / delete rows;
+  server-side filter and sort straight from the column headers; per-column freeze;
+  a whole-row JSON view/edit panel; per-column display formatters; and export to
+  CSV / JSON / SQL / Markdown / HTML.
+- **Navigate** — schema browser with favorites, query history, `EXPLAIN` query
+  plans, and a global "find anywhere" for schema objects.
+- **Connect** — MySQL / MariaDB / PostgreSQL, direct or over SSH tunnels, with
+  per-connection colors, environment badges, and a read-only guard-rail.
+- **AI assistant** — pass-through to the `claude` CLI, with a built-in MCP server
+  so it can read your schema and query the database.
+- **Themeable** — dark / light UI themes and multiple editor color schemes.
 
 ## Build & run
 
