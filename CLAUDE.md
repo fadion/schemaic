@@ -190,6 +190,9 @@ bug fixes start with a failing test, then the code that makes it pass. Concretel
 - **Never commit unless the user explicitly asks.** Making edits does not imply committing — leave
   changes in the working tree. Same for `git tag`/`git push`. Amending is fine when the user is
   iterating on a commit.
+- **Always run `cargo fmt --all` before a push.** CI (`ci.yml`) fails the build on an unformatted
+  tree (`cargo fmt --all --check`), and it's historically the most common CI failure. Run it and
+  commit any resulting changes *before* `git push` — verify with `cargo fmt --all --check` (exit 0).
 - **Conventional Commits** — `type(scope): subject`, imperative, no trailing period, lower-case
   after the colon. Types: `feat`/`fix`/`refactor`/`perf`/`docs`/`test`/`chore`/`build`/`ci`. Scope
   = the crate/module the change centers on (`grid`, `editor`, `schema`, `ai`, `sql`, `theme`, `db`,
