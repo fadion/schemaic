@@ -1738,9 +1738,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     if pe.modifiers.control() {
                         let dy = pe.delta.y;
                         if dy != 0.0 {
-                            let cur = zoom
-                                .get_untracked()
-                                .unwrap_or_else(theme::editor_font_size);
+                            let cur = zoom.get_untracked().unwrap_or_else(theme::editor_font_size);
                             let next = (cur + if dy < 0.0 { ZOOM_STEP } else { -ZOOM_STEP })
                                 .clamp(ZOOM_MIN, ZOOM_MAX);
                             if Some(next) != zoom.get_untracked() {
