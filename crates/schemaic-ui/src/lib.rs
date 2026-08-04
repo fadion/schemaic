@@ -3109,6 +3109,11 @@ pub(crate) struct FieldCfg {
     /// `CHAT_MAX_ROWS`. A signal so the cap can follow a resizing container (the
     /// value viewer caps at the results-panel height).
     pub max_rows: Option<RwSignal<usize>>,
+    /// Multiline only: suppress soft word-wrap (long lines scroll horizontally
+    /// instead). Keeps the box height a function of the *logical* line count, so
+    /// content whose line count is constant (e.g. a row's JSON — one key per line)
+    /// doesn't change height as values vary. Default `false` (wrap, as before).
+    pub no_wrap: bool,
     /// Override the text colour (`None` = `theme::text`). A `fn` (not a `Color`)
     /// so it's re-read inside the reactive style — follows a live theme switch
     /// instead of freezing the colour captured at build (§7.4, matches `background`).
@@ -3158,6 +3163,7 @@ impl Default for FieldCfg {
             read_only: false,
             height: None,
             max_rows: None,
+            no_wrap: false,
             text_color: None,
             placeholder_color: None,
             border_color: None,
@@ -3226,6 +3232,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         read_only,
         height,
         max_rows,
+        no_wrap,
         text_color,
         placeholder_color,
         border_color,
@@ -3255,7 +3262,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         None => CHAT_PAD_V,
     };
     let cap = if multiline { CHAT_MAX_ROWS } else { 1 };
-    let wrap = if multiline {
+    let wrap = if multiline && !no_wrap {
         WrapMethod::EditorWidth
     } else {
         WrapMethod::None

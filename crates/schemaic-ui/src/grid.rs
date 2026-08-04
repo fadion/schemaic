@@ -2192,13 +2192,59 @@ fn row_colspecs(gs: GridState, di: usize) -> Vec<ColSpec> {
 
 /// Open the row view/edit panel for real data row `di`: serialize the whole row to
 /// JSON (all columns, read-only ones included for context) and reveal the panel.
-fn open_edit_row(gs: GridState, di: usize) {
+/// Load data-row `di` into the view/edit panel: (re)fill the JSON buffer, point
+/// the panel at it, and clear any error. Used both to open the panel and to walk
+/// to another row — reloading the buffer here is what discards unsaved edits when
+/// stepping. Does NOT touch `edit_row_open` (the caller owns opening).
+fn load_edit_row(gs: GridState, di: usize) {
     gs.edit_row_buf
         .set(rowjson::row_to_json(&row_colspecs(gs, di)));
     gs.edit_row_di.set(Some(di));
     gs.edit_row_err.set(None);
+}
+
+fn open_edit_row(gs: GridState, di: usize) {
+    load_edit_row(gs, di);
     gs.seed_open.set(false);
     gs.edit_row_open.set(true);
+}
+
+/// Display position (0-based) of data row `di` in the current sort order; the
+/// identity when unsorted (`order` empty). Mirrors the `row_no` math.
+fn edit_row_disp(gs: GridState, di: usize) -> usize {
+    gs.order
+        .get_untracked()
+        .iter()
+        .position(|&d| d == di)
+        .unwrap_or(di)
+}
+
+/// Walk the view panel to the previous/next real row in display order, discarding
+/// any unsaved edits (the buffer is reloaded). No-op at the first/last row.
+fn edit_row_step(gs: GridState, forward: bool) {
+    let Some(di) = gs.edit_row_di.get_untracked() else {
+        return;
+    };
+    let nrows = gs.rs.get_untracked().row_count();
+    let disp = edit_row_disp(gs, di);
+    let new_disp = if forward {
+        if disp + 1 >= nrows {
+            return;
+        }
+        disp + 1
+    } else {
+        if disp == 0 {
+            return;
+        }
+        disp - 1
+    };
+    let new_di = gs
+        .order
+        .get_untracked()
+        .get(new_disp)
+        .copied()
+        .unwrap_or(new_disp);
+    load_edit_row(gs, new_di);
 }
 
 /// Validate the edited JSON and commit the changed editable columns for this row as
@@ -2737,25 +2783,22 @@ fn seed_popover(gs: GridState) -> impl IntoView {
 /// `max_rows` (≈80% of the panel) then scrolls, and the grid above shrinks to fit.
 fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
     dyn_container(
-        move || gs.edit_row_open.get(),
-        move |open| {
+        // Keyed on (open, current row) so walking to another row (prev/next)
+        // rebuilds the panel — the header number, chevron enabled-state, and the
+        // freshly-loaded buffer all refresh together.
+        move || (gs.edit_row_open.get(), gs.edit_row_di.get()),
+        move |(open, di_opt)| {
             if !open {
                 return empty().into_any();
             }
             let close: Rc<dyn Fn()> = Rc::new(move || gs.edit_row_open.set(false));
-            // Display row number (the grid gutter number): the data row's position in
-            // the current sort order, 1-based; unsorted → the data index itself.
-            let row_no = match gs.edit_row_di.get_untracked() {
-                Some(di) => {
-                    gs.order
-                        .get_untracked()
-                        .iter()
-                        .position(|&d| d == di)
-                        .unwrap_or(di)
-                        + 1
-                }
-                None => 0,
-            };
+            // Display position (0-based) of this row in the current sort order;
+            // identity when unsorted. Drives the 1-based number + chevron gating.
+            let disp = di_opt.map(|di| edit_row_disp(gs, di));
+            let nrows = gs.rs.get_untracked().row_count();
+            let can_prev = disp.is_some_and(|d| d > 0);
+            let can_next = disp.is_some_and(|d| d + 1 < nrows);
+            let row_no = disp.map(|d| d + 1).unwrap_or(0);
             let title = match gs.source.get_untracked() {
                 Some((_, t)) if !t.is_empty() => format!("Row {row_no}  ·  {t}"),
                 _ => format!("Row {row_no}"),
@@ -2775,18 +2818,16 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                 .on_click_stop(move |_| (close_x)())
                 .style(|s| {
                     s.padding(4.0)
-                        .border_radius(4.0)
                         .color(theme::text_dim())
-                        .hover(|s| s.background(theme::row_hover()).color(theme::text()))
+                        .hover(|s| s.color(theme::text()))
                 });
             let trailing = if any_editable {
                 let save_btn = container(icons::icon(icons::CHECK, 14.0))
                     .on_click_stop(move |_| save_edit_row(gs))
                     .style(|s| {
                         s.padding(4.0)
-                            .border_radius(4.0)
                             .color(theme::text_dim())
-                            .hover(|s| s.background(theme::row_hover()).color(theme::text()))
+                            .hover(|s| s.color(theme::text()))
                     });
                 h_stack((save_btn, close_btn))
                     .style(|s| s.flex_row().items_center().gap(4.0))
@@ -2794,8 +2835,33 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
             } else {
                 close_btn.into_any()
             };
+            // Prev/next-row chevrons, just after the title. Up = previous row,
+            // down = next; each disabled (dimmed, non-interactive) at the first /
+            // last row. Stepping discards unsaved edits (buffer reloads).
+            let nav_chevron = |icon: &'static str, enabled: bool, forward: bool| {
+                let btn = container(icons::icon(icon, 14.0));
+                if enabled {
+                    btn.on_click_stop(move |_| edit_row_step(gs, forward))
+                        .style(|s| {
+                            s.padding(4.0)
+                                .color(theme::text_dim())
+                                .hover(|s| s.color(theme::text()))
+                        })
+                        .into_any()
+                } else {
+                    btn.style(|s| s.padding(4.0).color(theme::text_faint()))
+                        .into_any()
+                }
+            };
+            let nav = h_stack((
+                nav_chevron(icons::CHEVRON_UP, can_prev, false),
+                nav_chevron(icons::CHEVRON_DOWN, can_next, true),
+            ))
+            .style(|s| s.flex_row().items_center().gap(2.0).margin_left(8.0));
+
             let head = h_stack((
                 text(title).style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_dim())),
+                nav,
                 empty().style(|s| s.flex_grow(1.0_f32)),
                 trailing,
             ))
@@ -2814,6 +2880,11 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                     multiline: true,
                     autofocus: true,
                     max_rows: Some(max_rows),
+                    // No soft-wrap: the JSON is one key per line, so the panel
+                    // height tracks the (constant per table) line count and doesn't
+                    // jump between rows whose values wrap differently. Long values
+                    // scroll horizontally instead.
+                    no_wrap: true,
                     background: theme::bg_editor,
                     on_escape: Some(Rc::new(move || (esc)())),
                     ..Default::default()
