@@ -12,8 +12,10 @@ with an editable results grid and schema-aware intelligence, built to feel insta
 Schemaic is in active development. It should **not** be used or trusted with
 production data, or any data you care about.
 
-Saved connection passwords are currently stored in **plaintext** on disk.
-Encrypting them (via the OS keyring) is a planned fix in the near future.
+Saved connection secrets (database and SSH passwords, SSH key passphrases) are
+stored in the **OS keyring** (Windows Credential Manager / Secret Service /
+macOS Keychain), not in the config file. On a machine with no keyring available
+they fall back to plaintext on disk so the app still works.
 
 ## Why
 

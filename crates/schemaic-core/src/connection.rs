@@ -5,8 +5,12 @@
 //! optional SSH tunnel is captured here (password / key-pair / agent auth); it's
 //! established by `schemaic_db::ssh::open_tunnel`.
 //!
-//! NOTE: passwords are stored in plaintext JSON for now. Moving secrets to the
-//! OS keychain (`keyring`) is tracked in ARCHITECTURE §16.
+//! NOTE: secrets (the DB password, the SSH tunnel password, and the SSH key
+//! passphrase) are NOT persisted in this struct's JSON — they live in the OS
+//! keyring and are hydrated back into these fields on load. See [`crate::secrets`]
+//! for the store seam + migration, and `schemaic-app`'s `secrets` module for the
+//! keyring-backed implementation. On a machine with no working keyring the fields
+//! fall back to plaintext in the JSON so the app keeps working.
 
 use serde::{Deserialize, Serialize};
 

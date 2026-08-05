@@ -26,6 +26,7 @@ pub mod resource;
 pub mod rowjson;
 pub mod schema;
 pub mod search_history;
+pub mod secrets;
 pub mod seed;
 pub mod sql;
 pub mod sqlfmt;
