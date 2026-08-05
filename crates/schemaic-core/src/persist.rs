@@ -360,6 +360,19 @@ pub fn save_connections(file: &ConnectionsFile) {
     write_json(connections_path(), file);
 }
 
+/// Remove the `connections.json.bak` recovery copy (best effort).
+///
+/// [`write_json`] snapshots the *previous* file to `.bak` before each write, so
+/// the first save that migrates legacy plaintext secrets into the keyring leaves
+/// a `.bak` still holding those plaintext secrets. The secret layer calls this
+/// right after a migration save to make sure no plaintext credential lingers at
+/// rest; a fresh (already-sanitized) `.bak` is regenerated on the next save.
+pub fn clear_connections_backup() {
+    if let Some(path) = connections_path() {
+        let _ = std::fs::remove_file(sibling(&path, ".bak"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Load, classify, recover, sibling};

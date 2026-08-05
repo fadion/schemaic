@@ -37,6 +37,13 @@ Zed-inspired, aiming to replace DataGrip.
   - `format.rs` — per-column display formatters (`ColumnFormat`/`apply`: epoch→datetime, bytes,
     bool). Display-only; edit/copy stay raw. Persisted to `format.json`.
   - `schema::TableInfo::create_ddl` — `CREATE TABLE`/`VIEW` skeleton.
+  - `secrets.rs` — keeps connection secrets (DB/SSH passwords + SSH key passphrase) out of the
+    plaintext `connections.json`: the `SecretStore` seam + pure transforms `hydrate_file` (load →
+    fill empty fields from the store, flag legacy plaintext for migration), `sanitize_file` (save →
+    move secrets into the store, blank the disk copy; keep plaintext only if the store is
+    unavailable) and `forget` (delete). The real keyring-backed store lives in `schemaic-app`'s
+    `secrets` module (the heavy `keyring`/D-Bus dep stays out of core); pure + unit-tested via an
+    in-memory fake.
   - `rowjson.rs` — the grid's whole-row **view/edit panel** logic: `row_to_json` serializes a row to
     a pretty JSON object (keys in column order, reusing `export::value_to_json`; DECIMAL/dates stay
     quoted strings, join-duplicate names → `name#ci`), and `parse_row_edit` validates an edited object
@@ -136,6 +143,13 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **Connection identity is the `Db` handle / `conn_id`, never a `mysql://user:pass@host/db` URL.**
   Credentials go through `OptsBuilder`; never in a URL, argv, or log. The MCP subprocess gets its
   endpoint via a temp `--mcp-config` file, not argv. Don't add new plaintext-secret surfaces.
+- **Connection secrets persist to the OS keyring, not `connections.json`.** DB/SSH passwords and the
+  SSH key passphrase go through `schemaic_core::secrets` (`SecretStore` seam) + `schemaic-app`'s
+  keyring-backed store; the JSON on disk is blanked and hydrated on load. All connection saves route
+  through the app's `secrets::{load,save}_connections`/`forget_connection` (which wrap
+  `persist::{load,save}_connections`) — never call `persist::save_connections` directly from the app,
+  or you reintroduce plaintext. Plaintext in the JSON is a *fallback only* for a machine with no
+  working keyring.
 - **Own per-entity signals in a child `Scope`; dispose it *deferred*.** A `Tab`/`ConnNode` creates
   its signals in `parent.create_child()`; removal disposes that scope via
   `exec_after(Duration::ZERO, …)` — one tick later, after the keyed `dyn_container` has unmounted

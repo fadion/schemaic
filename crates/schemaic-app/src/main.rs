@@ -15,6 +15,7 @@ mod ai;
 mod claude_cli;
 mod heap;
 mod mcp;
+mod secrets;
 
 /// Process-wide heap accounting (live/peak bytes), for leak-vs-retention
 /// diagnosis. Delegates to the system allocator; only adds two atomics per
@@ -423,13 +424,14 @@ fn seed_connection() -> Connection {
 fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let cx = Scope::current();
 
-    // Load (or seed) saved connections.
-    let mut cf = persist::load_connections();
+    // Load (or seed) saved connections. Secrets are hydrated from the OS keyring
+    // (and any legacy plaintext migrated into it) by `secrets::load_connections`.
+    let mut cf = secrets::load_connections();
     if cf.connections.is_empty() {
         let seed = seed_connection();
         cf.active = Some(seed.id);
         cf.connections.push(seed);
-        persist::save_connections(&cf);
+        secrets::save_connections(&cf);
     }
     // Backfill an identity colour for any connection saved before colours existed
     // (and the freshly-seeded one), so every connection always has one. Colours
@@ -450,7 +452,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             }
         }
         if changed {
-            persist::save_connections(&cf);
+            secrets::save_connections(&cf);
         }
     }
     let active_id = cf
@@ -2034,7 +2036,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             connections: connections.get_untracked(),
             active,
         };
-        persist::save_connections(&file);
+        secrets::save_connections(&file);
     };
 
     // Flip a connection's read-only flag and persist (the status-bar shortcut).
@@ -2162,6 +2164,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             let was_active = active_conn.get_untracked() == id;
             // Drop any tunnel for the deleted connection (frees its listener/port).
             tunnels.borrow_mut().remove(&id);
+            // Forget its keyring secrets so nothing is left behind.
+            secrets::forget_connection(id);
             connections.update(|cs| cs.retain(|c| c.id != id));
             let fallback = connections.with_untracked(|cs| cs.first().map(|c| c.id));
             let new_active = if was_active {
