@@ -66,7 +66,9 @@ use floem::views::editor::keypress::default_key_handler;
 use floem::views::editor::keypress::key::KeyInput;
 use floem::views::editor::text::{SimpleStyling, WrapMethod, default_dark_color};
 use floem::views::scroll::{Handle, Rounded, Thickness, Track};
-use floem::views::{Decorators, Delay, TextInputClass, TooltipClass, TooltipContainerClass};
+use floem::views::{
+    Decorators, Delay, LabelClass, TextInputClass, TooltipClass, TooltipContainerClass,
+};
 use schemaic_core::connection::{ConnStatus, Connection, Environment, SshAuth};
 use schemaic_core::db_color::DbColorRule;
 use schemaic_core::favorite::FavoriteRule;
@@ -1443,6 +1445,17 @@ pub fn workspace(ui: Ui) -> impl IntoView {
     })
     .style(|s| {
         s.size_full()
+            // Floem labels are drag-selectable by default (`Selectable` = true),
+            // which reads as web-y in a native app: every caption, header, tree row
+            // and status string would highlight under the pointer. Turn it off for
+            // *every* label in the tree — text selection belongs to real text
+            // surfaces (`text_input`/`edit_field`, the SQL editor, the terminal's
+            // own selection model), which are separate views and unaffected.
+            // A class rule cascades to the whole subtree, and Floem's dropdown
+            // popup carries the ambient context style into its overlay, so that
+            // gets it too; a tooltip tip only inherits `TooltipClass`, so
+            // `tooltip_style` repeats the rule for those.
+            .class(LabelClass, |s| s.selectable(false))
             // Floem's default theme paints text inputs white — and also sets
             // light backgrounds for the hover/active/focus states. Override the
             // class for every state so inputs stay dark throughout (app + modals).

@@ -227,6 +227,12 @@ bug fixes start with a failing test, then the code that makes it pass. Concretel
 - **No pointer cursor on buttons/icons** — native apps keep the arrow cursor; a pointer feels
   web-like. Use the default; reserve `CursorStyle::Text` for text inputs (a genuine hyperlink may
   keep `Pointer`).
+- **Labels aren't selectable** — Floem's `Selectable` defaults to *true*, so every caption/header/tree
+  row would drag-highlight like a web page. The workspace root sets `.class(LabelClass, |s|
+  s.selectable(false))`, which cascades to the whole tree (and, via the captured context style, into
+  dropdown popups); `tooltip_style` repeats it because a tip overlay only inherits `TooltipClass`.
+  Text selection belongs to real text surfaces — `text_input`/`edit_field`, the SQL editor, and the
+  terminal (which paints its own selection). Don't re-enable it on a label.
 - **Colors live in `theme.rs`** as named fns — add one rather than inlining a hex literal. They read
   the *active* theme from `themes.rs` (reactive), so calling one inside a `.style(…)` closure follows
   a live theme switch for free.
