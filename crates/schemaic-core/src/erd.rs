@@ -568,6 +568,28 @@ pub fn place(
         .collect()
 }
 
+/// Zoom + pan that fits `content` `(w, h)` centred in `viewport` `(w, h)`: the
+/// largest zoom in `[zoom_min, 1.0]` that shows the whole diagram — never
+/// magnifying past 100% — then the pan that centres the scaled content. Drives both
+/// the "Fit" control and the fit-on-open behaviour. A zero content dimension yields
+/// zoom 1.0 (nothing to scale). Returns `(zoom, (pan_x, pan_y))`.
+pub fn fit_view(content: (f64, f64), viewport: (f64, f64), zoom_min: f64) -> (f64, (f64, f64)) {
+    let (cw, ch) = content;
+    let (vw, vh) = viewport;
+    let z = if cw > 0.0 && ch > 0.0 {
+        (vw / cw).min(vh / ch).clamp(zoom_min, 1.0)
+    } else {
+        1.0
+    };
+    (z, ((vw - cw * z) / 2.0, (vh - ch * z) / 2.0))
+}
+
+/// Does `content` `(w, h)` overflow `viewport` `(w, h)` in either dimension — i.e.
+/// would opening at 100% top-left hide part of the diagram? Gate for fit-on-open.
+pub fn view_overflows(content: (f64, f64), viewport: (f64, f64)) -> bool {
+    content.0 > viewport.0 || content.1 > viewport.1
+}
+
 // ── Edge geometry (SVG drawing + hover hit-test) ────────────────────────────
 //
 // Pure geometry shared by the UI's edge-drawing (one generated `<svg>` string)
@@ -1227,6 +1249,46 @@ mod tests {
         // Within layer 1: a at y=0, b below by a's height (40) + gap (20) = 60.
         assert_eq!(at("a").y, 0.0);
         assert_eq!(at("b").y, 60.0);
+    }
+
+    // ── fit-to-view ──
+
+    #[test]
+    fn fit_view_never_magnifies_and_centres_small_content() {
+        // Content smaller than the viewport → zoom stays 1.0 (no magnify), centred.
+        let (z, (px, py)) = fit_view((200.0, 100.0), (800.0, 600.0), 0.25);
+        assert_eq!(z, 1.0);
+        assert_eq!((px, py), (300.0, 250.0));
+    }
+
+    #[test]
+    fn fit_view_scales_down_overflowing_content() {
+        // Wide content: limited by the width ratio 800/1600 = 0.5; centred vertically.
+        let (z, (px, py)) = fit_view((1600.0, 600.0), (800.0, 600.0), 0.25);
+        assert_eq!(z, 0.5);
+        assert_eq!((px, py), (0.0, 150.0));
+        // Huge content clamps at the zoom floor rather than going smaller.
+        let (z2, _) = fit_view((8000.0, 8000.0), (800.0, 600.0), 0.25);
+        assert_eq!(z2, 0.25);
+    }
+
+    #[test]
+    fn fit_view_handles_zero_content() {
+        // No content → zoom 1.0, no NaN/inf.
+        let (z, (px, py)) = fit_view((0.0, 0.0), (800.0, 600.0), 0.25);
+        assert_eq!(z, 1.0);
+        assert_eq!((px, py), (400.0, 300.0));
+    }
+
+    #[test]
+    fn view_overflows_only_when_content_exceeds_viewport() {
+        assert!(!view_overflows((200.0, 100.0), (800.0, 600.0)), "fits");
+        assert!(view_overflows((900.0, 100.0), (800.0, 600.0)), "too wide");
+        assert!(view_overflows((200.0, 700.0), (800.0, 600.0)), "too tall");
+        assert!(
+            !view_overflows((800.0, 600.0), (800.0, 600.0)),
+            "exact fit is not overflow"
+        );
     }
 
     // ── edge geometry ──

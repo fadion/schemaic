@@ -947,10 +947,9 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
 
             // Fit the whole diagram in the measured viewport and centre it.
             let fit: Rc<dyn Fn()> = Rc::new(move || {
-                let (vw, vh) = viewport_size.get_untracked();
-                let z = (vw / cw).min(vh / ch).clamp(ZOOM_MIN, 1.0);
+                let (z, p) = erd::fit_view((cw, ch), viewport_size.get_untracked(), ZOOM_MIN);
                 zoom.set(z);
-                pan.set(((vw - cw * z) / 2.0, (vh - ch * z) / 2.0));
+                pan.set(p);
             });
 
             // Positions: auto-layout, overridden by any saved manual layout for this
@@ -1020,12 +1019,16 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                 zoom_at(vw / 2.0, vh / 2.0, 1.0 / 1.2);
             });
 
-            // Right-side controls, left→right: zoom unit, Fit, Reset layout.
+            // Right-side controls, left→right: zoom unit, Fit, Reset layout. Keep a
+            // clone of `fit` for the one-shot fit-on-open below.
+            let fit_on_open = fit.clone();
             let controls: Vec<AnyView> = vec![
                 zoom_unit(zoom, zoom_out, zoom_in),
                 control_button(icons::SCAN_SQUARE, fit),
                 control_button(icons::ROTATE_CCW, reset),
             ];
+            // Fit-on-open runs once, the first time the canvas reports its real size.
+            let did_autofit = RwSignal::new(false);
 
             let hovered = RwSignal::new(None::<usize>);
 
@@ -1192,6 +1195,16 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                     let (w, h) = (rect.width(), rect.height());
                     if viewport_size.get_untracked() != (w, h) {
                         viewport_size.set((w, h));
+                    }
+                    // Fit-on-open: the first time the canvas reports a real size, if
+                    // the diagram overflows the viewport, fit + centre it (small
+                    // diagrams keep their 100% top-left open). One-shot, so a later
+                    // window resize never yanks the user's zoom/pan.
+                    if !did_autofit.get_untracked() && w > 1.0 && h > 1.0 {
+                        did_autofit.set(true);
+                        if erd::view_overflows((cw, ch), (w, h)) {
+                            (fit_on_open)();
+                        }
                     }
                 })
                 .style(|s| {
