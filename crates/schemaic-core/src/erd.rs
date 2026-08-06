@@ -347,6 +347,47 @@ pub fn collapsed_visible(cols: &[DiagramColumn], collapsed_cols: usize) -> Vec<u
         .collect()
 }
 
+/// The centre y-offset (from a card's top) at which an edge for `col_names` should
+/// anchor: `header_h + (row + 0.5) * row_h`, averaged over the named columns that
+/// are currently *visible* (`visible` = the shown column indices from
+/// [`collapsed_visible`] / the full range), or `None` if none of them is visible
+/// (the FK's columns are collapsed away → the caller falls back to the card edge).
+/// `header_h`/`row_h` are the UI's layout metrics, kept as parameters so this stays
+/// layout-agnostic. FK and PK columns are pinned by [`collapsed_visible`], so an FK
+/// edge normally anchors precisely even on a collapsed card.
+pub fn column_row_offset(
+    cols: &[DiagramColumn],
+    visible: &[usize],
+    col_names: &[String],
+    header_h: f64,
+    row_h: f64,
+) -> Option<f64> {
+    let want: HashSet<&str> = col_names.iter().map(String::as_str).collect();
+    let ys: Vec<f64> = visible
+        .iter()
+        .enumerate()
+        .filter(|&(_, &ci)| cols.get(ci).is_some_and(|c| want.contains(c.name.as_str())))
+        .map(|(row, _)| header_h + (row as f64 + 0.5) * row_h)
+        .collect();
+    if ys.is_empty() {
+        None
+    } else {
+        Some(ys.iter().sum::<f64>() / ys.len() as f64)
+    }
+}
+
+/// Whether the edge at index `edge` (into `graph.edges`) attaches to column `col`
+/// of node `node_id`: true when the node is the edge's child and `col` is one of
+/// its FK columns, or the node is the parent and `col` a referenced column. Drives
+/// the endpoint-row highlight when a relationship is hovered (both ends light up).
+pub fn edge_touches_column(graph: &DiagramGraph, edge: usize, node_id: &str, col: &str) -> bool {
+    let Some(e) = graph.edges.get(edge) else {
+        return false;
+    };
+    (e.from == node_id && e.from_columns.iter().any(|c| c == col))
+        || (e.to == node_id && e.to_columns.iter().any(|c| c == col))
+}
+
 // ── Deterministic auto-layout ──────────────────────────────────────────────
 //
 // A layered ("Sugiyama-lite") layout: nodes are assigned to layers by longest FK
@@ -554,30 +595,47 @@ pub struct Rect {
 /// vertical centre. The side is chosen purely by horizontal *centre* position, so
 /// the connection stays right-edge→left-edge (or the mirror) even when the cards
 /// overlap horizontally — no "both exit the same side" case, which produced a
-/// jarring flip as two cards were dragged close. (Column-row-precise anchoring is a
-/// later refinement.)
+/// jarring flip as two cards were dragged close.
+///
+/// Card-centre anchoring; see [`edge_anchors_rows`] for column-row-precise anchoring
+/// (this is `edge_anchors_rows(from, to, None, None)`).
 pub fn edge_anchors(from: Rect, to: Rect) -> (Pt, Pt) {
-    let from_cy = from.y + from.h / 2.0;
-    let to_cy = to.y + to.h / 2.0;
+    edge_anchors_rows(from, to, None, None)
+}
+
+/// Column-precise anchor points: same facing-side selection as [`edge_anchors`],
+/// but each end's *y* is placed at a specific column row (`from_y`/`to_y` are
+/// absolute canvas y-coordinates for the FK-child / parent-PK rows) instead of the
+/// card centre. A `None` end — the column is collapsed away or hidden — falls back
+/// to the card's vertical centre. Each row y is clamped inside the card (with a 6px
+/// inset) so it can never sit exactly on a corner.
+pub fn edge_anchors_rows(from: Rect, to: Rect, from_y: Option<f64>, to_y: Option<f64>) -> (Pt, Pt) {
+    let anchor_y = |r: Rect, y: Option<f64>| match y {
+        Some(y) => {
+            let lo = r.y + 6.0;
+            let hi = (r.y + r.h - 6.0).max(lo);
+            y.clamp(lo, hi)
+        }
+        None => r.y + r.h / 2.0,
+    };
+    let fy = anchor_y(from, from_y);
+    let ty = anchor_y(to, to_y);
     if to.x + to.w / 2.0 >= from.x + from.w / 2.0 {
         // Target centre to the right: source right edge → target left edge.
         (
             Pt {
                 x: from.x + from.w,
-                y: from_cy,
+                y: fy,
             },
-            Pt { x: to.x, y: to_cy },
+            Pt { x: to.x, y: ty },
         )
     } else {
         // Target centre to the left: source left edge → target right edge.
         (
-            Pt {
-                x: from.x,
-                y: from_cy,
-            },
+            Pt { x: from.x, y: fy },
             Pt {
                 x: to.x + to.w,
-                y: to_cy,
+                y: ty,
             },
         )
     }
@@ -1151,6 +1209,155 @@ mod tests {
         let (a2, b2) = edge_anchors(from, left);
         assert_eq!(a2, pt(0.0, 20.0));
         assert_eq!(b2, pt(-100.0, 20.0));
+    }
+
+    #[test]
+    fn edge_anchors_rows_place_ends_at_specific_rows() {
+        let from = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        };
+        let to = Rect {
+            x: 200.0,
+            y: 40.0,
+            w: 100.0,
+            h: 100.0,
+        };
+        // Both ends anchored at a given row y (absolute canvas coords).
+        let (a, b) = edge_anchors_rows(from, to, Some(18.0), Some(70.0));
+        assert_eq!(a, pt(100.0, 18.0), "leaves source right edge at the row y");
+        assert_eq!(b, pt(200.0, 70.0), "enters target left edge at the row y");
+        // A `None` end falls back to that card's vertical centre.
+        let (a2, b2) = edge_anchors_rows(from, to, None, Some(70.0));
+        assert_eq!(a2, pt(100.0, 50.0), "None → source card centre");
+        assert_eq!(b2, pt(200.0, 70.0));
+        // With both None it matches the card-centre `edge_anchors`.
+        assert_eq!(
+            edge_anchors_rows(from, to, None, None),
+            edge_anchors(from, to)
+        );
+    }
+
+    #[test]
+    fn edge_anchors_rows_clamp_y_inside_the_card() {
+        let from = Rect {
+            x: 0.0,
+            y: 10.0,
+            w: 80.0,
+            h: 40.0,
+        };
+        let to = Rect {
+            x: 200.0,
+            y: 10.0,
+            w: 80.0,
+            h: 40.0,
+        };
+        // A y above/below the card is clamped to the 6px inset band [16, 44].
+        let (a, _) = edge_anchors_rows(from, to, Some(-100.0), None);
+        assert_eq!(a.y, 16.0, "clamped to top inset");
+        let (a2, _) = edge_anchors_rows(from, to, Some(999.0), None);
+        assert_eq!(a2.y, 44.0, "clamped to bottom inset");
+    }
+
+    #[test]
+    fn column_row_offset_averages_visible_named_rows() {
+        let cols = vec![
+            DiagramColumn {
+                name: "id".into(),
+                type_name: "int".into(),
+                nullable: false,
+                pk: true,
+                fk: false,
+            },
+            DiagramColumn {
+                name: "a_id".into(),
+                type_name: "int".into(),
+                nullable: true,
+                pk: false,
+                fk: true,
+            },
+            DiagramColumn {
+                name: "b_id".into(),
+                type_name: "int".into(),
+                nullable: true,
+                pk: false,
+                fk: true,
+            },
+        ];
+        let visible = vec![0, 1, 2];
+        // header 30, row 24 → row centres at 42, 66, 90.
+        assert_eq!(
+            column_row_offset(&cols, &visible, &["id".into()], 30.0, 24.0),
+            Some(42.0)
+        );
+        // Composite FK over rows 1 & 2 → average of 66 and 90 = 78.
+        assert_eq!(
+            column_row_offset(&cols, &visible, &["a_id".into(), "b_id".into()], 30.0, 24.0),
+            Some(78.0)
+        );
+        // A column collapsed away (not in `visible`) → None (fall back to card edge).
+        assert_eq!(
+            column_row_offset(&cols, &[0], &["a_id".into()], 30.0, 24.0),
+            None
+        );
+        // An unknown column name → None.
+        assert_eq!(
+            column_row_offset(&cols, &visible, &["nope".into()], 30.0, 24.0),
+            None
+        );
+    }
+
+    #[test]
+    fn column_row_offset_uses_visible_position_not_schema_index() {
+        // Same cols as above, but only id (0) and b_id (2) are visible — b_id is the
+        // *second* visible row, so its centre is 30 + 1.5*24 = 66, not row-2's 90.
+        let cols = vec![
+            DiagramColumn {
+                name: "id".into(),
+                type_name: "int".into(),
+                nullable: false,
+                pk: true,
+                fk: false,
+            },
+            DiagramColumn {
+                name: "a_id".into(),
+                type_name: "int".into(),
+                nullable: true,
+                pk: false,
+                fk: true,
+            },
+            DiagramColumn {
+                name: "b_id".into(),
+                type_name: "int".into(),
+                nullable: true,
+                pk: false,
+                fk: true,
+            },
+        ];
+        assert_eq!(
+            column_row_offset(&cols, &[0, 2], &["b_id".into()], 30.0, 24.0),
+            Some(66.0)
+        );
+    }
+
+    #[test]
+    fn edge_touches_column_marks_both_endpoints() {
+        // orders.user_id (FK) → users.id (referenced).
+        let graph = graph_of(&["orders", "users"], &[("orders", "users")]);
+        let mut graph = graph;
+        graph.edges[0].from_columns = vec!["user_id".into()];
+        graph.edges[0].to_columns = vec!["id".into()];
+        // Child end: the FK column on the child node.
+        assert!(edge_touches_column(&graph, 0, "orders", "user_id"));
+        // Parent end: the referenced column on the parent node.
+        assert!(edge_touches_column(&graph, 0, "users", "id"));
+        // Not the child's PK, not the parent's other columns, not swapped roles.
+        assert!(!edge_touches_column(&graph, 0, "orders", "id"));
+        assert!(!edge_touches_column(&graph, 0, "users", "user_id"));
+        // Out-of-range edge index → false, never panics.
+        assert!(!edge_touches_column(&graph, 9, "orders", "user_id"));
     }
 
     #[test]

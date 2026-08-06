@@ -272,14 +272,50 @@ fn rects(
         .collect()
 }
 
-/// Build every edge's drawable shapes from the current node rects.
-fn edge_shapes(graph: &DiagramGraph, rect: &HashMap<String, Rect>) -> Vec<EdgeShapes> {
+/// Each real node's currently-visible column indices, given the reactive collapse
+/// state — the input to column-precise edge anchoring (which FK/PK row an edge end
+/// attaches to). Stubs (no columns) are omitted.
+fn visible_map(
+    graph: &DiagramGraph,
+    collapsed: &HashMap<String, bool>,
+) -> HashMap<String, Vec<usize>> {
+    graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind != NodeKind::Stub)
+        .map(|n| {
+            let is_collapsed = collapsed.get(&n.id).copied().unwrap_or(false);
+            let (visible, _collapsible, _h) = card_metrics(n, is_collapsed);
+            (n.id.clone(), visible)
+        })
+        .collect()
+}
+
+/// Build every edge's drawable shapes from the current node rects. `visible` maps a
+/// node id to its shown column indices, so each edge end anchors on the exact FK
+/// (child) / referenced (parent) column row when that row is visible, falling back
+/// to the card's vertical centre when the column is collapsed away.
+fn edge_shapes(
+    graph: &DiagramGraph,
+    rect: &HashMap<String, Rect>,
+    visible: &HashMap<String, Vec<usize>>,
+) -> Vec<EdgeShapes> {
+    let node_by_id: HashMap<&str, &DiagramNode> =
+        graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    // Absolute row-centre y for `cols` on node `id`, or None (→ card-edge fallback).
+    let row_y = |id: &str, cols: &[String], r: Rect| -> Option<f64> {
+        let node = node_by_id.get(id)?;
+        let vis = visible.get(id)?;
+        erd::column_row_offset(&node.columns, vis, cols, HEADER_H, ROW_H).map(|off| r.y + off)
+    };
     let mut out = Vec::new();
     for e in &graph.edges {
         let (Some(&fr), Some(&tr)) = (rect.get(&e.from), rect.get(&e.to)) else {
             continue;
         };
-        let (p0, p1) = erd::edge_anchors(fr, tr);
+        let from_y = row_y(&e.from, &e.from_columns, fr);
+        let to_y = row_y(&e.to, &e.to_columns, tr);
+        let (p0, p1) = erd::edge_anchors_rows(fr, tr, from_y, to_y);
         let (o0, o1) = erd::edge_dirs(fr, tr);
         // Straight stubs off each card edge, then the curve bends between the stub
         // ends — so the markers sit on a straight run and stay symmetric.
@@ -315,6 +351,7 @@ struct EdgeCanvas {
     graph: Rc<DiagramGraph>,
     positions: RwSignal<HashMap<String, (f64, f64)>>,
     sizes: RwSignal<HashMap<String, (f64, f64)>>,
+    collapsed: RwSignal<HashMap<String, bool>>,
     hovered: RwSignal<Option<usize>>,
     zoom: RwSignal<f64>,
     pan: RwSignal<(f64, f64)>,
@@ -324,16 +361,18 @@ fn edge_canvas(
     graph: Rc<DiagramGraph>,
     positions: RwSignal<HashMap<String, (f64, f64)>>,
     sizes: RwSignal<HashMap<String, (f64, f64)>>,
+    collapsed: RwSignal<HashMap<String, bool>>,
     hovered: RwSignal<Option<usize>>,
     zoom: RwSignal<f64>,
     pan: RwSignal<(f64, f64)>,
 ) -> EdgeCanvas {
     let id = ViewId::new();
-    // Repaint whenever a node moves/resizes, the hovered edge changes, or the view
-    // (zoom / pan) changes.
+    // Repaint whenever a node moves/resizes, its collapse (→ column-precise anchor
+    // row) changes, the hovered edge changes, or the view (zoom / pan) changes.
     create_effect(move |_| {
         positions.track();
         sizes.track();
+        collapsed.track();
         hovered.track();
         zoom.track();
         pan.track();
@@ -344,6 +383,7 @@ fn edge_canvas(
         graph,
         positions,
         sizes,
+        collapsed,
         hovered,
         zoom,
         pan,
@@ -365,8 +405,9 @@ impl View for EdgeCanvas {
         // bake into their insets — semantic zoom + free pan, no view transform).
         let sc = |p: Pt| Point::new(panx + p.x * z, pany + p.y * z);
         let r = rects(&self.positions.get_untracked(), &self.sizes.get_untracked());
+        let vis = visible_map(&self.graph, &self.collapsed.get_untracked());
         let hov = self.hovered.get_untracked();
-        for (i, sh) in edge_shapes(&self.graph, &r).iter().enumerate() {
+        for (i, sh) in edge_shapes(&self.graph, &r, &vis).iter().enumerate() {
             let hot = Some(i) == hov;
             let brush = if hot { accent } else { base };
             // Hover changes colour only — width stays constant (no thickening).
@@ -401,8 +442,17 @@ impl View for EdgeCanvas {
 /// One column row — pointer-transparent so a drag started on it still reaches the
 /// card, and text isn't selectable. Sizes/fonts multiply by `zoom` (semantic
 /// zoom: text re-lays-out crisply at each level rather than being transform-scaled).
-fn column_row(c: &DiagramColumn, zoom: RwSignal<f64>) -> AnyView {
+/// The row background lights up (`erd_row_highlight`) while its node/column is an
+/// endpoint of the hovered edge — both linked rows highlight together.
+fn column_row(
+    c: &DiagramColumn,
+    zoom: RwSignal<f64>,
+    hovered: RwSignal<Option<usize>>,
+    graph: Rc<DiagramGraph>,
+    node_id: Rc<str>,
+) -> AnyView {
     let name = c.name.clone();
+    let hl_name = c.name.clone();
     let ty = c.type_name.clone();
     let (pk, fk) = (c.pk, c.fk);
     // Type-family glyph + name in the full key tint (gold PK / purple FK / normal),
@@ -430,11 +480,20 @@ fn column_row(c: &DiagramColumn, zoom: RwSignal<f64>) -> AnyView {
     ))
     .style(move |s| {
         let z = zoom.get();
+        // Light up when this column is an endpoint of the hovered edge.
+        let hl = hovered
+            .get()
+            .is_some_and(|idx| erd::edge_touches_column(&graph, idx, &node_id, &hl_name));
         s.items_center()
             .gap(8.0 * z)
             .height(ROW_H * z)
             .width_full()
             .padding_horiz(10.0 * z)
+            .background(if hl {
+                theme::erd_row_highlight()
+            } else {
+                floem::peniko::Color::TRANSPARENT
+            })
     })
     .pointer_events(|| false)
     .into_any()
@@ -443,17 +502,29 @@ fn column_row(c: &DiagramColumn, zoom: RwSignal<f64>) -> AnyView {
 /// The visible column rows for `node` at a collapse state, plus a clickable
 /// expand/collapse toggle row when the node has hidden columns. Pressing the
 /// toggle flips `collapsed[id]` and updates `sizes[id]` so edges re-route.
+#[allow(clippy::too_many_arguments)]
 fn column_rows(
     node: Rc<DiagramNode>,
     is_collapsed: bool,
     sizes: RwSignal<HashMap<String, (f64, f64)>>,
     collapsed: RwSignal<HashMap<String, bool>>,
     zoom: RwSignal<f64>,
+    hovered: RwSignal<Option<usize>>,
+    graph: Rc<DiagramGraph>,
 ) -> impl IntoView {
     let (visible, collapsible, _h) = card_metrics(&node, is_collapsed);
+    let node_id: Rc<str> = Rc::from(node.id.as_str());
     let mut rows: Vec<AnyView> = visible
         .iter()
-        .map(|&ci| column_row(&node.columns[ci], zoom))
+        .map(|&ci| {
+            column_row(
+                &node.columns[ci],
+                zoom,
+                hovered,
+                graph.clone(),
+                node_id.clone(),
+            )
+        })
         .collect();
     if collapsible {
         let hidden = node.columns.len() - visible.len();
@@ -510,6 +581,8 @@ fn node_card(
     collapsed: RwSignal<HashMap<String, bool>>,
     zoom: RwSignal<f64>,
     pan: RwSignal<(f64, f64)>,
+    hovered: RwSignal<Option<usize>>,
+    graph: Rc<DiagramGraph>,
     persist: Rc<dyn Fn()>,
     reveal: Rc<dyn Fn(String)>,
 ) -> AnyView {
@@ -598,7 +671,16 @@ fn node_card(
         dyn_container(
             move || collapsed.get().get(&id_k).copied().unwrap_or(false),
             move |is_collapsed| {
-                column_rows(node.clone(), is_collapsed, sizes, collapsed, zoom).into_any()
+                column_rows(
+                    node.clone(),
+                    is_collapsed,
+                    sizes,
+                    collapsed,
+                    zoom,
+                    hovered,
+                    graph.clone(),
+                )
+                .into_any()
             },
         )
         .style(|s| s.width_full())
@@ -934,15 +1016,23 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
 
             // Edge layer: fills the viewport and paints edges at pan + logical*zoom
             // (see `EdgeCanvas`); pointer-transparent so drags/pans fall through.
-            let edge_layer = edge_canvas(graph.clone(), positions, sizes, hovered, zoom, pan)
-                .pointer_events(|| false)
-                .style(|s| {
-                    s.absolute()
-                        .inset_left(0.0)
-                        .inset_top(0.0)
-                        .width_full()
-                        .height_full()
-                });
+            let edge_layer = edge_canvas(
+                graph.clone(),
+                positions,
+                sizes,
+                collapsed,
+                hovered,
+                zoom,
+                pan,
+            )
+            .pointer_events(|| false)
+            .style(|s| {
+                s.absolute()
+                    .inset_left(0.0)
+                    .inset_top(0.0)
+                    .width_full()
+                    .height_full()
+            });
 
             // Node cards over the edge layer.
             let mut children: Vec<AnyView> = vec![edge_layer.into_any()];
@@ -954,6 +1044,8 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                     collapsed,
                     zoom,
                     pan,
+                    hovered,
+                    graph.clone(),
                     persist.clone(),
                     reveal.clone(),
                 ));
@@ -1007,7 +1099,8 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                     let z = zoom.get_untracked();
                     let (panx, pany) = pan.get_untracked();
                     let r = rects(&positions.get_untracked(), &sizes.get_untracked());
-                    let polys: Vec<Vec<Pt>> = edge_shapes(&g_hit, &r)
+                    let vis = visible_map(&g_hit, &collapsed.get_untracked());
+                    let polys: Vec<Vec<Pt>> = edge_shapes(&g_hit, &r, &vis)
                         .into_iter()
                         .map(|e| e.poly)
                         .collect();
@@ -1247,7 +1340,8 @@ mod tests {
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))
                 .collect();
-            let shapes = edge_shapes(&graph, &rects(&positions, &sizes));
+            let vis = visible_map(&graph, &HashMap::new());
+            let shapes = edge_shapes(&graph, &rects(&positions, &sizes), &vis);
             assert_eq!(shapes.len(), 1);
             let s = &shapes[0];
             assert!(!s.markers.is_empty(), "crow's-foot markers present");
@@ -1256,5 +1350,72 @@ mod tests {
                 "flattened curve / hit-test polyline sampled"
             );
         }
+    }
+
+    fn col(name: &str, pk: bool, fk: bool) -> DiagramColumn {
+        DiagramColumn {
+            name: name.to_string(),
+            type_name: "int".into(),
+            nullable: !pk,
+            pk,
+            fk,
+        }
+    }
+
+    /// The child edge end anchors on the FK column's row, the parent end on the
+    /// referenced PK row — not the cards' vertical centres.
+    #[test]
+    fn edge_ends_anchor_on_the_key_column_rows() {
+        // parent `users`: id(0). child `orders`: id(0), user_id(1, FK→users.id).
+        let users = DiagramNode {
+            id: "users".into(),
+            name: "users".into(),
+            kind: NodeKind::Table,
+            columns: vec![col("id", true, false)],
+        };
+        let orders = DiagramNode {
+            id: "orders".into(),
+            name: "orders".into(),
+            kind: NodeKind::Table,
+            columns: vec![col("id", true, false), col("user_id", false, true)],
+        };
+        let graph = DiagramGraph {
+            nodes: vec![orders, users],
+            edges: vec![DiagramEdge {
+                from: "orders".into(),
+                from_columns: vec!["user_id".into()],
+                to: "users".into(),
+                to_columns: vec!["id".into()],
+                cardinality: Cardinality::OneToMany,
+                optional: false,
+            }],
+            hidden_islands: vec![],
+            total_tables: 2,
+        };
+        // orders card left of users so the edge runs orders.right → users.left.
+        let positions: HashMap<String, (f64, f64)> = [
+            ("orders".to_string(), (0.0, 0.0)),
+            ("users".to_string(), (400.0, 0.0)),
+        ]
+        .into_iter()
+        .collect();
+        let sizes: HashMap<String, (f64, f64)> = [
+            ("orders".to_string(), (200.0, HEADER_H + 2.0 * ROW_H)),
+            ("users".to_string(), (200.0, HEADER_H + ROW_H)),
+        ]
+        .into_iter()
+        .collect();
+        let vis = visible_map(&graph, &HashMap::new());
+        let shapes = edge_shapes(&graph, &rects(&positions, &sizes), &vis);
+        assert_eq!(shapes.len(), 1);
+        let poly = &shapes[0].poly;
+        // Child end = first poly point (source anchor): on orders.user_id (row 1).
+        let child_y = HEADER_H + 1.5 * ROW_H; // 0.0 + header + (1 + 0.5)*row
+        assert_eq!(poly.first().unwrap().y, child_y);
+        assert_eq!(poly.first().unwrap().x, 200.0, "orders right edge");
+        // Parent end = last poly point: on users.id (row 0).
+        let parent_y = HEADER_H + 0.5 * ROW_H;
+        assert_eq!(poly.last().unwrap().y, parent_y);
+        assert_eq!(poly.last().unwrap().x, 400.0, "users left edge");
     }
 }
