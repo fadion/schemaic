@@ -38,7 +38,7 @@ pub enum JsonNode {
 }
 
 /// One step of a path into a [`JsonNode`] tree: an object key or an array index.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PathSeg {
     Key(String),
     Index(usize),

@@ -28,6 +28,7 @@ use schemaic_core::edit::{EditModel, analyze_edit, refetch_template};
 use schemaic_core::filter::{FilterError, build_query, eq_condition};
 use schemaic_core::format::{self, ColumnFormat, ColumnFormatRule};
 use schemaic_core::intel::SqlDialect;
+use schemaic_core::jsontree::{JsonNode, PathSeg, RowKind, TreeRow};
 use schemaic_core::model::{
     CellRef, CellTag, CommitDone, GridWrite, QueryState, RefetchRequest, RefetchRow, ResultSet,
     RowDelete, RowEdit, RowInsert, Value,
@@ -3035,6 +3036,288 @@ fn scalar_editor(gs: GridState, nullable: bool, autofocus: bool, f: FieldSig) ->
     .into_any()
 }
 
+/// True for a JSON/JSONB column type (MySQL `json`, Postgres `json`/`jsonb`).
+fn is_json_type(type_name: &str) -> bool {
+    let t = type_name.trim();
+    t.eq_ignore_ascii_case("json") || t.eq_ignore_ascii_case("jsonb")
+}
+
+/// Left indent (px) per JSON tree depth level.
+const JSON_INDENT: f64 = 15.0;
+
+/// Is `path` hidden because one of its ancestor container paths is collapsed?
+fn json_path_hidden(path: &[PathSeg], collapsed: &HashSet<Vec<PathSeg>>) -> bool {
+    (1..path.len()).any(|n| collapsed.contains(&path[..n].to_vec()))
+}
+
+/// One rendered row of the JSON tree: indent, disclosure (for containers), key /
+/// index label, and value — a `{n}` / `[n]` summary for a container, a click-to-edit
+/// scalar for a leaf (the row being edited shows an inline `edit_field`).
+#[allow(clippy::too_many_arguments)]
+fn json_row_view(
+    r: &TreeRow,
+    is_editing: bool,
+    collapsed: RwSignal<HashSet<Vec<PathSeg>>>,
+    editing: RwSignal<Option<Vec<PathSeg>>>,
+    edit_buf: RwSignal<String>,
+    err: RwSignal<Option<String>>,
+    start_edit: Rc<dyn Fn(Vec<PathSeg>, String)>,
+    commit_current: Rc<dyn Fn()>,
+) -> AnyView {
+    let indent = r.depth as f64 * JSON_INDENT;
+    let path = r.path.clone();
+
+    let disclosure: AnyView = if matches!(r.kind, RowKind::Scalar) {
+        empty()
+            .style(|s| s.width(15.0).flex_shrink(0.0_f32))
+            .into_any()
+    } else {
+        let is_collapsed = collapsed.get_untracked().contains(&path);
+        let p = path.clone();
+        container(icons::icon(
+            if is_collapsed {
+                icons::CHEVRON_RIGHT
+            } else {
+                icons::CHEVRON_DOWN
+            },
+            12.0,
+        ))
+        .on_click_stop(move |_| {
+            collapsed.update(|c| {
+                if !c.remove(&p) {
+                    c.insert(p.clone());
+                }
+            });
+        })
+        .style(|s| {
+            s.width(15.0)
+                .flex_shrink(0.0_f32)
+                .items_center()
+                .color(theme::text_dim())
+                .hover(|s| s.color(theme::text()))
+        })
+        .into_any()
+    };
+
+    // Label: `key:` for an object member, `[i]` for an array element, none at root.
+    let label: AnyView = match (&r.label, r.path.last()) {
+        (Some(k), _) => h_stack((
+            text(k.clone()).style(|s| s.font_size(12.5).color(theme::key_index())),
+            text(":").style(|s| {
+                s.font_size(12.5)
+                    .color(theme::text_faint())
+                    .margin_right(6.0)
+            }),
+        ))
+        .style(|s| s.items_center().flex_shrink(0.0_f32))
+        .into_any(),
+        (None, Some(PathSeg::Index(i))) => text(format!("[{i}]"))
+            .style(|s| {
+                s.font_size(12.5)
+                    .color(theme::text_faint())
+                    .margin_right(6.0)
+                    .flex_shrink(0.0_f32)
+            })
+            .into_any(),
+        _ => empty().into_any(),
+    };
+
+    let value: AnyView = match &r.kind {
+        RowKind::Object(n) => text(format!("{{{n}}}"))
+            .style(|s| s.font_size(12.0).color(theme::text_faint()))
+            .into_any(),
+        RowKind::Array(n) => text(format!("[{n}]"))
+            .style(|s| s.font_size(12.0).color(theme::text_faint()))
+            .into_any(),
+        RowKind::Scalar => {
+            if is_editing {
+                edit_field(
+                    edit_buf,
+                    FieldCfg {
+                        background: theme::bg_deepest,
+                        font_size: 12.5,
+                        autofocus: true,
+                        on_submit: Some(commit_current.clone()),
+                        on_blur: Some(commit_current.clone()),
+                        on_escape: Some(Rc::new(move || {
+                            editing.set(None);
+                            err.set(None);
+                        })),
+                        ..Default::default()
+                    },
+                )
+                .style(|s| s.flex_grow(1.0_f32).min_width(0.0))
+                .into_any()
+            } else {
+                let vj = r.value_json.clone().unwrap_or_default();
+                let vj2 = vj.clone();
+                let p = path.clone();
+                container(text(vj).style(|s| s.font_size(12.5).color(theme::text())))
+                    .on_click_stop(move |_| (start_edit)(p.clone(), vj2.clone()))
+                    .style(|s| {
+                        s.padding_horiz(4.0)
+                            .padding_vert(1.0)
+                            .border_radius(3.0)
+                            .hover(|s| s.background(theme::bg_deepest()))
+                    })
+                    .into_any()
+            }
+        }
+    };
+
+    h_stack((
+        empty().style(move |s| s.width(indent).flex_shrink(0.0_f32)),
+        disclosure,
+        label,
+        value,
+    ))
+    .style(|s| s.items_center().width_full().min_height(22.0))
+    .into_any()
+}
+
+/// The interactive JSON tree editor for a JSON-typed column value. Parses the field
+/// buffer into a tree; each leaf is click-to-edit as a JSON scalar (`"str"`, a
+/// number, `true`, `null`, or even a nested object), containers collapse/expand.
+/// Every committed edit re-serialises the tree back into the field buffer, so Save
+/// writes the updated JSON. Falls back to a raw-text field if the value isn't valid
+/// JSON.
+fn json_editor(f: FieldSig) -> AnyView {
+    let Ok(root) = JsonNode::parse(&f.buf.get_untracked()) else {
+        return edit_field(
+            f.buf,
+            FieldCfg {
+                background: theme::bg_editor,
+                font_size: 13.0,
+                ..Default::default()
+            },
+        )
+        .style(|s| s.width_full())
+        .into_any();
+    };
+    let tree = RwSignal::new(root);
+    let collapsed: RwSignal<HashSet<Vec<PathSeg>>> = RwSignal::new(HashSet::new());
+    let editing: RwSignal<Option<Vec<PathSeg>>> = RwSignal::new(None);
+    let edit_buf = RwSignal::new(String::new());
+    let err: RwSignal<Option<String>> = RwSignal::new(None);
+
+    // Commit the currently-edited leaf: parse the JSON scalar, write it into the
+    // tree, re-serialise into the field buffer. Invalid JSON shows an inline error
+    // and keeps the leaf in edit mode.
+    let commit_current: Rc<dyn Fn()> = Rc::new(move || {
+        let Some(path) = editing.get_untracked() else {
+            return;
+        };
+        match JsonNode::parse(&edit_buf.get_untracked()) {
+            Ok(node) => {
+                tree.update(|t| {
+                    t.set(&path, node);
+                });
+                f.buf.set(tree.get_untracked().to_compact());
+                f.is_null.set(false);
+                editing.set(None);
+                err.set(None);
+            }
+            Err(e) => err.set(Some(format!("Invalid JSON: {e}"))),
+        }
+    });
+    // Start editing a leaf, committing any in-progress edit first (so switching
+    // leaves never loses or misattributes the previous one). If the in-progress
+    // edit was invalid, stay on it (don't switch).
+    let start_edit: Rc<dyn Fn(Vec<PathSeg>, String)> = {
+        let commit_current = commit_current.clone();
+        Rc::new(move |path, value| {
+            (commit_current)();
+            if editing.get_untracked().is_none() {
+                edit_buf.set(value);
+                editing.set(Some(path));
+                err.set(None);
+            }
+        })
+    };
+
+    let rows_view = dyn_container(
+        move || (tree.get(), collapsed.get(), editing.get()),
+        move |(root, collapsed_set, editing_path)| {
+            let mut views: Vec<AnyView> = Vec::new();
+            for r in root.rows() {
+                if json_path_hidden(&r.path, &collapsed_set) {
+                    continue;
+                }
+                let is_editing = editing_path.as_ref() == Some(&r.path);
+                views.push(json_row_view(
+                    &r,
+                    is_editing,
+                    collapsed,
+                    editing,
+                    edit_buf,
+                    err,
+                    start_edit.clone(),
+                    commit_current.clone(),
+                ));
+            }
+            v_stack_from_iter(views)
+                .style(|s| s.width_full().flex_col())
+                .into_any()
+        },
+    )
+    .style(|s| s.width_full());
+
+    let err_view = dyn_container(
+        move || err.get(),
+        move |e| match e {
+            Some(msg) => text(msg)
+                .style(|s| s.font_size(11.0).color(theme::conn_delete()))
+                .into_any(),
+            None => empty().into_any(),
+        },
+    );
+
+    v_stack((rows_view, err_view))
+        .style(|s| {
+            s.width_full()
+                .flex_col()
+                .gap(2.0)
+                .padding(6.0)
+                .border(1.0)
+                .border_color(theme::border())
+                .border_radius(6.0)
+                .background(theme::bg_editor())
+        })
+        .into_any()
+}
+
+/// A JSON-typed editable field: the tree editor, wrapped (for a nullable column) in
+/// the same NULL toggle as scalar fields. Activating a NULL field seeds an empty
+/// object so the tree has something to edit.
+fn json_field(nullable: bool, f: FieldSig) -> AnyView {
+    if !nullable {
+        return json_editor(f);
+    }
+    dyn_container(
+        move || f.is_null.get(),
+        move |is_null| {
+            if is_null {
+                h_stack((
+                    null_sentinel(),
+                    empty().style(|s| s.flex_grow(1.0_f32)),
+                    field_mini_btn("Set value", move || {
+                        if JsonNode::parse(&f.buf.get_untracked()).is_err() {
+                            f.buf.set("{}".to_string());
+                        }
+                        f.is_null.set(false);
+                    }),
+                ))
+                .style(|s| s.items_center().width_full().gap(8.0))
+                .into_any()
+            } else {
+                json_editor(f)
+            }
+        },
+    )
+    .style(|s| s.width_full())
+    .into_any()
+}
+
 /// The read-only value cell: dim text (NULL → `<null>`), shown for context, no caret.
 fn readonly_value(f: FieldSig) -> AnyView {
     if f.is_null.get_untracked() {
@@ -3061,21 +3344,30 @@ fn field_row(
     autofocus: bool,
     f: FieldSig,
 ) -> AnyView {
-    let editor = if editable {
-        scalar_editor(gs, nullable, autofocus, f)
-    } else {
+    let is_json = is_json_type(&type_name);
+    let editor = if !editable {
         readonly_value(f)
+    } else if is_json {
+        json_field(nullable, f)
+    } else {
+        scalar_editor(gs, nullable, autofocus, f)
     };
     h_stack((
         field_label(name, type_name),
         container(editor).style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
     ))
-    .style(|s| {
-        s.items_center()
+    .style(move |s| {
+        let s = s
             .width_full()
             .gap(8.0)
             .padding_vert(3.0)
-            .min_height(FIELD_ROW_MIN_H)
+            .min_height(FIELD_ROW_MIN_H);
+        // A JSON tree grows tall — top-align the label with it; scalar rows centre.
+        if is_json {
+            s.items_start()
+        } else {
+            s.items_center()
+        }
     })
     .into_any()
 }
