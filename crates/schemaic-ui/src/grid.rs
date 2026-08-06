@@ -3497,12 +3497,15 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                     .gap(4.0)
                     .height(24.0)
                     .flex_shrink(0.0_f32)
+                    .padding_horiz(10.0)
             });
 
             // The field list scrolls (app-standard auto-hiding bars) once it exceeds
-            // the pixel cap (~half the results area).
+            // the pixel cap (~half the results area). The scroll spans the full panel
+            // width so its bar sits at the standard edge inset; the row content keeps
+            // its 10px horizontal padding *inside* the scroll.
             let fields = autohide(scroll(
-                v_stack_from_iter(rows).style(|s| s.width_full().flex_col()),
+                v_stack_from_iter(rows).style(|s| s.width_full().flex_col().padding_horiz(10.0)),
             ))
             .style(move |s| s.width_full().max_height(max_rows.get() as f64));
 
@@ -3515,17 +3518,17 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                     None => empty().into_any(),
                 },
             )
-            .style(|s| s.width_full());
+            .style(|s| s.width_full().padding_horiz(10.0));
 
             // In-flow strip attached to the grid's bottom edge (border_top + panel
-            // background), not a floating overlay. Escape closes it (handled at the
-            // results-area level).
+            // background), not a floating overlay. Horizontal padding lives on the
+            // children (not here) so the field scroll can span full-width and pin its
+            // bar to the edge. Escape closes it (handled at the results-area level).
             v_stack((head, fields, err_line))
                 .style(|s| {
                     s.width_full()
                         .flex_col()
                         .gap(8.0)
-                        .padding_horiz(10.0)
                         .padding_vert(8.0)
                         .border_top(1.0)
                         .border_color(theme::border())
