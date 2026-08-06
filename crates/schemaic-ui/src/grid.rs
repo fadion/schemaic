@@ -2314,6 +2314,8 @@ fn row_colspecs(gs: GridState, di: usize) -> Vec<ColSpec> {
                 .cell(di, ci)
                 .map(|cell| cell.to_value())
                 .unwrap_or(Value::Null),
+            // Existing-row form: no insert placeholder.
+            sentinel: None,
         })
         .collect()
 }

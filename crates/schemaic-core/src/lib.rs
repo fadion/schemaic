@@ -17,6 +17,7 @@ pub mod filter;
 pub mod format;
 pub mod history;
 pub mod intel;
+pub mod jsontree;
 pub mod model;
 pub mod monitor;
 pub mod pairs;
