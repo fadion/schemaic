@@ -681,6 +681,59 @@ pub fn cubic_controls(p0: Pt, p1: Pt, out0: f64, out1: f64) -> (Pt, Pt) {
     )
 }
 
+/// Anchor points for a *self-referencing* edge (`from == to` — e.g.
+/// `employees.reports_to → employees.id`): both ends leave the **same** side of the
+/// card (its right edge) at their respective column rows, instead of wrapping
+/// right-edge→left-edge across the whole node (which drew an awkward loop around the
+/// card). `from_y`/`to_y` are the FK-child / referenced-PK row ys (absolute canvas),
+/// falling back to the card centre when a column is collapsed away. The two ys are
+/// spread to a minimum separation so the loop is always a visible arc, then clamped
+/// inside the card. Pair with [`self_loop_controls`] for the outward bulge.
+pub fn self_loop_anchors(rect: Rect, from_y: Option<f64>, to_y: Option<f64>) -> (Pt, Pt) {
+    let centre = rect.y + rect.h / 2.0;
+    let mut fy = from_y.unwrap_or(centre);
+    let mut ty = to_y.unwrap_or(centre);
+    const MIN_SEP: f64 = 24.0;
+    if (fy - ty).abs() < MIN_SEP {
+        let mid = (fy + ty) / 2.0;
+        fy = mid - MIN_SEP / 2.0;
+        ty = mid + MIN_SEP / 2.0;
+    }
+    let lo = rect.y + 6.0;
+    let hi = (rect.y + rect.h - 6.0).max(lo);
+    let x = rect.x + rect.w;
+    (
+        Pt {
+            x,
+            y: fy.clamp(lo, hi),
+        },
+        Pt {
+            x,
+            y: ty.clamp(lo, hi),
+        },
+    )
+}
+
+/// Cubic control points for a self-loop between two same-side anchors, bulging
+/// outward in direction `dir` (`+1` right / `-1` left). Both controls keep their
+/// anchor's y and are pushed out by a `bulge` = a small base plus a gentle fraction
+/// of the vertical gap, **capped** — so a tall loop (top row → bottom row of a big
+/// card) stays snug against the card instead of ballooning far to the side, while a
+/// short gap still reads as a rounded loop.
+pub fn self_loop_controls(p0: Pt, p1: Pt, dir: f64) -> (Pt, Pt) {
+    let bulge = (16.0 + (p0.y - p1.y).abs() * 0.25).min(72.0);
+    (
+        Pt {
+            x: p0.x + dir * bulge,
+            y: p0.y,
+        },
+        Pt {
+            x: p1.x + dir * bulge,
+            y: p1.y,
+        },
+    )
+}
+
 /// SVG `d` attribute for the cubic bezier `p0 → p1` with controls `c1`, `c2`.
 pub fn cubic_path_d(p0: Pt, c1: Pt, c2: Pt, p1: Pt) -> String {
     format!(
@@ -1398,6 +1451,48 @@ mod tests {
         assert_eq!(pts.len(), 17);
         assert_eq!(*pts.first().unwrap(), p0);
         assert_eq!(*pts.last().unwrap(), p1);
+    }
+
+    #[test]
+    fn self_loop_anchors_share_the_right_side_and_spread() {
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 200.0,
+        };
+        // Two distinct rows → anchors sit at those ys on the card's right edge.
+        let (p0, p1) = self_loop_anchors(rect, Some(50.0), Some(120.0));
+        assert_eq!(p0, pt(100.0, 50.0));
+        assert_eq!(p1, pt(100.0, 120.0));
+        // Collapsed (both None) → spread symmetrically around the card centre so the
+        // loop is a visible arc rather than a zero-height sliver.
+        let (a, b) = self_loop_anchors(rect, None, None);
+        assert_eq!(a.x, 100.0);
+        assert_eq!(b.x, 100.0);
+        assert!((a.y - b.y).abs() >= 24.0, "spread to a visible separation");
+        assert!(
+            ((a.y + b.y) / 2.0 - 100.0).abs() < 1e-9,
+            "centred on the card"
+        );
+    }
+
+    #[test]
+    fn self_loop_controls_bulge_outward() {
+        let (p0, p1) = (pt(100.0, 40.0), pt(100.0, 100.0));
+        let (c1, c2) = self_loop_controls(p0, p1, 1.0);
+        // Both controls pushed right of the anchors, each keeping its anchor's y.
+        assert!(c1.x > p0.x && c2.x > p1.x);
+        assert_eq!(c1.y, 40.0);
+        assert_eq!(c2.y, 100.0);
+        // Bulge = 16 + 0.25*gap: gap 60 → 16 + 15 = 31.
+        assert!((c1.x - (100.0 + 31.0)).abs() < 1e-9);
+        // A very tall gap is capped at 72 so the loop stays near the card.
+        let (c1big, _) = self_loop_controls(pt(100.0, 0.0), pt(100.0, 400.0), 1.0);
+        assert!((c1big.x - (100.0 + 72.0)).abs() < 1e-9);
+        // Leftward direction mirrors.
+        let (c1l, _) = self_loop_controls(p0, p1, -1.0);
+        assert!(c1l.x < p0.x);
     }
 
     #[test]
