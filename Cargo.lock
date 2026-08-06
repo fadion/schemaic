@@ -4779,6 +4779,7 @@ name = "schemaic-ui"
 version = "0.7.0"
 dependencies = [
  "floem",
+ "floem_renderer",
  "pulldown-cmark",
  "schemaic-core",
  "schemaic-term",

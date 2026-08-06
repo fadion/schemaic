@@ -147,6 +147,23 @@ pub struct UiTheme {
     pub key_foreign: Color,
     /// Gold star marking a favorited database in the schema tree.
     pub favorite_star: Color,
+    /// ER-diagram modal: dotted canvas background.
+    pub erd_canvas: Color,
+    /// ER-diagram modal: canvas dot-grid dot.
+    pub erd_dot: Color,
+    /// ER-diagram modal: table-node card background.
+    pub erd_node_bg: Color,
+    /// ER-diagram modal: table-node header (title) background.
+    pub erd_node_header: Color,
+    /// ER-diagram modal: relationship (FK) edge line + cardinality markers.
+    pub erd_edge: Color,
+    /// ER-diagram modal: edge + markers when the relationship is hovered.
+    pub erd_edge_hover: Color,
+    /// ER-diagram modal: toolbar strip top/bottom border.
+    pub erd_toolbar_border: Color,
+    /// ER-diagram modal: toolbar control (button / count chip / zoom unit) border
+    /// and the zoom unit's internal separators.
+    pub erd_control_border: Color,
     /// Results grid: background of a column header whose column is selected.
     pub grid_col_sel: Color,
     /// Results grid: background of a cell with a staged (uncommitted) edit.
@@ -250,6 +267,14 @@ impl UiTheme {
             key_index: c("#8394FF"),
             key_foreign: c("#B677EE"),
             favorite_star: c("#F9C24A"),
+            erd_canvas: c("#151620"),
+            erd_dot: c("#232532"),
+            erd_node_bg: c("#22232E"),
+            erd_node_header: c("#2B2D3A"),
+            erd_edge: c("#3F4152"),
+            erd_edge_hover: c("#464E9E"),
+            erd_toolbar_border: c("#434553"),
+            erd_control_border: c("#424553"),
             grid_col_sel: c("#292D3E"),
             grid_edit_staged: c("#509950"),
             grid_edit_staged_hover: c("#93FF93"),
@@ -347,6 +372,14 @@ impl UiTheme {
             key_index: c("#5A6EE0"),
             key_foreign: c("#9450D6"),
             favorite_star: c("#C68A1A"),
+            erd_canvas: c("#EDEFF3"),
+            erd_dot: c("#CDD2DC"),
+            erd_node_bg: c("#FFFFFF"),
+            erd_node_header: c("#EEF0F5"),
+            erd_edge: c("#9298AC"),
+            erd_edge_hover: c("#464E9E"),
+            erd_toolbar_border: c("#CDD2DC"),
+            erd_control_border: c("#C4CAD6"),
             grid_col_sel: c("#DCE3F2"),
             grid_edit_staged: c("#509950"),
             grid_edit_staged_hover: c("#93FF93"),

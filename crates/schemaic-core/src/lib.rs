@@ -10,6 +10,7 @@ pub mod connection;
 pub mod db_color;
 pub mod diff;
 pub mod edit;
+pub mod erd;
 pub mod export;
 pub mod favorite;
 pub mod filter;

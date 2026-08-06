@@ -36,13 +36,15 @@ fn modal_title_impl(title: &'static str, close: Rc<dyn Fn()>, border: bool) -> i
     h_stack((
         text(title).style(|s| s.font_size(15.0).font_bold().color(theme::text())),
         empty().style(|s| s.flex_grow(1.0_f32)),
-        // Lucide X, 16px, 14px from the right edge (via the header's padding),
-        // vertically centred. Same dim→bright colour as the old glyph.
+        // Lucide X, 16px, vertically centred; `padding(6)` enlarges the click
+        // hitbox (same idiom as `toolbar_icon`) so it's not fiddly to hit. Same
+        // dim→bright colour as the old glyph.
         container(icons::icon(icons::X, 16.0))
             .on_click_stop(move |_| (close)())
             .style(|s| {
                 s.flex_shrink(0.0_f32)
                     .items_center()
+                    .padding(6.0)
                     .color(theme::text_dim())
                     .hover(|s| s.color(theme::text()))
             }),
