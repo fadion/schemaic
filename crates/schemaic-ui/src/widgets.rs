@@ -84,10 +84,17 @@ pub(crate) fn panel_style(s: floem::style::Style) -> floem::style::Style {
 /// bordered panel matching the app's popovers, with a soft drop shadow lifting it
 /// off the content. `color`/`font_size` are inherited, so a bare `text(…)` tip
 /// picks them up.
+///
+/// A tip is mounted as a Floem *overlay* (a child of the window root), so the
+/// root stylesheet's non-selectable-label rule can't reach it — this style is
+/// applied directly to the tip view, so it carries the rule itself (as a direct
+/// prop for a bare `text(…)` tip, and as a class rule for a wrapped one).
 pub(crate) fn tooltip_style(s: floem::style::Style) -> floem::style::Style {
     s.background(theme::bg_panel())
         .color(theme::text())
         .font_size(theme::FONT_LABEL)
+        .selectable(false)
+        .class(floem::views::LabelClass, |s| s.selectable(false))
         .border(1.0)
         .border_color(theme::border())
         .border_radius(6.0)
