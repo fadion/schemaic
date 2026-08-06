@@ -379,6 +379,8 @@ struct GridState {
     /// own path, not the staged `dirty` batch).
     edit_row_open: RwSignal<bool>,
     edit_row_di: RwSignal<Option<usize>>,
+    /// The panel is adding a new row (an `INSERT`) rather than editing `edit_row_di`.
+    edit_row_insert: RwSignal<bool>,
     edit_row_err: RwSignal<Option<String>>,
     edit_row_saving: RwSignal<bool>,
 }
@@ -471,6 +473,7 @@ impl GridState {
             seed_buf: RwSignal::new(String::new()),
             edit_row_open: RwSignal::new(false),
             edit_row_di: RwSignal::new(None),
+            edit_row_insert: RwSignal::new(false),
             edit_row_err: RwSignal::new(None),
             edit_row_saving: RwSignal::new(false),
         }
@@ -2330,9 +2333,51 @@ fn load_edit_row(gs: GridState, di: usize) {
 }
 
 fn open_edit_row(gs: GridState, di: usize) {
+    gs.edit_row_insert.set(false);
     load_edit_row(gs, di);
     gs.seed_open.set(false);
     gs.edit_row_open.set(true);
+}
+
+/// Open the panel in **new-row** (insert) mode: every column starts unset at its
+/// insert sentinel; the user sets the ones they want. No-op if the result isn't a
+/// single-table insert destination.
+fn open_insert_row(gs: GridState) {
+    if gs.edit_model.get_untracked().insert_target().is_none() {
+        return;
+    }
+    gs.edit_row_insert.set(true);
+    gs.edit_row_di.set(None);
+    gs.edit_row_err.set(None);
+    gs.seed_open.set(false);
+    gs.edit_row_open.set(true);
+}
+
+/// `ColSpec`s for a **new** row: one per result column, value NULL, carrying the
+/// column's insert sentinel from its wire flags (auto-increment / no-default /
+/// nullable). Editability comes from the same `EditModel` as an edit.
+fn insert_colspecs(gs: GridState) -> Vec<ColSpec> {
+    let rs = gs.rs.get_untracked();
+    let model = gs.edit_model.get_untracked();
+    rs.columns
+        .iter()
+        .enumerate()
+        .map(|(ci, c)| {
+            let flags = c.origin.as_ref().map(|o| o.flags);
+            let (auto, no_default, not_null) = flags
+                .map(|f| (f.auto_increment, f.no_default, f.not_null))
+                .unwrap_or((false, false, false));
+            ColSpec {
+                name: c.name.clone(),
+                editable: model.editable(ci),
+                nullable: !not_null,
+                value: Value::Null,
+                sentinel: Some(rowjson::InsertSentinel::from_flags(
+                    auto, no_default, not_null,
+                )),
+            }
+        })
+        .collect()
 }
 
 /// Display position (0-based) of data row `di` in the current sort order; the
@@ -2424,6 +2469,67 @@ fn commit_row_update(
         }
     });
     (commit)(write, refetch, done);
+}
+
+/// Commit the panel's per-field `state` as an `INSERT` of a new row. `state` holds
+/// only the fields the user set (each `None` = SQL NULL); unset columns take their DB
+/// default. On a validation error or DB failure the message shows in the panel;
+/// success closes the panel and re-runs the query (membership changed).
+fn commit_row_insert(gs: GridState, cols: &[ColSpec], state: Vec<(usize, Option<String>)>) {
+    if gs.edit_row_saving.get_untracked() || gs.commit_busy.get_untracked() {
+        return;
+    }
+    let values = match rowjson::insert_values(cols, &state) {
+        Ok(v) => v,
+        Err(msg) => {
+            gs.edit_row_err.set(Some(msg));
+            return;
+        }
+    };
+    let model = gs.edit_model.get_untracked();
+    let Some(tbl) = model.insert_target() else {
+        gs.edit_row_err
+            .set(Some("This result can't insert rows.".to_string()));
+        return;
+    };
+    // Map each set column to its real name; drop any without a real origin.
+    let rs = gs.rs.get_untracked();
+    let cols_vals: Vec<(String, Option<String>)> = values
+        .into_iter()
+        .filter_map(|(ci, v)| {
+            rs.columns
+                .get(ci)
+                .and_then(|c| c.origin.as_ref())
+                .map(|o| (o.column.clone(), v))
+        })
+        .collect();
+    let insert = RowInsert {
+        database: tbl.database.clone(),
+        table: tbl.table.clone(),
+        cols: cols_vals,
+    };
+    let Some(commit) = gs.commit.get_untracked() else {
+        return;
+    };
+    let write = GridWrite {
+        updates: Vec::new(),
+        inserts: vec![insert],
+        deletes: Vec::new(),
+    };
+    gs.edit_row_saving.set(true);
+    gs.commit_busy.set(true);
+    gs.edit_row_err.set(None);
+    let done: Rc<dyn Fn(CommitDone)> = Rc::new(move |outcome| {
+        gs.commit_busy.set(false);
+        gs.edit_row_saving.set(false);
+        match outcome {
+            // Inserts change membership → the query re-runs (no splice).
+            CommitDone::Spliced(_) | CommitDone::FullReran => gs.edit_row_open.set(false),
+            CommitDone::Failed(msg) => gs.edit_row_err.set(Some(msg)),
+        }
+    });
+    // An insert changes the row set → no single-row refetch template.
+    (commit)(write, None, done);
 }
 
 /// The next (`forward`) / previous editable column after `ci`, if any — used to
@@ -2909,32 +3015,40 @@ const FIELD_NAME_W: f64 = 150.0;
 /// Minimum height of one field row (so single-line editors don't feel cramped).
 const FIELD_ROW_MIN_H: f64 = 28.0;
 
-/// Per-field editing state for the structured row panel: the raw text buffer and a
-/// NULL flag, created fresh per opened row (so the panel's `dyn_container` disposes
-/// them on close / row-step).
+/// Per-field editing state for the structured row panel: the raw text buffer, a NULL
+/// flag, and an `active` flag (always true when editing a row; starts false for a
+/// **new** row, where an inactive field shows its insert sentinel and is omitted from
+/// the `INSERT` until the user sets it). Created fresh per opened row (so the panel's
+/// `dyn_container` disposes them on close / row-step).
 #[derive(Clone, Copy)]
 struct FieldSig {
     ci: usize,
     buf: RwSignal<String>,
     is_null: RwSignal<bool>,
+    active: RwSignal<bool>,
 }
 
 /// One field signal per column, seeded from the row's values (empty buffer + null
-/// flag for a SQL NULL).
-fn field_sigs(cols: &[ColSpec]) -> Vec<FieldSig> {
+/// flag for a SQL NULL). `active_default` is `true` for an existing row (every field
+/// participates), `false` for a new row (fields start unset at their sentinel).
+fn field_sigs(cols: &[ColSpec], active_default: bool) -> Vec<FieldSig> {
     cols.iter()
         .enumerate()
         .map(|(ci, c)| FieldSig {
             ci,
             buf: RwSignal::new(rowjson::field_value_text(&c.value)),
             is_null: RwSignal::new(c.value.is_null()),
+            active: RwSignal::new(active_default),
         })
         .collect()
 }
 
-/// Gather each field's current value (`None` = staged NULL) for the write assembly.
+/// Gather each *active* field's current value (`None` = staged NULL) for the write
+/// assembly. Inactive fields (an unset new-row column) are omitted — they take the
+/// DB default.
 fn field_state(sigs: &[FieldSig]) -> Vec<(usize, Option<String>)> {
     sigs.iter()
+        .filter(|f| f.active.get_untracked())
         .map(|f| {
             let v = (!f.is_null.get_untracked()).then(|| f.buf.get_untracked());
             (f.ci, v)
@@ -3334,7 +3448,70 @@ fn readonly_value(f: FieldSig) -> AnyView {
         .into_any()
 }
 
+/// The dim (or, for `<required>`, warning-coloured) insert sentinel label.
+fn insert_sentinel_view(sent: rowjson::InsertSentinel) -> AnyView {
+    let required = sent.is_required();
+    text(sent.label())
+        .style(move |s| {
+            s.font_size(12.5).color(if required {
+                theme::conn_delete()
+            } else {
+                theme::text_faint()
+            })
+        })
+        .into_any()
+}
+
+/// The editable value cell. In edit mode (`sentinel` is `None`) it's the plain
+/// editor. In new-row mode (`sentinel` is `Some`) an **inactive** field shows its
+/// sentinel with a "Set value" button; activating reveals the editor plus an "Unset"
+/// button to return the column to its DB default.
+fn field_editor(
+    gs: GridState,
+    sentinel: Option<rowjson::InsertSentinel>,
+    is_json: bool,
+    nullable: bool,
+    autofocus: bool,
+    f: FieldSig,
+) -> AnyView {
+    let inner = move || -> AnyView {
+        if is_json {
+            json_field(nullable, f)
+        } else {
+            scalar_editor(gs, nullable, autofocus, f)
+        }
+    };
+    let Some(sent) = sentinel else {
+        return inner();
+    };
+    dyn_container(
+        move || f.active.get(),
+        move |active| {
+            if active {
+                h_stack((
+                    container(inner()).style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
+                    field_mini_btn("Unset", move || f.active.set(false)),
+                ))
+                .style(|s| s.items_start().width_full().gap(6.0))
+                .into_any()
+            } else {
+                h_stack((
+                    insert_sentinel_view(sent),
+                    empty().style(|s| s.flex_grow(1.0_f32)),
+                    field_mini_btn("Set value", move || f.active.set(true)),
+                ))
+                .style(|s| s.items_center().width_full().gap(8.0))
+                .into_any()
+            }
+        },
+    )
+    .style(|s| s.width_full())
+    .into_any()
+}
+
 /// One field row: the column label + its value editor (editable) or read-only cell.
+/// `sentinel` is `Some` only for a new-row form.
+#[allow(clippy::too_many_arguments)]
 fn field_row(
     gs: GridState,
     name: String,
@@ -3342,15 +3519,18 @@ fn field_row(
     editable: bool,
     nullable: bool,
     autofocus: bool,
+    sentinel: Option<rowjson::InsertSentinel>,
     f: FieldSig,
 ) -> AnyView {
     let is_json = is_json_type(&type_name);
     let editor = if !editable {
-        readonly_value(f)
-    } else if is_json {
-        json_field(nullable, f)
+        // Read-only: an existing value for context, or the sentinel for a new row.
+        match sentinel {
+            Some(sent) => insert_sentinel_view(sent),
+            None => readonly_value(f),
+        }
     } else {
-        scalar_editor(gs, nullable, autofocus, f)
+        field_editor(gs, sentinel, is_json, nullable, autofocus, f)
     };
     h_stack((
         field_label(name, type_name),
@@ -3380,25 +3560,35 @@ fn field_row(
 /// the field list scrolls past `max_rows` and the grid above shrinks to fit.
 fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
     dyn_container(
-        // Keyed on (open, current row) so walking to another row (prev/next) rebuilds
-        // the panel — header number, chevron state, and the per-field editors all
-        // refresh together (and the old row's field signals dispose).
-        move || (gs.edit_row_open.get(), gs.edit_row_di.get()),
-        move |(open, di_opt)| {
-            if !open {
+        // Keyed on (open, insert-mode, current row) so switching mode / walking rows
+        // rebuilds the panel — header, nav, and per-field editors refresh together
+        // (and the old row's field signals dispose).
+        move || {
+            (
+                gs.edit_row_open.get(),
+                gs.edit_row_insert.get(),
+                gs.edit_row_di.get(),
+            )
+        },
+        move |(open, insert, di_opt)| {
+            if !open || (!insert && di_opt.is_none()) {
                 return empty().into_any();
             }
-            let Some(di) = di_opt else {
-                return empty().into_any();
-            };
             let close: Rc<dyn Fn()> = Rc::new(move || gs.edit_row_open.set(false));
 
-            // Build the per-field editors from the row.
-            let cols = row_colspecs(gs, di);
-            let sigs = field_sigs(&cols);
+            // Build the per-field editors — from the target row (edit) or blank at
+            // each column's insert sentinel (new row).
+            let cols = if insert {
+                insert_colspecs(gs)
+            } else {
+                row_colspecs(gs, di_opt.unwrap())
+            };
+            let sigs = field_sigs(&cols, !insert);
             let rs = gs.rs.get_untracked();
             let first_editable = cols.iter().position(|c| c.editable);
-            let any_editable = first_editable.is_some();
+            // Insert always has a writable target (open_insert_row gates it); edit
+            // shows Save only when some column is editable.
+            let any_editable = insert || first_editable.is_some();
             let mut rows: Vec<AnyView> = Vec::with_capacity(cols.len());
             for (ci, c) in cols.iter().enumerate() {
                 let type_name = rs
@@ -3406,7 +3596,9 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                     .get(ci)
                     .map(|col| col.type_name.clone())
                     .unwrap_or_default();
-                let autofocus = first_editable == Some(ci);
+                // Autofocus the first editable field only when editing (a new row
+                // starts with every field unset at its sentinel — nothing to focus).
+                let autofocus = !insert && first_editable == Some(ci);
                 rows.push(field_row(
                     gs,
                     c.name.clone(),
@@ -3414,28 +3606,37 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                     c.editable,
                     c.nullable,
                     autofocus,
+                    c.sentinel,
                     sigs[ci],
                 ));
             }
 
-            // Save gathers the per-field state and commits an UPDATE.
+            // Save commits an INSERT (new row) or an UPDATE (existing row).
             let cols_rc = Rc::new(cols);
             let save: Rc<dyn Fn()> = {
                 let cols_rc = cols_rc.clone();
                 let sigs = sigs.clone();
-                Rc::new(move || commit_row_update(gs, di, &cols_rc, field_state(&sigs)))
+                Rc::new(move || {
+                    if insert {
+                        commit_row_insert(gs, &cols_rc, field_state(&sigs));
+                    } else {
+                        commit_row_update(gs, di_opt.unwrap(), &cols_rc, field_state(&sigs));
+                    }
+                })
             };
 
-            // Display position (0-based) of this row in the current sort order;
-            // identity when unsorted. Drives the 1-based number + chevron gating.
-            let disp = edit_row_disp(gs, di);
-            let nrows = rs.row_count();
-            let can_prev = disp > 0;
-            let can_next = disp + 1 < nrows;
-            let row_no = disp + 1;
-            let title = match gs.source.get_untracked() {
-                Some((_, t)) if !t.is_empty() => format!("Row {row_no}  ·  {t}"),
-                _ => format!("Row {row_no}"),
+            // Title: "New row · table" (insert) or "Row N · table" (edit).
+            let title = if insert {
+                match gs.source.get_untracked() {
+                    Some((_, t)) if !t.is_empty() => format!("New row  ·  {t}"),
+                    _ => "New row".to_string(),
+                }
+            } else {
+                let row_no = edit_row_disp(gs, di_opt.unwrap()) + 1;
+                match gs.source.get_untracked() {
+                    Some((_, t)) if !t.is_empty() => format!("Row {row_no}  ·  {t}"),
+                    _ => format!("Row {row_no}"),
+                }
             };
 
             // Header icons — Save (✓, when editable) then Close (✕). Save commits
@@ -3462,28 +3663,36 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
             } else {
                 close_btn.into_any()
             };
-            // Prev/next-row chevrons, just after the title. Stepping discards unsaved
-            // edits (the panel rebuilds).
-            let nav_chevron = |icon: &'static str, enabled: bool, forward: bool| {
-                let btn = container(icons::icon(icon, 14.0));
-                if enabled {
-                    btn.on_click_stop(move |_| edit_row_step(gs, forward))
-                        .style(|s| {
-                            s.padding(4.0)
-                                .color(theme::text_dim())
-                                .hover(|s| s.color(theme::text()))
-                        })
-                        .into_any()
-                } else {
-                    btn.style(|s| s.padding(4.0).color(theme::text_faint()))
-                        .into_any()
-                }
+            // Prev/next-row chevrons (edit mode only). Stepping discards unsaved edits.
+            let nav: AnyView = if insert {
+                empty().into_any()
+            } else {
+                let disp = edit_row_disp(gs, di_opt.unwrap());
+                let nrows = rs.row_count();
+                let can_prev = disp > 0;
+                let can_next = disp + 1 < nrows;
+                let nav_chevron = |icon: &'static str, enabled: bool, forward: bool| {
+                    let btn = container(icons::icon(icon, 14.0));
+                    if enabled {
+                        btn.on_click_stop(move |_| edit_row_step(gs, forward))
+                            .style(|s| {
+                                s.padding(4.0)
+                                    .color(theme::text_dim())
+                                    .hover(|s| s.color(theme::text()))
+                            })
+                            .into_any()
+                    } else {
+                        btn.style(|s| s.padding(4.0).color(theme::text_faint()))
+                            .into_any()
+                    }
+                };
+                h_stack((
+                    nav_chevron(icons::CHEVRON_UP, can_prev, false),
+                    nav_chevron(icons::CHEVRON_DOWN, can_next, true),
+                ))
+                .style(|s| s.flex_row().items_center().gap(2.0).margin_left(8.0))
+                .into_any()
             };
-            let nav = h_stack((
-                nav_chevron(icons::CHEVRON_UP, can_prev, false),
-                nav_chevron(icons::CHEVRON_DOWN, can_next, true),
-            ))
-            .style(|s| s.flex_row().items_center().gap(2.0).margin_left(8.0));
 
             let head = h_stack((
                 text(title).style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_dim())),
@@ -3963,6 +4172,14 @@ fn grid_toolbar(
             }
             h_stack((
                 toolbar_icon(icons::PLUS, 0.0, 0.0, || true, move || add_pending_row(gs)),
+                // Add a row via the structured form (vs. the inline blank row above).
+                toolbar_icon(
+                    icons::SQUARE_PEN,
+                    0.0,
+                    0.0,
+                    || true,
+                    move || open_insert_row(gs),
+                ),
                 toolbar_icon(icons::MINUS, 0.0, 0.0, row_selected, move || {
                     if let Some(di) = selected_data_row() {
                         gs.toggle_delete(di);
