@@ -315,8 +315,17 @@ fn edge_shapes(
         };
         let from_y = row_y(&e.from, &e.from_columns, fr);
         let to_y = row_y(&e.to, &e.to_columns, tr);
-        let (p0, p1) = erd::edge_anchors_rows(fr, tr, from_y, to_y);
-        let (o0, o1) = erd::edge_dirs(fr, tr);
+        // A self-referencing FK (`from == to`) loops on the card's right side; a
+        // normal edge runs between the two facing sides.
+        let self_ref = e.from == e.to;
+        let (p0, p1, o0, o1) = if self_ref {
+            let (p0, p1) = erd::self_loop_anchors(fr, from_y, to_y);
+            (p0, p1, 1.0, 1.0) // both ends leave rightward
+        } else {
+            let (p0, p1) = erd::edge_anchors_rows(fr, tr, from_y, to_y);
+            let (o0, o1) = erd::edge_dirs(fr, tr);
+            (p0, p1, o0, o1)
+        };
         // Straight stubs off each card edge, then the curve bends between the stub
         // ends — so the markers sit on a straight run and stay symmetric.
         let p0s = Pt {
@@ -327,7 +336,13 @@ fn edge_shapes(
             x: p1.x + o1 * EDGE_STUB,
             y: p1.y,
         };
-        let (c1, c2) = erd::cubic_controls(p0s, p1s, o0, o1);
+        // A self-loop bulges outward from its same-side stubs; a normal edge flows
+        // between opposite-facing stubs.
+        let (c1, c2) = if self_ref {
+            erd::self_loop_controls(p0s, p1s, o0)
+        } else {
+            erd::cubic_controls(p0s, p1s, o0, o1)
+        };
         // Anchor → stub (straight), stub → stub (curve), stub → anchor (straight).
         let mut poly = Vec::with_capacity(35);
         poly.push(p0);
@@ -1417,5 +1432,58 @@ mod tests {
         let parent_y = HEADER_H + 0.5 * ROW_H;
         assert_eq!(poly.last().unwrap().y, parent_y);
         assert_eq!(poly.last().unwrap().x, 400.0, "users left edge");
+    }
+
+    /// A self-referencing FK (child == parent) loops on the card's right side: both
+    /// poly ends sit on the right edge at their key rows, and the curve bulges out
+    /// past that edge instead of wrapping around the whole card.
+    #[test]
+    fn self_referencing_fk_loops_on_one_side() {
+        // employees.reports_to (row 1, FK) → employees.id (row 0, PK).
+        let employees = DiagramNode {
+            id: "employees".into(),
+            name: "employees".into(),
+            kind: NodeKind::Table,
+            columns: vec![col("id", true, false), col("reports_to", false, true)],
+        };
+        let graph = DiagramGraph {
+            nodes: vec![employees],
+            edges: vec![DiagramEdge {
+                from: "employees".into(),
+                from_columns: vec!["reports_to".into()],
+                to: "employees".into(),
+                to_columns: vec!["id".into()],
+                cardinality: Cardinality::OneToMany,
+                optional: true,
+            }],
+            hidden_islands: vec![],
+            total_tables: 1,
+        };
+        let positions: HashMap<String, (f64, f64)> = [("employees".to_string(), (0.0, 0.0))]
+            .into_iter()
+            .collect();
+        let w = 200.0;
+        let sizes: HashMap<String, (f64, f64)> =
+            [("employees".to_string(), (w, HEADER_H + 2.0 * ROW_H))]
+                .into_iter()
+                .collect();
+        let vis = visible_map(&graph, &HashMap::new());
+        let shapes = edge_shapes(&graph, &rects(&positions, &sizes), &vis);
+        assert_eq!(shapes.len(), 1);
+        let poly = &shapes[0].poly;
+        // Both ends anchor on the right edge (x == card right), at the FK and PK rows.
+        assert_eq!(poly.first().unwrap().x, w, "child end on the right edge");
+        assert_eq!(poly.last().unwrap().x, w, "parent end on the right edge");
+        assert_eq!(
+            poly.first().unwrap().y,
+            HEADER_H + 1.5 * ROW_H,
+            "reports_to row"
+        );
+        assert_eq!(poly.last().unwrap().y, HEADER_H + 0.5 * ROW_H, "id row");
+        // The curve bulges out to the right of the card, never crossing to the left.
+        let max_x = poly.iter().fold(f64::MIN, |m, p| m.max(p.x));
+        let min_x = poly.iter().fold(f64::MAX, |m, p| m.min(p.x));
+        assert!(max_x > w + EDGE_STUB, "loop bulges past the right stub");
+        assert!(min_x >= w, "loop stays on the right side of the card");
     }
 }
