@@ -40,7 +40,7 @@ use schemaic_core::text_ops::contains_ignore_ascii_case;
 
 use crate::consts::*;
 use crate::widgets::{
-    MenuEntry, autohide_state, centered_msg, measure_text_px, shift_hscroll, thin_scroll,
+    MenuEntry, autohide, autohide_state, centered_msg, measure_text_px, shift_hscroll, thin_scroll,
     toolbar_icon, verb_spinner,
 };
 use crate::{ConnNode, FieldCfg, PopupAnchor, edit_field, icons, theme};
@@ -2154,9 +2154,9 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         find_pos.set(pos);
     });
 
-    // Auto-grow cap for the row view/edit JSON field (≈80% of the panel), derived
-    // from the panel height on the root `on_resize` below (~19px/row).
-    let edit_row_max = RwSignal::new(20usize);
+    // Max pixel height of the row-panel field list before it scrolls (≈half the
+    // results area), derived from the area height on the root `on_resize` below.
+    let edit_row_max = RwSignal::new(320usize);
     // Wrap the grid so a 2px identity-colour rule can pin to its top edge (right
     // below the toolbar) without taking layout space — the "prominent colour"
     // setting. The box inherits the grid's growth so the table still fills.
@@ -2180,10 +2180,10 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         edit_row_panel(gs, edit_row_max),
     ))
     .on_resize(move |r| {
-        // The row view/edit field fills ~80% of the panel (minus header/error chrome).
-        let erows = (((r.height() * 0.8 - 110.0) / 19.0).floor() as i64).clamp(4, 80) as usize;
-        if edit_row_max.get_untracked() != erows {
-            edit_row_max.set(erows);
+        // The row-panel field list caps at ~half the results area, then scrolls.
+        let cap = (r.height() * 0.5).max(160.0) as usize;
+        if edit_row_max.get_untracked() != cap {
+            edit_row_max.set(cap);
         }
     })
     .style(|s| {
@@ -3012,8 +3012,11 @@ fn seed_popover(gs: GridState) -> impl IntoView {
 
 /// Fixed width of a field row's left-hand column-name label.
 const FIELD_NAME_W: f64 = 150.0;
-/// Minimum height of one field row (so single-line editors don't feel cramped).
-const FIELD_ROW_MIN_H: f64 = 28.0;
+/// Fixed height of a scalar field row — so toggling sentinel/`<null>` ↔ input never
+/// reflows the rows below.
+const FIELD_ROW_H: f64 = 32.0;
+/// Height of the text input inside a field row.
+const FIELD_INPUT_H: f64 = 26.0;
 
 /// Per-field editing state for the structured row panel: the raw text buffer, a NULL
 /// flag, and an `active` flag (always true when editing a row; starts false for a
@@ -3067,7 +3070,7 @@ fn field_label(name: String, type_name: String) -> impl IntoView {
                 .flex_grow(1.0_f32)
         }),
         text(type_name).style(|s| {
-            s.font_size(10.5)
+            s.font_size(13.0)
                 .color(theme::text_faint())
                 .margin_left(6.0)
                 .flex_shrink(0.0_f32)
@@ -3081,19 +3084,16 @@ fn field_label(name: String, type_name: String) -> impl IntoView {
     })
 }
 
-/// A small ghost button (the per-field NULL / Set-value affordances).
+/// A small borderless text button (the per-field Set-NULL / Set-value / Unset
+/// affordances): no background, just a text-colour hover.
 fn field_mini_btn(label: &'static str, action: impl Fn() + 'static) -> AnyView {
-    container(text(label).style(|s| s.font_size(11.0)))
+    container(text(label).style(|s| s.font_size(13.0)))
         .on_click_stop(move |_| action())
         .style(|s| {
-            s.padding_horiz(6.0)
-                .padding_vert(1.0)
+            s.padding_horiz(4.0)
                 .flex_shrink(0.0_f32)
                 .color(theme::text_dim())
-                .border(1.0)
-                .border_color(theme::border())
-                .border_radius(4.0)
-                .hover(|s| s.color(theme::text()).border_color(theme::text_dim()))
+                .hover(|s| s.color(theme::text()))
         })
         .into_any()
 }
@@ -3101,7 +3101,7 @@ fn field_mini_btn(label: &'static str, action: impl Fn() + 'static) -> AnyView {
 /// The dim `<null>` sentinel shown for a NULL field / value.
 fn null_sentinel() -> AnyView {
     text(rowjson::InsertSentinel::Null.label())
-        .style(|s| s.font_size(12.5).color(theme::text_faint()))
+        .style(|s| s.font_size(13.0).color(theme::text_faint()))
         .into_any()
 }
 
@@ -3116,6 +3116,7 @@ fn scalar_editor(gs: GridState, nullable: bool, autofocus: bool, f: FieldSig) ->
                 background: theme::bg_editor,
                 font_size: 13.0,
                 autofocus,
+                height: Some(FIELD_INPUT_H),
                 // Escape closes the panel even while a field is focused.
                 on_escape: Some(Rc::new(move || gs.edit_row_open.set(false))),
                 ..Default::default()
@@ -3139,7 +3140,7 @@ fn scalar_editor(gs: GridState, nullable: bool, autofocus: bool, f: FieldSig) ->
             } else {
                 h_stack((
                     make_field().style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
-                    field_mini_btn("NULL", move || f.is_null.set(true)),
+                    field_mini_btn("Set NULL", move || f.is_null.set(true)),
                 ))
                 .style(|s| s.items_center().width_full().gap(6.0))
                 .into_any()
@@ -3216,9 +3217,9 @@ fn json_row_view(
     // Label: `key:` for an object member, `[i]` for an array element, none at root.
     let label: AnyView = match (&r.label, r.path.last()) {
         (Some(k), _) => h_stack((
-            text(k.clone()).style(|s| s.font_size(12.5).color(theme::key_index())),
+            text(k.clone()).style(|s| s.font_size(13.0).color(theme::key_index())),
             text(":").style(|s| {
-                s.font_size(12.5)
+                s.font_size(13.0)
                     .color(theme::text_faint())
                     .margin_right(6.0)
             }),
@@ -3227,7 +3228,7 @@ fn json_row_view(
         .into_any(),
         (None, Some(PathSeg::Index(i))) => text(format!("[{i}]"))
             .style(|s| {
-                s.font_size(12.5)
+                s.font_size(13.0)
                     .color(theme::text_faint())
                     .margin_right(6.0)
                     .flex_shrink(0.0_f32)
@@ -3238,10 +3239,10 @@ fn json_row_view(
 
     let value: AnyView = match &r.kind {
         RowKind::Object(n) => text(format!("{{{n}}}"))
-            .style(|s| s.font_size(12.0).color(theme::text_faint()))
+            .style(|s| s.font_size(13.0).color(theme::text_faint()))
             .into_any(),
         RowKind::Array(n) => text(format!("[{n}]"))
-            .style(|s| s.font_size(12.0).color(theme::text_faint()))
+            .style(|s| s.font_size(13.0).color(theme::text_faint()))
             .into_any(),
         RowKind::Scalar => {
             if is_editing {
@@ -3249,8 +3250,9 @@ fn json_row_view(
                     edit_buf,
                     FieldCfg {
                         background: theme::bg_deepest,
-                        font_size: 12.5,
+                        font_size: 13.0,
                         autofocus: true,
+                        height: Some(FIELD_INPUT_H),
                         on_submit: Some(commit_current.clone()),
                         on_blur: Some(commit_current.clone()),
                         on_escape: Some(Rc::new(move || {
@@ -3266,7 +3268,7 @@ fn json_row_view(
                 let vj = r.value_json.clone().unwrap_or_default();
                 let vj2 = vj.clone();
                 let p = path.clone();
-                container(text(vj).style(|s| s.font_size(12.5).color(theme::text())))
+                container(text(vj).style(|s| s.font_size(13.0).color(theme::text())))
                     .on_click_stop(move |_| (start_edit)(p.clone(), vj2.clone()))
                     .style(|s| {
                         s.padding_horiz(4.0)
@@ -3285,7 +3287,7 @@ fn json_row_view(
         label,
         value,
     ))
-    .style(|s| s.items_center().width_full().min_height(22.0))
+    .style(|s| s.items_center().width_full().min_height(FIELD_ROW_H))
     .into_any()
 }
 
@@ -3302,6 +3304,7 @@ fn json_editor(f: FieldSig) -> AnyView {
             FieldCfg {
                 background: theme::bg_editor,
                 font_size: 13.0,
+                height: Some(FIELD_INPUT_H),
                 ..Default::default()
             },
         )
@@ -3380,7 +3383,7 @@ fn json_editor(f: FieldSig) -> AnyView {
         move || err.get(),
         move |e| match e {
             Some(msg) => text(msg)
-                .style(|s| s.font_size(11.0).color(theme::conn_delete()))
+                .style(|s| s.font_size(13.0).color(theme::conn_delete()))
                 .into_any(),
             None => empty().into_any(),
         },
@@ -3453,7 +3456,7 @@ fn insert_sentinel_view(sent: rowjson::InsertSentinel) -> AnyView {
     let required = sent.is_required();
     text(sent.label())
         .style(move |s| {
-            s.font_size(12.5).color(if required {
+            s.font_size(13.0).color(if required {
                 theme::conn_delete()
             } else {
                 theme::text_faint()
@@ -3537,16 +3540,14 @@ fn field_row(
         container(editor).style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
     ))
     .style(move |s| {
-        let s = s
-            .width_full()
-            .gap(8.0)
-            .padding_vert(3.0)
-            .min_height(FIELD_ROW_MIN_H);
-        // A JSON tree grows tall — top-align the label with it; scalar rows centre.
+        let s = s.width_full().gap(8.0).padding_vert(3.0);
+        // A JSON tree grows tall — top-align the label and let the row grow. A scalar
+        // row keeps a *fixed* height so toggling sentinel/`<null>` ↔ input (which are
+        // different natural heights) never reflows the rows below.
         if is_json {
-            s.items_start()
+            s.items_start().min_height(FIELD_ROW_H)
         } else {
-            s.items_center()
+            s.items_center().height(FIELD_ROW_H)
         }
     })
     .into_any()
@@ -3708,9 +3709,12 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                     .flex_shrink(0.0_f32)
             });
 
-            // The field list scrolls once it exceeds ~max_rows worth of height.
-            let fields = scroll(v_stack_from_iter(rows).style(|s| s.width_full().flex_col()))
-                .style(move |s| s.width_full().max_height(max_rows.get() as f64 * 30.0));
+            // The field list scrolls (app-standard auto-hiding bars) once it exceeds
+            // the pixel cap (~half the results area).
+            let fields = autohide(scroll(
+                v_stack_from_iter(rows).style(|s| s.width_full().flex_col()),
+            ))
+            .style(move |s| s.width_full().max_height(max_rows.get() as f64));
 
             let err_line = dyn_container(
                 move || gs.edit_row_err.get(),
@@ -5060,19 +5064,20 @@ fn data_cell(
                  If you can infer a pattern, format, or meaning from it, note that too."
             );
 
-            // "View" opens the whole-row view/edit JSON panel (read-only fields shown
-            // for context, editable ones editable). Real rows only — a pending new row
-            // has no committed row to serialize (it's filled via inline cell edits).
+            // "Edit Field" edits this single cell inline; "Edit Row" opens the
+            // whole-row structured panel (read-only fields shown for context). A row
+            // marked for deletion isn't editable, and a pending new row has no
+            // committed row to open in the panel (it's filled via inline cell edits).
             let mut entries: Vec<MenuEntry> = Vec::new();
-            if pending.is_none() {
-                entries.push(MenuEntry::action("View", move || {
-                    open_edit_row(gs, data_idx)
+            if editable && !deleted {
+                entries.push(MenuEntry::action("Edit Field", move || {
+                    start_edit(gs, i, ci)
                 }));
             }
-            // A row marked for deletion isn't editable (it's going away) — only
-            // View / Copy / Undo delete / AI Summary.
-            if editable && !deleted {
-                entries.push(MenuEntry::action("Edit", move || start_edit(gs, i, ci)));
+            if pending.is_none() {
+                entries.push(MenuEntry::action("Edit Row", move || {
+                    open_edit_row(gs, data_idx)
+                }));
             }
             entries.push(MenuEntry::action("Copy", move || {
                 let _ = floem::Clipboard::set_contents(v_copy.clone());
