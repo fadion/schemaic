@@ -8,5 +8,8 @@ license.workspace = true
 schemaic-core = { workspace = true }
 schemaic-term = { workspace = true }
 floem = { workspace = true }
+# The `Renderer` trait (stroke/fill in a custom view's `paint`) isn't re-exported
+# by `floem`; pull it directly. Already in the tree via floem — same version.
+floem_renderer = "0.2.0"
 serde_json = { workspace = true }
 pulldown-cmark = { version = "0.13.4", default-features = false }

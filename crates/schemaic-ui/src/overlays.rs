@@ -374,6 +374,7 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
 // Same styling as the other dropdowns.
 pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
     let ctx = ui.overlay.context_menu;
+    let erd = ui.overlay.erd;
     let last_mouse = ui.overlay.last_mouse;
     let toggle_hidden = ui.schema_actions.toggle_db_hidden.clone();
     let open_table = ui.tab_actions.open_table.clone();
@@ -419,6 +420,15 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     let dbn = menu.name.clone();
                     entries.push(MenuEntry::action("Open in CLI", move || {
                         (ocli)(Some(dbn.clone()))
+                    }));
+                    // ER diagram of the whole database (every related table).
+                    let edb = menu.name.clone();
+                    entries.push(MenuEntry::action("Show diagram", move || {
+                        erd.set(Some(crate::ErdTarget {
+                            conn_id: active_conn.get_untracked(),
+                            database: edb.clone(),
+                            seed: schemaic_core::erd::DiagramSeed::Database,
+                        }));
                     }));
                     // Set colour: preset swatches + Clear, stored per (active
                     // connection, database) and shown as a dot on the DB node,
@@ -505,6 +515,18 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let tbl = table.clone();
                         entries.push(MenuEntry::action("Open in new tab", move || {
                             (otn)(db.clone(), tbl.clone())
+                        }));
+                    }
+                    // ER diagram seeded on this table's FK neighbourhood.
+                    {
+                        let db = database.clone();
+                        let tbl = table.clone();
+                        entries.push(MenuEntry::action("Show diagram", move || {
+                            erd.set(Some(crate::ErdTarget {
+                                conn_id: active_conn.get_untracked(),
+                                database: db.clone(),
+                                seed: schemaic_core::erd::DiagramSeed::Table(tbl.clone()),
+                            }));
                         }));
                     }
                     let oq = open_query.clone();

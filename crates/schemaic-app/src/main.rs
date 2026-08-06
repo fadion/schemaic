@@ -3002,6 +3002,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             monitor_log,
             monitor_error,
             monitor_interval,
+            erd: RwSignal::new(None),
         },
         schema: SchemaUi {
             db_nodes,

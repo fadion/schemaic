@@ -352,6 +352,34 @@ pub fn favorite_star() -> Color {
     ui().favorite_star
 }
 
+// ER-diagram modal surfaces.
+pub fn erd_canvas() -> Color {
+    ui().erd_canvas
+}
+pub fn erd_dot() -> Color {
+    ui().erd_dot
+}
+pub fn erd_node_bg() -> Color {
+    ui().erd_node_bg
+}
+pub fn erd_node_header() -> Color {
+    ui().erd_node_header
+}
+pub fn erd_edge() -> Color {
+    ui().erd_edge
+}
+pub fn erd_edge_hover() -> Color {
+    ui().erd_edge_hover
+}
+/// ER-diagram toolbar strip top/bottom border.
+pub fn erd_toolbar_border() -> Color {
+    ui().erd_toolbar_border
+}
+/// ER-diagram toolbar control border + zoom-unit separators.
+pub fn erd_control_border() -> Color {
+    ui().erd_control_border
+}
+
 // Schema search placeholder / faint input text.
 pub fn search_hint() -> Color {
     ui().search_hint

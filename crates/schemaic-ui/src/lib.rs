@@ -12,6 +12,7 @@ mod connection_form;
 mod consts;
 mod diff_view;
 mod editor_pane;
+mod erd_view;
 pub mod fonts;
 mod grid;
 mod history_panel;
@@ -32,6 +33,7 @@ use ai_panel::ai_panel;
 use connection_form::manage_modal;
 use consts::*;
 use editor_pane::{QueryPaneParams, editor_placeholder, query_pane};
+use erd_view::erd_overlay;
 use grid::{GridCtx, grid_error_bar, grid_find_bar, loaded_view, results_view, running_view};
 use history_panel::history_panel;
 use monitor_view::monitor_overlay;
@@ -494,6 +496,18 @@ pub enum CtxKind {
         ddl: String,
     },
     Field,
+}
+
+/// Which database/table an open ER-diagram modal is showing, and how it was
+/// seeded (a single table's neighbourhood, or the whole database). `Some` on
+/// `OverlayUi::erd` means the modal is open. The `conn_id` is captured for
+/// completeness; the schema is resolved from `db_nodes` by `database` (that list
+/// is always the active connection's).
+#[derive(Clone)]
+pub struct ErdTarget {
+    pub conn_id: u64,
+    pub database: String,
+    pub seed: schemaic_core::erd::DiagramSeed,
 }
 
 /// An open schema context menu: what was clicked, its display name (for "Copy
@@ -1006,6 +1020,8 @@ pub struct OverlayUi {
     /// Poll interval in seconds (the popup's dropdown). Read by the poll loop on
     /// each re-arm, so a change takes effect on the next tick. Session-only.
     pub monitor_interval: RwSignal<u64>,
+    /// ER-diagram modal: `Some(target)` opens it for that database/seed.
+    pub erd: RwSignal<Option<ErdTarget>>,
 }
 
 /// One entry in the Live Monitor's change log: a detected [`RowChange`] plus the
@@ -1317,7 +1333,23 @@ pub fn workspace(ui: Ui) -> impl IntoView {
         find_overlay(ui.clone()),
         error_modal_overlay(ui.clone()),
         plan_overlay(ui.clone()),
-        monitor_overlay(ui.clone()),
+        // Monitor + ER-diagram modals share one tuple element (the workspace stack
+        // is at Floem's 16-arity `ViewTuple` limit). The wrapper must fill the
+        // window when either is open — so their own `.absolute().inset(0)` resolves
+        // against the root and the dim backdrop covers everything — but stay
+        // out-of-flow (zero-size) when both are closed, or it would intercept every
+        // click meant for the app beneath it.
+        {
+            let mon_open = ui.overlay.monitor_open;
+            let erd_open = ui.overlay.erd;
+            stack((monitor_overlay(ui.clone()), erd_overlay(ui.clone()))).style(move |s| {
+                if mon_open.get() || erd_open.get().is_some() {
+                    s.absolute().inset(0.0)
+                } else {
+                    s
+                }
+            })
+        },
         term_settings_overlay(ui.clone()),
         ai_settings_overlay(ui.clone()),
         theme_settings_overlay(ui.clone()),

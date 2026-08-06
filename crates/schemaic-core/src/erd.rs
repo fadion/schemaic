@@ -1,0 +1,1286 @@
+//! ER-diagram model: turn an introspected [`DbSchema`] into a diagram graph
+//! (nodes = tables, edges = foreign keys) for the read-only ER-diagram modal.
+//!
+//! Pure + unit-tested. This layer answers *what* to draw — the node/edge set for a
+//! seed (a single table's FK neighbourhood, or a whole database), which columns to
+//! show when a node is collapsed, and each FK's cardinality. Pixel layout lives in
+//! [`auto_layout`](crate::erd) (next), rendering in the UI. Nothing here does IO or
+//! touches the UI.
+//!
+//! The graph is built from one [`DbSchema`] (a single database). A foreign key that
+//! points at a table in *another* database (MySQL only — `ref_schema` differs from
+//! the current DB) can't be enumerated here, so it becomes a **stub node** carrying
+//! just the qualified name, never expanded.
+
+use crate::schema::{DbSchema, TableInfo};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+
+/// What seeds the diagram.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiagramSeed {
+    /// The whole database: every table that participates in a relationship
+    /// (tables with no FK in or out are hidden as islands).
+    Database,
+    /// One table plus its one-hop FK neighbours (tables it references and tables
+    /// that reference it).
+    Table(String),
+}
+
+/// A node's kind: a real table in this database (with columns), or a stub standing
+/// in for a cross-database FK target we can't enumerate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeKind {
+    /// A base table in the current database.
+    Table,
+    /// A view in the current database.
+    View,
+    /// A cross-database FK target — name only, not expandable.
+    Stub,
+}
+
+/// One column row inside a table node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiagramColumn {
+    pub name: String,
+    pub type_name: String,
+    pub nullable: bool,
+    /// Part of the primary key.
+    pub pk: bool,
+    /// Referenced by a foreign key declared on this table.
+    pub fk: bool,
+}
+
+impl DiagramColumn {
+    /// A key column (PK or FK) — pinned into the collapsed view.
+    pub fn is_key(&self) -> bool {
+        self.pk || self.fk
+    }
+}
+
+/// A table (or stub) in the diagram. `id` is the stable key used by edges and by
+/// persisted layout positions: the bare table name for a real node, `db.table` for
+/// a cross-database stub.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiagramNode {
+    pub id: String,
+    /// Display name (the table name; stubs show the qualified `db.table`).
+    pub name: String,
+    pub kind: NodeKind,
+    /// Columns, in schema order. Empty for a stub.
+    pub columns: Vec<DiagramColumn>,
+}
+
+/// Relationship multiplicity, from the referencing side's uniqueness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cardinality {
+    /// The referencing columns are not unique — many children per parent row.
+    OneToMany,
+    /// The referencing columns are themselves unique (or the child PK) — 1:1.
+    OneToOne,
+}
+
+/// A foreign-key relationship, drawn child → parent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiagramEdge {
+    /// Referencing (child) node id.
+    pub from: String,
+    /// Referencing columns, in key order.
+    pub from_columns: Vec<String>,
+    /// Referenced (parent) node id.
+    pub to: String,
+    /// Referenced columns, aligned to `from_columns`.
+    pub to_columns: Vec<String>,
+    pub cardinality: Cardinality,
+    /// The FK is optional — at least one referencing column is nullable, so a child
+    /// row may have no parent ("zero-or-one" at the parent end → optionality circle).
+    pub optional: bool,
+}
+
+/// The built diagram graph.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiagramGraph {
+    pub nodes: Vec<DiagramNode>,
+    pub edges: Vec<DiagramEdge>,
+    /// Tables omitted because they have no relationships (Database seed only),
+    /// surfaced as a "N unrelated tables hidden" note. Sorted, for stable display.
+    pub hidden_islands: Vec<String>,
+    /// Total table count in the source schema (the "N tables" chip).
+    pub total_tables: usize,
+}
+
+/// Does `fk_cols` (a foreign key's referencing columns) form a unique key on
+/// `child` — either exactly the primary key, or a UNIQUE index over the same set?
+/// If so the relationship is 1:1, otherwise 1:many.
+fn fk_is_unique(child: &TableInfo, fk_cols: &[String]) -> bool {
+    let want: HashSet<&str> = fk_cols.iter().map(String::as_str).collect();
+    if want.is_empty() {
+        return false;
+    }
+    let pk: HashSet<&str> = child
+        .columns
+        .iter()
+        .filter(|c| c.primary_key)
+        .map(|c| c.name.as_str())
+        .collect();
+    if !pk.is_empty() && pk == want {
+        return true;
+    }
+    child.indexes.iter().any(|ix| {
+        ix.unique
+            && ix
+                .columns
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+                == want
+    })
+}
+
+/// Is the foreign key optional — i.e. any of its referencing columns nullable, so
+/// a child row may reference no parent? Drives the optionality circle drawn at the
+/// parent ("one") end of the edge. An unknown column (not found on `child`) is
+/// treated as non-null (conservative — no false "optional").
+fn fk_is_optional(child: &TableInfo, fk_cols: &[String]) -> bool {
+    let want: HashSet<&str> = fk_cols.iter().map(String::as_str).collect();
+    child
+        .columns
+        .iter()
+        .any(|c| c.nullable && want.contains(c.name.as_str()))
+}
+
+/// The `id` of an FK's target: the referenced table name when it's in the current
+/// database, or `db.table` when the FK crosses into another database. `current_db`
+/// is the name of the database this schema belongs to; a `ref_schema` of `None` (or
+/// equal to `current_db`) is same-database.
+fn target_id(fk_ref_schema: &Option<String>, ref_table: &str, current_db: &str) -> (String, bool) {
+    match fk_ref_schema {
+        Some(s) if s != current_db => (format!("{s}.{ref_table}"), true),
+        _ => (ref_table.to_string(), false),
+    }
+}
+
+/// Build the diagram graph for `seed` from `schema` (the schema of `current_db`).
+///
+/// - `Database`: every table that has at least one FK (in or out); tables with no
+///   relationship go to `hidden_islands`.
+/// - `Table(name)`: the named table plus every table one FK hop away. An unknown
+///   table name yields an empty graph.
+///
+/// Edges are drawn for FKs whose *child* is in the node set; a same-database target
+/// outside the set (a second hop, in the neighbourhood case) is skipped, while a
+/// cross-database target adds a stub node.
+pub fn build_graph(schema: &DbSchema, current_db: &str, seed: &DiagramSeed) -> DiagramGraph {
+    let by_name: HashMap<&str, &TableInfo> =
+        schema.tables.iter().map(|t| (t.name.as_str(), t)).collect();
+
+    // 1. Decide which real tables are in the node set.
+    let included: Vec<&TableInfo> = match seed {
+        DiagramSeed::Database => schema.tables.iter().collect(),
+        DiagramSeed::Table(name) => {
+            let Some(seed_t) = by_name.get(name.as_str()) else {
+                return DiagramGraph {
+                    total_tables: schema.tables.len(),
+                    ..Default::default()
+                };
+            };
+            let mut set: HashSet<&str> = HashSet::new();
+            set.insert(seed_t.name.as_str());
+            // Tables the seed references (same-database targets only).
+            for fk in &seed_t.foreign_keys {
+                let (_, cross) = target_id(&fk.ref_schema, &fk.ref_table, current_db);
+                if !cross && by_name.contains_key(fk.ref_table.as_str()) {
+                    set.insert(by_name[fk.ref_table.as_str()].name.as_str());
+                }
+            }
+            // Tables that reference the seed.
+            for t in &schema.tables {
+                if t.foreign_keys.iter().any(|fk| {
+                    let (_, cross) = target_id(&fk.ref_schema, &fk.ref_table, current_db);
+                    !cross && fk.ref_table == *name
+                }) {
+                    set.insert(t.name.as_str());
+                }
+            }
+            schema
+                .tables
+                .iter()
+                .filter(|t| set.contains(t.name.as_str()))
+                .collect()
+        }
+    };
+    let included_names: HashSet<&str> = included.iter().map(|t| t.name.as_str()).collect();
+
+    // 2. Real table nodes (columns with pk/fk flags).
+    let mut nodes: Vec<DiagramNode> = included.iter().map(|t| table_node(t)).collect();
+
+    // 3. Edges (and any cross-database stub nodes they need).
+    let mut edges: Vec<DiagramEdge> = Vec::new();
+    let mut stubs: Vec<String> = Vec::new();
+    for child in &included {
+        for fk in &child.foreign_keys {
+            let (to, cross) = target_id(&fk.ref_schema, &fk.ref_table, current_db);
+            if cross {
+                if !stubs.contains(&to) {
+                    stubs.push(to.clone());
+                }
+            } else if !included_names.contains(fk.ref_table.as_str()) {
+                continue; // same-DB target outside the set (a second hop) — skip.
+            }
+            edges.push(DiagramEdge {
+                from: child.name.clone(),
+                from_columns: fk.columns.clone(),
+                to,
+                to_columns: fk.ref_columns.clone(),
+                cardinality: if fk_is_unique(child, &fk.columns) {
+                    Cardinality::OneToOne
+                } else {
+                    Cardinality::OneToMany
+                },
+                optional: fk_is_optional(child, &fk.columns),
+            });
+        }
+    }
+    for id in stubs {
+        let name = id.clone();
+        nodes.push(DiagramNode {
+            id,
+            name,
+            kind: NodeKind::Stub,
+            columns: Vec::new(),
+        });
+    }
+
+    // 4. Island tables (Database seed only): real nodes with no incident edge.
+    let mut hidden_islands: Vec<String> = Vec::new();
+    if *seed == DiagramSeed::Database {
+        let connected: HashSet<&str> = edges
+            .iter()
+            .flat_map(|e| [e.from.as_str(), e.to.as_str()])
+            .collect();
+        hidden_islands = nodes
+            .iter()
+            .filter(|n| n.kind != NodeKind::Stub && !connected.contains(n.id.as_str()))
+            .map(|n| n.name.clone())
+            .collect();
+        hidden_islands.sort();
+        let hidden: HashSet<&str> = hidden_islands.iter().map(String::as_str).collect();
+        nodes.retain(|n| n.kind == NodeKind::Stub || !hidden.contains(n.id.as_str()));
+    }
+
+    DiagramGraph {
+        nodes,
+        edges,
+        hidden_islands,
+        total_tables: schema.tables.len(),
+    }
+}
+
+/// Build a real table node, flagging each column PK (from schema) and FK (any
+/// column named in one of the table's foreign keys).
+fn table_node(t: &TableInfo) -> DiagramNode {
+    let fk_cols: HashSet<&str> = t
+        .foreign_keys
+        .iter()
+        .flat_map(|fk| fk.columns.iter().map(String::as_str))
+        .collect();
+    let columns = t
+        .columns
+        .iter()
+        .map(|c| DiagramColumn {
+            name: c.name.clone(),
+            type_name: c.type_name.clone(),
+            nullable: c.nullable,
+            pk: c.primary_key,
+            fk: fk_cols.contains(c.name.as_str()),
+        })
+        .collect();
+    DiagramNode {
+        id: t.name.clone(),
+        name: t.name.clone(),
+        kind: if t.is_view {
+            NodeKind::View
+        } else {
+            NodeKind::Table
+        },
+        columns,
+    }
+}
+
+/// Density thresholds for node collapse (all tunable starting guesses).
+#[derive(Clone, Copy, Debug)]
+pub struct DensityOpts {
+    /// A table with this many columns or more starts collapsed.
+    pub full_cols_max: usize,
+    /// When the diagram has this many nodes or more, every node starts collapsed.
+    pub crowded_nodes: usize,
+    /// How many leading columns a collapsed node shows.
+    pub collapsed_cols: usize,
+}
+
+impl Default for DensityOpts {
+    fn default() -> Self {
+        DensityOpts {
+            full_cols_max: 15,
+            crowded_nodes: 25,
+            collapsed_cols: 5,
+        }
+    }
+}
+
+/// Whether a node should render collapsed by *default* (the user can still toggle):
+/// collapse a table with too many columns, or every table once the canvas is
+/// crowded. A small table on an uncrowded canvas draws in full.
+pub fn should_collapse(node_col_count: usize, total_nodes: usize, opts: DensityOpts) -> bool {
+    node_col_count >= opts.full_cols_max || total_nodes >= opts.crowded_nodes
+}
+
+/// The column indices a collapsed node shows: the first `collapsed_cols`, plus any
+/// key (PK/FK) column beyond that cutoff pinned in, preserving schema order. The
+/// count of remaining hidden columns is `cols.len() - result.len()` (the "⌄ N more"
+/// expander).
+pub fn collapsed_visible(cols: &[DiagramColumn], collapsed_cols: usize) -> Vec<usize> {
+    cols.iter()
+        .enumerate()
+        .filter(|(i, c)| *i < collapsed_cols || c.is_key())
+        .map(|(i, _)| i)
+        .collect()
+}
+
+// ── Deterministic auto-layout ──────────────────────────────────────────────
+//
+// A layered ("Sugiyama-lite") layout: nodes are assigned to layers by longest FK
+// dependency chain (a referenced parent lands in an earlier layer than the child
+// that references it), then ordered within each layer by the barycentre of their
+// already-placed neighbours to reduce crossings. Fully deterministic — the same
+// graph always lays out identically — so it's a stable *starting* arrangement that
+// manual drag + persistence then refine. Self-loops and cycles are handled (a
+// back-edge simply doesn't raise the layer), never panicking.
+
+/// A node's place in the layer grid: its layer (horizontal band) and order within
+/// that layer (vertical slot). Turned into pixels by [`place`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutCell {
+    pub id: String,
+    pub layer: usize,
+    pub order: usize,
+}
+
+/// Longest-path layer of every node: `layer(n) = 1 + max(layer(t))` over `n`'s
+/// in-graph FK targets (self-loops and back-edges in a cycle contribute nothing),
+/// so a node with no outgoing FK is layer 0. Memoised; cycle-safe via a DFS stack.
+fn compute_layer<'a>(
+    node: &'a str,
+    targets: &HashMap<&'a str, Vec<&'a str>>,
+    memo: &mut HashMap<&'a str, usize>,
+    on_stack: &mut HashSet<&'a str>,
+) -> usize {
+    if let Some(&l) = memo.get(node) {
+        return l;
+    }
+    on_stack.insert(node);
+    let mut best = 0;
+    if let Some(ts) = targets.get(node) {
+        for &t in ts {
+            if on_stack.contains(t) {
+                continue; // back-edge (cycle / self-loop) — don't raise the layer.
+            }
+            best = best.max(compute_layer(t, targets, memo, on_stack) + 1);
+        }
+    }
+    on_stack.remove(node);
+    memo.insert(node, best);
+    best
+}
+
+/// Assign every node a [`LayoutCell`] (layer + within-layer order). Deterministic.
+pub fn layout(graph: &DiagramGraph) -> Vec<LayoutCell> {
+    let ids: Vec<&str> = graph.nodes.iter().map(|n| n.id.as_str()).collect();
+    let id_set: HashSet<&str> = ids.iter().copied().collect();
+
+    // FK targets per node: in-graph, excluding self-loops (they can't set a layer).
+    let mut targets: HashMap<&str, Vec<&str>> = ids.iter().map(|&id| (id, Vec::new())).collect();
+    for e in &graph.edges {
+        if e.from != e.to
+            && id_set.contains(e.to.as_str())
+            && let Some(v) = targets.get_mut(e.from.as_str())
+        {
+            let t = e.to.as_str();
+            if !v.contains(&t) {
+                v.push(t);
+            }
+        }
+    }
+
+    let mut memo: HashMap<&str, usize> = HashMap::new();
+    let mut layer_of: HashMap<&str, usize> = HashMap::new();
+    for &id in &ids {
+        let mut on_stack = HashSet::new();
+        let l = compute_layer(id, &targets, &mut memo, &mut on_stack);
+        layer_of.insert(id, l);
+    }
+
+    // Group by layer (BTreeMap → ascending, so lower layers order first).
+    let mut by_layer: std::collections::BTreeMap<usize, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for &id in &ids {
+        by_layer.entry(layer_of[id]).or_default().push(id);
+    }
+
+    // Order within each layer by the barycentre of targets' orders (they live in
+    // lower, already-ordered layers), tie-broken by id for determinism.
+    let mut order_of: HashMap<&str, usize> = HashMap::new();
+    let mut cells: Vec<LayoutCell> = Vec::with_capacity(ids.len());
+    for (&layer, layer_ids) in &by_layer {
+        let mut sorted: Vec<&str> = layer_ids.clone();
+        sorted.sort_by(|a, b| {
+            let bary = |n: &str| -> f64 {
+                let ts = &targets[n];
+                let placed: Vec<usize> =
+                    ts.iter().filter_map(|t| order_of.get(t).copied()).collect();
+                if placed.is_empty() {
+                    f64::INFINITY // no placed targets → fall to id order (sorts last, stable)
+                } else {
+                    placed.iter().sum::<usize>() as f64 / placed.len() as f64
+                }
+            };
+            bary(a)
+                .partial_cmp(&bary(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.cmp(b))
+        });
+        for (i, &id) in sorted.iter().enumerate() {
+            order_of.insert(id, i);
+            cells.push(LayoutCell {
+                id: id.to_string(),
+                layer,
+                order: i,
+            });
+        }
+    }
+    cells
+}
+
+/// Pixel gaps between layers (horizontal) and stacked nodes (vertical).
+#[derive(Clone, Copy, Debug)]
+pub struct LayoutOpts {
+    pub h_gap: f64,
+    pub v_gap: f64,
+}
+
+impl Default for LayoutOpts {
+    fn default() -> Self {
+        LayoutOpts {
+            h_gap: 64.0,
+            v_gap: 28.0,
+        }
+    }
+}
+
+/// Absolute canvas position of a node's top-left corner.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodePos {
+    pub id: String,
+    pub x: f64,
+    pub y: f64,
+}
+
+/// Turn [`LayoutCell`]s into pixel positions given each node's `(width, height)`
+/// (the UI measures these from column count + collapse state). Each layer is a
+/// column whose x clears the widest node of every earlier layer; within a layer,
+/// nodes stack top-down by order. A node with no entry in `sizes` is treated as
+/// zero-sized. Pure arithmetic.
+pub fn place(
+    cells: &[LayoutCell],
+    sizes: &HashMap<String, (f64, f64)>,
+    opts: LayoutOpts,
+) -> Vec<NodePos> {
+    let size = |id: &str| sizes.get(id).copied().unwrap_or((0.0, 0.0));
+    let max_layer = cells.iter().map(|c| c.layer).max().unwrap_or(0);
+
+    // x offset of each layer = sum of prior layers' max widths + gaps.
+    let mut layer_x = vec![0.0_f64; max_layer + 1];
+    for l in 1..=max_layer {
+        let prev_max_w = cells
+            .iter()
+            .filter(|c| c.layer == l - 1)
+            .map(|c| size(&c.id).0)
+            .fold(0.0_f64, f64::max);
+        layer_x[l] = layer_x[l - 1] + prev_max_w + opts.h_gap;
+    }
+
+    cells
+        .iter()
+        .map(|c| {
+            // y = stacked heights of earlier-ordered nodes in the same layer.
+            let y = cells
+                .iter()
+                .filter(|o| o.layer == c.layer && o.order < c.order)
+                .map(|o| size(&o.id).1 + opts.v_gap)
+                .sum();
+            NodePos {
+                id: c.id.clone(),
+                x: layer_x[c.layer],
+                y,
+            }
+        })
+        .collect()
+}
+
+// ── Edge geometry (SVG drawing + hover hit-test) ────────────────────────────
+//
+// Pure geometry shared by the UI's edge-drawing (one generated `<svg>` string)
+// and the hover hit-test (Floem's `svg` view is one opaque picture with no
+// per-path events, so the UI finds the hovered edge by proximity in Rust).
+
+/// A 2-D point in canvas pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pt {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// A node's rectangle in canvas pixels (top-left origin).
+#[derive(Clone, Copy, Debug)]
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+/// Anchor points for an edge between two card rects: leave the source on the side
+/// facing the target and enter the target on its facing side, both at the card's
+/// vertical centre. The side is chosen purely by horizontal *centre* position, so
+/// the connection stays right-edge→left-edge (or the mirror) even when the cards
+/// overlap horizontally — no "both exit the same side" case, which produced a
+/// jarring flip as two cards were dragged close. (Column-row-precise anchoring is a
+/// later refinement.)
+pub fn edge_anchors(from: Rect, to: Rect) -> (Pt, Pt) {
+    let from_cy = from.y + from.h / 2.0;
+    let to_cy = to.y + to.h / 2.0;
+    if to.x + to.w / 2.0 >= from.x + from.w / 2.0 {
+        // Target centre to the right: source right edge → target left edge.
+        (
+            Pt {
+                x: from.x + from.w,
+                y: from_cy,
+            },
+            Pt { x: to.x, y: to_cy },
+        )
+    } else {
+        // Target centre to the left: source left edge → target right edge.
+        (
+            Pt {
+                x: from.x,
+                y: from_cy,
+            },
+            Pt {
+                x: to.x + to.w,
+                y: to_cy,
+            },
+        )
+    }
+}
+
+/// The outward horizontal direction (`+1` → the edge leaves/enters on the card's
+/// right side, `-1` → its left) of each anchor from [`edge_anchors`], in the same
+/// `(from, to)` order. Lets the UI draw a short straight stub off each card before
+/// the curve bends, so the crow's-foot / bar markers sit on a straight segment and
+/// stay symmetric even when the two cards are vertically offset.
+pub fn edge_dirs(from: Rect, to: Rect) -> (f64, f64) {
+    if to.x + to.w / 2.0 >= from.x + from.w / 2.0 {
+        (1.0, -1.0) // source right edge → target left edge
+    } else {
+        (-1.0, 1.0) // source left edge → target right edge
+    }
+}
+
+/// Cubic-bezier control points for the horizontal-flow curve between `p0` and `p1`.
+/// Each control is pushed along that end's *outward* direction (`out0`/`out1` from
+/// [`edge_dirs`]) so the curve continues the straight marker stub — its tangent
+/// matches the stub (no kink) and the direction is fixed by the anchor's side, not
+/// by the sign of `p1.x - p0.x` (that sign-based version flipped the curve when the
+/// stub-ends crossed as two cards drew close).
+///
+/// The lead length per end is half the horizontal *flow toward the other end in
+/// this end's outward direction*, floored at 8px. For a normal gap that's half the
+/// separation (unchanged from before); when the ends are "crossed" (cards close, the
+/// inward-pointing stubs overshoot) the flow is negative and it floors to 8 — a small
+/// bend, not a big overshoot loop.
+pub fn cubic_controls(p0: Pt, p1: Pt, out0: f64, out1: f64) -> (Pt, Pt) {
+    let dx0 = ((p1.x - p0.x) * out0 * 0.5).max(8.0);
+    let dx1 = ((p0.x - p1.x) * out1 * 0.5).max(8.0);
+    (
+        Pt {
+            x: p0.x + out0 * dx0,
+            y: p0.y,
+        },
+        Pt {
+            x: p1.x + out1 * dx1,
+            y: p1.y,
+        },
+    )
+}
+
+/// SVG `d` attribute for the cubic bezier `p0 → p1` with controls `c1`, `c2`.
+pub fn cubic_path_d(p0: Pt, c1: Pt, c2: Pt, p1: Pt) -> String {
+    format!(
+        "M {:.1} {:.1} C {:.1} {:.1}, {:.1} {:.1}, {:.1} {:.1}",
+        p0.x, p0.y, c1.x, c1.y, c2.x, c2.y, p1.x, p1.y
+    )
+}
+
+/// Sample a cubic bezier into `segments + 1` points (for the hit-test polyline).
+pub fn sample_cubic(p0: Pt, c1: Pt, c2: Pt, p1: Pt, segments: usize) -> Vec<Pt> {
+    let n = segments.max(1);
+    (0..=n)
+        .map(|i| {
+            let t = i as f64 / n as f64;
+            let mt = 1.0 - t;
+            let (a, b, c, d) = (mt * mt * mt, 3.0 * mt * mt * t, 3.0 * mt * t * t, t * t * t);
+            Pt {
+                x: a * p0.x + b * c1.x + c * c2.x + d * p1.x,
+                y: a * p0.y + b * c1.y + c * c2.y + d * p1.y,
+            }
+        })
+        .collect()
+}
+
+/// Distance from point `p` to segment `a→b`.
+pub fn dist_point_segment(p: Pt, a: Pt, b: Pt) -> f64 {
+    let (abx, aby) = (b.x - a.x, b.y - a.y);
+    let len2 = abx * abx + aby * aby;
+    let t = if len2 == 0.0 {
+        0.0
+    } else {
+        (((p.x - a.x) * abx + (p.y - a.y) * aby) / len2).clamp(0.0, 1.0)
+    };
+    let (cx, cy) = (a.x + t * abx, a.y + t * aby);
+    ((p.x - cx).powi(2) + (p.y - cy).powi(2)).sqrt()
+}
+
+/// Index of the polyline nearest to `p` within `threshold` px (min distance over
+/// its segments), or `None` if none is close enough. Used for edge hover.
+pub fn nearest_polyline(p: Pt, polylines: &[Vec<Pt>], threshold: f64) -> Option<usize> {
+    let mut best: Option<(usize, f64)> = None;
+    for (i, poly) in polylines.iter().enumerate() {
+        let d = poly
+            .windows(2)
+            .map(|w| dist_point_segment(p, w[0], w[1]))
+            .fold(f64::INFINITY, f64::min);
+        if d <= threshold && best.is_none_or(|(_, bd)| d < bd) {
+            best = Some((i, d));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+// ── Persisted manual layout ─────────────────────────────────────────────────
+//
+// After auto-layout, the user can drag nodes; their positions persist per diagram
+// so the arrangement is theirs. Stored in `diagrams.json` keyed by
+// `conn_id:database`. Node ids not present fall back to auto-layout; stale ids
+// (a dropped table) are ignored on load.
+
+/// One diagram's manual node positions: node id → (x, y) top-left in canvas px.
+pub type NodePositions = HashMap<String, (f64, f64)>;
+
+/// Persisted manual layouts for every diagram (`diagrams.json`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DiagramLayoutsFile {
+    #[serde(default)]
+    pub layouts: HashMap<String, NodePositions>,
+}
+
+/// Storage key for a diagram's layout.
+pub fn layout_key(conn_id: u64, database: &str) -> String {
+    format!("{conn_id}:{database}")
+}
+
+/// The saved positions for a diagram, if any.
+pub fn get_layout<'a>(
+    file: &'a DiagramLayoutsFile,
+    conn_id: u64,
+    database: &str,
+) -> Option<&'a NodePositions> {
+    file.layouts.get(&layout_key(conn_id, database))
+}
+
+/// Store (replacing) a diagram's manual positions.
+pub fn upsert_layout(
+    file: &mut DiagramLayoutsFile,
+    conn_id: u64,
+    database: &str,
+    positions: NodePositions,
+) {
+    file.layouts
+        .insert(layout_key(conn_id, database), positions);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{ColumnInfo, ForeignKeyInfo, IndexInfo};
+
+    fn col(name: &str, ty: &str, pk: bool) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            type_name: ty.to_string(),
+            nullable: !pk,
+            primary_key: pk,
+        }
+    }
+
+    fn fk(cols: &[&str], ref_table: &str, ref_cols: &[&str]) -> ForeignKeyInfo {
+        ForeignKeyInfo {
+            columns: cols.iter().map(|s| s.to_string()).collect(),
+            ref_schema: None,
+            ref_table: ref_table.to_string(),
+            ref_columns: ref_cols.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn table(name: &str, cols: Vec<ColumnInfo>, fks: Vec<ForeignKeyInfo>) -> TableInfo {
+        TableInfo {
+            name: name.to_string(),
+            columns: cols,
+            indexes: Vec::new(),
+            foreign_keys: fks,
+            is_view: false,
+            view_definition: None,
+        }
+    }
+
+    /// customers ← orders ← orderdetails → products ; plus an island `logs`.
+    fn shop() -> DbSchema {
+        DbSchema {
+            tables: vec![
+                table("customers", vec![col("id", "int", true)], vec![]),
+                table(
+                    "orders",
+                    vec![col("id", "int", true), col("customer_id", "int", false)],
+                    vec![fk(&["customer_id"], "customers", &["id"])],
+                ),
+                table(
+                    "orderdetails",
+                    vec![col("order_id", "int", true), col("product_id", "int", true)],
+                    vec![
+                        fk(&["order_id"], "orders", &["id"]),
+                        fk(&["product_id"], "products", &["id"]),
+                    ],
+                ),
+                table("products", vec![col("id", "int", true)], vec![]),
+                table("logs", vec![col("id", "int", true)], vec![]), // island
+            ],
+        }
+    }
+
+    #[test]
+    fn database_seed_hides_island_and_counts() {
+        let g = build_graph(&shop(), "shop", &DiagramSeed::Database);
+        assert_eq!(g.total_tables, 5);
+        assert_eq!(g.hidden_islands, vec!["logs".to_string()]);
+        let names: HashSet<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(!names.contains("logs"));
+        assert!(names.contains("customers") && names.contains("orderdetails"));
+        // 3 FKs → 3 edges (orders→customers, orderdetails→orders, orderdetails→products).
+        assert_eq!(g.edges.len(), 3);
+    }
+
+    #[test]
+    fn column_flags_mark_pk_and_fk() {
+        let g = build_graph(&shop(), "shop", &DiagramSeed::Database);
+        let orders = g.nodes.iter().find(|n| n.name == "orders").unwrap();
+        let cust = orders
+            .columns
+            .iter()
+            .find(|c| c.name == "customer_id")
+            .unwrap();
+        assert!(cust.fk && !cust.pk && cust.is_key());
+        let id = orders.columns.iter().find(|c| c.name == "id").unwrap();
+        assert!(id.pk && !id.fk);
+    }
+
+    #[test]
+    fn table_seed_is_one_hop_neighbourhood() {
+        // orders neighbours: customers (referenced) + orderdetails (references orders).
+        let g = build_graph(&shop(), "shop", &DiagramSeed::Table("orders".into()));
+        let names: HashSet<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["orders", "customers", "orderdetails"]
+                .into_iter()
+                .collect()
+        );
+        // `products` (a second hop, via orderdetails) is NOT pulled in...
+        assert!(!names.contains("products"));
+        // ...and orderdetails' FK to products is dropped (target out of set), so only
+        // orders→customers and orderdetails→orders remain.
+        assert_eq!(g.edges.len(), 2);
+        // Neighbourhood never reports islands.
+        assert!(g.hidden_islands.is_empty());
+    }
+
+    #[test]
+    fn unknown_seed_table_yields_empty_graph_but_keeps_count() {
+        let g = build_graph(&shop(), "shop", &DiagramSeed::Table("nope".into()));
+        assert!(g.nodes.is_empty() && g.edges.is_empty());
+        assert_eq!(g.total_tables, 5);
+    }
+
+    #[test]
+    fn cross_database_fk_becomes_a_stub_node() {
+        let mut s = DbSchema {
+            tables: vec![table(
+                "orders",
+                vec![col("id", "int", true), col("wh", "int", false)],
+                vec![ForeignKeyInfo {
+                    columns: vec!["wh".into()],
+                    ref_schema: Some("warehouse".into()),
+                    ref_table: "inventory".into(),
+                    ref_columns: vec!["id".into()],
+                }],
+            )],
+        };
+        // Also add the referenced customers-less setup: orders is the only table.
+        let g = build_graph(&s, "shop", &DiagramSeed::Database);
+        let stub = g.nodes.iter().find(|n| n.kind == NodeKind::Stub).unwrap();
+        assert_eq!(stub.id, "warehouse.inventory");
+        assert!(stub.columns.is_empty());
+        assert_eq!(g.edges.len(), 1);
+        assert_eq!(g.edges[0].to, "warehouse.inventory");
+        // orders has a cross-DB relationship, so it is NOT an island.
+        assert!(g.hidden_islands.is_empty());
+        // A ref_schema equal to the current DB is treated as same-database.
+        s.tables[0].foreign_keys[0].ref_schema = Some("shop".into());
+        s.tables[0].foreign_keys[0].ref_table = "orders".into(); // self-ref, in-set
+        let g2 = build_graph(&s, "shop", &DiagramSeed::Database);
+        assert!(g2.nodes.iter().all(|n| n.kind != NodeKind::Stub));
+    }
+
+    #[test]
+    fn cardinality_one_to_one_when_fk_is_unique() {
+        // profile.user_id is the PK of profile → 1:1 with users.
+        let s = DbSchema {
+            tables: vec![
+                table("users", vec![col("id", "int", true)], vec![]),
+                table(
+                    "profile",
+                    vec![col("user_id", "int", true)],
+                    vec![fk(&["user_id"], "users", &["id"])],
+                ),
+            ],
+        };
+        let g = build_graph(&s, "app", &DiagramSeed::Database);
+        assert_eq!(g.edges[0].cardinality, Cardinality::OneToOne);
+
+        // Same but with a UNIQUE index instead of PK backing the FK column.
+        let mut s2 = s.clone();
+        s2.tables[1].columns[0].primary_key = false;
+        s2.tables[1].indexes = vec![IndexInfo {
+            name: "uq".into(),
+            columns: vec!["user_id".into()],
+            unique: true,
+            foreign: true,
+        }];
+        let g2 = build_graph(&s2, "app", &DiagramSeed::Database);
+        assert_eq!(g2.edges[0].cardinality, Cardinality::OneToOne);
+    }
+
+    #[test]
+    fn cardinality_one_to_many_by_default() {
+        let g = build_graph(&shop(), "shop", &DiagramSeed::Database);
+        let e = g.edges.iter().find(|e| e.from == "orders").unwrap();
+        assert_eq!(e.cardinality, Cardinality::OneToMany);
+    }
+
+    #[test]
+    fn edge_optional_when_any_fk_column_nullable() {
+        let g = build_graph(&shop(), "shop", &DiagramSeed::Database);
+        // orders.customer_id is nullable → the orders→customers FK is optional.
+        let opt = g.edges.iter().find(|e| e.from == "orders").unwrap();
+        assert!(opt.optional, "nullable FK column → optional");
+        // orderdetails' FK columns are its (NOT NULL) composite PK → mandatory.
+        let mand = g.edges.iter().find(|e| e.from == "orderdetails").unwrap();
+        assert!(!mand.optional, "NOT NULL FK columns → mandatory");
+    }
+
+    #[test]
+    fn should_collapse_rule() {
+        let d = DensityOpts::default(); // 15 / 25 / 5
+        assert!(!should_collapse(5, 3, d), "small table, few nodes → full");
+        assert!(should_collapse(20, 3, d), "wide table → collapse");
+        assert!(should_collapse(5, 30, d), "crowded canvas → collapse");
+        assert!(
+            should_collapse(15, 1, d),
+            "at the column threshold → collapse"
+        );
+    }
+
+    #[test]
+    fn collapsed_visible_pins_keys_past_the_cutoff() {
+        let cols = vec![
+            DiagramColumn {
+                name: "a".into(),
+                type_name: "int".into(),
+                nullable: false,
+                pk: true,
+                fk: false,
+            },
+            DiagramColumn {
+                name: "b".into(),
+                type_name: "int".into(),
+                nullable: true,
+                pk: false,
+                fk: false,
+            },
+            DiagramColumn {
+                name: "c".into(),
+                type_name: "int".into(),
+                nullable: true,
+                pk: false,
+                fk: false,
+            },
+            DiagramColumn {
+                name: "d".into(),
+                type_name: "int".into(),
+                nullable: true,
+                pk: false,
+                fk: false,
+            },
+            // Beyond the cutoff of 3, but an FK → pinned in.
+            DiagramColumn {
+                name: "e_fk".into(),
+                type_name: "int".into(),
+                nullable: true,
+                pk: false,
+                fk: true,
+            },
+            DiagramColumn {
+                name: "f".into(),
+                type_name: "int".into(),
+                nullable: true,
+                pk: false,
+                fk: false,
+            },
+        ];
+        let vis = collapsed_visible(&cols, 3);
+        assert_eq!(vis, vec![0, 1, 2, 4], "first 3 + the pinned FK at index 4");
+        assert_eq!(
+            cols.len() - vis.len(),
+            2,
+            "b-count for the ⌄ N more expander"
+        );
+    }
+
+    // ── layout ──
+
+    /// A bare graph: node ids + `from → to` edges (child references parent). No
+    /// columns needed for layout.
+    fn graph_of(ids: &[&str], edges: &[(&str, &str)]) -> DiagramGraph {
+        DiagramGraph {
+            nodes: ids
+                .iter()
+                .map(|id| DiagramNode {
+                    id: id.to_string(),
+                    name: id.to_string(),
+                    kind: NodeKind::Table,
+                    columns: Vec::new(),
+                })
+                .collect(),
+            edges: edges
+                .iter()
+                .map(|(f, t)| DiagramEdge {
+                    from: f.to_string(),
+                    from_columns: vec![],
+                    to: t.to_string(),
+                    to_columns: vec![],
+                    cardinality: Cardinality::OneToMany,
+                    optional: false,
+                })
+                .collect(),
+            hidden_islands: vec![],
+            total_tables: ids.len(),
+        }
+    }
+
+    fn layer(cells: &[LayoutCell], id: &str) -> usize {
+        cells.iter().find(|c| c.id == id).unwrap().layer
+    }
+
+    #[test]
+    fn layout_chain_layers_by_dependency_depth() {
+        // a → b → c : c is the ultimate parent (layer 0), a the deepest child.
+        let cells = layout(&graph_of(&["a", "b", "c"], &[("a", "b"), ("b", "c")]));
+        assert_eq!(layer(&cells, "c"), 0);
+        assert_eq!(layer(&cells, "b"), 1);
+        assert_eq!(layer(&cells, "a"), 2);
+    }
+
+    #[test]
+    fn layout_diamond_uses_longest_path() {
+        // a→b, a→c, b→d, c→d : d=0, b=c=1, a=2 (longest path a→b→d = a→c→d = 2).
+        let cells = layout(&graph_of(
+            &["a", "b", "c", "d"],
+            &[("a", "b"), ("a", "c"), ("b", "d"), ("c", "d")],
+        ));
+        assert_eq!(layer(&cells, "d"), 0);
+        assert_eq!(layer(&cells, "b"), 1);
+        assert_eq!(layer(&cells, "c"), 1);
+        assert_eq!(layer(&cells, "a"), 2);
+    }
+
+    #[test]
+    fn layout_handles_cycles_and_self_loops_without_panicking() {
+        // 2-cycle a↔b and a self-loop on c: must terminate with finite layers.
+        let cells = layout(&graph_of(
+            &["a", "b", "c"],
+            &[("a", "b"), ("b", "a"), ("c", "c")],
+        ));
+        assert_eq!(cells.len(), 3);
+        assert_eq!(
+            layer(&cells, "c"),
+            0,
+            "self-loop doesn't raise its own layer"
+        );
+        // The cycle resolves to adjacent layers (one back-edge broken), not infinity.
+        assert!(layer(&cells, "a") <= 1 && layer(&cells, "b") <= 1);
+    }
+
+    #[test]
+    fn layout_disconnected_components_are_independent() {
+        // a→b, and a lone c.
+        let cells = layout(&graph_of(&["a", "b", "c"], &[("a", "b")]));
+        assert_eq!(layer(&cells, "b"), 0);
+        assert_eq!(layer(&cells, "a"), 1);
+        assert_eq!(layer(&cells, "c"), 0, "island sits in the base layer");
+    }
+
+    #[test]
+    fn layout_orders_within_a_layer_deterministically() {
+        // Two children a, b both referencing parent p: p in layer 0, a & b in
+        // layer 1 ordered by id (both share the same single barycentre).
+        let cells = layout(&graph_of(&["b", "a", "p"], &[("a", "p"), ("b", "p")]));
+        let a = cells.iter().find(|c| c.id == "a").unwrap();
+        let b = cells.iter().find(|c| c.id == "b").unwrap();
+        assert_eq!(a.layer, 1);
+        assert_eq!(b.layer, 1);
+        assert!(a.order < b.order, "tie broken by id: a before b");
+        // Deterministic: a second run gives the identical result.
+        assert_eq!(
+            cells,
+            layout(&graph_of(&["b", "a", "p"], &[("a", "p"), ("b", "p")]))
+        );
+    }
+
+    #[test]
+    fn place_lays_layers_left_to_right_and_stacks_by_order() {
+        let cells = vec![
+            LayoutCell {
+                id: "p".into(),
+                layer: 0,
+                order: 0,
+            },
+            LayoutCell {
+                id: "a".into(),
+                layer: 1,
+                order: 0,
+            },
+            LayoutCell {
+                id: "b".into(),
+                layer: 1,
+                order: 1,
+            },
+        ];
+        let sizes: HashMap<String, (f64, f64)> = [
+            ("p".to_string(), (100.0, 60.0)),
+            ("a".to_string(), (100.0, 40.0)),
+            ("b".to_string(), (100.0, 40.0)),
+        ]
+        .into_iter()
+        .collect();
+        let pos = place(
+            &cells,
+            &sizes,
+            LayoutOpts {
+                h_gap: 50.0,
+                v_gap: 20.0,
+            },
+        );
+        let at = |id: &str| pos.iter().find(|p| p.id == id).unwrap();
+        // Layer 0 at x=0; layer 1 clears p's width (100) + gap (50) = 150.
+        assert_eq!(at("p").x, 0.0);
+        assert_eq!(at("a").x, 150.0);
+        assert_eq!(at("b").x, 150.0);
+        // Within layer 1: a at y=0, b below by a's height (40) + gap (20) = 60.
+        assert_eq!(at("a").y, 0.0);
+        assert_eq!(at("b").y, 60.0);
+    }
+
+    // ── edge geometry ──
+
+    fn pt(x: f64, y: f64) -> Pt {
+        Pt { x, y }
+    }
+
+    #[test]
+    fn edge_anchors_pick_facing_sides() {
+        let from = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 40.0,
+        };
+        let right = Rect {
+            x: 200.0,
+            y: 0.0,
+            w: 100.0,
+            h: 40.0,
+        };
+        let (a, b) = edge_anchors(from, right);
+        assert_eq!(a, pt(100.0, 20.0), "leaves source right edge at its centre");
+        assert_eq!(b, pt(200.0, 20.0), "enters target left edge at its centre");
+        // Target to the left mirrors the sides.
+        let left = Rect {
+            x: -200.0,
+            y: 0.0,
+            w: 100.0,
+            h: 40.0,
+        };
+        let (a2, b2) = edge_anchors(from, left);
+        assert_eq!(a2, pt(0.0, 20.0));
+        assert_eq!(b2, pt(-100.0, 20.0));
+    }
+
+    #[test]
+    fn edge_dirs_match_the_facing_sides() {
+        let from = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 40.0,
+        };
+        let right = Rect {
+            x: 200.0,
+            y: 0.0,
+            w: 100.0,
+            h: 40.0,
+        };
+        // Source leaves rightward (+1), target entered from its left (outward -1).
+        assert_eq!(edge_dirs(from, right), (1.0, -1.0));
+        let left = Rect { x: -200.0, ..right };
+        assert_eq!(edge_dirs(from, left), (-1.0, 1.0));
+        // Horizontally overlapping cards decide by centre (no "both exit the same
+        // side" flip): this one's centre (90) is right of `from`'s (50) → right→left.
+        let overlap = Rect {
+            x: 40.0,
+            y: 200.0,
+            w: 100.0,
+            h: 40.0,
+        };
+        assert_eq!(edge_dirs(from, overlap), (1.0, -1.0));
+    }
+
+    #[test]
+    fn sample_cubic_hits_both_endpoints() {
+        let (p0, p1) = (pt(0.0, 0.0), pt(90.0, 30.0));
+        // p0 exits right (+1), p1 entered from its left (-1).
+        let (c1, c2) = cubic_controls(p0, p1, 1.0, -1.0);
+        let pts = sample_cubic(p0, c1, c2, p1, 16);
+        assert_eq!(pts.len(), 17);
+        assert_eq!(*pts.first().unwrap(), p0);
+        assert_eq!(*pts.last().unwrap(), p1);
+    }
+
+    #[test]
+    fn cubic_path_d_formats_move_and_curve() {
+        let d = cubic_path_d(pt(1.0, 2.0), pt(3.0, 4.0), pt(5.0, 6.0), pt(7.0, 8.0));
+        assert_eq!(d, "M 1.0 2.0 C 3.0 4.0, 5.0 6.0, 7.0 8.0");
+    }
+
+    #[test]
+    fn dist_point_segment_cases() {
+        let (a, b) = (pt(0.0, 0.0), pt(10.0, 0.0));
+        assert!(
+            (dist_point_segment(pt(5.0, 0.0), a, b) - 0.0).abs() < 1e-9,
+            "on segment"
+        );
+        assert!(
+            (dist_point_segment(pt(5.0, 3.0), a, b) - 3.0).abs() < 1e-9,
+            "perpendicular"
+        );
+        assert!(
+            (dist_point_segment(pt(-4.0, 0.0), a, b) - 4.0).abs() < 1e-9,
+            "clamps past the start endpoint"
+        );
+    }
+
+    #[test]
+    fn nearest_polyline_picks_closest_within_threshold() {
+        // Two horizontal polylines at y=0 and y=100.
+        let near = vec![pt(0.0, 0.0), pt(100.0, 0.0)];
+        let far = vec![pt(0.0, 100.0), pt(100.0, 100.0)];
+        let polys = vec![near, far];
+        assert_eq!(nearest_polyline(pt(50.0, 3.0), &polys, 6.0), Some(0));
+        assert_eq!(nearest_polyline(pt(50.0, 97.0), &polys, 6.0), Some(1));
+        // Equidistant-ish but only one within threshold.
+        assert_eq!(
+            nearest_polyline(pt(50.0, 50.0), &polys, 6.0),
+            None,
+            "too far from both"
+        );
+    }
+
+    // ── persisted layout ──
+
+    #[test]
+    fn layout_key_is_conn_and_db() {
+        assert_eq!(layout_key(7, "shop"), "7:shop");
+        assert_ne!(layout_key(7, "shop"), layout_key(8, "shop"));
+        assert_ne!(layout_key(7, "shop"), layout_key(7, "warehouse"));
+    }
+
+    #[test]
+    fn upsert_then_get_roundtrips_and_is_isolated() {
+        let mut f = DiagramLayoutsFile::default();
+        let mut a: NodePositions = HashMap::new();
+        a.insert("orders".into(), (10.0, 20.0));
+        upsert_layout(&mut f, 1, "shop", a);
+        upsert_layout(&mut f, 2, "shop", HashMap::new());
+
+        assert_eq!(
+            get_layout(&f, 1, "shop").unwrap().get("orders"),
+            Some(&(10.0, 20.0))
+        );
+        // A different connection with the same db name is a separate entry.
+        assert!(get_layout(&f, 2, "shop").unwrap().is_empty());
+        assert!(get_layout(&f, 9, "shop").is_none());
+    }
+
+    #[test]
+    fn upsert_replaces_existing_layout() {
+        let mut f = DiagramLayoutsFile::default();
+        let mut a: NodePositions = HashMap::new();
+        a.insert("t".into(), (1.0, 1.0));
+        upsert_layout(&mut f, 1, "d", a);
+        let mut b: NodePositions = HashMap::new();
+        b.insert("t".into(), (2.0, 2.0));
+        upsert_layout(&mut f, 1, "d", b);
+        assert_eq!(get_layout(&f, 1, "d").unwrap().get("t"), Some(&(2.0, 2.0)));
+    }
+
+    #[test]
+    fn layouts_file_json_roundtrips() {
+        let mut f = DiagramLayoutsFile::default();
+        let mut a: NodePositions = HashMap::new();
+        a.insert("orders".into(), (10.5, 20.5));
+        upsert_layout(&mut f, 1, "shop", a);
+        let json = serde_json::to_string(&f).unwrap();
+        let back: DiagramLayoutsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            get_layout(&back, 1, "shop").unwrap().get("orders"),
+            Some(&(10.5, 20.5))
+        );
+    }
+}
