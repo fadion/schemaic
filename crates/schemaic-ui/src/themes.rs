@@ -155,6 +155,9 @@ pub struct UiTheme {
     pub erd_node_bg: Color,
     /// ER-diagram modal: table-node header (title) background.
     pub erd_node_header: Color,
+    /// ER-diagram modal: column-row background when the row is an endpoint of the
+    /// hovered edge (a touch lighter than the card background).
+    pub erd_row_highlight: Color,
     /// ER-diagram modal: relationship (FK) edge line + cardinality markers.
     pub erd_edge: Color,
     /// ER-diagram modal: edge + markers when the relationship is hovered.
@@ -271,6 +274,7 @@ impl UiTheme {
             erd_dot: c("#232532"),
             erd_node_bg: c("#22232E"),
             erd_node_header: c("#2B2D3A"),
+            erd_row_highlight: c("#313348"),
             erd_edge: c("#3F4152"),
             erd_edge_hover: c("#464E9E"),
             erd_toolbar_border: c("#434553"),
@@ -376,6 +380,8 @@ impl UiTheme {
             erd_dot: c("#CDD2DC"),
             erd_node_bg: c("#FFFFFF"),
             erd_node_header: c("#EEF0F5"),
+            // White can't go lighter, so a faint indigo wash tied to the edge accent.
+            erd_row_highlight: c("#E6EAFB"),
             erd_edge: c("#9298AC"),
             erd_edge_hover: c("#464E9E"),
             erd_toolbar_border: c("#CDD2DC"),

@@ -365,6 +365,10 @@ pub fn erd_node_bg() -> Color {
 pub fn erd_node_header() -> Color {
     ui().erd_node_header
 }
+/// Column-row background when the row is an endpoint of the hovered edge.
+pub fn erd_row_highlight() -> Color {
+    ui().erd_row_highlight
+}
 pub fn erd_edge() -> Color {
     ui().erd_edge
 }
