@@ -372,12 +372,12 @@ struct GridState {
     /// "AI Seed Table…" count popover: whether it's open + its (text) row count.
     seed_open: RwSignal<bool>,
     seed_buf: RwSignal<String>,
-    /// "Edit Row" whole-row JSON panel: open flag, the target data-row, the editable
-    /// JSON buffer, an inline validation/commit error, and an in-flight guard. Commits
-    /// immediately on Save (its own path, not the staged `dirty` batch).
+    /// "Edit Row" structured panel: open flag, the target data-row, an inline
+    /// validation/commit error, and an in-flight guard. Per-field editor state is
+    /// local to the panel view (rebuilt per row). Commits immediately on Save (its
+    /// own path, not the staged `dirty` batch).
     edit_row_open: RwSignal<bool>,
     edit_row_di: RwSignal<Option<usize>>,
-    edit_row_buf: RwSignal<String>,
     edit_row_err: RwSignal<Option<String>>,
     edit_row_saving: RwSignal<bool>,
 }
@@ -470,7 +470,6 @@ impl GridState {
             seed_buf: RwSignal::new(String::new()),
             edit_row_open: RwSignal::new(false),
             edit_row_di: RwSignal::new(None),
-            edit_row_buf: RwSignal::new(String::new()),
             edit_row_err: RwSignal::new(None),
             edit_row_saving: RwSignal::new(false),
         }
@@ -2320,15 +2319,11 @@ fn row_colspecs(gs: GridState, di: usize) -> Vec<ColSpec> {
         .collect()
 }
 
-/// Open the row view/edit panel for real data row `di`: serialize the whole row to
-/// JSON (all columns, read-only ones included for context) and reveal the panel.
-/// Load data-row `di` into the view/edit panel: (re)fill the JSON buffer, point
-/// the panel at it, and clear any error. Used both to open the panel and to walk
-/// to another row — reloading the buffer here is what discards unsaved edits when
-/// stepping. Does NOT touch `edit_row_open` (the caller owns opening).
+/// Point the view/edit panel at data-row `di` and clear any error. The per-field
+/// editors are rebuilt from the row by the panel's `dyn_container` (keyed on the
+/// row), so walking to another row here discards unsaved edits. Does NOT touch
+/// `edit_row_open` (the caller owns opening).
 fn load_edit_row(gs: GridState, di: usize) {
-    gs.edit_row_buf
-        .set(rowjson::row_to_json(&row_colspecs(gs, di)));
     gs.edit_row_di.set(Some(di));
     gs.edit_row_err.set(None);
 }
@@ -2377,19 +2372,21 @@ fn edit_row_step(gs: GridState, forward: bool) {
     load_edit_row(gs, new_di);
 }
 
-/// Validate the edited JSON and commit the changed editable columns for this row as
-/// an `UPDATE`, immediately (its own path — not the staged `dirty` batch). On a
-/// parse/validation error or DB failure the message shows in the panel and it stays
-/// open; on success the panel closes and the row splices in place.
-fn save_edit_row(gs: GridState) {
+/// Commit the panel's per-field `state` for existing row `di` as an `UPDATE`,
+/// immediately (its own path — not the staged `dirty` batch). `state` is each
+/// field's current value (`None` = SQL NULL). On a validation error or DB failure
+/// the message shows in the panel and it stays open; on success the panel closes and
+/// the row splices in place.
+fn commit_row_update(
+    gs: GridState,
+    di: usize,
+    cols: &[ColSpec],
+    state: Vec<(usize, Option<String>)>,
+) {
     if gs.edit_row_saving.get_untracked() || gs.commit_busy.get_untracked() {
         return;
     }
-    let Some(di) = gs.edit_row_di.get_untracked() else {
-        return;
-    };
-    let cols = row_colspecs(gs, di);
-    let changes = match rowjson::parse_row_edit(&cols, &gs.edit_row_buf.get_untracked()) {
+    let changes = match rowjson::update_changes(cols, &state) {
         Ok(c) => c,
         Err(msg) => {
             gs.edit_row_err.set(Some(msg));
@@ -2906,43 +2903,251 @@ fn seed_popover(gs: GridState) -> impl IntoView {
     })
 }
 
+/// Fixed width of a field row's left-hand column-name label.
+const FIELD_NAME_W: f64 = 150.0;
+/// Minimum height of one field row (so single-line editors don't feel cramped).
+const FIELD_ROW_MIN_H: f64 = 28.0;
+
+/// Per-field editing state for the structured row panel: the raw text buffer and a
+/// NULL flag, created fresh per opened row (so the panel's `dyn_container` disposes
+/// them on close / row-step).
+#[derive(Clone, Copy)]
+struct FieldSig {
+    ci: usize,
+    buf: RwSignal<String>,
+    is_null: RwSignal<bool>,
+}
+
+/// One field signal per column, seeded from the row's values (empty buffer + null
+/// flag for a SQL NULL).
+fn field_sigs(cols: &[ColSpec]) -> Vec<FieldSig> {
+    cols.iter()
+        .enumerate()
+        .map(|(ci, c)| FieldSig {
+            ci,
+            buf: RwSignal::new(rowjson::field_value_text(&c.value)),
+            is_null: RwSignal::new(c.value.is_null()),
+        })
+        .collect()
+}
+
+/// Gather each field's current value (`None` = staged NULL) for the write assembly.
+fn field_state(sigs: &[FieldSig]) -> Vec<(usize, Option<String>)> {
+    sigs.iter()
+        .map(|f| {
+            let v = (!f.is_null.get_untracked()).then(|| f.buf.get_untracked());
+            (f.ci, v)
+        })
+        .collect()
+}
+
+/// The left-hand column label in a field row: name + dim type.
+fn field_label(name: String, type_name: String) -> impl IntoView {
+    h_stack((
+        text(name).style(|s| {
+            s.font_size(13.0)
+                .color(theme::text())
+                .text_ellipsis()
+                .min_width(0.0)
+                .flex_grow(1.0_f32)
+        }),
+        text(type_name).style(|s| {
+            s.font_size(10.5)
+                .color(theme::text_faint())
+                .margin_left(6.0)
+                .flex_shrink(0.0_f32)
+        }),
+    ))
+    .style(|s| {
+        s.items_center()
+            .width(FIELD_NAME_W)
+            .flex_shrink(0.0_f32)
+            .padding_right(10.0)
+    })
+}
+
+/// A small ghost button (the per-field NULL / Set-value affordances).
+fn field_mini_btn(label: &'static str, action: impl Fn() + 'static) -> AnyView {
+    container(text(label).style(|s| s.font_size(11.0)))
+        .on_click_stop(move |_| action())
+        .style(|s| {
+            s.padding_horiz(6.0)
+                .padding_vert(1.0)
+                .flex_shrink(0.0_f32)
+                .color(theme::text_dim())
+                .border(1.0)
+                .border_color(theme::border())
+                .border_radius(4.0)
+                .hover(|s| s.color(theme::text()).border_color(theme::text_dim()))
+        })
+        .into_any()
+}
+
+/// The dim `<null>` sentinel shown for a NULL field / value.
+fn null_sentinel() -> AnyView {
+    text(rowjson::InsertSentinel::Null.label())
+        .style(|s| s.font_size(12.5).color(theme::text_faint()))
+        .into_any()
+}
+
+/// The editable value cell for a scalar field: a text input, plus (for a nullable
+/// column) a NULL toggle. NULL is an explicit state — clearing the text to empty is
+/// the empty string, not NULL.
+fn scalar_editor(gs: GridState, nullable: bool, autofocus: bool, f: FieldSig) -> AnyView {
+    let make_field = move || {
+        edit_field(
+            f.buf,
+            FieldCfg {
+                background: theme::bg_editor,
+                font_size: 13.0,
+                autofocus,
+                // Escape closes the panel even while a field is focused.
+                on_escape: Some(Rc::new(move || gs.edit_row_open.set(false))),
+                ..Default::default()
+            },
+        )
+    };
+    if !nullable {
+        return make_field().style(|s| s.width_full()).into_any();
+    }
+    dyn_container(
+        move || f.is_null.get(),
+        move |is_null| {
+            if is_null {
+                h_stack((
+                    null_sentinel(),
+                    empty().style(|s| s.flex_grow(1.0_f32)),
+                    field_mini_btn("Set value", move || f.is_null.set(false)),
+                ))
+                .style(|s| s.items_center().width_full().gap(8.0))
+                .into_any()
+            } else {
+                h_stack((
+                    make_field().style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
+                    field_mini_btn("NULL", move || f.is_null.set(true)),
+                ))
+                .style(|s| s.items_center().width_full().gap(6.0))
+                .into_any()
+            }
+        },
+    )
+    .style(|s| s.width_full())
+    .into_any()
+}
+
+/// The read-only value cell: dim text (NULL → `<null>`), shown for context, no caret.
+fn readonly_value(f: FieldSig) -> AnyView {
+    if f.is_null.get_untracked() {
+        return null_sentinel();
+    }
+    text(f.buf.get_untracked())
+        .style(|s| {
+            s.font_size(13.0)
+                .color(theme::text_dim())
+                .text_ellipsis()
+                .min_width(0.0)
+                .flex_grow(1.0_f32)
+        })
+        .into_any()
+}
+
+/// One field row: the column label + its value editor (editable) or read-only cell.
+fn field_row(
+    gs: GridState,
+    name: String,
+    type_name: String,
+    editable: bool,
+    nullable: bool,
+    autofocus: bool,
+    f: FieldSig,
+) -> AnyView {
+    let editor = if editable {
+        scalar_editor(gs, nullable, autofocus, f)
+    } else {
+        readonly_value(f)
+    };
+    h_stack((
+        field_label(name, type_name),
+        container(editor).style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
+    ))
+    .style(|s| {
+        s.items_center()
+            .width_full()
+            .gap(8.0)
+            .padding_vert(3.0)
+            .min_height(FIELD_ROW_MIN_H)
+    })
+    .into_any()
+}
+
 /// The "Edit Row" panel — an in-flow strip at the bottom of the results area (like
 /// the "View" value viewer), integrated with the grid rather than a floating popup.
-/// Shows the whole row as editable JSON with an inline error line + Cancel / Save;
-/// Save validates + commits immediately (`save_edit_row`). The field grows to
-/// `max_rows` (≈80% of the panel) then scrolls, and the grid above shrinks to fit.
+/// Renders the row as a **structured, per-field editor** (one row per column):
+/// read-only columns are shown for context (no caret), editable ones get a text
+/// input with an explicit NULL toggle. Save commits immediately (`commit_row_update`);
+/// the field list scrolls past `max_rows` and the grid above shrinks to fit.
 fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
     dyn_container(
-        // Keyed on (open, current row) so walking to another row (prev/next)
-        // rebuilds the panel — the header number, chevron enabled-state, and the
-        // freshly-loaded buffer all refresh together.
+        // Keyed on (open, current row) so walking to another row (prev/next) rebuilds
+        // the panel — header number, chevron state, and the per-field editors all
+        // refresh together (and the old row's field signals dispose).
         move || (gs.edit_row_open.get(), gs.edit_row_di.get()),
         move |(open, di_opt)| {
             if !open {
                 return empty().into_any();
             }
+            let Some(di) = di_opt else {
+                return empty().into_any();
+            };
             let close: Rc<dyn Fn()> = Rc::new(move || gs.edit_row_open.set(false));
+
+            // Build the per-field editors from the row.
+            let cols = row_colspecs(gs, di);
+            let sigs = field_sigs(&cols);
+            let rs = gs.rs.get_untracked();
+            let first_editable = cols.iter().position(|c| c.editable);
+            let any_editable = first_editable.is_some();
+            let mut rows: Vec<AnyView> = Vec::with_capacity(cols.len());
+            for (ci, c) in cols.iter().enumerate() {
+                let type_name = rs
+                    .columns
+                    .get(ci)
+                    .map(|col| col.type_name.clone())
+                    .unwrap_or_default();
+                let autofocus = first_editable == Some(ci);
+                rows.push(field_row(
+                    gs,
+                    c.name.clone(),
+                    type_name,
+                    c.editable,
+                    c.nullable,
+                    autofocus,
+                    sigs[ci],
+                ));
+            }
+
+            // Save gathers the per-field state and commits an UPDATE.
+            let cols_rc = Rc::new(cols);
+            let save: Rc<dyn Fn()> = {
+                let cols_rc = cols_rc.clone();
+                let sigs = sigs.clone();
+                Rc::new(move || commit_row_update(gs, di, &cols_rc, field_state(&sigs)))
+            };
+
             // Display position (0-based) of this row in the current sort order;
             // identity when unsorted. Drives the 1-based number + chevron gating.
-            let disp = di_opt.map(|di| edit_row_disp(gs, di));
-            let nrows = gs.rs.get_untracked().row_count();
-            let can_prev = disp.is_some_and(|d| d > 0);
-            let can_next = disp.is_some_and(|d| d + 1 < nrows);
-            let row_no = disp.map(|d| d + 1).unwrap_or(0);
+            let disp = edit_row_disp(gs, di);
+            let nrows = rs.row_count();
+            let can_prev = disp > 0;
+            let can_next = disp + 1 < nrows;
+            let row_no = disp + 1;
             let title = match gs.source.get_untracked() {
                 Some((_, t)) if !t.is_empty() => format!("Row {row_no}  ·  {t}"),
                 _ => format!("Row {row_no}"),
             };
-            // Show the Save (✓) action only when the result has editable columns;
-            // otherwise the panel is a read-only row viewer (Close only).
-            let any_editable = {
-                let rs = gs.rs.get_untracked();
-                let model = gs.edit_model.get_untracked();
-                (0..rs.columns.len()).any(|c| model.editable(c))
-            };
-            // Header icons — Save (✓, when editable) then Close (✕), styled like the
-            // former value viewer's header icons. Save commits immediately; Close
-            // cancels (no bottom button row eating vertical space).
+
+            // Header icons — Save (✓, when editable) then Close (✕). Save commits
+            // immediately; Close cancels.
             let close_x = close.clone();
             let close_btn = container(icons::icon(icons::X, 14.0))
                 .on_click_stop(move |_| (close_x)())
@@ -2953,7 +3158,7 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                 });
             let trailing = if any_editable {
                 let save_btn = container(icons::icon(icons::CHECK, 14.0))
-                    .on_click_stop(move |_| save_edit_row(gs))
+                    .on_click_stop(move |_| (save)())
                     .style(|s| {
                         s.padding(4.0)
                             .color(theme::text_dim())
@@ -2965,9 +3170,8 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
             } else {
                 close_btn.into_any()
             };
-            // Prev/next-row chevrons, just after the title. Up = previous row,
-            // down = next; each disabled (dimmed, non-interactive) at the first /
-            // last row. Stepping discards unsaved edits (buffer reloads).
+            // Prev/next-row chevrons, just after the title. Stepping discards unsaved
+            // edits (the panel rebuilds).
             let nav_chevron = |icon: &'static str, enabled: bool, forward: bool| {
                 let btn = container(icons::icon(icon, 14.0));
                 if enabled {
@@ -3003,24 +3207,9 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                     .flex_shrink(0.0_f32)
             });
 
-            let esc = close.clone();
-            let field = edit_field(
-                gs.edit_row_buf,
-                FieldCfg {
-                    multiline: true,
-                    autofocus: true,
-                    max_rows: Some(max_rows),
-                    // No soft-wrap: the JSON is one key per line, so the panel
-                    // height tracks the (constant per table) line count and doesn't
-                    // jump between rows whose values wrap differently. Long values
-                    // scroll horizontally instead.
-                    no_wrap: true,
-                    background: theme::bg_editor,
-                    on_escape: Some(Rc::new(move || (esc)())),
-                    ..Default::default()
-                },
-            )
-            .style(|s| s.width_full());
+            // The field list scrolls once it exceeds ~max_rows worth of height.
+            let fields = scroll(v_stack_from_iter(rows).style(|s| s.width_full().flex_col()))
+                .style(move |s| s.width_full().max_height(max_rows.get() as f64 * 30.0));
 
             let err_line = dyn_container(
                 move || gs.edit_row_err.get(),
@@ -3033,9 +3222,10 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
             )
             .style(|s| s.width_full());
 
-            // In-flow strip attached to the grid's bottom edge (border_top +
-            // panel background), not a floating overlay.
-            v_stack((head, field, err_line))
+            // In-flow strip attached to the grid's bottom edge (border_top + panel
+            // background), not a floating overlay. Escape closes it (handled at the
+            // results-area level).
+            v_stack((head, fields, err_line))
                 .style(|s| {
                     s.width_full()
                         .flex_col()
