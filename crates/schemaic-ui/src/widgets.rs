@@ -1008,3 +1008,31 @@ pub(crate) fn jump_to_bottom_button(
         })
         .pointer_events(show)
 }
+
+#[cfg(test)]
+mod measure_tests {
+    use super::*;
+
+    #[test]
+    fn bold_measures_wider_than_regular() {
+        // The whole reason `measure_text_px_bold_at` exists: the ER-diagram card
+        // header is drawn `.font_bold()`, and sizing it from the regular
+        // measurement made every card narrower than its own title. For a
+        // schema-qualified name the gap exceeds `node_width`'s 6px slack, so the
+        // name ellipsized nowhere near the max card width.
+        for name in ["analytics.daily_revenue", "sales.line_items", "orders"] {
+            let reg = measure_text_px_at(name, 13.0);
+            let bold = measure_text_px_bold_at(name, 13.0);
+            assert!(
+                bold > reg,
+                "{name}: bold {bold} should exceed regular {reg}"
+            );
+        }
+        // A long qualified name drifts by more than the slack — the actual bug.
+        let n = "analytics.daily_revenue";
+        assert!(
+            measure_text_px_bold_at(n, 13.0) - measure_text_px_at(n, 13.0) > 6.0,
+            "the regression this guards needs the drift to exceed node_width's slack"
+        );
+    }
+}
