@@ -2600,8 +2600,28 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let delete_conn: Rc<dyn Fn(u64)> = {
         let load_schema = load_schema.clone();
         let tunnels = tunnels.clone();
+        let drop_session = drop_session.clone();
         Rc::new(move |id: u64| {
             let was_active = active_conn.get_untracked() == id;
+            // Release any pinned transaction connection on the connection being
+            // deleted — its tunnel is about to go, and a Manual tab pointed at a
+            // connection that no longer exists can't do anything with it. No
+            // prompt: the connection is already gone as far as the user is
+            // concerned, and the server rolls back on disconnect. The tabs drop
+            // back to Auto-commit so their footer stops claiming a transaction.
+            let orphaned: Vec<usize> = tabs.with_untracked(|v| {
+                v.iter()
+                    .filter(|t| t.conn_id.get_untracked() == id)
+                    .map(|t| {
+                        t.tx_mode.set(TxMode::Auto);
+                        t.tx.set(TxState::closed());
+                        t.id
+                    })
+                    .collect()
+            });
+            for tab_id in orphaned {
+                (drop_session)(tab_id);
+            }
             // Drop any tunnel for the deleted connection (frees its listener/port).
             tunnels.borrow_mut().remove(&id);
             // Forget its keyring secrets so nothing is left behind.
