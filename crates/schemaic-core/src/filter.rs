@@ -236,6 +236,48 @@ fn quote_value(v: &str, dialect: SqlDialect) -> String {
     format!("'{escaped}'")
 }
 
+/// Does `name` have to be quoted to survive a round-trip through the server?
+///
+/// Only when it isn't a bare identifier, or collides with a reserved word. The
+/// dialects differ on case: Postgres folds an unquoted identifier to lower case,
+/// so anything with an upper-case letter must be quoted or it resolves to a
+/// different (probably missing) table; MySQL doesn't fold, so mixed case is fine
+/// bare.
+///
+/// Used to keep generated SQL free of decorative quoting — which reads better,
+/// and keeps names visible to the mid-edit tokenizer that backs completion.
+fn needs_quoting(name: &str, dialect: SqlDialect) -> bool {
+    if name.is_empty() {
+        return true;
+    }
+    let bare = match dialect {
+        // MySQL bare identifiers: letters, digits, `_`, `$`; no leading digit.
+        SqlDialect::MySql => {
+            !name.starts_with(|c: char| c.is_ascii_digit())
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        }
+        // Postgres: lower-case only (anything else folds), plus `_` and digits.
+        SqlDialect::Postgres => {
+            name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        }
+    };
+    !bare || crate::intel::is_reserved_word(name, dialect)
+}
+
+/// Quote `name` only if it needs it.
+fn quote_if_needed(name: &str, dialect: SqlDialect) -> String {
+    if needs_quoting(name, dialect) {
+        quote_ident(name, dialect)
+    } else {
+        name.to_string()
+    }
+}
+
 /// Direction for a generated `ORDER BY`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Order {
@@ -288,17 +330,17 @@ pub fn table_query(
     let name = match dialect {
         SqlDialect::MySql => format!(
             "{}.{}",
-            quote_ident(database, dialect),
-            quote_ident(table, dialect)
+            quote_if_needed(database, dialect),
+            quote_if_needed(table, dialect)
         ),
-        SqlDialect::Postgres => quote_ident(table, dialect),
+        SqlDialect::Postgres => quote_if_needed(table, dialect),
     };
     let order_by = if key_cols.is_empty() {
         String::new()
     } else {
         let cols = key_cols
             .iter()
-            .map(|c| format!("{} {}", quote_ident(c, dialect), order.keyword()))
+            .map(|c| format!("{} {}", quote_if_needed(c, dialect), order.keyword()))
             .collect::<Vec<_>>()
             .join(", ");
         format!(" ORDER BY {cols}")
@@ -326,7 +368,7 @@ mod tests {
     fn table_query_mysql_qualifies_and_orders() {
         assert_eq!(
             tq(SqlDialect::MySql, "orders", &["id"], Order::Asc, 100),
-            "SELECT * FROM `shop`.`orders` ORDER BY `id` ASC LIMIT 100"
+            "SELECT * FROM shop.orders ORDER BY id ASC LIMIT 100"
         );
     }
 
@@ -336,7 +378,7 @@ mod tests {
         // through `search_path`, exactly like the write path.
         assert_eq!(
             tq(SqlDialect::Postgres, "orders", &["id"], Order::Asc, 100),
-            "SELECT * FROM \"orders\" ORDER BY \"id\" ASC LIMIT 100"
+            "SELECT * FROM orders ORDER BY id ASC LIMIT 100"
         );
     }
 
@@ -350,7 +392,7 @@ mod tests {
                 Order::Asc,
                 50
             ),
-            "SELECT * FROM `shop`.`line_items` ORDER BY `order_id` ASC, `line_no` ASC LIMIT 50"
+            "SELECT * FROM shop.line_items ORDER BY order_id ASC, line_no ASC LIMIT 50"
         );
     }
 
@@ -360,11 +402,11 @@ mod tests {
         // guessing at a column.
         assert_eq!(
             tq(SqlDialect::MySql, "logs", &[], Order::Asc, 100),
-            "SELECT * FROM `shop`.`logs` LIMIT 100"
+            "SELECT * FROM shop.logs LIMIT 100"
         );
         assert_eq!(
             tq(SqlDialect::Postgres, "logs", &[], Order::Asc, 100),
-            "SELECT * FROM \"logs\" LIMIT 100"
+            "SELECT * FROM logs LIMIT 100"
         );
     }
 
@@ -373,7 +415,51 @@ mod tests {
         // The AI seed sample wants the most recent rows.
         assert_eq!(
             tq(SqlDialect::MySql, "orders", &["id"], Order::Desc, 20),
-            "SELECT * FROM `shop`.`orders` ORDER BY `id` DESC LIMIT 20"
+            "SELECT * FROM shop.orders ORDER BY id DESC LIMIT 20"
+        );
+    }
+
+    #[test]
+    fn table_query_leaves_ordinary_names_unquoted() {
+        // Quoting every name is noisy, and it costs real functionality: the
+        // mid-edit tokenizer (the fallback that runs the moment a statement stops
+        // parsing) can't see inside a Postgres double-quoted name, so a quoted
+        // table loses column completion as soon as you type `WHERE`.
+        assert_eq!(
+            tq(SqlDialect::MySql, "orders", &["id"], Order::Asc, 100),
+            "SELECT * FROM shop.orders ORDER BY id ASC LIMIT 100"
+        );
+        assert_eq!(
+            tq(SqlDialect::Postgres, "orders", &["id"], Order::Asc, 100),
+            "SELECT * FROM orders ORDER BY id ASC LIMIT 100"
+        );
+    }
+
+    #[test]
+    fn table_query_quotes_a_name_that_needs_it() {
+        // Reserved word.
+        assert_eq!(
+            tq(SqlDialect::MySql, "order", &["key"], Order::Asc, 10),
+            "SELECT * FROM shop.`order` ORDER BY `key` ASC LIMIT 10"
+        );
+        // Not a bare identifier.
+        assert_eq!(
+            tq(SqlDialect::MySql, "my table", &["id"], Order::Asc, 10),
+            "SELECT * FROM shop.`my table` ORDER BY id ASC LIMIT 10"
+        );
+    }
+
+    #[test]
+    fn table_query_quotes_uppercase_only_on_postgres() {
+        // Postgres folds an unquoted name to lower case, so `MyTable` unquoted
+        // would resolve to `mytable` and fail. MySQL doesn't fold.
+        assert_eq!(
+            tq(SqlDialect::Postgres, "MyTable", &["Id"], Order::Asc, 10),
+            "SELECT * FROM \"MyTable\" ORDER BY \"Id\" ASC LIMIT 10"
+        );
+        assert_eq!(
+            tq(SqlDialect::MySql, "MyTable", &["Id"], Order::Asc, 10),
+            "SELECT * FROM shop.MyTable ORDER BY Id ASC LIMIT 10"
         );
     }
 
@@ -392,6 +478,7 @@ mod tests {
             ),
             "SELECT * FROM `we``ird`.`ta``ble` ORDER BY `i``d` ASC LIMIT 10"
         );
+        assert!(needs_quoting("we`ird", SqlDialect::MySql));
         assert_eq!(
             table_query(
                 SqlDialect::Postgres,
@@ -414,7 +501,7 @@ mod tests {
         let out = build(&base, "", &[("total", false)], SqlDialect::MySql).unwrap();
         assert_eq!(
             out,
-            "SELECT * FROM `shop`.`orders` ORDER BY `total` DESC LIMIT 100"
+            "SELECT * FROM shop.orders ORDER BY `total` DESC LIMIT 100"
         );
     }
 
