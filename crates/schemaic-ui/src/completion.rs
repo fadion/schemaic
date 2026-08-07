@@ -371,7 +371,7 @@ pub(crate) fn update_signature_help(ed: &Editor, comp: Completion, dialect: SqlD
     let offset = ed.cursor.get_untracked().offset();
     let text = ed.doc().text().to_string();
     let (lo, hi) = statement_range(&text, offset, dialect);
-    let help = intel::signature_help(&text, lo, hi, offset);
+    let help = intel::signature_help(&text, lo, hi, offset, dialect);
     if help.is_some() {
         // `.0` is the point at the *top* of the caret's line; the popup sits above it.
         let mut p = ed.points_of_offset(offset, CursorAffinity::Backward).0;
@@ -415,13 +415,13 @@ pub(crate) fn recompute_completions(
     let (lo, hi) = statement_range(&text, offset, dialect);
     // Context is lexer-based (correct mid-edit); scope prefers the real AST
     // (robust CTE/alias/derived-table resolution), falling back to the lexer.
-    let ctx = intel::clause_context(&text, lo, word_lo);
+    let ctx = intel::clause_context(&text, lo, word_lo, dialect);
     let qualified = matches!(ctx, ClauseCtx::Qualified(_));
     // Expected next keyword/phrase continuations from SQL clause grammar (the
     // `WHERE` after a complete table ref, `FROM` after the projection, `GROUP BY`
     // as one item). These seed the top suggestion tier; `auto_show` opens the popup
     // on an empty prefix right after an operand-taking clause keyword.
-    let cont = intel::clause_continuation(&text, lo, word_lo);
+    let cont = intel::clause_continuation(&text, lo, word_lo, dialect);
 
     // FK-aware auto-join: right after a fresh `JOIN … ON `, offer the foreign-key
     // join predicate as a single, ready-to-insert suggestion (DataGrip-style). Only
@@ -649,7 +649,7 @@ pub(crate) fn recompute_completions(
             // key to something in scope, inserting `table ON <predicate>` in one go.
             let catalog = build_catalog(db_nodes, active_db);
             let mut fk_added = false;
-            for jt in intel::join_targets(&text, lo, hi, offset, &catalog) {
+            for jt in intel::join_targets(&text, lo, hi, offset, &catalog, dialect) {
                 let tl = jt.table.to_ascii_lowercase();
                 if tl == pl || !seen.insert(tl) {
                     continue;
@@ -800,7 +800,7 @@ pub(crate) fn recompute_completions(
     // SELECT * expansion: when the caret sits right after a projection `*`/`t.*`,
     // offer an item that rewrites it into the explicit column list (shown when the
     // popup opens here — e.g. via Ctrl+Space, since the list doesn't auto-open on `*`).
-    if let Some(exp) = star_expansion(&text, lo, hi, offset, db_nodes, active_db) {
+    if let Some(exp) = star_expansion(&text, lo, hi, offset, db_nodes, active_db, dialect) {
         let ncols = exp.replacement.matches(',').count() + 1;
         cands.push(Cand {
             text: "expand *".to_string(),
@@ -906,6 +906,7 @@ fn star_expansion(
     offset: usize,
     db_nodes: RwSignal<Vec<ConnNode>>,
     active_db: Option<&str>,
+    dialect: SqlDialect,
 ) -> Option<intel::StarExpansion> {
     let b = text.as_bytes();
     let mut p = offset.min(hi);
@@ -916,7 +917,7 @@ fn star_expansion(
         return None;
     }
     let catalog = build_catalog(db_nodes, active_db);
-    intel::expand_star(text, lo, hi, offset, &catalog)
+    intel::expand_star(text, lo, hi, offset, &catalog, dialect)
 }
 
 /// The text to splice for an accepted completion and the caret offset *within* that

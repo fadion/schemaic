@@ -981,21 +981,56 @@ struct Token {
     quoted: bool,
 }
 
+/// The parts of an AST object name as their **unquoted** identifier text.
+///
+/// `ObjectNamePart`'s `Display` re-adds the quoting, so `` `MyTable` `` /
+/// `"MyTable"` would come back quote-wrapped and never match the catalog (which
+/// is keyed on bare names) — the alias path beside every call site already reads
+/// `Ident::value` for exactly this reason. A non-identifier part (a
+/// dialect-specific function name) has no bare form, so it falls back to
+/// `Display`.
+fn object_name_parts(name: &sqlparser::ast::ObjectName) -> Vec<String> {
+    name.0
+        .iter()
+        .map(|p| {
+            p.as_ident()
+                .map(|i| i.value.clone())
+                .unwrap_or_else(|| p.to_string())
+        })
+        .collect()
+}
+
+/// The byte that quotes an identifier in `dialect`: `` ` `` on MySQL, `"` on
+/// PostgreSQL. Everything else `skip_noncode` consumes at that position is a
+/// string or comment, i.e. genuinely not code.
+fn ident_quote(dialect: SqlDialect) -> u8 {
+    match dialect {
+        SqlDialect::MySql => b'`',
+        SqlDialect::Postgres => b'"',
+    }
+}
+
 /// Tokenize `sql[lo..hi]` into words + `. , ( )`, skipping string literals and
 /// comments via the shared [`skip_noncode`] primitive.
 ///
-/// A **backtick-quoted identifier becomes a `Word`** carrying its unquoted text,
-/// rather than being skipped like a string: `` `shop`.`customers` `` has to
-/// resolve to the same scope as `shop.customers`. Schemaic generates the quoted
-/// form itself (see [`crate::filter::table_query`]), and this is the *fallback*
-/// path — the one that runs the moment a statement stops parsing, i.e. exactly
-/// while the user is typing a `WHERE`. Skipping the name there cost the tab its
-/// column completion.
+/// A **quoted identifier becomes a `Word`** carrying its unquoted text, rather
+/// than being skipped like a string: `` `shop`.`customers` `` (MySQL) and
+/// `"sales"."orders"` (PostgreSQL) have to resolve to the same scope as the bare
+/// names. Schemaic generates the quoted form itself (see
+/// [`crate::filter::table_query`], which quotes a mixed-case name on PG), and this
+/// is the *fallback* path — the one that runs the moment a statement stops
+/// parsing, i.e. exactly while the user is typing a `WHERE`. Skipping the name
+/// there cost the tab its column completion.
 ///
-/// `skip_noncode` still decides where the quoted run ends, so there's no second
-/// boundary scanner here — only the content is lifted out of the span it returns.
-fn tokenize_range(sql: &str, lo: usize, hi: usize) -> Vec<Token> {
+/// It is **dialect-aware**: which byte quotes an identifier differs (`"` is a
+/// *string* in MySQL but an identifier in PG), and so do comment and string
+/// boundaries (`#` is a comment in MySQL, an operator in PG; `$tag$…$tag$` is a
+/// PG string whose contents must not be read as code). `skip_noncode` decides
+/// every boundary, so there's no second scanner here — only the content of a
+/// quoted-identifier span is lifted out.
+fn tokenize_range(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<Token> {
     let b = sql.as_bytes();
+    let quote = ident_quote(dialect);
     let mut out = Vec::new();
     let mut i = lo;
     let push = |out: &mut Vec<Token>, at: usize, kind: TkKind| {
@@ -1008,31 +1043,32 @@ fn tokenize_range(sql: &str, lo: usize, hi: usize) -> Vec<Token> {
     while i < hi {
         // Quoted identifier → a word. Must be tried before `skip_noncode`, which
         // would otherwise consume it as an opaque non-code run.
-        if b[i] == b'`'
-            && let Some(j) = skip_noncode(b, i, SqlDialect::MySql)
+        if b[i] == quote
+            && let Some(j) = skip_noncode(b, i, dialect)
         {
             let end = j.min(hi);
-            // `j` points past the closing backtick; an unterminated quote runs to
-            // the end of the range, in which case there's no closer to trim.
-            let closed = j <= hi && b.get(j - 1) == Some(&b'`') && j - 1 > i;
+            // `j` points past the closing quote; an unterminated quote runs to the
+            // end of the range, in which case there's no closer to trim.
+            let closed = j <= hi && b.get(j - 1) == Some(&quote) && j - 1 > i;
             let inner = sql
                 .get(i + 1..if closed { j - 1 } else { end })
                 .unwrap_or("");
             if !inner.is_empty() {
+                // A doubled quote inside the name is one literal quote char.
+                let doubled = [quote, quote];
+                let doubled = std::str::from_utf8(&doubled).unwrap_or("");
+                let single = [quote];
+                let single = std::str::from_utf8(&single).unwrap_or("");
                 out.push(Token {
                     at: i,
-                    kind: TkKind::Word(inner.replace("``", "`")),
+                    kind: TkKind::Word(inner.replace(doubled, single)),
                     quoted: true,
                 });
             }
             i = end;
             continue;
         }
-        // Intel's byte-position tokenizer stays MySQL-flavored: it's the *fallback*
-        // (the per-dialect AST is the primary, dialect-correct analysis). A
-        // dialect-aware tokenizer here would cascade `dialect` through ~13 helpers
-        // for a narrow gain (PG `#`/`$$`/`"` boundaries in mid-edit positioning only).
-        if let Some(j) = skip_noncode(b, i, SqlDialect::MySql) {
+        if let Some(j) = skip_noncode(b, i, dialect) {
             i = j.min(hi);
             continue;
         }
@@ -1131,7 +1167,7 @@ pub fn word_start(text: &str, offset: usize) -> usize {
 /// Classify the caret context from the statement `sql[lo..hi]`. `word_lo` is the
 /// byte offset where the caret's current word begins. Lexer-based, so it stays
 /// correct mid-edit (when the statement doesn't parse).
-pub fn clause_context(sql: &str, lo: usize, word_lo: usize) -> ClauseCtx {
+pub fn clause_context(sql: &str, lo: usize, word_lo: usize, dialect: SqlDialect) -> ClauseCtx {
     // Qualified reference: the char just before the word is a `.`.
     if word_lo > lo && sql.as_bytes()[word_lo - 1] == b'.' {
         let q_start = word_start(sql, word_lo - 1);
@@ -1141,7 +1177,7 @@ pub fn clause_context(sql: &str, lo: usize, word_lo: usize) -> ClauseCtx {
         }
     }
     // The last clause keyword strictly before the caret's word decides the rest.
-    let toks = tokenize_range(sql, lo, word_lo);
+    let toks = tokenize_range(sql, lo, word_lo, dialect);
     let mut last_kw: Option<String> = None;
     for t in &toks {
         if let TkKind::Word(w) = &t.kind {
@@ -1234,8 +1270,8 @@ pub struct Continuation {
 /// The byte offset to start scanning the caret's local clause sequence from: just
 /// inside the innermost unclosed `(` before the caret (so a subquery's clauses
 /// don't bleed in from the outer query), else `lo`.
-fn local_scope_start(sql: &str, lo: usize, caret: usize) -> usize {
-    let toks = tokenize_range(sql, lo, caret);
+fn local_scope_start(sql: &str, lo: usize, caret: usize, dialect: SqlDialect) -> usize {
+    let toks = tokenize_range(sql, lo, caret, dialect);
     let mut stack: Vec<usize> = Vec::new();
     for t in &toks {
         match t.kind {
@@ -1454,9 +1490,14 @@ fn scan_clauses(
 /// are considered, so a phrase like `GROUP BY` is offered while `GROUP` is still
 /// being typed. Lexer-based (correct mid-edit) and microsecond-cheap — it runs every
 /// keystroke.
-pub fn clause_continuation(sql: &str, lo: usize, word_lo: usize) -> Continuation {
-    let start = local_scope_start(sql, lo, word_lo);
-    let toks = tokenize_range(sql, start, word_lo);
+pub fn clause_continuation(
+    sql: &str,
+    lo: usize,
+    word_lo: usize,
+    dialect: SqlDialect,
+) -> Continuation {
+    let start = local_scope_start(sql, lo, word_lo, dialect);
+    let toks = tokenize_range(sql, start, word_lo, dialect);
     let (kind, cur, operand, seen, select_has_content, select_has_star, distinct_seen) =
         scan_clauses(sql, &toks, word_lo);
     let filled = operand >= 1;
@@ -1573,7 +1614,7 @@ fn lexer_scope(
     caret: usize,
     dialect: SqlDialect,
 ) -> Vec<TableRef> {
-    let toks = tokenize_range(sql, lo, hi);
+    let toks = tokenize_range(sql, lo, hi, dialect);
     let chain = caret_scope_chain(&toks, caret);
     let word = |k: &TkKind| -> Option<String> {
         if let TkKind::Word(w) = k {
@@ -1775,7 +1816,7 @@ mod ast_scope {
     fn collect_factor(factor: &TableFactor, out: &mut Scope) {
         match factor {
             TableFactor::Table { name, alias, .. } => {
-                let parts: Vec<String> = name.0.iter().map(|p| p.to_string()).collect();
+                let parts: Vec<String> = super::object_name_parts(name);
                 let (db, table) = match parts.as_slice() {
                     [t] => (None, t.clone()),
                     [d, t] => (Some(d.clone()), t.clone()),
@@ -2131,7 +2172,7 @@ fn table_refs_with_pos(
     hi: usize,
     dialect: SqlDialect,
 ) -> Vec<(TableRef, (usize, usize))> {
-    let toks = tokenize_range(sql, lo, hi);
+    let toks = tokenize_range(sql, lo, hi, dialect);
     let word = |k: &TkKind| -> Option<String> {
         if let TkKind::Word(w) = k {
             Some(w.clone())
@@ -2726,7 +2767,7 @@ fn is_table_ref_continuation(word: &str) -> bool {
 /// ([`is_reserved_word`]) and only where an alias is actually expected, so well-formed
 /// SQL isn't squiggled.
 fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut Vec<Diagnostic>) {
-    let toks = tokenize_range(sql, lo, hi);
+    let toks = tokenize_range(sql, lo, hi, dialect);
     let flag = |out: &mut Vec<Diagnostic>, at: usize, kw: &str| {
         out.push(Diagnostic {
             range: (at, at + kw.len()),
@@ -2873,7 +2914,7 @@ fn qualified_column_checks(
     out: &mut Vec<Diagnostic>,
 ) {
     let refs = table_refs_with_pos(sql, lo, hi, dialect);
-    let toks = tokenize_range(sql, lo, hi);
+    let toks = tokenize_range(sql, lo, hi, dialect);
     for w in toks.windows(3) {
         let (TkKind::Word(q), TkKind::Dot, TkKind::Word(col)) =
             (&w[0].kind, &w[1].kind, &w[2].kind)
@@ -3435,7 +3476,7 @@ mod colres {
                     sources.push(open_src());
                     return;
                 }
-                let parts: Vec<String> = name.0.iter().map(|p| p.to_string()).collect();
+                let parts: Vec<String> = super::object_name_parts(name);
                 let (db, tname) = match parts.as_slice() {
                     [t] => (None, t.clone()),
                     [.., d, t] => (Some(d.clone()), t.clone()),
@@ -3846,7 +3887,7 @@ pub fn join_condition(
     catalog: &Catalog,
     dialect: SqlDialect,
 ) -> Option<String> {
-    let toks = tokenize_range(sql, lo, hi);
+    let toks = tokenize_range(sql, lo, hi, dialect);
     // The last clause keyword strictly before the caret must be `ON`.
     let mut last_kw_idx = None;
     for (i, t) in toks.iter().enumerate() {
@@ -3921,8 +3962,9 @@ pub fn join_targets(
     hi: usize,
     caret: usize,
     catalog: &Catalog,
+    dialect: SqlDialect,
 ) -> Vec<JoinTarget> {
-    let toks = tokenize_range(sql, lo, hi);
+    let toks = tokenize_range(sql, lo, hi, dialect);
     let word_lo = word_start(sql, caret);
     // The last clause keyword strictly before the partial table name must be `JOIN`.
     let mut join_idx = None;
@@ -4028,6 +4070,7 @@ pub fn expand_star(
     hi: usize,
     caret: usize,
     catalog: &Catalog,
+    dialect: SqlDialect,
 ) -> Option<StarExpansion> {
     let b = sql.as_bytes();
     // The caret must sit right after a `*` (trailing whitespace allowed).
@@ -4055,7 +4098,7 @@ pub fn expand_star(
     } else {
         (star, None)
     };
-    let toks = tokenize_range(sql, lo, hi);
+    let toks = tokenize_range(sql, lo, hi, dialect);
     // Must be in the SELECT projection clause.
     let mut last_kw = None;
     for t in &toks {
@@ -4145,8 +4188,14 @@ pub struct SignatureHelp {
 /// signature help. Resolves the *innermost* enclosing call (so `POWER(a, FLOOR(b|`
 /// describes `FLOOR`), counts top-level commas to find the active argument, and
 /// ignores grouping parens / non-function calls (`(a+b)`, `IN (…)`, subqueries).
-pub fn signature_help(sql: &str, lo: usize, hi: usize, caret: usize) -> Option<SignatureHelp> {
-    let toks = tokenize_range(sql, lo, hi);
+pub fn signature_help(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    caret: usize,
+    dialect: SqlDialect,
+) -> Option<SignatureHelp> {
+    let toks = tokenize_range(sql, lo, hi, dialect);
     // Stack of open parens up to the caret, each with its top-level comma count.
     let mut stack: Vec<(usize, usize)> = Vec::new();
     for (idx, t) in toks.iter().enumerate() {
@@ -4417,28 +4466,93 @@ mod tests {
         assert_eq!(s.tables[0].db.as_deref(), Some("shop"));
     }
 
+    /// A mid-edit scope resolved with Postgres rules.
+    fn pg_scope(sql: &str) -> Scope {
+        statement_scope(sql, 0, sql.len(), sql.len(), SqlDialect::Postgres)
+    }
+
     #[test]
-    fn scope_misses_pg_double_quoted_names_mid_edit_known_gap() {
-        // KNOWN LIMITATION, pinned so a future fix trips this test.
-        //
-        // The backtick case above works because a backtick is only ever an
-        // identifier quote. `"…"` is not: it's a *string* in MySQL and an
-        // identifier in Postgres, and this tokenizer is MySQL-flavored on purpose
-        // (the per-dialect AST is the primary path) — so mid-edit, when the AST
-        // can't parse, a double-quoted Postgres name is invisible here.
-        //
-        // Reach: only names that actually need quoting. `filter::table_query`
-        // emits bare identifiers wherever it legally can, so the generated
-        // statement doesn't hit this. Fixing it properly means threading
-        // `dialect` through `tokenize_range` and its public callers — the
-        // "intel mid-edit tokenizer dialect" item in TODO.md.
-        let sql = "SELECT * FROM \"customers\" WHERE ";
-        let s = statement_scope(sql, 0, sql.len(), sql.len(), SqlDialect::Postgres);
-        assert!(
-            names(&s).is_empty(),
-            "if this now resolves, the tokenizer became dialect-aware — \
-             update this test to assert [\"customers\"]"
+    fn scope_resolves_pg_double_quoted_names_mid_edit() {
+        // The Postgres analog of the backtick case above. `"…"` is a *string* in
+        // MySQL but an *identifier* in Postgres, so tokenizing PG with MySQL rules
+        // swallowed the name whole and the tab lost column completion the instant
+        // you typed `WHERE`.
+        assert_eq!(
+            names(&pg_scope("SELECT * FROM \"customers\" WHERE ")),
+            vec!["customers"]
         );
+        // Qualified, and the namespace comes through as the qualifier.
+        let s = pg_scope("SELECT * FROM \"sales\".\"orders\" WHERE ");
+        assert_eq!(names(&s), vec!["orders"]);
+        assert_eq!(s.tables[0].db.as_deref(), Some("sales"));
+        // With an alias, like the backtick test.
+        let s = pg_scope("SELECT * FROM \"orders\" \"o\" WHERE ");
+        assert_eq!(names(&s), vec!["orders"]);
+        assert_eq!(s.tables[0].alias.as_deref(), Some("o"));
+        // A doubled quote inside the name is one literal quote.
+        assert_eq!(
+            names(&pg_scope("SELECT * FROM \"we\"\"ird\" WHERE ")),
+            vec!["we\"ird"]
+        );
+    }
+
+    #[test]
+    fn scope_strips_quotes_from_a_parsed_table_name() {
+        // The AST path, not the lexer fallback: these statements parse, and
+        // sqlparser's `Display` re-adds the quoting. Keeping it would have made
+        // the name unmatchable against the catalog (which is keyed on bare
+        // names) — the alias beside it was already unquoted, so the two disagreed.
+        let s = scope("SELECT * FROM `shop`.`MyTable` ORDER BY id");
+        assert_eq!(names(&s), vec!["MyTable"]);
+        assert_eq!(s.tables[0].db.as_deref(), Some("shop"));
+
+        let sql = "SELECT * FROM \"sales\".\"MyTable\" ORDER BY id";
+        let s = statement_scope(sql, 0, sql.len(), sql.len(), SqlDialect::Postgres);
+        assert_eq!(names(&s), vec!["MyTable"]);
+        assert_eq!(s.tables[0].db.as_deref(), Some("sales"));
+    }
+
+    #[test]
+    fn scope_resolves_the_generated_mixed_case_pg_statement() {
+        // Not hypothetical: `filter::table_query` quotes a mixed-case name on
+        // Postgres (it folds to lower case unquoted), so opening `MyTable` and
+        // typing `WHERE` hit exactly the gap above.
+        let sql = "SELECT * FROM \"MyTable\" ORDER BY \"Id\" ASC LIMIT 100";
+        let s = statement_scope(sql, 0, sql.len(), sql.len(), SqlDialect::Postgres);
+        assert_eq!(names(&s), vec!["MyTable"]);
+    }
+
+    #[test]
+    fn scope_ignores_tables_named_inside_a_dollar_quoted_string() {
+        // `$$ … $$` is a Postgres string. Tokenized MySQL-style its contents were
+        // ordinary words, so a `FROM` inside one invented a table that isn't in
+        // scope — a false positive, not just a miss.
+        let s = pg_scope("SELECT * FROM orders WHERE note = $$ FROM ghosts $$ AND ");
+        assert_eq!(names(&s), vec!["orders"]);
+        // Tagged form too.
+        let s = pg_scope("SELECT * FROM orders WHERE b = $tag$ JOIN ghosts $tag$ AND ");
+        assert_eq!(names(&s), vec!["orders"]);
+    }
+
+    #[test]
+    fn scope_treats_pg_hash_as_an_operator_not_a_comment() {
+        // `#` starts a comment in MySQL but is an operator in Postgres, so a name
+        // after one *on the same line* is real code there and dead text here. The
+        // discriminating table is the one written after the `#`.
+        let sql = "SELECT * FROM orders JOIN items ON a = b # 1 JOIN more ON c = d WHERE ";
+        assert_eq!(names(&pg_scope(sql)), vec!["items", "more", "orders"]);
+        assert_eq!(names(&scope(sql)), vec!["items", "orders"]);
+    }
+
+    #[test]
+    fn scope_still_ignores_pg_string_literals() {
+        // The dialect switch must not turn a single-quoted string into code.
+        let s = pg_scope("SELECT * FROM orders WHERE note = 'FROM ghosts' AND ");
+        assert_eq!(names(&s), vec!["orders"]);
+        // Backticks aren't identifier quotes in Postgres — they must not resolve
+        // a name there the way they do on MySQL.
+        let s = pg_scope("SELECT * FROM \"orders\" WHERE ");
+        assert_eq!(names(&s), vec!["orders"]);
     }
 
     #[test]
@@ -4533,7 +4647,7 @@ mod tests {
 
     fn ctx_at(sql: &str, caret: usize) -> ClauseCtx {
         let word_lo = word_start(sql, caret);
-        clause_context(sql, 0, word_lo)
+        clause_context(sql, 0, word_lo, SqlDialect::MySql)
     }
 
     #[test]
@@ -4558,7 +4672,7 @@ mod tests {
 
     fn cont_at(sql: &str, caret: usize) -> Continuation {
         let word_lo = word_start(sql, caret);
-        clause_continuation(sql, 0, word_lo)
+        clause_continuation(sql, 0, word_lo, SqlDialect::MySql)
     }
     fn cont(sql: &str) -> Continuation {
         cont_at(sql, sql.len())
@@ -5864,7 +5978,7 @@ mod tests {
     fn jt(sql: &str) -> Vec<JoinTarget> {
         let (schema, db) = fk_catalog();
         let cat = Catalog::build(&[(db, &schema)], Some(db));
-        join_targets(sql, 0, sql.len(), sql.len(), &cat)
+        join_targets(sql, 0, sql.len(), sql.len(), &cat, SqlDialect::MySql)
     }
 
     #[test]
@@ -5902,7 +6016,7 @@ mod tests {
         let (schema, db) = fk_catalog();
         let cat = Catalog::build(&[(db, &schema)], Some(db));
         let sql = "SELECT * FROM orders o JOIN customers c ";
-        assert!(join_targets(sql, 0, sql.len(), sql.len(), &cat).is_empty());
+        assert!(join_targets(sql, 0, sql.len(), sql.len(), &cat, SqlDialect::MySql).is_empty());
     }
 
     #[test]
@@ -5917,7 +6031,7 @@ mod tests {
     fn expand(sql: &str, caret: usize) -> Option<StarExpansion> {
         let (schema, db) = sample_catalog();
         let cat = Catalog::build(&[(db, &schema)], Some(db));
-        expand_star(sql, 0, sql.len(), caret, &cat)
+        expand_star(sql, 0, sql.len(), caret, &cat, SqlDialect::MySql)
     }
 
     #[test]
@@ -5961,7 +6075,7 @@ mod tests {
     // ── signature help ────────────────────────────────────────────────────────
 
     fn sig(sql: &str) -> Option<SignatureHelp> {
-        signature_help(sql, 0, sql.len(), sql.len())
+        signature_help(sql, 0, sql.len(), sql.len(), SqlDialect::MySql)
     }
 
     #[test]
