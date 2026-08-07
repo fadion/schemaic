@@ -912,6 +912,8 @@ fn schema_node(
         filter,
         on_toggle,
         nav,
+        context_menu,
+        dialect,
         ..
     } = ctx.clone();
     let key = schema_key(&database, &ns);
@@ -952,6 +954,28 @@ fn schema_node(
         )),
     ))
     .on_double_click_stop(move |_| (toggle_row)(key_row.clone()))
+    .on_secondary_click_stop({
+        let ctx_db = database.clone();
+        let ctx_ns = ns.clone();
+        let ddl_schema = schema.clone();
+        move |_| {
+            let ai_prompt = format!(
+                "Give me a concise overview of the `{ctx_ns}` schema in the `{ctx_db}` \
+                 database — what it models, its key tables, and how they relate."
+            );
+            // Built here rather than per render: a namespace can hold a lot of
+            // tables, and the script is only ever needed once the menu opens.
+            let ddl = ddl_schema.create_ddl_script(Some(&ctx_ns), dialect);
+            context_menu.set(Some(CtxMenu {
+                kind: CtxKind::Schema {
+                    database: ctx_db.clone(),
+                    ddl,
+                },
+                name: ctx_ns.clone(),
+                ai_prompt,
+            }));
+        }
+    })
     .style({
         let hl = key.clone();
         move |s| {

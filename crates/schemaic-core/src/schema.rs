@@ -382,6 +382,37 @@ impl DbSchema {
             .or_else(|| by_name().next())
     }
 
+    /// Every table in one namespace, in introspection order. `None` selects the
+    /// tables that carry no namespace (i.e. all of them, on MySQL).
+    pub fn tables_in(&self, schema: Option<&str>) -> impl Iterator<Item = &TableInfo> {
+        self.tables
+            .iter()
+            .filter(move |t| t.schema.as_deref() == schema)
+    }
+
+    /// A `CREATE` script for every table in one namespace, blank-line separated.
+    ///
+    /// **Base tables first, then views** — a view's body references the tables it
+    /// selects from, so the script only replays cleanly in that order. Foreign
+    /// keys aren't emitted by [`TableInfo::create_ddl`] at all, so ordering
+    /// *between* base tables doesn't affect validity.
+    ///
+    /// Empty when the namespace holds nothing.
+    pub fn create_ddl_script(
+        &self,
+        schema: Option<&str>,
+        dialect: crate::intel::SqlDialect,
+    ) -> String {
+        let (views, tables): (Vec<&TableInfo>, Vec<&TableInfo>) =
+            self.tables_in(schema).partition(|t| t.is_view);
+        tables
+            .into_iter()
+            .chain(views)
+            .map(|t| t.create_ddl(dialect))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
     /// Every namespace present, in display order (`public` first, then
     /// alphabetical). Empty on MySQL, where tables carry no namespace — which is
     /// how the schema tree decides whether to render a schema level at all.
@@ -849,6 +880,54 @@ mod tests {
             ],
         };
         assert_eq!(s.schemas(), vec!["public", "analytics", "sales"]);
+    }
+
+    #[test]
+    fn create_ddl_script_emits_base_tables_before_views() {
+        use crate::intel::SqlDialect::Postgres;
+        let base = |ns: &str, name: &str| TableInfo {
+            name: name.into(),
+            schema: Some(ns.into()),
+            columns: vec![col("id", "integer", false, true)],
+            ..Default::default()
+        };
+        let s = DbSchema {
+            tables: vec![
+                // The view comes FIRST in introspection order, so a naive fold
+                // would emit it before the table it selects from.
+                TableInfo {
+                    name: "big_orders".into(),
+                    schema: Some("sales".into()),
+                    is_view: true,
+                    view_definition: Some("SELECT id FROM orders".into()),
+                    ..Default::default()
+                },
+                base("sales", "orders"),
+                base("public", "elsewhere"),
+            ],
+        };
+        let out = s.create_ddl_script(Some("sales"), Postgres);
+        let table_at = out.find("CREATE TABLE").expect("table emitted");
+        let view_at = out.find("CREATE OR REPLACE VIEW").expect("view emitted");
+        assert!(table_at < view_at, "base tables must precede views:\n{out}");
+        // Only this namespace's tables, blank-line separated.
+        assert!(!out.contains("elsewhere"), "{out}");
+        assert!(out.contains("\n\n"), "{out}");
+    }
+
+    #[test]
+    fn create_ddl_script_is_empty_for_an_unknown_namespace() {
+        use crate::intel::SqlDialect::Postgres;
+        let s = DbSchema {
+            tables: vec![TableInfo {
+                name: "orders".into(),
+                schema: Some("sales".into()),
+                ..Default::default()
+            }],
+        };
+        assert_eq!(s.create_ddl_script(Some("ghosts"), Postgres), "");
+        assert_eq!(s.tables_in(Some("ghosts")).count(), 0);
+        assert_eq!(s.tables_in(Some("sales")).count(), 1);
     }
 
     #[test]

@@ -538,6 +538,14 @@ impl DraftSignals {
 #[derive(Clone)]
 pub enum CtxKind {
     Database,
+    /// A PostgreSQL namespace group — only rendered when a database has more than
+    /// one, so this never appears on MySQL.
+    Schema {
+        database: String,
+        /// A `CREATE` script for every table in the namespace, built lazily when
+        /// the menu is staged (see `DbSchema::create_ddl_script`).
+        ddl: String,
+    },
     Table {
         database: String,
         /// PostgreSQL namespace (`None` on MySQL) — carried so the menu's actions
