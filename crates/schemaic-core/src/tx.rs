@@ -1,0 +1,457 @@
+//! Manual-transaction state — pure over statement outcomes, no DB, no UI.
+//!
+//! In **Manual** mode a query tab pins one connection open and holds a
+//! transaction across many UI actions, so the user decides when to `COMMIT` or
+//! `ROLLBACK`. The connection pinning lives in `schemaic-db`'s `Session` and the
+//! wiring in the app; what belongs *here* is the decision logic: how a statement
+//! outcome moves the transaction, which engine poisons a transaction on error,
+//! which statements silently end one, and what the status pill reads.
+//!
+//! The engine divergence is the whole reason this is a state machine rather than
+//! a boolean:
+//!
+//! * **PostgreSQL** aborts the entire transaction on *any* statement error
+//!   (`25P02` — "current transaction is aborted, commands ignored until end of
+//!   transaction block"), so the only way forward is `ROLLBACK`. A cancelled
+//!   statement (`57014`) is an error too, so it poisons as well.
+//! * **MySQL/MariaDB** leaves the transaction usable after a failed statement,
+//!   but *implicitly commits* it when DDL runs mid-transaction — the transaction
+//!   is silently gone, which the UI has to say out loud.
+
+/// Which engine's transaction semantics apply. Mirrors `schemaic_db::Engine`
+/// (core doesn't depend on the db crate).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TxEngine {
+    #[default]
+    MySql,
+    Postgres,
+}
+
+/// A tab's commit mode. Session-only — a tab always starts in [`TxMode::Auto`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TxMode {
+    /// Every statement commits on its own, each on a fresh connection. The
+    /// behaviour Schemaic has always had.
+    #[default]
+    Auto,
+    /// Statements run on one pinned connection inside a transaction the user
+    /// commits or rolls back explicitly.
+    Manual,
+}
+
+impl TxMode {
+    /// Status-bar label.
+    pub fn label(self) -> &'static str {
+        match self {
+            TxMode::Auto => "Auto-commit",
+            TxMode::Manual => "Manual",
+        }
+    }
+
+    pub fn is_manual(self) -> bool {
+        matches!(self, TxMode::Manual)
+    }
+}
+
+/// What happened to one statement run on the session connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StmtOutcome {
+    Ok,
+    /// The server rejected it (syntax, constraint, permission…).
+    Failed,
+    /// The user cancelled it (`KILL QUERY` / PG cancel request).
+    Cancelled,
+    /// The connection itself died — idle-in-transaction timeout, server
+    /// restart, network drop. Whatever was in the transaction is gone.
+    ConnectionLost,
+}
+
+/// Where a tab's transaction stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TxState {
+    /// No transaction open (always the case in [`TxMode::Auto`]).
+    #[default]
+    Idle,
+    /// Open, with the number of statements run inside it so far.
+    Open { stmts: u32 },
+    /// PostgreSQL only: a statement errored, so the server rejects everything
+    /// until `ROLLBACK`. The count is kept for the pill.
+    Poisoned { stmts: u32 },
+    /// The pinned connection died with a transaction open — the work is gone.
+    /// Reported rather than silently reconnected into a fresh, empty one.
+    Lost,
+}
+
+impl TxState {
+    /// Is a transaction open in any form (including poisoned)? Drives the
+    /// "you'll lose work" prompts on close / disconnect / mode switch.
+    pub fn is_open(self) -> bool {
+        matches!(self, TxState::Open { .. } | TxState::Poisoned { .. })
+    }
+
+    /// Statements run inside the current transaction.
+    pub fn stmts(self) -> u32 {
+        match self {
+            TxState::Open { stmts } | TxState::Poisoned { stmts } => stmts,
+            TxState::Idle | TxState::Lost => 0,
+        }
+    }
+
+    /// Can the user commit right now? A poisoned transaction can't — PostgreSQL
+    /// turns `COMMIT` on an aborted transaction into a `ROLLBACK`, so offering
+    /// Commit would be a lie. A lost one has nothing to commit.
+    pub fn can_commit(self) -> bool {
+        matches!(self, TxState::Open { .. })
+    }
+
+    /// Can the user roll back? Any live transaction, poisoned included — that's
+    /// the way out of `25P02`.
+    pub fn can_rollback(self) -> bool {
+        self.is_open()
+    }
+
+    /// `BEGIN` succeeded. Lazily called on the first statement of a Manual tab.
+    pub fn begun() -> TxState {
+        TxState::Open { stmts: 0 }
+    }
+
+    /// A `COMMIT`/`ROLLBACK` completed, or the session was closed — either way
+    /// there's no transaction any more. Also the way out of `Poisoned`/`Lost`.
+    pub fn closed() -> TxState {
+        TxState::Idle
+    }
+
+    /// Fold one statement's outcome into the transaction state.
+    ///
+    /// `sql` is the statement that ran — needed because MySQL DDL implicitly
+    /// commits (see [`implicit_commit`]). A statement arriving while [`Idle`]
+    /// opens the transaction (the app issues `BEGIN` lazily, so the first
+    /// statement lands as the first statement of a fresh transaction).
+    pub fn on_statement(self, engine: TxEngine, sql: &str, outcome: StmtOutcome) -> TxState {
+        if outcome == StmtOutcome::ConnectionLost {
+            // Only meaningful mid-transaction; with none open there's nothing to
+            // mourn and the next op just reconnects.
+            return if self.is_open() {
+                TxState::Lost
+            } else {
+                TxState::Idle
+            };
+        }
+        match self {
+            TxState::Lost => TxState::Lost,
+            // Postgres rejects everything until ROLLBACK, so nothing counts.
+            TxState::Poisoned { stmts } => TxState::Poisoned { stmts },
+            TxState::Idle | TxState::Open { .. } => {
+                let stmts = self.stmts();
+                match outcome {
+                    StmtOutcome::Ok => {
+                        if implicit_commit(engine, sql) {
+                            // MySQL DDL committed the transaction out from under
+                            // us — back to no transaction, not to `stmts + 1`.
+                            TxState::Idle
+                        } else {
+                            TxState::Open { stmts: stmts + 1 }
+                        }
+                    }
+                    // A statement that didn't apply doesn't count. On Postgres it
+                    // also poisons: both a server error and a cancellation leave
+                    // the transaction in the aborted state.
+                    StmtOutcome::Failed | StmtOutcome::Cancelled => match engine {
+                        TxEngine::Postgres => TxState::Poisoned { stmts },
+                        TxEngine::MySql => TxState::Open { stmts },
+                    },
+                    StmtOutcome::ConnectionLost => unreachable!("handled above"),
+                }
+            }
+        }
+    }
+}
+
+/// Does running `sql` silently end an open transaction?
+///
+/// MySQL/MariaDB has no transactional DDL: `CREATE`/`ALTER`/`DROP`/`TRUNCATE`/
+/// `RENAME`, and a few session statements, commit the current transaction before
+/// they run ("statements that cause an implicit commit"). PostgreSQL has fully
+/// transactional DDL, so nothing does this there.
+///
+/// The keyword is read with [`crate::sql::leading_keyword`], so it's the shared
+/// boundary lexer deciding what the first token is — a leading comment or an
+/// `/* … */` block can't fool it. The list covers the statements a SQL editor
+/// realistically sees; it is intentionally conservative — a miss means the pill
+/// keeps counting a transaction the server already committed, which the next
+/// Commit/Rollback resolves harmlessly.
+pub fn implicit_commit(engine: TxEngine, sql: &str) -> bool {
+    if engine != TxEngine::MySql {
+        return false;
+    }
+    let Some(kw) = crate::sql::leading_keyword(sql, crate::intel::SqlDialect::MySql) else {
+        return false;
+    };
+    matches!(
+        kw.as_str(),
+        "ALTER"
+            | "ANALYZE"
+            | "CREATE"
+            | "DROP"
+            | "GRANT"
+            | "LOCK"
+            | "OPTIMIZE"
+            | "RENAME"
+            | "REPAIR"
+            | "REVOKE"
+            | "TRUNCATE"
+            | "UNLOCK"
+            // Opening a new transaction commits the current one.
+            | "BEGIN"
+            | "START"
+    )
+}
+
+/// The status-bar pill for a transaction, or `None` when there's nothing to say
+/// (no transaction open).
+pub fn pill_text(state: TxState) -> Option<String> {
+    match state {
+        TxState::Idle => None,
+        TxState::Open { stmts: 0 } => Some("Tx open".to_string()),
+        TxState::Open { stmts: 1 } => Some("Tx open · 1 stmt".to_string()),
+        TxState::Open { stmts } => Some(format!("Tx open · {stmts} stmts")),
+        TxState::Poisoned { .. } => Some("Tx aborted — rollback to continue".to_string()),
+        TxState::Lost => Some("Transaction lost".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MY: TxEngine = TxEngine::MySql;
+    const PG: TxEngine = TxEngine::Postgres;
+
+    fn ok(state: TxState, engine: TxEngine, sql: &str) -> TxState {
+        state.on_statement(engine, sql, StmtOutcome::Ok)
+    }
+
+    // ── Counting ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn begun_opens_an_empty_transaction() {
+        assert_eq!(TxState::begun(), TxState::Open { stmts: 0 });
+        assert!(TxState::begun().is_open());
+        assert_eq!(TxState::begun().stmts(), 0);
+    }
+
+    #[test]
+    fn successful_statements_count_up() {
+        let s = ok(TxState::begun(), MY, "UPDATE t SET a = 1");
+        assert_eq!(s, TxState::Open { stmts: 1 });
+        let s = ok(s, MY, "DELETE FROM t WHERE id = 2");
+        assert_eq!(s, TxState::Open { stmts: 2 });
+    }
+
+    #[test]
+    fn a_statement_while_idle_opens_the_transaction() {
+        // The app issues BEGIN lazily, so the first statement of a Manual tab
+        // arrives with the state still Idle.
+        assert_eq!(
+            ok(TxState::Idle, PG, "UPDATE t SET a = 1"),
+            TxState::Open { stmts: 1 }
+        );
+    }
+
+    #[test]
+    fn closed_resets_the_counter() {
+        let s = ok(TxState::begun(), MY, "UPDATE t SET a = 1");
+        assert_eq!(s.stmts(), 1);
+        assert_eq!(TxState::closed(), TxState::Idle);
+        assert_eq!(TxState::closed().stmts(), 0);
+        assert!(!TxState::closed().is_open());
+    }
+
+    // ── Engine divergence on a failed statement ───────────────────────────
+
+    #[test]
+    fn postgres_poisons_the_transaction_on_error() {
+        let s = ok(TxState::begun(), PG, "UPDATE t SET a = 1");
+        let s = s.on_statement(PG, "SELECT nope", StmtOutcome::Failed);
+        assert_eq!(s, TxState::Poisoned { stmts: 1 });
+        assert!(s.is_open(), "still an open transaction to get rid of");
+        assert!(!s.can_commit(), "COMMIT on an aborted PG tx is a ROLLBACK");
+        assert!(s.can_rollback(), "rollback is the way out of 25P02");
+    }
+
+    #[test]
+    fn postgres_stays_poisoned_and_stops_counting() {
+        let s = TxState::Poisoned { stmts: 2 };
+        assert_eq!(ok(s, PG, "SELECT 1"), TxState::Poisoned { stmts: 2 });
+        assert_eq!(
+            s.on_statement(PG, "SELECT 1", StmtOutcome::Failed),
+            TxState::Poisoned { stmts: 2 }
+        );
+    }
+
+    #[test]
+    fn mysql_survives_a_failed_statement() {
+        let s = ok(TxState::begun(), MY, "UPDATE t SET a = 1");
+        let s = s.on_statement(MY, "SELECT nope", StmtOutcome::Failed);
+        assert_eq!(s, TxState::Open { stmts: 1 }, "failed stmt doesn't count");
+        assert!(s.can_commit());
+    }
+
+    #[test]
+    fn cancellation_poisons_on_postgres_only() {
+        let pg = ok(TxState::begun(), PG, "UPDATE t SET a = 1");
+        assert_eq!(
+            pg.on_statement(PG, "SELECT pg_sleep(60)", StmtOutcome::Cancelled),
+            TxState::Poisoned { stmts: 1 },
+            "PG cancellation is error 57014 — it aborts the transaction"
+        );
+        let my = ok(TxState::begun(), MY, "UPDATE t SET a = 1");
+        assert_eq!(
+            my.on_statement(MY, "SELECT SLEEP(60)", StmtOutcome::Cancelled),
+            TxState::Open { stmts: 1 },
+            "KILL QUERY kills the statement, not the transaction"
+        );
+    }
+
+    // ── Connection loss ───────────────────────────────────────────────────
+
+    #[test]
+    fn a_dropped_connection_loses_an_open_transaction() {
+        let s = ok(TxState::begun(), MY, "UPDATE t SET a = 1");
+        let s = s.on_statement(MY, "SELECT 1", StmtOutcome::ConnectionLost);
+        assert_eq!(s, TxState::Lost);
+        assert!(!s.can_commit());
+        assert!(!s.can_rollback(), "there's no connection left to roll back");
+    }
+
+    #[test]
+    fn a_dropped_connection_with_no_transaction_is_not_a_loss() {
+        assert_eq!(
+            TxState::Idle.on_statement(PG, "SELECT 1", StmtOutcome::ConnectionLost),
+            TxState::Idle
+        );
+    }
+
+    #[test]
+    fn lost_is_terminal_until_closed() {
+        let s = TxState::Lost;
+        assert_eq!(ok(s, MY, "SELECT 1"), TxState::Lost);
+        assert_eq!(
+            s.on_statement(PG, "SELECT 1", StmtOutcome::Failed),
+            TxState::Lost
+        );
+        assert_eq!(TxState::closed(), TxState::Idle, "close clears it");
+    }
+
+    // ── MySQL implicit commit ─────────────────────────────────────────────
+
+    #[test]
+    fn mysql_ddl_implicitly_commits() {
+        for sql in [
+            "CREATE TABLE t (id INT)",
+            "drop table t",
+            "ALTER TABLE t ADD COLUMN c INT",
+            "TRUNCATE TABLE t",
+            "RENAME TABLE a TO b",
+            "LOCK TABLES t WRITE",
+        ] {
+            assert!(implicit_commit(MY, sql), "{sql} should implicitly commit");
+            assert_eq!(
+                ok(TxState::Open { stmts: 3 }, MY, sql),
+                TxState::Idle,
+                "{sql} ends the transaction"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_ddl_is_transactional() {
+        assert!(!implicit_commit(PG, "CREATE TABLE t (id INT)"));
+        assert_eq!(
+            ok(TxState::Open { stmts: 3 }, PG, "CREATE TABLE t (id INT)"),
+            TxState::Open { stmts: 4 },
+            "PG DDL is just another statement in the transaction"
+        );
+    }
+
+    #[test]
+    fn dml_does_not_implicitly_commit() {
+        for sql in [
+            "SELECT 1",
+            "UPDATE t SET a = 1",
+            "INSERT INTO t VALUES (1)",
+            "DELETE FROM t",
+            "REPLACE INTO t VALUES (1)",
+        ] {
+            assert!(!implicit_commit(MY, sql), "{sql} must not commit");
+        }
+    }
+
+    #[test]
+    fn implicit_commit_sees_past_comments() {
+        // `leading_keyword` runs on the shared boundary lexer, so a leading
+        // comment doesn't hide the DDL keyword behind it.
+        assert!(implicit_commit(MY, "/* migration step */ DROP TABLE t"));
+        assert!(implicit_commit(MY, "-- cleanup\nTRUNCATE TABLE t"));
+        // …and a keyword that only appears *inside* a comment isn't the leader.
+        assert!(!implicit_commit(MY, "/* DROP */ SELECT 1"));
+    }
+
+    #[test]
+    fn implicit_commit_ignores_a_word_that_merely_starts_with_a_keyword() {
+        assert!(!implicit_commit(MY, "CREATED_AT_CHECK()"));
+        assert!(!implicit_commit(MY, "SELECT dropped FROM t"));
+    }
+
+    #[test]
+    fn empty_or_comment_only_sql_commits_nothing() {
+        assert!(!implicit_commit(MY, ""));
+        assert!(!implicit_commit(MY, "   "));
+        assert!(!implicit_commit(MY, "-- just a note"));
+    }
+
+    // ── Pill text ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn pill_is_silent_when_idle() {
+        assert_eq!(pill_text(TxState::Idle), None);
+    }
+
+    #[test]
+    fn pill_counts_statements_with_correct_plural() {
+        assert_eq!(
+            pill_text(TxState::Open { stmts: 0 }).as_deref(),
+            Some("Tx open")
+        );
+        assert_eq!(
+            pill_text(TxState::Open { stmts: 1 }).as_deref(),
+            Some("Tx open · 1 stmt")
+        );
+        assert_eq!(
+            pill_text(TxState::Open { stmts: 2 }).as_deref(),
+            Some("Tx open · 2 stmts")
+        );
+    }
+
+    #[test]
+    fn pill_names_the_abnormal_states() {
+        assert_eq!(
+            pill_text(TxState::Poisoned { stmts: 3 }).as_deref(),
+            Some("Tx aborted — rollback to continue")
+        );
+        assert_eq!(
+            pill_text(TxState::Lost).as_deref(),
+            Some("Transaction lost")
+        );
+    }
+
+    // ── Mode ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mode_defaults_to_auto() {
+        assert_eq!(TxMode::default(), TxMode::Auto);
+        assert!(!TxMode::default().is_manual());
+        assert_eq!(TxMode::Auto.label(), "Auto-commit");
+        assert_eq!(TxMode::Manual.label(), "Manual");
+    }
+}
