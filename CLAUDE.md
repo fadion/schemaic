@@ -140,6 +140,19 @@ Re-introducing the anti-patterns these guard against is a regression:
   because per-occurrence positions can't come from the lexer. Name resolution here is deliberately
   conservative: an unenumerable source (unloaded/unknown table, `SELECT *` derived/CTE) is *open* so
   uncertainty never yields a false positive; the DB stays the authority for type checking.
+- **One connection per operation — except a Manual-mode tab.** Every `Db` method opens a fresh
+  connection, runs, and disconnects; that statelessness is why a dropped connection is never a
+  problem. The *single* exception is manual-transaction mode: a tab set to `TxMode::Manual` pins one
+  connection (`schemaic_db::Session`, one `Conn`/`Client` behind a `tokio::Mutex`) for the life of
+  its transaction, held in the app's `sessions` map (tab id → `Arc<Session>`). Only the tab's own
+  work routes there — run, Run Everything, grid writes, and the post-write re-fetch (which *must*,
+  since no other connection can see uncommitted rows). Read-only side channels (schema
+  introspection, live-validate `PREPARE`, EXPLAIN, Live Monitor, AI/MCP) stay on fresh connections so
+  a long transaction can't block them. Don't add a second connection-caching path; extend `Session`.
+  In-transaction writes nest under a `SAVEPOINT` (`TxScope`) so the 1-row guard can roll back its own
+  batch without ending the user's transaction, and the transaction *state* is the pure, tested
+  `schemaic_core::tx::TxState` — engine divergence (PG poisons on error, MySQL implicitly commits on
+  DDL) belongs there, not in UI conditionals.
 - **Connection identity is the `Db` handle / `conn_id`, never a `mysql://user:pass@host/db` URL.**
   Credentials go through `OptsBuilder`; never in a URL, argv, or log. The MCP subprocess gets its
   endpoint via a temp `--mcp-config` file, not argv. Don't add new plaintext-secret surfaces.

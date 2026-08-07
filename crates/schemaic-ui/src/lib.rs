@@ -40,6 +40,7 @@ use monitor_view::monitor_overlay;
 use overlays::{
     active_db_menu_overlay, conn_menu_overlay, context_menu_overlay, db_visibility_overlay,
     error_modal_overlay, find_overlay, popup_menu_overlay, schema_settings_overlay,
+    tx_prompt_overlay,
 };
 use plan_view::plan_overlay;
 use schema_tree::schema_panel;
@@ -1391,7 +1392,24 @@ pub fn workspace(ui: Ui) -> impl IntoView {
         context_menu_overlay(ui.clone()),
         popup_menu_overlay(ui.clone()),
         find_overlay(ui.clone()),
-        error_modal_overlay(ui.clone()),
+        // Error modal + open-transaction prompt share one tuple element, for the
+        // same 16-arity reason as monitor/ERD below (and with the same
+        // fill-only-when-open wrapper, or it would eat every click).
+        {
+            let err_open = ui.overlay.error_modal_open;
+            let tx_prompt = ui.overlay.tx_prompt;
+            stack((
+                error_modal_overlay(ui.clone()),
+                tx_prompt_overlay(ui.clone()),
+            ))
+            .style(move |s| {
+                if err_open.get() || tx_prompt.get().is_some() {
+                    s.absolute().inset(0.0)
+                } else {
+                    s
+                }
+            })
+        },
         plan_overlay(ui.clone()),
         // Monitor + ER-diagram modals share one tuple element (the workspace stack
         // is at Floem's 16-arity `ViewTuple` limit). The wrapper must fill the
@@ -4269,6 +4287,107 @@ fn footer(ui: Ui) -> impl IntoView {
             .color(base)
             .hover(move |s| s.color(hover))
     });
+    // ── Manual-transaction cluster ───────────────────────────────────────────
+    // Mode ("Auto-commit" / "Manual"), then — only while a transaction is open —
+    // the pill and its Commit / Rollback actions. Sits next to Read only / Write
+    // mode because it's the same kind of thing: what this tab does to the
+    // database when you press Run.
+    let active_tab = move || {
+        let id = active.get();
+        tabs.with(|v| v.iter().find(|t| t.id == id).copied())
+    };
+    let tx_mode = create_memo(move |_| active_tab().map(|t| t.tx_mode.get()).unwrap_or_default());
+    let tx_state = create_memo(move |_| active_tab().map(|t| t.tx.get()).unwrap_or_default());
+
+    let set_tx_mode = ui.tab_actions.set_tx_mode.clone();
+    let mode_seg = dyn_container(
+        move || tx_mode.get(),
+        move |m| {
+            text(m.label())
+                .style(|s| s.font_size(theme::FONT_STATUS))
+                .into_any()
+        },
+    )
+    .on_click_stop(move |_| {
+        let id = active.get_untracked();
+        // Flipping out of Manual with a transaction open is guarded app-side —
+        // it raises the prompt instead of silently discarding the work.
+        let next = match tx_mode.get_untracked() {
+            TxMode::Auto => TxMode::Manual,
+            TxMode::Manual => TxMode::Auto,
+        };
+        (set_tx_mode)(id, next);
+    })
+    .style(move |s| {
+        // Manual is a held state worth noticing; Auto is the quiet default.
+        let manual = tx_mode.get().is_manual();
+        let base = if manual {
+            theme::tx_open()
+        } else {
+            theme::status_text()
+        };
+        let hover = if manual {
+            theme::tx_open_hover()
+        } else {
+            theme::chip_active()
+        };
+        s.margin_left(15.0)
+            .items_center()
+            .color(base)
+            .hover(move |s| s.color(hover))
+    });
+
+    // "Tx open · N stmts" — or why it can't go forward. Hidden when idle.
+    let tx_pill = dyn_container(
+        move || tx_state.get(),
+        move |st| {
+            text(schemaic_core::tx::pill_text(st).unwrap_or_default())
+                .style(|s| s.font_size(theme::FONT_STATUS))
+                .into_any()
+        },
+    )
+    .style(move |s| {
+        let st = tx_state.get();
+        let s = s.margin_left(15.0).items_center().color(match st {
+            TxState::Poisoned { .. } | TxState::Lost => theme::tx_danger(),
+            _ => theme::tx_open(),
+        });
+        if st.is_open() || matches!(st, TxState::Lost) {
+            s
+        } else {
+            s.hide()
+        }
+    });
+
+    // Commit / Rollback. Commit disappears on an aborted transaction — Postgres
+    // turns COMMIT into a ROLLBACK there, so offering it would be a lie.
+    let commit_tx = ui.tab_actions.commit_tx.clone();
+    let rollback_tx = ui.tab_actions.rollback_tx.clone();
+    let tx_action =
+        move |label: &'static str, visible: Box<dyn Fn() -> bool>, act: Rc<dyn Fn(usize)>| {
+            text(label)
+                .on_click_stop(move |_| (act)(active.get_untracked()))
+                .style(move |s| {
+                    let s = s
+                        .margin_left(12.0)
+                        .items_center()
+                        .font_size(theme::FONT_STATUS)
+                        .color(theme::tx_open())
+                        .hover(|s| s.color(theme::tx_open_hover()));
+                    if visible() { s } else { s.hide() }
+                })
+        };
+    let commit_seg = tx_action(
+        "Commit",
+        Box::new(move || tx_state.get().can_commit()),
+        commit_tx,
+    );
+    let rollback_seg = tx_action(
+        "Rollback",
+        Box::new(move || tx_state.get().can_rollback()),
+        rollback_tx,
+    );
+
     // AI model + effort: click each to pick from the AI-panel options; the active
     // one is tinted the chip accent. Placed right after read-only (15px), with CPU
     // then RAM after (40px from effort).
@@ -4340,6 +4459,10 @@ fn footer(ui: Ui) -> impl IntoView {
         collapsing_seg(wrap_seg, ai_x),
         collapsing_seg(warn_seg, ai_x),
         collapsing_seg(ro_seg, ai_x),
+        collapsing_seg(mode_seg, ai_x),
+        collapsing_seg(tx_pill, ai_x),
+        collapsing_seg(commit_seg, ai_x),
+        collapsing_seg(rollback_seg, ai_x),
         collapsing_seg(model_seg, ai_x),
         collapsing_seg(effort_seg, ai_x),
         collapsing_seg(cpu_seg, ai_x),
