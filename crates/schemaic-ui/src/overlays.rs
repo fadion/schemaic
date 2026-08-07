@@ -483,6 +483,24 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         }));
                     }
                 }
+                CtxKind::Schema { database, ddl } => {
+                    entries.push(MenuEntry::action("Copy name", copy(menu.name.clone())));
+                    // The whole namespace as one CREATE script — the schema-level
+                    // analog of a table's "Generate DDL" (same clipboard + new-tab
+                    // behaviour). Empty for a namespace with no tables, in which
+                    // case there's nothing to offer.
+                    if !ddl.is_empty() {
+                        let oq = open_query.clone();
+                        entries.push(MenuEntry::action("Generate DDL", move || {
+                            let _ = floem::Clipboard::set_contents(ddl.clone());
+                            (oq)(ddl.clone());
+                        }));
+                    }
+                    // A namespace is introspected as part of its database, so
+                    // refreshing targets the database.
+                    let rf = refresh_db.clone();
+                    entries.push(MenuEntry::action("Refresh", move || (rf)(database.clone())));
+                }
                 CtxKind::Table {
                     database,
                     schema,
