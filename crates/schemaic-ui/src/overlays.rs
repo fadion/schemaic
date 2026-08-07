@@ -16,7 +16,7 @@ use floem::reactive::create_effect;
 
 use schemaic_core::connection::Connection;
 use schemaic_core::model::QueryState;
-use schemaic_core::schema::SchemaState;
+use schemaic_core::schema::{SchemaState, TableSource};
 
 use crate::consts::{CHAT_PAD_H, CHAT_PAD_V, DB_MENU_W};
 use crate::widgets::{
@@ -485,19 +485,20 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                 }
                 CtxKind::Table {
                     database,
+                    schema,
                     table,
                     ddl,
                 } => {
-                    let qualified = format!("{database}.{table}");
+                    let source = TableSource::new(database.clone(), schema.clone(), table.clone());
+                    // `database.schema.table` on PostgreSQL outside `public`, so
+                    // "Copy qualified name" names something that actually resolves.
+                    let qualified = format!("{database}.{}", source.display());
                     let refresh_database = database.clone();
                     // "Open": focus the tab already showing this table, else open one.
                     {
                         let ot = open_table.clone();
-                        let db = database.clone();
-                        let tbl = table.clone();
-                        entries.push(MenuEntry::action("Open", move || {
-                            (ot)(db.clone(), tbl.clone())
-                        }));
+                        let src = source.clone();
+                        entries.push(MenuEntry::action("Open", move || (ot)(src.clone())));
                     }
                     // "Open in new tab" is only useful (and only shown) when a tab
                     // for this table is already open — otherwise it does exactly
@@ -505,16 +506,15 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     // table under another connection isn't "this table".
                     let already_open = tabs.with_untracked(|v| {
                         v.iter().any(|t| {
-                            t.source.get_untracked() == Some((database.clone(), table.clone()))
+                            t.source.get_untracked().as_ref() == Some(&source)
                                 && t.conn_id.get_untracked() == active_conn.get_untracked()
                         })
                     });
                     if already_open {
                         let otn = open_table_new.clone();
-                        let db = database.clone();
-                        let tbl = table.clone();
+                        let src = source.clone();
                         entries.push(MenuEntry::action("Open in new tab", move || {
-                            (otn)(db.clone(), tbl.clone())
+                            (otn)(src.clone())
                         }));
                     }
                     // ER diagram seeded on this table's FK neighbourhood.
@@ -776,16 +776,15 @@ fn column_result_icon(
 /// persisted). `None` if the schema isn't loaded or the table/column is gone.
 fn lookup_result_icon(
     db_nodes: RwSignal<Vec<ConnNode>>,
-    db: &str,
-    table: &str,
+    source: &TableSource,
     column: Option<&str>,
 ) -> Option<ResultIcon> {
     db_nodes.with_untracked(|nodes| {
-        let node = nodes.iter().find(|n| n.database == db)?;
+        let node = nodes.iter().find(|n| n.database == source.database)?;
         let SchemaState::Loaded(schema) = node.schema.get_untracked() else {
             return None;
         };
-        let t = schema.tables.iter().find(|t| t.name == table)?;
+        let t = schema.find_table(source.schema.as_deref(), &source.table)?;
         match column {
             None => Some(table_result_icon(t)),
             Some(col) => t
@@ -803,41 +802,46 @@ fn lookup_result_icon(
 /// adds the trailing rotate-ccw-clock marker.
 #[allow(clippy::too_many_arguments)]
 fn search_result_item(
-    db: String,
-    table: String,
+    source: TableSource,
     column: Option<String>,
     left_icon: Option<ResultIcon>,
     history: bool,
     match_term: Option<String>,
     active_conn: RwSignal<u64>,
     search_history: RwSignal<Vec<schemaic_core::search_history::SearchEntry>>,
-    open_table: Rc<dyn Fn(String, String)>,
-    open_table_col: Rc<dyn Fn(String, String, String)>,
+    open_table: Rc<dyn Fn(TableSource)>,
+    open_table_col: Rc<dyn Fn(TableSource, String)>,
     close: Rc<dyn Fn()>,
 ) -> PaletteItem {
+    // The table reads `sales.orders` outside `public`, so two same-named tables
+    // in one database are distinguishable in the result list.
+    let table = source.display();
     let primary = match &column {
         Some(c) => format!("{table}.{c}"),
         None => table.clone(),
     };
-    let complete = column.clone().unwrap_or_else(|| table.clone());
+    // Tab-completion inserts the bare name — the qualifier isn't what you're
+    // typing to search for.
+    let complete = column.clone().unwrap_or_else(|| source.table.clone());
     PaletteItem {
         primary,
-        secondary: db.clone(),
+        secondary: source.database.clone(),
         activate: Rc::new(move || {
             search_history.update(|v| {
                 schemaic_core::search_history::push(
                     v,
                     schemaic_core::search_history::SearchEntry {
                         conn_id: active_conn.get_untracked(),
-                        database: db.clone(),
-                        table: table.clone(),
+                        database: source.database.clone(),
+                        schema: source.schema.clone(),
+                        table: source.table.clone(),
                         column: column.clone(),
                     },
                 );
             });
             match &column {
-                Some(c) => (open_table_col)(db.clone(), table.clone(), c.clone()),
-                None => (open_table)(db.clone(), table.clone()),
+                Some(c) => (open_table_col)(source.clone(), c.clone()),
+                None => (open_table)(source.clone()),
             }
             (close)();
         }),
@@ -1438,8 +1442,8 @@ fn build_items(
     hidden: RwSignal<HashSet<String>>,
     active_conn: RwSignal<u64>,
     search_history: RwSignal<Vec<schemaic_core::search_history::SearchEntry>>,
-    open_table: &Rc<dyn Fn(String, String)>,
-    open_table_col: &Rc<dyn Fn(String, String, String)>,
+    open_table: &Rc<dyn Fn(TableSource)>,
+    open_table_col: &Rc<dyn Fn(TableSource, String)>,
     close: &Rc<dyn Fn()>,
     query: RwSignal<String>,
     caret_end: RwSignal<u64>,
@@ -1460,15 +1464,10 @@ fn build_items(
                 return recent
                     .into_iter()
                     .map(|e| {
-                        let left = lookup_result_icon(
-                            db_nodes,
-                            &e.database,
-                            &e.table,
-                            e.column.as_deref(),
-                        );
+                        let source = TableSource::new(e.database, e.schema, e.table);
+                        let left = lookup_result_icon(db_nodes, &source, e.column.as_deref());
                         search_result_item(
-                            e.database,
-                            e.table,
+                            source,
                             e.column,
                             left,
                             true, // history row → trailing clock marker
@@ -1486,8 +1485,7 @@ fn build_items(
                 .into_iter()
                 .map(|hit| {
                     search_result_item(
-                        hit.db,
-                        hit.table,
+                        hit.source,
                         hit.column,
                         Some(hit.icon),
                         false,
@@ -2164,8 +2162,7 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
 /// table (`column: Some`). Clicking either opens the table.
 #[derive(Clone)]
 struct FindHit {
-    db: String,
-    table: String,
+    source: TableSource,
     column: Option<String>,
     /// The schema-style icon for this hit (table/view or column-by-type+key).
     icon: ResultIcon,
@@ -2187,10 +2184,11 @@ fn find_matches(
             for t in &schema.tables {
                 // A table-name match lists the table itself; then each matching
                 // column is listed as its own `table.column` hit.
+                let source =
+                    TableSource::new(node.database.clone(), t.schema.clone(), t.name.clone());
                 if q.is_empty() || t.name.to_lowercase().contains(q) {
                     out.push(FindHit {
-                        db: node.database.clone(),
-                        table: t.name.clone(),
+                        source: source.clone(),
                         column: None,
                         icon: table_result_icon(t),
                     });
@@ -2202,8 +2200,7 @@ fn find_matches(
                     for c in &t.columns {
                         if c.name.to_lowercase().contains(q) {
                             out.push(FindHit {
-                                db: node.database.clone(),
-                                table: t.name.clone(),
+                                source: source.clone(),
                                 column: Some(c.name.clone()),
                                 icon: column_result_icon(t, c),
                             });

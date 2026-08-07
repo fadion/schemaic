@@ -142,6 +142,12 @@ impl<'a> CellRef<'a> {
 pub struct ColumnOrigin {
     /// Real schema (database) the column belongs to.
     pub database: String,
+    /// PostgreSQL namespace the table lives in (`public`, `sales`, …), from the
+    /// prepared column's `table_oid`. `None` on MySQL, which has no level between
+    /// database and table. Part of the table's identity: without it, same-named
+    /// tables in two schemas collapse into one and an `UPDATE` could hit the
+    /// wrong one.
+    pub schema: Option<String>,
     /// Real table (`org_table`), not the query alias.
     pub table: String,
     /// Real column name (`org_name`), not the query alias.
@@ -487,6 +493,10 @@ impl ResultBuilder {
 #[derive(Clone, Debug)]
 pub struct RowEdit {
     pub database: String,
+    /// PostgreSQL namespace of `table` (`None` on MySQL). The executor qualifies
+    /// with it **unconditionally** — this statement is never shown to the user,
+    /// so it must not depend on `search_path`.
+    pub schema: Option<String>,
     pub table: String,
     /// Columns to set → new value. `Some(text)` is bound as a string param (the
     /// server coerces to the column type); `None` sets SQL `NULL`.
@@ -504,6 +514,8 @@ pub struct RowEdit {
 #[derive(Clone, Debug)]
 pub struct RowInsert {
     pub database: String,
+    /// PostgreSQL namespace of `table` — see [`RowEdit::schema`].
+    pub schema: Option<String>,
     pub table: String,
     pub cols: Vec<(String, Option<String>)>,
 }
@@ -515,6 +527,8 @@ pub struct RowInsert {
 #[derive(Clone, Debug)]
 pub struct RowDelete {
     pub database: String,
+    /// PostgreSQL namespace of `table` — see [`RowEdit::schema`].
+    pub schema: Option<String>,
     pub table: String,
     pub key: Vec<(String, Value)>,
 }
@@ -543,6 +557,8 @@ impl GridWrite {
 #[derive(Clone, Debug)]
 pub struct RefetchTemplate {
     pub database: String,
+    /// PostgreSQL namespace of `table` — see [`RowEdit::schema`].
+    pub schema: Option<String>,
     pub table: String,
     /// Real column name for every result column, in result-column order.
     pub columns: Vec<String>,
@@ -663,6 +679,7 @@ mod tests {
         assert!(w.is_empty());
         w.updates.push(RowEdit {
             database: "d".to_string(),
+            schema: None,
             table: "t".to_string(),
             set: vec![],
             key: vec![],
@@ -672,6 +689,7 @@ mod tests {
         let mut w = GridWrite::default();
         w.inserts.push(RowInsert {
             database: "d".to_string(),
+            schema: None,
             table: "t".to_string(),
             cols: vec![],
         });
@@ -680,6 +698,7 @@ mod tests {
         let mut w = GridWrite::default();
         w.deletes.push(RowDelete {
             database: "d".to_string(),
+            schema: None,
             table: "t".to_string(),
             key: vec![],
         });

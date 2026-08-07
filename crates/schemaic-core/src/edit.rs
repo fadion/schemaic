@@ -16,6 +16,10 @@ use crate::schema::TableInfo;
 #[derive(Clone, Debug)]
 pub struct EditTable {
     pub database: String,
+    /// PostgreSQL namespace of `table` (`None` on MySQL). Carried through to the
+    /// staged `RowEdit`/`RowInsert`/`RowDelete` so the write names the same table
+    /// the row was read from, not whatever `search_path` resolves.
+    pub schema: Option<String>,
     pub table: String,
     pub key_cols: Vec<usize>,
 }
@@ -76,35 +80,41 @@ pub fn refetch_template(rs: &ResultSet, model: &EditModel) -> Option<RefetchTemp
     let mut columns = Vec::with_capacity(rs.columns.len());
     for col in &rs.columns {
         let o = col.origin.as_ref()?;
-        if o.database != tbl.database || o.table != tbl.table {
+        if o.database != tbl.database || o.schema != tbl.schema || o.table != tbl.table {
             return None;
         }
         columns.push(o.column.clone());
     }
     Some(RefetchTemplate {
         database: tbl.database.clone(),
+        schema: tbl.schema.clone(),
         table: tbl.table.clone(),
         columns,
         key_cols: tbl.key_cols.clone(),
     })
 }
 
-/// Compute the [`EditModel`]. `schema_for(database, table)` returns the loaded
-/// schema for a base table (or `None` if unknown) — the UI supplies a closure
-/// that reads its schema signals; tests supply a plain map.
+/// Compute the [`EditModel`]. `schema_for(database, schema, table)` returns the
+/// loaded schema for a base table (or `None` if unknown) — the UI supplies a
+/// closure that reads its schema signals; tests supply a plain map. `schema` is
+/// the PostgreSQL namespace, `None` on MySQL.
 pub fn analyze_edit(
     rs: &ResultSet,
-    schema_for: impl Fn(&str, &str) -> Option<TableInfo>,
+    schema_for: impl Fn(&str, Option<&str>, &str) -> Option<TableInfo>,
 ) -> EditModel {
     let ncols = rs.columns.len();
     let mut col_table: Vec<Option<usize>> = vec![None; ncols];
     let mut tables: Vec<EditTable> = Vec::new();
 
-    // Distinct (database, table) in first-seen order → its result columns.
-    let mut groups: Vec<((String, String), Vec<usize>)> = Vec::new();
+    // Distinct (database, schema, table) in first-seen order → its result
+    // columns. The namespace is part of the key: `sales.orders` and
+    // `archive.orders` are different tables, and merging them would let one
+    // table's key columns address the other's rows.
+    type TableKey = (String, Option<String>, String);
+    let mut groups: Vec<(TableKey, Vec<usize>)> = Vec::new();
     for (ci, col) in rs.columns.iter().enumerate() {
         let Some(o) = &col.origin else { continue };
-        let key = (o.database.clone(), o.table.clone());
+        let key = (o.database.clone(), o.schema.clone(), o.table.clone());
         if let Some(g) = groups.iter_mut().find(|(k, _)| *k == key) {
             g.1.push(ci);
         } else {
@@ -112,11 +122,12 @@ pub fn analyze_edit(
         }
     }
 
-    for ((db, table), cis) in &groups {
-        if let Some(key_cols) = resolve_key(&schema_for, db, table, cis, rs) {
+    for ((db, schema, table), cis) in &groups {
+        if let Some(key_cols) = resolve_key(&schema_for, db, schema.as_deref(), table, cis, rs) {
             let idx = tables.len();
             tables.push(EditTable {
                 database: db.clone(),
+                schema: schema.clone(),
                 table: table.clone(),
                 key_cols,
             });
@@ -140,8 +151,9 @@ pub fn analyze_edit(
 /// Find the result-column indices forming a usable row key for one base table,
 /// or `None` if the table's rows can't be identified safely (read-only).
 fn resolve_key(
-    schema_for: &impl Fn(&str, &str) -> Option<TableInfo>,
+    schema_for: &impl Fn(&str, Option<&str>, &str) -> Option<TableInfo>,
     db: &str,
+    schema: Option<&str>,
     table: &str,
     cis: &[usize],
     rs: &ResultSet,
@@ -168,7 +180,7 @@ fn resolve_key(
     let all_present =
         |names: &[String]| -> Option<Vec<usize>> { names.iter().map(|n| col_ci(n)).collect() };
 
-    let candidate: Option<Vec<usize>> = if let Some(t) = schema_for(db, table) {
+    let candidate: Option<Vec<usize>> = if let Some(t) = schema_for(db, schema, table) {
         // Primary key, if it's fully present in the result.
         let pk: Vec<String> = t
             .columns
@@ -237,13 +249,26 @@ mod tests {
     use crate::model::{Column, ColumnFlags, ColumnOrigin};
     use crate::schema::ColumnInfo;
 
-    /// A result column with a base-table origin.
+    /// A result column with a base-table origin (no namespace — the MySQL shape).
     fn col(name: &str, ty: &str, table: &str, pk: bool, binary: bool) -> Column {
+        col_in(None, name, ty, table, pk, binary)
+    }
+
+    /// As [`col`], but in an explicit PostgreSQL namespace.
+    fn col_in(
+        schema: Option<&str>,
+        name: &str,
+        ty: &str,
+        table: &str,
+        pk: bool,
+        binary: bool,
+    ) -> Column {
         Column {
             name: name.to_string(),
             type_name: ty.to_string(),
             origin: Some(ColumnOrigin {
                 database: "db".to_string(),
+                schema: schema.map(str::to_string),
                 table: table.to_string(),
                 column: name.to_string(),
                 flags: ColumnFlags {
@@ -263,6 +288,7 @@ mod tests {
     /// Schema table with the given primary-key column names (INT, NOT NULL).
     fn schema_with_pk(table: &str, pk: &[&str], cols: &[(&str, &str)]) -> TableInfo {
         TableInfo {
+            schema: None,
             name: table.to_string(),
             columns: cols
                 .iter()
@@ -286,13 +312,85 @@ mod tests {
             col("id", "INT", "users", true, false),
             col("name", "VARCHAR", "users", false, false),
         ]);
-        let schema = |_db: &str, t: &str| {
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
             (t == "users")
                 .then(|| schema_with_pk("users", &["id"], &[("id", "int"), ("name", "varchar")]))
         };
         let m = analyze_edit(&r, schema);
         assert!(m.editable(0));
         assert!(m.editable(1));
+    }
+
+    // ── multi-schema: the namespace is part of a table's identity ─────────
+
+    #[test]
+    fn same_table_name_in_two_schemas_stays_two_edit_tables() {
+        // `sales.orders` joined to `archive.orders`. Keying groups on the table
+        // name alone would fold them into one — and then one table's key columns
+        // would be used to address the other's rows.
+        let r = rs(vec![
+            col_in(Some("sales"), "id", "INT", "orders", true, false),
+            col_in(Some("sales"), "total", "INT", "orders", false, false),
+            col_in(Some("archive"), "id", "INT", "orders", true, false),
+        ]);
+        let schema = |_db: &str, s: Option<&str>, t: &str| {
+            (t == "orders").then(|| TableInfo {
+                schema: s.map(str::to_string),
+                ..schema_with_pk("orders", &["id"], &[("id", "int"), ("total", "int")])
+            })
+        };
+        let m = analyze_edit(&r, schema);
+        // Two distinct writable tables, each carrying its own namespace.
+        assert_eq!(m.table(0).map(|t| t.schema.as_deref()), Some(Some("sales")));
+        assert_eq!(
+            m.table(1).map(|t| t.schema.as_deref()),
+            Some(Some("archive"))
+        );
+        assert_eq!(m.table_index(0), Some(0));
+        assert_eq!(m.table_index(2), Some(1));
+        // Two writable tables → no single INSERT target.
+        assert!(m.insert_target().is_none());
+        // And the result isn't spliceable (a join across two base tables).
+        assert!(refetch_template(&r, &m).is_none());
+    }
+
+    #[test]
+    fn refetch_template_carries_the_namespace() {
+        let r = rs(vec![
+            col_in(Some("sales"), "id", "INT", "orders", true, false),
+            col_in(Some("sales"), "total", "INT", "orders", false, false),
+        ]);
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "orders")
+                .then(|| schema_with_pk("orders", &["id"], &[("id", "int"), ("total", "int")]))
+        };
+        let m = analyze_edit(&r, schema);
+        let tpl = refetch_template(&r, &m).expect("single base table is spliceable");
+        assert_eq!(tpl.schema.as_deref(), Some("sales"));
+        assert_eq!(tpl.table, "orders");
+    }
+
+    #[test]
+    fn analyze_edit_passes_the_namespace_to_the_schema_lookup() {
+        // The lookup must be able to tell the two apart; a closure that only
+        // answers for `sales` leaves an `archive` column read-only rather than
+        // silently borrowing the other schema's key.
+        let r = rs(vec![col_in(
+            Some("archive"),
+            "id",
+            "INT",
+            "orders",
+            false,
+            false,
+        )]);
+        let schema = |_db: &str, s: Option<&str>, t: &str| {
+            (s == Some("sales") && t == "orders")
+                .then(|| schema_with_pk("orders", &["id"], &[("id", "int")]))
+        };
+        let m = analyze_edit(&r, schema);
+        // No schema for `archive.orders`, and the wire flags say it isn't a PK →
+        // no usable key → read-only.
+        assert!(!m.editable(0));
     }
 
     #[test]
@@ -304,7 +402,7 @@ mod tests {
             col("id", "INT", "users", true, false),
             col("name", "VARCHAR", "users", false, false),
         ]);
-        let schema = |_db: &str, t: &str| {
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
             (t == "users")
                 .then(|| schema_with_pk("users", &["id"], &[("id", "int"), ("name", "varchar")]))
         };
@@ -320,7 +418,7 @@ mod tests {
             col("id", "INT", "docs", true, false),
             col("blob", "BLOB", "docs", false, true),
         ]);
-        let schema = |_db: &str, t: &str| {
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
             (t == "docs")
                 .then(|| schema_with_pk("docs", &["id"], &[("id", "int"), ("blob", "blob")]))
         };
@@ -333,7 +431,7 @@ mod tests {
             col("id", "VARBINARY", "b", true, true),
             col("v", "INT", "b", false, false),
         ]);
-        let schema2 = |_db: &str, t: &str| {
+        let schema2 = |_db: &str, _s: Option<&str>, t: &str| {
             (t == "b").then(|| schema_with_pk("b", &["id"], &[("id", "varbinary"), ("v", "int")]))
         };
         let m2 = analyze_edit(&r2, schema2);
@@ -347,7 +445,7 @@ mod tests {
             col("id", "FLOAT", "m", true, false),
             col("v", "INT", "m", false, false),
         ]);
-        let schema = |_db: &str, t: &str| {
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
             (t == "m").then(|| schema_with_pk("m", &["id"], &[("id", "float"), ("v", "int")]))
         };
         let m = analyze_edit(&r, schema);
@@ -360,8 +458,9 @@ mod tests {
         let mut expr = col("cnt", "BIGINT", "", false, false);
         expr.origin = None; // aggregate / expression
         let r = rs(vec![col("id", "INT", "t", true, false), expr]);
-        let schema =
-            |_db: &str, t: &str| (t == "t").then(|| schema_with_pk("t", &["id"], &[("id", "int")]));
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "t").then(|| schema_with_pk("t", &["id"], &[("id", "int")]))
+        };
         let m = analyze_edit(&r, schema);
         assert!(m.editable(0));
         assert!(!m.editable(1));
@@ -373,7 +472,7 @@ mod tests {
             col("id", "INT", "users", true, false),
             col("name", "VARCHAR", "users", false, false),
         ]);
-        let schema = |_db: &str, t: &str| {
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
             (t == "users")
                 .then(|| schema_with_pk("users", &["id"], &[("id", "int"), ("name", "varchar")]))
         };
@@ -390,8 +489,9 @@ mod tests {
         let mut expr = col("cnt", "BIGINT", "", false, false);
         expr.origin = None;
         let r = rs(vec![col("id", "INT", "t", true, false), expr]);
-        let schema =
-            |_db: &str, t: &str| (t == "t").then(|| schema_with_pk("t", &["id"], &[("id", "int")]));
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "t").then(|| schema_with_pk("t", &["id"], &[("id", "int")]))
+        };
         let m = analyze_edit(&r, schema);
         assert!(super::refetch_template(&r, &m).is_none());
     }
@@ -403,7 +503,7 @@ mod tests {
             col("id", "INT", "a", true, false),
             col("bid", "INT", "b", true, false),
         ]);
-        let schema = |_db: &str, t: &str| match t {
+        let schema = |_db: &str, _s: Option<&str>, t: &str| match t {
             "a" => Some(schema_with_pk("a", &["id"], &[("id", "int")])),
             "b" => Some(schema_with_pk("b", &["bid"], &[("bid", "int")])),
             _ => None,
@@ -419,7 +519,7 @@ mod tests {
             col("id", "INT", "users", true, false),
             col("name", "VARCHAR", "users", false, false),
         ]);
-        let schema = |_db: &str, t: &str| {
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
             (t == "users")
                 .then(|| schema_with_pk("users", &["id"], &[("id", "int"), ("name", "varchar")]))
         };
@@ -431,7 +531,7 @@ mod tests {
             col("id", "INT", "a", true, false),
             col("bid", "INT", "b", true, false),
         ]);
-        let schema2 = |_db: &str, t: &str| match t {
+        let schema2 = |_db: &str, _s: Option<&str>, t: &str| match t {
             "a" => Some(schema_with_pk("a", &["id"], &[("id", "int")])),
             "b" => Some(schema_with_pk("b", &["bid"], &[("bid", "int")])),
             _ => None,
@@ -449,7 +549,7 @@ mod tests {
             col("id", "INT", "users", true, false),
             col("name", "VARCHAR", "users", false, false),
         ]);
-        let schema = |_db: &str, t: &str| {
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
             (t == "users")
                 .then(|| schema_with_pk("users", &["id"], &[("id", "int"), ("name", "varchar")]))
         };
@@ -471,7 +571,7 @@ mod tests {
             col("id", "INT", "users", true, false),
             col("name", "VARCHAR", "users", false, false),
         ]);
-        let no_schema = |_db: &str, _t: &str| None;
+        let no_schema = |_db: &str, _s: Option<&str>, _t: &str| None;
         let m = analyze_edit(&r, no_schema);
         assert!(m.editable(0), "wire PK flag makes the table editable");
         assert!(m.editable(1));
@@ -496,8 +596,9 @@ mod tests {
             col("email", "VARCHAR", "users", false, false),
             col("name", "VARCHAR", "users", false, false),
         ]);
-        let schema = |_db: &str, t: &str| {
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
             (t == "users").then(|| TableInfo {
+                schema: None,
                 name: "users".to_string(),
                 columns: vec![
                     ColumnInfo {
@@ -531,8 +632,9 @@ mod tests {
         assert_eq!(t.key_cols, vec![0]); // email
 
         // A NULLABLE unique index is NOT a safe key → read-only.
-        let schema_nullable = |_db: &str, t: &str| {
+        let schema_nullable = |_db: &str, _s: Option<&str>, t: &str| {
             (t == "users").then(|| TableInfo {
+                schema: None,
                 name: "users".to_string(),
                 columns: vec![
                     ColumnInfo {

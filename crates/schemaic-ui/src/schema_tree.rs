@@ -21,7 +21,8 @@ use schemaic_core::db_color::DbColorRule;
 use schemaic_core::favorite::FavoriteRule;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::schema::{
-    ColumnInfo, ColumnTypeClass, IndexInfo, SchemaState, TableInfo, classify_column_type,
+    ColumnInfo, ColumnTypeClass, IndexInfo, SchemaState, TableInfo, TableSource,
+    classify_column_type,
 };
 use schemaic_core::text::plural;
 
@@ -52,6 +53,54 @@ struct Nav {
 fn nav_select(nav: Nav, key: String) {
     nav.selected.set(Some(key.clone()));
     nav.reveal.set(Some(key));
+}
+
+// ── Tree identity: one place that builds every node's key ────────────────────
+//
+// Keys are shared by the expand/collapse set, the nav cursor, and the persisted
+// expansion state, so the render and `visible_nav_rows` must agree exactly. A
+// table's key uses its *display* name (`schema.table` outside PostgreSQL's
+// `public`), which keeps every MySQL and single-schema key byte-identical to
+// what earlier versions wrote — a saved expansion set still applies.
+
+fn db_key(database: &str) -> String {
+    format!("db:{database}")
+}
+
+/// A PostgreSQL namespace group. Only rendered when a database has more than one
+/// (see [`schema_groups`]), so this key never appears for MySQL.
+fn schema_key(database: &str, schema: &str) -> String {
+    format!("sch:{database}:{schema}")
+}
+
+fn table_key(database: &str, t: &TableInfo) -> String {
+    format!(
+        "tbl:{database}:{}",
+        schemaic_core::schema::display_name(t.schema.as_deref(), &t.name)
+    )
+}
+
+fn column_key(database: &str, t: &TableInfo, column: &str) -> String {
+    format!(
+        "col:{database}:{}:{column}",
+        schemaic_core::schema::display_name(t.schema.as_deref(), &t.name)
+    )
+}
+
+/// The namespaces to render as their own tree level, or empty when the tables
+/// should be listed flat directly under the database.
+///
+/// A schema level only earns its extra click when there's a choice to make: MySQL
+/// has no namespaces at all, and a PostgreSQL database with only `public` looks
+/// exactly as it did before multi-schema browsing existed.
+fn schema_groups(schema: &schemaic_core::schema::DbSchema) -> Vec<String> {
+    let names = schema.schemas();
+    if names.len() > 1 { names } else { Vec::new() }
+}
+
+/// The source identity of a schema-tree table row.
+fn table_source(database: &str, t: &TableInfo) -> schemaic_core::schema::TableSource {
+    schemaic_core::schema::TableSource::new(database, t.schema.clone(), t.name.clone())
 }
 
 // One row in the flattened, currently-visible tree (respecting expand state,
@@ -119,7 +168,7 @@ fn visible_nav_rows(
                 continue;
             }
         }
-        let db_key = format!("db:{}", n.database);
+        let db_key = db_key(&n.database);
         let db_open = exp.contains(&db_key) || filtering;
         rows.push(NavRow {
             key: db_key.clone(),
@@ -133,34 +182,69 @@ fn visible_nav_rows(
         let Some(schema) = schema else {
             continue;
         };
-        for t in &schema.tables {
-            if filtering && !db_hit && !t.matches_search(&filt) {
-                continue;
+        // Mirror the tree: with >1 PostgreSQL namespace, tables hang off a schema
+        // row; otherwise they hang off the database directly.
+        let groups = schema_groups(schema);
+        let push_tables = |rows: &mut Vec<NavRow>, parent: &String, ns: Option<&str>| {
+            // A schema whose own name matches shows all its tables, like `db_hit`.
+            let ns_hit = filtering && ns.is_some_and(|s| s.to_lowercase().contains(&filt));
+            for t in schema.tables.iter().filter(|t| t.schema.as_deref() == ns) {
+                if filtering && !db_hit && !ns_hit && !t.matches_search(&filt) {
+                    continue;
+                }
+                let tbl_key = table_key(&n.database, t);
+                // A column match force-reveals the table's columns/keys (like the tree).
+                let force_cols = filtering && t.any_column_matches(&filt);
+                let tbl_open = exp.contains(&tbl_key) || force_cols;
+                rows.push(NavRow {
+                    key: tbl_key.clone(),
+                    parent: Some(parent.clone()),
+                    expandable: true,
+                    expanded: tbl_open,
+                });
+                if !tbl_open {
+                    continue;
+                }
+                for c in &t.columns {
+                    rows.push(NavRow {
+                        key: column_key(&n.database, t, &c.name),
+                        parent: Some(tbl_key.clone()),
+                        expandable: false,
+                        expanded: false,
+                    });
+                }
+                // Key/index rows are intentionally *not* navigable: they open
+                // nowhere, so keyboard-selecting them would be a dead end (columns
+                // are the only leaf that acts on Enter/double-click).
             }
-            let tbl_key = format!("tbl:{}:{}", n.database, t.name);
-            // A column match force-reveals the table's columns/keys (like the tree).
-            let force_cols = filtering && t.any_column_matches(&filt);
-            let tbl_open = exp.contains(&tbl_key) || force_cols;
+        };
+        if groups.is_empty() {
+            push_tables(&mut rows, &db_key, None);
+            continue;
+        }
+        for ns in &groups {
+            let ns_hit = filtering && ns.to_lowercase().contains(&filt);
+            if filtering
+                && !db_hit
+                && !ns_hit
+                && !schema
+                    .tables
+                    .iter()
+                    .any(|t| t.schema.as_deref() == Some(ns.as_str()) && t.matches_search(&filt))
+            {
+                continue; // no match in this namespace → the group is hidden
+            }
+            let key = schema_key(&n.database, ns);
+            let open = exp.contains(&key) || filtering;
             rows.push(NavRow {
-                key: tbl_key.clone(),
+                key: key.clone(),
                 parent: Some(db_key.clone()),
                 expandable: true,
-                expanded: tbl_open,
+                expanded: open,
             });
-            if !tbl_open {
-                continue;
+            if open {
+                push_tables(&mut rows, &key, Some(ns));
             }
-            for c in &t.columns {
-                rows.push(NavRow {
-                    key: format!("col:{}:{}:{}", n.database, t.name, c.name),
-                    parent: Some(tbl_key.clone()),
-                    expandable: false,
-                    expanded: false,
-                });
-            }
-            // Key/index rows are intentionally *not* navigable: they open nowhere,
-            // so keyboard-selecting them would be a dead end (columns are the only
-            // leaf that acts on Enter/double-click).
         }
     }
     rows
@@ -309,6 +393,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                     db_favorites,
                     dialect,
                     nav,
+                    indent: 0.0,
                 },
             )
         },
@@ -330,8 +415,8 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
             nav.focused.set(true);
             // Start from the active table whenever one is open and visible;
             // otherwise resume wherever the cursor last was.
-            if let Some((db, tbl)) = active_table.get_untracked() {
-                let k = format!("tbl:{db}:{tbl}");
+            if let Some(src) = active_table.get_untracked() {
+                let k = format!("tbl:{}:{}", src.database, src.display());
                 let rows = visible_nav_rows(
                     db_nodes,
                     expanded,
@@ -356,29 +441,28 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
             };
             // Enter opens the selected row: a table row → open it (new tab, or the
             // existing one — see `open_table`); a column row → open its table and
-            // highlight the column (mirrors the column double-click). Columns are
-            // matched by reconstructing their exact nav key from the schema rather
-            // than parsing `col:db:table:name` (identifiers may contain ':').
+            // highlight the column (mirrors the column double-click). BOTH are
+            // matched by rebuilding their exact nav key from the schema rather than
+            // parsing it — identifiers may contain ':' and, now, a '.' that a
+            // schema-qualified key also uses.
             if matches!(ke.key.logical_key, Key::Named(NamedKey::Enter)) {
                 if let Some(sel) = nav.selected.get_untracked() {
                     'find: for node in db_nodes.get_untracked() {
-                        let tbl_prefix = format!("tbl:{}:", node.database);
-                        if let Some(table) = sel.strip_prefix(&tbl_prefix) {
-                            (nav_open_table)(node.database.clone(), table.to_string());
-                            break 'find;
-                        }
-                        if let SchemaState::Loaded(schema) = node.schema.get_untracked() {
-                            for t in &schema.tables {
-                                for c in &t.columns {
-                                    let k = format!("col:{}:{}:{}", node.database, t.name, c.name);
-                                    if k == sel {
-                                        (nav_open_table_col)(
-                                            node.database.clone(),
-                                            t.name.clone(),
-                                            c.name.clone(),
-                                        );
-                                        break 'find;
-                                    }
+                        let SchemaState::Loaded(schema) = node.schema.get_untracked() else {
+                            continue;
+                        };
+                        for t in &schema.tables {
+                            if table_key(&node.database, t) == sel {
+                                (nav_open_table)(table_source(&node.database, t));
+                                break 'find;
+                            }
+                            for c in &t.columns {
+                                if column_key(&node.database, t, &c.name) == sel {
+                                    (nav_open_table_col)(
+                                        table_source(&node.database, t),
+                                        c.name.clone(),
+                                    );
+                                    break 'find;
                                 }
                             }
                         }
@@ -556,11 +640,15 @@ struct SchemaTreeCtx {
     expanded: RwSignal<HashSet<String>>,
     filter: RwSignal<String>,
     on_toggle: Rc<dyn Fn(String)>,
-    open_table: Rc<dyn Fn(String, String)>,
+    open_table: Rc<dyn Fn(TableSource)>,
     /// Open the column's table and highlight that column in the grid (column-row
     /// double-click).
-    open_table_col: Rc<dyn Fn(String, String, String)>,
-    active_table: RwSignal<Option<(String, String)>>,
+    open_table_col: Rc<dyn Fn(TableSource, String)>,
+    active_table: RwSignal<Option<TableSource>>,
+    /// Extra left inset (px) for rows below the database level, so a table nested
+    /// under a PostgreSQL schema group sits one level deeper than a flat one. `0.0`
+    /// whenever tables hang off the database directly.
+    indent: f64,
     active_db: Memo<Option<String>>,
     context_menu: RwSignal<Option<CtxMenu>>,
     /// The active connection id + the app-wide DB-colour store, for the identity
@@ -589,8 +677,9 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
         db_favorites,
         dialect,
         nav,
+        ..
     } = ctx;
-    let key = format!("db:{}", conn.database);
+    let key = db_key(&conn.database);
     let schema_sig = conn.schema;
 
     let toggle_row = on_toggle.clone();
@@ -727,6 +816,56 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                 .into_any(),
                 SchemaState::Failed(e) => info_row(e, theme::error()).into_any(),
                 SchemaState::Loaded(schema) => {
+                    let db = database.clone();
+                    let child_ctx = |indent: f64| SchemaTreeCtx {
+                        expanded,
+                        filter,
+                        on_toggle: toggle_tables.clone(),
+                        open_table: ot_tables.clone(),
+                        open_table_col: otc_tables.clone(),
+                        active_table,
+                        active_db,
+                        context_menu,
+                        active_conn,
+                        db_colors,
+                        db_favorites,
+                        dialect,
+                        nav,
+                        indent,
+                    };
+                    // More than one PostgreSQL namespace → group the tables under a
+                    // schema row each. A single-schema (or MySQL) database keeps the
+                    // flat list it has always had.
+                    let groups = schema_groups(&schema);
+                    if !groups.is_empty() {
+                        let visible: Vec<String> = groups
+                            .into_iter()
+                            .filter(|ns| {
+                                !filtering
+                                    || db_hit
+                                    || ns.to_lowercase().contains(&filt)
+                                    || schema.tables.iter().any(|t| {
+                                        t.schema.as_deref() == Some(ns.as_str())
+                                            && t.matches_search(&filt)
+                                    })
+                            })
+                            .collect();
+                        if visible.is_empty() {
+                            return empty().into_any();
+                        }
+                        let schema = std::sync::Arc::new(schema);
+                        return v_stack_from_iter(visible.into_iter().map(move |ns| {
+                            schema_node(
+                                db.clone(),
+                                ns,
+                                schema.clone(),
+                                db_hit,
+                                child_ctx(LEVEL_INDENT),
+                            )
+                        }))
+                        .style(|s| s.flex_col())
+                        .into_any();
+                    }
                     let tables: Vec<TableInfo> = schema
                         .tables
                         .into_iter()
@@ -741,35 +880,127 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                             info_row("No tables", theme::text_muted()).into_any()
                         };
                     }
-                    let db = database.clone();
-                    let ot = ot_tables.clone();
-                    let otc = otc_tables.clone();
-                    let toggle = toggle_tables.clone();
-                    v_stack_from_iter(tables.into_iter().map(move |t| {
-                        table_node(
-                            db.clone(),
-                            t,
-                            SchemaTreeCtx {
-                                expanded,
-                                filter,
-                                on_toggle: toggle.clone(),
-                                open_table: ot.clone(),
-                                open_table_col: otc.clone(),
-                                active_table,
-                                active_db,
-                                context_menu,
-                                active_conn,
-                                db_colors,
-                                db_favorites,
-                                dialect,
-                                nav,
-                            },
-                        )
-                    }))
+                    v_stack_from_iter(
+                        tables
+                            .into_iter()
+                            .map(move |t| table_node(db.clone(), t, child_ctx(0.0))),
+                    )
                     .style(|s| s.flex_col())
                     .into_any()
                 }
             }
+        },
+    );
+
+    v_stack((header, children)).style(|s| s.flex_col())
+}
+
+// A PostgreSQL namespace node: a header row over the tables in that schema.
+// Rendered only when the database has more than one (see `schema_groups`), so a
+// MySQL or `public`-only tree is untouched. Purely structural — a schema row
+// opens nothing, so (like key/index rows) it isn't a keyboard-Enter target,
+// though it is navigable and expandable.
+fn schema_node(
+    database: String,
+    ns: String,
+    schema: std::sync::Arc<schemaic_core::schema::DbSchema>,
+    db_hit: bool,
+    ctx: SchemaTreeCtx,
+) -> impl IntoView {
+    let SchemaTreeCtx {
+        expanded,
+        filter,
+        on_toggle,
+        nav,
+        ..
+    } = ctx.clone();
+    let key = schema_key(&database, &ns);
+    let table_count = schema
+        .tables
+        .iter()
+        .filter(|t| t.schema.as_deref() == Some(ns.as_str()))
+        .count();
+
+    let toggle_row = on_toggle.clone();
+    let key_row = key.clone();
+    let name_term = {
+        let f = filter.get_untracked();
+        let f = f.trim();
+        (!f.is_empty()).then(|| f.to_string())
+    };
+    let header = h_stack((
+        chevron(expanded, key.clone(), on_toggle),
+        // Muted: a schema row is structural, not something you open — it should
+        // read quieter than the database above and the tables below it.
+        icons::icon(icons::FOLDER, SCHEMA_ICON as f32).style(move |s| {
+            s.color(theme::text_muted())
+                .margin_left(CHEVRON_GAP)
+                .margin_right(ICON_GAP)
+                .flex_shrink(0.0_f32)
+        }),
+        highlight_text(
+            ns.clone(),
+            name_term,
+            theme::FONT_BODY,
+            theme::text,
+            false,
+            1.0,
+        ),
+        capsule(format!(
+            "{table_count} {}",
+            plural(table_count, "table", "tables")
+        )),
+    ))
+    .on_double_click_stop(move |_| (toggle_row)(key_row.clone()))
+    .style({
+        let hl = key.clone();
+        move |s| {
+            let s = tree_row(s, ROW_PAD + LEVEL_INDENT).gap(6.0);
+            if is_nav_selected(nav, &hl) {
+                s.background(theme::row_selected())
+            } else {
+                s
+            }
+        }
+    });
+    let header = with_nav_scroll(header.into_any(), nav, key.clone());
+
+    let key_children = key.clone();
+    let ns_children = ns.clone();
+    let children = dyn_container(
+        move || (expanded.get().contains(&key_children), filter.get()),
+        move |(open, filt)| {
+            let filt = filt.trim().to_lowercase();
+            let filtering = !filt.is_empty();
+            if !open && !filtering {
+                return empty().into_any();
+            }
+            // The schema's own name matching reveals all its tables, mirroring the
+            // database-level `db_hit` rule.
+            let ns_hit = filtering && ns_children.to_lowercase().contains(&filt);
+            let tables: Vec<TableInfo> = schema
+                .tables
+                .iter()
+                .filter(|t| t.schema.as_deref() == Some(ns_children.as_str()))
+                .filter(|t| !filtering || db_hit || ns_hit || t.matches_search(&filt))
+                .cloned()
+                .collect();
+            if tables.is_empty() {
+                return if filtering {
+                    empty().into_any()
+                } else {
+                    info_row("No tables", theme::text_muted()).into_any()
+                };
+            }
+            let db = database.clone();
+            let ctx = ctx.clone();
+            v_stack_from_iter(
+                tables
+                    .into_iter()
+                    .map(move |t| table_node(db.clone(), t, ctx.clone())),
+            )
+            .style(|s| s.flex_col())
+            .into_any()
         },
     );
 
@@ -790,6 +1021,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
         context_menu,
         dialect,
         nav,
+        indent,
         ..
     } = ctx;
     // The active filter term to highlight in the table + column names (the tree
@@ -811,7 +1043,8 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
         }
         None => false,
     };
-    let key = format!("tbl:{}:{}", database, table.name);
+    let key = table_key(&database, &table);
+    let source = table_source(&database, &table);
     let col_count = table.columns.len();
     let key_count = table.indexes.len();
     let ddl = table.create_ddl(dialect);
@@ -822,12 +1055,14 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
         (icons::TABLE, theme::table_icon())
     };
 
-    let dbl_db = database.clone();
-    let dbl_table = table.name.clone();
-    let hl_db = database.clone();
-    let hl_table = table.name.clone();
+    let dbl_source = source.clone();
+    let hl_source = source.clone();
     let ctx_db = database.clone();
     let ctx_table = table.name.clone();
+    // Qualified in the AI prompt + the context menu's title, so a question about
+    // `sales.orders` isn't answered about `public.orders`.
+    let ctx_display = source.display();
+    let col_source = source.clone();
     let header = h_stack((
         chevron(expanded, key.clone(), on_toggle),
         icons::icon(glyph, SCHEMA_ICON as f32).style(move |s| {
@@ -845,29 +1080,30 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
             1.0,
         ),
     ))
-    .on_double_click_stop(move |_| (open_table)(dbl_db.clone(), dbl_table.clone()))
+    .on_double_click_stop(move |_| (open_table)(dbl_source.clone()))
     .on_secondary_click_stop(move |_| {
         let ai_prompt = format!(
-            "Explain the `{ctx_table}` table in the `{ctx_db}` database: what each column \
+            "Explain the `{ctx_display}` table in the `{ctx_db}` database: what each column \
              represents, the primary key, and any foreign-key relationships. Keep it concise."
         );
         context_menu.set(Some(CtxMenu {
             kind: CtxKind::Table {
                 database: ctx_db.clone(),
+                schema: source.schema.clone(),
                 table: ctx_table.clone(),
                 ddl: ddl.clone(),
             },
-            name: ctx_table.clone(),
+            name: ctx_display.clone(),
             ai_prompt,
         }));
     })
     .style({
         let hl = key.clone();
         move |s| {
-            let s = tree_row(s, ROW_PAD + LEVEL_INDENT);
+            let s = tree_row(s, ROW_PAD + LEVEL_INDENT + indent);
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
-            } else if active_table.get().as_ref() == Some(&(hl_db.clone(), hl_table.clone())) {
+            } else if active_table.get().as_ref() == Some(&hl_source) {
                 s.background(theme::row_active())
             } else {
                 s
@@ -891,8 +1127,8 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
             if !open {
                 return empty().into_any();
             }
-            let counts = count_row(col_count, key_count);
-            let (cdb, ctbl) = (cols_db.clone(), cols_table.clone());
+            let counts = count_row(col_count, key_count, indent);
+            let csrc = col_source.clone();
             let otc = open_table_col.clone();
             let cterm = col_term.clone();
             // Foreign-key referencing columns — tinted purple like their key.
@@ -914,11 +1150,11 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
                     c,
                     ckind,
                     context_menu,
-                    cdb.clone(),
-                    ctbl.clone(),
+                    csrc.clone(),
                     otc.clone(),
                     cterm.clone(),
                     nav,
+                    indent,
                 )
             }))
             .style(|s| s.flex_col());
@@ -929,7 +1165,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
             let keys_block = v_stack_from_iter(
                 sorted_idxs
                     .into_iter()
-                    .map(move |ix| key_row(ix, context_menu, kdb.clone(), ktbl.clone())),
+                    .map(move |ix| key_row(ix, context_menu, kdb.clone(), ktbl.clone(), indent)),
             )
             .style(|s| s.flex_col());
             v_stack((counts, cols_block, keys_block))
@@ -942,15 +1178,15 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
 }
 
 // The "N cols · M keys" capsule row shown directly under a table's header.
-fn count_row(cols: usize, keys: usize) -> impl IntoView {
+fn count_row(cols: usize, keys: usize, indent: f64) -> impl IntoView {
     h_stack((
         capsule(format!("{cols} {}", plural(cols, "col", "cols"))),
         capsule(format!("{keys} {}", plural(keys, "key", "keys"))),
     ))
-    .style(|s| {
+    .style(move |s| {
         s.flex_row()
             .gap(5.0)
-            .padding_left(LEAF_PAD)
+            .padding_left(LEAF_PAD + indent)
             .margin_top(6.0)
             .margin_bottom(6.0)
     })
@@ -1009,20 +1245,20 @@ fn column_row(
     c: ColumnInfo,
     kind: ColKey,
     context_menu: RwSignal<Option<CtxMenu>>,
-    database: String,
-    table: String,
-    open_table_col: Rc<dyn Fn(String, String, String)>,
+    source: TableSource,
+    open_table_col: Rc<dyn Fn(TableSource, String)>,
     term: Option<String>,
     nav: Nav,
+    indent: f64,
 ) -> impl IntoView {
     let name = c.name;
     let ty = c.type_name;
     let ctx_name = name.clone();
     let ctx_ty = ty.clone();
     // Double-click opens the column's table (reusing a tab) + highlights it.
-    let dbl_db = database.clone();
-    let dbl_table = table.clone();
+    let dbl_source = source.clone();
     let dbl_col = name.clone();
+    let (database, table) = (source.database.clone(), source.display());
     let nav_key = format!("col:{database}:{table}:{name}");
     // The glyph always reflects the column's *type* family — the key glyph is for
     // the key/index rows, not the columns they cover (so `id` is a numeric column,
@@ -1053,9 +1289,7 @@ fn column_row(
     // The name inherits `kind.color()`; the icon overrides to 50% of it above and
     // the type text to muted.
     .style(move |s| s.color(kind.color()).items_center())
-    .on_double_click_stop(move |_| {
-        (open_table_col)(dbl_db.clone(), dbl_table.clone(), dbl_col.clone())
-    })
+    .on_double_click_stop(move |_| (open_table_col)(dbl_source.clone(), dbl_col.clone()))
     .on_secondary_click_stop(move |_| {
         let ai_prompt = format!(
             "In `{database}`.`{table}`, explain the `{ctx_name}` column (type `{ctx_ty}`) — \
@@ -1070,7 +1304,7 @@ fn column_row(
     .style({
         let hl = nav_key.clone();
         move |s| {
-            let s = tree_row(s, COL_PAD);
+            let s = tree_row(s, COL_PAD + indent);
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
             } else {
@@ -1088,6 +1322,7 @@ fn key_row(
     context_menu: RwSignal<Option<CtxMenu>>,
     database: String,
     table: String,
+    indent: f64,
 ) -> impl IntoView {
     let (color, tag) = if ix.is_primary() {
         (theme::key_primary(), "UNIQUE")
@@ -1132,7 +1367,7 @@ fn key_row(
     })
     // Non-interactive: static layout (no hover), and not in the nav sequence, so
     // it never shows a selection highlight either — it opens nowhere.
-    .style(|s| tree_row_static(s, COL_PAD))
+    .style(move |s| tree_row_static(s, COL_PAD + indent))
 }
 
 // A clickable disclosure chevron: chevron-down when expanded, chevron-right
@@ -1242,4 +1477,109 @@ fn schema_search(filter: RwSignal<String>) -> impl IntoView {
         },
     )
     .style(|s| s.margin_left(12.0).margin_right(12.0).flex_shrink(0.0_f32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use schemaic_core::schema::DbSchema;
+
+    fn tbl(ns: Option<&str>, name: &str) -> TableInfo {
+        TableInfo {
+            name: name.to_string(),
+            schema: ns.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    // ── when the tree grows a schema level ────────────────────────────────
+
+    #[test]
+    fn mysql_never_gets_a_schema_level() {
+        // No namespaces at all → the flat list every MySQL user already has.
+        let s = DbSchema {
+            tables: vec![tbl(None, "users"), tbl(None, "orders")],
+        };
+        assert!(schema_groups(&s).is_empty());
+    }
+
+    #[test]
+    fn a_public_only_database_stays_flat() {
+        // One namespace is no choice at all — grouping would just cost a click.
+        let s = DbSchema {
+            tables: vec![tbl(Some("public"), "album"), tbl(Some("public"), "artist")],
+        };
+        assert!(schema_groups(&s).is_empty());
+    }
+
+    #[test]
+    fn more_than_one_namespace_groups_public_first() {
+        let s = DbSchema {
+            tables: vec![
+                tbl(Some("sales"), "orders"),
+                tbl(Some("public"), "staging"),
+                tbl(Some("analytics"), "daily"),
+            ],
+        };
+        assert_eq!(schema_groups(&s), vec!["public", "analytics", "sales"]);
+    }
+
+    #[test]
+    fn a_single_non_public_namespace_also_stays_flat() {
+        // Everything lives in one schema that just isn't `public`: still no choice
+        // to present, so no level — the table rows carry the qualifier themselves.
+        let s = DbSchema {
+            tables: vec![tbl(Some("sales"), "orders")],
+        };
+        assert!(schema_groups(&s).is_empty());
+    }
+
+    // ── node keys ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn table_keys_are_unchanged_for_mysql_and_public() {
+        // The expand/collapse set is persisted, so these keys must stay exactly
+        // what earlier versions wrote or every saved expansion silently resets.
+        assert_eq!(table_key("shop", &tbl(None, "users")), "tbl:shop:users");
+        assert_eq!(
+            table_key("chinook", &tbl(Some("public"), "album")),
+            "tbl:chinook:album"
+        );
+        assert_eq!(
+            column_key("shop", &tbl(None, "users"), "id"),
+            "col:shop:users:id"
+        );
+    }
+
+    #[test]
+    fn table_keys_separate_same_named_tables_in_two_schemas() {
+        let a = table_key("warehouse", &tbl(Some("public"), "orders"));
+        let b = table_key("warehouse", &tbl(Some("sales"), "orders"));
+        assert_eq!(a, "tbl:warehouse:orders");
+        assert_eq!(b, "tbl:warehouse:sales.orders");
+        assert_ne!(a, b, "one expand state must not toggle both rows");
+
+        let ca = column_key("warehouse", &tbl(Some("public"), "orders"), "id");
+        let cb = column_key("warehouse", &tbl(Some("sales"), "orders"), "id");
+        assert_ne!(ca, cb);
+    }
+
+    #[test]
+    fn schema_key_is_namespaced_by_database() {
+        assert_eq!(schema_key("warehouse", "sales"), "sch:warehouse:sales");
+        assert_ne!(
+            schema_key("warehouse", "sales"),
+            schema_key("other", "sales")
+        );
+    }
+
+    #[test]
+    fn table_source_carries_the_namespace() {
+        let s = table_source("warehouse", &tbl(Some("sales"), "orders"));
+        assert_eq!(s.database, "warehouse");
+        assert_eq!(s.schema.as_deref(), Some("sales"));
+        assert_eq!(s.table, "orders");
+        // MySQL rows carry none, so they compare equal to a restored source.
+        assert_eq!(table_source("shop", &tbl(None, "users")).schema, None);
+    }
 }

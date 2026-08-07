@@ -985,14 +985,25 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                 })
             };
 
-            // Double-clicking a table closes the modal and opens/reveals it.
+            // Double-clicking a table closes the modal and opens/reveals it. The
+            // diagram identifies nodes by bare table name, so the namespace is
+            // resolved back out of the introspected schema (`find_table` prefers
+            // `public` when two schemas share a name).
             let reveal: Rc<dyn Fn(String)> = {
                 let ot = open_table.clone();
                 let db = target.database.clone();
                 let close = close.clone();
-                Rc::new(move |table| {
+                let resolved = schema.clone();
+                Rc::new(move |table: String| {
                     (close)();
-                    (ot)(db.clone(), table);
+                    let ns = resolved
+                        .find_table(None, &table)
+                        .and_then(|t| t.schema.clone());
+                    (ot)(schemaic_core::schema::TableSource::new(
+                        db.clone(),
+                        ns,
+                        table,
+                    ));
                 })
             };
 
