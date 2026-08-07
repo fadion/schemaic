@@ -77,17 +77,28 @@ struct ClosedTab {
 }
 /// Record one executed query into history: `(conn_id, database, sql, tab_name)`.
 type RecordHistoryFn = Rc<dyn Fn(u64, Option<String>, String, Option<String>)>;
+
+/// Resolve the pinned session a tab's statements must run on: `Ok(None)` in
+/// Auto-commit (fresh connection per op, as everywhere else), `Err` when the tab
+/// is Manual but its connection isn't up.
+type SessionForFn = Rc<dyn Fn(&Tab) -> Result<Option<Arc<Session>>, String>>;
+/// End a tab's transaction — `(tab id, commit?, what to run once it's settled)`.
+type EndTxFn = Rc<dyn Fn(usize, bool, Option<Rc<dyn Fn()>>)>;
+/// Settle an open transaction before an action that would strand it —
+/// `(tab id, what the user is doing, the action to resume)`.
+type GuardTxFn = Rc<dyn Fn(usize, String, Rc<dyn Fn()>)>;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::persist::{self, ConnectionsFile, UiState};
 use schemaic_core::schema::SchemaState;
-use schemaic_db::{Db, DbError};
+use schemaic_core::tx::{StmtOutcome, TxEngine, TxMode, TxState};
+use schemaic_db::{Db, DbError, Session};
 use schemaic_ui::theme::{EditorThemeKind, UiThemeKind};
 use schemaic_ui::{
     AiActions, AiEffort, AiModel, AiUi, ChatMessage, ConnActions, ConnNode, ConnUi, CtxMenu,
     DraftSignals, HistoryActions, HistoryUi, InlineAiRequest, InlineAiState, LayoutUi,
     MonitorEntry, OverlayUi, PlanState, ResultPanel, RightPanel, Role, SchemaActions, SchemaScope,
-    SchemaUi, Tab, TabsActions, TabsUi, TermActions, TermCursor, TermUi, TestState, Ui,
-    pick_connection_color,
+    SchemaUi, Tab, TabsActions, TabsUi, TermActions, TermCursor, TermUi, TestState, TxChoice,
+    TxPrompt, Ui, pick_connection_color,
 };
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -421,6 +432,16 @@ fn seed_connection() -> Connection {
     }
 }
 
+/// Which engine's transaction semantics apply — the divergence that
+/// [`schemaic_core::tx`] encodes (Postgres poisons a transaction on any error;
+/// MySQL implicitly commits on DDL).
+fn tx_engine(db: &Db) -> TxEngine {
+    match db.engine() {
+        schemaic_db::Engine::Postgres => TxEngine::Postgres,
+        schemaic_db::Engine::MySql => TxEngine::MySql,
+    }
+}
+
 fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let cx = Scope::current();
 
@@ -583,6 +604,14 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         Rc::new(RefCell::new(HashMap::new()));
     let run_gen = Rc::new(Cell::new(0u64));
 
+    // Pinned connections for tabs in manual-transaction mode: tab id → session.
+    // Absent for every tab in Auto-commit (the default), which keeps using a
+    // fresh connection per operation — the session map is the *only* place this
+    // app holds a connection open across UI actions. Entries are created lazily
+    // on a Manual tab's first statement and removed (rolled back + closed) when
+    // the tab leaves Manual, closes, or its connection goes away.
+    let sessions: Rc<RefCell<HashMap<usize, Arc<Session>>>> = Rc::new(RefCell::new(HashMap::new()));
+
     // Cache of established SSH tunnels: connection id → live tunnel handle.
     // Keeps us from re-opening a tunnel on every schema reload; dropping a handle
     // (evict/replace) tears down its listener + local port (review H9).
@@ -615,6 +644,28 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 None
             };
             Ok(Db::connect(&conn, tunnel))
+        })
+    };
+
+    // The pinned session a tab's statements must run on, or `None` when the tab
+    // is in Auto-commit and every op gets its own fresh connection.
+    //
+    // `Err` means the tab *is* in Manual but its connection isn't up yet — the
+    // session opens asynchronously when the mode is switched, so there's a brief
+    // window (and a permanent one if that open failed). Running the statement on
+    // a fresh connection instead would silently escape the transaction the user
+    // asked for, so this refuses rather than guesses.
+    let session_for: SessionForFn = {
+        let sessions = sessions.clone();
+        Rc::new(move |tab: &Tab| match tab.tx_mode.get_untracked() {
+            TxMode::Auto => Ok(None),
+            TxMode::Manual => match sessions.borrow().get(&tab.id).cloned() {
+                Some(s) => Ok(Some(s)),
+                None => Err(
+                    "the transaction connection isn't ready — switch to Auto-commit and back"
+                        .to_string(),
+                ),
+            },
         })
     };
 
@@ -690,7 +741,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let find_open = RwSignal::new(false);
     let find_query = RwSignal::new(String::new());
     let error_modal_open = RwSignal::new(false);
+    let error_modal_text: RwSignal<Option<String>> = RwSignal::new(None);
     let conn_status = RwSignal::new(ConnStatus::Unknown);
+    // Pending "you have an open transaction" question (see `TxPrompt`).
+    let tx_prompt: RwSignal<Option<TxPrompt>> = RwSignal::new(None);
 
     // Query-plan (EXPLAIN) modal signals.
     let plan_open = RwSignal::new(false);
@@ -772,6 +826,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         let tokens = tokens.clone();
         let run_gen = run_gen.clone();
         let db_for = db_for.clone();
+        let session_for = session_for.clone();
         let record_history = record_history.clone();
         Rc::new(move |sql: String, is_view: bool| {
             if sql.trim().is_empty() {
@@ -787,6 +842,20 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             // Resolve this tab's own connection (not necessarily the active one).
             let db = match db_for(tab.conn_id.get_untracked()) {
                 Ok(db) => db,
+                Err(e) => {
+                    if is_view {
+                        view_err.set(Some(e));
+                    } else {
+                        tab.result_tabs.set(Vec::new());
+                        results.set(QueryState::Failed(e));
+                    }
+                    return;
+                }
+            };
+            // In Manual mode the statement runs on the tab's pinned connection,
+            // inside the transaction, instead of on a fresh one.
+            let session = match session_for(&tab) {
+                Ok(s) => s,
                 Err(e) => {
                     if is_view {
                         view_err.set(Some(e));
@@ -826,37 +895,65 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             }
 
             let tokens_done = tokens.clone();
-            let send = create_ext_action(cx, move |state: QueryState| {
-                // Only apply if this run still owns the tab (else a newer run or
-                // a close superseded it — don't clobber their state/token).
-                if tokens_done.borrow().get(&id).map(|(g, _)| *g) != Some(generation) {
-                    return;
-                }
-                tokens_done.borrow_mut().remove(&id);
-                if is_view {
-                    match state {
-                        // Success → swap in the filtered result, then bump the load
-                        // nonce so the grid rebuilds despite Loaded→Loaded. Order
-                        // matters: the rebuild reads `results` untracked, so the new
-                        // Arc must already be in place before the nonce changes.
-                        QueryState::Loaded(_) => {
-                            results.set(state);
-                            load_gen.update(|g| *g = g.wrapping_add(1));
-                            view_err.set(None);
-                        }
-                        // Error → keep the current table, show the message in the bar.
-                        QueryState::Failed(m) => view_err.set(Some(m)),
-                        // Cancelled/superseded → leave the table + error untouched.
-                        _ => {}
+            let tx_sql = sql.clone();
+            let engine = tx_engine(&db);
+            let send = create_ext_action(
+                cx,
+                move |(state, stmt): (QueryState, Option<StmtOutcome>)| {
+                    // Fold the transaction state first, and unconditionally: it
+                    // tracks the *connection*, so it stays true even when a newer run
+                    // has superseded this one for display purposes.
+                    if let Some(stmt) = stmt {
+                        tab.tx
+                            .update(|t| *t = t.on_statement(engine, &tx_sql, stmt));
                     }
-                } else {
-                    results.set(state);
-                }
-            });
+                    // Only apply if this run still owns the tab (else a newer run or
+                    // a close superseded it — don't clobber their state/token).
+                    if tokens_done.borrow().get(&id).map(|(g, _)| *g) != Some(generation) {
+                        return;
+                    }
+                    tokens_done.borrow_mut().remove(&id);
+                    if is_view {
+                        match state {
+                            // Success → swap in the filtered result, then bump the load
+                            // nonce so the grid rebuilds despite Loaded→Loaded. Order
+                            // matters: the rebuild reads `results` untracked, so the new
+                            // Arc must already be in place before the nonce changes.
+                            QueryState::Loaded(_) => {
+                                results.set(state);
+                                load_gen.update(|g| *g = g.wrapping_add(1));
+                                view_err.set(None);
+                            }
+                            // Error → keep the current table, show the message in the bar.
+                            QueryState::Failed(m) => view_err.set(Some(m)),
+                            // Cancelled/superseded → leave the table + error untouched.
+                            _ => {}
+                        }
+                    } else {
+                        results.set(state);
+                    }
+                },
+            );
             // Read the row cap on the UI thread (signals are single-threaded).
             let cap = row_limit.get_untracked();
+            // `BEGIN` is issued lazily, on the first statement of a transaction,
+            // so flipping to Manual and changing your mind costs nothing.
+            let needs_begin = session.is_some() && !tab.tx.get_untracked().is_open();
             handle.spawn(async move {
-                let state = match db.fetch_query(database.as_deref(), &sql, cap, token).await {
+                let (res, stmt) = match &session {
+                    Some(s) => {
+                        if needs_begin && let Err(e) = s.begin().await {
+                            tracing::error!("BEGIN failed: {e}");
+                        }
+                        let out = s.fetch_query(&sql, cap, token).await;
+                        (out.result, Some(out.stmt))
+                    }
+                    None => (
+                        db.fetch_query(database.as_deref(), &sql, cap, token).await,
+                        None,
+                    ),
+                };
+                let state = match res {
                     Ok(rs) => {
                         tracing::info!(
                             "query ok: {} rows (truncated={}), {} cols in {} ms",
@@ -876,7 +973,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         QueryState::Failed(e.to_string())
                     }
                 };
-                send(state);
+                send((state, stmt));
             });
         })
     };
@@ -1047,6 +1144,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         let tokens = tokens.clone();
         let run_gen = run_gen.clone();
         let db_for = db_for.clone();
+        let session_for = session_for.clone();
         let record_history = record_history.clone();
         Rc::new(move |stmts: Vec<String>| {
             let stmts: Vec<String> = stmts.into_iter().filter(|s| !s.trim().is_empty()).collect();
@@ -1059,6 +1157,13 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             };
             let db = match db_for(tab.conn_id.get_untracked()) {
                 Ok(db) => db,
+                Err(e) => {
+                    tab.results.set(QueryState::Failed(e));
+                    return;
+                }
+            };
+            let session = match session_for(&tab) {
+                Ok(s) => s,
                 Err(e) => {
                     tab.results.set(QueryState::Failed(e));
                     return;
@@ -1096,30 +1201,76 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
 
             let result_tabs = tab.result_tabs;
             let tokens_done = tokens.clone();
-            let send = create_ext_action(cx, move |states: Vec<QueryState>| {
-                // Only apply if this batch still owns the tab (see `run`).
-                if tokens_done.borrow().get(&id).map(|(g, _)| *g) != Some(generation) {
-                    return;
-                }
-                tokens_done.borrow_mut().remove(&id);
-                result_tabs.update(|panels| {
-                    for (p, st) in panels.iter_mut().zip(states) {
-                        p.state = st;
+            let engine = tx_engine(&db);
+            // The batch's effect on the transaction is folded per statement, in
+            // order — a MySQL DDL halfway through implicitly commits, and the
+            // statements after it belong to a *new* transaction.
+            let tx_stmts = stmts.clone();
+            let send = create_ext_action(
+                cx,
+                move |(states, outcomes): (Vec<QueryState>, Vec<Option<StmtOutcome>>)| {
+                    for (sql, stmt) in tx_stmts.iter().zip(&outcomes) {
+                        if let Some(stmt) = stmt {
+                            tab.tx.update(|t| *t = t.on_statement(engine, sql, *stmt));
+                        }
                     }
-                });
-            });
+                    // Only apply if this batch still owns the tab (see `run`).
+                    if tokens_done.borrow().get(&id).map(|(g, _)| *g) != Some(generation) {
+                        return;
+                    }
+                    tokens_done.borrow_mut().remove(&id);
+                    result_tabs.update(|panels| {
+                        for (p, st) in panels.iter_mut().zip(states) {
+                            p.state = st;
+                        }
+                    });
+                },
+            );
             let cap = row_limit.get_untracked();
+            let needs_begin = session.is_some() && !tab.tx.get_untracked().is_open();
             handle.spawn(async move {
                 let mut states: Vec<QueryState> = vec![QueryState::Cancelled; n];
-                db.run_batch(database.as_deref(), &stmts, cap, token, |i, res| {
-                    states[i] = match res {
-                        Ok(rs) => QueryState::Loaded(Arc::new(rs)),
-                        Err(DbError::Cancelled) => QueryState::Cancelled,
-                        Err(e) => QueryState::Failed(e.to_string()),
-                    };
-                })
-                .await;
-                send(states);
+                let mut outcomes: Vec<Option<StmtOutcome>> = vec![None; n];
+                match &session {
+                    Some(s) => {
+                        if needs_begin && let Err(e) = s.begin().await {
+                            tracing::error!("BEGIN failed: {e}");
+                        }
+                        // The session runs statements one at a time on the pinned
+                        // connection, so each outcome is collected as it lands.
+                        let mut stopped = false;
+                        for (i, sql) in stmts.iter().enumerate() {
+                            if stopped || token.is_cancelled() {
+                                states[i] = QueryState::Cancelled;
+                                continue;
+                            }
+                            let out = s.fetch_query(sql, cap, token.clone()).await;
+                            outcomes[i] = Some(out.stmt);
+                            states[i] = match out.result {
+                                Ok(rs) => QueryState::Loaded(Arc::new(rs)),
+                                Err(DbError::Cancelled) => {
+                                    stopped = true;
+                                    QueryState::Cancelled
+                                }
+                                Err(e) => {
+                                    stopped = true;
+                                    QueryState::Failed(e.to_string())
+                                }
+                            };
+                        }
+                    }
+                    None => {
+                        db.run_batch(database.as_deref(), &stmts, cap, token, |i, res| {
+                            states[i] = match res {
+                                Ok(rs) => QueryState::Loaded(Arc::new(rs)),
+                                Err(DbError::Cancelled) => QueryState::Cancelled,
+                                Err(e) => QueryState::Failed(e.to_string()),
+                            };
+                        })
+                        .await;
+                    }
+                }
+                send((states, outcomes));
             });
         })
     };
@@ -1164,8 +1315,24 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         return;
                     }
                 };
+                // In Manual mode the edits join the tab's transaction (nested
+                // under a savepoint) instead of committing on their own.
+                let session = match session_for(&tab) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        (done)(CommitDone::Failed(e));
+                        return;
+                    }
+                };
                 let query = tab.query.get_untracked();
                 let run = run.clone();
+                let engine = tx_engine(&db);
+                let fold = create_ext_action(cx, move |stmt: StmtOutcome| {
+                    // A write batch is one unit as far as the transaction is
+                    // concerned, so it folds as a single statement.
+                    tab.tx
+                        .update(|t| *t = t.on_statement(engine, "UPDATE", stmt));
+                });
                 let finish = create_ext_action(cx, move |outcome: CommitDone| {
                     // A full re-run must happen on the UI thread and only if the
                     // committed tab is still active — `run` targets the active tab,
@@ -1189,31 +1356,260 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     };
                     (done)(outcome);
                 });
+                let needs_begin = session.is_some() && !tab.tx.get_untracked().is_open();
                 handle.spawn(async move {
                     let token = CancellationToken::new();
-                    match db.commit_writes(&write, token.clone()).await {
-                        Err(e) => {
-                            tracing::error!("commit failed: {e}");
-                            finish(CommitDone::Failed(e.to_string()));
+                    // Both branches write the rows and then, on success, re-read
+                    // them. The session branch keeps both on the pinned
+                    // connection — a fresh one couldn't see rows the transaction
+                    // hasn't committed.
+                    let written = match &session {
+                        Some(s) => {
+                            if needs_begin && let Err(e) = s.begin().await {
+                                tracing::error!("BEGIN failed: {e}");
+                            }
+                            let out = s.commit_writes(&write, token.clone()).await;
+                            fold(out.stmt);
+                            out.result
                         }
-                        Ok(_) => match refetch {
-                            // Splice path: re-fetch just the edited rows. If that
-                            // fails, fall back to a full re-run (data is committed).
-                            Some(req) => {
-                                match db.refetch_rows(&req.template, &req.rows, token).await {
-                                    Ok(rows) => finish(CommitDone::Spliced(rows)),
-                                    Err(e) => {
-                                        tracing::warn!("re-fetch after commit failed: {e}");
-                                        finish(CommitDone::FullReran);
-                                    }
+                        None => db.commit_writes(&write, token.clone()).await,
+                    };
+                    if let Err(e) = written {
+                        tracing::error!("commit failed: {e}");
+                        finish(CommitDone::Failed(e.to_string()));
+                        return;
+                    }
+                    match refetch {
+                        // Splice path: re-fetch just the edited rows. If that
+                        // fails, fall back to a full re-run (data is committed).
+                        Some(req) => {
+                            let rows = match &session {
+                                Some(s) => {
+                                    s.refetch_rows(&req.template, &req.rows, token).await.result
+                                }
+                                None => db.refetch_rows(&req.template, &req.rows, token).await,
+                            };
+                            match rows {
+                                Ok(rows) => finish(CommitDone::Spliced(rows)),
+                                Err(e) => {
+                                    tracing::warn!("re-fetch after commit failed: {e}");
+                                    finish(CommitDone::FullReran);
                                 }
                             }
-                            None => finish(CommitDone::FullReran),
-                        },
+                        }
+                        None => finish(CommitDone::FullReran),
                     }
                 });
             },
         )
+    };
+
+    // ── Manual-transaction controls ──────────────────────────────────────────
+    // Throw away a tab's pinned session, rolling back anything still open. Used
+    // whenever the tab stops being a Manual tab: mode switch, close, disconnect.
+    // The rollback is spawned, never awaited — the UI thread must not block on
+    // the network, and the server rolls back on disconnect regardless.
+    let drop_session: Rc<dyn Fn(usize)> = {
+        let sessions = sessions.clone();
+        let handle = handle.clone();
+        Rc::new(move |tab_id: usize| {
+            if let Some(s) = sessions.borrow_mut().remove(&tab_id) {
+                handle.spawn(async move {
+                    let _ = s.rollback().await;
+                    s.close().await;
+                });
+            }
+        })
+    };
+
+    // COMMIT or ROLLBACK a tab's transaction, then optionally resume whatever
+    // was waiting on the answer (the `TxPrompt` continuation). The tab stays in
+    // Manual and its session stays open, ready for the next transaction.
+    let end_tx: EndTxFn = {
+        let sessions = sessions.clone();
+        let handle = handle.clone();
+        Rc::new(
+            move |tab_id: usize, commit: bool, then: Option<Rc<dyn Fn()>>| {
+                let Some(tab) = tabs.with_untracked(|v| v.iter().find(|t| t.id == tab_id).copied())
+                else {
+                    return;
+                };
+                let Some(session) = sessions.borrow().get(&tab_id).cloned() else {
+                    // No session: nothing to end, but the state machine may still
+                    // be showing a lost transaction — clear it and carry on.
+                    tab.tx.set(TxState::closed());
+                    if let Some(then) = then {
+                        then();
+                    }
+                    return;
+                };
+                let done = create_ext_action(cx, move |err: Option<String>| {
+                    match err {
+                        // Even a failed COMMIT/ROLLBACK leaves no usable
+                        // transaction — the server has ended it or the connection
+                        // is gone — so the state resets either way; the message is
+                        // what the user acts on.
+                        Some(msg) => {
+                            tab.tx.set(TxState::closed());
+                            error_modal_text.set(Some(msg));
+                            error_modal_open.set(true);
+                        }
+                        None => tab.tx.set(TxState::closed()),
+                    }
+                    if let Some(then) = then.clone() {
+                        then();
+                    }
+                });
+                handle.spawn(async move {
+                    let r = if commit {
+                        session.commit().await
+                    } else {
+                        session.rollback().await
+                    };
+                    done(r.err().map(|e| e.to_string()));
+                });
+            },
+        )
+    };
+
+    // Ask about an open transaction before doing something that would strand it.
+    // `proceed` runs once the transaction is settled (or immediately when there
+    // is none); Cancel drops it entirely. Every path that can orphan a
+    // transaction — mode switch, tab close, database switch — goes through here,
+    // so the UI never has to remember to ask.
+    let guard_tx: GuardTxFn = {
+        let end_tx = end_tx.clone();
+        Rc::new(
+            move |tab_id: usize, action: String, proceed: Rc<dyn Fn()>| {
+                let state = tabs
+                    .with_untracked(|v| {
+                        v.iter()
+                            .find(|t| t.id == tab_id)
+                            .map(|t| t.tx.get_untracked())
+                    })
+                    .unwrap_or_default();
+                if !state.is_open() {
+                    proceed();
+                    return;
+                }
+                let end_tx = end_tx.clone();
+                tx_prompt.set(Some(TxPrompt {
+                    tab_id,
+                    action,
+                    stmts: state.stmts(),
+                    can_commit: state.can_commit(),
+                    resolve: Rc::new(move |choice| {
+                        tx_prompt.set(None);
+                        match choice {
+                            TxChoice::Commit => (end_tx)(tab_id, true, Some(proceed.clone())),
+                            TxChoice::Rollback => (end_tx)(tab_id, false, Some(proceed.clone())),
+                            TxChoice::Cancel => {}
+                        }
+                    }),
+                }));
+            },
+        )
+    };
+
+    // Pin a fresh connection for a Manual tab, replacing any it already had.
+    // Opened eagerly (so a bad connection is reported when the user asks for
+    // Manual, not at their first statement) but *not* begun — `BEGIN` is lazy.
+    // Also used to re-pin when the tab's database changes, since a PostgreSQL
+    // session is bound to one database for its whole life.
+    let open_session: Rc<dyn Fn(usize)> = {
+        let sessions = sessions.clone();
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        let drop_session = drop_session.clone();
+        Rc::new(move |tab_id: usize| {
+            let Some(tab) = tabs.with_untracked(|v| v.iter().find(|t| t.id == tab_id).copied())
+            else {
+                return;
+            };
+            (drop_session)(tab_id);
+            let db = match db_for(tab.conn_id.get_untracked()) {
+                Ok(db) => db,
+                Err(e) => {
+                    tab.tx_mode.set(TxMode::Auto);
+                    error_modal_text.set(Some(e));
+                    error_modal_open.set(true);
+                    return;
+                }
+            };
+            let database = tab.database.get_untracked();
+            let sessions = sessions.clone();
+            let opened =
+                create_ext_action(cx, move |res: Result<Arc<Session>, String>| match res {
+                    Ok(s) => {
+                        // A flip back to Auto (or a tab close) may have raced us;
+                        // don't resurrect a session nobody wants.
+                        if tab.tx_mode.get_untracked().is_manual() {
+                            sessions.borrow_mut().insert(tab_id, s);
+                        }
+                    }
+                    Err(e) => {
+                        tab.tx_mode.set(TxMode::Auto);
+                        error_modal_text
+                            .set(Some(format!("couldn't open a transaction connection: {e}")));
+                        error_modal_open.set(true);
+                    }
+                });
+            handle.spawn(async move {
+                opened(
+                    Session::open(&db, database.as_deref())
+                        .await
+                        .map_err(|e| e.to_string()),
+                );
+            });
+        })
+    };
+
+    // Flip a tab between Auto-commit and Manual. Auto is only reachable with no
+    // transaction open; the footer raises a `TxPrompt` first if there is one.
+    let set_tx_mode: Rc<dyn Fn(usize, TxMode)> = {
+        let drop_session = drop_session.clone();
+        let open_session = open_session.clone();
+        let guard_tx = guard_tx.clone();
+        Rc::new(move |tab_id: usize, mode: TxMode| {
+            let Some(tab) = tabs.with_untracked(|v| v.iter().find(|t| t.id == tab_id).copied())
+            else {
+                return;
+            };
+            if tab.tx_mode.get_untracked() == mode {
+                return;
+            }
+            match mode {
+                TxMode::Manual => {
+                    tab.tx.set(TxState::closed());
+                    tab.tx_mode.set(TxMode::Manual);
+                    (open_session)(tab_id);
+                }
+                // Leaving Manual with a transaction open would silently discard
+                // it, so ask; `guard_tx` runs this straight through when there's
+                // nothing open.
+                TxMode::Auto => {
+                    let drop_session = drop_session.clone();
+                    (guard_tx)(
+                        tab_id,
+                        "Switch to Auto-commit".to_string(),
+                        Rc::new(move || {
+                            tab.tx.set(TxState::closed());
+                            tab.tx_mode.set(TxMode::Auto);
+                            (drop_session)(tab_id);
+                        }),
+                    );
+                }
+            }
+        })
+    };
+
+    let commit_tx: Rc<dyn Fn(usize)> = {
+        let end_tx = end_tx.clone();
+        Rc::new(move |id: usize| (end_tx)(id, true, None))
+    };
+    let rollback_tx: Rc<dyn Fn(usize)> = {
+        let end_tx = end_tx.clone();
+        Rc::new(move |id: usize| (end_tx)(id, false, None))
     };
 
     // Active-database context. A tab carries its `(conn_id, database)`, so
@@ -1227,21 +1623,42 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         let id = active.get();
         tabs.with(|v| v.iter().find(|t| t.id == id).and_then(|t| t.database.get()))
     });
-    let set_active_db: Rc<dyn Fn(String)> = Rc::new(move |name: String| {
-        // The DB selector lists the active connection's databases, so picking one
-        // binds the active tab to the active connection + that database.
-        let exists = db_nodes.with_untracked(|ns| ns.iter().any(|n| n.database == name));
-        if exists {
+    let set_active_db: Rc<dyn Fn(String)> = {
+        let guard_tx = guard_tx.clone();
+        let open_session = open_session.clone();
+        Rc::new(move |name: String| {
+            // The DB selector lists the active connection's databases, so picking
+            // one binds the active tab to the active connection + that database.
+            let exists = db_nodes.with_untracked(|ns| ns.iter().any(|n| n.database == name));
+            if !exists {
+                return;
+            }
             let id = active.get_untracked();
-            tabs.with_untracked(|v| {
-                if let Some(t) = v.iter().find(|t| t.id == id) {
-                    t.conn_id.set(active_conn.get_untracked());
-                    t.database.set(Some(name.clone()));
-                }
-            });
-            last_db.set(Some(name));
-        }
-    });
+            let open_session = open_session.clone();
+            // A pinned session belongs to one database — PostgreSQL can't switch
+            // and MySQL's transaction context wouldn't survive the move — so an
+            // open transaction has to be settled before the tab moves.
+            (guard_tx)(
+                id,
+                format!("Switch to {name}"),
+                Rc::new(move || {
+                    let manual = tabs.with_untracked(|v| {
+                        if let Some(t) = v.iter().find(|t| t.id == id) {
+                            t.conn_id.set(active_conn.get_untracked());
+                            t.database.set(Some(name.clone()));
+                            t.tx_mode.get_untracked().is_manual()
+                        } else {
+                            false
+                        }
+                    });
+                    last_db.set(Some(name.clone()));
+                    if manual {
+                        (open_session)(id);
+                    }
+                }),
+            );
+        })
+    };
 
     // A new tab's target `(conn_id, database)`: the active connection, scoped to
     // the last database the user switched to, else its first database (so an
@@ -1277,10 +1694,15 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
 
     // Close a tab. Closing the last one clears it and briefly flashes it away
     // (design keeps ≥1 tab); other tabs activate a neighbor.
-    let close_tab: Rc<dyn Fn(usize)> = {
+    let close_tab_now: Rc<dyn Fn(usize)> = {
         let tokens = tokens.clone();
         let recently_closed = recently_closed.clone();
+        let drop_session = drop_session.clone();
         Rc::new(move |id: usize| {
+            // A Manual tab's pinned connection goes with it. By the time we get
+            // here any open transaction has been settled by `close_tab`'s prompt,
+            // so this is just releasing the connection.
+            (drop_session)(id);
             // Snapshot a closing tab into the reopen ring (most-recent first,
             // capped at 10) — but only if it holds something worth restoring.
             let record = |tab: &Tab| {
@@ -1368,6 +1790,24 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             if let Some(scope) = closed_cx {
                 exec_after(Duration::ZERO, move |_| scope.dispose());
             }
+        })
+    };
+
+    // Closing a tab with an open transaction asks first — the pinned connection
+    // dies with the tab, so an unanswered transaction would just vanish.
+    let close_tab: Rc<dyn Fn(usize)> = {
+        let close_tab_now = close_tab_now.clone();
+        let guard_tx = guard_tx.clone();
+        Rc::new(move |id: usize| {
+            let title = tabs
+                .with_untracked(|v| v.iter().find(|t| t.id == id).map(|t| t.title()))
+                .unwrap_or_else(|| "this tab".to_string());
+            let close_tab_now = close_tab_now.clone();
+            (guard_tx)(
+                id,
+                format!("Close {title}"),
+                Rc::new(move || (close_tab_now)(id)),
+            );
         })
     };
 
@@ -2963,6 +3403,9 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             run_all,
             cancel,
             commit_edits,
+            set_tx_mode,
+            commit_tx,
+            rollback_tx,
             add_tab,
             close_tab,
             toggle_pin,
@@ -2991,7 +3434,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             find_query,
             search_history,
             error_modal_open,
-            error_modal_text: RwSignal::new(None),
+            error_modal_text,
+            tx_prompt,
             plan_open,
             plan_state,
             plan_sql,
