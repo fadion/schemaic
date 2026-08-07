@@ -36,13 +36,13 @@ use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Db, DbError, FkColRow, assemble_schema, parse_typed};
+use crate::{Db, DbError, FkColRow, TxScope, assemble_schema, parse_typed};
 
 /// Open a fresh connection to a specific PostgreSQL database. Unlike MySQL,
 /// PostgreSQL requires connecting to a concrete database to run any statement.
 /// The background connection driver is spawned onto the tokio runtime and lives
 /// until the returned [`Client`] is dropped.
-async fn connect_to(db: &Db, database: &str) -> Result<Client, DbError> {
+pub(crate) async fn connect_to(db: &Db, database: &str) -> Result<Client, DbError> {
     let mut cfg = Config::new();
     cfg.host(&db.host)
         .port(db.port)
@@ -65,7 +65,7 @@ async fn connect_to(db: &Db, database: &str) -> Result<Client, DbError> {
 /// Connect to a *maintenance* database for server-level work (listing databases,
 /// health checks) — PostgreSQL has no server-level connection. Tries the usual
 /// always-present candidates in turn so it works whether or not `postgres` exists.
-async fn connect_maintenance(db: &Db) -> Result<Client, DbError> {
+pub(crate) async fn connect_maintenance(db: &Db) -> Result<Client, DbError> {
     let mut last: Option<DbError> = None;
     for cand in ["postgres", db.user.as_str(), "template1"] {
         match connect_to(db, cand).await {
@@ -251,7 +251,7 @@ pub(crate) async fn explain(
 /// isn't preparable (some utility statements) the columns fall back to those on
 /// the first returned row (names only). A statement with no result columns
 /// (DML/DDL) reports its affected-row count instead of a grid.
-async fn run_statement(
+pub(crate) async fn run_statement(
     client: &Client,
     database: &str,
     sql: &str,
@@ -777,61 +777,101 @@ pub(crate) async fn commit_writes(
     if database.is_empty() {
         return Ok(0);
     }
-    let mut client = connect_to(db, database).await?;
+    let client = connect_to(db, database).await?;
     let token = client.cancel_token();
 
-    let run = async {
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| DbError::Query(e.to_string()))?;
-        let mut total: u64 = 0;
-        for del in &write.deletes {
-            let n = tx
-                .execute(build_delete(del).as_str(), &[])
-                .await
-                .map_err(|e| DbError::Query(e.to_string()))?;
-            if n != 1 {
-                let _ = tx.rollback().await;
-                return Err(one_row_err("delete on", &del.database, &del.table, n));
-            }
-            total += n;
-        }
-        for edit in &write.updates {
-            let n = tx
-                .execute(build_update(edit).as_str(), &[])
-                .await
-                .map_err(|e| DbError::Query(e.to_string()))?;
-            if n != 1 {
-                let _ = tx.rollback().await;
-                return Err(one_row_err("update on", &edit.database, &edit.table, n));
-            }
-            total += n;
-        }
-        for ins in &write.inserts {
-            let n = tx
-                .execute(build_insert(ins).as_str(), &[])
-                .await
-                .map_err(|e| DbError::Query(e.to_string()))?;
-            if n != 1 {
-                let _ = tx.rollback().await;
-                return Err(one_row_err("insert into", &ins.database, &ins.table, n));
-            }
-            total += n;
-        }
-        tx.commit()
-            .await
-            .map_err(|e| DbError::Query(e.to_string()))?;
-        Ok(total)
-    };
-
     tokio::select! {
-        r = run => r,
+        r = write_on(&client, write, TxScope::Own) => r,
         _ = cancel.cancelled() => {
             let _ = token.cancel_query(NoTls).await;
             Err(DbError::Cancelled)
         }
     }
+}
+
+/// Apply a staged batch of grid mutations on an already-open client: deletes →
+/// updates → inserts, each required to affect exactly one row, the whole batch
+/// undone if any doesn't. `scope` decides whether that atomicity is a
+/// transaction of its own or a savepoint nested in the caller's transaction.
+///
+/// Control statements go through `batch_execute` — `BEGIN`/`SAVEPOINT` aren't
+/// preparable, so `execute` can't run them.
+pub(crate) async fn write_on(
+    client: &Client,
+    write: &GridWrite,
+    scope: TxScope,
+) -> Result<u64, DbError> {
+    let qerr = |e: tokio_postgres::Error| DbError::Query(e.to_string());
+    client
+        .batch_execute(scope.begin_sql())
+        .await
+        .map_err(qerr)?;
+
+    // One statement + its 1-row check; on a miss the batch is undone. Postgres
+    // needs the undo even for a plain error — the transaction is aborted until
+    // something rolls it back, and with a savepoint that something is us.
+    async fn one(
+        client: &Client,
+        scope: TxScope,
+        sql: String,
+        action: &str,
+        database: &str,
+        table: &str,
+    ) -> Result<u64, DbError> {
+        let n = match client.execute(sql.as_str(), &[]).await {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = client.batch_execute(scope.rollback_sql()).await;
+                return Err(DbError::Query(e.to_string()));
+            }
+        };
+        if n != 1 {
+            let _ = client.batch_execute(scope.rollback_sql()).await;
+            return Err(one_row_err(action, database, table, n));
+        }
+        Ok(n)
+    }
+
+    let mut total: u64 = 0;
+    for del in &write.deletes {
+        total += one(
+            client,
+            scope,
+            build_delete(del),
+            "delete on",
+            &del.database,
+            &del.table,
+        )
+        .await?;
+    }
+    for edit in &write.updates {
+        total += one(
+            client,
+            scope,
+            build_update(edit),
+            "update on",
+            &edit.database,
+            &edit.table,
+        )
+        .await?;
+    }
+    for ins in &write.inserts {
+        total += one(
+            client,
+            scope,
+            build_insert(ins),
+            "insert into",
+            &ins.database,
+            &ins.table,
+        )
+        .await?;
+    }
+
+    if let Err(e) = client.batch_execute(scope.commit_sql()).await {
+        let _ = client.batch_execute(scope.rollback_sql()).await;
+        return Err(qerr(e));
+    }
+    Ok(total)
 }
 
 /// Re-`SELECT` the given just-edited rows by their (post-edit) key, so the grid
@@ -849,6 +889,23 @@ pub(crate) async fn refetch_rows(
     let client = connect_to(db, &template.database).await?;
     let token = client.cancel_token();
 
+    tokio::select! {
+        r = refetch_on(&client, template, rows) => r,
+        _ = cancel.cancelled() => {
+            let _ = token.cancel_query(NoTls).await;
+            Err(DbError::Cancelled)
+        }
+    }
+}
+
+/// Re-`SELECT` just-edited rows on an already-open client. Read-only, so it is
+/// safe on a fresh connection and *necessary* inside an open transaction — only
+/// that connection can see the rows it just wrote but hasn't committed.
+pub(crate) async fn refetch_on(
+    client: &Client,
+    template: &RefetchTemplate,
+    rows: &[RefetchRow],
+) -> Result<Vec<(usize, Vec<Value>)>, DbError> {
     let proj = template
         .columns
         .iter()
@@ -869,7 +926,7 @@ pub(crate) async fn refetch_rows(
         }
     };
 
-    let run = async {
+    {
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let where_sql = template
@@ -907,14 +964,6 @@ pub(crate) async fn refetch_rows(
             }
         }
         Ok(out)
-    };
-
-    tokio::select! {
-        r = run => r,
-        _ = cancel.cancelled() => {
-            let _ = token.cancel_query(NoTls).await;
-            Err(DbError::Cancelled)
-        }
     }
 }
 

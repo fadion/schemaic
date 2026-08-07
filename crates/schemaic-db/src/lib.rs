@@ -12,7 +12,10 @@
 //! so it can't tell which real table/column a result cell came from.
 
 pub mod pg;
+pub mod session;
 pub mod ssh;
+
+pub use session::{Outcome, Session};
 
 use std::collections::HashMap;
 
@@ -20,7 +23,7 @@ use futures_util::StreamExt;
 use mysql_async::consts::{ColumnFlags, ColumnType};
 use mysql_async::prelude::Queryable;
 use mysql_async::{Column as MyColumn, Conn, Row, Value as MyValue};
-use mysql_async::{OptsBuilder, Params, TxOpts};
+use mysql_async::{OptsBuilder, Params};
 use schemaic_core::model::{
     Column, ColumnFlags as CoreColFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
     ResultBuilder, ResultSet, RowDelete, RowEdit, RowInsert, Value,
@@ -165,14 +168,18 @@ impl Db {
     }
 
     /// Open one connection to this endpoint (optionally scoped to a database).
-    async fn open(&self, database: Option<&str>, found_rows: bool) -> Result<Conn, DbError> {
+    pub(crate) async fn open(
+        &self,
+        database: Option<&str>,
+        found_rows: bool,
+    ) -> Result<Conn, DbError> {
         Conn::new(self.opts(database, found_rows))
             .await
             .map_err(|e| DbError::Connect(e.to_string()))
     }
 
     /// Best-effort server-side cancel: connect afresh and `KILL QUERY <id>`.
-    async fn kill_query(&self, conn_id: u32) {
+    pub(crate) async fn kill_query(&self, conn_id: u32) {
         if let Ok(mut killer) = self.open(None, false).await {
             let _ = killer.query_drop(format!("KILL QUERY {conn_id}")).await;
             let _ = killer.disconnect().await;
@@ -701,7 +708,7 @@ pub(crate) fn assemble_schema(
 /// stream is abandoned as soon as the cap is hit (the caller tears the
 /// connection down); when false, the rest is drained so the connection stays
 /// reusable for the next statement in a batch.
-async fn collect_rows(
+pub(crate) async fn collect_rows(
     conn: &mut Conn,
     sql: &str,
     row_cap: usize,
@@ -969,72 +976,8 @@ impl Db {
         let mut conn = self.open(None, true).await?;
         let conn_id = conn.id();
 
-        let run = async {
-            let mut tx = conn
-                .start_transaction(TxOpts::default())
-                .await
-                .map_err(|e| DbError::Query(e.to_string()))?;
-            let mut total: u64 = 0;
-            // Deletes first (so "delete a row then insert one with the same unique
-            // key" works), then updates, then inserts — all in the one transaction.
-            for del in &write.deletes {
-                let (sql, params) = build_delete(del);
-                tx.exec_drop(sql, params)
-                    .await
-                    .map_err(|e| DbError::Query(e.to_string()))?;
-                let affected = tx.affected_rows();
-                if affected != 1 {
-                    let _ = tx.rollback().await;
-                    return Err(DbError::Query(format!(
-                        "delete on `{}`.`{}` matched {affected} rows (expected exactly 1) — \
-                     rolled back all changes",
-                        del.database, del.table
-                    )));
-                }
-                total += affected;
-            }
-            // Then updates, then inserts.
-            for edit in &write.updates {
-                let (sql, params) = build_update(edit);
-                tx.exec_drop(sql, params)
-                    .await
-                    .map_err(|e| DbError::Query(e.to_string()))?;
-                let affected = tx.affected_rows();
-                if affected != 1 {
-                    // Roll back everything: the identity wasn't unique / current.
-                    let _ = tx.rollback().await;
-                    return Err(DbError::Query(format!(
-                        "update on `{}`.`{}` matched {affected} rows (expected exactly 1) — \
-                     rolled back all changes",
-                        edit.database, edit.table
-                    )));
-                }
-                total += affected;
-            }
-            for ins in &write.inserts {
-                let (sql, params) = build_insert(ins);
-                tx.exec_drop(sql, params)
-                    .await
-                    .map_err(|e| DbError::Query(e.to_string()))?;
-                let affected = tx.affected_rows();
-                if affected != 1 {
-                    let _ = tx.rollback().await;
-                    return Err(DbError::Query(format!(
-                        "insert into `{}`.`{}` added {affected} rows (expected exactly 1) — \
-                     rolled back all changes",
-                        ins.database, ins.table
-                    )));
-                }
-                total += affected;
-            }
-            tx.commit()
-                .await
-                .map_err(|e| DbError::Query(e.to_string()))?;
-            Ok(total)
-        };
-
         let outcome = tokio::select! {
-            r = run => r,
+            r = write_on(&mut conn, write, TxScope::Own) => r,
             _ = cancel.cancelled() => {
                 self.kill_query(conn_id).await;
                 Err(DbError::Cancelled)
@@ -1044,6 +987,145 @@ impl Db {
         let _ = conn.disconnect().await;
         outcome
     }
+}
+
+/// How a batch of writes gets its atomicity.
+///
+/// A fresh connection owns the whole transaction ([`TxScope::Own`]). Inside a
+/// user's **manual** transaction the batch must be atomic *without* ending that
+/// transaction, so it nests under a savepoint ([`TxScope::Savepoint`]) — the
+/// 1-row guard then rolls back only its own batch and leaves the surrounding
+/// transaction intact and usable. (On PostgreSQL the savepoint is what makes a
+/// failed batch recoverable at all: a bare error aborts the whole transaction.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TxScope {
+    Own,
+    Savepoint,
+}
+
+/// The savepoint is named `schemaic_w` throughout. A fixed name is safe because
+/// batches never overlap on one connection — the session serialises them behind
+/// its mutex — and it keeps these strings `&'static`.
+impl TxScope {
+    pub(crate) fn begin_sql(self) -> &'static str {
+        match self {
+            TxScope::Own => "BEGIN",
+            TxScope::Savepoint => "SAVEPOINT schemaic_w",
+        }
+    }
+
+    /// Make the batch permanent — for a savepoint that means releasing it, which
+    /// merges it into the enclosing transaction rather than committing anything.
+    pub(crate) fn commit_sql(self) -> &'static str {
+        match self {
+            TxScope::Own => "COMMIT",
+            TxScope::Savepoint => "RELEASE SAVEPOINT schemaic_w",
+        }
+    }
+
+    /// Undo the batch, and nothing beyond it.
+    pub(crate) fn rollback_sql(self) -> &'static str {
+        match self {
+            TxScope::Own => "ROLLBACK",
+            TxScope::Savepoint => "ROLLBACK TO SAVEPOINT schemaic_w",
+        }
+    }
+}
+
+/// Apply a staged batch of grid mutations on an already-open connection:
+/// deletes → updates → inserts, each required to affect exactly one row, the
+/// whole batch rolled back if any doesn't. `scope` decides whether that
+/// atomicity comes from a transaction of its own or a nested savepoint.
+///
+/// Deletes run first so "delete a row, then insert one with the same unique key"
+/// works. The caller is responsible for `client_found_rows` being on — the guard
+/// counts *matched* rows, not *changed* ones.
+pub(crate) async fn write_on(
+    conn: &mut Conn,
+    write: &GridWrite,
+    scope: TxScope,
+) -> Result<u64, DbError> {
+    let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
+    conn.query_drop(scope.begin_sql()).await.map_err(qerr)?;
+
+    // One statement + its 1-row check. On a miss the batch is undone and the
+    // error describes what happened, in the caller's terms.
+    #[allow(clippy::too_many_arguments)]
+    async fn one(
+        conn: &mut Conn,
+        scope: TxScope,
+        sql: String,
+        params: Params,
+        action: &str,
+        verb: &str,
+        database: &str,
+        table: &str,
+    ) -> Result<u64, DbError> {
+        let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
+        if let Err(e) = conn.exec_drop(sql, params).await {
+            let _ = conn.query_drop(scope.rollback_sql()).await;
+            return Err(qerr(e));
+        }
+        let affected = conn.affected_rows();
+        if affected != 1 {
+            let _ = conn.query_drop(scope.rollback_sql()).await;
+            return Err(DbError::Query(format!(
+                "{action} `{database}`.`{table}` {verb} {affected} rows (expected exactly 1) — \
+                 rolled back all changes"
+            )));
+        }
+        Ok(affected)
+    }
+
+    let mut total: u64 = 0;
+    for del in &write.deletes {
+        let (sql, params) = build_delete(del);
+        total += one(
+            conn,
+            scope,
+            sql,
+            params,
+            "delete on",
+            "matched",
+            &del.database,
+            &del.table,
+        )
+        .await?;
+    }
+    for edit in &write.updates {
+        let (sql, params) = build_update(edit);
+        total += one(
+            conn,
+            scope,
+            sql,
+            params,
+            "update on",
+            "matched",
+            &edit.database,
+            &edit.table,
+        )
+        .await?;
+    }
+    for ins in &write.inserts {
+        let (sql, params) = build_insert(ins);
+        total += one(
+            conn,
+            scope,
+            sql,
+            params,
+            "insert into",
+            "added",
+            &ins.database,
+            &ins.table,
+        )
+        .await?;
+    }
+
+    if let Err(e) = conn.query_drop(scope.commit_sql()).await {
+        let _ = conn.query_drop(scope.rollback_sql()).await;
+        return Err(qerr(e));
+    }
+    Ok(total)
 }
 
 impl Db {
@@ -1067,30 +1149,10 @@ impl Db {
         if self.engine == Engine::Postgres {
             return pg::refetch_rows(self, template, rows, cancel).await;
         }
-        let sql = build_refetch_sql(template);
-
         let mut conn = self.open(None, false).await?;
         let conn_id = conn.id();
-        let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
-        let run = async {
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                let params: Vec<MyValue> = row.key.iter().map(value_to_param).collect();
-                let mut result = conn
-                    .exec_iter(sql.as_str(), Params::Positional(params))
-                    .await
-                    .map_err(qerr)?;
-                // Column metadata (owned) before consuming the result stream.
-                let columns: Vec<Column> = result.columns_ref().iter().map(map_column).collect();
-                let fetched: Vec<Row> = result.collect::<Row>().await.map_err(qerr)?;
-                if let Some(r) = fetched.first() {
-                    out.push((row.data_row, convert_row(r, &columns)));
-                }
-            }
-            Ok(out)
-        };
         let outcome = tokio::select! {
-            r = run => r,
+            r = refetch_on(&mut conn, template, rows) => r,
             _ = cancel.cancelled() => {
                 self.kill_query(conn_id).await;
                 Err(DbError::Cancelled)
@@ -1099,6 +1161,34 @@ impl Db {
         let _ = conn.disconnect().await;
         outcome
     }
+}
+
+/// Re-`SELECT` just-edited rows on an already-open connection. Read-only, so it
+/// is safe both on a fresh connection and inside an open transaction — and
+/// inside one it is *required*, since only that connection can see the
+/// uncommitted rows it just wrote.
+pub(crate) async fn refetch_on(
+    conn: &mut Conn,
+    template: &RefetchTemplate,
+    rows: &[RefetchRow],
+) -> Result<Vec<(usize, Vec<Value>)>, DbError> {
+    let sql = build_refetch_sql(template);
+    let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let params: Vec<MyValue> = row.key.iter().map(value_to_param).collect();
+        let mut result = conn
+            .exec_iter(sql.as_str(), Params::Positional(params))
+            .await
+            .map_err(qerr)?;
+        // Column metadata (owned) before consuming the result stream.
+        let columns: Vec<Column> = result.columns_ref().iter().map(map_column).collect();
+        let fetched: Vec<Row> = result.collect::<Row>().await.map_err(qerr)?;
+        if let Some(r) = fetched.first() {
+            out.push((row.data_row, convert_row(r, &columns)));
+        }
+    }
+    Ok(out)
 }
 
 /// Build a parameterized `UPDATE db.table SET … WHERE …` for one row edit.

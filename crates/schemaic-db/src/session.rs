@@ -1,0 +1,332 @@
+//! A **pinned connection** for manual-transaction mode.
+//!
+//! Everywhere else in this crate a `Db` operation opens a fresh connection, runs,
+//! and disconnects — the app stays stateless and a dropped connection is never a
+//! problem. That model can't express a user-driven transaction: `BEGIN` and
+//! `COMMIT` are separate UI actions, minutes apart, with statements in between.
+//!
+//! A [`Session`] is the deliberate exception. It owns exactly one open connection
+//! behind a `tokio::Mutex` — the mutex is what makes it usable as `Arc<Session>`
+//! from spawned tasks, and it also serialises statements onto the connection,
+//! which the driver requires anyway. One session belongs to one query tab, for as
+//! long as that tab is in Manual mode.
+//!
+//! What runs here is the tab's own work: queries, batches, grid writes, and the
+//! re-fetch after a write (which *must* be on this connection — it's the only one
+//! that can see uncommitted rows). Read-only side channels — schema
+//! introspection, live-validate, EXPLAIN, the Live Monitor, AI/MCP — deliberately
+//! keep using fresh connections, so a long-running transaction never blocks them.
+//!
+//! The session doesn't track transaction state; it reports a
+//! [`StmtOutcome`] per operation and the app folds that into
+//! [`schemaic_core::tx::TxState`].
+
+use std::sync::Arc;
+
+use mysql_async::Conn;
+use mysql_async::prelude::Queryable;
+use schemaic_core::model::{GridWrite, RefetchRow, RefetchTemplate, ResultSet, Value};
+use schemaic_core::tx::StmtOutcome;
+use tokio::sync::Mutex;
+use tokio_postgres::{Client, NoTls};
+use tokio_util::sync::CancellationToken;
+
+use crate::{Db, DbError, Engine, TxScope, collect_rows, pg, refetch_on, write_on};
+
+/// An operation's result plus what it means for the enclosing transaction.
+///
+/// The two are separate on purpose: `Err(Query(..))` on MySQL leaves the
+/// transaction usable, the same error on PostgreSQL aborts it, and either engine
+/// can hand back an error that actually means "the connection is gone". The
+/// session is the only place that can tell those apart (it can probe the
+/// connection), so it does, and the caller just folds the verdict in.
+pub struct Outcome<T> {
+    pub result: Result<T, DbError>,
+    pub stmt: StmtOutcome,
+}
+
+impl<T> Outcome<T> {
+    fn ok(value: T) -> Self {
+        Outcome {
+            result: Ok(value),
+            stmt: StmtOutcome::Ok,
+        }
+    }
+}
+
+enum Backend {
+    MySql { conn: Conn, conn_id: u32 },
+    Postgres { client: Client },
+}
+
+/// One pinned connection, owned by one query tab in Manual mode.
+pub struct Session {
+    /// Kept so cancellation can open a *second* connection to `KILL QUERY` the
+    /// pinned one (MySQL); the pinned connection is busy running the statement
+    /// we're trying to kill.
+    db: Db,
+    database: Option<String>,
+    inner: Mutex<Backend>,
+}
+
+impl Session {
+    /// Open the pinned connection. No transaction is started yet — [`begin`] is
+    /// called lazily on the tab's first statement, so flipping to Manual and then
+    /// changing your mind costs nothing on the server.
+    ///
+    /// [`begin`]: Session::begin
+    pub async fn open(db: &Db, database: Option<&str>) -> Result<Arc<Session>, DbError> {
+        let backend = match db.engine() {
+            Engine::MySql => {
+                // `client_found_rows` matters: the write path's exactly-one-row
+                // guard counts *matched* rows, not *changed* ones. A pinned
+                // connection serves reads and writes both, so it has to be on
+                // here or the safety net quietly changes meaning.
+                let conn = db.open(database, true).await?;
+                let conn_id = conn.id();
+                Backend::MySql { conn, conn_id }
+            }
+            Engine::Postgres => {
+                // Postgres has no server-level connection; a session is bound to
+                // one database for its whole life. That's also why changing a
+                // tab's database with a transaction open has to prompt.
+                let client = match database {
+                    Some(d) => pg::connect_to(db, d).await?,
+                    None => pg::connect_maintenance(db).await?,
+                };
+                Backend::Postgres { client }
+            }
+        };
+        Ok(Arc::new(Session {
+            db: db.clone(),
+            database: database.map(|s| s.to_string()),
+            inner: Mutex::new(backend),
+        }))
+    }
+
+    pub fn engine(&self) -> Engine {
+        self.db.engine()
+    }
+
+    /// The database this session is pinned to.
+    pub fn database(&self) -> Option<&str> {
+        self.database.as_deref()
+    }
+
+    /// Run a bare control statement (`BEGIN` / `COMMIT` / `ROLLBACK`) on the
+    /// pinned connection.
+    async fn control(&self, sql: &str) -> Result<(), DbError> {
+        let mut guard = self.inner.lock().await;
+        match &mut *guard {
+            Backend::MySql { conn, .. } => conn
+                .query_drop(sql)
+                .await
+                .map_err(|e| DbError::Query(e.to_string())),
+            Backend::Postgres { client } => client
+                .batch_execute(sql)
+                .await
+                .map_err(|e| DbError::Query(e.to_string())),
+        }
+    }
+
+    pub async fn begin(&self) -> Result<(), DbError> {
+        self.control("BEGIN").await
+    }
+
+    pub async fn commit(&self) -> Result<(), DbError> {
+        self.control("COMMIT").await
+    }
+
+    /// Roll the transaction back. Also the way out of a PostgreSQL transaction
+    /// that a failed statement aborted (`25P02`).
+    pub async fn rollback(&self) -> Result<(), DbError> {
+        self.control("ROLLBACK").await
+    }
+
+    /// Close the pinned connection. Any open transaction is rolled back by the
+    /// server when the connection drops, but callers should `rollback()` first so
+    /// the intent is explicit rather than implied by a disconnect.
+    pub async fn close(&self) {
+        let mut guard = self.inner.lock().await;
+        match &mut *guard {
+            Backend::MySql { conn, .. } => {
+                // `Conn::disconnect` consumes the connection, which we can't do
+                // through a borrow — a quiet reset leaves the server tidy and the
+                // real teardown happens when the `Session` drops.
+                let _ = conn.query_drop("ROLLBACK").await;
+            }
+            Backend::Postgres { .. } => {
+                // Dropping the client ends the connection task.
+            }
+        }
+    }
+
+    /// Is the pinned connection still alive? Used to tell "the statement failed"
+    /// apart from "the connection died under us" — an idle-in-transaction timeout
+    /// or a server restart looks like an ordinary query error otherwise, and
+    /// silently reconnecting would hand the user a fresh, empty transaction while
+    /// their work was already discarded.
+    async fn alive(guard: &mut Backend) -> bool {
+        match guard {
+            Backend::MySql { conn, .. } => conn.ping().await.is_ok(),
+            Backend::Postgres { client } => !client.is_closed(),
+        }
+    }
+
+    /// Classify a finished operation for the transaction state machine.
+    async fn classify<T>(guard: &mut Backend, result: Result<T, DbError>) -> Outcome<T> {
+        let stmt = match &result {
+            Ok(_) => StmtOutcome::Ok,
+            Err(DbError::Cancelled) => StmtOutcome::Cancelled,
+            Err(_) => {
+                if Session::alive(guard).await {
+                    StmtOutcome::Failed
+                } else {
+                    StmtOutcome::ConnectionLost
+                }
+            }
+        };
+        Outcome { result, stmt }
+    }
+
+    /// Run one statement on the pinned connection, inside the open transaction.
+    pub async fn fetch_query(
+        &self,
+        sql: &str,
+        row_cap: usize,
+        cancel: CancellationToken,
+    ) -> Outcome<ResultSet> {
+        let mut guard = self.inner.lock().await;
+        let result = match &mut *guard {
+            Backend::MySql { conn, conn_id } => {
+                let conn_id = *conn_id;
+                tokio::select! {
+                    // `early_stop = false`: the connection outlives this
+                    // statement, so a truncated result must be drained fully to
+                    // leave it clean for the next one.
+                    r = collect_rows(conn, sql, row_cap, false) => r,
+                    _ = cancel.cancelled() => {
+                        self.db.kill_query(conn_id).await;
+                        Err(DbError::Cancelled)
+                    }
+                }
+            }
+            Backend::Postgres { client } => {
+                let token = client.cancel_token();
+                let db = self.database.as_deref().unwrap_or("");
+                tokio::select! {
+                    r = pg::run_statement(client, db, sql, row_cap, &cancel) => r,
+                    _ = cancel.cancelled() => {
+                        let _ = token.cancel_query(NoTls).await;
+                        Err(DbError::Cancelled)
+                    }
+                }
+            }
+        };
+        Session::classify(&mut guard, result).await
+    }
+
+    /// Run several statements in order on the pinned connection, reporting each
+    /// through `on_result` as it finishes. Stops at the first failure, like the
+    /// fresh-connection `run_batch`. Returns the outcome that decided the
+    /// transaction's fate (the first non-`Ok` one, else `Ok`).
+    pub async fn run_batch(
+        &self,
+        stmts: &[String],
+        row_cap: usize,
+        cancel: CancellationToken,
+        mut on_result: impl FnMut(usize, Result<ResultSet, DbError>),
+    ) -> StmtOutcome {
+        let mut verdict = StmtOutcome::Ok;
+        let mut stopped = false;
+        for (i, sql) in stmts.iter().enumerate() {
+            if stopped || cancel.is_cancelled() {
+                on_result(i, Err(DbError::Cancelled));
+                continue;
+            }
+            let out = self.fetch_query(sql, row_cap, cancel.clone()).await;
+            if out.result.is_err() {
+                stopped = true;
+                verdict = out.stmt;
+            }
+            on_result(i, out.result);
+        }
+        verdict
+    }
+
+    /// Apply staged grid edits inside the user's transaction.
+    ///
+    /// Nested under a savepoint, so the exactly-one-row guard rolls back its own
+    /// batch without ending the transaction the user is building. On PostgreSQL
+    /// the savepoint is also what keeps a failed batch recoverable.
+    pub async fn commit_writes(
+        &self,
+        write: &GridWrite,
+        cancel: CancellationToken,
+    ) -> Outcome<u64> {
+        if write.is_empty() {
+            return Outcome::ok(0);
+        }
+        let mut guard = self.inner.lock().await;
+        let result = match &mut *guard {
+            Backend::MySql { conn, conn_id } => {
+                let conn_id = *conn_id;
+                tokio::select! {
+                    r = write_on(conn, write, TxScope::Savepoint) => r,
+                    _ = cancel.cancelled() => {
+                        self.db.kill_query(conn_id).await;
+                        Err(DbError::Cancelled)
+                    }
+                }
+            }
+            Backend::Postgres { client } => {
+                let token = client.cancel_token();
+                tokio::select! {
+                    r = pg::write_on(client, write, TxScope::Savepoint) => r,
+                    _ = cancel.cancelled() => {
+                        let _ = token.cancel_query(NoTls).await;
+                        Err(DbError::Cancelled)
+                    }
+                }
+            }
+        };
+        Session::classify(&mut guard, result).await
+    }
+
+    /// Re-read just-edited rows **on this connection** — the only one that can
+    /// see rows written inside the open transaction.
+    pub async fn refetch_rows(
+        &self,
+        template: &RefetchTemplate,
+        rows: &[RefetchRow],
+        cancel: CancellationToken,
+    ) -> Outcome<Vec<(usize, Vec<Value>)>> {
+        if rows.is_empty() {
+            return Outcome::ok(Vec::new());
+        }
+        let mut guard = self.inner.lock().await;
+        let result = match &mut *guard {
+            Backend::MySql { conn, conn_id } => {
+                let conn_id = *conn_id;
+                tokio::select! {
+                    r = refetch_on(conn, template, rows) => r,
+                    _ = cancel.cancelled() => {
+                        self.db.kill_query(conn_id).await;
+                        Err(DbError::Cancelled)
+                    }
+                }
+            }
+            Backend::Postgres { client } => {
+                let token = client.cancel_token();
+                tokio::select! {
+                    r = pg::refetch_on(client, template, rows) => r,
+                    _ = cancel.cancelled() => {
+                        let _ = token.cancel_query(NoTls).await;
+                        Err(DbError::Cancelled)
+                    }
+                }
+            }
+        };
+        Session::classify(&mut guard, result).await
+    }
+}
