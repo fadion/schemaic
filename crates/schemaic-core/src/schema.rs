@@ -382,6 +382,16 @@ impl DbSchema {
             .or_else(|| by_name().next())
     }
 
+    /// The table whose [`display_name`] is `name` — the inverse of the naming used
+    /// for tree keys and ER-diagram node ids, for turning one of those back into a
+    /// real table. Matches `sales.orders` and, for a `public`/MySQL table, the bare
+    /// `orders`.
+    pub fn find_by_display(&self, name: &str) -> Option<&TableInfo> {
+        self.tables
+            .iter()
+            .find(|t| display_name(t.schema.as_deref(), &t.name) == name)
+    }
+
     /// Every table in one namespace, in introspection order. `None` selects the
     /// tables that carry no namespace (i.e. all of them, on MySQL).
     pub fn tables_in(&self, schema: Option<&str>) -> impl Iterator<Item = &TableInfo> {
@@ -913,6 +923,44 @@ mod tests {
         // Only this namespace's tables, blank-line separated.
         assert!(!out.contains("elsewhere"), "{out}");
         assert!(out.contains("\n\n"), "{out}");
+    }
+
+    #[test]
+    fn find_by_display_round_trips_the_naming() {
+        let s = DbSchema {
+            tables: vec![
+                TableInfo {
+                    name: "orders".into(),
+                    schema: Some("sales".into()),
+                    ..Default::default()
+                },
+                TableInfo {
+                    name: "orders".into(),
+                    schema: Some("public".into()),
+                    columns: vec![col("legacy", "text", true, false)],
+                    ..Default::default()
+                },
+            ],
+        };
+        // Every table round-trips through its own display name.
+        for t in &s.tables {
+            let found = s
+                .find_by_display(&display_name(t.schema.as_deref(), &t.name))
+                .expect("round-trips");
+            assert_eq!(found.schema, t.schema);
+        }
+        // And the two are told apart.
+        assert_eq!(
+            s.find_by_display("sales.orders")
+                .map(|t| t.schema.as_deref()),
+            Some(Some("sales"))
+        );
+        assert_eq!(
+            s.find_by_display("orders").map(|t| t.schema.as_deref()),
+            Some(Some("public"))
+        );
+        // A stub / unknown id resolves to nothing rather than guessing.
+        assert!(s.find_by_display("other_db.orders").is_none());
     }
 
     #[test]
