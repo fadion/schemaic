@@ -127,9 +127,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   `skip_comment` (and the `sql.rs` helpers built on them — `statement_bounds`/`ranges`/`range`,
   `read_only_reason`, `has_top_level_where`/`unsafe_reason`/`first_unsafe`/`contains_write`) take a
   `SqlDialect`, so pass the connection's dialect (Postgres `#` is an operator not a comment, `$tag$…$tag$`
-  is a string, `"…"` an identifier, `\`-escapes only in MySQL / PG `E'…'`). The one exception is
-  `intel::tokenize_range` (the mid-edit byte-position *fallback*), which stays MySQL-flavored on purpose
-  — the per-dialect AST is the primary, dialect-correct path.
+  is a string, `"…"` an identifier, `\`-escapes only in MySQL / PG `E'…'`). **No exceptions** —
+  `intel::tokenize_range` (the mid-edit byte-position *fallback*) is dialect-aware too, and so are the
+  `intel` entry points that reach it (`clause_context`/`clause_continuation`/`join_targets`/
+  `expand_star`/`signature_help` all take a `SqlDialect`). It additionally lifts a **quoted identifier**
+  out as a word — `` `t` `` on MySQL, `"t"` on PG — since that's the form Schemaic itself generates and
+  the fallback is exactly what runs mid-`WHERE`.
 - **Structure-aware SQL analysis goes through `schemaic_core::intel` (real per-dialect AST), not new
   hand-rolled scanners.** Scope resolution, completion context, and diagnostics build on the
   `sqlparser` AST (with a `skip_noncode` fallback for mid-edit); the **DB stays the semantic
@@ -140,6 +143,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   because per-occurrence positions can't come from the lexer. Name resolution here is deliberately
   conservative: an unenumerable source (unloaded/unknown table, `SELECT *` derived/CTE) is *open* so
   uncertainty never yields a false positive; the DB stays the authority for type checking.
+  **Read AST identifiers unquoted** — `Ident`/`ObjectNamePart`'s `Display` re-adds the quoting, so a
+  `` `t` ``/`"t"` name comes back quote-wrapped and never matches the catalog (which is keyed on bare
+  names). Go through `intel::object_name_parts`, or `Ident::value` for a lone identifier.
 - **One connection per operation — except a Manual-mode tab.** Every `Db` method opens a fresh
   connection, runs, and disconnects; that statelessness is why a dropped connection is never a
   problem. The *single* exception is manual-transaction mode: a tab set to `TxMode::Manual` pins one
