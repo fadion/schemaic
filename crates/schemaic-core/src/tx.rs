@@ -212,9 +212,9 @@ pub fn implicit_commit(engine: TxEngine, sql: &str) -> bool {
 pub fn pill_text(state: TxState) -> Option<String> {
     match state {
         TxState::Idle => None,
-        TxState::Open { stmts: 0 } => Some("Tx open".to_string()),
-        TxState::Open { stmts: 1 } => Some("Tx open · 1 stmt".to_string()),
-        TxState::Open { stmts } => Some(format!("Tx open · {stmts} stmts")),
+        // "3 Open" — the count is the useful part, and it sits next to Commit /
+        // Rollback in the status bar, which already says what it's counting.
+        TxState::Open { stmts } => Some(format!("{stmts} Open")),
         TxState::Poisoned { .. } => Some("Tx aborted — rollback to continue".to_string()),
         TxState::Lost => Some("Transaction lost".to_string()),
     }
@@ -418,18 +418,22 @@ mod tests {
     }
 
     #[test]
-    fn pill_counts_statements_with_correct_plural() {
+    fn pill_counts_open_statements() {
         assert_eq!(
             pill_text(TxState::Open { stmts: 0 }).as_deref(),
-            Some("Tx open")
+            Some("0 Open")
         );
         assert_eq!(
             pill_text(TxState::Open { stmts: 1 }).as_deref(),
-            Some("Tx open · 1 stmt")
+            Some("1 Open")
         );
         assert_eq!(
             pill_text(TxState::Open { stmts: 2 }).as_deref(),
-            Some("Tx open · 2 stmts")
+            Some("2 Open")
+        );
+        assert_eq!(
+            pill_text(TxState::Open { stmts: 42 }).as_deref(),
+            Some("42 Open")
         );
     }
 

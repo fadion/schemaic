@@ -85,8 +85,8 @@ type SessionForFn = Rc<dyn Fn(&Tab) -> Result<Option<Arc<Session>>, String>>;
 /// End a tab's transaction — `(tab id, commit?, what to run once it's settled)`.
 type EndTxFn = Rc<dyn Fn(usize, bool, Option<Rc<dyn Fn()>>)>;
 /// Settle an open transaction before an action that would strand it —
-/// `(tab id, what the user is doing, the action to resume)`.
-type GuardTxFn = Rc<dyn Fn(usize, String, Rc<dyn Fn()>)>;
+/// `(tab id, the action to resume once it's settled)`.
+type GuardTxFn = Rc<dyn Fn(usize, Rc<dyn Fn()>)>;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::persist::{self, ConnectionsFile, UiState};
 use schemaic_core::schema::SchemaState;
@@ -1479,36 +1479,33 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // so the UI never has to remember to ask.
     let guard_tx: GuardTxFn = {
         let end_tx = end_tx.clone();
-        Rc::new(
-            move |tab_id: usize, action: String, proceed: Rc<dyn Fn()>| {
-                let state = tabs
-                    .with_untracked(|v| {
-                        v.iter()
-                            .find(|t| t.id == tab_id)
-                            .map(|t| t.tx.get_untracked())
-                    })
-                    .unwrap_or_default();
-                if !state.is_open() {
-                    proceed();
-                    return;
-                }
-                let end_tx = end_tx.clone();
-                tx_prompt.set(Some(TxPrompt {
-                    tab_id,
-                    action,
-                    stmts: state.stmts(),
-                    can_commit: state.can_commit(),
-                    resolve: Rc::new(move |choice| {
-                        tx_prompt.set(None);
-                        match choice {
-                            TxChoice::Commit => (end_tx)(tab_id, true, Some(proceed.clone())),
-                            TxChoice::Rollback => (end_tx)(tab_id, false, Some(proceed.clone())),
-                            TxChoice::Cancel => {}
-                        }
-                    }),
-                }));
-            },
-        )
+        Rc::new(move |tab_id: usize, proceed: Rc<dyn Fn()>| {
+            let found = tabs.with_untracked(|v| {
+                v.iter()
+                    .find(|t| t.id == tab_id)
+                    .map(|t| (t.tx.get_untracked(), t.title()))
+            });
+            let (state, tab_title) = found.unwrap_or_default();
+            if !state.is_open() {
+                proceed();
+                return;
+            }
+            let end_tx = end_tx.clone();
+            tx_prompt.set(Some(TxPrompt {
+                tab_id,
+                tab: tab_title,
+                stmts: state.stmts(),
+                can_commit: state.can_commit(),
+                resolve: Rc::new(move |choice| {
+                    tx_prompt.set(None);
+                    match choice {
+                        TxChoice::Commit => (end_tx)(tab_id, true, Some(proceed.clone())),
+                        TxChoice::Rollback => (end_tx)(tab_id, false, Some(proceed.clone())),
+                        TxChoice::Cancel => {}
+                    }
+                }),
+            }));
+        })
     };
 
     // Pin a fresh connection for a Manual tab, replacing any it already had.
@@ -1591,7 +1588,6 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     let drop_session = drop_session.clone();
                     (guard_tx)(
                         tab_id,
-                        "Switch to Auto-commit".to_string(),
                         Rc::new(move || {
                             tab.tx.set(TxState::closed());
                             tab.tx_mode.set(TxMode::Auto);
@@ -1640,7 +1636,6 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             // open transaction has to be settled before the tab moves.
             (guard_tx)(
                 id,
-                format!("Switch to {name}"),
                 Rc::new(move || {
                     let manual = tabs.with_untracked(|v| {
                         if let Some(t) = v.iter().find(|t| t.id == id) {
@@ -1799,15 +1794,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         let close_tab_now = close_tab_now.clone();
         let guard_tx = guard_tx.clone();
         Rc::new(move |id: usize| {
-            let title = tabs
-                .with_untracked(|v| v.iter().find(|t| t.id == id).map(|t| t.title()))
-                .unwrap_or_else(|| "this tab".to_string());
             let close_tab_now = close_tab_now.clone();
-            (guard_tx)(
-                id,
-                format!("Close {title}"),
-                Rc::new(move || (close_tab_now)(id)),
-            );
+            (guard_tx)(id, Rc::new(move || (close_tab_now)(id)));
         })
     };
 
