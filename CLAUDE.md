@@ -211,7 +211,7 @@ bug fixes start with a failing test, then the code that makes it pass. Concretel
   after the colon. Types: `feat`/`fix`/`refactor`/`perf`/`docs`/`test`/`chore`/`build`/`ci`. Scope
   = the crate/module the change centers on (`grid`, `editor`, `schema`, `ai`, `sql`, `theme`, `db`,
   `ci`…); omit only when cross-cutting. Optional body (blank line first) explains the *why*. Every
-  message ends with the trailer `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`. Example:
+  message ends with the trailer `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. Example:
   `feat(grid): add row cloning via context menu`.
 - **Version bumps are explicit-only.** Bump only when asked; never as a side effect of an unrelated
   commit. Edit **one** place — `[workspace.package].version` in the root `Cargo.toml` (all crates
