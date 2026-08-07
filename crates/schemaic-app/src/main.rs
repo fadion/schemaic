@@ -24,8 +24,9 @@ mod secrets;
 static GLOBAL: heap::Tracking = heap::Tracking;
 
 use ai::{
-    AiContextParams, AiSession, AiSettings, AiStreamMsg, StartAiParams, ai_context, extract_sql,
-    inline_system_prompt, mcp_endpoint_from_env, start_ai_session,
+    AiContextParams, AiSession, AiSettings, AiStreamMsg, StartAiParams, ai_context,
+    apply_turn_delta, extract_sql, inline_system_prompt, mcp_endpoint_from_env, start_ai_session,
+    turn_context,
 };
 use claude_cli::{claude_bin, claude_reachable, detect_claude_bin};
 
@@ -2716,19 +2717,21 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 .as_ref()
                 .map(|s| s.conn_id != active_id)
                 .unwrap_or(true);
+            // The live context as it stands *now* — the system prompt is written
+            // once at spawn, so every later turn carries the delta (see
+            // `apply_turn_delta`).
+            let cx_params = AiContextParams {
+                connections,
+                active_conn,
+                db_nodes,
+                tabs,
+                active,
+                scope: ai_schema_scope.get_untracked(),
+                run_queries: ai_run_queries.get_untracked(),
+            };
+            let context_now = turn_context(cx_params);
             if need_new {
-                let context = ai_context(
-                    AiContextParams {
-                        connections,
-                        active_conn,
-                        db_nodes,
-                        tabs,
-                        active,
-                        scope: ai_schema_scope.get_untracked(),
-                        run_queries: ai_run_queries.get_untracked(),
-                    },
-                    &ai_instructions.get_untracked(),
-                );
+                let context = ai_context(cx_params, &ai_instructions.get_untracked());
                 // The MCP endpoint is the active connection, scoped to the active
                 // tab's database (else the new-tab default). If the connection's
                 // `Db` can't be built yet (SSH tunnel pending), skip the MCP tools
@@ -2742,6 +2745,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     .flatten()
                     .or_else(|| default_tab_target().1);
                 if let Ok(db) = db_for(active_id) {
+                    let mcp_database = database.clone();
                     let (stdin_tx, mcp_cfg) = start_ai_session(
                         &handle,
                         StartAiParams {
@@ -2760,6 +2764,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         stdin_tx,
                         mcp_cfg,
                         settings: ai_settings_now(),
+                        // The system prompt just stated this context, so the
+                        // first turn has no delta to report.
+                        last_context: context_now.clone(),
+                        mcp_database,
                     });
                 }
             }
@@ -2771,8 +2779,19 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             ai_input.set(String::new());
             ai_busy.set(true);
 
-            if let Some(s) = ai_session.borrow().as_ref() {
-                let _ = s.stdin_tx.send(schemaic_ai::user_message_line(&msg));
+            // Prepend whatever moved since the assistant last looked (edited SQL,
+            // a switched database, a schema that finished introspecting), then
+            // advance the session's snapshot so the next turn diffs against this
+            // one.
+            if let Some(s) = ai_session.borrow_mut().as_mut() {
+                let turn = apply_turn_delta(
+                    &s.last_context,
+                    &context_now,
+                    s.mcp_database.as_deref(),
+                    &msg,
+                );
+                s.last_context = context_now;
+                let _ = s.stdin_tx.send(schemaic_ai::user_message_line(&turn));
             }
         })
     };
