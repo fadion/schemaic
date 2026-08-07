@@ -454,8 +454,22 @@ pub(crate) fn measure_text_px(text: &str) -> f64 {
 
 /// Like [`measure_text_px`] but at an explicit font size (e.g. the 16px Find box).
 pub(crate) fn measure_text_px_at(text: &str, size: f32) -> f64 {
-    use floem::text::{Attrs, AttrsList, TextLayout};
-    let attrs = Attrs::new().font_size(size);
+    measure_text_px_weighted(text, size, false)
+}
+
+/// As [`measure_text_px_at`], but for text rendered `.font_bold()`. Bold glyphs are
+/// wider, so measuring them at regular weight under-reports — enough that a name
+/// sized to the regular measurement still ellipsizes when drawn bold.
+pub(crate) fn measure_text_px_bold_at(text: &str, size: f32) -> f64 {
+    measure_text_px_weighted(text, size, true)
+}
+
+fn measure_text_px_weighted(text: &str, size: f32, bold: bool) -> f64 {
+    use floem::text::{Attrs, AttrsList, TextLayout, Weight};
+    let mut attrs = Attrs::new().font_size(size);
+    if bold {
+        attrs = attrs.weight(Weight::BOLD);
+    }
     let mut layout = TextLayout::new();
     layout.set_text(text, AttrsList::new(attrs));
     layout.size().width

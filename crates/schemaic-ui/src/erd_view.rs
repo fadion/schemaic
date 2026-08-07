@@ -54,7 +54,8 @@ use schemaic_core::schema::{DbSchema, SchemaState, classify_column_type};
 
 use crate::schema_tree::column_type_icon;
 use crate::widgets::{
-    centered_msg, measure_text_px_at, modal_title_borderless, panel_style, window_size,
+    centered_msg, measure_text_px_at, measure_text_px_bold_at, modal_title_borderless, panel_style,
+    window_size,
 };
 use crate::{ConnNode, Ui, icons, theme};
 
@@ -632,6 +633,13 @@ fn node_card(
     }
 
     let name = p.node.name.clone();
+    // Does the name ellipsize at this card's width? The header lays out as
+    // icon (13) + gap (7) + name, inside 10px horizontal padding each side, so the
+    // name gets `w - 40`. Measured BOLD, matching how it's drawn — a node id is
+    // `schema.table` outside `public`, which truncates far more often than a bare
+    // name did. Compared in unzoomed space: zoom scales both sides alike.
+    let name_truncated = measure_text_px_bold_at(&name, 13.0) > w - 40.0;
+    let full_name = name.clone();
     // Table icon + colour from the schema panel (base table vs. view).
     let is_view = p.node.kind == NodeKind::View;
     let header = h_stack((
@@ -672,11 +680,21 @@ fn node_card(
             .background(theme::erd_node_header())
             .border_bottom(1.0)
             .border_color(theme::border())
-    })
-    // Whole card is the drag zone; content is pointer-transparent so a drag
-    // starting on the name/columns still reaches the card (and text can't be
-    // selected, which was aborting drags).
-    .pointer_events(|| false);
+    });
+
+    // A truncated name gets a tooltip with the full text — only on the header, and
+    // only when it actually ellipsizes (same rule as the tab strip).
+    //
+    // The tooltip needs hover, so the header can't stay `pointer_events(false)`
+    // like the rest of the card's content. It registers no pointer handlers, so
+    // PointerDown/Move/Up and the double-click still reach the card's drag zone by
+    // bubbling — a child only stops propagation when it *consumes* an event.
+    let header: AnyView = if name_truncated {
+        header.tooltip(move || text(full_name.clone())).into_any()
+    } else {
+        // Nothing to reveal → stay pointer-transparent, exactly as before.
+        header.pointer_events(|| false).into_any()
+    };
 
     // Rows are reactive: rebuilt when this node's collapse state changes.
     let node = Rc::new(p.node.clone());
