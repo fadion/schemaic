@@ -126,8 +126,10 @@ struct EdgeShapes {
 /// Card width sized to its widest content row over *all* columns (so width stays
 /// stable across expand/collapse), clamped to `[NODE_MIN_W, NODE_MAX_W]`.
 fn node_width(node: &DiagramNode) -> f64 {
-    // Header: table icon (13) + gap (7) + bold name (13px).
-    let mut content = 13.0 + 7.0 + measure_text_px_at(&node.name, 13.0);
+    // Header: table icon (13) + gap (7) + bold name (13px). Measured BOLD, as it's
+    // drawn — measuring at regular weight under-reports, which sized every card
+    // narrower than its own title and ellipsized names nowhere near `NODE_MAX_W`.
+    let mut content = 13.0 + 7.0 + measure_text_px_bold_at(&node.name, 13.0);
     for c in &node.columns {
         // column icon (13) + gap (8) + name + gap (8) + type.
         let row = 13.0
