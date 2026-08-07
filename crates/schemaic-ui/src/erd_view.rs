@@ -985,24 +985,25 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                 })
             };
 
-            // Double-clicking a table closes the modal and opens/reveals it. The
-            // diagram identifies nodes by bare table name, so the namespace is
-            // resolved back out of the introspected schema (`find_table` prefers
-            // `public` when two schemas share a name).
+            // Double-clicking a table closes the modal and opens/reveals it. A
+            // diagram node id is a *display* name (`sales.orders` outside
+            // `public`), so it's resolved back to a real table rather than used
+            // as one. A stub node (a cross-database FK target) resolves to
+            // nothing and is left alone.
             let reveal: Rc<dyn Fn(String)> = {
                 let ot = open_table.clone();
                 let db = target.database.clone();
                 let close = close.clone();
                 let resolved = schema.clone();
-                Rc::new(move |table: String| {
+                Rc::new(move |node_id: String| {
+                    let Some(t) = resolved.find_by_display(&node_id) else {
+                        return;
+                    };
                     (close)();
-                    let ns = resolved
-                        .find_table(None, &table)
-                        .and_then(|t| t.schema.clone());
                     (ot)(schemaic_core::schema::TableSource::new(
                         db.clone(),
-                        ns,
-                        table,
+                        t.schema.clone(),
+                        t.name.clone(),
                     ));
                 })
             };

@@ -538,12 +538,15 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     // ER diagram seeded on this table's FK neighbourhood.
                     {
                         let db = database.clone();
-                        let tbl = table.clone();
+                        // The seed is a diagram *node id*, which is the display
+                        // name — so a table outside `public` seeds `sales.orders`
+                        // and can't be confused with a same-named one elsewhere.
+                        let seed_id = source.display();
                         entries.push(MenuEntry::action("Show diagram", move || {
                             erd.set(Some(crate::ErdTarget {
                                 conn_id: active_conn.get_untracked(),
                                 database: db.clone(),
-                                seed: schemaic_core::erd::DiagramSeed::Table(tbl.clone()),
+                                seed: schemaic_core::erd::DiagramSeed::Table(seed_id.clone()),
                             }));
                         }));
                     }

@@ -12,7 +12,7 @@
 //! the current DB) can't be enumerated here, so it becomes a **stub node** carrying
 //! just the qualified name, never expanded.
 
-use crate::schema::{DbSchema, TableInfo};
+use crate::schema::{DbSchema, ForeignKeyInfo, TableInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -149,14 +149,36 @@ fn fk_is_optional(child: &TableInfo, fk_cols: &[String]) -> bool {
         .any(|c| c.nullable && want.contains(c.name.as_str()))
 }
 
-/// The `id` of an FK's target: the referenced table name when it's in the current
-/// database, or `db.table` when the FK crosses into another database. `current_db`
-/// is the name of the database this schema belongs to; a `ref_schema` of `None` (or
-/// equal to `current_db`) is same-database.
-fn target_id(fk_ref_schema: &Option<String>, ref_table: &str, current_db: &str) -> (String, bool) {
-    match fk_ref_schema {
-        Some(s) if s != current_db => (format!("{s}.{ref_table}"), true),
-        _ => (ref_table.to_string(), false),
+/// A table's stable diagram id: its display name, so a PostgreSQL table outside
+/// `public` is `schema.table` and everything else stays the bare name.
+///
+/// Keeping MySQL and `public` ids byte-identical matters — `diagrams.json`
+/// persists manual layout positions keyed by node id, so a qualified-everything
+/// scheme would silently orphan every saved layout.
+fn node_id(t: &TableInfo) -> String {
+    crate::schema::display_name(t.schema.as_deref(), &t.name)
+}
+
+/// The `id` of an FK's target, and whether it's a cross-*database* reference this
+/// graph can't enumerate (→ a stub node).
+///
+/// `ForeignKeyInfo::ref_schema` means different things per engine, so the `child`
+/// table decides how to read it:
+/// - **PostgreSQL** (the child carries a namespace): `ref_schema` is a *namespace*,
+///   and a FK can't cross databases there — so the target always resolves inside
+///   this schema, whichever namespace it names.
+/// - **MySQL** (no namespace): `ref_schema` is a *database*; a different one is
+///   genuinely cross-database and can't be enumerated.
+fn target_id(child: &TableInfo, fk: &ForeignKeyInfo, current_db: &str) -> (String, bool) {
+    if child.schema.is_some() {
+        return (
+            crate::schema::display_name(fk.ref_schema.as_deref(), &fk.ref_table),
+            false,
+        );
+    }
+    match &fk.ref_schema {
+        Some(s) if s != current_db => (format!("{s}.{}", fk.ref_table), true),
+        _ => (fk.ref_table.clone(), false),
     }
 }
 
@@ -171,45 +193,47 @@ fn target_id(fk_ref_schema: &Option<String>, ref_table: &str, current_db: &str) 
 /// outside the set (a second hop, in the neighbourhood case) is skipped, while a
 /// cross-database target adds a stub node.
 pub fn build_graph(schema: &DbSchema, current_db: &str, seed: &DiagramSeed) -> DiagramGraph {
-    let by_name: HashMap<&str, &TableInfo> =
-        schema.tables.iter().map(|t| (t.name.as_str(), t)).collect();
+    // Keyed by *id*, not bare name: two namespaces may hold same-named tables,
+    // and collapsing them loses a node and misroutes its FK edges.
+    let by_id: HashMap<String, &TableInfo> =
+        schema.tables.iter().map(|t| (node_id(t), t)).collect();
 
     // 1. Decide which real tables are in the node set.
     let included: Vec<&TableInfo> = match seed {
         DiagramSeed::Database => schema.tables.iter().collect(),
-        DiagramSeed::Table(name) => {
-            let Some(seed_t) = by_name.get(name.as_str()) else {
+        DiagramSeed::Table(seed_id) => {
+            let Some(seed_t) = by_id.get(seed_id.as_str()) else {
                 return DiagramGraph {
                     total_tables: schema.tables.len(),
                     ..Default::default()
                 };
             };
-            let mut set: HashSet<&str> = HashSet::new();
-            set.insert(seed_t.name.as_str());
+            let mut set: HashSet<String> = HashSet::new();
+            set.insert(node_id(seed_t));
             // Tables the seed references (same-database targets only).
             for fk in &seed_t.foreign_keys {
-                let (_, cross) = target_id(&fk.ref_schema, &fk.ref_table, current_db);
-                if !cross && by_name.contains_key(fk.ref_table.as_str()) {
-                    set.insert(by_name[fk.ref_table.as_str()].name.as_str());
+                let (to, cross) = target_id(seed_t, fk, current_db);
+                if !cross && by_id.contains_key(&to) {
+                    set.insert(to);
                 }
             }
             // Tables that reference the seed.
             for t in &schema.tables {
                 if t.foreign_keys.iter().any(|fk| {
-                    let (_, cross) = target_id(&fk.ref_schema, &fk.ref_table, current_db);
-                    !cross && fk.ref_table == *name
+                    let (to, cross) = target_id(t, fk, current_db);
+                    !cross && to == *seed_id
                 }) {
-                    set.insert(t.name.as_str());
+                    set.insert(node_id(t));
                 }
             }
             schema
                 .tables
                 .iter()
-                .filter(|t| set.contains(t.name.as_str()))
+                .filter(|t| set.contains(&node_id(t)))
                 .collect()
         }
     };
-    let included_names: HashSet<&str> = included.iter().map(|t| t.name.as_str()).collect();
+    let included_ids: HashSet<String> = included.iter().map(|t| node_id(t)).collect();
 
     // 2. Real table nodes (columns with pk/fk flags).
     let mut nodes: Vec<DiagramNode> = included.iter().map(|t| table_node(t)).collect();
@@ -219,16 +243,16 @@ pub fn build_graph(schema: &DbSchema, current_db: &str, seed: &DiagramSeed) -> D
     let mut stubs: Vec<String> = Vec::new();
     for child in &included {
         for fk in &child.foreign_keys {
-            let (to, cross) = target_id(&fk.ref_schema, &fk.ref_table, current_db);
+            let (to, cross) = target_id(child, fk, current_db);
             if cross {
                 if !stubs.contains(&to) {
                     stubs.push(to.clone());
                 }
-            } else if !included_names.contains(fk.ref_table.as_str()) {
+            } else if !included_ids.contains(&to) {
                 continue; // same-DB target outside the set (a second hop) — skip.
             }
             edges.push(DiagramEdge {
-                from: child.name.clone(),
+                from: node_id(child),
                 from_columns: fk.columns.clone(),
                 to,
                 to_columns: fk.ref_columns.clone(),
@@ -295,9 +319,12 @@ fn table_node(t: &TableInfo) -> DiagramNode {
             fk: fk_cols.contains(c.name.as_str()),
         })
         .collect();
+    // Card label = the id, so two same-named tables in different namespaces are
+    // told apart on the canvas rather than both reading "orders".
+    let id = node_id(t);
     DiagramNode {
-        id: t.name.clone(),
-        name: t.name.clone(),
+        name: id.clone(),
+        id,
         kind: if t.is_view {
             NodeKind::View
         } else {
@@ -1647,5 +1674,176 @@ mod tests {
             get_layout(&back, 1, "shop").unwrap().get("orders"),
             Some(&(10.5, 20.5))
         );
+    }
+}
+
+#[cfg(test)]
+mod multi_schema_tests {
+    use super::*;
+    use crate::schema::{ColumnInfo, ForeignKeyInfo};
+
+    fn col(name: &str, pk: bool) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            type_name: "integer".to_string(),
+            nullable: !pk,
+            primary_key: pk,
+        }
+    }
+
+    /// A PostgreSQL table in an explicit namespace.
+    fn pg(ns: &str, name: &str, cols: &[&str], fks: Vec<ForeignKeyInfo>) -> TableInfo {
+        TableInfo {
+            name: name.to_string(),
+            schema: Some(ns.to_string()),
+            columns: cols.iter().map(|c| col(c, *c == "id")).collect(),
+            foreign_keys: fks,
+            ..Default::default()
+        }
+    }
+
+    /// An FK whose target names a namespace (the PostgreSQL shape).
+    fn pg_fk(cols: &[&str], ref_ns: &str, ref_table: &str, ref_cols: &[&str]) -> ForeignKeyInfo {
+        ForeignKeyInfo {
+            columns: cols.iter().map(|s| s.to_string()).collect(),
+            ref_schema: Some(ref_ns.to_string()),
+            ref_table: ref_table.to_string(),
+            ref_columns: ref_cols.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// The `warehouse` fixture's shape: a same-named `orders` in two namespaces,
+    /// plus a cross-schema FK from `analytics` into `sales`.
+    fn warehouse() -> DbSchema {
+        DbSchema {
+            tables: vec![
+                pg("public", "orders", &["id", "legacy_ref"], vec![]),
+                pg("sales", "customers", &["id", "name"], vec![]),
+                pg(
+                    "sales",
+                    "orders",
+                    &["id", "customer_id"],
+                    vec![pg_fk(&["customer_id"], "sales", "customers", &["id"])],
+                ),
+                pg(
+                    "analytics",
+                    "daily_revenue",
+                    &["id", "order_id"],
+                    vec![pg_fk(&["order_id"], "sales", "orders", &["id"])],
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn same_named_tables_in_two_schemas_are_separate_nodes() {
+        let g = build_graph(&warehouse(), "warehouse", &DiagramSeed::Database);
+        let ids: Vec<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
+        // `public.orders` is an island (no FKs) so it's hidden, but `sales.orders`
+        // must be its own node — keyed by namespace, not collapsed onto the other.
+        assert!(ids.contains(&"sales.orders"), "ids: {ids:?}");
+        assert!(ids.contains(&"sales.customers"), "ids: {ids:?}");
+        assert!(
+            ids.iter().all(|i| *i != "orders"),
+            "a bare `orders` id means the two namespaces collapsed: {ids:?}"
+        );
+        // Every id is unique — the collapse would have silently deduped one away.
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "duplicate node ids: {ids:?}");
+    }
+
+    #[test]
+    fn a_cross_schema_fk_links_the_real_node_not_a_stub() {
+        // `ref_schema` is a *namespace* on Postgres, and a FK can't cross
+        // databases there — so this must resolve to the real `sales.orders`
+        // node, not become an unexpandable cross-database stub.
+        let g = build_graph(&warehouse(), "warehouse", &DiagramSeed::Database);
+        let e = g
+            .edges
+            .iter()
+            .find(|e| e.from == "analytics.daily_revenue")
+            .expect("the cross-schema FK is drawn");
+        assert_eq!(e.to, "sales.orders");
+        assert!(
+            g.nodes.iter().all(|n| n.kind != NodeKind::Stub),
+            "no stub should be created for a same-database namespace hop"
+        );
+    }
+
+    #[test]
+    fn a_qualified_seed_picks_the_right_same_named_table() {
+        // Seeding on `sales.orders` must not pull in `public.orders`.
+        let g = build_graph(
+            &warehouse(),
+            "warehouse",
+            &DiagramSeed::Table("sales.orders".to_string()),
+        );
+        let ids: Vec<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"sales.orders"), "{ids:?}");
+        // Its FK neighbours, both directions.
+        assert!(ids.contains(&"sales.customers"), "{ids:?}");
+        assert!(ids.contains(&"analytics.daily_revenue"), "{ids:?}");
+        // Not the unrelated same-named table in `public`.
+        assert!(!ids.contains(&"orders"), "{ids:?}");
+    }
+
+    #[test]
+    fn mysql_node_ids_stay_bare_names() {
+        // No namespaces → ids are exactly what they always were, so persisted
+        // diagram layouts (keyed by node id) keep applying.
+        let s = DbSchema {
+            tables: vec![
+                TableInfo {
+                    name: "orders".into(),
+                    columns: vec![col("id", true), col("cust", false)],
+                    foreign_keys: vec![ForeignKeyInfo {
+                        columns: vec!["cust".into()],
+                        ref_schema: None,
+                        ref_table: "customers".into(),
+                        ref_columns: vec!["id".into()],
+                    }],
+                    ..Default::default()
+                },
+                TableInfo {
+                    name: "customers".into(),
+                    columns: vec![col("id", true)],
+                    ..Default::default()
+                },
+            ],
+        };
+        let g = build_graph(&s, "shop", &DiagramSeed::Database);
+        let mut ids: Vec<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["customers", "orders"]);
+        assert_eq!(g.edges[0].from, "orders");
+        assert_eq!(g.edges[0].to, "customers");
+    }
+
+    #[test]
+    fn a_mysql_cross_database_fk_still_stubs() {
+        // The MySQL case `target_id` exists for must keep working: `ref_schema`
+        // there is a *database*, and a different one can't be enumerated.
+        let s = DbSchema {
+            tables: vec![TableInfo {
+                name: "orders".into(),
+                columns: vec![col("id", true), col("cust", false)],
+                foreign_keys: vec![ForeignKeyInfo {
+                    columns: vec!["cust".into()],
+                    ref_schema: Some("other_db".into()),
+                    ref_table: "customers".into(),
+                    ref_columns: vec!["id".into()],
+                }],
+                ..Default::default()
+            }],
+        };
+        let g = build_graph(&s, "shop", &DiagramSeed::Database);
+        assert!(
+            g.nodes
+                .iter()
+                .any(|n| n.kind == NodeKind::Stub && n.id == "other_db.customers")
+        );
+        assert_eq!(g.edges[0].to, "other_db.customers");
     }
 }
