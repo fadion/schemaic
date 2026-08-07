@@ -2048,6 +2048,14 @@ pub(crate) fn tx_prompt_overlay(ui: Ui) -> impl IntoView {
             });
 
             container(panel)
+                // Take focus so the editor and the global shortcuts behind the
+                // backdrop stop receiving keys — Ctrl+W closing another tab while
+                // this one is asking about a transaction would be a mess. Escape
+                // is swallowed rather than handled: unlike every other modal here,
+                // there's no safe "never mind" for uncommitted writes.
+                .keyboard_navigable()
+                .request_focus(|| {})
+                .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| {})
                 .style(|s| {
                     s.size_full()
                         .flex_col()

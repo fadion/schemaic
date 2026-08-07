@@ -226,33 +226,12 @@ impl Session {
         Session::classify(&mut guard, result).await
     }
 
-    /// Run several statements in order on the pinned connection, reporting each
-    /// through `on_result` as it finishes. Stops at the first failure, like the
-    /// fresh-connection `run_batch`. Returns the outcome that decided the
-    /// transaction's fate (the first non-`Ok` one, else `Ok`).
-    pub async fn run_batch(
-        &self,
-        stmts: &[String],
-        row_cap: usize,
-        cancel: CancellationToken,
-        mut on_result: impl FnMut(usize, Result<ResultSet, DbError>),
-    ) -> StmtOutcome {
-        let mut verdict = StmtOutcome::Ok;
-        let mut stopped = false;
-        for (i, sql) in stmts.iter().enumerate() {
-            if stopped || cancel.is_cancelled() {
-                on_result(i, Err(DbError::Cancelled));
-                continue;
-            }
-            let out = self.fetch_query(sql, row_cap, cancel.clone()).await;
-            if out.result.is_err() {
-                stopped = true;
-                verdict = out.stmt;
-            }
-            on_result(i, out.result);
-        }
-        verdict
-    }
+    // There's deliberately no `run_batch` here. The fresh-connection one collapses
+    // a batch into a single call, but inside a transaction each statement's
+    // outcome has to be folded *individually and in order* — a MySQL DDL halfway
+    // through implicitly commits, and the statements after it belong to a new
+    // transaction. The caller drives `fetch_query` in a loop instead, which keeps
+    // that ordering visible where the state machine lives.
 
     /// Apply staged grid edits inside the user's transaction.
     ///
