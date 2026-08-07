@@ -975,16 +975,59 @@ enum TkKind {
 struct Token {
     at: usize,
     kind: TkKind,
+    /// The word came from a quoted identifier (`` `select` ``). Quoting is what
+    /// makes a reserved word legal as a name, so the alias checks must not flag
+    /// it — and the scope resolver must still see the name.
+    quoted: bool,
 }
 
-/// Tokenize `sql[lo..hi]` into words + `. , ( )`, skipping string literals,
-/// backtick identifiers, and comments via the shared [`skip_noncode`] primitive.
+/// Tokenize `sql[lo..hi]` into words + `. , ( )`, skipping string literals and
+/// comments via the shared [`skip_noncode`] primitive.
+///
+/// A **backtick-quoted identifier becomes a `Word`** carrying its unquoted text,
+/// rather than being skipped like a string: `` `shop`.`customers` `` has to
+/// resolve to the same scope as `shop.customers`. Schemaic generates the quoted
+/// form itself (see [`crate::filter::table_query`]), and this is the *fallback*
+/// path — the one that runs the moment a statement stops parsing, i.e. exactly
+/// while the user is typing a `WHERE`. Skipping the name there cost the tab its
+/// column completion.
+///
+/// `skip_noncode` still decides where the quoted run ends, so there's no second
+/// boundary scanner here — only the content is lifted out of the span it returns.
 fn tokenize_range(sql: &str, lo: usize, hi: usize) -> Vec<Token> {
     let b = sql.as_bytes();
     let mut out = Vec::new();
     let mut i = lo;
-    let push = |out: &mut Vec<Token>, at: usize, kind: TkKind| out.push(Token { at, kind });
+    let push = |out: &mut Vec<Token>, at: usize, kind: TkKind| {
+        out.push(Token {
+            at,
+            kind,
+            quoted: false,
+        })
+    };
     while i < hi {
+        // Quoted identifier → a word. Must be tried before `skip_noncode`, which
+        // would otherwise consume it as an opaque non-code run.
+        if b[i] == b'`'
+            && let Some(j) = skip_noncode(b, i, SqlDialect::MySql)
+        {
+            let end = j.min(hi);
+            // `j` points past the closing backtick; an unterminated quote runs to
+            // the end of the range, in which case there's no closer to trim.
+            let closed = j <= hi && b.get(j - 1) == Some(&b'`') && j - 1 > i;
+            let inner = sql
+                .get(i + 1..if closed { j - 1 } else { end })
+                .unwrap_or("");
+            if !inner.is_empty() {
+                out.push(Token {
+                    at: i,
+                    kind: TkKind::Word(inner.replace("``", "`")),
+                    quoted: true,
+                });
+            }
+            i = end;
+            continue;
+        }
         // Intel's byte-position tokenizer stays MySQL-flavored: it's the *fallback*
         // (the per-dialect AST is the primary, dialect-correct analysis). A
         // dialect-aware tokenizer here would cascade `dialect` through ~13 helpers
@@ -2683,9 +2726,14 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
         if is_create && is_query_body_keyword(b) {
             continue;
         }
-        // The alias must sit immediately after AS (whitespace only between). A skipped
-        // backtick/quote/comment in the gap means the alias was quoted (`AS `select``)
-        // and `b` is the *following* token (e.g. FROM) — never flag that.
+        // `AS `select`` is legal — quoting is the whole remedy this diagnostic
+        // recommends, so a quoted alias is never the mistake.
+        if w[1].quoted {
+            continue;
+        }
+        // The alias must sit immediately after AS (whitespace only between). A
+        // skipped quote/comment in the gap means `b` is the *following* token
+        // (e.g. FROM) rather than the alias — never flag that.
         let as_end = w[0].at + a.len();
         if sql
             .get(as_end..w[1].at)
@@ -2734,6 +2782,9 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
                     // Handled by the `AS` scan above; consume `AS` + the next token.
                     i += toks.get(i + 1).map_or(1, |_| 2);
                 }
+                // A quoted alias is always legal, reserved word or not — and a
+                // quoted name is never a clause keyword ending the ref.
+                Some(TkKind::Word(_)) if toks[i].quoted => i += 1,
                 // A clause/join keyword ends this ref — not an alias (check before
                 // `is_reserved_word`, since these are reserved too).
                 Some(TkKind::Word(a)) if is_table_ref_continuation(a) => break,
@@ -4322,6 +4373,51 @@ mod tests {
         assert_eq!(s.tables[0].name, "actor");
         assert_eq!(s.tables[0].db.as_deref(), Some("sakila"));
         assert_eq!(s.tables[0].alias.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn scope_resolves_backticked_names_when_parsing_fails() {
+        // The generated "open this table" statement is backtick-quoted, and the
+        // moment the user starts a WHERE the statement no longer parses — so the
+        // mid-edit lexer fallback has to see through the quoting, or the tab
+        // loses column completion the instant you type `WHERE `.
+        let s = scope("SELECT * FROM `shop`.`customers` WHERE ");
+        assert_eq!(names(&s), vec!["customers"]);
+        assert_eq!(s.tables[0].db.as_deref(), Some("shop"));
+    }
+
+    #[test]
+    fn scope_misses_pg_double_quoted_names_mid_edit_known_gap() {
+        // KNOWN LIMITATION, pinned so a future fix trips this test.
+        //
+        // The backtick case above works because a backtick is only ever an
+        // identifier quote. `"…"` is not: it's a *string* in MySQL and an
+        // identifier in Postgres, and this tokenizer is MySQL-flavored on purpose
+        // (the per-dialect AST is the primary path) — so mid-edit, when the AST
+        // can't parse, a double-quoted Postgres name is invisible here.
+        //
+        // Reach: only names that actually need quoting. `filter::table_query`
+        // emits bare identifiers wherever it legally can, so the generated
+        // statement doesn't hit this. Fixing it properly means threading
+        // `dialect` through `tokenize_range` and its public callers — the
+        // "intel mid-edit tokenizer dialect" item in TODO.md.
+        let sql = "SELECT * FROM \"customers\" WHERE ";
+        let s = statement_scope(sql, 0, sql.len(), sql.len(), SqlDialect::Postgres);
+        assert!(
+            names(&s).is_empty(),
+            "if this now resolves, the tokenizer became dialect-aware — \
+             update this test to assert [\"customers\"]"
+        );
+    }
+
+    #[test]
+    fn scope_resolves_a_backticked_alias_and_escaped_quotes() {
+        let s = scope("SELECT * FROM `orders` `o` WHERE ");
+        assert_eq!(names(&s), vec!["orders"]);
+        assert_eq!(s.tables[0].alias.as_deref(), Some("o"));
+        // A doubled backtick inside a quoted name is one literal backtick.
+        let s = scope("SELECT * FROM `we``ird` WHERE ");
+        assert_eq!(names(&s), vec!["we`ird"]);
     }
 
     #[test]
