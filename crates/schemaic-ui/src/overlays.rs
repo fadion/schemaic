@@ -1954,15 +1954,15 @@ pub(crate) fn tx_prompt_overlay(ui: Ui) -> impl IntoView {
             let body = if p.can_commit {
                 format!(
                     "{} has an open transaction with {stmts} in it. \
-                     Commit them, or roll them back and lose them?",
-                    p.action
+                     You can commit to keep the changes, or rollback to discard them.",
+                    p.tab
                 )
             } else {
                 // Postgres aborted it, so committing isn't on the table.
                 format!(
-                    "{} has a transaction that was aborted by a failed statement, \
-                     with {stmts} in it. They can only be rolled back.",
-                    p.action
+                    "{} has a transaction that a failed statement aborted, with {stmts} \
+                     in it. It can only be rolled back, which discards the changes.",
+                    p.tab
                 )
             };
 
@@ -1992,10 +1992,11 @@ pub(crate) fn tx_prompt_overlay(ui: Ui) -> impl IntoView {
             };
             let rollback = {
                 let r = resolve.clone();
+                // "Rollback", matching the status bar's action and the body text.
                 btn(
-                    "Roll back",
-                    theme::tx_danger,
-                    theme::error,
+                    "Rollback",
+                    theme::tx_rollback,
+                    theme::tx_rollback_hover,
                     Rc::new(move || (r)(TxChoice::Rollback)),
                 )
             };
@@ -2004,8 +2005,8 @@ pub(crate) fn tx_prompt_overlay(ui: Ui) -> impl IntoView {
                 let can = p.can_commit;
                 btn(
                     "Commit",
-                    theme::tx_open,
-                    theme::tx_open_hover,
+                    theme::tx_commit,
+                    theme::tx_commit_hover,
                     Rc::new(move || (r)(TxChoice::Commit)),
                 )
                 .style(move |s| if can { s } else { s.hide() })

@@ -443,9 +443,30 @@ pub fn tx_open_hover() -> Color {
 }
 /// A transaction that can't go forward — PostgreSQL aborted it, or the pinned
 /// connection died (`#E05A5A`, matching `diag_error`'s red but independent of
-/// the editor's diagnostics).
+/// the editor's diagnostics). Used on the modal, where red reads cleanly against
+/// the panel; the status bar's Rollback uses `tx_rollback` instead.
 pub fn tx_danger() -> Color {
     Color::rgb8(0xE0, 0x5A, 0x5A)
+}
+/// Green for the status bar's Commit action (`#71C371`). Same hex as
+/// `status_ok`, kept separate: one is "your SQL is clean", this is an action.
+pub fn tx_commit() -> Color {
+    Color::rgb8(0x71, 0xC3, 0x71)
+}
+/// Brighter green for hovering Commit (`#8FDC8F`).
+pub fn tx_commit_hover() -> Color {
+    Color::rgb8(0x8F, 0xDC, 0x8F)
+}
+/// Red for the status bar's Rollback action (`#E05A5A`) — the same red as the
+/// confirmation modal's Roll back, so the discard action reads the same in both
+/// places. Kept as its own fn so it can be warmed up (or taken back to the
+/// write-mode amber `#E08A4B`) without touching the modal.
+pub fn tx_rollback() -> Color {
+    Color::rgb8(0xE0, 0x5A, 0x5A)
+}
+/// Brighter red for hovering Rollback (`#FF7B7B`).
+pub fn tx_rollback_hover() -> Color {
+    Color::rgb8(0xFF, 0x7B, 0x7B)
 }
 
 // Connection status: reachable (unreachable reuses `reject_bg`).

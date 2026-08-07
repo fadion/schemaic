@@ -315,8 +315,10 @@ pub enum TxChoice {
 #[derive(Clone)]
 pub struct TxPrompt {
     pub tab_id: usize,
-    /// What the user was trying to do, e.g. "Close Query 3".
-    pub action: String,
+    /// The tab's title — the subject of the question ("Query 3 has an open
+    /// transaction…"). What the user was *doing* isn't repeated: the prompt
+    /// appears the instant they do it.
+    pub tab: String,
     /// Statements in the transaction at risk, for the body text.
     pub stmts: u32,
     /// `false` when the transaction is aborted (PostgreSQL) — Commit isn't
@@ -4289,9 +4291,11 @@ fn footer(ui: Ui) -> impl IntoView {
     });
     // ── Manual-transaction cluster ───────────────────────────────────────────
     // Mode ("Auto-commit" / "Manual"), then — only while a transaction is open —
-    // the pill and its Commit / Rollback actions. Sits next to Read only / Write
-    // mode because it's the same kind of thing: what this tab does to the
-    // database when you press Run.
+    // the pill and its Commit / Rollback actions. Its own footer section: 40px
+    // clear on each side (the gap the bar uses between sections, e.g. before the
+    // diagnostics check and before CPU), 15px between the items inside it. The
+    // transaction controls are a a set of related controls, not one more status
+    // reading, so they shouldn't blend into the run of segments around them.
     let active_tab = move || {
         let id = active.get();
         tabs.with(|v| v.iter().find(|t| t.id == id).copied())
@@ -4331,7 +4335,8 @@ fn footer(ui: Ui) -> impl IntoView {
         } else {
             theme::chip_active()
         };
-        s.margin_left(15.0)
+        // 40px: opens the transaction section.
+        s.margin_left(40.0)
             .items_center()
             .color(base)
             .hover(move |s| s.color(hover))
@@ -4363,34 +4368,43 @@ fn footer(ui: Ui) -> impl IntoView {
     // turns COMMIT into a ROLLBACK there, so offering it would be a lie.
     let commit_tx = ui.tab_actions.commit_tx.clone();
     let rollback_tx = ui.tab_actions.rollback_tx.clone();
-    let tx_action =
-        move |label: &'static str, visible: Box<dyn Fn() -> bool>, act: Rc<dyn Fn(usize)>| {
-            text(label)
-                .on_click_stop(move |_| (act)(active.get_untracked()))
-                .style(move |s| {
-                    let s = s
-                        .margin_left(12.0)
-                        .items_center()
-                        .font_size(theme::FONT_STATUS)
-                        .color(theme::tx_open())
-                        .hover(|s| s.color(theme::tx_open_hover()));
-                    if visible() { s } else { s.hide() }
-                })
-        };
+    // Plain text segments like everything else in the bar (no padding or pill
+    // chrome), so `margin_left(15)` is a true 15px gap matching the rest.
+    let tx_action = move |label: &'static str,
+                          color: fn() -> Color,
+                          hover: fn() -> Color,
+                          visible: Box<dyn Fn() -> bool>,
+                          act: Rc<dyn Fn(usize)>| {
+        text(label)
+            .on_click_stop(move |_| (act)(active.get_untracked()))
+            .style(move |s| {
+                let s = s
+                    .margin_left(15.0)
+                    .items_center()
+                    .font_size(theme::FONT_STATUS)
+                    .color(color())
+                    .hover(move |s| s.color(hover()));
+                if visible() { s } else { s.hide() }
+            })
+    };
     let commit_seg = tx_action(
         "Commit",
+        theme::tx_commit,
+        theme::tx_commit_hover,
         Box::new(move || tx_state.get().can_commit()),
         commit_tx,
     );
     let rollback_seg = tx_action(
         "Rollback",
+        theme::tx_rollback,
+        theme::tx_rollback_hover,
         Box::new(move || tx_state.get().can_rollback()),
         rollback_tx,
     );
 
     // AI model + effort: click each to pick from the AI-panel options; the active
-    // one is tinted the chip accent. Placed right after read-only (15px), with CPU
-    // then RAM after (40px from effort).
+    // one is tinted the chip accent. Opens the AI section 40px after the
+    // transaction controls, with CPU then RAM after (40px from effort).
     let model_seg = status_menu_seg(
         move || ai_model.get().label().to_string(),
         2,
@@ -4413,7 +4427,7 @@ fn footer(ui: Ui) -> impl IntoView {
         popup_menu,
         popup_anchor,
         popup_width,
-        15.0,
+        40.0,
     );
     let effort_seg = status_menu_seg(
         move || ai_effort.get().label().to_string(),
