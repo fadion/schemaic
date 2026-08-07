@@ -309,26 +309,11 @@ pub fn follow_target(
     // target's schema. On MySQL it was already consumed as the database above.
     let schema = postgres.then(|| fk.ref_schema.clone()).flatten();
     let table = fk.ref_table.clone();
-    let quote = |s: &str| {
-        if postgres {
-            format!("\"{}\"", s.replace('"', "\"\""))
-        } else {
-            crate::export::ident_sql(s)
-        }
-    };
-    let literal = |v: &Value| -> String {
-        if postgres {
-            match v {
-                Value::Null => "NULL".to_string(),
-                Value::Int(i) => i.to_string(),
-                Value::UInt(u) => u.to_string(),
-                Value::Float(f) => f.to_string(),
-                Value::Str(s) => format!("'{}'", s.replace('\'', "''")),
-            }
-        } else {
-            crate::export::sql_literal(v)
-        }
-    };
+    // One dialect-aware quoter/literal for both engines, rather than a second
+    // hand-rolled copy here — that's how the two drift (the copy this replaced
+    // rendered a non-finite float as `NaN`, which isn't valid SQL).
+    let quote = |s: &str| crate::export::ident_sql(s, dialect);
+    let literal = |v: &Value| crate::export::sql_literal(v, dialect);
     let where_sql = fk
         .ref_columns
         .iter()
@@ -354,8 +339,8 @@ pub fn follow_target(
     } else {
         format!(
             "SELECT * FROM {}.{} WHERE {where_sql}",
-            crate::export::ident_sql(&database),
-            crate::export::ident_sql(&table),
+            quote(&database),
+            quote(&table),
         )
     };
     Some(FollowTarget {
@@ -1039,6 +1024,40 @@ mod tests {
         let ft = follow_target(&f, &[Value::Int(1)], "shop", SqlDialect::MySql).unwrap();
         assert_eq!(ft.database, "other_db");
         assert_eq!(ft.schema, None);
+    }
+
+    #[test]
+    fn follow_target_postgres_leaves_backslashes_alone() {
+        use crate::intel::SqlDialect;
+        // Postgres takes a backslash literally, so doubling it (MySQL's rule)
+        // would follow the FK to a value that doesn't exist.
+        let f = fk(&["p"], Some("public"), "files", &["path"]);
+        let ft = follow_target(
+            &f,
+            &[Value::Str(r"C:\tmp".into())],
+            "db",
+            SqlDialect::Postgres,
+        )
+        .unwrap();
+        assert_eq!(ft.sql, r#"SELECT * FROM "files" WHERE "path" = 'C:\tmp'"#);
+
+        // MySQL still doubles it, because there `\` escapes.
+        let m =
+            follow_target(&f, &[Value::Str(r"C:\tmp".into())], "db", SqlDialect::MySql).unwrap();
+        assert!(m.sql.ends_with(r"= 'C:\\tmp'"), "{}", m.sql);
+    }
+
+    #[test]
+    fn follow_target_renders_a_nonfinite_float_as_null() {
+        use crate::intel::SqlDialect;
+        // Not reachable from a real key column (floats are refused as WHERE keys),
+        // but the shared literal must never emit a bare `NaN` — that's a parse
+        // error on both engines. Both dialects agree on NULL.
+        let f = fk(&["m"], Some("public"), "m", &["v"]);
+        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+            let ft = follow_target(&f, &[Value::Float(f64::NAN)], "db", d).unwrap();
+            assert!(ft.sql.ends_with("= NULL"), "{d:?}: {}", ft.sql);
+        }
     }
 
     #[test]

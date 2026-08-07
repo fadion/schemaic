@@ -4,6 +4,7 @@
 //! grid's live order so exports match what's on screen. The UI keeps only thin
 //! clipboard wrappers around these.
 
+use crate::intel::SqlDialect;
 use crate::model::{ResultSet, Value};
 
 /// A cell as a JSON value (non-finite floats → null).
@@ -45,20 +46,37 @@ pub fn csv_field(s: &str) -> String {
 }
 
 /// A cell as a SQL literal (non-finite float → NULL; strings escaped).
-pub fn sql_literal(v: &Value) -> String {
+///
+/// **Backslashes are dialect-critical.** MySQL treats `\` as an escape character
+/// inside a string literal, so it must be doubled. PostgreSQL, under its default
+/// `standard_conforming_strings = on` (since 9.1), takes a backslash literally —
+/// doubling it there would silently *corrupt* the value (`C:\tmp` → `C:\\tmp`).
+/// Doubling the single quote is the injection guard on both.
+pub fn sql_literal(v: &Value, dialect: SqlDialect) -> String {
     match v {
         Value::Null => "NULL".to_string(),
         Value::Int(i) => i.to_string(),
         Value::UInt(u) => u.to_string(),
         Value::Float(f) if !f.is_finite() => "NULL".to_string(),
         Value::Float(f) => f.to_string(),
-        Value::Str(s) => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''")),
+        Value::Str(s) => {
+            let escaped = match dialect {
+                SqlDialect::MySql => s.replace('\\', "\\\\").replace('\'', "''"),
+                SqlDialect::Postgres => s.replace('\'', "''"),
+            };
+            format!("'{escaped}'")
+        }
     }
 }
 
-/// Backtick-quote a SQL identifier, doubling any embedded backtick.
-pub fn ident_sql(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
+/// Quote a SQL identifier in the connection's dialect, doubling the embedded
+/// quote character: MySQL `` `name` ``, PostgreSQL `"name"`. The *other*
+/// dialect's quote char is an ordinary character and passes through untouched.
+pub fn ident_sql(name: &str, dialect: SqlDialect) -> String {
+    match dialect {
+        SqlDialect::MySql => format!("`{}`", name.replace('`', "``")),
+        SqlDialect::Postgres => format!("\"{}\"", name.replace('"', "\"\"")),
+    }
 }
 
 /// The whole result as a pretty JSON array of row objects (keyed by column name).
@@ -233,10 +251,14 @@ pub fn export_html(rs: &ResultSet, order: &[usize]) -> String {
     out
 }
 
-/// The result as `INSERT` statements. `source` is the real
-/// `(database, namespace, table)` when known; otherwise a `` `table` ``
-/// placeholder is emitted for the user to fill in. Identifiers are
-/// backtick-escaped.
+/// The result as `INSERT` statements, in the connection's dialect. `source` is
+/// the real `(database, namespace, table)` when known; otherwise a `table`
+/// placeholder is emitted for the user to fill in.
+///
+/// Identifiers and literals are quoted per `dialect` (see [`ident_sql`] and
+/// [`sql_literal`]) so the output pastes straight into a client for that engine —
+/// backticks and backslash-escaping for MySQL, double quotes and literal
+/// backslashes for PostgreSQL.
 ///
 /// A PostgreSQL namespace qualifies the table *instead of* the database — a PG
 /// connection is bound to one database, so `schema.table` is the addressable
@@ -245,16 +267,18 @@ pub fn export_inserts(
     rs: &ResultSet,
     order: &[usize],
     source: Option<(&str, Option<&str>, &str)>,
+    dialect: SqlDialect,
 ) -> String {
+    let q = |s: &str| ident_sql(s, dialect);
     let table_sql = match source {
-        Some((_, Some(ns), table)) => format!("{}.{}", ident_sql(ns), ident_sql(table)),
-        Some((db, None, table)) => format!("{}.{}", ident_sql(db), ident_sql(table)),
-        None => "`table`".to_string(),
+        Some((_, Some(ns), table)) => format!("{}.{}", q(ns), q(table)),
+        Some((db, None, table)) => format!("{}.{}", q(db), q(table)),
+        None => q("table"),
     };
     let cols = rs
         .columns
         .iter()
-        .map(|c| ident_sql(&c.name))
+        .map(|c| q(&c.name))
         .collect::<Vec<_>>()
         .join(", ");
     let mut out = String::new();
@@ -265,7 +289,7 @@ pub fn export_inserts(
         let vals = (0..rs.columns.len())
             .map(|ci| {
                 rs.cell(di, ci)
-                    .map(|c| sql_literal(&c.to_value()))
+                    .map(|c| sql_literal(&c.to_value(), dialect))
                     .unwrap_or_else(|| "NULL".to_string())
             })
             .collect::<Vec<_>>()
@@ -300,36 +324,99 @@ mod tests {
         )
     }
 
+    use crate::intel::SqlDialect::{MySql, Postgres};
+
     #[test]
-    fn ident_doubles_backticks() {
-        assert_eq!(ident_sql("a`b"), "`a``b`");
+    fn ident_quotes_per_dialect() {
+        // MySQL backticks (doubling an embedded backtick); Postgres double-quotes
+        // (doubling an embedded double-quote).
+        assert_eq!(ident_sql("a`b", MySql), "`a``b`");
+        assert_eq!(ident_sql("plain", Postgres), "\"plain\"");
+        assert_eq!(ident_sql("a\"b", Postgres), "\"a\"\"b\"");
+        // The other dialect's quote char is NOT special — it's just a character.
+        assert_eq!(ident_sql("a\"b", MySql), "`a\"b`");
+        assert_eq!(ident_sql("a`b", Postgres), "\"a`b\"");
     }
 
     #[test]
     fn sql_literal_handles_nonfinite_and_escapes() {
-        assert_eq!(sql_literal(&Value::Float(f64::NAN)), "NULL");
-        assert_eq!(sql_literal(&Value::Float(f64::INFINITY)), "NULL");
-        assert_eq!(sql_literal(&Value::Str("O'Hara".to_string())), "'O''Hara'");
+        assert_eq!(sql_literal(&Value::Float(f64::NAN), MySql), "NULL");
+        assert_eq!(sql_literal(&Value::Float(f64::INFINITY), MySql), "NULL");
+        assert_eq!(
+            sql_literal(&Value::Str("O'Hara".to_string()), MySql),
+            "'O''Hara'"
+        );
+    }
+
+    #[test]
+    fn sql_literal_only_escapes_backslashes_on_mysql() {
+        // MySQL treats `\` as an escape inside a string, so it must be doubled.
+        assert_eq!(
+            sql_literal(&Value::Str(r"C:\tmp".to_string()), MySql),
+            r"'C:\\tmp'"
+        );
+        // Postgres (standard_conforming_strings = on, the default since 9.1) takes
+        // a backslash literally — doubling it would silently CORRUPT the value,
+        // turning `C:\tmp` into `C:\\tmp`.
+        assert_eq!(
+            sql_literal(&Value::Str(r"C:\tmp".to_string()), Postgres),
+            r"'C:\tmp'"
+        );
+        // Quote-doubling is the injection guard on both.
+        assert_eq!(
+            sql_literal(&Value::Str("x'; DROP TABLE t; --".to_string()), Postgres),
+            "'x''; DROP TABLE t; --'"
+        );
     }
 
     #[test]
     fn c5_inserts_use_real_table_and_escape_identifiers() {
-        let out = export_inserts(&rs(), &[0, 1], Some(("shop", None, "cust")));
+        let out = export_inserts(&rs(), &[0, 1], Some(("shop", None, "cust")), MySql);
         // Real qualified table, not a `table` placeholder; column `a`b` escaped.
         assert!(out.contains("INSERT INTO `shop`.`cust` (`id`, `a``b`) VALUES"));
         assert!(out.contains("(1, 'x')"));
         assert!(out.contains("(NULL, 'y')"));
         // Placeholder only when the source is unknown.
-        assert!(export_inserts(&rs(), &[0], None).contains("INSERT INTO `table` ("));
+        assert!(export_inserts(&rs(), &[0], None, MySql).contains("INSERT INTO `table` ("));
     }
 
     #[test]
     fn inserts_qualify_by_namespace_instead_of_database() {
         // A PostgreSQL connection is bound to one database, so the namespace is
         // what makes the name resolvable — `schema.table`, not `db.table`.
-        let out = export_inserts(&rs(), &[0], Some(("warehouse", Some("sales"), "orders")));
-        assert!(out.contains("INSERT INTO `sales`.`orders` ("), "{out}");
+        let out = export_inserts(
+            &rs(),
+            &[0],
+            Some(("warehouse", Some("sales"), "orders")),
+            Postgres,
+        );
+        assert!(out.contains("INSERT INTO \"sales\".\"orders\" ("), "{out}");
         assert!(!out.contains("warehouse"), "{out}");
+    }
+
+    #[test]
+    fn inserts_for_postgres_are_valid_postgres() {
+        // The whole statement has to be pasteable into a PG client: every
+        // identifier double-quoted, none backtick-quoted. Note the fixture's
+        // column is literally named "a`b" — on Postgres that backtick is an
+        // ordinary character inside the name, so the check is that no identifier
+        // is *wrapped* in backticks, not that none appears at all.
+        let out = export_inserts(
+            &rs(),
+            &[0, 1],
+            Some(("db", Some("public"), "cust")),
+            Postgres,
+        );
+        assert!(
+            out.contains("INSERT INTO \"public\".\"cust\" (\"id\", \"a`b\") VALUES"),
+            "{out}"
+        );
+        assert!(!out.contains("`id`"), "MySQL quoting leaked: {out}");
+        assert!(!out.contains("`cust`"), "MySQL quoting leaked: {out}");
+        // The unknown-source placeholder follows the dialect too.
+        let ph = export_inserts(&rs(), &[0], None, Postgres);
+        assert!(ph.contains("INSERT INTO \"table\" ("), "{ph}");
+        assert!(!ph.contains("`table`"), "{ph}");
     }
 
     #[test]
