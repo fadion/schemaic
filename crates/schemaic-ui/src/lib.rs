@@ -77,6 +77,7 @@ use schemaic_core::history::HistoryEntry;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{CommitDone, GridWrite, QueryState, RefetchRequest};
 use schemaic_core::resource::ResourceSample;
+use schemaic_core::tx::{TxMode, TxState};
 
 /// The grid-commit completion callback, invoked on the UI thread with the outcome.
 pub type CommitDoneFn = Rc<dyn Fn(CommitDone)>;
@@ -211,6 +212,16 @@ pub struct Tab {
     /// loaded on tab switch and written back by the expand/shrink toggle. Session-only
     /// (starts un-maximized), matching the pre-per-tab behaviour.
     pub results_maximized: RwSignal<bool>,
+    /// Commit mode for this tab. [`TxMode::Manual`] pins one connection open (a
+    /// `Session` in the app) and holds a transaction across statements until the
+    /// user commits or rolls back. Session-only, and always starts
+    /// [`TxMode::Auto`] — a tab that reopened in Manual would be an easy way to
+    /// leave writes uncommitted without realising.
+    pub tx_mode: RwSignal<TxMode>,
+    /// Where this tab's transaction stands, folded from each statement's outcome
+    /// by the app (see `schemaic_core::tx`). Always [`TxState::Idle`] in
+    /// [`TxMode::Auto`]; drives the footer pill and the Commit/Rollback controls.
+    pub tx: RwSignal<TxState>,
     /// Temporary per-tab editor font-size override (px) for Ctrl+scroll zoom —
     /// `None` follows the user's configured font size. Session-only, per-tab, not
     /// persisted; Ctrl+middle-click resets it to `None`. Useful for screen-sharing.
@@ -264,6 +275,8 @@ impl Tab {
             jump_offset: cx.create_rw_signal(None),
             highlight_col: cx.create_rw_signal(None),
             results_maximized: cx.create_rw_signal(false),
+            tx_mode: cx.create_rw_signal(TxMode::default()),
+            tx: cx.create_rw_signal(TxState::default()),
             font_zoom: cx.create_rw_signal(None),
             base_sql: cx.create_rw_signal(None),
             grid_query: cx.create_rw_signal(schemaic_core::filter::GridQuery::default()),
@@ -280,6 +293,35 @@ impl Tab {
             .get()
             .unwrap_or_else(|| format!("Query {}", self.label))
     }
+}
+
+/// What the user chose when asked about an open transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxChoice {
+    Commit,
+    Rollback,
+    /// Back out — the action that raised the prompt doesn't happen either.
+    Cancel,
+}
+
+/// A pending "this would strand your open transaction" question.
+///
+/// Raised by the four actions that can't just proceed: switching a tab back to
+/// Auto-commit, closing it, disconnecting, and changing its database (a
+/// PostgreSQL session is bound to one database for life). The modal only
+/// renders it and calls `resolve`; the app does the `COMMIT`/`ROLLBACK` and then
+/// resumes — or abandons — whatever raised it.
+#[derive(Clone)]
+pub struct TxPrompt {
+    pub tab_id: usize,
+    /// What the user was trying to do, e.g. "Close Query 3".
+    pub action: String,
+    /// Statements in the transaction at risk, for the body text.
+    pub stmts: u32,
+    /// `false` when the transaction is aborted (PostgreSQL) — Commit isn't
+    /// offered, because committing an aborted transaction just rolls it back.
+    pub can_commit: bool,
+    pub resolve: Rc<dyn Fn(TxChoice)>,
 }
 
 /// One statement's result within a multi-statement (Run Everything) run. The
@@ -665,6 +707,17 @@ pub struct TabsActions {
     /// instead of full-re-running; `None` for inserts, which full-re-run); arg 3 is
     /// the completion callback, invoked on the UI thread with the outcome.
     pub commit_edits: CommitFn,
+    /// Set a tab's commit mode (by tab id). Switching to Manual only marks the
+    /// tab — the connection is pinned and `BEGIN` issued lazily on its first
+    /// statement. Switching back to Auto with a transaction still open is the
+    /// caller's problem to resolve first (see [`OverlayUi::tx_prompt`]).
+    pub set_tx_mode: Rc<dyn Fn(usize, TxMode)>,
+    /// `COMMIT` the tab's open transaction; the tab stays in Manual, ready for
+    /// the next one.
+    pub commit_tx: Rc<dyn Fn(usize)>,
+    /// `ROLLBACK` the tab's open transaction — also the way out of a PostgreSQL
+    /// transaction a failed statement aborted.
+    pub rollback_tx: Rc<dyn Fn(usize)>,
     pub add_tab: Rc<dyn Fn()>,
     pub close_tab: Rc<dyn Fn(usize)>,
     /// Toggle a tab's pinned state (by id) and re-order the strip so pinned tabs
@@ -1002,6 +1055,11 @@ pub struct OverlayUi {
     /// active tab's full query error (the editor error bar).
     pub error_modal_open: RwSignal<bool>,
     pub error_modal_text: RwSignal<Option<String>>,
+    /// Pending "you have an open transaction" prompt, or `None`. Set by any
+    /// action that would strand a transaction — switching back to Auto-commit,
+    /// closing the tab, disconnecting, or changing the tab's database — and
+    /// cleared when the user picks. See [`TxPrompt`].
+    pub tx_prompt: RwSignal<Option<TxPrompt>>,
     /// Query-plan (EXPLAIN) modal: open flag, the running/loaded state, the
     /// statement being explained (re-run when the Analyze toggle flips), and the
     /// Analyze toggle itself.
