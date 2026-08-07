@@ -1278,6 +1278,9 @@ fn export_inserts(gs: GridState) -> String {
         source
             .as_ref()
             .map(|s| (s.database.as_str(), s.schema.as_deref(), s.table.as_str())),
+        // The tab's own connection dialect — copy-as-INSERT has to paste into the
+        // engine the rows came from.
+        gs.dialect,
     )
 }
 
