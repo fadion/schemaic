@@ -2,9 +2,12 @@
 //! `start_ai_session`, which spawns the CLI child and streams transcript snapshots
 //! over a channel), the per-session MCP config plumbing (the DB endpoint written
 //! to a temp file so credentials stay off the command line — review C6), the
-//! system-prompt context builder (`ai_context`), and the inline-AI (Ctrl+K)
-//! helpers (`inline_system_prompt` / `extract_sql`). These are free functions and
-//! plain types — the reactive wiring that drives them lives in `app_view`.
+//! system-prompt context builder (`ai_context`), the per-turn context refresh
+//! (`TurnContext` / `apply_turn_delta` — the system prompt is written once at
+//! spawn, so what moves afterwards rides along with each user turn), and the
+//! inline-AI (Ctrl+K) helpers (`inline_system_prompt` / `extract_sql`). These are
+//! free functions and plain types — the reactive wiring that drives them lives in
+//! `app_view`.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -37,6 +40,16 @@ pub(crate) struct AiSession {
     /// The AI settings this session was spawned with, so closing the settings
     /// modal only respawns `claude` when one actually changed (review §7.4).
     pub(crate) settings: AiSettings,
+    /// The live context (active database / schema outline / editor contents) as
+    /// the assistant last saw it — seeded from the system prompt at spawn, then
+    /// advanced on every turn. The system prompt is written once, so without
+    /// this the assistant answers later turns against the state from the first
+    /// question.
+    pub(crate) last_context: TurnContext,
+    /// The database the MCP subprocess was spawned against. Fixed for the life
+    /// of the session (it rides in the config file `claude` was launched with),
+    /// so the turn delta has to warn when the user switches away from it.
+    pub(crate) mcp_database: Option<String>,
 }
 
 /// Snapshot of the AI settings that require respawning the `claude` session
@@ -363,7 +376,86 @@ pub(crate) fn start_ai_session(
     (tx, mcp_cfg)
 }
 
+/// The parts of the AI's context that change *while a session is alive* — the
+/// active database, the schema outline (a database's tables land here when
+/// introspection finishes), and the query editor's contents.
+///
+/// The system prompt is written once, when the `claude` child is spawned, so
+/// without this the assistant answers every later turn against the state from
+/// the first question. [`render_turn_delta`] diffs two snapshots into a small
+/// block prepended to the user's turn.
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct TurnContext {
+    pub(crate) active_db: Option<String>,
+    pub(crate) outline: String,
+    pub(crate) query: String,
+}
+
+/// Render the context block prepended to a user turn: only the parts that
+/// changed since `prev`, or `None` when nothing did (the common case — no
+/// tokens spent re-stating what the model already knows).
+///
+/// An outline that is empty in both snapshots is never reported: that's
+/// `SchemaScope::None`, where the system prompt promised no schema section at
+/// all.
+///
+/// `mcp_database` is the database the MCP subprocess was spawned against. It's
+/// fixed for the life of the session, so once the user switches away the block
+/// says so — otherwise `run_query` would silently resolve the assistant's
+/// unqualified table names against the old database.
+fn render_turn_delta(
+    prev: &TurnContext,
+    cur: &TurnContext,
+    mcp_database: Option<&str>,
+) -> Option<String> {
+    if prev == cur {
+        return None;
+    }
+    let mut out = String::from(
+        "[Schemaic context update — this supersedes the matching section of your \
+         system prompt.]\n",
+    );
+    if prev.active_db != cur.active_db {
+        out.push_str(&format!(
+            "Active database: {}\n",
+            cur.active_db.as_deref().unwrap_or("(none)")
+        ));
+        if cur.active_db.is_some() && cur.active_db.as_deref() != mcp_database {
+            let pinned = mcp_database.unwrap_or("the connection default");
+            out.push_str(&format!(
+                "Note: the run_query tool still runs against {pinned} — qualify table \
+                 names (db.table) to reach another database.\n"
+            ));
+        }
+    }
+    if prev.outline != cur.outline && !cur.outline.is_empty() {
+        out.push_str(&format!("Databases and tables:\n{}", cur.outline));
+    }
+    if prev.query != cur.query {
+        out.push_str(&format!(
+            "Current query editor:\n```sql\n{}\n```\n",
+            cur.query
+        ));
+    }
+    Some(out)
+}
+
+/// Prepend the context delta (if any) to a user turn, so the model reads the
+/// refreshed context before the question it applies to.
+pub(crate) fn apply_turn_delta(
+    prev: &TurnContext,
+    cur: &TurnContext,
+    mcp_database: Option<&str>,
+    msg: &str,
+) -> String {
+    match render_turn_delta(prev, cur, mcp_database) {
+        Some(block) => format!("{block}\n{msg}"),
+        None => msg.to_string(),
+    }
+}
+
 /// Bundled inputs for [`ai_context`] (keeps the argument count in check).
+#[derive(Clone, Copy)]
 pub(crate) struct AiContextParams {
     pub connections: RwSignal<Vec<Connection>>,
     pub active_conn: RwSignal<u64>,
@@ -375,44 +467,82 @@ pub(crate) struct AiContextParams {
 }
 
 pub(crate) fn ai_context(p: AiContextParams, instructions: &str) -> String {
+    let conn_name = p
+        .connections
+        .with_untracked(|cs| {
+            cs.iter()
+                .find(|c| c.id == p.active_conn.get_untracked())
+                .map(|c| c.name.clone())
+        })
+        .unwrap_or_else(|| "(none)".to_string());
+    render_ai_context(
+        &conn_name,
+        &turn_context(p),
+        p.scope,
+        p.run_queries,
+        instructions,
+    )
+}
+
+/// Snapshot the live parts of the AI's context (active database, schema outline,
+/// editor contents) for the active tab. Taken before every user turn so
+/// [`apply_turn_delta`] can report what moved since the session started.
+pub(crate) fn turn_context(p: AiContextParams) -> TurnContext {
     let AiContextParams {
-        connections,
-        active_conn,
         db_nodes,
         tabs,
         active,
         scope,
-        run_queries,
+        ..
     } = p;
-    let conn_name = connections
-        .with_untracked(|cs| {
-            cs.iter()
-                .find(|c| c.id == active_conn.get_untracked())
-                .map(|c| c.name.clone())
-        })
-        .unwrap_or_else(|| "(none)".to_string());
-    let active_db = tabs.with_untracked(|v| {
-        v.iter()
-            .find(|t| t.id == active.get_untracked())
-            .and_then(|t| t.database.get_untracked())
-    });
-    let current = tabs
-        .with_untracked(|v| {
+    let tab = |f: &dyn Fn(&Tab) -> Option<String>| {
+        tabs.with_untracked(|v| {
             v.iter()
                 .find(|t| t.id == active.get_untracked())
-                .map(|t| t.query.get_untracked())
+                .and_then(f)
         })
-        .unwrap_or_default();
+    };
+    let active_db = tab(&|t| t.database.get_untracked());
+    let query = tab(&|t| Some(t.query.get_untracked())).unwrap_or_default();
     let databases = snapshot_databases(db_nodes);
-    render_ai_context(
-        &conn_name,
-        active_db.as_deref(),
-        &databases,
-        &current,
-        scope,
-        run_queries,
-        instructions,
-    )
+    TurnContext {
+        outline: render_schema_outline(&databases, active_db.as_deref(), scope),
+        active_db,
+        query,
+    }
+}
+
+/// The `- database: table, table` outline, filtered per the scope setting.
+/// Shared by the system prompt and the per-turn delta so the two can never
+/// disagree about what the assistant has been told.
+fn render_schema_outline(
+    databases: &[(String, Option<DbSchema>)],
+    active_db: Option<&str>,
+    scope: SchemaScope,
+) -> String {
+    let mut outline = String::new();
+    if scope == SchemaScope::None {
+        return outline;
+    }
+    for (database, schema) in databases {
+        if scope == SchemaScope::Active && Some(database.as_str()) != active_db {
+            continue;
+        }
+        match schema {
+            Some(s) => {
+                // Qualified outside PostgreSQL's `public` — the assistant has to
+                // be able to name the table it's told about.
+                let tables: Vec<String> = s
+                    .tables
+                    .iter()
+                    .map(|t| schemaic_core::schema::display_name(t.schema.as_deref(), &t.name))
+                    .collect();
+                outline.push_str(&format!("- {}: {}\n", database, tables.join(", ")));
+            }
+            None => outline.push_str(&format!("- {database}\n")),
+        }
+    }
+    outline
 }
 
 /// Snapshot each schema-tree node into plain data: `(database, Some(schema))`
@@ -433,41 +563,17 @@ fn snapshot_databases(db_nodes: RwSignal<Vec<ConnNode>>) -> Vec<(String, Option<
 }
 
 /// Pure core of [`ai_context`]: assemble the AI-panel system prompt from an
-/// already-snapshotted connection name, active database, per-database schema,
-/// current query, scope, and run-queries flag. No signals — so the prompt shape
-/// (tools line, scope filtering, schema section) is unit-tested.
+/// already-snapshotted connection name, [`TurnContext`], scope, and run-queries
+/// flag. No signals — so the prompt shape (tools line, schema section) is
+/// unit-tested. Every live section it writes is one [`render_turn_delta`] can
+/// supersede later in the session.
 fn render_ai_context(
     conn_name: &str,
-    active_db: Option<&str>,
-    databases: &[(String, Option<DbSchema>)],
-    current: &str,
+    cx: &TurnContext,
     scope: SchemaScope,
     run_queries: bool,
     instructions: &str,
 ) -> String {
-    // Schema outline, scoped per the setting.
-    let mut outline = String::new();
-    if scope != SchemaScope::None {
-        for (database, schema) in databases {
-            if scope == SchemaScope::Active && Some(database.as_str()) != active_db {
-                continue;
-            }
-            match schema {
-                Some(s) => {
-                    // Qualified outside PostgreSQL's `public` — the assistant has to
-                    // be able to name the table it's told about.
-                    let tables: Vec<String> = s
-                        .tables
-                        .iter()
-                        .map(|t| schemaic_core::schema::display_name(t.schema.as_deref(), &t.name))
-                        .collect();
-                    outline.push_str(&format!("- {}: {}\n", database, tables.join(", ")));
-                }
-                None => outline.push_str(&format!("- {database}\n")),
-            }
-        }
-    }
-
     // Tools line — kept truthful: the assistant always has `list_schema`, and
     // `run_query` only when the setting allows it.
     let tools_line = if run_queries {
@@ -481,16 +587,19 @@ fn render_ai_context(
     let schema_section = if scope == SchemaScope::None {
         String::new()
     } else {
-        format!("Databases and tables:\n{outline}\n")
+        format!("Databases and tables:\n{}\n", cx.outline)
     };
+    let current = &cx.query;
 
     let mut out = format!(
         "You are a SQL assistant embedded in Schemaic, a native MySQL/MariaDB editor. \
          Help the user write, fix, and understand SQL. Be concise and return runnable \
          SQL in fenced code blocks. {tools_line}\n\n\
          Active connection: {conn_name}\n\
+         Active database: {active_db}\n\
          {schema_section}\
-         Current query editor:\n```sql\n{current}\n```"
+         Current query editor:\n```sql\n{current}\n```",
+        active_db = cx.active_db.as_deref().unwrap_or("(none)"),
     );
     let instructions = instructions.trim();
     if !instructions.is_empty() {
@@ -700,6 +809,21 @@ mod tests {
         DbSchema { tables }
     }
 
+    /// Build the system-prompt context the way `turn_context` would, but from
+    /// plain snapshotted data (no signals).
+    fn ctx_of(
+        dbs: &[(String, Option<DbSchema>)],
+        active_db: Option<&str>,
+        query: &str,
+        scope: SchemaScope,
+    ) -> TurnContext {
+        TurnContext {
+            outline: render_schema_outline(dbs, active_db, scope),
+            active_db: active_db.map(str::to_string),
+            query: query.to_string(),
+        }
+    }
+
     #[test]
     fn render_ai_context_active_scope_lists_only_active_db() {
         let dbs = vec![
@@ -712,16 +836,10 @@ mod tests {
                 Some(schema(vec![table("posts", &["id"])])),
             ),
         ];
-        let out = render_ai_context(
-            "Local",
-            Some("shop"),
-            &dbs,
-            "SELECT 1",
-            SchemaScope::Active,
-            true,
-            "",
-        );
+        let cx = ctx_of(&dbs, Some("shop"), "SELECT 1", SchemaScope::Active);
+        let out = render_ai_context("Local", &cx, SchemaScope::Active, true, "");
         assert!(out.contains("Active connection: Local"));
+        assert!(out.contains("Active database: shop"));
         assert!(out.contains("- shop: orders"));
         assert!(!out.contains("blog")); // Active scope drops non-active dbs
         // run_queries = true → mentions run_query.
@@ -738,7 +856,8 @@ mod tests {
             ),
             ("blog".to_string(), None), // schema not loaded yet
         ];
-        let out = render_ai_context("Local", Some("shop"), &dbs, "", SchemaScope::All, false, "");
+        let cx = ctx_of(&dbs, Some("shop"), "", SchemaScope::All);
+        let out = render_ai_context("Local", &cx, SchemaScope::All, false, "");
         assert!(out.contains("- shop: orders"));
         assert!(out.contains("- blog\n")); // unloaded → name only, no ": tables"
         // run_queries = false → the no-queries tools line.
@@ -752,15 +871,8 @@ mod tests {
             "shop".to_string(),
             Some(schema(vec![table("orders", &["id"])])),
         )];
-        let out = render_ai_context(
-            "Local",
-            Some("shop"),
-            &dbs,
-            "",
-            SchemaScope::None,
-            true,
-            "  Prefer CTEs.  ",
-        );
+        let cx = ctx_of(&dbs, Some("shop"), "", SchemaScope::None);
+        let out = render_ai_context("Local", &cx, SchemaScope::None, true, "  Prefer CTEs.  ");
         assert!(!out.contains("Databases and tables:"));
         assert!(!out.contains("orders"));
         // Instructions are trimmed and appended.
@@ -809,6 +921,123 @@ mod tests {
         assert!(out.contains("posts(id, body)")); // mentioned → columns
         assert!(out.contains("  tags\n")); // not mentioned → bare name
         assert!(!out.contains("tags(")); // no columns for the unmentioned table
+    }
+
+    fn cx(active_db: Option<&str>, outline: &str, query: &str) -> TurnContext {
+        TurnContext {
+            active_db: active_db.map(str::to_string),
+            outline: outline.to_string(),
+            query: query.to_string(),
+        }
+    }
+
+    #[test]
+    fn turn_delta_is_none_when_nothing_changed() {
+        let c = cx(Some("shop"), "- shop: orders\n", "SELECT 1");
+        assert_eq!(render_turn_delta(&c, &c, Some("shop")), None);
+    }
+
+    #[test]
+    fn turn_delta_reports_only_the_changed_query() {
+        let prev = cx(Some("shop"), "- shop: orders\n", "SELECT 1");
+        let cur = cx(Some("shop"), "- shop: orders\n", "SELECT 2");
+        let out = render_turn_delta(&prev, &cur, Some("shop")).expect("query changed");
+        assert!(out.contains("```sql\nSELECT 2\n```"));
+        // Unchanged parts are not re-sent.
+        assert!(!out.contains("Active database:"));
+        assert!(!out.contains("Databases and tables:"));
+    }
+
+    #[test]
+    fn turn_delta_reports_active_database_change() {
+        let prev = cx(Some("shop"), "- shop: orders\n", "SELECT 1");
+        let cur = cx(Some("blog"), "- shop: orders\n", "SELECT 1");
+        let out = render_turn_delta(&prev, &cur, Some("shop")).expect("database changed");
+        assert!(out.contains("Active database: blog"));
+        assert!(!out.contains("Current query editor:"));
+    }
+
+    #[test]
+    fn turn_delta_reports_schema_outline_change() {
+        // A schema finishing introspection changes the outline even though the
+        // active database and editor are untouched.
+        let prev = cx(Some("shop"), "- shop\n", "SELECT 1");
+        let cur = cx(Some("shop"), "- shop: orders, customers\n", "SELECT 1");
+        let out = render_turn_delta(&prev, &cur, Some("shop")).expect("outline changed");
+        assert!(out.contains("Databases and tables:\n- shop: orders, customers"));
+        assert!(!out.contains("Active database:"));
+    }
+
+    #[test]
+    fn turn_delta_reports_a_cleared_editor_and_dropped_database() {
+        let prev = cx(Some("shop"), "- shop: orders\n", "SELECT 1");
+        let cur = cx(None, "- shop: orders\n", "");
+        let out = render_turn_delta(&prev, &cur, Some("shop")).expect("db and query changed");
+        assert!(out.contains("Active database: (none)"));
+        assert!(out.contains("```sql\n\n```"));
+    }
+
+    #[test]
+    fn turn_delta_warns_when_the_active_db_drifts_from_the_mcp_default() {
+        // `run_query` is pinned to the database the session was spawned with, so
+        // once the user switches the assistant must qualify its table names.
+        let prev = cx(Some("shop"), "", "SELECT 1");
+        let cur = cx(Some("blog"), "", "SELECT 1");
+        let out = render_turn_delta(&prev, &cur, Some("shop")).expect("database changed");
+        assert!(out.contains("Active database: blog"));
+        assert!(out.contains("run_query"));
+        assert!(out.contains("shop"));
+    }
+
+    #[test]
+    fn turn_delta_has_no_tool_warning_while_the_active_db_matches() {
+        let prev = cx(Some("shop"), "", "SELECT 1");
+        let cur = cx(Some("shop"), "", "SELECT 2");
+        let out = render_turn_delta(&prev, &cur, Some("shop")).expect("query changed");
+        assert!(!out.contains("run_query"));
+    }
+
+    #[test]
+    fn apply_turn_delta_prepends_the_block_and_passes_a_clean_turn_through() {
+        let prev = cx(Some("shop"), "", "SELECT 1");
+        let cur = cx(Some("shop"), "", "SELECT 2");
+        let out = apply_turn_delta(&prev, &cur, Some("shop"), "why is this slow?");
+        assert!(out.starts_with("[Schemaic context update"));
+        assert!(out.ends_with("why is this slow?"));
+        // Nothing moved → the user's message is sent verbatim.
+        assert_eq!(apply_turn_delta(&cur, &cur, Some("shop"), "hello"), "hello");
+    }
+
+    #[test]
+    fn turn_delta_omits_the_outline_when_scope_is_none() {
+        // SchemaScope::None yields an empty outline in both snapshots — nothing to
+        // report, so an unchanged-empty outline never emits a header.
+        let prev = cx(Some("shop"), "", "SELECT 1");
+        let cur = cx(Some("shop"), "", "SELECT 2");
+        let out = render_turn_delta(&prev, &cur, Some("shop")).expect("query changed");
+        assert!(!out.contains("Databases and tables:"));
+    }
+
+    #[test]
+    fn schema_outline_matches_the_scope() {
+        let dbs = vec![
+            (
+                "shop".to_string(),
+                Some(schema(vec![table("orders", &["id"])])),
+            ),
+            ("blog".to_string(), None),
+        ];
+        // Active → only the active database.
+        let out = render_schema_outline(&dbs, Some("shop"), SchemaScope::Active);
+        assert_eq!(out, "- shop: orders\n");
+        // All → every database; an unloaded one is listed bare.
+        let out = render_schema_outline(&dbs, Some("shop"), SchemaScope::All);
+        assert_eq!(out, "- shop: orders\n- blog\n");
+        // None → nothing at all.
+        assert_eq!(
+            render_schema_outline(&dbs, Some("shop"), SchemaScope::None),
+            ""
+        );
     }
 
     #[test]
