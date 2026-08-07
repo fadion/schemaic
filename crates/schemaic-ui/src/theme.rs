@@ -429,6 +429,25 @@ pub fn seed_button() -> Color {
     Color::rgb8(0x71, 0xC3, 0x71)
 }
 
+/// A tab in manual-commit mode, and its open-transaction pill (`#E0B24B`). Its
+/// own colour rather than `status_warn`'s amber: an open transaction is a
+/// *state you're holding*, not a warning about your SQL, and the two want to be
+/// retunable apart.
+pub fn tx_open() -> Color {
+    Color::rgb8(0xE0, 0xB2, 0x4B)
+}
+/// Hover for the clickable manual-mode / Commit / Rollback footer segments
+/// (`#FFD070`).
+pub fn tx_open_hover() -> Color {
+    Color::rgb8(0xFF, 0xD0, 0x70)
+}
+/// A transaction that can't go forward — PostgreSQL aborted it, or the pinned
+/// connection died (`#E05A5A`, matching `diag_error`'s red but independent of
+/// the editor's diagnostics).
+pub fn tx_danger() -> Color {
+    Color::rgb8(0xE0, 0x5A, 0x5A)
+}
+
 // Connection status: reachable (unreachable reuses `reject_bg`).
 pub fn conn_ok() -> Color {
     ui().conn_ok

@@ -23,7 +23,7 @@ use crate::widgets::{
     MenuEntry, autohide, measure_text_px_at, menu_item_style, menu_panel, panel_style, window_size,
 };
 use crate::{
-    ConnNode, CtxKind, PopupAnchor, RightPanel, Ui, icons, right_panel_allowed,
+    ConnNode, CtxKind, PopupAnchor, RightPanel, TxChoice, Ui, icons, right_panel_allowed,
     schema_panel_allowed, search_box, status_color, theme,
 };
 
@@ -1924,6 +1924,142 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
     )
     .style(move |s| {
         if open.get() {
+            s.absolute().inset(0.0)
+        } else {
+            s
+        }
+    })
+}
+
+/// "You have an open transaction" — the question raised by anything that would
+/// strand one (leaving Manual mode, closing the tab, switching its database).
+///
+/// Deliberately *not* dismissible by clicking away or Escape-ing: those read as
+/// "never mind", and there's no safe default between committing and discarding
+/// someone's uncommitted writes. Cancel is spelled out as a button, and it
+/// abandons the action that raised the prompt rather than the transaction.
+pub(crate) fn tx_prompt_overlay(ui: Ui) -> impl IntoView {
+    let prompt = ui.overlay.tx_prompt;
+
+    dyn_container(
+        move || prompt.get(),
+        move |p| {
+            let Some(p) = p else {
+                return empty().into_any();
+            };
+            let stmts = match p.stmts {
+                1 => "1 statement".to_string(),
+                n => format!("{n} statements"),
+            };
+            let body = if p.can_commit {
+                format!(
+                    "{} has an open transaction with {stmts} in it. \
+                     Commit them, or roll them back and lose them?",
+                    p.action
+                )
+            } else {
+                // Postgres aborted it, so committing isn't on the table.
+                format!(
+                    "{} has a transaction that was aborted by a failed statement, \
+                     with {stmts} in it. They can only be rolled back.",
+                    p.action
+                )
+            };
+
+            // One button row: Cancel (quiet) · Rollback (danger) · Commit.
+            let btn = |label: &'static str,
+                       color: fn() -> Color,
+                       hover: fn() -> Color,
+                       act: Rc<dyn Fn()>| {
+                text(label).on_click_stop(move |_| (act)()).style(move |s| {
+                    s.font_size(theme::FONT_BODY)
+                        .padding_horiz(10.0)
+                        .padding_vert(5.0)
+                        .border_radius(6.0)
+                        .color(color())
+                        .hover(move |s| s.color(hover()))
+                })
+            };
+            let resolve = p.resolve.clone();
+            let cancel = {
+                let r = resolve.clone();
+                btn(
+                    "Cancel",
+                    theme::text_dim,
+                    theme::text,
+                    Rc::new(move || (r)(TxChoice::Cancel)),
+                )
+            };
+            let rollback = {
+                let r = resolve.clone();
+                btn(
+                    "Roll back",
+                    theme::tx_danger,
+                    theme::error,
+                    Rc::new(move || (r)(TxChoice::Rollback)),
+                )
+            };
+            let commit = {
+                let r = resolve.clone();
+                let can = p.can_commit;
+                btn(
+                    "Commit",
+                    theme::tx_open,
+                    theme::tx_open_hover,
+                    Rc::new(move || (r)(TxChoice::Commit)),
+                )
+                .style(move |s| if can { s } else { s.hide() })
+            };
+
+            let panel = v_stack((
+                text("Open transaction").style(|s| {
+                    s.font_size(15.0)
+                        .font_bold()
+                        .color(theme::text())
+                        .margin_bottom(10.0)
+                }),
+                text(body).style(|s| {
+                    s.width(420.0)
+                        .color(theme::text())
+                        .font_size(theme::FONT_BODY)
+                        .line_height(1.4)
+                }),
+                h_stack((
+                    empty().style(|s| s.flex_grow(1.0_f32)),
+                    cancel,
+                    rollback,
+                    commit,
+                ))
+                .style(|s| {
+                    s.width_full()
+                        .flex_row()
+                        .items_center()
+                        .gap(6.0)
+                        .margin_top(18.0)
+                }),
+            ))
+            .on_click_stop(|_| {})
+            .style(|s| {
+                panel_style(s)
+                    .width(470.0)
+                    .padding(20.0)
+                    .flex_col()
+                    .border_color(theme::modal_border())
+            });
+
+            container(panel)
+                .style(|s| {
+                    s.size_full()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .background(theme::modal_backdrop())
+                })
+                .into_any()
+        },
+    )
+    .style(move |s| {
+        if prompt.get().is_some() {
             s.absolute().inset(0.0)
         } else {
             s
