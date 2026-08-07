@@ -23,8 +23,12 @@ use floem::reactive::{Memo, create_effect, create_memo};
 use floem::style::CursorStyle;
 use floem::views::{VirtualDirection, VirtualItemSize, VirtualVector};
 
+use floem::action::save_as;
+use floem::file::{FileDialogOptions, FileSpec};
+
 use schemaic_core::connection::Connection;
 use schemaic_core::edit::{EditModel, analyze_edit, refetch_template};
+use schemaic_core::export::{ExportFormat, suggested_filename};
 use schemaic_core::filter::{FilterError, build_query, eq_condition};
 use schemaic_core::format::{self, ColumnFormat, ColumnFormatRule};
 use schemaic_core::intel::SqlDialect;
@@ -1224,10 +1228,22 @@ fn copy_selection(gs: GridState) {
 
 // Thin clipboard-facing wrappers over `schemaic_core::export` — unwrap the
 // grid's live `ResultSet` + display order and delegate to the pure functions.
-fn export_json(gs: GridState) -> String {
-    schemaic_core::export::export_json(
-        gs.rs.get_untracked().as_ref(),
-        gs.order.get_untracked().as_slice(),
+
+/// Render the whole result in `format`. The single dispatch point for both the
+/// copy menu and the save-to-file menu, so the two can't drift.
+fn render_export(gs: GridState, format: ExportFormat) -> String {
+    let rs = gs.rs.get_untracked();
+    let order = gs.order.get_untracked();
+    let source = gs.source.get_untracked();
+    format.render(
+        rs.as_ref(),
+        order.as_slice(),
+        source
+            .as_ref()
+            .map(|s| (s.database.as_str(), s.schema.as_deref(), s.table.as_str())),
+        // The tab's own connection dialect — an exported `INSERT` has to load into
+        // the engine the rows came from.
+        gs.dialect,
     )
 }
 
@@ -1247,41 +1263,42 @@ fn export_column_csv(gs: GridState, ci: usize) -> String {
     )
 }
 
-fn export_csv(gs: GridState) -> String {
-    schemaic_core::export::export_csv(
-        gs.rs.get_untracked().as_ref(),
-        gs.order.get_untracked().as_slice(),
-    )
-}
-
-fn export_markdown(gs: GridState) -> String {
-    schemaic_core::export::export_markdown(
-        gs.rs.get_untracked().as_ref(),
-        gs.order.get_untracked().as_slice(),
-    )
-}
-
-fn export_html(gs: GridState) -> String {
-    schemaic_core::export::export_html(
-        gs.rs.get_untracked().as_ref(),
-        gs.order.get_untracked().as_slice(),
-    )
-}
-
-fn export_inserts(gs: GridState) -> String {
-    let rs = gs.rs.get_untracked();
-    let order = gs.order.get_untracked();
-    let source = gs.source.get_untracked();
-    schemaic_core::export::export_inserts(
-        rs.as_ref(),
-        order.as_slice(),
-        source
+/// Save the whole result to a file the user picks. Opens the system save dialog
+/// (pre-filled with the source table's name + the format's extension), then writes
+/// the rendered text; a cancelled dialog does nothing. A write failure surfaces in
+/// the grid's error bar — the same place a failed commit reports.
+fn save_export(gs: GridState, format: ExportFormat) {
+    let default_name = suggested_filename(
+        gs.source
+            .get_untracked()
             .as_ref()
-            .map(|s| (s.database.as_str(), s.schema.as_deref(), s.table.as_str())),
-        // The tab's own connection dialect — copy-as-INSERT has to paste into the
-        // engine the rows came from.
-        gs.dialect,
-    )
+            .map(|s| s.display())
+            .as_deref(),
+        format,
+    );
+    let opts = FileDialogOptions::new()
+        .title("Export results")
+        .default_name(default_name)
+        .allowed_types(vec![FileSpec {
+            name: format.label(),
+            extensions: format.extensions(),
+        }]);
+    // Rendered *before* the dialog opens: the dialog is modal and slow, and the
+    // grid's result could be re-run or the tab switched while it's up — the export
+    // should be of what the user was looking at when they asked.
+    let body = render_export(gs, format);
+    save_as(opts, move |file| {
+        let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
+            return; // cancelled
+        };
+        if let Err(e) = std::fs::write(&path, &body) {
+            // `try_update`: the result-set scope may have been disposed while the
+            // (modal, off-thread) dialog was open — a plain `set` would panic on
+            // the freed signal.
+            gs.commit_err
+                .try_update(|v| *v = Some(format!("Export failed: {e}")));
+        }
+    });
 }
 
 /// A draggable column-resize divider pinned to the right edge of a header cell.
@@ -4038,26 +4055,62 @@ fn grid_toolbar(
         gs.popup_width.set(GRID_COPY_MENU_W);
         gs.popup_anchor
             .set(Some(PopupAnchor::BelowIcon(o.x, o.x + sz, o.y + sz)));
-        gs.popup.set(Some(vec![
-            MenuEntry::action("JSON", move || {
-                let _ = floem::Clipboard::set_contents(export_json(gs));
-            }),
-            MenuEntry::action("CSV", move || {
-                let _ = floem::Clipboard::set_contents(export_csv(gs));
-            }),
-            MenuEntry::action("SQL", move || {
-                let _ = floem::Clipboard::set_contents(export_inserts(gs));
-            }),
-            MenuEntry::action("Markdown", move || {
-                let _ = floem::Clipboard::set_contents(export_markdown(gs));
-            }),
-            MenuEntry::action("HTML", move || {
-                let _ = floem::Clipboard::set_contents(export_html(gs));
-            }),
-        ]));
+        gs.popup.set(Some(
+            ExportFormat::ALL
+                .iter()
+                .map(|&f| {
+                    MenuEntry::action(f.label(), move || {
+                        let _ = floem::Clipboard::set_contents(render_export(gs, f));
+                    })
+                })
+                .collect(),
+        ));
     })
     .on_event_cont(EventListener::PointerEnter, move |_| copy_hov.set(true))
     .on_event_cont(EventListener::PointerLeave, move |_| copy_hov.set(false))
+    .on_event_stop(EventListener::PointerDown, |_| {})
+    .style(|s| {
+        s.items_center()
+            .padding_vert(3.0)
+            .padding_horiz(5.0)
+            .cursor(CursorStyle::Default)
+    });
+
+    // Download icon → the same format dropdown as Copy, but each choice opens a
+    // save dialog and writes the file. Identical styling/anchoring to `copy_menu`
+    // so the pair reads as one control: copy it, or save it.
+    let save_origin = RwSignal::new(Point::ZERO);
+    let save_hov = RwSignal::new(false);
+    let save_menu = container(
+        icons::icon(icons::DOWNLOAD, 16.0)
+            .on_move(move |p| save_origin.set(p))
+            .style(move |s| {
+                let c = if save_hov.get() {
+                    theme::text()
+                } else {
+                    theme::text_muted()
+                };
+                s.color(c).flex_shrink(0.0_f32)
+            }),
+    )
+    .on_click_stop(move |_| {
+        if let Some(d) = gs.dismiss.get_untracked() {
+            (d)();
+        }
+        let o = save_origin.get_untracked();
+        let sz = 16.0; // the DOWNLOAD glyph size above
+        gs.popup_width.set(GRID_COPY_MENU_W);
+        gs.popup_anchor
+            .set(Some(PopupAnchor::BelowIcon(o.x, o.x + sz, o.y + sz)));
+        gs.popup.set(Some(
+            ExportFormat::ALL
+                .iter()
+                .map(|&f| MenuEntry::action(f.label(), move || save_export(gs, f)))
+                .collect(),
+        ));
+    })
+    .on_event_cont(EventListener::PointerEnter, move |_| save_hov.set(true))
+    .on_event_cont(EventListener::PointerLeave, move |_| save_hov.set(false))
     .on_event_stop(EventListener::PointerDown, |_| {})
     .style(|s| {
         s.items_center()
@@ -4151,7 +4204,7 @@ fn grid_toolbar(
     // The icon cluster — 3px between icons (on top of each icon's padded hitbox),
     // separators pushed further out by their own margin:
     // [commit ✓][discard ✗] │ [＋][－][clone] │ [✦ AI][copy].
-    let icons_cluster = h_stack((commit_ctrl, row_actions, ai_menu, copy_menu))
+    let icons_cluster = h_stack((commit_ctrl, row_actions, ai_menu, copy_menu, save_menu))
         .style(|s| s.items_center().flex_row().gap(3.0));
 
     h_stack((

@@ -1,11 +1,125 @@
 //! Result-set export — pure over [`ResultSet`] + a display order, no UI.
 //!
 //! `order` is the display→data-row permutation (post-sort); callers pass the
-//! grid's live order so exports match what's on screen. The UI keeps only thin
-//! clipboard wrappers around these.
+//! grid's live order so exports match what's on screen.
+//!
+//! [`ExportFormat`] is the single value the grid's two menus dispatch on — Copy
+//! (to the clipboard) and Download (to a file) — so the label, extension,
+//! suggested file name and rendering can't drift between them. The UI keeps only
+//! thin wrappers: unwrap the live result set, then write the returned `String` to
+//! the clipboard or to the path the save dialog returned.
 
 use crate::intel::SqlDialect;
 use crate::model::{ResultSet, Value};
+
+/// The formats the results grid can export a result set to — one value driving
+/// the menu label, the file extension, the suggested file name, and the rendering,
+/// so "copy to clipboard" and "save to file" can't drift apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportFormat {
+    Json,
+    Csv,
+    /// `INSERT` statements, in the connection's dialect.
+    Sql,
+    Markdown,
+    Html,
+}
+
+impl ExportFormat {
+    /// Every format, in the order the grid's menus list them.
+    pub const ALL: [ExportFormat; 5] = [
+        ExportFormat::Json,
+        ExportFormat::Csv,
+        ExportFormat::Sql,
+        ExportFormat::Markdown,
+        ExportFormat::Html,
+    ];
+
+    /// The menu label.
+    pub fn label(self) -> &'static str {
+        match self {
+            ExportFormat::Json => "JSON",
+            ExportFormat::Csv => "CSV",
+            ExportFormat::Sql => "SQL",
+            ExportFormat::Markdown => "Markdown",
+            ExportFormat::Html => "HTML",
+        }
+    }
+
+    /// The file extension, without the leading dot.
+    pub fn extension(self) -> &'static str {
+        self.extensions()[0]
+    }
+
+    /// The extensions as a `'static` slice, for a file dialog's type filter.
+    pub fn extensions(self) -> &'static [&'static str] {
+        match self {
+            ExportFormat::Json => &["json"],
+            ExportFormat::Csv => &["csv"],
+            ExportFormat::Sql => &["sql"],
+            ExportFormat::Markdown => &["md", "markdown"],
+            ExportFormat::Html => &["html", "htm"],
+        }
+    }
+
+    /// Render `rs` (in display `order`) in this format. `source` is the result's
+    /// real `(database, namespace, table)` when known — only [`ExportFormat::Sql`]
+    /// uses it, to name the `INSERT` target.
+    pub fn render(
+        self,
+        rs: &ResultSet,
+        order: &[usize],
+        source: Option<(&str, Option<&str>, &str)>,
+        dialect: SqlDialect,
+    ) -> String {
+        match self {
+            ExportFormat::Json => export_json(rs, order),
+            ExportFormat::Csv => export_csv(rs, order),
+            ExportFormat::Sql => export_inserts(rs, order, source, dialect),
+            ExportFormat::Markdown => export_markdown(rs, order),
+            ExportFormat::Html => export_html(rs, order),
+        }
+    }
+}
+
+/// A default file name for saving a result: the source table's display name when
+/// the tab has one, else `result` — plus the format's extension.
+///
+/// `base` is **sanitized**, not trusted: a table name is server-controlled and may
+/// hold characters no filesystem accepts (`/`, `:`, `*`, …), so those become `_`.
+/// Windows also rejects a trailing dot or space and reserves a handful of device
+/// names, so the stem is trimmed and a reserved stem is prefixed. A base that
+/// sanitizes away to nothing falls back to `result`.
+pub fn suggested_filename(base: Option<&str>, format: ExportFormat) -> String {
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let mut stem: String = base
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    // Windows won't accept a name ending in a dot or space.
+    stem = stem.trim_end_matches(['.', ' ']).trim_start().to_string();
+    // Keep the whole name comfortably inside the usual 255-byte component limit.
+    if stem.chars().count() > 100 {
+        stem = stem.chars().take(100).collect();
+    }
+    if stem.is_empty() {
+        stem = "result".to_string();
+    }
+    if RESERVED.contains(&stem.to_ascii_uppercase().as_str()) {
+        stem = format!("_{stem}");
+    }
+    format!("{stem}.{}", format.extension())
+}
 
 /// A cell as a JSON value (non-finite floats → null).
 pub fn value_to_json(v: &Value) -> serde_json::Value {
@@ -417,6 +531,110 @@ mod tests {
         let ph = export_inserts(&rs(), &[0], None, Postgres);
         assert!(ph.contains("INSERT INTO \"table\" ("), "{ph}");
         assert!(!ph.contains("`table`"), "{ph}");
+    }
+
+    // ── export formats + save-file naming ─────────────────────────────────
+
+    #[test]
+    fn every_format_has_a_distinct_label_and_extension() {
+        let labels: Vec<&str> = ExportFormat::ALL.iter().map(|f| f.label()).collect();
+        let exts: Vec<&str> = ExportFormat::ALL.iter().map(|f| f.extension()).collect();
+        for v in [&labels, &exts] {
+            let mut s = v.clone();
+            s.sort_unstable();
+            s.dedup();
+            assert_eq!(s.len(), v.len(), "duplicates in {v:?}");
+        }
+        // No leading dot — Floem's FileSpec adds it.
+        assert!(exts.iter().all(|e| !e.starts_with('.')));
+    }
+
+    #[test]
+    fn format_render_matches_the_direct_call() {
+        // The enum is the single dispatch point for both menus, so it must agree
+        // with the functions it fronts.
+        let (rs, order) = (rs(), [0, 1][..].to_vec());
+        let src = Some(("shop", None, "cust"));
+        for f in ExportFormat::ALL {
+            let via_enum = f.render(&rs, &order, src, MySql);
+            let direct = match f {
+                ExportFormat::Json => export_json(&rs, &order),
+                ExportFormat::Csv => export_csv(&rs, &order),
+                ExportFormat::Sql => export_inserts(&rs, &order, src, MySql),
+                ExportFormat::Markdown => export_markdown(&rs, &order),
+                ExportFormat::Html => export_html(&rs, &order),
+            };
+            assert_eq!(via_enum, direct, "{}", f.label());
+        }
+        // Only SQL is dialect- and source-sensitive.
+        assert_ne!(
+            ExportFormat::Sql.render(&rs, &order, src, MySql),
+            ExportFormat::Sql.render(&rs, &order, src, Postgres)
+        );
+        assert_eq!(
+            ExportFormat::Csv.render(&rs, &order, src, MySql),
+            ExportFormat::Csv.render(&rs, &order, None, Postgres)
+        );
+    }
+
+    #[test]
+    fn suggested_filename_uses_the_source_table() {
+        assert_eq!(
+            suggested_filename(Some("orders"), ExportFormat::Csv),
+            "orders.csv"
+        );
+        // A schema-qualified name keeps its dot — it's a legal file-name char.
+        assert_eq!(
+            suggested_filename(Some("sales.orders"), ExportFormat::Json),
+            "sales.orders.json"
+        );
+        // No source (an arbitrary SELECT) → a neutral default.
+        assert_eq!(suggested_filename(None, ExportFormat::Sql), "result.sql");
+        assert_eq!(
+            suggested_filename(Some(""), ExportFormat::Markdown),
+            "result.md"
+        );
+    }
+
+    #[test]
+    fn suggested_filename_sanitizes_a_hostile_table_name() {
+        // A table name comes from the server, so it can hold anything. None of it
+        // may become a path separator or an illegal component.
+        let out = suggested_filename(Some("a/b\\c:d*e?f\"g<h>i|j"), ExportFormat::Csv);
+        assert_eq!(out, "a_b_c_d_e_f_g_h_i_j.csv");
+        assert!(!out.contains(['/', '\\']), "{out}");
+        // Control characters too.
+        assert_eq!(
+            suggested_filename(Some("a\nb\tc"), ExportFormat::Csv),
+            "a_b_c.csv"
+        );
+        // A name that sanitizes to nothing falls back rather than yielding ".csv".
+        assert_eq!(
+            suggested_filename(Some("..."), ExportFormat::Csv),
+            "result.csv"
+        );
+        assert_eq!(
+            suggested_filename(Some("   "), ExportFormat::Csv),
+            "result.csv"
+        );
+        // Windows rejects a trailing dot/space.
+        assert_eq!(
+            suggested_filename(Some("orders. "), ExportFormat::Csv),
+            "orders.csv"
+        );
+        // Reserved device names are escaped, case-insensitively.
+        assert_eq!(
+            suggested_filename(Some("CON"), ExportFormat::Csv),
+            "_CON.csv"
+        );
+        assert_eq!(
+            suggested_filename(Some("nul"), ExportFormat::Csv),
+            "_nul.csv"
+        );
+        // A very long name is capped (component limits are ~255 bytes).
+        let long = "x".repeat(400);
+        let out = suggested_filename(Some(&long), ExportFormat::Csv);
+        assert!(out.len() < 120, "{} chars", out.len());
     }
 
     #[test]
