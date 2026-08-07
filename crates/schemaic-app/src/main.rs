@@ -87,6 +87,7 @@ type EndTxFn = Rc<dyn Fn(usize, bool, Option<Rc<dyn Fn()>>)>;
 /// Settle an open transaction before an action that would strand it —
 /// `(tab id, the action to resume once it's settled)`.
 type GuardTxFn = Rc<dyn Fn(usize, Rc<dyn Fn()>)>;
+use schemaic_core::filter::{Order, table_query};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::persist::{self, ConnectionsFile, UiState};
 use schemaic_core::schema::SchemaState;
@@ -322,43 +323,35 @@ fn table_ddl_and_pk(
 }
 
 /// The bottom-sample query for AI seed data: most-recent rows by primary key
-/// (`ORDER BY <pk> DESC`) so enums/sequences/FK values are representative. Falls
-/// back to an unordered `LIMIT` when the PK is unknown (schema not loaded).
-///
-/// Dialect-aware: MySQL qualifies `` `db`.`table` `` (server-level connection);
-/// Postgres connects to `database` directly, so it uses the unqualified,
-/// double-quoted table name (resolved via `search_path`, like the write path).
+/// (`ORDER BY <pk> DESC`) so enums/sequences/FK values are representative.
 fn sample_sql(
     engine: schemaic_db::Engine,
     database: &str,
     table: &str,
     pk_cols: &[String],
 ) -> String {
-    if engine == schemaic_db::Engine::Postgres {
-        let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-        let order = if pk_cols.is_empty() {
-            String::new()
-        } else {
-            let cols = pk_cols.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
-            format!(" ORDER BY {cols} DESC")
-        };
-        return format!("SELECT * FROM {}{order} LIMIT 20", q(table));
-    }
-    let order = if pk_cols.is_empty() {
-        String::new()
-    } else {
-        let cols = pk_cols
-            .iter()
-            .map(|c| schemaic_core::export::ident_sql(c))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(" ORDER BY {cols} DESC")
-    };
-    format!(
-        "SELECT * FROM {}.{}{order} LIMIT 20",
-        schemaic_core::export::ident_sql(database),
-        schemaic_core::export::ident_sql(table),
+    table_query(
+        dialect_for(engine),
+        database,
+        table,
+        pk_cols,
+        Order::Desc,
+        AI_SAMPLE_ROWS,
     )
+}
+
+/// Rows the AI seed sample reads from the bottom of a table.
+const AI_SAMPLE_ROWS: usize = 20;
+/// Rows a freshly-opened table tab shows.
+const TABLE_TAB_ROWS: usize = 100;
+
+/// The engine's SQL dialect — the two enums are parallel (one is the driver, the
+/// other the parser/quoting rules).
+fn dialect_for(engine: schemaic_db::Engine) -> SqlDialect {
+    match engine {
+        schemaic_db::Engine::Postgres => SqlDialect::Postgres,
+        schemaic_db::Engine::MySql => SqlDialect::MySql,
+    }
 }
 
 /// A throwaway shell that just prints `msg` and stays open — used to surface "no
@@ -1893,10 +1886,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         })
     };
 
-    // Build + place a fresh tab showing a table: `SELECT * … LIMIT 100` bound to
-    // the active connection + that db, remembering its source for tree
-    // highlighting. Reuses a blank active tab (via `place_tab`), but never dedupes
-    // to an already-open table tab — that's the caller's job.
+    // Build + place a fresh tab showing a table: `SELECT * … ORDER BY <pk> LIMIT
+    // 100` bound to the active connection + that db, remembering its source for
+    // tree highlighting. Reuses a blank active tab (via `place_tab`), but never
+    // dedupes to an already-open table tab — that's the caller's job.
     let spawn_table_tab: Rc<dyn Fn(String, String, Option<String>)> = {
         let run = run.clone();
         let next_id = next_id.clone();
@@ -1905,7 +1898,31 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             move |database: String, table: String, highlight: Option<String>| {
                 let id = next_id.get();
                 next_id.set(id + 1);
-                let sql = format!("SELECT * FROM {table} LIMIT 100");
+                // Order by the primary key so the capped page is a defined set
+                // (see `table_query`). The key comes from the loaded schema —
+                // which is how the user got here, via the tree — and is empty
+                // only if introspection hasn't finished, in which case the
+                // statement is unordered exactly as before.
+                // From the saved connection's `db_type`, not `db_for` — that
+                // needs an established SSH tunnel, and falling back to the
+                // default dialect would quote a Postgres table MySQL-style.
+                let conn_id = active_conn.get_untracked();
+                let dialect = connections
+                    .with_untracked(|cs| {
+                        cs.iter()
+                            .find(|c| c.id == conn_id)
+                            .map(|c| SqlDialect::from_db_type(&c.db_type))
+                    })
+                    .unwrap_or_default();
+                let (_, pk_cols) = table_ddl_and_pk(db_nodes, &database, &table, dialect);
+                let sql = table_query(
+                    dialect,
+                    &database,
+                    &table,
+                    &pk_cols,
+                    Order::Asc,
+                    TABLE_TAB_ROWS,
+                );
                 let tab = Tab::new(
                     cx,
                     id,

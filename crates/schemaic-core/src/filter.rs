@@ -236,6 +236,76 @@ fn quote_value(v: &str, dialect: SqlDialect) -> String {
     format!("'{escaped}'")
 }
 
+/// Direction for a generated `ORDER BY`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order {
+    Asc,
+    Desc,
+}
+
+impl Order {
+    fn keyword(self) -> &'static str {
+        match self {
+            Order::Asc => "ASC",
+            Order::Desc => "DESC",
+        }
+    }
+}
+
+/// The `SELECT` Schemaic generates for a table — opening one from the schema
+/// tree, and the AI's bottom-sample.
+///
+/// **Why it orders.** Without an `ORDER BY` neither engine promises anything, so
+/// "the first `limit` rows" is an undefined set: InnoDB usually walks the
+/// primary key, but Postgres returns heap order, where an `UPDATE` can move a
+/// row to the end of the table and change what you see between runs. Ordering by
+/// the key makes the capped page deterministic. The key is also the cheap column
+/// to sort by — on InnoDB it *is* the clustered order.
+///
+/// The `ORDER BY` is written into the statement the user sees rather than
+/// spliced in on the way to the server: the editor text has to stay what
+/// actually runs, or history, EXPLAIN and copy-as-SQL all quietly disagree with
+/// it. It's ordinary SQL in the editor — deletable, editable, and replaced (not
+/// appended to) when a column header is clicked, since [`build_query`] rewrites
+/// an existing `ORDER BY`.
+///
+/// `key_cols` is normally the primary key, in key order; empty (no PK, or the
+/// schema hasn't been introspected yet) means no `ORDER BY` at all rather than a
+/// guess at some column.
+///
+/// Dialect-aware, matching the write path: MySQL qualifies `` `db`.`table` ``
+/// (its connection is server-level), Postgres emits the unqualified,
+/// double-quoted name (its connection is already bound to the database, and the
+/// name resolves through `search_path`).
+pub fn table_query(
+    dialect: SqlDialect,
+    database: &str,
+    table: &str,
+    key_cols: &[String],
+    order: Order,
+    limit: usize,
+) -> String {
+    let name = match dialect {
+        SqlDialect::MySql => format!(
+            "{}.{}",
+            quote_ident(database, dialect),
+            quote_ident(table, dialect)
+        ),
+        SqlDialect::Postgres => quote_ident(table, dialect),
+    };
+    let order_by = if key_cols.is_empty() {
+        String::new()
+    } else {
+        let cols = key_cols
+            .iter()
+            .map(|c| format!("{} {}", quote_ident(c, dialect), order.keyword()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" ORDER BY {cols}")
+    };
+    format!("SELECT * FROM {name}{order_by} LIMIT {limit}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +313,109 @@ mod tests {
     fn build(base: &str, filter: &str, sort: &[(&str, bool)], d: SqlDialect) -> Option<String> {
         let sort: Vec<(String, bool)> = sort.iter().map(|(c, a)| (c.to_string(), *a)).collect();
         build_query(base, filter, &sort, d).unwrap()
+    }
+
+    // ── table_query: the generated "open this table" statement ────────────
+
+    fn tq(d: SqlDialect, table: &str, pk: &[&str], order: Order, limit: usize) -> String {
+        let pk: Vec<String> = pk.iter().map(|c| c.to_string()).collect();
+        table_query(d, "shop", table, &pk, order, limit)
+    }
+
+    #[test]
+    fn table_query_mysql_qualifies_and_orders() {
+        assert_eq!(
+            tq(SqlDialect::MySql, "orders", &["id"], Order::Asc, 100),
+            "SELECT * FROM `shop`.`orders` ORDER BY `id` ASC LIMIT 100"
+        );
+    }
+
+    #[test]
+    fn table_query_postgres_is_unqualified() {
+        // A PG connection is already bound to the database; the table resolves
+        // through `search_path`, exactly like the write path.
+        assert_eq!(
+            tq(SqlDialect::Postgres, "orders", &["id"], Order::Asc, 100),
+            "SELECT * FROM \"orders\" ORDER BY \"id\" ASC LIMIT 100"
+        );
+    }
+
+    #[test]
+    fn table_query_orders_by_a_composite_key_in_order() {
+        assert_eq!(
+            tq(
+                SqlDialect::MySql,
+                "line_items",
+                &["order_id", "line_no"],
+                Order::Asc,
+                50
+            ),
+            "SELECT * FROM `shop`.`line_items` ORDER BY `order_id` ASC, `line_no` ASC LIMIT 50"
+        );
+    }
+
+    #[test]
+    fn table_query_without_a_key_is_unordered() {
+        // No PK (or the schema hasn't loaded) → no ORDER BY at all, rather than
+        // guessing at a column.
+        assert_eq!(
+            tq(SqlDialect::MySql, "logs", &[], Order::Asc, 100),
+            "SELECT * FROM `shop`.`logs` LIMIT 100"
+        );
+        assert_eq!(
+            tq(SqlDialect::Postgres, "logs", &[], Order::Asc, 100),
+            "SELECT * FROM \"logs\" LIMIT 100"
+        );
+    }
+
+    #[test]
+    fn table_query_descending() {
+        // The AI seed sample wants the most recent rows.
+        assert_eq!(
+            tq(SqlDialect::MySql, "orders", &["id"], Order::Desc, 20),
+            "SELECT * FROM `shop`.`orders` ORDER BY `id` DESC LIMIT 20"
+        );
+    }
+
+    #[test]
+    fn table_query_escapes_identifier_quotes() {
+        // A backtick in a MySQL name and a double-quote in a PG one are doubled,
+        // so a hostile name can't break out of the quoting.
+        assert_eq!(
+            table_query(
+                SqlDialect::MySql,
+                "we`ird",
+                "ta`ble",
+                &["i`d".to_string()],
+                Order::Asc,
+                10
+            ),
+            "SELECT * FROM `we``ird`.`ta``ble` ORDER BY `i``d` ASC LIMIT 10"
+        );
+        assert_eq!(
+            table_query(
+                SqlDialect::Postgres,
+                "db",
+                "ta\"ble",
+                &["i\"d".to_string()],
+                Order::Asc,
+                10
+            ),
+            "SELECT * FROM \"ta\"\"ble\" ORDER BY \"i\"\"d\" ASC LIMIT 10"
+        );
+    }
+
+    #[test]
+    fn table_query_output_is_rewritable_by_the_filter() {
+        // The generated statement is the *base* the header filter/sort rewrites,
+        // so it has to survive a round-trip: sorting by another column replaces
+        // the generated ORDER BY rather than appending to it.
+        let base = tq(SqlDialect::MySql, "orders", &["id"], Order::Asc, 100);
+        let out = build(&base, "", &[("total", false)], SqlDialect::MySql).unwrap();
+        assert_eq!(
+            out,
+            "SELECT * FROM `shop`.`orders` ORDER BY `total` DESC LIMIT 100"
+        );
     }
 
     #[test]
