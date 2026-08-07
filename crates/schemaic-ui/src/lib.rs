@@ -100,8 +100,9 @@ pub type ValidateFn = Rc<dyn Fn(String, usize, usize, ValidateDoneFn)>;
 /// `claude -p` call, parses the reply, and reports back via [`AiFillDoneFn`].
 pub struct AiFillRequest {
     pub conn_id: u64,
-    pub database: String,
-    pub table: String,
+    /// The base table being sampled — namespace included, so a PostgreSQL table
+    /// outside `public` is sampled from the right schema.
+    pub source: TableSource,
     /// The real column name being filled.
     pub column: String,
     /// The row being filled, as `(column_name, value)` for the same base table —
@@ -125,8 +126,8 @@ pub type AiFillFn = Rc<dyn Fn(AiFillRequest, AiFillDoneFn)>;
 /// call, parses a JSON array of rows, and reports back via [`AiSeedDoneFn`].
 pub struct AiSeedRequest {
     pub conn_id: u64,
-    pub database: String,
-    pub table: String,
+    /// The base table being seeded — namespace included (see [`AiFillRequest`]).
+    pub source: TableSource,
     /// The columns the model should fill (editable, non-auto-increment). The grid
     /// stages only these back, so a stray column in the reply is ignored.
     pub fill_columns: Vec<String>,
@@ -142,7 +143,7 @@ pub enum AiSeedResult {
 pub type AiSeedDoneFn = Rc<dyn Fn(AiSeedResult)>;
 /// AI-generate seed rows (grid → app), reporting via [`AiSeedDoneFn`].
 pub type AiSeedFn = Rc<dyn Fn(AiSeedRequest, AiSeedDoneFn)>;
-use schemaic_core::schema::SchemaState;
+use schemaic_core::schema::{SchemaState, TableSource};
 use schemaic_core::transcript::{Seg, TurnStats};
 use schemaic_term::Screen;
 
@@ -179,9 +180,9 @@ pub struct Tab {
     /// The database `USE`d for this tab's queries (`None` before the connection's
     /// database list has loaded — queries then run at the server level).
     pub database: RwSignal<Option<String>>,
-    /// `(database, table)` this tab was opened from, if any — used to highlight
-    /// the source table in the schema sidebar.
-    pub source: RwSignal<Option<(String, String)>>,
+    /// The table this tab was opened from, if any — used to highlight the source
+    /// table in the schema sidebar and to make the grid editable.
+    pub source: RwSignal<Option<TableSource>>,
     /// User-assigned tab name (double-click to rename). `None` = the default
     /// "Query N" label. Persisted with the tab and shown in query history.
     pub name: RwSignal<Option<String>>,
@@ -539,6 +540,9 @@ pub enum CtxKind {
     Database,
     Table {
         database: String,
+        /// PostgreSQL namespace (`None` on MySQL) — carried so the menu's actions
+        /// (Open, ERD, Live Monitor) address the table the user right-clicked.
+        schema: Option<String>,
         table: String,
         ddl: String,
     },
@@ -729,26 +733,24 @@ pub struct TabsActions {
     /// Duplicate a tab (by id): a new tab with the same connection/database and
     /// query, opened right after the source and made active.
     pub duplicate_tab: Rc<dyn Fn(usize)>,
-    /// (database, table) → show it in a tab: focus the tab already showing it, or
-    /// open a fresh one ("Open").
-    pub open_table: Rc<dyn Fn(String, String)>,
-    /// (database, table) → always open the table in a brand-new tab, even if it's
-    /// already open ("Open in new tab").
-    pub open_table_new: Rc<dyn Fn(String, String)>,
-    /// (database, table, column) → open the table (reusing an existing tab) and
-    /// select + scroll the named column into view in the grid (schema-tree column
-    /// double-click).
-    pub open_table_col: Rc<dyn Fn(String, String, String)>,
+    /// Show a table in a tab: focus the tab already showing it, or open a fresh
+    /// one ("Open").
+    pub open_table: Rc<dyn Fn(TableSource)>,
+    /// Always open the table in a brand-new tab, even if it's already open
+    /// ("Open in new tab").
+    pub open_table_new: Rc<dyn Fn(TableSource)>,
+    /// Open the table (reusing an existing tab) and select + scroll the named
+    /// column into view in the grid (schema-tree column double-click).
+    pub open_table_col: Rc<dyn Fn(TableSource, String)>,
     /// Open a new query tab containing `sql` (does NOT run it).
     pub open_query: Rc<dyn Fn(String)>,
     /// Reopen the most-recently-closed tab (Ctrl+Shift+T): restores its query,
     /// connection/database, source, and name from a small ring. No-op when empty.
     pub reopen_closed_tab: Rc<dyn Fn()>,
-    /// (database, table, sql) → open a brand-new tab sourced from `(database,
-    /// table)` (so its grid stays editable) running `sql`, and auto-run it. Used by
-    /// the grid's "Follow foreign key" to land on the referenced table filtered to
-    /// a row.
-    pub open_table_filtered: Rc<dyn Fn(String, String, String)>,
+    /// Open a brand-new tab sourced from a table (so its grid stays editable)
+    /// running `sql`, and auto-run it. Used by the grid's "Follow foreign key" to
+    /// land on the referenced table filtered to a row.
+    pub open_table_filtered: Rc<dyn Fn(TableSource, String)>,
     /// Switch the active tab to a database (remembers it as the new-tab default).
     pub set_active_db: Rc<dyn Fn(String)>,
     /// Open the DB CLI for the active connection in the terminal, optionally
@@ -869,8 +871,8 @@ impl NavKeys {
 pub struct SchemaUi {
     pub db_nodes: RwSignal<Vec<ConnNode>>,
     pub expanded: RwSignal<HashSet<String>>,
-    /// (database, table) of the active tab's source, highlighted in the tree.
-    pub active_table: RwSignal<Option<(String, String)>>,
+    /// The active tab's source table, highlighted in the tree.
+    pub active_table: RwSignal<Option<TableSource>>,
     /// Names of databases hidden from the schema panel and search.
     pub hidden_dbs: RwSignal<HashSet<String>>,
     /// Whether the database-visibility menu is open.
@@ -1095,9 +1097,9 @@ pub struct MonitorEntry {
     pub change: schemaic_core::monitor::RowChange,
 }
 
-/// Open the Live Monitor for a `(conn_id, database, table)` — starts polling that
-/// table and reveals the modal. Built in the app, invoked from the grid toolbar.
-pub type MonitorFn = Rc<dyn Fn(u64, String, String)>;
+/// Open the Live Monitor for a table on a connection — starts polling that table
+/// and reveals the modal. Built in the app, invoked from the grid toolbar.
+pub type MonitorFn = Rc<dyn Fn(u64, TableSource)>;
 
 /// All app state + callbacks the UI needs, bundled so views take one argument.
 /// The app (schemaic-app) owns the signals and provides the `Rc<dyn Fn>`
@@ -2655,8 +2657,8 @@ fn results_section(
         let open_monitor = open_monitor.clone();
         let enabled = move || monitor_source.get().is_some();
         toolbar_icon(icons::ACTIVITY, 5.0, 2.0, enabled, move || {
-            if let Some((db, table)) = monitor_source.get_untracked() {
-                (open_monitor)(monitor_conn.get_untracked(), db, table);
+            if let Some(src) = monitor_source.get_untracked() {
+                (open_monitor)(monitor_conn.get_untracked(), src);
             }
         })
     };

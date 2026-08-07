@@ -226,13 +226,16 @@ impl Db {
     pub async fn fetch_table(
         &self,
         database: &str,
+        schema: Option<&str>,
         table: &str,
         limit: usize,
         cancel: CancellationToken,
     ) -> Result<ResultSet, DbError> {
         if self.engine == Engine::Postgres {
-            return pg::fetch_table(self, database, table, limit, cancel).await;
+            return pg::fetch_table(self, database, schema, table, limit, cancel).await;
         }
+        // MySQL has no namespace level — the database already is one.
+        debug_assert!(schema.is_none(), "MySQL tables carry no namespace");
         let sql = format!(
             "SELECT * FROM {}.{} LIMIT {}",
             ident(database),
@@ -571,6 +574,8 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
     };
 
     Ok(assemble_schema(
+        // MySQL: the database is the namespace, so tables carry none.
+        None,
         &table_rows,
         &col_rows,
         &fk_col_rows,
@@ -602,7 +607,14 @@ pub(crate) type FkColRow = (
 /// Rows referencing a table not in `table_rows` are dropped. `idx_rows` and
 /// `col_rows` are consumed in order, so callers must sort by
 /// `TABLE_NAME, SEQ_IN_INDEX` / `ORDINAL_POSITION` as the queries do.
+///
+/// All rows must belong to **one** namespace, which is stamped onto every
+/// produced table as [`TableInfo::schema`]: MySQL passes `None` (a database *is*
+/// its namespace), and PostgreSQL calls this once per schema and concatenates,
+/// since every row here is keyed by table name alone and two schemas may hold
+/// same-named tables.
 pub(crate) fn assemble_schema(
+    schema: Option<&str>,
     table_rows: &[(String, String)],
     col_rows: &[(String, String, String, String, String)],
     fk_col_rows: &[FkColRow],
@@ -614,6 +626,7 @@ pub(crate) fn assemble_schema(
     for (name, ty) in table_rows {
         index.insert(name.clone(), tables.len());
         tables.push(TableInfo {
+            schema: schema.map(str::to_string),
             name: name.clone(),
             columns: Vec::new(),
             indexes: Vec::new(),
@@ -821,6 +834,9 @@ fn column_origin(
     }
     Some(ColumnOrigin {
         database: schema.to_string(),
+        // MySQL has no namespace between database and table — `schema` here is
+        // the wire protocol's `org_schema`, i.e. the database.
+        schema: None,
         table: org_table.to_string(),
         column: org_name.to_string(),
         flags,
@@ -1348,6 +1364,7 @@ mod tests {
         // Normal insert: listed columns → backtick-quoted names + placeholders.
         let ins = RowInsert {
             database: "db".to_string(),
+            schema: None,
             table: "users".to_string(),
             cols: vec![
                 ("name".to_string(), Some("Ada".to_string())),
@@ -1363,6 +1380,7 @@ mod tests {
         // All-defaults insert (no columns set) → `() VALUES ()`.
         let empty = RowInsert {
             database: "db".to_string(),
+            schema: None,
             table: "t".to_string(),
             cols: vec![],
         };
@@ -1372,6 +1390,7 @@ mod tests {
         // Identifiers with backticks are doubled.
         let weird = RowInsert {
             database: "d`b".to_string(),
+            schema: None,
             table: "t".to_string(),
             cols: vec![("a`b".to_string(), Some("x".to_string()))],
         };
@@ -1384,6 +1403,7 @@ mod tests {
         // NULL-safe equality per key column (composite key joins with AND).
         let del = RowDelete {
             database: "db".to_string(),
+            schema: None,
             table: "users".to_string(),
             key: vec![
                 ("id".to_string(), Value::Int(7)),
@@ -1409,6 +1429,7 @@ mod tests {
         // SET params come first (in column order), then WHERE key params.
         let edit = RowEdit {
             database: "db".to_string(),
+            schema: None,
             table: "users".to_string(),
             set: vec![
                 ("name".to_string(), Some("Ada".to_string())),
@@ -1432,6 +1453,7 @@ mod tests {
     fn build_update_escapes_backtick_identifiers() {
         let edit = RowEdit {
             database: "d`b".to_string(),
+            schema: None,
             table: "t`t".to_string(),
             set: vec![("a`b".to_string(), Some("x".to_string()))],
             key: vec![("k`k".to_string(), Value::Int(1))],
@@ -1540,6 +1562,7 @@ mod tests {
     fn build_refetch_sql_single_key() {
         let t = RefetchTemplate {
             database: "db".to_string(),
+            schema: None,
             table: "users".to_string(),
             columns: vec!["id".to_string(), "name".to_string()],
             key_cols: vec![0],
@@ -1554,6 +1577,7 @@ mod tests {
     fn build_refetch_sql_composite_key_joins_with_and() {
         let t = RefetchTemplate {
             database: "db".to_string(),
+            schema: None,
             table: "t".to_string(),
             columns: vec!["a".to_string(), "b".to_string(), "c".to_string()],
             key_cols: vec![0, 2],
@@ -1568,6 +1592,7 @@ mod tests {
     fn build_refetch_sql_escapes_identifiers() {
         let t = RefetchTemplate {
             database: "d`b".to_string(),
+            schema: None,
             table: "t`t".to_string(),
             columns: vec!["a`b".to_string()],
             key_cols: vec![0],
@@ -1707,7 +1732,7 @@ mod tests {
             (s("users"), s("id"), s("int"), s("NO"), s("PRI")),
             (s("users"), s("email"), s("varchar(255)"), s("YES"), s("")),
         ];
-        let schema = assemble_schema(&tables, &cols, &[], &[], &[]);
+        let schema = assemble_schema(None, &tables, &cols, &[], &[], &[]);
         assert_eq!(schema.tables.len(), 1);
         let t = &schema.tables[0];
         assert!(!t.is_view);
@@ -1719,6 +1744,22 @@ mod tests {
     }
 
     #[test]
+    fn assemble_schema_stamps_the_namespace_on_every_table() {
+        let tables = [(s("orders"), s("BASE TABLE")), (s("v"), s("VIEW"))];
+        // MySQL: no namespace level at all.
+        let mysql = assemble_schema(None, &tables, &[], &[], &[], &[]);
+        assert!(mysql.tables.iter().all(|t| t.schema.is_none()));
+        // Postgres: every table in the batch belongs to the one namespace it was
+        // fetched for — views included.
+        let pg = assemble_schema(Some("sales"), &tables, &[], &[], &[], &[]);
+        assert!(
+            pg.tables
+                .iter()
+                .all(|t| t.schema.as_deref() == Some("sales"))
+        );
+    }
+
+    #[test]
     fn assemble_schema_folds_composite_index_in_order() {
         let tables = [(s("t"), s("BASE TABLE"))];
         // Two rows for the same index name → one IndexInfo, columns in row order.
@@ -1727,7 +1768,7 @@ mod tests {
             (s("t"), s("idx_ab"), 1, s("b")),
             (s("t"), s("PRIMARY"), 0, s("id")),
         ];
-        let schema = assemble_schema(&tables, &[], &[], &idx, &[]);
+        let schema = assemble_schema(None, &tables, &[], &[], &idx, &[]);
         let t = &schema.tables[0];
         assert_eq!(t.indexes.len(), 2);
         let ab = t.indexes.iter().find(|i| i.name == "idx_ab").unwrap();
@@ -1756,7 +1797,7 @@ mod tests {
             Some(s("customers")),
             Some(s("customerNumber")),
         )];
-        let schema = assemble_schema(&tables, &[], &fks, &idx, &[]);
+        let schema = assemble_schema(None, &tables, &[], &fks, &idx, &[]);
         let t = &schema.tables[0];
         assert!(
             t.indexes
@@ -1805,7 +1846,7 @@ mod tests {
                 Some(s("no")),
             ),
         ];
-        let schema = assemble_schema(&tables, &[], &fks, &[], &[]);
+        let schema = assemble_schema(None, &tables, &[], &fks, &[], &[]);
         let t = &schema.tables[0];
         assert_eq!(t.foreign_keys.len(), 2);
 
@@ -1831,7 +1872,7 @@ mod tests {
     fn assemble_schema_marks_views_and_attaches_definition() {
         let tables = [(s("v"), s("VIEW")), (s("base"), s("BASE TABLE"))];
         let views = [(s("v"), s("SELECT 1"))];
-        let schema = assemble_schema(&tables, &[], &[], &[], &views);
+        let schema = assemble_schema(None, &tables, &[], &[], &[], &views);
         let v = schema.tables.iter().find(|t| t.name == "v").unwrap();
         assert!(v.is_view);
         assert_eq!(v.view_definition.as_deref(), Some("SELECT 1"));
@@ -1846,7 +1887,7 @@ mod tests {
         // Column/index rows referencing a table absent from `tables` are ignored.
         let cols = [(s("ghost"), s("x"), s("int"), s("NO"), s("PRI"))];
         let idx = [(s("ghost"), s("idx"), 1, s("x"))];
-        let schema = assemble_schema(&tables, &cols, &[], &idx, &[]);
+        let schema = assemble_schema(None, &tables, &cols, &[], &idx, &[]);
         assert_eq!(schema.tables.len(), 1);
         assert!(schema.tables[0].columns.is_empty());
         assert!(schema.tables[0].indexes.is_empty());
@@ -1858,7 +1899,7 @@ mod tests {
         // so create_ddl falls back to its placeholder.
         let tables = [(s("v"), s("VIEW"))];
         let views = [(s("v"), s(""))];
-        let schema = assemble_schema(&tables, &[], &[], &[], &views);
+        let schema = assemble_schema(None, &tables, &[], &[], &[], &views);
         assert!(schema.tables[0].view_definition.is_none());
     }
 

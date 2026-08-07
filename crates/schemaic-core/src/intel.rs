@@ -1857,6 +1857,14 @@ enum TableStatus {
 pub struct Catalog {
     /// (db_lower, table_lower) → column names (original case).
     qualified: HashMap<(String, String), Vec<String>>,
+    /// (schema_lower, table_lower) → column names, for a PostgreSQL two-part
+    /// `schema.table` reference. Separate from `qualified` because there the
+    /// first part is a *database*: the two namespaces are unrelated, and a name
+    /// that resolves in neither must stay "can't judge" rather than an error.
+    schema_qualified: HashMap<(String, String), Vec<String>>,
+    /// Every introspected PostgreSQL namespace (lower). A two-part reference
+    /// whose qualifier is in here can be judged; one whose isn't isn't.
+    known_schemas: HashSet<String>,
     /// table_lower → column names, for unqualified refs (active-db scoped).
     unqualified: HashMap<String, Vec<String>>,
     /// table_lower → its foreign-key edges (active-db scoped), for the FK-aware
@@ -1889,6 +1897,8 @@ impl Catalog {
     /// absent database is treated as "can't judge" rather than "not found".
     pub fn build(loaded: &[(&str, &DbSchema)], active_db: Option<&str>) -> Catalog {
         let mut qualified = HashMap::new();
+        let mut schema_qualified: HashMap<(String, String), Vec<String>> = HashMap::new();
+        let mut known_schemas = HashSet::new();
         let mut unqualified: HashMap<String, Vec<String>> = HashMap::new();
         let mut fks: HashMap<String, Vec<FkEdge>> = HashMap::new();
         let mut pks: HashMap<String, Vec<String>> = HashMap::new();
@@ -1912,6 +1922,16 @@ impl Catalog {
                     (db_lower.clone(), t.name.to_ascii_lowercase()),
                     cols.clone(),
                 );
+                // PostgreSQL namespace, when the table carries one. Indexed only
+                // for the in-scope database: `schema.table` never crosses a
+                // database in PG, so an out-of-scope db's namespaces would just
+                // be wrong answers.
+                if in_scope && let Some(ns) = &t.schema {
+                    let ns_lower = ns.to_ascii_lowercase();
+                    known_schemas.insert(ns_lower.clone());
+                    known_idents.insert(ns_lower.clone());
+                    schema_qualified.insert((ns_lower, t.name.to_ascii_lowercase()), cols.clone());
+                }
                 if in_scope {
                     let entry = unqualified.entry(t.name.to_ascii_lowercase()).or_default();
                     for c in cols {
@@ -1942,6 +1962,8 @@ impl Catalog {
         }
         Catalog {
             qualified,
+            schema_qualified,
+            known_schemas,
             unqualified,
             fks,
             pks,
@@ -1969,16 +1991,20 @@ impl Catalog {
         match &r.db {
             Some(db) => {
                 let db_lower = db.to_ascii_lowercase();
-                if !self.loaded_dbs.contains(&db_lower) {
-                    return TableStatus::Unknown;
+                let table_lower = r.name.to_ascii_lowercase();
+                // A two-part name is `db.table` on MySQL and `schema.table` on
+                // PostgreSQL. Try both: whichever namespace the qualifier names
+                // decides, and a hit in either is a hit.
+                let key = (db_lower.clone(), table_lower);
+                if self.qualified.contains_key(&key) || self.schema_qualified.contains_key(&key) {
+                    return TableStatus::Found;
                 }
-                if self
-                    .qualified
-                    .contains_key(&(db_lower, r.name.to_ascii_lowercase()))
-                {
-                    TableStatus::Found
-                } else {
+                // Only a qualifier we've actually introspected can be judged
+                // absent; anything else is "can't judge".
+                if self.loaded_dbs.contains(&db_lower) || self.known_schemas.contains(&db_lower) {
                     TableStatus::NotFound
+                } else {
+                    TableStatus::Unknown
                 }
             }
             None => {
@@ -1997,9 +2023,14 @@ impl Catalog {
     /// The columns of a resolved table reference, if known.
     fn columns_of(&self, r: &TableRef) -> Option<&Vec<String>> {
         match &r.db {
-            Some(db) => self
-                .qualified
-                .get(&(db.to_ascii_lowercase(), r.name.to_ascii_lowercase())),
+            Some(db) => {
+                let key = (db.to_ascii_lowercase(), r.name.to_ascii_lowercase());
+                // Same two-part ambiguity as `table_status`: database on MySQL,
+                // namespace on PostgreSQL.
+                self.qualified
+                    .get(&key)
+                    .or_else(|| self.schema_qualified.get(&key))
+            }
             None => self.unqualified.get(&r.name.to_ascii_lowercase()),
         }
     }
@@ -4670,6 +4701,7 @@ mod tests {
 
     fn tbl(name: &str, cols: &[&str]) -> TableInfo {
         TableInfo {
+            schema: None,
             name: name.to_string(),
             columns: cols
                 .iter()
@@ -4709,6 +4741,95 @@ mod tests {
         let (schema, db) = sample_catalog();
         let cat = Catalog::build(&[(db, &schema)], Some(db));
         diagnostics(sql, &cat, dialect)
+    }
+
+    // ── multi-schema (PostgreSQL namespaces) ──────────────────────────────────
+
+    /// A table in an explicit PostgreSQL namespace.
+    fn tbl_in(schema: &str, name: &str, cols: &[&str]) -> TableInfo {
+        TableInfo {
+            schema: Some(schema.to_string()),
+            ..tbl(name, cols)
+        }
+    }
+
+    /// A single-database catalog whose tables span `public` and `sales`.
+    fn pg_catalog() -> Catalog {
+        let schema = DbSchema {
+            tables: vec![
+                tbl_in("public", "customers", &["id", "name"]),
+                tbl_in("sales", "orders", &["id", "total"]),
+            ],
+        };
+        // Build over an owned schema; the catalog copies what it needs.
+        Catalog::build(&[("warehouse", &schema)], Some("warehouse"))
+    }
+
+    fn pg_diag(sql: &str) -> Vec<Diagnostic> {
+        diagnostics(sql, &pg_catalog(), SqlDialect::Postgres)
+    }
+
+    #[test]
+    fn diag_schema_qualified_table_resolves() {
+        // `sales.orders` is a namespace-qualified reference, not `db.table` —
+        // it must resolve, and its columns must resolve through it too.
+        assert!(
+            pg_diag("SELECT id, total FROM sales.orders").is_empty(),
+            "{:?}",
+            pg_diag("SELECT id, total FROM sales.orders")
+        );
+        // Through an alias as well.
+        assert!(pg_diag("SELECT o.total FROM sales.orders o").is_empty());
+    }
+
+    #[test]
+    fn diag_unknown_column_in_a_qualified_schema_is_flagged() {
+        // The namespace is known, so the catalog can actually judge its columns.
+        let d = pg_diag("SELECT nope FROM sales.orders");
+        assert!(
+            d.iter().any(|d| d.message.contains("nope")),
+            "expected an unknown-column diagnostic, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn diag_missing_table_in_a_known_schema_is_flagged() {
+        let d = pg_diag("SELECT * FROM sales.ghosts");
+        assert!(
+            d.iter().any(|d| d.message.contains("ghosts")),
+            "expected an unknown-table diagnostic, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn diag_unknown_qualifier_stays_unjudged() {
+        // Neither a loaded database nor an introspected namespace → we can't tell
+        // whether it exists, so we must not invent an error.
+        assert!(
+            pg_diag("SELECT * FROM elsewhere.orders").is_empty(),
+            "{:?}",
+            pg_diag("SELECT * FROM elsewhere.orders")
+        );
+    }
+
+    #[test]
+    fn diag_unqualified_name_unions_across_schemas() {
+        // Without a qualifier we don't know the server's real `search_path`, so
+        // an unqualified name resolves against every schema's columns. Permissive
+        // on purpose: a false "unknown column" is worse than a missed one.
+        assert!(pg_diag("SELECT total FROM orders").is_empty());
+        assert!(pg_diag("SELECT name FROM customers").is_empty());
+    }
+
+    #[test]
+    fn diag_mysql_two_part_name_still_means_database() {
+        // The namespace index must not change what `db.table` means on MySQL.
+        assert!(diag("SELECT id FROM company.employees").is_empty());
+        let d = diag("SELECT id FROM company.ghosts");
+        assert!(
+            d.iter().any(|d| d.message.contains("ghosts")),
+            "expected an unknown-table diagnostic, got {d:?}"
+        );
     }
 
     #[test]

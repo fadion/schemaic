@@ -876,6 +876,7 @@ mod tests {
 
     fn table(name: &str, cols: Vec<ColumnInfo>, fks: Vec<ForeignKeyInfo>) -> TableInfo {
         TableInfo {
+            schema: None,
             name: name.to_string(),
             columns: cols,
             indexes: Vec::new(),

@@ -316,12 +316,15 @@ impl Order {
 /// guess at some column.
 ///
 /// Dialect-aware, matching the write path: MySQL qualifies `` `db`.`table` ``
-/// (its connection is server-level), Postgres emits the unqualified,
-/// double-quoted name (its connection is already bound to the database, and the
-/// name resolves through `search_path`).
+/// (its connection is server-level), Postgres emits the double-quoted name
+/// (its connection is already bound to the database) — bare for a table in
+/// `public`, which resolves through `search_path`, and `"schema"."table"` for one
+/// in any other namespace. `schema` is the table's PostgreSQL namespace and is
+/// always `None` on MySQL, where the database already is the namespace.
 pub fn table_query(
     dialect: SqlDialect,
     database: &str,
+    schema: Option<&str>,
     table: &str,
     key_cols: &[String],
     order: Order,
@@ -333,7 +336,14 @@ pub fn table_query(
             quote_if_needed(database, dialect),
             quote_if_needed(table, dialect)
         ),
-        SqlDialect::Postgres => quote_if_needed(table, dialect),
+        SqlDialect::Postgres => match crate::schema::sql_qualifier(schema) {
+            Some(s) => format!(
+                "{}.{}",
+                quote_if_needed(s, dialect),
+                quote_if_needed(table, dialect)
+            ),
+            None => quote_if_needed(table, dialect),
+        },
     };
     let order_by = if key_cols.is_empty() {
         String::new()
@@ -361,7 +371,49 @@ mod tests {
 
     fn tq(d: SqlDialect, table: &str, pk: &[&str], order: Order, limit: usize) -> String {
         let pk: Vec<String> = pk.iter().map(|c| c.to_string()).collect();
-        table_query(d, "shop", table, &pk, order, limit)
+        table_query(d, "shop", None, table, &pk, order, limit)
+    }
+
+    /// As [`tq`], but for a table in an explicit PostgreSQL namespace.
+    fn tq_in(d: SqlDialect, schema: &str, table: &str, pk: &[&str]) -> String {
+        let pk: Vec<String> = pk.iter().map(|c| c.to_string()).collect();
+        table_query(d, "shop", Some(schema), table, &pk, Order::Asc, 100)
+    }
+
+    #[test]
+    fn table_query_postgres_qualifies_a_non_public_schema() {
+        assert_eq!(
+            tq_in(SqlDialect::Postgres, "sales", "orders", &["id"]),
+            "SELECT * FROM sales.orders ORDER BY id ASC LIMIT 100"
+        );
+        // `public` is on the search_path → the statement stays exactly what it
+        // was before multi-schema browsing existed.
+        assert_eq!(
+            tq_in(SqlDialect::Postgres, "public", "orders", &["id"]),
+            "SELECT * FROM orders ORDER BY id ASC LIMIT 100"
+        );
+    }
+
+    #[test]
+    fn table_query_quotes_a_schema_that_needs_it() {
+        // The namespace goes through the same quoting rules as the table, so a
+        // mixed-case or reserved-word schema still resolves.
+        assert_eq!(
+            tq_in(SqlDialect::Postgres, "Sales Ops", "orders", &["id"]),
+            "SELECT * FROM \"Sales Ops\".orders ORDER BY id ASC LIMIT 100"
+        );
+        assert_eq!(
+            table_query(
+                SqlDialect::Postgres,
+                "shop",
+                Some("we\"ird"),
+                "orders",
+                &[],
+                Order::Asc,
+                10
+            ),
+            "SELECT * FROM \"we\"\"ird\".orders LIMIT 10"
+        );
     }
 
     #[test]
@@ -471,6 +523,7 @@ mod tests {
             table_query(
                 SqlDialect::MySql,
                 "we`ird",
+                None,
                 "ta`ble",
                 &["i`d".to_string()],
                 Order::Asc,
@@ -483,6 +536,7 @@ mod tests {
             table_query(
                 SqlDialect::Postgres,
                 "db",
+                None,
                 "ta\"ble",
                 &["i\"d".to_string()],
                 Order::Asc,

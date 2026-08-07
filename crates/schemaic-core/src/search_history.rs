@@ -17,6 +17,11 @@ pub const MAX_PER_CONN: usize = 10;
 pub struct SearchEntry {
     pub conn_id: u64,
     pub database: String,
+    /// PostgreSQL namespace of `table` (`None` on MySQL, and on entries written
+    /// before multi-schema browsing existed — `#[serde(default)]` keeps those
+    /// files loading).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
     pub table: String,
     #[serde(default)]
     pub column: Option<String>,
@@ -34,6 +39,7 @@ impl SearchEntry {
     fn same_target(&self, other: &SearchEntry) -> bool {
         self.conn_id == other.conn_id
             && self.database == other.database
+            && self.schema == other.schema
             && self.table == other.table
             && self.column == other.column
     }
@@ -80,9 +86,28 @@ mod tests {
         SearchEntry {
             conn_id: conn,
             database: "db".into(),
+            schema: None,
             table: table.into(),
             column: column.map(|c| c.into()),
         }
+    }
+
+    #[test]
+    fn same_named_tables_in_two_schemas_are_separate_entries() {
+        // Without the namespace in the identity, opening `sales.orders` would
+        // silently replace the `public.orders` entry (and vice versa).
+        let mut v = Vec::new();
+        let mk = |ns: &str| SearchEntry {
+            schema: Some(ns.into()),
+            ..entry(1, "orders", None)
+        };
+        push(&mut v, mk("public"));
+        push(&mut v, mk("sales"));
+        assert_eq!(v.len(), 2);
+        // Re-pushing one of them dedups it to the front without dropping the other.
+        push(&mut v, mk("public"));
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].schema.as_deref(), Some("public"));
     }
 
     #[test]

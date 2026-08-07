@@ -70,7 +70,7 @@ struct ClosedTab {
     query: String,
     conn_id: u64,
     database: Option<String>,
-    source: Option<(String, String)>,
+    source: Option<TableSource>,
     name: Option<String>,
     /// The original "Query N" number, restored on reopen when no live tab claims it.
     label: usize,
@@ -90,7 +90,7 @@ type GuardTxFn = Rc<dyn Fn(usize, Rc<dyn Fn()>)>;
 use schemaic_core::filter::{Order, table_query};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::persist::{self, ConnectionsFile, UiState};
-use schemaic_core::schema::SchemaState;
+use schemaic_core::schema::{SchemaState, TableSource};
 use schemaic_core::tx::{StmtOutcome, TxEngine, TxMode, TxState};
 use schemaic_db::{Db, DbError, Session};
 use schemaic_ui::theme::{EditorThemeKind, UiThemeKind};
@@ -296,16 +296,18 @@ fn dialect_of(db: &Db) -> SqlDialect {
 
 fn table_ddl_and_pk(
     db_nodes: RwSignal<Vec<ConnNode>>,
-    database: &str,
-    table: &str,
+    source: &TableSource,
     dialect: SqlDialect,
 ) -> (String, Vec<String>) {
     db_nodes
         .with_untracked(|nodes| {
-            nodes.iter().find(|n| n.database == database).and_then(|n| {
-                match n.schema.get_untracked() {
-                    schemaic_core::schema::SchemaState::Loaded(s) => {
-                        s.tables.iter().find(|t| t.name == table).map(|t| {
+            nodes
+                .iter()
+                .find(|n| n.database == source.database)
+                .and_then(|n| match n.schema.get_untracked() {
+                    schemaic_core::schema::SchemaState::Loaded(s) => s
+                        .find_table(source.schema.as_deref(), &source.table)
+                        .map(|t| {
                             let pk = t
                                 .columns
                                 .iter()
@@ -313,27 +315,21 @@ fn table_ddl_and_pk(
                                 .map(|c| c.name.clone())
                                 .collect();
                             (t.create_ddl(dialect), pk)
-                        })
-                    }
+                        }),
                     _ => None,
-                }
-            })
+                })
         })
         .unwrap_or_default()
 }
 
 /// The bottom-sample query for AI seed data: most-recent rows by primary key
 /// (`ORDER BY <pk> DESC`) so enums/sequences/FK values are representative.
-fn sample_sql(
-    engine: schemaic_db::Engine,
-    database: &str,
-    table: &str,
-    pk_cols: &[String],
-) -> String {
+fn sample_sql(engine: schemaic_db::Engine, source: &TableSource, pk_cols: &[String]) -> String {
     table_query(
         dialect_for(engine),
-        database,
-        table,
+        &source.database,
+        source.schema.as_deref(),
+        &source.table,
         pk_cols,
         Order::Desc,
         AI_SAMPLE_ROWS,
@@ -559,23 +555,26 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         if saved_tabs.tabs.is_empty() {
             (vec![Tab::new(cx, 1, "", active_id, None)], 1, 2)
         } else {
-            let mut built: Vec<Tab> = saved_tabs
-                .tabs
-                .iter()
-                .enumerate()
-                .map(|(i, s)| {
-                    let conn = if cf.connections.iter().any(|c| c.id == s.conn_id) {
-                        s.conn_id
-                    } else {
-                        active_id
-                    };
-                    let t = Tab::new(cx, i + 1, &s.query, conn, s.database.clone());
-                    t.source.set(s.source.clone());
-                    t.name.set(s.name.clone());
-                    t.pinned.set(s.pinned);
-                    t
-                })
-                .collect();
+            let mut built: Vec<Tab> =
+                saved_tabs
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        let conn = if cf.connections.iter().any(|c| c.id == s.conn_id) {
+                            s.conn_id
+                        } else {
+                            active_id
+                        };
+                        let t = Tab::new(cx, i + 1, &s.query, conn, s.database.clone());
+                        t.source.set(s.source.clone().map(|(db, table)| {
+                            TableSource::new(db, s.source_schema.clone(), table)
+                        }));
+                        t.name.set(s.name.clone());
+                        t.pinned.set(s.pinned);
+                        t
+                    })
+                    .collect();
             let n = built.len();
             let active_id = built[saved_tabs.active.min(n - 1)].id;
             // Enforce the pinned-first invariant (stable, so pin order + relative
@@ -724,7 +723,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let schema_menu_open = RwSignal::new(false);
     let context_menu: RwSignal<Option<CtxMenu>> = RwSignal::new(None);
     let last_mouse: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
-    let active_table: RwSignal<Option<(String, String)>> = RwSignal::new(None);
+    let active_table: RwSignal<Option<TableSource>> = RwSignal::new(None);
 
     // Manage-connections form + overlay signals.
     let draft = DraftSignals::new(cx);
@@ -1090,13 +1089,13 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let monitor_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
     let monitor_prev: Rc<RefCell<Option<Snapshot>>> = Rc::new(RefCell::new(None));
     let monitor_key_cols: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
-    let open_monitor: Rc<dyn Fn(u64, String, String)> = {
+    let open_monitor: schemaic_ui::MonitorFn = {
         let handle = handle.clone();
         let db_for = db_for.clone();
         let monitor_gen = monitor_gen.clone();
         let monitor_prev = monitor_prev.clone();
         let monitor_key_cols = monitor_key_cols.clone();
-        Rc::new(move |conn_id: u64, database: String, table: String| {
+        Rc::new(move |conn_id: u64, source: TableSource| {
             // Fresh session: bump the generation (kills any stale tick), reset state,
             // reveal the modal.
             let g = monitor_gen.get().wrapping_add(1);
@@ -1106,7 +1105,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             monitor_log.set(Vec::new());
             monitor_cols.set(Vec::new());
             monitor_error.set(None);
-            monitor_title.set(Some(format!("{database}.{table}")));
+            monitor_title.set(Some(format!("{}.{}", source.database, source.display())));
             monitor_open.set(true);
             let ctx = MonitorCtx {
                 handle: handle.clone(),
@@ -1121,7 +1120,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 key_cols: monitor_key_cols.clone(),
                 generation: monitor_gen.clone(),
                 started: Instant::now(),
-                target: (conn_id, database, table),
+                target: (conn_id, source),
                 interval: monitor_interval,
             };
             monitor_tick(ctx, g);
@@ -1890,68 +1889,67 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // 100` bound to the active connection + that db, remembering its source for
     // tree highlighting. Reuses a blank active tab (via `place_tab`), but never
     // dedupes to an already-open table tab — that's the caller's job.
-    let spawn_table_tab: Rc<dyn Fn(String, String, Option<String>)> = {
+    let spawn_table_tab: Rc<dyn Fn(TableSource, Option<String>)> = {
         let run = run.clone();
         let next_id = next_id.clone();
         let place_tab = place_tab.clone();
-        Rc::new(
-            move |database: String, table: String, highlight: Option<String>| {
-                let id = next_id.get();
-                next_id.set(id + 1);
-                // Order by the primary key so the capped page is a defined set
-                // (see `table_query`). The key comes from the loaded schema —
-                // which is how the user got here, via the tree — and is empty
-                // only if introspection hasn't finished, in which case the
-                // statement is unordered exactly as before.
-                // From the saved connection's `db_type`, not `db_for` — that
-                // needs an established SSH tunnel, and falling back to the
-                // default dialect would quote a Postgres table MySQL-style.
-                let conn_id = active_conn.get_untracked();
-                let dialect = connections
-                    .with_untracked(|cs| {
-                        cs.iter()
-                            .find(|c| c.id == conn_id)
-                            .map(|c| SqlDialect::from_db_type(&c.db_type))
-                    })
-                    .unwrap_or_default();
-                let (_, pk_cols) = table_ddl_and_pk(db_nodes, &database, &table, dialect);
-                let sql = table_query(
-                    dialect,
-                    &database,
-                    &table,
-                    &pk_cols,
-                    Order::Asc,
-                    TABLE_TAB_ROWS,
-                );
-                let tab = Tab::new(
-                    cx,
-                    id,
-                    &sql,
-                    active_conn.get_untracked(),
-                    Some(database.clone()),
-                );
-                tab.source.set(Some((database, table)));
-                // A column to select once the results load (schema-tree column
-                // double-click). Consumed + cleared by the grid.
-                tab.highlight_col.set(highlight);
-                (place_tab)(tab);
-                run(sql);
-            },
-        )
+        Rc::new(move |source: TableSource, highlight: Option<String>| {
+            let id = next_id.get();
+            next_id.set(id + 1);
+            // Order by the primary key so the capped page is a defined set
+            // (see `table_query`). The key comes from the loaded schema —
+            // which is how the user got here, via the tree — and is empty
+            // only if introspection hasn't finished, in which case the
+            // statement is unordered exactly as before.
+            // From the saved connection's `db_type`, not `db_for` — that
+            // needs an established SSH tunnel, and falling back to the
+            // default dialect would quote a Postgres table MySQL-style.
+            let conn_id = active_conn.get_untracked();
+            let dialect = connections
+                .with_untracked(|cs| {
+                    cs.iter()
+                        .find(|c| c.id == conn_id)
+                        .map(|c| SqlDialect::from_db_type(&c.db_type))
+                })
+                .unwrap_or_default();
+            let (_, pk_cols) = table_ddl_and_pk(db_nodes, &source, dialect);
+            let sql = table_query(
+                dialect,
+                &source.database,
+                source.schema.as_deref(),
+                &source.table,
+                &pk_cols,
+                Order::Asc,
+                TABLE_TAB_ROWS,
+            );
+            let tab = Tab::new(
+                cx,
+                id,
+                &sql,
+                active_conn.get_untracked(),
+                Some(source.database.clone()),
+            );
+            tab.source.set(Some(source));
+            // A column to select once the results load (schema-tree column
+            // double-click). Consumed + cleared by the grid.
+            tab.highlight_col.set(highlight);
+            (place_tab)(tab);
+            run(sql);
+        })
     };
 
     // Open a table from the sidebar / Find ("Open"): if a tab is already showing
     // it (same connection + source), just switch to that tab; otherwise open a
     // fresh one. Matching on `conn_id` too (not source alone) so the same-named
     // table under a different connection doesn't wrongly steal focus (H13).
-    let open_table: Rc<dyn Fn(String, String)> = {
+    let open_table: Rc<dyn Fn(TableSource)> = {
         let spawn = spawn_table_tab.clone();
         let run = run.clone();
-        Rc::new(move |database: String, table: String| {
+        Rc::new(move |source: TableSource| {
             let existing = tabs.with_untracked(|v| {
                 v.iter()
                     .find(|t| {
-                        t.source.get_untracked() == Some((database.clone(), table.clone()))
+                        t.source.get_untracked().as_ref() == Some(&source)
                             && t.conn_id.get_untracked() == active_conn.get_untracked()
                     })
                     .copied()
@@ -1967,7 +1965,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 }
                 return;
             }
-            (spawn)(database, table, None);
+            (spawn)(source, None);
         })
     };
 
@@ -1975,14 +1973,14 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // double-click). Same tab-reuse rules as `open_table`, but records the column to
     // select once the grid loads. For an already-open tab, set the highlight *then*
     // switch to it — switching rebuilds that tab's grid, whose effect consumes it.
-    let open_table_col: Rc<dyn Fn(String, String, String)> = {
+    let open_table_col: Rc<dyn Fn(TableSource, String)> = {
         let spawn = spawn_table_tab.clone();
         let run = run.clone();
-        Rc::new(move |database: String, table: String, column: String| {
+        Rc::new(move |source: TableSource, column: String| {
             let existing = tabs.with_untracked(|v| {
                 v.iter()
                     .find(|t| {
-                        t.source.get_untracked() == Some((database.clone(), table.clone()))
+                        t.source.get_untracked().as_ref() == Some(&source)
                             && t.conn_id.get_untracked() == active_conn.get_untracked()
                     })
                     .copied()
@@ -2005,15 +2003,15 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 }
                 return;
             }
-            (spawn)(database, table, Some(column));
+            (spawn)(source, Some(column));
         })
     };
 
     // Always open the table in a brand-new tab, even if it's already open
     // ("Open in new tab" — only offered by the menu when a tab for it exists).
-    let open_table_new: Rc<dyn Fn(String, String)> = {
+    let open_table_new: Rc<dyn Fn(TableSource)> = {
         let spawn = spawn_table_tab.clone();
-        Rc::new(move |database: String, table: String| (spawn)(database, table, None))
+        Rc::new(move |source: TableSource| (spawn)(source, None))
     };
 
     // Follow a foreign key from the grid: open the referenced table in a fresh tab
@@ -2021,11 +2019,11 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // `(database, table)` so the new grid is editable and shows key icons — like a
     // normal table tab, only with a WHERE. The referenced table lives on the same
     // connection (FKs can't cross servers), possibly in another database.
-    let open_table_filtered: Rc<dyn Fn(String, String, String)> = {
+    let open_table_filtered: Rc<dyn Fn(TableSource, String)> = {
         let next_id = next_id.clone();
         let place_tab = place_tab.clone();
         let run = run.clone();
-        Rc::new(move |database: String, table: String, sql: String| {
+        Rc::new(move |source: TableSource, sql: String| {
             let id = next_id.get();
             next_id.set(id + 1);
             let tab = Tab::new(
@@ -2033,9 +2031,9 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 id,
                 &sql,
                 active_conn.get_untracked(),
-                Some(database.clone()),
+                Some(source.database.clone()),
             );
-            tab.source.set(Some((database, table)));
+            tab.source.set(Some(source));
             (place_tab)(tab);
             run(sql);
         })
@@ -2213,13 +2211,22 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         active: v.iter().position(|t| t.id == active_id).unwrap_or(0),
                         tabs: v
                             .iter()
-                            .map(|t| schemaic_core::persist::SavedTab {
-                                query: t.query.get_untracked(),
-                                conn_id: t.conn_id.get_untracked(),
-                                database: t.database.get_untracked(),
-                                source: t.source.get_untracked(),
-                                name: t.name.get_untracked(),
-                                pinned: t.pinned.get_untracked(),
+                            .map(|t| {
+                                let src = t.source.get_untracked();
+                                schemaic_core::persist::SavedTab {
+                                    query: t.query.get_untracked(),
+                                    conn_id: t.conn_id.get_untracked(),
+                                    database: t.database.get_untracked(),
+                                    // The namespace rides alongside the pair rather
+                                    // than widening it, so an older build's session
+                                    // file still restores (see `SavedTab`).
+                                    source: src
+                                        .as_ref()
+                                        .map(|s| (s.database.clone(), s.table.clone())),
+                                    source_schema: src.and_then(|s| s.schema),
+                                    name: t.name.get_untracked(),
+                                    pinned: t.pinned.get_untracked(),
+                                }
                             })
                             .collect(),
                     }
@@ -2934,14 +2941,12 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 };
                 // DDL skeleton + PK columns from the loaded schema (empty if
                 // introspection hasn't run — the sample still carries conventions).
-                let (ddl, pk_cols) =
-                    table_ddl_and_pk(db_nodes, &req.database, &req.table, dialect_of(&db));
+                let (ddl, pk_cols) = table_ddl_and_pk(db_nodes, &req.source, dialect_of(&db));
                 let bin = claude_bin(&ai_cli_path.get_untracked());
                 let model = ai_model.get_untracked().cli().to_string();
                 let finish = create_ext_action(cx, move |res: AiFillResult| (done)(res));
                 let schemaic_ui::AiFillRequest {
-                    database,
-                    table,
+                    source,
                     column,
                     row_context,
                     ..
@@ -2949,13 +2954,14 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 handle.spawn(async move {
                     let token = CancellationToken::new();
                     // Bottom-sample the base table for enum/format/FK inference.
-                    let sql = sample_sql(db.engine(), &database, &table, &pk_cols);
+                    let sql = sample_sql(db.engine(), &source, &pk_cols);
+                    let database = source.database.clone();
                     let sample = match db.fetch_query(Some(&database), &sql, 20, token).await {
                         Ok(rs) => sample_rows(&rs),
                         Err(_) => Vec::new(), // empty/unsampleable → DDL-only prompt
                     };
                     let prompt = schemaic_core::seed::build_fill_prompt(
-                        &format!("{database}.{table}"),
+                        &format!("{database}.{}", source.display()),
                         &column,
                         &ddl,
                         &sample,
@@ -3013,27 +3019,26 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         return;
                     }
                 };
-                let (ddl, pk_cols) =
-                    table_ddl_and_pk(db_nodes, &req.database, &req.table, dialect_of(&db));
+                let (ddl, pk_cols) = table_ddl_and_pk(db_nodes, &req.source, dialect_of(&db));
                 let bin = claude_bin(&ai_cli_path.get_untracked());
                 let model = ai_model.get_untracked().cli().to_string();
                 let finish = create_ext_action(cx, move |res: AiSeedResult| (done)(res));
                 let schemaic_ui::AiSeedRequest {
-                    database,
-                    table,
+                    source,
                     fill_columns,
                     count,
                     ..
                 } = req;
                 handle.spawn(async move {
                     let token = CancellationToken::new();
-                    let sql = sample_sql(db.engine(), &database, &table, &pk_cols);
+                    let sql = sample_sql(db.engine(), &source, &pk_cols);
+                    let database = source.database.clone();
                     let sample = match db.fetch_query(Some(&database), &sql, 20, token).await {
                         Ok(rs) => sample_rows(&rs),
                         Err(_) => Vec::new(), // empty/unsampleable → DDL-only prompt
                     };
                     let prompt = schemaic_core::seed::build_seed_prompt(
-                        &format!("{database}.{table}"),
+                        &format!("{database}.{}", source.display()),
                         &ddl,
                         &fill_columns,
                         &sample,
@@ -3619,7 +3624,9 @@ struct MonitorCtx {
     key_cols: Rc<RefCell<Vec<usize>>>,
     generation: Rc<Cell<u64>>,
     started: Instant,
-    target: (u64, String, String),
+    /// The connection + the table being watched (namespace included, so a
+    /// PostgreSQL table outside `public` is actually the one polled).
+    target: (u64, TableSource),
     /// Poll interval (seconds), read fresh on each re-arm so the popup's dropdown
     /// takes effect on the next tick.
     interval: RwSignal<u64>,
@@ -3632,7 +3639,7 @@ fn monitor_tick(ctx: MonitorCtx, my_gen: u64) {
     if ctx.open.try_get_untracked() != Some(true) || ctx.generation.get() != my_gen {
         return;
     }
-    let (conn_id, database, table) = ctx.target.clone();
+    let (conn_id, source) = ctx.target.clone();
     let db = match (ctx.db_for)(conn_id) {
         Ok(db) => db,
         Err(e) => {
@@ -3647,7 +3654,13 @@ fn monitor_tick(ctx: MonitorCtx, my_gen: u64) {
     });
     ctx.handle.spawn(async move {
         let out = db
-            .fetch_table(&database, &table, MONITOR_LIMIT, CancellationToken::new())
+            .fetch_table(
+                &source.database,
+                source.schema.as_deref(),
+                &source.table,
+                MONITOR_LIMIT,
+                CancellationToken::new(),
+            )
             .await
             .map_err(|e| e.to_string());
         send(out);
@@ -3669,13 +3682,11 @@ fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
                 ctx.cols
                     .set(rs.columns.iter().map(|c| c.name.clone()).collect());
                 let db_nodes = ctx.db_nodes;
-                let model = analyze_edit(&rs, |db, table| {
+                let model = analyze_edit(&rs, |db, ns, table| {
                     db_nodes.with_untracked(|nodes| {
                         nodes.iter().find(|n| n.database == db).and_then(|n| {
                             match n.schema.get_untracked() {
-                                SchemaState::Loaded(s) => {
-                                    s.tables.iter().find(|t| t.name == table).cloned()
-                                }
+                                SchemaState::Loaded(s) => s.find_table(ns, table).cloned(),
                                 _ => None,
                             }
                         })

@@ -204,7 +204,10 @@ async fn list_schema(db: &Db) -> (String, bool) {
                         .iter()
                         .map(|c| format!("{} {}", c.name, c.type_name))
                         .collect();
-                    out.push_str(&format!("- {}({})\n", t.name, cols.join(", ")));
+                    // Namespace-qualified outside PostgreSQL's `public`, so the
+                    // assistant writes a name that actually resolves.
+                    let name = schemaic_core::schema::display_name(t.schema.as_deref(), &t.name);
+                    out.push_str(&format!("- {name}({})\n", cols.join(", ")));
                 }
             }
             Err(e) => out.push_str(&format!("  (error: {e})\n")),

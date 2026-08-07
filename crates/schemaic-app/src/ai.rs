@@ -454,7 +454,13 @@ fn render_ai_context(
             }
             match schema {
                 Some(s) => {
-                    let tables: Vec<&str> = s.tables.iter().map(|t| t.name.as_str()).collect();
+                    // Qualified outside PostgreSQL's `public` — the assistant has to
+                    // be able to name the table it's told about.
+                    let tables: Vec<String> = s
+                        .tables
+                        .iter()
+                        .map(|t| schemaic_core::schema::display_name(t.schema.as_deref(), &t.name))
+                        .collect();
                     outline.push_str(&format!("- {}: {}\n", database, tables.join(", ")));
                 }
                 None => outline.push_str(&format!("- {database}\n")),
@@ -546,11 +552,14 @@ fn render_inline_prompt(
                 outline.push_str(&format!("{database}:\n"));
                 let full_db = active_db == Some(database.as_str());
                 for t in &s.tables {
+                    let name = schemaic_core::schema::display_name(t.schema.as_deref(), &t.name);
+                    // Match on the bare name: a buffer saying `orders` should pull in
+                    // `sales.orders`'s columns too.
                     if full_db || haystack.contains(&t.name.to_lowercase()) {
                         let cols: Vec<&str> = t.columns.iter().map(|c| c.name.as_str()).collect();
-                        outline.push_str(&format!("  {}({})\n", t.name, cols.join(", ")));
+                        outline.push_str(&format!("  {name}({})\n", cols.join(", ")));
                     } else {
-                        outline.push_str(&format!("  {}\n", t.name));
+                        outline.push_str(&format!("  {name}\n"));
                     }
                 }
             }
@@ -669,6 +678,7 @@ mod tests {
 
     fn table(name: &str, cols: &[&str]) -> TableInfo {
         TableInfo {
+            schema: None,
             name: name.to_string(),
             columns: cols
                 .iter()

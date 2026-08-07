@@ -19,10 +19,19 @@
 //! key flags. Expression columns carry `origin: None`.
 //!
 //! **Model note:** a PostgreSQL *database* maps onto the app's "database" tree
-//! level (mirroring a MySQL schema). Within a database we introspect the `public`
-//! schema — where the standard sample databases live. Multi-schema browsing and
-//! cross-database references (which PostgreSQL itself doesn't support) remain
-//! future work.
+//! level (mirroring a MySQL schema). Within a database, **every user namespace**
+//! is introspected (see `user_schema_filter`) and each table carries its
+//! `TableInfo::schema`; the UI adds a schema tree level only when a database has
+//! more than one, so a `public`-only database looks exactly as it always did.
+//! Cross-*database* references remain out of scope — PostgreSQL itself doesn't
+//! support them.
+//!
+//! **Two qualification rules, on purpose.** User-facing SQL (the editor's
+//! open-table statement, FK-follow, DDL) uses `schemaic_core::schema::
+//! sql_qualifier`, which drops `public` so single-schema statements stay clean.
+//! The write path (`commit_writes`/`refetch_rows`/`fetch_table`) uses `pg_qname`,
+//! which qualifies **always** — that SQL is never shown and must not resolve
+//! through `search_path`.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -211,17 +220,19 @@ pub(crate) async fn prepare_check(
     }
 }
 
-/// Fetch up to `limit` rows of a single table for the Live Monitor. Unqualified,
-/// double-quoted table name (resolved via search_path — the connection is scoped
-/// to `database`), matching the write path.
+/// Fetch up to `limit` rows of a single table for the Live Monitor. The
+/// double-quoted table name is namespace-qualified whenever one is known (the
+/// connection is already scoped to `database`), matching the write path — a
+/// monitor must watch exactly the table it was opened on.
 pub(crate) async fn fetch_table(
     db: &Db,
     database: &str,
+    schema: Option<&str>,
     table: &str,
     limit: usize,
     cancel: CancellationToken,
 ) -> Result<ResultSet, DbError> {
-    let sql = format!("SELECT * FROM {} LIMIT {}", pg_ident(table), limit);
+    let sql = format!("SELECT * FROM {} LIMIT {}", pg_qname(schema, table), limit);
     fetch_query(db, Some(database), &sql, limit, cancel).await
 }
 
@@ -298,6 +309,7 @@ pub(crate) async fn run_statement(
                         let binary = col.type_name == "BYTEA";
                         col.origin = Some(ColumnOrigin {
                             database: database.to_string(),
+                            schema: Some(m.schema.clone()),
                             table: m.table.clone(),
                             column: m.column.clone(),
                             flags: m.flags,
@@ -382,21 +394,65 @@ pub(crate) async fn run_statement(
     Ok(builder.finish())
 }
 
-/// Introspect one database's `public` schema (tables → columns + PK/unique/FK +
-/// all indexes) via `information_schema` + `pg_catalog`, then hand the rows to the
-/// shared, engine-agnostic [`assemble_schema`] (same folding as MySQL).
+/// SQL predicate selecting the *user* schemas of a database — everything except
+/// PostgreSQL's own catalogs and the per-session temp namespaces. Extension-owned
+/// schemas (PostGIS's `topology`, `pg_cron`, …) are deliberately kept: the user
+/// installed them and their tables are legitimately browsable.
+///
+/// `{ns}` is the alias of the `pg_namespace` (or `information_schema` column)
+/// holding the schema name, so the same rule can be spliced into either catalogue
+/// style of query and the five introspection queries can't drift apart.
+fn user_schema_filter(ns: &str) -> String {
+    format!(
+        "{ns} NOT IN ('pg_catalog', 'information_schema') \
+         AND {ns} NOT LIKE 'pg\\_toast%' AND {ns} NOT LIKE 'pg\\_temp%' \
+         AND {ns} NOT LIKE 'pg\\_toast\\_temp%'"
+    )
+}
+
+/// One `information_schema.columns` row as [`assemble_schema`] wants it:
+/// `(table, column, type, is_nullable, key)`.
+type ColRow = (String, String, String, String, String);
+/// One `pg_index` key-column row: `(table, index, non_unique, column)`.
+type IdxRow = (String, String, i64, String);
+/// A catalogue row tagged with the namespace it belongs to, so the whole-database
+/// fetch can be partitioned per schema before folding.
+type InSchema<T> = (String, T);
+
+/// Order schemas for display: `public` first (it's the default namespace and
+/// where most work happens), everything else alphabetically.
+fn schema_sort_key(name: &str) -> (u8, String) {
+    if name == schemaic_core::schema::PG_DEFAULT_SCHEMA {
+        (0, String::new())
+    } else {
+        (1, name.to_string())
+    }
+}
+
+/// Introspect every **user** schema of one database (tables → columns +
+/// PK/unique/FK + all indexes) via `information_schema` + `pg_catalog`.
+///
+/// The catalogue rows are fetched for all namespaces in one round trip each, then
+/// **partitioned by namespace** and handed to the shared, engine-agnostic
+/// [`assemble_schema`] one schema at a time — that function keys its rows by table
+/// name alone, so feeding it two schemas at once would silently merge same-named
+/// tables. Each resulting [`TableInfo`](schemaic_core::schema::TableInfo) carries
+/// its namespace, and the schemas are concatenated `public`-first.
 pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, DbError> {
     let client = connect_to(db, database).await?;
 
-    // Tables (BASE TABLE / VIEW).
-    let table_rows: Vec<(String, String)> = query_all(
+    // Tables (BASE TABLE / VIEW), across every user schema.
+    let table_rows: Vec<(String, String, String)> = query_all(
         &client,
-        "SELECT table_name, table_type FROM information_schema.tables \
-         WHERE table_schema = 'public' ORDER BY table_name",
+        &format!(
+            "SELECT table_schema, table_name, table_type FROM information_schema.tables \
+             WHERE {} ORDER BY table_schema, table_name",
+            user_schema_filter("table_schema")
+        ),
     )
     .await?
     .into_iter()
-    .map(|r| (cell(&r, 0), cell(&r, 1)))
+    .map(|r| (cell(&r, 0), cell(&r, 1), cell(&r, 2)))
     .collect();
 
     // Indexes via `pg_catalog` (every index, not just constraint-backed ones),
@@ -405,36 +461,43 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
     // (and `create_ddl`) treat it the MySQL way. `pk_set` is derived from it.
     let idx_all = query_all(
         &client,
-        "SELECT c.relname, \
-                CASE WHEN ix.indisprimary THEN 'PRIMARY' ELSE ic.relname END AS iname, \
-                CASE WHEN ix.indisunique THEN 0 ELSE 1 END AS non_unique, \
-                a.attname, ix.indisprimary \
-         FROM pg_index ix \
-         JOIN pg_class c ON c.oid = ix.indrelid \
-         JOIN pg_class ic ON ic.oid = ix.indexrelid \
-         JOIN pg_namespace n ON n.oid = c.relnamespace \
-         JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true \
-         JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.attnum \
-         WHERE n.nspname = 'public' AND a.attnum > 0 \
-         ORDER BY c.relname, iname, k.ord",
+        &format!(
+            "SELECT n.nspname, c.relname, \
+                    CASE WHEN ix.indisprimary THEN 'PRIMARY' ELSE ic.relname END AS iname, \
+                    CASE WHEN ix.indisunique THEN 0 ELSE 1 END AS non_unique, \
+                    a.attname, ix.indisprimary \
+             FROM pg_index ix \
+             JOIN pg_class c ON c.oid = ix.indrelid \
+             JOIN pg_class ic ON ic.oid = ix.indexrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true \
+             JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.attnum \
+             WHERE {} AND a.attnum > 0 \
+             ORDER BY n.nspname, c.relname, iname, k.ord",
+            user_schema_filter("n.nspname")
+        ),
     )
     .await?;
-    let idx_rows: Vec<(String, String, i64, String)> = idx_all
+    let idx_rows: Vec<InSchema<IdxRow>> = idx_all
         .iter()
         .map(|r| {
             (
                 cell(r, 0),
-                cell(r, 1),
-                cell(r, 2).parse::<i64>().unwrap_or(1),
-                cell(r, 3),
+                (
+                    cell(r, 1),
+                    cell(r, 2),
+                    cell(r, 3).parse::<i64>().unwrap_or(1),
+                    cell(r, 4),
+                ),
             )
         })
         .collect();
-    // Primary-key columns = the columns of the primary index (`indisprimary`).
-    let pk_set: HashSet<(String, String)> = idx_all
+    // Primary-key columns = the columns of the primary index (`indisprimary`),
+    // keyed by (schema, table, column) so two namespaces don't share a PK set.
+    let pk_set: HashSet<(String, String, String)> = idx_all
         .iter()
-        .filter(|r| cell(r, 4) == "t")
-        .map(|r| (cell(r, 0), cell(r, 3)))
+        .filter(|r| cell(r, 5) == "t")
+        .map(|r| (cell(r, 0), cell(r, 1), cell(r, 4)))
         .collect();
 
     // Columns for the whole schema, in ordinal order. Type names come from
@@ -442,76 +505,116 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
     // through the shared `pg_type_name_str`, so the schema panel shows the SAME
     // short names as the grid (which maps the wire type) — not the verbose
     // `data_type` ("character varying", "timestamp without time zone").
-    let col_rows: Vec<(String, String, String, String, String)> = query_all(
+    let col_rows: Vec<InSchema<ColRow>> = query_all(
         &client,
-        "SELECT table_name, column_name, udt_name, is_nullable \
-         FROM information_schema.columns \
-         WHERE table_schema = 'public' \
-         ORDER BY table_name, ordinal_position",
+        &format!(
+            "SELECT table_schema, table_name, column_name, udt_name, is_nullable \
+             FROM information_schema.columns \
+             WHERE {} \
+             ORDER BY table_schema, table_name, ordinal_position",
+            user_schema_filter("table_schema")
+        ),
     )
     .await?
     .into_iter()
     .map(|r| {
-        let (t, c) = (cell(&r, 0), cell(&r, 1));
-        let key = if pk_set.contains(&(t.clone(), c.clone())) {
+        let (ns, t, c) = (cell(&r, 0), cell(&r, 1), cell(&r, 2));
+        let key = if pk_set.contains(&(ns.clone(), t.clone(), c.clone())) {
             "PRI".to_string()
         } else {
             String::new()
         };
-        (t, c, pg_type_name_str(&cell(&r, 2)), cell(&r, 3), key)
+        (ns, (t, c, pg_type_name_str(&cell(&r, 3)), cell(&r, 4), key))
     })
     .collect();
 
     // Foreign keys via `pg_catalog`: pair `conkey` (referencing) with `confkey`
     // (referenced) by ordinal so composite FKs map their columns correctly (the
     // `constraint_column_usage` join can mis-pair them).
-    let fk_col_rows: Vec<FkColRow> = query_all(
+    let fk_col_rows: Vec<InSchema<FkColRow>> = query_all(
         &client,
-        "SELECT c.relname, con.conname, a.attname, rn.nspname, rc.relname, ra.attname \
-         FROM pg_constraint con \
-         JOIN pg_class c ON c.oid = con.conrelid \
-         JOIN pg_namespace n ON n.oid = c.relnamespace \
-         JOIN pg_class rc ON rc.oid = con.confrelid \
-         JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
-         JOIN unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) ON true \
-         JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum \
-         JOIN unnest(con.confkey) WITH ORDINALITY AS fk(attnum, ord) ON fk.ord = k.ord \
-         JOIN pg_attribute ra ON ra.attrelid = con.confrelid AND ra.attnum = fk.attnum \
-         WHERE con.contype = 'f' AND n.nspname = 'public' \
-         ORDER BY c.relname, con.conname, k.ord",
+        &format!(
+            "SELECT n.nspname, c.relname, con.conname, a.attname, \
+                    rn.nspname, rc.relname, ra.attname \
+             FROM pg_constraint con \
+             JOIN pg_class c ON c.oid = con.conrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             JOIN pg_class rc ON rc.oid = con.confrelid \
+             JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
+             JOIN unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) ON true \
+             JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum \
+             JOIN unnest(con.confkey) WITH ORDINALITY AS fk(attnum, ord) ON fk.ord = k.ord \
+             JOIN pg_attribute ra ON ra.attrelid = con.confrelid AND ra.attnum = fk.attnum \
+             WHERE con.contype = 'f' AND {} \
+             ORDER BY n.nspname, c.relname, con.conname, k.ord",
+            user_schema_filter("n.nspname")
+        ),
     )
     .await?
     .into_iter()
     .map(|r| {
         (
             cell(&r, 0),
-            cell(&r, 1),
-            cell(&r, 2),
-            Some(cell(&r, 3)),
-            Some(cell(&r, 4)),
-            Some(cell(&r, 5)),
+            (
+                cell(&r, 1),
+                cell(&r, 2),
+                cell(&r, 3),
+                // The *referenced* namespace: kept as-is (it may point into
+                // another schema) and consumed by `follow_target`.
+                Some(cell(&r, 4)),
+                Some(cell(&r, 5)),
+                Some(cell(&r, 6)),
+            ),
         )
     })
     .collect();
 
     // View definitions.
-    let view_rows: Vec<(String, String)> = query_all(
+    let view_rows: Vec<InSchema<(String, String)>> = query_all(
         &client,
-        "SELECT table_name, view_definition FROM information_schema.views \
-         WHERE table_schema = 'public'",
+        &format!(
+            "SELECT table_schema, table_name, view_definition \
+             FROM information_schema.views WHERE {}",
+            user_schema_filter("table_schema")
+        ),
     )
     .await?
     .into_iter()
-    .map(|r| (cell(&r, 0), cell(&r, 1)))
+    .map(|r| (cell(&r, 0), (cell(&r, 1), cell(&r, 2))))
     .collect();
 
-    Ok(assemble_schema(
-        &table_rows,
-        &col_rows,
-        &fk_col_rows,
-        &idx_rows,
-        &view_rows,
-    ))
+    // Partition every row set by namespace, then fold one namespace at a time —
+    // `assemble_schema` keys on table name alone, so a shared call would merge
+    // `public.orders` with `sales.orders`.
+    let mut namespaces: Vec<String> = table_rows.iter().map(|(ns, ..)| ns.clone()).collect();
+    namespaces.sort_by_key(|n| schema_sort_key(n));
+    namespaces.dedup();
+
+    /// Keep only the rows tagged with `ns`, dropping the tag.
+    fn of<T: Clone>(rows: &[InSchema<T>], ns: &str) -> Vec<T> {
+        rows.iter()
+            .filter(|(s, _)| s == ns)
+            .map(|(_, r)| r.clone())
+            .collect()
+    }
+    let mut tables = Vec::new();
+    for ns in &namespaces {
+        let t: Vec<(String, String)> = table_rows
+            .iter()
+            .filter(|(s, ..)| s == ns)
+            .map(|(_, name, ty)| (name.clone(), ty.clone()))
+            .collect();
+        let schema = assemble_schema(
+            Some(ns),
+            &t,
+            &of(&col_rows, ns),
+            &of(&fk_col_rows, ns),
+            &of(&idx_rows, ns),
+            &of(&view_rows, ns),
+        );
+        tables.extend(schema.tables);
+    }
+    Ok(DbSchema { tables })
 }
 
 /// Run a read-only SELECT and return every row as a `Vec<Option<String>>` (one
@@ -585,6 +688,9 @@ fn pg_type_name_str(name: &str) -> String {
 /// column: its real table/column name + key flags (drives editability + the
 /// new-row placeholder previews).
 struct ColMeta {
+    /// The table's namespace (`pg_namespace.nspname`) — part of its identity, so
+    /// the write path can name exactly the table the row was read from.
+    schema: String,
     table: String,
     column: String,
     flags: ColumnFlags,
@@ -609,7 +715,7 @@ async fn fetch_col_meta(
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "SELECT a.attrelid, a.attnum, a.attname, c.relname, \
+        "SELECT a.attrelid, a.attnum, a.attname, c.relname, n.nspname, \
                 a.attnotnull, \
                 (a.attidentity <> '' OR (a.atthasdef AND \
                     COALESCE(pg_get_expr(ad.adbin, ad.adrelid), '') LIKE 'nextval(%')) AS auto_inc, \
@@ -617,6 +723,7 @@ async fn fetch_col_meta(
                 (pk.attnum IS NOT NULL) AS is_pk \
          FROM pg_attribute a \
          JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
          LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
          LEFT JOIN (SELECT i.indrelid AS relid, k AS attnum \
                     FROM pg_index i, unnest(i.indkey) AS k WHERE i.indisprimary) pk \
@@ -631,16 +738,19 @@ async fn fetch_col_meta(
         if oid == 0 || attnum <= 0 {
             continue;
         }
+        // Column order: attrelid, attnum, attname, relname, nspname, attnotnull,
+        // auto_inc, no_default, is_pk.
         let flags = ColumnFlags {
-            primary_key: cell(&r, 7) == "t",
+            primary_key: cell(&r, 8) == "t",
             unique_key: false, // not surfaced yet (key-icon nicety); PK covers editing
-            not_null: cell(&r, 4) == "t",
-            auto_increment: cell(&r, 5) == "t",
-            no_default: cell(&r, 6) == "t",
+            not_null: cell(&r, 5) == "t",
+            auto_increment: cell(&r, 6) == "t",
+            no_default: cell(&r, 7) == "t",
         };
         out.insert(
             (oid, attnum),
             ColMeta {
+                schema: cell(&r, 4),
                 table: cell(&r, 3),
                 column: cell(&r, 2),
                 flags,
@@ -655,6 +765,22 @@ async fn fetch_col_meta(
 /// Double-quote a Postgres identifier, doubling any embedded quote.
 fn pg_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// A table name for the **write path**, qualified with its namespace whenever one
+/// is known — including `public`.
+///
+/// Deliberately unlike the user-facing
+/// [`sql_qualifier`](schemaic_core::schema::sql_qualifier), which drops `public`
+/// to keep the editor's SQL clean: nothing here is ever shown, and an `UPDATE`
+/// that resolves through `search_path` could hit a different table than the one
+/// the row was read from. `None` (MySQL-shaped origins, or a Postgres result
+/// whose namespace couldn't be resolved) falls back to the bare name.
+fn pg_qname(schema: Option<&str>, table: &str) -> String {
+    match schema {
+        Some(s) => format!("{}.{}", pg_ident(s), pg_ident(table)),
+        None => pg_ident(table),
+    }
 }
 
 /// A SQL string literal (single-quoted, quotes doubled). Safe under Postgres's
@@ -707,7 +833,7 @@ fn build_update(edit: &RowEdit) -> String {
         .join(", ");
     format!(
         "UPDATE {} SET {set_sql} WHERE {}",
-        pg_ident(&edit.table),
+        pg_qname(edit.schema.as_deref(), &edit.table),
         where_key(&edit.key)
     )
 }
@@ -716,8 +842,9 @@ fn build_update(edit: &RowEdit) -> String {
 /// no columns are set (Postgres's all-defaults form — MySQL's `() VALUES ()` is
 /// invalid here).
 fn build_insert(ins: &RowInsert) -> String {
+    let name = pg_qname(ins.schema.as_deref(), &ins.table);
     if ins.cols.is_empty() {
-        return format!("INSERT INTO {} DEFAULT VALUES", pg_ident(&ins.table));
+        return format!("INSERT INTO {name} DEFAULT VALUES");
     }
     let cols = ins
         .cols
@@ -731,17 +858,14 @@ fn build_insert(ins: &RowInsert) -> String {
         .map(|(_, v)| pg_opt_lit(v))
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
-        "INSERT INTO {} ({cols}) VALUES ({vals})",
-        pg_ident(&ins.table)
-    )
+    format!("INSERT INTO {name} ({cols}) VALUES ({vals})")
 }
 
 /// `DELETE FROM "t" WHERE <key>`.
 fn build_delete(del: &RowDelete) -> String {
     format!(
         "DELETE FROM {} WHERE {}",
-        pg_ident(&del.table),
+        pg_qname(del.schema.as_deref(), &del.table),
         where_key(&del.key)
     )
 }
@@ -914,8 +1038,9 @@ pub(crate) async fn refetch_on(
         .join(", ");
     // Column types once (via a LIMIT 0 prepare) so every row's text cells parse
     // to the same typed `Value` the grid already holds.
+    let qname = pg_qname(template.schema.as_deref(), &template.table);
     let type_names: Vec<String> = {
-        let probe = format!("SELECT {proj} FROM {} LIMIT 0", pg_ident(&template.table));
+        let probe = format!("SELECT {proj} FROM {qname} LIMIT 0");
         match client.prepare(&probe).await {
             Ok(stmt) => stmt
                 .columns()
@@ -942,10 +1067,7 @@ pub(crate) async fn refetch_on(
                 })
                 .collect::<Vec<_>>()
                 .join(" AND ");
-            let sql = format!(
-                "SELECT {proj} FROM {} WHERE {where_sql} LIMIT 1",
-                pg_ident(&template.table)
-            );
+            let sql = format!("SELECT {proj} FROM {qname} WHERE {where_sql} LIMIT 1");
             let msgs = client
                 .simple_query(&sql)
                 .await
@@ -1065,6 +1187,7 @@ mod tests {
     fn build_update_shape_null_safe_key() {
         let edit = RowEdit {
             database: "world".into(),
+            schema: None,
             table: "city".into(),
             set: vec![
                 ("name".into(), Some("Kabul".into())),
@@ -1083,6 +1206,7 @@ mod tests {
     fn build_insert_shapes_including_default_values() {
         let ins = RowInsert {
             database: "world".into(),
+            schema: None,
             table: "country".into(),
             cols: vec![("code".into(), Some("AAA".into())), ("name".into(), None)],
         };
@@ -1093,6 +1217,7 @@ mod tests {
         // No columns set → Postgres all-defaults form (NOT `() VALUES ()`).
         let empty = RowInsert {
             database: "world".into(),
+            schema: None,
             table: "t".into(),
             cols: vec![],
         };
@@ -1103,6 +1228,7 @@ mod tests {
     fn build_delete_shape_composite_key() {
         let del = RowDelete {
             database: "world".into(),
+            schema: None,
             table: "countrylanguage".into(),
             key: vec![
                 ("countrycode".into(), Value::Str("NLD".into())),
@@ -1115,5 +1241,89 @@ mod tests {
              WHERE \"countrycode\" IS NOT DISTINCT FROM 'NLD' \
              AND \"language\" IS NOT DISTINCT FROM 'Dutch'"
         );
+    }
+
+    // ── multi-schema write path ───────────────────────────────────────────
+
+    #[test]
+    fn pg_qname_qualifies_whenever_a_namespace_is_known() {
+        // Unlike the user-facing SQL, the write path qualifies `public` too — an
+        // invisible statement must not depend on `search_path`.
+        assert_eq!(pg_qname(Some("public"), "city"), "\"public\".\"city\"");
+        assert_eq!(pg_qname(Some("sales"), "orders"), "\"sales\".\"orders\"");
+        // No namespace (MySQL-shaped origin, or unresolved) → bare name.
+        assert_eq!(pg_qname(None, "city"), "\"city\"");
+        // Both halves are escaped.
+        assert_eq!(
+            pg_qname(Some("we\"ird"), "t\"x"),
+            "\"we\"\"ird\".\"t\"\"x\""
+        );
+    }
+
+    #[test]
+    fn writes_target_the_rows_own_namespace() {
+        // The three write shapes must all name the schema the row came from —
+        // otherwise a same-named table earlier on the search_path gets the write.
+        let edit = RowEdit {
+            database: "warehouse".into(),
+            schema: Some("sales".into()),
+            table: "orders".into(),
+            set: vec![("total".into(), Some("9".into()))],
+            key: vec![("id".into(), Value::Int(1))],
+        };
+        assert_eq!(
+            build_update(&edit),
+            "UPDATE \"sales\".\"orders\" SET \"total\" = '9' \
+             WHERE \"id\" IS NOT DISTINCT FROM 1"
+        );
+
+        let ins = RowInsert {
+            database: "warehouse".into(),
+            schema: Some("sales".into()),
+            table: "orders".into(),
+            cols: vec![("total".into(), Some("9".into()))],
+        };
+        assert_eq!(
+            build_insert(&ins),
+            "INSERT INTO \"sales\".\"orders\" (\"total\") VALUES ('9')"
+        );
+        let empty = RowInsert {
+            cols: vec![],
+            ..ins
+        };
+        assert_eq!(
+            build_insert(&empty),
+            "INSERT INTO \"sales\".\"orders\" DEFAULT VALUES"
+        );
+
+        let del = RowDelete {
+            database: "warehouse".into(),
+            schema: Some("sales".into()),
+            table: "orders".into(),
+            key: vec![("id".into(), Value::Int(1))],
+        };
+        assert_eq!(
+            build_delete(&del),
+            "DELETE FROM \"sales\".\"orders\" WHERE \"id\" IS NOT DISTINCT FROM 1"
+        );
+    }
+
+    #[test]
+    fn user_schema_filter_excludes_only_postgres_internals() {
+        let f = user_schema_filter("n.nspname");
+        assert!(f.contains("'pg_catalog', 'information_schema'"));
+        assert!(f.contains("pg\\_toast%"));
+        assert!(f.contains("pg\\_temp%"));
+        // Extension-owned namespaces stay browsable — they aren't named here.
+        assert!(!f.contains("topology"));
+        // The alias is spliced everywhere, so the five queries can't diverge.
+        assert_eq!(f.matches("n.nspname").count(), 4);
+    }
+
+    #[test]
+    fn schema_sort_key_puts_public_first() {
+        let mut v = vec!["sales", "public", "analytics"];
+        v.sort_by_key(|s| schema_sort_key(s));
+        assert_eq!(v, vec!["public", "analytics", "sales"]);
     }
 }

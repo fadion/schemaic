@@ -34,7 +34,7 @@ use schemaic_core::model::{
     RowDelete, RowEdit, RowInsert, Value,
 };
 use schemaic_core::rowjson::{self, ColSpec};
-use schemaic_core::schema::{ForeignKeyInfo, SchemaState};
+use schemaic_core::schema::{ForeignKeyInfo, SchemaState, TableSource};
 use schemaic_core::text::plural;
 use schemaic_core::text_ops::contains_ignore_ascii_case;
 
@@ -246,9 +246,9 @@ pub(crate) fn loaded_view(rs: Arc<ResultSet>, gctx: GridCtx) -> AnyView {
 type SummarizeFn = Rc<dyn Fn(String)>;
 /// Splice sink: replace the tab's canonical result set after an in-place commit.
 type SyncCanonicalFn = Rc<dyn Fn(Arc<ResultSet>)>;
-/// "Follow foreign key" callback: open the referenced `(database, table)` in a new
-/// tab running the given filter `sql`. The grid builds the SQL from a FK + row.
-type FollowFn = Rc<dyn Fn(String, String, String)>;
+/// "Follow foreign key" callback: open the referenced table in a new tab running
+/// the given filter `sql`. The grid builds the SQL from a FK + row.
+type FollowFn = Rc<dyn Fn(TableSource, String)>;
 /// Re-run the active tab with a rewritten (filtered/sorted) statement — the
 /// server-side filter/sort callback (`TabsActions::apply_view`).
 type ApplyViewFn = Rc<dyn Fn(String)>;
@@ -306,7 +306,7 @@ struct GridState {
     /// width from a prior (narrower) menu can't shrink it.
     popup_width: RwSignal<f64>,
     /// The result's source `(database, table)` — for the cell "AI Summary" context.
-    source: RwSignal<Option<(String, String)>>,
+    source: RwSignal<Option<TableSource>>,
     /// Callbacks wrapped in signals so `GridState` stays `Copy`. `summarize`
     /// reveals the AI panel + sends a message; `dismiss` closes any open menu;
     /// `commit` executes staged edits.
@@ -409,10 +409,12 @@ impl GridState {
                     .unwrap_or(("", ""));
                 // An explicit saved rule wins; otherwise fall back to the name/type
                 // smart default (e.g. an int `*_at` column → Timestamp).
+                // Keyed by the *display* name, so a rule saved for `sales.orders`
+                // doesn't leak onto `public.orders`.
                 let saved = match &src {
-                    Some((db, table)) => gctx
-                        .formats
-                        .with_untracked(|rules| format::lookup(rules, conn, db, table, name)),
+                    Some(s) => gctx.formats.with_untracked(|rules| {
+                        format::lookup(rules, conn, &s.database, &s.display(), name)
+                    }),
                     None => None,
                 };
                 saved.unwrap_or_else(|| format::smart_default(name, ty))
@@ -781,6 +783,7 @@ impl GridState {
                 .collect();
             edits.push(RowEdit {
                 database: tbl.database.clone(),
+                schema: tbl.schema.clone(),
                 table: tbl.table.clone(),
                 set,
                 key,
@@ -830,6 +833,7 @@ impl GridState {
                 .collect();
             edits.push(RowEdit {
                 database: tbl.database.clone(),
+                schema: tbl.schema.clone(),
                 table: tbl.table.clone(),
                 set,
                 key,
@@ -892,6 +896,7 @@ impl GridState {
                     .collect();
                 RowInsert {
                     database: tbl.database.clone(),
+                    schema: tbl.schema.clone(),
                     table: tbl.table.clone(),
                     cols,
                 }
@@ -940,6 +945,7 @@ impl GridState {
                     .collect();
                 Some(RowDelete {
                     database: tbl.database.clone(),
+                    schema: tbl.schema.clone(),
                     table: tbl.table.clone(),
                     key,
                 })
@@ -1269,7 +1275,9 @@ fn export_inserts(gs: GridState) -> String {
     schemaic_core::export::export_inserts(
         rs.as_ref(),
         order.as_slice(),
-        source.as_ref().map(|(d, t)| (d.as_str(), t.as_str())),
+        source
+            .as_ref()
+            .map(|s| (s.database.as_str(), s.schema.as_deref(), s.table.as_str())),
     )
 }
 
@@ -1368,21 +1376,22 @@ impl ColKey {
 /// Primary keys win; single-column indexes are Foreign (if they back an FK) else
 /// Index. Multi-column indexes are ignored (only single-column ones get a marker).
 fn column_key_map(
-    source: RwSignal<Option<(String, String)>>,
+    source: RwSignal<Option<TableSource>>,
     db_nodes: RwSignal<Vec<ConnNode>>,
 ) -> HashMap<String, ColKey> {
     let mut map = HashMap::new();
-    let Some((db, table)) = source.get_untracked() else {
+    let Some(src) = source.get_untracked() else {
         return map;
     };
+    let (db, table) = (&src.database, &src.table);
     let nodes = db_nodes.get_untracked();
-    let Some(node) = nodes.iter().find(|n| n.database == db) else {
+    let Some(node) = nodes.iter().find(|n| &n.database == db) else {
         return map;
     };
     let SchemaState::Loaded(schema) = node.schema.get_untracked() else {
         return map;
     };
-    let Some(t) = schema.tables.iter().find(|t| t.name == table) else {
+    let Some(t) = schema.find_table(src.schema.as_deref(), table) else {
         return map;
     };
     for c in &t.columns {
@@ -1426,21 +1435,22 @@ struct FollowSpec {
 /// Empty unless the tab has a source table with loaded schema and FKs.
 fn build_follow_specs(
     rs: &ResultSet,
-    source: RwSignal<Option<(String, String)>>,
+    source: RwSignal<Option<TableSource>>,
     db_nodes: RwSignal<Vec<ConnNode>>,
 ) -> HashMap<usize, Rc<FollowSpec>> {
     let mut map = HashMap::new();
-    let Some((db, table)) = source.get_untracked() else {
+    let Some(src) = source.get_untracked() else {
         return map;
     };
+    let (db, table) = (&src.database, &src.table);
     let nodes = db_nodes.get_untracked();
-    let Some(node) = nodes.iter().find(|n| n.database == db) else {
+    let Some(node) = nodes.iter().find(|n| &n.database == db) else {
         return map;
     };
     let SchemaState::Loaded(schema) = node.schema.get_untracked() else {
         return map;
     };
-    let Some(t) = schema.tables.iter().find(|t| t.name == table) else {
+    let Some(t) = schema.find_table(src.schema.as_deref(), table) else {
         return map;
     };
     if t.foreign_keys.is_empty() {
@@ -1450,8 +1460,11 @@ fn build_follow_specs(
     let mut real_to_ci: HashMap<&str, usize> = HashMap::new();
     for (ci, col) in rs.columns.iter().enumerate() {
         if let Some(o) = &col.origin
-            && o.table == table
-            && o.database == db
+            && &o.table == table
+            && &o.database == db
+            // Namespace too, or a self-join-shaped result spanning `public.orders`
+            // and `sales.orders` would map the wrong side's values.
+            && o.schema == src.schema
         {
             real_to_ci.entry(o.column.as_str()).or_insert(ci);
         }
@@ -1496,7 +1509,7 @@ fn follow_relation(gs: GridState, data_idx: usize, spec: &FollowSpec) {
         schemaic_core::schema::follow_target(&spec.fk, &values, &spec.default_schema, gs.dialect)
         && let Some(cb) = gs.follow_fk.get_untracked()
     {
-        (cb)(ft.database, ft.table, ft.sql);
+        (cb)(TableSource::new(ft.database, ft.schema, ft.table), ft.sql);
     }
 }
 
@@ -1505,7 +1518,7 @@ fn follow_relation(gs: GridState, data_idx: usize, spec: &FollowSpec) {
 #[derive(Clone)]
 pub(crate) struct GridCtx {
     /// The active tab's source `(database, table)`, for key-icon lookup.
-    pub(crate) source: RwSignal<Option<(String, String)>>,
+    pub(crate) source: RwSignal<Option<TableSource>>,
     /// A column name to select + scroll into view once the grid loads, then clear
     /// (schema-tree column double-click → open table + highlight column). The grid
     /// consumes it via an effect, so re-requesting on an already-loaded tab works.
@@ -1785,13 +1798,19 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         let model = if read_only.get() {
             EditModel::default()
         } else {
-            analyze_edit(&rs_model, |db, table| {
+            analyze_edit(&rs_model, |db, ns, table| {
                 db_nodes.with_untracked(|nodes| {
                     nodes.iter().find(|n| n.database == db).and_then(|n| {
                         match n.schema.get_untracked() {
-                            SchemaState::Loaded(s) => {
-                                s.tables.iter().find(|t| t.name == table).cloned()
-                            }
+                            SchemaState::Loaded(s) => s
+                                .tables
+                                .iter()
+                                // Match the namespace too: a database may hold
+                                // same-named tables in two PostgreSQL schemas,
+                                // and picking the wrong one hands the write the
+                                // wrong key columns.
+                                .find(|t| t.name == table && t.schema.as_deref() == ns)
+                                .cloned(),
                             _ => None,
                         }
                     })
@@ -2573,7 +2592,7 @@ fn ai_fill_value(gs: GridState) {
     let Some(et) = model.table(ti) else {
         return;
     };
-    let (database, table) = (et.database.clone(), et.table.clone());
+    let source = TableSource::new(et.database.clone(), et.schema.clone(), et.table.clone());
     let rs = gs.rs.get_untracked();
     let ncols = rs.col_count();
     let nrows = rs.row_count();
@@ -2633,8 +2652,7 @@ fn ai_fill_value(gs: GridState) {
     start_ai_pulse(gs);
     let req = crate::AiFillRequest {
         conn_id: gs.conn_id.get_untracked(),
-        database,
-        table,
+        source,
         column,
         row_context,
     };
@@ -2675,7 +2693,7 @@ fn ai_seed_rows(gs: GridState, count: usize) {
     let Some(et) = model.insert_target() else {
         return;
     };
-    let (database, table) = (et.database.clone(), et.table.clone());
+    let source = TableSource::new(et.database.clone(), et.schema.clone(), et.table.clone());
     let rs = gs.rs.get_untracked();
     let ncols = rs.col_count();
     // Columns the model should fill (editable, non-auto-increment) + a name→ci map
@@ -2724,8 +2742,7 @@ fn ai_seed_rows(gs: GridState, count: usize) {
     }
     let req = crate::AiSeedRequest {
         conn_id: gs.conn_id.get_untracked(),
-        database,
-        table,
+        source,
         fill_columns,
         count,
     };
@@ -3430,7 +3447,10 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
 
             let row_no = edit_row_disp(gs, di) + 1;
             let title = match gs.source.get_untracked() {
-                Some((_, t)) if !t.is_empty() => format!("Row {row_no}  ·  {t}"),
+                // Qualified outside `public`, so two same-named tables read apart.
+                Some(src) if !src.table.is_empty() => {
+                    format!("Row {row_no}  ·  {}", src.display())
+                }
                 _ => format!("Row {row_no}"),
             };
 
@@ -4291,7 +4311,7 @@ fn set_format(gs: GridState, ci: usize, fmt: ColumnFormat) {
             v[ci] = fmt;
         }
     });
-    if let Some((db, table)) = gs.source.get_untracked()
+    if let Some(src) = gs.source.get_untracked()
         && let Some(col) = gs
             .rs
             .get_untracked()
@@ -4300,8 +4320,11 @@ fn set_format(gs: GridState, ci: usize, fmt: ColumnFormat) {
             .map(|c| c.name.clone())
     {
         let conn = gs.conn_id.get_untracked();
+        // Keyed by the display name (see `GridState::new`) so the rule belongs to
+        // this namespace's table, not a same-named one in another schema.
+        let table = src.display();
         gs.fmt_rules
-            .update(|rules| format::upsert(rules, conn, &db, &table, &col, fmt));
+            .update(|rules| format::upsert(rules, conn, &src.database, &table, &col, fmt));
         if let Some(save) = gs.save_formats.get_untracked() {
             (save)();
         }
@@ -4841,7 +4864,7 @@ fn data_cell(
                 .and_then(|c| (!c.is_null()).then(|| c.display().to_string()));
             // Context for the AI: the source table (if known) + this column.
             let from = match gs.source.get_untracked() {
-                Some((db, table)) => format!(" from the `{db}.{table}` table"),
+                Some(src) => format!(" from the `{}.{}` table", src.database, src.display()),
                 None => String::new(),
             };
             let msg = format!(

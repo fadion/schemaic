@@ -187,6 +187,11 @@ pub struct SavedTab {
     pub database: Option<String>,
     #[serde(default)]
     pub source: Option<(String, String)>,
+    /// The source table's PostgreSQL namespace, stored beside `source` rather than
+    /// widening it to a triple so a session file written by an older build still
+    /// restores its tabs (it just reads back as `None`, i.e. `public`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_schema: Option<String>,
     /// User-assigned tab name (double-click to rename); `None` = the default
     /// "Query N" label. Persisted so a restored tab keeps its name.
     #[serde(default)]

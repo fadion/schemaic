@@ -233,12 +233,22 @@ pub fn export_html(rs: &ResultSet, order: &[usize]) -> String {
     out
 }
 
-/// The result as `INSERT` statements. `source` is the real `(database, table)`
-/// when known; otherwise a `` `table` `` placeholder is emitted for the user to
-/// fill in. Identifiers are backtick-escaped.
-pub fn export_inserts(rs: &ResultSet, order: &[usize], source: Option<(&str, &str)>) -> String {
+/// The result as `INSERT` statements. `source` is the real
+/// `(database, namespace, table)` when known; otherwise a `` `table` ``
+/// placeholder is emitted for the user to fill in. Identifiers are
+/// backtick-escaped.
+///
+/// A PostgreSQL namespace qualifies the table *instead of* the database — a PG
+/// connection is bound to one database, so `schema.table` is the addressable
+/// name, exactly as everywhere else in the app.
+pub fn export_inserts(
+    rs: &ResultSet,
+    order: &[usize],
+    source: Option<(&str, Option<&str>, &str)>,
+) -> String {
     let table_sql = match source {
-        Some((db, table)) => format!("{}.{}", ident_sql(db), ident_sql(table)),
+        Some((_, Some(ns), table)) => format!("{}.{}", ident_sql(ns), ident_sql(table)),
+        Some((db, None, table)) => format!("{}.{}", ident_sql(db), ident_sql(table)),
         None => "`table`".to_string(),
     };
     let cols = rs
@@ -304,13 +314,22 @@ mod tests {
 
     #[test]
     fn c5_inserts_use_real_table_and_escape_identifiers() {
-        let out = export_inserts(&rs(), &[0, 1], Some(("shop", "cust")));
+        let out = export_inserts(&rs(), &[0, 1], Some(("shop", None, "cust")));
         // Real qualified table, not a `table` placeholder; column `a`b` escaped.
         assert!(out.contains("INSERT INTO `shop`.`cust` (`id`, `a``b`) VALUES"));
         assert!(out.contains("(1, 'x')"));
         assert!(out.contains("(NULL, 'y')"));
         // Placeholder only when the source is unknown.
         assert!(export_inserts(&rs(), &[0], None).contains("INSERT INTO `table` ("));
+    }
+
+    #[test]
+    fn inserts_qualify_by_namespace_instead_of_database() {
+        // A PostgreSQL connection is bound to one database, so the namespace is
+        // what makes the name resolvable — `schema.table`, not `db.table`.
+        let out = export_inserts(&rs(), &[0], Some(("warehouse", Some("sales"), "orders")));
+        assert!(out.contains("INSERT INTO `sales`.`orders` ("), "{out}");
+        assert!(!out.contains("warehouse"), "{out}");
     }
 
     #[test]
