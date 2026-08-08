@@ -51,17 +51,80 @@ fn truncate(value: &str) -> String {
     }
 }
 
-/// Prompt for summarizing a single cell. `table` is the qualified source table
-/// when the result came from one.
-pub fn cell_prompt(table: Option<&str>, column: &str, value: &str) -> String {
+/// Fields of the focused cell's own row included as context.
+pub const CELL_ROW_FIELDS: usize = 12;
+
+/// The other columns of one row, as `(name, displayed value)`.
+///
+/// A lone value rarely explains itself; the row it sits in usually does — a
+/// status reads differently next to an `order_id` than next to a `job_id`.
+/// `skip_ci` is the focused column, quoted separately in the prompt.
+pub fn sample_row(
+    rs: &ResultSet,
+    row: usize,
+    skip_ci: usize,
+    max_fields: usize,
+) -> Vec<(String, String)> {
+    if row >= rs.row_count() {
+        return Vec::new();
+    }
+    (0..rs.col_count())
+        .filter(|ci| *ci != skip_ci)
+        .filter_map(|ci| {
+            let name = rs.columns.get(ci)?.name.clone();
+            Some((name, truncate(rs.cell(row, ci)?.display())))
+        })
+        .take(max_fields)
+        .collect()
+}
+
+/// Prompt for summarizing a single cell.
+///
+/// Carries everything already on screen — the column's type, the rest of the
+/// cell's row, and a sample of the column's other values — so the assistant can
+/// answer from context instead of going querying. It has `run_query` when the
+/// setting allows, but a menu action shouldn't need a round-trip to say what a
+/// value is, and with queries turned off it wouldn't have one.
+///
+/// `table` is the qualified source table when the result came from one; the row
+/// and sample sections are omitted when empty rather than sent as headings with
+/// nothing under them.
+pub fn cell_prompt(
+    table: Option<&str>,
+    column: &str,
+    type_name: &str,
+    value: &str,
+    row: &[(String, String)],
+    samples: &[String],
+) -> String {
     let from = match table {
-        Some(t) => format!(" from the `{t}` table"),
+        Some(t) => format!(" of the `{t}` table"),
         None => String::new(),
     };
-    format!(
-        "Summarize this value{from}, column `{column}`:\n```\n{value}\n```\n\
-         If you can infer a pattern, format, or meaning from it, note that too."
-    )
+    let mut out = format!(
+        "Summarize this value from the `{column}` column{from} (type `{type_name}`):\
+         \n```\n{value}\n```"
+    );
+    if !row.is_empty() {
+        let fields: Vec<String> = row.iter().map(|(k, v)| format!("{k}: {v}")).collect();
+        out.push_str(&format!(
+            "\n\nThe rest of its row, for context:\n```\n{}\n```",
+            fields.join("\n")
+        ));
+    }
+    if !samples.is_empty() {
+        out.push_str(&format!(
+            "\n\nOther values in the same column, sampled across the loaded rows:\n\
+             ```\n{}\n```",
+            samples.join("\n")
+        ));
+    }
+    out.push_str(
+        "\n\nSay what it represents and note any pattern, format, or encoding — \
+         including whether it looks typical for this column or unusual. Answer \
+         from what's above; say so if something you'd need isn't shown.",
+    );
+    out
 }
 
 /// Prompt for summarizing a whole column, given a sample of its values.
@@ -161,15 +224,89 @@ mod tests {
         assert_eq!(sample_column(&rs, 0, 5), ["NULL"]);
     }
 
+    fn wide_row() -> ResultSet {
+        ResultSet::from_rows(
+            vec![col("id"), col("status"), col("note")],
+            vec![
+                vec![
+                    Value::Int(1),
+                    Value::Str("A".into()),
+                    Value::Str("first".into()),
+                ],
+                vec![
+                    Value::Int(2),
+                    Value::Str("B".into()),
+                    Value::Str("second".into()),
+                ],
+            ],
+        )
+    }
+
     #[test]
-    fn cell_prompt_names_the_table_when_known() {
-        let with = cell_prompt(Some("shop.orders"), "total", "12.50");
-        assert!(with.contains("from the `shop.orders` table"));
-        assert!(with.contains("column `total`"));
-        assert!(with.contains("12.50"));
-        // No source table → no dangling "from the `` table".
-        let without = cell_prompt(None, "total", "12.50");
-        assert!(!without.contains("table"));
+    fn row_context_lists_the_other_columns_of_that_row() {
+        let got = sample_row(&wide_row(), 1, 1, 10);
+        // The focused column is skipped — its value is quoted on its own.
+        assert_eq!(
+            got,
+            vec![
+                ("id".to_string(), "2".to_string()),
+                ("note".to_string(), "second".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn row_context_is_capped_and_truncated() {
+        let long = "z".repeat(SAMPLE_CHARS + 40);
+        let rs = ResultSet::from_rows(
+            vec![col("a"), col("b"), col("c")],
+            vec![vec![
+                Value::Str(long),
+                Value::Str("b".into()),
+                Value::Str("c".into()),
+            ]],
+        );
+        let got = sample_row(&rs, 0, 9, 2);
+        assert_eq!(got.len(), 2); // capped
+        assert_eq!(got[0].1, format!("{}…", "z".repeat(SAMPLE_CHARS)));
+    }
+
+    #[test]
+    fn row_context_is_empty_for_a_missing_row() {
+        assert!(sample_row(&wide_row(), 99, 0, 10).is_empty());
+    }
+
+    #[test]
+    fn cell_prompt_frames_the_value_with_everything_on_screen() {
+        let row = vec![("id".to_string(), "2".to_string())];
+        let samples = vec!["A".to_string(), "B".to_string()];
+        let out = cell_prompt(
+            Some("shop.orders"),
+            "status",
+            "char(1)",
+            "B",
+            &row,
+            &samples,
+        );
+        assert!(out.contains("`status`"));
+        assert!(out.contains("`shop.orders`"));
+        assert!(out.contains("char(1)"));
+        assert!(out.contains("\nB\n")); // the value itself, fenced
+        assert!(out.contains("id: 2")); // the rest of its row
+        assert!(out.contains("A\nB")); // sibling values from the column
+        // Enough context that it needn't go querying to answer.
+        assert!(out.contains("pattern"));
+    }
+
+    #[test]
+    fn cell_prompt_omits_sections_it_has_nothing_for() {
+        let out = cell_prompt(None, "total", "decimal", "12.50", &[], &[]);
+        assert!(out.contains("`total`"));
+        assert!(out.contains("12.50"));
+        // No source table → no dangling "of the `` table".
+        assert!(!out.contains("table"));
+        assert!(!out.contains("Other values"));
+        assert!(!out.contains("rest of"));
     }
 
     #[test]
