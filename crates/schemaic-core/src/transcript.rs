@@ -4,9 +4,79 @@
 //! renders them (prose as markdown, tool calls as chips) and shows the
 //! per-turn [`TurnStats`] footer. Keeping the type here lets both crates share
 //! it without the UI depending on the CLI-integration crate.
+//!
+//! These types are serializable so a conversation can outlive the process —
+//! see [`crate::chat`], which persists them per connection.
+
+use serde::{Deserialize, Serialize};
+
+/// Who authored a chat message in the AI panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Role {
+    User,
+    Assistant,
+    Error,
+}
+
+/// One message in the AI panel conversation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: Role,
+    /// The user's text (user messages only).
+    pub text: String,
+    /// The assistant turn's rendered segments (assistant/error messages).
+    #[serde(default)]
+    pub segs: Vec<Seg>,
+    /// Cost/usage footer, once the turn completes.
+    #[serde(default)]
+    pub stats: Option<TurnStats>,
+    /// True while awaiting the assistant's reply (renders as "Thinking…").
+    /// Never persisted as true — a restored turn is always finished.
+    #[serde(default)]
+    pub pending: bool,
+}
+
+impl ChatMessage {
+    pub fn user(text: String) -> ChatMessage {
+        ChatMessage {
+            role: Role::User,
+            text,
+            segs: Vec::new(),
+            stats: None,
+            pending: false,
+        }
+    }
+    /// Placeholder assistant message shown while the CLI runs.
+    pub fn pending() -> ChatMessage {
+        ChatMessage {
+            role: Role::Assistant,
+            text: String::new(),
+            segs: Vec::new(),
+            stats: None,
+            pending: true,
+        }
+    }
+
+    /// The message's prose: the user's own text, or the assistant's text
+    /// segments joined (tool calls are the assistant *using* tools, not
+    /// content). Used for the copy action and for replaying a restored
+    /// conversation into a fresh session's prompt.
+    pub fn prose(&self) -> String {
+        if self.role == Role::User {
+            return self.text.trim().to_string();
+        }
+        let mut out = String::new();
+        for s in &self.segs {
+            if let Seg::Text(t) = s {
+                out.push_str(t);
+            }
+        }
+        out.trim().to_string()
+    }
+}
 
 /// One piece of a rendered assistant turn, in emission order.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Seg {
     /// Assistant prose (light markdown).
     Text(String),
@@ -15,7 +85,7 @@ pub enum Seg {
 }
 
 /// A single tool invocation and (once it returns) its result.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolCall {
     /// Fully-qualified tool name, e.g. `mcp__schemaic__run_query`.
     pub name: String,
@@ -35,7 +105,7 @@ impl ToolCall {
 }
 
 /// Timing/usage summary for a finished turn (from the CLI's `result` event).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct TurnStats {
     pub duration_ms: Option<u64>,
     pub input_tokens: Option<u64>,

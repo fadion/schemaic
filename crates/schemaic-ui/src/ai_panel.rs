@@ -49,6 +49,17 @@ fn ai_seen() -> RwSignal<usize> {
     })
 }
 
+/// Treat the next `n` bubbles as already seen, so they mount without the
+/// entrance pop.
+///
+/// Call this immediately *before* replacing the conversation wholesale — a
+/// restore from disk or a connection switch. Those messages aren't arriving,
+/// they're reappearing, and animating a whole conversation in at once reads as
+/// a glitch rather than an arrival.
+pub fn mark_messages_seen(n: usize) {
+    ai_seen().set(n);
+}
+
 // ── AI panel: Claude Code chat ───────────────────────────────────────────────
 pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     let messages = ui.ai.messages;
@@ -387,7 +398,8 @@ fn message_bubble(
         // Assistant turn: "Thinking…" until the first token, then the streamed
         // segments — with a footer underneath (a live elapsed timer while the turn
         // runs, swapped for the final cost/token summary + actions once it finishes).
-        let copy_text = message_text(&m.segs);
+        // Prose only — tool chips are the assistant *using* tools, not content.
+        let copy_text = m.prose();
         let content: AnyView = if m.pending && m.segs.is_empty() {
             verb_spinner(theme::text_muted, 14.0).into_any()
         } else {
@@ -493,19 +505,6 @@ fn format_elapsed(ms: u64) -> String {
     } else {
         format!("{ms}ms")
     }
-}
-
-/// The assistant turn's copyable text: its prose/markdown segments concatenated
-/// (tool-call segments are the assistant *using* tools, not response content, so
-/// they're skipped).
-fn message_text(segs: &[Seg]) -> String {
-    let mut out = String::new();
-    for s in segs {
-        if let Seg::Text(t) = s {
-            out.push_str(t);
-        }
-    }
-    out.trim().to_string()
 }
 
 /// A footer action icon (copy / regenerate): 16px, footer-text colour, brightens
