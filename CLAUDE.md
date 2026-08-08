@@ -34,6 +34,10 @@ Zed-inspired, aiming to replace DataGrip.
   - `diff.rs` — `line_diff`/`build_diff_rows` (Ctrl+K preview).
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
     persisted to `history.json`.
+  - `health.rs` — connection health-poll policy: `tick(HealthCfg, TickCtx) -> Tick` decides
+    ping-or-skip + the delay until the next tick (exponential `backoff` on consecutive failures,
+    longer interval for SSH-tunnelled connections, skip while the window is unfocused / a query is
+    already in flight / the tunnel isn't up). The app owns only the timer + `Db::ping`.
   - `format.rs` — per-column display formatters (`ColumnFormat`/`apply`: epoch→datetime, bytes,
     bool). Display-only; edit/copy stay raw. Persisted to `format.json`.
   - `schema::TableInfo::create_ddl` — `CREATE TABLE`/`VIEW` skeleton.

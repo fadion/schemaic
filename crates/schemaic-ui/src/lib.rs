@@ -987,6 +987,11 @@ pub struct LayoutUi {
     /// Validate the statement under the cursor against the live DB (non-executing
     /// PREPARE) as you type. Drives the editor's Tier-2 diagnostics.
     pub live_validate: RwSignal<bool>,
+    /// Whether the OS window currently has focus. Session-only (never persisted);
+    /// set from the workspace root's window-focus events. The app's connection
+    /// health poll reads it so a backgrounded Schemaic stops opening connections
+    /// it isn't about to use, and re-checks the moment focus comes back.
+    pub window_focused: RwSignal<bool>,
 }
 
 /// Where the shared `popup_menu` anchors when it's *not* opened at the cursor.
@@ -1337,6 +1342,7 @@ pub fn workspace(ui: Ui) -> impl IntoView {
     // layout is restored on the next launch.
     let schema_visible = ui.layout.schema_visible;
     let right_panel = ui.layout.right_panel;
+    let window_focused = ui.layout.window_focused;
     // Global tab/find navigation keys (shared with the editor's own handler).
     let navkeys = NavKeys {
         tabs: ui.tabs_ui.tabs,
@@ -1421,6 +1427,15 @@ pub fn workspace(ui: Ui) -> impl IntoView {
     })
     // Publish the window size (for menu edge-flipping).
     .on_resize(|r| window_size().set((r.width(), r.height())))
+    // Publish window focus (for the connection health poll). These two events
+    // don't need keyboard focus, so they reach the root regardless of which
+    // widget is active.
+    .on_event_cont(EventListener::WindowGotFocus, move |_| {
+        window_focused.set(true)
+    })
+    .on_event_cont(EventListener::WindowLostFocus, move |_| {
+        window_focused.set(false)
+    })
     // Panel toggles when focus is OUTSIDE the editor (the editor handles these
     // in its own key handler and stops propagation; anything else that doesn't
     // consume the key bubbles up here). Ctrl+Shift+E / Ctrl+Shift+A / Ctrl+`.
