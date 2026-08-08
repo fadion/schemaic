@@ -494,7 +494,11 @@ pub(crate) struct AiContextParams {
     pub run_queries: bool,
 }
 
-pub(crate) fn ai_context(p: AiContextParams, instructions: &str) -> String {
+pub(crate) fn ai_context(
+    p: AiContextParams,
+    fallback_db: Option<&str>,
+    instructions: &str,
+) -> String {
     let conn_name = p
         .connections
         .with_untracked(|cs| {
@@ -505,7 +509,7 @@ pub(crate) fn ai_context(p: AiContextParams, instructions: &str) -> String {
         .unwrap_or_else(|| "(none)".to_string());
     render_ai_context(
         &conn_name,
-        &turn_context(p),
+        &turn_context(p, fallback_db),
         p.scope,
         p.run_queries,
         instructions,
@@ -515,7 +519,7 @@ pub(crate) fn ai_context(p: AiContextParams, instructions: &str) -> String {
 /// Snapshot the live parts of the AI's context (active database, schema outline,
 /// editor contents) for the active tab. Taken before every user turn so
 /// [`apply_turn_delta`] can report what moved since the session started.
-pub(crate) fn turn_context(p: AiContextParams) -> TurnContext {
+pub(crate) fn turn_context(p: AiContextParams, fallback_db: Option<&str>) -> TurnContext {
     let AiContextParams {
         db_nodes,
         tabs,
@@ -530,7 +534,7 @@ pub(crate) fn turn_context(p: AiContextParams) -> TurnContext {
                 .and_then(f)
         })
     };
-    let active_db = tab(&|t| t.database.get_untracked());
+    let active_db = active_tab_database(p, fallback_db);
     let query = tab(&|t| Some(t.query.get_untracked())).unwrap_or_default();
     let databases = snapshot_databases(db_nodes);
     TurnContext {
@@ -538,6 +542,35 @@ pub(crate) fn turn_context(p: AiContextParams) -> TurnContext {
         active_db,
         query,
     }
+}
+
+/// The database the AI should treat as active: the focused tab's, but only when
+/// that tab belongs to the active connection — otherwise `fallback` (the
+/// caller's new-tab default, which is already connection-scoped).
+///
+/// Switching tabs doesn't change `active_conn` — a tab keeps its own connection
+/// — so the focused tab can name a database that exists on a *different*
+/// connection. Handing that name to the active connection's `Db` is how the MCP
+/// endpoint ended up asking MariaDB for `chinook`.
+pub(crate) fn active_tab_database(p: AiContextParams, fallback: Option<&str>) -> Option<String> {
+    let tab = p.tabs.with_untracked(|v| {
+        v.iter()
+            .find(|t| t.id == p.active.get_untracked())
+            .map(|t| (t.conn_id.get_untracked(), t.database.get_untracked()))
+    });
+    scoped_database(tab, p.active_conn.get_untracked(), fallback)
+}
+
+/// Pure core of [`active_tab_database`]: the tab's `(conn_id, database)` pair
+/// yields a database only when the connection matches; anything else falls back.
+fn scoped_database(
+    tab: Option<(u64, Option<String>)>,
+    active_conn: u64,
+    fallback: Option<&str>,
+) -> Option<String> {
+    tab.filter(|(conn_id, _)| *conn_id == active_conn)
+        .and_then(|(_, database)| database)
+        .or_else(|| fallback.map(str::to_string))
 }
 
 /// The `- database: table, table` outline, filtered per the scope setting.
@@ -979,6 +1012,49 @@ mod tests {
             outline: outline.to_string(),
             query: query.to_string(),
         }
+    }
+
+    #[test]
+    fn scoped_database_takes_the_tab_database_on_the_active_connection() {
+        let tab = Some((7, Some("classicmodels".to_string())));
+        assert_eq!(
+            scoped_database(tab, 7, Some("world")),
+            Some("classicmodels".to_string())
+        );
+    }
+
+    #[test]
+    fn scoped_database_ignores_a_tab_from_another_connection() {
+        // A tab keeps its own connection, so the active tab can name a database
+        // that doesn't exist on the connection the AI is bound to — handing that
+        // name over produced `Unknown database 'chinook'` against MariaDB. The
+        // active connection's own default stands in.
+        let tab = Some((9, Some("chinook".to_string())));
+        assert_eq!(
+            scoped_database(tab, 7, Some("classicmodels")),
+            Some("classicmodels".to_string())
+        );
+        // …and with no default to fall back on, nothing rather than the wrong
+        // connection's database.
+        assert_eq!(
+            scoped_database(Some((9, Some("chinook".into()))), 7, None),
+            None
+        );
+    }
+
+    #[test]
+    fn scoped_database_falls_back_for_no_tab_and_a_server_level_tab() {
+        assert_eq!(
+            scoped_database(None, 7, Some("world")),
+            Some("world".to_string())
+        );
+        // A tab on this connection but with no database (server-level) also
+        // takes the default, as it did before the connection guard.
+        assert_eq!(
+            scoped_database(Some((7, None)), 7, Some("world")),
+            Some("world".to_string())
+        );
+        assert_eq!(scoped_database(None, 7, None), None);
     }
 
     #[test]
