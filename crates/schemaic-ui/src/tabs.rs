@@ -22,6 +22,7 @@ pub(crate) fn tab_bar(ui: Ui) -> impl IntoView {
     let tabs = ui.tabs_ui.tabs;
     let flashing = ui.tabs_ui.flashing;
     let active_conn = ui.conn.active_conn;
+    let conn_status = ui.conn.conn_status;
     let add_tab = ui.tab_actions.add_tab.clone();
     // Each chip gets its own `Ui` handle — for the close/pin/duplicate actions and
     // the shared popup-menu channel that the right-click context menu opens on.
@@ -56,17 +57,26 @@ pub(crate) fn tab_bar(ui: Ui) -> impl IntoView {
     // The "+" is a flat, full-height button matching the tabs: chrome background,
     // the plus glyph with 10px breathing room each side, brightening on hover. It
     // never scrolls away (flex_shrink(0)).
-    let add = container(icons::icon(icons::PLUS, 16.0))
-        .on_click_stop(move |_| (add_tab)())
-        .style(|s| {
-            s.flex_row()
-                .items_center()
-                .flex_shrink(0.0_f32)
-                .padding_horiz(10.0)
-                .background(theme::bg_chrome())
-                .color(theme::tab_text())
-                .hover(|s| s.color(theme::text()))
-        });
+    // Dimmed while the connection is known-dead, but still clickable: the click
+    // re-checks and opens the tab if the server is back (see the app's
+    // connection gate). The header's "Not connected · Retry" is the other way in.
+    let add = container(icons::icon(icons::PLUS, 16.0).style(move |s| {
+        if conn_status.get().is_down() {
+            s.color(theme::text_muted().multiply_alpha(0.4))
+        } else {
+            s
+        }
+    }))
+    .on_click_stop(move |_| (add_tab)())
+    .style(|s| {
+        s.flex_row()
+            .items_center()
+            .flex_shrink(0.0_f32)
+            .padding_horiz(10.0)
+            .background(theme::bg_chrome())
+            .color(theme::tab_text())
+            .hover(|s| s.color(theme::text()))
+    });
 
     h_stack((scroller, add)).style(|s| {
         s.width_full()

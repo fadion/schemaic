@@ -30,6 +30,7 @@ use floem::views::editor::keypress::default_key_handler;
 use floem::views::editor::keypress::key::KeyInput;
 use floem::views::editor::text::WrapMethod;
 use floem::views::scroll::{Handle, Thickness};
+use schemaic_core::connection::ConnStatus;
 
 use schemaic_core::diff::{DiffTag, build_diff_rows, line_diff};
 use schemaic_core::intel::{self, Diagnostic, Severity, SqlDialect};
@@ -745,6 +746,9 @@ pub(crate) struct QueryPaneParams {
     /// This tab's temporary font-size override (px) for Ctrl+scroll zoom; `None`
     /// follows the user's configured size. Driven here, read by `SqlStyling`.
     pub zoom: RwSignal<Option<f32>>,
+    /// Live reachability, for dimming the Run button while the connection is
+    /// known-dead. The action itself is gated by the app.
+    pub conn_status: RwSignal<ConnStatus>,
 }
 
 pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
@@ -781,6 +785,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         open_plan,
         nav,
         zoom,
+        conn_status,
     } = p;
     let comp = Completion {
         items: RwSignal::new(Vec::new()),
@@ -2812,14 +2817,19 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         let run = guarded_run.clone();
         let hovered = RwSignal::new(false);
         container(icons::icon(icons::PLAY_LUCIDE, 16.0).style(move |s| {
-            // Disabled (empty query): dim the play glyph to 30% (background stays).
+            // Dimmed to 30% (background stays) when there's nothing to run, or
+            // while the connection is known-dead. It stays *clickable* when
+            // disconnected on purpose: the click re-checks the connection and
+            // runs if the server is back, which is the only recovery path
+            // besides the header's Retry.
             let empty = query.with(|q| q.trim().is_empty());
-            let base = if !empty && hovered.get() {
+            let down = conn_status.get().is_down();
+            let base = if !empty && !down && hovered.get() {
                 theme::grid_edit_staged_hover()
             } else {
                 theme::approve_bg()
             };
-            let color = if empty {
+            let color = if empty || down {
                 base.multiply_alpha(0.3)
             } else {
                 base

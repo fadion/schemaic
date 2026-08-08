@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Live reachability of the active connection (health-checked periodically).
+/// Live reachability of the active connection, from the last health check.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ConnStatus {
     /// Not yet checked (or check in flight before any result).
@@ -24,6 +24,18 @@ pub enum ConnStatus {
     Connected,
     /// A recent health check failed (unreachable / auth / tunnel down).
     Disconnected,
+}
+
+impl ConnStatus {
+    /// Should work against this connection be blocked?
+    ///
+    /// Only a *failed* check blocks. `Unknown` deliberately doesn't: it covers
+    /// "not checked yet" and "SSH tunnel still coming up", and treating either
+    /// as dead would lock the UI during normal startup. The cost of being wrong
+    /// here is a query that fails on its own, which is the status quo.
+    pub fn is_down(self) -> bool {
+        matches!(self, ConnStatus::Disconnected)
+    }
 }
 
 /// How the SSH tunnel authenticates to the jump host.
@@ -186,6 +198,21 @@ impl Connection {
     /// percent-encoding (review B7).
     pub fn endpoint(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::ConnStatus;
+
+    #[test]
+    fn only_a_failed_check_blocks_work() {
+        assert!(ConnStatus::Disconnected.is_down());
+        assert!(!ConnStatus::Connected.is_down());
+        // Unknown covers "not checked yet" and "tunnel still coming up" — both
+        // normal startup states that must not gate the UI.
+        assert!(!ConnStatus::Unknown.is_down());
+        assert!(!ConnStatus::default().is_down());
     }
 }
 

@@ -219,14 +219,16 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
 
     // Input: enabled when Claude is reachable, otherwise a disabled placeholder
     // box (no point sending into a black hole).
+    // Two ways the box can be inert, and they mean different things: Claude
+    // isn't reachable, or the database isn't. The second is recoverable from the
+    // header's Retry, so say which it is rather than showing one dead box.
+    let conn_status = ui.conn.conn_status;
     let input_row = dyn_container(
-        move || available.get(),
-        move |ok| {
-            if ok {
-                ai_input_row(input, busy, send.clone(), cancel.clone()).into_any()
-            } else {
-                ai_input_disabled().into_any()
-            }
+        move || (available.get(), conn_status.get().is_down()),
+        move |(claude_ok, db_down)| match (claude_ok, db_down) {
+            (true, false) => ai_input_row(input, busy, send.clone(), cancel.clone()).into_any(),
+            (_, true) => ai_input_disabled("Not connected to the database").into_any(),
+            (false, _) => ai_input_disabled("Message…").into_any(),
         },
     )
     .style(|s| s.flex_shrink(0.0_f32));
@@ -349,8 +351,8 @@ fn ai_input_row(
 
 // The disabled message box shown when Claude isn't connected — matches the real
 // box's metrics but is inert (dim placeholder, no send icon, no pointer events).
-fn ai_input_disabled() -> impl IntoView {
-    let box_ = container(text("Message…").style(|s| {
+fn ai_input_disabled(placeholder: &'static str) -> impl IntoView {
+    let box_ = container(text(placeholder).style(|s| {
         s.font_size(theme::FONT_BODY)
             .font_family("IBM Plex Sans".to_string())
             .color(theme::placeholder())
