@@ -24,7 +24,7 @@ use crate::widgets::{
 };
 use crate::{
     ConnNode, CtxKind, PopupAnchor, RightPanel, TxChoice, Ui, icons, right_panel_allowed,
-    schema_panel_allowed, search_box, status_color, theme,
+    schema_panel_allowed, search_box, theme,
 };
 
 // ===== moved from lib.rs (overlays) =====
@@ -32,7 +32,6 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
     let open = ui.conn.conn_menu_open;
     let connections = ui.conn.connections;
     let active_conn = ui.conn.active_conn;
-    let conn_status = ui.conn.conn_status;
     let switch = ui.conn_actions.switch_conn.clone();
     let manage_open = ui.conn.manage_open;
     let select_conn = ui.conn_actions.select_conn.clone();
@@ -52,22 +51,25 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
                 move |c| {
                     let id = c.id;
                     let switch = switch.clone();
-                    // Leading status dot in a fixed 14px slot. Only the active
-                    // connection is health-checked, so others show a neutral dot.
-                    let dot = container(icons::icon(icons::DOT, 6.0).style(move |s| {
-                        let c = if active_conn.get() == id {
-                            status_color(conn_status.get())
-                        } else {
-                            theme::text_dim()
-                        };
-                        s.color(c)
-                    }))
-                    .style(|s| {
-                        s.width(14.0)
-                            .flex_shrink(0.0_f32)
-                            .items_center()
-                            .justify_center()
-                    });
+                    // Leading identity dot in a fixed 14px slot — this
+                    // connection's own colour, the same one on the switcher's
+                    // outline and its tabs. It used to carry health, but only
+                    // the active connection is ever checked, so every other row
+                    // was neutral and the dot really only marked "this is the
+                    // current one" — which the row's own highlight already says.
+                    let dot_color = c
+                        .color
+                        .as_deref()
+                        .and_then(theme::parse_hex)
+                        .unwrap_or_else(theme::text_dim);
+                    let dot =
+                        container(icons::icon(icons::DOT, 6.0).style(move |s| s.color(dot_color)))
+                            .style(|s| {
+                                s.width(14.0)
+                                    .flex_shrink(0.0_f32)
+                                    .items_center()
+                                    .justify_center()
+                            });
                     // Truncate long names to 20 chars (+ ellipsis) so the row —
                     // and thus the fixed-width menu — never overflows past the
                     // panel edge; the endpoint stays fully visible on the right.
