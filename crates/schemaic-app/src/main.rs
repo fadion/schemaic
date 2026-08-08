@@ -24,9 +24,9 @@ mod secrets;
 static GLOBAL: heap::Tracking = heap::Tracking;
 
 use ai::{
-    AiContextParams, AiSession, AiSettings, AiStreamMsg, StartAiParams, active_tab_database,
-    ai_context, apply_turn_delta, extract_sql, inline_system_prompt, mcp_endpoint_from_env,
-    start_ai_session, turn_context,
+    AiContextParams, AiSession, AiSettings, AiStreamMsg, RECAP_QUESTIONS, StartAiParams,
+    active_tab_database, ai_context, apply_turn_delta, extract_sql, inline_system_prompt,
+    mcp_endpoint_from_env, render_recap, start_ai_session, turn_context,
 };
 use claude_cli::{claude_bin, claude_reachable, detect_claude_bin};
 
@@ -2818,6 +2818,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             // same database.
             let fallback_db = default_tab_target().1;
             let context_now = turn_context(cx_params, fallback_db.as_deref());
+            // The conversation as it stands *before* this question is appended.
+            let prior = ai_messages.get_untracked();
             if need_new {
                 // Whatever is on screen predates this session — a restored
                 // conversation, or turns from one that was cancelled/respawned.
@@ -2825,7 +2827,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 let context = ai_context(
                     cx_params,
                     fallback_db.as_deref(),
-                    &ai_messages.get_untracked(),
+                    &prior,
                     &ai_instructions.get_untracked(),
                 );
                 // If the connection's `Db` can't be built yet (SSH tunnel
@@ -2870,11 +2872,21 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             // a switched database, a schema that finished introspecting), then
             // advance the session's snapshot so the next turn diffs against this
             // one.
+            // A recap of recent questions rides along, because the CLI's own
+            // cross-turn memory isn't dependable (measured: ~2 in 3, unaffected
+            // by --session-id or --resume). Skipped when the session was just
+            // spawned above — its system prompt already replayed the thread.
+            let recap = if need_new {
+                String::new()
+            } else {
+                render_recap(&prior, RECAP_QUESTIONS)
+            };
             if let Some(s) = ai_session.borrow_mut().as_mut() {
                 let turn = apply_turn_delta(
                     &s.last_context,
                     &context_now,
                     s.mcp_database.as_deref(),
+                    &recap,
                     &msg,
                 );
                 s.last_context = context_now;
