@@ -162,7 +162,8 @@ pub(crate) fn active_db_menu_overlay(ui: Ui) -> impl IntoView {
     let anchor = ui.tabs_ui.active_db_anchor;
 
     dyn_container(
-        move || open.get(),
+        // Same rule as the schema eye: no databases, no dropdown.
+        move || open.get() && !db_nodes.with(|n| n.is_empty()),
         move |is_open| {
             if !is_open {
                 return empty().into_any();
@@ -242,7 +243,10 @@ pub(crate) fn db_visibility_overlay(ui: Ui) -> impl IntoView {
     let toggle = ui.schema_actions.toggle_db_hidden.clone();
 
     dyn_container(
-        move || open.get(),
+        // Nothing to list → no panel. An empty dropdown is worse than none: it
+        // reads as a broken menu rather than "this connection has no databases"
+        // (true on a dead connection, and on a live one with nothing to show).
+        move || open.get() && !db_nodes.with(|n| n.is_empty()),
         move |is_open| {
             if !is_open {
                 return empty().into_any();

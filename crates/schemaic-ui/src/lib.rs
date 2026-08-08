@@ -922,6 +922,10 @@ pub struct ConnActions {
     /// Test the draft's host + credentials (opens a throwaway connection/tunnel
     /// and pings); the result lands in [`ConnUi::conn_test`].
     pub test_conn: Rc<dyn Fn()>,
+    /// Re-run the active connection's health check. Nothing re-checks on a
+    /// timer, so this is how a recovered server gets noticed without switching
+    /// connections — it's what the header's "Not connected" retry calls.
+    pub recheck_conn: Rc<dyn Fn()>,
 }
 
 /// Query-history signals (Copy bundle). The full list across all connections;
@@ -1662,8 +1666,13 @@ fn header(ui: Ui) -> impl IntoView {
     // cluster, pinned to opposite edges via `justify_between` (a lone flex-grow
     // spacer under-fills — see the schema title-row note). The dot's own
     // `margin_left(15)` sets the left inset.
-    let left = h_stack((connection_dot(conn_status), switcher, badge))
-        .style(|s| s.flex_row().items_center());
+    let left = h_stack((
+        connection_dot(conn_status),
+        switcher,
+        badge,
+        not_connected_notice(conn_status, ui.conn_actions.recheck_conn.clone()),
+    ))
+    .style(|s| s.flex_row().items_center());
     h_stack((left, right)).style(|s| {
         s.width_full()
             .height(theme::HEADER_H)
@@ -1675,6 +1684,38 @@ fn header(ui: Ui) -> impl IntoView {
             .background(theme::bg_chrome())
             .border_bottom(1.0)
             .border_color(theme::border())
+    })
+}
+
+/// "Not connected · Retry", shown in the header while the last health check
+/// failed.
+///
+/// This is the one recovery affordance: nothing re-checks reachability on a
+/// timer, so without it a server that came back stays red — and every gated
+/// action blocked — until the user switches connections. Hidden entirely
+/// otherwise (`.hide()`/`.flex()`, not opacity, so it takes no layout space).
+fn not_connected_notice(conn_status: RwSignal<ConnStatus>, recheck: Rc<dyn Fn()>) -> impl IntoView {
+    // The red status dot beside it already says *what's* wrong, so this only
+    // offers the fix — no "Not connected" label repeating it.
+    let glyph = icons::icon(icons::ROTATE_CCW, 13.0).style(|s| s.margin_right(5.0));
+    let retry = h_stack((
+        glyph,
+        text("Retry").style(|s| s.font_size(theme::FONT_LABEL)),
+    ))
+    .on_click_stop(move |_| (recheck)())
+    .style(|s| {
+        s.flex_row()
+            .items_center()
+            .color(theme::error())
+            .hover(|s| s.color(theme::error().multiply_alpha(0.75)))
+    });
+    container(retry).style(move |s| {
+        let s = s.flex_row().items_center().margin_left(12.0);
+        if conn_status.get().is_down() {
+            s.flex()
+        } else {
+            s.hide()
+        }
     })
 }
 
@@ -2242,6 +2283,7 @@ fn center(ui: Ui) -> impl IntoView {
     let flashing = ui.tabs_ui.flashing;
     let connections = ui.conn.connections;
     let active_conn = ui.conn.active_conn;
+    let conn_status = ui.conn.conn_status;
     // Is the active tab's connection read-only? (Reactive — follows the tab's
     // `conn_id` and a live toggle of the connection.) Gates cell edits + write runs.
     let read_only = create_memo(move |_| {
@@ -2451,6 +2493,7 @@ fn center(ui: Ui) -> impl IntoView {
                     open_plan: open_plan.clone(),
                     nav: navkeys.clone(),
                     zoom: tab.font_zoom,
+                    conn_status,
                 })
                 .into_any(),
                 None => editor_placeholder(editor_h, editor_collapsed).into_any(),

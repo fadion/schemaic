@@ -252,6 +252,27 @@ fn mysql_shell_config(
 /// The CLI reports an interrupted turn as an error `result`, so this also undoes
 /// the error styling that would otherwise make a deliberate stop look like a
 /// failure. Usage stats are left alone — the tokens were really spent.
+/// An action with no arguments, held by the connection gate across an async
+/// re-check.
+type Action = Rc<dyn Fn()>;
+/// Runs an [`Action`], but only against a connection that answers.
+type ConnGate = Rc<dyn Fn(Action)>;
+/// Reports a health check's outcome.
+type CheckDoneFn = Rc<dyn Fn(bool)>;
+
+/// Wrap a one-argument action behind the live-connection gate.
+///
+/// The argument is cloned per invocation because the gate may hold the action
+/// across an async re-check and call it later.
+fn gate1<A: Clone + 'static>(gate: &ConnGate, action: &Rc<dyn Fn(A)>) -> Rc<dyn Fn(A)> {
+    let gate = gate.clone();
+    let action = action.clone();
+    Rc::new(move |arg: A| {
+        let action = action.clone();
+        (gate)(Rc::new(move || action(arg.clone())));
+    })
+}
+
 fn mark_stopped(messages: RwSignal<Vec<ChatMessage>>) {
     messages.update(|v| {
         if let Some(last) = v.last_mut() {
@@ -2420,10 +2441,14 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // One health check of the *active* connection: ping it (through the SSH
     // tunnel if one is established) and set `conn_status`. Runs off the UI
     // thread; the result is marshalled back via `create_ext_action`.
-    let check_conn: Rc<dyn Fn()> = {
+    // Health-check the active connection, optionally running `on_ok` if it
+    // answers. The continuation is what makes the "connection is down" block
+    // recoverable: a blocked action re-checks and proceeds if the server is
+    // back, so a stale `Disconnected` can't strand the user.
+    let check_conn_then: Rc<dyn Fn(Option<CheckDoneFn>)> = {
         let handle = handle.clone();
         let tunnels = tunnels.clone();
-        Rc::new(move || {
+        Rc::new(move |done: Option<CheckDoneFn>| {
             let id = active_conn.get_untracked();
             let Some(conn) =
                 connections.with_untracked(|cs| cs.iter().find(|c| c.id == id).cloned())
@@ -2451,11 +2476,58 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 } else {
                     ConnStatus::Disconnected
                 });
+                if let Some(f) = &done {
+                    f(ok);
+                }
             });
             handle.spawn(async move {
                 let ok = db.ping(std::time::Duration::from_secs(5)).await.is_ok();
                 send(ok);
             });
+        })
+    };
+    let check_conn: Rc<dyn Fn()> = {
+        let check_conn_then = check_conn_then.clone();
+        Rc::new(move || (check_conn_then)(None))
+    };
+
+    // Gate for anything that needs a working connection: run it now when the
+    // connection isn't known-dead, otherwise re-check and run it only if the
+    // server answers.
+    //
+    // The block has to be recoverable. Nothing re-checks reachability on a
+    // timer, so `Disconnected` can be minutes stale — gating on the cached flag
+    // alone would lock a user out of a server that came back. A blocked attempt
+    // therefore pings first; if it still fails, the reason is surfaced rather
+    // than the action silently doing nothing.
+    let with_conn: ConnGate = {
+        let check_conn_then = check_conn_then.clone();
+        Rc::new(move |action: Rc<dyn Fn()>| {
+            if !conn_status.get_untracked().is_down() {
+                action();
+                return;
+            }
+            let name = connections
+                .with_untracked(|cs| {
+                    cs.iter()
+                        .find(|c| c.id == active_conn.get_untracked())
+                        .map(|c| c.name.clone())
+                })
+                .unwrap_or_else(|| "this connection".to_string());
+            (check_conn_then)(Some(Rc::new(move |ok: bool| {
+                if ok {
+                    action();
+                } else {
+                    // Still unreachable — say so, rather than letting the action
+                    // silently do nothing.
+                    error_modal_text.set(Some(format!(
+                        "Not connected to {name}. The server didn't answer — check \
+                         that it's running and that this connection's settings are \
+                         right."
+                    )));
+                    error_modal_open.set(true);
+                }
+            })));
         })
     };
 
@@ -3760,15 +3832,37 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             active_db_anchor,
         },
         tab_actions: Rc::new(TabsActions {
-            run,
+            run: gate1(&with_conn, &run),
             apply_view,
-            run_all,
+            run_all: gate1(&with_conn, &run_all),
             cancel,
-            commit_edits,
+            commit_edits: {
+                // Writes need the same gate, but a `CommitFn` reports back
+                // through its own callback — so a blocked commit answers the
+                // grid with an error instead of leaving it spinning.
+                let g = with_conn.clone();
+                let f = commit_edits.clone();
+                Rc::new(move |w, r, done: schemaic_ui::CommitDoneFn| {
+                    if conn_status.get_untracked().is_down() {
+                        (g)(Rc::new(|| {}));
+                        done(schemaic_core::model::CommitDone::Failed(
+                            "Not connected — the commit was not attempted. Staged \
+                             edits are kept."
+                                .into(),
+                        ));
+                        return;
+                    }
+                    f(w, r, done);
+                })
+            },
             set_tx_mode,
             commit_tx,
             rollback_tx,
-            add_tab,
+            add_tab: {
+                let g = with_conn.clone();
+                let f = add_tab.clone();
+                Rc::new(move || (g)(f.clone()))
+            },
             close_tab,
             toggle_pin,
             duplicate_tab,
@@ -3780,7 +3874,14 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             open_table_filtered,
             set_active_db,
             open_db_cli,
-            run_plan,
+            run_plan: {
+                let g = with_conn.clone();
+                let f = run_plan.clone();
+                Rc::new(move |sql: String, analyze: bool| {
+                    let f = f.clone();
+                    (g)(Rc::new(move || f(sql.clone(), analyze)))
+                })
+            },
             validate_stmt,
             open_monitor,
             ai_fill,
@@ -3843,6 +3944,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             toggle_read_only,
             delete_conn,
             test_conn,
+            recheck_conn: check_conn.clone(),
         }),
         ai: AiUi {
             messages: ai_messages,
@@ -3858,7 +3960,9 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             inline: inline_ai,
         },
         ai_actions: Rc::new(AiActions {
-            send: ai_send,
+            // The assistant's DB tools can't reach a dead connection and its
+            // schema never loaded, so a turn would answer from nothing.
+            send: gate1(&with_conn, &ai_send),
             cancel: ai_cancel,
             new_chat: ai_new_chat,
             regenerate: ai_regenerate,
