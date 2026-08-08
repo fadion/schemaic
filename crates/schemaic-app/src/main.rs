@@ -97,8 +97,8 @@ use schemaic_core::tx::{StmtOutcome, TxEngine, TxMode, TxState};
 use schemaic_db::{Db, DbError, Session};
 use schemaic_ui::theme::{EditorThemeKind, UiThemeKind};
 use schemaic_ui::{
-    AiActions, AiEffort, AiModel, AiUi, ChatMessage, ConnActions, ConnNode, ConnUi, CtxMenu,
-    DraftSignals, HistoryActions, HistoryUi, InlineAiRequest, InlineAiState, LayoutUi,
+    AiActions, AiEffort, AiModel, AiUi, ChatMessage, Confirm, ConnActions, ConnNode, ConnUi,
+    CtxMenu, DraftSignals, HistoryActions, HistoryUi, InlineAiRequest, InlineAiState, LayoutUi,
     MonitorEntry, OverlayUi, PlanState, ResultPanel, RightPanel, Role, SchemaActions, SchemaScope,
     SchemaUi, Tab, TabsActions, TabsUi, TermActions, TermCursor, TermUi, TestState, TxChoice,
     TxPrompt, Ui, pick_connection_color,
@@ -832,6 +832,9 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let window_focused = RwSignal::new(true);
     // Pending "you have an open transaction" question (see `TxPrompt`).
     let tx_prompt: RwSignal<Option<TxPrompt>> = RwSignal::new(None);
+    // The shared "are you sure?" channel (see `Confirm`) — one modal for every
+    // destructive action, rather than one modal each.
+    let confirm: RwSignal<Option<Confirm>> = RwSignal::new(None);
 
     // Query-plan (EXPLAIN) modal signals.
     let plan_open = RwSignal::new(false);
@@ -1898,6 +1901,32 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 // Drop any temporary font zoom so the respawned tab starts at the
                 // user's configured size (the post-flash rebuild reads this).
                 tab.font_zoom.set(None);
+                // This tab survives only because the strip must keep one — but
+                // what comes back is a blank slate, so give it a blank slate's
+                // identity too: no custom name, and the lowest free number for
+                // the connection. Its old number went with its contents (already
+                // snapshotted into the reopen ring above). Without this, closing
+                // "Query 3" as the last tab leaves a ghost still calling itself
+                // Query 3 while the next new tab opens as Query 1 beside it —
+                // most visible after Close all tabs, which always ends here.
+                tab.name.set(None);
+                let conn = tab.conn_id.get_untracked();
+                let free = smallest_free_label(&tabs.with_untracked(|v| {
+                    v.iter()
+                        .filter(|t| t.id != id && t.conn_id.get_untracked() == conn)
+                        .map(|t| t.label)
+                        .collect::<Vec<_>>()
+                }));
+                if free != tab.label {
+                    // `label` is a plain field and the strip keys its chips on
+                    // `(id, label)`, so writing it through `tabs` is what makes
+                    // the new number render.
+                    tabs.update(|v| {
+                        if let Some(t) = v.iter_mut().find(|t| t.id == id) {
+                            t.label = free;
+                        }
+                    });
+                }
                 flashing.set(Some(id));
                 exec_after(Duration::from_millis(150), move |_| flashing.set(None));
                 return;
@@ -1937,6 +1966,68 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         Rc::new(move |id: usize| {
             let close_tab_now = close_tab_now.clone();
             (guard_tx)(id, Rc::new(move || (close_tab_now)(id)));
+        })
+    };
+
+    // Close `ids` one at a time, each tab waiting on the one before it. Recursion
+    // rather than a loop because the wait is a *continuation*: `guard_tx` may
+    // return having only opened a prompt, and the close happens whenever the user
+    // answers it.
+    fn close_tabs_seq(ids: Vec<usize>, guard_tx: GuardTxFn, close_now: Rc<dyn Fn(usize)>) {
+        let Some((&id, rest)) = ids.split_first() else {
+            return;
+        };
+        let rest = rest.to_vec();
+        let g = guard_tx.clone();
+        let c = close_now.clone();
+        (guard_tx)(
+            id,
+            Rc::new(move || {
+                (c)(id);
+                close_tabs_seq(rest.clone(), g.clone(), c.clone());
+            }),
+        );
+    }
+
+    // Close every tab of the active connection — the ones the strip actually
+    // shows. Pinned tabs stay (they're unclosable through every other path too),
+    // and the connection's last remaining tab clears in place instead of
+    // vanishing, per `close_tab_now`'s "keep ≥1 tab" rule.
+    //
+    // Sequential rather than a loop over `close_tab`: `tx_prompt` holds one
+    // question at a time, so asking about several open transactions at once would
+    // clobber every prompt but the last and strand exactly the transactions the
+    // prompt exists to protect. Chaining also gives Cancel the sensible meaning —
+    // it stops the whole run, rather than skipping one tab and closing the rest.
+    //
+    // Asks first: this is the one action that can clear the whole strip in a
+    // click, and undoing it means pressing Ctrl+Shift+T once per tab.
+    let close_all_tabs: Rc<dyn Fn()> = {
+        let close_tab_now = close_tab_now.clone();
+        let guard_tx = guard_tx.clone();
+        Rc::new(move || {
+            let conn = active_conn.get_untracked();
+            let ids = tabs.with_untracked(|v| {
+                v.iter()
+                    .filter(|t| t.conn_id.get_untracked() == conn && !t.pinned.get_untracked())
+                    .map(|t| t.id)
+                    .collect::<Vec<_>>()
+            });
+            // Nothing closable (every tab pinned) — no action, so nothing to ask.
+            if ids.is_empty() {
+                return;
+            }
+            let guard_tx = guard_tx.clone();
+            let close_tab_now = close_tab_now.clone();
+            confirm.set(Some(Confirm {
+                title: "Close all tabs".to_string(),
+                message: "Are you sure you want to close all the tabs?".to_string(),
+                resolve: Rc::new(move |yes| {
+                    if yes {
+                        close_tabs_seq(ids.clone(), guard_tx.clone(), close_tab_now.clone());
+                    }
+                }),
+            }));
         })
     };
 
@@ -2267,6 +2358,17 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     });
                 }
             }
+        })
+    };
+
+    // Does the ring hold anything for the active connection? Same per-connection
+    // scoping `reopen_closed_tab` itself applies, so the tab menu can dim the
+    // entry instead of offering a click that does nothing.
+    let can_reopen_closed_tab: Rc<dyn Fn() -> bool> = {
+        let recently_closed = recently_closed.clone();
+        Rc::new(move || {
+            let conn = active_conn.get_untracked();
+            recently_closed.borrow().iter().any(|s| s.conn_id == conn)
         })
     };
 
@@ -3961,6 +4063,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 Rc::new(move || (g)(f.clone()))
             },
             close_tab,
+            close_all_tabs,
             toggle_pin,
             duplicate_tab,
             open_table,
@@ -3968,6 +4071,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             open_table_col,
             open_query,
             reopen_closed_tab,
+            can_reopen_closed_tab,
             open_table_filtered,
             set_active_db,
             open_db_cli,
@@ -3996,6 +4100,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             error_modal_open,
             error_modal_text,
             tx_prompt,
+            confirm,
             plan_open,
             plan_state,
             plan_sql,

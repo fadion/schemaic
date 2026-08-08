@@ -107,6 +107,9 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
     let db_colors = ui.db_colors;
     let toggle_pin = ui.tab_actions.toggle_pin.clone();
     let duplicate = ui.tab_actions.duplicate_tab.clone();
+    let reopen = ui.tab_actions.reopen_closed_tab.clone();
+    let can_reopen = ui.tab_actions.can_reopen_closed_tab.clone();
+    let close_all = ui.tab_actions.close_all_tabs.clone();
     let overlay = ui.overlay;
 
     // Commit the inline rename: an empty/blank name reverts to the default
@@ -264,6 +267,9 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
         // cursor edge-flipping (`popup_anchor = None` ⇒ open at the cursor, flips
         // left/up near the window edge, so a right-most tab doesn't overflow). A
         // pinned tab shows Unpin and omits Close (unpin to close).
+        //
+        // The last group is strip-wide rather than about the clicked tab, hence
+        // the separator: reopen the last close, or close the lot.
         .on_secondary_click_stop(move |_| {
             overlay.context_menu.set(None);
             overlay.popup_anchor.set(None);
@@ -282,7 +288,23 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                 let close = close_tab.clone();
                 entries.push(MenuEntry::action("Close", move || (close)(tab.id)));
             }
-            overlay.popup_width.set(120.0);
+            entries.push(MenuEntry::Separator);
+            entries.push(
+                MenuEntry::action("Reopen last tab", {
+                    let reopen = reopen.clone();
+                    move || (reopen)()
+                })
+                // Dimmed when this connection has nothing closed to restore —
+                // the ring is per-connection, like the strip.
+                .disabled(!(can_reopen)()),
+            );
+            entries.push(MenuEntry::action("Close all tabs", {
+                let close_all = close_all.clone();
+                move || (close_all)()
+            }));
+            // Wider than the old Pin/Duplicate/Close set needed — "Reopen last
+            // tab" is the longest label here.
+            overlay.popup_width.set(150.0);
             overlay.popup_menu.set(Some(entries));
         })
         // Flat, full-height tab capped at `TAB_MAX_W`: chrome background (invisible

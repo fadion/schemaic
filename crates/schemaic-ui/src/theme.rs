@@ -484,6 +484,18 @@ pub fn tx_rollback_hover() -> Color {
     Color::rgb8(0xFF, 0x7B, 0x7B)
 }
 
+/// The affirmative button in the generic confirm modal (`#E05A5A`). Starts at
+/// the same red as the transaction reds, but kept separate on purpose: this one
+/// answers "yes, do the destructive thing" for *any* action, so it should be
+/// retunable without dragging Rollback along with it.
+pub fn confirm_yes() -> Color {
+    Color::rgb8(0xE0, 0x5A, 0x5A)
+}
+/// Brighter red for hovering the confirm modal's Yes (`#FF7B7B`).
+pub fn confirm_yes_hover() -> Color {
+    Color::rgb8(0xFF, 0x7B, 0x7B)
+}
+
 // Connection status: reachable (unreachable reuses `reject_bg`).
 pub fn conn_ok() -> Color {
     ui().conn_ok
