@@ -4954,8 +4954,29 @@ fn data_cell(
             let filter_val: Option<String> = rs
                 .cell(data_idx, ci)
                 .and_then(|c| (!c.is_null()).then(|| c.display().to_string()));
-            // Context for the AI: the source table (if known) + this column.
-            let msg = summary::cell_prompt(source_table(gs).as_deref(), &column, &val);
+            // Context for the AI: the source table (if known), this column's
+            // type, the rest of the cell's row, and a sample of the column's
+            // other values — all already loaded, so the assistant can answer
+            // without a round-trip (and without `run_query`, which the settings
+            // may have turned off). A pending new row has no committed row to
+            // quote, so it contributes no row context.
+            let type_name = rs
+                .columns
+                .get(ci)
+                .map(|c| c.type_name.clone())
+                .unwrap_or_default();
+            let row_ctx = match pending {
+                Some(_) => Vec::new(),
+                None => summary::sample_row(&rs, data_idx, ci, summary::CELL_ROW_FIELDS),
+            };
+            let msg = summary::cell_prompt(
+                source_table(gs).as_deref(),
+                &column,
+                &type_name,
+                &val,
+                &row_ctx,
+                &summary::sample_column(&rs, ci, summary::COLUMN_SAMPLE),
+            );
 
             // "Edit Field" edits this single cell inline; "Edit Row" opens the
             // whole-row structured panel (read-only fields shown for context). A row
