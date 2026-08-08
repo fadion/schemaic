@@ -384,6 +384,21 @@ pub fn erd_control_border() -> Color {
     ui().erd_control_border
 }
 
+// ── Small toolbar controls ──────────────────────────────────────────────────
+// The ER-diagram toolbar's button chrome, named for the role rather than the
+// place now that the header's Retry uses it too. They deliberately share the
+// ER-diagram control palette — same role, same surface, and they should retune
+// together. Split into their own theme fields if that ever stops being true.
+pub fn control_bg() -> Color {
+    ui().erd_canvas
+}
+pub fn control_border() -> Color {
+    ui().erd_control_border
+}
+pub fn control_hover() -> Color {
+    ui().erd_node_bg
+}
+
 // Schema search placeholder / faint input text.
 pub fn search_hint() -> Color {
     ui().search_hint

@@ -580,6 +580,19 @@ pub(crate) fn wheel_hscroll<V: IntoView + 'static>(child: V) -> Scroll {
 }
 
 // ── Shared bits (section headers, centered messages, panel-toggle icon) ──
+/// Font size for small toolbar controls (ER-diagram toolbar, header Retry).
+pub(crate) const TOOLBAR_FONT: f32 = 13.0;
+
+/// The chrome shared by small toolbar controls: bordered, rounded surface.
+/// Callers add their own padding and hover — see `control_button` in the ERD
+/// toolbar and the header's Retry.
+pub(crate) fn control_surface(s: floem::style::Style) -> floem::style::Style {
+    s.background(theme::control_bg())
+        .border(1.0)
+        .border_color(theme::control_border())
+        .border_radius(6.0)
+}
+
 pub(crate) fn section_title(t: &'static str) -> impl IntoView {
     text(t).style(|s| {
         s.font_size(theme::FONT_TITLE)

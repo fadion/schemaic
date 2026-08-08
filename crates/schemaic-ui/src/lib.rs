@@ -1666,11 +1666,13 @@ fn header(ui: Ui) -> impl IntoView {
     // cluster, pinned to opposite edges via `justify_between` (a lone flex-grow
     // spacer under-fills — see the schema title-row note). The dot's own
     // `margin_left(15)` sets the left inset.
+    // The switcher's left inset matches `section_title`'s 12px, so it lines up
+    // with "SCHEMA" in the panel below it. (There's no status dot ahead of it
+    // any more — health is now told by the Disconnected notice alone.)
     let left = h_stack((
-        connection_dot(conn_status),
-        switcher,
+        container(switcher).style(|s| s.margin_left(12.0)),
         badge,
-        not_connected_notice(conn_status, ui.conn_actions.recheck_conn.clone()),
+        disconnected_notice(conn_status, ui.conn_actions.recheck_conn.clone()),
     ))
     .style(|s| s.flex_row().items_center());
     h_stack((left, right)).style(|s| {
@@ -1687,57 +1689,43 @@ fn header(ui: Ui) -> impl IntoView {
     })
 }
 
-/// "Not connected · Retry", shown in the header while the last health check
-/// failed.
+/// "Disconnected" + a Retry button, shown in the header while the last health
+/// check failed.
 ///
-/// This is the one recovery affordance: nothing re-checks reachability on a
-/// timer, so without it a server that came back stays red — and every gated
-/// action blocked — until the user switches connections. Hidden entirely
-/// otherwise (`.hide()`/`.flex()`, not opacity, so it takes no layout space).
-fn not_connected_notice(conn_status: RwSignal<ConnStatus>, recheck: Rc<dyn Fn()>) -> impl IntoView {
-    // The red status dot beside it already says *what's* wrong, so this only
-    // offers the fix — no "Not connected" label repeating it.
-    let glyph = icons::icon(icons::ROTATE_CCW, 13.0).style(|s| s.margin_right(5.0));
-    let retry = h_stack((
-        glyph,
-        text("Retry").style(|s| s.font_size(theme::FONT_LABEL)),
-    ))
-    .on_click_stop(move |_| (recheck)())
-    .style(|s| {
-        s.flex_row()
-            .items_center()
+/// This carries the whole connection-health signal now that the status dot is
+/// gone: a healthy connection says nothing (the schema tree populating is the
+/// proof), and a dead one states the problem and offers the fix. That fix
+/// matters — nothing re-checks reachability on a timer, so without it a server
+/// that came back stays blocked until the user switches connections. Hidden
+/// entirely otherwise (`.hide()`/`.flex()`, not opacity, so it costs no layout
+/// space when healthy).
+fn disconnected_notice(conn_status: RwSignal<ConnStatus>, recheck: Rc<dyn Fn()>) -> impl IntoView {
+    let label = text("Disconnected").style(|s| {
+        s.font_size(TOOLBAR_FONT)
             .color(theme::error())
-            .hover(|s| s.color(theme::error().multiply_alpha(0.75)))
+            .margin_left(15.0)
     });
-    container(retry).style(move |s| {
-        let s = s.flex_row().items_center().margin_left(12.0);
+    // Same chrome as the ER-diagram toolbar buttons (`control_surface`), so the
+    // app has one button vocabulary rather than a bespoke one per surface.
+    let retry = text("Retry")
+        .on_click_stop(move |_| (recheck)())
+        .style(|s| {
+            control_surface(s)
+                .font_size(TOOLBAR_FONT)
+                .color(theme::text())
+                .margin_left(15.0)
+                .padding_horiz(10.0)
+                .padding_vert(5.0)
+                .hover(|s| s.background(theme::control_hover()))
+        });
+    h_stack((label, retry)).style(move |s| {
+        let s = s.flex_row().items_center();
         if conn_status.get().is_down() {
             s.flex()
         } else {
             s.hide()
         }
     })
-}
-
-fn connection_dot(conn_status: RwSignal<ConnStatus>) -> impl IntoView {
-    // 15px from the header's left edge, 15px from the switcher button — carries
-    // the live health status (the identity colour is on the switcher outline).
-    icons::icon(icons::DOT, 6.0).style(move |s| {
-        s.color(status_color(conn_status.get()))
-            .margin_left(15.0)
-            .margin_right(15.0)
-    })
-}
-
-/// Live connection-status accent: green when reachable, red when not, neutral
-/// until the first health check lands. Drives the status dots (the connection
-/// identity colour lives on the switcher outline instead).
-pub(crate) fn status_color(status: ConnStatus) -> floem::peniko::Color {
-    match status {
-        ConnStatus::Connected => theme::conn_ok(),
-        ConnStatus::Disconnected => theme::reject_bg(),
-        ConnStatus::Unknown => theme::text_dim(),
-    }
 }
 
 /// The active connection's identity colour (its `#rrggbb` parsed to a `Color`),

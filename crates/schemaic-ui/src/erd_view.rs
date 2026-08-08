@@ -799,17 +799,11 @@ fn node_card(
     .into_any()
 }
 
-/// Shared surface for every toolbar control (count chip, icon button, zoom unit):
-/// the inset background, 1px `erd_control_border`, rounded corners. Text/icon
-/// colour is `theme::text()` (~#C6C8D6, the app's approximation of the spec's
-/// #C2C4D2); everything in the toolbar is 13px.
-const TOOLBAR_FONT: f32 = 13.0;
-fn toolbar_surface(s: floem::style::Style) -> floem::style::Style {
-    s.background(theme::erd_canvas())
-        .border(1.0)
-        .border_color(theme::erd_control_border())
-        .border_radius(6.0)
-}
+/// Shared surface for every toolbar control (count chip, icon button, zoom unit).
+/// Lives in `widgets` now that the header's Retry wears the same chrome; text and
+/// icon colour is `theme::text()` (~#C6C8D6, the app's approximation of the
+/// spec's #C2C4D2), and everything in the toolbar is 13px.
+use crate::widgets::{TOOLBAR_FONT, control_surface as toolbar_surface};
 
 /// A read-only count pill (e.g. "3 tables"), styled like the buttons.
 fn count_chip(label: String) -> AnyView {
