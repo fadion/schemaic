@@ -21,17 +21,21 @@ use crate::{FieldCfg, Tab, Ui, bg_transparent, db_color_dot, edit_field, icons, 
 pub(crate) fn tab_bar(ui: Ui) -> impl IntoView {
     let tabs = ui.tabs_ui.tabs;
     let flashing = ui.tabs_ui.flashing;
+    let active_conn = ui.conn.active_conn;
     let add_tab = ui.tab_actions.add_tab.clone();
     // Each chip gets its own `Ui` handle — for the close/pin/duplicate actions and
     // the shared popup-menu channel that the right-click context menu opens on.
     let chip_ui = ui;
     // A flashing tab's chip is hidden for the duration of the flash. Flat,
     // full-height tabs sit flush (no gap); each draws its own right separator.
+    // Only the active connection's tabs: a tab belongs to a connection, so
+    // showing five MariaDB tabs beside three Postgres ones just loses the user.
     let chips = dyn_stack(
         move || {
+            let conn = active_conn.get();
             tabs.get()
                 .into_iter()
-                .filter(|t| flashing.get() != Some(t.id))
+                .filter(|t| t.conn_id.get() == conn && flashing.get() != Some(t.id))
                 .collect::<Vec<_>>()
         },
         // Key on (id, label): the label is a plain field read at build time (not a
