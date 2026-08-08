@@ -6,12 +6,22 @@
 //! (`prepare_check`), EXPLAIN, the Live Monitor (`fetch_table`), and transactional
 //! write-back (`commit_writes`/`refetch_rows`) with the same 1-row safety net.
 //!
-//! **Values come back over the simple-query (text) protocol** (`simple_query`):
-//! every cell arrives as its textual form, so `NUMERIC`, `UUID`, arrays, and any
-//! exotic type round-trip losslessly without a per-type decoder — mirroring the
-//! MySQL text-protocol path (`crate::parse_typed`). Column *types* are obtained
-//! from a non-executing `PREPARE` (`Client::prepare`) so the grid still gets type
-//! names (and zero-row `SELECT`s still report their columns).
+//! **Values come back over the simple-query (text) protocol**, *streamed*
+//! (`simple_query_raw`): every cell arrives as its textual form, so `NUMERIC`,
+//! `UUID`, arrays, and any exotic type round-trip losslessly without a per-type
+//! decoder — mirroring the MySQL text-protocol path (`crate::parse_typed`).
+//! Column *types* are obtained from a non-executing `PREPARE`
+//! (`Client::prepare`) so the grid still gets type names (and zero-row `SELECT`s
+//! still report their columns).
+//!
+//! Use `simple_query_raw` rather than `simple_query` for anything row-bearing:
+//! the latter is the former plus `try_collect()`, so it materializes the entire
+//! result before the row cap can apply. Rows stream into the columnar
+//! `ResultBuilder` and the stream is dropped at the cap — safe on a reused
+//! connection because tokio-postgres' connection task keeps paging through a
+//! hung-up receiver's remaining messages, so the protocol stays in sync. (The
+//! bounded helpers — schema introspection, `refetch_rows` — keep using
+//! `simple_query`; their size is the schema's, not the user's.)
 //!
 //! **Column provenance** (`ColumnOrigin`, driving grid editability) is resolved
 //! from each prepared column's `table_oid`/`column_id` via a `pg_catalog` lookup
@@ -36,6 +46,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
 use schemaic_core::model::{
     Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder,
     ResultSet, RowDelete, RowEdit, RowInsert, Value,
@@ -324,37 +335,81 @@ pub(crate) async fn run_statement(
     };
 
     // Execute over the text protocol, honoring cancellation via the cancel token.
+    //
+    // `simple_query_raw`, not `simple_query`: the latter is just the former plus
+    // `try_collect()`, so it materializes every row of the result as a
+    // `Vec<SimpleQueryMessage>` before the row cap gets a say. On a table larger
+    // than the cap that's the whole table in memory to keep 200k rows of it —
+    // the MySQL path has streamed row-by-row all along. Rows go straight into the
+    // columnar `ResultBuilder` as they arrive, and the stream is dropped once the
+    // cap is reached.
     let token = client.cancel_token();
-    let messages = tokio::select! {
-        r = client.simple_query(sql) => r.map_err(|e| DbError::Query(e.to_string()))?,
+    let stream = tokio::select! {
+        r = client.simple_query_raw(sql) => r.map_err(|e| DbError::Query(e.to_string()))?,
         _ = cancel.cancelled() => {
             let _ = token.cancel_query(NoTls).await;
             return Err(DbError::Cancelled);
         }
     };
+    let mut stream = std::pin::pin!(stream);
 
-    // Split into rows + affected-row count; derive columns from the first row if
-    // PREPARE didn't yield any (e.g. an unpreparable statement that still returns
-    // rows).
-    let mut rows: Vec<tokio_postgres::SimpleQueryRow> = Vec::new();
+    // Start the builder from PREPARE's columns when it gave any, so a zero-row
+    // SELECT still reports its columns. Otherwise the first row names them (names
+    // only) — an unpreparable statement that still returns rows. Still `None`
+    // after the loop ⇒ DML/DDL/utility, which reports affected rows, not a grid.
+    let mut grid: Option<(ResultBuilder, Vec<String>)> = prepared_cols
+        .filter(|c| !c.is_empty())
+        .map(|c| (ResultBuilder::new(c.clone()), type_names_of(&c)));
     let mut affected: u64 = 0;
-    let mut columns = prepared_cols;
-    for msg in messages {
-        match msg {
+    let mut truncated = false;
+
+    loop {
+        // Cancellation is checked per message now rather than only around the
+        // whole call, so stopping a long fetch takes effect at the next row
+        // instead of after the last one.
+        let next = tokio::select! {
+            n = stream.next() => n,
+            _ = cancel.cancelled() => {
+                let _ = token.cancel_query(NoTls).await;
+                return Err(DbError::Cancelled);
+            }
+        };
+        let Some(msg) = next else { break };
+        match msg.map_err(|e| DbError::Query(e.to_string()))? {
             SimpleQueryMessage::Row(r) => {
-                if columns.is_none() {
-                    columns = Some(
-                        r.columns()
-                            .iter()
-                            .map(|c| Column {
-                                name: c.name().to_string(),
-                                type_name: String::new(),
-                                origin: None,
-                            })
-                            .collect(),
-                    );
+                let (builder, type_names) = grid.get_or_insert_with(|| {
+                    let cols: Vec<Column> = r
+                        .columns()
+                        .iter()
+                        .map(|c| Column {
+                            name: c.name().to_string(),
+                            type_name: String::new(),
+                            origin: None,
+                        })
+                        .collect();
+                    let names = type_names_of(&cols);
+                    (ResultBuilder::new(cols), names)
+                });
+                if builder.row_count() >= row_cap {
+                    // A row beyond the cap exists → the result is truncated. Drop
+                    // the stream rather than draining it: tokio-postgres' own
+                    // connection task keeps paging through the remaining messages
+                    // for a hung-up receiver, so the protocol stays in sync and
+                    // the connection is still reusable — which a Manual-mode tab,
+                    // holding one pinned connection, depends on.
+                    truncated = true;
+                    break;
                 }
-                rows.push(r);
+                // Parse each text cell by its column type (integers/floats become
+                // compact numeric variants; everything else stays an exact string
+                // — never lossy).
+                let cells: Vec<Value> = (0..type_names.len())
+                    .map(|i| match r.get(i) {
+                        None => Value::Null,
+                        Some(s) => parse_typed(s.to_string(), &type_names[i]),
+                    })
+                    .collect();
+                builder.push_row(&cells);
             }
             SimpleQueryMessage::CommandComplete(n) => affected = n,
             _ => {}
@@ -362,36 +417,18 @@ pub(crate) async fn run_statement(
     }
 
     // No result columns → DML/DDL/utility: report affected rows, not a grid.
-    let columns = match columns {
-        Some(c) if !c.is_empty() => c,
-        _ => {
-            return Ok(ResultSet::affected_rows(Vec::new(), affected)
-                .with_elapsed(start.elapsed().as_millis()));
-        }
+    let Some((mut builder, _)) = grid else {
+        return Ok(ResultSet::affected_rows(Vec::new(), affected)
+            .with_elapsed(start.elapsed().as_millis()));
     };
-
-    // Parse each text cell by its column type (integers/floats become compact
-    // numeric variants; everything else stays an exact string — never lossy).
-    let type_names: Vec<String> = columns.iter().map(|c| c.type_name.clone()).collect();
-    let ncols = columns.len();
-    let mut builder = ResultBuilder::new(columns);
-    let mut truncated = false;
-    for r in &rows {
-        if builder.row_count() >= row_cap {
-            truncated = true; // a row beyond the cap exists → result is truncated
-            break;
-        }
-        let cells: Vec<Value> = (0..ncols)
-            .map(|i| match r.get(i) {
-                None => Value::Null,
-                Some(s) => parse_typed(s.to_string(), &type_names[i]),
-            })
-            .collect();
-        builder.push_row(&cells);
-    }
     builder.set_truncated(truncated);
     builder.set_elapsed(start.elapsed().as_millis());
     Ok(builder.finish())
+}
+
+/// The per-column type names the text-cell parser keys on, in column order.
+fn type_names_of(columns: &[Column]) -> Vec<String> {
+    columns.iter().map(|c| c.type_name.clone()).collect()
 }
 
 /// SQL predicate selecting the *user* schemas of a database — everything except
