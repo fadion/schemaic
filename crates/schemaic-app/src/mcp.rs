@@ -2,16 +2,24 @@
 //!
 //! Launched as `schemaic --mcp-serve` by the `claude` CLI (configured via a
 //! temp-file `--mcp-config`, so no credentials ride a command line — review C6).
-//! Speaks newline-delimited JSON-RPC over stdin/stdout and exposes two read-only
-//! tools against the DB endpoint passed in `$SCHEMAIC_MCP_ENDPOINT`:
-//!   - `run_query`  — run a single read-only statement, return the rows.
-//!   - `list_schema` — databases → tables → columns.
+//! Speaks newline-delimited JSON-RPC over stdin/stdout and exposes three
+//! read-only tools against the DB endpoint passed in `$SCHEMAIC_MCP_ENDPOINT`:
+//!   - `run_query` — run a single read-only statement, return the rows.
+//!   - `list_schema` — the server as an overview (databases → table names), or
+//!     one database in full (columns, PK/NOT NULL markers, foreign-key edges).
+//!   - `describe_table` — one table's DDL, foreign keys, and sample rows.
+//!
+//! The split is deliberate: enriching every table with keys makes each entry
+//! bigger, so the broad listing stays cheap and the detail lives behind a
+//! drill-down rather than blowing the model's context on a 50-database server.
 //!
 //! The endpoint points at the app's active connection (already tunnelled for
 //! SSH, since the tunnel is just a local listener any process can use), and is a
 //! structured `schemaic_db::Db` handle — no credential URL is involved.
 
+use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::ResultSet;
+use schemaic_core::schema::{DbSchema, TableInfo};
 use schemaic_db::Db;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -21,9 +29,14 @@ use tokio_util::sync::CancellationToken;
 // model reasons over a sample, not the full result). Distinct from QUERY_ROW_CAP.
 const MCP_ROW_CAP: usize = 200;
 
-/// Run the stdio JSON-RPC loop until stdin closes. `db` is the resolved endpoint
-/// and `database` the default schema (`USE`d for `run_query`).
-pub async fn serve(db: Db, database: Option<String>) {
+/// Run the stdio JSON-RPC loop until stdin closes, against the resolved
+/// endpoint (its `database` is the default schema `USE`d for `run_query`).
+pub async fn serve(endpoint: crate::ai::McpEndpoint) {
+    let crate::ai::McpEndpoint {
+        db,
+        database,
+        samples,
+    } = endpoint;
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -61,7 +74,7 @@ pub async fn serve(db: Db, database: Option<String>) {
                     .pointer("/params/arguments")
                     .cloned()
                     .unwrap_or(json!({}));
-                Some(call_tool(&db, database.as_deref(), &name, &args).await)
+                Some(call_tool(&db, database.as_deref(), samples, &name, &args).await)
             }
             "ping" => Some(json!({})),
             // Unknown request → empty result; notifications (no id) → nothing.
@@ -92,22 +105,77 @@ fn tools_list() -> Value {
         },
         {
             "name": "list_schema",
-            "description": "List the databases, tables, and columns available on the active connection.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "description": "List what's on the active connection. With no arguments: every database \
+                            and its table names. With `database`: that database's tables in full — \
+                            columns with types, PK and NOT NULL markers, and foreign-key edges.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "database": {
+                        "type": "string",
+                        "description": "Limit to one database and include its columns and keys."
+                    }
+                }
+            }
+        },
+        {
+            "name": "describe_table",
+            "description": "One table in depth: its CREATE TABLE (or CREATE VIEW) definition \
+                            including indexes, its foreign keys, and a few sample rows.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "table": {
+                        "type": "string",
+                        "description": "Table name; use `schema.table` for a PostgreSQL table \
+                                        outside `public`."
+                    },
+                    "database": {
+                        "type": "string",
+                        "description": "Defaults to the connection's active database."
+                    }
+                },
+                "required": ["table"]
+            }
         }
     ])
 }
 
-async fn call_tool(db: &Db, database: Option<&str>, name: &str, args: &Value) -> Value {
+async fn call_tool(
+    db: &Db,
+    database: Option<&str>,
+    samples: bool,
+    name: &str,
+    args: &Value,
+) -> Value {
+    let arg = |key: &str| {
+        args.get(key)
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+    };
     let (text, is_error) = match name {
         "run_query" => {
             let sql = args.get("sql").and_then(|s| s.as_str()).unwrap_or("");
             run_query(db, database, sql).await
         }
-        "list_schema" => list_schema(db).await,
+        "list_schema" => list_schema(db, arg("database")).await,
+        "describe_table" => match arg("table") {
+            Some(table) => describe_table(db, database, arg("database"), table, samples).await,
+            None => ("describe_table needs a `table`.".to_string(), true),
+        },
         other => (format!("Unknown tool: {other}"), true),
     };
     json!({ "content": [ { "type": "text", "text": text } ], "isError": is_error })
+}
+
+/// The connection's SQL dialect — shared by the read-only gate, the DDL
+/// skeleton, and the sample-row query builder so all three agree on quoting.
+fn dialect_of(db: &Db) -> SqlDialect {
+    if db.engine() == schemaic_db::Engine::Postgres {
+        SqlDialect::Postgres
+    } else {
+        SqlDialect::MySql
+    }
 }
 
 /// Statement timeout for AI-issued queries — a backstop against `SLEEP()` /
@@ -121,12 +189,7 @@ async fn run_query(db: &Db, database: Option<&str>, sql: &str) -> (String, bool)
     // Read-only gate (comment/string/identifier-aware) lives in schemaic-core,
     // where it's unit-tested alongside the other SQL analysis. Gate in the
     // connection's dialect so PG `#`-operators aren't mistaken for comments.
-    let dialect = if db.engine() == schemaic_db::Engine::Postgres {
-        schemaic_core::intel::SqlDialect::Postgres
-    } else {
-        schemaic_core::intel::SqlDialect::MySql
-    };
-    if let Err(reason) = schemaic_core::sql::read_only_reason(stmt, dialect) {
+    if let Err(reason) = schemaic_core::sql::read_only_reason(stmt, dialect_of(db)) {
         return (format!("Rejected: {reason}."), true);
     }
     // Run with a deadline; on timeout, cancel so the query is killed server-side
@@ -188,38 +251,344 @@ fn format_table(rs: &ResultSet) -> String {
     out
 }
 
-async fn list_schema(db: &Db) -> (String, bool) {
-    let dbs = match db.fetch_databases().await {
+/// `list_schema` — the whole server as an overview (databases + table names), or
+/// one database in full (columns, keys, foreign keys) when `database` is given.
+/// Splitting it this way keeps a 50-database server from burning the model's
+/// context on a listing it didn't ask for.
+async fn list_schema(db: &Db, database: Option<&str>) -> (String, bool) {
+    if let Some(name) = database {
+        return match db.fetch_schema(name).await {
+            Ok(schema) => (format_database_schema(name, &schema), false),
+            Err(e) => (format!("Error reading schema for {name}: {e}"), true),
+        };
+    }
+    let names = match db.fetch_databases().await {
         Ok(d) => d,
         Err(e) => return (format!("Error listing databases: {e}"), true),
     };
+    let mut dbs = Vec::with_capacity(names.len());
+    for name in names {
+        let schema = db.fetch_schema(&name).await.map_err(|e| e.to_string());
+        dbs.push((name, schema));
+    }
+    (format_database_list(&dbs), false)
+}
+
+/// The server overview: one heading per database, its tables listed by name.
+/// Columns deliberately stay out — the trailing hint points at the two calls
+/// that carry them. Pure so the shape is unit-tested.
+fn format_database_list(dbs: &[(String, Result<DbSchema, String>)]) -> String {
     let mut out = String::new();
-    for name in &dbs {
-        out.push_str(&format!("## {name}\n"));
-        match db.fetch_schema(name).await {
-            Ok(schema) => {
-                for t in &schema.tables {
-                    let cols: Vec<String> = t
-                        .columns
-                        .iter()
-                        .map(|c| format!("{} {}", c.name, c.type_name))
-                        .collect();
+    for (name, schema) in dbs {
+        match schema {
+            Ok(s) => {
+                let n = s.tables.len();
+                let plural = if n == 1 { "table" } else { "tables" };
+                out.push_str(&format!("## {name} ({n} {plural})\n"));
+                for t in &s.tables {
+                    let view = if t.is_view { " (view)" } else { "" };
                     // Namespace-qualified outside PostgreSQL's `public`, so the
                     // assistant writes a name that actually resolves.
-                    let name = schemaic_core::schema::display_name(t.schema.as_deref(), &t.name);
-                    out.push_str(&format!("- {name}({})\n", cols.join(", ")));
+                    out.push_str(&format!("- {}{view}\n", table_label(t)));
                 }
             }
-            Err(e) => out.push_str(&format!("  (error: {e})\n")),
+            Err(e) => out.push_str(&format!("## {name} (error: {e})\n")),
         }
+    }
+    out.push_str(
+        "\nCall list_schema with {\"database\": \"<name>\"} for that database's columns and \
+         keys, or describe_table for one table's DDL, foreign keys, and sample rows.\n",
+    );
+    out
+}
+
+/// One database in full: every table with its columns (marked `PK` / `NOT NULL`)
+/// and its foreign-key edges. The FK lines are the point — without them the
+/// assistant invents join conditions we already introspected. Pure.
+fn format_database_schema(database: &str, schema: &DbSchema) -> String {
+    let mut out = format!("## {database}\n");
+    if schema.tables.is_empty() {
+        out.push_str("(no tables)\n");
+        return out;
+    }
+    for t in &schema.tables {
+        let view = if t.is_view { " (view)" } else { "" };
+        out.push_str(&format!("### {}{view}\n", table_label(t)));
+        for c in &t.columns {
+            let pk = if c.primary_key { " PK" } else { "" };
+            // Nullable is the default; only the constraint is worth the tokens.
+            let not_null = if c.nullable { "" } else { " NOT NULL" };
+            out.push_str(&format!("  {} {}{pk}{not_null}\n", c.name, c.type_name));
+        }
+        for line in fk_lines(t) {
+            out.push_str(&format!("  {line}\n"));
+        }
+    }
+    out
+}
+
+/// One table in depth: the `CREATE TABLE` skeleton (columns, PK, indexes) plus a
+/// foreign-key section — `create_ddl` documents that it emits no FK references,
+/// so they'd otherwise be missing entirely. Sample rows are appended by the
+/// caller, which needs the DB. Pure.
+fn format_table_detail(t: &TableInfo, dialect: schemaic_core::intel::SqlDialect) -> String {
+    let mut out = format!("{}\n", t.create_ddl(dialect));
+    let fks = fk_lines(t);
+    if !fks.is_empty() {
+        out.push_str("\nForeign keys:\n");
+        for line in fks {
+            out.push_str(&format!("- {}\n", line.trim_start_matches("FK: ")));
+        }
+    }
+    out
+}
+
+/// A table's FK edges as `FK: col -> other.col` (or, for a composite key,
+/// `FK: (a, b) -> other(x, y)`). ASCII arrows — the result is read by a model,
+/// not rendered in the UI.
+fn fk_lines(t: &TableInfo) -> Vec<String> {
+    t.foreign_keys
+        .iter()
+        .map(|fk| {
+            let target =
+                schemaic_core::schema::display_name(fk.ref_schema.as_deref(), &fk.ref_table);
+            if fk.columns.len() == 1 && fk.ref_columns.len() == 1 {
+                format!("FK: {} -> {target}.{}", fk.columns[0], fk.ref_columns[0])
+            } else {
+                format!(
+                    "FK: ({}) -> {target}({})",
+                    fk.columns.join(", "),
+                    fk.ref_columns.join(", ")
+                )
+            }
+        })
+        .collect()
+}
+
+/// A table's name as the assistant should write it — namespace-qualified outside
+/// PostgreSQL's `public`.
+fn table_label(t: &TableInfo) -> String {
+    schemaic_core::schema::display_name(t.schema.as_deref(), &t.name)
+}
+
+/// Number of sample rows `describe_table` returns — enough to show the shape of
+/// the data (formats, typical magnitudes, whether a column is really populated)
+/// without turning the tool result into a data dump.
+const SAMPLE_ROWS: usize = 5;
+
+/// `describe_table` — one table's DDL, foreign keys, and a few sample rows.
+async fn describe_table(
+    db: &Db,
+    default_db: Option<&str>,
+    database: Option<&str>,
+    table: &str,
+    samples: bool,
+) -> (String, bool) {
+    let Some(database) = database.or(default_db) else {
+        return (
+            "No database given and the connection has no default — pass a `database`.".to_string(),
+            true,
+        );
+    };
+    let schema = match db.fetch_schema(database).await {
+        Ok(s) => s,
+        Err(e) => return (format!("Error reading schema for {database}: {e}"), true),
+    };
+    // `find_by_display` matches both `schema.table` and a bare name; fall back to
+    // a bare lookup so a MySQL table named with a dot-free alias still resolves.
+    let Some(info) = schema
+        .find_by_display(table)
+        .or_else(|| schema.find_table(None, table))
+    else {
+        return (
+            format!("Table {table} not found in {database}. Call list_schema to see what exists."),
+            true,
+        );
+    };
+
+    let dialect = dialect_of(db);
+    let mut out = format!("### {database}.{}\n", table_label(info));
+    out.push_str(&format_table_detail(info, dialect));
+
+    // Sample rows read real data, so they follow the panel's "run queries"
+    // setting — with it off the assistant still gets the DDL and the keys.
+    if !samples {
+        return (out, false);
+    }
+    // Reuse the same dialect-aware, properly quoted builder the grid's "open
+    // table" uses, so a reserved-word or spaced name is safe.
+    let sql = schemaic_core::filter::table_query(
+        dialect,
+        database,
+        info.schema.as_deref(),
+        &info.name,
+        &[],
+        schemaic_core::filter::Order::Asc,
+        SAMPLE_ROWS,
+    );
+    out.push_str(&format!("\nSample rows (up to {SAMPLE_ROWS}):\n"));
+    let token = CancellationToken::new();
+    match db
+        .fetch_query(Some(database), &sql, SAMPLE_ROWS, token)
+        .await
+    {
+        Ok(rs) => out.push_str(&format_table(&rs)),
+        // A sample is a bonus, not the point — a view we can't select from still
+        // returns its DDL and keys.
+        Err(e) => out.push_str(&format!("(unavailable: {e})")),
     }
     (out, false)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{format_table, normalize_stmt};
+    use super::{
+        format_database_list, format_database_schema, format_table, format_table_detail,
+        normalize_stmt,
+    };
+    use schemaic_core::intel::SqlDialect;
     use schemaic_core::model::{Column, ResultSet, Value};
+    use schemaic_core::schema::{ColumnInfo, DbSchema, ForeignKeyInfo, IndexInfo, TableInfo};
+
+    fn tbl(name: &str, columns: Vec<ColumnInfo>) -> TableInfo {
+        TableInfo {
+            schema: None,
+            name: name.to_string(),
+            columns,
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            is_view: false,
+            view_definition: None,
+        }
+    }
+
+    fn c(name: &str, type_name: &str, nullable: bool, primary_key: bool) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            nullable,
+            primary_key,
+        }
+    }
+
+    fn fk(columns: &[&str], ref_table: &str, ref_columns: &[&str]) -> ForeignKeyInfo {
+        ForeignKeyInfo {
+            columns: columns.iter().map(|s| s.to_string()).collect(),
+            ref_schema: None,
+            ref_table: ref_table.to_string(),
+            ref_columns: ref_columns.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn database_list_names_tables_and_marks_views() {
+        let mut view = tbl("v_active", vec![c("id", "int", true, false)]);
+        view.is_view = true;
+        let dbs = vec![(
+            "shop".to_string(),
+            Ok(DbSchema {
+                tables: vec![tbl("orders", vec![c("id", "int", false, true)]), view],
+            }),
+        )];
+        let out = format_database_list(&dbs);
+        assert!(out.contains("## shop (2 tables)"));
+        assert!(out.contains("- orders\n"));
+        assert!(out.contains("- v_active (view)"));
+        // No columns at this level — that's what the drill-down calls are for.
+        assert!(!out.contains("int"));
+        assert!(out.contains("describe_table"));
+    }
+
+    #[test]
+    fn database_list_reports_a_failed_introspection() {
+        let dbs = vec![("locked".to_string(), Err("access denied".to_string()))];
+        let out = format_database_list(&dbs);
+        assert!(out.contains("## locked (error: access denied)"));
+    }
+
+    #[test]
+    fn database_schema_marks_keys_not_null_and_foreign_keys() {
+        let mut orders = tbl(
+            "orders",
+            vec![
+                c("id", "int", false, true),
+                c("customer_id", "int", false, false),
+                c("total", "decimal(10,2)", true, false),
+            ],
+        );
+        orders.foreign_keys = vec![fk(&["customer_id"], "customers", &["id"])];
+        let schema = DbSchema {
+            tables: vec![orders],
+        };
+        let out = format_database_schema("shop", &schema);
+        assert!(out.contains("## shop"));
+        assert!(out.contains("### orders"));
+        assert!(out.contains("  id int PK NOT NULL"));
+        assert!(out.contains("  customer_id int NOT NULL"));
+        // Nullable is the default — no marker, no noise.
+        assert!(out.contains("  total decimal(10,2)\n"));
+        assert!(out.contains("  FK: customer_id -> customers.id"));
+    }
+
+    #[test]
+    fn database_schema_renders_a_composite_foreign_key() {
+        let mut t = tbl(
+            "line_items",
+            vec![
+                c("order_id", "int", false, true),
+                c("line_no", "int", false, true),
+            ],
+        );
+        t.foreign_keys = vec![fk(&["order_id", "line_no"], "shipments", &["ord", "line"])];
+        let out = format_database_schema("shop", &DbSchema { tables: vec![t] });
+        assert!(out.contains("  FK: (order_id, line_no) -> shipments(ord, line)"));
+    }
+
+    #[test]
+    fn database_schema_marks_a_view() {
+        let mut view = tbl("v_active", vec![c("id", "int", true, false)]);
+        view.is_view = true;
+        let out = format_database_schema("shop", &DbSchema { tables: vec![view] });
+        assert!(out.contains("### v_active (view)"));
+    }
+
+    #[test]
+    fn database_schema_reports_an_empty_database() {
+        let out = format_database_schema("shop", &DbSchema { tables: vec![] });
+        assert!(out.contains("(no tables)"));
+    }
+
+    #[test]
+    fn table_detail_carries_ddl_and_foreign_keys() {
+        let mut orders = tbl(
+            "orders",
+            vec![
+                c("id", "int", false, true),
+                c("customer_id", "int", false, false),
+            ],
+        );
+        orders.indexes = vec![IndexInfo {
+            name: "ix_customer".to_string(),
+            columns: vec!["customer_id".to_string()],
+            unique: false,
+            foreign: true,
+        }];
+        orders.foreign_keys = vec![fk(&["customer_id"], "customers", &["id"])];
+        let out = format_table_detail(&orders, SqlDialect::MySql);
+        // The DDL skeleton carries columns + PK + indexes…
+        assert!(out.contains("CREATE TABLE `orders`"));
+        assert!(out.contains("PRIMARY KEY (`id`)"));
+        assert!(out.contains("KEY `ix_customer`"));
+        // …but never FK references, so they get their own section.
+        assert!(out.contains("Foreign keys:\n- customer_id -> customers.id"));
+    }
+
+    #[test]
+    fn table_detail_omits_the_fk_section_when_there_are_none() {
+        let t = tbl("logs", vec![c("id", "int", false, true)]);
+        let out = format_table_detail(&t, SqlDialect::MySql);
+        assert!(!out.contains("Foreign keys:"));
+    }
 
     #[test]
     fn normalize_stmt_trims_and_rejects_empty() {
