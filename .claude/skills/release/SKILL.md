@@ -69,9 +69,12 @@ gh run watch <id> --exit-status
 ```
 
 `--exit-status` is what makes failure loud — without it the command succeeds
-even when the run failed. If CI is red, stop: report which job failed and paste
-the failing step's output (`gh run view <id> --log-failed`). Do not proceed to
-the tag.
+even when the run failed. CI finishes in about three minutes, so watching it is
+fine; if the watch ever gets cut off by a command timeout, fall back to the
+polling loop in phase 3 rather than assuming the worst.
+
+If CI is red, stop: report which job failed and paste the failing step's output
+(`gh run view <id> --log-failed`). Do not proceed to the tag.
 
 ## Phase 2 — bump and tag
 
@@ -117,21 +120,32 @@ git push origin vX.Y.Z
 
 The tag push triggers **Release** (`release.yml`), which builds Linux and Windows
 binaries and creates the GitHub Release. The branch push separately re-runs
-**CI** on the chore commit. Release is the one that matters — watch it:
+**CI** on the chore commit. Release is the one that matters.
+
+Don't use `gh run watch` here. This run is slow — two OS matrix legs, and the
+Linux one installs Zig and `cargo-zigbuild` to link against glibc 2.31 — and a
+blocking watch reliably outlives the command timeout, which kills the wait
+rather than the run. Poll instead:
 
 ```bash
-gh run list --workflow Release --limit 1 --json databaseId,headBranch --jq '.[0].databaseId'
+gh run list --workflow Release --limit 1 --json databaseId --jq '.[0].databaseId'
 ```
 
-```bash
-gh run watch <id> --exit-status
+```powershell
+$id = <id>
+do {
+  Start-Sleep -Seconds 25
+  $r = gh run view $id --json status,conclusion | ConvertFrom-Json
+} while ($r.status -ne "completed")
+"$($r.status) / $($r.conclusion)"
 ```
 
-It takes several minutes (two OS matrix legs, and the Linux leg installs Zig and
-`cargo-zigbuild` to link against glibc 2.31). If it fails, the tag already
-exists but the release is incomplete — report the failure and ask before doing
-anything drastic. Deleting and re-pushing a tag is possible but it's the user's
-call, not yours.
+The loop costs nothing and survives a run of any length. A `conclusion` of
+anything but `success` is a stop.
+
+If it fails, the tag already exists but the release is incomplete — report the
+failure and ask before doing anything drastic. Deleting and re-pushing a tag is
+possible but it's the user's call, not yours.
 
 ## Phase 4 — write the release notes
 
@@ -153,14 +167,48 @@ the real thing before writing):
 - **No title heading.** GitHub already shows the tag as the title. Open with one
   sentence: `Schemaic vX.Y.Z — **theme one**, **theme two**, and a third thing.`
 - Then `## ` sections in this order, each **optional if empty**: **Highlights**,
-  **Improvements**, **Performance**, **Fixes**, **Under the hood**.
-- Bullets lead with a bold phrase, then one to three sentences:
-  `* **Feature name.** What it does and why it matters.`
-- Write the *why*, not just the what. The good entries in past releases explain
-  the problem that existed before — that's what makes a changelog readable
-  rather than a diff summary.
-- "Under the hood" is where architecture/testing notes go, including the current
-  test count if it's worth mentioning.
+  **Improvements**, **Performance**, **Fixes**.
+- Bullets lead with a bold phrase: `* **Feature name.** What changed.`
+
+**No "Under the hood" section.** Every release through v0.10.0 has been rewritten
+without one; don't reintroduce it. The audience is someone deciding whether to
+download a database client, and internal refactors, module reorganizations and
+test counts tell them nothing about whether the app got better. If a piece of
+internal work genuinely changed the experience, say it as the experience — "wide
+tables stay smooth" rather than "columns are virtualized" — and it belongs in
+Improvements or Performance. If it can't be stated that way, it doesn't go in the
+notes at all.
+
+Watch for a real feature hiding in there when trimming an old release: v0.5.0's
+"Under the hood" held live DB validation, a user-facing setting, which had to move
+up rather than be deleted with the section.
+
+**Keep it short — this is the hard part.** The easy failure is writing the commit
+message again. A changelog is *scanned*, by someone deciding whether to update or
+hunting the thing that broke. The reasoning, the edge cases and the rejected
+alternatives already live in the commit; repeating them here buries the release
+under its own footnotes.
+
+**Calibrate against the v0.3.0 release** — read it before drafting and match its
+scope:
+
+```bash
+gh release view v0.3.0 --json body --jq .body
+```
+
+- **Highlights: one sentence, two at the most.** Three or four bullets — if
+  everything is a highlight, nothing is. Bold the sub-features inline rather than
+  spending a sentence on each (`**Go-to-line** (Ctrl+G), a **word-wrap** toggle,
+  and an **AI model** picker`) — that packs a lot into a line and stays scannable.
+- **Improvements and Fixes: one short sentence each, often just a clause.** A fix
+  is *what was broken*, not the diagnosis that found it: "Truncated tab titles no
+  longer clip the close icon."
+- Where a sentence is spare, spend it on the problem that existed before rather
+  than on how the fix works. That's the one piece of "why" worth the space.
+
+If a bullet needs a third sentence to make sense, either it deserves its own
+Highlight or the extra sentence isn't needed. Prose paragraphs are the signal
+you've drifted — go back to v0.3.0 and cut to its shape.
 
 Write the body to a file and set it with `--notes-file`. Passing multi-line
 markdown as a `-m` argument through PowerShell gets mangled (a `>=` in the text
@@ -173,6 +221,18 @@ gh release edit vX.Y.Z --notes-file notes.md
 Put the file somewhere temporary, not in the repo. Show the user the drafted
 notes before setting them if the release is substantial — it's the one part of
 this flow that's a judgement call rather than a procedure.
+
+## Command notes (Windows / PowerShell)
+
+Two things mangle commands on this machine, both worth knowing before you spend a
+round trip debugging them:
+
+- **`gh --jq` expressions containing `->` or `\(…)` get eaten** — PowerShell reads
+  `>` as a redirect. Keep `--jq` to plain field access (`'.[0].databaseId'`) and
+  do anything structured by piping the JSON through `ConvertFrom-Json` instead.
+- **Multi-line text can't go through `-m`.** A `>=` inside a commit message is
+  read as a redirect and the message arrives split into pathspecs. Write the text
+  to a file and use `git commit -F` / `gh release edit --notes-file`.
 
 ## Finishing
 
