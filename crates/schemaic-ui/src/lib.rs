@@ -7,6 +7,7 @@
 //! follows FEATURES §1.
 
 mod ai_panel;
+pub use ai_panel::mark_messages_seen;
 mod completion;
 mod connection_form;
 mod consts;
@@ -144,7 +145,6 @@ pub type AiSeedDoneFn = Rc<dyn Fn(AiSeedResult)>;
 /// AI-generate seed rows (grid → app), reporting via [`AiSeedDoneFn`].
 pub type AiSeedFn = Rc<dyn Fn(AiSeedRequest, AiSeedDoneFn)>;
 use schemaic_core::schema::{SchemaState, TableSource};
-use schemaic_core::transcript::{Seg, TurnStats};
 use schemaic_term::Screen;
 
 // Layout & dimension constants live in `consts.rs` (glob-imported above).
@@ -336,49 +336,10 @@ pub struct ResultPanel {
     pub state: QueryState,
 }
 
-/// Who authored a chat message in the AI panel.
-#[derive(Clone, Copy, PartialEq)]
-pub enum Role {
-    User,
-    Assistant,
-    Error,
-}
-
-/// One message in the AI panel conversation.
-#[derive(Clone)]
-pub struct ChatMessage {
-    pub role: Role,
-    /// The user's text (user messages only).
-    pub text: String,
-    /// The assistant turn's rendered segments (assistant/error messages).
-    pub segs: Vec<Seg>,
-    /// Cost/usage footer, once the turn completes.
-    pub stats: Option<TurnStats>,
-    /// True while awaiting the assistant's reply (renders as "Thinking…").
-    pub pending: bool,
-}
-
-impl ChatMessage {
-    pub fn user(text: String) -> ChatMessage {
-        ChatMessage {
-            role: Role::User,
-            text,
-            segs: Vec::new(),
-            stats: None,
-            pending: false,
-        }
-    }
-    /// Placeholder assistant message shown while the CLI runs.
-    pub fn pending() -> ChatMessage {
-        ChatMessage {
-            role: Role::Assistant,
-            text: String::new(),
-            segs: Vec::new(),
-            stats: None,
-            pending: true,
-        }
-    }
-}
+// The chat message types live in `schemaic_core::transcript` alongside the
+// segments they carry — they're persisted (`core::chat`), and core can't depend
+// on the UI. Re-exported so `schemaic_ui::ChatMessage` keeps working.
+pub use schemaic_core::transcript::{ChatMessage, Role};
 
 /// One connection shown in the schema sidebar: a named database plus its
 /// lazily-introspected schema (updated through the `schema` signal when the

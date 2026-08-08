@@ -760,6 +760,32 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let ai_input = RwSignal::new(String::new());
     let ai_busy = RwSignal::new(false);
     let ai_session: Rc<RefCell<Option<AiSession>>> = Rc::new(RefCell::new(None));
+    // Saved conversations (`chats.json`), keyed by connection like the panel
+    // itself. Seeded into `ai_messages` for the active connection below, once
+    // the restored connection id is known.
+    let saved_chats: RwSignal<Vec<schemaic_core::chat::SavedChat>> =
+        RwSignal::new(persist::load_json::<schemaic_core::chat::ChatFile>("chats.json").chats);
+    // Restore the active connection's conversation at launch (the switch path
+    // does the same on every later change). Marked seen first so the whole
+    // conversation doesn't play the new-message entrance animation.
+    let restored =
+        schemaic_core::chat::for_conn(&saved_chats.get_untracked(), active_conn.get_untracked());
+    schemaic_ui::mark_messages_seen(restored.len());
+    ai_messages.set(restored);
+    // Store the panel's current conversation under `conn_id` and write the file.
+    // Called when a turn finishes and when a conversation is cleared — never
+    // mid-stream, so a half-written turn can't reach disk.
+    let persist_chat: Rc<dyn Fn(u64)> = Rc::new(move |conn_id: u64| {
+        saved_chats.update(|chats| {
+            schemaic_core::chat::save(chats, conn_id, &ai_messages.get_untracked());
+        });
+        persist::save_json(
+            "chats.json",
+            &schemaic_core::chat::ChatFile {
+                chats: saved_chats.get_untracked(),
+            },
+        );
+    });
     let (ai_tx, ai_rx) = crossbeam_channel::unbounded::<AiStreamMsg>();
     let ai_stream = create_signal_from_channel(ai_rx);
 
@@ -2513,9 +2539,15 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             persist_conns(Some(id));
             // Clear stale status until this connection's own check lands.
             conn_status.set(ConnStatus::Unknown);
-            // The AI conversation is bound to a connection — reset it on switch.
+            // The AI conversation is bound to a connection — swap in the one
+            // saved for this connection (empty when there isn't one). The live
+            // session can't be reused, so the restored turns are transcript;
+            // the next message spawns a session that gets them replayed.
             *ai_session.borrow_mut() = None;
-            ai_messages.set(Vec::new());
+            let restored = schemaic_core::chat::for_conn(&saved_chats.get_untracked(), id);
+            // Reappearing, not arriving — mount them without the entrance pop.
+            schemaic_ui::mark_messages_seen(restored.len());
+            ai_messages.set(restored);
             ai_busy.set(false);
             if let Some(conn) =
                 connections.with_untracked(|cs| cs.iter().find(|c| c.id == id).cloned())
@@ -2639,6 +2671,15 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             tunnels.borrow_mut().remove(&id);
             // Forget its keyring secrets so nothing is left behind.
             secrets::forget_connection(id);
+            // …and its saved AI conversation, which would otherwise linger and
+            // resurface under whatever connection reuses the id.
+            saved_chats.update(|chats| schemaic_core::chat::clear_conn(chats, id));
+            persist::save_json(
+                "chats.json",
+                &schemaic_core::chat::ChatFile {
+                    chats: saved_chats.get_untracked(),
+                },
+            );
             connections.update(|cs| cs.retain(|c| c.id != id));
             let fallback = connections.with_untracked(|cs| cs.first().map(|c| c.id));
             let new_active = if was_active {
@@ -2670,23 +2711,34 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
 
     // ── AI panel (Claude Code) ──────────────────────────────────────────────
     // Apply streamed transcript snapshots to the pending assistant bubble.
-    create_effect(move |_| {
-        if let Some(msg) = ai_stream.get() {
-            ai_messages.update(|v| {
-                if let Some(last) = v.last_mut() {
-                    last.segs = msg.segs;
-                    last.stats = msg.stats;
-                    last.pending = !msg.done;
-                    if msg.done && msg.is_error {
-                        last.role = Role::Error;
+    {
+        let ai_session = ai_session.clone();
+        let persist_chat = persist_chat.clone();
+        create_effect(move |_| {
+            if let Some(msg) = ai_stream.get() {
+                ai_messages.update(|v| {
+                    if let Some(last) = v.last_mut() {
+                        last.segs = msg.segs;
+                        last.stats = msg.stats;
+                        last.pending = !msg.done;
+                        if msg.done && msg.is_error {
+                            last.role = Role::Error;
+                        }
+                    }
+                });
+                if msg.done {
+                    ai_busy.set(false);
+                    // Save under the *session's* connection, not the active one:
+                    // a switch mid-turn drops the session and clears the panel,
+                    // and a late snapshot must not overwrite the conversation
+                    // just restored for the connection switched to.
+                    if let Some(id) = ai_session.borrow().as_ref().map(|s| s.conn_id) {
+                        (persist_chat)(id);
                     }
                 }
-            });
-            if msg.done {
-                ai_busy.set(false);
             }
-        }
-    });
+        });
+    }
 
     // Send a user turn: (re)start the per-connection session, then write it to
     // the CLI's stdin. Replies stream back via `ai_stream` (above).
@@ -2737,9 +2789,13 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             let fallback_db = default_tab_target().1;
             let context_now = turn_context(cx_params, fallback_db.as_deref());
             if need_new {
+                // Whatever is on screen predates this session — a restored
+                // conversation, or turns from one that was cancelled/respawned.
+                // Replay it into the prompt so a follow-up still resolves.
                 let context = ai_context(
                     cx_params,
                     fallback_db.as_deref(),
+                    &ai_messages.get_untracked(),
                     &ai_instructions.get_untracked(),
                 );
                 // If the connection's `Db` can't be built yet (SSH tunnel
@@ -2822,12 +2878,16 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     };
 
     // New chat: drop the session (fresh context next message) and clear bubbles.
+    // Also forgets the saved conversation — "New Chat" should not leave the old
+    // one waiting to reappear on the next connection switch.
     let ai_new_chat: Rc<dyn Fn()> = {
         let ai_session = ai_session.clone();
+        let persist_chat = persist_chat.clone();
         Rc::new(move || {
             ai_session.borrow_mut().take();
             ai_messages.set(Vec::new());
             ai_busy.set(false);
+            (persist_chat)(active_conn.get_untracked());
         })
     };
 

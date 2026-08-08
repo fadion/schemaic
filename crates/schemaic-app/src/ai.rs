@@ -19,6 +19,7 @@ use tokio::process::Command;
 
 use schemaic_core::connection::Connection;
 use schemaic_core::schema::{DbSchema, SchemaState};
+use schemaic_core::transcript::{ChatMessage, Role};
 use schemaic_db::Db;
 use schemaic_ui::{AiEffort, AiModel, ConnNode, InlineAiRequest, SchemaScope, Tab};
 
@@ -482,6 +483,50 @@ pub(crate) fn apply_turn_delta(
     }
 }
 
+/// Messages replayed into a fresh session's prompt, and the per-message
+/// character budget. A conversation restored from disk is *transcript*, not
+/// memory — the session that produced it is gone — so enough of it is replayed
+/// for a follow-up like "and the other one?" to resolve, without pasting a whole
+/// working session back in.
+pub(crate) const HISTORY_TURNS: usize = 10;
+pub(crate) const HISTORY_MSG_CHARS: usize = 600;
+
+/// Render a conversation the current `claude` process never saw (restored from
+/// disk, or carried across a respawn) as a prompt section. Empty when there's
+/// nothing to replay. Prose only — tool calls and their results are left out, so
+/// the assistant re-runs whatever it actually needs rather than trusting a stale
+/// result.
+pub(crate) fn render_history(messages: &[ChatMessage], max_turns: usize) -> String {
+    let start = messages.len().saturating_sub(max_turns);
+    let mut lines = String::new();
+    for m in &messages[start..] {
+        let prose = m.prose();
+        if prose.is_empty() {
+            continue;
+        }
+        let who = match m.role {
+            Role::User => "User",
+            _ => "Assistant",
+        };
+        let prose = if prose.chars().count() > HISTORY_MSG_CHARS {
+            format!(
+                "{}…",
+                prose.chars().take(HISTORY_MSG_CHARS).collect::<String>()
+            )
+        } else {
+            prose
+        };
+        lines.push_str(&format!("{who}: {prose}\n"));
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Earlier in this conversation (restored from a previous session — you did not \
+         see these turns, and any data in them may be stale):\n{lines}"
+    )
+}
+
 /// Bundled inputs for [`ai_context`] (keeps the argument count in check).
 #[derive(Clone, Copy)]
 pub(crate) struct AiContextParams {
@@ -497,6 +542,7 @@ pub(crate) struct AiContextParams {
 pub(crate) fn ai_context(
     p: AiContextParams,
     fallback_db: Option<&str>,
+    history: &[ChatMessage],
     instructions: &str,
 ) -> String {
     let conn_name = p
@@ -512,6 +558,7 @@ pub(crate) fn ai_context(
         &turn_context(p, fallback_db),
         p.scope,
         p.run_queries,
+        &render_history(history, HISTORY_TURNS),
         instructions,
     )
 }
@@ -633,6 +680,7 @@ fn render_ai_context(
     cx: &TurnContext,
     scope: SchemaScope,
     run_queries: bool,
+    history: &str,
     instructions: &str,
 ) -> String {
     // Tools line — kept truthful: the assistant always has `list_schema`, and
@@ -664,6 +712,9 @@ fn render_ai_context(
          Current query editor:\n```sql\n{current}\n```",
         active_db = cx.active_db.as_deref().unwrap_or("(none)"),
     );
+    if !history.is_empty() {
+        out.push_str(&format!("\n\n{history}"));
+    }
     let instructions = instructions.trim();
     if !instructions.is_empty() {
         out.push_str(&format!(
@@ -920,7 +971,7 @@ mod tests {
             ),
         ];
         let cx = ctx_of(&dbs, Some("shop"), "SELECT 1", SchemaScope::Active);
-        let out = render_ai_context("Local", &cx, SchemaScope::Active, true, "");
+        let out = render_ai_context("Local", &cx, SchemaScope::Active, true, "", "");
         assert!(out.contains("Active connection: Local"));
         assert!(out.contains("Active database: shop"));
         assert!(out.contains("- shop: orders"));
@@ -940,7 +991,7 @@ mod tests {
             ("blog".to_string(), None), // schema not loaded yet
         ];
         let cx = ctx_of(&dbs, Some("shop"), "", SchemaScope::All);
-        let out = render_ai_context("Local", &cx, SchemaScope::All, false, "");
+        let out = render_ai_context("Local", &cx, SchemaScope::All, false, "", "");
         assert!(out.contains("- shop: orders"));
         assert!(out.contains("- blog\n")); // unloaded → name only, no ": tables"
         // run_queries = false → the no-queries tools line.
@@ -955,7 +1006,14 @@ mod tests {
             Some(schema(vec![table("orders", &["id"])])),
         )];
         let cx = ctx_of(&dbs, Some("shop"), "", SchemaScope::None);
-        let out = render_ai_context("Local", &cx, SchemaScope::None, true, "  Prefer CTEs.  ");
+        let out = render_ai_context(
+            "Local",
+            &cx,
+            SchemaScope::None,
+            true,
+            "",
+            "  Prefer CTEs.  ",
+        );
         assert!(!out.contains("Databases and tables:"));
         assert!(!out.contains("orders"));
         // Instructions are trimmed and appended.
@@ -1012,6 +1070,71 @@ mod tests {
             outline: outline.to_string(),
             query: query.to_string(),
         }
+    }
+
+    use schemaic_core::transcript::Seg;
+
+    fn msg(role: Role, prose: &str) -> ChatMessage {
+        match role {
+            Role::User => ChatMessage::user(prose.to_string()),
+            _ => ChatMessage {
+                role,
+                text: String::new(),
+                segs: vec![Seg::Text(prose.to_string())],
+                stats: None,
+                pending: false,
+            },
+        }
+    }
+
+    #[test]
+    fn history_replay_is_empty_for_a_fresh_conversation() {
+        assert_eq!(render_history(&[], 10), "");
+    }
+
+    #[test]
+    fn history_replay_labels_each_side() {
+        let msgs = vec![
+            msg(Role::User, "how many orders?"),
+            msg(Role::Assistant, "1,204"),
+        ];
+        let out = render_history(&msgs, 10);
+        assert!(out.contains("User: how many orders?"));
+        assert!(out.contains("Assistant: 1,204"));
+        // The model is told these turns aren't in its own context.
+        assert!(out.contains("did not see"));
+    }
+
+    #[test]
+    fn history_replay_keeps_only_the_most_recent_turns() {
+        let msgs: Vec<ChatMessage> = (0..10).map(|i| msg(Role::User, &format!("q{i}"))).collect();
+        let out = render_history(&msgs, 3);
+        assert!(out.contains("q7") && out.contains("q9"));
+        assert!(!out.contains("q6"));
+    }
+
+    #[test]
+    fn history_replay_truncates_a_long_message() {
+        let long = "x".repeat(HISTORY_MSG_CHARS + 200);
+        let out = render_history(&[msg(Role::Assistant, &long)], 10);
+        assert!(out.contains(&format!("{}…", "x".repeat(HISTORY_MSG_CHARS))));
+        assert!(!out.contains(&"x".repeat(HISTORY_MSG_CHARS + 1)));
+    }
+
+    #[test]
+    fn history_replay_skips_messages_with_no_prose() {
+        // A turn that was only tool calls (or an emptied bubble) contributes
+        // nothing to replay — and mustn't emit a bare "Assistant:" line.
+        let mut tool_only = msg(Role::Assistant, "");
+        tool_only.segs = vec![Seg::Tool(schemaic_core::transcript::ToolCall {
+            name: "mcp__schemaic__run_query".to_string(),
+            sql: Some("SELECT 1".to_string()),
+            result: None,
+            is_error: false,
+        })];
+        let out = render_history(&[msg(Role::User, "hi"), tool_only], 10);
+        assert!(out.contains("User: hi"));
+        assert!(!out.contains("Assistant:"));
     }
 
     #[test]
