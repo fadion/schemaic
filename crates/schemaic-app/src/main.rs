@@ -2773,6 +2773,13 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         let load_schema = load_schema.clone();
         let tunnels = tunnels.clone();
         let drop_session = drop_session.clone();
+        let tokens = tokens.clone();
+        let recently_closed = recently_closed.clone();
+        let last_tab = last_tab.clone();
+        let open_tab_on = open_tab_on.clone();
+        let save_db_colors = save_db_colors.clone();
+        let save_db_favorites = save_db_favorites.clone();
+        let save_formats = save_formats.clone();
         Rc::new(move |id: u64| {
             let was_active = active_conn.get_untracked() == id;
             // Release any pinned transaction connection on the connection being
@@ -2833,30 +2840,72 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     None => db_nodes.set(Vec::new()),
                 }
             }
-            // The deleted connection's tabs would now be invisible in every
-            // connection's strip. Adopt them into the active one rather than
-            // closing them — an unsaved query shouldn't vanish with a connection
-            // — clearing the database, which named one that just went away.
-            // (Restore does the same for a tab whose connection is gone.)
-            let adopting = active_conn.get_untracked();
-            if adopting != id {
-                tabs.with_untracked(|v| {
-                    for t in v.iter().filter(|t| t.conn_id.get_untracked() == id) {
-                        t.conn_id.set(adopting);
-                        t.database.set(None);
-                    }
-                });
+            // The connection's tabs go with it. Folding them into another
+            // connection's strip would be a contradiction — tabs scoped to a
+            // connection that no longer exists — and deleting a connection
+            // (often a temporary or production one) shouldn't leave its queries
+            // behind.
+            let doomed: Vec<(usize, floem::reactive::Scope)> = tabs.with_untracked(|v| {
+                v.iter()
+                    .filter(|t| t.conn_id.get_untracked() == id)
+                    .map(|t| (t.id, t.cx))
+                    .collect()
+            });
+            for (tab_id, _) in &doomed {
+                // H5: cancel in-flight work so it can't complete onto freed
+                // signals (its session was already released above).
+                if let Some((_, tok)) = tokens.borrow_mut().remove(tab_id) {
+                    tok.cancel();
+                }
             }
+            tabs.update(|v| v.retain(|t| t.conn_id.get_untracked() != id));
+            recently_closed.borrow_mut().retain(|s| s.conn_id != id);
             last_tab.borrow_mut().remove(&id);
-            // The active tab may have been one of those (or on the deleted
-            // connection); make sure it's one the strip will show.
-            if let Some(tab) = schemaic_core::tabsel::pick_active(
+            // Whatever is active now may have just been removed; make sure it's
+            // a tab the strip will show, opening one if this connection has none.
+            let adopting = active_conn.get_untracked();
+            match schemaic_core::tabsel::pick_active(
                 &tab_refs(),
                 adopting,
                 Some(active.get_untracked()),
             ) {
-                active.set(tab);
+                Some(tab) => active.set(tab),
+                None => (open_tab_on)(adopting, None),
             }
+            // Scopes are disposed a tick later, once the center view has rebuilt
+            // for the new active tab — freeing them now drops signals a mounted
+            // view still reads this frame (C14).
+            if !doomed.is_empty() {
+                exec_after(Duration::ZERO, move |_| {
+                    for (_, scope) in doomed {
+                        scope.dispose();
+                    }
+                });
+            }
+
+            // Everything else keyed to this connection goes too. A deleted
+            // connection shouldn't be reconstructable from what's left on disk —
+            // its queries, the databases it had, the tables looked at.
+            history_entries.update(|v| schemaic_core::history::clear_conn(v, id));
+            persist::save_json(
+                "history.json",
+                &schemaic_core::history::HistoryFile {
+                    entries: history_entries.get_untracked(),
+                },
+            );
+            // Persisted by an effect on change.
+            search_history.update(|v| schemaic_core::search_history::clear_conn(v, id));
+            db_colors.update(|v| schemaic_core::db_color::clear_conn(v, id));
+            (save_db_colors)();
+            db_favorites.update(|v| schemaic_core::favorite::clear_conn(v, id));
+            (save_db_favorites)();
+            formats.update(|v| schemaic_core::format::clear_conn(v, id));
+            (save_formats)();
+            // Diagram layouts live only on disk (no signal) — load, prune, save.
+            let mut layouts: schemaic_core::erd::DiagramLayoutsFile =
+                persist::load_json("diagrams.json");
+            schemaic_core::erd::clear_conn_layouts(&mut layouts, id);
+            persist::save_json("diagrams.json", &layouts);
         })
     };
 

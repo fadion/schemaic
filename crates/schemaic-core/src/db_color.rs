@@ -24,6 +24,12 @@ pub struct DbColorsFile {
     pub rules: Vec<DbColorRule>,
 }
 
+/// Forget every colour belonging to `conn_id` — the connection was deleted, and
+/// nothing keyed to it should outlive it.
+pub fn clear_conn(rules: &mut Vec<DbColorRule>, conn_id: u64) {
+    rules.retain(|r| r.conn_id != conn_id);
+}
+
 /// The colour set for a `(conn_id, database)`, or `None` if the user never set one.
 pub fn lookup(rules: &[DbColorRule], conn_id: u64, database: &str) -> Option<String> {
     rules
@@ -42,6 +48,33 @@ pub fn upsert(rules: &mut Vec<DbColorRule>, conn_id: u64, database: &str, color:
             database: database.to_string(),
             color,
         });
+    }
+}
+
+#[cfg(test)]
+mod clear_tests {
+    use super::*;
+
+    #[test]
+    fn clear_conn_drops_only_that_connections_colours() {
+        let mut rules = vec![
+            DbColorRule {
+                conn_id: 1,
+                database: "shop".into(),
+                color: "#aabbcc".into(),
+            },
+            DbColorRule {
+                conn_id: 2,
+                database: "shop".into(),
+                color: "#ddeeff".into(),
+            },
+        ];
+        clear_conn(&mut rules, 1);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].conn_id, 2);
+        // Clearing an absent connection is a no-op.
+        clear_conn(&mut rules, 99);
+        assert_eq!(rules.len(), 1);
     }
 }
 

@@ -867,6 +867,14 @@ pub fn get_layout<'a>(
     file.layouts.get(&layout_key(conn_id, database))
 }
 
+/// Forget every diagram layout belonging to `conn_id` — the connection was
+/// deleted, and nothing keyed to it should outlive it. Layouts are keyed by
+/// `conn_id:database`, so this matches on that prefix rather than a field.
+pub fn clear_conn_layouts(file: &mut DiagramLayoutsFile, conn_id: u64) {
+    let prefix = format!("{conn_id}:");
+    file.layouts.retain(|k, _| !k.starts_with(&prefix));
+}
+
 /// Store (replacing) a diagram's manual positions.
 pub fn upsert_layout(
     file: &mut DiagramLayoutsFile,
@@ -876,6 +884,25 @@ pub fn upsert_layout(
 ) {
     file.layouts
         .insert(layout_key(conn_id, database), positions);
+}
+
+#[cfg(test)]
+mod layout_clear_tests {
+    use super::*;
+
+    #[test]
+    fn clear_conn_layouts_drops_only_that_connections_diagrams() {
+        let mut file = DiagramLayoutsFile::default();
+        upsert_layout(&mut file, 1, "shop", NodePositions::new());
+        upsert_layout(&mut file, 1, "blog", NodePositions::new());
+        upsert_layout(&mut file, 2, "shop", NodePositions::new());
+        // Connection 12 must not be swept up by connection 1's prefix.
+        upsert_layout(&mut file, 12, "shop", NodePositions::new());
+        clear_conn_layouts(&mut file, 1);
+        let mut keys: Vec<&String> = file.layouts.keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["12:shop", "2:shop"]);
+    }
 }
 
 #[cfg(test)]

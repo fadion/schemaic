@@ -21,6 +21,12 @@ pub struct FavoritesFile {
     pub rules: Vec<FavoriteRule>,
 }
 
+/// Forget every favorite belonging to `conn_id` — the connection was deleted,
+/// and nothing keyed to it should outlive it.
+pub fn clear_conn(rules: &mut Vec<FavoriteRule>, conn_id: u64) {
+    rules.retain(|r| r.conn_id != conn_id);
+}
+
 /// Whether `(conn_id, database)` is favorited.
 pub fn is_favorite(rules: &[FavoriteRule], conn_id: u64, database: &str) -> bool {
     rules
@@ -47,6 +53,34 @@ pub fn toggle(rules: &mut Vec<FavoriteRule>, conn_id: u64, database: &str) -> bo
             database: database.to_string(),
         });
         true
+    }
+}
+
+#[cfg(test)]
+mod clear_tests {
+    use super::*;
+
+    #[test]
+    fn clear_conn_drops_only_that_connections_favorites() {
+        let mut rules = vec![
+            FavoriteRule {
+                conn_id: 1,
+                database: "shop".into(),
+            },
+            FavoriteRule {
+                conn_id: 1,
+                database: "blog".into(),
+            },
+            FavoriteRule {
+                conn_id: 2,
+                database: "shop".into(),
+            },
+        ];
+        clear_conn(&mut rules, 1);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].conn_id, 2);
+        clear_conn(&mut rules, 99);
+        assert_eq!(rules.len(), 1);
     }
 }
 

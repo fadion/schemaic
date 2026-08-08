@@ -72,6 +72,12 @@ pub struct FormatsFile {
 }
 
 /// The explicitly-stored format for a column, or `None` if the user has never set
+/// Forget every formatter belonging to `conn_id` — the connection was deleted,
+/// and nothing keyed to it should outlive it.
+pub fn clear_conn(rules: &mut Vec<ColumnFormatRule>, conn_id: u64) {
+    rules.retain(|r| r.conn_id != conn_id);
+}
+
 /// one (in which case the caller falls back to [`smart_default`]). An explicit
 /// `Some(ColumnFormat::None)` means the user deliberately chose "raw", overriding
 /// any smart default — distinct from "no rule".
@@ -274,6 +280,31 @@ fn bool_glyph(v: &Value) -> String {
         "false".to_string()
     } else {
         "true".to_string()
+    }
+}
+
+#[cfg(test)]
+mod clear_tests {
+    use super::*;
+
+    fn rule(conn_id: u64, column: &str) -> ColumnFormatRule {
+        ColumnFormatRule {
+            conn_id,
+            database: "shop".into(),
+            table: "orders".into(),
+            column: column.into(),
+            format: ColumnFormat::Bytes,
+        }
+    }
+
+    #[test]
+    fn clear_conn_drops_only_that_connections_rules() {
+        let mut rules = vec![rule(1, "size"), rule(1, "total"), rule(2, "size")];
+        clear_conn(&mut rules, 1);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].conn_id, 2);
+        clear_conn(&mut rules, 99);
+        assert_eq!(rules.len(), 1);
     }
 }
 
