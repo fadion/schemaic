@@ -30,7 +30,11 @@ Zed-inspired, aiming to replace DataGrip.
     `live_validate` setting (off by default), merging dialect-exact errors into the editor squiggles.
   - `edit.rs` — `analyze_edit` → `EditModel` (write-back updatability analysis).
   - `export.rs` — CSV/JSON/SQL/Markdown/HTML export (incl. CSV formula-injection guard;
-    Markdown pipe/backslash escaping; HTML entity escaping).
+    Markdown pipe/backslash escaping; HTML entity escaping). Every renderer has a **streaming**
+    `*_to<W: io::Write>` form (`ExportFormat::render_to`) — what file export uses, so a large
+    result is never rendered into a second full copy in memory — with the `String` versions kept
+    as thin wrappers for the clipboard. A test asserts the two agree byte-for-byte per format;
+    add new formats to both by adding the `*_to` and wrapping it.
   - `diff.rs` — `line_diff`/`build_diff_rows` (Ctrl+K preview).
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
     persisted to `history.json`.

@@ -5,12 +5,32 @@
 //!
 //! [`ExportFormat`] is the single value the grid's two menus dispatch on — Copy
 //! (to the clipboard) and Download (to a file) — so the label, extension,
-//! suggested file name and rendering can't drift between them. The UI keeps only
-//! thin wrappers: unwrap the live result set, then write the returned `String` to
-//! the clipboard or to the path the save dialog returned.
+//! suggested file name and rendering can't drift between them.
+//!
+//! Every renderer comes in two shapes. The `*_to` functions write into any
+//! [`std::io::Write`], which is what the file export uses: a 200k-row result
+//! rendered into a `String` first is a second full copy of the data — hundreds of
+//! megabytes on a wide result — held only to hand it to `fs::write`. Streaming it
+//! into a `BufWriter` keeps that cost to the buffer. The `String`-returning
+//! versions are thin wrappers over them, kept for the clipboard, which has no
+//! streaming API to target. Both share one implementation, so the two paths can't
+//! drift — a test asserts they agree byte-for-byte in every format.
+
+use std::io::{self, Write};
 
 use crate::intel::SqlDialect;
 use crate::model::{ResultSet, Value};
+
+/// Run a `*_to` renderer into a `String`. Writing into a `Vec<u8>` can't fail and
+/// every renderer emits `&str`, so both the io error and the UTF-8 check are
+/// unreachable — `unwrap_or_default` keeps that from becoming a panic path.
+fn to_string(f: impl FnOnce(&mut Vec<u8>) -> io::Result<()>) -> String {
+    let mut buf = Vec::new();
+    match f(&mut buf) {
+        Ok(()) => String::from_utf8(buf).unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
 
 /// The formats the results grid can export a result set to — one value driving
 /// the menu label, the file extension, the suggested file name, and the rendering,
@@ -72,12 +92,30 @@ impl ExportFormat {
         source: Option<(&str, Option<&str>, &str)>,
         dialect: SqlDialect,
     ) -> String {
+        to_string(|w| self.render_to(w, rs, order, source, dialect))
+    }
+
+    /// Stream the same rendering into `w` — the file export's path, so a large
+    /// result never exists twice in memory. Identical output to [`Self::render`].
+    ///
+    /// Errors are the writer's own (a full disk, a revoked permission). They must
+    /// reach the user: unlike the buffered path, which either produced the whole
+    /// text or nothing, a failure here leaves a **truncated file** that looks
+    /// complete.
+    pub fn render_to<W: Write>(
+        self,
+        w: &mut W,
+        rs: &ResultSet,
+        order: &[usize],
+        source: Option<(&str, Option<&str>, &str)>,
+        dialect: SqlDialect,
+    ) -> io::Result<()> {
         match self {
-            ExportFormat::Json => export_json(rs, order),
-            ExportFormat::Csv => export_csv(rs, order),
-            ExportFormat::Sql => export_inserts(rs, order, source, dialect),
-            ExportFormat::Markdown => export_markdown(rs, order),
-            ExportFormat::Html => export_html(rs, order),
+            ExportFormat::Json => export_json_to(w, rs, order),
+            ExportFormat::Csv => export_csv_to(w, rs, order),
+            ExportFormat::Sql => export_inserts_to(w, rs, order, source, dialect),
+            ExportFormat::Markdown => export_markdown_to(w, rs, order),
+            ExportFormat::Html => export_html_to(w, rs, order),
         }
     }
 }
@@ -197,24 +235,59 @@ pub fn ident_sql(name: &str, dialect: SqlDialect) -> String {
 /// Duplicate column names (e.g. `a.id, b.id` from a join) are suffixed `_2`,
 /// `_3`, … so a JSON object doesn't silently drop all but the last (§7.4).
 pub fn export_json(rs: &ResultSet, order: &[usize]) -> String {
+    to_string(|w| export_json_to(w, rs, order))
+}
+
+/// One row as a JSON object, with the keys in **column order**.
+///
+/// Not a `serde_json::Map`: that's a `BTreeMap` (the `preserve_order` feature
+/// isn't on), so building one sorts the keys alphabetically and a `SELECT id,
+/// name` exported as `{"name": …, "id": …}` — the column order the user chose,
+/// silently discarded. Emitting the entries directly keeps it.
+struct RowObject<'a> {
+    rs: &'a ResultSet,
+    keys: &'a [String],
+    di: usize,
+}
+
+impl serde::Serialize for RowObject<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(Some(self.keys.len()))?;
+        for (ci, key) in self.keys.iter().enumerate() {
+            let v = self
+                .rs
+                .cell(self.di, ci)
+                .map(|c| value_to_json(&c.to_value()))
+                .unwrap_or(serde_json::Value::Null);
+            m.serialize_entry(key, &v)?;
+        }
+        m.end()
+    }
+}
+
+/// [`export_json`], streamed.
+///
+/// This is the one format that genuinely had to buffer: it built the entire array
+/// as a `serde_json::Value` before `to_string_pretty` could see it, so a large
+/// export held the rows a third time (result set, `Value` tree, output string).
+/// Serializing the array element-by-element through a `serde_json::Serializer`
+/// emits the same pretty output while only ever holding one row.
+pub fn export_json_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> io::Result<()> {
+    use serde::ser::{SerializeSeq, Serializer as _};
+
     let keys = unique_column_keys(rs);
-    let arr: Vec<serde_json::Value> = order
-        .iter()
-        .filter(|&&di| di < rs.row_count())
-        .map(|&di| {
-            let mut obj = serde_json::Map::new();
-            for (ci, key) in keys.iter().enumerate() {
-                obj.insert(
-                    key.clone(),
-                    rs.cell(di, ci)
-                        .map(|c| value_to_json(&c.to_value()))
-                        .unwrap_or(serde_json::Value::Null),
-                );
-            }
-            serde_json::Value::Object(obj)
+    let mut ser = serde_json::Serializer::pretty(w);
+    let mut seq = ser.serialize_seq(None).map_err(io::Error::other)?;
+    for &di in order.iter().filter(|&&di| di < rs.row_count()) {
+        seq.serialize_element(&RowObject {
+            rs,
+            keys: &keys,
+            di,
         })
-        .collect();
-    serde_json::to_string_pretty(&serde_json::Value::Array(arr)).unwrap_or_default()
+        .map_err(io::Error::other)?;
+    }
+    seq.end().map_err(io::Error::other)
 }
 
 /// Column names made unique for use as JSON object keys: a repeated name gets a
@@ -237,57 +310,84 @@ fn unique_column_keys(rs: &ResultSet) -> Vec<String> {
 
 /// One column's values as a JSON array (for building arrays out of a column).
 pub fn export_column_json(rs: &ResultSet, order: &[usize], ci: usize) -> String {
-    let arr: Vec<serde_json::Value> = order
-        .iter()
-        .map(|&di| {
-            rs.cell(di, ci)
-                .map(|c| value_to_json(&c.to_value()))
-                .unwrap_or(serde_json::Value::Null)
-        })
-        .collect();
-    serde_json::to_string_pretty(&serde_json::Value::Array(arr)).unwrap_or_default()
+    to_string(|w| export_column_json_to(w, rs, order, ci))
+}
+
+/// [`export_column_json`], streamed.
+pub fn export_column_json_to<W: Write>(
+    w: &mut W,
+    rs: &ResultSet,
+    order: &[usize],
+    ci: usize,
+) -> io::Result<()> {
+    use serde::ser::{SerializeSeq, Serializer as _};
+
+    let mut ser = serde_json::Serializer::pretty(w);
+    let mut seq = ser.serialize_seq(None).map_err(io::Error::other)?;
+    for &di in order {
+        let v = rs
+            .cell(di, ci)
+            .map(|c| value_to_json(&c.to_value()))
+            .unwrap_or(serde_json::Value::Null);
+        seq.serialize_element(&v).map_err(io::Error::other)?;
+    }
+    seq.end().map_err(io::Error::other)
 }
 
 /// One column's values as a newline-separated list (a single-column CSV).
 pub fn export_column_csv(rs: &ResultSet, order: &[usize], ci: usize) -> String {
-    let mut out = String::new();
+    to_string(|w| export_column_csv_to(w, rs, order, ci))
+}
+
+/// [`export_column_csv`], streamed.
+pub fn export_column_csv_to<W: Write>(
+    w: &mut W,
+    rs: &ResultSet,
+    order: &[usize],
+    ci: usize,
+) -> io::Result<()> {
     for &di in order {
-        let v = match rs.cell(di, ci) {
-            None => String::new(),
-            Some(c) if c.is_null() => String::new(),
-            Some(c) => csv_field(c.display()),
-        };
-        out.push_str(&v);
-        out.push('\n');
+        match rs.cell(di, ci) {
+            None => {}
+            Some(c) if c.is_null() => {}
+            Some(c) => w.write_all(csv_field(c.display()).as_bytes())?,
+        }
+        w.write_all(b"\n")?;
     }
-    out
+    Ok(())
 }
 
 /// The whole result as CSV (header row + data rows; NULL → empty field).
 pub fn export_csv(rs: &ResultSet, order: &[usize]) -> String {
-    let mut out = rs
-        .columns
-        .iter()
-        .map(|c| csv_field(&c.name))
-        .collect::<Vec<_>>()
-        .join(",");
-    out.push('\n');
+    to_string(|w| export_csv_to(w, rs, order))
+}
+
+/// [`export_csv`], streamed.
+pub fn export_csv_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> io::Result<()> {
+    for (ci, c) in rs.columns.iter().enumerate() {
+        if ci > 0 {
+            w.write_all(b",")?;
+        }
+        w.write_all(csv_field(&c.name).as_bytes())?;
+    }
+    w.write_all(b"\n")?;
     for &di in order {
         if di >= rs.row_count() {
             continue;
         }
-        let line = (0..rs.columns.len())
-            .map(|ci| match rs.cell(di, ci) {
-                None => String::new(),
-                Some(c) if c.is_null() => String::new(),
-                Some(c) => csv_field(c.display()),
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        out.push_str(&line);
-        out.push('\n');
+        for ci in 0..rs.columns.len() {
+            if ci > 0 {
+                w.write_all(b",")?;
+            }
+            match rs.cell(di, ci) {
+                None => {}
+                Some(c) if c.is_null() => {}
+                Some(c) => w.write_all(csv_field(c.display()).as_bytes())?,
+            }
+        }
+        w.write_all(b"\n")?;
     }
-    out
+    Ok(())
 }
 
 /// Escape a Markdown table cell. A `|` starts a new column, so it must be
@@ -314,55 +414,78 @@ pub fn html_escape(s: &str) -> String {
 /// separator + data rows). Cells are escaped via [`md_cell`]; NULL renders as an
 /// empty cell (matching [`export_csv`]).
 pub fn export_markdown(rs: &ResultSet, order: &[usize]) -> String {
+    to_string(|w| export_markdown_to(w, rs, order))
+}
+
+/// [`export_markdown`], streamed.
+pub fn export_markdown_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> io::Result<()> {
     let n = rs.columns.len();
-    let row_line = |cells: Vec<String>| format!("| {} |\n", cells.join(" | "));
-    let mut out = row_line(rs.columns.iter().map(|c| md_cell(&c.name)).collect());
-    out.push_str(&row_line((0..n).map(|_| "---".to_string()).collect()));
+    // One row's cells, already escaped, as `| a | b |`. The separator row is a
+    // fixed `---` per column, so no pass over the data is needed to size them.
+    // Mirrors the old `format!("| {} |\n", cells.join(" | "))` exactly, including
+    // the degenerate zero-column case (`|  |`).
+    let row_line = |w: &mut W, cells: &mut dyn Iterator<Item = String>| -> io::Result<()> {
+        w.write_all(b"| ")?;
+        for (i, cell) in cells.enumerate() {
+            if i > 0 {
+                w.write_all(b" | ")?;
+            }
+            w.write_all(cell.as_bytes())?;
+        }
+        w.write_all(b" |\n")
+    };
+    row_line(w, &mut rs.columns.iter().map(|c| md_cell(&c.name)))?;
+    row_line(w, &mut (0..n).map(|_| "---".to_string()))?;
     for &di in order {
         if di >= rs.row_count() {
             continue;
         }
-        let cells = (0..n)
-            .map(|ci| match rs.cell(di, ci) {
+        row_line(
+            w,
+            &mut (0..n).map(|ci| match rs.cell(di, ci) {
                 None => String::new(),
                 Some(c) if c.is_null() => String::new(),
                 Some(c) => md_cell(c.display()),
-            })
-            .collect();
-        out.push_str(&row_line(cells));
+            }),
+        )?;
     }
-    out
+    Ok(())
 }
 
 /// The whole result as an HTML `<table>` (thead + tbody). Cells/headers are
 /// escaped via [`html_escape`]; NULL renders as an empty `<td>` (matching
 /// [`export_csv`]).
 pub fn export_html(rs: &ResultSet, order: &[usize]) -> String {
-    let mut out = String::from("<table>\n<thead>\n<tr>");
+    to_string(|w| export_html_to(w, rs, order))
+}
+
+/// [`export_html`], streamed. The preamble and closing tags are fixed strings, so
+/// nothing here needs to see the whole result first.
+pub fn export_html_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> io::Result<()> {
+    w.write_all(b"<table>\n<thead>\n<tr>")?;
     for c in &rs.columns {
-        out.push_str("<th>");
-        out.push_str(&html_escape(&c.name));
-        out.push_str("</th>");
+        w.write_all(b"<th>")?;
+        w.write_all(html_escape(&c.name).as_bytes())?;
+        w.write_all(b"</th>")?;
     }
-    out.push_str("</tr>\n</thead>\n<tbody>\n");
+    w.write_all(b"</tr>\n</thead>\n<tbody>\n")?;
     for &di in order {
         if di >= rs.row_count() {
             continue;
         }
-        out.push_str("<tr>");
+        w.write_all(b"<tr>")?;
         for ci in 0..rs.columns.len() {
-            out.push_str("<td>");
+            w.write_all(b"<td>")?;
             match rs.cell(di, ci) {
                 None => {}
                 Some(c) if c.is_null() => {}
-                Some(c) => out.push_str(&html_escape(c.display())),
+                Some(c) => w.write_all(html_escape(c.display()).as_bytes())?,
             }
-            out.push_str("</td>");
+            w.write_all(b"</td>")?;
         }
-        out.push_str("</tr>\n");
+        w.write_all(b"</tr>\n")?;
     }
-    out.push_str("</tbody>\n</table>\n");
-    out
+    w.write_all(b"</tbody>\n</table>\n")
 }
 
 /// The result as `INSERT` statements, in the connection's dialect. `source` is
@@ -383,6 +506,19 @@ pub fn export_inserts(
     source: Option<(&str, Option<&str>, &str)>,
     dialect: SqlDialect,
 ) -> String {
+    to_string(|w| export_inserts_to(w, rs, order, source, dialect))
+}
+
+/// [`export_inserts`], streamed. One statement per row and no batching, so a row
+/// carries no state into the next — the table and column lists are computed once
+/// and repeated verbatim.
+pub fn export_inserts_to<W: Write>(
+    w: &mut W,
+    rs: &ResultSet,
+    order: &[usize],
+    source: Option<(&str, Option<&str>, &str)>,
+    dialect: SqlDialect,
+) -> io::Result<()> {
     let q = |s: &str| ident_sql(s, dialect);
     let table_sql = match source {
         Some((_, Some(ns), table)) => format!("{}.{}", q(ns), q(table)),
@@ -395,24 +531,24 @@ pub fn export_inserts(
         .map(|c| q(&c.name))
         .collect::<Vec<_>>()
         .join(", ");
-    let mut out = String::new();
     for &di in order {
         if di >= rs.row_count() {
             continue;
         }
-        let vals = (0..rs.columns.len())
-            .map(|ci| {
-                rs.cell(di, ci)
-                    .map(|c| sql_literal(&c.to_value(), dialect))
-                    .unwrap_or_else(|| "NULL".to_string())
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        out.push_str(&format!(
-            "INSERT INTO {table_sql} ({cols}) VALUES ({vals});\n"
-        ));
+        write!(w, "INSERT INTO {table_sql} ({cols}) VALUES (")?;
+        for ci in 0..rs.columns.len() {
+            if ci > 0 {
+                w.write_all(b", ")?;
+            }
+            let lit = rs
+                .cell(di, ci)
+                .map(|c| sql_literal(&c.to_value(), dialect))
+                .unwrap_or_else(|| "NULL".to_string());
+            w.write_all(lit.as_bytes())?;
+        }
+        w.write_all(b");\n")?;
     }
-    out
+    Ok(())
 }
 
 #[cfg(test)]
@@ -439,6 +575,128 @@ mod tests {
     }
 
     use crate::intel::SqlDialect::{MySql, Postgres};
+
+    /// A writer that fails after `ok_bytes` bytes — stands in for a full disk or a
+    /// revoked permission part-way through a large export.
+    struct FailingWriter {
+        written: usize,
+        ok_bytes: usize,
+    }
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.written >= self.ok_bytes {
+                return Err(std::io::Error::other("disk full"));
+            }
+            let n = buf.len().min(self.ok_bytes - self.written);
+            self.written += n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The streaming and buffered paths must agree byte-for-byte, in every format.
+    /// This is what lets the file export stream while the clipboard keeps a
+    /// `String` without the two drifting — the same guarantee `ExportFormat`
+    /// itself exists to give the Copy and Download menus.
+    #[test]
+    fn streaming_render_matches_the_string_render_in_every_format() {
+        let rs = rs();
+        let order = [1usize, 0];
+        let source = Some(("db", None, "t"));
+        for f in ExportFormat::ALL {
+            let mut buf: Vec<u8> = Vec::new();
+            f.render_to(&mut buf, &rs, &order, source, MySql).unwrap();
+            assert_eq!(
+                String::from_utf8(buf).unwrap(),
+                f.render(&rs, &order, source, MySql),
+                "{:?} streamed output differs from the buffered one",
+                f
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_column_exports_match_the_string_versions() {
+        let rs = rs();
+        let order = [0usize, 1];
+        for ci in 0..2 {
+            let mut csv: Vec<u8> = Vec::new();
+            export_column_csv_to(&mut csv, &rs, &order, ci).unwrap();
+            assert_eq!(
+                String::from_utf8(csv).unwrap(),
+                export_column_csv(&rs, &order, ci)
+            );
+            let mut json: Vec<u8> = Vec::new();
+            export_column_json_to(&mut json, &rs, &order, ci).unwrap();
+            assert_eq!(
+                String::from_utf8(json).unwrap(),
+                export_column_json(&rs, &order, ci)
+            );
+        }
+    }
+
+    /// The JSON array is emitted incrementally rather than built as one
+    /// `serde_json::Value`, so pin the exact pretty-printed shape — a formatting
+    /// drift here would silently change every exported file.
+    ///
+    /// Keys follow **column order** (`id` before `a\`b`), not alphabetical order —
+    /// see [`RowObject`]. Going through `serde_json::Map` would sort them.
+    #[test]
+    fn streaming_json_keeps_the_pretty_array_layout() {
+        let rs = rs();
+        let mut buf: Vec<u8> = Vec::new();
+        export_json_to(&mut buf, &rs, &[0, 1]).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "[\n  {\n    \"id\": 1,\n    \"a`b\": \"x\"\n  },\n  \
+             {\n    \"id\": null,\n    \"a`b\": \"y\"\n  }\n]"
+        );
+    }
+
+    /// The export must preserve the order the user selected. A `SELECT` names its
+    /// columns for a reason, and an alphabetically-sorted export silently throws
+    /// that away — worst on a wide result, where `id` ends up buried mid-object.
+    #[test]
+    fn json_keys_follow_column_order_not_alphabetical() {
+        let rs = ResultSet::from_rows(
+            vec![col("zebra"), col("apple"), col("middle")],
+            vec![vec![Value::Int(1), Value::Int(2), Value::Int(3)]],
+        );
+        let out = export_json(&rs, &[0]);
+        let z = out.find("zebra").unwrap();
+        let a = out.find("apple").unwrap();
+        let m = out.find("middle").unwrap();
+        assert!(z < a && a < m, "keys were reordered:\n{out}");
+    }
+
+    #[test]
+    fn streaming_json_of_no_rows_is_an_empty_array() {
+        let rs = rs();
+        let mut buf: Vec<u8> = Vec::new();
+        export_json_to(&mut buf, &rs, &[]).unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), "[]");
+        assert_eq!(export_json(&rs, &[]), "[]");
+    }
+
+    /// A write failure must surface. Buffering into a `String` first made the
+    /// whole export either succeed or never start; streaming can fail half-way
+    /// through, and a caller that ignored that would leave a truncated file
+    /// looking like a complete one.
+    #[test]
+    fn a_failing_writer_reports_the_error_in_every_format() {
+        let rs = rs();
+        for f in ExportFormat::ALL {
+            let mut w = FailingWriter {
+                written: 0,
+                ok_bytes: 4,
+            };
+            let err = f.render_to(&mut w, &rs, &[0, 1], None, MySql).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::Other, "{:?}", f);
+        }
+    }
 
     #[test]
     fn ident_quotes_per_dialect() {

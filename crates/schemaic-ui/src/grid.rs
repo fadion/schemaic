@@ -318,6 +318,8 @@ struct GridState {
     summarize: RwSignal<Option<SummarizeFn>>,
     dismiss: RwSignal<Option<Rc<dyn Fn()>>>,
     commit: RwSignal<Option<crate::CommitFn>>,
+    /// Writes an export to disk on a worker thread (see [`crate::ExportFn`]).
+    export_file: RwSignal<Option<crate::ExportFn>>,
     /// Update the tab's *canonical* result set after a splice, so a later grid
     /// rebuild (tab switch away/back) reflects the committed values. `None` for the
     /// multi-result path, which stays on the full-re-run commit flow. Present ⇒ the
@@ -451,6 +453,7 @@ impl GridState {
             summarize: RwSignal::new(Some(gctx.summarize.clone())),
             dismiss: RwSignal::new(Some(gctx.dismiss.clone())),
             commit: RwSignal::new(Some(gctx.commit.clone())),
+            export_file: RwSignal::new(Some(gctx.export_file.clone())),
             sync_canonical: RwSignal::new(gctx.sync_canonical.clone()),
             formats: RwSignal::new(formats),
             conn_id: gctx.conn_id,
@@ -1265,9 +1268,17 @@ fn export_column_csv(gs: GridState, ci: usize) -> String {
 }
 
 /// Save the whole result to a file the user picks. Opens the system save dialog
-/// (pre-filled with the source table's name + the format's extension), then writes
-/// the rendered text; a cancelled dialog does nothing. A write failure surfaces in
-/// the grid's error bar — the same place a failed commit reports.
+/// (pre-filled with the source table's name + the format's extension), then
+/// streams the rendering straight into the file; a cancelled dialog does nothing.
+/// A write failure surfaces in the grid's error bar — the same place a failed
+/// commit reports.
+///
+/// The rows are **snapshotted** before the dialog opens, not rendered: the dialog
+/// is modal and slow, and the grid's result could be re-run or the tab switched
+/// while it's up, so the export has to be of what the user was looking at when
+/// they asked. `ResultSet` and the display order are behind `Arc`s, so holding
+/// that snapshot costs a refcount rather than a copy — and a cancelled dialog now
+/// costs nothing at all, where it used to pay a full render first.
 fn save_export(gs: GridState, format: ExportFormat) {
     let default_name = suggested_filename(
         gs.source
@@ -1284,21 +1295,37 @@ fn save_export(gs: GridState, format: ExportFormat) {
             name: format.label(),
             extensions: format.extensions(),
         }]);
-    // Rendered *before* the dialog opens: the dialog is modal and slow, and the
-    // grid's result could be re-run or the tab switched while it's up — the export
-    // should be of what the user was looking at when they asked.
-    let body = render_export(gs, format);
+    let rs = gs.rs.get_untracked();
+    let order = gs.order.get_untracked();
+    let source = gs.source.get_untracked();
+    let dialect = gs.dialect;
+    let Some(export) = gs.export_file.get_untracked() else {
+        return;
+    };
     save_as(opts, move |file| {
         let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
             return; // cancelled
         };
-        if let Err(e) = std::fs::write(&path, &body) {
+        // `save_as` takes an `Fn`, so the snapshot is cloned rather than moved —
+        // two `Arc` bumps and a small `Option<TableSource>`, not the rows.
+        (export)(
+            crate::ExportRequest {
+                path,
+                format,
+                rs: rs.clone(),
+                order: order.clone(),
+                source: source.clone(),
+                dialect,
+            },
             // `try_update`: the result-set scope may have been disposed while the
-            // (modal, off-thread) dialog was open — a plain `set` would panic on
-            // the freed signal.
-            gs.commit_err
-                .try_update(|v| *v = Some(format!("Export failed: {e}")));
-        }
+            // dialog was open or the write ran — a plain `set` would panic on the
+            // freed signal.
+            Rc::new(move |res| {
+                if let Err(e) = res {
+                    gs.commit_err.try_update(|v| *v = Some(e));
+                }
+            }),
+        );
     });
 }
 
@@ -1591,6 +1618,8 @@ pub(crate) struct GridCtx {
     /// (present ⇒ splice the edited rows instead of full-re-running); arg 3 is the
     /// completion callback, invoked on the UI thread with the [`CommitDone`].
     pub(crate) commit: crate::CommitFn,
+    /// Write an export to disk off the UI thread (see [`crate::ExportFn`]).
+    pub(crate) export_file: crate::ExportFn,
     /// Splice sink: replace the tab's canonical result set (so a later rebuild is
     /// fresh). `None` on the multi-result path (no splice — full re-run instead).
     pub(crate) sync_canonical: Option<SyncCanonicalFn>,

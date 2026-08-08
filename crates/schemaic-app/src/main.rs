@@ -1411,6 +1411,43 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // rows and hand them back so the grid splices them in place — no re-run,
     // scroll/selection preserved. Otherwise (inserts, or not spliceable) we re-run
     // the whole query. On failure the message goes back and the grid keeps its edits.
+    // Render + write an export on a worker thread. The grid owns the save dialog
+    // and snapshots the rows (cheap `Arc` clones) before it opens; this does the
+    // part that scales with the result — a 200k-row export took long enough to
+    // freeze the window when it ran inline on the UI thread.
+    //
+    // `spawn_blocking`, not `spawn`: this is synchronous file IO, and running it
+    // on a runtime worker would stall every other task sharing that thread.
+    let export_file: schemaic_ui::ExportFn = {
+        let handle = handle.clone();
+        Rc::new(
+            move |req: schemaic_ui::ExportRequest, done: schemaic_ui::ExportDoneFn| {
+                let report = create_ext_action(cx, move |res: Result<(), String>| (done)(res));
+                handle.spawn_blocking(move || {
+                    let write = || -> std::io::Result<()> {
+                        use std::io::Write as _;
+                        let file = std::fs::File::create(&req.path)?;
+                        let mut w = std::io::BufWriter::new(file);
+                        req.format.render_to(
+                            &mut w,
+                            req.rs.as_ref(),
+                            req.order.as_slice(),
+                            req.source.as_ref().map(|s| {
+                                (s.database.as_str(), s.schema.as_deref(), s.table.as_str())
+                            }),
+                            req.dialect,
+                        )?;
+                        // Explicit: `BufWriter` swallows a flush failure on drop,
+                        // which is exactly the case where the last block never
+                        // reached the disk — silently truncating the file.
+                        w.flush()
+                    };
+                    report(write().map_err(|e| format!("Export failed: {e}")));
+                });
+            },
+        )
+    };
+
     let commit_edits: schemaic_ui::CommitFn = {
         let handle = handle.clone();
         let run = run.clone();
@@ -4054,6 +4091,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     f(w, r, done);
                 })
             },
+            // Deliberately un-gated: an export writes rows that are already
+            // fetched and sitting in memory, so it works fine on a connection
+            // that has since gone away.
+            export_file,
             set_tx_mode,
             commit_tx,
             rollback_tx,
