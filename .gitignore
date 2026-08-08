@@ -6,10 +6,11 @@
 /THIRD-PARTY-LICENSES.html
 
 # Claude Code: ignore everything under .claude/ (per-machine permissions in
-# settings.local.json, etc.) EXCEPT the shared subagent definitions, which are
-# checked in so the whole team gets them.
+# settings.local.json, etc.) EXCEPT the shared subagent and skill definitions,
+# which are checked in so the whole team gets them.
 .claude/*
 !.claude/agents/
+!.claude/skills/
 
 # Private working notes — kept local, never published.
 TODO.md
