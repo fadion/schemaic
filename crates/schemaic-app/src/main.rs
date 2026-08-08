@@ -246,6 +246,23 @@ fn mysql_shell_config(
 /// success, the fence-stripped SQL (or "No SQL returned" if blank); on failure,
 /// the first stderr line. Pure so the parsing of untrusted subprocess output is
 /// unit-tested (the closure keeps only the spawn + the spawn-error arm).
+/// Settle the in-flight assistant bubble after the user stops a turn.
+///
+/// Keeps whatever partial answer had streamed in and adds a `(stopped)` marker.
+/// The CLI reports an interrupted turn as an error `result`, so this also undoes
+/// the error styling that would otherwise make a deliberate stop look like a
+/// failure. Usage stats are left alone — the tokens were really spent.
+fn mark_stopped(messages: RwSignal<Vec<ChatMessage>>) {
+    messages.update(|v| {
+        if let Some(last) = v.last_mut() {
+            last.pending = false;
+            last.role = Role::Assistant;
+            last.segs
+                .push(schemaic_core::transcript::Seg::Text("(stopped)".into()));
+        }
+    });
+}
+
 fn inline_outcome(success: bool, stdout: &[u8], stderr: &[u8]) -> InlineAiState {
     if success {
         let sql = extract_sql(&String::from_utf8_lossy(stdout));
@@ -760,6 +777,9 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let ai_input = RwSignal::new(String::new());
     let ai_busy = RwSignal::new(false);
     let ai_session: Rc<RefCell<Option<AiSession>>> = Rc::new(RefCell::new(None));
+    // True between pressing Stop and the interrupted turn's `result` landing.
+    // The CLI reports that result as an error; this says it was us.
+    let ai_stopping = RwSignal::new(false);
     // Saved conversations (`chats.json`), keyed by connection like the panel
     // itself. Seeded into `ai_messages` for the active connection below, once
     // the restored connection id is known.
@@ -2549,6 +2569,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             schemaic_ui::mark_messages_seen(restored.len());
             ai_messages.set(restored);
             ai_busy.set(false);
+            // Any in-flight Stop belonged to the conversation just replaced.
+            ai_stopping.set(false);
             if let Some(conn) =
                 connections.with_untracked(|cs| cs.iter().find(|c| c.id == id).cloned())
             {
@@ -2710,6 +2732,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     };
 
     // ── AI panel (Claude Code) ──────────────────────────────────────────────
+    // (see `mark_stopped` below for how a stopped turn is settled)
     // Apply streamed transcript snapshots to the pending assistant bubble.
     {
         let ai_session = ai_session.clone();
@@ -2727,6 +2750,13 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     }
                 });
                 if msg.done {
+                    // A turn we stopped ends as an error by the CLI's reckoning;
+                    // present it as a stop instead, keeping whatever partial
+                    // answer had streamed in.
+                    if ai_stopping.get_untracked() {
+                        ai_stopping.set(false);
+                        mark_stopped(ai_messages);
+                    }
                     ai_busy.set(false);
                     // Save under the *session's* connection, not the active one:
                     // a switch mid-turn drops the session and clears the panel,
@@ -2864,16 +2894,38 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             if !ai_busy.get_untracked() {
                 return;
             }
-            ai_session.borrow_mut().take();
-            ai_messages.update(|v| {
-                if let Some(last) = v.last_mut() {
-                    last.pending = false;
-                    if last.segs.is_empty() {
-                        last.segs = vec![schemaic_core::transcript::Seg::Text("(stopped)".into())];
+            // Ask the CLI to end the *turn*. It answers with a `control_response`
+            // and a `result`, then stays available for the next message — so
+            // stopping one runaway answer no longer costs a process respawn.
+            // `ai_stopping` tells the stream effect that the `result` about to
+            // arrive (flagged `is_error`) is this stop, not a failure.
+            let sent = ai_session
+                .borrow()
+                .as_ref()
+                .map(|s| s.stdin_tx.send(schemaic_ai::interrupt_line("stop")).is_ok())
+                .unwrap_or(false);
+            if !sent {
+                // No live session (or its channel is gone) — fall back to the
+                // old behaviour so Stop always stops.
+                ai_session.borrow_mut().take();
+                mark_stopped(ai_messages);
+                ai_busy.set(false);
+                return;
+            }
+            ai_stopping.set(true);
+            // Safety net: if the interrupt is ignored, don't leave the panel
+            // spinning — drop the session (killing the child) and settle the UI.
+            floem::action::exec_after(std::time::Duration::from_secs(5), {
+                let ai_session = ai_session.clone();
+                move |_| {
+                    if ai_stopping.try_get_untracked() == Some(true) {
+                        ai_session.borrow_mut().take();
+                        mark_stopped(ai_messages);
+                        ai_stopping.set(false);
+                        ai_busy.set(false);
                     }
                 }
             });
-            ai_busy.set(false);
         })
     };
 
@@ -2887,6 +2939,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             ai_session.borrow_mut().take();
             ai_messages.set(Vec::new());
             ai_busy.set(false);
+            ai_stopping.set(false);
             (persist_chat)(active_conn.get_untracked());
         })
     };
