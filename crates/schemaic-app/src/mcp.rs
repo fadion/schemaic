@@ -127,8 +127,8 @@ fn tools_list() -> Value {
                 "properties": {
                     "table": {
                         "type": "string",
-                        "description": "Table name; use `schema.table` for a PostgreSQL table \
-                                        outside `public`."
+                        "description": "Table name, exactly as list_schema printed it — including \
+                                        the `schema.` prefix when it showed one."
                     },
                     "database": {
                         "type": "string",
@@ -284,12 +284,13 @@ fn format_database_list(dbs: &[(String, Result<DbSchema, String>)]) -> String {
             Ok(s) => {
                 let n = s.tables.len();
                 let plural = if n == 1 { "table" } else { "tables" };
+                let qualify = needs_qualifier(s);
                 out.push_str(&format!("## {name} ({n} {plural})\n"));
                 for t in &s.tables {
                     let view = if t.is_view { " (view)" } else { "" };
-                    // Namespace-qualified outside PostgreSQL's `public`, so the
-                    // assistant writes a name that actually resolves.
-                    out.push_str(&format!("- {}{view}\n", table_label(t)));
+                    // Namespace-qualified so the assistant writes a name that
+                    // actually resolves.
+                    out.push_str(&format!("- {}{view}\n", table_label(t, qualify)));
                 }
             }
             Err(e) => out.push_str(&format!("## {name} (error: {e})\n")),
@@ -311,16 +312,17 @@ fn format_database_schema(database: &str, schema: &DbSchema) -> String {
         out.push_str("(no tables)\n");
         return out;
     }
+    let qualify = needs_qualifier(schema);
     for t in &schema.tables {
         let view = if t.is_view { " (view)" } else { "" };
-        out.push_str(&format!("### {}{view}\n", table_label(t)));
+        out.push_str(&format!("### {}{view}\n", table_label(t, qualify)));
         for c in &t.columns {
             let pk = if c.primary_key { " PK" } else { "" };
             // Nullable is the default; only the constraint is worth the tokens.
             let not_null = if c.nullable { "" } else { " NOT NULL" };
             out.push_str(&format!("  {} {}{pk}{not_null}\n", c.name, c.type_name));
         }
-        for line in fk_lines(t) {
+        for line in fk_lines(t, qualify) {
             out.push_str(&format!("  {line}\n"));
         }
     }
@@ -331,9 +333,13 @@ fn format_database_schema(database: &str, schema: &DbSchema) -> String {
 /// foreign-key section — `create_ddl` documents that it emits no FK references,
 /// so they'd otherwise be missing entirely. Sample rows are appended by the
 /// caller, which needs the DB. Pure.
-fn format_table_detail(t: &TableInfo, dialect: schemaic_core::intel::SqlDialect) -> String {
+fn format_table_detail(
+    t: &TableInfo,
+    dialect: schemaic_core::intel::SqlDialect,
+    qualify: bool,
+) -> String {
     let mut out = format!("{}\n", t.create_ddl(dialect));
-    let fks = fk_lines(t);
+    let fks = fk_lines(t, qualify);
     if !fks.is_empty() {
         out.push_str("\nForeign keys:\n");
         for line in fks {
@@ -343,15 +349,36 @@ fn format_table_detail(t: &TableInfo, dialect: schemaic_core::intel::SqlDialect)
     out
 }
 
+/// The heading above a table's detail: a name the connection's dialect can
+/// actually resolve.
+///
+/// On MySQL the database *is* the namespace, so `database.table` is valid SQL.
+/// On PostgreSQL it isn't — `warehouse.sales.orders` names nothing — so the
+/// heading carries the schema-qualified name and the database goes on its own
+/// line. (An earlier `{database}.{table}` heading is exactly what led a model to
+/// write `warehouse.orders` for a `public` table.)
+fn format_table_heading(
+    database: &str,
+    t: &TableInfo,
+    dialect: schemaic_core::intel::SqlDialect,
+    qualify: bool,
+) -> String {
+    match dialect {
+        schemaic_core::intel::SqlDialect::MySql => {
+            format!("### {database}.{}\n", t.name)
+        }
+        _ => format!("### {}\nDatabase: {database}\n", table_label(t, qualify)),
+    }
+}
+
 /// A table's FK edges as `FK: col -> other.col` (or, for a composite key,
 /// `FK: (a, b) -> other(x, y)`). ASCII arrows — the result is read by a model,
 /// not rendered in the UI.
-fn fk_lines(t: &TableInfo) -> Vec<String> {
+fn fk_lines(t: &TableInfo, qualify: bool) -> Vec<String> {
     t.foreign_keys
         .iter()
         .map(|fk| {
-            let target =
-                schemaic_core::schema::display_name(fk.ref_schema.as_deref(), &fk.ref_table);
+            let target = namespaced(fk.ref_schema.as_deref(), &fk.ref_table, qualify);
             if fk.columns.len() == 1 && fk.ref_columns.len() == 1 {
                 format!("FK: {} -> {target}.{}", fk.columns[0], fk.ref_columns[0])
             } else {
@@ -365,10 +392,42 @@ fn fk_lines(t: &TableInfo) -> Vec<String> {
         .collect()
 }
 
-/// A table's name as the assistant should write it — namespace-qualified outside
-/// PostgreSQL's `public`.
-fn table_label(t: &TableInfo) -> String {
-    schemaic_core::schema::display_name(t.schema.as_deref(), &t.name)
+/// Resolve the name `describe_table` was given against the database's tables.
+///
+/// Every form the listings can print has to round-trip: `display_name`'s output
+/// (`sales.orders`, or a bare name in `public`/MySQL), and — since a
+/// multi-schema listing spells out `public.` — an explicitly qualified name that
+/// `display_name` would never produce.
+fn find_described<'a>(schema: &'a DbSchema, table: &str) -> Option<&'a TableInfo> {
+    schema
+        .find_by_display(table)
+        .or_else(|| {
+            let (ns, name) = table.split_once('.')?;
+            schema.find_table(Some(ns), name)
+        })
+        .or_else(|| schema.find_table(None, table))
+}
+
+/// Does this database need its namespaces spelled out? True once more than one
+/// is present — the same rule the schema tree uses to grow a namespace level.
+/// `schemas()` is empty on MySQL, so those always render bare.
+fn needs_qualifier(schema: &DbSchema) -> bool {
+    schema.schemas().len() > 1
+}
+
+/// A table's name as the assistant should write it.
+fn table_label(t: &TableInfo, qualify: bool) -> String {
+    namespaced(t.schema.as_deref(), &t.name, qualify)
+}
+
+/// `schema.table` when the database has several namespaces, else
+/// [`display_name`]'s rule (bare in `public`, qualified elsewhere). Spelling out
+/// `public.` matters only when something else could be meant.
+fn namespaced(schema: Option<&str>, table: &str, qualify: bool) -> String {
+    match schema {
+        Some(s) if qualify => format!("{s}.{table}"),
+        _ => schemaic_core::schema::display_name(schema, table),
+    }
 }
 
 /// Number of sample rows `describe_table` returns — enough to show the shape of
@@ -394,12 +453,7 @@ async fn describe_table(
         Ok(s) => s,
         Err(e) => return (format!("Error reading schema for {database}: {e}"), true),
     };
-    // `find_by_display` matches both `schema.table` and a bare name; fall back to
-    // a bare lookup so a MySQL table named with a dot-free alias still resolves.
-    let Some(info) = schema
-        .find_by_display(table)
-        .or_else(|| schema.find_table(None, table))
-    else {
+    let Some(info) = find_described(&schema, table) else {
         return (
             format!("Table {table} not found in {database}. Call list_schema to see what exists."),
             true,
@@ -407,8 +461,9 @@ async fn describe_table(
     };
 
     let dialect = dialect_of(db);
-    let mut out = format!("### {database}.{}\n", table_label(info));
-    out.push_str(&format_table_detail(info, dialect));
+    let qualify = needs_qualifier(&schema);
+    let mut out = format_table_heading(database, info, dialect, qualify);
+    out.push_str(&format_table_detail(info, dialect, qualify));
 
     // Sample rows read real data, so they follow the panel's "run queries"
     // setting — with it off the assistant still gets the DDL and the keys.
@@ -443,8 +498,8 @@ async fn describe_table(
 #[cfg(test)]
 mod tests {
     use super::{
-        format_database_list, format_database_schema, format_table, format_table_detail,
-        normalize_stmt,
+        find_described, format_database_list, format_database_schema, format_table,
+        format_table_detail, format_table_heading, normalize_stmt,
     };
     use schemaic_core::intel::SqlDialect;
     use schemaic_core::model::{Column, ResultSet, Value};
@@ -574,7 +629,7 @@ mod tests {
             foreign: true,
         }];
         orders.foreign_keys = vec![fk(&["customer_id"], "customers", &["id"])];
-        let out = format_table_detail(&orders, SqlDialect::MySql);
+        let out = format_table_detail(&orders, SqlDialect::MySql, false);
         // The DDL skeleton carries columns + PK + indexes…
         assert!(out.contains("CREATE TABLE `orders`"));
         assert!(out.contains("PRIMARY KEY (`id`)"));
@@ -583,10 +638,117 @@ mod tests {
         assert!(out.contains("Foreign keys:\n- customer_id -> customers.id"));
     }
 
+    fn in_schema(mut t: TableInfo, schema: &str) -> TableInfo {
+        t.schema = Some(schema.to_string());
+        t
+    }
+
+    #[test]
+    fn multi_schema_database_qualifies_every_table_including_public() {
+        // `display_name` leaves a `public` table bare, which is unambiguous on
+        // its own but not beside `sales.orders` — a model reading the bare name
+        // invented `warehouse.orders` (database.table, invalid in PostgreSQL).
+        let schema = DbSchema {
+            tables: vec![
+                in_schema(tbl("orders", vec![c("id", "int", false, true)]), "public"),
+                in_schema(tbl("orders", vec![c("id", "int", false, true)]), "sales"),
+            ],
+        };
+        let out = format_database_schema("warehouse", &schema);
+        assert!(out.contains("### public.orders"));
+        assert!(out.contains("### sales.orders"));
+        // The overview qualifies the same way.
+        let list = format_database_list(&[("warehouse".to_string(), Ok(schema))]);
+        assert!(list.contains("- public.orders"));
+        assert!(list.contains("- sales.orders"));
+    }
+
+    #[test]
+    fn single_schema_database_leaves_public_tables_bare() {
+        // One namespace → no ambiguity to resolve, and `public.` prefixes would
+        // just be noise. MySQL tables (no namespace at all) take this path too.
+        let pg = DbSchema {
+            tables: vec![in_schema(
+                tbl("orders", vec![c("id", "int", false, true)]),
+                "public",
+            )],
+        };
+        let out = format_database_schema("shop", &pg);
+        assert!(out.contains("### orders"));
+        assert!(!out.contains("public."));
+
+        let mysql = DbSchema {
+            tables: vec![tbl("orders", vec![c("id", "int", false, true)])],
+        };
+        assert!(format_database_schema("shop", &mysql).contains("### orders"));
+    }
+
+    #[test]
+    fn multi_schema_database_qualifies_foreign_key_targets() {
+        let mut child = in_schema(
+            tbl("daily_revenue", vec![c("order_id", "int", false, false)]),
+            "analytics",
+        );
+        child.foreign_keys = vec![ForeignKeyInfo {
+            columns: vec!["order_id".to_string()],
+            ref_schema: Some("public".to_string()),
+            ref_table: "orders".to_string(),
+            ref_columns: vec!["id".to_string()],
+        }];
+        let schema = DbSchema {
+            tables: vec![
+                child,
+                in_schema(tbl("orders", vec![c("id", "int", false, true)]), "public"),
+            ],
+        };
+        let out = format_database_schema("warehouse", &schema);
+        // A `public` FK target is spelled out too, or the edge reads as though it
+        // pointed at whatever `orders` means here.
+        assert!(out.contains("FK: order_id -> public.orders.id"));
+    }
+
+    #[test]
+    fn table_detail_heading_is_a_name_the_dialect_can_actually_resolve() {
+        // MySQL: the database *is* the namespace, so `db.table` is valid SQL.
+        let t = tbl("payments", vec![c("id", "int", false, true)]);
+        let out = format_table_heading("classicmodels", &t, SqlDialect::MySql, false);
+        assert_eq!(out, "### classicmodels.payments\n");
+
+        // PostgreSQL: `warehouse.sales.orders` is not a thing, so the heading
+        // carries the schema-qualified name and states the database separately.
+        let t = in_schema(tbl("orders", vec![c("id", "int", false, true)]), "sales");
+        let out = format_table_heading("warehouse", &t, SqlDialect::Postgres, true);
+        assert!(out.starts_with("### sales.orders\n"));
+        assert!(out.contains("Database: warehouse"));
+        assert!(!out.contains("warehouse.sales"));
+    }
+
+    #[test]
+    fn lookup_resolves_every_name_the_listing_advertises() {
+        let schema = DbSchema {
+            tables: vec![
+                in_schema(tbl("orders", vec![c("id", "int", false, true)]), "public"),
+                in_schema(tbl("orders", vec![c("id", "int", false, true)]), "sales"),
+                tbl("payments", vec![c("id", "int", false, true)]),
+            ],
+        };
+        let found = |n: &str| find_described(&schema, n).map(|t| t.schema.clone());
+        // A multi-schema listing prints `public.orders`, so that name has to
+        // resolve — `display_name` renders a `public` table bare, so the plain
+        // display lookup never matches it.
+        assert_eq!(found("public.orders"), Some(Some("public".to_string())));
+        assert_eq!(found("sales.orders"), Some(Some("sales".to_string())));
+        // A bare name still lands on `public` (the display-name rule).
+        assert_eq!(found("orders"), Some(Some("public".to_string())));
+        // MySQL tables carry no namespace.
+        assert_eq!(found("payments"), Some(None));
+        assert!(find_described(&schema, "nope").is_none());
+    }
+
     #[test]
     fn table_detail_omits_the_fk_section_when_there_are_none() {
         let t = tbl("logs", vec![c("id", "int", false, true)]);
-        let out = format_table_detail(&t, SqlDialect::MySql);
+        let out = format_table_detail(&t, SqlDialect::MySql, false);
         assert!(!out.contains("Foreign keys:"));
     }
 
