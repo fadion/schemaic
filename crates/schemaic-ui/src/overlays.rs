@@ -1074,13 +1074,19 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             name: "next tab",
             label: "Next Tab",
             hint: "",
-            arg: instant(Rc::new(move || cycle_tab(tabs, active, 1)), &close),
+            arg: instant(
+                Rc::new(move || cycle_tab(tabs, active, active_conn, 1)),
+                &close,
+            ),
         },
         Command {
             name: "previous tab",
             label: "Previous Tab",
             hint: "",
-            arg: instant(Rc::new(move || cycle_tab(tabs, active, -1)), &close),
+            arg: instant(
+                Rc::new(move || cycle_tab(tabs, active, active_conn, -1)),
+                &close,
+            ),
         },
         Command {
             name: "format code",
@@ -1428,16 +1434,27 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
 }
 
 /// Move the active tab by `step` (±1), wrapping around the strip order.
-fn cycle_tab(tabs: RwSignal<Vec<crate::Tab>>, active: RwSignal<usize>, step: isize) {
-    let ids: Vec<usize> = tabs.with_untracked(|v| v.iter().map(|t| t.id).collect());
-    if ids.is_empty() {
-        return;
+/// Next/Previous Tab, wrapping within the *active connection's* tabs — the only
+/// ones the strip is showing, so cycling can't land on an invisible tab.
+fn cycle_tab(
+    tabs: RwSignal<Vec<crate::Tab>>,
+    active: RwSignal<usize>,
+    active_conn: RwSignal<u64>,
+    step: isize,
+) {
+    let refs: Vec<(usize, u64)> = tabs.with_untracked(|v| {
+        v.iter()
+            .map(|t| (t.id, t.conn_id.get_untracked()))
+            .collect()
+    });
+    if let Some(next) = schemaic_core::tabsel::cycle(
+        &refs,
+        active_conn.get_untracked(),
+        Some(active.get_untracked()),
+        step,
+    ) {
+        active.set(next);
     }
-    let cur = active.get_untracked();
-    let idx = ids.iter().position(|&x| x == cur).unwrap_or(0) as isize;
-    let n = ids.len() as isize;
-    let next = ((idx + step) % n + n) % n;
-    active.set(ids[next as usize]);
 }
 
 /// A non-actionable informational row (Enter does nothing, palette stays open).

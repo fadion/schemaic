@@ -1,0 +1,187 @@
+//! Which query tab is active, given that tabs belong to connections.
+//!
+//! A tab carries its own connection, and the tab strip shows only the active
+//! connection's tabs — so every "which tab now?" question (switching
+//! connections, closing a tab, cycling with Next/Previous) has to be answered
+//! within one connection rather than across the whole list. These are those
+//! rules, pure and tested; the UI passes `(tab id, connection id)` pairs in
+//! display order and applies the answer.
+
+/// One tab, reduced to what selection cares about.
+pub type TabRef = (usize, u64);
+
+/// The ids on `conn`, in display order — what the strip renders.
+pub fn visible(tabs: &[TabRef], conn: u64) -> Vec<usize> {
+    tabs.iter()
+        .filter(|(_, c)| *c == conn)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// The tab to activate when `conn` becomes the active connection.
+///
+/// Prefers `remembered` — where the user last was on this connection — so
+/// switching away and back doesn't dump them on tab 1. Falls back to the first
+/// tab, and `None` when the connection has none at all (the caller then opens a
+/// fresh one; there is no empty-editor state).
+pub fn pick_active(tabs: &[TabRef], conn: u64, remembered: Option<usize>) -> Option<usize> {
+    let ids = visible(tabs, conn);
+    match remembered {
+        Some(id) if ids.contains(&id) => Some(id),
+        _ => ids.first().copied(),
+    }
+}
+
+/// The tab to activate after closing `closing`: the one after it on the same
+/// connection, else the one before. `None` when it was that connection's last
+/// tab.
+///
+/// Scoped deliberately — the neighbour in the *full* list can belong to another
+/// connection, which would silently switch what the user is looking at.
+pub fn neighbor(tabs: &[TabRef], closing: usize) -> Option<usize> {
+    let conn = tabs
+        .iter()
+        .find(|(id, _)| *id == closing)
+        .map(|(_, c)| *c)?;
+    let ids = visible(tabs, conn);
+    let at = ids.iter().position(|id| *id == closing)?;
+    ids.get(at + 1)
+        .or_else(|| at.checked_sub(1).and_then(|p| ids.get(p)))
+        .copied()
+}
+
+/// Would closing `id` leave its connection with no tabs?
+///
+/// This is the "keep at least one tab" test, and it is deliberately **per
+/// connection**: the strip shows one connection at a time, so emptying that
+/// connection leaves the user staring at nothing however many tabs other
+/// connections hold. An unknown `id` answers `true` — there's nothing to close,
+/// and the caller's keep-one path bails harmlessly.
+pub fn closing_would_empty(tabs: &[TabRef], id: usize) -> bool {
+    match tabs.iter().find(|(t, _)| *t == id).map(|(_, c)| *c) {
+        Some(conn) => visible(tabs, conn).len() <= 1,
+        None => true,
+    }
+}
+
+/// Step `step` tabs from `current` within `conn`, wrapping at both ends.
+///
+/// A `current` that isn't on this connection (or no current at all) starts from
+/// the first tab, so cycling can't land on something the strip isn't showing.
+pub fn cycle(tabs: &[TabRef], conn: u64, current: Option<usize>, step: isize) -> Option<usize> {
+    let ids = visible(tabs, conn);
+    if ids.is_empty() {
+        return None;
+    }
+    let at = current
+        .and_then(|c| ids.iter().position(|id| *id == c))
+        .unwrap_or(0) as isize;
+    let n = ids.len() as isize;
+    let next = ((at + step) % n + n) % n;
+    ids.get(next as usize).copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tabs interleaved across two connections, as the flat list really is.
+    fn mixed() -> Vec<TabRef> {
+        vec![(1, 10), (2, 20), (3, 10), (4, 20), (5, 10)]
+    }
+
+    #[test]
+    fn visible_keeps_one_connections_tabs_in_order() {
+        assert_eq!(visible(&mixed(), 10), [1, 3, 5]);
+        assert_eq!(visible(&mixed(), 20), [2, 4]);
+        assert!(visible(&mixed(), 99).is_empty());
+    }
+
+    #[test]
+    fn pick_active_prefers_where_the_user_left_off() {
+        assert_eq!(pick_active(&mixed(), 10, Some(3)), Some(3));
+    }
+
+    #[test]
+    fn pick_active_falls_back_when_the_remembered_tab_is_gone_or_foreign() {
+        // Closed since.
+        assert_eq!(pick_active(&mixed(), 10, Some(99)), Some(1));
+        // Remembered against a different connection — must not leak across.
+        assert_eq!(pick_active(&mixed(), 10, Some(2)), Some(1));
+        // Nothing remembered.
+        assert_eq!(pick_active(&mixed(), 20, None), Some(2));
+    }
+
+    #[test]
+    fn pick_active_is_none_for_a_connection_with_no_tabs() {
+        assert_eq!(pick_active(&mixed(), 99, None), None);
+        assert_eq!(pick_active(&[], 10, Some(1)), None);
+    }
+
+    #[test]
+    fn neighbor_takes_the_next_tab_on_the_same_connection() {
+        // 1 → 3, skipping tab 2, which belongs to connection 20.
+        assert_eq!(neighbor(&mixed(), 1), Some(3));
+        assert_eq!(neighbor(&mixed(), 3), Some(5));
+    }
+
+    #[test]
+    fn neighbor_falls_back_to_the_previous_tab_at_the_end() {
+        assert_eq!(neighbor(&mixed(), 5), Some(3));
+        assert_eq!(neighbor(&mixed(), 4), Some(2));
+    }
+
+    #[test]
+    fn neighbor_is_none_for_a_connections_last_tab_or_an_unknown_id() {
+        assert_eq!(neighbor(&[(1, 10), (2, 20)], 1), None);
+        assert_eq!(neighbor(&mixed(), 99), None);
+    }
+
+    #[test]
+    fn closing_would_empty_is_per_connection_not_global() {
+        // Tab 2 is connection 20's… one of two, so closing it leaves tab 4.
+        assert!(!closing_would_empty(&mixed(), 2));
+        // Strip connection 20 down to a single tab: closing it empties that
+        // connection's strip even though three other tabs exist elsewhere.
+        let tabs = vec![(1, 10), (2, 20), (3, 10), (5, 10)];
+        assert!(closing_would_empty(&tabs, 2));
+    }
+
+    #[test]
+    fn closing_would_empty_for_the_only_tab_anywhere() {
+        assert!(closing_would_empty(&[(1, 10)], 1));
+    }
+
+    #[test]
+    fn closing_would_empty_for_an_unknown_tab() {
+        // Nothing to close — the caller's keep-one path bails harmlessly.
+        assert!(closing_would_empty(&mixed(), 99));
+    }
+
+    #[test]
+    fn cycle_wraps_within_the_connection() {
+        assert_eq!(cycle(&mixed(), 10, Some(1), 1), Some(3));
+        assert_eq!(cycle(&mixed(), 10, Some(5), 1), Some(1)); // wraps forward
+        assert_eq!(cycle(&mixed(), 10, Some(1), -1), Some(5)); // wraps backward
+        assert_eq!(cycle(&mixed(), 20, Some(2), 1), Some(4));
+    }
+
+    #[test]
+    fn cycle_starts_from_the_first_tab_when_current_is_not_on_this_connection() {
+        // Current belongs to connection 20 while cycling connection 10.
+        assert_eq!(cycle(&mixed(), 10, Some(2), 1), Some(3));
+        assert_eq!(cycle(&mixed(), 10, None, 1), Some(3));
+    }
+
+    #[test]
+    fn cycle_is_none_without_visible_tabs() {
+        assert_eq!(cycle(&mixed(), 99, Some(1), 1), None);
+        assert_eq!(cycle(&[], 10, None, 1), None);
+    }
+
+    #[test]
+    fn a_single_tab_cycles_to_itself() {
+        assert_eq!(cycle(&[(1, 10)], 10, Some(1), 1), Some(1));
+        assert_eq!(cycle(&[(1, 10)], 10, Some(1), -1), Some(1));
+    }
+}

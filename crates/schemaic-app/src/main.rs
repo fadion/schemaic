@@ -412,6 +412,19 @@ fn unique_name(base: &str, existing: &[String]) -> String {
 /// number, its `label`). New tabs pick the lowest free number so closing and
 /// opening keeps numbering compact instead of climbing forever — the display
 /// number is decoupled from the ever-incrementing tab `id`.
+/// The "Query N" numbers already taken **on one connection**.
+///
+/// Numbering is per connection because everything else about a tab is: the
+/// strip, history, the AI conversation. A brand-new connection opening on
+/// "Query 10" — or skipping 5 because another connection holds it — reads as a
+/// bug, since those tabs are never on screen together.
+fn used_labels(tabs: &[Tab], conn: u64) -> Vec<usize> {
+    tabs.iter()
+        .filter(|t| t.conn_id.get_untracked() == conn)
+        .map(|t| t.label)
+        .collect()
+}
+
 fn smallest_free_label(used: &[usize]) -> usize {
     let mut n = 1;
     while used.contains(&n) {
@@ -573,6 +586,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         if saved_tabs.tabs.is_empty() {
             (vec![Tab::new(cx, 1, "", active_id, None)], 1, 2)
         } else {
+            // Running "Query N" counter per connection, for the labels below.
+            let mut per_conn: HashMap<u64, usize> = HashMap::new();
             let mut built: Vec<Tab> =
                 saved_tabs
                     .tabs
@@ -584,7 +599,12 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         } else {
                             active_id
                         };
-                        let t = Tab::new(cx, i + 1, &s.query, conn, s.database.clone());
+                        let mut t = Tab::new(cx, i + 1, &s.query, conn, s.database.clone());
+                        // Numbering restarts per connection (labels aren't
+                        // persisted — they're always derived on restore), so a
+                        // connection's tabs come back as Query 1..N rather than
+                        // carrying the whole file's running count.
+                        t.label = *per_conn.entry(conn).and_modify(|n| *n += 1).or_insert(1);
                         t.source.set(s.source.clone().map(|(db, table)| {
                             TableSource::new(db, s.source_schema.clone(), table)
                         }));
@@ -600,6 +620,30 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             built.sort_by_key(|t| !t.pinned.get_untracked());
             (built, active_id, n + 1)
         };
+    // `tabs.json` and `connections.json` restore independently, so the saved
+    // active tab can belong to a connection other than the saved active one —
+    // and the strip only shows the active connection's tabs. Land on one of
+    // them, opening a tab when this connection has none (there's no
+    // empty-editor state).
+    let (mut initial_tabs, initial_active, first_free_id) =
+        (initial_tabs, initial_active, first_free_id);
+    let (initial_active, first_free_id) = {
+        let refs: Vec<(usize, u64)> = initial_tabs
+            .iter()
+            .map(|t| (t.id, t.conn_id.get_untracked()))
+            .collect();
+        match schemaic_core::tabsel::pick_active(&refs, active_id, Some(initial_active)) {
+            Some(id) => (id, first_free_id),
+            None => {
+                let used = used_labels(&initial_tabs, active_id);
+                let mut t = Tab::new(cx, first_free_id, "", active_id, None);
+                t.label = smallest_free_label(&used);
+                let id = t.id;
+                initial_tabs.push(t);
+                (id, first_free_id + 1)
+            }
+        }
+    };
     let tabs = RwSignal::new(initial_tabs);
     let active = RwSignal::new(initial_active);
     let next_id = Rc::new(Cell::new(first_free_id));
@@ -607,6 +651,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // Plain `ClosedTab` data so entries survive the closed tab's scope disposal.
     let recently_closed: Rc<RefCell<VecDeque<ClosedTab>>> = Rc::new(RefCell::new(VecDeque::new()));
     let flashing: RwSignal<Option<usize>> = RwSignal::new(None);
+    // Where the user last was on each connection (connection id → tab id), so
+    // switching away and back returns to that tab instead of the first one.
+    // Runtime only — on launch every connection falls back to its first tab.
+    let last_tab: Rc<RefCell<HashMap<u64, usize>>> = Rc::new(RefCell::new(HashMap::new()));
     // Per-tab in-flight query token, tagged with a monotonic run generation so a
     // completing run can tell whether it still owns the tab's slot (a newer run
     // or a tab close supersedes it) before touching `tokens`/`results`.
@@ -1709,20 +1757,41 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         (conn_id, database)
     });
 
-    let add_tab: Rc<dyn Fn()> = {
+    // Open a tab against an explicit connection + database and activate it.
+    // Split out from `add_tab` so a connection switch can open one on the
+    // connection being switched *to* — `default_tab_target` reads `db_nodes`,
+    // which still holds the previous connection's databases until its schema
+    // finishes loading.
+    let open_tab_on: Rc<dyn Fn(u64, Option<String>)> = {
         let next_id = next_id.clone();
-        let default_tab_target = default_tab_target.clone();
-        Rc::new(move || {
+        Rc::new(move |conn_id: u64, database: Option<String>| {
             let id = next_id.get();
             next_id.set(id + 1);
-            let (conn_id, database) = default_tab_target();
             tabs.update(|v| {
                 let mut t = Tab::new(cx, id, "", conn_id, database);
-                let used: Vec<usize> = v.iter().map(|t| t.label).collect();
-                t.label = smallest_free_label(&used);
+                t.label = smallest_free_label(&used_labels(v, conn_id));
                 v.push(t);
             });
             active.set(id);
+        })
+    };
+
+    let add_tab: Rc<dyn Fn()> = {
+        let default_tab_target = default_tab_target.clone();
+        let open_tab_on = open_tab_on.clone();
+        Rc::new(move || {
+            let (conn_id, database) = default_tab_target();
+            (open_tab_on)(conn_id, database);
+        })
+    };
+
+    // `(tab id, connection id)` in display order — the shape `core::tabsel`'s
+    // selection rules work on.
+    let tab_refs = move || {
+        tabs.with_untracked(|v| {
+            v.iter()
+                .map(|t| (t.id, t.conn_id.get_untracked()))
+                .collect::<Vec<_>>()
         })
     };
 
@@ -1777,7 +1846,13 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             if let Some((_, tok)) = tokens.borrow_mut().remove(&id) {
                 tok.cancel();
             }
-            let is_last = tabs.with_untracked(|v| v.len()) <= 1;
+            // "Keep ≥1 tab" is per *connection* now: the strip shows one
+            // connection's tabs, so closing the last of those must clear-and-
+            // flash rather than remove — however many tabs other connections
+            // hold. Removing it would leave `active` pointing at a tab that no
+            // longer exists (its scoped neighbour is `None`), and the deferred
+            // scope disposal then frees signals the mounted view still reads.
+            let is_last = schemaic_core::tabsel::closing_would_empty(&tab_refs(), id);
             if is_last {
                 let Some(tab) = tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied())
                 else {
@@ -1799,12 +1874,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 return;
             }
             let was_active = active.get_untracked() == id;
-            let neighbor = tabs.with_untracked(|v| {
-                v.iter().position(|t| t.id == id).map(|i| {
-                    let ni = if i + 1 < v.len() { i + 1 } else { i - 1 };
-                    v[ni].id
-                })
-            });
+            // Scoped to the closing tab's own connection: the neighbour in the
+            // flat list can belong to another one, which would silently switch
+            // what the user is looking at.
+            let neighbor = schemaic_core::tabsel::neighbor(&tab_refs(), id);
             // Grab this tab before dropping it from the list: snapshot it for the
             // reopen ring and keep its scope so we can free its signals (C14).
             let closed = tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied());
@@ -1864,7 +1937,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             }
             None => {
                 let mut nt = new_tab;
-                let used: Vec<usize> = v.iter().map(|t| t.label).collect();
+                let used = used_labels(v, nt.conn_id.get_untracked());
                 nt.label = smallest_free_label(&used);
                 v.push(nt);
             }
@@ -1917,7 +1990,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             );
             tabs.update(|v| {
                 let mut nt = nt;
-                let used: Vec<usize> = v.iter().map(|t| t.label).collect();
+                let used = used_labels(v, nt.conn_id.get_untracked());
                 nt.label = smallest_free_label(&used);
                 let boundary = v.iter().take_while(|t| t.pinned.get_untracked()).count();
                 let at = v
@@ -2125,7 +2198,16 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         let place_tab = place_tab.clone();
         let recently_closed = recently_closed.clone();
         Rc::new(move || {
-            let Some(snap) = recently_closed.borrow_mut().pop_front() else {
+            // Reopen the most recent close *on this connection*. The strip is
+            // scoped, so reopening another connection's tab would restore it out
+            // of sight; its own connection reopens it when the user goes back.
+            let Some(snap) = ({
+                let mut ring = recently_closed.borrow_mut();
+                let conn = active_conn.get_untracked();
+                ring.iter()
+                    .position(|s| s.conn_id == conn)
+                    .and_then(|at| ring.remove(at))
+            }) else {
                 return;
             };
             let id = next_id.get();
@@ -2139,8 +2221,15 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             tab.name.set(snap.name);
             (place_tab)(tab);
             if restore_label {
-                let clash =
-                    tabs.with_untracked(|v| v.iter().any(|t| t.id != id && t.label == orig_label));
+                // A clash only matters within the connection — that's the scope
+                // the number is unique in, and the only place both would show.
+                let clash = tabs.with_untracked(|v| {
+                    v.iter().any(|t| {
+                        t.id != id
+                            && t.label == orig_label
+                            && t.conn_id.get_untracked() == snap.conn_id
+                    })
+                });
                 if !clash {
                     tabs.update(|v| {
                         if let Some(t) = v.iter_mut().find(|t| t.id == id) {
@@ -2554,9 +2643,25 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         let load_schema = load_schema.clone();
         let ai_session = ai_session.clone();
         let check_conn = check_conn.clone();
+        let last_tab = last_tab.clone();
+        let open_tab_on = open_tab_on.clone();
         Rc::new(move |id: u64| {
+            // Remember where the user was here before leaving, so coming back
+            // returns to that tab rather than the connection's first.
+            last_tab
+                .borrow_mut()
+                .insert(active_conn.get_untracked(), active.get_untracked());
             active_conn.set(id);
             persist_conns(Some(id));
+            // The strip shows only this connection's tabs, so the active tab has
+            // to become one of them. A connection with none gets a fresh tab —
+            // with no database, since `db_nodes` still holds the previous
+            // connection's until `load_schema` below finishes.
+            let remembered = last_tab.borrow().get(&id).copied();
+            match schemaic_core::tabsel::pick_active(&tab_refs(), id, remembered) {
+                Some(tab) => active.set(tab),
+                None => (open_tab_on)(id, None),
+            }
             // Clear stale status until this connection's own check lands.
             conn_status.set(ConnStatus::Unknown);
             // The AI conversation is bound to a connection — swap in the one
@@ -2727,6 +2832,30 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     }
                     None => db_nodes.set(Vec::new()),
                 }
+            }
+            // The deleted connection's tabs would now be invisible in every
+            // connection's strip. Adopt them into the active one rather than
+            // closing them — an unsaved query shouldn't vanish with a connection
+            // — clearing the database, which named one that just went away.
+            // (Restore does the same for a tab whose connection is gone.)
+            let adopting = active_conn.get_untracked();
+            if adopting != id {
+                tabs.with_untracked(|v| {
+                    for t in v.iter().filter(|t| t.conn_id.get_untracked() == id) {
+                        t.conn_id.set(adopting);
+                        t.database.set(None);
+                    }
+                });
+            }
+            last_tab.borrow_mut().remove(&id);
+            // The active tab may have been one of those (or on the deleted
+            // connection); make sure it's one the strip will show.
+            if let Some(tab) = schemaic_core::tabsel::pick_active(
+                &tab_refs(),
+                adopting,
+                Some(active.get_untracked()),
+            ) {
+                active.set(tab);
             }
         })
     };
