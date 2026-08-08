@@ -4,10 +4,11 @@
 //! to a temp file so credentials stay off the command line — review C6), the
 //! system-prompt context builder (`ai_context`), the per-turn context refresh
 //! (`TurnContext` / `apply_turn_delta` — the system prompt is written once at
-//! spawn, so what moves afterwards rides along with each user turn), and the
-//! inline-AI (Ctrl+K) helpers (`inline_system_prompt` / `extract_sql`). These are
-//! free functions and plain types — the reactive wiring that drives them lives in
-//! `app_view`.
+//! spawn, so what moves afterwards rides along with each user turn), the
+//! conversation recap that keeps follow-ups resolvable (`render_recap`, since the
+//! CLI's own cross-turn memory proved unreliable), and the inline-AI (Ctrl+K)
+//! helpers (`inline_system_prompt` / `extract_sql`). These are free functions and
+//! plain types — the reactive wiring that drives them lives in `app_view`.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -469,18 +470,76 @@ fn render_turn_delta(
     Some(out)
 }
 
-/// Prepend the context delta (if any) to a user turn, so the model reads the
-/// refreshed context before the question it applies to.
+/// Assemble a user turn: the conversation recap, then the context delta (if
+/// any), then the question — history, current state, ask.
+///
+/// Unlike the delta, `recap` can't be sent only when something changed: whether
+/// the CLI still holds the thread isn't observable, so it rides along every
+/// turn. See [`render_recap`].
 pub(crate) fn apply_turn_delta(
     prev: &TurnContext,
     cur: &TurnContext,
     mcp_database: Option<&str>,
+    recap: &str,
     msg: &str,
 ) -> String {
-    match render_turn_delta(prev, cur, mcp_database) {
-        Some(block) => format!("{block}\n{msg}"),
-        None => msg.to_string(),
+    let mut out = String::new();
+    if !recap.is_empty() {
+        out.push_str(recap);
+        out.push('\n');
     }
+    if let Some(block) = render_turn_delta(prev, cur, mcp_database) {
+        out.push_str(&block);
+        out.push('\n');
+    }
+    out.push_str(msg);
+    out
+}
+
+/// How many of the user's recent questions ride along with each turn, and the
+/// per-question character budget.
+pub(crate) const RECAP_QUESTIONS: usize = 3;
+pub(crate) const RECAP_CHARS: usize = 300;
+
+/// Recap the user's recent questions so a follow-up ("and by month?") still
+/// resolves.
+///
+/// The `claude` CLI's own cross-turn memory proved unreliable in this
+/// invocation — measured against the installed binary, a second turn recalled a
+/// fact from the first about two thirds of the time, and neither `--session-id`
+/// nor `--resume` changed that. So the app carries the thread itself rather than
+/// depending on the CLI's.
+///
+/// Only the user's side is replayed: the questions are what a follow-up refers
+/// back to, and repeating the assistant's answers would multiply the cost of
+/// something sent on every single turn.
+pub(crate) fn render_recap(messages: &[ChatMessage], max: usize) -> String {
+    let mut questions: Vec<String> = messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .map(|m| m.prose())
+        .filter(|q| !q.is_empty())
+        .collect();
+    if questions.is_empty() {
+        return String::new();
+    }
+    if questions.len() > max {
+        questions.drain(..questions.len() - max);
+    }
+    let mut out = String::from(
+        "[Earlier questions in this conversation, oldest first — your own replies \
+         are not repeated:]\n",
+    );
+    for q in questions {
+        let q = if q.chars().count() > RECAP_CHARS {
+            format!("{}…", q.chars().take(RECAP_CHARS).collect::<String>())
+        } else {
+            q
+        };
+        // One line each: a multi-line question would break the list.
+        out.push_str(&format!("- {}\n", q.replace('\n', " ")));
+    }
+    out
 }
 
 /// Messages replayed into a fresh session's prompt, and the per-message
@@ -1088,6 +1147,67 @@ mod tests {
     }
 
     #[test]
+    fn recap_is_empty_without_earlier_questions() {
+        assert_eq!(render_recap(&[], 3), "");
+        // An assistant turn alone is not a question to recap.
+        assert_eq!(render_recap(&[msg(Role::Assistant, "hello")], 3), "");
+    }
+
+    #[test]
+    fn recap_lists_only_the_users_own_questions() {
+        let msgs = vec![
+            msg(Role::User, "how many orders?"),
+            msg(Role::Assistant, "1,204 orders"),
+            msg(Role::User, "and by month?"),
+            msg(Role::Assistant, "here you go"),
+        ];
+        let out = render_recap(&msgs, 3);
+        assert!(out.contains("how many orders?"));
+        assert!(out.contains("and by month?"));
+        // Answers are deliberately not replayed — that's the token economy.
+        assert!(!out.contains("1,204"));
+        assert!(!out.contains("here you go"));
+    }
+
+    #[test]
+    fn recap_keeps_the_most_recent_questions_in_order() {
+        let msgs: Vec<ChatMessage> = (1..=5).map(|i| msg(Role::User, &format!("q{i}"))).collect();
+        let out = render_recap(&msgs, 3);
+        assert!(!out.contains("q1") && !out.contains("q2"));
+        // Oldest of the kept three first, newest last.
+        let q3 = out.find("q3").expect("q3 kept");
+        let q5 = out.find("q5").expect("q5 kept");
+        assert!(q3 < q5);
+    }
+
+    #[test]
+    fn recap_truncates_a_long_question() {
+        let long = "y".repeat(RECAP_CHARS + 100);
+        let out = render_recap(&[msg(Role::User, &long)], 3);
+        assert!(out.contains(&format!("{}…", "y".repeat(RECAP_CHARS))));
+        assert!(!out.contains(&"y".repeat(RECAP_CHARS + 1)));
+    }
+
+    #[test]
+    fn recap_skips_a_blank_question() {
+        let msgs = vec![msg(Role::User, "   "), msg(Role::User, "real one")];
+        let out = render_recap(&msgs, 3);
+        assert!(out.contains("real one"));
+        assert_eq!(out.matches("- ").count(), 1);
+    }
+
+    #[test]
+    fn turn_carries_the_recap_ahead_of_the_context_and_the_question() {
+        let cx = cx(Some("shop"), "", "SELECT 1");
+        let out = apply_turn_delta(&cx, &cx, Some("shop"), "earlier: q1\n", "and now?");
+        // Nothing moved in the context, but the recap still rides along — the
+        // CLI's own memory can't be relied on.
+        let recap_at = out.find("earlier: q1").expect("recap present");
+        let msg_at = out.find("and now?").expect("message present");
+        assert!(recap_at < msg_at);
+    }
+
+    #[test]
     fn history_replay_is_empty_for_a_fresh_conversation() {
         assert_eq!(render_history(&[], 10), "");
     }
@@ -1250,11 +1370,15 @@ mod tests {
     fn apply_turn_delta_prepends_the_block_and_passes_a_clean_turn_through() {
         let prev = cx(Some("shop"), "", "SELECT 1");
         let cur = cx(Some("shop"), "", "SELECT 2");
-        let out = apply_turn_delta(&prev, &cur, Some("shop"), "why is this slow?");
+        let out = apply_turn_delta(&prev, &cur, Some("shop"), "", "why is this slow?");
         assert!(out.starts_with("[Schemaic context update"));
         assert!(out.ends_with("why is this slow?"));
         // Nothing moved → the user's message is sent verbatim.
-        assert_eq!(apply_turn_delta(&cur, &cur, Some("shop"), "hello"), "hello");
+        // Nothing moved and nothing to recap → the message goes verbatim.
+        assert_eq!(
+            apply_turn_delta(&cur, &cur, Some("shop"), "", "hello"),
+            "hello"
+        );
     }
 
     #[test]
