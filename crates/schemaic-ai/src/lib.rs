@@ -122,6 +122,21 @@ pub fn user_message_line(text: &str) -> String {
     format!("{v}\n")
 }
 
+/// Encode an `interrupt` control request as a `stream-json` stdin line.
+///
+/// Ends the turn in flight without ending the process: the CLI answers with a
+/// `control_response` and emits a `result`, then accepts the next message. That
+/// is the difference between Stop and killing the child — verified against the
+/// CLI, where every sampled interrupt ended the turn and left the session usable.
+pub fn interrupt_line(request_id: &str) -> String {
+    let v = serde_json::json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "interrupt" }
+    });
+    format!("{v}\n")
+}
+
 /// A meaningful event decoded from one `stream-json` output line.
 #[derive(Clone, Debug)]
 pub enum StreamEvent {
@@ -540,6 +555,16 @@ mod tests {
                 "claude-opus-4-8",
             ]
         );
+    }
+
+    #[test]
+    fn interrupt_line_is_a_control_request() {
+        let line = interrupt_line("stop-7");
+        assert!(line.ends_with('\n'));
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["type"], "control_request");
+        assert_eq!(v["request_id"], "stop-7");
+        assert_eq!(v["request"]["subtype"], "interrupt");
     }
 
     #[test]
