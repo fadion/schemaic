@@ -33,6 +33,7 @@ pub mod secrets;
 pub mod seed;
 pub mod sql;
 pub mod sqlfmt;
+pub mod summary;
 pub mod text;
 pub mod text_ops;
 pub mod transcript;

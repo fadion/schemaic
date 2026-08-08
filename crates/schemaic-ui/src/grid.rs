@@ -39,6 +39,7 @@ use schemaic_core::model::{
 };
 use schemaic_core::rowjson::{self, ColSpec};
 use schemaic_core::schema::{ForeignKeyInfo, SchemaState, TableSource};
+use schemaic_core::summary;
 use schemaic_core::text::plural;
 use schemaic_core::text_ops::contains_ignore_ascii_case;
 
@@ -2242,6 +2243,14 @@ fn refocus_grid(gs: GridState) {
             f.request_focus();
         });
     }
+}
+
+/// The result's source table, qualified, for an AI prompt's context — `None`
+/// for an arbitrary SELECT that isn't backed by one table.
+fn source_table(gs: GridState) -> Option<String> {
+    gs.source
+        .get_untracked()
+        .map(|src| format!("{}.{}", src.database, src.display()))
 }
 
 /// Open the inline editor on the cell at display `(i, ci)`, seeding the buffer
@@ -4531,6 +4540,23 @@ fn header_cell(
             } else {
                 MenuEntry::action("Freeze", move || gs.frozen.set(Some(ci)))
             };
+            // "AI Summary" for the whole column: what is this field *for*? The
+            // prompt carries a sample of the loaded values, which usually settles
+            // it where the name alone wouldn't. Sampled from what's on screen —
+            // no query, so the menu stays instant.
+            let sum = gs.summarize.get_untracked();
+            let rs = gs.rs.get_untracked();
+            let (column, type_name) = rs
+                .columns
+                .get(ci)
+                .map(|c| (c.name.clone(), c.type_name.clone()))
+                .unwrap_or_default();
+            let msg = summary::column_prompt(
+                source_table(gs).as_deref(),
+                &column,
+                &type_name,
+                &summary::sample_column(&rs, ci, summary::COLUMN_SAMPLE),
+            );
             gs.popup_anchor.set(None); // right-click → open at the cursor
             gs.popup.set(Some(vec![
                 freeze_item,
@@ -4546,6 +4572,16 @@ fn header_cell(
                             let _ = floem::Clipboard::set_contents(export_column_json(gs, ci));
                         }),
                     ],
+                ),
+                MenuEntry::Separator,
+                MenuEntry::action_icon(
+                    "AI Summary",
+                    (icons::SPARKLES, theme::key_foreign),
+                    move || {
+                        if let Some(s) = &sum {
+                            (s)(msg.clone());
+                        }
+                    },
                 ),
             ]));
         })
@@ -4919,14 +4955,7 @@ fn data_cell(
                 .cell(data_idx, ci)
                 .and_then(|c| (!c.is_null()).then(|| c.display().to_string()));
             // Context for the AI: the source table (if known) + this column.
-            let from = match gs.source.get_untracked() {
-                Some(src) => format!(" from the `{}.{}` table", src.database, src.display()),
-                None => String::new(),
-            };
-            let msg = format!(
-                "Summarize this value{from}, column `{column}`:\n```\n{val}\n```\n\
-                 If you can infer a pattern, format, or meaning from it, note that too."
-            );
+            let msg = summary::cell_prompt(source_table(gs).as_deref(), &column, &val);
 
             // "Edit Field" edits this single cell inline; "Edit Row" opens the
             // whole-row structured panel (read-only fields shown for context). A row
@@ -4992,6 +5021,9 @@ fn data_cell(
                     gs.toggle_delete(data_idx);
                 }));
             }
+            // Set off from the row actions above it — asking about a value is a
+            // different kind of act from editing or deleting one.
+            entries.push(MenuEntry::Separator);
             entries.push(MenuEntry::action_icon(
                 "AI Summary",
                 (icons::SPARKLES, theme::key_foreign),
