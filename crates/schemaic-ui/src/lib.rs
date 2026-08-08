@@ -51,6 +51,7 @@ use widgets::*;
 
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use floem::AnyView;
 use floem::event::{Event, EventListener, EventPropagation};
@@ -87,6 +88,30 @@ pub type CommitDoneFn = Rc<dyn Fn(CommitDone)>;
 /// re-fetch (`Some` ⇒ splice the edited rows in place), then report via
 /// [`CommitDoneFn`]. Aliased to keep the field/signal types below readable.
 pub type CommitFn = Rc<dyn Fn(GridWrite, Option<RefetchRequest>, CommitDoneFn)>;
+
+/// What to write, and where. Everything here is owned or refcounted so the
+/// request can cross to a worker thread — the `Arc`s mean a 200k-row snapshot
+/// costs a refcount, not a copy.
+pub struct ExportRequest {
+    pub path: std::path::PathBuf,
+    pub format: schemaic_core::export::ExportFormat,
+    pub rs: Arc<schemaic_core::model::ResultSet>,
+    pub order: Arc<Vec<usize>>,
+    /// The result's base table, when it has one — only the SQL format uses it, to
+    /// name the `INSERT` target.
+    pub source: Option<TableSource>,
+    /// The tab's connection dialect, so an exported `INSERT` loads back into the
+    /// engine the rows came from.
+    pub dialect: schemaic_core::intel::SqlDialect,
+}
+
+/// Reports an export's outcome back on the UI thread (`Err` carries a
+/// user-facing message).
+pub type ExportDoneFn = Rc<dyn Fn(Result<(), String>)>;
+/// Stream a result set to a file **off the UI thread**, reporting via
+/// [`ExportDoneFn`]. Writing a large export inline froze the window for as long
+/// as it took; the grid owns the save dialog, the app owns the worker.
+pub type ExportFn = Rc<dyn Fn(ExportRequest, ExportDoneFn)>;
 
 /// Delivers the Tier-2 (DB-validated) diagnostics for the statement under the
 /// cursor back onto the UI thread.
@@ -702,6 +727,10 @@ pub struct TabsActions {
     /// instead of full-re-running; `None` for inserts, which full-re-run); arg 3 is
     /// the completion callback, invoked on the UI thread with the outcome.
     pub commit_edits: CommitFn,
+    /// Stream a result set to a file on a worker thread. The grid owns the save
+    /// dialog and the snapshot; this does the rendering + writing, so a large
+    /// export doesn't block the window.
+    pub export_file: ExportFn,
     /// Set a tab's commit mode (by tab id). Switching to Manual only marks the
     /// tab — the connection is pinned and `BEGIN` issued lazily on its first
     /// statement. Switching back to Auto with a transaction still open is the
@@ -2447,6 +2476,7 @@ fn center(ui: Ui) -> impl IntoView {
         }
     });
     let commit_edits = ui.tab_actions.commit_edits.clone();
+    let export_file = ui.tab_actions.export_file.clone();
     let apply_view = ui.tab_actions.apply_view.clone();
     let follow_fk = ui.tab_actions.open_table_filtered.clone();
     let open_monitor = ui.tab_actions.open_monitor.clone();
@@ -2580,6 +2610,7 @@ fn center(ui: Ui) -> impl IntoView {
                     ai_seed: ai_seed.clone(),
                     dismiss: dismiss_menus.clone(),
                     commit: commit_edits.clone(),
+                    export_file: export_file.clone(),
                     // `results_view` fills this in for the single-result path; the
                     // multi-result path leaves it `None` (full-re-run on commit).
                     sync_canonical: None,
