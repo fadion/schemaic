@@ -16,6 +16,7 @@ pub mod export;
 pub mod favorite;
 pub mod filter;
 pub mod format;
+pub mod health;
 pub mod history;
 pub mod intel;
 pub mod jsontree;

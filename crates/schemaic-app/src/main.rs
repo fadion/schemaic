@@ -48,6 +48,7 @@ use floem::reactive::{
 use floem::window::{Icon, WindowConfig};
 use schemaic_core::connection::{ConnStatus, Connection};
 use schemaic_core::edit::analyze_edit;
+use schemaic_core::health;
 use schemaic_core::model::{CommitDone, GridWrite, QueryState, RefetchRequest, ResultSet};
 use schemaic_core::monitor::{Snapshot, diff_snapshots};
 
@@ -822,6 +823,13 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let error_modal_open = RwSignal::new(false);
     let error_modal_text: RwSignal<Option<String>> = RwSignal::new(None);
     let conn_status = RwSignal::new(ConnStatus::Unknown);
+    // Consecutive failed health checks of the active connection, folded by every
+    // check (polled or manual). Drives the health poll's backoff so a server
+    // that's been down for a while isn't probed every 10s; reset on switch.
+    let health_failures = RwSignal::new(0u32);
+    // OS window focus, set from the workspace root. Starts `true`: the window is
+    // focused on launch and winit only reports the *changes*.
+    let window_focused = RwSignal::new(true);
     // Pending "you have an open transaction" question (see `TxPrompt`).
     let tx_prompt: RwSignal<Option<TxPrompt>> = RwSignal::new(None);
 
@@ -2476,6 +2484,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 } else {
                     ConnStatus::Disconnected
                 });
+                // Every check counts toward the backoff, not just the polled
+                // ones — a user hammering Retry against a dead host shouldn't
+                // reset the timer's patience either.
+                health_failures.set(health::record(health_failures.get_untracked(), ok));
                 if let Some(f) = &done {
                     f(ok);
                 }
@@ -2495,11 +2507,13 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // connection isn't known-dead, otherwise re-check and run it only if the
     // server answers.
     //
-    // The block has to be recoverable. Nothing re-checks reachability on a
-    // timer, so `Disconnected` can be minutes stale — gating on the cached flag
-    // alone would lock a user out of a server that came back. A blocked attempt
-    // therefore pings first; if it still fails, the reason is surfaced rather
-    // than the action silently doing nothing.
+    // The block has to be recoverable even so. The health poll keeps the flag
+    // reasonably fresh, but it deliberately backs off a dead host and pauses
+    // while the window is unfocused, so `Disconnected` can still be a minute or
+    // two stale — gating on the cached flag alone would lock a user out of a
+    // server that came back. A blocked attempt therefore pings first; if it
+    // still fails, the reason is surfaced rather than the action silently doing
+    // nothing.
     let with_conn: ConnGate = {
         let check_conn_then = check_conn_then.clone();
         Rc::new(move |action: Rc<dyn Fn()>| {
@@ -2734,8 +2748,11 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 Some(tab) => active.set(tab),
                 None => (open_tab_on)(id, None),
             }
-            // Clear stale status until this connection's own check lands.
+            // Clear stale status until this connection's own check lands. The
+            // failure count goes with it — the previous connection's backoff
+            // says nothing about this one.
             conn_status.set(ConnStatus::Unknown);
+            health_failures.set(0);
             // The AI conversation is bound to a connection — swap in the one
             // saved for this connection (empty when there isn't one). The live
             // session can't be reused, so the restored turns are transcript;
@@ -3491,16 +3508,96 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         load_schema(conn);
     }
 
-    // Health-check the active connection now, then re-check every 10s. The
-    // timer re-arms itself; each tick reads the current active connection.
-    fn arm_health_poll(check: Rc<dyn Fn()>) {
-        floem::action::exec_after(std::time::Duration::from_secs(10), move |_| {
-            check();
-            arm_health_poll(check.clone());
+    // ── Connection health poll ───────────────────────────────────────────────
+    // Health-check the active connection now, then keep re-checking so
+    // `ConnStatus` stays worth trusting: a server that dies mid-session goes red
+    // on its own, and one that comes back goes green without the user clicking
+    // Retry. Every gate that reads `is_down()` gets a fresher answer for it.
+    //
+    // What to do on each tick is `core::health`'s call (pure + tested) — ping or
+    // skip, and how long until the next one. This closure only gathers the
+    // snapshot it decides from, and re-arms.
+    //
+    // Perpetual, so every signal read goes through `try_*_untracked`: at
+    // shutdown the scope disposes and a pending timer would otherwise panic on a
+    // freed signal. `None` from any read means "the app is going away" — stop
+    // rescheduling.
+    let health_poll: Rc<dyn Fn() -> Option<std::time::Duration>> = {
+        let check_conn = check_conn.clone();
+        let tunnels = tunnels.clone();
+        let tokens = tokens.clone();
+        Rc::new(move || {
+            let status = conn_status.try_get_untracked()?;
+            let failures = health_failures.try_get_untracked()?;
+            let focused = window_focused.try_get_untracked()?;
+            let id = active_conn.try_get_untracked()?;
+            // An id with no saved connection behind it (none configured yet)
+            // reads as "not tunnelled" — `check_conn` handles the nothing-to-ping
+            // case itself.
+            let ssh = connections
+                .try_with_untracked(|cs| {
+                    cs.map(|cs| cs.iter().find(|c| c.id == id).map(|c| c.ssh.enabled))
+                })?
+                .unwrap_or(false);
+            // A run already in flight against *this* connection probes it far
+            // better than `SELECT 1` does. Runs on another connection's tabs
+            // don't count — they say nothing about this server.
+            let any_running = !tokens.borrow().is_empty();
+            let busy = any_running
+                && tabs.try_with_untracked(|ts| {
+                    ts.map(|ts| {
+                        ts.iter().any(|t| {
+                            t.conn_id.get_untracked() == id && tokens.borrow().contains_key(&t.id)
+                        })
+                    })
+                })?;
+            let ctx = health::TickCtx {
+                status,
+                failures,
+                busy,
+                focused,
+                tunnelled: ssh,
+                tunnel_pending: ssh && !tunnels.borrow().contains_key(&id),
+            };
+            let tick = health::tick(health::HealthCfg::default(), ctx);
+            if tick.ping() {
+                check_conn();
+            }
+            Some(tick.next)
+        })
+    };
+    fn arm_health_poll(
+        delay: std::time::Duration,
+        poll: Rc<dyn Fn() -> Option<std::time::Duration>>,
+    ) {
+        floem::action::exec_after(delay, move |_| {
+            if let Some(next) = poll() {
+                arm_health_poll(next, poll.clone());
+            }
         });
     }
     check_conn();
-    arm_health_poll(check_conn.clone());
+    arm_health_poll(
+        health::interval(health::HealthCfg::default(), false),
+        health_poll,
+    );
+
+    // Regaining focus re-checks immediately: the poll pauses while the window is
+    // in the background, so this is what makes coming back to Schemaic show a
+    // current status instead of however things stood when the user left.
+    {
+        let check_conn = check_conn.clone();
+        create_effect(move |prev: Option<bool>| {
+            let focused = window_focused.get();
+            // Only a real false → true transition. `prev` is `None` on the
+            // effect's own first run, which is a mount, not a focus change (and
+            // the startup check above already covers it).
+            if prev == Some(false) && focused {
+                check_conn();
+            }
+            focused
+        });
+    }
 
     // ── Terminal panel ──────────────────────────────────────────────────────
     // A shell on a PTY (schemaic-term). The reader thread notifies via a
@@ -4023,6 +4120,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             confirm_writes,
             restore_tabs,
             live_validate,
+            window_focused,
         },
         persist_layout: save_ui.clone(),
         formats,
