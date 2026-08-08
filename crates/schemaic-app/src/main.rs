@@ -112,12 +112,12 @@ fn main() {
     // arrives as a JSON blob in `$SCHEMAIC_MCP_ENDPOINT` (set via the MCP config
     // file, never a command-line arg — review C6). No credential URL is involved.
     if std::env::args().any(|a| a == "--mcp-serve") {
-        let (db, database) = mcp_endpoint_from_env();
+        let endpoint = mcp_endpoint_from_env();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("build tokio runtime");
-        rt.block_on(mcp::serve(db, database));
+        rt.block_on(mcp::serve(endpoint));
         return;
     }
 

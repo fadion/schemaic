@@ -25,8 +25,17 @@ use schemaic_ui::{AiEffort, AiModel, ConnNode, InlineAiRequest, SchemaScope, Tab
 use crate::claude_cli::claude_bin;
 
 // ===== moved from main.rs (AI session + context) =====
-const AI_TOOLS_WITH_QUERY: &[&str] = &["mcp__schemaic__run_query", "mcp__schemaic__list_schema"];
-const AI_TOOLS_READ_ONLY: &[&str] = &["mcp__schemaic__list_schema"];
+const AI_TOOLS_WITH_QUERY: &[&str] = &[
+    "mcp__schemaic__run_query",
+    "mcp__schemaic__list_schema",
+    "mcp__schemaic__describe_table",
+];
+// `describe_table` stays available with queries off — it's a schema tool, and the
+// server drops its sample-rows section when the endpoint says samples are off.
+const AI_TOOLS_READ_ONLY: &[&str] = &[
+    "mcp__schemaic__list_schema",
+    "mcp__schemaic__describe_table",
+];
 
 /// A live AI conversation: the CLI child's stdin channel plus which connection
 /// it's bound to. Dropping this (its `stdin_tx`) ends the session task, which
@@ -72,9 +81,21 @@ impl Drop for AiSession {
     }
 }
 
+/// What the MCP subprocess is pointed at: the DB handle, the default database
+/// for tool calls, and whether it may include sample rows in its results.
+pub(crate) struct McpEndpoint {
+    pub(crate) db: Db,
+    pub(crate) database: Option<String>,
+    /// Mirrors the AI panel's "run queries" setting. `describe_table` is a schema
+    /// tool the assistant keeps either way, but its sample-rows section reads
+    /// real data — so with queries off, the section is dropped rather than the
+    /// whole tool.
+    pub(crate) samples: bool,
+}
+
 /// Parse the MCP DB endpoint from `$SCHEMAIC_MCP_ENDPOINT` (the JSON the app
 /// writes into the MCP config file). Falls back to an empty local endpoint.
-pub(crate) fn mcp_endpoint_from_env() -> (Db, Option<String>) {
+pub(crate) fn mcp_endpoint_from_env() -> McpEndpoint {
     let v = std::env::var("SCHEMAIC_MCP_ENDPOINT")
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -83,9 +104,9 @@ pub(crate) fn mcp_endpoint_from_env() -> (Db, Option<String>) {
 }
 
 /// Parse a DB endpoint from the MCP-config JSON value: host defaults to
-/// `127.0.0.1`, port to `3306`, user/pass to empty, database optional. Pure so
-/// the defaulting is unit-tested without touching the environment.
-fn endpoint_from_value(v: &serde_json::Value) -> (Db, Option<String>) {
+/// `127.0.0.1`, port to `3306`, user/pass to empty, database optional, samples
+/// on. Pure so the defaulting is unit-tested without touching the environment.
+fn endpoint_from_value(v: &serde_json::Value) -> McpEndpoint {
     let host = v
         .get("host")
         .and_then(|x| x.as_str())
@@ -111,16 +132,23 @@ fn endpoint_from_value(v: &serde_json::Value) -> (Db, Option<String>) {
     let engine = schemaic_db::Engine::from_db_type(
         v.get("engine").and_then(|x| x.as_str()).unwrap_or("mysql"),
     );
-    (Db::from_parts(engine, host, port, user, pass), database)
+    McpEndpoint {
+        db: Db::from_parts(engine, host, port, user, pass),
+        database,
+        // Absent → on, matching the endpoint blobs written before the flag
+        // existed (which also predate any tool that reads rows from schema).
+        samples: v.get("samples").and_then(|x| x.as_bool()).unwrap_or(true),
+    }
 }
 
-/// Serialize a DB endpoint (host/port/user/pass + default database) as the JSON
-/// blob handed to the MCP subprocess via its environment.
-fn endpoint_json(db: &Db, database: Option<&str>) -> String {
+/// Serialize a DB endpoint (host/port/user/pass + default database + the
+/// sample-rows permission) as the JSON blob handed to the MCP subprocess via its
+/// environment.
+fn endpoint_json(db: &Db, database: Option<&str>, samples: bool) -> String {
     let (host, port, user, pass) = db.parts();
     serde_json::json!({
         "host": host, "port": port, "user": user, "pass": pass,
-        "database": database, "engine": db.engine().as_str()
+        "database": database, "engine": db.engine().as_str(), "samples": samples
     })
     .to_string()
 }
@@ -227,7 +255,7 @@ pub(crate) fn start_ai_session(
     // MCP config: launch THIS binary in `--mcp-serve` mode, handing it the
     // (already-tunnelled) DB endpoint via env — written to a temp file so the
     // credentials never appear on a command line (review C6).
-    let mcp_cfg = write_mcp_config(&endpoint_json(&db, database.as_deref()));
+    let mcp_cfg = write_mcp_config(&endpoint_json(&db, database.as_deref(), run_queries));
     let tools = if run_queries {
         AI_TOOLS_WITH_QUERY
     } else {
@@ -577,12 +605,14 @@ fn render_ai_context(
     // Tools line — kept truthful: the assistant always has `list_schema`, and
     // `run_query` only when the setting allows it.
     let tools_line = if run_queries {
-        "You can inspect the live schema with the list_schema tool and run read-only \
-         queries (a single SELECT/SHOW/DESCRIBE/EXPLAIN/WITH statement) with the run_query \
-         tool. Use them when they help you answer."
+        "You can inspect the live schema with the list_schema and describe_table tools \
+         (describe_table gives one table's DDL, foreign keys, and sample rows) and run \
+         read-only queries (a single SELECT/SHOW/DESCRIBE/EXPLAIN/WITH statement) with the \
+         run_query tool. Use them when they help you answer."
     } else {
-        "You can inspect the live schema with the list_schema tool, but you cannot run \
-         queries — answer from the schema context and your knowledge."
+        "You can inspect the live schema with the list_schema and describe_table tools, but \
+         you cannot run queries — answer from the schema context and your knowledge. \
+         describe_table omits its sample rows while queries are off."
     };
     let schema_section = if scope == SchemaScope::None {
         String::new()
@@ -726,7 +756,7 @@ mod tests {
             "u".into(),
             "p".into(),
         );
-        let out = endpoint_json(&db, Some("shop"));
+        let out = endpoint_json(&db, Some("shop"), true);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["host"], "h");
         assert_eq!(v["port"], 3307);
@@ -734,10 +764,30 @@ mod tests {
         assert_eq!(v["pass"], "p");
         assert_eq!(v["database"], "shop");
         assert_eq!(v["engine"], "postgres"); // engine tag serialized
+        assert_eq!(v["samples"], true);
         // No default database → JSON null.
-        let out = endpoint_json(&db, None);
+        let out = endpoint_json(&db, None, false);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["database"].is_null());
+        // Queries off → the subprocess is told to withhold sample rows.
+        assert_eq!(v["samples"], false);
+    }
+
+    #[test]
+    fn endpoint_samples_flag_round_trips_and_defaults_on() {
+        let db = Db::from_parts(
+            schemaic_db::Engine::MySql,
+            "h".into(),
+            3306,
+            "u".into(),
+            "p".into(),
+        );
+        let json = endpoint_json(&db, Some("shop"), false);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(!endpoint_from_value(&v).samples);
+        // An older blob with no flag → samples on (nothing then read rows).
+        let v = serde_json::json!({ "host": "h" });
+        assert!(endpoint_from_value(&v).samples);
     }
 
     #[test]
@@ -751,26 +801,26 @@ mod tests {
             "user".into(),
             "pw".into(),
         );
-        let json = endpoint_json(&db, Some("db1"));
+        let json = endpoint_json(&db, Some("db1"), true);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let (parsed, database) = endpoint_from_value(&v);
-        assert_eq!(parsed.parts(), ("host", 3306, "user", "pw"));
-        assert_eq!(parsed.engine(), schemaic_db::Engine::Postgres);
-        assert_eq!(database.as_deref(), Some("db1"));
+        let parsed = endpoint_from_value(&v);
+        assert_eq!(parsed.db.parts(), ("host", 3306, "user", "pw"));
+        assert_eq!(parsed.db.engine(), schemaic_db::Engine::Postgres);
+        assert_eq!(parsed.database.as_deref(), Some("db1"));
     }
 
     #[test]
     fn endpoint_from_value_fills_defaults() {
         // Empty/Null object → local defaults, no database, MySQL engine.
-        let (db, database) = endpoint_from_value(&serde_json::Value::Null);
-        assert_eq!(db.parts(), ("127.0.0.1", 3306, "", ""));
-        assert_eq!(db.engine(), schemaic_db::Engine::MySql);
-        assert!(database.is_none());
+        let e = endpoint_from_value(&serde_json::Value::Null);
+        assert_eq!(e.db.parts(), ("127.0.0.1", 3306, "", ""));
+        assert_eq!(e.db.engine(), schemaic_db::Engine::MySql);
+        assert!(e.database.is_none());
         // Partial object → only the missing keys default.
         let v = serde_json::json!({ "host": "h", "user": "u" });
-        let (db, database) = endpoint_from_value(&v);
-        assert_eq!(db.parts(), ("h", 3306, "u", ""));
-        assert!(database.is_none());
+        let e = endpoint_from_value(&v);
+        assert_eq!(e.db.parts(), ("h", 3306, "u", ""));
+        assert!(e.database.is_none());
     }
 
     #[test]
