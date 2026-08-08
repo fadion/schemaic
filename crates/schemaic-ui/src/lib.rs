@@ -39,9 +39,9 @@ use grid::{GridCtx, grid_error_bar, grid_find_bar, loaded_view, results_view, ru
 use history_panel::history_panel;
 use monitor_view::monitor_overlay;
 use overlays::{
-    active_db_menu_overlay, conn_menu_overlay, context_menu_overlay, db_visibility_overlay,
-    error_modal_overlay, find_overlay, popup_menu_overlay, schema_settings_overlay,
-    tx_prompt_overlay,
+    active_db_menu_overlay, confirm_overlay, conn_menu_overlay, context_menu_overlay,
+    db_visibility_overlay, error_modal_overlay, find_overlay, popup_menu_overlay,
+    schema_settings_overlay, tx_prompt_overlay,
 };
 use plan_view::plan_overlay;
 use schema_tree::schema_panel;
@@ -326,6 +326,25 @@ pub struct TxPrompt {
     /// offered, because committing an aborted transaction just rolls it back.
     pub can_commit: bool,
     pub resolve: Rc<dyn Fn(TxChoice)>,
+}
+
+/// A yes/no question asked before something destructive runs.
+///
+/// Deliberately generic: this is *the* confirm modal, so the next action that
+/// needs asking sets [`OverlayUi::confirm`] rather than growing a fourth bespoke
+/// overlay. [`TxPrompt`] stays separate — Commit/Rollback/Cancel isn't a yes/no,
+/// and there no safe default answer between keeping and discarding writes.
+///
+/// The overlay only renders the question; `resolve` gets the answer (`true` =
+/// Yes) and the caller does the work. Escape and clicking the backdrop both
+/// answer No, since declining is always the safe side of a confirm.
+#[derive(Clone)]
+pub struct Confirm {
+    /// Bold heading, naming the action ("Close all tabs").
+    pub title: String,
+    /// The question itself.
+    pub message: String,
+    pub resolve: Rc<dyn Fn(bool)>,
 }
 
 /// One statement's result within a multi-statement (Run Everything) run. The
@@ -696,6 +715,11 @@ pub struct TabsActions {
     pub rollback_tx: Rc<dyn Fn(usize)>,
     pub add_tab: Rc<dyn Fn()>,
     pub close_tab: Rc<dyn Fn(usize)>,
+    /// Close every tab of the active connection (the ones the strip shows).
+    /// Pinned tabs stay, and the connection's last remaining tab clears in place
+    /// rather than disappearing. Tabs holding an open transaction are asked
+    /// about one at a time; answering Cancel stops the run.
+    pub close_all_tabs: Rc<dyn Fn()>,
     /// Toggle a tab's pinned state (by id) and re-order the strip so pinned tabs
     /// stay contiguous at the left, in pin order.
     pub toggle_pin: Rc<dyn Fn(usize)>,
@@ -716,6 +740,10 @@ pub struct TabsActions {
     /// Reopen the most-recently-closed tab (Ctrl+Shift+T): restores its query,
     /// connection/database, source, and name from a small ring. No-op when empty.
     pub reopen_closed_tab: Rc<dyn Fn()>,
+    /// Whether [`Self::reopen_closed_tab`] has anything to restore for the active
+    /// connection — same per-connection scoping it applies itself. The tab menu
+    /// dims its entry rather than offering a click that does nothing.
+    pub can_reopen_closed_tab: Rc<dyn Fn() -> bool>,
     /// Open a brand-new tab sourced from a table (so its grid stays editable)
     /// running `sql`, and auto-run it. Used by the grid's "Follow foreign key" to
     /// land on the referenced table filtered to a row.
@@ -1043,6 +1071,9 @@ pub struct OverlayUi {
     /// closing the tab, disconnecting, or changing the tab's database — and
     /// cleared when the user picks. See [`TxPrompt`].
     pub tx_prompt: RwSignal<Option<TxPrompt>>,
+    /// Pending yes/no confirmation, or `None`. The shared channel for "are you
+    /// sure" — set it rather than adding another modal. See [`Confirm`].
+    pub confirm: RwSignal<Option<Confirm>>,
     /// Query-plan (EXPLAIN) modal: open flag, the running/loaded state, the
     /// statement being explained (re-run when the Analyze toggle flips), and the
     /// Analyze toggle itself.
@@ -1375,18 +1406,20 @@ pub fn workspace(ui: Ui) -> impl IntoView {
         context_menu_overlay(ui.clone()),
         popup_menu_overlay(ui.clone()),
         find_overlay(ui.clone()),
-        // Error modal + open-transaction prompt share one tuple element, for the
-        // same 16-arity reason as monitor/ERD below (and with the same
-        // fill-only-when-open wrapper, or it would eat every click).
+        // Error modal + open-transaction prompt + the shared confirm share one
+        // tuple element, for the same 16-arity reason as monitor/ERD below (and
+        // with the same fill-only-when-open wrapper, or it would eat every click).
         {
             let err_open = ui.overlay.error_modal_open;
             let tx_prompt = ui.overlay.tx_prompt;
+            let confirm = ui.overlay.confirm;
             stack((
                 error_modal_overlay(ui.clone()),
                 tx_prompt_overlay(ui.clone()),
+                confirm_overlay(ui.clone()),
             ))
             .style(move |s| {
-                if err_open.get() || tx_prompt.get().is_some() {
+                if err_open.get() || tx_prompt.get().is_some() || confirm.get().is_some() {
                     s.absolute().inset(0.0)
                 } else {
                     s

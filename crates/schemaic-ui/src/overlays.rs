@@ -2118,6 +2118,126 @@ pub(crate) fn tx_prompt_overlay(ui: Ui) -> impl IntoView {
     })
 }
 
+/// The shared yes/no confirmation — "are you sure?" for anything destructive.
+/// Same chrome as `tx_prompt_overlay`, but with a safe default: Escape and
+/// clicking the backdrop both answer No, because declining a confirm never
+/// loses anything. (The transaction prompt has no such default, which is why it
+/// swallows Escape instead.)
+///
+/// Generic by design — raise it through [`crate::Confirm`] rather than writing
+/// another one-off modal.
+pub(crate) fn confirm_overlay(ui: Ui) -> impl IntoView {
+    let confirm = ui.overlay.confirm;
+
+    dyn_container(
+        move || confirm.get(),
+        move |c| {
+            let Some(c) = c else {
+                return empty().into_any();
+            };
+            // Answer once and close. Shared by both buttons, Escape, and the
+            // backdrop, so no path can leave the modal up or resolve twice.
+            let answer: Rc<dyn Fn(bool)> = {
+                let resolve = c.resolve.clone();
+                Rc::new(move |yes: bool| {
+                    confirm.set(None);
+                    (resolve)(yes);
+                })
+            };
+
+            let btn = |label: &'static str,
+                       color: fn() -> Color,
+                       hover: fn() -> Color,
+                       act: Rc<dyn Fn()>| {
+                text(label).on_click_stop(move |_| (act)()).style(move |s| {
+                    s.font_size(theme::FONT_BODY)
+                        .padding_horiz(10.0)
+                        .padding_vert(5.0)
+                        .border_radius(6.0)
+                        .color(color())
+                        .hover(move |s| s.color(hover()))
+                })
+            };
+            let no = {
+                let a = answer.clone();
+                btn(
+                    "No",
+                    theme::text_dim,
+                    theme::text,
+                    Rc::new(move || (a)(false)),
+                )
+            };
+            let yes = {
+                let a = answer.clone();
+                btn(
+                    "Yes",
+                    theme::confirm_yes,
+                    theme::confirm_yes_hover,
+                    Rc::new(move || (a)(true)),
+                )
+            };
+
+            let panel = v_stack((
+                text(c.title).style(|s| {
+                    s.font_size(15.0)
+                        .font_bold()
+                        .color(theme::text())
+                        .margin_bottom(10.0)
+                }),
+                text(c.message).style(|s| {
+                    s.width(380.0)
+                        .color(theme::text())
+                        .font_size(theme::FONT_BODY)
+                        .line_height(1.4)
+                }),
+                h_stack((empty().style(|s| s.flex_grow(1.0_f32)), no, yes)).style(|s| {
+                    s.width_full()
+                        .flex_row()
+                        .items_center()
+                        .gap(6.0)
+                        .margin_top(18.0)
+                }),
+            ))
+            // Clicks inside the panel mustn't reach the backdrop's "No".
+            .on_click_stop(|_| {})
+            .style(|s| {
+                panel_style(s)
+                    .width(430.0)
+                    .padding(20.0)
+                    .flex_col()
+                    .border_color(theme::modal_border())
+            });
+
+            container(panel)
+                // Focus so the shortcuts behind the backdrop stop firing while
+                // the question is up (Ctrl+W closing a tab mid-confirm would be
+                // a mess), and so Escape lands here.
+                .keyboard_navigable()
+                .request_focus(|| {})
+                .on_key_down(Key::Named(NamedKey::Escape), |_| true, {
+                    let a = answer.clone();
+                    move |_| (a)(false)
+                })
+                .on_click_stop(move |_| (answer)(false))
+                .style(|s| {
+                    s.size_full()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .background(theme::modal_backdrop())
+                })
+                .into_any()
+        },
+    )
+    .style(move |s| {
+        if confirm.get().is_some() {
+            s.absolute().inset(0.0)
+        } else {
+            s
+        }
+    })
+}
+
 /// "View" modal for the editor error bar: same backdrop + panel chrome as
 /// `find_overlay`, but no input — the active tab's full error, centered and
 /// scrollable. Click-away or Escape closes.
