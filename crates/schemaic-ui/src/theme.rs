@@ -443,6 +443,13 @@ pub fn status_ok() -> Color {
 pub fn seed_button() -> Color {
     Color::rgb8(0x71, 0xC3, 0x71)
 }
+/// The table designer's "N changes" count, when there *are* changes (`#71C371`).
+/// Same hex as `status_ok` and kept separate for the usual reason: that one says
+/// "your SQL is clean", this one says "you have unsaved schema edits" — they'd
+/// want retuning apart the moment either is touched.
+pub fn change_count() -> Color {
+    Color::rgb8(0x71, 0xC3, 0x71)
+}
 
 /// A tab in manual-commit mode, and its open-transaction pill (`#E0B24B`). Its
 /// own colour rather than `status_warn`'s amber: an open transaction is a

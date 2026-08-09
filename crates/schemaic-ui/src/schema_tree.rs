@@ -1140,8 +1140,6 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
     let cols = table.columns;
     let idxs = table.indexes;
     let fkeys = table.foreign_keys;
-    let cols_db = database.clone();
-    let cols_table = table.name.clone();
     let col_term = name_term;
     let children = dyn_container(
         // Show columns/keys when the table is expanded OR when a column matched the
@@ -1153,6 +1151,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
             }
             let counts = count_row(col_count, key_count, indent);
             let csrc = col_source.clone();
+            let key_source = col_source.clone();
             let otc = open_table_col.clone();
             let cterm = col_term.clone();
             // Foreign-key referencing columns — tinted purple like their key.
@@ -1182,15 +1181,25 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
                 )
             }))
             .style(|s| s.flex_col());
-            let (kdb, ktbl) = (cols_db.clone(), cols_table.clone());
             // PRIMARY first, then the rest in their original order (stable sort).
             let mut sorted_idxs: Vec<IndexInfo> = idxs.to_vec();
             sorted_idxs.sort_by_key(|ix| !ix.is_primary());
-            let keys_block = v_stack_from_iter(
-                sorted_idxs
-                    .into_iter()
-                    .map(move |ix| key_row(ix, context_menu, kdb.clone(), ktbl.clone(), indent)),
-            )
+            // Which constraint each foreign-key-backing index belongs to, matched
+            // by *columns* — the same rule the introspection uses to set
+            // `IndexInfo::foreign`, and for the same reason: the index is often
+            // named after its column, not after the constraint.
+            let key_src = key_source.clone();
+            let key_fks = fkeys.clone();
+            let keys_block = v_stack_from_iter(sorted_idxs.into_iter().map(move |ix| {
+                let names: Vec<&str> = ix.column_names().collect();
+                let fk = key_fks
+                    .iter()
+                    .find(|fk| {
+                        fk.columns.len() == names.len() && fk.columns.iter().eq(names.iter())
+                    })
+                    .map(|fk| fk.name.clone());
+                key_row(ix, context_menu, key_src.clone(), fk, indent)
+            }))
             .style(|s| s.flex_col());
             v_stack((counts, cols_block, keys_block))
                 .style(|s| s.flex_col())
@@ -1281,6 +1290,7 @@ fn column_row(
     let ctx_ty = ty.clone();
     // Double-click opens the column's table (reusing a tab) + highlights it.
     let dbl_source = source.clone();
+    let ctx_source = source.clone();
     let dbl_col = name.clone();
     let (database, table) = (source.database.clone(), source.display());
     let nav_key = format!("col:{database}:{table}:{name}");
@@ -1320,7 +1330,10 @@ fn column_row(
              what it stores and how it's typically used."
         );
         context_menu.set(Some(CtxMenu {
-            kind: CtxKind::Field,
+            kind: CtxKind::Field {
+                source: ctx_source.clone(),
+                column: ctx_name.clone(),
+            },
             name: ctx_name.clone(),
             ai_prompt,
         }));
@@ -1344,10 +1357,14 @@ fn column_row(
 fn key_row(
     ix: IndexInfo,
     context_menu: RwSignal<Option<CtxMenu>>,
-    database: String,
-    table: String,
+    source: TableSource,
+    // `fk_name`: the foreign key this index backs, when it backs one — resolved
+    // by the caller from the table's own constraints, since the names needn't
+    // match.
+    fk_name: Option<String>,
     indent: f64,
 ) -> impl IntoView {
+    let (database, table) = (source.database.clone(), source.display());
     let (color, tag) = if ix.is_primary() {
         (theme::key_primary(), "UNIQUE")
     } else if ix.foreign {
@@ -1361,6 +1378,7 @@ fn key_row(
     let cols = ix.column_names().collect::<Vec<_>>().join(", ");
     let ctx_name = ix.name.clone();
     let label = format!("{} ({cols})", ix.name);
+    let ctx_index = ix.clone();
     h_stack((
         icons::icon(icons::KEY_ROUND, SCHEMA_ICON as f32).style(move |s| {
             // 50%-alpha key colour, matching the column icons' quieter marker.
@@ -1384,7 +1402,11 @@ fn key_row(
              purpose (uniqueness, faster lookups, or a foreign-key relationship)."
         );
         context_menu.set(Some(CtxMenu {
-            kind: CtxKind::Field,
+            kind: CtxKind::Key {
+                source: source.clone(),
+                index: Box::new(ctx_index.clone()),
+                foreign_key: fk_name.clone(),
+            },
             name: ctx_name.clone(),
             ai_prompt,
         }));

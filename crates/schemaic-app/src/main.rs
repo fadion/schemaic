@@ -3016,6 +3016,47 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         })
     };
 
+    // ── Schema editing (DDL) ────────────────────────────────────────────────
+    // Apply an approved plan, then re-introspect the database it changed.
+    //
+    // The re-introspection isn't optional bookkeeping: `db_nodes` is what the
+    // schema tree, the grid's key icons, the completion index and `intel`'s
+    // catalog all read, so leaving it stale after an `ALTER` would have the
+    // editor flagging columns that now exist as unknown.
+    let run_ddl: schemaic_ui::DdlFn = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        let refresh_db = refresh_db.clone();
+        Rc::new(
+            move |req: schemaic_ui::DdlRunRequest, done: schemaic_ui::DdlDoneFn| {
+                let db = match db_for(req.conn_id) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        (done)(Err(e));
+                        return;
+                    }
+                };
+                let refresh_db = refresh_db.clone();
+                let database = req.database.clone();
+                let report = create_ext_action(cx, move |res: Result<(), String>| {
+                    // Refresh before reporting, so the modal's success state and
+                    // the tree can't be seen disagreeing for a frame.
+                    if res.is_ok() {
+                        (refresh_db)(database.clone());
+                    }
+                    (done)(res);
+                });
+                handle.spawn(async move {
+                    let out = db
+                        .run_ddl(&req.database, &req.statements, CancellationToken::new())
+                        .await
+                        .map_err(|e| e.to_string());
+                    report(out);
+                });
+            },
+        )
+    };
+
     // Persist the current connections list with a given active id.
     let persist_conns = move |active: Option<u64>| {
         let file = ConnectionsFile {
@@ -4352,6 +4393,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     }
                 })
             },
+            run_ddl,
         }),
         // Reset on every open (`import_view::open_import`), so one bundle serves
         // every table rather than a per-open scope that would need disposing.
@@ -4375,6 +4417,22 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             imported: RwSignal::new(0),
             busy: RwSignal::new(false),
             applying: RwSignal::new(false),
+            generation: RwSignal::new(0),
+        },
+        // Same rule as `import` above: reset on open, so one bundle serves every
+        // table rather than a per-open scope that would need disposing.
+        ddl: schemaic_ui::DdlUi {
+            designer: RwSignal::new(None),
+            draft: RwSignal::new(schemaic_core::ddl::TableDraft::default()),
+            tab: RwSignal::new(schemaic_ui::DesignerTab::Table),
+            selected: RwSignal::new(0),
+            rev: RwSignal::new(0),
+            preview: RwSignal::new(None),
+            sql: RwSignal::new(String::new()),
+            sql_rows: RwSignal::new(16),
+            applying: RwSignal::new(false),
+            error: RwSignal::new(None),
+            applied: RwSignal::new(false),
             generation: RwSignal::new(0),
         },
         conn: ConnUi {
