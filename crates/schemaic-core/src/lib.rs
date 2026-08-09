@@ -9,6 +9,7 @@
 pub mod chat;
 pub mod connection;
 pub mod db_color;
+pub mod ddl;
 pub mod diff;
 pub mod edit;
 pub mod erd;
