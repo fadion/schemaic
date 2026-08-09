@@ -51,7 +51,7 @@ use schemaic_core::model::{
     Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder,
     ResultSet, RowDelete, RowEdit, RowInsert, Value,
 };
-use schemaic_core::schema::DbSchema;
+use schemaic_core::schema::{ColumnInfo, DbSchema, IndexColumn};
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
@@ -447,11 +447,7 @@ fn user_schema_filter(ns: &str) -> String {
     )
 }
 
-/// One `information_schema.columns` row as [`assemble_schema`] wants it:
-/// `(table, column, type, is_nullable, key)`.
-type ColRow = (String, String, String, String, String);
-/// One `pg_index` key-column row: `(table, index, non_unique, column)`.
-type IdxRow = (String, String, i64, String);
+use crate::{ColRow, IdxRow};
 /// A catalogue row tagged with the namespace it belongs to, so the whole-database
 /// fetch can be partitioned per schema before folding.
 type InSchema<T> = (String, T);
@@ -502,11 +498,13 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
             "SELECT n.nspname, c.relname, \
                     CASE WHEN ix.indisprimary THEN 'PRIMARY' ELSE ic.relname END AS iname, \
                     CASE WHEN ix.indisunique THEN 0 ELSE 1 END AS non_unique, \
-                    a.attname, ix.indisprimary \
+                    a.attname, ix.indisprimary, \
+                    am.amname, pg_get_expr(ix.indpred, ix.indrelid) \
              FROM pg_index ix \
              JOIN pg_class c ON c.oid = ix.indrelid \
              JOIN pg_class ic ON ic.oid = ix.indexrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
+             JOIN pg_am am ON am.oid = ic.relam \
              JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true \
              JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.attnum \
              WHERE {} AND a.attnum > 0 \
@@ -518,14 +516,22 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
     let idx_rows: Vec<InSchema<IdxRow>> = idx_all
         .iter()
         .map(|r| {
+            let method = cell(r, 6);
             (
                 cell(r, 0),
-                (
-                    cell(r, 1),
-                    cell(r, 2),
-                    cell(r, 3).parse::<i64>().unwrap_or(1),
-                    cell(r, 4),
-                ),
+                IdxRow {
+                    table: cell(r, 1),
+                    index: cell(r, 2),
+                    unique: cell(r, 3) == "0",
+                    // PostgreSQL records a key column's sort direction in
+                    // `indoption`, which isn't read here — a DESC index
+                    // round-trips as ASC. Prefixes don't exist on PG at all.
+                    column: IndexColumn::plain(cell(r, 4)),
+                    // Only worth restating when it isn't the default, or every
+                    // generated statement carries a redundant `USING btree`.
+                    method: (method != "btree" && !method.is_empty()).then_some(method),
+                    predicate: r.get(7).cloned().flatten(),
+                },
             )
         })
         .collect();
@@ -537,31 +543,73 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
         .map(|r| (cell(r, 0), cell(r, 1), cell(r, 4)))
         .collect();
 
-    // Columns for the whole schema, in ordinal order. Type names come from
-    // `udt_name` (the underlying pg type — `varchar`, `timestamp`, `int4`) mapped
-    // through the shared `pg_type_name_str`, so the schema panel shows the SAME
-    // short names as the grid (which maps the wire type) — not the verbose
-    // `data_type` ("character varying", "timestamp without time zone").
+    // Columns for the whole schema, in ordinal order — from `pg_catalog`, not
+    // `information_schema.columns`.
+    //
+    // `format_type(atttypid, atttypmod)` is the reason. `udt_name` names the
+    // *base* type only, so `varchar(45)` came back as `varchar` and
+    // `numeric(10,2)` as `numeric` — the length and precision were being dropped
+    // before anything could see them, which made generated DDL wrong and a
+    // faithful column edit impossible. `format_type` is what `pg_dump` uses and
+    // returns the declared type in full.
+    //
+    // The rest of the row is equally unavailable from `information_schema`
+    // without more joins than it's worth: `pg_get_expr(adbin, adrelid)` renders a
+    // default back to SQL text, `attidentity`/`attgenerated` distinguish an
+    // identity column from a generated one, and `col_description` carries the
+    // comment.
     let col_rows: Vec<InSchema<ColRow>> = query_all(
         &client,
         &format!(
-            "SELECT table_schema, table_name, column_name, udt_name, is_nullable \
-             FROM information_schema.columns \
-             WHERE {} \
-             ORDER BY table_schema, table_name, ordinal_position",
-            user_schema_filter("table_schema")
+            "SELECT n.nspname, c.relname, a.attname, \
+                    format_type(a.atttypid, a.atttypmod), \
+                    a.attnotnull, \
+                    pg_get_expr(ad.adbin, ad.adrelid), \
+                    a.attidentity, a.attgenerated, \
+                    col_description(c.oid, a.attnum), \
+                    co.collname \
+             FROM pg_attribute a \
+             JOIN pg_class c ON c.oid = a.attrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
+             LEFT JOIN pg_collation co ON co.oid = a.attcollation \
+                   AND co.collname <> 'default' \
+             WHERE a.attnum > 0 AND NOT a.attisdropped \
+               AND c.relkind IN ('r', 'v', 'm', 'p', 'f') \
+               AND {} \
+             ORDER BY n.nspname, c.relname, a.attnum",
+            user_schema_filter("n.nspname")
         ),
     )
     .await?
     .into_iter()
     .map(|r| {
         let (ns, t, c) = (cell(&r, 0), cell(&r, 1), cell(&r, 2));
-        let key = if pk_set.contains(&(ns.clone(), t.clone(), c.clone())) {
-            "PRI".to_string()
-        } else {
-            String::new()
+        let identity = !cell(&r, 6).is_empty();
+        let generated = !cell(&r, 7).is_empty();
+        let default = r.get(5).cloned().flatten();
+        let column = ColumnInfo {
+            primary_key: pk_set.contains(&(ns.clone(), t.clone(), c.clone())),
+            name: c,
+            type_name: cell(&r, 3),
+            // `attnotnull` arrives over the text protocol as `t`/`f`.
+            nullable: cell(&r, 4) != "t",
+            // A generated column's `pg_get_expr` *is* its expression, and it
+            // must not also be emitted as a DEFAULT.
+            generated: generated.then(|| default.clone().unwrap_or_default()),
+            default: default.clone().filter(|_| !generated && !identity),
+            // Both an identity column and a `serial` (a default of
+            // `nextval(...)`) are server-assigned; the designer treats them the
+            // same way, so both land here.
+            auto_increment: identity
+                || default
+                    .as_deref()
+                    .is_some_and(|d| d.starts_with("nextval(")),
+            comment: r.get(8).cloned().flatten(),
+            collation: r.get(9).cloned().flatten(),
+            on_update: None,
         };
-        (ns, (t, c, pg_type_name_str(&cell(&r, 3)), cell(&r, 4), key))
+        (ns, ColRow { table: t, column })
     })
     .collect();
 

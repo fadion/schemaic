@@ -126,15 +126,10 @@ fn fk_is_unique(child: &TableInfo, fk_cols: &[String]) -> bool {
     if !pk.is_empty() && pk == want {
         return true;
     }
-    child.indexes.iter().any(|ix| {
-        ix.unique
-            && ix
-                .columns
-                .iter()
-                .map(String::as_str)
-                .collect::<HashSet<_>>()
-                == want
-    })
+    child
+        .indexes
+        .iter()
+        .any(|ix| ix.unique && ix.column_names().collect::<HashSet<_>>() == want)
 }
 
 /// Is the foreign key optional — i.e. any of its referencing columns nullable, so
@@ -916,6 +911,7 @@ mod tests {
             type_name: ty.to_string(),
             nullable: !pk,
             primary_key: pk,
+            ..Default::default()
         }
     }
 
@@ -925,6 +921,7 @@ mod tests {
             ref_schema: None,
             ref_table: ref_table.to_string(),
             ref_columns: ref_cols.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 
@@ -933,10 +930,8 @@ mod tests {
             schema: None,
             name: name.to_string(),
             columns: cols,
-            indexes: Vec::new(),
             foreign_keys: fks,
-            is_view: false,
-            view_definition: None,
+            ..Default::default()
         }
     }
 
@@ -1028,6 +1023,7 @@ mod tests {
                     ref_schema: Some("warehouse".into()),
                     ref_table: "inventory".into(),
                     ref_columns: vec!["id".into()],
+                    ..Default::default()
                 }],
             )],
         };
@@ -1067,10 +1063,8 @@ mod tests {
         let mut s2 = s.clone();
         s2.tables[1].columns[0].primary_key = false;
         s2.tables[1].indexes = vec![IndexInfo {
-            name: "uq".into(),
-            columns: vec!["user_id".into()],
-            unique: true,
             foreign: true,
+            ..IndexInfo::plain("uq", vec!["user_id"], true)
         }];
         let g2 = build_graph(&s2, "app", &DiagramSeed::Database);
         assert_eq!(g2.edges[0].cardinality, Cardinality::OneToOne);
@@ -1715,6 +1709,7 @@ mod multi_schema_tests {
             type_name: "integer".to_string(),
             nullable: !pk,
             primary_key: pk,
+            ..Default::default()
         }
     }
 
@@ -1736,6 +1731,7 @@ mod multi_schema_tests {
             ref_schema: Some(ref_ns.to_string()),
             ref_table: ref_table.to_string(),
             ref_columns: ref_cols.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 
@@ -1830,6 +1826,7 @@ mod multi_schema_tests {
                         ref_schema: None,
                         ref_table: "customers".into(),
                         ref_columns: vec!["id".into()],
+                        ..Default::default()
                     }],
                     ..Default::default()
                 },
@@ -1861,6 +1858,7 @@ mod multi_schema_tests {
                     ref_schema: Some("other_db".into()),
                     ref_table: "customers".into(),
                     ref_columns: vec!["id".into()],
+                    ..Default::default()
                 }],
                 ..Default::default()
             }],

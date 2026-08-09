@@ -4823,13 +4823,10 @@ mod tests {
                     name: c.to_string(),
                     type_name: "int".to_string(),
                     nullable: true,
-                    primary_key: false,
+                    ..Default::default()
                 })
                 .collect(),
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
-            is_view: false,
-            view_definition: None,
+            ..Default::default()
         }
     }
 
@@ -5897,6 +5894,7 @@ mod tests {
             ref_schema: None,
             ref_table: "customers".to_string(),
             ref_columns: vec!["id".to_string()],
+            ..Default::default()
         }];
         let customers = tbl("customers", &["id", "name"]);
         // Composite FK: order_items(order_id, item_id) → … just test single here,
@@ -5907,6 +5905,7 @@ mod tests {
             ref_schema: None,
             ref_table: "orders".to_string(),
             ref_columns: vec!["id".to_string()],
+            ..Default::default()
         }];
         (
             DbSchema {

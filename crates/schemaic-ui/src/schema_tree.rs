@@ -1358,7 +1358,7 @@ fn key_row(
         (theme::key_index(), "INDEX")
     };
     let kind = if ix.foreign { "foreign key" } else { "index" };
-    let cols = ix.columns.join(", ");
+    let cols = ix.column_names().collect::<Vec<_>>().join(", ");
     let ctx_name = ix.name.clone();
     let label = format!("{} ({cols})", ix.name);
     h_stack((

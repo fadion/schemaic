@@ -1451,7 +1451,7 @@ fn column_key_map(
         if ix.is_primary() || ix.columns.len() != 1 {
             continue;
         }
-        let col = &ix.columns[0];
+        let col = &ix.columns[0].name;
         if map.get(col) == Some(&ColKey::Primary) {
             continue;
         }

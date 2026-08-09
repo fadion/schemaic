@@ -505,24 +505,39 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         .await
         .map_err(qerr)?;
 
+    // Which server this is, for `mysql_column`'s default normalization — MariaDB
+    // hands back SQL text where MySQL hands back a raw value, and nothing in the
+    // catalogue itself says which. One extra row per schema fetch.
+    let mariadb: bool = conn
+        .query_first::<String, _>("SELECT VERSION()")
+        .await
+        .map_err(qerr)?
+        .is_some_and(|v| v.to_ascii_lowercase().contains("mariadb"));
+
     // Columns for the whole schema in one pass, grouped back onto their tables.
-    let col_rows: Vec<(String, String, String, String, String)> = conn
+    let col_rows: Vec<ColRow> = conn
         .exec_map(
             "SELECT CAST(TABLE_NAME AS CHAR) AS t, \
                     CAST(COLUMN_NAME AS CHAR) AS c, \
                     CAST(COLUMN_TYPE AS CHAR) AS ty, \
                     CAST(IS_NULLABLE AS CHAR) AS nullable, \
-                    CAST(COLUMN_KEY AS CHAR) AS ck \
+                    CAST(COLUMN_KEY AS CHAR) AS ck, \
+                    CAST(COLUMN_DEFAULT AS CHAR) AS def, \
+                    CAST(EXTRA AS CHAR) AS extra, \
+                    CAST(COLLATION_NAME AS CHAR) AS coll, \
+                    CAST(COLUMN_COMMENT AS CHAR) AS cmt, \
+                    CAST(GENERATION_EXPRESSION AS CHAR) AS genexpr \
              FROM information_schema.COLUMNS \
              WHERE TABLE_SCHEMA = ? \
              ORDER BY TABLE_NAME, ORDINAL_POSITION",
             (database,),
-            |(t, c, ty, nullable, ck): (String, String, String, String, String)| {
-                (t, c, ty, nullable, ck)
-            },
+            |r: MyColRow| r,
         )
         .await
-        .map_err(qerr)?;
+        .map_err(qerr)?
+        .into_iter()
+        .map(|r| mysql_column(r, mariadb))
+        .collect();
 
     // Foreign keys, one row per referencing key-column with its referenced
     // target, ordered so a composite key's columns fold in order. Drives both the
@@ -548,20 +563,42 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
 
     // Indexes: one row per (index, key-column); fold consecutive columns into
     // the same index, preserving `SEQ_IN_INDEX` order.
-    let idx_rows: Vec<(String, String, i64, String)> = conn
+    let idx_rows: Vec<IdxRow> = conn
         .exec_map(
             "SELECT CAST(TABLE_NAME AS CHAR) AS t, \
                     CAST(INDEX_NAME AS CHAR) AS i, \
                     CAST(NON_UNIQUE AS SIGNED) AS nu, \
-                    CAST(COLUMN_NAME AS CHAR) AS c \
+                    CAST(COLUMN_NAME AS CHAR) AS c, \
+                    CAST(SUB_PART AS SIGNED) AS sub, \
+                    CAST(COLLATION AS CHAR) AS coll \
              FROM information_schema.STATISTICS \
              WHERE TABLE_SCHEMA = ? \
              ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
             (database,),
-            |(t, i, nu, c): (String, String, i64, String)| (t, i, nu, c),
+            |r: (String, String, i64, String, Option<i64>, Option<String>)| r,
         )
         .await
-        .map_err(qerr)?;
+        .map_err(qerr)?
+        .into_iter()
+        .map(|(t, i, nu, c, sub, coll)| IdxRow {
+            table: t,
+            index: i,
+            unique: nu == 0,
+            column: schemaic_core::schema::IndexColumn {
+                name: c,
+                // A prefix index (`KEY (bio(20))`) — recreating it without the
+                // length fails outright on a TEXT column.
+                prefix: sub.and_then(|n| u32::try_from(n).ok()),
+                // `COLLATION` is 'A' ascending, 'D' descending, NULL unsorted.
+                descending: coll.as_deref() == Some("D"),
+            },
+            // MySQL's index type is only worth restating when it isn't the
+            // default; BTREE is, so emitting `USING BTREE` everywhere would be
+            // noise in every generated statement.
+            method: None,
+            predicate: None,
+        })
+        .collect();
 
     // View definitions (only if the schema has any views) — the stored SELECT
     // body, attached to each view's `TableInfo` for `CREATE VIEW` DDL.
@@ -591,6 +628,113 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         &idx_rows,
         &view_rows,
     ))
+}
+
+/// A raw `information_schema.COLUMNS` row as the MySQL fetch selects it.
+pub(crate) type MyColRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Turn one MySQL/MariaDB catalogue row into a [`ColumnInfo`].
+///
+/// The whole reason this isn't a field-for-field copy is `COLUMN_DEFAULT`, where
+/// the two servers genuinely disagree:
+///
+/// * **MariaDB** returns SQL text — a string default comes back *already quoted*
+///   (`'draft'`), and an explicit `DEFAULT NULL` comes back as the four
+///   characters `NULL`. It can be emitted verbatim.
+/// * **MySQL** returns the *raw value* — `draft`, unquoted and indistinguishable
+///   from the expression `draft`. Emitting it verbatim produces
+///   `DEFAULT draft`, which is a syntax error at best and a column reference at
+///   worst, so a non-expression default on a non-numeric column has to be quoted
+///   here.
+///
+/// Expressions are told apart by `EXTRA`, which carries `DEFAULT_GENERATED` for
+/// them on MySQL 8, plus the `CURRENT_TIMESTAMP` family which predates that flag.
+/// Getting this wrong doesn't fail loudly — it writes a *different default* — so
+/// it's normalized once, here, and the model downstream is plain SQL text.
+pub(crate) fn mysql_column(r: MyColRow, mariadb: bool) -> ColRow {
+    let (table, name, type_name, nullable, key, default, extra, collation, comment, generated) = r;
+    let extra_lc = extra.to_ascii_lowercase();
+    let numeric_or_bool = {
+        let t = type_name.to_ascii_lowercase();
+        [
+            "int", "dec", "num", "float", "double", "real", "bit", "bool",
+        ]
+        .iter()
+        .any(|p| t.starts_with(p))
+    };
+    let default = default.and_then(|d| {
+        if mariadb {
+            // Already SQL text. MariaDB writes a *missing* default as SQL NULL
+            // and an explicit `DEFAULT NULL` as the literal text — both mean "no
+            // default worth emitting" on a nullable column.
+            (d != "NULL").then_some(d)
+        } else if extra_lc.contains("default_generated")
+            || numeric_or_bool
+            || d.to_ascii_uppercase().starts_with("CURRENT_TIMESTAMP")
+        {
+            Some(d)
+        } else {
+            Some(schemaic_core::schema::ddl_string(&d))
+        }
+    });
+    ColRow {
+        table,
+        column: ColumnInfo {
+            name,
+            type_name,
+            nullable: nullable.eq_ignore_ascii_case("YES"),
+            primary_key: key == "PRI",
+            default,
+            auto_increment: extra_lc.contains("auto_increment"),
+            // `GENERATION_EXPRESSION` is the empty string, not NULL, for an
+            // ordinary column.
+            generated: generated.filter(|g| !g.is_empty()),
+            on_update: extra_lc
+                .contains("on update current_timestamp")
+                .then(|| "CURRENT_TIMESTAMP".to_string()),
+            comment: comment.filter(|c| !c.is_empty()),
+            collation,
+        },
+    }
+}
+
+/// One introspected column, already turned into the model. A struct rather than
+/// a widening tuple because a column now carries nine fields, and
+/// `(String, String, String, String, String, Option<String>, bool, …)` at the
+/// call site is unreadable and trivially mis-ordered.
+///
+/// Each engine's fetch does its own normalization (see
+/// [`ColumnInfo::default`](schemaic_core::schema::ColumnInfo)) and hands the
+/// finished column here, so [`assemble_schema`] stays pure grouping.
+#[derive(Clone)]
+pub(crate) struct ColRow {
+    pub table: String,
+    pub column: ColumnInfo,
+}
+
+/// One key-column of one index, plus the index-level attributes carried on every
+/// row of it (they repeat per key column; the first row wins).
+#[derive(Clone)]
+pub(crate) struct IdxRow {
+    pub table: String,
+    pub index: String,
+    pub unique: bool,
+    pub column: schemaic_core::schema::IndexColumn,
+    /// Access method, when the engine names one worth emitting.
+    pub method: Option<String>,
+    /// Partial-index predicate (PostgreSQL).
+    pub predicate: Option<String>,
 }
 
 /// One `KEY_COLUMN_USAGE` row for a foreign key: `(table, constraint, column,
@@ -625,9 +769,9 @@ pub(crate) type FkColRow = (
 pub(crate) fn assemble_schema(
     schema: Option<&str>,
     table_rows: &[(String, String)],
-    col_rows: &[(String, String, String, String, String)],
+    col_rows: &[ColRow],
     fk_col_rows: &[FkColRow],
-    idx_rows: &[(String, String, i64, String)],
+    idx_rows: &[IdxRow],
     view_rows: &[(String, String)],
 ) -> DbSchema {
     let mut tables: Vec<TableInfo> = Vec::with_capacity(table_rows.len());
@@ -637,22 +781,16 @@ pub(crate) fn assemble_schema(
         tables.push(TableInfo {
             schema: schema.map(str::to_string),
             name: name.clone(),
-            columns: Vec::new(),
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
             is_view: ty.eq_ignore_ascii_case("VIEW"),
-            view_definition: None,
+            ..Default::default()
         });
     }
 
-    for (t, c, ty, nullable, key) in col_rows {
-        let Some(&ti) = index.get(t) else { continue };
-        tables[ti].columns.push(ColumnInfo {
-            name: c.clone(),
-            type_name: ty.clone(),
-            nullable: nullable.eq_ignore_ascii_case("YES"),
-            primary_key: key == "PRI",
-        });
+    for c in col_rows {
+        let Some(&ti) = index.get(&c.table) else {
+            continue;
+        };
+        tables[ti].columns.push(c.column.clone());
     }
 
     // Fold the FK key-column rows into one `ForeignKeyInfo` per (table,
@@ -673,27 +811,33 @@ pub(crate) fn assemble_schema(
             None => {
                 let fi = tables[ti].foreign_keys.len();
                 tables[ti].foreign_keys.push(ForeignKeyInfo {
+                    name: cn.clone(),
                     columns: vec![col.clone()],
                     ref_schema: rs.clone(),
                     ref_table: rt.clone(),
                     ref_columns: vec![rc.clone()],
+                    ..Default::default()
                 });
                 fk_slot.insert((ti, cn.clone()), fi);
             }
         }
     }
 
-    for (t, iname, non_unique, col) in idx_rows {
-        let Some(&ti) = index.get(t) else { continue };
+    for r in idx_rows {
+        let Some(&ti) = index.get(&r.table) else {
+            continue;
+        };
         let table = &mut tables[ti];
-        if let Some(existing) = table.indexes.iter_mut().find(|x| &x.name == iname) {
-            existing.columns.push(col.clone());
+        if let Some(existing) = table.indexes.iter_mut().find(|x| x.name == r.index) {
+            existing.columns.push(r.column.clone());
         } else {
             table.indexes.push(IndexInfo {
-                name: iname.clone(),
-                columns: vec![col.clone()],
-                unique: *non_unique == 0,
+                name: r.index.clone(),
+                columns: vec![r.column.clone()],
+                unique: r.unique,
                 foreign: false, // set by the column-match pass below
+                method: r.method.clone(),
+                predicate: r.predicate.clone(),
             });
         }
     }
@@ -711,7 +855,10 @@ pub(crate) fn assemble_schema(
             .filter(|cols| !cols.is_empty())
             .collect();
         for ix in table.indexes.iter_mut() {
-            ix.foreign = fk_cols.iter().any(|&cols| ix.columns == cols);
+            let names: Vec<&str> = ix.column_names().collect();
+            ix.foreign = fk_cols
+                .iter()
+                .any(|&cols| cols.len() == names.len() && cols.iter().eq(names.iter()));
         }
     }
 
@@ -1866,12 +2013,120 @@ mod tests {
         x.to_string()
     }
 
+    /// A plain introspected column, for the grouping tests.
+    fn cr(table: &str, name: &str, ty: &str, nullable: bool, pk: bool) -> ColRow {
+        ColRow {
+            table: s(table),
+            column: ColumnInfo {
+                name: s(name),
+                type_name: s(ty),
+                nullable,
+                primary_key: pk,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A raw catalogue row, for the default-normalization tests.
+    fn my_row(ty: &str, default: Option<&str>, extra: &str) -> MyColRow {
+        (
+            s("t"),
+            s("c"),
+            s(ty),
+            s("YES"),
+            s(""),
+            default.map(s),
+            s(extra),
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// MySQL hands back a string default *unquoted*, so emitting it verbatim
+    /// would produce `DEFAULT draft` — a column reference, not a string.
+    #[test]
+    fn mysql_quotes_a_raw_string_default() {
+        let c = mysql_column(my_row("varchar(20)", Some("draft"), ""), false).column;
+        assert_eq!(c.default.as_deref(), Some("'draft'"));
+    }
+
+    /// MariaDB already hands back SQL text, so quoting again would store the
+    /// quotes as part of the value.
+    #[test]
+    fn mariadb_keeps_its_already_quoted_default() {
+        let c = mysql_column(my_row("varchar(20)", Some("'draft'"), ""), true).column;
+        assert_eq!(c.default.as_deref(), Some("'draft'"));
+    }
+
+    /// MariaDB writes an explicit `DEFAULT NULL` as the four characters `NULL`;
+    /// that's the same as having no default worth restating.
+    #[test]
+    fn mariadb_null_default_is_no_default() {
+        let c = mysql_column(my_row("varchar(20)", Some("NULL"), ""), true).column;
+        assert_eq!(c.default, None);
+    }
+
+    /// A numeric default is a literal in both servers — quoting it would change
+    /// the type of the stored default.
+    #[test]
+    fn a_numeric_default_is_never_quoted() {
+        let c = mysql_column(my_row("int(11)", Some("0"), ""), false).column;
+        assert_eq!(c.default.as_deref(), Some("0"));
+    }
+
+    /// The two ways MySQL says "this default is an expression": the 8.0
+    /// `DEFAULT_GENERATED` flag, and the `CURRENT_TIMESTAMP` family that predates
+    /// it. Quoting either would turn a live expression into a constant string.
+    #[test]
+    fn an_expression_default_is_left_alone() {
+        let c = mysql_column(my_row("timestamp", Some("CURRENT_TIMESTAMP"), ""), false).column;
+        assert_eq!(c.default.as_deref(), Some("CURRENT_TIMESTAMP"));
+        let c = mysql_column(
+            my_row("varchar(36)", Some("(uuid())"), "DEFAULT_GENERATED"),
+            false,
+        )
+        .column;
+        assert_eq!(c.default.as_deref(), Some("(uuid())"));
+    }
+
+    /// `EXTRA` is where MySQL keeps the two attributes `MODIFY COLUMN` would
+    /// otherwise drop.
+    #[test]
+    fn extra_carries_auto_increment_and_on_update() {
+        let c = mysql_column(my_row("int", None, "auto_increment"), false).column;
+        assert!(c.auto_increment);
+        let c = mysql_column(
+            my_row(
+                "timestamp",
+                Some("CURRENT_TIMESTAMP"),
+                "DEFAULT_GENERATED on update CURRENT_TIMESTAMP",
+            ),
+            false,
+        )
+        .column;
+        assert_eq!(c.on_update.as_deref(), Some("CURRENT_TIMESTAMP"));
+    }
+
+    /// One key column of an index, as the MySQL fetch produces it (`non_unique`
+    /// is the catalogue's sense: 1 means not unique).
+    fn ir(table: &str, index: &str, non_unique: i64, col: &str) -> IdxRow {
+        IdxRow {
+            table: s(table),
+            index: s(index),
+            unique: non_unique == 0,
+            column: schemaic_core::schema::IndexColumn::plain(col),
+            method: None,
+            predicate: None,
+        }
+    }
+
     #[test]
     fn assemble_schema_groups_columns_and_flags_pk() {
         let tables = [(s("users"), s("BASE TABLE"))];
         let cols = [
-            (s("users"), s("id"), s("int"), s("NO"), s("PRI")),
-            (s("users"), s("email"), s("varchar(255)"), s("YES"), s("")),
+            cr("users", "id", "int", false, true),
+            cr("users", "email", "varchar(255)", true, false),
         ];
         let schema = assemble_schema(None, &tables, &cols, &[], &[], &[]);
         assert_eq!(schema.tables.len(), 1);
@@ -1905,15 +2160,15 @@ mod tests {
         let tables = [(s("t"), s("BASE TABLE"))];
         // Two rows for the same index name → one IndexInfo, columns in row order.
         let idx = [
-            (s("t"), s("idx_ab"), 1, s("a")),
-            (s("t"), s("idx_ab"), 1, s("b")),
-            (s("t"), s("PRIMARY"), 0, s("id")),
+            ir("t", "idx_ab", 1, "a"),
+            ir("t", "idx_ab", 1, "b"),
+            ir("t", "PRIMARY", 0, "id"),
         ];
         let schema = assemble_schema(None, &tables, &[], &[], &idx, &[]);
         let t = &schema.tables[0];
         assert_eq!(t.indexes.len(), 2);
         let ab = t.indexes.iter().find(|i| i.name == "idx_ab").unwrap();
-        assert_eq!(ab.columns, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(ab.column_names().collect::<Vec<_>>(), vec!["a", "b"]);
         assert!(!ab.unique); // NON_UNIQUE = 1
         let pk = t.indexes.iter().find(|i| i.name == "PRIMARY").unwrap();
         assert!(pk.unique); // NON_UNIQUE = 0
@@ -1927,8 +2182,8 @@ mod tests {
         // the constraint (`orders_ibfk_1`) — the classicmodels case. Matching by
         // name misses it; matching by columns flags it.
         let idx = [
-            (s("orders"), s("customerNumber"), 1, s("customerNumber")),
-            (s("orders"), s("idx_plain"), 1, s("total")),
+            ir("orders", "customerNumber", 1, "customerNumber"),
+            ir("orders", "idx_plain", 1, "total"),
         ];
         let fks = [(
             s("orders"),
@@ -2026,8 +2281,8 @@ mod tests {
     fn assemble_schema_drops_rows_for_unknown_tables() {
         let tables = [(s("known"), s("BASE TABLE"))];
         // Column/index rows referencing a table absent from `tables` are ignored.
-        let cols = [(s("ghost"), s("x"), s("int"), s("NO"), s("PRI"))];
-        let idx = [(s("ghost"), s("idx"), 1, s("x"))];
+        let cols = [cr("ghost", "x", "int", false, true)];
+        let idx = [ir("ghost", "idx", 1, "x")];
         let schema = assemble_schema(None, &tables, &cols, &[], &idx, &[]);
         assert_eq!(schema.tables.len(), 1);
         assert!(schema.tables[0].columns.is_empty());

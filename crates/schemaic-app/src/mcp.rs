@@ -507,13 +507,9 @@ mod tests {
 
     fn tbl(name: &str, columns: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
-            schema: None,
             name: name.to_string(),
             columns,
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
-            is_view: false,
-            view_definition: None,
+            ..Default::default()
         }
     }
 
@@ -523,15 +519,18 @@ mod tests {
             type_name: type_name.to_string(),
             nullable,
             primary_key,
+            ..Default::default()
         }
     }
 
     fn fk(columns: &[&str], ref_table: &str, ref_columns: &[&str]) -> ForeignKeyInfo {
         ForeignKeyInfo {
+            name: format!("fk_{ref_table}"),
             columns: columns.iter().map(|s| s.to_string()).collect(),
             ref_schema: None,
             ref_table: ref_table.to_string(),
             ref_columns: ref_columns.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 
@@ -623,10 +622,8 @@ mod tests {
             ],
         );
         orders.indexes = vec![IndexInfo {
-            name: "ix_customer".to_string(),
-            columns: vec!["customer_id".to_string()],
-            unique: false,
             foreign: true,
+            ..IndexInfo::plain("ix_customer", vec!["customer_id"], false)
         }];
         orders.foreign_keys = vec![fk(&["customer_id"], "customers", &["id"])];
         let out = format_table_detail(&orders, SqlDialect::MySql, false);
@@ -694,6 +691,7 @@ mod tests {
             ref_schema: Some("public".to_string()),
             ref_table: "orders".to_string(),
             ref_columns: vec!["id".to_string()],
+            ..Default::default()
         }];
         let schema = DbSchema {
             tables: vec![
