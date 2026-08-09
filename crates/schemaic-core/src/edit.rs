@@ -197,15 +197,18 @@ fn resolve_key(
                 .iter()
                 .filter(|ix| ix.unique && !ix.foreign)
                 .filter(|ix| {
-                    ix.columns.iter().all(|c| {
+                    ix.column_names().all(|c| {
                         t.columns
                             .iter()
-                            .find(|tc| &tc.name == c)
+                            .find(|tc| tc.name == c)
                             .map(|tc| !tc.nullable)
                             .unwrap_or(false)
                     })
                 })
-                .find_map(|ix| all_present(&ix.columns))
+                .find_map(|ix| {
+                    let names: Vec<String> = ix.column_names().map(str::to_string).collect();
+                    all_present(&names)
+                })
         }
     } else {
         // No schema loaded: trust the wire PK flags on the returned columns.
@@ -297,12 +300,10 @@ mod tests {
                     type_name: ty.to_string(),
                     nullable: !pk.contains(n),
                     primary_key: pk.contains(n),
+                    ..Default::default()
                 })
                 .collect(),
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
-            is_view: false,
-            view_definition: None,
+            ..Default::default()
         }
     }
 
@@ -605,24 +606,21 @@ mod tests {
                         name: "email".to_string(),
                         type_name: "varchar".to_string(),
                         nullable: false, // NOT NULL — required for the unique-index key
-                        primary_key: false,
+                        ..Default::default()
                     },
                     ColumnInfo {
                         name: "name".to_string(),
                         type_name: "varchar".to_string(),
                         nullable: true,
-                        primary_key: false,
+                        ..Default::default()
                     },
                 ],
-                indexes: vec![crate::schema::IndexInfo {
-                    name: "email_uq".to_string(),
-                    columns: vec!["email".to_string()],
-                    unique: true,
-                    foreign: false,
-                }],
-                foreign_keys: Vec::new(),
-                is_view: false,
-                view_definition: None,
+                indexes: vec![crate::schema::IndexInfo::plain(
+                    "email_uq",
+                    vec!["email"],
+                    true,
+                )],
+                ..Default::default()
             })
         };
         let m = analyze_edit(&r, schema);
@@ -641,24 +639,21 @@ mod tests {
                         name: "email".to_string(),
                         type_name: "varchar".to_string(),
                         nullable: true, // nullable → can't uniquely identify a row
-                        primary_key: false,
+                        ..Default::default()
                     },
                     ColumnInfo {
                         name: "name".to_string(),
                         type_name: "varchar".to_string(),
                         nullable: true,
-                        primary_key: false,
+                        ..Default::default()
                     },
                 ],
-                indexes: vec![crate::schema::IndexInfo {
-                    name: "email_uq".to_string(),
-                    columns: vec!["email".to_string()],
-                    unique: true,
-                    foreign: false,
-                }],
-                foreign_keys: Vec::new(),
-                is_view: false,
-                view_definition: None,
+                indexes: vec![crate::schema::IndexInfo::plain(
+                    "email_uq",
+                    vec!["email"],
+                    true,
+                )],
+                ..Default::default()
             })
         };
         let m2 = analyze_edit(&r, schema_nullable);

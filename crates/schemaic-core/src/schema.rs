@@ -6,25 +6,85 @@
 use crate::model::Value;
 
 /// A single column of a table.
-#[derive(Clone, Debug)]
+///
+/// Everything past `primary_key` exists because **MySQL's `MODIFY COLUMN`
+/// replaces a column's entire definition** — anything not restated is silently
+/// dropped. Widening a `varchar` without knowing the column's default, comment,
+/// collation and auto-increment would destroy all four, so a schema editor can't
+/// be built on a model that doesn't carry them. They are equally what makes
+/// [`TableInfo::create_ddl`] emit SQL that actually recreates the table.
+///
+/// `Default` so the many places that only care about a column's name and type
+/// (tests, the MCP surface, the AI context) can spell out those and take the
+/// rest — the alternative is every one of them listing eight fields it has no
+/// opinion about.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ColumnInfo {
     pub name: String,
-    /// Full SQL type as reported by `information_schema` (e.g. `varchar(45)`,
-    /// `int(11) unsigned`).
+    /// Full SQL type as reported by the server (e.g. `varchar(45)`,
+    /// `int(11) unsigned`, `numeric(10,2)`) — **with** its parameters, which is
+    /// what makes it re-emittable.
     pub type_name: String,
     pub nullable: bool,
     /// True if this column is part of the primary key.
     pub primary_key: bool,
+    /// The declared `DEFAULT`, as SQL text ready to emit: a quoted literal
+    /// (`'draft'`), a number, or an expression (`CURRENT_TIMESTAMP`, `now()`).
+    ///
+    /// Normalized at the introspection boundary rather than here, because the
+    /// servers disagree about what they hand back — MariaDB and PostgreSQL
+    /// already return SQL text, MySQL returns a *raw value* that has to be
+    /// quoted by type. Downstream can treat this as "paste after `DEFAULT `".
+    pub default: Option<String>,
+    /// Server-assigned on insert: MySQL `AUTO_INCREMENT`, PostgreSQL an identity
+    /// column or a `serial`'s owned sequence.
+    pub auto_increment: bool,
+    /// A generated/computed column's expression, without the `AS (…)` wrapper.
+    pub generated: Option<String>,
+    /// MySQL's `ON UPDATE CURRENT_TIMESTAMP` (the expression, not the keyword).
+    pub on_update: Option<String>,
+    pub comment: Option<String>,
+    /// Explicit collation, when the server reports one for this column.
+    pub collation: Option<String>,
+}
+
+/// One key column of an index, with the parts of it that aren't just a name.
+///
+/// Modelled rather than flattened to a string because both are silently lost
+/// otherwise: recreating a MySQL prefix index `KEY (bio(20))` as `KEY (bio)`
+/// fails outright on a `TEXT` column, and dropping a `DESC` turns an index that
+/// serves an `ORDER BY` into one that doesn't.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IndexColumn {
+    pub name: String,
+    /// MySQL prefix length — `KEY (bio(20))`. Always `None` on PostgreSQL.
+    pub prefix: Option<u32>,
+    pub descending: bool,
+}
+
+impl IndexColumn {
+    /// The ordinary case: a whole column, ascending.
+    pub fn plain(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
 }
 
 /// An index on a table (its ordered key columns).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IndexInfo {
     pub name: String,
-    pub columns: Vec<String>,
+    pub columns: Vec<IndexColumn>,
     pub unique: bool,
     /// True if this index backs a FOREIGN KEY constraint.
     pub foreign: bool,
+    /// The access method (`btree`, `hash`, `gin`…), when the server names one.
+    /// Left `None` for the engine's default so generated DDL stays plain.
+    pub method: Option<String>,
+    /// A partial index's predicate, without the `WHERE` (PostgreSQL only).
+    pub predicate: Option<String>,
 }
 
 impl IndexInfo {
@@ -32,14 +92,54 @@ impl IndexInfo {
     pub fn is_primary(&self) -> bool {
         self.name == "PRIMARY"
     }
+
+    /// Just the key column names, for the callers that don't care about prefixes
+    /// or sort order (edit-model key selection, the schema tree, the grid's key
+    /// icons).
+    pub fn column_names(&self) -> impl Iterator<Item = &str> {
+        self.columns.iter().map(|c| c.name.as_str())
+    }
+
+    /// An index over whole columns, ascending — the shape most call sites mean.
+    pub fn plain<S: Into<String>>(name: impl Into<String>, columns: Vec<S>, unique: bool) -> Self {
+        Self {
+            name: name.into(),
+            columns: columns.into_iter().map(IndexColumn::plain).collect(),
+            unique,
+            ..Default::default()
+        }
+    }
+
+    /// The parenthesised key list, with each column's prefix length and sort
+    /// direction — `` `bio`(20), `age` DESC ``.
+    pub fn key_sql(&self, dialect: crate::intel::SqlDialect) -> String {
+        self.columns
+            .iter()
+            .map(|c| {
+                let mut s = ddl_ident_in(&c.name, dialect);
+                if let Some(n) = c.prefix {
+                    s.push_str(&format!("({n})"));
+                }
+                if c.descending {
+                    s.push_str(" DESC");
+                }
+                s
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// A foreign-key constraint: which local columns reference which columns of which
 /// table. Populated from `information_schema.KEY_COLUMN_USAGE`; `columns` (the
 /// referencing columns, in this table) and `ref_columns` (the referenced columns)
 /// are aligned by key position. Drives "Follow" navigation from the data grid.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ForeignKeyInfo {
+    /// The constraint's name. Without it a foreign key can't be dropped — both
+    /// engines drop by name — so it's carried even though FK *navigation* never
+    /// needed it.
+    pub name: String,
     /// Referencing columns in *this* table, in key order.
     pub columns: Vec<String>,
     /// Referenced schema/database. `None` when the server reports none (treated
@@ -49,11 +149,89 @@ pub struct ForeignKeyInfo {
     pub ref_table: String,
     /// Referenced columns, aligned to [`ForeignKeyInfo::columns`].
     pub ref_columns: Vec<String>,
+    /// `ON DELETE` action (`CASCADE`, `SET NULL`, …). `None` means the standard
+    /// default, `NO ACTION`, which both engines leave unwritten — so emitting
+    /// nothing for `None` round-trips exactly.
+    pub on_delete: Option<String>,
+    /// `ON UPDATE` action, same rule as [`ForeignKeyInfo::on_delete`].
+    pub on_update: Option<String>,
 }
 
 /// Backtick-quote a SQL identifier, doubling any embedded backtick.
 fn ddl_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
+}
+
+/// Quote an identifier for generated DDL in `dialect`.
+pub fn ddl_ident_in(name: &str, dialect: crate::intel::SqlDialect) -> String {
+    match dialect {
+        crate::intel::SqlDialect::Postgres => format!("\"{}\"", name.replace('"', "\"\"")),
+        _ => ddl_ident(name),
+    }
+}
+
+/// Quote a string as a SQL literal for generated DDL (comments, and defaults we
+/// had to quote ourselves).
+pub fn ddl_string(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+impl ColumnInfo {
+    /// This column as it appears inside `CREATE TABLE` — the **whole**
+    /// definition, in `dialect`.
+    ///
+    /// Whole is the point. MySQL's `MODIFY COLUMN` replaces a column outright, so
+    /// this is exactly what an `ALTER` has to restate to avoid dropping the
+    /// column's default, comment, collation or auto-increment as a side effect of
+    /// changing its type. One emitter shared between `CREATE` and `MODIFY` is
+    /// what keeps the two from drifting apart.
+    pub fn definition_sql(&self, dialect: crate::intel::SqlDialect) -> String {
+        let pg = dialect == crate::intel::SqlDialect::Postgres;
+        let mut out = format!("{} {}", ddl_ident_in(&self.name, dialect), self.type_name);
+        if let Some(col) = &self.collation
+            && !pg
+        {
+            out.push_str(&format!(" COLLATE {col}"));
+        }
+        // A generated column carries an expression instead of a default.
+        if let Some(expr) = &self.generated {
+            out.push_str(&format!(" GENERATED ALWAYS AS ({expr})"));
+            if pg {
+                // PostgreSQL only has the stored form, and requires the keyword.
+                out.push_str(" STORED");
+            }
+        }
+        if !self.nullable {
+            out.push_str(" NOT NULL");
+        }
+        if self.generated.is_none() {
+            if let Some(d) = &self.default {
+                out.push_str(&format!(" DEFAULT {d}"));
+            }
+            if self.auto_increment {
+                // PostgreSQL's identity is a column attribute; MySQL's is a flag.
+                out.push_str(if pg {
+                    " GENERATED BY DEFAULT AS IDENTITY"
+                } else {
+                    " AUTO_INCREMENT"
+                });
+            }
+        }
+        if let Some(u) = &self.on_update
+            && !pg
+        {
+            out.push_str(&format!(" ON UPDATE {u}"));
+        }
+        // PostgreSQL has no inline column comment — it's a separate `COMMENT ON`
+        // statement, which the DDL emitter adds alongside.
+        if let Some(c) = &self.comment
+            && !pg
+            && !c.is_empty()
+        {
+            out.push_str(&format!(" COMMENT {}", ddl_string(c)));
+        }
+        out
+    }
 }
 
 /// PostgreSQL's default namespace. It is always on the stock `search_path`, so a
@@ -124,7 +302,7 @@ impl TableSource {
 }
 
 /// A table with its columns and indexes.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableInfo {
     pub name: String,
     /// The namespace the table lives in — a PostgreSQL schema (`public`,
@@ -142,6 +320,12 @@ pub struct TableInfo {
     /// used to emit `CREATE VIEW`. `None` for base tables (and views whose
     /// definition couldn't be read).
     pub view_definition: Option<String>,
+    /// MySQL storage engine (`InnoDB`, `MyISAM`). `None` on PostgreSQL, which has
+    /// no equivalent.
+    pub engine: Option<String>,
+    /// MySQL table collation (which implies its charset). `None` on PostgreSQL.
+    pub collation: Option<String>,
+    pub comment: Option<String>,
 }
 
 impl TableInfo {
@@ -180,8 +364,7 @@ impl TableInfo {
         }
         let mut lines: Vec<String> = Vec::new();
         for c in &self.columns {
-            let null = if c.nullable { "" } else { " NOT NULL" };
-            lines.push(format!("  {} {}{}", q(&c.name), c.type_name, null));
+            lines.push(format!("  {}", c.definition_sql(dialect)));
         }
         let pk: Vec<String> = self
             .columns
@@ -198,18 +381,21 @@ impl TableInfo {
             let mut out = format!("CREATE TABLE {qname} (\n{}\n);", lines.join(",\n"));
             for ix in non_pk {
                 let uniq = if ix.unique { "UNIQUE " } else { "" };
-                let cols = ix
-                    .columns
-                    .iter()
-                    .map(|c| q(c))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let using = match &ix.method {
+                    Some(m) => format!(" USING {m}"),
+                    None => String::new(),
+                };
+                let filter = match &ix.predicate {
+                    Some(p) => format!(" WHERE {p}"),
+                    None => String::new(),
+                };
                 // The index name is never qualified — Postgres puts an index in
                 // its table's schema automatically, and `CREATE INDEX "s"."i"` is
                 // a syntax error.
                 out.push_str(&format!(
-                    "\nCREATE {uniq}INDEX {} ON {qname} ({cols});",
+                    "\nCREATE {uniq}INDEX {} ON {qname}{using} ({}){filter};",
                     q(&ix.name),
+                    ix.key_sql(dialect),
                 ));
             }
             out
@@ -217,13 +403,7 @@ impl TableInfo {
             // MySQL: inline KEY / UNIQUE KEY.
             for ix in non_pk {
                 let kw = if ix.unique { "UNIQUE KEY" } else { "KEY" };
-                let cols = ix
-                    .columns
-                    .iter()
-                    .map(|c| q(c))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                lines.push(format!("  {kw} {} ({cols})", q(&ix.name)));
+                lines.push(format!("  {kw} {} ({})", q(&ix.name), ix.key_sql(dialect)));
             }
             format!("CREATE TABLE {qname} (\n{}\n);", lines.join(",\n"))
         }
@@ -505,21 +685,111 @@ pub enum SchemaState {
 mod tests {
     use super::*;
 
+    /// The whole reason the column model was widened: MySQL's `MODIFY COLUMN`
+    /// replaces a column outright, so anything this doesn't emit is destroyed by
+    /// an ordinary type change. Each attribute is pinned individually.
+    #[test]
+    fn a_column_definition_restates_every_attribute() {
+        let c = ColumnInfo {
+            name: "status".into(),
+            type_name: "varchar(20)".into(),
+            nullable: false,
+            default: Some("'draft'".into()),
+            comment: Some("workflow state".into()),
+            collation: Some("utf8mb4_bin".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            c.definition_sql(crate::intel::SqlDialect::MySql),
+            "`status` varchar(20) COLLATE utf8mb4_bin NOT NULL DEFAULT 'draft' \
+             COMMENT 'workflow state'"
+        );
+    }
+
+    /// Auto-increment is spelled differently enough that a shared emitter has to
+    /// branch — and a PostgreSQL comment isn't inline at all.
+    #[test]
+    fn auto_increment_and_comments_follow_the_dialect() {
+        let c = ColumnInfo {
+            name: "id".into(),
+            type_name: "bigint".into(),
+            primary_key: true,
+            auto_increment: true,
+            comment: Some("pk".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            c.definition_sql(crate::intel::SqlDialect::MySql),
+            "`id` bigint NOT NULL AUTO_INCREMENT COMMENT 'pk'"
+        );
+        // PostgreSQL: identity syntax, and the comment is a separate statement.
+        assert_eq!(
+            c.definition_sql(crate::intel::SqlDialect::Postgres),
+            "\"id\" bigint NOT NULL GENERATED BY DEFAULT AS IDENTITY"
+        );
+    }
+
+    /// A generated column carries an expression *instead of* a default — emitting
+    /// both is a syntax error.
+    #[test]
+    fn a_generated_column_emits_its_expression_and_no_default() {
+        let c = ColumnInfo {
+            name: "total".into(),
+            type_name: "int".into(),
+            nullable: true,
+            generated: Some("qty * price".into()),
+            default: Some("0".into()),
+            ..Default::default()
+        };
+        let sql = c.definition_sql(crate::intel::SqlDialect::MySql);
+        assert_eq!(sql, "`total` int GENERATED ALWAYS AS (qty * price)");
+        assert!(!sql.contains("DEFAULT"));
+    }
+
+    /// A prefix index recreated without its length fails outright on a TEXT
+    /// column, and a dropped DESC silently changes what the index is good for.
+    #[test]
+    fn an_index_key_keeps_prefixes_and_sort_order() {
+        let ix = IndexInfo {
+            name: "ix".into(),
+            columns: vec![
+                IndexColumn {
+                    name: "bio".into(),
+                    prefix: Some(20),
+                    descending: false,
+                },
+                IndexColumn {
+                    name: "age".into(),
+                    prefix: None,
+                    descending: true,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            ix.key_sql(crate::intel::SqlDialect::MySql),
+            "`bio`(20), `age` DESC"
+        );
+    }
+
     fn col(name: &str, ty: &str, nullable: bool, pk: bool) -> ColumnInfo {
         ColumnInfo {
             name: name.to_string(),
             type_name: ty.to_string(),
             nullable,
             primary_key: pk,
+            ..Default::default()
         }
     }
 
     fn fk(cols: &[&str], schema: Option<&str>, table: &str, ref_cols: &[&str]) -> ForeignKeyInfo {
         ForeignKeyInfo {
+            name: format!("fk_{}", cols.join("_")),
             columns: cols.iter().map(|s| s.to_string()).collect(),
             ref_schema: schema.map(|s| s.to_string()),
             ref_table: table.to_string(),
             ref_columns: ref_cols.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 
@@ -559,8 +829,7 @@ mod tests {
             ],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
-            is_view: false,
-            view_definition: None,
+            ..Default::default()
         };
         // By table name (case-insensitive substring).
         assert!(t.matches_search("ord"));
@@ -585,22 +854,11 @@ mod tests {
                 col("email", "varchar(255)", true, false),
             ],
             indexes: vec![
-                IndexInfo {
-                    name: "PRIMARY".to_string(),
-                    columns: vec!["id".to_string()],
-                    unique: true,
-                    foreign: false,
-                },
-                IndexInfo {
-                    name: "email_uq".to_string(),
-                    columns: vec!["email".to_string()],
-                    unique: true,
-                    foreign: false,
-                },
+                IndexInfo::plain("PRIMARY", vec!["id"], true),
+                IndexInfo::plain("email_uq", vec!["email"], true),
             ],
             foreign_keys: Vec::new(),
-            is_view: false,
-            view_definition: None,
+            ..Default::default()
         };
         let ddl = t.create_ddl(crate::intel::SqlDialect::MySql);
         assert!(ddl.starts_with("CREATE TABLE `users` ("));
@@ -622,22 +880,11 @@ mod tests {
                 col("email", "text", false, false),
             ],
             indexes: vec![
-                IndexInfo {
-                    name: "PRIMARY".to_string(),
-                    columns: vec!["id".to_string()],
-                    unique: true,
-                    foreign: false,
-                },
-                IndexInfo {
-                    name: "email_uq".to_string(),
-                    columns: vec!["email".to_string()],
-                    unique: true,
-                    foreign: false,
-                },
+                IndexInfo::plain("PRIMARY", vec!["id"], true),
+                IndexInfo::plain("email_uq", vec!["email"], true),
             ],
             foreign_keys: Vec::new(),
-            is_view: false,
-            view_definition: None,
+            ..Default::default()
         };
         let ddl = t.create_ddl(crate::intel::SqlDialect::Postgres);
         assert!(ddl.starts_with("CREATE TABLE \"users\" ("), "{ddl}");
@@ -655,11 +902,9 @@ mod tests {
         let t = TableInfo {
             schema: None,
             name: "v".to_string(),
-            columns: Vec::new(),
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
             is_view: true,
             view_definition: Some("SELECT 1".to_string()),
+            ..Default::default()
         };
         assert_eq!(
             t.create_ddl(crate::intel::SqlDialect::MySql),
@@ -675,8 +920,7 @@ mod tests {
             columns: vec![col("a`b", "int", true, false)],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
-            is_view: false,
-            view_definition: None,
+            ..Default::default()
         };
         let ddl = t.create_ddl(crate::intel::SqlDialect::MySql);
         assert!(ddl.contains("CREATE TABLE `we``ird`"));
@@ -688,11 +932,8 @@ mod tests {
         let t = TableInfo {
             schema: None,
             name: "v".to_string(),
-            columns: Vec::new(),
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
             is_view: true,
-            view_definition: None,
+            ..Default::default()
         };
         let ddl = t.create_ddl(crate::intel::SqlDialect::MySql);
         assert!(ddl.contains("-- View definition for `v` was not available."));
@@ -729,12 +970,7 @@ mod tests {
             name: "orders".to_string(),
             schema: Some("sales".to_string()),
             columns: vec![col("id", "integer", false, true)],
-            indexes: vec![IndexInfo {
-                name: "orders_ts".to_string(),
-                columns: vec!["id".to_string()],
-                unique: false,
-                foreign: false,
-            }],
+            indexes: vec![IndexInfo::plain("orders_ts", vec!["id"], false)],
             ..Default::default()
         };
         let ddl = t.create_ddl(crate::intel::SqlDialect::Postgres);
@@ -993,12 +1229,7 @@ mod tests {
 
     #[test]
     fn is_primary_only_for_the_primary_index() {
-        let ix = |name: &str| IndexInfo {
-            name: name.to_string(),
-            columns: vec!["id".to_string()],
-            unique: true,
-            foreign: false,
-        };
+        let ix = |name: &str| IndexInfo::plain(name, vec!["id"], true);
         assert!(ix("PRIMARY").is_primary());
         assert!(!ix("primary").is_primary()); // case-sensitive: only literal PRIMARY
         assert!(!ix("email_uq").is_primary());
@@ -1010,22 +1241,13 @@ mod tests {
         let s = DbSchema {
             tables: vec![
                 TableInfo {
-                    schema: None,
                     name: "a".to_string(),
-                    columns: Vec::new(),
-                    indexes: Vec::new(),
-                    foreign_keys: Vec::new(),
-                    is_view: false,
-                    view_definition: None,
+                    ..Default::default()
                 },
                 TableInfo {
-                    schema: None,
                     name: "b".to_string(),
-                    columns: Vec::new(),
-                    indexes: Vec::new(),
-                    foreign_keys: Vec::new(),
                     is_view: true,
-                    view_definition: None,
+                    ..Default::default()
                 },
             ],
         };
@@ -1036,11 +1258,8 @@ mod tests {
         TableInfo {
             schema: None,
             name: "orders".to_string(),
-            columns: Vec::new(),
-            indexes: Vec::new(),
             foreign_keys: fks,
-            is_view: false,
-            view_definition: None,
+            ..Default::default()
         }
     }
 

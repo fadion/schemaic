@@ -976,7 +976,7 @@ mod tests {
         assert_eq!(server["env"]["SCHEMAIC_MCP_ENDPOINT"], "ENDPOINT_BLOB");
     }
 
-    use schemaic_core::schema::{ColumnInfo, IndexInfo, TableInfo};
+    use schemaic_core::schema::{ColumnInfo, TableInfo};
 
     fn table(name: &str, cols: &[&str]) -> TableInfo {
         TableInfo {
@@ -988,13 +988,10 @@ mod tests {
                     name: c.to_string(),
                     type_name: "int".to_string(),
                     nullable: true,
-                    primary_key: false,
+                    ..Default::default()
                 })
                 .collect(),
-            indexes: Vec::<IndexInfo>::new(),
-            foreign_keys: Vec::new(),
-            is_view: false,
-            view_definition: None,
+            ..Default::default()
         }
     }
 

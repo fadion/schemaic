@@ -1242,12 +1242,10 @@ mod tests {
                     type_name: (*ty).into(),
                     nullable: *nullable,
                     primary_key: *n == "id",
+                    ..Default::default()
                 })
                 .collect(),
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
-            is_view: false,
-            view_definition: None,
+            ..Default::default()
         }
     }
 

@@ -59,7 +59,14 @@ Zed-inspired, aiming to replace DataGrip.
     already in flight / the tunnel isn't up). The app owns only the timer + `Db::ping`.
   - `format.rs` — per-column display formatters (`ColumnFormat`/`apply`: epoch→datetime, bytes,
     bool). Display-only; edit/copy stay raw. Persisted to `format.json`.
-  - `schema::TableInfo::create_ddl` — `CREATE TABLE`/`VIEW` skeleton.
+  - `schema.rs` — the introspected model. `ColumnInfo` carries the **full** column definition
+    (type *with* parameters, default as ready-to-emit SQL text, auto-increment/identity, generated
+    expression, `ON UPDATE`, comment, collation) because MySQL's `MODIFY COLUMN` replaces a column
+    outright — anything not restated is silently destroyed, so a schema editor can't stand on a
+    thinner model. `ColumnInfo::definition_sql` is that one emitter, shared by `CREATE` and (later)
+    `MODIFY` so they can't drift. `IndexColumn` keeps prefix lengths + `DESC`; `ForeignKeyInfo`
+    keeps its name (both engines drop by name) + referential actions.
+    `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the above.
   - `secrets.rs` — keeps connection secrets (DB/SSH passwords + SSH key passphrase) out of the
     plaintext `connections.json`: the `SecretStore` seam + pure transforms `hydrate_file` (load →
     fill empty fields from the store, flag legacy plaintext for migration), `sanitize_file` (save →
@@ -92,6 +99,14 @@ Zed-inspired, aiming to replace DataGrip.
   `origin` (real table/column + key flags) from the wire protocol. Connection **identity** is the
   `Db` handle (`Db::connect(&Connection, tunnel_port)`), not a `mysql://…` URL — credentials go
   through `OptsBuilder` (passwords with `@ / # ? %` need no escaping; no plaintext URL anywhere).
+  Schema introspection fills the **full** column model (see `core::schema`): MySQL from
+  `information_schema.COLUMNS` (`COLUMN_DEFAULT`/`EXTRA`/`COLLATION_NAME`/`COLUMN_COMMENT`/
+  `GENERATION_EXPRESSION`) + `STATISTICS` (`SUB_PART`/`COLLATION` for prefix + `DESC`); PostgreSQL
+  from **`pg_catalog`, not `information_schema`** — `format_type(atttypid, atttypmod)` is the only
+  source of the *declared* type (`udt_name` gives `varchar`, losing the `(45)`), plus
+  `pg_get_expr` for defaults and `attidentity`/`attgenerated`. `mysql_column` normalizes the
+  MySQL/MariaDB `COLUMN_DEFAULT` divergence (MariaDB returns SQL text, MySQL a raw value needing
+  quoting) — pure + tested, since getting it wrong writes a *different* default rather than failing.
   `fetch_query`/`run_batch`/`fetch_schema`/`ping`/`commit_writes`/`refetch_rows`/`prepare_check`
   (non-executing `PREPARE` for the editor's live validation) are `Db` methods taking the target DB
   per call. SSH tunnels return a `TunnelHandle` (drop → port freed) with
@@ -254,6 +269,30 @@ bug fixes start with a failing test, then the code that makes it pass. Concretel
 - `cargo build` / `cargo run -p schemaic-app`.
 - **Windows:** if the app is running, the linker can't overwrite `target/debug/schemaic.exe`
   ("Access is denied"). Stop it first (`Get-Process schemaic | Stop-Process -Force`).
+
+## Never bulk-rewrite source with a script
+
+**Do not use `sed -i`/`awk`/`perl -i` (or any generated script) to edit `.rs` files in place.** Use
+the editor tools, one site at a time, driven by the compiler's error list. Adding a field to a
+widely-constructed struct breaks 20+ literals and the temptation to "just script it" is exactly
+when this goes wrong.
+
+This is written down because it already destroyed ~900 lines across seven files in one command. The
+awk had a line-buffering bug: it printed a held line only on *some* paths, so every branch that
+didn't print silently dropped a line. The damage isn't localized to the intended matches — it's
+scattered through whole files — and it compiles-ish, so the error list *shrinks* and looks like
+progress. Recovery was only cheap because the tree happened to be committed a few minutes earlier.
+
+If a mechanical edit really is unavoidable:
+
+- **Commit (or stash) first.** A dirty tree plus an in-place script is how uncommitted work dies.
+- Verify with `git diff --stat` **before** trusting the build: net line count should match what you
+  intended. Mass deletions are the tell — a shrinking error count is not.
+- Prefer a change that avoids the churn (a `Default` derive + `..Default::default()`, a constructor,
+  a `From` impl) over a change that requires touching every call site.
+
+Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain `git checkout --`
+/`git restore` may be blocked as a destructive operation, and `git show` is read-only.
 
 ## Commits & releases
 
