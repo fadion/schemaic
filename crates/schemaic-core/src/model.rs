@@ -14,7 +14,9 @@ use std::sync::Arc;
 /// large results and right-aligned display); everything else — including
 /// `DECIMAL` and dates, which MySQL already sends as exact text — stays a
 /// `Str`, so nothing is rounded or reformatted lossily.
-#[derive(Clone, Debug)]
+/// `PartialEq` (not `Eq` — `Float` rules that out) so tests can compare a parsed
+/// or coerced cell directly against the value it should be.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Null,
     Int(i64),

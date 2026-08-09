@@ -35,6 +35,21 @@ Zed-inspired, aiming to replace DataGrip.
     result is never rendered into a second full copy in memory — with the `String` versions kept
     as thin wrappers for the clipboard. A test asserts the two agree byte-for-byte per format;
     add new formats to both by adding the `*_to` and wrapping it.
+  - `import.rs` — the inverse of `export.rs`: CSV/TSV + JSON (array *or* NDJSON) → table. Format
+    inference, delimiter/header `sniff` (by *consistency*, quote-aware), `auto_map` (name-match with
+    a header, positional without), per-column `coerce` (only the families a wrong answer would
+    definitely break — int/uint/float/exact/bool; everything else passes through, the **server stays
+    the type authority**), and a two-pass contract: `validate` reads the whole file and returns
+    *every* `Issue` with its line before anything is written, then `row_iter` streams coerced rows
+    for the load. `build_insert` reuses `export::ident_sql`/`sql_literal`, so quoting can't drift
+    from the SQL export. Note JSON columns are the union of every object's keys and the mapping is
+    built from a *sample* — `trim_to_mapping` drops keys that first appear past it (CSV keeps the
+    field-count check, where a mismatch means a stray delimiter). An array and JSON Lines read
+    through one path: `ArrayUnwrap` blanks the wrapping brackets + top-level commas as bytes
+    stream past, so a sample really stops at its limit instead of deserializing the file first
+    (a whole-file walk still buffers, for the key union). NULL tokens match the *trimmed* field,
+    except the empty one, which is exact — a blank field is data, and `trim` is the setting that
+    says otherwise. Pure + unit-tested.
   - `diff.rs` — `line_diff`/`build_diff_rows` (Ctrl+K preview).
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
     persisted to `history.json`.
@@ -81,6 +96,10 @@ Zed-inspired, aiming to replace DataGrip.
   (non-executing `PREPARE` for the editor's live validation) are `Db` methods taking the target DB
   per call. SSH tunnels return a `TunnelHandle` (drop → port freed) with
   keepalives + TOFU host-key verification (`ssh_known_hosts.json`).
+  `import_rows` is the bulk-load path (both engines): one transaction of batched multi-row
+  `INSERT`s pulled from a `RowSource` iterator, each batch required to affect exactly as many rows
+  as it carried — the `commit_writes` 1-row safety net scaled to a file, without its
+  statement-per-row round-trips.
 - `schemaic-ai` — persistent `claude` CLI session (stream-json), turn parsing.
 - `schemaic-term` — terminal panel + shell.
 - `schemaic-ui` — the Floem UI. The central `Ui` struct (threaded everywhere) is split per-domain:
@@ -97,6 +116,16 @@ Zed-inspired, aiming to replace DataGrip.
   - `diff_view.rs` — Ctrl+K diff preview. `history_panel.rs` — Query History right-column panel.
   - `plan_view.rs` — Query Plan modal (`EXPLAIN`/`EXPLAIN ANALYZE` table + warnings + "Ask AI"),
     via `TabsActions::run_plan` → `Db::explain`.
+  - `import_view.rs` — the file-import modal (schema context menu → **Import**), over
+    `core::import`. Two steps (Source → Mapping) in one panel driven by the `ImportUi` bundle;
+    `SchemaActions::import_probe`/`import_run` do the file + DB work off the UI thread. A probe or
+    an import can outlive the modal, so both callbacks check `ImportUi::generation` (bumped on
+    every open) before writing. The effect that re-probes on a settings change tracks only settings
+    that change how the file *parses* — the NULL rules apply at coercion time, so tracking them
+    would re-read the file per keystroke and stamp over a hand-edited mapping. While a load runs,
+    the footer's Cancel fires `SchemaActions::import_cancel` (the app owns the token, as it does
+    for query runs) instead of closing — the transaction rolls back, so a cancelled import writes
+    nothing.
   - `ai_panel.rs` — AI Assistant panel (`ai_panel`/`message_bubble`/`render_segments`/`tool_chip`/
     `assistant_footer`).
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context

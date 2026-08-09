@@ -67,6 +67,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# CSV *reading* for the import path. Writing it is a few lines (see
+# `core::export::csv_field`); reading it correctly — quotes, embedded delimiters
+# and newlines, escapes, BOMs — is not, and a hand-rolled parser here would lose
+# data quietly.
+csv = "1"
 
 # Profiling build: release-grade optimization (so we measure real perf, not a slow
 # debug build) but with full debug symbols so a sampling profiler (samply, etc.) can

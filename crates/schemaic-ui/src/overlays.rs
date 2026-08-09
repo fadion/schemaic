@@ -396,6 +396,9 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
     let save_db_colors = ui.save_db_colors.clone();
     let db_favorites = ui.db_favorites;
     let save_db_favorites = ui.save_db_favorites.clone();
+    let db_nodes = ui.schema.db_nodes;
+    let connections = ui.conn.connections;
+    let import_ui = ui.clone();
 
     dyn_container(
         move || ctx.get(),
@@ -573,6 +576,62 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     entries.push(MenuEntry::action("Refresh", move || {
                         (rf)(refresh_database.clone())
                     }));
+                    // Its own group, just above AI Explain — schema editing will
+                    // join it here, so the table-wide actions read as one set
+                    // rather than trailing off the end of the per-table ones.
+                    entries.push(MenuEntry::Separator);
+                    // Import writes rows, so a read-only connection shows the
+                    // entry dimmed rather than hiding it — a missing item reads as
+                    // "not supported", a dimmed one as "not here".
+                    {
+                        let read_only = connections.with_untracked(|cs| {
+                            cs.iter()
+                                .find(|c| c.id == active_conn.get_untracked())
+                                .is_some_and(|c| c.read_only)
+                        });
+                        // The full `TableInfo` (columns, nullability) is what the
+                        // modal maps onto, and it only exists once the schema has
+                        // loaded.
+                        let info = db_nodes.with_untracked(|nodes| {
+                            nodes
+                                .iter()
+                                .find(|n| n.database == *database)
+                                .and_then(|n| match n.schema.get_untracked() {
+                                    schemaic_core::schema::SchemaState::Loaded(db) => db
+                                        .tables
+                                        .iter()
+                                        .find(|t| {
+                                            t.name == *table
+                                                && t.schema.as_deref() == schema.as_deref()
+                                        })
+                                        .cloned(),
+                                    _ => None,
+                                })
+                        });
+                        let ui = import_ui.clone();
+                        let db = database.clone();
+                        let ns = schema.clone();
+                        let is_view = info.as_ref().is_some_and(|i| i.is_view);
+                        let has_columns = info.as_ref().is_some_and(|i| !i.columns.is_empty());
+                        entries.push(
+                            MenuEntry::action("Import", move || {
+                                if let Some(info) = info.clone() {
+                                    crate::import_view::open_import(
+                                        &ui,
+                                        crate::ImportTargetInfo {
+                                            conn_id: active_conn.get_untracked(),
+                                            database: db.clone(),
+                                            schema: ns.clone(),
+                                            table: info,
+                                        },
+                                    );
+                                }
+                            })
+                            // A view isn't insertable, and a table whose schema
+                            // hasn't loaded has no columns to map onto.
+                            .disabled(read_only || is_view || !has_columns),
+                        );
+                    }
                 }
                 CtxKind::Field => {
                     entries.push(MenuEntry::action("Copy name", copy(menu.name.clone())));

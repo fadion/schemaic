@@ -32,7 +32,14 @@ pub(crate) fn modal_title_borderless(title: &'static str, close: Rc<dyn Fn()>) -
     modal_title_impl(title, close, false)
 }
 
-fn modal_title_impl(title: &'static str, close: Rc<dyn Fn()>, border: bool) -> impl IntoView {
+/// [`modal_title`] for a title that isn't known at compile time (the import
+/// modal names the table it's loading into).
+pub(crate) fn modal_title_owned(title: String, close: Rc<dyn Fn()>) -> impl IntoView {
+    modal_title_impl(title, close, true)
+}
+
+fn modal_title_impl(title: impl Into<String>, close: Rc<dyn Fn()>, border: bool) -> impl IntoView {
+    let title = title.into();
     h_stack((
         text(title).style(|s| s.font_size(15.0).font_bold().color(theme::text())),
         empty().style(|s| s.flex_grow(1.0_f32)),

@@ -56,6 +56,15 @@ pub enum Engine {
 }
 
 impl Engine {
+    /// The SQL dialect this engine speaks — the quoting and escaping rules any
+    /// generated statement has to follow.
+    pub fn dialect(self) -> schemaic_core::intel::SqlDialect {
+        match self {
+            Engine::MySql => schemaic_core::intel::SqlDialect::MySql,
+            Engine::Postgres => schemaic_core::intel::SqlDialect::Postgres,
+        }
+    }
+
     /// A stable lowercase tag for this engine — used to serialize the engine into
     /// the MCP endpoint JSON (round-trips through [`Engine::from_db_type`]).
     pub fn as_str(self) -> &'static str {
@@ -962,6 +971,138 @@ fn convert_row(row: &Row, columns: &[Column]) -> Vec<Value> {
             Some(other) => Value::Str(other.as_sql(false).trim_matches('\'').to_string()),
         })
         .collect()
+}
+
+/// Where an import is writing, and what its `INSERT`s name.
+///
+/// `columns` are bare names (unquoted); the quoting is the export path's, applied
+/// when the statement is built, so it can't drift from the SQL export that reads
+/// the same table back out.
+pub struct ImportTarget<'a> {
+    pub database: &'a str,
+    /// The PostgreSQL namespace, when the table has one. On MySQL a database *is*
+    /// the namespace, so this is `None`.
+    pub schema: Option<&'a str>,
+    pub table: &'a str,
+    pub columns: &'a [String],
+}
+
+/// A source of rows to import. Errors are the reader's — a malformed record or a
+/// value that wouldn't coerce — and abort the transaction.
+///
+/// `Send` because the import runs on the tokio runtime: the reader is pulled
+/// between `await`s, so it crosses whatever thread the task resumes on.
+pub type RowSource<'a> = &'a mut (dyn Iterator<Item = Result<Vec<Value>, String>> + Send);
+
+impl Db {
+    /// Bulk-load rows into one table in a single transaction, as batched
+    /// multi-row `INSERT`s.
+    ///
+    /// Deliberately **not** [`Db::commit_writes`], though it borrows its
+    /// discipline. That path runs one statement per row with an exactly-one-row
+    /// check, which is right for a handful of grid edits and ruinous for a file:
+    /// 100k rows would be 100k round-trips inside one transaction. Here each
+    /// statement carries up to `import::INSERT_BATCH_ROWS` rows and the check
+    /// becomes "this batch affected exactly as many rows as it had" — same
+    /// guarantee that nothing landed half-applied, at a thousandth of the
+    /// round-trips.
+    ///
+    /// All-or-nothing: any reader error, any batch whose count doesn't match, or
+    /// a cancellation rolls the whole thing back. Rows are pulled from `rows` in
+    /// batches between statements, so the file is never held in memory — and
+    /// since a reader that parses a batch does so between two awaits, the work it
+    /// does there should stay small.
+    pub async fn import_rows(
+        &self,
+        target: ImportTarget<'_>,
+        rows: RowSource<'_>,
+        cancel: CancellationToken,
+    ) -> Result<u64, DbError> {
+        if target.columns.is_empty() {
+            return Err(DbError::Query("No columns to import into".to_string()));
+        }
+        if self.engine == Engine::Postgres {
+            return pg::import_rows(self, target, rows, cancel).await;
+        }
+        let mut conn = self.open(Some(target.database), false).await?;
+        let conn_id = conn.id();
+        let outcome = tokio::select! {
+            r = import_on(&mut conn, self.engine.dialect(), &target, rows) => r,
+            _ = cancel.cancelled() => {
+                self.kill_query(conn_id).await;
+                Err(DbError::Cancelled)
+            }
+        };
+        let _ = conn.disconnect().await;
+        outcome
+    }
+}
+
+/// Pull the next batch of rows from the source. `Ok(None)` at the end.
+fn next_batch(rows: RowSource<'_>) -> Result<Option<Vec<Vec<Value>>>, DbError> {
+    let mut batch = Vec::with_capacity(schemaic_core::import::INSERT_BATCH_ROWS);
+    // `next()` in a loop rather than `by_ref().take(..)`: `by_ref` isn't callable
+    // on a `dyn Iterator`, and the source has to stay borrowed for the next batch.
+    while batch.len() < schemaic_core::import::INSERT_BATCH_ROWS {
+        match rows.next() {
+            Some(row) => batch.push(row.map_err(DbError::Query)?),
+            None => break,
+        }
+    }
+    Ok(if batch.is_empty() { None } else { Some(batch) })
+}
+
+/// The MySQL half of [`Db::import_rows`], on an already-open connection.
+async fn import_on(
+    conn: &mut Conn,
+    dialect: schemaic_core::intel::SqlDialect,
+    target: &ImportTarget<'_>,
+    rows: RowSource<'_>,
+) -> Result<u64, DbError> {
+    let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
+    let cols: Vec<&str> = target.columns.iter().map(String::as_str).collect();
+    conn.query_drop("BEGIN").await.map_err(qerr)?;
+
+    let mut total: u64 = 0;
+    loop {
+        // A reader error (a bad record, a value that wouldn't coerce) has to undo
+        // the transaction too — returning straight out would leave it open until
+        // the connection drops, which is a lock held for no reason.
+        let batch = match next_batch(rows) {
+            Ok(Some(b)) => b,
+            Ok(None) => break,
+            Err(e) => {
+                let _ = conn.query_drop("ROLLBACK").await;
+                return Err(e);
+            }
+        };
+        let Some(sql) = schemaic_core::import::build_insert(
+            target.database,
+            target.schema,
+            target.table,
+            &cols,
+            &batch,
+            dialect,
+        ) else {
+            continue;
+        };
+        if let Err(e) = conn.query_drop(&sql).await {
+            let _ = conn.query_drop("ROLLBACK").await;
+            return Err(qerr(e));
+        }
+        let affected = conn.affected_rows();
+        if affected != batch.len() as u64 {
+            let _ = conn.query_drop("ROLLBACK").await;
+            return Err(DbError::Query(format!(
+                "a batch of {} rows inserted {affected} — rolled back the whole import",
+                batch.len()
+            )));
+        }
+        total += affected;
+    }
+
+    conn.query_drop("COMMIT").await.map_err(qerr)?;
+    Ok(total)
 }
 
 /// Apply a batch of staged grid mutations — `UPDATE`s then `INSERT`s — in a

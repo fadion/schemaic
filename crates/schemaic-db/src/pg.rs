@@ -345,7 +345,7 @@ pub(crate) async fn run_statement(
     // cap is reached.
     let token = client.cancel_token();
     let stream = tokio::select! {
-        r = client.simple_query_raw(sql) => r.map_err(|e| DbError::Query(e.to_string()))?,
+        r = client.simple_query_raw(sql) => r.map_err(|e| db_err(&e))?,
         _ = cancel.cancelled() => {
             let _ = token.cancel_query(NoTls).await;
             return Err(DbError::Cancelled);
@@ -375,7 +375,7 @@ pub(crate) async fn run_statement(
             }
         };
         let Some(msg) = next else { break };
-        match msg.map_err(|e| DbError::Query(e.to_string()))? {
+        match msg.map_err(|e| db_err(&e))? {
             SimpleQueryMessage::Row(r) => {
                 let (builder, type_names) = grid.get_or_insert_with(|| {
                     let cols: Vec<Column> = r
@@ -914,6 +914,85 @@ fn one_row_err(action: &str, database: &str, table: &str, n: u64) -> DbError {
     ))
 }
 
+/// The PostgreSQL half of [`crate::Db::import_rows`] — same contract: one
+/// transaction, batched multi-row `INSERT`s, each batch's affected count checked
+/// against its size, everything undone on any failure.
+pub(crate) async fn import_rows(
+    db: &Db,
+    target: crate::ImportTarget<'_>,
+    rows: crate::RowSource<'_>,
+    cancel: CancellationToken,
+) -> Result<u64, DbError> {
+    let client = connect_to(db, target.database).await?;
+    let token = client.cancel_token();
+    tokio::select! {
+        r = import_on(&client, &target, rows) => r,
+        _ = cancel.cancelled() => {
+            let _ = token.cancel_query(NoTls).await;
+            Err(DbError::Cancelled)
+        }
+    }
+}
+
+async fn import_on(
+    client: &Client,
+    target: &crate::ImportTarget<'_>,
+    rows: crate::RowSource<'_>,
+) -> Result<u64, DbError> {
+    // `db_err`, not `to_string()`: the driver's own Display for a server error is
+    // the literal text "db error" — a duplicate-key import has to say so.
+    let cols: Vec<&str> = target.columns.iter().map(String::as_str).collect();
+    client
+        .batch_execute("BEGIN")
+        .await
+        .map_err(|e| db_err(&e))?;
+
+    let mut total: u64 = 0;
+    loop {
+        // Postgres leaves the transaction aborted after any error, so every exit
+        // path below rolls back explicitly rather than relying on the drop.
+        let batch = match crate::next_batch(rows) {
+            Ok(Some(b)) => b,
+            Ok(None) => break,
+            Err(e) => {
+                let _ = client.batch_execute("ROLLBACK").await;
+                return Err(e);
+            }
+        };
+        let Some(sql) = schemaic_core::import::build_insert(
+            target.database,
+            target.schema,
+            target.table,
+            &cols,
+            &batch,
+            schemaic_core::intel::SqlDialect::Postgres,
+        ) else {
+            continue;
+        };
+        let affected = match client.execute(sql.as_str(), &[]).await {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = client.batch_execute("ROLLBACK").await;
+                return Err(db_err(&e));
+            }
+        };
+        if affected != batch.len() as u64 {
+            let _ = client.batch_execute("ROLLBACK").await;
+            return Err(DbError::Query(format!(
+                "a batch of {} rows inserted {affected} — rolled back the whole import",
+                batch.len()
+            )));
+        }
+        total += affected;
+    }
+
+    client
+        .batch_execute("COMMIT")
+        .await
+        .map_err(|e| db_err(&e))?;
+    Ok(total)
+}
+
 /// Apply a batch of staged grid mutations in a single transaction — deletes →
 /// updates → inserts, each required to affect exactly one row (else roll back
 /// all). Mirrors the MySQL `commit_writes` contract + 1-row safety net; the
@@ -962,7 +1041,7 @@ pub(crate) async fn write_on(
     write: &GridWrite,
     scope: TxScope,
 ) -> Result<u64, DbError> {
-    let qerr = |e: tokio_postgres::Error| DbError::Query(e.to_string());
+    let qerr = |e: tokio_postgres::Error| db_err(&e);
     client
         .batch_execute(scope.begin_sql())
         .await
@@ -983,7 +1062,7 @@ pub(crate) async fn write_on(
             Ok(n) => n,
             Err(e) => {
                 let _ = client.batch_execute(scope.rollback_sql()).await;
-                return Err(DbError::Query(e.to_string()));
+                return Err(db_err(&e));
             }
         };
         if n != 1 {
