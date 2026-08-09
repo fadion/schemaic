@@ -11,6 +11,7 @@ pub use ai_panel::mark_messages_seen;
 mod completion;
 mod connection_form;
 mod consts;
+mod ddl_preview;
 mod diff_view;
 mod editor_pane;
 mod erd_view;
@@ -26,6 +27,7 @@ mod plan_view;
 mod schema_tree;
 mod settings;
 pub mod sql_highlight;
+mod table_designer;
 mod tabs;
 pub mod theme;
 pub mod themes;
@@ -174,6 +176,132 @@ pub enum ImportOutcome {
 pub type ImportDoneFn = Rc<dyn Fn(ImportOutcome)>;
 /// Validate the whole file, then load it in one transaction — off the UI thread.
 pub type ImportFn = Rc<dyn Fn(ImportRunRequest, ImportDoneFn)>;
+
+/// What the table designer is editing.
+///
+/// Captured when the modal opens, like [`ImportTargetInfo`]: a schema refresh
+/// underneath must not retarget a draft the user is halfway through.
+#[derive(Clone)]
+pub struct DesignerTarget {
+    pub conn_id: u64,
+    pub database: String,
+    /// The namespace a *new* table goes into (`None` on MySQL). For an existing
+    /// table the draft carries it.
+    pub schema: Option<String>,
+    pub dialect: SqlDialect,
+    /// The introspected table the draft started from — the left-hand side of
+    /// every diff. `None` means this is a new table, which emits `CREATE`.
+    pub current: Option<schemaic_core::schema::TableInfo>,
+    /// Table names in the database, for the foreign-key target picker.
+    pub tables: Vec<String>,
+    /// The connection's read-only guard rail: the designer still opens (looking
+    /// is fine), but Apply is refused.
+    pub read_only: bool,
+}
+
+impl DesignerTarget {
+    /// The modal's title subject: the table being designed, or the database a
+    /// new one is being created in.
+    pub fn display(&self) -> String {
+        match &self.current {
+            Some(t) => schemaic_core::schema::display_name(t.schema.as_deref(), &t.name),
+            None => self.database.clone(),
+        }
+    }
+}
+
+/// Which section of the designer is showing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DesignerTab {
+    Table,
+    Columns,
+    Indexes,
+    ForeignKeys,
+}
+
+impl DesignerTab {
+    pub const ALL: [DesignerTab; 4] = [
+        DesignerTab::Table,
+        DesignerTab::Columns,
+        DesignerTab::Indexes,
+        DesignerTab::ForeignKeys,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            DesignerTab::Table => "Table",
+            DesignerTab::Columns => "Columns",
+            DesignerTab::Indexes => "Indexes",
+            DesignerTab::ForeignKeys => "Foreign keys",
+        }
+    }
+}
+
+/// A generated DDL plan waiting for approval. **No DDL is ever run without one**
+/// — that's the decision this type exists to enforce, so every path into schema
+/// editing (designer, create-table, context-menu shortcut) funnels through the
+/// same review.
+#[derive(Clone)]
+pub struct DdlPreview {
+    pub conn_id: u64,
+    pub database: String,
+    /// What the plan is about, for the title ("orders", or a new table's name).
+    pub subject: String,
+    /// One plain-language line per change.
+    pub changes: Vec<String>,
+    /// What the plan destroys, in plain language. Non-empty ⇒ the modal says so
+    /// before the Apply button, in the error colour.
+    pub destructive: Vec<String>,
+    pub statements: Vec<String>,
+    pub read_only: bool,
+}
+
+/// Run a generated DDL plan against a database.
+pub struct DdlRunRequest {
+    pub conn_id: u64,
+    pub database: String,
+    pub statements: Vec<String>,
+}
+
+/// Reports a DDL run's outcome on the UI thread. `Err` carries a message that
+/// already says which statement failed and how much of the plan stuck (see
+/// `schemaic_db::DdlError`).
+pub type DdlDoneFn = Rc<dyn Fn(Result<(), String>)>;
+/// Apply a DDL plan off the UI thread, then re-introspect the database.
+pub type DdlFn = Rc<dyn Fn(DdlRunRequest, DdlDoneFn)>;
+
+/// The schema-editing modals' state (Copy bundle, reset on open — as with
+/// [`ImportUi`], these outlive no view so they need no scope to dispose).
+///
+/// `designer` and `preview` each double as their modal's open flag.
+#[derive(Clone, Copy)]
+pub struct DdlUi {
+    pub designer: RwSignal<Option<DesignerTarget>>,
+    /// The table being designed. One signal rather than a field per control: the
+    /// draft is what [`schemaic_core::ddl::diff`] reads, so every edit has to
+    /// land in the same value or the change count lies.
+    pub draft: RwSignal<schemaic_core::ddl::TableDraft>,
+    pub tab: RwSignal<DesignerTab>,
+    /// Selected row in the active section's list.
+    pub selected: RwSignal<usize>,
+    /// Bumped on every *structural* edit (add / remove / move). The detail form
+    /// is keyed on it as well as on `selected`, because removing the selected
+    /// row leaves `selected` unchanged while the item at that index is now a
+    /// different one — nothing else would tell the form to rebuild.
+    pub rev: RwSignal<u64>,
+    pub preview: RwSignal<Option<DdlPreview>>,
+    /// The plan's SQL, bound to the preview's read-only field.
+    pub sql: RwSignal<String>,
+    /// The preview's SQL box auto-grow cap, in rows. A signal because that's
+    /// what [`FieldCfg::max_rows`] takes; nothing changes it.
+    pub sql_rows: RwSignal<usize>,
+    pub applying: RwSignal<bool>,
+    pub error: RwSignal<Option<String>>,
+    /// Set once the plan has been applied — the modal then only offers Close.
+    pub applied: RwSignal<bool>,
+    /// Bumped on every open. An apply is off-thread and can outlive the modal
+    /// that asked for it, so its callback checks this before writing.
+    pub generation: RwSignal<u64>,
+}
 
 /// Reports an export's outcome back on the UI thread (`Err` carries a
 /// user-facing message).
@@ -690,7 +818,23 @@ pub enum CtxKind {
         table: String,
         ddl: String,
     },
-    Field,
+    /// A column. Carries its table, because the schema-editing entries act on
+    /// the column *in* a table — a bare name can't be dropped.
+    Field {
+        source: TableSource,
+        column: String,
+    },
+    /// An index or foreign-key row under a table.
+    Key {
+        source: TableSource,
+        /// The index the row stands for, whole — a drop has to know whether
+        /// PostgreSQL needs `DROP INDEX` or `ALTER TABLE … DROP CONSTRAINT`.
+        index: Box<schemaic_core::schema::IndexInfo>,
+        /// The foreign-key constraint this index backs, when it does. Dropping
+        /// *that* is what the user means; the backing index needn't share its
+        /// name (classicmodels' `customerNumber` backs `orders_ibfk_1`).
+        foreign_key: Option<String>,
+    },
 }
 
 /// Which database/table an open ER-diagram modal is showing, and how it was
@@ -1059,6 +1203,8 @@ pub struct SchemaActions {
     /// Stop the import [`SchemaActions::import_run`] is running, rolling it back.
     /// A no-op when nothing is running.
     pub import_cancel: Rc<dyn Fn()>,
+    /// Apply an approved DDL plan, then re-introspect the database it changed.
+    pub run_ddl: DdlFn,
 }
 
 /// Result of a "Test" of the Manage-Connections draft (host + credentials),
@@ -1297,6 +1443,8 @@ pub struct Ui {
     pub schema_actions: Rc<SchemaActions>,
     /// The file-import modal (opened from a table's schema context menu).
     pub import: ImportUi,
+    /// The schema-editing modals: the table designer and the DDL preview.
+    pub ddl: DdlUi,
     // Connections — grouped (review §3.3).
     pub conn: ConnUi,
     pub conn_actions: Rc<ConnActions>,
@@ -1574,7 +1722,6 @@ pub fn workspace(ui: Ui) -> impl IntoView {
         db_visibility_overlay(ui.clone()),
         schema_settings_overlay(ui.clone()),
         context_menu_overlay(ui.clone()),
-        popup_menu_overlay(ui.clone()),
         find_overlay(ui.clone()),
         // Error modal + open-transaction prompt + the shared confirm share one
         // tuple element, for the same 16-arity reason as monitor/ERD below (and
@@ -1584,17 +1731,23 @@ pub fn workspace(ui: Ui) -> impl IntoView {
             let tx_prompt = ui.overlay.tx_prompt;
             let confirm = ui.overlay.confirm;
             let import_open = ui.import.target;
+            let designer_open = ui.ddl.designer;
+            let ddl_preview_open = ui.ddl.preview;
             stack((
                 error_modal_overlay(ui.clone()),
                 tx_prompt_overlay(ui.clone()),
                 confirm_overlay(ui.clone()),
                 import_view::import_overlay(ui.clone()),
+                table_designer::table_designer_overlay(ui.clone()),
+                ddl_preview::ddl_preview_overlay(ui.clone()),
             ))
             .style(move |s| {
                 if err_open.get()
                     || tx_prompt.get().is_some()
                     || confirm.get().is_some()
                     || import_open.get().is_some()
+                    || designer_open.get().is_some()
+                    || ddl_preview_open.get().is_some()
                 {
                     s.absolute().inset(0.0)
                 } else {
@@ -1624,7 +1777,13 @@ pub fn workspace(ui: Ui) -> impl IntoView {
         ai_settings_overlay(ui.clone()),
         theme_settings_overlay(ui.clone()),
         help_overlay(ui.clone()),
-        manage_modal(ui),
+        manage_modal(ui.clone()),
+        // **Last on purpose.** A sibling paints in tuple order, so anything after
+        // this would cover it — and the shared popup menu is opened from *inside*
+        // modals too (the designer's type shortcut), where being painted behind
+        // the panel and its backdrop made it invisible. It's the topmost surface
+        // in the app, which is what a menu should be.
+        popup_menu_overlay(ui),
     ))
     // Track the pointer in window coordinates (root-local == window) so the
     // schema context menu can anchor at the cursor.

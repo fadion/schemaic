@@ -27,6 +27,17 @@ use crate::{
     schema_panel_allowed, search_box, theme,
 };
 
+/// Is the active connection read-only? Every schema-editing menu entry asks,
+/// because a write it can't perform is shown dimmed rather than hidden — a
+/// missing item reads as "not supported", a dimmed one as "not here".
+fn conn_read_only(connections: &RwSignal<Vec<Connection>>, active_conn: RwSignal<u64>) -> bool {
+    connections.with_untracked(|cs| {
+        cs.iter()
+            .find(|c| c.id == active_conn.get_untracked())
+            .is_some_and(|c| c.read_only)
+    })
+}
+
 // ===== moved from lib.rs (overlays) =====
 pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
     let open = ui.conn.conn_menu_open;
@@ -425,20 +436,6 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     let cd = collapse_db.clone();
                     let cn = menu.name.clone();
                     entries.push(MenuEntry::action("Collapse all", move || (cd)(cn.clone())));
-                    let ocli = open_db_cli.clone();
-                    let dbn = menu.name.clone();
-                    entries.push(MenuEntry::action("Open in CLI", move || {
-                        (ocli)(Some(dbn.clone()))
-                    }));
-                    // ER diagram of the whole database (every related table).
-                    let edb = menu.name.clone();
-                    entries.push(MenuEntry::action("Show diagram", move || {
-                        erd.set(Some(crate::ErdTarget {
-                            conn_id: active_conn.get_untracked(),
-                            database: edb.clone(),
-                            seed: schemaic_core::erd::DiagramSeed::Database,
-                        }));
-                    }));
                     // Set colour: preset swatches + Clear, stored per (active
                     // connection, database) and shown as a dot on the DB node,
                     // active-DB selector, and this database's query tabs.
@@ -491,6 +488,50 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             (save)();
                         }));
                     }
+                    // ER diagram of the whole database (every related table).
+                    let edb = menu.name.clone();
+                    entries.push(MenuEntry::action("Show diagram", move || {
+                        erd.set(Some(crate::ErdTarget {
+                            conn_id: active_conn.get_untracked(),
+                            database: edb.clone(),
+                            seed: schemaic_core::erd::DiagramSeed::Database,
+                        }));
+                    }));
+                    let ocli = open_db_cli.clone();
+                    let dbn = menu.name.clone();
+                    entries.push(MenuEntry::action("Open in CLI", move || {
+                        (ocli)(Some(dbn.clone()))
+                    }));
+                    // Schema editing gets its own group — it's the one entry here
+                    // that writes.
+                    entries.push(MenuEntry::Separator);
+                    // On PostgreSQL a database node stands for its `public`
+                    // namespace (other namespaces get their own node), so a new
+                    // table lands where the tree says it will.
+                    {
+                        let ui = import_ui.clone();
+                        let db = menu.name.clone();
+                        let pg = ui
+                            .schema
+                            .db_nodes
+                            .with_untracked(|nodes| {
+                                nodes.iter().find(|n| n.database == db).map(|n| {
+                                    match n.schema.get_untracked() {
+                                        SchemaState::Loaded(s) => !s.schemas().is_empty(),
+                                        _ => false,
+                                    }
+                                })
+                            })
+                            .unwrap_or(false);
+                        let ns = pg.then(|| schemaic_core::schema::PG_DEFAULT_SCHEMA.to_string());
+                        let dbn = menu.name.clone();
+                        entries.push(
+                            MenuEntry::action("New table", move || {
+                                crate::table_designer::open_for_new(&ui, &dbn, ns.as_deref());
+                            })
+                            .disabled(conn_read_only(&connections, active_conn)),
+                        );
+                    }
                 }
                 CtxKind::Schema { database, ddl } => {
                     entries.push(MenuEntry::action("Copy name", copy(menu.name.clone())));
@@ -504,6 +545,16 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             let _ = floem::Clipboard::set_contents(ddl.clone());
                             (oq)(ddl.clone());
                         }));
+                    }
+                    {
+                        let ui = import_ui.clone();
+                        let (db, ns) = (database.clone(), menu.name.clone());
+                        entries.push(
+                            MenuEntry::action("New table", move || {
+                                crate::table_designer::open_for_new(&ui, &db, Some(&ns));
+                            })
+                            .disabled(conn_read_only(&connections, active_conn)),
+                        );
                     }
                     // A namespace is introspected as part of its database, so
                     // refreshing targets the database.
@@ -544,6 +595,18 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             (otn)(src.clone())
                         }));
                     }
+                    // Group the two copy variants into a "Copy" submenu.
+                    entries.push(MenuEntry::sub(
+                        "Copy",
+                        vec![
+                            MenuEntry::action("Name", copy(menu.name.clone())),
+                            MenuEntry::action("Qualified name", copy(qualified)),
+                        ],
+                    ));
+                    let rf = refresh_db.clone();
+                    entries.push(MenuEntry::action("Refresh", move || {
+                        (rf)(refresh_database.clone())
+                    }));
                     // ER diagram seeded on this table's FK neighbourhood.
                     {
                         let db = database.clone();
@@ -564,31 +627,12 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let _ = floem::Clipboard::set_contents(ddl.clone());
                         (oq)(ddl.clone());
                     }));
-                    // Group the two copy variants into a "Copy" submenu.
-                    entries.push(MenuEntry::sub(
-                        "Copy",
-                        vec![
-                            MenuEntry::action("Name", copy(menu.name.clone())),
-                            MenuEntry::action("Qualified name", copy(qualified)),
-                        ],
-                    ));
-                    let rf = refresh_db.clone();
-                    entries.push(MenuEntry::action("Refresh", move || {
-                        (rf)(refresh_database.clone())
-                    }));
-                    // Its own group, just above AI Explain — schema editing will
-                    // join it here, so the table-wide actions read as one set
-                    // rather than trailing off the end of the per-table ones.
+                    // Its own group, just above AI Explain: everything that
+                    // *writes* — import and schema editing — reads as one set
+                    // rather than trailing off the end of the read-only ones.
                     entries.push(MenuEntry::Separator);
-                    // Import writes rows, so a read-only connection shows the
-                    // entry dimmed rather than hiding it — a missing item reads as
-                    // "not supported", a dimmed one as "not here".
                     {
-                        let read_only = connections.with_untracked(|cs| {
-                            cs.iter()
-                                .find(|c| c.id == active_conn.get_untracked())
-                                .is_some_and(|c| c.read_only)
-                        });
+                        let read_only = conn_read_only(&connections, active_conn);
                         // The full `TableInfo` (columns, nullability) is what the
                         // modal maps onto, and it only exists once the schema has
                         // loaded.
@@ -631,10 +675,204 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             // hasn't loaded has no columns to map onto.
                             .disabled(read_only || is_view || !has_columns),
                         );
+
+                        // ── Schema editing ────────────────────────────────────
+                        // Everything here ends at the DDL preview; nothing runs
+                        // a statement from the menu.
+                        {
+                            let ui = import_ui.clone();
+                            let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
+                            entries.push(
+                                MenuEntry::action("Edit", move || {
+                                    crate::table_designer::open_for_table(
+                                        &ui,
+                                        &db,
+                                        ns.as_deref(),
+                                        &tbl,
+                                        None,
+                                    );
+                                })
+                                // A view has no designable shape, and an
+                                // unloaded schema has nothing to design from.
+                                .disabled(is_view || !has_columns),
+                            );
+                        }
+                        // Truncate and drop are the two that can't be taken back
+                        // and sit next to harmless entries, so they ask first and
+                        // *then* show the plan. Everything else relies on the
+                        // preview alone, which already names the consequence.
+                        {
+                            let ui = import_ui.clone();
+                            let confirm = ui.overlay.confirm;
+                            let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
+                            let label = source.display();
+                            entries.push(
+                                MenuEntry::action("Truncate", move || {
+                                    let (ui, db, ns, tbl) =
+                                        (ui.clone(), db.clone(), ns.clone(), tbl.clone());
+                                    confirm.set(Some(crate::Confirm {
+                                        title: "Truncate table".to_string(),
+                                        message: format!(
+                                            "Delete every row in {label}? This can't be undone."
+                                        ),
+                                        resolve: Rc::new(move |yes| {
+                                            if yes {
+                                                crate::ddl_preview::preview_change(
+                                                    &ui,
+                                                    &db,
+                                                    &tbl,
+                                                    ns.as_deref(),
+                                                    schemaic_core::ddl::Change::TruncateTable,
+                                                );
+                                            }
+                                        }),
+                                    }));
+                                })
+                                .disabled(read_only || is_view),
+                            );
+                        }
+                        {
+                            let ui = import_ui.clone();
+                            let confirm = ui.overlay.confirm;
+                            let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
+                            let label = source.display();
+                            entries.push(
+                                MenuEntry::action_colored("Drop", theme::error, move || {
+                                    let (ui, db, ns, tbl) =
+                                        (ui.clone(), db.clone(), ns.clone(), tbl.clone());
+                                    confirm.set(Some(crate::Confirm {
+                                        title: "Drop table".to_string(),
+                                        message: format!(
+                                            "Drop {label} and every row in it? \
+                                                 This can't be undone."
+                                        ),
+                                        resolve: Rc::new(move |yes| {
+                                            if yes {
+                                                crate::ddl_preview::preview_change(
+                                                    &ui,
+                                                    &db,
+                                                    &tbl,
+                                                    ns.as_deref(),
+                                                    schemaic_core::ddl::Change::DropTable,
+                                                );
+                                            }
+                                        }),
+                                    }));
+                                })
+                                .disabled(read_only),
+                            );
+                        }
                     }
                 }
-                CtxKind::Field => {
+                CtxKind::Field { source, column } => {
                     entries.push(MenuEntry::action("Copy name", copy(menu.name.clone())));
+                    let read_only = conn_read_only(&connections, active_conn);
+                    entries.push(MenuEntry::Separator);
+                    {
+                        let ui = import_ui.clone();
+                        let (src, col) = (source.clone(), column.clone());
+                        entries.push(MenuEntry::action("Edit", move || {
+                            crate::table_designer::open_for_table(
+                                &ui,
+                                &src.database,
+                                src.schema.as_deref(),
+                                &src.table,
+                                Some(&col),
+                            );
+                        }));
+                    }
+                    {
+                        let ui = import_ui.clone();
+                        let (src, col) = (source.clone(), column.clone());
+                        // Through the draft, not as a lone `DropColumn`: the
+                        // index over the column and any foreign key standing on
+                        // it have to come off first or the server refuses it.
+                        entries.push(
+                            MenuEntry::action("Drop", move || {
+                                let col = col.clone();
+                                crate::table_designer::preview_draft_edit(
+                                    &ui,
+                                    &src.database,
+                                    src.schema.as_deref(),
+                                    &src.table,
+                                    move |d| {
+                                        if let Some(i) =
+                                            d.columns.iter().position(|c| c.info.name == col)
+                                        {
+                                            d.remove_column(i);
+                                        }
+                                    },
+                                );
+                            })
+                            .disabled(read_only),
+                        );
+                    }
+                }
+                CtxKind::Key {
+                    source,
+                    index,
+                    foreign_key,
+                } => {
+                    entries.push(MenuEntry::action("Copy name", copy(menu.name.clone())));
+                    let read_only = conn_read_only(&connections, active_conn);
+                    entries.push(MenuEntry::Separator);
+                    // A foreign key's backing index can't be dropped while the
+                    // constraint stands, so the entry offers the constraint —
+                    // which is what the row is really showing.
+                    match foreign_key {
+                        Some(name) => {
+                            let ui = import_ui.clone();
+                            let src = source.clone();
+                            entries.push(
+                                MenuEntry::action("Drop foreign key", move || {
+                                    crate::ddl_preview::preview_change(
+                                        &ui,
+                                        &src.database,
+                                        &src.table,
+                                        src.schema.as_deref(),
+                                        schemaic_core::ddl::Change::DropForeignKey {
+                                            name: name.clone(),
+                                        },
+                                    );
+                                })
+                                .disabled(read_only),
+                            );
+                        }
+                        // The primary key isn't dropped on its own — you replace
+                        // it, which is a designer edit.
+                        None if !index.is_primary() => {
+                            let ui = import_ui.clone();
+                            let src = source.clone();
+                            let ix = index.clone();
+                            entries.push(
+                                MenuEntry::action("Drop index", move || {
+                                    crate::ddl_preview::preview_change(
+                                        &ui,
+                                        &src.database,
+                                        &src.table,
+                                        src.schema.as_deref(),
+                                        schemaic_core::ddl::Change::DropIndex {
+                                            name: ix.name.clone(),
+                                            constraint: ix.constraint.clone(),
+                                        },
+                                    );
+                                })
+                                .disabled(read_only),
+                            );
+                        }
+                        None => {}
+                    }
+                    let ui = import_ui.clone();
+                    let src = source.clone();
+                    entries.push(MenuEntry::action("Edit table", move || {
+                        crate::table_designer::open_for_table(
+                            &ui,
+                            &src.database,
+                            src.schema.as_deref(),
+                            &src.table,
+                            None,
+                        );
+                    }));
                 }
             }
             entries.push(MenuEntry::Separator);
