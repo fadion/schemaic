@@ -273,6 +273,47 @@ pub(crate) async fn explain(
 /// isn't preparable (some utility statements) the columns fall back to those on
 /// the first returned row (names only). A statement with no result columns
 /// (DML/DDL) reports its affected-row count instead of a grid.
+/// The PostgreSQL half of [`Db::run_ddl`]: one transaction around the whole
+/// plan. `ALTER TABLE`, `CREATE INDEX` and `COMMENT ON` are all transactional
+/// here, so a failure anywhere leaves the table exactly as it was — which is why
+/// [`DdlError::applied`] is always 0 on this path.
+pub(crate) async fn run_ddl(
+    db: &Db,
+    database: &str,
+    stmts: &[String],
+    cancel: CancellationToken,
+) -> Result<(), crate::DdlError> {
+    let fail = |at: usize, e: String| crate::DdlError {
+        message: e,
+        at,
+        applied: 0,
+    };
+    let client = connect_to(db, database)
+        .await
+        .map_err(|e| fail(0, e.to_string()))?;
+    // Control statements go through `batch_execute` — `BEGIN` isn't a preparable
+    // statement, and neither are several DDL forms.
+    client
+        .batch_execute("BEGIN")
+        .await
+        .map_err(|e| fail(0, e.to_string()))?;
+    for (i, sql) in stmts.iter().enumerate() {
+        let step = tokio::select! {
+            r = client.batch_execute(sql) => r.map_err(|e| e.to_string()),
+            _ = cancel.cancelled() => Err("cancelled".to_string()),
+        };
+        if let Err(e) = step {
+            let _ = client.batch_execute("ROLLBACK").await;
+            return Err(fail(i, e));
+        }
+    }
+    if let Err(e) = client.batch_execute("COMMIT").await {
+        let _ = client.batch_execute("ROLLBACK").await;
+        return Err(fail(stmts.len().saturating_sub(1), e.to_string()));
+    }
+    Ok(())
+}
+
 pub(crate) async fn run_statement(
     client: &Client,
     database: &str,
@@ -499,12 +540,15 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
                     CASE WHEN ix.indisprimary THEN 'PRIMARY' ELSE ic.relname END AS iname, \
                     CASE WHEN ix.indisunique THEN 0 ELSE 1 END AS non_unique, \
                     a.attname, ix.indisprimary, \
-                    am.amname, pg_get_expr(ix.indpred, ix.indrelid) \
+                    am.amname, pg_get_expr(ix.indpred, ix.indrelid), \
+                    pgc.conname \
              FROM pg_index ix \
              JOIN pg_class c ON c.oid = ix.indrelid \
              JOIN pg_class ic ON ic.oid = ix.indexrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              JOIN pg_am am ON am.oid = ic.relam \
+             LEFT JOIN pg_constraint pgc \
+                    ON pgc.conindid = ic.oid AND pgc.contype IN ('p', 'u') \
              JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true \
              JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.attnum \
              WHERE {} AND a.attnum > 0 \
@@ -616,11 +660,12 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
     // Foreign keys via `pg_catalog`: pair `conkey` (referencing) with `confkey`
     // (referenced) by ordinal so composite FKs map their columns correctly (the
     // `constraint_column_usage` join can mis-pair them).
-    let fk_col_rows: Vec<InSchema<FkColRow>> = query_all(
+    let fk_all = query_all(
         &client,
         &format!(
             "SELECT n.nspname, c.relname, con.conname, a.attname, \
-                    rn.nspname, rc.relname, ra.attname \
+                    rn.nspname, rc.relname, ra.attname, \
+                    con.confdeltype, con.confupdtype \
              FROM pg_constraint con \
              JOIN pg_class c ON c.oid = con.conrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -635,24 +680,42 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
             user_schema_filter("n.nspname")
         ),
     )
-    .await?
-    .into_iter()
-    .map(|r| {
-        (
-            cell(&r, 0),
+    .await?;
+    let fk_col_rows: Vec<InSchema<FkColRow>> = fk_all
+        .iter()
+        .map(|r| {
             (
-                cell(&r, 1),
-                cell(&r, 2),
-                cell(&r, 3),
-                // The *referenced* namespace: kept as-is (it may point into
-                // another schema) and consumed by `follow_target`.
-                Some(cell(&r, 4)),
-                Some(cell(&r, 5)),
-                Some(cell(&r, 6)),
-            ),
-        )
-    })
-    .collect();
+                cell(r, 0),
+                (
+                    cell(r, 1),
+                    cell(r, 2),
+                    cell(r, 3),
+                    // The *referenced* namespace: kept as-is (it may point into
+                    // another schema) and consumed by `follow_target`.
+                    Some(cell(r, 4)),
+                    Some(cell(r, 5)),
+                    Some(cell(r, 6)),
+                ),
+            )
+        })
+        .collect();
+    // Referential actions, per constraint. A key that isn't restated with its
+    // `ON DELETE CASCADE` comes back as `NO ACTION`, so a schema editor that
+    // drops and recreates one has to know it.
+    // `(namespace, table, constraint, on_delete, on_update)`.
+    type FkRule = (String, String, String, Option<String>, Option<String>);
+    let fk_rules: Vec<FkRule> = fk_all
+        .iter()
+        .map(|r| {
+            (
+                cell(r, 0),
+                cell(r, 1),
+                cell(r, 2),
+                fk_action(&cell(r, 7)),
+                fk_action(&cell(r, 8)),
+            )
+        })
+        .collect();
 
     // View definitions.
     let view_rows: Vec<InSchema<(String, String)>> = query_all(
@@ -699,7 +762,48 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
         );
         tables.extend(schema.tables);
     }
+
+    // Post-fold enrichment: the two things `assemble_schema` can't carry because
+    // MySQL has no equivalent — an index's backing constraint, and each foreign
+    // key's referential actions.
+    let idx_constraints: HashMap<(String, String, String), String> = idx_all
+        .iter()
+        .filter_map(|r| {
+            let name = cell(r, 8);
+            (!name.is_empty()).then(|| ((cell(r, 0), cell(r, 1), cell(r, 2)), name))
+        })
+        .collect();
+    for t in &mut tables {
+        let ns = t.schema.clone().unwrap_or_default();
+        for ix in &mut t.indexes {
+            ix.constraint = idx_constraints
+                .get(&(ns.clone(), t.name.clone(), ix.name.clone()))
+                .cloned();
+        }
+        for (rns, rtable, rname, on_delete, on_update) in &fk_rules {
+            if *rns == ns
+                && *rtable == t.name
+                && let Some(fk) = t.foreign_keys.iter_mut().find(|f| f.name == *rname)
+            {
+                fk.on_delete = on_delete.clone();
+                fk.on_update = on_update.clone();
+            }
+        }
+    }
     Ok(DbSchema { tables })
+}
+
+/// One `pg_constraint.confdeltype`/`confupdtype` code as the SQL it stands for.
+/// `a` is `NO ACTION` — the standard default, which both engines leave unwritten,
+/// so it maps to `None` and an untouched key round-trips to no change.
+fn fk_action(code: &str) -> Option<String> {
+    match code {
+        "r" => Some("RESTRICT".to_string()),
+        "c" => Some("CASCADE".to_string()),
+        "n" => Some("SET NULL".to_string()),
+        "d" => Some("SET DEFAULT".to_string()),
+        _ => None,
+    }
 }
 
 /// Run a read-only SELECT and return every row as a `Vec<Option<String>>` (one
