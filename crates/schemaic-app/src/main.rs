@@ -1404,13 +1404,179 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         })
     };
 
-    // Commit staged grid changes (cell edits + new-row inserts): run them in one
-    // transaction off-thread, then reflect the database's truth (triggers /
-    // defaults / computed columns). If the grid supplied a re-fetch request (a
-    // spliceable single-table UPDATE-only result), we re-`SELECT` just the edited
-    // rows and hand them back so the grid splices them in place — no re-run,
-    // scroll/selection preserved. Otherwise (inserts, or not spliceable) we re-run
-    // the whole query. On failure the message goes back and the grid keeps its edits.
+    // ── File import ─────────────────────────────────────────────────────────
+    // Read a file's opening records so the modal can show what it found. On a
+    // worker thread: the path comes from a file dialog and could be anything —
+    // a huge file, a slow network share — and the window must stay live.
+    //
+    // Only the first bytes are read for the sniff, and only `SAMPLE_ROWS`
+    // records for the preview, so opening a 2GB CSV costs the same as a small
+    // one. A JSON *array* is the exception — its structure isn't known until the
+    // closing bracket, so `read_sample` has to parse the whole thing (see
+    // `import::json_records`); JSON Lines samples as cheaply as CSV.
+    let import_probe: schemaic_ui::ImportProbeFn = {
+        let handle = handle.clone();
+        Rc::new(
+            move |req: schemaic_ui::ImportProbeRequest, done: schemaic_ui::ImportProbeDoneFn| {
+                const SNIFF_BYTES: usize = 64 * 1024;
+                const SAMPLE_ROWS: usize = 200;
+                let report = create_ext_action(
+                    cx,
+                    move |res: Result<schemaic_ui::ImportProbeResult, String>| (done)(res),
+                );
+                handle.spawn_blocking(move || {
+                    let probe = || -> Result<schemaic_ui::ImportProbeResult, String> {
+                        use std::io::Read as _;
+                        // Settings first: either the caller's, or sniffed from the
+                        // head of the file.
+                        let cfg = match req.cfg {
+                            Some(c) => c,
+                            None => {
+                                let mut head = vec![0u8; SNIFF_BYTES];
+                                let mut f =
+                                    std::fs::File::open(&req.path).map_err(|e| e.to_string())?;
+                                let n = f.read(&mut head).map_err(|e| e.to_string())?;
+                                head.truncate(n);
+                                schemaic_core::import::ReadConfig {
+                                    dialect: schemaic_core::import::sniff(
+                                        &String::from_utf8_lossy(&head),
+                                    ),
+                                    ..Default::default()
+                                }
+                            }
+                        };
+                        let f = std::fs::File::open(&req.path).map_err(|e| e.to_string())?;
+                        let sample = schemaic_core::import::read_sample(
+                            std::io::BufReader::new(f),
+                            req.format,
+                            &cfg,
+                            SAMPLE_ROWS,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        Ok(schemaic_ui::ImportProbeResult { cfg, sample })
+                    };
+                    report(probe());
+                });
+            },
+        )
+    };
+
+    // Check the whole file, then — only if it's clean — load it in one
+    // transaction.
+    //
+    // The check is a separate pass over the file, and it's the point of the
+    // design: the transaction would roll back on the first bad row anyway, one
+    // error per attempt. Reading it through first turns that into a single list
+    // of everything wrong, with nothing written either way.
+    // The running import's cancellation token, so the modal's Cancel can reach it.
+    // One at a time by construction: the modal is the only caller and its Import
+    // button is disabled while one is in flight.
+    let import_token: Rc<RefCell<Option<CancellationToken>>> = Rc::new(RefCell::new(None));
+
+    let import_run: schemaic_ui::ImportFn = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        let import_token = import_token.clone();
+        Rc::new(
+            move |req: schemaic_ui::ImportRunRequest, done: schemaic_ui::ImportDoneFn| {
+                const MAX_ISSUES: usize = 200;
+                let db = match db_for(req.target.conn_id) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        (done)(schemaic_ui::ImportOutcome::Failed(e));
+                        return;
+                    }
+                };
+                let dialect = db.engine().dialect();
+                let token = CancellationToken::new();
+                *import_token.borrow_mut() = Some(token.clone());
+                let report = create_ext_action(cx, move |o: schemaic_ui::ImportOutcome| (done)(o));
+                handle.spawn(async move {
+                    let open = |path: &std::path::PathBuf| {
+                        std::fs::File::open(path)
+                            .map(std::io::BufReader::new)
+                            .map_err(|e| e.to_string())
+                    };
+                    // Pass 1 — validate. Blocking file work, so off the runtime.
+                    let checked = {
+                        let (path, format, cfg, table, mapping) = (
+                            req.path.clone(),
+                            req.format,
+                            req.cfg.clone(),
+                            req.target.table.clone(),
+                            req.mapping.clone(),
+                        );
+                        tokio::task::spawn_blocking(move || {
+                            let f = open(&path)?;
+                            schemaic_core::import::validate(
+                                f, format, &cfg, &table, &mapping, dialect, MAX_ISSUES,
+                            )
+                            .map_err(|e| e.to_string())
+                        })
+                        .await
+                    };
+                    let validation = match checked {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(e)) => return report(schemaic_ui::ImportOutcome::Failed(e)),
+                        Err(e) => {
+                            return report(schemaic_ui::ImportOutcome::Failed(e.to_string()));
+                        }
+                    };
+                    if !validation.issues.is_empty() {
+                        return report(schemaic_ui::ImportOutcome::Invalid(validation));
+                    }
+                    // Cancelling during the check can't interrupt the read itself
+                    // (it's one blocking pass over the file), but it must still
+                    // stop the load that would follow — which is the part that
+                    // writes and the part that takes minutes.
+                    if token.is_cancelled() {
+                        return report(schemaic_ui::ImportOutcome::Cancelled);
+                    }
+
+                    // Pass 2 — load. The row iterator parses between statements;
+                    // 500 records is microseconds against a round-trip.
+                    let f = match open(&req.path) {
+                        Ok(f) => f,
+                        Err(e) => return report(schemaic_ui::ImportOutcome::Failed(e)),
+                    };
+                    let mut rows = match schemaic_core::import::row_iter(
+                        f,
+                        req.format,
+                        &req.cfg,
+                        &req.target.table,
+                        &req.mapping,
+                        dialect,
+                    ) {
+                        Ok(it) => it,
+                        Err(e) => return report(schemaic_ui::ImportOutcome::Failed(e.to_string())),
+                    };
+                    let columns: Vec<String> =
+                        schemaic_core::import::insert_columns(&req.mapping, &req.target.table)
+                            .iter()
+                            .map(|&i| req.target.table.columns[i].name.clone())
+                            .collect();
+                    let outcome = db
+                        .import_rows(
+                            schemaic_db::ImportTarget {
+                                database: &req.target.database,
+                                schema: req.target.schema.as_deref(),
+                                table: &req.target.table.name,
+                                columns: &columns,
+                            },
+                            &mut rows,
+                            token,
+                        )
+                        .await;
+                    report(match outcome {
+                        Ok(n) => schemaic_ui::ImportOutcome::Done(n),
+                        Err(DbError::Cancelled) => schemaic_ui::ImportOutcome::Cancelled,
+                        Err(e) => schemaic_ui::ImportOutcome::Failed(e.to_string()),
+                    });
+                });
+            },
+        )
+    };
+
     // Render + write an export on a worker thread. The grid owns the save dialog
     // and snapshots the rows (cheap `Arc` clones) before it opens; this does the
     // part that scales with the result — a 200k-row export took long enough to
@@ -1448,6 +1614,13 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         )
     };
 
+    // Commit staged grid changes (cell edits + new-row inserts): run them in one
+    // transaction off-thread, then reflect the database's truth (triggers /
+    // defaults / computed columns). If the grid supplied a re-fetch request (a
+    // spliceable single-table UPDATE-only result), we re-`SELECT` just the edited
+    // rows and hand them back so the grid splices them in place — no re-run,
+    // scroll/selection preserved. Otherwise (inserts, or not spliceable) we re-run
+    // the whole query. On failure the message goes back and the grid keeps its edits.
     let commit_edits: schemaic_ui::CommitFn = {
         let handle = handle.clone();
         let run = run.clone();
@@ -4169,7 +4342,41 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             collapse_db,
             refresh_schema,
             refresh_db,
+            import_probe,
+            import_run,
+            import_cancel: {
+                let import_token = import_token.clone();
+                Rc::new(move || {
+                    if let Some(t) = import_token.borrow().as_ref() {
+                        t.cancel();
+                    }
+                })
+            },
         }),
+        // Reset on every open (`import_view::open_import`), so one bundle serves
+        // every table rather than a per-open scope that would need disposing.
+        import: schemaic_ui::ImportUi {
+            target: RwSignal::new(None),
+            step: RwSignal::new(schemaic_ui::ImportStep::Source),
+            path: RwSignal::new(None),
+            format: RwSignal::new(schemaic_core::import::ImportFormat::Csv),
+            delimiter: RwSignal::new(",".to_string()),
+            has_header: RwSignal::new(true),
+            empty_is_null: RwSignal::new(true),
+            null_tokens: RwSignal::new(String::new()),
+            trim: RwSignal::new(false),
+            sample: RwSignal::new(None),
+            mapping: RwSignal::new(schemaic_core::import::Mapping {
+                targets: Vec::new(),
+            }),
+            issues: RwSignal::new(Vec::new()),
+            more_issues: RwSignal::new(false),
+            error: RwSignal::new(None),
+            imported: RwSignal::new(0),
+            busy: RwSignal::new(false),
+            applying: RwSignal::new(false),
+            generation: RwSignal::new(0),
+        },
         conn: ConnUi {
             connections,
             active_conn,

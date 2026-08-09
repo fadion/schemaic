@@ -1,0 +1,2218 @@
+//! File → table import: format inference, CSV dialect sniffing, and column
+//! mapping. Pure over a *sample* of the file plus the target table's schema — no
+//! IO, no DB (the app streams the real file past this).
+//!
+//! The design rule throughout is the one `intel` uses: **only decide what can be
+//! decided.** A sniffed delimiter is a proposal the user sees and can override,
+//! an auto-mapping is a starting point, and validation (see the coercion half of
+//! this module) checks only what a wrong answer would definitely break. The
+//! server remains the authority on whether a value is acceptable — it parses more
+//! date and numeric formats than we could enumerate, and rejecting valid data is
+//! a worse failure than passing it through.
+
+use crate::intel::SqlDialect;
+use crate::model::Value;
+use crate::schema::TableInfo;
+
+/// The file formats import accepts.
+///
+/// Deliberately not the mirror of [`crate::export::ExportFormat`]: a `.sql` file
+/// belongs in the editor, and Markdown/HTML tables aren't a data interchange
+/// anyone imports from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportFormat {
+    /// Delimiter-separated text. The delimiter itself lives in [`CsvDialect`], so
+    /// TSV is this too.
+    Csv,
+    /// Objects keyed by column name — either one array of them, or one per line
+    /// (JSON Lines). Both read the same way; see [`ArrayUnwrap`].
+    Json,
+}
+
+impl ImportFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            ImportFormat::Csv => "CSV / TSV",
+            ImportFormat::Json => "JSON",
+        }
+    }
+
+    /// Every format, for the override dropdown.
+    pub const ALL: [ImportFormat; 2] = [ImportFormat::Csv, ImportFormat::Json];
+}
+
+/// Guess the format from a file name's extension. `None` when the extension says
+/// nothing useful — the UI then leaves the dropdown on its default rather than
+/// pretending to know.
+pub fn infer_format(file_name: &str) -> Option<ImportFormat> {
+    let ext = file_name.rsplit_once('.')?.1.to_ascii_lowercase();
+    match ext.as_str() {
+        "csv" | "tsv" | "tab" | "txt" => Some(ImportFormat::Csv),
+        "json" => Some(ImportFormat::Json),
+        _ => None,
+    }
+}
+
+/// How to read a delimited file. Sniffed from a sample, then shown to the user as
+/// editable settings — a wrong delimiter is the single most common import
+/// failure, and it's obvious the moment the preview renders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CsvDialect {
+    pub delimiter: u8,
+    pub quote: u8,
+    /// Whether the first record names the columns.
+    pub has_header: bool,
+}
+
+impl Default for CsvDialect {
+    fn default() -> Self {
+        Self {
+            delimiter: b',',
+            quote: b'"',
+            has_header: true,
+        }
+    }
+}
+
+/// The delimiters worth guessing between, in preference order. Comma first: a
+/// tie (a file with equal counts, e.g. one column and no delimiter at all) should
+/// land on the overwhelmingly common case.
+const CANDIDATE_DELIMITERS: &[u8] = b",\t;|";
+
+/// Guess a file's delimiter and whether it has a header, from the first few
+/// lines.
+///
+/// The delimiter is chosen by *consistency*, not raw frequency: the right
+/// delimiter splits every line into the same number of fields, while a character
+/// that merely appears often (a comma inside prose, say) splits them unevenly.
+/// Counting outside quoted regions matters for the same reason — a quoted
+/// `"Smith, John"` would otherwise vote for the comma in a semicolon file.
+///
+/// The header guess is deliberately weak, and negative: a numeric field anywhere
+/// in the first row means it's data. Files where every column is text are
+/// genuinely ambiguous, so it defaults to "yes, header" — the common case, and
+/// visibly wrong in the preview if it isn't.
+pub fn sniff(sample: &str) -> CsvDialect {
+    let lines: Vec<&str> = sample
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .take(20)
+        .collect();
+    if lines.is_empty() {
+        return CsvDialect::default();
+    }
+
+    let mut best = (b',', 0usize); // (delimiter, score)
+    for &d in CANDIDATE_DELIMITERS {
+        let counts: Vec<usize> = lines.iter().map(|l| count_unquoted(l, d, b'"')).collect();
+        let first = counts[0];
+        // A delimiter that never appears isn't a delimiter.
+        if first == 0 {
+            continue;
+        }
+        // Consistent across every sampled line ⇒ score by how many fields it
+        // yields, so a file that's consistent under both `,` and `;` picks the
+        // one actually structuring it.
+        if counts.iter().all(|&c| c == first) && first > best.1 {
+            best = (d, first);
+        }
+    }
+    let delimiter = best.0;
+
+    CsvDialect {
+        delimiter,
+        quote: b'"',
+        has_header: guess_header(&lines, delimiter),
+    }
+}
+
+/// Occurrences of `d` in `line` that are outside a quoted field.
+fn count_unquoted(line: &str, d: u8, quote: u8) -> usize {
+    let mut n = 0;
+    let mut in_quotes = false;
+    for &b in line.as_bytes() {
+        if b == quote {
+            in_quotes = !in_quotes;
+        } else if b == d && !in_quotes {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Split on `d` outside quotes, dropping the quote characters themselves.
+fn split_unquoted(line: &str, d: u8) -> Vec<String> {
+    let (d, quote) = (d as char, '"');
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for ch in line.chars() {
+        if ch == quote {
+            in_quotes = !in_quotes;
+        } else if ch == d && !in_quotes {
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(ch);
+        }
+    }
+    out.push(cur);
+    out
+}
+
+fn looks_numeric(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty() && s.parse::<f64>().is_ok()
+}
+
+/// Does the first line name the columns?
+///
+/// There's only one reliable signal, and it's negative: a numeric field in the
+/// first row means it's data. Everything else is ambiguous — an all-text file
+/// genuinely could go either way — so this answers "yes" unless it has that
+/// evidence to the contrary. That's the common case, and the preview makes a
+/// wrong guess obvious immediately (the header row shows up as data, or the
+/// first data row goes missing).
+fn guess_header(lines: &[&str], d: u8) -> bool {
+    !split_unquoted(lines[0], d).iter().any(|f| looks_numeric(f))
+}
+
+/// Where one of the file's columns lands in the target table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// Into the table column at this index.
+    Column(usize),
+    /// Not imported. Also what an unmatched column starts as — importing a
+    /// column nobody asked for is worse than leaving it out visibly.
+    Skip,
+}
+
+/// One entry per *file* column, in file order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mapping {
+    pub targets: Vec<Target>,
+}
+
+impl Mapping {
+    /// Table columns nothing maps to. These are left out of the `INSERT`
+    /// entirely, so the server applies their default — which is how an
+    /// auto-increment key stays out of the way without import having to know it's
+    /// auto-increment.
+    pub fn unmapped_columns(&self, table: &TableInfo) -> Vec<usize> {
+        (0..table.columns.len())
+            .filter(|i| !self.targets.contains(&Target::Column(*i)))
+            .collect()
+    }
+
+    /// Unmapped NOT NULL columns — the ones likely to fail on insert. "Likely",
+    /// not "certainly": a NOT NULL column with a server-side default is fine, and
+    /// the introspected schema doesn't record defaults, so this is a warning for
+    /// the user to weigh rather than a blocking error.
+    ///
+    /// An **integer** primary key is excluded, because that's the auto-increment
+    /// shape and warning about it on every import would train the user to ignore
+    /// the warning. A non-integer key is not: a `varchar` primary key is never
+    /// auto-assigned, so leaving it unmapped fails every time.
+    pub fn missing_required(&self, table: &TableInfo) -> Vec<String> {
+        self.unmapped_columns(table)
+            .into_iter()
+            .filter(|&i| {
+                let c = &table.columns[i];
+                let auto_key =
+                    c.primary_key && matches!(classify(&c.type_name), ColKind::Int | ColKind::Uint);
+                !c.nullable && !auto_key
+            })
+            .map(|i| table.columns[i].name.clone())
+            .collect()
+    }
+}
+
+/// Propose a mapping from the file's columns onto the table's.
+///
+/// With a header, match on name, case-insensitively and ignoring surrounding
+/// whitespace — that's what people actually expect, and it survives a file whose
+/// columns are in a different order. Without one, fall back to position, which is
+/// the only signal there is. Anything unmatched starts as [`Target::Skip`] so the
+/// mapping step shows the gap instead of quietly inventing a pairing.
+pub fn auto_map(file_columns: &[String], table: &TableInfo, has_header: bool) -> Mapping {
+    if !has_header {
+        return Mapping {
+            targets: (0..file_columns.len())
+                .map(|i| {
+                    if i < table.columns.len() {
+                        Target::Column(i)
+                    } else {
+                        Target::Skip
+                    }
+                })
+                .collect(),
+        };
+    }
+    let norm = |s: &str| s.trim().to_ascii_lowercase();
+    // `used` keeps two same-named file columns from both claiming one target —
+    // the second is left Skip for the user to resolve.
+    let mut used = vec![false; table.columns.len()];
+    let targets = file_columns
+        .iter()
+        .map(|fc| {
+            let want = norm(fc);
+            let found = table
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(i, tc)| !used[*i] && norm(&tc.name) == want)
+                .map(|(i, _)| i);
+            match found {
+                Some(i) => {
+                    used[i] = true;
+                    Target::Column(i)
+                }
+                None => Target::Skip,
+            }
+        })
+        .collect();
+    Mapping { targets }
+}
+
+/// Synthesized names for a headerless file's columns (`Column 1`, `Column 2`, …),
+/// so the mapping UI has something to label its rows with.
+pub fn placeholder_columns(n: usize) -> Vec<String> {
+    (1..=n).map(|i| format!("Column {i}")).collect()
+}
+
+/// Which field texts mean SQL `NULL`.
+///
+/// This is the setting that quietly corrupts data when it's wrong — an empty
+/// field is `NULL` in one export and the empty string in the next, and nothing
+/// about the file says which. So it's explicit, and it's shown in the first step
+/// rather than buried.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NullRule {
+    /// Compared against the trimmed field, case-insensitively.
+    pub tokens: Vec<String>,
+}
+
+impl Default for NullRule {
+    /// Empty field ⇒ NULL. The most common convention, and the one every tool
+    /// that wrote the file was probably using.
+    fn default() -> Self {
+        Self {
+            tokens: vec![String::new()],
+        }
+    }
+}
+
+impl NullRule {
+    /// No text means NULL. What JSON uses: the format carries nullness itself, so
+    /// re-interpreting `""` as NULL would contradict the file.
+    pub fn none() -> Self {
+        Self { tokens: Vec::new() }
+    }
+
+    fn matches(&self, field: &str) -> bool {
+        let trimmed = field.trim();
+        self.tokens.iter().any(|t| {
+            if t.is_empty() {
+                // The empty token means an *empty* field, not a blank one. A
+                // quoted `"   "` is a deliberate three spaces, and nulling it
+                // would be this module rewriting data it was told to carry —
+                // exactly what the trim setting exists to ask about first.
+                field.is_empty()
+            } else {
+                // A written token is matched against the trimmed field, so
+                // `NULL` still matches ` NULL ` in a padded file.
+                t.eq_ignore_ascii_case(trimmed)
+            }
+        })
+    }
+}
+
+/// One field of a source record.
+///
+/// `None` is a value the *format itself* says is absent — a JSON `null`, or a key
+/// the object simply doesn't have. CSV never produces it: a missing CSV field is
+/// empty text, and whether that means NULL is [`NullRule`]'s call. Keeping the
+/// two distinct is what lets a JSON `""` stay an empty string while a CSV `` is
+/// a NULL.
+pub type Field = Option<String>;
+
+/// The column families import validates. Everything outside them is
+/// [`ColKind::Other`] and passes through untouched — see the module docs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColKind {
+    Int,
+    Uint,
+    /// Binary floating point (`FLOAT`/`DOUBLE`/`REAL`).
+    Float,
+    /// Exact numeric (`DECIMAL`/`NUMERIC`) — validated, but kept as text so the
+    /// precision that made someone choose the type in the first place survives.
+    Exact,
+    Bool,
+    Other,
+}
+
+/// Classify a column by its declared type.
+///
+/// Matches the *base* type name, not a substring: `interval` and `point` both
+/// contain "int", and treating them as integers would reject every valid value
+/// they hold.
+pub fn classify(type_name: &str) -> ColKind {
+    let lower = type_name.to_ascii_lowercase();
+    let unsigned = lower.contains("unsigned");
+    // Strip the parameter list and any trailing modifiers: `int(10) unsigned`,
+    // `decimal(10,2)`, `timestamp with time zone`.
+    let base = lower
+        .split(['(', ' '])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    match base.as_str() {
+        "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" | "int2" | "int4"
+        | "int8" | "serial" | "bigserial" | "smallserial" => {
+            if unsigned {
+                ColKind::Uint
+            } else {
+                ColKind::Int
+            }
+        }
+        "float" | "double" | "real" | "float4" | "float8" => ColKind::Float,
+        "decimal" | "numeric" => ColKind::Exact,
+        "bool" | "boolean" => ColKind::Bool,
+        _ => ColKind::Other,
+    }
+}
+
+/// Why a field couldn't be imported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IssueKind {
+    NotAnInteger,
+    NotANumber,
+    NotABoolean,
+    /// The field is NULL (or empty) but the column doesn't allow it.
+    NullInNotNull,
+    /// The record has a different number of fields than the header did.
+    FieldCount {
+        expected: usize,
+        found: usize,
+    },
+}
+
+impl IssueKind {
+    /// A short, user-facing explanation for the preview's error list.
+    pub fn message(self) -> String {
+        match self {
+            IssueKind::NotAnInteger => "not a whole number".into(),
+            IssueKind::NotANumber => "not a number".into(),
+            IssueKind::NotABoolean => "not a true/false value".into(),
+            IssueKind::NullInNotNull => "empty, but the column can't be NULL".into(),
+            IssueKind::FieldCount { expected, found } => {
+                format!("has {found} fields, expected {expected}")
+            }
+        }
+    }
+}
+
+/// One problem, located, so the preview can say *where* rather than just *that*.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Issue {
+    /// 1-based record number within the file (the header, when present, is
+    /// record 0 — so this matches what a text editor shows).
+    pub line: u64,
+    /// The target column's name, or the file column's when it maps to nothing.
+    pub column: String,
+    /// The offending text, for the message.
+    pub text: String,
+    pub kind: IssueKind,
+}
+
+/// Turn one field's text into a [`Value`] for `kind`, or say why it can't be.
+///
+/// `dialect` is needed only for booleans, and only because the engines genuinely
+/// disagree there — see [`ColKind::Bool`].
+pub fn coerce(
+    text: &str,
+    kind: ColKind,
+    nullable: bool,
+    nulls: &NullRule,
+    dialect: SqlDialect,
+) -> Result<Value, IssueKind> {
+    if nulls.matches(text) {
+        return if nullable {
+            Ok(Value::Null)
+        } else {
+            Err(IssueKind::NullInNotNull)
+        };
+    }
+    let t = text.trim();
+    match kind {
+        ColKind::Int => t
+            .parse::<i64>()
+            .map(Value::Int)
+            .map_err(|_| IssueKind::NotAnInteger),
+        ColKind::Uint => t
+            .parse::<u64>()
+            .map(Value::UInt)
+            .map_err(|_| IssueKind::NotAnInteger),
+        ColKind::Float => match t.parse::<f64>() {
+            // A non-finite has no SQL literal — `sql_literal` renders it NULL,
+            // which would silently drop the value rather than report it.
+            Ok(f) if f.is_finite() => Ok(Value::Float(f)),
+            _ => Err(IssueKind::NotANumber),
+        },
+        // Shape-checked only; the text is what gets inserted, so no precision is
+        // lost on the way through.
+        ColKind::Exact => match t.parse::<f64>() {
+            Ok(_) => Ok(Value::Str(t.to_string())),
+            Err(_) => Err(IssueKind::NotANumber),
+        },
+        ColKind::Bool => {
+            let b = match t.to_ascii_lowercase().as_str() {
+                "1" | "t" | "true" | "y" | "yes" | "on" => true,
+                "0" | "f" | "false" | "n" | "no" | "off" => false,
+                _ => return Err(IssueKind::NotABoolean),
+            };
+            Ok(match dialect {
+                // MySQL's BOOLEAN is a TINYINT: `'true'` stores as 0, silently.
+                SqlDialect::MySql => Value::Int(b as i64),
+                // PostgreSQL rejects the integer 1 for a boolean column, but
+                // takes the quoted literal.
+                _ => Value::Str(if b { "true".into() } else { "false".into() }),
+            })
+        }
+        ColKind::Other => Ok(Value::Str(text.to_string())),
+    }
+}
+
+/// Everything needed to turn a file's bytes into fields — the dialect plus what
+/// counts as NULL. Bundled because the preview, the validation pass and the
+/// import itself must all read the file identically; passing them separately is
+/// how a preview ends up showing something the import doesn't do.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ReadConfig {
+    pub dialect: CsvDialect,
+    pub nulls: NullRule,
+    /// Strip surrounding whitespace from every field and header.
+    ///
+    /// Off by default, and deliberately so: trimming silently rewrites the data,
+    /// and `" x "` may be exactly what the column holds. The preview shows the
+    /// padding either way, which is what lets the user decide rather than guess.
+    ///
+    /// Note it trims **quoted** fields too — `"  padded  "` becomes `padded`.
+    /// That's the `csv` reader's behaviour, not a choice made here, and it's the
+    /// sharpest reason to leave this off unless a file actually needs it.
+    pub trim: bool,
+}
+
+/// Why a file couldn't be read or planned at all — as opposed to an [`Issue`],
+/// which is one bad cell in an otherwise workable file.
+#[derive(Debug)]
+pub enum ImportError {
+    /// The file couldn't be parsed as delimited text at all.
+    Read(String),
+    /// Not one file column maps to a table column, so there's nothing to insert.
+    /// Caught here rather than emitting `INSERT INTO t () VALUES ()`.
+    NoColumnsMapped,
+}
+
+impl std::fmt::Display for ImportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImportError::Read(e) => write!(f, "Couldn't read the file: {e}"),
+            ImportError::NoColumnsMapped => {
+                write!(f, "No file columns are mapped to table columns")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ImportError {}
+
+impl From<csv::Error> for ImportError {
+    fn from(e: csv::Error) -> Self {
+        ImportError::Read(e.to_string())
+    }
+}
+
+/// The first `limit` records of a file, for the mapping step's preview.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sample {
+    /// The header's names, or `Column N` placeholders when there isn't one. For
+    /// JSON, the union of the sampled objects' keys, first-seen order.
+    pub columns: Vec<String>,
+    /// Raw field text in `columns` order — coercion happens later, so the preview
+    /// can show what's in the file beside what it would become. `None` is a
+    /// format-level null (see [`Field`]).
+    pub rows: Vec<Vec<Field>>,
+    /// More records exist beyond the sample.
+    pub more: bool,
+}
+
+fn reader_for<R: std::io::Read>(r: R, cfg: &ReadConfig) -> csv::Reader<R> {
+    let dialect = cfg.dialect;
+    csv::ReaderBuilder::new()
+        .delimiter(dialect.delimiter)
+        .quote(dialect.quote)
+        // `Trim::All` covers headers too — a padded header would otherwise fail
+        // to name-match the column it obviously means.
+        .trim(if cfg.trim {
+            csv::Trim::All
+        } else {
+            csv::Trim::None
+        })
+        // Headers are taken by hand below so the header row can be treated as
+        // data when the file doesn't have one.
+        .has_headers(false)
+        // Ragged records are reported as an `Issue` with a line number, not a
+        // hard read error that says nothing about where the problem is.
+        .flexible(true)
+        .from_reader(r)
+}
+
+/// A UTF-8 BOM is invisible in an editor but lands inside the first header name,
+/// where it silently breaks name-matching on the very first column.
+fn strip_bom(s: &str) -> &str {
+    s.strip_prefix('\u{feff}').unwrap_or(s)
+}
+
+/// Read the first `limit` records for the preview, in whichever format.
+pub fn read_sample<R: std::io::Read>(
+    r: R,
+    format: ImportFormat,
+    cfg: &ReadConfig,
+    limit: usize,
+) -> Result<Sample, ImportError> {
+    match format {
+        ImportFormat::Csv => read_csv_sample(r, cfg, limit),
+        ImportFormat::Json => read_json_sample(r, limit),
+    }
+}
+
+/// Walk a file's records, calling `on_record` with each one's fields and its
+/// location, until `on_record` returns `false`.
+///
+/// The single traversal both the preview and the validation pass go through, so
+/// the rows the user reviewed are literally the rows that get checked.
+fn for_each_record<R: std::io::Read>(
+    r: R,
+    format: ImportFormat,
+    cfg: &ReadConfig,
+    mut on_record: impl FnMut(Vec<Field>, u64) -> bool,
+) -> Result<(), ImportError> {
+    match format {
+        ImportFormat::Csv => {
+            let mut rdr = reader_for(r, cfg);
+            let mut records = rdr.records();
+            if cfg.dialect.has_header {
+                records.next().transpose()?;
+            }
+            for rec in records {
+                let rec = rec?;
+                // The record's real line, from the parser — counting by hand goes
+                // wrong the moment a quoted field contains a newline, and a wrong
+                // line number in an error list is worse than none.
+                let line = rec.position().map(|p| p.line()).unwrap_or(0);
+                let fields = rec.iter().map(|f| Some(f.to_string())).collect();
+                if !on_record(fields, line) {
+                    break;
+                }
+            }
+        }
+        ImportFormat::Json => {
+            let mut keys: Vec<String> = Vec::new();
+            json_records(r, &mut keys, usize::MAX, on_record)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_csv_sample<R: std::io::Read>(
+    r: R,
+    cfg: &ReadConfig,
+    limit: usize,
+) -> Result<Sample, ImportError> {
+    let mut rdr = reader_for(r, cfg);
+    let mut records = rdr.records();
+
+    let mut columns: Vec<String> = Vec::new();
+    let mut rows: Vec<Vec<Field>> = Vec::new();
+
+    if cfg.dialect.has_header {
+        match records.next() {
+            Some(rec) => {
+                let rec = rec?;
+                columns = rec
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| if i == 0 { strip_bom(f) } else { f }.to_string())
+                    .collect();
+            }
+            None => {
+                return Ok(Sample {
+                    columns,
+                    rows,
+                    more: false,
+                });
+            }
+        }
+    }
+
+    let mut more = false;
+    for rec in records {
+        let rec = rec?;
+        if rows.len() >= limit {
+            more = true;
+            break;
+        }
+        let fields: Vec<Field> = rec
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                Some(
+                    if i == 0 && !cfg.dialect.has_header && rows.is_empty() {
+                        strip_bom(f)
+                    } else {
+                        f
+                    }
+                    .to_string(),
+                )
+            })
+            .collect();
+        if columns.is_empty() {
+            columns = placeholder_columns(fields.len());
+        }
+        rows.push(fields);
+    }
+    Ok(Sample {
+        columns,
+        rows,
+        more,
+    })
+}
+
+/// Presents a JSON *array* of values as the whitespace-separated stream of those
+/// values, so one reader handles both shapes people actually have: `[{…}, {…}]`
+/// and newline-delimited `{…}\n{…}` (JSON Lines).
+///
+/// Without this, an array has to be deserialized whole before its first record is
+/// available — so *previewing* a multi-gigabyte export costs as much as importing
+/// it. Blanking the wrapping brackets and the commas between top-level elements
+/// turns the array into exactly what [`serde_json::StreamDeserializer`] already
+/// reads a value at a time, which is what makes the sample's record limit real
+/// rather than nominal.
+///
+/// It rewrites bytes in place (every replacement is one byte wide, so nothing is
+/// buffered) and only ever *blanks* structure it has accounted for: anything
+/// malformed passes through to serde, which reports it properly. A file that
+/// doesn't open with `[` is passed through untouched, so JSON Lines is unaffected.
+struct ArrayUnwrap<R> {
+    inner: R,
+    /// `None` until the first non-whitespace byte says whether this is an array.
+    array: Option<bool>,
+    /// Nesting depth *within* the outer array. Commas and the closing bracket
+    /// matter only at 0; deeper ones belong to a record and are left alone.
+    depth: u32,
+    in_string: bool,
+    escaped: bool,
+}
+
+impl<R: std::io::Read> ArrayUnwrap<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            array: None,
+            depth: 0,
+            in_string: false,
+            escaped: false,
+        }
+    }
+
+    fn rewrite(&mut self, buf: &mut [u8]) {
+        for b in buf.iter_mut() {
+            // Decide what kind of file this is on the first byte that isn't
+            // whitespace, then never revisit it.
+            if self.array.is_none() {
+                if b.is_ascii_whitespace() {
+                    continue;
+                }
+                self.array = Some(*b == b'[');
+                if *b == b'[' {
+                    *b = b' ';
+                    continue;
+                }
+            }
+            if self.array != Some(true) {
+                return; // JSON Lines: nothing to rewrite, ever.
+            }
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if *b == b'\\' {
+                    self.escaped = true;
+                } else if *b == b'"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            match *b {
+                b'"' => self.in_string = true,
+                b'{' | b'[' => self.depth += 1,
+                // At depth 0 this is the array's own `]`; anything after it
+                // should be whitespace, and serde says so if it isn't.
+                b']' | b'}' if self.depth == 0 => *b = b' ',
+                b']' | b'}' => self.depth -= 1,
+                b',' if self.depth == 0 => *b = b' ',
+                _ => {}
+            }
+        }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for ArrayUnwrap<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.rewrite(&mut buf[..n]);
+        Ok(n)
+    }
+}
+
+/// Walk a JSON source's records.
+///
+/// Both shapes stream a record at a time — an array via [`ArrayUnwrap`], JSON
+/// Lines natively — so reading a sample really does stop at the sample.
+///
+/// `keys` accumulates the columns across every object, so a later record
+/// carrying an extra key widens the set instead of being dropped. That
+/// accumulation is why a *whole-file* walk (validate, import) still holds the
+/// records it has seen: every one has to be emitted against the final key set.
+/// Sampling doesn't, since `limit` bounds it.
+///
+/// Their *order* is alphabetical, not the document's: `serde_json::Map` is a
+/// `BTreeMap` without the `preserve_order` feature, and turning that feature on
+/// would reorder every other `serde_json::Map` in the workspace to fix a
+/// cosmetic issue here. JSON records are matched to columns by name and inserted
+/// in table order, so key order only affects how the preview lays its columns
+/// out.
+fn json_records<R: std::io::Read>(
+    r: R,
+    keys: &mut Vec<String>,
+    limit: usize,
+    mut on_record: impl FnMut(Vec<Field>, u64) -> bool,
+) -> Result<bool, ImportError> {
+    // Collected first so every record can be emitted against the *final* key set
+    // — otherwise the first row's fields wouldn't line up with a column list that
+    // grew later.
+    let mut objects: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
+    let mut more = false;
+
+    let stream =
+        serde_json::Deserializer::from_reader(ArrayUnwrap::new(r)).into_iter::<serde_json::Value>();
+    for v in stream {
+        // Past the limit nothing more needs reading — and for a large file that's
+        // the whole point, so stop before deserializing another record.
+        if objects.len() >= limit {
+            more = true;
+            break;
+        }
+        let v = v.map_err(|e| ImportError::Read(e.to_string()))?;
+        let serde_json::Value::Object(map) = v else {
+            return Err(ImportError::Read(
+                "expected JSON objects (an array of them, or one per line)".into(),
+            ));
+        };
+        for k in map.keys() {
+            if !keys.iter().any(|s| s == k) {
+                keys.push(k.clone());
+            }
+        }
+        objects.push(map);
+    }
+
+    for (i, map) in objects.iter().enumerate() {
+        let fields = keys
+            .iter()
+            .map(|k| match map.get(k) {
+                // A key that's absent, or explicitly null, is a real null — not
+                // the empty string, and not subject to the NULL-token rule.
+                None | Some(serde_json::Value::Null) => None,
+                // A JSON string is used as-is; anything else (number, bool,
+                // nested object/array) becomes its JSON text, which is both what
+                // a numeric column wants and what a JSON column wants.
+                Some(serde_json::Value::String(s)) => Some(s.clone()),
+                Some(other) => Some(other.to_string()),
+            })
+            .collect();
+        // No line numbers in a JSON array, so records are numbered from 1 — see
+        // `Issue::line`.
+        if !on_record(fields, i as u64 + 1) {
+            break;
+        }
+    }
+    Ok(more)
+}
+
+fn read_json_sample<R: std::io::Read>(r: R, limit: usize) -> Result<Sample, ImportError> {
+    let mut columns: Vec<String> = Vec::new();
+    let mut rows: Vec<Vec<Field>> = Vec::new();
+    let more = json_records(r, &mut columns, limit, |fields, _| {
+        rows.push(fields);
+        true
+    })?;
+    Ok(Sample {
+        columns,
+        rows,
+        more,
+    })
+}
+
+/// The table columns an import writes, as indices in **table order**.
+///
+/// Table order rather than file order so the generated `INSERT` reads naturally
+/// and every batch lists its columns identically.
+pub fn insert_columns(mapping: &Mapping, table: &TableInfo) -> Vec<usize> {
+    let mut cols: Vec<usize> = mapping
+        .targets
+        .iter()
+        .filter_map(|t| match t {
+            Target::Column(i) if *i < table.columns.len() => Some(*i),
+            _ => None,
+        })
+        .collect();
+    cols.sort_unstable();
+    cols.dedup();
+    cols
+}
+
+/// Coerce one file record into the values for an `INSERT`, in
+/// [`insert_columns`] order, collecting anything wrong with it.
+///
+/// `line` is the record's 1-based line in the file, so an issue can say where.
+pub fn coerce_record(
+    fields: &[Field],
+    mapping: &Mapping,
+    table: &TableInfo,
+    nulls: &NullRule,
+    dialect: SqlDialect,
+    line: u64,
+) -> (Vec<Value>, Vec<Issue>) {
+    let cols = insert_columns(mapping, table);
+    let mut issues = Vec::new();
+
+    // A record whose field count doesn't match the header is reported once, then
+    // read as far as it goes — the alternative is discarding a row that may be
+    // only trailing-comma wrong.
+    if fields.len() != mapping.targets.len() {
+        issues.push(Issue {
+            line,
+            column: String::new(),
+            text: String::new(),
+            kind: IssueKind::FieldCount {
+                expected: mapping.targets.len(),
+                found: fields.len(),
+            },
+        });
+    }
+
+    // Which file field feeds each table column, resolved in one pass. The
+    // obvious `targets.iter().position(..)` inside the per-column loop is
+    // quadratic per row, which at 50 columns × 100k rows is hundreds of millions
+    // of comparisons for a lookup that never changes.
+    let mut field_of = vec![None; table.columns.len()];
+    for (fi, t) in mapping.targets.iter().enumerate() {
+        if let Target::Column(ci) = t
+            && *ci < field_of.len()
+            && field_of[*ci].is_none()
+        {
+            field_of[*ci] = Some(fi);
+        }
+    }
+
+    let values = cols
+        .iter()
+        .map(|&ci| {
+            let col = &table.columns[ci];
+            // Three cases, and they're genuinely different: a field the format
+            // says is null (`Some(None)`), a field the record simply doesn't
+            // reach (`None` — a short CSV record), and text to interpret.
+            let field = match field_of[ci].and_then(|fi| fields.get(fi)) {
+                Some(Some(text)) => text.as_str(),
+                Some(None) | None => {
+                    return if col.nullable {
+                        Value::Null
+                    } else {
+                        issues.push(Issue {
+                            line,
+                            column: col.name.clone(),
+                            text: String::new(),
+                            kind: IssueKind::NullInNotNull,
+                        });
+                        Value::Null
+                    };
+                }
+            };
+            match coerce(
+                field,
+                classify(&col.type_name),
+                col.nullable,
+                nulls,
+                dialect,
+            ) {
+                Ok(v) => v,
+                Err(kind) => {
+                    issues.push(Issue {
+                        line,
+                        column: col.name.clone(),
+                        text: field.to_string(),
+                        kind,
+                    });
+                    // Keep the row shaped correctly so a later issue still lines
+                    // up with its column; nothing is inserted anyway.
+                    Value::Null
+                }
+            }
+        })
+        .collect();
+    (values, issues)
+}
+
+/// What a whole-file check found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Validation {
+    /// Records read (excluding the header).
+    pub rows: u64,
+    pub issues: Vec<Issue>,
+    /// The issue list was capped — there are more.
+    pub more_issues: bool,
+}
+
+/// Check every record without inserting anything.
+///
+/// This is what makes the all-or-nothing import bearable: the transaction would
+/// roll back on the first bad row anyway, one error at a time, across however
+/// many attempts it takes. Reading the file through once first turns that into a
+/// single list of everything wrong, before anything is written.
+///
+/// Counting continues past the issue cap so the row total stays truthful.
+pub fn validate<R: std::io::Read>(
+    r: R,
+    format: ImportFormat,
+    cfg: &ReadConfig,
+    table: &TableInfo,
+    mapping: &Mapping,
+    dialect: SqlDialect,
+    max_issues: usize,
+) -> Result<Validation, ImportError> {
+    if insert_columns(mapping, table).is_empty() {
+        return Err(ImportError::NoColumnsMapped);
+    }
+    // JSON carries its own nulls, so the NULL-token rule (which exists because
+    // CSV can't tell an empty string from a missing value) must not also apply —
+    // it would turn every empty JSON string into a NULL.
+    let nulls = match format {
+        ImportFormat::Csv => cfg.nulls.clone(),
+        ImportFormat::Json => NullRule::none(),
+    };
+
+    let mut out = Validation {
+        rows: 0,
+        issues: Vec::new(),
+        more_issues: false,
+    };
+    for_each_record(r, format, cfg, |mut fields, line| {
+        out.rows += 1;
+        // See `trim_to_mapping` — the check must see exactly what the import will.
+        fields.truncate(trim_to_mapping(&fields, format, mapping));
+        let (_, issues) = coerce_record(&fields, mapping, table, &nulls, dialect, line);
+        for i in issues {
+            if out.issues.len() >= max_issues {
+                out.more_issues = true;
+                break;
+            }
+            out.issues.push(i);
+        }
+        true
+    })?;
+    Ok(out)
+}
+
+/// Narrow a JSON record to the columns the mapping was built from.
+///
+/// JSON columns are the *union* of every object's keys, and the mapping the user
+/// approved was built from a sample of the first records. A key that first
+/// appears past that sample widens every record — so without this, each row would
+/// carry more fields than the mapping has targets and be reported as a
+/// field-count mismatch, failing the whole import on a file that's perfectly
+/// fine. Keys accumulate in first-seen order, so the sampled ones are always a
+/// prefix and the tail dropped here is exactly the columns nothing maps to.
+///
+/// CSV is untouched: its columns are fixed by the header, so a count mismatch
+/// there is a real stray-delimiter problem worth reporting.
+fn trim_to_mapping(fields: &[Field], format: ImportFormat, mapping: &Mapping) -> usize {
+    match format {
+        ImportFormat::Json => fields.len().min(mapping.targets.len()),
+        ImportFormat::Csv => fields.len(),
+    }
+}
+
+/// Everything a row needs to become values, owned so the iterator can outlive
+/// the call that built it.
+struct RowCtx {
+    table: TableInfo,
+    mapping: Mapping,
+    nulls: NullRule,
+    dialect: SqlDialect,
+    format: ImportFormat,
+}
+
+impl RowCtx {
+    fn row(&self, fields: &[Field], line: u64) -> Result<Vec<Value>, String> {
+        let fields = &fields[..trim_to_mapping(fields, self.format, &self.mapping)];
+        let (values, issues) = coerce_record(
+            fields,
+            &self.mapping,
+            &self.table,
+            &self.nulls,
+            self.dialect,
+            line,
+        );
+        match issues.first() {
+            // Only the first issue is reported here: the import is all-or-nothing,
+            // and `validate` has already shown the user the whole list. This is
+            // the backstop for a file that changed underneath them.
+            Some(i) => Err(format!(
+                "line {}, column {}: {} ({})",
+                i.line,
+                i.column,
+                i.kind.message(),
+                if i.text.is_empty() {
+                    "empty".to_string()
+                } else {
+                    i.text.clone()
+                }
+            )),
+            None => Ok(values),
+        }
+    }
+}
+
+/// Streams a file's rows, already coerced into the values an `INSERT` takes.
+///
+/// This is what the database layer pulls batches from, so a CSV is never held in
+/// memory. JSON is the caveat, and it's the key union rather than the bracket
+/// syntax: every record has to be emitted against the columns of *all* of them
+/// (see [`json_records`]), so a whole-file walk buffers whichever shape it's in.
+/// Sampling doesn't — that's bounded by its limit — so previewing a large JSON
+/// file is cheap even though importing it isn't.
+pub struct RowIter<R: std::io::Read> {
+    ctx: RowCtx,
+    source: RowSourceIter<R>,
+}
+
+enum RowSourceIter<R: std::io::Read> {
+    Csv(csv::StringRecordsIntoIter<R>),
+    Json(std::vec::IntoIter<(Vec<Field>, u64)>),
+}
+
+/// Build the row stream for an import. `mapping` must have at least one target,
+/// which [`validate`] checks first.
+pub fn row_iter<R: std::io::Read>(
+    r: R,
+    format: ImportFormat,
+    cfg: &ReadConfig,
+    table: &TableInfo,
+    mapping: &Mapping,
+    dialect: SqlDialect,
+) -> Result<RowIter<R>, ImportError> {
+    if insert_columns(mapping, table).is_empty() {
+        return Err(ImportError::NoColumnsMapped);
+    }
+    let ctx = RowCtx {
+        table: table.clone(),
+        mapping: mapping.clone(),
+        // JSON carries its own nulls — see `validate`.
+        nulls: match format {
+            ImportFormat::Csv => cfg.nulls.clone(),
+            ImportFormat::Json => NullRule::none(),
+        },
+        dialect,
+        format,
+    };
+    let source = match format {
+        ImportFormat::Csv => {
+            let mut records = reader_for(r, cfg).into_records();
+            if cfg.dialect.has_header {
+                records.next().transpose()?;
+            }
+            RowSourceIter::Csv(records)
+        }
+        ImportFormat::Json => {
+            let mut keys = Vec::new();
+            let mut rows = Vec::new();
+            json_records(r, &mut keys, usize::MAX, |fields, n| {
+                rows.push((fields, n));
+                true
+            })?;
+            RowSourceIter::Json(rows.into_iter())
+        }
+    };
+    Ok(RowIter { ctx, source })
+}
+
+impl<R: std::io::Read> Iterator for RowIter<R> {
+    type Item = Result<Vec<Value>, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.source {
+            RowSourceIter::Csv(records) => {
+                let rec = records.next()?;
+                Some(match rec {
+                    Ok(rec) => {
+                        let line = rec.position().map(|p| p.line()).unwrap_or(0);
+                        let fields: Vec<Field> = rec.iter().map(|f| Some(f.to_string())).collect();
+                        self.ctx.row(&fields, line)
+                    }
+                    Err(e) => Err(e.to_string()),
+                })
+            }
+            RowSourceIter::Json(rows) => {
+                let (fields, line) = rows.next()?;
+                Some(self.ctx.row(&fields, line))
+            }
+        }
+    }
+}
+
+/// Rows per `INSERT`. Bulk import is one transaction of batched statements
+/// rather than the grid write-back's statement-per-row: at 100k rows that's 100k
+/// server round-trips, which is minutes on a remote host.
+pub const INSERT_BATCH_ROWS: usize = 500;
+
+/// One multi-row `INSERT` for `rows`, in the connection's dialect. `None` when
+/// there's nothing to insert.
+///
+/// Identifier and literal quoting come from [`crate::export`] — import is the
+/// inverse of the SQL export, so the escaping that's already tested there (the
+/// MySQL-only backslash doubling in particular) is the escaping used here.
+pub fn build_insert(
+    database: &str,
+    schema: Option<&str>,
+    table: &str,
+    columns: &[&str],
+    rows: &[Vec<Value>],
+    dialect: SqlDialect,
+) -> Option<String> {
+    if rows.is_empty() || columns.is_empty() {
+        return None;
+    }
+    let q = |s: &str| crate::export::ident_sql(s, dialect);
+    // A PostgreSQL namespace qualifies the table instead of the database — a PG
+    // connection is bound to one database, exactly as the export path has it.
+    let target = match schema {
+        Some(ns) => format!("{}.{}", q(ns), q(table)),
+        None => format!("{}.{}", q(database), q(table)),
+    };
+    let cols = columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
+    let values = rows
+        .iter()
+        .map(|r| {
+            let cells = r
+                .iter()
+                .map(|v| crate::export::sql_literal(v, dialect))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({cells})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("INSERT INTO {target} ({cols}) VALUES {values}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::ColumnInfo;
+
+    fn tbl(cols: &[(&str, &str, bool)]) -> TableInfo {
+        TableInfo {
+            name: "t".into(),
+            schema: None,
+            columns: cols
+                .iter()
+                .map(|(n, ty, nullable)| ColumnInfo {
+                    name: (*n).into(),
+                    type_name: (*ty).into(),
+                    nullable: *nullable,
+                    primary_key: *n == "id",
+                })
+                .collect(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            is_view: false,
+            view_definition: None,
+        }
+    }
+
+    #[test]
+    fn format_is_inferred_from_the_extension() {
+        assert_eq!(infer_format("rows.csv"), Some(ImportFormat::Csv));
+        assert_eq!(infer_format("rows.TSV"), Some(ImportFormat::Csv));
+        assert_eq!(infer_format("export.json"), Some(ImportFormat::Json));
+        // An extension that says nothing shouldn't be guessed at.
+        assert_eq!(infer_format("data.xlsx"), None);
+        assert_eq!(infer_format("noextension"), None);
+    }
+
+    #[test]
+    fn sniff_finds_the_delimiter_by_consistency() {
+        let csv = "a,b,c\n1,2,3\n4,5,6\n";
+        assert_eq!(sniff(csv).delimiter, b',');
+        let tsv = "a\tb\tc\n1\t2\t3\n";
+        assert_eq!(sniff(tsv).delimiter, b'\t');
+        let semi = "a;b;c\n1;2;3\n";
+        assert_eq!(sniff(semi).delimiter, b';');
+        let pipe = "a|b|c\n1|2|3\n";
+        assert_eq!(sniff(pipe).delimiter, b'|');
+    }
+
+    /// A comma inside prose shouldn't outvote the real delimiter just by being
+    /// more frequent — this is the case raw frequency counting gets wrong.
+    #[test]
+    fn sniff_prefers_the_consistent_delimiter_over_the_frequent_one() {
+        let s = "name;note\nSmith;a, b, c, d\nJones;e, f, g, h\n";
+        assert_eq!(sniff(s).delimiter, b';');
+    }
+
+    /// A delimiter inside a quoted field isn't a delimiter.
+    #[test]
+    fn sniff_ignores_delimiters_inside_quotes() {
+        let s = "name;city\n\"Smith, John\";Berlin\n\"Doe, Jane\";Paris\n";
+        assert_eq!(sniff(s).delimiter, b';');
+    }
+
+    #[test]
+    fn sniff_of_a_single_column_file_defaults_to_comma() {
+        let s = "name\nSmith\nJones\n";
+        let d = sniff(s);
+        assert_eq!(d.delimiter, b',');
+    }
+
+    #[test]
+    fn sniff_of_empty_input_is_the_default_dialect() {
+        assert_eq!(sniff(""), CsvDialect::default());
+        assert_eq!(sniff("\n\n  \n"), CsvDialect::default());
+    }
+
+    #[test]
+    fn header_is_detected_when_the_first_row_is_text_over_numeric_data() {
+        let s = "id,name\n1,Smith\n2,Jones\n";
+        assert!(sniff(s).has_header);
+    }
+
+    /// A numeric field in the first row means it's data, not names.
+    #[test]
+    fn a_numeric_first_row_is_not_a_header() {
+        let s = "1,Smith\n2,Jones\n";
+        assert!(!sniff(s).has_header);
+    }
+
+    #[test]
+    fn an_all_text_file_assumes_a_header() {
+        // Genuinely ambiguous — take the common case, which the preview shows.
+        let s = "name,city\nSmith,Berlin\nJones,Paris\n";
+        assert!(sniff(s).has_header);
+    }
+
+    #[test]
+    fn auto_map_matches_on_name_ignoring_case_and_space() {
+        let t = tbl(&[("id", "int", false), ("name", "varchar", true)]);
+        let m = auto_map(&[" NAME ".into(), "id".into()], &t, true);
+        // Order doesn't matter — a name match survives a reordered file.
+        assert_eq!(m.targets, vec![Target::Column(1), Target::Column(0)]);
+    }
+
+    #[test]
+    fn auto_map_skips_a_file_column_with_no_match() {
+        let t = tbl(&[("id", "int", false), ("name", "varchar", true)]);
+        let m = auto_map(&["name".into(), "nonsense".into()], &t, true);
+        assert_eq!(m.targets, vec![Target::Column(1), Target::Skip]);
+    }
+
+    #[test]
+    fn auto_map_never_maps_two_file_columns_onto_one_target() {
+        let t = tbl(&[("id", "int", false), ("name", "varchar", true)]);
+        let m = auto_map(&["name".into(), "NAME".into()], &t, true);
+        assert_eq!(m.targets, vec![Target::Column(1), Target::Skip]);
+    }
+
+    #[test]
+    fn auto_map_without_a_header_falls_back_to_position() {
+        let t = tbl(&[("id", "int", false), ("name", "varchar", true)]);
+        let m = auto_map(&placeholder_columns(3), &t, false);
+        // The third file column has nowhere to go.
+        assert_eq!(
+            m.targets,
+            vec![Target::Column(0), Target::Column(1), Target::Skip]
+        );
+    }
+
+    #[test]
+    fn unmapped_columns_are_left_to_the_server_default() {
+        let t = tbl(&[
+            ("id", "int", false),
+            ("name", "varchar", true),
+            ("note", "text", true),
+        ]);
+        let m = auto_map(&["name".into()], &t, true);
+        assert_eq!(m.unmapped_columns(&t), vec![0, 2]);
+    }
+
+    /// An unmapped NOT NULL column is worth warning about — but an *integer*
+    /// primary key is excluded, since that's the auto-increment case and warning
+    /// about it every time would train the user to ignore the warning.
+    #[test]
+    fn missing_required_warns_about_not_null_but_not_an_auto_key() {
+        let t = tbl(&[
+            ("id", "int", false),
+            ("name", "varchar", false),
+            ("note", "text", true),
+        ]);
+        let m = auto_map(&["note".into()], &t, true);
+        assert_eq!(m.missing_required(&t), vec!["name".to_string()]);
+    }
+
+    /// A `varchar` primary key is never auto-assigned — `classicmodels.offices`
+    /// has exactly this shape — so leaving it unmapped fails every time and has
+    /// to be warned about.
+    #[test]
+    fn missing_required_warns_about_a_non_integer_primary_key() {
+        let t = tbl(&[("id", "varchar(10)", false), ("city", "varchar(50)", false)]);
+        let m = auto_map(&["city".into()], &t, true);
+        assert_eq!(m.missing_required(&t), vec!["id".to_string()]);
+    }
+
+    #[test]
+    fn placeholder_columns_are_one_based() {
+        assert_eq!(placeholder_columns(2), vec!["Column 1", "Column 2"]);
+        assert!(placeholder_columns(0).is_empty());
+    }
+
+    // ── coercion ────────────────────────────────────────────────────────────
+
+    use crate::intel::SqlDialect::{MySql, Postgres};
+
+    #[test]
+    fn classify_recognizes_the_families_we_validate() {
+        assert_eq!(classify("int(11)"), ColKind::Int);
+        assert_eq!(classify("BIGINT"), ColKind::Int);
+        assert_eq!(classify("int4"), ColKind::Int);
+        assert_eq!(classify("int(10) unsigned"), ColKind::Uint);
+        assert_eq!(classify("double"), ColKind::Float);
+        assert_eq!(classify("real"), ColKind::Float);
+        assert_eq!(classify("decimal(10,2)"), ColKind::Exact);
+        assert_eq!(classify("numeric"), ColKind::Exact);
+        assert_eq!(classify("boolean"), ColKind::Bool);
+    }
+
+    /// `interval` and `point` contain "int" — a substring match would classify
+    /// them as integers and then reject every valid value in them.
+    #[test]
+    fn classify_does_not_match_int_as_a_substring() {
+        assert_eq!(classify("interval"), ColKind::Other);
+        assert_eq!(classify("point"), ColKind::Other);
+        assert_eq!(classify("varchar(45)"), ColKind::Other);
+        assert_eq!(classify("timestamptz"), ColKind::Other);
+        assert_eq!(classify("jsonb"), ColKind::Other);
+        assert_eq!(classify("uuid"), ColKind::Other);
+    }
+
+    #[test]
+    fn coerce_parses_integers_and_rejects_text() {
+        let n = NullRule::default();
+        assert_eq!(
+            coerce("42", ColKind::Int, true, &n, MySql),
+            Ok(Value::Int(42))
+        );
+        assert_eq!(
+            coerce(" -7 ", ColKind::Int, true, &n, MySql),
+            Ok(Value::Int(-7))
+        );
+        assert_eq!(
+            coerce("N/A", ColKind::Int, true, &n, MySql),
+            Err(IssueKind::NotAnInteger)
+        );
+        // The classic: a float where an integer belongs.
+        assert_eq!(
+            coerce("1.5", ColKind::Int, true, &n, MySql),
+            Err(IssueKind::NotAnInteger)
+        );
+    }
+
+    /// DECIMAL/NUMERIC must never round-trip through f64 — that's the exact
+    /// lossiness the read path goes out of its way to avoid.
+    #[test]
+    fn coerce_keeps_exact_numerics_as_text() {
+        let n = NullRule::default();
+        let big = "1234567890123456789012.345";
+        assert_eq!(
+            coerce(big, ColKind::Exact, true, &n, MySql),
+            Ok(Value::Str(big.to_string()))
+        );
+        assert_eq!(
+            coerce("oops", ColKind::Exact, true, &n, MySql),
+            Err(IssueKind::NotANumber)
+        );
+    }
+
+    #[test]
+    fn coerce_rejects_non_finite_floats() {
+        let n = NullRule::default();
+        assert_eq!(
+            coerce("inf", ColKind::Float, true, &n, MySql),
+            Err(IssueKind::NotANumber)
+        );
+        assert_eq!(
+            coerce("NaN", ColKind::Float, true, &n, MySql),
+            Err(IssueKind::NotANumber)
+        );
+    }
+
+    /// Booleans are the one place the engines genuinely disagree: MySQL's BOOLEAN
+    /// is a TINYINT that silently stores `'true'` as 0, while PostgreSQL rejects
+    /// the integer 1. So the literal is normalized per dialect rather than passed
+    /// through — passing through is what corrupts MySQL data.
+    #[test]
+    fn coerce_normalizes_booleans_per_dialect() {
+        let n = NullRule::default();
+        for t in ["true", "TRUE", "t", "yes", "1"] {
+            assert_eq!(coerce(t, ColKind::Bool, true, &n, MySql), Ok(Value::Int(1)));
+            assert_eq!(
+                coerce(t, ColKind::Bool, true, &n, Postgres),
+                Ok(Value::Str("true".into()))
+            );
+        }
+        for f in ["false", "F", "no", "0"] {
+            assert_eq!(coerce(f, ColKind::Bool, true, &n, MySql), Ok(Value::Int(0)));
+            assert_eq!(
+                coerce(f, ColKind::Bool, true, &n, Postgres),
+                Ok(Value::Str("false".into()))
+            );
+        }
+        assert_eq!(
+            coerce("maybe", ColKind::Bool, true, &n, MySql),
+            Err(IssueKind::NotABoolean)
+        );
+    }
+
+    /// Anything we can't be certain about goes to the server verbatim — it parses
+    /// more date and numeric formats than we could enumerate, and rejecting valid
+    /// data is worse than passing it on.
+    #[test]
+    fn coerce_passes_unclassified_types_through_untouched() {
+        let n = NullRule::default();
+        assert_eq!(
+            coerce("2026-02-30ish", ColKind::Other, true, &n, MySql),
+            Ok(Value::Str("2026-02-30ish".into()))
+        );
+    }
+
+    #[test]
+    fn an_empty_field_is_null_by_default() {
+        let n = NullRule::default();
+        assert_eq!(coerce("", ColKind::Other, true, &n, MySql), Ok(Value::Null));
+        assert_eq!(coerce("", ColKind::Int, true, &n, MySql), Ok(Value::Null));
+    }
+
+    /// A blank field is not an empty one. Quoted padding is how a file says the
+    /// spaces are deliberate, and the `csv` reader hands them over identically
+    /// either way — so nulling them would rewrite data on a guess. `trim` is the
+    /// setting that says "treat blank as empty", and it applies before this.
+    #[test]
+    fn a_whitespace_only_field_is_not_null() {
+        let n = NullRule::default();
+        assert_eq!(
+            coerce("   ", ColKind::Other, true, &n, MySql),
+            Ok(Value::Str("   ".into()))
+        );
+        // With trim on, the reader has already emptied it, so it *is* NULL.
+        assert_eq!(coerce("", ColKind::Other, true, &n, MySql), Ok(Value::Null));
+    }
+
+    /// A written token still matches a padded field — only the empty one is
+    /// exact, since it's the only one whose meaning trimming would change.
+    #[test]
+    fn a_written_null_token_still_matches_a_padded_field() {
+        let n = NullRule {
+            tokens: vec!["NULL".into()],
+        };
+        assert_eq!(
+            coerce("  null  ", ColKind::Other, true, &n, MySql),
+            Ok(Value::Null)
+        );
+    }
+
+    #[test]
+    fn null_tokens_are_configurable_and_case_insensitive() {
+        let n = NullRule {
+            tokens: vec!["NULL".into(), r"\N".into()],
+        };
+        assert_eq!(
+            coerce("null", ColKind::Other, true, &n, MySql),
+            Ok(Value::Null)
+        );
+        assert_eq!(
+            coerce(r"\N", ColKind::Other, true, &n, MySql),
+            Ok(Value::Null)
+        );
+        // With "" no longer a token, an empty field is the empty string.
+        assert_eq!(
+            coerce("", ColKind::Other, true, &n, MySql),
+            Ok(Value::Str(String::new()))
+        );
+    }
+
+    #[test]
+    fn a_null_in_a_not_null_column_is_an_issue() {
+        let n = NullRule::default();
+        assert_eq!(
+            coerce("", ColKind::Other, false, &n, MySql),
+            Err(IssueKind::NullInNotNull)
+        );
+    }
+
+    // ── INSERT building ─────────────────────────────────────────────────────
+
+    #[test]
+    fn build_insert_emits_one_multi_row_statement() {
+        let rows = vec![
+            vec![Value::Int(1), Value::Str("a".into())],
+            vec![Value::Int(2), Value::Null],
+        ];
+        let sql = build_insert("db", None, "t", &["id", "name"], &rows, MySql).unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO `db`.`t` (`id`, `name`) VALUES (1, 'a'), (2, NULL)"
+        );
+    }
+
+    /// A PostgreSQL namespace qualifies the table *instead of* the database, and
+    /// identifiers double-quote — same rule the export path follows.
+    #[test]
+    fn build_insert_qualifies_per_dialect() {
+        let rows = vec![vec![Value::Int(1)]];
+        let sql = build_insert("db", Some("sales"), "t", &["id"], &rows, Postgres).unwrap();
+        assert_eq!(sql, r#"INSERT INTO "sales"."t" ("id") VALUES (1)"#);
+    }
+
+    #[test]
+    fn row_iter_streams_coerced_rows_in_insert_order() {
+        let t = tbl(&[("id", "int", false), ("name", "varchar", true)]);
+        let csv = "name,id\nSmith,1\nJones,2\n";
+        let m = auto_map(&["name".into(), "id".into()], &t, true);
+        let rows: Vec<_> = row_iter(csv.as_bytes(), ImportFormat::Csv, &cfg(true), &t, &m, MySql)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Str("Smith".into())],
+                vec![Value::Int(2), Value::Str("Jones".into())],
+            ]
+        );
+    }
+
+    /// The backstop for a file that changed since it was validated: the first bad
+    /// row stops the stream, and the message says where.
+    #[test]
+    fn row_iter_reports_the_first_bad_row_and_says_where() {
+        let t = tbl(&[("id", "int", false)]);
+        let csv = "id\n1\nnope\n";
+        let m = auto_map(&["id".into()], &t, true);
+        let mut it =
+            row_iter(csv.as_bytes(), ImportFormat::Csv, &cfg(true), &t, &m, MySql).unwrap();
+        assert!(it.next().unwrap().is_ok());
+        let err = it.next().unwrap().unwrap_err();
+        assert!(err.contains("line 3"), "{err}");
+        assert!(err.contains("id"), "{err}");
+    }
+
+    #[test]
+    fn row_iter_streams_json_too() {
+        let t = tbl(&[("id", "int", false)]);
+        let json = "{\"id\": 1}\n{\"id\": 2}\n";
+        let m = auto_map(&["id".into()], &t, true);
+        let rows: Vec<_> = row_iter(
+            json.as_bytes(),
+            ImportFormat::Json,
+            &cfg(true),
+            &t,
+            &m,
+            MySql,
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+    }
+
+    #[test]
+    fn build_insert_of_no_rows_is_nothing_to_run() {
+        assert_eq!(build_insert("db", None, "t", &["id"], &[], MySql), None);
+    }
+
+    /// Quoting is export's, so an apostrophe can't break out of the literal.
+    #[test]
+    fn build_insert_escapes_values() {
+        let rows = vec![vec![Value::Str("x'; DROP TABLE t; --".into())]];
+        let sql = build_insert("db", None, "t", &["c"], &rows, MySql).unwrap();
+        assert!(sql.contains("'x''; DROP TABLE t; --'"), "{sql}");
+    }
+
+    // ── reading + validating ────────────────────────────────────────────────
+
+    fn cfg(has_header: bool) -> ReadConfig {
+        ReadConfig {
+            dialect: CsvDialect {
+                has_header,
+                ..CsvDialect::default()
+            },
+            nulls: NullRule::default(),
+            trim: false,
+        }
+    }
+
+    /// Fields as CSV produces them — text, never a format-level null.
+    fn f(v: &[&str]) -> Vec<Field> {
+        v.iter().map(|s| Some((*s).to_string())).collect()
+    }
+
+    #[test]
+    fn read_sample_takes_the_header_and_the_first_rows() {
+        let csv = "id,name\n1,Smith\n2,Jones\n3,Ray\n";
+        let s = read_sample(csv.as_bytes(), ImportFormat::Csv, &cfg(true), 2).unwrap();
+        assert_eq!(s.columns, vec!["id", "name"]);
+        assert_eq!(s.rows, vec![f(&["1", "Smith"]), f(&["2", "Jones"])]);
+        assert!(s.more, "a fourth record exists beyond the sample");
+    }
+
+    #[test]
+    fn read_sample_without_a_header_synthesizes_column_names() {
+        let csv = "1,Smith\n2,Jones\n";
+        let s = read_sample(csv.as_bytes(), ImportFormat::Csv, &cfg(false), 10).unwrap();
+        assert_eq!(s.columns, vec!["Column 1", "Column 2"]);
+        assert_eq!(s.rows.len(), 2);
+        assert!(!s.more);
+    }
+
+    /// A UTF-8 BOM is invisible in an editor but becomes part of the first
+    /// column's name, so name-matching silently fails on the one column most
+    /// likely to be the key.
+    #[test]
+    fn read_sample_strips_a_utf8_bom_from_the_first_column() {
+        let csv = "\u{feff}id,name\n1,Smith\n";
+        let s = read_sample(csv.as_bytes(), ImportFormat::Csv, &cfg(true), 10).unwrap();
+        assert_eq!(s.columns, vec!["id", "name"]);
+    }
+
+    /// `name, city` with a space after the comma is everywhere, and only numeric
+    /// parsing trims — a text column would store the leading space verbatim.
+    #[test]
+    fn trim_strips_surrounding_whitespace_from_fields_and_headers() {
+        let csv = " id , name \n 1 , Smith \n";
+        let mut c = cfg(true);
+        c.trim = true;
+        let s = read_sample(csv.as_bytes(), ImportFormat::Csv, &c, 10).unwrap();
+        assert_eq!(s.columns, vec!["id", "name"]);
+        assert_eq!(s.rows[0], f(&["1", "Smith"]));
+    }
+
+    /// Off by default: trimming silently rewrites data, so it's the user's call —
+    /// and the preview shows the spaces, which is what makes it their call.
+    #[test]
+    fn without_trim_the_whitespace_is_kept() {
+        let csv = " id , name \n 1 , Smith \n";
+        let s = read_sample(csv.as_bytes(), ImportFormat::Csv, &cfg(true), 10).unwrap();
+        assert_eq!(s.columns, vec![" id ", " name "]);
+        assert_eq!(s.rows[0], f(&[" 1 ", " Smith "]));
+        assert!(!ReadConfig::default().trim, "trim defaults off");
+    }
+
+    /// Trimming reaches *inside* quotes too — arguably it shouldn't, since
+    /// quoting padding is how a file says it's deliberate, but that's the `csv`
+    /// reader's behaviour. Pinned so it's a known limitation rather than a
+    /// surprise, and it's why the setting defaults off.
+    #[test]
+    fn trim_also_strips_padding_inside_quotes() {
+        let csv = "name\n\"  padded  \"\n";
+        let mut c = cfg(true);
+        c.trim = true;
+        let s = read_sample(csv.as_bytes(), ImportFormat::Csv, &c, 10).unwrap();
+        assert_eq!(s.rows[0][0].as_deref(), Some("padded"));
+        // Off (the default), the padding is kept.
+        let s = read_sample(csv.as_bytes(), ImportFormat::Csv, &cfg(true), 10).unwrap();
+        assert_eq!(s.rows[0][0].as_deref(), Some("  padded  "));
+    }
+
+    #[test]
+    fn read_sample_keeps_quoted_delimiters_and_newlines_intact() {
+        let csv = "name,note\n\"Smith, John\",\"line one\nline two\"\n";
+        let s = read_sample(csv.as_bytes(), ImportFormat::Csv, &cfg(true), 10).unwrap();
+        assert_eq!(s.rows[0][0].as_deref(), Some("Smith, John"));
+        assert_eq!(s.rows[0][1].as_deref(), Some("line one\nline two"));
+    }
+
+    // ── JSON ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn read_sample_reads_a_json_array_of_objects() {
+        let json = r#"[{"id": 1, "name": "Smith"}, {"id": 2, "name": "Jones"}]"#;
+        let s = read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 10).unwrap();
+        assert_eq!(s.columns, vec!["id", "name"]);
+        assert_eq!(s.rows, vec![f(&["1", "Smith"]), f(&["2", "Jones"])]);
+    }
+
+    /// Newline-delimited JSON is what most tools emit for anything large, and it
+    /// streams where an array can't.
+    #[test]
+    fn read_sample_reads_newline_delimited_json() {
+        let json = "{\"id\": 1}\n{\"id\": 2}\n";
+        let s = read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 10).unwrap();
+        assert_eq!(s.columns, vec!["id"]);
+        assert_eq!(s.rows, vec![f(&["1"]), f(&["2"])]);
+    }
+
+    /// A later object carrying a key the first one lacked must widen the column
+    /// set, not be silently dropped.
+    #[test]
+    fn json_columns_are_the_union_of_every_objects_keys() {
+        let json = r#"[{"b": 1}, {"a": 2, "b": 3}]"#;
+        let s = read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 10).unwrap();
+        assert_eq!(s.columns, vec!["b", "a"]);
+        // The first object has no `a`, so that field is a real null.
+        assert_eq!(s.rows[0], vec![Some("1".to_string()), None]);
+        assert_eq!(
+            s.rows[1],
+            vec![Some("3".to_string()), Some("2".to_string())]
+        );
+    }
+
+    /// Within one object the keys arrive alphabetically, not in document order —
+    /// `serde_json::Map` is a `BTreeMap`. Pinned so it's a known, deliberate
+    /// limitation rather than a surprise; it only affects preview column order,
+    /// since JSON maps to columns by name.
+    #[test]
+    fn json_keys_within_an_object_come_out_alphabetically() {
+        let json = r#"[{"zebra": 1, "apple": 2}]"#;
+        let s = read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 10).unwrap();
+        assert_eq!(s.columns, vec!["apple", "zebra"]);
+    }
+
+    /// The distinction CSV can't make: JSON says outright which is which.
+    #[test]
+    fn json_null_and_empty_string_stay_different() {
+        let json = r#"[{"a": null, "b": ""}]"#;
+        let s = read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 10).unwrap();
+        assert_eq!(s.rows[0], vec![None, Some(String::new())]);
+    }
+
+    /// A nested value becomes its JSON text — which is exactly what a JSON column
+    /// wants, and readable in the preview either way.
+    #[test]
+    fn json_nested_values_become_their_json_text() {
+        let json = r#"[{"meta": {"k": [1, 2]}, "flag": true, "n": 1.5}]"#;
+        let s = read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 10).unwrap();
+        // Columns are alphabetical: flag, meta, n.
+        assert_eq!(s.columns, vec!["flag", "meta", "n"]);
+        assert_eq!(s.rows[0][0].as_deref(), Some("true"));
+        assert_eq!(s.rows[0][1].as_deref(), Some(r#"{"k":[1,2]}"#));
+        assert_eq!(s.rows[0][2].as_deref(), Some("1.5"));
+    }
+
+    /// A comma inside a string is data, not a separator — blanking it would
+    /// silently rewrite the value, which is the one way this reader could corrupt
+    /// an import rather than just fail it.
+    #[test]
+    fn json_array_commas_inside_strings_and_records_survive() {
+        let json = r#"[{"a": "x,y", "b": [1, 2], "c": {"d": 3}},
+                       {"a": "esc\", still string, here", "b": [], "c": {}}]"#;
+        let s = read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 10).unwrap();
+        assert_eq!(s.columns, vec!["a", "b", "c"]);
+        assert_eq!(s.rows[0][0].as_deref(), Some("x,y"));
+        assert_eq!(s.rows[0][1].as_deref(), Some("[1,2]"));
+        assert_eq!(s.rows[0][2].as_deref(), Some(r#"{"d":3}"#));
+        // A `,` after an escaped quote is still inside the string.
+        assert_eq!(s.rows[1][0].as_deref(), Some(r#"esc", still string, here"#));
+    }
+
+    /// The point of streaming the array: a sample must stop at its limit instead
+    /// of deserializing the whole file first. Reading through a reader that
+    /// refuses to go past the sample is the only way to assert it actually did.
+    #[test]
+    fn sampling_a_json_array_stops_reading_at_the_limit() {
+        struct Fused<'a> {
+            data: &'a [u8],
+            pos: usize,
+            cap: usize,
+        }
+        impl std::io::Read for Fused<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.pos >= self.cap {
+                    panic!("read past byte {} — the whole array was parsed", self.cap);
+                }
+                let n = (self.data.len() - self.pos).min(buf.len()).min(1);
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+        let mut json = String::from("[");
+        for i in 0..2000 {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(r#"{{"id": {i}}}"#));
+        }
+        json.push(']');
+        // Three records is a few dozen bytes; a materializing reader would run to
+        // the end of a 20KB document and trip the panic above.
+        let r = Fused {
+            data: json.as_bytes(),
+            pos: 0,
+            cap: 400,
+        };
+        let s = read_sample(r, ImportFormat::Json, &cfg(true), 3).unwrap();
+        assert_eq!(s.rows.len(), 3);
+        assert!(s.more);
+        assert_eq!(s.rows[0][0].as_deref(), Some("0"));
+        assert_eq!(s.rows[2][0].as_deref(), Some("2"));
+    }
+
+    /// The rewrite is byte-for-byte in place, so it has to survive a record
+    /// straddling any read boundary — including one that splits an escape pair.
+    #[test]
+    fn json_array_reads_the_same_however_the_bytes_arrive() {
+        struct Trickle<'a>(&'a [u8], usize, usize);
+        impl std::io::Read for Trickle<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = (self.0.len() - self.1).min(buf.len()).min(self.2);
+                buf[..n].copy_from_slice(&self.0[self.1..self.1 + n]);
+                self.1 += n;
+                Ok(n)
+            }
+        }
+        let json = r#"[{"a": "x,\"y", "b": 1}, {"a": "z", "b": 2}]"#;
+        let whole = read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 10).unwrap();
+        for chunk in [1usize, 2, 3, 7, 13] {
+            let s = read_sample(
+                Trickle(json.as_bytes(), 0, chunk),
+                ImportFormat::Json,
+                &cfg(true),
+                10,
+            )
+            .unwrap();
+            assert_eq!(s, whole, "chunk size {chunk}");
+        }
+    }
+
+    /// JSON Lines must pass through the unwrapper untouched — a top-level comma
+    /// inside an object would otherwise be blanked.
+    #[test]
+    fn json_lines_are_not_rewritten() {
+        let json = "{\"a\": 1, \"b\": \"x,y\"}\n{\"a\": 2, \"b\": \"z\"}\n";
+        let s = read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 10).unwrap();
+        assert_eq!(s.rows.len(), 2);
+        assert_eq!(s.rows[0][1].as_deref(), Some("x,y"));
+    }
+
+    #[test]
+    fn an_empty_json_array_reads_as_no_rows() {
+        let s = read_sample(b"[]".as_slice(), ImportFormat::Json, &cfg(true), 10).unwrap();
+        assert!(s.columns.is_empty());
+        assert!(s.rows.is_empty());
+        assert!(!s.more);
+    }
+
+    #[test]
+    fn json_that_is_not_objects_is_a_read_error() {
+        let json = "[1, 2, 3]";
+        assert!(matches!(
+            read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 10),
+            Err(ImportError::Read(_))
+        ));
+    }
+
+    /// JSON booleans and numbers must survive the same coercion path CSV uses —
+    /// this is the check that the two formats really do share one validator.
+    #[test]
+    fn json_validates_through_the_same_path_as_csv() {
+        let t = tbl(&[("id", "int", false), ("ok", "boolean", true)]);
+        let json = r#"[{"id": 1, "ok": true}, {"id": "nope", "ok": false}]"#;
+        let m = auto_map(&["id".into(), "ok".into()], &t, true);
+        let v = validate(
+            json.as_bytes(),
+            ImportFormat::Json,
+            &cfg(true),
+            &t,
+            &m,
+            MySql,
+            100,
+        )
+        .unwrap();
+        assert_eq!(v.rows, 2);
+        assert_eq!(v.issues.len(), 1);
+        assert_eq!(v.issues[0].kind, IssueKind::NotAnInteger);
+        // Records are numbered from 1 — a JSON array has no meaningful lines.
+        assert_eq!(v.issues[0].line, 2);
+    }
+
+    /// The NULL-token rule is CSV's answer to a format that can't express null.
+    /// Applying it to JSON would turn every empty string into a NULL.
+    #[test]
+    fn json_ignores_the_csv_null_token_rule() {
+        let t = tbl(&[("name", "varchar", false)]);
+        let json = r#"[{"name": ""}]"#;
+        let m = auto_map(&["name".into()], &t, true);
+        let v = validate(
+            json.as_bytes(),
+            ImportFormat::Json,
+            &cfg(true),
+            &t,
+            &m,
+            MySql,
+            100,
+        )
+        .unwrap();
+        // An empty string is a value, so a NOT NULL column is satisfied.
+        assert!(v.issues.is_empty(), "{:?}", v.issues);
+    }
+
+    /// A JSON null in a NOT NULL column is the real error the above must not mask.
+    #[test]
+    fn a_json_null_in_a_not_null_column_is_reported() {
+        let t = tbl(&[("name", "varchar", false)]);
+        let json = r#"[{"name": null}]"#;
+        let m = auto_map(&["name".into()], &t, true);
+        let v = validate(
+            json.as_bytes(),
+            ImportFormat::Json,
+            &cfg(true),
+            &t,
+            &m,
+            MySql,
+            100,
+        )
+        .unwrap();
+        assert_eq!(v.issues.len(), 1);
+        assert_eq!(v.issues[0].kind, IssueKind::NullInNotNull);
+    }
+
+    /// The mapping is built from a *sample*, but JSON columns are the union of
+    /// every object's keys — so a key that first appears past the sample widens
+    /// every record. Left alone, that reads as a field-count mismatch on all of
+    /// them and refuses a file that's perfectly importable.
+    #[test]
+    fn a_json_key_appearing_past_the_sample_does_not_fail_every_row() {
+        let t = tbl(&[("id", "int", false), ("name", "varchar", true)]);
+        // The mapping the user approved, from a sample that only saw `id`/`name`.
+        let m = auto_map(&["id".into(), "name".into()], &t, true);
+        // The third record introduces `note`, which nothing maps to.
+        let json = r#"[{"id": 1, "name": "a"}, {"id": 2, "name": "b"},
+                       {"id": 3, "name": "c", "note": "late"}]"#;
+        let v = validate(
+            json.as_bytes(),
+            ImportFormat::Json,
+            &cfg(true),
+            &t,
+            &m,
+            MySql,
+            100,
+        )
+        .unwrap();
+        assert_eq!(v.rows, 3);
+        assert!(v.issues.is_empty(), "{:?}", v.issues);
+
+        // And the load agrees with the check — the unmapped key is just dropped.
+        let rows: Vec<_> = row_iter(
+            json.as_bytes(),
+            ImportFormat::Json,
+            &cfg(true),
+            &t,
+            &m,
+            MySql,
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2], vec![Value::Int(3), Value::Str("c".into())]);
+    }
+
+    /// The CSV half of the rule above: a stray delimiter really does mean the
+    /// values may have shifted, so an over-long record stays an issue.
+    #[test]
+    fn a_csv_record_with_extra_fields_is_still_reported() {
+        let t = tbl(&[("id", "int", false), ("name", "varchar", true)]);
+        let m = auto_map(&["id".into(), "name".into()], &t, true);
+        let csv = "id,name\n1,a\n2,b,stray\n";
+        let v = validate(
+            csv.as_bytes(),
+            ImportFormat::Csv,
+            &cfg(true),
+            &t,
+            &m,
+            MySql,
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            v.issues.iter().map(|i| i.kind).collect::<Vec<_>>(),
+            vec![IssueKind::FieldCount {
+                expected: 2,
+                found: 3
+            }]
+        );
+    }
+
+    #[test]
+    fn insert_columns_are_the_mapped_ones_in_table_order() {
+        let t = tbl(&[
+            ("id", "int", false),
+            ("name", "varchar", true),
+            ("note", "text", true),
+        ]);
+        // File order is reversed; the INSERT should still list table order.
+        let m = auto_map(&["note".into(), "name".into()], &t, true);
+        assert_eq!(insert_columns(&m, &t), vec![1, 2]);
+    }
+
+    #[test]
+    fn coerce_record_orders_values_to_match_insert_columns() {
+        let t = tbl(&[("id", "int", false), ("name", "varchar", true)]);
+        let m = auto_map(&["name".into(), "id".into()], &t, true);
+        let (vals, issues) =
+            coerce_record(&f(&["Smith", "7"]), &m, &t, &NullRule::default(), MySql, 2);
+        // insert_columns is [0 (id), 1 (name)] — values follow that, not the file.
+        assert_eq!(vals, vec![Value::Int(7), Value::Str("Smith".into())]);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn coerce_record_locates_a_bad_cell_by_line_and_column() {
+        let t = tbl(&[("id", "int", false), ("name", "varchar", true)]);
+        let m = auto_map(&["id".into(), "name".into()], &t, true);
+        let (_, issues) = coerce_record(
+            &f(&["N/A", "Smith"]),
+            &m,
+            &t,
+            &NullRule::default(),
+            MySql,
+            42,
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].line, 42);
+        assert_eq!(issues[0].column, "id");
+        assert_eq!(issues[0].text, "N/A");
+        assert_eq!(issues[0].kind, IssueKind::NotAnInteger);
+    }
+
+    /// A short record shouldn't panic or silently shift values into the wrong
+    /// columns — it's reported, and the missing fields read as empty.
+    #[test]
+    fn coerce_record_reports_a_field_count_mismatch() {
+        let t = tbl(&[("id", "int", false), ("name", "varchar", true)]);
+        let m = auto_map(&["id".into(), "name".into()], &t, true);
+        let (vals, issues) = coerce_record(&f(&["7"]), &m, &t, &NullRule::default(), MySql, 3);
+        assert!(issues.iter().any(|i| i.kind
+            == IssueKind::FieldCount {
+                expected: 2,
+                found: 1
+            }));
+        assert_eq!(vals, vec![Value::Int(7), Value::Null]);
+    }
+
+    #[test]
+    fn validate_reports_every_bad_row_with_its_line() {
+        let t = tbl(&[("id", "int", false), ("name", "varchar", true)]);
+        let csv = "id,name\n1,a\nzz,b\n3,c\nyy,d\n";
+        let m = auto_map(&["id".into(), "name".into()], &t, true);
+        let v = validate(
+            csv.as_bytes(),
+            ImportFormat::Csv,
+            &cfg(true),
+            &t,
+            &m,
+            MySql,
+            100,
+        )
+        .unwrap();
+        assert_eq!(v.rows, 4);
+        assert_eq!(v.issues.len(), 2);
+        // Line numbers match what a text editor shows: the header is line 1.
+        assert_eq!(v.issues[0].line, 3);
+        assert_eq!(v.issues[1].line, 5);
+        assert!(!v.more_issues);
+    }
+
+    /// A file that's wrong in a thousand places shouldn't produce a thousand-row
+    /// error list — the first screenful is what tells you what's wrong.
+    #[test]
+    fn validate_caps_the_issue_list_but_says_it_did() {
+        let t = tbl(&[("id", "int", false)]);
+        let mut csv = String::from("id\n");
+        for _ in 0..50 {
+            csv.push_str("nope\n");
+        }
+        let m = auto_map(&["id".into()], &t, true);
+        let v = validate(
+            csv.as_bytes(),
+            ImportFormat::Csv,
+            &cfg(true),
+            &t,
+            &m,
+            MySql,
+            10,
+        )
+        .unwrap();
+        assert_eq!(v.issues.len(), 10);
+        assert!(v.more_issues);
+        // Still counts every row, so the summary is honest.
+        assert_eq!(v.rows, 50);
+    }
+
+    #[test]
+    fn validate_of_a_clean_file_finds_nothing() {
+        let t = tbl(&[("id", "int", false), ("name", "varchar", true)]);
+        let csv = "id,name\n1,a\n2,b\n";
+        let m = auto_map(&["id".into(), "name".into()], &t, true);
+        let v = validate(
+            csv.as_bytes(),
+            ImportFormat::Csv,
+            &cfg(true),
+            &t,
+            &m,
+            MySql,
+            100,
+        )
+        .unwrap();
+        assert_eq!(v.rows, 2);
+        assert!(v.issues.is_empty());
+    }
+
+    #[test]
+    fn a_file_with_no_mapped_columns_is_an_error_not_an_empty_insert() {
+        let t = tbl(&[("id", "int", false)]);
+        let csv = "other\n1\n";
+        let m = auto_map(&["other".into()], &t, true);
+        assert!(matches!(
+            validate(
+                csv.as_bytes(),
+                ImportFormat::Csv,
+                &cfg(true),
+                &t,
+                &m,
+                MySql,
+                100
+            ),
+            Err(ImportError::NoColumnsMapped)
+        ));
+    }
+}

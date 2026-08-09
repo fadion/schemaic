@@ -18,6 +18,7 @@ pub mod fonts;
 mod grid;
 mod history_panel;
 pub mod icons;
+mod import_view;
 mod markdown;
 mod monitor_view;
 mod overlays;
@@ -104,6 +105,75 @@ pub struct ExportRequest {
     /// engine the rows came from.
     pub dialect: schemaic_core::intel::SqlDialect,
 }
+
+/// The table an import is loading into, captured when the modal opens so a
+/// schema refresh underneath it can't retarget the import.
+#[derive(Clone, Debug)]
+pub struct ImportTargetInfo {
+    pub conn_id: u64,
+    pub database: String,
+    /// The PostgreSQL namespace, when the table has one.
+    pub schema: Option<String>,
+    pub table: schemaic_core::schema::TableInfo,
+}
+
+impl ImportTargetInfo {
+    /// `schema.table` on PostgreSQL outside `public`, else just the table name.
+    pub fn display(&self) -> String {
+        match &self.schema {
+            Some(s) if s != "public" => format!("{s}.{}", self.table.name),
+            _ => self.table.name.clone(),
+        }
+    }
+}
+
+/// Read a file's opening records so the modal can show what it found. `cfg` is
+/// `None` on the first look, which asks for the dialect to be sniffed.
+pub struct ImportProbeRequest {
+    pub path: std::path::PathBuf,
+    pub format: schemaic_core::import::ImportFormat,
+    pub cfg: Option<schemaic_core::import::ReadConfig>,
+}
+
+/// What a probe found: the settings in effect (sniffed or as supplied) and the
+/// first rows under them.
+pub struct ImportProbeResult {
+    pub cfg: schemaic_core::import::ReadConfig,
+    pub sample: schemaic_core::import::Sample,
+}
+
+pub type ImportProbeDoneFn = Rc<dyn Fn(Result<ImportProbeResult, String>)>;
+/// Read a sample off the UI thread — a file dialog can hand back anything, and
+/// opening it must not stall the window.
+pub type ImportProbeFn = Rc<dyn Fn(ImportProbeRequest, ImportProbeDoneFn)>;
+
+/// Everything needed to check and load a file into a table.
+pub struct ImportRunRequest {
+    pub target: ImportTargetInfo,
+    pub path: std::path::PathBuf,
+    pub format: schemaic_core::import::ImportFormat,
+    pub cfg: schemaic_core::import::ReadConfig,
+    pub mapping: schemaic_core::import::Mapping,
+}
+
+/// How an import ended.
+pub enum ImportOutcome {
+    /// The file was checked and found wanting — **nothing was written**. This is
+    /// the point of validating first: the all-or-nothing transaction would have
+    /// rolled back on the first bad row, one error at a time.
+    Invalid(schemaic_core::import::Validation),
+    /// Rows committed.
+    Done(u64),
+    /// Stopped on request. Like every other exit that isn't `Done`, the
+    /// transaction rolled back — a cancelled import leaves no partial load.
+    Cancelled,
+    /// The read or the transaction failed.
+    Failed(String),
+}
+
+pub type ImportDoneFn = Rc<dyn Fn(ImportOutcome)>;
+/// Validate the whole file, then load it in one transaction — off the UI thread.
+pub type ImportFn = Rc<dyn Fn(ImportRunRequest, ImportDoneFn)>;
 
 /// Reports an export's outcome back on the UI thread (`Err` carries a
 /// user-facing message).
@@ -351,6 +421,67 @@ pub struct TxPrompt {
     /// offered, because committing an aborted transaction just rolls it back.
     pub can_commit: bool,
     pub resolve: Rc<dyn Fn(TxChoice)>,
+}
+
+/// Which step of the import modal is showing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportStep {
+    /// Pick the file and confirm how to read it.
+    Source,
+    /// Map the file's columns onto the table's, with a preview.
+    Mapping,
+    /// Rows landed.
+    Done,
+}
+
+/// The import modal's state (Copy bundle, created once and reset on open —
+/// per-open signals would need a scope to dispose, and this modal outlives no
+/// view).
+///
+/// `target` doubles as the open flag: `Some` ⇒ the modal is showing.
+#[derive(Clone, Copy)]
+pub struct ImportUi {
+    pub target: RwSignal<Option<ImportTargetInfo>>,
+    pub step: RwSignal<ImportStep>,
+    /// The chosen file. `None` until one is picked.
+    pub path: RwSignal<Option<std::path::PathBuf>>,
+    pub format: RwSignal<schemaic_core::import::ImportFormat>,
+    /// Read settings — sniffed on pick, then editable. Held as separate signals
+    /// so each control binds to one.
+    pub delimiter: RwSignal<String>,
+    pub has_header: RwSignal<bool>,
+    /// Whether an empty CSV field means NULL. Its own control rather than a
+    /// token in the list below, because "the empty string" can't be written in a
+    /// comma-separated list — an empty box would be indistinguishable from "no
+    /// tokens at all", which silently flips the meaning of every blank field.
+    pub empty_is_null: RwSignal<bool>,
+    /// Additional comma-separated texts that mean NULL (`NULL`, `\N`, `NA`…).
+    pub null_tokens: RwSignal<String>,
+    /// Strip whitespace around every field. Off by default — see
+    /// [`schemaic_core::import::ReadConfig::trim`].
+    pub trim: RwSignal<bool>,
+    /// The file's columns and first rows, under the current settings.
+    pub sample: RwSignal<Option<schemaic_core::import::Sample>>,
+    pub mapping: RwSignal<schemaic_core::import::Mapping>,
+    /// Problems found by the full check — populated only when an import was
+    /// refused, so a non-empty list always means nothing was written.
+    pub issues: RwSignal<Vec<schemaic_core::import::Issue>>,
+    pub more_issues: RwSignal<bool>,
+    /// A read or transaction failure (as opposed to per-row issues).
+    pub error: RwSignal<Option<String>>,
+    /// Rows committed, once the import succeeds.
+    pub imported: RwSignal<u64>,
+    /// True while a probe, check or load is running.
+    pub busy: RwSignal<bool>,
+    /// Set while the modal writes settings into its own controls, so the effect
+    /// that re-reads the file on a settings change doesn't treat the app's own
+    /// answer as a new question and loop.
+    pub applying: RwSignal<bool>,
+    /// Bumped on every open. A probe or an import is off-thread and can outlive
+    /// the modal that asked for it, so its callback checks this before writing —
+    /// otherwise closing a running import and opening the modal on another table
+    /// lets the first one report its result into the second one's state.
+    pub generation: RwSignal<u64>,
 }
 
 /// A yes/no question asked before something destructive runs.
@@ -920,6 +1051,14 @@ pub struct SchemaActions {
     pub refresh_schema: Rc<dyn Fn()>,
     /// Re-introspect a single database's schema by name (context-menu Refresh).
     pub refresh_db: Rc<dyn Fn(String)>,
+    /// Read a file's opening records (off the UI thread) so the import modal can
+    /// show what it found.
+    pub import_probe: ImportProbeFn,
+    /// Check a file and, if it's clean, load it in one transaction.
+    pub import_run: ImportFn,
+    /// Stop the import [`SchemaActions::import_run`] is running, rolling it back.
+    /// A no-op when nothing is running.
+    pub import_cancel: Rc<dyn Fn()>,
 }
 
 /// Result of a "Test" of the Manage-Connections draft (host + credentials),
@@ -1156,6 +1295,8 @@ pub struct Ui {
     // Schema tree — grouped (review §3.3).
     pub schema: SchemaUi,
     pub schema_actions: Rc<SchemaActions>,
+    /// The file-import modal (opened from a table's schema context menu).
+    pub import: ImportUi,
     // Connections — grouped (review §3.3).
     pub conn: ConnUi,
     pub conn_actions: Rc<ConnActions>,
@@ -1442,13 +1583,19 @@ pub fn workspace(ui: Ui) -> impl IntoView {
             let err_open = ui.overlay.error_modal_open;
             let tx_prompt = ui.overlay.tx_prompt;
             let confirm = ui.overlay.confirm;
+            let import_open = ui.import.target;
             stack((
                 error_modal_overlay(ui.clone()),
                 tx_prompt_overlay(ui.clone()),
                 confirm_overlay(ui.clone()),
+                import_view::import_overlay(ui.clone()),
             ))
             .style(move |s| {
-                if err_open.get() || tx_prompt.get().is_some() || confirm.get().is_some() {
+                if err_open.get()
+                    || tx_prompt.get().is_some()
+                    || confirm.get().is_some()
+                    || import_open.get().is_some()
+                {
                     s.absolute().inset(0.0)
                 } else {
                     s

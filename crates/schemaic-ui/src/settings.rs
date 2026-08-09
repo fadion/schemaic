@@ -249,7 +249,7 @@ where
 // The closed-box + floating-popup styling shared by every settings dropdown: a
 // dark field-like box with a chevron, and a `bg_panel` menu surface with Floem's
 // default list chrome neutralised (see `dropdown_item_style`).
-fn dropdown_box_style(s: floem::style::Style) -> floem::style::Style {
+pub(crate) fn dropdown_box_style(s: floem::style::Style) -> floem::style::Style {
     use floem::views::scroll::ScrollClass;
     use floem::views::{ListClass, ListItemClass};
     s.width_full()
