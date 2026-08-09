@@ -23,7 +23,10 @@ use schemaic_core::import::{
 
 use crate::consts::ROW_H;
 use crate::settings::{dropdown_box_style, settings_dropdown, settings_toggle_row};
-use crate::widgets::{autohide, control_surface, modal_title_owned, panel_style, shift_hscroll};
+use crate::widgets::{
+    FORM_GAP, autohide, control_button, footer_button, form_section, form_separator, form_setting,
+    modal_footer, modal_title_owned, panel_style, shift_hscroll,
+};
 use crate::{
     FieldCfg, ImportProbeRequest, ImportRunRequest, ImportStep, ImportTargetInfo, ImportUi, Ui,
     edit_field, icons, theme,
@@ -32,8 +35,6 @@ use crate::{
 /// Rows shown in the mapping step's preview. Enough to spot a wrong delimiter or
 /// an off-by-one mapping; not so many that the panel becomes a grid.
 const PREVIEW_ROWS: usize = 50;
-/// Gap between form rows — the Manage-Connections form's spacing.
-const FORM_GAP: f64 = 18.0;
 /// One width for every step, so the panel doesn't resize as you move through it.
 const PANEL_W: f64 = 620.0;
 /// The source step's height. Fixed rather than content-sized so the footer sits
@@ -49,53 +50,6 @@ const PANEL_H_MAPPING: f64 = PANEL_H + 134.0;
 const MAPPING_LIST_H: f64 = 216.0;
 /// Text-field width, matching the connection form's fixed-width fields.
 const FIELD_W: f64 = 220.0;
-
-/// A bordered control button (Choose file…), wearing the same chrome as the
-/// header's Retry and the ER-diagram toolbar rather than Floem's default button.
-fn control_button(label: impl Into<String>, on_click: impl Fn() + 'static) -> impl IntoView {
-    text(label.into())
-        .on_click_stop(move |_| on_click())
-        .style(|s| {
-            control_surface(s)
-                .font_size(theme::FONT_BODY)
-                .color(theme::text())
-                .padding_horiz(10.0)
-                .padding_vert(5.0)
-                .flex_shrink(0.0_f32)
-                .hover(|s| s.background(theme::control_hover()))
-        })
-}
-
-/// A footer action, styled like Manage Connections' Test / Save: text only, a
-/// colour that carries the meaning, brightening on hover.
-fn footer_button(
-    label: impl Into<String>,
-    color: fn() -> floem::peniko::Color,
-    hover: fn() -> floem::peniko::Color,
-    enabled: bool,
-    on_click: impl Fn() + 'static,
-) -> impl IntoView {
-    text(label.into())
-        .on_click_stop(move |_| {
-            if enabled {
-                on_click()
-            }
-        })
-        .style(move |s| {
-            let s = s
-                .font_size(theme::FONT_BODY)
-                .padding_horiz(6.0)
-                .padding_vert(4.0)
-                .border_radius(6.0);
-            if enabled {
-                s.color(color()).hover(move |s| s.color(hover()))
-            } else {
-                // Dimmed and inert rather than hidden: the button staying put is
-                // what makes it obvious which step you're on.
-                s.color(theme::text_faint())
-            }
-        })
-}
 
 /// The settings the modal's controls describe, as the reader wants them.
 fn read_config(ui: ImportUi) -> ReadConfig {
@@ -230,25 +184,6 @@ fn probe(ui: Ui, sniff: bool) {
     );
 }
 
-/// A labelled control: caption above, control below — the Manage-Connections
-/// form's shape, so the two modals read as the same app.
-fn setting(label: &'static str, control: impl IntoView + 'static) -> impl IntoView {
-    v_stack((
-        text(label).style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL)),
-        control,
-    ))
-    .style(|s| s.flex_col().gap(6.0).width_full())
-}
-
-/// A small bold section heading, as in the settings modal.
-fn section(label: &'static str) -> impl IntoView {
-    text(label).style(|s| {
-        s.font_size(theme::FONT_BODY)
-            .font_bold()
-            .color(theme::text())
-    })
-}
-
 fn small_field(value: RwSignal<String>, width: f64) -> impl IntoView {
     edit_field(value, FieldCfg::default()).style(move |s| s.width(width))
 }
@@ -304,8 +239,8 @@ fn source_step(ui: Ui) -> impl IntoView {
 
     // CSV-only settings — a JSON file has no delimiter, and its nulls are its own.
     let csv_settings = v_stack((
-        section("Reading"),
-        setting("Delimiter", small_field(i.delimiter, 96.0)),
+        form_section("Reading"),
+        form_setting("Delimiter", small_field(i.delimiter, 96.0)),
         settings_toggle_row(
             "First row is a header",
             "Use the first row as column names instead of data.",
@@ -321,7 +256,7 @@ fn source_step(ui: Ui) -> impl IntoView {
             "An empty field means NULL rather than an empty string.",
             i.empty_is_null,
         ),
-        setting(
+        form_setting(
             "Other values meaning NULL",
             v_stack((
                 edit_field(i.null_tokens, FieldCfg::default()).style(|s| s.width(FIELD_W)),
@@ -341,13 +276,13 @@ fn source_step(ui: Ui) -> impl IntoView {
     });
 
     v_stack((
-        section("Source"),
-        setting(
+        form_section("Source"),
+        form_setting(
             "File",
             h_stack((pick, chosen.style(|s| s.flex_grow(1.0_f32).min_width(0.0))))
                 .style(|s| s.items_center().gap(10.0).width_full()),
         ),
-        setting(
+        form_setting(
             "Format",
             container(settings_dropdown(
                 i.format,
@@ -485,21 +420,6 @@ const PREVIEW_COL_W: f64 = 140.0;
 /// pattern (and a wrong delimiter) while still fitting the step without the
 /// whole body needing to scroll.
 const PREVIEW_BODY_H: f64 = ROW_H * 5.0;
-/// A rule between sections: the same weight and colour as the one under the
-/// modal header, inset with the rest of the body content.
-///
-/// The margin is 20 *minus* the enclosing stack's gap, which also applies above
-/// and below — so the gap that lands on screen is exactly 20, not 28.
-fn separator(stack_gap: f64) -> impl IntoView {
-    empty().style(move |s| {
-        s.width_full()
-            .height(1.0)
-            .flex_shrink(0.0_f32)
-            .background(theme::border())
-            .margin_vert(20.0 - stack_gap)
-    })
-}
-
 /// One preview cell, wearing the results grid's cell metrics: 8px horizontal
 /// padding, the grid's row height, and faint italic for a NULL — so the preview
 /// looks like the table the rows are going into.
@@ -717,11 +637,11 @@ fn mapping_step(ui: Ui) -> impl IntoView {
 
     const GAP: f64 = 8.0;
     v_stack((
-        section("Columns"),
+        form_section("Columns"),
         autohide(scroll(rows)).style(|s| s.max_height(MAPPING_LIST_H).width_full()),
         missing,
-        separator(GAP),
-        section("Preview"),
+        form_separator(GAP),
+        form_section("Preview"),
         preview_table(ui.clone()),
         issue_list(ui).style(|s| s.margin_top(16.0)),
     ))
@@ -960,15 +880,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                 )
                 .into_any(),
             };
-            let footer = h_stack((empty().style(|s| s.flex_grow(1.0_f32)), actions)).style(|s| {
-                s.width_full()
-                    .flex_row()
-                    .items_center()
-                    .padding_horiz(14.0)
-                    .padding_vert(10.0)
-                    .border_top(1.0)
-                    .border_color(theme::border())
-            });
+            let footer = modal_footer(actions);
 
             let close_x: Rc<dyn Fn()> = Rc::new(close);
             let panel = v_stack((

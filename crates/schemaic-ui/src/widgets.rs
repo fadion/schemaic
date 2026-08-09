@@ -67,6 +67,133 @@ fn modal_title_impl(title: impl Into<String>, close: Rc<dyn Fn()>, border: bool)
     })
 }
 
+// ===== modal form chrome =====
+// The shape every modal form in the app wears — Manage Connections set it, the
+// import modal followed it, and the schema designer follows both. Collected here
+// rather than copied a third time, because "consistent" that lives in three
+// files stops being consistent the first time one of them is tweaked.
+
+/// Gap between form rows.
+pub(crate) const FORM_GAP: f64 = 18.0;
+
+/// A labelled control: caption above, control below.
+pub(crate) fn form_setting(label: &'static str, control: impl IntoView + 'static) -> impl IntoView {
+    form_setting_owned(label.to_string(), control)
+}
+
+/// [`form_setting`] for a caption that isn't known at compile time.
+pub(crate) fn form_setting_owned(label: String, control: impl IntoView + 'static) -> impl IntoView {
+    v_stack((
+        text(label).style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL)),
+        control,
+    ))
+    .style(|s| s.flex_col().gap(6.0).width_full())
+}
+
+/// A small bold section heading.
+pub(crate) fn form_section(label: &'static str) -> impl IntoView {
+    text(label).style(|s| {
+        s.font_size(theme::FONT_BODY)
+            .font_bold()
+            .color(theme::text())
+    })
+}
+
+/// A rule between sections: the same weight and colour as the one under a modal
+/// header, inset with the rest of the body content.
+///
+/// The margin is 20 *minus* the enclosing stack's gap, which also applies above
+/// and below — so the gap that lands on screen is exactly 20, not 28.
+pub(crate) fn form_separator(stack_gap: f64) -> impl IntoView {
+    empty().style(move |s| {
+        s.width_full()
+            .height(1.0)
+            .flex_shrink(0.0_f32)
+            .background(theme::border())
+            .margin_vert(20.0 - stack_gap)
+    })
+}
+
+/// A bordered control button (Choose file…, + Column), wearing the same chrome as
+/// the header's Retry and the ER-diagram toolbar rather than Floem's default
+/// button.
+pub(crate) fn control_button(
+    label: impl Into<String>,
+    on_click: impl Fn() + 'static,
+) -> impl IntoView {
+    text(label.into())
+        .on_click_stop(move |_| on_click())
+        .style(|s| {
+            control_surface(s)
+                .font_size(theme::FONT_BODY)
+                .color(theme::text())
+                .padding_horiz(10.0)
+                .padding_vert(5.0)
+                .flex_shrink(0.0_f32)
+                .hover(|s| s.background(theme::control_hover()))
+        })
+}
+
+/// A footer action, styled like Manage Connections' Test / Save: text only, a
+/// colour that carries the meaning, brightening on hover.
+pub(crate) fn footer_button(
+    label: impl Into<String>,
+    color: fn() -> floem::peniko::Color,
+    hover: fn() -> floem::peniko::Color,
+    enabled: bool,
+    on_click: impl Fn() + 'static,
+) -> impl IntoView {
+    text(label.into())
+        .on_click_stop(move |_| {
+            if enabled {
+                on_click()
+            }
+        })
+        .style(move |s| {
+            let s = s
+                .font_size(theme::FONT_BODY)
+                .padding_horiz(6.0)
+                .padding_vert(4.0)
+                .border_radius(6.0);
+            if enabled {
+                s.color(color()).hover(move |s| s.color(hover()))
+            } else {
+                // Dimmed and inert rather than hidden: the button staying put is
+                // what makes it obvious which step you're on.
+                s.color(theme::text_faint())
+            }
+        })
+}
+
+/// The bordered bar a modal's actions sit in — quiet actions on the right, the
+/// affirmative one last.
+pub(crate) fn modal_footer(actions: impl IntoView + 'static) -> impl IntoView {
+    modal_footer_split(empty(), actions)
+}
+
+/// [`modal_footer`] with something pinned to the *left* as well — a status the
+/// footer's buttons act on (the designer's change count), which belongs at the
+/// far edge rather than crowded against them.
+pub(crate) fn modal_footer_split(
+    status: impl IntoView + 'static,
+    actions: impl IntoView + 'static,
+) -> impl IntoView {
+    h_stack((
+        status,
+        empty().style(|s| s.flex_grow(1.0_f32).min_width(10.0)),
+        actions,
+    ))
+    .style(|s| {
+        s.width_full()
+            .flex_row()
+            .items_center()
+            .padding_horiz(14.0)
+            .padding_vert(10.0)
+            .border_top(1.0)
+            .border_color(theme::border())
+    })
+}
+
 pub(crate) fn menu_item_style(s: floem::style::Style) -> floem::style::Style {
     s.width_full()
         .flex_row()
