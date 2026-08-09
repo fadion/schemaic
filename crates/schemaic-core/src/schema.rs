@@ -85,6 +85,16 @@ pub struct IndexInfo {
     pub method: Option<String>,
     /// A partial index's predicate, without the `WHERE` (PostgreSQL only).
     pub predicate: Option<String>,
+    /// The constraint this index *is*, when it backs one — a PostgreSQL
+    /// `PRIMARY KEY` or `UNIQUE` constraint. `None` for a plain index (and always
+    /// on MySQL, which drops every key by index name).
+    ///
+    /// Carried because PostgreSQL refuses `DROP INDEX` on a constraint-backed
+    /// index and has no `DROP PRIMARY KEY` — the only way to remove one is
+    /// `ALTER TABLE … DROP CONSTRAINT <name>`, and the introspected index name
+    /// isn't it (the primary index is renamed `PRIMARY` so
+    /// [`IndexInfo::is_primary`] works the MySQL way).
+    pub constraint: Option<String>,
 }
 
 impl IndexInfo {

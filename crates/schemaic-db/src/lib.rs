@@ -493,17 +493,25 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
     let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
 
     // Tables, ordered. `TABLE_TYPE` flags views ('VIEW') vs base tables so the
-    // tree can render them distinctly.
-    let table_rows: Vec<(String, String)> = conn
+    // tree can render them distinctly; the engine/collation/comment behind it are
+    // the table-level options the schema designer edits (and `ALTER TABLE`
+    // replaces wholesale, so they have to be readable before they can be shown).
+    let table_opt_rows: Vec<MyTableRow> = conn
         .exec_map(
-            "SELECT CAST(TABLE_NAME AS CHAR) AS t, CAST(TABLE_TYPE AS CHAR) AS ty \
+            "SELECT CAST(TABLE_NAME AS CHAR) AS t, CAST(TABLE_TYPE AS CHAR) AS ty, \
+                    CAST(ENGINE AS CHAR) AS eng, CAST(TABLE_COLLATION AS CHAR) AS coll, \
+                    CAST(TABLE_COMMENT AS CHAR) AS cmt \
              FROM information_schema.TABLES \
              WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
             (database,),
-            |(t, ty): (String, String)| (t, ty),
+            |r: MyTableRow| r,
         )
         .await
         .map_err(qerr)?;
+    let table_rows: Vec<(String, String)> = table_opt_rows
+        .iter()
+        .map(|(t, ty, ..)| (t.clone(), ty.clone()))
+        .collect();
 
     // Which server this is, for `mysql_column`'s default normalization — MariaDB
     // hands back SQL text where MySQL hands back a raw value, and nothing in the
@@ -557,6 +565,23 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
              ORDER BY TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION",
             (database,),
             |(t, cn, col, rs, rt, rc): FkColRow| (t, cn, col, rs, rt, rc),
+        )
+        .await
+        .map_err(qerr)?;
+
+    // Each FK's referential actions, keyed by constraint. Separate from the
+    // key-column rows above because they're per *constraint*, not per column —
+    // and they can't be skipped: a schema editor that drops and recreates a
+    // `ON DELETE CASCADE` key without restating the action silently turns it into
+    // `NO ACTION`.
+    let fk_rule_rows: Vec<(String, String, String, String)> = conn
+        .exec_map(
+            "SELECT CAST(TABLE_NAME AS CHAR) AS t, CAST(CONSTRAINT_NAME AS CHAR) AS cn, \
+                    CAST(DELETE_RULE AS CHAR) AS dr, CAST(UPDATE_RULE AS CHAR) AS ur \
+             FROM information_schema.REFERENTIAL_CONSTRAINTS \
+             WHERE CONSTRAINT_SCHEMA = ?",
+            (database,),
+            |r: (String, String, String, String)| r,
         )
         .await
         .map_err(qerr)?;
@@ -619,7 +644,7 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         Vec::new()
     };
 
-    Ok(assemble_schema(
+    let mut schema = assemble_schema(
         // MySQL: the database is the namespace, so tables carry none.
         None,
         &table_rows,
@@ -627,7 +652,49 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         &fk_col_rows,
         &idx_rows,
         &view_rows,
-    ))
+    );
+    apply_table_options(&mut schema, &table_opt_rows);
+    apply_fk_rules(&mut schema, &fk_rule_rows);
+    Ok(schema)
+}
+
+/// One `information_schema.TABLES` row: `(name, type, engine, collation,
+/// comment)`.
+type MyTableRow = (String, String, Option<String>, Option<String>, String);
+
+/// Fold MySQL's table-level options onto the assembled tables. Kept out of
+/// [`assemble_schema`] (which both engines share) because PostgreSQL has no
+/// equivalent of either the engine or the table collation.
+fn apply_table_options(schema: &mut DbSchema, rows: &[MyTableRow]) {
+    let by_name: HashMap<&str, &MyTableRow> = rows.iter().map(|r| (r.0.as_str(), r)).collect();
+    for t in &mut schema.tables {
+        let Some((.., engine, collation, comment)) = by_name.get(t.name.as_str()) else {
+            continue;
+        };
+        t.engine = engine.clone().filter(|e| !e.is_empty());
+        t.collation = collation.clone().filter(|c| !c.is_empty());
+        t.comment = Some(comment.clone()).filter(|c| !c.is_empty());
+    }
+}
+
+/// Attach each foreign key's referential actions. `NO ACTION` is the standard
+/// default and both engines leave it unwritten, so it stays `None` — which is
+/// exactly what makes an untouched key round-trip to no change at all.
+fn apply_fk_rules(schema: &mut DbSchema, rows: &[(String, String, String, String)]) {
+    let keep = |rule: &str| {
+        let r = rule.trim();
+        (!r.is_empty() && !r.eq_ignore_ascii_case("NO ACTION")).then(|| r.to_uppercase())
+    };
+    for (table, name, on_delete, on_update) in rows {
+        let Some(t) = schema.tables.iter_mut().find(|t| t.name == *table) else {
+            continue;
+        };
+        let Some(fk) = t.foreign_keys.iter_mut().find(|f| f.name == *name) else {
+            continue;
+        };
+        fk.on_delete = keep(on_delete);
+        fk.on_update = keep(on_update);
+    }
 }
 
 /// A raw `information_schema.COLUMNS` row as the MySQL fetch selects it.
@@ -838,6 +905,10 @@ pub(crate) fn assemble_schema(
                 foreign: false, // set by the column-match pass below
                 method: r.method.clone(),
                 predicate: r.predicate.clone(),
+                // Constraint-backed indexes are tagged by the engine's own fetch
+                // afterwards (PostgreSQL only); the catalogue rows folded here
+                // don't carry it.
+                constraint: None,
             });
         }
     }
@@ -1118,6 +1189,101 @@ fn convert_row(row: &Row, columns: &[Column]) -> Vec<Value> {
             Some(other) => Value::Str(other.as_sql(false).trim_matches('\'').to_string()),
         })
         .collect()
+}
+
+/// Why a DDL run stopped, and — the part that matters — **how much of it
+/// already happened**.
+///
+/// The two engines differ in a way no amount of wrapping can hide. PostgreSQL
+/// has transactional DDL, so a failure rolls the whole plan back and `applied`
+/// is 0. MySQL commits implicitly around every DDL statement, so a plan that
+/// fails halfway has genuinely half-applied — and the honest thing is to say
+/// which statement failed and how many are already in effect, not to pretend the
+/// table is untouched.
+#[derive(Debug, Clone)]
+pub struct DdlError {
+    pub message: String,
+    /// 0-based index of the statement that failed.
+    pub at: usize,
+    /// Statements that are in effect on the server despite the failure. Always 0
+    /// on PostgreSQL.
+    pub applied: usize,
+}
+
+impl std::fmt::Display for DdlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "statement {} failed: {}", self.at + 1, self.message)?;
+        if self.applied > 0 {
+            write!(
+                f,
+                " — {} earlier statement{} already applied and cannot be rolled back",
+                self.applied,
+                if self.applied == 1 { "" } else { "s" }
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl Db {
+    /// Run a generated DDL plan against `database`.
+    ///
+    /// The statements come from [`ChangeSet::emit`](schemaic_core::ddl::ChangeSet::emit),
+    /// which has already put them in an order that works; this only decides how
+    /// much atomicity the engine can actually give:
+    ///
+    /// * **PostgreSQL** — one transaction. `ALTER TABLE`/`CREATE INDEX` are
+    ///   transactional there, so a failure anywhere leaves nothing behind.
+    /// * **MySQL** — sequential, stopping at the first failure. Every DDL
+    ///   statement commits implicitly, so a transaction here would be theatre
+    ///   (`tx::implicit_commit` models the same truth for the manual-transaction
+    ///   path). The caller is told which statement failed and how many stuck.
+    ///
+    /// Runs on a fresh connection, like every other operation — a designer's
+    /// Apply must not be blocked behind, or ride inside, a tab's transaction.
+    pub async fn run_ddl(
+        &self,
+        database: &str,
+        stmts: &[String],
+        cancel: CancellationToken,
+    ) -> Result<(), DdlError> {
+        let fail = |at: usize, applied: usize, e: DbError| DdlError {
+            message: e.to_string(),
+            at,
+            applied,
+        };
+        if stmts.is_empty() {
+            return Ok(());
+        }
+        if self.engine == Engine::Postgres {
+            return pg::run_ddl(self, database, stmts, cancel).await;
+        }
+        let mut conn = self
+            .open(Some(database), false)
+            .await
+            .map_err(|e| fail(0, 0, e))?;
+        let conn_id = conn.id();
+        let mut applied = 0usize;
+        let mut out = Ok(());
+        for (i, sql) in stmts.iter().enumerate() {
+            let step = tokio::select! {
+                r = conn.query_drop(sql) => r.map_err(|e| DbError::Query(e.to_string())),
+                _ = cancel.cancelled() => {
+                    self.kill_query(conn_id).await;
+                    Err(DbError::Cancelled)
+                }
+            };
+            match step {
+                Ok(()) => applied += 1,
+                Err(e) => {
+                    out = Err(fail(i, applied, e));
+                    break;
+                }
+            }
+        }
+        let _ = conn.disconnect().await;
+        out
+    }
 }
 
 /// Where an import is writing, and what its `INSERT`s name.
