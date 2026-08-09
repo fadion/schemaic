@@ -742,6 +742,10 @@ pub(crate) struct QueryPaneParams {
     pub popup_anchor: RwSignal<Option<PopupAnchor>>,
     pub popup_width: RwSignal<f64>,
     pub open_plan: Rc<dyn Fn(String)>,
+    /// Opens the view editor on the statement under the right-click — the
+    /// editor's half of "Create view". Takes the statement text; the database
+    /// and namespace are the caller's to resolve.
+    pub create_view: Rc<dyn Fn(String)>,
     pub nav: NavKeys,
     /// This tab's temporary font-size override (px) for Ctrl+scroll zoom; `None`
     /// follows the user's configured size. Driven here, read by `SqlStyling`.
@@ -783,6 +787,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         popup_anchor,
         popup_width,
         open_plan,
+        create_view,
         nav,
         zoom,
         conn_status,
@@ -1635,15 +1640,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         let inline_ai_run = inline_ai_run.clone();
         let open_plan = open_plan.clone();
         let ed_fmt = ed_fmt.clone();
+        let create_view = create_view.clone();
         Rc::new(move || {
             let ed_ask = ed_menu_act.clone();
             let ai_explain = ai_send.clone();
             let run_optimize = inline_ai_run.clone();
             let show_plan = open_plan.clone();
             let ed_format = ed_fmt.clone();
+            let make_view = create_view.clone();
             // The three AI actions carry the sparkle (matching AI Summary in the
             // grid); Plan + Format sit below the separator as plain actions.
-            vec![
+            let mut entries = vec![
                 MenuEntry::action_icon(
                     "Ask AI…",
                     (icons::SPARKLES, theme::key_foreign),
@@ -1722,7 +1729,28 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 MenuEntry::action("Format", move || {
                     format_editor(&ed_format, dialect.get_untracked())
                 }),
-            ]
+            ];
+            // "Create view" only when there's a query to make one *out of* — the
+            // statement the right-click landed on has to be something a view's
+            // body may be (`can_be_view_body`, the same rule the editor's own
+            // validation uses). Shown rather than disabled: on a `DELETE`, or on
+            // a read-only connection, the entry has nothing to offer.
+            let sql = query.get_untracked();
+            let (lo, hi) =
+                statement_range(&sql, menu_offset.get_untracked(), dialect.get_untracked());
+            let stmt = sql.get(lo..hi).unwrap_or_default().trim().to_string();
+            if !read_only.get_untracked()
+                && active_db.get_untracked().is_some()
+                && schemaic_core::ddl::can_be_view_body(&stmt)
+            {
+                // Its own group, as in the schema tree: it's the one entry here
+                // that ends at a statement against the database.
+                entries.push(MenuEntry::Separator);
+                entries.push(MenuEntry::action("Create view", move || {
+                    (make_view)(stmt.clone());
+                }));
+            }
+            entries
         })
     };
 

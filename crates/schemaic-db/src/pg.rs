@@ -51,7 +51,7 @@ use schemaic_core::model::{
     Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder,
     ResultSet, RowDelete, RowEdit, RowInsert, Value,
 };
-use schemaic_core::schema::{ColumnInfo, DbSchema, IndexColumn};
+use schemaic_core::schema::{ColumnInfo, DbSchema, IndexColumn, ViewOptions};
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
@@ -717,19 +717,30 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
         })
         .collect();
 
-    // View definitions.
-    let view_rows: Vec<InSchema<(String, String)>> = query_all(
+    // View bodies and options, from `pg_catalog` rather than
+    // `information_schema.views`. Two reasons, both the kind that only show up
+    // in someone else's database: that view hands back an **empty** definition
+    // to anyone who doesn't own the view, and it doesn't list materialized views
+    // at all (they aren't in the SQL standard), so a matview's body read as
+    // `None`. `pg_get_viewdef` answers for both, and `reloptions` carries the
+    // storage parameters a `CREATE OR REPLACE` would otherwise reset —
+    // `security_barrier` among them, whose loss makes a view leak the rows it
+    // was written to hide.
+    let view_all = query_all(
         &client,
         &format!(
-            "SELECT table_schema, table_name, view_definition \
-             FROM information_schema.views WHERE {}",
-            user_schema_filter("table_schema")
+            "SELECT n.nspname, c.relname, pg_get_viewdef(c.oid, true), \
+                    c.relkind, array_to_string(c.reloptions, ',') \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind IN ('v', 'm') AND {}",
+            user_schema_filter("n.nspname")
         ),
     )
-    .await?
-    .into_iter()
-    .map(|r| (cell(&r, 0), (cell(&r, 1), cell(&r, 2))))
-    .collect();
+    .await?;
+    let view_rows: Vec<InSchema<(String, String)>> = view_all
+        .iter()
+        .map(|r| (cell(r, 0), (cell(r, 1), cell(r, 2))))
+        .collect();
 
     // Partition every row set by namespace, then fold one namespace at a time —
     // `assemble_schema` keys on table name alone, so a shared call would merge
@@ -773,8 +784,20 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
             (!name.is_empty()).then(|| ((cell(r, 0), cell(r, 1), cell(r, 2)), name))
         })
         .collect();
+    let view_options: HashMap<(String, String), ViewOptions> = view_all
+        .iter()
+        .map(|r| {
+            (
+                (cell(r, 0), cell(r, 1)),
+                pg_view_options(&cell(r, 3), &cell(r, 4)),
+            )
+        })
+        .collect();
     for t in &mut tables {
         let ns = t.schema.clone().unwrap_or_default();
+        if t.is_view {
+            t.view_options = view_options.get(&(ns.clone(), t.name.clone())).cloned();
+        }
         for ix in &mut t.indexes {
             ix.constraint = idx_constraints
                 .get(&(ns.clone(), t.name.clone(), ix.name.clone()))
@@ -791,6 +814,33 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
         }
     }
     Ok(DbSchema { tables })
+}
+
+/// A view's options from its `pg_class` row: the relation kind (`v` a view, `m`
+/// a materialized one) and its storage parameters, already flattened to
+/// `a=1,b=2` by `array_to_string`.
+///
+/// `check_option` is lifted out because both engines spell that one the same way
+/// in DDL (`WITH CASCADED CHECK OPTION`); everything else stays verbatim, since
+/// it's restated inside the `WITH (…)` it came from. Pure + tested.
+pub(crate) fn pg_view_options(relkind: &str, reloptions: &str) -> ViewOptions {
+    let mut out = ViewOptions {
+        materialized: relkind == "m",
+        ..Default::default()
+    };
+    for opt in reloptions
+        .split(',')
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+    {
+        match opt.split_once('=') {
+            Some((k, v)) if k.trim().eq_ignore_ascii_case("check_option") => {
+                out.check_option = Some(v.trim().to_ascii_uppercase());
+            }
+            _ => out.storage.push(opt.to_string()),
+        }
+    }
+    out
 }
 
 /// One `pg_constraint.confdeltype`/`confupdtype` code as the SQL it stands for.
@@ -1360,6 +1410,22 @@ pub(crate) async fn refetch_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `check_option` is lifted out (it's a DDL clause on both engines); the
+    /// rest is restated verbatim inside the `WITH (…)` it came from.
+    #[test]
+    fn pg_view_options_splits_check_option_from_the_storage_parameters() {
+        let o = pg_view_options("v", "security_barrier=true,check_option=cascaded");
+        assert_eq!(o.check_option.as_deref(), Some("CASCADED"));
+        assert_eq!(o.storage, vec!["security_barrier=true".to_string()]);
+        assert!(!o.materialized);
+
+        // A plain view with no options at all.
+        assert_eq!(pg_view_options("v", ""), ViewOptions::default());
+
+        // `relkind = 'm'` is the one thing that makes a view uneditable here.
+        assert!(pg_view_options("m", "").materialized);
+    }
 
     #[test]
     fn pg_type_name_maps_numeric_and_text_types() {

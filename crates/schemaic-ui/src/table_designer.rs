@@ -71,6 +71,8 @@ pub(crate) fn open_designer(ui: &Ui, target: DesignerTarget) {
     d.rev.update(|r| *r += 1);
     d.error.set(None);
     d.preview.set(None);
+    // See `view_editor::open_editor`: each overlay knows only its own flag.
+    d.view.set(None);
     d.designer.set(Some(target));
 }
 
@@ -119,6 +121,28 @@ pub(crate) fn loaded_table(
                 _ => None,
             })
     })
+}
+
+/// The namespace a *new* object in `database` should land in: `public` on
+/// PostgreSQL, `None` on MySQL (which has no level between database and table).
+///
+/// Read off the loaded schema rather than the connection's engine, because it's
+/// the same question the tree answers by *showing* namespace nodes — a database
+/// node stands for `public`, and any other namespace has its own node.
+pub(crate) fn default_schema(ui: &Ui, database: &str) -> Option<String> {
+    let has_namespaces =
+        ui.schema
+            .db_nodes
+            .with_untracked(|nodes| {
+                nodes.iter().find(|n| n.database == database).map(|n| {
+                    match n.schema.get_untracked() {
+                        schemaic_core::schema::SchemaState::Loaded(s) => !s.schemas().is_empty(),
+                        _ => false,
+                    }
+                })
+            })
+            .unwrap_or(false);
+    has_namespaces.then(|| schemaic_core::schema::PG_DEFAULT_SCHEMA.to_string())
 }
 
 /// Every table name in a database, for the foreign-key target picker. Views are
@@ -284,6 +308,33 @@ fn bound_field(
     placeholder: &'static str,
     apply: impl Fn(&mut TableDraft, &str) + 'static,
 ) -> AnyView {
+    field_view(bound_signal(ui, initial, apply), width, placeholder, false)
+}
+
+/// [`bound_field`] for a field whose content is **SQL**, not prose — a type, a
+/// default expression, a generated expression. Monospace for the same reason the
+/// DDL preview and the view editor's body are: it's the text that ends up in the
+/// generated statement verbatim, and `varchar(255)` / `CURRENT_TIMESTAMP(3)`
+/// read as code.
+fn sql_field(
+    ui: &Ui,
+    initial: String,
+    width: f64,
+    placeholder: &'static str,
+    apply: impl Fn(&mut TableDraft, &str) + 'static,
+) -> AnyView {
+    field_view(bound_signal(ui, initial, apply), width, placeholder, true)
+}
+
+/// The signal behind a bound field: seeded once, on build; the effect writes
+/// back only on a genuine change. Seeding through the effect instead would set
+/// the draft to the value it already holds — and `RwSignal::set` never dedups,
+/// so every rebuild of the form would look like an edit and re-render the list.
+fn bound_signal(
+    ui: &Ui,
+    initial: String,
+    apply: impl Fn(&mut TableDraft, &str) + 'static,
+) -> RwSignal<String> {
     let draft = ui.ddl.draft;
     let sig = floem::reactive::create_rw_signal(initial);
     create_effect(move |prev: Option<String>| {
@@ -293,10 +344,15 @@ fn bound_field(
         }
         v
     });
+    sig
+}
+
+fn field_view(sig: RwSignal<String>, width: f64, placeholder: &'static str, mono: bool) -> AnyView {
     edit_field(
         sig,
         FieldCfg {
             placeholder,
+            mono,
             ..Default::default()
         },
     )
@@ -311,29 +367,15 @@ fn bound_field_with_menu(
     initial: String,
     width: f64,
     placeholder: &'static str,
+    mono: bool,
     options: Vec<String>,
     apply: impl Fn(&mut TableDraft, &str) + 'static,
 ) -> AnyView {
-    let draft = ui.ddl.draft;
     let popup = ui.overlay.popup_menu;
     let anchor = ui.overlay.popup_anchor;
-    let sig = floem::reactive::create_rw_signal(initial);
-    create_effect(move |prev: Option<String>| {
-        let v = sig.get();
-        if prev.is_some_and(|p| p != v) {
-            draft.update(|d| apply(d, &v));
-        }
-        v
-    });
+    let sig = bound_signal(ui, initial, apply);
     h_stack((
-        edit_field(
-            sig,
-            FieldCfg {
-                placeholder,
-                ..Default::default()
-            },
-        )
-        .style(move |s| s.width(width)),
+        field_view(sig, width, placeholder, mono),
         container(icons::icon(icons::CHEVRON_DOWN, 16.0))
             .on_click_stop(move |_| {
                 anchor.set(None);
@@ -359,7 +401,7 @@ fn bound_field_with_menu(
 
 /// A `<select>`-style dropdown over owned values (the settings one needs `Copy`,
 /// and a table name isn't). Same chrome, so it reads as the same control.
-fn owned_dropdown(
+pub(crate) fn owned_dropdown(
     current: impl Fn() -> String + Copy + 'static,
     options: Vec<String>,
     width: f64,
@@ -605,6 +647,8 @@ fn table_section(ui: Ui, target: &DesignerTarget) -> AnyView {
                 draft.engine.clone().unwrap_or_default(),
                 180.0,
                 "InnoDB",
+                // A storage-engine name isn't SQL text the way a type is.
+                false,
                 ddl::MYSQL_ENGINES.iter().map(|e| e.to_string()).collect(),
                 |d, v| d.engine = Some(v.trim().to_string()).filter(|s| !s.is_empty()),
             ),
@@ -728,6 +772,7 @@ fn column_form(ui: Ui, target: &DesignerTarget) -> AnyView {
                 c.type_name.clone(),
                 FIELD_W,
                 "varchar(255)",
+                true,
                 ddl::common_types(target.dialect)
                     .iter()
                     .map(|t| t.to_string())
@@ -788,7 +833,7 @@ fn column_form(ui: Ui, target: &DesignerTarget) -> AnyView {
     let default = form_setting(
         "Default",
         field_with_hint(
-            bound_field(
+            sql_field(
                 &ui,
                 c.default.clone().unwrap_or_default(),
                 FIELD_W,
@@ -805,7 +850,7 @@ fn column_form(ui: Ui, target: &DesignerTarget) -> AnyView {
     let generated = form_setting(
         "Generated from",
         field_with_hint(
-            bound_field(
+            sql_field(
                 &ui,
                 c.generated.clone().unwrap_or_default(),
                 FIELD_W,
@@ -1313,7 +1358,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
             let ui = ui.clone();
             let title = match &target.current {
                 Some(_) => format!("Design {}", target.display()),
-                None => format!("New table in {}", target.database),
+                None => format!("Create table in {}", target.database),
             };
 
             // The list re-renders on every draft change (it shows names and

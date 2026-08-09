@@ -511,25 +511,27 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     {
                         let ui = import_ui.clone();
                         let db = menu.name.clone();
-                        let pg = ui
-                            .schema
-                            .db_nodes
-                            .with_untracked(|nodes| {
-                                nodes.iter().find(|n| n.database == db).map(|n| {
-                                    match n.schema.get_untracked() {
-                                        SchemaState::Loaded(s) => !s.schemas().is_empty(),
-                                        _ => false,
-                                    }
-                                })
-                            })
-                            .unwrap_or(false);
-                        let ns = pg.then(|| schemaic_core::schema::PG_DEFAULT_SCHEMA.to_string());
+                        let ns = crate::table_designer::default_schema(&ui, &db);
                         let dbn = menu.name.clone();
+                        let view_ui = ui.clone();
+                        let view_ns = ns.clone();
+                        let view_db = menu.name.clone();
+                        let read_only = conn_read_only(&connections, active_conn);
                         entries.push(
-                            MenuEntry::action("New table", move || {
+                            MenuEntry::action("Create table", move || {
                                 crate::table_designer::open_for_new(&ui, &dbn, ns.as_deref());
                             })
-                            .disabled(conn_read_only(&connections, active_conn)),
+                            .disabled(read_only),
+                        );
+                        entries.push(
+                            MenuEntry::action("Create view", move || {
+                                crate::view_editor::open_for_new(
+                                    &view_ui,
+                                    &view_db,
+                                    view_ns.as_deref(),
+                                );
+                            })
+                            .disabled(read_only),
                         );
                     }
                 }
@@ -549,11 +551,24 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     {
                         let ui = import_ui.clone();
                         let (db, ns) = (database.clone(), menu.name.clone());
+                        let view_ui = import_ui.clone();
+                        let (view_db, view_ns) = (database.clone(), menu.name.clone());
+                        let read_only = conn_read_only(&connections, active_conn);
                         entries.push(
-                            MenuEntry::action("New table", move || {
+                            MenuEntry::action("Create table", move || {
                                 crate::table_designer::open_for_new(&ui, &db, Some(&ns));
                             })
-                            .disabled(conn_read_only(&connections, active_conn)),
+                            .disabled(read_only),
+                        );
+                        entries.push(
+                            MenuEntry::action("Create view", move || {
+                                crate::view_editor::open_for_new(
+                                    &view_ui,
+                                    &view_db,
+                                    Some(&view_ns),
+                                );
+                            })
+                            .disabled(read_only),
                         );
                     }
                     // A namespace is introspected as part of its database, so
@@ -657,6 +672,10 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let ns = schema.clone();
                         let is_view = info.as_ref().is_some_and(|i| i.is_view);
                         let has_columns = info.as_ref().is_some_and(|i| !i.columns.is_empty());
+                        // A view Schemaic can edit — read before `info` is moved
+                        // into the Import entry below.
+                        let editable_view = crate::view_editor::is_editable_view(info.as_ref());
+                        let materialized = is_view && !editable_view;
                         entries.push(
                             MenuEntry::action("Import", move || {
                                 if let Some(info) = info.clone() {
@@ -682,19 +701,36 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         {
                             let ui = import_ui.clone();
                             let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
+                            // Same entry, two editors: a view is a name and a
+                            // SELECT, so it gets its own modal rather than the
+                            // designer's list-plus-form.
                             entries.push(
                                 MenuEntry::action("Edit", move || {
-                                    crate::table_designer::open_for_table(
-                                        &ui,
-                                        &db,
-                                        ns.as_deref(),
-                                        &tbl,
-                                        None,
-                                    );
+                                    if is_view {
+                                        crate::view_editor::open_for_view(
+                                            &ui,
+                                            &db,
+                                            ns.as_deref(),
+                                            &tbl,
+                                        );
+                                    } else {
+                                        crate::table_designer::open_for_table(
+                                            &ui,
+                                            &db,
+                                            ns.as_deref(),
+                                            &tbl,
+                                            None,
+                                        );
+                                    }
                                 })
-                                // A view has no designable shape, and an
-                                // unloaded schema has nothing to design from.
-                                .disabled(is_view || !has_columns),
+                                // An unloaded schema has nothing to edit from,
+                                // and a materialized view has no
+                                // `CREATE OR REPLACE` to edit it with.
+                                .disabled(if is_view {
+                                    !editable_view
+                                } else {
+                                    !has_columns
+                                }),
                             );
                         }
                         // Truncate and drop are the two that can't be taken back
@@ -707,7 +743,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
                             let label = source.display();
                             entries.push(
-                                MenuEntry::action("Truncate", move || {
+                                MenuEntry::action_colored("Truncate", theme::error, move || {
                                     let (ui, db, ns, tbl) =
                                         (ui.clone(), db.clone(), ns.clone(), tbl.clone());
                                     confirm.set(Some(crate::Confirm {
@@ -740,12 +776,29 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 MenuEntry::action_colored("Drop", theme::error, move || {
                                     let (ui, db, ns, tbl) =
                                         (ui.clone(), db.clone(), ns.clone(), tbl.clone());
-                                    confirm.set(Some(crate::Confirm {
-                                        title: "Drop table".to_string(),
-                                        message: format!(
-                                            "Drop {label} and every row in it? \
+                                    // A view is dropped by `DROP VIEW`; asking
+                                    // about "every row in it" would be asking
+                                    // about rows it doesn't own either.
+                                    let (title, message) = if is_view {
+                                        (
+                                            "Drop view",
+                                            format!(
+                                                "Drop {label}? Anything built on it goes too. \
                                                  This can't be undone."
-                                        ),
+                                            ),
+                                        )
+                                    } else {
+                                        (
+                                            "Drop table",
+                                            format!(
+                                                "Drop {label} and every row in it? \
+                                                 This can't be undone."
+                                            ),
+                                        )
+                                    };
+                                    confirm.set(Some(crate::Confirm {
+                                        title: title.to_string(),
+                                        message,
                                         resolve: Rc::new(move |yes| {
                                             if yes {
                                                 crate::ddl_preview::preview_change(
@@ -753,7 +806,13 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                                     &db,
                                                     &tbl,
                                                     ns.as_deref(),
-                                                    schemaic_core::ddl::Change::DropTable,
+                                                    if is_view {
+                                                        schemaic_core::ddl::Change::DropView {
+                                                            materialized,
+                                                        }
+                                                    } else {
+                                                        schemaic_core::ddl::Change::DropTable
+                                                    },
                                                 );
                                             }
                                         }),

@@ -28,7 +28,9 @@ use schemaic_core::model::{
     Column, ColumnFlags as CoreColFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
     ResultBuilder, ResultSet, RowDelete, RowEdit, RowInsert, Value,
 };
-use schemaic_core::schema::{ColumnInfo, DbSchema, ForeignKeyInfo, IndexInfo, TableInfo};
+use schemaic_core::schema::{
+    ColumnInfo, DbSchema, ForeignKeyInfo, IndexInfo, TableInfo, ViewOptions,
+};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, thiserror::Error)]
@@ -625,24 +627,42 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         })
         .collect();
 
-    // View definitions (only if the schema has any views) — the stored SELECT
-    // body, attached to each view's `TableInfo` for `CREATE VIEW` DDL.
+    // Views (only if the schema has any): the stored SELECT body, plus the
+    // options a `CREATE OR REPLACE VIEW` **resets** when it doesn't restate them
+    // — the check option, the definer, and the security type. The last of those
+    // is a privilege: a view redefined without `SQL SECURITY DEFINER` starts
+    // running as whoever calls it. Reading them here is what lets the schema
+    // editor carry them through an edit (see `core::schema::ViewOptions`).
     let has_views = table_rows
         .iter()
         .any(|(_, ty)| ty.eq_ignore_ascii_case("VIEW"));
-    let view_rows: Vec<(String, String)> = if has_views {
-        conn.exec_map(
-            "SELECT CAST(TABLE_NAME AS CHAR) AS t, CAST(VIEW_DEFINITION AS CHAR) AS def \
-                 FROM information_schema.VIEWS \
-                 WHERE TABLE_SCHEMA = ?",
-            (database,),
-            |(t, def): (String, String)| (t, def),
-        )
-        .await
-        .map_err(qerr)?
+    let view_sql = format!(
+        "SELECT CAST(TABLE_NAME AS CHAR) AS t, CAST(VIEW_DEFINITION AS CHAR) AS def, \
+                CAST(CHECK_OPTION AS CHAR) AS chk, CAST(DEFINER AS CHAR) AS definer, \
+                CAST(SECURITY_TYPE AS CHAR) AS sec, {} AS algo \
+             FROM information_schema.VIEWS \
+             WHERE TABLE_SCHEMA = ?",
+        // MariaDB reports the view's ALGORITHM; MySQL 8 doesn't have the column
+        // at all (only `SHOW CREATE VIEW` knows), and naming a column that
+        // doesn't exist fails the whole query — so the row *shape* is held
+        // steady with a NULL instead of branching the parsing.
+        if mariadb {
+            "CAST(ALGORITHM AS CHAR)"
+        } else {
+            "CAST(NULL AS CHAR)"
+        }
+    );
+    let view_opt_rows: Vec<MyViewRow> = if has_views {
+        conn.exec_map(view_sql.as_str(), (database,), |r: MyViewRow| r)
+            .await
+            .map_err(qerr)?
     } else {
         Vec::new()
     };
+    let view_rows: Vec<(String, String)> = view_opt_rows
+        .iter()
+        .map(|(t, def, ..)| (t.clone(), def.clone()))
+        .collect();
 
     let mut schema = assemble_schema(
         // MySQL: the database is the namespace, so tables carry none.
@@ -654,8 +674,59 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         &view_rows,
     );
     apply_table_options(&mut schema, &table_opt_rows);
+    apply_view_options(&mut schema, &view_opt_rows);
     apply_fk_rules(&mut schema, &fk_rule_rows);
     Ok(schema)
+}
+
+/// One `information_schema.VIEWS` row: `(name, definition, check option, definer,
+/// security type, algorithm)`. The algorithm is `None` on MySQL, which doesn't
+/// report it.
+type MyViewRow = (String, String, String, String, String, Option<String>);
+
+/// Fold MySQL's view options onto the assembled views. Kept out of
+/// [`assemble_schema`] for the same reason [`apply_table_options`] is: half of
+/// these have no PostgreSQL equivalent.
+fn apply_view_options(schema: &mut DbSchema, rows: &[MyViewRow]) {
+    let by_name: HashMap<&str, &MyViewRow> = rows.iter().map(|r| (r.0.as_str(), r)).collect();
+    for t in schema.tables.iter_mut().filter(|t| t.is_view) {
+        if let Some((_, _, check, definer, security, algorithm)) = by_name.get(t.name.as_str()) {
+            t.view_options = Some(mysql_view_options(
+                check,
+                definer,
+                security,
+                algorithm.as_deref(),
+            ));
+        }
+    }
+}
+
+/// A view's options as the catalogue reports them, in the form the emitter
+/// wants: the values that *mean* "unset" (`NONE`, `UNDEFINED`, empty) become
+/// `None`, so an untouched view round-trips to no change and nothing needless is
+/// restated. Pure + tested — like [`mysql_column`], getting this wrong writes a
+/// *different* view rather than failing.
+pub(crate) fn mysql_view_options(
+    check: &str,
+    definer: &str,
+    security: &str,
+    algorithm: Option<&str>,
+) -> ViewOptions {
+    let set = |s: &str, unset: &str| {
+        let s = s.trim();
+        (!s.is_empty() && !s.eq_ignore_ascii_case(unset)).then(|| s.to_ascii_uppercase())
+    };
+    ViewOptions {
+        check_option: set(check, "NONE"),
+        // Not upper-cased: an account name is data, not a keyword.
+        definer: Some(definer.trim().to_string()).filter(|d| !d.is_empty()),
+        // Both values matter. `INVOKER` has to be restated or it reverts to the
+        // default, and `DEFINER` is what that default *is* — restating it costs
+        // nothing and keeps the emitted statement explicit.
+        security: set(security, ""),
+        algorithm: algorithm.and_then(|a| set(a, "UNDEFINED")),
+        ..Default::default()
+    }
 }
 
 /// One `information_schema.TABLES` row: `(name, type, engine, collation,
@@ -2463,6 +2534,31 @@ mod tests {
         let views = [(s("v"), s(""))];
         let schema = assemble_schema(None, &tables, &[], &[], &[], &views);
         assert!(schema.tables[0].view_definition.is_none());
+    }
+
+    /// The values that mean "nothing to restate" have to fold to `None`, or the
+    /// schema editor opens on a phantom change; the ones that mean something
+    /// have to survive, or a replace quietly resets them.
+    #[test]
+    fn mysql_view_options_keeps_only_what_is_set() {
+        let o = mysql_view_options("NONE", "root@localhost", "DEFINER", Some("UNDEFINED"));
+        assert_eq!(o.check_option, None);
+        assert_eq!(o.definer.as_deref(), Some("root@localhost"));
+        assert_eq!(o.security.as_deref(), Some("DEFINER"));
+        assert_eq!(o.algorithm, None);
+
+        let o = mysql_view_options("cascaded", "app@10.0.0.1", "INVOKER", Some("merge"));
+        assert_eq!(o.check_option.as_deref(), Some("CASCADED"));
+        assert_eq!(o.security.as_deref(), Some("INVOKER"));
+        assert_eq!(o.algorithm.as_deref(), Some("MERGE"));
+        // PostgreSQL's half of the struct stays empty on MySQL.
+        assert!(o.storage.is_empty() && !o.materialized);
+
+        // MySQL 8 reports no algorithm at all.
+        assert_eq!(
+            mysql_view_options("NONE", "", "", None),
+            ViewOptions::default()
+        );
     }
 
     #[test]

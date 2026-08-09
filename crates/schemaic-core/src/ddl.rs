@@ -29,7 +29,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::intel::SqlDialect;
 use crate::schema::{
-    ColumnInfo, ForeignKeyInfo, IndexInfo, TableInfo, ddl_ident_in, ddl_string, sql_qualifier,
+    ColumnInfo, ForeignKeyInfo, IndexInfo, TableInfo, ViewOptions, ddl_ident_in, ddl_string,
+    definer_sql, sql_qualifier,
 };
 
 // ── The desired state ────────────────────────────────────────────────────────
@@ -329,6 +330,144 @@ impl TableDraft {
     }
 }
 
+// ── The desired state of a view ──────────────────────────────────────────────
+
+/// The whole desired shape of one view: a name, a `SELECT`, and the options that
+/// have to be carried along whether or not anyone edits them.
+///
+/// Carried along is the point. A view is redefined by *replacing* it, so a
+/// `CREATE OR REPLACE` that doesn't restate the definer, the security type or
+/// the check option resets them — see [`ViewOptions`]. The draft holds them for
+/// the same reason [`ColumnDraft`] holds a whole [`ColumnInfo`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ViewDraft {
+    /// The view's name on the server, or `None` when this draft is a new view.
+    /// Identity, not a name: editing `name` is a rename.
+    pub original: Option<String>,
+    pub name: String,
+    /// PostgreSQL namespace; `None` on MySQL.
+    pub schema: Option<String>,
+    /// The body, without a trailing semicolon (see [`view_body`]).
+    pub select: String,
+    pub options: ViewOptions,
+    /// **PostgreSQL only.** Apply the edit by dropping and re-creating the view
+    /// instead of replacing it in place.
+    ///
+    /// `CREATE OR REPLACE VIEW` there can only *append* columns, and whether a
+    /// given body still produces the old ones can't always be read off the
+    /// statement ([`pg_replaceable`]). When it can't, the plan replaces and lets
+    /// the server judge — and this is the user's answer when the server says no.
+    /// Ignored on MySQL, which replaces anything.
+    pub force_recreate: bool,
+}
+
+impl ViewDraft {
+    /// The draft that describes an introspected view exactly — the editor's
+    /// starting point, and the input to the round-trip gate. `None` for a base
+    /// table, which has no view to draft.
+    pub fn from_table(t: &TableInfo) -> Option<ViewDraft> {
+        if !t.is_view {
+            return None;
+        }
+        Some(ViewDraft {
+            original: Some(t.name.clone()),
+            name: t.name.clone(),
+            schema: t.schema.clone(),
+            select: view_body(t.view_definition.as_deref().unwrap_or_default()),
+            options: t.view_options.clone().unwrap_or_default(),
+            force_recreate: false,
+        })
+    }
+
+    /// An empty draft for a brand-new view in `schema`.
+    pub fn blank(name: impl Into<String>, schema: Option<String>) -> ViewDraft {
+        ViewDraft {
+            original: None,
+            name: name.into(),
+            schema,
+            ..Default::default()
+        }
+    }
+
+    /// Problems that would make the generated SQL nonsense, in plain language.
+    /// Empty means "emittable", **not** "the server will accept it" — whether the
+    /// body's tables and columns exist is the server's judgement, as everywhere
+    /// else here.
+    pub fn validate(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.name.trim().is_empty() {
+            out.push("The view needs a name.".to_string());
+        }
+        let body = self.select.trim();
+        if body.is_empty() {
+            out.push("A view needs a SELECT to define it.".to_string());
+        } else if !can_be_view_body(body) {
+            // Head-keyword only: anything past that is the parser's job, and a
+            // body it can't parse mid-edit still has to be emittable.
+            out.push(
+                "A view's body has to be a query — it starts with SELECT, WITH, VALUES or TABLE."
+                    .to_string(),
+            );
+        }
+        if self.options.materialized {
+            out.push(
+                "Schemaic can't edit a materialized view — PostgreSQL has no \
+                 CREATE OR REPLACE for one."
+                    .to_string(),
+            );
+        }
+        out
+    }
+}
+
+/// Could `body` be a view's definition — does it start like a query?
+///
+/// The set is every head keyword a view body may legitimately take on either
+/// engine. Head-keyword only, deliberately: it's the same answer mid-edit as it
+/// is on a complete statement, which is what both callers need — the draft's
+/// [`validate`](ViewDraft::validate), and the editor's right-click menu deciding
+/// whether "Create view" applies to the statement under the cursor.
+pub fn can_be_view_body(body: &str) -> bool {
+    let head = body
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .find(|w| !w.is_empty())
+        .unwrap_or_default();
+    ["SELECT", "WITH", "VALUES", "TABLE"]
+        .iter()
+        .any(|k| head.eq_ignore_ascii_case(k))
+}
+
+/// A view body as it goes into a `CREATE VIEW`: trimmed, with the terminating
+/// semicolon off.
+///
+/// `pg_get_viewdef` hands back a *statement*, semicolon and all, and pasting
+/// that in front of `WITH CASCADED CHECK OPTION` is a syntax error. Only a
+/// genuinely trailing `;` is removed — one inside a string literal is data.
+pub fn view_body(sql: &str) -> String {
+    sql.trim().trim_end_matches(';').trim_end().to_string()
+}
+
+/// Can PostgreSQL redefine a view whose columns are `current` with the body
+/// `select`, in place?
+///
+/// `CREATE OR REPLACE VIEW` there may only **append**: every existing column has
+/// to still be produced, under the same name, in the same position. `None` means
+/// the answer can't be read off the statement (a `*`, a set operation, an
+/// unnamed expression) — and uncertainty must resolve to "replace and let the
+/// server refuse", never to "drop it and find out".
+pub fn pg_replaceable(current: &[String], select: &str, dialect: SqlDialect) -> Option<bool> {
+    let names = crate::intel::select_output_names(select, dialect)?;
+    if names.len() < current.len() {
+        return Some(false);
+    }
+    Some(
+        current
+            .iter()
+            .zip(&names)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b)),
+    )
+}
+
 /// A table's primary-key columns in key order: the `PRIMARY` index when the
 /// server reported one (authoritative for a composite key's order), else the
 /// flagged columns in column order.
@@ -399,7 +538,28 @@ pub enum Change {
         collation: Option<String>,
         comment: Option<String>,
     },
+    /// Create a view that doesn't exist yet — plain `CREATE VIEW`, so a name
+    /// already taken fails instead of silently replacing someone else's view.
+    CreateView(Box<ViewDraft>),
+    /// Redefine an existing view. `recreate` ⇒ the engine can't replace it in
+    /// place, so this is a `DROP` followed by a `CREATE` — one change, because
+    /// it's one edit, with the cost stated in [`Change::is_destructive`].
+    ReplaceView {
+        draft: Box<ViewDraft>,
+        recreate: bool,
+    },
+    RenameView {
+        to: String,
+    },
+    DropView {
+        materialized: bool,
+    },
 }
+
+/// What a view loses when it's dropped — the sentence behind both the plain
+/// `DROP VIEW` and the recreate that has to drop first.
+const VIEW_DROP_COST: &str =
+    "Dependent views, rules and grants on it are dropped with it and aren't restored.";
 
 impl Change {
     /// One line of plain language for the preview's change list.
@@ -460,6 +620,21 @@ impl Change {
             ),
             Change::DropForeignKey { name } => format!("Drop foreign key {name}"),
             Change::TableOptions { .. } => "Change the table's options".to_string(),
+            Change::CreateView(d) => format!("Create view {}", d.name),
+            Change::ReplaceView { draft, recreate } => {
+                if *recreate {
+                    format!("Drop and re-create view {}", draft.name)
+                } else {
+                    format!("Redefine view {}", draft.name)
+                }
+            }
+            Change::RenameView { to } => format!("Rename the view to {to}"),
+            Change::DropView { materialized } => {
+                format!(
+                    "Drop the {}view",
+                    if *materialized { "materialized " } else { "" }
+                )
+            }
         }
     }
 
@@ -479,6 +654,20 @@ impl Change {
             Change::PrimaryKey { from, to, .. } if !from.is_empty() && to.is_empty() => {
                 Some("Leaves the table without a primary key — rows can no longer be edited from the grid.".to_string())
             }
+            Change::DropView { materialized } => Some(format!(
+                "Drops the {}view. {VIEW_DROP_COST}",
+                if *materialized { "materialized " } else { "" }
+            )),
+            // The one place a *redefinition* is destructive: PostgreSQL can only
+            // append columns to a view, so an edit that renames, retypes or
+            // reorders one can't be applied in place at all. Saying that here is
+            // the whole reason the recreate isn't done quietly.
+            Change::ReplaceView { draft, recreate: true } => Some(format!(
+                "Re-creating {} drops it first. {VIEW_DROP_COST} PostgreSQL can't \
+                 replace a view whose columns changed name, type or order, so this \
+                 is the only way to apply the edit.",
+                draft.name
+            )),
             _ => None,
         }
     }
@@ -576,7 +765,7 @@ impl ChangeSet {
     /// has to go before the column it constrains.
     fn emit_mysql(&self) -> Vec<String> {
         let d = self.dialect;
-        let mut out = Vec::new();
+        let mut out = self.view_statements();
         // Whole-table statements stand alone; they never share an ALTER.
         for c in &self.changes {
             match c {
@@ -703,7 +892,7 @@ impl ChangeSet {
     fn emit_postgres(&self) -> Vec<String> {
         let d = self.dialect;
         let q = |s: &str| ddl_ident_in(s, d);
-        let mut out = Vec::new();
+        let mut out = self.view_statements();
         for c in &self.changes {
             match c {
                 Change::CreateTable(draft) => out.extend(create_table_sql(draft, d)),
@@ -851,6 +1040,118 @@ impl ChangeSet {
             .collect::<Vec<_>>()
             .join(", ")
     }
+
+    // ── Views ────────────────────────────────────────────────────────────────
+
+    /// The view statements in this set, in the order they must run.
+    ///
+    /// One function for both engines rather than an arm in each: a view is a
+    /// name and a `SELECT` everywhere, and the divergence is small enough to
+    /// live inside [`create_view_sql`] — quoting, the `DEFINER`/storage clauses,
+    /// and the rename verb. Views never share a set with column changes (they
+    /// come out of [`diff_view`], which produces nothing else), so this runs
+    /// before the `ALTER TABLE` builders without interleaving with them.
+    fn view_statements(&self) -> Vec<String> {
+        let d = self.dialect;
+        let mut out = Vec::new();
+        for c in &self.changes {
+            match c {
+                Change::CreateView(draft) => {
+                    out.push(create_view_sql(draft, &draft.name, d, false))
+                }
+                Change::ReplaceView { draft, recreate } => {
+                    // A replace addresses the view under the name the server
+                    // knows; a re-create drops that one and builds the draft's,
+                    // which is how a rename comes along for free.
+                    let server_name = draft.original.as_deref().unwrap_or(&draft.name);
+                    if *recreate {
+                        out.push(drop_view_sql(
+                            &qualified(server_name, draft.schema.as_deref(), d),
+                            draft.options.materialized,
+                        ));
+                        out.push(create_view_sql(draft, &draft.name, d, false));
+                    } else {
+                        out.push(create_view_sql(draft, server_name, d, true));
+                    }
+                }
+                Change::DropView { materialized } => {
+                    out.push(drop_view_sql(&self.qname(), *materialized))
+                }
+                // MySQL has no `ALTER VIEW … RENAME`; `RENAME TABLE` is what it
+                // renames a view with.
+                Change::RenameView { to } => out.push(match d {
+                    SqlDialect::Postgres => format!(
+                        "ALTER VIEW {} RENAME TO {};",
+                        self.qname(),
+                        ddl_ident_in(to, d)
+                    ),
+                    _ => format!(
+                        "RENAME TABLE {} TO {};",
+                        self.qname(),
+                        qualified(to, self.schema.as_deref(), d)
+                    ),
+                }),
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// `CREATE [OR REPLACE] VIEW`, with every option restated.
+///
+/// `name` is the view the statement addresses, which isn't always
+/// `draft.name` — a replace has to name the view the server already has, since
+/// the rename runs after it.
+fn create_view_sql(v: &ViewDraft, name: &str, dialect: SqlDialect, replace: bool) -> String {
+    let pg = dialect == SqlDialect::Postgres;
+    let o = &v.options;
+    fn set(s: &Option<String>) -> Option<&str> {
+        s.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    }
+    let mut sql = String::from("CREATE ");
+    if replace {
+        sql.push_str("OR REPLACE ");
+    }
+    if !pg {
+        // MySQL's clause order is fixed: ALGORITHM, DEFINER, SQL SECURITY, VIEW.
+        // `UNDEFINED` is the default and says nothing, so it isn't emitted.
+        if let Some(a) = set(&o.algorithm).filter(|a| !a.eq_ignore_ascii_case("UNDEFINED")) {
+            sql.push_str(&format!("ALGORITHM = {} ", a.to_ascii_uppercase()));
+        }
+        if let Some(def) = set(&o.definer) {
+            sql.push_str(&definer_sql(def));
+            sql.push(' ');
+        }
+        if let Some(s) = set(&o.security) {
+            sql.push_str(&format!("SQL SECURITY {} ", s.to_ascii_uppercase()));
+        }
+    }
+    if pg && o.materialized {
+        sql.push_str("MATERIALIZED ");
+    }
+    sql.push_str("VIEW ");
+    sql.push_str(&qualified(name, v.schema.as_deref(), dialect));
+    if pg && !o.storage.is_empty() {
+        sql.push_str(&format!(" WITH ({})", o.storage.join(", ")));
+    }
+    sql.push_str(" AS\n");
+    sql.push_str(&view_body(&v.select));
+    // A materialized view has no check option — it isn't updatable at all.
+    if !o.materialized
+        && let Some(co) = set(&o.check_option).filter(|c| !c.eq_ignore_ascii_case("NONE"))
+    {
+        sql.push_str(&format!("\nWITH {} CHECK OPTION", co.to_ascii_uppercase()));
+    }
+    sql.push(';');
+    sql
+}
+
+fn drop_view_sql(qname: &str, materialized: bool) -> String {
+    format!(
+        "DROP {}VIEW {qname};",
+        if materialized { "MATERIALIZED " } else { "" }
+    )
 }
 
 // ── Emitter helpers ──────────────────────────────────────────────────────────
@@ -1662,6 +1963,64 @@ fn rename_fk(fk: &ForeignKeyInfo, renamed: &HashMap<String, String>) -> ForeignK
 }
 
 // ── Ready-made change sets (the context-menu shortcuts) ──────────────────────
+
+/// Everything that has to happen to turn the view `current` into `draft`.
+///
+/// Same round-trip gate as [`diff`]: a view diffed against its own draft must
+/// produce nothing. The one decision here that isn't a comparison is *how* a
+/// redefinition is applied — see [`pg_replaceable`].
+pub fn diff_view(current: &TableInfo, draft: &ViewDraft, dialect: SqlDialect) -> ChangeSet {
+    let mut changes: Vec<Change> = Vec::new();
+    let server = ViewDraft::from_table(current);
+    let old_body = server
+        .as_ref()
+        .map(|v| v.select.clone())
+        .unwrap_or_default();
+    let old_options = server.map(|v| v.options).unwrap_or_default();
+    let renamed = draft.name != current.name && !draft.name.trim().is_empty();
+
+    if view_body(&draft.select) != old_body || draft.options != old_options {
+        // MySQL's `CREATE OR REPLACE VIEW` redefines anything, so the whole
+        // question — and the override — is PostgreSQL's.
+        let recreate = dialect == SqlDialect::Postgres
+            && (draft.force_recreate || {
+                let cols: Vec<String> = current.columns.iter().map(|c| c.name.clone()).collect();
+                pg_replaceable(&cols, &draft.select, dialect) == Some(false)
+            });
+        changes.push(Change::ReplaceView {
+            draft: Box::new(draft.clone()),
+            recreate,
+        });
+        // A re-create already builds the view under its new name; renaming
+        // after it would address a name nothing answers to.
+        if renamed && !recreate {
+            changes.push(Change::RenameView {
+                to: draft.name.clone(),
+            });
+        }
+    } else if renamed {
+        changes.push(Change::RenameView {
+            to: draft.name.clone(),
+        });
+    }
+
+    ChangeSet {
+        table: current.name.clone(),
+        schema: current.schema.clone(),
+        dialect,
+        changes,
+    }
+}
+
+/// The `CREATE VIEW` for a brand-new view.
+pub fn create_view(draft: &ViewDraft, dialect: SqlDialect) -> ChangeSet {
+    ChangeSet {
+        table: draft.name.clone(),
+        schema: draft.schema.clone(),
+        dialect,
+        changes: vec![Change::CreateView(Box::new(draft.clone()))],
+    }
+}
 
 /// The `CREATE TABLE` for a brand-new table.
 pub fn create(draft: &TableDraft, dialect: SqlDialect) -> ChangeSet {
@@ -2826,6 +3185,23 @@ mod tests {
             assert!(ix_at < col_at, "{sql}");
         }
 
+        /// A view drafts and diffs to nothing on both engines, exactly like a
+        /// table — the same gate, for the model that carries a view's options.
+        #[test]
+        fn every_view_fixture_diffs_to_nothing_against_itself() {
+            for (dialect, t) in super::views::view_fixtures() {
+                let draft = ViewDraft::from_table(&t).expect("a view drafts");
+                let cs = diff_view(&t, &draft, dialect);
+                assert!(
+                    cs.is_empty(),
+                    "{} shows a phantom change on {dialect:?}: {:#?}",
+                    t.name,
+                    cs.changes
+                );
+                assert!(draft.validate().is_empty(), "{:?}", draft.validate());
+            }
+        }
+
         /// Every fixture can be re-created from its own draft, and what comes out
         /// carries the attributes that make the table what it is.
         #[test]
@@ -2857,6 +3233,393 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Views: a name and a `SELECT`, and everything that makes redefining one
+    /// more dangerous than it looks — the options a replace resets, and the
+    /// engine that can't replace at all.
+    mod views {
+        use super::*;
+
+        fn col(name: &str) -> ColumnInfo {
+            ColumnInfo {
+                name: name.into(),
+                type_name: "int".into(),
+                nullable: true,
+                ..Default::default()
+            }
+        }
+
+        /// A MySQL view carrying every option `information_schema.VIEWS` reports
+        /// — the ones a `CREATE OR REPLACE` that didn't restate them would reset.
+        pub(super) fn my_view() -> TableInfo {
+            TableInfo {
+                name: "active_staff".into(),
+                columns: vec![col("staff_id"), col("name")],
+                is_view: true,
+                view_definition: Some(
+                    "select `s`.`staff_id` AS `staff_id`,`s`.`name` AS `name` \
+                     from `staff` `s` where `s`.`active` = 1"
+                        .into(),
+                ),
+                view_options: Some(ViewOptions {
+                    check_option: Some("CASCADED".into()),
+                    definer: Some("root@localhost".into()),
+                    security: Some("DEFINER".into()),
+                    algorithm: Some("MERGE".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        /// A PostgreSQL view, whose body arrives pretty-printed *and terminated*
+        /// from `pg_get_viewdef`.
+        pub(super) fn pg_view() -> TableInfo {
+            TableInfo {
+                name: "big_city".into(),
+                schema: Some("public".into()),
+                columns: vec![col("id"), col("name")],
+                is_view: true,
+                view_definition: Some(
+                    " SELECT city.id,\n    city.name\n   FROM city\n  WHERE (city.pop > 1000);"
+                        .into(),
+                ),
+                view_options: Some(ViewOptions {
+                    storage: vec!["security_barrier=true".into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        pub(super) fn view_fixtures() -> Vec<(SqlDialect, TableInfo)> {
+            vec![(MySql, my_view()), (Postgres, pg_view())]
+        }
+
+        /// The draft is the view; a base table has no view to draft.
+        #[test]
+        fn only_a_view_drafts_as_one() {
+            assert!(ViewDraft::from_table(&my_view()).is_some());
+            let base = TableInfo {
+                name: "staff".into(),
+                ..Default::default()
+            };
+            assert!(ViewDraft::from_table(&base).is_none());
+        }
+
+        /// The bug this whole struct exists for: redefining a view without
+        /// restating `DEFINER`/`SQL SECURITY` silently hands it the caller's
+        /// privileges instead of its owner's.
+        #[test]
+        fn mysql_replace_restates_every_option() {
+            let v = my_view();
+            let mut draft = ViewDraft::from_table(&v).unwrap();
+            draft.select = "select 1 as staff_id, 'x' as name".into();
+            let cs = diff_view(&v, &draft, MySql);
+            assert_eq!(cs.len(), 1, "{:#?}", cs.changes);
+            let sql = cs.script();
+            assert!(sql.starts_with("CREATE OR REPLACE "), "{sql}");
+            assert!(sql.contains("ALGORITHM = MERGE"), "{sql}");
+            assert!(sql.contains("DEFINER = `root`@`localhost`"), "{sql}");
+            assert!(sql.contains("SQL SECURITY DEFINER"), "{sql}");
+            assert!(sql.contains("VIEW `active_staff` AS"), "{sql}");
+            assert!(
+                sql.trim_end().ends_with("WITH CASCADED CHECK OPTION;"),
+                "{sql}"
+            );
+            // Redefining in place takes nothing away.
+            assert!(cs.destructive().is_empty(), "{:?}", cs.destructive());
+        }
+
+        /// `pg_get_viewdef` hands back a terminated statement; pasting it in
+        /// front of `WITH … CHECK OPTION` would be a syntax error.
+        #[test]
+        fn a_body_loses_its_trailing_semicolon() {
+            assert_eq!(view_body("  SELECT 1;  "), "SELECT 1");
+            assert_eq!(view_body("SELECT 1"), "SELECT 1");
+            assert_eq!(view_body("SELECT ';' ;"), "SELECT ';'");
+            let mut v = pg_view();
+            v.view_options = Some(ViewOptions {
+                check_option: Some("LOCAL".into()),
+                ..Default::default()
+            });
+            let mut draft = ViewDraft::from_table(&v).unwrap();
+            draft.select = "SELECT city.id, city.name FROM city;".into();
+            let sql = diff_view(&v, &draft, Postgres).script();
+            assert!(!sql.contains(";\nWITH"), "{sql}");
+            assert!(
+                sql.trim_end().ends_with("WITH LOCAL CHECK OPTION;"),
+                "{sql}"
+            );
+        }
+
+        /// PostgreSQL's storage parameters are the same class of reset as
+        /// MySQL's `DEFINER` — a replace that drops `security_barrier` widens
+        /// what the view leaks.
+        #[test]
+        fn pg_replace_restates_storage_parameters() {
+            let v = pg_view();
+            let mut draft = ViewDraft::from_table(&v).unwrap();
+            draft.select = "SELECT city.id, city.name, city.pop FROM city".into();
+            let sql = diff_view(&v, &draft, Postgres).script();
+            assert!(sql.contains("WITH (security_barrier=true)"), "{sql}");
+        }
+
+        /// Appending a column is the one redefinition PostgreSQL takes in place.
+        #[test]
+        fn pg_appending_a_column_replaces_in_place() {
+            let v = pg_view();
+            let mut draft = ViewDraft::from_table(&v).unwrap();
+            draft.select = "SELECT city.id, city.name, city.pop FROM city".into();
+            let cs = diff_view(&v, &draft, Postgres);
+            assert_eq!(cs.len(), 1, "{:#?}", cs.changes);
+            let sql = cs.script();
+            assert!(sql.contains("CREATE OR REPLACE VIEW"), "{sql}");
+            assert!(!sql.contains("DROP VIEW"), "{sql}");
+            assert!(cs.destructive().is_empty(), "{:?}", cs.destructive());
+        }
+
+        /// Renaming, retyping or reordering a column is not something
+        /// `CREATE OR REPLACE VIEW` can do there — and the drop it takes instead
+        /// has to be *said*, not done quietly.
+        #[test]
+        fn pg_renaming_a_column_recreates_and_says_so() {
+            let v = pg_view();
+            let mut draft = ViewDraft::from_table(&v).unwrap();
+            draft.select = "SELECT city.id, city.name AS city_name FROM city".into();
+            let cs = diff_view(&v, &draft, Postgres);
+            let sql = cs.script();
+            let drop_at = sql.find("DROP VIEW").expect("dropped first");
+            let create_at = sql.find("CREATE VIEW").expect("then created");
+            assert!(drop_at < create_at, "{sql}");
+            assert!(!sql.contains("OR REPLACE"), "{sql}");
+            let risks = cs.destructive().join(" ");
+            assert!(risks.contains("Dependent views"), "{risks}");
+            assert!(risks.contains("grants"), "{risks}");
+        }
+
+        /// Dropping a column is the same story — and the *count* has to shrink
+        /// for it to be one, so a shorter list can't read as a prefix match.
+        #[test]
+        fn pg_dropping_a_column_recreates() {
+            let v = pg_view();
+            let mut draft = ViewDraft::from_table(&v).unwrap();
+            draft.select = "SELECT city.id FROM city".into();
+            assert!(
+                diff_view(&v, &draft, Postgres)
+                    .script()
+                    .contains("DROP VIEW")
+            );
+        }
+
+        /// Uncertainty means "let the server judge", never "drop it and find
+        /// out": a `SELECT *` body can't be resolved without the catalogue, so
+        /// it replaces and fails loudly if PostgreSQL disagrees.
+        #[test]
+        fn pg_unreadable_columns_replace_rather_than_drop() {
+            let v = pg_view();
+            let mut draft = ViewDraft::from_table(&v).unwrap();
+            draft.select = "SELECT * FROM city".into();
+            let cs = diff_view(&v, &draft, Postgres);
+            assert!(!cs.script().contains("DROP VIEW"), "{}", cs.script());
+            assert!(cs.destructive().is_empty());
+        }
+
+        /// …which is why the user gets the override, and taking it says what it
+        /// costs.
+        #[test]
+        fn pg_forced_recreate_is_honoured() {
+            let v = pg_view();
+            let mut draft = ViewDraft::from_table(&v).unwrap();
+            draft.select = "SELECT city.id, city.name, city.pop FROM city".into();
+            draft.force_recreate = true;
+            let cs = diff_view(&v, &draft, Postgres);
+            assert!(cs.script().contains("DROP VIEW"), "{}", cs.script());
+            assert!(!cs.destructive().is_empty());
+        }
+
+        /// MySQL replaces whatever the edit is, so the override is a PostgreSQL
+        /// rule and doesn't leak into the other engine.
+        #[test]
+        fn mysql_never_recreates() {
+            let v = my_view();
+            let mut draft = ViewDraft::from_table(&v).unwrap();
+            draft.select = "select 1 as x".into();
+            draft.force_recreate = true;
+            let sql = diff_view(&v, &draft, MySql).script();
+            assert!(!sql.contains("DROP VIEW"), "{sql}");
+        }
+
+        #[test]
+        fn renaming_a_view_uses_each_engine_s_verb() {
+            let v = my_view();
+            let mut draft = ViewDraft::from_table(&v).unwrap();
+            draft.name = "staff_on_duty".into();
+            let cs = diff_view(&v, &draft, MySql);
+            assert_eq!(cs.len(), 1, "{:#?}", cs.changes);
+            assert!(
+                cs.script()
+                    .contains("RENAME TABLE `active_staff` TO `staff_on_duty`;"),
+                "{}",
+                cs.script()
+            );
+
+            let v = pg_view();
+            let mut draft = ViewDraft::from_table(&v).unwrap();
+            draft.name = "large_city".into();
+            let sql = diff_view(&v, &draft, Postgres).script();
+            assert!(
+                sql.contains(r#"ALTER VIEW "big_city" RENAME TO "large_city";"#),
+                "{sql}"
+            );
+        }
+
+        /// A recreate already creates the view under its new name — emitting a
+        /// rename after it would fail on a name nothing answers to.
+        #[test]
+        fn a_recreate_carries_the_rename_instead_of_repeating_it() {
+            let v = pg_view();
+            let mut draft = ViewDraft::from_table(&v).unwrap();
+            draft.name = "large_city".into();
+            draft.select = "SELECT city.id AS city_id FROM city".into();
+            let sql = diff_view(&v, &draft, Postgres).script();
+            assert!(sql.contains(r#"DROP VIEW "big_city";"#), "{sql}");
+            assert!(sql.contains(r#"CREATE VIEW "large_city""#), "{sql}");
+            assert!(!sql.contains("RENAME"), "{sql}");
+        }
+
+        /// A brand-new view is `CREATE VIEW`, not `CREATE OR REPLACE`: if the
+        /// name is taken, that has to fail rather than silently replace someone
+        /// else's view.
+        #[test]
+        fn a_new_view_never_replaces() {
+            let draft = ViewDraft {
+                select: "SELECT 1 AS one".into(),
+                ..ViewDraft::blank("one_row", None)
+            };
+            let cs = create_view(&draft, MySql);
+            let sql = cs.script();
+            assert_eq!(sql, "CREATE VIEW `one_row` AS\nSELECT 1 AS one;");
+            assert!(cs.destructive().is_empty());
+        }
+
+        #[test]
+        fn dropping_a_view_names_what_goes_with_it() {
+            let cs = single(
+                "active_staff",
+                None,
+                MySql,
+                Change::DropView {
+                    materialized: false,
+                },
+            );
+            assert_eq!(cs.script(), "DROP VIEW `active_staff`;");
+            assert!(
+                cs.destructive()[0].contains("Dependent"),
+                "{:?}",
+                cs.destructive()
+            );
+
+            let cs = single(
+                "city_stats",
+                Some("public"),
+                Postgres,
+                Change::DropView { materialized: true },
+            );
+            assert_eq!(cs.script(), r#"DROP MATERIALIZED VIEW "city_stats";"#);
+        }
+
+        /// What the designer refuses to hand to the preview.
+        #[test]
+        fn validate_catches_what_cannot_be_emitted() {
+            let msgs = |d: &ViewDraft| d.validate().join(" | ");
+
+            let mut d = ViewDraft::blank("", None);
+            d.select = "SELECT 1".into();
+            assert!(msgs(&d).contains("name"), "{}", msgs(&d));
+
+            let mut d = ViewDraft::blank("v", None);
+            d.select = "   ".into();
+            assert!(msgs(&d).contains("SELECT"), "{}", msgs(&d));
+
+            let mut d = ViewDraft::blank("v", None);
+            d.select = "DELETE FROM staff".into();
+            assert!(msgs(&d).contains("SELECT"), "{}", msgs(&d));
+
+            // The forms a body may legitimately take.
+            for body in [
+                "SELECT 1",
+                "with x as (select 1) select * from x",
+                "VALUES (1)",
+            ] {
+                let mut d = ViewDraft::blank("v", None);
+                d.select = body.into();
+                assert!(d.validate().is_empty(), "{body}: {:?}", d.validate());
+            }
+        }
+
+        /// The same predicate answers the editor menu's "is there a query here
+        /// to make a view out of?", so it has to hold on a half-typed statement
+        /// too — head keyword only, never a parse.
+        #[test]
+        fn can_be_view_body_reads_the_head_keyword() {
+            for yes in [
+                "SELECT 1",
+                "  select a from t where b = 1",
+                "WITH x AS (SELECT 1) SELECT * FROM x",
+                "(SELECT 1)",
+                "VALUES (1)",
+                "TABLE city",
+                "SELECT a FROM ", // mid-edit, still a query
+            ] {
+                assert!(can_be_view_body(yes), "{yes}");
+            }
+            for no in [
+                "",
+                "   ",
+                "DELETE FROM t",
+                "INSERT INTO t VALUES (1)",
+                "CREATE VIEW v AS SELECT 1",
+                "SELECTED",
+            ] {
+                assert!(!can_be_view_body(no), "{no}");
+            }
+        }
+
+        /// A materialized view has no `CREATE OR REPLACE` and isn't editable
+        /// here — better to say so than to open half a form over it.
+        #[test]
+        fn a_materialized_view_is_not_editable() {
+            let mut v = pg_view();
+            v.view_options = Some(ViewOptions {
+                materialized: true,
+                ..Default::default()
+            });
+            let draft = ViewDraft::from_table(&v).unwrap();
+            assert!(draft.options.materialized);
+            assert!(
+                draft.validate().iter().any(|m| m.contains("materialized")),
+                "{:?}",
+                draft.validate()
+            );
+        }
+
+        /// The PostgreSQL rule on its own: what a replace can and can't do.
+        #[test]
+        fn pg_replaceable_reads_the_new_column_list() {
+            let cur = ["id".to_string(), "name".to_string()];
+            let ok = |s: &str| pg_replaceable(&cur, s, Postgres);
+            assert_eq!(ok("SELECT id, name FROM t"), Some(true));
+            assert_eq!(ok("SELECT id, name, pop FROM t"), Some(true));
+            assert_eq!(ok("SELECT id FROM t"), Some(false));
+            assert_eq!(ok("SELECT name, id FROM t"), Some(false));
+            assert_eq!(ok("SELECT id, name AS label FROM t"), Some(false));
+            // Unknowable, either way.
+            assert_eq!(ok("SELECT * FROM t"), None);
+            assert_eq!(ok("SELECT id, count(*) FROM t GROUP BY id"), None);
+            assert_eq!(ok("not sql at all"), None);
         }
     }
 }

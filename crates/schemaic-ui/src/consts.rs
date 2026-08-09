@@ -91,8 +91,11 @@ pub(crate) const HL_PAD: f64 = 3.0;
 pub(crate) const HL_GUTTER: f64 = 56.0;
 pub(crate) const HL_DIGIT_W: f64 = 8.0;
 
-/// Monospace family used by the Ctrl+K diff (matches the editor exactly).
-pub(crate) const DIFF_MONO: &str = "IBM Plex Mono";
+/// The app's monospace face — the bundled family the SQL editor resolves
+/// `monospace` to. Anything rendering SQL as *code* outside the editor (the
+/// Ctrl+K diff, an `edit_field` with `mono`) uses this, so they all match the
+/// editor and follow it if the bundled face ever changes.
+pub(crate) const MONO_FAMILY: &str = "IBM Plex Mono";
 
 // ── Panel resize handles ────────────────────────────────────────────────────
 

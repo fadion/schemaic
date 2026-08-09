@@ -4281,6 +4281,51 @@ pub fn parses(stmt: &str, dialect: SqlDialect) -> bool {
     sqlparser::parser::Parser::parse_sql(&*dialect.parser(), stmt).is_ok()
 }
 
+/// The column names a `SELECT` produces, **in order**, when they can be read off
+/// the statement alone.
+///
+/// `None` means "can't tell from here", and callers must treat that as unknown
+/// rather than as an empty list — a `*`, a set operation, or an unnamed
+/// expression all land there, and each of them names its columns from the
+/// catalogue or from the server's own rules.
+///
+/// Ordered, unlike the set [`colres`](self) builds for name resolution, because
+/// the caller that needs this — PostgreSQL's rule that
+/// `CREATE OR REPLACE VIEW` may only *append* columns — is a rule about
+/// position.
+pub fn select_output_names(sql: &str, dialect: SqlDialect) -> Option<Vec<String>> {
+    use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement};
+    let mut asts = sqlparser::parser::Parser::parse_sql(&*dialect.parser(), sql).ok()?;
+    if asts.len() != 1 {
+        return None;
+    }
+    let query = match asts.pop()? {
+        Statement::Query(q) => q,
+        _ => return None,
+    };
+    let select = match *query.body {
+        SetExpr::Select(s) => s,
+        // A set operation's names come from its left arm, but its *types* come
+        // from both; a union is exactly where an appended column is least safe
+        // to assume. Left as unknown.
+        _ => return None,
+    };
+    let mut out = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(Expr::Identifier(id)) => out.push(id.value.clone()),
+            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if !parts.is_empty() => {
+                out.push(parts[parts.len() - 1].value.clone())
+            }
+            SelectItem::ExprWithAlias { alias, .. } => out.push(alias.value.clone()),
+            // `*`, `t.*`, or an unnamed expression the server names by its own
+            // rules (`?column?`, the expression text) — unknowable here.
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 /// Case-insensitive search for `needle` in `hay`, returning its byte range.
 fn find_ci(hay: &str, needle: &str) -> Option<(usize, usize)> {
     if needle.is_empty() {
@@ -4422,6 +4467,31 @@ mod tests {
         let mut v: Vec<String> = scope.tables.iter().map(|t| t.name.clone()).collect();
         v.sort();
         v
+    }
+
+    #[test]
+    fn select_output_names_reads_a_projection_in_order() {
+        let out = |s: &str| select_output_names(s, SqlDialect::Postgres);
+        assert_eq!(
+            out("SELECT id, t.name, price * 2 AS gross FROM t"),
+            Some(vec!["id".into(), "name".into(), "gross".into()])
+        );
+        // Case is preserved — the caller decides how to fold it.
+        assert_eq!(out("SELECT Id FROM t"), Some(vec!["Id".into()]));
+        // Everything the statement alone can't name.
+        assert_eq!(out("SELECT * FROM t"), None);
+        assert_eq!(out("SELECT t.* FROM t"), None);
+        assert_eq!(out("SELECT count(*) FROM t"), None);
+        assert_eq!(out("SELECT a FROM t UNION SELECT b FROM u"), None);
+        assert_eq!(out("VALUES (1)"), None);
+        assert_eq!(out("UPDATE t SET a = 1"), None);
+        assert_eq!(out("SELECT a FROM t; SELECT b FROM u"), None);
+        assert_eq!(out("not sql"), None);
+        // A CTE's body is what the view produces.
+        assert_eq!(
+            out("WITH x AS (SELECT 1 AS n) SELECT x.n FROM x"),
+            Some(vec!["n".into()])
+        );
     }
 
     #[test]

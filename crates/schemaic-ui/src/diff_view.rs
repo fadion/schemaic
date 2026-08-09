@@ -8,7 +8,7 @@ use floem::prelude::*;
 use schemaic_core::diff::{DiffRow, DiffTag};
 use schemaic_core::intel::SqlDialect;
 
-use crate::consts::DIFF_MONO;
+use crate::consts::MONO_FAMILY;
 use crate::{sql_highlight, theme};
 
 // ===== moved from lib.rs (Ctrl+K diff view) =====
@@ -18,7 +18,7 @@ use crate::{sql_highlight, theme};
 /// one line — the row's parent stack decides width/overflow.
 fn diff_line(line: String, dialect: SqlDialect) -> impl IntoView {
     let mono = |st: floem::style::Style| {
-        st.font_family(DIFF_MONO.to_string())
+        st.font_family(MONO_FAMILY.to_string())
             .font_size(theme::FONT_TITLE)
     };
     let spans = sql_highlight::highlight_spans(&line, dialect);
@@ -55,7 +55,7 @@ fn diff_line(line: String, dialect: SqlDialect) -> impl IntoView {
 /// over a tinted background; gaps render as a faint "⋯ N unchanged lines" row.
 pub(crate) fn diff_view(rows: Vec<DiffRow>, dialect: SqlDialect) -> impl IntoView {
     let mono = |s: floem::style::Style| {
-        s.font_family(DIFF_MONO.to_string())
+        s.font_family(MONO_FAMILY.to_string())
             .font_size(theme::FONT_TITLE)
     };
     // Give the diff a DEFINITE content width so the scroll can detect horizontal
