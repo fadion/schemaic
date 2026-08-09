@@ -1162,6 +1162,12 @@ mod measure_tests {
 
     #[test]
     fn bold_measures_wider_than_regular() {
+        // Measure against the *bundled* faces, as the app does. Without this the
+        // global `FontSystem` falls back to whatever the host has installed, and
+        // the assertion becomes a claim about that machine's fonts: it held on
+        // Windows and failed on a bare Linux runner, where the fallback's bold
+        // measured *narrower* than its regular.
+        crate::fonts::load_fonts();
         // The whole reason `measure_text_px_bold_at` exists: the ER-diagram card
         // header is drawn `.font_bold()`, and sizing it from the regular
         // measurement made every card narrower than its own title. For a
