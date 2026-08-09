@@ -31,6 +31,7 @@ mod table_designer;
 mod tabs;
 pub mod theme;
 pub mod themes;
+mod view_editor;
 mod widgets;
 
 use ai_panel::ai_panel;
@@ -210,6 +211,36 @@ impl DesignerTarget {
     }
 }
 
+/// What the view editor is editing.
+///
+/// Captured when the modal opens, exactly like [`DesignerTarget`] — but a much
+/// smaller thing to hold, because a view *is* a name and a `SELECT`. That's why
+/// this doesn't reuse the designer: a list-plus-form has nothing to list.
+#[derive(Clone)]
+pub struct ViewTarget {
+    pub conn_id: u64,
+    pub database: String,
+    /// The namespace a *new* view goes into (`None` on MySQL). For an existing
+    /// view the draft carries it.
+    pub schema: Option<String>,
+    pub dialect: SqlDialect,
+    /// The introspected view the draft started from — the left-hand side of the
+    /// diff. `None` means this is a new view, which emits `CREATE VIEW`.
+    pub current: Option<schemaic_core::schema::TableInfo>,
+    pub read_only: bool,
+}
+
+impl ViewTarget {
+    /// The modal's title subject: the view being edited, or the database a new
+    /// one is being created in.
+    pub fn display(&self) -> String {
+        match &self.current {
+            Some(t) => schemaic_core::schema::display_name(t.schema.as_deref(), &t.name),
+            None => self.database.clone(),
+        }
+    }
+}
+
 /// Which section of the designer is showing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DesignerTab {
@@ -288,6 +319,15 @@ pub struct DdlUi {
     /// row leaves `selected` unchanged while the item at that index is now a
     /// different one — nothing else would tell the form to rebuild.
     pub rev: RwSignal<u64>,
+    /// The view editor's target; doubles as its open flag. A view gets its own
+    /// modal rather than a designer tab — see [`ViewTarget`].
+    pub view: RwSignal<Option<ViewTarget>>,
+    /// The view being edited. Same rule as `draft`: one value, because the
+    /// footer's change count is [`schemaic_core::ddl::diff_view`] of exactly it.
+    pub view_draft: RwSignal<schemaic_core::ddl::ViewDraft>,
+    /// The body editor's auto-grow cap, in rows. A signal because that's what
+    /// [`FieldCfg::max_rows`] takes; nothing changes it.
+    pub view_rows: RwSignal<usize>,
     pub preview: RwSignal<Option<DdlPreview>>,
     /// The plan's SQL, bound to the preview's read-only field.
     pub sql: RwSignal<String>,
@@ -1732,6 +1772,7 @@ pub fn workspace(ui: Ui) -> impl IntoView {
             let confirm = ui.overlay.confirm;
             let import_open = ui.import.target;
             let designer_open = ui.ddl.designer;
+            let view_open = ui.ddl.view;
             let ddl_preview_open = ui.ddl.preview;
             stack((
                 error_modal_overlay(ui.clone()),
@@ -1739,6 +1780,7 @@ pub fn workspace(ui: Ui) -> impl IntoView {
                 confirm_overlay(ui.clone()),
                 import_view::import_overlay(ui.clone()),
                 table_designer::table_designer_overlay(ui.clone()),
+                view_editor::view_editor_overlay(ui.clone()),
                 ddl_preview::ddl_preview_overlay(ui.clone()),
             ))
             .style(move |s| {
@@ -1747,6 +1789,7 @@ pub fn workspace(ui: Ui) -> impl IntoView {
                     || confirm.get().is_some()
                     || import_open.get().is_some()
                     || designer_open.get().is_some()
+                    || view_open.get().is_some()
                     || ddl_preview_open.get().is_some()
                 {
                     s.absolute().inset(0.0)
@@ -2822,6 +2865,18 @@ fn center(ui: Ui) -> impl IntoView {
         })
     };
 
+    // "Create view" from the editor's right-click: the statement becomes a new
+    // view's body, in the tab's active database. Built here because the pane
+    // takes callbacks, not the whole `Ui`.
+    let create_view: Rc<dyn Fn(String)> = {
+        let ui = ui.clone();
+        Rc::new(move |select: String| {
+            if let Some(db) = active_db.get_untracked() {
+                view_editor::open_from_query(&ui, &db, &select);
+            }
+        })
+    };
+
     // Editor area: the active tab's query editor — or, while that tab is
     // "flashing" closed, a solid placeholder of identical size, so nothing
     // below it shifts.
@@ -2863,6 +2918,7 @@ fn center(ui: Ui) -> impl IntoView {
                     popup_anchor,
                     popup_width,
                     open_plan: open_plan.clone(),
+                    create_view: create_view.clone(),
                     nav: navkeys.clone(),
                     zoom: tab.font_zoom,
                     conn_status,
@@ -3690,6 +3746,11 @@ pub(crate) struct FieldCfg {
     /// Grab focus on mount (e.g. the Find palette).
     pub autofocus: bool,
     pub font_size: f32,
+    /// Render in the app's monospace face ([`MONO_FAMILY`]) instead of IBM Plex
+    /// Sans — for a field whose content is *code* and wants column alignment
+    /// (the DDL preview's generated SQL). Doesn't change the line height, so the
+    /// auto-grow box math is unaffected.
+    pub mono: bool,
     pub border_radius: f32,
     /// Read-only: no text edits (still handles Enter/Escape). Suppresses autofocus.
     pub read_only: bool,
@@ -3749,6 +3810,7 @@ impl Default for FieldCfg {
             clearable: false,
             autofocus: false,
             font_size: 13.0,
+            mono: false,
             border_radius: 6.0,
             read_only: false,
             height: None,
@@ -3818,6 +3880,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         clearable,
         autofocus,
         font_size,
+        mono,
         border_radius,
         read_only,
         height,
@@ -3933,7 +3996,9 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         let mut b = SimpleStyling::builder();
         b.font_size(font_size as usize)
             .line_height(line_h as f32)
-            .font_family(vec![FamilyOwned::Name("IBM Plex Sans".to_string())]);
+            .font_family(vec![FamilyOwned::Name(
+                if mono { MONO_FAMILY } else { "IBM Plex Sans" }.to_string(),
+            )]);
         b.build()
     };
 

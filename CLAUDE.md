@@ -24,8 +24,9 @@ Zed-inspired, aiming to replace DataGrip.
     same column name in an inner vs outer scope is placed independently. `Catalog` is the case-folded view over
     the introspected `DbSchema`s (columns + FK edges). Hosts the shared `SQL_KEYWORDS`/`SQL_FUNCTIONS`/
     `STMT_KEYWORDS` (the UI's completion + editor build on these). Also `join_condition` (FK-aware
-    `JOIN … ON` auto-fill), `db_error_diagnostic` (positions a live DB error within the statement), and
-    `parses` (Tier-2 gate). The live DB stays the semantic authority: **Tier-2 live validation**
+    `JOIN … ON` auto-fill), `db_error_diagnostic` (positions a live DB error within the statement),
+    `parses` (Tier-2 gate), and `select_output_names` (a projection's column names *in order*, or
+    `None` when the statement alone can't say — what `ddl::pg_replaceable` reads). The live DB stays the semantic authority: **Tier-2 live validation**
     PREPAREs the statement under the cursor (`Db::prepare_check`, non-executing) behind the
     `live_validate` setting (off by default), merging dialect-exact errors into the editor squiggles.
   - `edit.rs` — `analyze_edit` → `EditModel` (write-back updatability analysis).
@@ -68,6 +69,19 @@ Zed-inspired, aiming to replace DataGrip.
     working around them, since any model-fidelity gap surfaces to the user as a phantom
     change. Also `key_list_text`/`parse_key_list` (the designer's `bio(20), age DESC`
     field) and `common_types`. Pure + unit-tested.
+    **Views** ride the same rails: `ViewDraft` (name + body + the `ViewOptions` it
+    carries) → `diff_view` → `Change::{CreateView, ReplaceView, RenameView, DropView}`
+    → the same preview. Two engine rules live here. MySQL's `CREATE OR REPLACE VIEW`
+    replaces the *whole* view, so the emitter restates `ALGORITHM`/`DEFINER`/
+    `SQL SECURITY`/`CHECK OPTION` — omitting the security type silently turns a
+    `DEFINER` view into an `INVOKER` one, which is a privilege change, the same class
+    of bug as `MODIFY COLUMN`'s. PostgreSQL's may only **append** columns, so an edit
+    that renames/retypes/reorders one needs `DROP` + `CREATE`, which takes dependent
+    views and grants with it: `pg_replaceable` (over `intel::select_output_names`)
+    decides where it can, **uncertainty resolves to replace-and-let-the-server-refuse,
+    never to drop**, and `ViewDraft::force_recreate` is the user's override. Materialized
+    views are drop-only (no `CREATE OR REPLACE` exists for one). Same round-trip gate,
+    same rule about extending fixtures.
   - `diff.rs` — `line_diff`/`build_diff_rows` (Ctrl+K preview).
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
     persisted to `history.json`.
@@ -83,8 +97,12 @@ Zed-inspired, aiming to replace DataGrip.
     outright — anything not restated is silently destroyed, so a schema editor can't stand on a
     thinner model. `ColumnInfo::definition_sql` is that one emitter, shared by `CREATE` and (later)
     `MODIFY` so they can't drift. `IndexColumn` keeps prefix lengths + `DESC`; `ForeignKeyInfo`
-    keeps its name (both engines drop by name) + referential actions.
-    `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the above.
+    keeps its name (both engines drop by name) + referential actions. `ViewOptions` is the same
+    idea for a view (check option, MySQL definer/security/algorithm, PG storage params +
+    `materialized`) — `CREATE OR REPLACE VIEW` replaces the whole view, so what isn't restated
+    resets, and `SQL SECURITY DEFINER → INVOKER` is a privilege change. `definer_sql` quotes the
+    two halves of a MySQL account. `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the
+    above.
   - `secrets.rs` — keeps connection secrets (DB/SSH passwords + SSH key passphrase) out of the
     plaintext `connections.json`: the `SecretStore` seam + pure transforms `hydrate_file` (load →
     fill empty fields from the store, flag legacy plaintext for migration), `sanitize_file` (save →
@@ -125,10 +143,16 @@ Zed-inspired, aiming to replace DataGrip.
   `pg_get_expr` for defaults and `attidentity`/`attgenerated`. `mysql_column` normalizes the
   MySQL/MariaDB `COLUMN_DEFAULT` divergence (MariaDB returns SQL text, MySQL a raw value needing
   quoting) — pure + tested, since getting it wrong writes a *different* default rather than failing.
-  MySQL additionally reads each table's engine/collation/comment and each FK's
-  `REFERENTIAL_CONSTRAINTS` rules; PG reads `confdeltype`/`confupdtype` and the
-  `pg_constraint` name behind a PK/unique index — all folded on *after* the shared
-  `assemble_schema` (which both engines share and neither's extras belong in).
+  MySQL additionally reads each table's engine/collation/comment, each FK's
+  `REFERENTIAL_CONSTRAINTS` rules, and each view's `CHECK_OPTION`/`DEFINER`/`SECURITY_TYPE`
+  (`mysql_view_options`; `ALGORITHM` too, but only on MariaDB — MySQL 8 has the column
+  nowhere but `SHOW CREATE VIEW`, so the query holds its shape with a `CAST(NULL AS CHAR)`);
+  PG reads `confdeltype`/`confupdtype`, the `pg_constraint` name behind a PK/unique index,
+  and its view bodies from **`pg_get_viewdef` over `pg_class`, not `information_schema.views`**
+  (which hands back an empty definition to a non-owner and omits materialized views entirely)
+  plus `reloptions` for the storage params a replace would reset (`pg_view_options`) — all
+  folded on *after* the shared `assemble_schema` (which both engines share and neither's
+  extras belong in).
   `fetch_query`/`run_batch`/`fetch_schema`/`ping`/`commit_writes`/`refetch_rows`/`prepare_check`
   (non-executing `PREPARE` for the editor's live validation)/`run_ddl` are `Db` methods taking
   the target DB per call. `run_ddl` is the schema-editing apply path and is **honest about
@@ -147,7 +171,9 @@ Zed-inspired, aiming to replace DataGrip.
   `Copy` signal bundles (`TabsUi`/`SchemaUi`/`ConnUi`/`AiUi`/`TermUi`/`LayoutUi`/`OverlayUi`) +
   `Rc<…Actions>` callback bundles — so `ui.run` is `ui.tab_actions.run`, `ui.db_nodes` is
   `ui.schema.db_nodes`, the tabs signal is `ui.tabs_ui.tabs`. Modules:
-  - `consts.rs` — layout/dimension constants (glob-imported).
+  - `consts.rs` — layout/dimension constants + `MONO_FAMILY` (glob-imported). Any SQL/code
+    surface reads that one name — the diff view, and `FieldCfg::mono` (the DDL preview's
+    script box, the view editor's definition).
   - `widgets.rs` — reusable widgets: `menu_panel`/`MenuEntry`, `modal_title`/`panel_style`/
     `menu_item_style`, `window_size`, `autohide`/`shift_hscroll`/`wheel_hscroll` scroll wrappers,
     `section_title`/`centered_msg`/`toggle_icon`, `measure_text_px`, `jump_to_bottom_button`.
@@ -185,6 +211,16 @@ Zed-inspired, aiming to replace DataGrip.
     `table_designer::open_for_table`/`open_for_new`/`preview_draft_edit` (a shortcut whose
     edit has dependents — dropping a column takes its index and FK with it) and
     `ddl_preview::preview_change` (a lone `Change`).
+  - `view_editor.rs` — the **view** modal (tree "Edit" on a view, "Create view" on a database/
+    schema node *and* on the editor's right-click when the statement under the caret can be a
+    view body — `ddl::can_be_view_body`, which seeds the draft with it), over `core::ddl`'s
+    `ViewDraft`. Not a designer tab: a view is a name and a
+    `SELECT`, so it's one form on the shared modal chrome, ending at the same `ddl_preview`.
+    Same seed-local-signals-then-write-back rule as the designer (the form is built once per
+    open; only the footer is keyed on the draft). The options are shown because they're
+    *carried* through a replace, and the PG "re-create instead of replacing" toggle is the
+    override for the cases `ddl::pg_replaceable` can't read off the statement.
+    `is_editable_view` is the entry point's gate — a materialized view is drop-only.
   - `ai_panel.rs` — AI Assistant panel (`ai_panel`/`message_bubble`/`render_segments`/`tool_chip`/
     `assistant_footer`).
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context
@@ -276,8 +312,8 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **Pure logic lives in `schemaic-core` with unit tests** — SQL boundaries, edit-model analysis,
   export (incl. CSV formula-injection guard), diff, DDL. The UI keeps thin wrappers.
 - **Generated DDL is never run silently, and never emitted from a second differ.** Every
-  schema edit goes `TableDraft` → `ddl::diff` → `ChangeSet::emit` → the preview modal →
-  `Db::run_ddl`. Don't add a path that builds `ALTER`/`CREATE`/`DROP` text somewhere else, and
+  schema edit goes `TableDraft`/`ViewDraft` → `ddl::diff`/`diff_view` → `ChangeSet::emit` →
+  the preview modal → `Db::run_ddl`. Don't add a path that builds `ALTER`/`CREATE`/`DROP` text somewhere else, and
   don't add one that applies a plan without the preview — the preview is where the destructive
   consequence is stated in plain language and where "Open in editor" hands the script over. A
   new engine is a `SqlDialect` arm in `ddl.rs`'s emitter, not a parallel emitter. The

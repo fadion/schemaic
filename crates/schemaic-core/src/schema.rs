@@ -330,12 +330,66 @@ pub struct TableInfo {
     /// used to emit `CREATE VIEW`. `None` for base tables (and views whose
     /// definition couldn't be read).
     pub view_definition: Option<String>,
+    /// For views, everything about them that isn't the SELECT — see
+    /// [`ViewOptions`], which exists because redefining a view **replaces** it.
+    /// `None` for base tables.
+    pub view_options: Option<ViewOptions>,
     /// MySQL storage engine (`InnoDB`, `MyISAM`). `None` on PostgreSQL, which has
     /// no equivalent.
     pub engine: Option<String>,
     /// MySQL table collation (which implies its charset). `None` on PostgreSQL.
     pub collation: Option<String>,
     pub comment: Option<String>,
+}
+
+/// A view's options — everything about it that isn't the `SELECT`.
+///
+/// These are modelled at all for the same reason [`ColumnInfo`] carries a
+/// column's whole definition: `CREATE OR REPLACE VIEW` **replaces the view**, so
+/// anything the statement doesn't restate reverts to the server's default. For
+/// `SQL SECURITY` that isn't cosmetic — a view redefined without the clause runs
+/// as the *caller* instead of its definer, which is a privilege change nobody
+/// asked for. Same for PostgreSQL's `security_barrier`, whose loss makes a view
+/// leak rows it was written to hide.
+///
+/// Half the fields belong to one engine (as [`TableInfo::engine`] does): MySQL
+/// has the definer and the security type, PostgreSQL the storage parameters and
+/// materialization. `check_option` is the one both spell the same way.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ViewOptions {
+    /// `WITH {CASCADED|LOCAL} CHECK OPTION`, upper-cased. `None` for a view
+    /// without one (MySQL reports that as `NONE`).
+    pub check_option: Option<String>,
+    /// MySQL's `DEFINER`, as the catalogue reports it — `root@localhost`,
+    /// unquoted. The two halves quote separately, so it's split at emit time
+    /// ([`definer_sql`]) rather than stored pre-quoted.
+    pub definer: Option<String>,
+    /// MySQL's `SQL SECURITY`: `DEFINER` or `INVOKER`.
+    pub security: Option<String>,
+    /// MariaDB's `ALGORITHM` (`MERGE`/`TEMPTABLE`; `UNDEFINED` is the default and
+    /// stays `None`). MySQL 8 doesn't expose it in `information_schema` at all —
+    /// only `SHOW CREATE VIEW` has it — so a MySQL view's non-default algorithm
+    /// is the one option a replace can still reset. Known gap.
+    pub algorithm: Option<String>,
+    /// PostgreSQL storage parameters other than `check_option`, verbatim
+    /// (`security_barrier=true`, `security_invoker=true`).
+    pub storage: Vec<String>,
+    /// PostgreSQL materialized view (`relkind = 'm'`). It has no
+    /// `CREATE OR REPLACE` and no check option, so Schemaic shows it rather than
+    /// editing it.
+    pub materialized: bool,
+}
+
+/// A MySQL `DEFINER` clause from the catalogue's `user@host` form.
+///
+/// The two halves are separate identifiers and quote separately, and the split
+/// is on the **last** `@` — a user name may contain one, a host name may not.
+pub fn definer_sql(definer: &str) -> String {
+    match definer.rsplit_once('@') {
+        Some((user, host)) => format!("DEFINER = {}@{}", ddl_ident(user), ddl_ident(host)),
+        // No host part: emit the account as given, still quoted.
+        None => format!("DEFINER = {}", ddl_ident(definer)),
+    }
 }
 
 impl TableInfo {
@@ -920,6 +974,23 @@ mod tests {
             t.create_ddl(crate::intel::SqlDialect::MySql),
             "CREATE OR REPLACE VIEW `v` AS\nSELECT 1;"
         );
+    }
+
+    /// The two halves of a MySQL account are separate identifiers, split on the
+    /// **last** `@` — a user name may hold one, a host name may not.
+    #[test]
+    fn definer_splits_the_account_and_quotes_both_halves() {
+        assert_eq!(
+            definer_sql("root@localhost"),
+            "DEFINER = `root`@`localhost`"
+        );
+        assert_eq!(
+            definer_sql("app@user@10.0.0.1"),
+            "DEFINER = `app@user`@`10.0.0.1`"
+        );
+        assert_eq!(definer_sql("we`ird@host"), "DEFINER = `we``ird`@`host`");
+        // No host part: still an identifier, still quoted.
+        assert_eq!(definer_sql("root"), "DEFINER = `root`");
     }
 
     #[test]

@@ -168,9 +168,10 @@ fn apply(ui: Ui) {
             match res {
                 Ok(()) => {
                     d.applied.set(true);
-                    // The draft behind this is now the server's state, so the
-                    // designer has nothing left to show.
+                    // The draft behind this is now the server's state, so
+                    // whichever editor opened it has nothing left to show.
                     d.designer.set(None);
+                    d.view.set(None);
                 }
                 Err(e) => d.error.set(Some(e)),
             }
@@ -232,13 +233,16 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                     form_section("SQL").style(|s| s.margin_top(18.0)),
                     // Read-only, but a real editor field: the script is meant to
                     // be read and selected, and it's the same widget the rest of
-                    // the app uses for text.
+                    // the app uses for text. Monospace, because this is the one
+                    // place the user reads generated SQL closely — aligned
+                    // columns are how a stray clause gets spotted before Apply.
                     edit_field(
                         d.sql,
                         FieldCfg {
                             multiline: true,
                             no_wrap: true,
                             read_only: true,
+                            mono: true,
                             font_size: theme::FONT_BODY,
                             max_rows: Some(d.sql_rows),
                             ..Default::default()
@@ -291,7 +295,9 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                         // context-menu shortcut opens this modal with nothing
                         // behind it, where Back would point at nowhere.
                         footer_button(
-                            if d.designer.get_untracked().is_some() {
+                            if d.designer.get_untracked().is_some()
+                                || d.view.get_untracked().is_some()
+                            {
                                 "Back"
                             } else {
                                 "Cancel"
@@ -315,6 +321,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                                 (open_query)(open_sql.clone());
                                 d.preview.set(None);
                                 d.designer.set(None);
+                                d.view.set(None);
                             },
                         ),
                         footer_button(
