@@ -50,6 +50,24 @@ Zed-inspired, aiming to replace DataGrip.
     (a whole-file walk still buffers, for the key union). NULL tokens match the *trimmed* field,
     except the empty one, which is exact — a blank field is data, and `trim` is the setting that
     says otherwise. Pure + unit-tested.
+  - `ddl.rs` — **schema editing**. `TableDraft` (the desired table; column/index/FK
+    entries each carry the name they had on the server, which is what tells a *rename*
+    from a drop-plus-add) → `diff(current, draft, dialect) -> ChangeSet` → `emit()`.
+    Every `Change` answers `summary()` and `is_destructive()`, which is what the preview
+    modal renders. The emitter owns the engine divergence: MySQL coalesces into one
+    `ALTER TABLE` and restates a whole column via `definition_sql` (`MODIFY` replaces it,
+    so anything omitted is destroyed); PostgreSQL splits renames / `DROP INDEX` /
+    `CREATE INDEX` / `COMMENT ON` into their own statements and drops a key by
+    *constraint* name (`IndexInfo::constraint` — it has no `DROP PRIMARY KEY`). Ordering
+    is dependency-first (FKs and indexes off before the columns under them; keys back on
+    after). `normalize_type`/`types_equal` + `defaults_equal` are the reason a designer
+    opens clean — `int(11)` ≡ `int`, `character varying(45)` ≡ `varchar(45)`. **The
+    round-trip gate is test-enforced**: `TableDraft::from_table(t)` diffed against `t`
+    must be empty over captured fixtures from classicmodels/sakila/employees/world +
+    PG world/chinook (`ddl::tests::roundtrip`) — extend those fixtures rather than
+    working around them, since any model-fidelity gap surfaces to the user as a phantom
+    change. Also `key_list_text`/`parse_key_list` (the designer's `bio(20), age DESC`
+    field) and `common_types`. Pure + unit-tested.
   - `diff.rs` — `line_diff`/`build_diff_rows` (Ctrl+K preview).
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
     persisted to `history.json`.
@@ -107,9 +125,17 @@ Zed-inspired, aiming to replace DataGrip.
   `pg_get_expr` for defaults and `attidentity`/`attgenerated`. `mysql_column` normalizes the
   MySQL/MariaDB `COLUMN_DEFAULT` divergence (MariaDB returns SQL text, MySQL a raw value needing
   quoting) — pure + tested, since getting it wrong writes a *different* default rather than failing.
+  MySQL additionally reads each table's engine/collation/comment and each FK's
+  `REFERENTIAL_CONSTRAINTS` rules; PG reads `confdeltype`/`confupdtype` and the
+  `pg_constraint` name behind a PK/unique index — all folded on *after* the shared
+  `assemble_schema` (which both engines share and neither's extras belong in).
   `fetch_query`/`run_batch`/`fetch_schema`/`ping`/`commit_writes`/`refetch_rows`/`prepare_check`
-  (non-executing `PREPARE` for the editor's live validation) are `Db` methods taking the target DB
-  per call. SSH tunnels return a `TunnelHandle` (drop → port freed) with
+  (non-executing `PREPARE` for the editor's live validation)/`run_ddl` are `Db` methods taking
+  the target DB per call. `run_ddl` is the schema-editing apply path and is **honest about
+  atomicity**: PostgreSQL runs the whole plan in one transaction (transactional DDL), MySQL runs
+  it sequentially and reports which statement failed *and how many already stuck*
+  (`DdlError::applied`) — every MySQL DDL statement commits implicitly, so a transaction there
+  would be theatre. SSH tunnels return a `TunnelHandle` (drop → port freed) with
   keepalives + TOFU host-key verification (`ssh_known_hosts.json`).
   `import_rows` is the bulk-load path (both engines): one transaction of batched multi-row
   `INSERT`s pulled from a `RowSource` iterator, each batch required to affect exactly as many rows
@@ -125,6 +151,10 @@ Zed-inspired, aiming to replace DataGrip.
   - `widgets.rs` — reusable widgets: `menu_panel`/`MenuEntry`, `modal_title`/`panel_style`/
     `menu_item_style`, `window_size`, `autohide`/`shift_hscroll`/`wheel_hscroll` scroll wrappers,
     `section_title`/`centered_msg`/`toggle_icon`, `measure_text_px`, `jump_to_bottom_button`.
+    Also the **shared modal form chrome** every modal wears — `form_setting`/`form_section`/
+    `form_separator`/`FORM_GAP`/`control_button`/`footer_button`/`modal_footer`. Manage
+    Connections set that shape and Import followed it; a new modal builds on these rather
+    than copying them a third time.
   - `markdown.rs` — AI-chat `render_markdown`/`CodeActions`/`code_block` (pulldown-cmark).
   - `settings.rs` — the three settings modals + shared controls.
   - `connection_form.rs` — Manage Connections modal + password-mask (+ tests).
@@ -141,6 +171,20 @@ Zed-inspired, aiming to replace DataGrip.
     the footer's Cancel fires `SchemaActions::import_cancel` (the app owns the token, as it does
     for query runs) instead of closing — the transaction rolls back, so a cancelled import writes
     nothing.
+  - `table_designer.rs` + `ddl_preview.rs` — **schema editing**, over `core::ddl`. The
+    designer is a list-plus-form per section (Table / Columns / Indexes / Foreign keys) over
+    one `DdlUi::draft`; the footer's change count *is* `ddl::diff` of that draft, the same
+    call the preview emits from, so the two can't disagree. The list re-renders on every
+    draft change but the **form must not** — it seeds local signals from the draft and writes
+    back through effects, so a draft-keyed form would tear down the field being typed into
+    (it's keyed on `(tab, selected, rev)`, where `rev` is bumped on structural edits because
+    removing the selected row leaves `selected` unchanged over a different item).
+    **Every path ends at `ddl_preview`** — designer, Create table, and the context-menu
+    shortcuts — so there's one place that shows the SQL, one that names what's destroyed, and
+    one "Open in editor" escape hatch. Never run generated DDL without it. Entry points:
+    `table_designer::open_for_table`/`open_for_new`/`preview_draft_edit` (a shortcut whose
+    edit has dependents — dropping a column takes its index and FK with it) and
+    `ddl_preview::preview_change` (a lone `Change`).
   - `ai_panel.rs` — AI Assistant panel (`ai_panel`/`message_bubble`/`render_segments`/`tool_chip`/
     `assistant_footer`).
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context
@@ -231,6 +275,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   the `.style(move |s| …)` closure (see `FieldCfg::background`).
 - **Pure logic lives in `schemaic-core` with unit tests** — SQL boundaries, edit-model analysis,
   export (incl. CSV formula-injection guard), diff, DDL. The UI keeps thin wrappers.
+- **Generated DDL is never run silently, and never emitted from a second differ.** Every
+  schema edit goes `TableDraft` → `ddl::diff` → `ChangeSet::emit` → the preview modal →
+  `Db::run_ddl`. Don't add a path that builds `ALTER`/`CREATE`/`DROP` text somewhere else, and
+  don't add one that applies a plan without the preview — the preview is where the destructive
+  consequence is stated in plain language and where "Open in editor" hands the script over. A
+  new engine is a `SqlDialect` arm in `ddl.rs`'s emitter, not a parallel emitter. The
+  round-trip gate (a draft built from a table must diff to *nothing*) is the test that keeps
+  the introspected model and the emitter honest with each other; extend its fixtures when you
+  widen the model.
 - **Write-back is transactional with a 1-row safety net.** `commit_writes` runs a `GridWrite`
   (DELETEs → UPDATEs → INSERTs) in one transaction, each statement required to affect exactly 1 row
   (else roll back all) — so an over-optimistic updatability analysis can't corrupt data. Commits
