@@ -6,6 +6,7 @@
 //! nothing is rounded or reformatted. Column provenance ([`ColumnOrigin`]) drives
 //! the write-back editing system.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// A single result cell.
@@ -696,6 +697,29 @@ pub fn one_row_verdict(step: WriteStep<'_>, affected: u64) -> Result<(), String>
     ))
 }
 
+/// The grid's staged (green) cell edits: `(data row, result column)` → the new
+/// value, `None` meaning SQL `NULL`. Staged is *not* written — a commit is what
+/// turns these into [`RowEdit`]s.
+pub type StagedEdits = HashMap<(usize, usize), Option<String>>;
+
+/// Drop exactly the staged edits a completed commit covered, leaving every other
+/// one staged.
+///
+/// The grid used to clear the whole map after any commit. That is right for the
+/// staged batch (which *is* the whole map) and wrong for the row panel, which
+/// commits on its own path — saving one row there discarded every green cell edit
+/// elsewhere in the grid, unwritten and unannounced, with the change counter
+/// dropping to zero as if they had been committed. It also swallowed an edit
+/// staged while a commit was in flight.
+///
+/// `committed` is the key set the write was assembled from, so an edit that
+/// arrived after that snapshot survives — which is the whole point. Clearing too
+/// *little* would leave a written cell painted green, so callers must pass every
+/// key their write covered, not only the ones that produced SQL.
+pub fn drop_committed(staged: &mut StagedEdits, committed: &HashSet<(usize, usize)>) {
+    staged.retain(|k, _| !committed.contains(k));
+}
+
 /// A template for re-`SELECT`ing just-edited rows so the grid can splice DB
 /// truth back in without re-running the whole query (built by
 /// [`crate::edit::refetch_template`]). Only produced when the result is a single
@@ -765,6 +789,54 @@ mod tests {
             type_name: type_name.to_string(),
             origin: None,
         }
+    }
+
+    // ── Clearing the staged map after a commit (`drop_committed`) ──
+
+    fn staged(keys: &[(usize, usize)]) -> StagedEdits {
+        keys.iter()
+            .map(|&k| (k, Some(format!("v{}{}", k.0, k.1))))
+            .collect()
+    }
+
+    #[test]
+    fn a_commit_drops_only_the_keys_it_covered() {
+        // Row 5 has two green edits; the row panel saves row 2 on its own path.
+        let mut s = staged(&[(5, 0), (5, 1), (2, 3)]);
+        drop_committed(&mut s, &[(2, 3)].into_iter().collect());
+        assert_eq!(s.len(), 2, "row 5's staged edits are still unwritten");
+        assert!(s.contains_key(&(5, 0)));
+        assert!(s.contains_key(&(5, 1)));
+        assert!(!s.contains_key(&(2, 3)));
+    }
+
+    #[test]
+    fn committing_the_whole_staged_batch_empties_it() {
+        let mut s = staged(&[(0, 0), (1, 1), (2, 2)]);
+        let all: HashSet<_> = s.keys().copied().collect();
+        drop_committed(&mut s, &all);
+        assert!(s.is_empty(), "no committed cell may stay painted green");
+    }
+
+    #[test]
+    fn an_edit_staged_after_the_write_was_assembled_survives_it() {
+        // The commit snapshotted {(1,1)}; the user staged (4,2) during the
+        // round-trip. Clearing wholesale sent it nowhere and said nothing.
+        let committed: HashSet<_> = [(1, 1)].into_iter().collect();
+        let mut s = staged(&[(1, 1), (4, 2)]);
+        drop_committed(&mut s, &committed);
+        assert_eq!(s.keys().copied().collect::<Vec<_>>(), vec![(4, 2)]);
+    }
+
+    #[test]
+    fn dropping_nothing_and_dropping_from_nothing_are_both_no_ops() {
+        let mut s = staged(&[(0, 0)]);
+        drop_committed(&mut s, &HashSet::new());
+        assert_eq!(s.len(), 1);
+
+        let mut empty = StagedEdits::new();
+        drop_committed(&mut empty, &[(0, 0)].into_iter().collect());
+        assert!(empty.is_empty());
     }
 
     #[test]
