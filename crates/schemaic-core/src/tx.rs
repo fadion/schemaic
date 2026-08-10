@@ -190,35 +190,98 @@ impl TxState {
 ///
 /// The keyword is read with [`crate::sql::leading_keyword`], so it's the shared
 /// boundary lexer deciding what the first token is — a leading comment or an
-/// `/* … */` block can't fool it. The list covers the statements a SQL editor
-/// realistically sees; it is intentionally conservative — a miss means the pill
-/// keeps counting a transaction the server already committed, which the next
-/// Commit/Rollback resolves harmlessly.
+/// `/* … */` block can't fool it.
+///
+/// **A miss is not harmless, and the direction matters.** After a statement the
+/// server committed but this didn't match, the pill keeps counting: a subsequent
+/// **Commit** still reaches the user's intended outcome, but a **Rollback** runs
+/// as a successful no-op and the UI reports an undo that never happened, over
+/// data that is now permanently written. A false *positive* is the mirror image —
+/// the pill goes quiet over an open transaction — so this matches MySQL's
+/// documented set as closely as a keyword can and no wider. That is still a
+/// guess: both engines report transaction status on the wire (MySQL's
+/// `SERVER_STATUS_IN_TRANS`, PostgreSQL's `ReadyForQuery`), and a pinned
+/// [`crate::tx`] session reading it would replace this with the truth, leaving
+/// this as the fallback.
 pub fn implicit_commit(engine: TxEngine, sql: &str) -> bool {
     if engine != TxEngine::MySql {
         return false;
     }
-    let Some(kw) = crate::sql::leading_keyword(sql, crate::intel::SqlDialect::MySql) else {
+    let dialect = crate::intel::SqlDialect::MySql;
+    let Some(kw) = crate::sql::leading_keyword(sql, dialect) else {
         return false;
     };
+    if kw == "SET" {
+        return set_commits(sql, dialect);
+    }
     matches!(
         kw.as_str(),
         "ALTER"
             | "ANALYZE"
+            | "CACHE"
+            | "CHECK"
             | "CREATE"
             | "DROP"
+            | "FLUSH"
             | "GRANT"
+            | "INSTALL"
+            // `LOAD INDEX INTO CACHE`. `LOAD DATA` doesn't commit, but it is a
+            // client-side statement Schemaic doesn't run, so this doesn't
+            // distinguish them.
+            | "LOAD"
             | "LOCK"
             | "OPTIMIZE"
             | "RENAME"
             | "REPAIR"
             | "REVOKE"
             | "TRUNCATE"
+            | "UNINSTALL"
             | "UNLOCK"
             // Opening a new transaction commits the current one.
             | "BEGIN"
             | "START"
     )
+}
+
+/// Does this `SET …` statement implicitly commit? Only two forms do, so `SET`
+/// can't join the list wholesale — `SET NAMES`, `SET @x`, `SET SESSION sql_mode`
+/// and the rest leave the transaction exactly where it was.
+///
+/// - `SET PASSWORD …`
+/// - `SET autocommit = 1` — turning it **on**, and only for this session. `= 0`
+///   commits nothing, and `SET GLOBAL autocommit` isn't this session's variable.
+///
+/// Anything it can't read is not a commit: claiming one that didn't happen would
+/// hide an open transaction, which is the failure this function's caller reports
+/// on.
+fn set_commits(sql: &str, dialect: crate::intel::SqlDialect) -> bool {
+    // Tokens after `SET`, upper-cased, split on the punctuation that separates a
+    // variable from its scope and its value.
+    let after = crate::sql::leading_keyword_end(sql, dialect).map_or("", |e| &sql[e..]);
+    let mut words = after
+        .split(|c: char| c.is_whitespace() || matches!(c, '=' | '.' | ',' | ';' | ':'))
+        .filter(|w| !w.is_empty())
+        .map(|w| w.trim_start_matches('@').to_ascii_uppercase());
+
+    let Some(first) = words.next() else {
+        return false;
+    };
+    if first == "PASSWORD" {
+        return true;
+    }
+    // An optional scope word. `GLOBAL`/`PERSIST` set a variable this session's
+    // transaction doesn't read, so they're excluded rather than skipped.
+    let name = match first.as_str() {
+        "SESSION" | "LOCAL" => match words.next() {
+            Some(w) => w,
+            None => return false,
+        },
+        _ => first,
+    };
+    if name != "AUTOCOMMIT" {
+        return false;
+    }
+    matches!(words.next().as_deref(), Some("1" | "ON" | "TRUE"))
 }
 
 /// The status-bar pill for a transaction, or `None` when there's nothing to say
@@ -446,6 +509,68 @@ mod tests {
             "REPLACE INTO t VALUES (1)",
         ] {
             assert!(!implicit_commit(MY, sql), "{sql} must not commit");
+        }
+    }
+
+    #[test]
+    fn mysqls_non_ddl_implicit_commits_are_matched_too() {
+        // Every one of these is on MySQL's "statements that cause an implicit
+        // commit" list and none was matched. `FLUSH` and `CHECK TABLE` are
+        // ordinary things to type in a SQL editor — and after one of them, a
+        // Rollback reports an undo the server never performed.
+        for sql in [
+            "FLUSH TABLES",
+            "flush privileges",
+            "CHECK TABLE t",
+            "CACHE INDEX t IN c",
+            "LOAD INDEX INTO CACHE t",
+            "INSTALL PLUGIN p SONAME 'p.so'",
+            "UNINSTALL PLUGIN p",
+        ] {
+            assert!(implicit_commit(MY, sql), "{sql} should implicitly commit");
+            assert_eq!(
+                ok(TxState::Open { stmts: 3 }, MY, sql),
+                TxState::Idle,
+                "{sql} ends the transaction"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_two_set_forms_that_commit_are_matched() {
+        // `SET` can't be matched wholesale — most of it is session state that
+        // leaves the transaction alone, and claiming a commit that didn't happen
+        // is the mirror-image lie (the pill would go quiet over open work).
+        for sql in [
+            "SET autocommit = 1",
+            "SET AUTOCOMMIT=1",
+            "SET @@autocommit = 1",
+            "SET SESSION autocommit = ON",
+            "SET @@session.autocommit = TRUE",
+            "SET PASSWORD FOR u = 'x'",
+        ] {
+            assert!(implicit_commit(MY, sql), "{sql} should implicitly commit");
+        }
+        for sql in [
+            "SET @x = 1",
+            "SET @autocommit_backup = 1",
+            "SET NAMES utf8mb4",
+            "SET SESSION sql_mode = ''",
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            // Turning autocommit *off* inside a transaction commits nothing…
+            "SET autocommit = 0",
+            // …and the global variable isn't this session's.
+            "SET GLOBAL autocommit = 1",
+            "SET",
+        ] {
+            assert!(!implicit_commit(MY, sql), "{sql} must not commit");
+        }
+    }
+
+    #[test]
+    fn postgres_has_transactional_ddl_so_none_of_them_commit() {
+        for sql in ["FLUSH TABLES", "CHECK TABLE t", "SET autocommit = 1"] {
+            assert!(!implicit_commit(PG, sql), "{sql} must not commit on PG");
         }
     }
 
