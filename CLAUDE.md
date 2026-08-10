@@ -625,7 +625,10 @@ for keyboard nav.
   staged `dirty` batch): `parse_row_edit` → `build_row_edits` (one `RowEdit` per base table, WHERE key
   from the *original* row) + a single-row `build_row_refetch` → the existing `CommitFn`; on success the
   row splices in place and the panel closes, on failure the message stays inline. Read-only fields
-  (PK/expression/`binary`) are shown for context but edits to them are rejected. State on `GridState`:
+  (expression/`binary`) are shown for context but edits to them are rejected — **a key column is
+  editable**, here as in the grid (`EditModel::editable` asks only whether the column maps to a base
+  table), which is why both re-fetches go through the one `edit::refetch_key`: the `UPDATE` keys on
+  the *original* row, but the re-fetch has to look for the key it just wrote. State on `GridState`:
   `edit_row_open` / `edit_row_di` / `edit_row_buf` / `edit_row_err` / `edit_row_saving`. Real rows only
   (a pending new row is filled via inline cells); Esc closes it (after the find bar).
 - **Inline edit writes back to the DB.** Per-column *provenance*: `schemaic-db` runs on

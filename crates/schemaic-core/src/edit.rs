@@ -8,8 +8,9 @@
 //! (a wrong key misdirects an UPDATE), so it lives here with tests rather than
 //! welded to Floem signals in the UI.
 
-use crate::model::{RefetchTemplate, ResultSet};
+use crate::model::{RefetchTemplate, ResultSet, Value};
 use crate::schema::TableInfo;
+use std::collections::HashMap;
 
 /// A base table the result can write back to, plus the result-column indices
 /// whose (original) values form the row-identity `WHERE`.
@@ -92,6 +93,42 @@ pub fn refetch_template(rs: &ResultSet, model: &EditModel) -> Option<RefetchTemp
         columns,
         key_cols: tbl.key_cols.clone(),
     })
+}
+
+/// The `WHERE` key identifying data row `di` **after** an edit, for re-fetching
+/// it into the grid.
+///
+/// `edited` is that row's changed result columns → their new value (`None` = SQL
+/// `NULL`); a key column among them is looked up by the value it was changed
+/// **to**, since that is what the just-committed `UPDATE` left in the table.
+/// Every other key column reads its original value out of `rs`.
+///
+/// This is the single builder for both write paths. There used to be two, and
+/// only the staged-batch one handled an edited key column; the row panel's built
+/// the key from the pre-edit row on the stated precondition that *"the editor
+/// blocks PK edits"* — which it does not (`EditModel::editable` asks only
+/// whether a column maps to a base table). So changing `id` there wrote
+/// correctly, re-fetched nothing, and left the grid showing the old key, after
+/// which every later edit to that row missed and rolled its batch back.
+pub fn refetch_key(
+    template: &RefetchTemplate,
+    rs: &ResultSet,
+    di: usize,
+    edited: &HashMap<usize, Option<String>>,
+) -> Vec<Value> {
+    template
+        .key_cols
+        .iter()
+        .map(|&kci| match edited.get(&kci) {
+            // Bound as text, exactly as the `UPDATE`'s own SET value was.
+            Some(Some(text)) => Value::Str(text.clone()),
+            Some(None) => Value::Null,
+            None => rs
+                .cell(di, kci)
+                .map(|c| c.to_value())
+                .unwrap_or(Value::Null),
+        })
+        .collect()
 }
 
 /// Compute the [`EditModel`]. `schema_for(database, schema, table)` returns the
@@ -482,6 +519,103 @@ mod tests {
         assert_eq!(t.table, "users");
         assert_eq!(t.columns, vec!["id".to_string(), "name".to_string()]);
         assert_eq!(t.key_cols, vec![0]); // `id` is the WHERE key
+    }
+
+    // ── The post-edit re-fetch key (`refetch_key`) ──
+    //
+    // A key column *is* editable — `EditModel::editable` asks only whether the
+    // column maps to a base table, and `happy_path_int_pk_is_editable` pins that
+    // — so the re-fetch has to look for the row by the key the UPDATE just gave
+    // it. The row panel's own builder assumed the opposite and silently left the
+    // grid on the old value.
+
+    /// A two-column `users` result (`id` PK, `name`) with one row, plus its
+    /// re-fetch template.
+    fn keyed_users_row() -> (ResultSet, RefetchTemplate) {
+        let r = ResultSet::from_rows(
+            vec![
+                col("id", "INT", "users", true, false),
+                col("name", "VARCHAR", "users", false, false),
+            ],
+            vec![vec![Value::Int(5), Value::Str("ada".to_string())]],
+        );
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "users")
+                .then(|| schema_with_pk("users", &["id"], &[("id", "int"), ("name", "varchar")]))
+        };
+        let m = analyze_edit(&r, schema);
+        let tpl = super::refetch_template(&r, &m).expect("single-table result is spliceable");
+        assert_eq!(tpl.key_cols, vec![0]);
+        (r, tpl)
+    }
+
+    #[test]
+    fn an_untouched_key_column_refetches_by_its_original_value() {
+        let (r, tpl) = keyed_users_row();
+        let edited: HashMap<usize, Option<String>> =
+            [(1, Some("grace".to_string()))].into_iter().collect();
+        assert_eq!(refetch_key(&tpl, &r, 0, &edited), vec![Value::Int(5)]);
+    }
+
+    #[test]
+    fn an_edited_key_column_refetches_by_its_new_value() {
+        // `UPDATE users SET id = 6 WHERE id = 5` committed; row 5 no longer
+        // exists, so re-fetching by 5 finds nothing and the grid keeps showing
+        // the stale key.
+        let (r, tpl) = keyed_users_row();
+        let edited: HashMap<usize, Option<String>> =
+            [(0, Some("6".to_string()))].into_iter().collect();
+        assert_eq!(
+            refetch_key(&tpl, &r, 0, &edited),
+            vec![Value::Str("6".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_key_column_edited_to_null_refetches_by_null() {
+        let (r, tpl) = keyed_users_row();
+        let edited: HashMap<usize, Option<String>> = [(0, None)].into_iter().collect();
+        assert_eq!(refetch_key(&tpl, &r, 0, &edited), vec![Value::Null]);
+    }
+
+    #[test]
+    fn a_composite_key_takes_each_column_from_where_it_stands() {
+        let r = ResultSet::from_rows(
+            vec![
+                col("a", "INT", "t", true, false),
+                col("b", "INT", "t", true, false),
+                col("v", "VARCHAR", "t", false, false),
+            ],
+            vec![vec![Value::Int(1), Value::Int(2), Value::Str("x".into())]],
+        );
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "t").then(|| {
+                schema_with_pk(
+                    "t",
+                    &["a", "b"],
+                    &[("a", "int"), ("b", "int"), ("v", "varchar")],
+                )
+            })
+        };
+        let m = analyze_edit(&r, schema);
+        let tpl = super::refetch_template(&r, &m).expect("spliceable");
+        assert_eq!(tpl.key_cols, vec![0, 1]);
+        // Only `b` was edited: `a` keeps its original, `b` takes the new value.
+        let edited: HashMap<usize, Option<String>> =
+            [(1, Some("9".to_string()))].into_iter().collect();
+        assert_eq!(
+            refetch_key(&tpl, &r, 0, &edited),
+            vec![Value::Int(1), Value::Str("9".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_row_past_the_end_keys_on_null_rather_than_panicking() {
+        let (r, tpl) = keyed_users_row();
+        assert_eq!(
+            refetch_key(&tpl, &r, 99, &HashMap::new()),
+            vec![Value::Null]
+        );
     }
 
     #[test]

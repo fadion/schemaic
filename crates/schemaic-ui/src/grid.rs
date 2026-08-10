@@ -27,7 +27,7 @@ use floem::action::save_as;
 use floem::file::{FileDialogOptions, FileSpec};
 
 use schemaic_core::connection::Connection;
-use schemaic_core::edit::{EditModel, analyze_edit, refetch_template};
+use schemaic_core::edit::{EditModel, analyze_edit, refetch_key, refetch_template};
 use schemaic_core::export::{ExportFormat, suggested_filename};
 use schemaic_core::filter::{FilterError, build_query, eq_condition};
 use schemaic_core::format::{self, ColumnFormat, ColumnFormatRule};
@@ -850,23 +850,22 @@ impl GridState {
         edits
     }
 
-    /// A single-row refetch (splice in place after the whole-row edit commits). Key
-    /// from the original row — the editor blocks PK edits, so it's unchanged. `None`
-    /// when the result isn't spliceable (multi-result path / no clean template).
-    fn build_row_refetch(&self, di: usize) -> Option<RefetchRequest> {
+    /// A single-row refetch (splice in place after the whole-row edit commits).
+    /// `changes` is the same change set the `UPDATE` was built from, because a key
+    /// column is editable here too and the row must be found by the key the write
+    /// just left in the table. `None` when the result isn't spliceable
+    /// (multi-result path / no clean template).
+    fn build_row_refetch(
+        &self,
+        di: usize,
+        changes: &[(usize, Option<String>)],
+    ) -> Option<RefetchRequest> {
         self.sync_canonical.get_untracked()?;
         let rs = self.rs.get_untracked();
         let model = self.edit_model.get_untracked();
         let template = refetch_template(&rs, &model)?;
-        let key = template
-            .key_cols
-            .iter()
-            .map(|&kci| {
-                rs.cell(di, kci)
-                    .map(|c| c.to_value())
-                    .unwrap_or(Value::Null)
-            })
-            .collect();
+        let edited: HashMap<usize, Option<String>> = changes.iter().cloned().collect();
+        let key = refetch_key(&template, &rs, di, &edited);
         Some(RefetchRequest {
             template,
             rows: vec![RefetchRow { data_row: di, key }],
@@ -980,19 +979,14 @@ impl GridState {
         let rows = data_rows
             .into_iter()
             .map(|di| {
-                let key = template
-                    .key_cols
+                // This row's staged edits, by result column — a key column among
+                // them is what the row now answers to.
+                let edited: HashMap<usize, Option<String>> = dirty
                     .iter()
-                    .map(|&kci| match dirty.get(&(di, kci)) {
-                        // The key column itself was edited → use the new value.
-                        Some(Some(t)) => Value::Str(t.clone()),
-                        Some(None) => Value::Null,
-                        None => rs
-                            .cell(di, kci)
-                            .map(|c| c.to_value())
-                            .unwrap_or(Value::Null),
-                    })
+                    .filter(|((d, _), _)| *d == di)
+                    .map(|((_, ci), v)| (*ci, v.clone()))
                     .collect();
+                let key = refetch_key(&template, &rs, di, &edited);
                 RefetchRow { data_row: di, key }
             })
             .collect();
@@ -2558,7 +2552,7 @@ fn commit_row_update(
         inserts: Vec::new(),
         deletes: Vec::new(),
     };
-    let refetch = gs.build_row_refetch(di);
+    let refetch = gs.build_row_refetch(di, &changes);
     gs.edit_row_saving.set(true);
     gs.commit_busy.set(true);
     gs.edit_row_err.set(None);
