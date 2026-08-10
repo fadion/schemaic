@@ -516,6 +516,48 @@ pub fn contains_write(sql: &str, dialect: SqlDialect) -> bool {
     false
 }
 
+/// Does any statement here carry a **credential in its text** — the class the
+/// `mysql` CLI's default `histignore` (`*IDENTIFIED*:*PASSWORD*`) keeps out of
+/// `~/.mysql_history`?
+///
+/// Used to keep such statements out of `history.json`. Schemaic goes out of its
+/// way to keep the connection password off disk (`core::secrets`), and a user who
+/// trusts that has no reason to expect the same directory to hold the password
+/// they typed into a `CREATE USER`.
+///
+/// Per statement, on whole tokens outside strings / quoted identifiers / comments
+/// (so `SELECT password FROM users` is *not* a credential statement — it names a
+/// column):
+///
+/// - anything containing `IDENTIFIED` — `CREATE`/`ALTER USER … IDENTIFIED BY`,
+///   and `GRANT … IDENTIFIED BY`;
+/// - a `SET` statement containing `PASSWORD` — `SET PASSWORD FOR … = …`;
+/// - a `CREATE`/`ALTER`/`DROP`/`GRANT`/`REVOKE` naming a `USER` or `ROLE` *and*
+///   `PASSWORD` — PostgreSQL's `CREATE ROLE … WITH PASSWORD '…'`.
+///
+/// Where it is imprecise it is imprecise toward omitting: a dropped history entry
+/// costs the user a scroll, a kept one writes their secret to disk.
+pub fn carries_credential(sql: &str, dialect: SqlDialect) -> bool {
+    for (lo, hi) in statement_ranges(sql, dialect) {
+        let (words, _) = word_tokens(&sql[lo..hi], dialect);
+        if words.iter().any(|w| w == "IDENTIFIED") {
+            return true;
+        }
+        if !words.iter().any(|w| w == "PASSWORD") {
+            continue;
+        }
+        let names_a_principal = words.iter().any(|w| w == "USER" || w == "ROLE");
+        match words.first().map(|s| s.as_str()) {
+            Some("SET") => return true,
+            Some("CREATE" | "ALTER" | "DROP" | "GRANT" | "REVOKE") if names_a_principal => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,6 +593,9 @@ mod tests {
     }
     fn read_only_reason(s: &str) -> Result<(), String> {
         super::read_only_reason(s, SqlDialect::MySql)
+    }
+    fn carries_credential(s: &str) -> bool {
+        super::carries_credential(s, SqlDialect::MySql)
     }
 
     // ── Postgres dialect boundary tests ──────────────────────────────────────
@@ -754,6 +799,44 @@ mod tests {
         assert!(contains_write("DROP TABLE t"));
         // A write anywhere in a multi-statement batch trips it.
         assert!(contains_write("SELECT 1; DELETE FROM t"));
+    }
+
+    #[test]
+    fn carries_credential_flags_the_statements_that_hold_a_secret() {
+        // Every shape whose text contains the password the user typed.
+        assert!(carries_credential("CREATE USER 'a'@'%' IDENTIFIED BY 'p'"));
+        assert!(carries_credential("ALTER USER 'a'@'%' IDENTIFIED BY 'p'"));
+        assert!(carries_credential(
+            "GRANT ALL ON *.* TO 'a'@'%' IDENTIFIED BY 'p'"
+        ));
+        assert!(carries_credential("SET PASSWORD FOR 'a'@'%' = 'p'"));
+        assert!(carries_credential("set password = 'p'")); // case-insensitive
+        assert!(super::carries_credential(
+            "CREATE ROLE app WITH LOGIN PASSWORD 'p'",
+            PG
+        ));
+        assert!(super::carries_credential("ALTER ROLE app PASSWORD 'p'", PG));
+        // Anywhere in a batch, not only at the head.
+        assert!(carries_credential("SELECT 1; SET PASSWORD = 'p'"));
+    }
+
+    #[test]
+    fn carries_credential_leaves_an_ordinary_password_column_alone() {
+        // A column named `password` must not suppress the query that reads it —
+        // this is why the check is on whole tokens rather than a substring scan.
+        assert!(!carries_credential("SELECT password FROM users"));
+        assert!(!carries_credential(
+            "ALTER TABLE users ADD COLUMN password varchar(64)"
+        ));
+        assert!(!carries_credential(
+            "CREATE TABLE users (id INT, password varchar(64))"
+        ));
+        assert!(!carries_credential("UPDATE users SET x = 1"));
+        assert!(!carries_credential("SELECT * FROM t"));
+        // Inside a string or a comment it isn't a token at all.
+        assert!(!carries_credential("SELECT 'IDENTIFIED BY' AS note"));
+        assert!(!carries_credential("SELECT 1 -- IDENTIFIED BY 'x'"));
+        assert!(!carries_credential("SELECT `password` FROM `user`"));
     }
 
     #[test]

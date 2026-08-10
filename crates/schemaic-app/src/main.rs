@@ -898,6 +898,16 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
+                // The connection's own dialect: `push` skips credential-bearing
+                // statements, and where a string or comment ends differs per
+                // engine.
+                let dialect = connections
+                    .with_untracked(|cs| {
+                        cs.iter()
+                            .find(|c| c.id == conn_id)
+                            .map(|c| SqlDialect::from_db_type(&c.db_type))
+                    })
+                    .unwrap_or_default();
                 history_entries.update(|v| {
                     schemaic_core::history::push(
                         v,
@@ -908,6 +918,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                             ts,
                             tab_name,
                         },
+                        dialect,
                     );
                 });
                 persist::save_json(

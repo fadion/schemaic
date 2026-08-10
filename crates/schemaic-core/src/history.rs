@@ -9,6 +9,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::intel::SqlDialect;
+use crate::sql;
+
 /// Cap on stored entries **per connection**; the oldest beyond this are dropped.
 pub const MAX_PER_CONN: usize = 50;
 
@@ -39,12 +42,24 @@ pub struct HistoryFile {
 
 /// Record a newly-run query at the front (newest-first). Blank SQL is ignored.
 ///
+/// **A statement carrying a credential is not recorded at all**
+/// ([`sql::carries_credential`] — `CREATE USER … IDENTIFIED BY '…'` and its
+/// relatives). `history.json` is plaintext, lives beside the `connections.json`
+/// whose secrets `core::secrets` takes care to keep out of files, and travels
+/// with whatever backs that directory up; the `mysql` CLI's default `histignore`
+/// makes the same omission. The check lives here, in `push`, so a second call
+/// site can't skip it. `dialect` is the connection's — comment and string
+/// boundaries differ per engine.
+///
 /// De-duplicates: a prior identical query on the same connection is dropped so the
 /// re-run bubbles to the top with a fresh timestamp instead of stacking copies.
 /// Then the connection is trimmed to its newest [`MAX_PER_CONN`] entries (other
 /// connections untouched).
-pub fn push(entries: &mut Vec<HistoryEntry>, entry: HistoryEntry) {
+pub fn push(entries: &mut Vec<HistoryEntry>, entry: HistoryEntry, dialect: SqlDialect) {
     if entry.sql.trim().is_empty() {
+        return;
+    }
+    if sql::carries_credential(&entry.sql, dialect) {
         return;
     }
     let conn = entry.conn_id;
@@ -119,6 +134,7 @@ pub fn relative_time(ts: u64, now: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::push as push_with;
     use super::*;
 
     fn entry(conn_id: u64, sql: &str, ts: u64) -> HistoryEntry {
@@ -129,6 +145,11 @@ mod tests {
             ts,
             tab_name: None,
         }
+    }
+
+    /// The tests that aren't about the dialect record as MySQL.
+    fn push(entries: &mut Vec<HistoryEntry>, e: HistoryEntry) {
+        push_with(entries, e, SqlDialect::MySql);
     }
 
     #[test]
@@ -188,6 +209,50 @@ mod tests {
         push(&mut v, entry(1, "SELECT 1", 100));
         push(&mut v, entry(2, "SELECT 1", 200));
         assert_eq!(v.len(), 2);
+    }
+
+    // ── Credential statements are never recorded ──────────────────────────
+    //
+    // `history.json` is plaintext and sits beside the `connections.json` whose
+    // secrets the product takes care to keep out of files. The `mysql` CLI's
+    // default `histignore` makes the same omission.
+
+    #[test]
+    fn credential_ddl_is_not_recorded() {
+        for sql in [
+            "CREATE USER 'app'@'%' IDENTIFIED BY 'hunter2'",
+            "ALTER USER 'app'@'%' IDENTIFIED BY 'hunter2'",
+            "GRANT ALL ON *.* TO 'app'@'%' IDENTIFIED BY 'hunter2'",
+            "SET PASSWORD FOR 'app'@'%' = 'hunter2'",
+            "CREATE ROLE app WITH LOGIN PASSWORD 'hunter2'",
+            "ALTER ROLE app WITH PASSWORD 'hunter2'",
+            // A trailing semicolon, and a credential statement in a batch.
+            "CREATE USER 'a' IDENTIFIED BY 'p';",
+            "SELECT 1; SET PASSWORD = 'p'",
+        ] {
+            let mut v = Vec::new();
+            push(&mut v, entry(1, sql, 100));
+            assert!(v.is_empty(), "should not be recorded: {sql}");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_statement_naming_a_password_column_is_still_recorded() {
+        // Omitting is the safe direction, but not at the cost of dropping every
+        // query someone writes against a users table.
+        for sql in [
+            "SELECT password FROM users",
+            "UPDATE users SET last_login = NOW() WHERE id = 1",
+            "ALTER TABLE users ADD COLUMN password varchar(64)",
+            "CREATE TABLE users (id int, password varchar(64))",
+            // The words only inside a string or a comment — the tokenizer's job.
+            "SELECT 'IDENTIFIED BY' AS note",
+            "SELECT 1 -- IDENTIFIED BY 'x'",
+        ] {
+            let mut v = Vec::new();
+            push(&mut v, entry(1, sql, 100));
+            assert_eq!(v.len(), 1, "should be recorded: {sql}");
+        }
     }
 
     #[test]
