@@ -701,8 +701,14 @@ fn alter_risks(from: &ColumnInfo, to: &ColumnInfo) -> Vec<String> {
             to.name
         ));
     }
-    let (fb, fa) = split_type(&from.type_name);
-    let (tb, ta) = split_type(&to.type_name);
+    let (fb, fa) = {
+        let p = split_type(&from.type_name);
+        (p.base, p.params)
+    };
+    let (tb, ta) = {
+        let p = split_type(&to.type_name);
+        (p.base, p.params)
+    };
     if fb.is_empty() || tb.is_empty() || from.type_name == to.type_name {
         return out;
     }
@@ -1526,17 +1532,33 @@ pub const MYSQL_ENGINES: [&str; 4] = ["InnoDB", "MyISAM", "MEMORY", "ARCHIVE"];
 
 // ── Type + default equivalence ───────────────────────────────────────────────
 
+/// A declared type taken apart: its base keyword(s) and whatever was inside the
+/// parentheses.
+struct TypeParts {
+    /// `numeric(10,2)` → `numeric`, `int(11) unsigned` → `int unsigned`,
+    /// `timestamp(3) without time zone` → `timestamp without time zone`. Lower-cased.
+    base: String,
+    /// The parameters when **every** one of them is an integer.
+    params: Vec<i64>,
+    /// The raw parameter text when they are not — an `ENUM`/`SET` value list.
+    /// Kept verbatim (bar outer whitespace) because those values *are* the type:
+    /// dropping them made every `ENUM` equal to every other one.
+    values: Option<String>,
+}
+
 /// Split a declared type into its base keyword(s) and its parenthesised
 /// parameters: `numeric(10,2)` → `("numeric", [10, 2])`, `int(11) unsigned` →
 /// `("int unsigned", [11])`, `timestamp(3) without time zone` →
-/// `("timestamp without time zone", [3])`.
-fn split_type(t: &str) -> (String, Vec<i64>) {
+/// `("timestamp without time zone", [3])`, `enum('a','b')` →
+/// `("enum", [], Some("'a','b'"))`.
+fn split_type(t: &str) -> TypeParts {
     let t = t.trim();
     let (head, rest) = match t.find('(') {
         Some(i) => (&t[..i], &t[i + 1..]),
         None => (t, ""),
     };
-    let (args, tail) = match rest.find(')') {
+    // The *last* `)`, not the first: an ENUM value may contain one.
+    let (args, tail) = match rest.rfind(')') {
         Some(j) => (&rest[..j], &rest[j + 1..]),
         None => ("", ""),
     };
@@ -1545,11 +1567,19 @@ fn split_type(t: &str) -> (String, Vec<i64>) {
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase();
-    let params = args
+    let args = args.trim();
+    let params: Vec<i64> = args
         .split(',')
         .filter_map(|p| p.trim().parse::<i64>().ok())
         .collect();
-    (base, params)
+    // All-integer parameters get compared numerically (so `( 10 , 2 )` and
+    // `(10,2)` agree). Anything else is a value list and is compared as text.
+    let all_numeric = !args.is_empty() && params.len() == args.split(',').count();
+    TypeParts {
+        base,
+        params: if all_numeric { params } else { Vec::new() },
+        values: (!args.is_empty() && !all_numeric).then(|| args.to_string()),
+    }
 }
 
 /// A declared type reduced to a canonical spelling, so two ways of writing the
@@ -1560,7 +1590,11 @@ fn split_type(t: &str) -> (String, Vec<i64>) {
 /// reports `int`, PostgreSQL reports `character varying(45)` where every human
 /// writes `varchar(45)`, and neither difference means anything.
 pub fn normalize_type(t: &str, dialect: SqlDialect) -> String {
-    let (base, params) = split_type(t);
+    let TypeParts {
+        base,
+        params,
+        values,
+    } = split_type(t);
     if base.is_empty() {
         return String::new();
     }
@@ -1610,17 +1644,23 @@ pub fn normalize_type(t: &str, dialect: SqlDialect) -> String {
     if !pg && matches!(word.as_str(), "bool" | "boolean") {
         return format!("tinyint(1){suffix}");
     }
-    let args = if params.is_empty() || drop_width {
-        String::new()
-    } else {
-        format!(
+    // An `ENUM`/`SET` value list is re-emitted verbatim. Comparison is exact,
+    // deliberately: splitting it into values needs a quote-aware scan, and a
+    // value may itself contain a comma — so `enum('a', 'b')` vs `enum('a','b')`
+    // is reported as a change rather than risk collapsing two genuinely
+    // different types into one. A phantom change is visible and previewable; a
+    // missed edit is silent, which is the bug this replaced.
+    let args = match &values {
+        Some(v) => format!("({v})"),
+        None if params.is_empty() || drop_width => String::new(),
+        None => format!(
             "({})",
             params
                 .iter()
                 .map(|p| p.to_string())
                 .collect::<Vec<_>>()
                 .join(",")
-        )
+        ),
     };
     format!("{canon}{args}{suffix}")
 }
@@ -2643,12 +2683,52 @@ mod tests {
     fn normalize_type_survives_junk() {
         assert_eq!(normalize_type("", MySql), "");
         assert_eq!(normalize_type("   ", MySql), "");
-        assert_eq!(normalize_type("enum('a','b')", MySql), "enum");
         assert_eq!(normalize_type("weird_type", MySql), "weird_type");
         assert_eq!(
             normalize_type(" DECIMAL ( 10 , 2 ) ", MySql),
             "decimal(10,2)"
         );
+    }
+
+    #[test]
+    fn an_enum_or_set_value_list_is_part_of_the_type() {
+        // The whole list, not the bare keyword: dropping it made every ENUM equal
+        // to every other ENUM, so the designer reported no change and applied
+        // nothing when the user edited the values.
+        assert_eq!(normalize_type("enum('a','b')", MySql), "enum('a','b')");
+        assert!(!types_equal("enum('a','b')", "enum('a')", MySql));
+        assert!(!types_equal("enum('a','b')", "enum('a','b','c')", MySql));
+        assert!(!types_equal(
+            "enum('G','PG','PG-13','R','NC-17')",
+            "enum('G','PG')",
+            MySql
+        ));
+        // Order is part of a SET's (and an ENUM's) identity — the values are
+        // stored by index.
+        assert!(!types_equal("set('a','b')", "set('b','a')", MySql));
+        assert!(!types_equal("set('a','b')", "set('a')", MySql));
+        // The keyword's case is noise; a value's case is not.
+        assert!(types_equal("ENUM('a','b')", "enum('a','b')", MySql));
+        assert!(!types_equal("enum('a')", "enum('A')", MySql));
+        // Still a different type from a SET with the same members.
+        assert!(!types_equal("enum('a','b')", "set('a','b')", MySql));
+    }
+
+    #[test]
+    fn the_numeric_equivalences_survive_the_value_list_fix() {
+        // The regression net the finding named: these eight must not move.
+        assert!(types_equal("int(11)", "int", MySql));
+        assert!(types_equal("varchar(45)", "varchar(45)", MySql));
+        assert!(types_equal(
+            "character varying(45)",
+            "varchar(45)",
+            Postgres
+        ));
+        assert!(types_equal("numeric(10,2)", "decimal(10,2)", Postgres));
+        assert!(!types_equal("varchar(45)", "varchar(50)", MySql));
+        assert!(!types_equal("decimal(10,2)", "decimal(10,0)", MySql));
+        assert!(!types_equal("int(11)", "bigint", MySql));
+        assert!(!types_equal("enum('a','b')", "set('a','b')", MySql));
     }
 
     #[test]
