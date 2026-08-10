@@ -6,13 +6,15 @@
 //! / comments). It's deliberately behind this one function — a tree-sitter
 //! grammar could replace `lex_line` later without touching the editor wiring.
 //!
-//! Multi-line `/* … */` block comments are handled by a cheap cross-line pass
-//! (`starts_in_block_comment`): before lexing a line, we check whether the text
-//! before it ends inside an open block comment and, if so, colour the line's lead
-//! as a comment. A *string* spanning lines is still coloured per-line (the rarer
-//! case); a full tree-sitter grammar would generalize both.
+//! Multi-line `/* … */` block comments are the one thing a per-line lexer can't
+//! see, so `block_comment_lines` makes one forward pass over the document and
+//! records, for every line, whether it *starts* inside an open block comment;
+//! `SqlStyling` caches that per document revision, and a line that does gets its
+//! lead coloured as a comment. A *string* spanning lines is still coloured
+//! per-line (the rarer case); a full tree-sitter grammar would generalize both.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use floem::peniko::Color;
@@ -59,6 +61,17 @@ pub struct SqlStyling {
     /// follows the user's configured size. Per-tab, so zooming one editor doesn't
     /// touch others.
     zoom: RwSignal<Option<f32>>,
+    /// Per-line "starts inside a block comment" flags, with the document
+    /// revision they were computed for.
+    ///
+    /// [`apply_attr_styles`](Styling::apply_attr_styles) is called per *visible
+    /// line*, and it used to answer this by copying and re-lexing the whole
+    /// document **before that line** — Θ(visible × document) per relayout, and a
+    /// relayout happens on every keystroke. A 190 KB script opening with a
+    /// `mysqldump` header comment cost ~11 ms of extra scanning per keypress.
+    /// One forward pass answers it for every line at once, so the cost is paid
+    /// once per edit instead of ~45 times.
+    block_lines: RefCell<Option<(u64, Vec<bool>)>>,
 }
 
 impl SqlStyling {
@@ -67,6 +80,7 @@ impl SqlStyling {
             doc,
             dialect,
             zoom,
+            block_lines: RefCell::new(None),
             // Explicit IBM Plex Mono (the bundled face) rather than the generic
             // `Monospace` — keeps the editor and the Ctrl+K diff on the exact
             // same family, not just both relying on the generic override.
@@ -81,6 +95,26 @@ impl SqlStyling {
         self.zoom
             .get()
             .unwrap_or_else(crate::theme::editor_font_size)
+    }
+
+    /// Does `line` begin inside a `/* … */` opened earlier?
+    ///
+    /// Recomputes the whole document's flags when it has changed since the last
+    /// call (`cache_rev` is bumped by every edit), and answers from the cache
+    /// otherwise — so a relayout's ~45 line callbacks share one pass.
+    fn starts_in_block(&self, line: usize) -> bool {
+        if line == 0 {
+            return false;
+        }
+        let rev = self.doc.cache_rev().get_untracked();
+        let mut cache = self.block_lines.borrow_mut();
+        if cache.as_ref().map(|(r, _)| *r) != Some(rev) {
+            let text = self.doc.text().to_string();
+            *cache = Some((rev, block_comment_lines(&text, self.dialect)));
+        }
+        cache
+            .as_ref()
+            .is_some_and(|(_, flags)| flags.get(line).copied().unwrap_or(false))
     }
 }
 
@@ -122,45 +156,64 @@ impl Styling for SqlStyling {
         }
         let content = rope.line_content(line);
         // Does this line begin inside a `/* … */` opened on an earlier line?
-        let start_in_block = line > 0 && {
-            let start = rope.offset_of_line(line);
-            starts_in_block_comment(&rope.slice_to_cow(0..start), self.dialect)
-        };
+        let start_in_block = self.starts_in_block(line);
         for (start, end, tok) in lex_line(&content, self.dialect, start_in_block) {
             attrs.add_span(start..end, default.color(tok.color()));
         }
     }
 }
 
-/// Whether `prefix` (all the editor text before the line being highlighted) ends
-/// *inside* an unterminated `/* … */` block comment — so the next line starts in a
-/// comment and its lead must be coloured as one. Built on the shared
-/// `schemaic_core::sql::skip_noncode` primitive, so strings / line-comments /
-/// dollar-quotes are skipped (a `/*` inside a string never opens a comment) and the
-/// block boundary agrees with the rest of the SQL tooling.
-fn starts_in_block_comment(prefix: &str, dialect: SqlDialect) -> bool {
-    let b = prefix.as_bytes();
-    // Fast path: no `/*` anywhere → definitely not inside a block comment.
-    if !b.windows(2).any(|w| w == b"/*") {
-        return false;
-    }
+/// For every line of `text`, whether it **starts inside** a `/* … */` block
+/// comment opened on an earlier line — so its lead must be coloured as a comment.
+///
+/// One forward pass for the whole document, rather than re-lexing the prefix per
+/// line: the editor asks this ~45 times per relayout and a relayout happens on
+/// every keystroke, so the per-line form was Θ(visible × document).
+///
+/// Built on the shared `schemaic_core::sql::skip_noncode` primitive, so
+/// strings / line-comments / dollar-quotes are skipped (a `/*` inside a string
+/// never opens a comment) and the block boundary agrees with the rest of the SQL
+/// tooling. `flags[0]` is always false — line 0 has nothing before it.
+fn block_comment_lines(text: &str, dialect: SqlDialect) -> Vec<bool> {
+    let b = text.as_bytes();
     let n = b.len();
+    // Where the block comments are. `skip_noncode` returns the end of whatever
+    // non-code region starts at `i`; an unterminated block runs to EOF.
+    let mut regions: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
     while i < n {
-        if let Some(end) = schemaic_core::sql::skip_noncode(b, i, dialect) {
-            // A block comment reaching `end` is *terminated* only if `end` sits right
-            // after a real `*/` (at least `/**/`, i.e. `end >= i + 4`, so the close
-            // doesn't overlap the opening `/*`). Otherwise it runs into the next line.
-            let is_block = b[i] == b'/' && b.get(i + 1) == Some(&b'*');
-            if is_block && !(end >= i + 4 && &b[end - 2..end] == b"*/") {
-                return true;
+        match schemaic_core::sql::skip_noncode(b, i, dialect) {
+            Some(end) => {
+                if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                    regions.push((i, end.min(n)));
+                }
+                i = end.max(i + 1);
             }
-            i = end.max(i + 1);
-        } else {
-            i += 1;
+            None => i += 1,
         }
     }
-    false
+    // A line starts inside a comment when its start offset falls *strictly*
+    // inside a region: equal to the region's end means the `*/` closed it on the
+    // previous line, and equal to its start means this line opens the comment
+    // itself (which `lex_line` handles on its own).
+    let mut flags = vec![false];
+    if regions.is_empty() {
+        flags.resize(1 + b.iter().filter(|&&c| c == b'\n').count(), false);
+        return flags;
+    }
+    let mut r = 0;
+    for (p, _) in b.iter().enumerate().filter(|&(_, &c)| c == b'\n') {
+        let start = p + 1;
+        while r < regions.len() && regions[r].1 <= start {
+            r += 1;
+        }
+        flags.push(
+            regions
+                .get(r)
+                .is_some_and(|&(lo, hi)| lo < start && start < hi),
+        );
+    }
+    flags
 }
 
 /// Public: color spans for a standalone SQL line (byte ranges + color), for
@@ -371,21 +424,47 @@ mod tests {
             .collect()
     }
 
+    fn flags(text: &str) -> Vec<bool> {
+        block_comment_lines(text, SqlDialect::MySql)
+    }
+
     #[test]
     fn block_open_state_across_lines() {
-        let d = SqlDialect::MySql;
-        // Unterminated `/*` → the next line starts inside the comment.
-        assert!(starts_in_block_comment("SELECT 1; /* note", d));
-        // Closed on the same line → not inside.
-        assert!(!starts_in_block_comment("SELECT 1; /* note */", d));
-        // Opened on an earlier line and still open.
-        assert!(starts_in_block_comment("/* a\nb\n", d));
-        // Opened then closed across lines → not inside after the close.
-        assert!(!starts_in_block_comment("/* a\nb */\n", d));
+        // One flag per line, line 0 never inside.
+        // Opened on line 0 and still open → lines 1 and 2 are inside it.
+        assert_eq!(flags("/* a\nb\nc"), vec![false, true, true]);
+        // Closed on line 1 → line 2 is back in code.
+        assert_eq!(flags("/* a\nb */\nc"), vec![false, true, false]);
+        // Closed on the line that opened it → nothing after is inside.
+        assert_eq!(flags("SELECT 1; /* note */\nSELECT 2"), vec![false, false]);
+        // Unterminated at EOF → every following line is inside.
+        assert_eq!(flags("SELECT 1; /* note\nmore"), vec![false, true]);
         // A `/*` inside a string literal does not open a comment.
-        assert!(!starts_in_block_comment("SELECT '/*';\n", d));
-        // No `/*` at all.
-        assert!(!starts_in_block_comment("SELECT 1;\n", d));
+        assert_eq!(flags("SELECT '/*';\nSELECT 2"), vec![false, false]);
+        // A `/*` inside a line comment doesn't either.
+        assert_eq!(flags("-- /* not a comment\nSELECT 2"), vec![false, false]);
+        // No `/*` at all — still one flag per line.
+        assert_eq!(flags("SELECT 1;\nSELECT 2;\n"), vec![false, false, false]);
+        assert_eq!(flags(""), vec![false]);
+    }
+
+    #[test]
+    fn a_comment_closing_exactly_at_a_line_end_does_not_leak() {
+        // The off-by-one that matters: the `*/` is the last thing on line 0, so
+        // line 1 starts *at* the region's end and is code, not comment.
+        assert_eq!(flags("/* a */\nSELECT 1"), vec![false, false]);
+        // And one that opens at a line start doesn't mark its own line.
+        assert_eq!(flags("SELECT 1\n/* a\nb"), vec![false, false, true]);
+    }
+
+    #[test]
+    fn several_block_comments_are_tracked_in_order() {
+        // Regions are consumed in order as the line starts advance; a later
+        // comment must not be missed because an earlier one was passed.
+        assert_eq!(
+            flags("/* a\nb */ SELECT 1\n/* c\nd */\nSELECT 2"),
+            vec![false, true, false, true, false]
+        );
     }
 
     #[test]
