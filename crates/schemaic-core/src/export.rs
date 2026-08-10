@@ -175,16 +175,55 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
 
 /// Quote a CSV field if it contains a delimiter/quote/newline, and neutralize
 /// spreadsheet formula/DDE injection (§7.5): a value a spreadsheet would evaluate
-/// as a formula — leading `=`, `+`, `@`, or a `\t`/`\r` control char — is prefixed
-/// with a single quote so Excel/Sheets import it as text (a cell `=HYPERLINK(...)`
-/// otherwise executes on open). Leading `-` is deliberately NOT guarded: it's a
-/// valid numeric sign and prefixing it would corrupt every negative number.
+/// as a formula — leading `=`, `+`, `@`, `-`, or a `\t`/`\r` control char — is
+/// prefixed with a single quote so Excel/Sheets import it as text (a cell
+/// `=HYPERLINK(...)` otherwise executes on open).
+///
+/// **Leading `-` is guarded only when the value isn't a number.** It was once
+/// skipped entirely, on the grounds that prefixing it would corrupt every
+/// negative value — but that dichotomy isn't forced. `-1+1+cmd|' /C calc'!A0` is
+/// a DDE payload and `-5.25` is a number, and [`is_negative_number`] tells them
+/// apart, so both cases can be served.
+/// Is `s` a plain negative number — the one leading-`-` shape a spreadsheet
+/// should be allowed to evaluate?
+///
+/// Deliberately strict: a decimal or scientific-notation literal and nothing
+/// else. Anything a formula could hide in — an operator, a cell reference, a
+/// `|` DDE separator — fails, and a false negative only costs a leading
+/// apostrophe on a value that wasn't a number anyway.
+fn is_negative_number(s: &str) -> bool {
+    // A lone `-` never reaches here (the caller skips it — there is nothing after
+    // the sign for a formula to hide in), so `rest` is non-empty in practice.
+    let rest = &s[1..];
+    if rest.is_empty() {
+        return false;
+    }
+    // At most one exponent, split on it; each part must look numeric.
+    let (mantissa, exponent) = match rest.split_once(['e', 'E']) {
+        Some((m, e)) => (m, Some(e)),
+        None => (rest, None),
+    };
+    let mantissa_ok = !mantissa.is_empty()
+        && mantissa.bytes().filter(|b| *b == b'.').count() <= 1
+        && mantissa.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && mantissa.bytes().any(|b| b.is_ascii_digit());
+    let exponent_ok = match exponent {
+        None => true,
+        Some(e) => {
+            let digits = e.strip_prefix(['+', '-']).unwrap_or(e);
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        }
+    };
+    mantissa_ok && exponent_ok
+}
+
 pub fn csv_field(s: &str) -> String {
     let guarded;
     let s = if matches!(
         s.as_bytes().first(),
         Some(b'=' | b'+' | b'@' | b'\t' | b'\r')
-    ) {
+    ) || (s.len() > 1 && s.starts_with('-') && !is_negative_number(s))
+    {
         guarded = format!("'{s}");
         guarded.as_str()
     } else {
@@ -462,6 +501,12 @@ pub fn export_html(rs: &ResultSet, order: &[usize]) -> String {
 /// [`export_html`], streamed. The preamble and closing tags are fixed strings, so
 /// nothing here needs to see the whole result first.
 pub fn export_html_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> io::Result<()> {
+    // The charset declaration is not optional. The bytes written here are UTF-8,
+    // but for a `file://` URL with no declaration and no BOM the HTML spec leaves
+    // the default to the user agent — windows-1252 in Western locales — so
+    // `José` opened as `JosÃ©`. Chrome dropped its manual encoding override in
+    // 2014, so there was no in-browser workaround; the user had to edit the file.
+    w.write_all(b"<meta charset=\"utf-8\">\n")?;
     w.write_all(b"<table>\n<thead>\n<tr>")?;
     for c in &rs.columns {
         w.write_all(b"<th>")?;
@@ -910,10 +955,41 @@ mod tests {
         assert_eq!(csv_field("@SUM(A1)"), "'@SUM(A1)");
         // Tab isn't a CSV delimiter, so the guarded value isn't additionally quoted.
         assert_eq!(csv_field("\tcmd"), "'\tcmd");
-        // Negative numbers are NOT guarded (would corrupt every negative value).
-        assert_eq!(csv_field("-5"), "-5");
         // A `=` mid-value is harmless — only leading chars trigger a formula.
         assert_eq!(csv_field("a=b"), "a=b");
+    }
+
+    /// A leading `-` was let through on the grounds that guarding it would
+    /// corrupt every negative number. That dichotomy isn't forced: a number and
+    /// a formula are distinguishable, so guard the one and leave the other.
+    #[test]
+    fn csv_guards_a_leading_dash_that_is_not_a_number() {
+        // The DDE payload the finding was written from.
+        assert_eq!(
+            csv_field("-1+1+cmd|' /C calc'!A0"),
+            "'-1+1+cmd|' /C calc'!A0"
+        );
+        assert_eq!(csv_field("-A1"), "'-A1");
+        assert_eq!(csv_field("-=1"), "'-=1");
+    }
+
+    /// …and every shape of negative number still exports unguarded, which is the
+    /// whole reason the character was skipped in the first place.
+    #[test]
+    fn csv_leaves_negative_numbers_alone() {
+        for n in [
+            "-5",
+            "-0",
+            "-5.25",
+            "-.5",
+            "-1e10",
+            "-1E-10",
+            "-1234567890123456789",
+        ] {
+            assert_eq!(csv_field(n), n, "{n} is a number, not a formula");
+        }
+        // A bare dash isn't a formula either — it's a common "no value" marker.
+        assert_eq!(csv_field("-"), "-");
     }
 
     #[test]
@@ -1013,10 +1089,28 @@ mod tests {
         assert!(out.contains("<td>x&amp;y</td>"));
         // NULL → empty cell, not the literal "NULL".
         assert!(out.contains("<td></td>"));
-        // Well-formed table scaffolding.
-        assert!(out.trim_start().starts_with("<table>"));
+        // Well-formed table scaffolding, behind the charset declaration.
+        assert!(out.trim_start().starts_with("<meta charset=\"utf-8\">"));
+        assert!(out.contains("<table>"));
         assert!(out.contains("<thead>") && out.contains("<tbody>"));
         assert!(out.trim_end().ends_with("</table>"));
+    }
+
+    /// Without a declared encoding, a browser opening the saved `file://` HTML
+    /// falls back to windows-1252 in Western locales and renders `José` as
+    /// `JosÃ©`. The bytes were always correct UTF-8; nothing said so.
+    #[test]
+    fn export_html_declares_utf8_so_non_ascii_survives() {
+        let rs = ResultSet::from_rows(
+            vec![col("name")],
+            vec![vec![Value::Str("José 東京 €".to_string())]],
+        );
+        let out = export_html(&rs, &[0]);
+        assert!(
+            out.trim_start().starts_with("<meta charset=\"utf-8\">"),
+            "the declaration must precede any content:\n{out}"
+        );
+        assert!(out.contains("José 東京 €"), "and the text passes through");
     }
 
     #[test]
