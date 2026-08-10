@@ -11,6 +11,7 @@
 //! `accept_completion`/`completion_popup` are `pub(crate)`; the rest is internal.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use floem::kurbo::Point;
 use floem::prelude::*;
@@ -166,7 +167,11 @@ struct SchemaIndex {
     /// (database, table) (both lowercase) → its columns, for *every* loaded database.
     /// Backs qualified completion of a cross-database table (`otherdb.t` or an alias
     /// pointing at one), which the active-db-only `columns` map can't answer.
-    columns_by_db: HashMap<(String, String), Vec<ColMeta>>,
+    ///
+    /// `Rc` because the same `Vec` also feeds the unqualified merge below, and
+    /// this map is populated for every loaded database on every recompute —
+    /// storing it by value cloned each table's columns a second time.
+    columns_by_db: HashMap<(String, String), Rc<Vec<ColMeta>>>,
     /// database name (lowercase) → its table names.
     tables_by_db: HashMap<String, Vec<String>>,
 }
@@ -182,7 +187,7 @@ impl SchemaIndex {
         let mut databases = Vec::new();
         let mut tables = Vec::new();
         let mut columns: HashMap<String, Vec<ColMeta>> = HashMap::new();
-        let mut columns_by_db: HashMap<(String, String), Vec<ColMeta>> = HashMap::new();
+        let mut columns_by_db: HashMap<(String, String), Rc<Vec<ColMeta>>> = HashMap::new();
         let mut tables_by_db: HashMap<String, Vec<String>> = HashMap::new();
         for node in db_nodes.get_untracked() {
             if !databases
@@ -198,24 +203,28 @@ impl SchemaIndex {
                 let in_scope = active_db.is_none_or(|db| db.eq_ignore_ascii_case(&node.database));
                 for t in &schema.tables {
                     by_db.push(t.name.clone());
-                    // Columns covered by a foreign key (case-folded) → the FK tint.
-                    let fk_cols: HashSet<String> = t
-                        .foreign_keys
-                        .iter()
-                        .flat_map(|fk| fk.columns.iter())
-                        .map(|c| c.to_ascii_lowercase())
-                        .collect();
-                    let metas: Vec<ColMeta> = t
-                        .columns
-                        .iter()
-                        .map(|c| ColMeta {
-                            name: c.name.clone(),
-                            type_name: c.type_name.clone(),
-                            nullable: c.nullable,
-                            primary_key: c.primary_key,
-                            foreign_key: fk_cols.contains(&c.name.to_ascii_lowercase()),
-                        })
-                        .collect();
+                    // Is this column covered by a foreign key (→ the FK tint)? A
+                    // linear scan of the table's FK columns, which number a handful:
+                    // building a lowercased `HashSet` cost an allocation per FK
+                    // column *and* one per column looked up.
+                    let is_fk = |name: &str| {
+                        t.foreign_keys
+                            .iter()
+                            .flat_map(|fk| fk.columns.iter())
+                            .any(|c| c.eq_ignore_ascii_case(name))
+                    };
+                    let metas: Rc<Vec<ColMeta>> = Rc::new(
+                        t.columns
+                            .iter()
+                            .map(|c| ColMeta {
+                                name: c.name.clone(),
+                                type_name: c.type_name.clone(),
+                                nullable: c.nullable,
+                                primary_key: c.primary_key,
+                                foreign_key: is_fk(&c.name),
+                            })
+                            .collect(),
+                    );
                     // Every database's columns are keyed by (db, table) for qualified
                     // (incl. cross-database) completion.
                     columns_by_db.insert(
@@ -225,9 +234,16 @@ impl SchemaIndex {
                     if in_scope {
                         tables.push((t.name.clone(), node.database.clone()));
                         let entry = columns.entry(t.name.to_ascii_lowercase()).or_default();
-                        for m in metas {
-                            if !entry.iter().any(|e| e.name.eq_ignore_ascii_case(&m.name)) {
-                                entry.push(m);
+                        if entry.is_empty() {
+                            // The ordinary case — nothing to dedup against, so skip
+                            // the per-column scan that makes the merge quadratic.
+                            entry.extend(metas.iter().cloned());
+                        } else {
+                            // A same-named table in another database: merge by name.
+                            for m in metas.iter() {
+                                if !entry.iter().any(|e| e.name.eq_ignore_ascii_case(&m.name)) {
+                                    entry.push(m.clone());
+                                }
                             }
                         }
                     }
@@ -577,7 +593,7 @@ pub(crate) fn recompute_completions(
             Some(db) => schema
                 .columns_by_db
                 .get(&(db.to_ascii_lowercase(), name.to_ascii_lowercase()))
-                .cloned()
+                .map(|m| m.as_ref().clone())
                 .unwrap_or_default(),
             None => schema
                 .columns
