@@ -124,6 +124,41 @@ fn sort_favorites_first(nodes: &mut [ConnNode], favorites: &[FavoriteRule], conn
     });
 }
 
+/// Which of a database's tables one `push_tables` call covers.
+///
+/// This exists because the two cases were once both spelled `Option<&str>`, and
+/// the flat one passed `None` — which then filtered on `table.schema == None`.
+/// But **flat means "this database has no schema level", not "these tables have
+/// no namespace"**: on PostgreSQL every table carries `Some("public")`, so the
+/// filter matched nothing and keyboard navigation could not reach a single table
+/// or column, while the render — which has no such filter — listed them all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TableScope<'a> {
+    /// No schema level: every table hangs off the database row, whatever
+    /// namespace it happens to carry.
+    Flat,
+    /// One PostgreSQL namespace's tables.
+    Namespace(&'a str),
+}
+
+impl<'a> TableScope<'a> {
+    /// Does a table with this namespace belong to the scope?
+    fn covers(self, table_schema: Option<&str>) -> bool {
+        match self {
+            TableScope::Flat => true,
+            TableScope::Namespace(ns) => table_schema == Some(ns),
+        }
+    }
+
+    /// The namespace name, for the search-term check (`Flat` has none to match).
+    fn name(self) -> Option<&'a str> {
+        match self {
+            TableScope::Flat => None,
+            TableScope::Namespace(ns) => Some(ns),
+        }
+    }
+}
+
 // Build the visible-row list in display order. Mirrors the tree's own render
 // rules: hidden DBs dropped; a non-empty filter force-expands DBs and narrows
 // their tables to name matches; only expanded tables contribute columns+keys.
@@ -185,10 +220,17 @@ fn visible_nav_rows(
         // Mirror the tree: with >1 PostgreSQL namespace, tables hang off a schema
         // row; otherwise they hang off the database directly.
         let groups = schema_groups(schema);
-        let push_tables = |rows: &mut Vec<NavRow>, parent: &String, ns: Option<&str>| {
+        let push_tables = |rows: &mut Vec<NavRow>, parent: &String, scope: TableScope| {
             // A schema whose own name matches shows all its tables, like `db_hit`.
-            let ns_hit = filtering && ns.is_some_and(|s| s.to_lowercase().contains(&filt));
-            for t in schema.tables.iter().filter(|t| t.schema.as_deref() == ns) {
+            let ns_hit = filtering
+                && scope
+                    .name()
+                    .is_some_and(|s| s.to_lowercase().contains(&filt));
+            for t in schema
+                .tables
+                .iter()
+                .filter(|t| scope.covers(t.schema.as_deref()))
+            {
                 if filtering && !db_hit && !ns_hit && !t.matches_search(&filt) {
                     continue;
                 }
@@ -219,7 +261,7 @@ fn visible_nav_rows(
             }
         };
         if groups.is_empty() {
-            push_tables(&mut rows, &db_key, None);
+            push_tables(&mut rows, &db_key, TableScope::Flat);
             continue;
         }
         for ns in &groups {
@@ -243,7 +285,7 @@ fn visible_nav_rows(
                 expanded: open,
             });
             if open {
-                push_tables(&mut rows, &key, Some(ns));
+                push_tables(&mut rows, &key, TableScope::Namespace(ns));
             }
         }
     }
@@ -1547,6 +1589,32 @@ mod tests {
             tables: vec![tbl(None, "users"), tbl(None, "orders")],
         };
         assert!(schema_groups(&s).is_empty());
+    }
+
+    /// The flat branch is taken whenever a database has no *schema level* — which
+    /// on PostgreSQL includes every ordinary `public`-only database, whose tables
+    /// still carry `Some("public")`. Selecting them by `schema == None` there
+    /// matched nothing, so arrow-key navigation reached no table or column at all
+    /// while the tree rendered them normally. Observed on the user's instance.
+    #[test]
+    fn flat_scope_covers_tables_whatever_namespace_they_carry() {
+        // PostgreSQL: a namespace is present and must not exclude the table.
+        assert!(TableScope::Flat.covers(Some("public")));
+        assert!(TableScope::Flat.covers(Some("sales")));
+        // MySQL: no namespace at all — the case that always worked.
+        assert!(TableScope::Flat.covers(None));
+    }
+
+    /// The grouped branch must stay exact, or a table would appear under every
+    /// namespace of a multi-schema database.
+    #[test]
+    fn namespace_scope_selects_only_that_namespace() {
+        let sales = TableScope::Namespace("sales");
+        assert!(sales.covers(Some("sales")));
+        assert!(!sales.covers(Some("public")));
+        assert!(!sales.covers(None));
+        assert_eq!(sales.name(), Some("sales"));
+        assert_eq!(TableScope::Flat.name(), None, "no namespace to search on");
     }
 
     #[test]
