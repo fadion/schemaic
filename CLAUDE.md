@@ -324,7 +324,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   (DELETEs → UPDATEs → INSERTs) in one transaction, each statement required to affect exactly 1 row
   (else roll back all) — so an over-optimistic updatability analysis can't corrupt data. Commits
   with inserts/deletes full-re-run the query (membership/order changed); pure-UPDATE commits splice
-  in place.
+  in place. Both halves of that rule are **pure and tested in `core::model`**, and both engines'
+  executors call them: `GridWrite::plan` is the statement order and `one_row_verdict` is the
+  per-statement verdict *and* its message — so neither can drift between MySQL and PostgreSQL, and
+  a change to `affected != 1` fails a test rather than passing silently.
 - **Identifier scanning treats bytes `>= 0x80` as word bytes** so Unicode identifiers tokenize whole
   (`is_word_byte`, `tokenize_range`, `syntax_errors`).
 - **Splitting `lib.rs` / `main.rs`:** grep the line range for interleaved unrelated `fn`s first; a

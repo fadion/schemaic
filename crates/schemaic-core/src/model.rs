@@ -549,6 +549,94 @@ impl GridWrite {
     pub fn is_empty(&self) -> bool {
         self.updates.is_empty() && self.inserts.is_empty() && self.deletes.is_empty()
     }
+
+    /// The batch's statements in the order they must execute: **deletes →
+    /// updates → inserts**.
+    ///
+    /// Deletes run first so "delete a row, then insert one carrying the same
+    /// unique key" works. Every engine's executor iterates this one plan, so the
+    /// order can't drift between them — and it is assertable without a server.
+    pub fn plan(&self) -> Vec<WriteStep<'_>> {
+        let dels = self.deletes.iter().map(WriteStep::Delete);
+        let upds = self.updates.iter().map(WriteStep::Update);
+        let inss = self.inserts.iter().map(WriteStep::Insert);
+        dels.chain(upds).chain(inss).collect()
+    }
+}
+
+/// One statement of a [`GridWrite`], as [`GridWrite::plan`] orders them.
+#[derive(Clone, Copy, Debug)]
+pub enum WriteStep<'a> {
+    Delete(&'a RowDelete),
+    Update(&'a RowEdit),
+    Insert(&'a RowInsert),
+}
+
+impl WriteStep<'_> {
+    /// How the statement is named in the 1-row guard's error message.
+    pub fn action(&self) -> &'static str {
+        match self {
+            WriteStep::Delete(_) => "delete on",
+            WriteStep::Update(_) => "update on",
+            WriteStep::Insert(_) => "insert into",
+        }
+    }
+
+    pub fn database(&self) -> &str {
+        match self {
+            WriteStep::Delete(d) => &d.database,
+            WriteStep::Update(e) => &e.database,
+            WriteStep::Insert(i) => &i.database,
+        }
+    }
+
+    pub fn schema(&self) -> Option<&str> {
+        match self {
+            WriteStep::Delete(d) => d.schema.as_deref(),
+            WriteStep::Update(e) => e.schema.as_deref(),
+            WriteStep::Insert(i) => i.schema.as_deref(),
+        }
+    }
+
+    pub fn table(&self) -> &str {
+        match self {
+            WriteStep::Delete(d) => &d.table,
+            WriteStep::Update(e) => &e.table,
+            WriteStep::Insert(i) => &i.table,
+        }
+    }
+
+    /// `db.table`, or `db.schema.table` on an engine that has namespaces — for
+    /// the error message only, so it is deliberately unquoted.
+    fn qualified(&self) -> String {
+        match self.schema() {
+            Some(s) => format!("{}.{}.{}", self.database(), s, self.table()),
+            None => format!("{}.{}", self.database(), self.table()),
+        }
+    }
+}
+
+/// The 1-row write-back safety net, as a decision: a staged statement must
+/// affect **exactly one** row, and anything else fails the whole batch.
+///
+/// This is what stands between an over-optimistic [`crate::edit::analyze_edit`]
+/// and a corrupted table. `0` means the WHERE key matched nothing (the row moved
+/// or was already gone); `2` or more means the key wasn't unique, and applying
+/// the edit would have silently rewritten rows the user never saw. Both roll the
+/// batch back.
+///
+/// Pure so both engines share one verdict *and* one message — it used to be
+/// written inline in each executor, with two divergent wordings and no test.
+/// `Err` carries the message; the caller wraps it in its own error type.
+pub fn one_row_verdict(step: WriteStep<'_>, affected: u64) -> Result<(), String> {
+    if affected == 1 {
+        return Ok(());
+    }
+    Err(format!(
+        "{} {} affected {affected} rows (expected exactly 1) — rolled back all changes",
+        step.action(),
+        step.qualified(),
+    ))
 }
 
 /// A template for re-`SELECT`ing just-edited rows so the grid can splice DB
@@ -862,5 +950,103 @@ mod tests {
         assert_eq!(rs.elapsed_ms, 12);
         assert!(rs.truncated);
         assert!(rs.affected.is_none());
+    }
+
+    // ── The 1-row write-back safety net ──
+    //
+    // The guard between an over-optimistic `analyze_edit` and a corrupted table.
+    // Both engines call this one verdict; before the extraction it was written
+    // inline in each executor and neither copy had a test.
+
+    fn del(table: &str) -> RowDelete {
+        RowDelete {
+            database: "db".into(),
+            schema: None,
+            table: table.into(),
+            key: vec![("id".into(), Value::Int(1))],
+        }
+    }
+
+    fn upd(table: &str) -> RowEdit {
+        RowEdit {
+            database: "db".into(),
+            schema: None,
+            table: table.into(),
+            set: vec![("name".into(), Some("x".into()))],
+            key: vec![("id".into(), Value::Int(1))],
+        }
+    }
+
+    fn ins(table: &str) -> RowInsert {
+        RowInsert {
+            database: "db".into(),
+            schema: None,
+            table: table.into(),
+            cols: vec![("name".into(), Some("x".into()))],
+        }
+    }
+
+    #[test]
+    fn one_row_verdict_accepts_exactly_one_row() {
+        assert!(one_row_verdict(WriteStep::Update(&upd("t")), 1).is_ok());
+        assert!(one_row_verdict(WriteStep::Delete(&del("t")), 1).is_ok());
+        assert!(one_row_verdict(WriteStep::Insert(&ins("t")), 1).is_ok());
+    }
+
+    #[test]
+    fn one_row_verdict_rejects_a_key_that_matched_nothing() {
+        // The row moved or was already gone — applying the rest of the batch on
+        // top of that would commit a half-understood edit.
+        let e = one_row_verdict(WriteStep::Update(&upd("city")), 0).unwrap_err();
+        assert!(e.contains("update on db.city"), "{e}");
+        assert!(e.contains("affected 0 rows"), "{e}");
+        assert!(e.contains("rolled back all changes"), "{e}");
+    }
+
+    #[test]
+    fn one_row_verdict_rejects_a_key_that_was_not_unique() {
+        // The corruption case: two rows matched, so committing would silently
+        // rewrite a row the user never saw.
+        let e = one_row_verdict(WriteStep::Delete(&del("city")), 2).unwrap_err();
+        assert!(e.contains("delete on db.city"), "{e}");
+        assert!(e.contains("affected 2 rows"), "{e}");
+        assert!(one_row_verdict(WriteStep::Insert(&ins("city")), 7).is_err());
+    }
+
+    #[test]
+    fn one_row_verdict_names_the_namespace_when_there_is_one() {
+        let mut e = upd("city");
+        e.schema = Some("public".into());
+        let msg = one_row_verdict(WriteStep::Update(&e), 0).unwrap_err();
+        assert!(msg.contains("db.public.city"), "{msg}");
+    }
+
+    #[test]
+    fn write_plan_orders_deletes_then_updates_then_inserts() {
+        // Deletes first is load-bearing: "delete a row, then insert one carrying
+        // the same unique key" must work. Both engines iterate this plan.
+        let w = GridWrite {
+            updates: vec![upd("u1"), upd("u2")],
+            inserts: vec![ins("i1")],
+            deletes: vec![del("d1")],
+        };
+        let plan = w.plan();
+        let names: Vec<(&str, &str)> = plan.iter().map(|s| (s.action(), s.table())).collect();
+        assert_eq!(
+            names,
+            vec![
+                ("delete on", "d1"),
+                ("update on", "u1"),
+                ("update on", "u2"),
+                ("insert into", "i1"),
+            ]
+        );
+    }
+
+    #[test]
+    fn write_plan_of_an_empty_batch_is_empty() {
+        let w = GridWrite::default();
+        assert!(w.is_empty());
+        assert!(w.plan().is_empty());
     }
 }

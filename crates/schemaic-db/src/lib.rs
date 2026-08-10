@@ -26,7 +26,7 @@ use mysql_async::{Column as MyColumn, Conn, Row, Value as MyValue};
 use mysql_async::{OptsBuilder, Params};
 use schemaic_core::model::{
     Column, ColumnFlags as CoreColFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
-    ResultBuilder, ResultSet, RowDelete, RowEdit, RowInsert, Value,
+    ResultBuilder, ResultSet, RowDelete, RowEdit, RowInsert, Value, WriteStep, one_row_verdict,
 };
 use schemaic_core::schema::{
     ColumnInfo, DbSchema, ForeignKeyInfo, IndexInfo, TableInfo, ViewOptions,
@@ -1644,17 +1644,14 @@ pub(crate) async fn write_on(
     conn.query_drop(scope.begin_sql()).await.map_err(qerr)?;
 
     // One statement + its 1-row check. On a miss the batch is undone and the
-    // error describes what happened, in the caller's terms.
-    #[allow(clippy::too_many_arguments)]
+    // error describes what happened, in the caller's terms — the verdict and its
+    // wording are `one_row_verdict`, shared with the PostgreSQL executor.
     async fn one(
         conn: &mut Conn,
         scope: TxScope,
         sql: String,
         params: Params,
-        action: &str,
-        verb: &str,
-        database: &str,
-        table: &str,
+        step: WriteStep<'_>,
     ) -> Result<u64, DbError> {
         let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
         if let Err(e) = conn.exec_drop(sql, params).await {
@@ -1662,58 +1659,23 @@ pub(crate) async fn write_on(
             return Err(qerr(e));
         }
         let affected = conn.affected_rows();
-        if affected != 1 {
+        if let Err(msg) = one_row_verdict(step, affected) {
             let _ = conn.query_drop(scope.rollback_sql()).await;
-            return Err(DbError::Query(format!(
-                "{action} `{database}`.`{table}` {verb} {affected} rows (expected exactly 1) — \
-                 rolled back all changes"
-            )));
+            return Err(DbError::Query(msg));
         }
         Ok(affected)
     }
 
     let mut total: u64 = 0;
-    for del in &write.deletes {
-        let (sql, params) = build_delete(del);
-        total += one(
-            conn,
-            scope,
-            sql,
-            params,
-            "delete on",
-            "matched",
-            &del.database,
-            &del.table,
-        )
-        .await?;
-    }
-    for edit in &write.updates {
-        let (sql, params) = build_update(edit);
-        total += one(
-            conn,
-            scope,
-            sql,
-            params,
-            "update on",
-            "matched",
-            &edit.database,
-            &edit.table,
-        )
-        .await?;
-    }
-    for ins in &write.inserts {
-        let (sql, params) = build_insert(ins);
-        total += one(
-            conn,
-            scope,
-            sql,
-            params,
-            "insert into",
-            "added",
-            &ins.database,
-            &ins.table,
-        )
-        .await?;
+    // Deletes → updates → inserts, ordered by `GridWrite::plan` rather than by
+    // three loops each engine has to keep in step.
+    for step in write.plan() {
+        let (sql, params) = match step {
+            WriteStep::Delete(del) => build_delete(del),
+            WriteStep::Update(edit) => build_update(edit),
+            WriteStep::Insert(ins) => build_insert(ins),
+        };
+        total += one(conn, scope, sql, params, step).await?;
     }
 
     if let Err(e) = conn.query_drop(scope.commit_sql()).await {
