@@ -858,7 +858,7 @@ impl ChangeSet {
                 }
                 cl.push(format!(
                     "COMMENT={}",
-                    ddl_string(comment.as_deref().unwrap_or(""))
+                    ddl_string(comment.as_deref().unwrap_or(""), SqlDialect::MySql)
                 ));
             }
         }
@@ -1020,7 +1020,7 @@ impl ChangeSet {
                 Change::TableOptions { comment, .. } => out.push(format!(
                     "COMMENT ON TABLE {} IS {};",
                     self.qname(),
-                    comment_literal(comment.as_deref())
+                    comment_literal(comment.as_deref(), d)
                 )),
                 _ => {}
             }
@@ -1224,9 +1224,9 @@ fn create_index_sql(ix: &IndexInfo, qtable: &str, dialect: SqlDialect) -> String
     )
 }
 
-fn comment_literal(c: Option<&str>) -> String {
+fn comment_literal(c: Option<&str>, dialect: SqlDialect) -> String {
     match c.filter(|s| !s.is_empty()) {
-        Some(s) => ddl_string(s),
+        Some(s) => ddl_string(s, dialect),
         None => "NULL".to_string(),
     }
 }
@@ -1240,7 +1240,7 @@ fn comment_on_column(
     format!(
         "COMMENT ON COLUMN {qtable}.{} IS {};",
         ddl_ident_in(column, dialect),
-        comment_literal(comment)
+        comment_literal(comment, dialect)
     )
 }
 
@@ -1336,7 +1336,7 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
             head.push_str(&format!(" COLLATE={c}"));
         }
         if let Some(c) = d.comment.as_deref().filter(|c| !c.is_empty()) {
-            head.push_str(&format!(" COMMENT={}", ddl_string(c)));
+            head.push_str(&format!(" COMMENT={}", ddl_string(c, dialect)));
         }
     }
     head.push(';');
@@ -1346,7 +1346,10 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
             out.push(create_index_sql(&ix.info, &qname, dialect));
         }
         if let Some(c) = d.comment.as_deref().filter(|c| !c.is_empty()) {
-            out.push(format!("COMMENT ON TABLE {qname} IS {};", ddl_string(c)));
+            out.push(format!(
+                "COMMENT ON TABLE {qname} IS {};",
+                ddl_string(c, dialect)
+            ));
         }
         for c in &d.columns {
             if let Some(cm) = c.info.comment.as_deref().filter(|s| !s.is_empty()) {
@@ -3076,6 +3079,10 @@ mod tests {
                 (MySql, a_view()),
                 (Postgres, pg_city()),
                 (Postgres, pg_invoice()),
+                // Values that need escaping, on both engines — the gap A5-L6-03
+                // named: without these the round-trip gate never sees one.
+                (MySql, backslashes(MySql)),
+                (Postgres, backslashes(Postgres)),
             ]
         }
 
@@ -3091,6 +3098,82 @@ mod tests {
                     cs.changes
                 );
             }
+        }
+
+        /// A table whose comment and default both contain a backslash.
+        ///
+        /// The default is stored the way introspection stores it — as
+        /// ready-to-emit SQL text, so already quoted and escaped for its engine.
+        fn backslashes(dialect: SqlDialect) -> TableInfo {
+            let mut col = c("path", "varchar(255)", true);
+            col.default = Some(crate::schema::ddl_string(r"C:\temp", dialect));
+            col.comment = Some(r"windows path, e.g. C:\temp".into());
+            let mut t = TableInfo {
+                name: "paths".into(),
+                columns: vec![pk(auto(c("id", "int(11)", false))), col],
+                comment: Some(r"paths like C:\temp".into()),
+                ..Default::default()
+            };
+            if dialect == MySql {
+                t = innodb(t);
+            }
+            t
+        }
+
+        /// **No DDL test fed a value that needed escaping**, which is why the
+        /// missing backslash handling in `ddl_string` survived — and the
+        /// round-trip gate structurally cannot catch it, since both sides of
+        /// that comparison go through the same emitter.
+        ///
+        /// So assert on the emitted text: MySQL treats `\` as an escape inside a
+        /// literal and must double it; PostgreSQL takes it literally and must
+        /// not, or the value is corrupted the other way.
+        /// Emit the full CREATE for a table, through the real emitter — which is
+        /// where the table-level comment is written, unlike
+        /// `TableInfo::create_ddl`.
+        fn emit_create(t: &TableInfo, dialect: SqlDialect) -> String {
+            create_table_sql(&TableDraft::from_table(t), dialect).join("\n")
+        }
+
+        #[test]
+        fn emitted_ddl_escapes_a_backslash_per_dialect() {
+            let my = emit_create(&backslashes(MySql), MySql);
+            assert!(
+                my.contains(r"COMMENT 'windows path, e.g. C:\\temp'"),
+                "MySQL column comment must double the backslash:\n{my}"
+            );
+            // The default is ready-to-emit text by the time it reaches here, so
+            // this pins the *introspection* quoting (`db::mysql_column` calls
+            // `ddl_string`) surviving into the emitted statement — not the
+            // emitter's own escaping, which the two comments above cover.
+            assert!(
+                my.contains(r"DEFAULT 'C:\\temp'"),
+                "MySQL default must double the backslash:\n{my}"
+            );
+            assert!(
+                my.contains(r"COMMENT='paths like C:\\temp'"),
+                "MySQL table comment must double the backslash:\n{my}"
+            );
+
+            let pg = emit_create(&backslashes(Postgres), Postgres);
+            assert!(
+                pg.contains(r"IS 'paths like C:\temp'"),
+                "PostgreSQL must leave the backslash alone:\n{pg}"
+            );
+            assert!(
+                !pg.contains(r"C:\\temp"),
+                "doubling on PostgreSQL corrupts the value:\n{pg}"
+            );
+        }
+
+        /// A trailing backslash is the case that malforms the *statement* rather
+        /// than merely the value: unescaped, it escapes the closing quote.
+        #[test]
+        fn a_trailing_backslash_does_not_escape_the_closing_quote() {
+            let mut t = backslashes(MySql);
+            t.comment = Some(r"ends with a slash\".into());
+            let sql = emit_create(&t, MySql);
+            assert!(sql.contains(r"COMMENT='ends with a slash\\'"), "{sql}");
         }
 
         #[test]

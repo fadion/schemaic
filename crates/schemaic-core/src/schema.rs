@@ -3,6 +3,7 @@
 //! `information_schema`; the UI renders them as the collapsible schema tree and
 //! (later) uses them as the autocomplete substrate.
 
+use crate::intel::SqlDialect;
 use crate::model::Value;
 
 /// A single column of a table.
@@ -182,8 +183,19 @@ pub fn ddl_ident_in(name: &str, dialect: crate::intel::SqlDialect) -> String {
 
 /// Quote a string as a SQL literal for generated DDL (comments, and defaults we
 /// had to quote ourselves).
-pub fn ddl_string(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+///
+/// **Takes the dialect because backslashes are dialect-critical**, and this
+/// function once didn't: it doubled only the single quote, so on MySQL — where
+/// `\` escapes inside a literal — a column comment of `C:\temp` was written as
+/// `C:<TAB>emp`, and a value ending in a backslash escaped the closing quote and
+/// malformed the statement. PostgreSQL takes a backslash literally, so doubling
+/// there would corrupt the value instead.
+///
+/// It delegates to [`crate::export::sql_literal`] rather than repeating the
+/// rule. Two implementations of one job is exactly how the rule came to be
+/// applied in one of them and not the other.
+pub fn ddl_string(s: &str, dialect: SqlDialect) -> String {
+    crate::export::sql_literal(&crate::model::Value::Str(s.to_string()), dialect)
 }
 
 impl ColumnInfo {
@@ -238,7 +250,7 @@ impl ColumnInfo {
             && !pg
             && !c.is_empty()
         {
-            out.push_str(&format!(" COMMENT {}", ddl_string(c)));
+            out.push_str(&format!(" COMMENT {}", ddl_string(c, dialect)));
         }
         out
     }
@@ -748,6 +760,43 @@ pub enum SchemaState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MySQL treats `\` as an escape inside a single-quoted literal, so a
+    /// comment of `C:\temp` was stored as `C:<TAB>emp` — silently different from
+    /// what the designer showed and the preview displayed. A value *ending* in a
+    /// backslash escaped the closing quote and malformed the statement outright.
+    /// PostgreSQL takes it literally, so doubling there would corrupt instead.
+    #[test]
+    fn ddl_string_escapes_backslashes_on_mysql_only() {
+        assert_eq!(ddl_string(r"C:\temp", SqlDialect::MySql), r"'C:\\temp'");
+        assert_eq!(ddl_string(r"C:\temp", SqlDialect::Postgres), r"'C:\temp'");
+        // A trailing backslash is the case that breaks the statement, not just
+        // the value.
+        assert_eq!(ddl_string(r"ends\", SqlDialect::MySql), r"'ends\\'");
+    }
+
+    /// The injection guard, which applies on both engines.
+    #[test]
+    fn ddl_string_doubles_single_quotes_on_both_dialects() {
+        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+            assert_eq!(ddl_string("it's", d), "'it''s'");
+        }
+    }
+
+    /// `ddl_string` and `export::sql_literal` quote for the same purpose, and
+    /// having two implementations is what let one of them miss backslashes.
+    #[test]
+    fn ddl_string_agrees_with_the_export_literal() {
+        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+            for s in [r"C:\temp", "it's", "plain", r"both\'here", ""] {
+                assert_eq!(
+                    ddl_string(s, d),
+                    crate::export::sql_literal(&crate::model::Value::Str(s.to_string()), d),
+                    "{s:?} in {d:?}"
+                );
+            }
+        }
+    }
 
     /// The whole reason the column model was widened: MySQL's `MODIFY COLUMN`
     /// replaces a column outright, so anything this doesn't emit is destroyed by
