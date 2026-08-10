@@ -663,6 +663,81 @@ mod tests {
         }
     }
 
+    /// A result whose every cell needs escaping *somewhere*: a CSV delimiter and
+    /// quote, an HTML entity, a Markdown pipe and backslash, a SQL quote and
+    /// backslash, a formula trigger, a newline, and non-ASCII text.
+    fn nasty_rs() -> ResultSet {
+        ResultSet::from_rows(
+            vec![col("a,b"), col("c|d"), col("e<f>")],
+            vec![
+                vec![
+                    Value::Str("he\"llo, world".to_string()),
+                    Value::Str(r"pipe | and \ backslash".to_string()),
+                    Value::Str("<script>&amp;".to_string()),
+                ],
+                vec![
+                    Value::Str("=HYPERLINK(\"x\")".to_string()),
+                    Value::Str("-1+1+cmd|' /C calc'!A0".to_string()),
+                    Value::Str("line\nbreak\ttab".to_string()),
+                ],
+                vec![
+                    Value::Str("it's a 'quote'".to_string()),
+                    Value::Str(r"C:\temp".to_string()),
+                    Value::Str("José 東京 €".to_string()),
+                ],
+            ],
+        )
+    }
+
+    /// The anti-drift gate above ran on data that exercised **none** of the
+    /// escaping paths — plain `x`/`y` strings — so the two renderers could have
+    /// disagreed on every escape in the codebase and it would still have passed.
+    /// Escaping is exactly where a streamed and a buffered writer diverge, since
+    /// that is where each one decides what bytes to emit.
+    #[test]
+    fn streaming_and_buffered_agree_on_data_that_needs_escaping() {
+        let rs = nasty_rs();
+        let order = [2usize, 0, 1];
+        let source = Some(("db", None, "t"));
+        for dialect in [MySql, Postgres] {
+            for f in ExportFormat::ALL {
+                let mut buf: Vec<u8> = Vec::new();
+                f.render_to(&mut buf, &rs, &order, source, dialect).unwrap();
+                assert_eq!(
+                    String::from_utf8(buf).unwrap(),
+                    f.render(&rs, &order, source, dialect),
+                    "{f:?}/{dialect:?} streamed output differs from the buffered one"
+                );
+            }
+        }
+    }
+
+    /// …and that the escaping actually fired, so the fixture can't quietly stop
+    /// being nasty.
+    #[test]
+    fn the_escaping_fixture_really_exercises_each_escape() {
+        let rs = nasty_rs();
+        let order = [0usize, 1, 2];
+        let csv = ExportFormat::Csv.render(&rs, &order, None, MySql);
+        assert!(csv.contains("\"he\"\"llo, world\""), "CSV quote doubling");
+        assert!(csv.contains("'=HYPERLINK"), "CSV formula guard");
+        assert!(csv.contains("'-1+1+cmd"), "CSV leading-dash guard");
+
+        let html = ExportFormat::Html.render(&rs, &order, None, MySql);
+        assert!(html.contains("&lt;script&gt;&amp;amp;"), "HTML entities");
+        assert!(html.contains("José 東京 €"), "HTML non-ASCII");
+
+        let md = ExportFormat::Markdown.render(&rs, &order, None, MySql);
+        assert!(md.contains(r"\|"), "Markdown pipe escape");
+
+        let my = ExportFormat::Sql.render(&rs, &order, Some(("db", None, "t")), MySql);
+        assert!(my.contains(r"'C:\\temp'"), "MySQL backslash doubling");
+        assert!(my.contains("'it''s a ''quote'''"), "SQL quote doubling");
+
+        let pg = ExportFormat::Sql.render(&rs, &order, Some(("db", None, "t")), Postgres);
+        assert!(pg.contains(r"'C:\temp'"), "PostgreSQL leaves backslashes");
+    }
+
     #[test]
     fn streaming_column_exports_match_the_string_versions() {
         let rs = rs();
