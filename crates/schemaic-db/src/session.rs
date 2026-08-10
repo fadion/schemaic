@@ -189,6 +189,38 @@ impl Session {
         Outcome { result, stmt }
     }
 
+    /// Classify a finished operation that ran inside its own `SAVEPOINT`.
+    ///
+    /// A plain failure here is *isolated*: the write path rolls back to its own
+    /// savepoint, which on PostgreSQL clears the aborted state, so the user's
+    /// transaction is untouched and still committable. Folding it as a bare
+    /// [`StmtOutcome::Failed`] is what made the pill read "Tx aborted" and left
+    /// Rollback — which discards everything — as the only enabled action.
+    ///
+    /// The recoverability is **confirmed, not assumed**. `write_on`'s own
+    /// rollback is best-effort (`let _ =`), so this re-issues it and claims
+    /// isolation only if it succeeds; `ROLLBACK TO SAVEPOINT` does not release
+    /// the savepoint, so doing it twice is harmless. A cancellation is left
+    /// alone: the query was killed mid-flight, so nothing guarantees the
+    /// savepoint rollback ran.
+    async fn classify_isolated<T>(guard: &mut Backend, result: Result<T, DbError>) -> Outcome<T> {
+        let mut out = Session::classify(guard, result).await;
+        if out.stmt == StmtOutcome::Failed && Session::undo_savepoint(guard).await {
+            out.stmt = StmtOutcome::FailedIsolated;
+        }
+        out
+    }
+
+    /// Roll back to the write savepoint, reporting whether the server accepted
+    /// it — which is the direct evidence that the transaction is alive.
+    async fn undo_savepoint(guard: &mut Backend) -> bool {
+        let sql = TxScope::Savepoint.rollback_sql();
+        match guard {
+            Backend::MySql { conn, .. } => conn.query_drop(sql).await.is_ok(),
+            Backend::Postgres { client } => client.batch_execute(sql).await.is_ok(),
+        }
+    }
+
     /// Run one statement on the pinned connection, inside the open transaction.
     pub async fn fetch_query(
         &self,
@@ -269,7 +301,7 @@ impl Session {
                 }
             }
         };
-        Session::classify(&mut guard, result).await
+        Session::classify_isolated(&mut guard, result).await
     }
 
     /// Re-read just-edited rows **on this connection** — the only one that can

@@ -59,6 +59,16 @@ pub enum StmtOutcome {
     Ok,
     /// The server rejected it (syntax, constraint, permission…).
     Failed,
+    /// The server rejected it, but it ran inside its own `SAVEPOINT` and that
+    /// savepoint has already been rolled back — so the enclosing transaction is
+    /// untouched and still committable.
+    ///
+    /// Distinct from [`StmtOutcome::Failed`] because on PostgreSQL the two have
+    /// opposite consequences: a bare failure aborts the transaction, while a
+    /// savepoint-isolated one is exactly what the savepoint exists to prevent.
+    /// Reporting the second as the first tells the user their work is lost and
+    /// offers only the action that loses it.
+    FailedIsolated,
     /// The user cancelled it (`KILL QUERY` / PG cancel request).
     Cancelled,
     /// The connection itself died — idle-in-transaction timeout, server
@@ -160,6 +170,10 @@ impl TxState {
                         TxEngine::Postgres => TxState::Poisoned { stmts },
                         TxEngine::MySql => TxState::Open { stmts },
                     },
+                    // Its savepoint already absorbed the abort, so the enclosing
+                    // transaction is untouched on either engine — it just gains
+                    // no statement.
+                    StmtOutcome::FailedIsolated => TxState::Open { stmts },
                     StmtOutcome::ConnectionLost => unreachable!("handled above"),
                 }
             }
@@ -286,6 +300,54 @@ mod tests {
         assert_eq!(
             s.on_statement(PG, "SELECT 1", StmtOutcome::Failed),
             TxState::Poisoned { stmts: 2 }
+        );
+    }
+
+    /// A grid write runs under `SAVEPOINT schemaic_w`, and `pg::write_on` rolls
+    /// back to that savepoint on failure — which clears PostgreSQL's aborted
+    /// state. Folding it as a bare failure told the user their transaction was
+    /// dead and left Rollback as the only enabled action, destroying every
+    /// statement they had built up.
+    #[test]
+    fn a_savepoint_isolated_failure_leaves_the_transaction_usable() {
+        let s = TxState::Open { stmts: 20 };
+        let after = s.on_statement(PG, "UPDATE t SET a = 1", StmtOutcome::FailedIsolated);
+        assert_eq!(
+            after,
+            TxState::Open { stmts: 20 },
+            "the failure didn't count"
+        );
+        assert!(after.can_commit(), "the savepoint already rescued it");
+        // Same on MySQL, which never poisoned anyway.
+        assert_eq!(
+            s.on_statement(MY, "UPDATE t SET a = 1", StmtOutcome::FailedIsolated),
+            TxState::Open { stmts: 20 }
+        );
+    }
+
+    /// The contrast that makes the new variant meaningful: a bare failure — a
+    /// plain `SELECT` error in the same tab, with no savepoint around it —
+    /// really does abort the transaction and must still poison.
+    #[test]
+    fn a_bare_failure_still_poisons_postgres() {
+        let s = TxState::Open { stmts: 20 };
+        assert_eq!(
+            s.on_statement(PG, "SELECT 1/0", StmtOutcome::Failed),
+            TxState::Poisoned { stmts: 20 }
+        );
+    }
+
+    /// An isolated failure can't resurrect a transaction that is already dead.
+    #[test]
+    fn a_savepoint_isolated_failure_does_not_revive_a_poisoned_transaction() {
+        let s = TxState::Poisoned { stmts: 3 };
+        assert_eq!(
+            s.on_statement(PG, "UPDATE t SET a = 1", StmtOutcome::FailedIsolated),
+            TxState::Poisoned { stmts: 3 }
+        );
+        assert_eq!(
+            TxState::Lost.on_statement(PG, "UPDATE t SET a = 1", StmtOutcome::FailedIsolated),
+            TxState::Lost
         );
     }
 
