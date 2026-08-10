@@ -752,6 +752,31 @@ mod tests {
         assert_eq!(parse_hex("#ff880080"), Some(Color::rgba8(255, 136, 0, 128)));
     }
 
+    /// `c()`'s doc says a bad literal is "a dev bug we want to hear about
+    /// immediately at startup". That isn't true of three of the five palettes:
+    /// they are built only when the user *selects* them, so a five-digit hex in
+    /// `UiTheme::light()` compiles, passes the suite, ships, and then panics the
+    /// running app the moment someone opens Settings and picks Light.
+    ///
+    /// Constructing every palette here is what makes the comment true. It is
+    /// also the whole test — a panic in `c()` fails it.
+    #[test]
+    fn every_builtin_palette_constructs() {
+        for kind in UiThemeKind::ALL {
+            let t = kind.build();
+            // Touch a field so the construction can't be optimised away.
+            assert!(
+                t.text.a > 0,
+                "{} has a transparent text colour",
+                kind.label()
+            );
+        }
+        for kind in EditorThemeKind::ALL {
+            let t = kind.build();
+            assert!(t.fg.a > 0, "{} has a transparent foreground", kind.label());
+        }
+    }
+
     #[test]
     fn parse_hex_rejects_malformed_ascii() {
         assert_eq!(parse_hex("#gg"), None);
