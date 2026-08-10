@@ -7,6 +7,16 @@ Zed-inspired, aiming to replace DataGrip.
 
 - `schemaic-core` — models, persisted UI state (`persist.rs`), transcript types, and the pure,
   unit-tested SQL/edit/export logic (UI/app keep thin wrappers; regression tests live here):
+  - `model.rs` — the shared result-set model everything else is phrased in. `Value` holds text-
+    protocol cells parsed into compact numeric variants *only where lossless* (`DECIMAL`/dates/JSON
+    stay `Str`, so nothing is rounded or reformatted); `ResultSet` stores them columnar, so
+    `CellRef` reads a cell without allocating. `Column`/`ColumnOrigin`/`ColumnFlags` carry the
+    write-back provenance the wire reports per column, and a binary column is unconditionally
+    read-only (it can't round-trip through text). The write path's shared decisions live here so the
+    two engines can't drift: `GridWrite::plan` (the deletes → updates → inserts order),
+    `one_row_verdict` (the 1-row safety net's verdict *and* its message),
+    `Rollback`/`engine_is_transactional` (what a rollback actually achieved — see the invariant
+    below), and `drop_committed` (which staged edits a commit un-stages).
   - `sql.rs` — one `skip_noncode` tokenizer → statement splitting, unsafe-statement guard, AI
     read-only gate, `edit_distance`. The *single* SQL boundary lexer; `intel` (scope/context/
     diagnostics)/`sql_highlight`/`sqlfmt` all build on it so string/`#`/`--`/`/* */`/backtick
@@ -29,7 +39,21 @@ Zed-inspired, aiming to replace DataGrip.
     `None` when the statement alone can't say — what `ddl::pg_replaceable` reads). The live DB stays the semantic authority: **Tier-2 live validation**
     PREPAREs the statement under the cursor (`Db::prepare_check`, non-executing) behind the
     `live_validate` setting (off by default), merging dialect-exact errors into the editor squiggles.
-  - `edit.rs` — `analyze_edit` → `EditModel` (write-back updatability analysis).
+  - `filter.rs` — the header filter/sort bar: a dialect-aware `sqlparser` **AST rewrite** that
+    splices a `WHERE`/`ORDER BY` into the `SELECT` that produced the result and hands back SQL to
+    re-run — so filtering covers the whole table, not the loaded page. `build_query` rewrites only
+    a structurally simple, join-free, CTE-free single-table `SELECT` and degrades to `Ok(None)`
+    ("not filterable") rather than erroring, because eligibility is the caller's question.
+    `eq_condition` is the right-click "Filter by / Exclude" fragment. `table_query` is what opening
+    a table from the tree generates: it orders by the PK on purpose — neither engine promises row
+    order for a capped page, and PG heap order shifts under an `UPDATE` — while leaving an ordinary
+    name unquoted, since a quoted identifier blinds the mid-edit tokenizer behind completion.
+    Quoting here goes through the same rules as the rest of the app; don't add a fourth.
+  - `edit.rs` — `analyze_edit` → `EditModel` (write-back updatability analysis) + `refetch_template`
+    and `refetch_key`, the **one** post-edit re-fetch key builder. A key column *is* editable
+    (`EditModel::editable` asks only whether a column maps to a base table), so the `UPDATE` keys on
+    the original row while the re-fetch must look for the value it just wrote; there were two
+    builders and only one knew that.
   - `export.rs` — CSV/JSON/SQL/Markdown/HTML export (incl. CSV formula-injection guard;
     Markdown pipe/backslash escaping; HTML entity escaping). Every renderer has a **streaming**
     `*_to<W: io::Write>` form (`ExportFormat::render_to`) — what file export uses, so a large
@@ -82,6 +106,27 @@ Zed-inspired, aiming to replace DataGrip.
     never to drop**, and `ViewDraft::force_recreate` is the user's override. Materialized
     views are drop-only (no `CREATE OR REPLACE` exists for one). Same round-trip gate,
     same rule about extending fixtures.
+  - `erd.rs` — the **ER-diagram** model (the UI half is `ui/erd_view.rs`). `build_graph` turns an
+    introspected `DbSchema` into a `DiagramGraph` — nodes = tables, edges = FKs — seeded either by
+    `DiagramSeed::Database` (whole database, hiding FK-less "island" tables) or `::Table` (one
+    table's one-hop neighbourhood). A cross-database FK target can't be enumerated from one
+    `DbSchema`, so it becomes an unexpandable `NodeKind::Stub` rather than a missing edge.
+    `should_collapse`/`collapsed_visible` decide per-card density (a wide or crowded table collapses
+    to a pinned PK/FK subset) and `column_row_offset` is what still anchors an FK edge to the right
+    row on a collapsed card. `layout`/`place` are a deterministic layered auto-layout (nodes layered
+    by longest FK-dependency chain, ordered by neighbour barycentre), so the same schema always
+    arranges the same way; `edge_anchors`/`cubic_controls`/`sample_cubic`/`nearest_polyline` are the
+    pure bezier geometry + hover hit-test the custom paint canvas uses. `DiagramLayoutsFile`
+    persists manual drags per `(conn_id, database)` to `diagrams.json`, falling back to auto-layout
+    for an unknown or stale id.
+  - `monitor.rs` — the **Live Monitor**'s pure change detector: no DB, no timer, no UI.
+    `Snapshot::from_result` captures a `ResultSet` keyed by its table's key columns (cells are
+    `Option<String>` so NULL stays distinct from `""`), and `diff_snapshots` matches two snapshots
+    by key into `RowChange::{Insert,Update,Delete}`, an update carrying per-column `FieldChange`.
+    Row identity is just `Vec<String>`, so a new engine's fetch path only has to produce a
+    `Snapshot`. The caller must skip the *first* poll itself — diffing against an empty prior reads
+    every row as an insert. A delete carries the row's last-seen cells deliberately: it is the one
+    case where the row is gone from the database and the log is the only remaining record.
   - `diff.rs` — `line_diff`/`build_diff_rows` (Ctrl+K preview).
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
     persisted to `history.json`.
@@ -89,8 +134,27 @@ Zed-inspired, aiming to replace DataGrip.
     ping-or-skip + the delay until the next tick (exponential `backoff` on consecutive failures,
     longer interval for SSH-tunnelled connections, skip while the window is unfocused / a query is
     already in flight / the tunnel isn't up). The app owns only the timer + `Db::ping`.
+  - `tx.rs` — the **manual-transaction** state machine behind `TxMode::Manual` (no DB, no UI).
+    `TxState::on_statement(engine, sql, outcome)` folds one statement into
+    `Idle`/`Open{stmts}`/`Poisoned{stmts}`/`Lost`. It is a state machine rather than a bool because
+    the engines diverge: PostgreSQL aborts the *whole* transaction on any error (`Poisoned` — only
+    `ROLLBACK` gets out), MySQL survives a failed statement but silently commits on mid-transaction
+    DDL. `implicit_commit` is that list, read through the shared `leading_keyword` lexer; a **miss
+    is not harmless** — after one, a Rollback runs as a successful no-op and reports an undo that
+    never happened. `StmtOutcome::FailedIsolated` is what a `SAVEPOINT`-wrapped grid write reports,
+    and it must not poison PostgreSQL, or one bad cell edit would tell the user their whole
+    transaction died. `pill_text` is the status-bar string.
   - `format.rs` — per-column display formatters (`ColumnFormat`/`apply`: epoch→datetime, bytes,
     bool). Display-only; edit/copy stay raw. Persisted to `format.json`.
+  - `connection.rs` — the saved-connection model. A `Connection` is a database **server**, not one
+    database — the sidebar lists all of its databases. `SshTunnel`/`SshAuth` cover the tunnel's own
+    auth, including `Agent` (delegates to the running SSH agent, storing no secret at all).
+    `ConnStatus::is_down` treats `Unknown` (not yet checked, or a tunnel still coming up) as
+    *non*-blocking — only a confirmed failure gates work. `SshAuth`/`Environment` deserialize
+    through a `…Raw` shim with `#[serde(other)]`, so a value written by a newer build degrades to a
+    default instead of failing all of `connections.json`. There is deliberately no
+    `mysql://user:pass@host` builder, and the password fields here aren't what's on disk — see
+    `secrets.rs`.
   - `schema.rs` — the introspected model. `ColumnInfo` carries the **full** column definition
     (type *with* parameters, default as ready-to-emit SQL text, auto-increment/identity, generated
     expression, `ON UPDATE`, comment, collation) because MySQL's `MODIFY COLUMN` replaces a column
@@ -110,14 +174,49 @@ Zed-inspired, aiming to replace DataGrip.
     unavailable) and `forget` (delete). The real keyring-backed store lives in `schemaic-app`'s
     `secrets` module (the heavy `keyring`/D-Bus dep stays out of core); pure + unit-tested via an
     in-memory fake.
-  - `rowjson.rs` — the grid's whole-row **view/edit panel** logic: `row_to_json` serializes a row to
-    a pretty JSON object (keys in column order, reusing `export::value_to_json`; DECIMAL/dates stay
-    quoted strings, join-duplicate names → `name#ci`), and `parse_row_edit` validates an edited object
-    back into the changed *editable* columns for an `UPDATE` (rejects bad JSON / non-object / unknown
-    key / read-only edit / NOT-NULL→null; untouched or omitted fields are no-ops via normalized-text
-    compare). Type-correctness stays the DB's job. Pure + unit-tested.
+  - `rowjson.rs` — the per-field model behind the grid's whole-row **view/edit panel**. A `ColSpec`
+    per result column carries what the panel needs (name, editability, nullability, current value);
+    `field_value_text` renders a cell into its editable text and `update_changes` diffs the panel's
+    per-field state back into the changed *editable* columns for an `UPDATE` (rejecting a read-only
+    edit or a NOT-NULL→null, and treating an untouched field as a no-op via normalized-text
+    compare). Validation here covers NULL and read-only rules only — **type-correctness stays the
+    DB's job**, and its error surfaces in the panel. Pure + unit-tested.
+  - `jsontree.rs` — the editable JSON tree the row panel uses for a `json`/`jsonb` column.
+    `JsonNode::parse` walks the document as `RawValue`s rather than going through
+    `serde_json::Value`, for two reasons: object key order survives, duplicates included (a
+    PostgreSQL `json` column really can hold `{"a":1,"a":2}`), and **a number keeps its source text
+    byte for byte** — going through `f64` turned `10.00` into `10` and a 21-digit integer into a
+    different integer, silently, the moment an unrelated leaf edit re-serialised the tree.
+    `PathSeg::{Member(i),Index(i)}` addresses by *position*, not key, so duplicate keys get distinct
+    independently-editable rows; `set_leaf` reparses arbitrary JSON, so editing a leaf may change
+    its type. `rows`/`TreeRow` is the flattened outline the UI renders.
   - `plan.rs` — `QueryPlan::from_result` parses an `EXPLAIN` result into a table + heuristic
     warnings (full scan / filesort / temp table); `to_prompt_text` for the AI.
+  - **AI prompt + reply plumbing** (all pure, all dialect-aware — a prompt that hardcodes
+    "MySQL/MariaDB" asks a Postgres connection for backtick-quoted SQL the server rejects):
+    - `prompt.rs` — fences DB content so an embedded ` ``` ` can't escape into prose. Every prompt
+      built from server-controlled text goes through it.
+    - `summary.rs` — the grid's "AI Summary" cell/column prompts. `sample_column` spreads its
+      sample *evenly* across loaded rows rather than taking the first N, because a sorted result's
+      head often shares a date/status/prefix that reads as a pattern that isn't real; `sample_row`
+      supplies the focused cell's own row, since a lone value rarely explains itself. Samples only
+      what is already on screen — no round-trip — so the menu action is instant.
+    - `seed.rs` — AI-generated seed data (Fill Value / Seed Table). `build_fill_prompt`/
+      `build_seed_prompt` assemble the one-shot prompt from the table's DDL plus a *bottom* sample
+      of real rows, so enum/format/FK conventions come from data rather than guesswork;
+      `parse_fill_response`/`parse_seed_response` read the reply back (fence stripping,
+      case-insensitive bare `null`, JSON bool → `"1"`/`"0"` for MySQL `tinyint(1)`).
+    - `transcript.rs` — the rendered shape of one AI turn (`ChatMessage`/`Seg::{Text,Tool}`/
+      `TurnStats`), kept here rather than in `schemaic-ai` so the UI crate needn't depend on the
+      CLI-integration crate. `ChatMessage::prose` is what copy *and* conversation replay use.
+    - `chat.rs` — per-connection conversations persisted to `chats.json`. `ChatFile::of` replaces
+      every tool `result` with `RESULT_OMITTED` before it reaches disk — a `run_query` result is up
+      to 200 rows of real table data, and writing it verbatim exported user data to a plaintext
+      config file indefinitely. Stripping happens at the *bytes* boundary, not in `save`, so
+      switching connections and back mid-session still shows that session's own results.
+      `persistable` drops a still-streaming turn and its unanswered question before capping. A
+      restored conversation is transcript, not memory: prose is replayed into a fresh `claude`
+      session's system prompt, tool calls never are.
   - `text_ops.rs` — Ctrl+/ `toggle_line_comment` + `find_matches`/`replace_all`/
     `contains_ignore_ascii_case` (find bars). Pure, ASCII-case-insensitive, byte-offset-preserving.
   - `sqlfmt.rs` — `format_sql` (Ctrl+Alt+L pretty-printer): re-flows whitespace/indent/line-breaks
@@ -131,7 +230,35 @@ Zed-inspired, aiming to replace DataGrip.
     `identifier_occurrences` (every whole-word, ASCII-case-insensitive occurrence of the identifier
     under the caret — excludes keywords/numbers/strings, needs ≥2 to fire), and `region_at`
     (`Code`/`Str`/`Comment` classification). Pure + unit-tested; dialect-aware (no backtick on PG).
-- `schemaic-db` — MySQL/MariaDB (`mysql_async`) + SSH tunnels. Populates each result column's
+  - **Small persisted / UI-state models**, each a flat `Vec` keyed by `conn_id` and each pure +
+    tested (they share `history.rs`'s shape; a new one belongs here, not in the UI):
+    - `search_history.rs` — recent Find-Anywhere targets (`MAX_PER_CONN`, newest-first, deduped).
+      `push` records only an *activated* result, not every keystroke, and the PG namespace is part
+      of the dedup identity so same-named tables in two schemas don't collapse into one.
+    - `favorite.rs` — the `(conn_id, database)` star list. `toggle` appends newest-**last** on
+      purpose: `rank` (0 = that connection's oldest) is what the schema tree sorts by, so order in
+      the `Vec` *is* the sort key.
+    - `db_color.rs` — a per-`(connection, database)` identity colour. Display-only (a dot in the
+      tree, the active-DB selector and tabs) and **manual only** — never inferred, and explicitly
+      not the editor's production-red danger frame, which stays a *connection*-level signal.
+    - `tabsel.rs` — tab-selection rules for a strip that shows only the active connection's tabs, so
+      every question (`pick_active`, `neighbor` after a close, `cycle`, `closing_would_empty`, `nth`
+      for Ctrl+1‑9) is answered *within one connection*. `nth` especially: the Nth visible chip is
+      not the Nth entry of the flat `Vec` once another connection's tabs interleave.
+      `pick_active` prefers the remembered per-connection tab, so switching away and back doesn't
+      dump the user on tab 1.
+    - `palette.rs` — parses the command palette's `>` command mode into
+      `Parsed::{Search,Filter,Command{name,arg}}`. The hard part is when typing stops filtering the
+      command list and becomes an argument: longest-word-prefix match against the caller's
+      argument-command names, under an invariant the caller must uphold — no argument-command name
+      may be a word-prefix of another (`indent style`/`indent width`, never a bare `indent`).
+    - `resource.rs` — the status bar's CPU/RAM model. `ResourceSample::new` divides `sysinfo`'s
+      per-process CPU% (single-core-relative, so it exceeds 100 on a multi-core box) across the
+      logical core count to give a whole-machine 0..=100. Sampling itself stays at the app boundary.
+    - `text.rs` — `plural(n, one, many)`, returning only the noun form so a humanized count
+      (`"1.2k"`) can be displayed while the singular/plural decision still follows the true `n`.
+- `schemaic-db` — MySQL/MariaDB (`mysql_async`) + SSH tunnels (`ssh.rs`), PostgreSQL in `pg.rs`, and
+  the pinned manual-transaction connection in `session.rs`. Populates each result column's
   `origin` (real table/column + key flags) from the wire protocol. Connection **identity** is the
   `Db` handle (`Db::connect(&Connection, tunnel_port)`), not a `mysql://…` URL — credentials go
   through `OptsBuilder` (passwords with `@ / # ? %` need no escaping; no plaintext URL anywhere).
@@ -166,7 +293,7 @@ Zed-inspired, aiming to replace DataGrip.
   as it carried — the `commit_writes` 1-row safety net scaled to a file, without its
   statement-per-row round-trips.
 - `schemaic-ai` — persistent `claude` CLI session (stream-json), turn parsing.
-- `schemaic-term` — terminal panel + shell.
+- `schemaic-term` — terminal panel + shell (`shell.rs`).
 - `schemaic-ui` — the Floem UI. The central `Ui` struct (threaded everywhere) is split per-domain:
   `Copy` signal bundles (`TabsUi`/`SchemaUi`/`ConnUi`/`AiUi`/`TermUi`/`LayoutUi`/`OverlayUi`) +
   `Rc<…Actions>` callback bundles — so `ui.run` is `ui.tab_actions.run`, `ui.db_nodes` is
@@ -234,10 +361,24 @@ Zed-inspired, aiming to replace DataGrip.
     (`query_pane` + Ctrl+K popup, statement highlight, custom scrollbars). `compute_diagnostics`
     bridges the tab's schema/active-db to `intel::diagnostics`; `syntax_view` draws severity-coloured
     squiggles (red errors / amber typo warnings) with hover tooltips.
+  - `erd_view.rs` — the **ER-diagram** canvas over `core::erd`. Edges are drawn by a custom paint
+    view (`EdgeCanvas`), *not* a Floem `svg` — `svg` doesn't repaint reliably on reactive change
+    here and blanked the edges on drag/hover. Zoom is **semantic, not a paint transform**: cards and
+    edges keep logical positions and multiply by `z` only at render, so text stays crisp at any
+    zoom. The surface is an infinite free pan (not a scroll view) — drag/middle-drag pans, Ctrl+wheel
+    zooms about the cursor, plain/Shift+wheel pans — and hit-testing maps cursor → logical space via
+    `(p − pan) / z`.
+  - `monitor_view.rs` — the **Live Monitor** modal (`monitor_overlay`), opened from the results
+    title bar with the tab's `(conn_id, database, table)`. It renders `overlay.monitor_log` — built
+    by the app's poll loop through `core::monitor::diff_snapshots` — as a Time·Action·ID·Data table,
+    and owns *none* of the polling: closing the modal flips `overlay.monitor_open` false, and that
+    is what stops the loop.
   - `theme.rs`/`themes.rs`/`icons.rs`/`fonts.rs`/`sql_highlight.rs`.
-  - `lib.rs` (~3.2k lines, being split further) — the `Ui` struct + bundles, shared model/state
+  - `lib.rs` (~5k lines, still the crate's largest) — the `Ui` struct + bundles, shared model/state
     types, `workspace`/`body`/`center`/`header`/`footer`, resize handles, `edit_field`/`FieldCfg`,
-    terminal panel.
+    terminal panel. The shared types living in the crate root is what stalls further splitting: the
+    root depends on the leaves (`mod`) and the leaves depend on the root (types), so a view builder
+    can't move out until the types do.
 - `schemaic-app` — `main.rs` wires signals + callbacks and builds the `Ui`; also the built-in MCP
   server (`--mcp-serve`) the AI panel talks to. A query tab's identity is `(conn_id, database)`;
   the app resolves `conn_id` → `Db` at run time (`db_for`), so a tab keeps its connection after a
@@ -246,7 +387,14 @@ Zed-inspired, aiming to replace DataGrip.
   to other same-user processes. Pure clusters split out: `claude_cli.rs` (`claude` binary
   discovery — PATH/PATHEXT/override) and `ai.rs` (`AiSession`/`start_ai_session` streaming,
   MCP-config plumbing, `ai_context`/`inline_system_prompt`). Reactive wiring (`app_view` closures)
-  stays in `main.rs`.
+  stays in `main.rs`. The MCP server itself is `mcp.rs`; `secrets.rs` is the keyring-backed
+  `SecretStore` behind `core::secrets`.
+  - `heap.rs` — process-wide heap accounting. `Tracking` is installed as the global allocator and
+    adds only two atomics — **live** bytes (allocated − freed) and the running peak — over the
+    system allocator. It exists to answer one question the OS can't: whether memory growth is a
+    real leak or benign allocator/OS retention. Live returning to its baseline after a table closes
+    while the working set stays high is the allocator holding freed pages for reuse; live *not*
+    returning is the leak.
 
 ## Architecture invariants (don't regress these)
 
@@ -359,7 +507,9 @@ bug fixes start with a failing test, then the code that makes it pass. Concretel
   inputs, and known failure modes. Prefer many small, named tests over one broad one.
 - **Keep the suite green + fast.** `cargo test --workspace` must pass before any commit; tests stay
   pure (no live DB / network / filesystem — model those at the boundary). Don't commit with failing
-  or `#[ignore]`d tests unless the user asks.
+  or `#[ignore]`d tests unless the user asks. The single exception is
+  `core/tests/doc_coverage.rs`, which asserts every `src/*.rs` module is named somewhere in this
+  file — the thing under test *is* a file. A new module fails it until it's on the map above.
 - **Architecture invariants are test-enforced where possible** — e.g. the single SQL boundary lexer,
   the 1-row write-back safety net, and edit-model key selection all have regression tests; extend
   them rather than working around them.
@@ -625,20 +775,30 @@ for keyboard nav.
   `ui.popup_menu` and `ui.context_menu`, guarded).
 - **Row view/edit panel** (`edit_row_panel`, replaced the old single-cell value viewer): the cell
   `View` item opens an **integrated in-flow bottom strip** (not a popup — `border_top` + panel bg, like
-  the old viewer; the grid above shrinks) showing the **whole row as JSON** via `core::rowjson`. Header
-  = `Row {gutter#} · {table}` + a Save (✓) icon (shown only when the result has ≥1 editable column;
-  otherwise it's a read-only row viewer) then Close (✕). The editable `edit_field` (`multiline`, NOT
-  read-only, autofocus, `max_rows` ≈ 80% of the panel then scrolls) is bound to `gs.edit_row_buf`; an
-  inline red line shows the validation/DB error. **Save commits immediately** (its own path, not the
-  staged `dirty` batch): `parse_row_edit` → `build_row_edits` (one `RowEdit` per base table, WHERE key
-  from the *original* row) + a single-row `build_row_refetch` → the existing `CommitFn`; on success the
-  row splices in place and the panel closes, on failure the message stays inline. Read-only fields
-  (expression/`binary`) are shown for context but edits to them are rejected — **a key column is
-  editable**, here as in the grid (`EditModel::editable` asks only whether the column maps to a base
-  table), which is why both re-fetches go through the one `edit::refetch_key`: the `UPDATE` keys on
-  the *original* row, but the re-fetch has to look for the key it just wrote. State on `GridState`:
-  `edit_row_open` / `edit_row_di` / `edit_row_buf` / `edit_row_err` / `edit_row_saving`. Real rows only
-  (a pending new row is filled via inline cells); Esc closes it (after the find bar).
+  the old viewer; the grid above shrinks) rendering the row as a **structured, per-field editor**, one
+  row per column, over `core::rowjson`. Header = `Row {gutter#} · {table}` + a Save (✓) icon (shown
+  only when the result has ≥1 editable column; otherwise it's a read-only row viewer) then Close (✕);
+  an inline red line shows the validation/DB error. A scalar field is an `edit_field` bound straight
+  to its `FieldSig::buf` with an explicit NULL toggle; a `json`/`jsonb` column gets the
+  `core::jsontree` tree editor instead (click-to-edit leaves, collapsible containers, raw-text
+  fallback for invalid JSON).
+  **Save commits immediately** (its own path, not the staged `dirty` batch): `flush_fields` →
+  `field_state` → `rowjson::update_changes` → `build_row_edits` (one `RowEdit` per base table, WHERE
+  key from the *original* row) + a single-row `build_row_refetch` → the existing `CommitFn`; on
+  success the row splices in place and the panel closes, on failure the message stays inline.
+  **`flush_fields` is not optional**: clicking Save doesn't blur the field being typed into (floem
+  moves focus on a pointer-down only for a `keyboard_navigable` view), so an editor holding a buffer
+  of its own — the JSON tree's open leaf — has to be asked to commit before the write is assembled;
+  a field that can't (invalid JSON) stops the write rather than letting the stale value through.
+  This is the row panel's counterpart to `commit_grid`'s "flush any open in-cell edit first".
+  Read-only fields (expression/`binary`) are shown for context but edits to them are rejected —
+  **a key column is editable**, here as in the grid (`EditModel::editable` asks only whether the
+  column maps to a base table), which is why both re-fetches go through the one `edit::refetch_key`:
+  the `UPDATE` keys on the *original* row, but the re-fetch has to look for the key it just wrote.
+  Because this path is separate from the staged batch, its splice un-stages **only its own** changed
+  columns (`model::drop_committed`) — a green cell edit elsewhere in the grid is still unwritten.
+  State on `GridState`: `edit_row_open` / `edit_row_di` / `edit_row_err` / `edit_row_saving`. Real
+  rows only (a pending new row is filled via inline cells); Esc closes it (after the find bar).
 - **Inline edit writes back to the DB.** Per-column *provenance*: `schemaic-db` runs on
   **`mysql_async`** (sqlx's MySQL driver discards `org_table`/`org_name`/key flags), so each `Column`
   carries `origin: Option<ColumnOrigin>` — real `database`/`table`/`column` + `ColumnFlags`
