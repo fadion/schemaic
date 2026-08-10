@@ -3050,14 +3050,20 @@ const FIELD_ROW_H: f64 = 32.0;
 /// Height of the text input inside a field row.
 const FIELD_INPUT_H: f64 = 26.0;
 
-/// Per-field editing state for the structured row panel: the raw text buffer and a
-/// NULL flag. Created fresh per opened row (so the panel's `dyn_container` disposes
-/// them on close / row-step).
+/// Per-field editing state for the structured row panel: the raw text buffer, a
+/// NULL flag, and the field editor's own pre-write flush (see [`flush_fields`]).
+/// Created fresh per opened row (so the panel's `dyn_container` disposes them on
+/// close / row-step).
 #[derive(Clone, Copy)]
 struct FieldSig {
     ci: usize,
     buf: RwSignal<String>,
     is_null: RwSignal<bool>,
+    /// Set by an editor that keeps a buffer of its own — the JSON tree, whose leaf
+    /// input only reaches `buf` on submit/blur. Returns whether the pending edit
+    /// committed. `None` when the field's editor writes `buf` directly, and cleared
+    /// again whenever such an editor is torn down (its signals go with it).
+    flush: RwSignal<Option<Rc<dyn Fn() -> bool>>>,
 }
 
 /// One field signal per column, seeded from the row's values (empty buffer + null
@@ -3069,8 +3075,30 @@ fn field_sigs(cols: &[ColSpec]) -> Vec<FieldSig> {
             ci,
             buf: RwSignal::new(rowjson::field_value_text(&c.value)),
             is_null: RwSignal::new(c.value.is_null()),
+            flush: RwSignal::new(None),
         })
         .collect()
+}
+
+/// Ask every field to commit its in-progress editor edit into its buffer, before
+/// the write is assembled from those buffers.
+///
+/// Clicking Save does **not** blur the field being typed into — floem moves focus
+/// on a pointer-down only for a `keyboard_navigable` view, and the Save button is a
+/// plain container — so a JSON leaf edit would otherwise never reach `buf` and Save
+/// would write the JSON it replaced (or decide nothing changed at all). This is the
+/// row panel's counterpart to `commit_grid`'s "flush any open in-cell edit first".
+///
+/// Returns false if any field's pending edit *couldn't* commit (unparseable JSON —
+/// the editor shows its own inline error): the caller must not go on to write the
+/// stale buffer. Every field is asked regardless, so one failure doesn't strand
+/// another field's valid edit.
+fn flush_fields(sigs: &[FieldSig]) -> bool {
+    sigs.iter()
+        .fold(true, |ok, f| match f.flush.get_untracked() {
+            Some(flush) => (flush)() && ok,
+            None => ok,
+        })
 }
 
 /// Gather each field's current value (`None` = staged NULL) for the write assembly.
@@ -3330,6 +3358,10 @@ fn json_row_view(
 /// JSON.
 fn json_editor(f: FieldSig) -> AnyView {
     let Ok(root) = JsonNode::parse(&f.buf.get_untracked()) else {
+        // The raw fallback is bound straight to `f.buf`, so there is nothing to
+        // flush — and leaving a previous editor's flush installed would call into
+        // signals this rebuild just disposed.
+        f.flush.set(None);
         return edit_field(
             f.buf,
             FieldCfg {
@@ -3382,6 +3414,15 @@ fn json_editor(f: FieldSig) -> AnyView {
             }
         })
     };
+    // Save's pre-write flush: same commit, reporting whether the leaf actually
+    // closed (an unparseable one stays open with its error showing).
+    f.flush.set(Some({
+        let commit_current = commit_current.clone();
+        Rc::new(move || {
+            (commit_current)();
+            editing.get_untracked().is_none()
+        })
+    }));
 
     let rows_view = dyn_container(
         move || (tree.get(), collapsed.get(), editing.get()),
@@ -3445,6 +3486,8 @@ fn json_field(nullable: bool, f: FieldSig) -> AnyView {
         move || f.is_null.get(),
         move |is_null| {
             if is_null {
+                // The tree editor (and its flush) went with this rebuild.
+                f.flush.set(None);
                 // Enabling a NULL JSON field seeds an empty object so the tree has
                 // something to edit; double-click does the same as "Set value".
                 let enable = move || {
@@ -3570,7 +3613,15 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
             let save: Rc<dyn Fn()> = {
                 let cols_rc = cols_rc.clone();
                 let sigs = sigs.clone();
-                Rc::new(move || commit_row_update(gs, di, &cols_rc, field_state(&sigs)))
+                Rc::new(move || {
+                    // Clicking Save doesn't blur the field being typed into, so ask
+                    // each editor to commit into its buffer first. A field that
+                    // can't (invalid JSON) shows its own error and stops the write.
+                    if !flush_fields(&sigs) {
+                        return;
+                    }
+                    commit_row_update(gs, di, &cols_rc, field_state(&sigs))
+                })
             };
 
             let row_no = edit_row_disp(gs, di) + 1;
@@ -5331,6 +5382,74 @@ mod tests {
         let collapsed = HashSet::new();
         assert!(!json_path_hidden(&[], &collapsed));
         assert!(!json_path_hidden(&[m(0), m(1)], &collapsed));
+    }
+
+    // ── The row panel's pre-write flush ──
+    //
+    // The JSON tree editor keeps its leaf in a buffer of its own and only writes
+    // the re-serialised tree into the field buffer on submit/blur — and clicking
+    // Save never blurs it (floem moves focus on a pointer-down only for a
+    // `keyboard_navigable` view). So the write has to ask each field to flush
+    // before it reads the buffers.
+
+    fn sig(ci: usize, value: &str) -> FieldSig {
+        FieldSig {
+            ci,
+            buf: RwSignal::new(value.to_string()),
+            is_null: RwSignal::new(false),
+            flush: RwSignal::new(None),
+        }
+    }
+
+    #[test]
+    fn a_pending_field_edit_reaches_the_buffer_before_the_write_is_assembled() {
+        let sigs = vec![sig(0, "{\"a\":1}"), sig(1, "x")];
+        let buf = sigs[0].buf;
+        // What the JSON editor installs: commit the open leaf into the buffer.
+        sigs[0].flush.set(Some(Rc::new(move || {
+            buf.set("{\"a\":2}".to_string());
+            true
+        })));
+
+        assert!(flush_fields(&sigs));
+        assert_eq!(
+            field_state(&sigs),
+            vec![
+                (0, Some("{\"a\":2}".to_string())),
+                (1, Some("x".to_string()))
+            ],
+            "the write must see the typed value, not the one it replaced"
+        );
+    }
+
+    #[test]
+    fn a_field_that_cannot_flush_stops_the_write() {
+        let sigs = vec![sig(0, "{\"a\":1}"), sig(1, "y")];
+        let touched = RwSignal::new(false);
+        // An unparseable leaf: the editor shows its own error and keeps the leaf
+        // open, so the buffer still holds the *stale* JSON — writing it would be
+        // exactly the failure this flush exists to prevent.
+        sigs[0].flush.set(Some(Rc::new(move || false)));
+        sigs[1].flush.set(Some(Rc::new(move || {
+            touched.set(true);
+            true
+        })));
+
+        assert!(!flush_fields(&sigs));
+        assert!(
+            touched.get_untracked(),
+            "every field flushes — one failure must not short-circuit the rest"
+        );
+    }
+
+    #[test]
+    fn fields_with_no_pending_editor_flush_trivially() {
+        let sigs = vec![sig(0, "a"), sig(1, "b")];
+        assert!(flush_fields(&sigs));
+        assert_eq!(
+            field_state(&sigs),
+            vec![(0, Some("a".to_string())), (1, Some("b".to_string()))]
+        );
     }
 
     // ── Column virtualization (`compute_window`) ──
