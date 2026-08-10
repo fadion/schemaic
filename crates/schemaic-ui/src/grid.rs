@@ -5287,8 +5287,9 @@ mod tests {
 
     // ── JSON tree collapse ──
 
-    fn key(k: &str) -> PathSeg {
-        PathSeg::Key(k.to_string())
+    /// Object member by ordinal — `m(0)` is the first entry in document order.
+    fn m(i: usize) -> PathSeg {
+        PathSeg::Member(i)
     }
 
     #[test]
@@ -5301,19 +5302,19 @@ mod tests {
             !json_path_hidden(&[], &collapsed),
             "the root renders itself"
         );
-        assert!(json_path_hidden(&[key("a")], &collapsed));
-        assert!(json_path_hidden(&[key("a"), PathSeg::Index(0)], &collapsed));
+        assert!(json_path_hidden(&[m(0)], &collapsed));
+        assert!(json_path_hidden(&[m(0), PathSeg::Index(0)], &collapsed));
     }
 
     #[test]
     fn collapsing_a_nested_json_container_hides_only_its_own_subtree() {
-        let collapsed: HashSet<Vec<PathSeg>> = [vec![key("a")]].into_iter().collect();
+        let collapsed: HashSet<Vec<PathSeg>> = [vec![m(0)]].into_iter().collect();
         assert!(!json_path_hidden(&[], &collapsed));
-        assert!(!json_path_hidden(&[key("a")], &collapsed));
-        assert!(!json_path_hidden(&[key("b")], &collapsed));
-        assert!(json_path_hidden(&[key("a"), key("x")], &collapsed));
+        assert!(!json_path_hidden(&[m(0)], &collapsed));
+        assert!(!json_path_hidden(&[m(1)], &collapsed));
+        assert!(json_path_hidden(&[m(0), m(3)], &collapsed));
         assert!(json_path_hidden(
-            &[key("a"), key("x"), PathSeg::Index(2)],
+            &[m(0), m(3), PathSeg::Index(2)],
             &collapsed
         ));
     }
@@ -5322,7 +5323,7 @@ mod tests {
     fn nothing_is_hidden_when_nothing_is_collapsed() {
         let collapsed = HashSet::new();
         assert!(!json_path_hidden(&[], &collapsed));
-        assert!(!json_path_hidden(&[key("a"), key("b")], &collapsed));
+        assert!(!json_path_hidden(&[m(0), m(1)], &collapsed));
     }
 
     // ── Column virtualization (`compute_window`) ──
