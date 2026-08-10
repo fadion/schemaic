@@ -456,6 +456,14 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
   so clicks fall through.
 - **Deferred layout**: `exec_after(Duration::ZERO, …)` runs after layout settles — so
   `scroll_to(bottom)` clamps against new content height, not stale.
+- **`.get()` clones the whole value — use `.with()` to read part of a collection.** `SignalGet::get`
+  is documented as *"try to **clone** and return the current value"*, so `widths.get().get(ci)`
+  allocates and frees the entire `Vec` to read one slot, and `expanded.get().contains(&k)` clones the
+  whole `HashSet` to answer one lookup. Harmless once; ruinous in a **per-item** closure, where it
+  turns an O(n) update into O(n²) — the ERD's position map cost 8.4 ms per pointer move at 500 cards
+  before the fix. `.with(|v| …)` borrows and tracks identically, so it is a drop-in. This was the
+  review's most-repeated mechanical defect: reach for `with` on any collection, and keep `get` for
+  small `Copy` values (`bool`, `f64`, `Option<usize>`).
 - **`RwSignal::set` never dedups** — setting a signal to its current value still notifies, re-running
   dependent `dyn_container`s (which dispose + rebuild their child scope + owned signals). Guard panel
   reveals: `if !matches!(right_panel.get_untracked(), Ai) { set(Ai) }` — a redundant `set(Ai)` while
