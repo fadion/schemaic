@@ -2941,7 +2941,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         let send_schema = create_ext_action(cx, move |st: SchemaState| sig.set(st));
                         handle_inner.spawn(async move {
                             let st = match db.fetch_schema(&dbname).await {
-                                Ok(s) => SchemaState::Loaded(s),
+                                Ok(s) => SchemaState::Loaded(Arc::new(s)),
                                 Err(e) => SchemaState::Failed(e.to_string()),
                             };
                             send_schema(st);
@@ -3014,7 +3014,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             let send_schema = create_ext_action(cx, move |st: SchemaState| sig.set(st));
             handle.spawn(async move {
                 let st = match db.fetch_schema(&database).await {
-                    Ok(s) => SchemaState::Loaded(s),
+                    Ok(s) => SchemaState::Loaded(Arc::new(s)),
                     Err(e) => SchemaState::Failed(e.to_string()),
                 };
                 send_schema(st);

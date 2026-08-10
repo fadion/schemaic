@@ -749,7 +749,7 @@ fn scoped_database(
 /// open a paragraph of its own in the middle of Schemaic's instructions. The
 /// sections that carry them are labelled with [`UNTRUSTED_NOTE`].
 fn render_schema_outline(
-    databases: &[(String, Option<DbSchema>)],
+    databases: &[DbSnapshot],
     active_db: Option<&str>,
     scope: SchemaScope,
 ) -> String {
@@ -787,10 +787,16 @@ fn render_schema_outline(
     outline
 }
 
+/// One database and its loaded schema, as the pure prompt builders take it —
+/// `None` while introspection is still in flight. The schema is the `Arc` out of
+/// [`SchemaState`], so snapshotting is a refcount bump rather than a deep copy of
+/// every table and column.
+type DbSnapshot = (String, Option<std::sync::Arc<DbSchema>>);
+
 /// Snapshot each schema-tree node into plain data: `(database, Some(schema))`
 /// when introspection has loaded, `(database, None)` while it's still pending.
 /// Reads the signals once so the prompt builders below can stay pure.
-fn snapshot_databases(db_nodes: RwSignal<Vec<ConnNode>>) -> Vec<(String, Option<DbSchema>)> {
+fn snapshot_databases(db_nodes: RwSignal<Vec<ConnNode>>) -> Vec<DbSnapshot> {
     db_nodes.with_untracked(|v| {
         v.iter()
             .map(|n| {
@@ -901,7 +907,7 @@ pub(crate) fn inline_system_prompt(
 /// every table is still listed by name. No signals — so the column-inclusion
 /// heuristic and the selection-vs-insert task line are unit-tested.
 fn render_inline_prompt(
-    databases: &[(String, Option<DbSchema>)],
+    databases: &[DbSnapshot],
     active_db: Option<&str>,
     req: &InlineAiRequest,
     dialect: SqlDialect,
@@ -1114,14 +1120,14 @@ mod tests {
         }
     }
 
-    fn schema(tables: Vec<TableInfo>) -> DbSchema {
-        DbSchema { tables }
+    fn schema(tables: Vec<TableInfo>) -> std::sync::Arc<DbSchema> {
+        std::sync::Arc::new(DbSchema { tables })
     }
 
     /// Build the system-prompt context the way `turn_context` would, but from
     /// plain snapshotted data (no signals).
     fn ctx_of(
-        dbs: &[(String, Option<DbSchema>)],
+        dbs: &[DbSnapshot],
         active_db: Option<&str>,
         query: &str,
         scope: SchemaScope,
@@ -1589,7 +1595,7 @@ mod tests {
 
     #[test]
     fn render_inline_prompt_selection_asks_for_rewrite() {
-        let dbs: Vec<(String, Option<DbSchema>)> = vec![];
+        let dbs: Vec<DbSnapshot> = vec![];
         let out = render_inline_prompt(
             &dbs,
             None,

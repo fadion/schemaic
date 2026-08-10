@@ -167,7 +167,7 @@ struct NavDb {
     name: String,
     /// `None` while introspection is still in flight or has failed — the walk
     /// keeps such a database (its tables aren't knowable yet), like the tree.
-    schema: Option<DbSchema>,
+    schema: Option<std::sync::Arc<DbSchema>>,
 }
 
 // Build the visible-row list in display order. Reads the signals the walk depends
@@ -932,7 +932,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                         if visible.is_empty() {
                             return empty().into_any();
                         }
-                        let schema = std::sync::Arc::new(schema);
+                        // `schema` is already the `Arc` out of `SchemaState`.
                         return v_stack_from_iter(visible.into_iter().map(move |ns| {
                             schema_node(
                                 db.clone(),
@@ -947,8 +947,9 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                     }
                     let tables: Vec<TableInfo> = schema
                         .tables
-                        .into_iter()
+                        .iter()
                         .filter(|t| !filtering || db_hit || t.matches_search(&filt))
+                        .cloned()
                         .collect();
                     if tables.is_empty() {
                         // Hide the node's body entirely while filtering with no
@@ -1633,7 +1634,7 @@ mod tests {
         NavDb {
             database: database.to_string(),
             name: database.to_string(),
-            schema: Some(DbSchema { tables }),
+            schema: Some(std::sync::Arc::new(DbSchema { tables })),
         }
     }
 
