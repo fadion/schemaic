@@ -13,14 +13,58 @@ use serde::{Deserialize, Serialize};
 use crate::connection::Connection;
 
 /// Which panel occupies the right column, persisted across sessions.
+///
+/// Deserialized through [`RightPanelRaw`], so an unrecognised value degrades to
+/// the default instead of failing the file. See that type for why.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "lowercase", from = "RightPanelRaw")]
 pub enum RightPanelState {
     None,
     #[default]
     Ai,
     Terminal,
     History,
+}
+
+/// Parsing shim for [`RightPanelState`] — the public enum's variants plus a
+/// catch-all, which is mapped to the default on the way in.
+///
+/// **Every persisted enum in Schemaic has one of these**, because these files
+/// are read by *older* builds too: releases are plain binaries with no
+/// auto-update, so rolling back a bad version is a file copy. A variant added by
+/// a newer build then appears in the JSON, and without a catch-all serde rejects
+/// the **whole document** for that one string — `classify` calls the file
+/// corrupt, and the `.bak` can't help because the same newer build wrote it. For
+/// `connections.json` that means every saved connection vanishes and the next
+/// ordinary save persists the empty list.
+///
+/// `#[serde(default)]` on the field does not cover this: it supplies a value for
+/// a *missing* field, not for a present one that fails to parse.
+///
+/// The shim exists rather than a public `Unknown` variant so the fallback can't
+/// leak into the app — every match on [`RightPanelState`] stays total over real
+/// states, and no call site has to remember to normalise.
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RightPanelRaw {
+    None,
+    Ai,
+    Terminal,
+    History,
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<RightPanelRaw> for RightPanelState {
+    fn from(raw: RightPanelRaw) -> Self {
+        match raw {
+            RightPanelRaw::None => RightPanelState::None,
+            RightPanelRaw::Ai => RightPanelState::Ai,
+            RightPanelRaw::Terminal => RightPanelState::Terminal,
+            RightPanelRaw::History => RightPanelState::History,
+            RightPanelRaw::Unknown => RightPanelState::default(),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -380,8 +424,90 @@ pub fn clear_connections_backup() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Load, classify, recover, sibling};
+    use super::{ConnectionsFile, Load, RightPanelState, UiState, classify, recover, sibling};
     use std::path::Path;
+
+    // ── Forward compatibility: an unknown enum variant must cost one field,
+    //    not the whole file ───────────────────────────────────────────────────
+    //
+    // These files are read by *older* builds too — Schemaic ships plain release
+    // binaries with no auto-update, so rolling back is a file copy. `#[serde(
+    // default)]` doesn't help here: it fills a *missing* field, not a present
+    // one that fails to parse. Without `#[serde(other)]` serde rejects the whole
+    // document, `classify` calls it corrupt, and the `.bak` is no use because it
+    // was written by the same newer build — so every connection disappears and
+    // the next save persists the empty list.
+
+    #[test]
+    fn an_unknown_right_panel_defaults_and_the_rest_of_the_file_survives() {
+        let json = br#"{"right_panel":"erd","schema_w":123.0}"#;
+        let s: UiState = serde_json::from_slice(json).expect("file must still parse");
+        assert_eq!(s.schema_w, 123.0, "the rest of the document survives");
+        assert_eq!(s.right_panel, RightPanelState::Ai, "unknown → the default");
+    }
+
+    /// The case that costs the most: a connection file is the one whose loss the
+    /// user can't reconstruct.
+    ///
+    /// The fixture is a *real* serialization with the two enum values swapped
+    /// for ones this build doesn't know, so it can't rot as fields are added —
+    /// which is what a newer build writing this file actually does.
+    #[test]
+    fn an_unknown_ssh_auth_or_environment_keeps_every_connection() {
+        use crate::connection::{Connection, Environment, SshAuth};
+
+        let c = Connection {
+            id: 1,
+            name: "keep me".to_string(),
+            db_type: "MySQL".to_string(),
+            host: "h".to_string(),
+            port: 3306,
+            user: "u".to_string(),
+            password: String::new(),
+            ssh: crate::connection::SshTunnel {
+                auth: SshAuth::Agent,
+                ..Default::default()
+            },
+            color: None,
+            prominent_color: false,
+            read_only: false,
+            environment: Environment::Production,
+        };
+        let file = ConnectionsFile {
+            connections: vec![c],
+            active: Some(1),
+        };
+
+        let json = serde_json::to_string(&file)
+            .unwrap()
+            .replace("\"Agent\"", "\"Fido2\"")
+            .replace("\"Production\"", "\"Sandbox\"");
+        assert!(
+            json.contains("Fido2") && json.contains("Sandbox"),
+            "fixture"
+        );
+
+        let back: ConnectionsFile =
+            serde_json::from_str(&json).expect("one unknown variant must not fail the file");
+        assert_eq!(back.connections.len(), 1, "the connection is not lost");
+        assert_eq!(back.connections[0].name, "keep me");
+        assert_eq!(back.connections[0].ssh.auth, SshAuth::Password, "→ default");
+        assert_eq!(
+            back.connections[0].environment,
+            Environment::None,
+            "→ default"
+        );
+    }
+
+    /// A file that is genuinely not JSON must still be classified corrupt —
+    /// tolerating unknown variants mustn't tolerate garbage.
+    #[test]
+    fn a_malformed_file_is_still_corrupt() {
+        assert!(matches!(
+            classify::<UiState>(Some(b"{not json")),
+            Load::Corrupt(_)
+        ));
+    }
 
     #[test]
     fn classify_absent_ok_and_corrupt() {
