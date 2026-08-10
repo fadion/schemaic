@@ -675,6 +675,14 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
 // Opened from the header's help (?) glyph. Same modal chrome as the Settings
 // modal; the body is a read-only reference of the app's keyboard shortcuts,
 // scrollable so it never overflows the window.
+//
+// This is the app's *only* keyboard documentation, and for Ctrl+H and Ctrl+G it
+// is the only affordance of any kind — so a binding missing here is a feature
+// nobody can find. The list is hand-maintained against handlers in three files
+// (`editor_pane.rs`, `grid.rs`, `lib.rs`); add the row in the same change as the
+// binding. Deriving it from the handlers would be better, but they are `match`
+// arms on `Key::Character` spread across those files, so the realistic version
+// is a shared table beside `NavKeys` — a bigger change than has been warranted.
 pub(crate) fn help_overlay(ui: Ui) -> impl IntoView {
     let open = ui.layout.help_open;
 
@@ -696,6 +704,7 @@ pub(crate) fn help_overlay(ui: Ui) -> impl IntoView {
                         ("Ctrl+W", "Close query tab"),
                         ("Ctrl+Tab", "Cycle tabs (Shift = reverse)"),
                         ("Ctrl+1…9", "Jump to tab"),
+                        ("Ctrl+Shift+T", "Reopen last closed tab"),
                         ("Ctrl+Shift+E", "Toggle schema panel"),
                         ("Ctrl+Shift+A", "Toggle AI panel"),
                         ("Ctrl+`", "Toggle terminal"),
@@ -708,6 +717,10 @@ pub(crate) fn help_overlay(ui: Ui) -> impl IntoView {
                         ("Ctrl+Space", "Autocomplete"),
                         ("Ctrl+K", "Inline AI edit"),
                         ("Ctrl+F", "Find in editor"),
+                        // Ctrl+F collapses the replace row, so nothing in the UI
+                        // reveals Ctrl+H — this modal is its only affordance.
+                        ("Ctrl+H", "Find and replace"),
+                        ("Ctrl+G", "Go to line"),
                         ("Ctrl+/", "Toggle line comment"),
                         ("Ctrl+D", "Duplicate line / selection"),
                         ("Ctrl+X", "Delete line"),
@@ -722,6 +735,7 @@ pub(crate) fn help_overlay(ui: Ui) -> impl IntoView {
                         ("Ctrl+A", "Select all"),
                         ("Enter", "Edit cell / open value"),
                         ("Ctrl+Enter", "Commit edits"),
+                        ("Del", "Mark row for deletion"),
                     ],
                 ),
             ))
