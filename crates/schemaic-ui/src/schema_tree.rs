@@ -422,7 +422,9 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
             let mut list = db_nodes
                 .get()
                 .into_iter()
-                .filter(|c| !hidden_dbs.get().contains(&c.database))
+                // `with`, not `get` — this runs per database, and `get` would clone
+                // the whole hidden set each time.
+                .filter(|c| !hidden_dbs.with(|h| h.contains(&c.database)))
                 // While filtering, drop a database with no match: neither its own
                 // name nor any of its tables/columns matches. A database whose schema
                 // is still loading is kept (we can't know its tables yet).
@@ -863,7 +865,9 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
     let children = dyn_container(
         move || {
             (
-                expanded.get().contains(&key_children),
+                // `with`, not `get`: every row in the tree reads this set, and
+                // `get` clones all of it to answer one `contains`.
+                expanded.with(|e| e.contains(&key_children)),
                 schema_sig.get(),
                 filter.get(),
             )
@@ -1067,7 +1071,7 @@ fn schema_node(
     let key_children = key.clone();
     let ns_children = ns.clone();
     let children = dyn_container(
-        move || (expanded.get().contains(&key_children), filter.get()),
+        move || (expanded.with(|e| e.contains(&key_children)), filter.get()),
         move |(open, filt)| {
             let filt = filt.trim().to_lowercase();
             let filtering = !filt.is_empty();
@@ -1219,7 +1223,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
     let children = dyn_container(
         // Show columns/keys when the table is expanded OR when a column matched the
         // filter (`force_cols`) — so the highlighted column is actually revealed.
-        move || expanded.get().contains(&key_children) || force_cols,
+        move || expanded.with(|e| e.contains(&key_children)) || force_cols,
         move |open| {
             if !open {
                 return empty().into_any();
@@ -1501,7 +1505,7 @@ fn chevron(
 ) -> impl IntoView {
     let key_read = key.clone();
     let glyph = dyn_container(
-        move || expanded.get().contains(&key_read),
+        move || expanded.with(|e| e.contains(&key_read)),
         move |open| {
             let svg = if open {
                 icons::CHEVRON_DOWN

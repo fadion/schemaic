@@ -279,7 +279,7 @@ pub(crate) fn db_visibility_overlay(ui: Ui) -> impl IntoView {
                         .on_click_stop(move |_| (toggle)(db_toggle.clone()))
                         .style(menu_item_style)
                         .style(move |s| {
-                            let c = if hidden.get().contains(&db_state) {
+                            let c = if hidden.with(|h| h.contains(&db_state)) {
                                 theme::db_toggle_off()
                             } else {
                                 theme::db_toggle_on()

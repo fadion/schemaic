@@ -711,7 +711,9 @@ fn node_card(
         let node = node.clone();
         let id_k = id.clone();
         dyn_container(
-            move || collapsed.get().get(&id_k).copied().unwrap_or(false),
+            // `with`: `get` would clone the whole collapse map per card (see the
+            // position read above).
+            move || collapsed.with(|m| m.get(&id_k).copied().unwrap_or(false)),
             move |is_collapsed| {
                 column_rows(
                     node.clone(),

@@ -3126,7 +3126,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 )
                 .style(|s| s.width(170.0));
                 let count = dyn_container(
-                    move || (find_hits.get().len(), find_idx.get()),
+                    // `with`, not `get` — reading a length shouldn't clone the hits.
+                    move || (find_hits.with(|h| h.len()), find_idx.get()),
                     move |(n, i)| {
                         let cur = if n == 0 { 0 } else { i + 1 };
                         text(format!("{cur}/{n}"))

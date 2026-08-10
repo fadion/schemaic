@@ -2122,7 +2122,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             .style(move |s| {
                 let w = GUTTER_W
                     + match frozen_col {
-                        Some(fc) => gs.widths.get().get(fc).copied().unwrap_or(0.0),
+                        Some(fc) => gs.widths.with(|w| w.get(fc).copied().unwrap_or(0.0)),
                         None => 0.0,
                     };
                 s.width(w)
@@ -4681,7 +4681,10 @@ fn header_cell(
             ]));
         })
         .style(move |s| {
-            let w = gs.widths.get().get(ci).copied().unwrap_or(CELL_W);
+            // `with`, not `get`: `get` clones the whole widths `Vec` to read one
+            // slot, and this closure re-runs for every visible header on any
+            // selection change.
+            let w = gs.widths.with(|ws| ws.get(ci).copied().unwrap_or(CELL_W));
             // Highlight the header when its column is within the cell selection.
             let col_sel = matches!(gs.bounds(), Some((_, c0, _, c1)) if ci >= c0 && ci <= c1);
             let formatted = gs
@@ -4859,7 +4862,7 @@ fn data_cell(
                                 // changes, keeping it right-anchored while typing). A
                                 // value wider than the column clamps to `pad_left = 0`
                                 // (full width, left-aligned + clip) like the display.
-                                let w = gs.widths.get().get(ci).copied().unwrap_or(CELL_W);
+                                let w = gs.widths.with(|ws| ws.get(ci).copied().unwrap_or(CELL_W));
                                 let text_px = gs.edit_buf.with(|b| measure_text_px(b));
                                 // Cell content box = column width minus the cell's 10px
                                 // horizontal padding on each side.
@@ -5153,7 +5156,11 @@ fn data_cell(
             gs.popup.set(Some(entries));
         })
         .style(move |s| {
-            let w = gs.widths.get().get(ci).copied().unwrap_or(CELL_W);
+            // `with`, not `get` — see the header closure. This one runs for every
+            // *cell* in the viewport on every selection change, so a drag-select
+            // over a wide result cloned the widths `Vec` hundreds of times per
+            // pointer move.
+            let w = gs.widths.with(|ws| ws.get(ci).copied().unwrap_or(CELL_W));
             let sel = cell_in(gs.bounds(), i, ci);
             let is_active = gs.active.get() == Some((i, ci));
             let is_dirty = match pending {
