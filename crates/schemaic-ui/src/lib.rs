@@ -1480,7 +1480,8 @@ pub struct OverlayUi {
     pub erd: RwSignal<Option<ErdTarget>>,
 }
 
-/// One entry in the Live Monitor's change log: a detected [`RowChange`] plus the
+/// One entry in the Live Monitor's change log: a detected
+/// [`schemaic_core::monitor::RowChange`] plus the
 /// elapsed-since-start timestamp (`M:SS`) at which the monitor observed it.
 #[derive(Clone, Debug)]
 pub struct MonitorEntry {

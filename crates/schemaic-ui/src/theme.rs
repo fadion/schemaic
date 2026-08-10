@@ -3,7 +3,8 @@
 //! These now read the *active* theme from [`crate::themes`] (a reactive signal),
 //! so switching themes at runtime re-runs every `.style(…)` closure that calls
 //! one. Adding/altering a colour means a field on [`crate::themes::UiTheme`] (or
-//! [`EditorTheme`]) plus an accessor here — the call sites never change.
+//! [`crate::themes::EditorTheme`]) plus an accessor here — the call sites never
+//! change.
 //!
 //! Editor-surface + syntax roles (`code_bg`, `suggest_*`, `syntax_underline`)
 //! read the separate [`crate::themes::EditorTheme`] axis instead of the UI theme.

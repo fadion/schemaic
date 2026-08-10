@@ -134,7 +134,7 @@ impl TxState {
     /// Fold one statement's outcome into the transaction state.
     ///
     /// `sql` is the statement that ran — needed because MySQL DDL implicitly
-    /// commits (see [`implicit_commit`]). A statement arriving while [`Idle`]
+    /// commits (see [`implicit_commit`]). A statement arriving while [`TxState::Idle`]
     /// opens the transaction (the app issues `BEGIN` lazily, so the first
     /// statement lands as the first statement of a fresh transaction).
     pub fn on_statement(self, engine: TxEngine, sql: &str, outcome: StmtOutcome) -> TxState {

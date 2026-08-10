@@ -421,7 +421,8 @@ fn table_label(t: &TableInfo, qualify: bool) -> String {
 }
 
 /// `schema.table` when the database has several namespaces, else
-/// [`display_name`]'s rule (bare in `public`, qualified elsewhere). Spelling out
+/// [`schemaic_core::schema::display_name`]'s rule (bare in `public`, qualified
+/// elsewhere). Spelling out
 /// `public.` matters only when something else could be meant.
 fn namespaced(schema: Option<&str>, table: &str, qualify: bool) -> String {
     match schema {

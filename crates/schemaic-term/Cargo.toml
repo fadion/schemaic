@@ -10,3 +10,6 @@ alacritty_terminal = "0.24"
 anyhow = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
+
+[lints]
+workspace = true
