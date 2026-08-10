@@ -129,7 +129,10 @@ pub(crate) fn build_catalog(
     db_nodes: RwSignal<Vec<ConnNode>>,
     active_db: Option<&str>,
 ) -> intel::Catalog {
-    let loaded: Vec<(String, DbSchema)> = db_nodes
+    // Each `schema` is the `Arc` out of `SchemaState`, so this walk is refcount
+    // bumps rather than a deep copy of every table and column of every loaded
+    // database — which is what it was, several times per keystroke.
+    let loaded: Vec<(String, std::sync::Arc<DbSchema>)> = db_nodes
         .get_untracked()
         .into_iter()
         .filter_map(|node| match node.schema.get_untracked() {
@@ -137,7 +140,7 @@ pub(crate) fn build_catalog(
             _ => None,
         })
         .collect();
-    let refs: Vec<(&str, &DbSchema)> = loaded.iter().map(|(d, s)| (d.as_str(), s)).collect();
+    let refs: Vec<(&str, &DbSchema)> = loaded.iter().map(|(d, s)| (d.as_str(), &**s)).collect();
     intel::Catalog::build(&refs, active_db)
 }
 

@@ -90,7 +90,10 @@ const ZOOM_MIN: f64 = 0.25;
 const ZOOM_MAX: f64 = 3.0;
 
 /// Resolve the active connection's loaded schema for `database`, if introspected.
-fn resolve_schema(db_nodes: RwSignal<Vec<ConnNode>>, database: &str) -> Option<DbSchema> {
+fn resolve_schema(
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    database: &str,
+) -> Option<std::sync::Arc<DbSchema>> {
     db_nodes.get_untracked().iter().find_map(|n| {
         if n.database == database {
             match n.schema.get_untracked() {
