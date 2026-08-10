@@ -39,7 +39,12 @@ impl ConnStatus {
 }
 
 /// How the SSH tunnel authenticates to the jump host.
+///
+/// Deserialized through [`SshAuthRaw`], so a value written by a newer build
+/// degrades to the default instead of failing the whole `connections.json` —
+/// see [`crate::persist::RightPanelState`] for the full reasoning.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(from = "SshAuthRaw")]
 pub enum SshAuth {
     /// Username + password.
     #[default]
@@ -49,6 +54,27 @@ pub enum SshAuth {
     /// Delegate signing to the running SSH agent (OpenSSH agent / Pageant on
     /// Windows, `$SSH_AUTH_SOCK` on Unix) — no secret is stored by Schemaic.
     Agent,
+}
+
+/// Parsing shim for [`SshAuth`]; see [`crate::persist::RightPanelState`].
+#[derive(Deserialize)]
+enum SshAuthRaw {
+    Password,
+    KeyPair,
+    Agent,
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<SshAuthRaw> for SshAuth {
+    fn from(raw: SshAuthRaw) -> Self {
+        match raw {
+            SshAuthRaw::Password => SshAuth::Password,
+            SshAuthRaw::KeyPair => SshAuth::KeyPair,
+            SshAuthRaw::Agent => SshAuth::Agent,
+            SshAuthRaw::Unknown => SshAuth::default(),
+        }
+    }
 }
 
 impl SshAuth {
@@ -67,7 +93,11 @@ impl SshAuth {
 
 /// Which environment a connection points at, surfaced as a badge in the top bar
 /// so it's always obvious what you're working against.
+///
+/// Deserialized through [`EnvironmentRaw`]; see
+/// [`crate::persist::RightPanelState`] for why every persisted enum has a shim.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(from = "EnvironmentRaw")]
 pub enum Environment {
     /// No environment assigned — no badge is shown. The default.
     #[default]
@@ -82,6 +112,33 @@ pub enum Environment {
     Staging,
     /// The live production environment.
     Production,
+}
+
+/// Parsing shim for [`Environment`]; see [`crate::persist::RightPanelState`].
+#[derive(Deserialize)]
+enum EnvironmentRaw {
+    None,
+    Local,
+    Development,
+    Testing,
+    Staging,
+    Production,
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<EnvironmentRaw> for Environment {
+    fn from(raw: EnvironmentRaw) -> Self {
+        match raw {
+            EnvironmentRaw::None => Environment::None,
+            EnvironmentRaw::Local => Environment::Local,
+            EnvironmentRaw::Development => Environment::Development,
+            EnvironmentRaw::Testing => Environment::Testing,
+            EnvironmentRaw::Staging => Environment::Staging,
+            EnvironmentRaw::Production => Environment::Production,
+            EnvironmentRaw::Unknown => Environment::default(),
+        }
+    }
 }
 
 impl Environment {
