@@ -217,6 +217,19 @@ pub fn statement_ranges(sql: &str, dialect: SqlDialect) -> Vec<(usize, usize)> {
 /// The uppercased first keyword of `sql` (skipping leading whitespace and
 /// comments), or `None` if it doesn't start with a word.
 pub fn leading_keyword(sql: &str, dialect: SqlDialect) -> Option<String> {
+    leading_keyword_span(sql, dialect).map(|(s, e)| sql[s..e].to_ascii_uppercase())
+}
+
+/// The byte offset just past [`leading_keyword`] — where the rest of the
+/// statement begins. `None` on the same inputs `leading_keyword` returns `None`
+/// for, so a caller that needs the second token can't accidentally read from
+/// offset 0 of a comment-only string.
+pub fn leading_keyword_end(sql: &str, dialect: SqlDialect) -> Option<usize> {
+    leading_keyword_span(sql, dialect).map(|(_, e)| e)
+}
+
+/// Byte range of the leading keyword, skipping whitespace and comments.
+fn leading_keyword_span(sql: &str, dialect: SqlDialect) -> Option<(usize, usize)> {
     let b = sql.as_bytes();
     let n = b.len();
     let mut i = 0;
@@ -238,7 +251,7 @@ pub fn leading_keyword(sql: &str, dialect: SqlDialect) -> Option<String> {
         while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
             j += 1;
         }
-        return Some(sql[s..j].to_ascii_uppercase());
+        return Some((s, j));
     }
     None
 }
