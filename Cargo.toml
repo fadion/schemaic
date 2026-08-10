@@ -9,6 +9,15 @@ members = [
     "crates/schemaic-app",
 ]
 
+# CI runs `cargo doc` with `-D warnings`, so a doc comment that points at
+# something no longer there fails the build — the class that let `history.rs`
+# link a `MAX_ENTRIES` renamed to `MAX_PER_CONN` while describing the wrong
+# cap. `private_intra_doc_links` is *not* that class: these crates are internal,
+# nothing is published, and a link from a public item to a private one is a real
+# reference a developer follows in the source. Only unresolved links are drift.
+[workspace.lints.rustdoc]
+private_intra_doc_links = "allow"
+
 [workspace.package]
 version = "0.11.0"
 edition = "2024"

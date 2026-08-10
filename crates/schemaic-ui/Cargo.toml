@@ -13,3 +13,6 @@ floem = { workspace = true }
 floem_renderer = "0.2.0"
 serde_json = { workspace = true }
 pulldown-cmark = { version = "0.13.4", default-features = false }
+
+[lints]
+workspace = true

@@ -95,8 +95,8 @@ impl Engine {
 
 /// A resolved connection target — server coordinates + credentials, already
 /// pointed through any established SSH tunnel. Built once from a saved
-/// [`Connection`]; every operation derives a fresh `mysql_async` connection from
-/// it.
+/// [`schemaic_core::connection::Connection`]; every operation derives a fresh
+/// `mysql_async` connection from it.
 ///
 /// This is the app's single connection *identity* (review §3.1): the app threads
 /// a `Db` (or a connection id resolving to one), never a `mysql://user:pass@…`
@@ -406,7 +406,7 @@ fn explain_commands(sql: &str, analyze: bool) -> (String, Option<String>) {
 
 /// Run several statements in order on ONE connection, so session state (`USE`,
 /// `SET`, temp tables, transactions) carries across them exactly as a SQL script
-/// would — unlike calling [`fetch_query`] per statement, which reconnects each
+/// would — unlike calling [`Db::fetch_query`] per statement, which reconnects each
 /// time. Each statement's outcome is delivered through `on_result(index, …)` as
 /// soon as it completes, so the UI can fill result tabs progressively.
 ///

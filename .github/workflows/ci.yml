@@ -33,6 +33,14 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy (warnings = errors)
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Clippy does not check rustdoc, so a doc comment linking to a renamed or
+      # deleted item shipped silently. `[workspace.lints.rustdoc]` allows links
+      # from a public item to a private one (real references in an unpublished
+      # workspace); what this catches is a link that resolves to nothing.
+      - name: Rustdoc (warnings = errors)
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
       - name: License / advisory policy
         uses: EmbarkStudios/cargo-deny-action@v2
 
