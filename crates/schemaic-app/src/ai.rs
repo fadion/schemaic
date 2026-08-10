@@ -19,6 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use schemaic_core::connection::Connection;
+use schemaic_core::intel::SqlDialect;
 use schemaic_core::schema::{DbSchema, SchemaState};
 use schemaic_core::transcript::{ChatMessage, Role};
 use schemaic_db::Db;
@@ -604,14 +605,16 @@ pub(crate) fn ai_context(
     history: &[ChatMessage],
     instructions: &str,
 ) -> String {
-    let conn_name = p
+    // Name *and* engine come from the same lookup: the assistant is told which
+    // dialect to write for, and that has to be the connection it is pointed at.
+    let (conn_name, dialect) = p
         .connections
         .with_untracked(|cs| {
             cs.iter()
                 .find(|c| c.id == p.active_conn.get_untracked())
-                .map(|c| c.name.clone())
+                .map(|c| (c.name.clone(), SqlDialect::from_db_type(&c.db_type)))
         })
-        .unwrap_or_else(|| "(none)".to_string());
+        .unwrap_or_else(|| ("(none)".to_string(), SqlDialect::MySql));
     render_ai_context(
         &conn_name,
         &turn_context(p, fallback_db),
@@ -619,6 +622,7 @@ pub(crate) fn ai_context(
         p.run_queries,
         &render_history(history, HISTORY_TURNS),
         instructions,
+        dialect,
     )
 }
 
@@ -741,7 +745,9 @@ fn render_ai_context(
     run_queries: bool,
     history: &str,
     instructions: &str,
+    dialect: SqlDialect,
 ) -> String {
+    let engine = dialect.engine_label();
     // Tools line — kept truthful: the assistant always has `list_schema`, and
     // `run_query` only when the setting allows it.
     let tools_line = if run_queries {
@@ -762,7 +768,8 @@ fn render_ai_context(
     let current = &cx.query;
 
     let mut out = format!(
-        "You are a SQL assistant embedded in Schemaic, a native MySQL/MariaDB editor. \
+        "You are a SQL assistant embedded in Schemaic. The active connection is \
+         {engine} — write SQL for that engine. \
          Help the user write, fix, and understand SQL. Be concise and return runnable \
          SQL in fenced code blocks. {tools_line}\n\n\
          Active connection: {conn_name}\n\
@@ -811,9 +818,10 @@ pub(crate) fn inline_system_prompt(
     db_nodes: RwSignal<Vec<ConnNode>>,
     active_db: Option<&str>,
     req: &InlineAiRequest,
+    dialect: SqlDialect,
 ) -> String {
     let databases = snapshot_databases(db_nodes);
-    render_inline_prompt(&databases, active_db, req)
+    render_inline_prompt(&databases, active_db, req, dialect)
 }
 
 /// Pure core of [`inline_system_prompt`]: build the Ctrl+K generator prompt from
@@ -825,7 +833,9 @@ fn render_inline_prompt(
     databases: &[(String, Option<DbSchema>)],
     active_db: Option<&str>,
     req: &InlineAiRequest,
+    dialect: SqlDialect,
 ) -> String {
+    let engine = dialect.engine_label();
     let haystack = format!("{} {}", req.current_sql, req.intent).to_lowercase();
     let mut outline = String::new();
     for (database, schema) in databases {
@@ -856,7 +866,7 @@ fn render_inline_prompt(
         None => "Write a SQL statement for the request, to be inserted at the cursor.".to_string(),
     };
     format!(
-        "You are a SQL generator for MySQL/MariaDB inside the Schemaic editor. Output \
+        "You are a SQL generator for {engine} inside the Schemaic editor. Output \
          ONLY SQL — no prose, no explanation, no markdown fences. Use only tables and \
          columns from the schema below.\n\n\
          Schema (database: table(columns)):\n{outline}\n\
@@ -1027,7 +1037,15 @@ mod tests {
             ),
         ];
         let cx = ctx_of(&dbs, Some("shop"), "SELECT 1", SchemaScope::Active);
-        let out = render_ai_context("Local", &cx, SchemaScope::Active, true, "", "");
+        let out = render_ai_context(
+            "Local",
+            &cx,
+            SchemaScope::Active,
+            true,
+            "",
+            "",
+            SqlDialect::MySql,
+        );
         assert!(out.contains("Active connection: Local"));
         assert!(out.contains("Active database: shop"));
         assert!(out.contains("- shop: orders"));
@@ -1047,7 +1065,15 @@ mod tests {
             ("blog".to_string(), None), // schema not loaded yet
         ];
         let cx = ctx_of(&dbs, Some("shop"), "", SchemaScope::All);
-        let out = render_ai_context("Local", &cx, SchemaScope::All, false, "", "");
+        let out = render_ai_context(
+            "Local",
+            &cx,
+            SchemaScope::All,
+            false,
+            "",
+            "",
+            SqlDialect::MySql,
+        );
         assert!(out.contains("- shop: orders"));
         assert!(out.contains("- blog\n")); // unloaded → name only, no ": tables"
         // run_queries = false → the no-queries tools line.
@@ -1069,6 +1095,7 @@ mod tests {
             true,
             "",
             "  Prefer CTEs.  ",
+            SqlDialect::MySql,
         );
         assert!(!out.contains("Databases and tables:"));
         assert!(!out.contains("orders"));
@@ -1094,7 +1121,12 @@ mod tests {
             ])),
         )];
         // active_db = shop → every table in shop gets columns.
-        let out = render_inline_prompt(&dbs, Some("shop"), &req("count orders", "SELECT 1", None));
+        let out = render_inline_prompt(
+            &dbs,
+            Some("shop"),
+            &req("count orders", "SELECT 1", None),
+            SqlDialect::MySql,
+        );
         assert!(out.contains("orders(id, total)"));
         assert!(out.contains("audit(id)"));
         assert!(out.contains("to be inserted at the cursor"));
@@ -1114,6 +1146,7 @@ mod tests {
             &dbs,
             Some("shop"),
             &req("update posts", "SELECT * FROM posts", None),
+            SqlDialect::MySql,
         );
         assert!(out.contains("posts(id, body)")); // mentioned → columns
         assert!(out.contains("  tags\n")); // not mentioned → bare name
@@ -1417,6 +1450,7 @@ mod tests {
             &dbs,
             None,
             &req("uppercase", "SELECT a FROM t", Some("SELECT a FROM t")),
+            SqlDialect::MySql,
         );
         assert!(out.contains("The user selected this SQL to transform:"));
         assert!(out.contains("Rewrite ONLY that"));

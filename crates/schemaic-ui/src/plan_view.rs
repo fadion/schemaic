@@ -107,6 +107,7 @@ pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
                     ai_send.clone(),
                     right_panel,
                     close.clone(),
+                    plan_dialect(),
                 ),
             ))
             .style(|s| {
@@ -350,6 +351,7 @@ fn ask_ai_button(
     ai_send: Rc<dyn Fn(String)>,
     right_panel: RwSignal<RightPanel>,
     close: Rc<dyn Fn()>,
+    dialect: schemaic_core::intel::SqlDialect,
 ) -> impl IntoView {
     h_stack((
         icons::icon(icons::SPARKLES, 15.0).style(|s| s.flex_shrink(0.0_f32)),
@@ -375,8 +377,11 @@ fn ask_ai_button(
             return;
         };
         let sql = plan_sql.get_untracked();
+        // The plan's shape and the useful advice both differ by engine, and the
+        // modal already knows which one produced it.
+        let engine = dialect.engine_label();
         let msg = format!(
-            "Here is the MySQL/MariaDB EXPLAIN plan for a query. Explain what it's \
+            "Here is the {engine} EXPLAIN plan for a query. Explain what it's \
              doing, then suggest concrete optimizations — indexes to add, or query \
              rewrites — to make it faster.\n\nQuery:\n```sql\n{sql}\n```\n\nEXPLAIN \
              output:\n```\n{}\n```",

@@ -151,7 +151,9 @@ pub fn build_fill_prompt(
     ddl: &str,
     sample: &[Row],
     row_context: &[(String, Option<String>)],
+    dialect: crate::intel::SqlDialect,
 ) -> String {
+    let engine = dialect.engine_label();
     let sample_section = if sample.is_empty() {
         "The table currently has no rows to sample — infer a realistic value from \
          the column's type and name."
@@ -174,7 +176,7 @@ pub fn build_fill_prompt(
     };
     format!(
         "You are generating a single realistic test-data value for one column of a \
-         MySQL/MariaDB table.\n\n\
+         {engine} table.\n\n\
          Table: {table}\n\
          Target column: {column}\n\n\
          Schema:\n{ddl}\n\n\
@@ -197,7 +199,9 @@ pub fn build_seed_prompt(
     fill_columns: &[String],
     sample: &[Row],
     n: usize,
+    dialect: crate::intel::SqlDialect,
 ) -> String {
+    let engine = dialect.engine_label();
     let cols = fill_columns.join(", ");
     let sample_section = if sample.is_empty() {
         "The table currently has no rows to sample — infer realistic values from the \
@@ -212,7 +216,7 @@ pub fn build_seed_prompt(
         )
     };
     format!(
-        "You are generating {n} row(s) of realistic test data for a MySQL/MariaDB \
+        "You are generating {n} row(s) of realistic test data for a {engine} \
          table.\n\n\
          Table: {table}\n\
          Fill ONLY these columns: {cols}\n\
@@ -392,7 +396,14 @@ mod tests {
             row(&[("id", Some("2")), ("status", Some("pending"))]),
         ];
         let ctx = row(&[("id", Some("3"))]);
-        let p = build_fill_prompt("shop.orders", "status", "CREATE TABLE ...", &sample, &ctx);
+        let p = build_fill_prompt(
+            "shop.orders",
+            "status",
+            "CREATE TABLE ...",
+            &sample,
+            &ctx,
+            crate::intel::SqlDialect::MySql,
+        );
         assert!(p.contains("shop.orders"));
         assert!(p.contains("status"));
         assert!(p.contains("CREATE TABLE ..."));
@@ -404,7 +415,7 @@ mod tests {
 
     #[test]
     fn fill_prompt_handles_empty_sample() {
-        let p = build_fill_prompt("t", "c", "ddl", &[], &[]);
+        let p = build_fill_prompt("t", "c", "ddl", &[], &[], crate::intel::SqlDialect::MySql);
         assert!(p.contains("no rows to sample"));
     }
 
@@ -414,7 +425,14 @@ mod tests {
     fn seed_prompt_includes_key_context() {
         let sample = vec![row(&[("name", Some("Ada")), ("role", Some("admin"))])];
         let cols = vec!["name".to_string(), "role".to_string()];
-        let p = build_seed_prompt("app.users", "CREATE TABLE users ...", &cols, &sample, 5);
+        let p = build_seed_prompt(
+            "app.users",
+            "CREATE TABLE users ...",
+            &cols,
+            &sample,
+            5,
+            crate::intel::SqlDialect::MySql,
+        );
         assert!(p.contains("app.users"));
         assert!(p.contains("CREATE TABLE users ..."));
         assert!(p.contains("name, role")); // fill-column list
@@ -425,7 +443,34 @@ mod tests {
 
     #[test]
     fn seed_prompt_handles_empty_sample() {
-        let p = build_seed_prompt("t", "ddl", &["c".to_string()], &[], 1);
+        let p = build_seed_prompt(
+            "t",
+            "ddl",
+            &["c".to_string()],
+            &[],
+            1,
+            crate::intel::SqlDialect::MySql,
+        );
         assert!(p.contains("no rows to sample"));
+    }
+
+    /// Every AI surface used to hardcode "MySQL/MariaDB", so on a PostgreSQL
+    /// connection the model was asked for the wrong engine's SQL — and obliges,
+    /// with backticks and `LIMIT x, y` the server rejects.
+    #[test]
+    fn seed_prompts_name_the_connections_own_engine() {
+        use crate::intel::SqlDialect;
+        for (dialect, want, wrong) in [
+            (SqlDialect::Postgres, "PostgreSQL", "MySQL"),
+            (SqlDialect::MySql, "MySQL/MariaDB", "PostgreSQL"),
+        ] {
+            let fill = build_fill_prompt("t", "c", "ddl", &[], &[], dialect);
+            assert!(fill.contains(want), "fill prompt, {dialect:?}:\n{fill}");
+            assert!(!fill.contains(wrong), "fill prompt, {dialect:?}:\n{fill}");
+
+            let seed = build_seed_prompt("t", "ddl", &["c".to_string()], &[], 3, dialect);
+            assert!(seed.contains(want), "seed prompt, {dialect:?}:\n{seed}");
+            assert!(!seed.contains(wrong), "seed prompt, {dialect:?}:\n{seed}");
+        }
     }
 }
