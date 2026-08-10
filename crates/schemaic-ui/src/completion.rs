@@ -10,8 +10,10 @@
 //! is the ranking + popup layer over it. Only `Completion`/`recompute_completions`/
 //! `accept_completion`/`completion_popup` are `pub(crate)`; the rest is internal.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use floem::kurbo::Point;
 use floem::prelude::*;
@@ -122,18 +124,28 @@ fn word_start(text: &str, offset: usize) -> usize {
     start
 }
 
-/// Build the `schemaic_core::intel::Catalog` from the loaded connection schemas
-/// and the tab's active database. Shared by the FK-aware `JOIN … ON` completion
-/// and the editor's diagnostics (`editor_pane::compute_diagnostics`), so both read
-/// the same catalog view.
+thread_local! {
+    /// One memoised catalog per UI thread — see [`intel::CatalogCache`]. A single
+    /// keystroke reaches `build_catalog` up to four times (column completion, JOIN
+    /// targets, signature help, diagnostics) and each build is milliseconds at
+    /// customer scale, so they share one. The cache keys on the schemas'
+    /// `Arc` identity, which a re-introspection changes, so nothing here has to be
+    /// invalidated by hand.
+    static CATALOG: RefCell<intel::CatalogCache> = RefCell::new(intel::CatalogCache::default());
+}
+
+/// The `schemaic_core::intel::Catalog` for the loaded connection schemas and the
+/// tab's active database. Shared by the FK-aware `JOIN … ON` completion and the
+/// editor's diagnostics (`editor_pane::compute_diagnostics`), so both read the same
+/// catalog view.
 pub(crate) fn build_catalog(
     db_nodes: RwSignal<Vec<ConnNode>>,
     active_db: Option<&str>,
-) -> intel::Catalog {
+) -> Arc<intel::Catalog> {
     // Each `schema` is the `Arc` out of `SchemaState`, so this walk is refcount
     // bumps rather than a deep copy of every table and column of every loaded
     // database — which is what it was, several times per keystroke.
-    let loaded: Vec<(String, std::sync::Arc<DbSchema>)> = db_nodes
+    let loaded: Vec<(String, Arc<DbSchema>)> = db_nodes
         .get_untracked()
         .into_iter()
         .filter_map(|node| match node.schema.get_untracked() {
@@ -141,8 +153,7 @@ pub(crate) fn build_catalog(
             _ => None,
         })
         .collect();
-    let refs: Vec<(&str, &DbSchema)> = loaded.iter().map(|(d, s)| (d.as_str(), &**s)).collect();
-    intel::Catalog::build(&refs, active_db)
+    CATALOG.with(|c| c.borrow_mut().get(&loaded, active_db))
 }
 
 /// One column's completion-relevant metadata.

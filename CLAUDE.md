@@ -38,7 +38,10 @@ Zed-inspired, aiming to replace DataGrip.
     keyword-typo warnings). **AST for classification, `skip_noncode` for byte positions by default** —
     except `colres`, which uses sqlparser 0.62's now-accurate per-identifier *spans* (verified) so the
     same column name in an inner vs outer scope is placed independently. `Catalog` is the case-folded view over
-    the introspected `DbSchema`s (columns + FK edges). Hosts the shared `SQL_KEYWORDS`/`SQL_FUNCTIONS`/
+    the introspected `DbSchema`s (columns + FK edges); building one is O(tables × columns) and a keystroke asks
+    for it up to four times, so the UI goes through `CatalogCache` — a memo keyed on the **`Arc<DbSchema>`
+    identity** of the schemas it was built from rather than a hand-bumped generation, so a re-introspection
+    misses by construction and there is no write site to remember. Hosts the shared `SQL_KEYWORDS`/`SQL_FUNCTIONS`/
     `STMT_KEYWORDS` (the UI's completion + editor build on these). Also `join_condition` (FK-aware
     `JOIN … ON` auto-fill), `db_error_diagnostic` (positions a live DB error within the statement),
     `parses` (Tier-2 gate), and `select_output_names` (a projection's column names *in order*, or
