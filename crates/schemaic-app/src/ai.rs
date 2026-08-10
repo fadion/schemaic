@@ -20,6 +20,7 @@ use tokio::process::Command;
 
 use schemaic_core::connection::Connection;
 use schemaic_core::intel::SqlDialect;
+use schemaic_core::persist;
 use schemaic_core::schema::{DbSchema, SchemaState};
 use schemaic_core::transcript::{ChatMessage, Role};
 use schemaic_db::Db;
@@ -169,7 +170,10 @@ fn write_mcp_config(endpoint: &str) -> Option<PathBuf> {
     let cfg = mcp_config_json(&exe, endpoint);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!("schemaic-mcp-{}-{n}.json", std::process::id()));
-    write_private(&path, cfg.as_bytes()).ok()?;
+    // On Windows the user's temp dir is already ACL-scoped to the user; a
+    // same-user process can read it, but that's no worse than the env var, and
+    // strictly better than a command-line argument (review C6).
+    persist::write_private(&path, cfg.as_bytes()).ok()?;
     Some(path)
 }
 
@@ -187,30 +191,6 @@ fn mcp_config_json(exe: &str, endpoint: &str) -> String {
         }
     })
     .to_string()
-}
-
-/// Write `bytes` to `path`, owner-only where the platform supports it.
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(bytes)
-    }
-    #[cfg(not(unix))]
-    {
-        // On Windows the user's temp dir is already ACL-scoped to the user; a
-        // same-user process can read it, but that's no worse than the env var,
-        // and strictly better than a command-line argument (review C6).
-        let mut f = std::fs::File::create(path)?;
-        f.write_all(bytes)
-    }
 }
 
 /// A streamed transcript snapshot pushed from the reader task to the UI.
