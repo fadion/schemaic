@@ -8,15 +8,19 @@
 //!
 //! **Dialect-aware.** The primitive takes a [`SqlDialect`] because the boundaries
 //! genuinely differ between engines: MySQL has `#` line comments, backtick
-//! identifiers, and `\`-escapes inside all quotes; PostgreSQL instead uses `#` in
-//! operators (`#>`/`#>>`/`#-`), double-quoted identifiers, dollar-quoted strings
-//! (`$tag$ … $tag$`), and `\`-escapes only in `E'…'` strings. Every caller passes
-//! the connection's dialect so splitting/guards/highlighting agree with the AST.
+//! identifiers, `\`-escapes inside all quotes, and requires whitespace after `--`
+//! (so `1--2` is arithmetic); PostgreSQL instead uses `#` in operators
+//! (`#>`/`#>>`/`#-`), double-quoted identifiers, dollar-quoted strings
+//! (`$tag$ … $tag$`), `\`-escapes only in `E'…'` strings, and follows the
+//! standard in starting a comment at `--` with no whitespace needed. Every caller
+//! passes the connection's dialect so splitting/guards/highlighting agree with
+//! the AST.
 
 use crate::intel::SqlDialect;
 
 /// If `b[i..]` starts a comment, return the index just past it. Handles `--`
-/// (requires whitespace/EOL after it, so `1--2` is `1 - -2`, not a comment),
+/// (**MySQL only** requires whitespace/EOL after it, so there `1--2` is
+/// `1 - -2`, not a comment; Postgres follows the standard and needs none),
 /// `#` line comments (**MySQL only** — Postgres uses `#` in operators), and
 /// `/* … */` block comments (both dialects; non-nesting).
 fn skip_comment(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
@@ -24,7 +28,7 @@ fn skip_comment(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
     if b[i] == b'-'
         && i + 1 < n
         && b[i + 1] == b'-'
-        && (i + 2 >= n || b[i + 2].is_ascii_whitespace())
+        && (dialect == SqlDialect::Postgres || i + 2 >= n || b[i + 2].is_ascii_whitespace())
     {
         let mut j = i + 2;
         while j < n && b[j] != b'\n' {
@@ -502,6 +506,60 @@ mod tests {
 
     // ── Postgres dialect boundary tests ──────────────────────────────────────
     const PG: SqlDialect = SqlDialect::Postgres;
+
+    /// MySQL requires whitespace after `--`; PostgreSQL and the SQL standard do
+    /// not. Applying MySQL's rule to PostgreSQL means `--WHERE` reads as code.
+    #[test]
+    fn pg_double_dash_needs_no_whitespace_to_start_a_comment() {
+        assert!(super::skip_noncode(b"--x", 0, PG).is_some());
+        assert!(
+            super::skip_noncode(b"--x", 0, SqlDialect::MySql).is_none(),
+            "MySQL: `1--2` is `1 - -2`, not a comment — must not move"
+        );
+        // The spaced form is a comment in both.
+        assert!(super::skip_noncode(b"-- x", 0, PG).is_some());
+        assert!(super::skip_noncode(b"-- x", 0, SqlDialect::MySql).is_some());
+    }
+
+    /// The guard consequence: a commented-out WHERE must not count as a WHERE,
+    /// or an ordinary mid-edit `DELETE FROM t --WHERE …` empties the table with
+    /// no warning.
+    #[test]
+    fn pg_commented_out_where_does_not_satisfy_the_guard() {
+        assert!(!super::has_top_level_where("DELETE FROM t --where", PG));
+        assert!(super::unsafe_reason("DELETE FROM t --WHERE id=1", PG).is_some());
+        assert!(super::unsafe_reason("DELETE FROM t -- where", PG).is_some());
+        // A real WHERE still clears it, and MySQL's reading is unchanged.
+        assert!(super::unsafe_reason("DELETE FROM t WHERE id=1", PG).is_none());
+        assert!(
+            super::has_top_level_where("DELETE FROM t --where", SqlDialect::MySql),
+            "MySQL: `--where` is not a comment, so this really is a WHERE"
+        );
+    }
+
+    /// The splitter consequence: a `;` inside a mis-lexed comment split the
+    /// statement, and the tail was sent *without* its leading `--` — running the
+    /// statement the user had commented out.
+    #[test]
+    fn pg_semicolon_inside_a_line_comment_does_not_split() {
+        let s = "SELECT 1;\n--a; DROP TABLE t";
+        let stmts = |d| -> Vec<String> {
+            super::statement_ranges(s, d)
+                .into_iter()
+                .map(|(a, b)| s[a..b].to_string())
+                .collect()
+        };
+        // The whole tail is one comment, so it yields no statement at all — the
+        // DROP the user commented out is not merely un-split, it is unrunnable.
+        assert_eq!(stmts(PG), vec!["SELECT 1;"]);
+        // MySQL reads `--a` as code, so the `;` really does split there, and the
+        // tail arrives stripped of its leading `--`. That is the bug this fix is
+        // about, preserved here as the contrast that makes the dialect split real.
+        assert_eq!(
+            stmts(SqlDialect::MySql),
+            vec!["SELECT 1;", "--a;", "DROP TABLE t"]
+        );
+    }
 
     #[test]
     fn pg_hash_is_not_a_comment() {
