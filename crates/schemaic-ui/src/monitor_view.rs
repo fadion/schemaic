@@ -329,8 +329,14 @@ fn entry_row(entry: MonitorEntry, cols: RwSignal<Vec<String>>) -> impl IntoView 
 }
 
 /// The Data column, as one non-wrapping line of coloured spans: for an update,
-/// `col: old → new` (old red, new green); for an insert, `col=value` (all green).
-/// Deletes show nothing (the ID column already identifies the row).
+/// `col: old → new` (old red, new green); for an insert, `col=value` (all
+/// green); for a delete, the same `col=value` in the *old* colour.
+///
+/// A delete used to render nothing, on the rationale that the key column already
+/// identifies the row — while `diff_snapshots` was deliberately cloning every
+/// deleted row's cells so the log *could* show them. A delete is precisely the
+/// case where the row is gone from the database and this log is the only
+/// remaining record of what it held, so the core's answer was the right one.
 fn data_view(change: &RowChange, cols: &[String]) -> impl IntoView + use<> {
     let name = |ci: usize| cols.get(ci).cloned().unwrap_or_else(|| "?".to_string());
     let dim = theme::text_dim();
@@ -348,16 +354,22 @@ fn data_view(change: &RowChange, cols: &[String]) -> impl IntoView + use<> {
                 spans.push(span(cell(&f.new), new_color()).into_any());
             }
         }
-        ChangeKind::Insert => {
+        // Same shape for both, differing only in the colour that says whether
+        // the values are arriving or leaving.
+        ChangeKind::Insert | ChangeKind::Delete => {
+            let value_color = if change.kind == ChangeKind::Insert {
+                new_color()
+            } else {
+                old_color()
+            };
             for (i, (n, c)) in cols.iter().zip(&change.cells).enumerate() {
                 if i > 0 {
                     spans.push(span(", ".to_string(), dim).into_any());
                 }
                 spans.push(span(format!("{n}="), dim).into_any());
-                spans.push(span(cell(c), new_color()).into_any());
+                spans.push(span(cell(c), value_color).into_any());
             }
         }
-        ChangeKind::Delete => {}
     }
     h_stack_from_iter(spans).style(|s| s.flex_row().items_center().flex_shrink(0.0_f32))
 }

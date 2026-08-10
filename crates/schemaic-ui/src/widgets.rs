@@ -949,12 +949,6 @@ pub(crate) fn verb_spinner(color: fn() -> floem::peniko::Color, font_size: f32) 
     loading_dots(pick_spinner_verb(), color, font_size)
 }
 
-/// An animated loading label — `prefix` followed by a cycling `.` → `..` → `...`
-/// on a 400ms timer (instead of a static `…`). The timer self-reschedules and
-/// stops when the view's scope is disposed (`try_update` → `None`), so it can't
-/// outlive a `dyn_container` rebuild (same pattern as the AI elapsed timer).
-/// Rendered pixel width of `text` at `font_size` in the app's default font, via a
-/// throwaway `TextLayout` (same global `FontSystem` the label renders with).
 /// Trailing debounce: returns a signal that mirrors `src` but only settles
 /// `delay` after the last change. Bind the input widget to `src` (so typing stays
 /// responsive) and let the expensive consumers read the returned signal, so a
@@ -978,6 +972,8 @@ pub(crate) fn debounced(src: RwSignal<String>, delay: std::time::Duration) -> Rw
     out
 }
 
+/// Rendered pixel width of `text` at `font_size` in the app's default font, via a
+/// throwaway `TextLayout` (same global `FontSystem` the label renders with).
 pub(crate) fn measure_px(text: &str, font_size: f32) -> f64 {
     use floem::text::{Attrs, AttrsList, TextLayout};
     let mut layout = TextLayout::new();
@@ -1029,6 +1025,10 @@ pub(crate) fn highlight_text(
     })
 }
 
+/// An animated loading label — `prefix` followed by a cycling `.` → `..` → `...`
+/// on a 400ms timer (instead of a static `…`). The timer self-reschedules and
+/// stops when the view's scope is disposed (`try_update` → `None`), so it can't
+/// outlive a `dyn_container` rebuild (same pattern as the AI elapsed timer).
 pub(crate) fn loading_dots(
     prefix: &'static str,
     color: fn() -> floem::peniko::Color,

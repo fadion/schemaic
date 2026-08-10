@@ -2149,9 +2149,11 @@ fn header(ui: Ui) -> impl IntoView {
 ///
 /// This carries the whole connection-health signal now that the status dot is
 /// gone: a healthy connection says nothing (the schema tree populating is the
-/// proof), and a dead one states the problem and offers the fix. That fix
-/// matters — nothing re-checks reachability on a timer, so without it a server
-/// that came back stays blocked until the user switches connections. Hidden
+/// proof), and a dead one states the problem and offers the fix. Retry is the
+/// *immediate* path, not the only one — the app's health poll does re-check on a
+/// timer, but `health::tick` backs off exponentially after consecutive failures
+/// (and skips while the window is unfocused), so a server that came back can
+/// take minutes to be noticed on its own. Hidden
 /// entirely otherwise (`.hide()`/`.flex()`, not opacity, so it costs no layout
 /// space when healthy).
 fn disconnected_notice(conn_status: RwSignal<ConnStatus>, recheck: Rc<dyn Fn()>) -> impl IntoView {

@@ -4522,9 +4522,6 @@ fn data_row(
     .style(|s| s.height(ROW_H))
 }
 
-/// Clickable, two-line header cell (name + SQL type). Sorts on click, shows a
-/// chevron for the active sort, a key icon for PK/index/FK columns, a selected-
-/// column background, and carries a right-edge resize divider.
 /// Apply a display formatter to column `ci`: update the live per-column state (so
 /// cells re-render) and, when the source table is known, upsert + persist the rule
 /// so it survives restarts.
@@ -4574,6 +4571,9 @@ fn format_submenu(gs: GridState, ci: usize) -> Vec<MenuEntry> {
         .collect()
 }
 
+/// Clickable, two-line header cell (name + SQL type). Sorts on click, shows a
+/// chevron for the active sort, a key icon for PK/index/FK columns, a selected-
+/// column background, and carries a right-edge resize divider.
 fn header_cell(
     gs: GridState,
     ci: usize,
