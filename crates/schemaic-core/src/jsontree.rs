@@ -7,12 +7,17 @@
 //!
 //! **Object key order is preserved** (a JSON editor that reshuffled keys would be
 //! maddening). `serde_json`'s `Value` sorts object keys unless the `preserve_order`
-//! feature is on, so instead of going through `Value` we deserialise straight into
-//! [`JsonNode`] with a hand-written visitor whose map branch pushes entries in
-//! document order.
+//! feature is on, so instead of going through `Value` we walk the document as
+//! `RawValue`s, pushing object entries in the order the map visitor yields them —
+//! document order, duplicates and all.
 //!
-//! Numbers keep a canonical text form (JSON numbers are IEEE-754 by spec, so this
-//! matches `serde_json`'s own round-trip); a leaf is displayed and edited as its
+//! **Numbers keep their source text, byte for byte.** They used to keep a
+//! *canonical* form, which meant every number that isn't an exact `i64`/`u64`
+//! round-tripped through an `f64`: `10.00` came back `10`, `1e3` came back `1000`,
+//! and a 21-digit integer came back a different integer. Since editing one leaf
+//! re-serialises the whole tree into the write, that silently rewrote numbers the
+//! user never touched — so the raw text is what the tree stores. A leaf is
+//! displayed and edited as its
 //! **JSON scalar** (`"Kabul"`, `34.5`, `true`, `null`) — unambiguous about string
 //! vs number vs null, and type changes fall out for free (`set_leaf` parses any
 //! JSON value, even replacing a scalar with a nested object).
@@ -20,7 +25,8 @@
 use std::fmt;
 
 use serde::Deserialize;
-use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::de::{Deserializer, MapAccess, Visitor};
+use serde_json::value::RawValue;
 
 /// One node of a JSON document. Objects keep their entries in insertion (document)
 /// order; numbers keep a canonical text form to avoid a float round-trip changing
@@ -83,7 +89,8 @@ impl JsonNode {
     /// Parse JSON text into a tree (object key order preserved). Returns the parse
     /// error message on invalid JSON.
     pub fn parse(s: &str) -> Result<JsonNode, String> {
-        serde_json::from_str(s).map_err(|e| e.to_string())
+        let raw: &RawValue = serde_json::from_str(s).map_err(|e| e.to_string())?;
+        from_raw(raw)
     }
 
     /// Is this a scalar (non-container) node?
@@ -272,67 +279,86 @@ fn encode_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
-// Hand-written deserialiser so object key order survives (serde_json::Value would
-// sort it without the `preserve_order` feature). The map visitor pushes entries in
-// the order `next_entry` yields them — document order.
-impl<'de> Deserialize<'de> for JsonNode {
+/// Object members in document order, values left **unparsed**.
+///
+/// `serde_json::Value` would sort the keys (without `preserve_order`) and drop
+/// duplicates, and a plain `Vec<(String, _)>` doesn't deserialize from a JSON
+/// map at all — hence the visitor, which pushes entries in the order
+/// `next_entry` yields them.
+struct RawObject<'a>(Vec<(String, &'a RawValue)>);
+
+impl<'de> Deserialize<'de> for RawObject<'de> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        struct NodeVisitor;
+        struct ObjVisitor;
 
-        impl<'de> Visitor<'de> for NodeVisitor {
-            type Value = JsonNode;
+        impl<'de> Visitor<'de> for ObjVisitor {
+            type Value = RawObject<'de>;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("any JSON value")
+                f.write_str("a JSON object")
             }
 
-            fn visit_unit<E: de::Error>(self) -> Result<JsonNode, E> {
-                Ok(JsonNode::Null)
-            }
-            fn visit_bool<E: de::Error>(self, v: bool) -> Result<JsonNode, E> {
-                Ok(JsonNode::Bool(v))
-            }
-            fn visit_i64<E: de::Error>(self, v: i64) -> Result<JsonNode, E> {
-                Ok(JsonNode::Num(v.to_string()))
-            }
-            fn visit_u64<E: de::Error>(self, v: u64) -> Result<JsonNode, E> {
-                Ok(JsonNode::Num(v.to_string()))
-            }
-            fn visit_f64<E: de::Error>(self, v: f64) -> Result<JsonNode, E> {
-                Ok(JsonNode::Num(v.to_string()))
-            }
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<JsonNode, E> {
-                Ok(JsonNode::Str(v.to_string()))
-            }
-            fn visit_string<E: de::Error>(self, v: String) -> Result<JsonNode, E> {
-                Ok(JsonNode::Str(v))
-            }
-            fn visit_seq<A>(self, mut seq: A) -> Result<JsonNode, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let mut items = Vec::new();
-                while let Some(item) = seq.next_element()? {
-                    items.push(item);
-                }
-                Ok(JsonNode::Array(items))
-            }
-            fn visit_map<A>(self, mut map: A) -> Result<JsonNode, A::Error>
+            fn visit_map<A>(self, mut map: A) -> Result<RawObject<'de>, A::Error>
             where
                 A: MapAccess<'de>,
             {
                 let mut entries = Vec::new();
-                while let Some((k, v)) = map.next_entry::<String, JsonNode>()? {
+                while let Some((k, v)) = map.next_entry::<String, &'de RawValue>()? {
                     entries.push((k, v));
                 }
-                Ok(JsonNode::Object(entries))
+                Ok(RawObject(entries))
             }
         }
 
-        deserializer.deserialize_any(NodeVisitor)
+        deserializer.deserialize_map(ObjVisitor)
+    }
+}
+
+/// Build a node from an already-validated raw JSON value, **keeping a number's
+/// source text byte for byte**.
+///
+/// Going through serde's `visit_f64` (or `serde_json::Value`) sends every number
+/// that isn't an exact `i64`/`u64` through an `f64` and back out in Rust's
+/// shortest round-trip form: `10.00` became `10`, `1e3` became `1000`, and a
+/// 21-digit integer became a *different* integer. That was invisible until Save,
+/// which rewrote every number in a JSON column the user had merely browsed.
+///
+/// The raw text is only ever inspected at its first byte — the value has already
+/// been parsed and validated by `serde_json`, so the leading byte determines the
+/// kind unambiguously.
+fn from_raw(raw: &RawValue) -> Result<JsonNode, String> {
+    let text = raw.get().trim();
+    let err = |e: serde_json::Error| e.to_string();
+    match text.as_bytes().first() {
+        Some(b'{') => {
+            let RawObject(entries) = serde_json::from_str(text).map_err(err)?;
+            let mut out = Vec::with_capacity(entries.len());
+            for (k, v) in entries {
+                out.push((k, from_raw(v)?));
+            }
+            Ok(JsonNode::Object(out))
+        }
+        Some(b'[') => {
+            let items: Vec<&RawValue> = serde_json::from_str(text).map_err(err)?;
+            items
+                .into_iter()
+                .map(from_raw)
+                .collect::<Result<Vec<_>, _>>()
+                .map(JsonNode::Array)
+        }
+        // Escapes and `\uXXXX` stay serde_json's job.
+        Some(b'"') => serde_json::from_str::<String>(text)
+            .map(JsonNode::Str)
+            .map_err(err),
+        Some(b't') | Some(b'f') => serde_json::from_str::<bool>(text)
+            .map(JsonNode::Bool)
+            .map_err(err),
+        Some(b'n') => Ok(JsonNode::Null),
+        // `-` or a digit: a number, kept exactly as written.
+        _ => Ok(JsonNode::Num(text.to_string())),
     }
 }
 
@@ -474,9 +500,57 @@ mod tests {
     }
 
     #[test]
-    fn numbers_keep_canonical_text() {
-        // Integers stay integers; floats keep their value.
-        let n = JsonNode::parse(r#"[7,-3,34.5,1000]"#).unwrap();
-        assert_eq!(n.to_compact(), "[7,-3,34.5,1000]");
+    fn numbers_keep_their_source_text() {
+        // This test used to assert the same property over `[7,-3,34.5,1000]` —
+        // four values chosen from exactly the set an `f64` round-trip survives, so
+        // it passed while every number below came back changed. Editing one leaf
+        // of a JSON column rewrote all of them, silently, in the row it wrote.
+        for src in [
+            "[7,-3,34.5,1000]",
+            "10.00",
+            "1.0",
+            "1e3",
+            "1.5E-7",
+            "-0.0",
+            // Past `f64`'s 17 significant digits, and past `u64::MAX`.
+            "0.1234567890123456789",
+            "123456789012345678901",
+            "18446744073709551616",
+            "123456789012345678.12345678",
+            r#"{"price":10.00,"note":"x"}"#,
+            r#"[{"a":1.0},[2.50,3e2]]"#,
+        ] {
+            let n = JsonNode::parse(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+            assert_eq!(n.to_compact(), src, "{src} must round-trip unchanged");
+        }
+    }
+
+    #[test]
+    fn a_number_the_user_types_keeps_the_form_they_typed() {
+        // `set_leaf` goes through the same parse, so the editor can't normalise a
+        // value behind the user either.
+        let mut n = JsonNode::parse(r#"{"price":1}"#).unwrap();
+        let rows = n.rows();
+        n.set_leaf(&rows[1].path, "10.00").unwrap();
+        assert_eq!(n.to_compact(), r#"{"price":10.00}"#);
+    }
+
+    #[test]
+    fn numbers_are_still_parsed_as_numbers_not_strings() {
+        // The text is kept, but the node is a `Num` — a leaf must not start
+        // rendering or editing as a quoted string.
+        let n = JsonNode::parse("10.00").unwrap();
+        assert_eq!(n, JsonNode::Num("10.00".to_string()));
+        assert_eq!(n.scalar_text().as_deref(), Some("10.00"));
+    }
+
+    #[test]
+    fn malformed_numbers_are_still_rejected() {
+        for bad in ["01", "1.", ".5", "+1", "1e", "--1", "0x10", "NaN", "1e+"] {
+            assert!(
+                JsonNode::parse(bad).is_err(),
+                "{bad} is not valid JSON and must not parse"
+            );
+        }
     }
 }

@@ -66,7 +66,10 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value` lets `core::jsontree` walk a JSON document without ever handing a
+# number to an `f64` — see its module doc. Deliberately *not* `arbitrary_precision`,
+# which would change `Value`'s number handling crate-wide, for export and import too.
+serde_json = { version = "1", features = ["raw_value"] }
 # CSV *reading* for the import path. Writing it is a few lines (see
 # `core::export::csv_field`); reading it correctly — quotes, embedded delimiters
 # and newlines, escapes, BOMs — is not, and a hand-rolled parser here would lose

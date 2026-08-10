@@ -3388,17 +3388,24 @@ fn json_editor(f: FieldSig) -> AnyView {
     // Commit the currently-edited leaf: parse the JSON scalar, write it into the
     // tree, re-serialise into the field buffer. Invalid JSON shows an inline error
     // and keeps the leaf in edit mode.
+    //
+    // A leaf that came back **unchanged** touches nothing. Opening a leaf and
+    // moving to another one commits the first, so a re-serialise here would rewrite
+    // the field buffer — and `update_changes` compares text, so merely *browsing* a
+    // JSON value by clicking two leaves would have put the column in the `UPDATE`.
     let commit_current: Rc<dyn Fn()> = Rc::new(move || {
         let Some(path) = editing.get_untracked() else {
             return;
         };
         match JsonNode::parse(&edit_buf.get_untracked()) {
             Ok(node) => {
-                tree.update(|t| {
-                    t.set(&path, node);
-                });
-                f.buf.set(tree.get_untracked().to_compact());
-                f.is_null.set(false);
+                if tree.with_untracked(|t| t.get(&path) != Some(&node)) {
+                    tree.update(|t| {
+                        t.set(&path, node);
+                    });
+                    f.buf.set(tree.get_untracked().to_compact());
+                    f.is_null.set(false);
+                }
                 editing.set(None);
                 err.set(None);
             }
