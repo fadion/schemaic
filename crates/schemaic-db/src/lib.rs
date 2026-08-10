@@ -869,7 +869,15 @@ pub(crate) fn mysql_column(r: MyColRow, mariadb: bool) -> ColRow {
         {
             Some(d)
         } else {
-            Some(schemaic_core::schema::ddl_string(&d))
+            // This is the MySQL/MariaDB introspection path by construction, and
+            // the quoting has to match what the emitter would write — otherwise
+            // a backslash-bearing default is corrupted on the way *in* and
+            // `TableDraft::from_table` produces a draft that differs from the
+            // server without the designer showing any change.
+            Some(schemaic_core::schema::ddl_string(
+                &d,
+                schemaic_core::intel::SqlDialect::MySql,
+            ))
         }
     });
     ColRow {
