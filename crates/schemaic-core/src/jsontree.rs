@@ -37,10 +37,21 @@ pub enum JsonNode {
     Object(Vec<(String, JsonNode)>),
 }
 
-/// One step of a path into a [`JsonNode`] tree: an object key or an array index.
+/// One step of a path into a [`JsonNode`] tree: an object member or an array
+/// element, both **by position**.
+///
+/// A member is addressed by its ordinal in document order rather than by key,
+/// because JSON permits duplicate keys and PostgreSQL's `json` type (which stores
+/// the text verbatim, unlike `jsonb` or MySQL's `JSON`) can hand one back. Keying
+/// a path by name made `{"a":1,"a":2}` yield two rows with the *same* path, so
+/// editing the second wrote the first and the two were indistinguishable to the
+/// panel's collapse/edit state. The member's key is on [`TreeRow::label`], which
+/// is what the UI displays.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PathSeg {
-    Key(String),
+    /// Object member, by its index in the entry vector (document order).
+    Member(usize),
+    /// Array element, by index.
     Index(usize),
 }
 
@@ -163,9 +174,7 @@ impl JsonNode {
             return Some(self);
         };
         let child = match (self, seg) {
-            (JsonNode::Object(entries), PathSeg::Key(k)) => {
-                entries.iter().find(|(ek, _)| ek == k).map(|(_, v)| v)
-            }
+            (JsonNode::Object(entries), PathSeg::Member(i)) => entries.get(*i).map(|(_, v)| v),
             (JsonNode::Array(items), PathSeg::Index(i)) => items.get(*i),
             _ => None,
         }?;
@@ -178,9 +187,7 @@ impl JsonNode {
             return Some(self);
         };
         let child = match (self, seg) {
-            (JsonNode::Object(entries), PathSeg::Key(k)) => {
-                entries.iter_mut().find(|(ek, _)| ek == k).map(|(_, v)| v)
-            }
+            (JsonNode::Object(entries), PathSeg::Member(i)) => entries.get_mut(*i).map(|(_, v)| v),
             (JsonNode::Array(items), PathSeg::Index(i)) => items.get_mut(*i),
             _ => None,
         }?;
@@ -241,8 +248,8 @@ impl JsonNode {
         });
         match self {
             JsonNode::Object(entries) => {
-                for (k, v) in entries {
-                    path.push(PathSeg::Key(k.clone()));
+                for (i, (k, v)) in entries.iter().enumerate() {
+                    path.push(PathSeg::Member(i));
                     v.collect_rows(path, depth + 1, Some(k.clone()), out);
                     path.pop();
                 }
@@ -333,8 +340,9 @@ impl<'de> Deserialize<'de> for JsonNode {
 mod tests {
     use super::*;
 
-    fn key(k: &str) -> PathSeg {
-        PathSeg::Key(k.to_string())
+    /// Object member by ordinal — `m(0)` is the first entry in document order.
+    fn m(i: usize) -> PathSeg {
+        PathSeg::Member(i)
     }
 
     #[test]
@@ -381,22 +389,23 @@ mod tests {
     #[test]
     fn get_and_set_by_path() {
         let mut n = JsonNode::parse(r#"{"user":{"name":"Kabul","tags":["a","b"]}}"#).unwrap();
-        let path = vec![key("user"), key("name")];
+        // user → name
+        let path = vec![m(0), m(0)];
         assert_eq!(n.get(&path), Some(&JsonNode::Str("Kabul".into())));
         // Set a nested leaf.
         assert!(n.set(&path, JsonNode::Str("Herat".into())));
         assert_eq!(n.get(&path), Some(&JsonNode::Str("Herat".into())));
-        // Array index path.
-        let ap = vec![key("user"), key("tags"), PathSeg::Index(1)];
+        // Array index path: user → tags[1]
+        let ap = vec![m(0), m(1), PathSeg::Index(1)];
         assert_eq!(n.get(&ap), Some(&JsonNode::Str("b".into())));
         // A bad path leaves the tree untouched and returns false.
-        assert!(!n.set(&[key("nope")], JsonNode::Null));
+        assert!(!n.set(&[m(9)], JsonNode::Null));
     }
 
     #[test]
     fn set_leaf_parses_json_and_allows_type_change() {
         let mut n = JsonNode::parse(r#"{"v":"old"}"#).unwrap();
-        let p = vec![key("v")];
+        let p = vec![m(0)];
         // Edit a string leaf to a number (type change via JSON text).
         n.set_leaf(&p, "42").unwrap();
         assert_eq!(n.get(&p), Some(&JsonNode::Num("42".into())));
@@ -427,13 +436,32 @@ mod tests {
         assert_eq!(rows[2].kind, RowKind::Array(2));
         // b[0]: array element, no label, value "x".
         assert_eq!(rows[3].label, None);
-        assert_eq!(rows[3].path, vec![key("b"), PathSeg::Index(0)]);
+        assert_eq!(rows[3].path, vec![m(1), PathSeg::Index(0)]);
         assert_eq!(rows[3].value_json.as_deref(), Some("\"x\""));
         // b[1]: object; b[1].c: leaf 2 at depth 3.
         assert_eq!(rows[4].kind, RowKind::Object(1));
         assert_eq!(rows[5].label.as_deref(), Some("c"));
         assert_eq!(rows[5].depth, 3);
         assert_eq!(rows[5].value_json.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn duplicate_object_keys_get_distinct_paths() {
+        // A PostgreSQL `json` column stores its text verbatim, so it really can
+        // hold `{"a":1,"a":2}` (both `jsonb` and MySQL's `JSON` drop the first).
+        // Keyed by name, the two members shared one path: editing the second wrote
+        // the first, and the panel's collapse/edit state couldn't tell them apart.
+        let mut n = JsonNode::parse(r#"{"a":1,"a":2}"#).unwrap();
+        let rows = n.rows();
+        assert_eq!(rows.len(), 3); // root + both members
+        assert_eq!(rows[1].label.as_deref(), Some("a"));
+        assert_eq!(rows[2].label.as_deref(), Some("a"));
+        assert_ne!(rows[1].path, rows[2].path);
+        assert_eq!(rows[1].value_json.as_deref(), Some("1"));
+        assert_eq!(rows[2].value_json.as_deref(), Some("2"));
+        // Editing the second leaves the first alone.
+        n.set_leaf(&rows[2].path, "9").unwrap();
+        assert_eq!(n.to_compact(), r#"{"a":1,"a":9}"#);
     }
 
     #[test]
