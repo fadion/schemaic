@@ -4,7 +4,7 @@
 //! Each row previews the SQL (whitespace-collapsed, wrapped to ~3 lines then
 //! clipped) with its database + relative run time; clicking opens the full query
 //! in a new tab (`open_query`). The title carries a trash-2 that clears the
-//! *current connection's* history. The list is filtered from the app-wide
+//! *current connection's* history, behind a confirm. The list is filtered from the app-wide
 //! `history.entries` signal by the active connection, so switching connections
 //! shows only that connection's queries.
 
@@ -101,7 +101,39 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
         autohide(scroll(list)).style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0));
 
     // Title row: "QUERY HISTORY" left; a trash-2 (clear) right.
-    let trash = toolbar_icon(icons::TRASH_2, 5.0, 7.0, || true, move || (clear)());
+    //
+    // The trash sits a few pixels from the panel chrome and erases the whole
+    // connection's history with no undo, so it asks first (the shared `Confirm`
+    // modal, same as Drop/Truncate) and is inert when there's nothing to clear.
+    // The count is the connection's *total* — the search box narrows the list, not
+    // the delete.
+    let confirm = ui.overlay.confirm;
+    let clearable = create_memo(move |_| {
+        let conn = active_conn.get();
+        entries.with(|v| v.iter().filter(|e| e.conn_id == conn).count())
+    });
+    let trash = toolbar_icon(
+        icons::TRASH_2,
+        5.0,
+        7.0,
+        move || clearable.get() > 0,
+        move || {
+            let n = clearable.get_untracked();
+            let clear = clear.clone();
+            confirm.set(Some(crate::Confirm {
+                title: "Clear query history".to_string(),
+                message: format!(
+                    "Delete {n} recorded {} for this connection? This can't be undone.",
+                    if n == 1 { "query" } else { "queries" }
+                ),
+                resolve: Rc::new(move |yes| {
+                    if yes {
+                        (clear)();
+                    }
+                }),
+            }));
+        },
+    );
     let title_row = h_stack((section_title("QUERY HISTORY"), trash))
         .style(|s| s.width_full().flex_row().items_start().justify_between());
 
