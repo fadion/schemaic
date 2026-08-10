@@ -11,6 +11,7 @@
 //! more than the sample shows.
 
 use crate::model::ResultSet;
+use crate::prompt;
 
 /// Values sampled from a column for the summary prompt.
 pub const COLUMN_SAMPLE: usize = 10;
@@ -101,22 +102,26 @@ pub fn cell_prompt(
         Some(t) => format!(" of the `{t}` table"),
         None => String::new(),
     };
+    // Every block below is database content — fenced so a value containing its
+    // own ``` can't close the block and continue as prose, and labelled so the
+    // assistant knows which parts are data rather than instruction.
     let mut out = format!(
-        "Summarize this value from the `{column}` column{from} (type `{type_name}`):\
-         \n```\n{value}\n```"
+        "Summarize this value from the `{column}` column{from} (type `{type_name}`). \
+         {}\n{}",
+        prompt::UNTRUSTED_NOTE,
+        prompt::fenced(value)
     );
     if !row.is_empty() {
         let fields: Vec<String> = row.iter().map(|(k, v)| format!("{k}: {v}")).collect();
         out.push_str(&format!(
-            "\n\nThe rest of its row, for context:\n```\n{}\n```",
-            fields.join("\n")
+            "\n\nThe rest of its row, for context:\n{}",
+            prompt::fenced(&fields.join("\n"))
         ));
     }
     if !samples.is_empty() {
         out.push_str(&format!(
-            "\n\nOther values in the same column, sampled across the loaded rows:\n\
-             ```\n{}\n```",
-            samples.join("\n")
+            "\n\nOther values in the same column, sampled across the loaded rows:\n{}",
+            prompt::fenced(&samples.join("\n"))
         ));
     }
     out.push_str(
@@ -151,9 +156,10 @@ pub fn column_prompt(
         return out;
     }
     out.push_str(&format!(
-        "\n\nA sample of {} values currently loaded in the grid:\n```\n{}\n```",
+        "\n\nA sample of {} values currently loaded in the grid. {}\n{}",
         samples.len(),
-        samples.join("\n")
+        prompt::UNTRUSTED_NOTE,
+        prompt::fenced(&samples.join("\n"))
     ));
     out.push_str(
         "\n\nDescribe what it holds and any pattern, format, or encoding you can \
