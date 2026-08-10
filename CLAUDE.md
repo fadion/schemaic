@@ -320,9 +320,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   round-trip gate (a draft built from a table must diff to *nothing*) is the test that keeps
   the introspected model and the emitter honest with each other; extend its fixtures when you
   widen the model.
-- **Write-back is transactional with a 1-row safety net.** `commit_writes` runs a `GridWrite`
+- **Write-back is transactional with a 1-row safety net — and the *report* never claims more than
+  the engine delivered.** `commit_writes` runs a `GridWrite`
   (DELETEs → UPDATEs → INSERTs) in one transaction, each statement required to affect exactly 1 row
-  (else roll back all) — so an over-optimistic updatability analysis can't corrupt data. Commits
+  (else roll back all) — so an over-optimistic updatability analysis can't corrupt data. That
+  promise is MySQL-engine-dependent: `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV` ignore `BEGIN`/`ROLLBACK`,
+  and `ROLLBACK` *succeeds* there while raising warning 1196. So no write path may discard a
+  rollback's outcome (`let _ = conn.query_drop("ROLLBACK")` was the bug): roll back through
+  `rollback()`, which reads `SHOW WARNINGS`, and append `core::model::Rollback::note()` to the
+  error. `one_row_verdict` states only what the guard saw — it runs *before* the rollback and can't
+  know what it achieved. `engine_is_transactional` is the predicate (unknown ⇒ not transactional,
+  same rule as `pg_replaceable`); the import modal warns from it before the load starts. Commits
   with inserts/deletes full-re-run the query (membership/order changed); pure-UPDATE commits splice
   in place. Both halves of that rule are **pure and tested in `core::model`**, and both engines'
   executors call them: `GridWrite::plan` is the statement order and `one_row_verdict` is the

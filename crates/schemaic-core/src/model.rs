@@ -686,15 +686,72 @@ impl WriteStep<'_> {
 /// Pure so both engines share one verdict *and* one message — it used to be
 /// written inline in each executor, with two divergent wordings and no test.
 /// `Err` carries the message; the caller wraps it in its own error type.
+/// The message states what the guard saw and stops there: it is reached
+/// *before* the rollback runs, so it can't know what the rollback achieved.
+/// The caller appends [`Rollback::note`] once it does.
 pub fn one_row_verdict(step: WriteStep<'_>, affected: u64) -> Result<(), String> {
     if affected == 1 {
         return Ok(());
     }
     Err(format!(
-        "{} {} affected {affected} rows (expected exactly 1) — rolled back all changes",
+        "{} {} affected {affected} rows (expected exactly 1)",
         step.action(),
         step.qualified(),
     ))
+}
+
+/// What a write path's rollback actually achieved.
+///
+/// The write paths open a transaction and roll it back on any failure, and their
+/// errors said so unconditionally. On MySQL that is a promise the engine may not
+/// keep: `MyISAM`, `MEMORY`, `ARCHIVE` and `CSV` ignore `BEGIN`/`ROLLBACK`
+/// entirely. `ROLLBACK` still *succeeds* — it raises warning 1196, *"Some
+/// non-transactional changed tables couldn't be rolled back"* — so a failed
+/// import of 100k rows reported "rolled back the whole import" over 50k rows
+/// that are permanently in the table. The user re-runs it and now has 50k
+/// duplicates, or a key collision that aborts the retry too, with the table in
+/// a state neither run describes.
+///
+/// PostgreSQL is fully transactional, so it is always [`Rollback::Complete`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rollback {
+    /// Every statement in the batch was undone.
+    Complete,
+    /// The server reported it couldn't undo everything (MySQL warning 1196), or
+    /// the rollback itself failed — either way, what was written is still there.
+    Incomplete,
+}
+
+impl Rollback {
+    /// The clause appended to a write-path error, describing what survived.
+    /// Starts with its own separator so it reads as one sentence after a
+    /// [`one_row_verdict`] message.
+    pub fn note(self) -> &'static str {
+        match self {
+            Rollback::Complete => " — rolled back all changes",
+            Rollback::Incomplete => {
+                " — the rollback did NOT undo them: this table's storage engine is \
+                 not transactional, so the rows already written remain. Check the \
+                 table before retrying."
+            }
+        }
+    }
+}
+
+/// Can a table on this MySQL storage engine honour a `ROLLBACK`?
+///
+/// Only used to decide whether atomicity may be *promised*, so an engine this
+/// doesn't recognise — including an empty string, which is what an unread
+/// catalogue gives — resolves to `false`. Same rule as `ddl::pg_replaceable`:
+/// uncertainty goes to the side that doesn't claim more than it knows.
+///
+/// MariaDB's `Aria` is deliberately absent: it is crash-safe, not
+/// transactional, and only its (non-default) transactional variant rolls back.
+pub fn engine_is_transactional(engine: &str) -> bool {
+    matches!(
+        engine.trim().to_ascii_lowercase().as_str(),
+        "innodb" | "ndbcluster" | "ndb" | "rocksdb" | "tokudb" | "myrocks"
+    )
 }
 
 /// The grid's staged (green) cell edits: `(data row, result column)` → the new
@@ -1195,7 +1252,75 @@ mod tests {
         let e = one_row_verdict(WriteStep::Update(&upd("city")), 0).unwrap_err();
         assert!(e.contains("update on db.city"), "{e}");
         assert!(e.contains("affected 0 rows"), "{e}");
-        assert!(e.contains("rolled back all changes"), "{e}");
+    }
+
+    #[test]
+    fn the_verdict_itself_claims_nothing_about_the_rollback() {
+        // It runs *before* the rollback, so it can't know. The claim used to be
+        // baked into this message and was false on a non-transactional table.
+        let e = one_row_verdict(WriteStep::Update(&upd("city")), 0).unwrap_err();
+        assert!(!e.contains("rolled back"), "{e}");
+    }
+
+    // ── What the rollback actually achieved (`Rollback`) ──
+
+    #[test]
+    fn a_complete_rollback_says_everything_was_undone() {
+        let msg = Rollback::Complete.note();
+        assert!(msg.contains("rolled back all changes"), "{msg}");
+    }
+
+    #[test]
+    fn an_incomplete_rollback_says_the_changes_remain() {
+        // MyISAM/MEMORY/ARCHIVE/CSV ignore BEGIN and ROLLBACK: the statements
+        // that already ran are permanent. Telling the user they were undone is
+        // how one failed import becomes 50k duplicates on the retry.
+        let msg = Rollback::Incomplete.note();
+        assert!(!msg.contains("rolled back all changes"), "{msg}");
+        assert!(msg.contains("not transactional"), "{msg}");
+        assert!(msg.contains("remain"), "{msg}");
+    }
+
+    #[test]
+    fn the_note_reads_as_one_sentence_with_the_verdict() {
+        let verdict = one_row_verdict(WriteStep::Update(&upd("city")), 2).unwrap_err();
+        let full = format!("{verdict}{}", Rollback::Complete.note());
+        assert_eq!(
+            full,
+            "update on db.city affected 2 rows (expected exactly 1) — rolled back all changes"
+        );
+    }
+
+    // ── Which storage engines can honour a rollback ──
+
+    #[test]
+    fn innodb_is_transactional_however_the_catalogue_spells_it() {
+        assert!(engine_is_transactional("InnoDB"));
+        assert!(engine_is_transactional("innodb"));
+        assert!(engine_is_transactional("  INNODB  "));
+    }
+
+    #[test]
+    fn the_non_transactional_engines_are_not() {
+        for e in [
+            "MyISAM",
+            "MEMORY",
+            "ARCHIVE",
+            "CSV",
+            "MRG_MyISAM",
+            "BLACKHOLE",
+        ] {
+            assert!(!engine_is_transactional(e), "{e} is not transactional");
+        }
+    }
+
+    #[test]
+    fn an_unknown_engine_does_not_get_the_benefit_of_the_doubt() {
+        // Same rule as `ddl::pg_replaceable`: uncertainty resolves to the side
+        // that doesn't promise something the server may not deliver.
+        assert!(!engine_is_transactional(""));
+        assert!(!engine_is_transactional("   "));
+        assert!(!engine_is_transactional("SomeFutureEngine"));
     }
 
     #[test]

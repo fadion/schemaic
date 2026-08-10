@@ -20,6 +20,7 @@ use floem::reactive::create_effect;
 use schemaic_core::import::{
     self, CsvDialect, ImportFormat, Issue, Mapping, NullRule, ReadConfig, Target,
 };
+use schemaic_core::model::engine_is_transactional;
 
 use crate::consts::ROW_H;
 use crate::settings::{dropdown_box_style, settings_dropdown, settings_toggle_row};
@@ -635,11 +636,44 @@ fn mapping_step(ui: Ui) -> impl IntoView {
         },
     );
 
+    // The load runs in one transaction and undoes itself on any failure — but
+    // MyISAM/MEMORY/ARCHIVE/CSV ignore `BEGIN`/`ROLLBACK`, so on those the rows
+    // written before a bad record stay. Said here, in the same place the preview
+    // states its other consequences, rather than only in the error after the
+    // fact. `engine` is `None` on PostgreSQL, where every table is
+    // transactional, so this is MySQL-only by construction.
+    let engine_note = dyn_container(
+        move || {
+            i.target
+                .get()
+                .and_then(|t| t.table.engine.clone())
+                .filter(|e| !engine_is_transactional(e))
+        },
+        move |engine| {
+            let Some(engine) = engine else {
+                return empty().into_any();
+            };
+            text(format!(
+                "This table's storage engine ({engine}) is not transactional, so a \
+                 failed import can't be undone — the rows loaded before the failure \
+                 will remain."
+            ))
+            .style(|s| {
+                s.color(theme::plan_warn())
+                    .font_size(theme::FONT_BODY)
+                    .max_width(560.0)
+                    .margin_top(20.0)
+            })
+            .into_any()
+        },
+    );
+
     const GAP: f64 = 8.0;
     v_stack((
         form_section("Columns"),
         autohide(scroll(rows)).style(|s| s.max_height(MAPPING_LIST_H).width_full()),
         missing,
+        engine_note,
         form_separator(GAP),
         form_section("Preview"),
         preview_table(ui.clone()),

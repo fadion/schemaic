@@ -26,7 +26,8 @@ use mysql_async::{Column as MyColumn, Conn, Row, Value as MyValue};
 use mysql_async::{OptsBuilder, Params};
 use schemaic_core::model::{
     Column, ColumnFlags as CoreColFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
-    ResultBuilder, ResultSet, RowDelete, RowEdit, RowInsert, Value, WriteStep, one_row_verdict,
+    ResultBuilder, ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value, WriteStep,
+    one_row_verdict,
 };
 use schemaic_core::schema::{
     ColumnInfo, DbSchema, ForeignKeyInfo, IndexInfo, TableInfo, ViewOptions,
@@ -1446,7 +1447,14 @@ impl Db {
     /// round-trips.
     ///
     /// All-or-nothing: any reader error, any batch whose count doesn't match, or
-    /// a cancellation rolls the whole thing back. Rows are pulled from `rows` in
+    /// a cancellation rolls the whole thing back — **as far as the engine allows**.
+    /// A MySQL table on `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV` ignores `BEGIN` and
+    /// `ROLLBACK`, so the batches already inserted stay; the error then says so
+    /// (`rollback` reads the server's warning 1196) rather than reporting an undo
+    /// that didn't happen, and
+    /// the import modal warns before the load starts.
+    ///
+    /// Rows are pulled from `rows` in
     /// batches between statements, so the file is never held in memory — and
     /// since a reader that parses a batch does so between two awaits, the work it
     /// does there should stay small.
@@ -1510,8 +1518,15 @@ async fn import_on(
             Ok(Some(b)) => b,
             Ok(None) => break,
             Err(e) => {
-                let _ = conn.query_drop("ROLLBACK").await;
-                return Err(e);
+                let undone = rollback(conn, "ROLLBACK").await;
+                return Err(match (e, undone) {
+                    // Only worth saying when it isn't what the message implies.
+                    (e, Rollback::Complete) => e,
+                    (DbError::Query(msg), undone) => {
+                        DbError::Query(format!("{msg}{}", undone.note()))
+                    }
+                    (e, _) => e,
+                });
             }
         };
         let Some(sql) = schemaic_core::import::build_insert(
@@ -1525,15 +1540,17 @@ async fn import_on(
             continue;
         };
         if let Err(e) = conn.query_drop(&sql).await {
-            let _ = conn.query_drop("ROLLBACK").await;
-            return Err(qerr(e));
+            let msg = e.to_string();
+            let undone = rollback(conn, "ROLLBACK").await;
+            return Err(DbError::Query(format!("{msg}{}", undone.note())));
         }
         let affected = conn.affected_rows();
         if affected != batch.len() as u64 {
-            let _ = conn.query_drop("ROLLBACK").await;
+            let n = batch.len();
+            let undone = rollback(conn, "ROLLBACK").await;
             return Err(DbError::Query(format!(
-                "a batch of {} rows inserted {affected} — rolled back the whole import",
-                batch.len()
+                "a batch of {n} rows inserted {affected}{}",
+                undone.note()
             )));
         }
         total += affected;
@@ -1645,7 +1662,8 @@ pub(crate) async fn write_on(
 
     // One statement + its 1-row check. On a miss the batch is undone and the
     // error describes what happened, in the caller's terms — the verdict and its
-    // wording are `one_row_verdict`, shared with the PostgreSQL executor.
+    // wording are `one_row_verdict`, shared with the PostgreSQL executor, and
+    // what the rollback *achieved* is asked of the server rather than assumed.
     async fn one(
         conn: &mut Conn,
         scope: TxScope,
@@ -1653,15 +1671,15 @@ pub(crate) async fn write_on(
         params: Params,
         step: WriteStep<'_>,
     ) -> Result<u64, DbError> {
-        let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
         if let Err(e) = conn.exec_drop(sql, params).await {
-            let _ = conn.query_drop(scope.rollback_sql()).await;
-            return Err(qerr(e));
+            let msg = e.to_string();
+            let undone = rollback(conn, scope.rollback_sql()).await;
+            return Err(DbError::Query(format!("{msg}{}", undone.note())));
         }
         let affected = conn.affected_rows();
         if let Err(msg) = one_row_verdict(step, affected) {
-            let _ = conn.query_drop(scope.rollback_sql()).await;
-            return Err(DbError::Query(msg));
+            let undone = rollback(conn, scope.rollback_sql()).await;
+            return Err(DbError::Query(format!("{msg}{}", undone.note())));
         }
         Ok(affected)
     }
@@ -1679,10 +1697,42 @@ pub(crate) async fn write_on(
     }
 
     if let Err(e) = conn.query_drop(scope.commit_sql()).await {
-        let _ = conn.query_drop(scope.rollback_sql()).await;
-        return Err(qerr(e));
+        let msg = e.to_string();
+        let undone = rollback(conn, scope.rollback_sql()).await;
+        return Err(DbError::Query(format!("{msg}{}", undone.note())));
     }
     Ok(total)
+}
+
+/// Roll back, and find out from the server whether it worked.
+///
+/// MySQL's `ROLLBACK` **succeeds** when the transaction touched a
+/// non-transactional table (`MyISAM`, `MEMORY`, `ARCHIVE`, `CSV`) and raises
+/// warning **1196** — *"Some non-transactional changed tables couldn't be rolled
+/// back"* — instead. Every rollback on this path used to be `let _ =
+/// conn.query_drop(…)`, discarding the result *and* the server's own statement
+/// that the undo was partial, so the write path promised an atomicity the engine
+/// had just said it couldn't provide.
+///
+/// `SHOW WARNINGS` is read immediately after, since the next statement clears
+/// it. Anything unreadable resolves to [`Rollback::Incomplete`] — the write
+/// path must not claim more than it knows.
+async fn rollback(conn: &mut Conn, sql: &str) -> Rollback {
+    /// `ER_WARNING_NOT_COMPLETE_ROLLBACK`.
+    const INCOMPLETE_ROLLBACK: u32 = 1196;
+    if conn.query_drop(sql).await.is_err() {
+        return Rollback::Incomplete;
+    }
+    let warnings: Vec<(String, u32, String)> =
+        conn.query("SHOW WARNINGS").await.unwrap_or_default();
+    if warnings
+        .iter()
+        .any(|(_, code, _)| *code == INCOMPLETE_ROLLBACK)
+    {
+        Rollback::Incomplete
+    } else {
+        Rollback::Complete
+    }
 }
 
 impl Db {
