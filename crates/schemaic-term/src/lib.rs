@@ -269,14 +269,7 @@ impl Terminal {
     /// Paste `text` into the shell (bracketed if the app enabled that mode).
     pub fn paste(&self, text: &str) {
         let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
-        if bracketed {
-            self.send_input(b"\x1b[200~");
-            self.send_input(text.as_bytes());
-            self.send_input(b"\x1b[201~");
-        } else {
-            let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
-            self.send_input(normalized.as_bytes());
-        }
+        self.send_input(&paste_payload(text, bracketed));
         self.scroll_to_bottom();
     }
 
@@ -344,6 +337,30 @@ impl Terminal {
             display_offset,
             total_lines,
         }
+    }
+}
+
+/// The bytes a paste of `text` writes to the PTY.
+///
+/// **The payload is stripped of ESC in both branches.** Bracketed paste exists to
+/// make a paste inert, but emitting the markers around an unfiltered payload does
+/// the opposite: text carrying its own `ESC[201~` leaves paste mode early and the
+/// shell runs the remainder as typed commands, with no Enter pressed. Dropping the
+/// escape byte outright is what Alacritty ships — it can't be defeated by a split or
+/// malformed marker, and no legitimate paste into a shell needs a raw ESC. It also
+/// closes the unbracketed branch's smaller version of the same hole (arbitrary
+/// escape sequences, incl. OSC 52 clipboard writes).
+fn paste_payload(text: &str, bracketed: bool) -> Vec<u8> {
+    let safe = text.replace('\x1b', "");
+    if bracketed {
+        let mut out = Vec::with_capacity(safe.len() + 12);
+        out.extend_from_slice(b"\x1b[200~");
+        out.extend_from_slice(safe.as_bytes());
+        out.extend_from_slice(b"\x1b[201~");
+        out
+    } else {
+        // Pasting into a raw shell delivers CR, not LF — that's what a keyboard does.
+        safe.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
     }
 }
 
@@ -627,6 +644,39 @@ mod tests {
                 link: None,
             })
             .collect()
+    }
+
+    /// The end marker embedded in a payload must not reach the shell: readline
+    /// would leave paste mode there and execute the rest as typed input.
+    #[test]
+    fn paste_payload_strips_an_embedded_end_marker() {
+        let out = paste_payload("echo one\x1b[201~\r echo PWNED", true);
+        let s = String::from_utf8(out).unwrap();
+
+        // Exactly two ESCs — the ones this function wrote — and none in between.
+        assert_eq!(s.matches('\x1b').count(), 2);
+        assert!(s.starts_with("\x1b[200~"));
+        assert!(s.ends_with("\x1b[201~"));
+        assert_eq!(s.matches("\x1b[201~").count(), 1);
+        // The literal text survives, minus the escape byte.
+        assert!(s.contains("echo one[201~\r echo PWNED"));
+    }
+
+    #[test]
+    fn paste_payload_brackets_a_clean_payload_unchanged() {
+        let out = paste_payload("SELECT 1;\n", true);
+        assert_eq!(out, b"\x1b[200~SELECT 1;\n\x1b[201~");
+    }
+
+    /// The unbracketed branch maps newlines to CR (what a keyboard delivers) and
+    /// must drop ESC too, or a paste can still emit arbitrary escape sequences.
+    #[test]
+    fn paste_payload_unbracketed_normalizes_newlines_and_drops_esc() {
+        assert_eq!(paste_payload("a\r\nb\nc", false), b"a\rb\rc");
+        assert_eq!(
+            paste_payload("\x1b]52;c;cGF5bG9hZA==\x07", false),
+            b"]52;c;cGF5bG9hZA==\x07"
+        );
     }
 
     #[test]
