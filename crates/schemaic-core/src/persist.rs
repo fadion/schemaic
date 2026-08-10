@@ -301,6 +301,73 @@ fn connections_path() -> Option<PathBuf> {
     Some(config_dir()?.join("connections.json"))
 }
 
+/// Write `bytes` to `path`, **owner-only** where the platform supports it,
+/// truncating an existing file.
+///
+/// Every config write goes through this. `connections.json` holds plaintext
+/// credentials whenever the keyring is unavailable — the fallback CLAUDE.md
+/// documents — and `std::fs::write` creates at `0o666 & !umask`, i.e. 0644 under
+/// the usual umask, which on a shared Unix host hands the DB password, the SSH
+/// password and the key passphrase to every other local account. The `.bak` and
+/// `.tmp` siblings carry the same bytes, so they take the same mode.
+///
+/// On Windows the file inherits the user profile's ACL and is not exposed to
+/// other accounts, so there is nothing to narrow.
+pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_mode(path, bytes, false)
+}
+
+/// As [`write_private`], but **refuses an existing path** (`O_EXCL`).
+///
+/// What a file written into a world-writable directory needs: `O_EXCL` refuses
+/// both a path another user pre-created (which would otherwise be opened and
+/// written *without* the mode applying, since the mode only takes effect on
+/// creation) and a symlink pointing somewhere they can read.
+pub fn create_private_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_mode(path, bytes, true)
+}
+
+fn write_mode(path: &Path, bytes: &[u8], exclusive: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true);
+    if exclusive {
+        opts.create_new(true);
+    } else {
+        opts.create(true).truncate(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    #[allow(unused_mut)]
+    let mut f = opts.open(path)?;
+    // `OpenOptions::mode` applies only when the call *creates* the file, so an
+    // existing one — say a 0644 written by a build from before this — would keep
+    // its mode. Narrow it through the open handle (no path re-resolution, so no
+    // TOCTOU). Not needed in the exclusive case: nothing pre-existed.
+    #[cfg(unix)]
+    if !exclusive {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    f.write_all(bytes)
+}
+
+/// Narrow `dir` to owner-only on Unix (best effort). Applied to our own config
+/// directory, so anything added to it later is protected by default rather than
+/// by each writer remembering.
+fn make_dir_private(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
 /// Append a suffix to a path's file name (`foo.json` → `foo.json.bak`).
 fn sibling(path: &Path, suffix: &str) -> PathBuf {
     let mut os = path.to_path_buf().into_os_string();
@@ -356,6 +423,11 @@ fn read_json<T: Default + for<'de> Deserialize<'de>>(path: Option<PathBuf>) -> T
     let Some(path) = path else {
         return T::default();
     };
+    // A crash between the staged write and the rename leaves a `.tmp` holding a
+    // full copy of the file — nothing reads it, and only the rename-failure path
+    // removed it, so it would sit there forever. Loading is the natural sweep
+    // point: the next save re-creates its own.
+    let _ = std::fs::remove_file(sibling(&path, ".tmp"));
     let primary = classify::<T>(std::fs::read(&path).ok().as_deref());
     let (value, corrupt) = recover(primary, || {
         classify::<T>(std::fs::read(sibling(&path, ".bak")).ok().as_deref())
@@ -397,24 +469,29 @@ fn write_json<T: Serialize>(path: Option<PathBuf>, value: &T) {
     };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
+        make_dir_private(parent);
     }
     let Ok(json) = serde_json::to_vec_pretty(value) else {
         return;
     };
     // Write to a temp file then atomically rename over the target, so a crash
     // mid-write can't truncate the real file (this JSON is the only copy). Keep
-    // the prior good version as `.bak` for recovery.
+    // the prior good version as `.bak` for recovery. All three paths hold the same
+    // bytes, so all three go through `write_private` — the rename carries the
+    // temp's mode onto the target.
     let tmp = sibling(&path, ".tmp");
-    if std::fs::write(&tmp, &json).is_err() {
+    if write_private(&tmp, &json).is_err() {
         return;
     }
-    if path.exists() {
-        let _ = std::fs::copy(&path, sibling(&path, ".bak"));
+    // Re-write rather than `fs::copy`, which would carry the *old* file's mode
+    // onto the backup — including a 0644 left by a build from before this.
+    if let Ok(prev) = std::fs::read(&path) {
+        let _ = write_private(&sibling(&path, ".bak"), &prev);
     }
     if std::fs::rename(&tmp, &path).is_err() {
         // Cross-device or transient rename failure: fall back to a direct write
         // rather than leaving only the temp file.
-        let _ = std::fs::write(&path, &json);
+        let _ = write_private(&path, &json);
         let _ = std::fs::remove_file(&tmp);
     }
 }
@@ -636,5 +713,106 @@ mod tests {
             sibling(Path::new("connections.json"), ".corrupt"),
             Path::new("connections.json.corrupt")
         );
+    }
+
+    // ── File modes ────────────────────────────────────────────────────────
+    //
+    // The one place the suite touches the filesystem, and deliberately: the mode
+    // a file is created with *is* the boundary, so there is nothing purer to test.
+    // Unix-only — on Windows the file inherits the profile ACL and there is no
+    // mode to assert.
+    #[cfg(unix)]
+    mod modes {
+        use super::super::*;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        /// A fresh directory under the system temp dir, removed by `Dir`'s drop.
+        struct Dir(PathBuf);
+
+        impl Dir {
+            fn new(tag: &str) -> Dir {
+                static SEQ: AtomicU32 = AtomicU32::new(0);
+                let n = SEQ.fetch_add(1, Ordering::Relaxed);
+                let p = std::env::temp_dir()
+                    .join(format!("schemaic-test-{tag}-{}-{n}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&p);
+                std::fs::create_dir_all(&p).unwrap();
+                Dir(p)
+            }
+        }
+
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn mode(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        #[test]
+        fn every_config_write_is_owner_only() {
+            // `connections.json` holds plaintext credentials whenever the keyring
+            // is unavailable, and `fs::write` would create it 0644 — readable by
+            // every other account on a shared host. The `.bak` carries the same
+            // bytes, so it must be narrowed too (`fs::copy` would have carried the
+            // *old* file's mode onto it).
+            let dir = Dir::new("modes");
+            let path = dir.0.join("connections.json");
+            write_json(Some(path.clone()), &"first");
+            write_json(Some(path.clone()), &"second");
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(&sibling(&path, ".bak")), 0o600);
+            // And the directory itself, so anything added later is protected by
+            // default rather than by each writer remembering.
+            assert_eq!(mode(&dir.0), 0o700);
+        }
+
+        #[test]
+        fn write_private_narrows_an_existing_world_readable_file() {
+            // The upgrade path: a file left 0644 by an earlier build.
+            let dir = Dir::new("upgrade");
+            let path = dir.0.join("connections.json");
+            std::fs::write(&path, b"old").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            write_private(&path, b"new").unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"new");
+            // `OpenOptions::mode` only applies on creation, so re-opening an
+            // existing file leaves its mode alone — narrow it explicitly.
+            assert_eq!(mode(&path), 0o600);
+        }
+
+        #[test]
+        fn create_private_new_refuses_a_path_someone_else_made() {
+            // The world-writable-temp-dir attack: another user pre-creates the
+            // path (or symlinks it), `create` opens it, and `.mode(0o600)` never
+            // applies because nothing was created. `O_EXCL` refuses both.
+            let dir = Dir::new("excl");
+            let path = dir.0.join("mcp.json");
+            std::fs::write(&path, b"planted").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+            assert!(create_private_new(&path, b"secret").is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"planted", "not written to");
+            // On a free path it creates owner-only.
+            let fresh = dir.0.join("fresh.json");
+            create_private_new(&fresh, b"secret").unwrap();
+            assert_eq!(mode(&fresh), 0o600);
+        }
+
+        #[test]
+        fn loading_sweeps_a_temp_file_left_by_an_interrupted_save() {
+            // A crash between the staged write and the rename leaves a full copy
+            // nothing would ever remove.
+            let dir = Dir::new("sweep");
+            let path = dir.0.join("ui_state.json");
+            write_json(Some(path.clone()), &"v");
+            let tmp = sibling(&path, ".tmp");
+            std::fs::write(&tmp, b"orphan").unwrap();
+            let v: String = read_json(Some(path.clone()));
+            assert_eq!(v, "v");
+            assert!(!tmp.exists(), "the orphaned .tmp must be swept");
+        }
     }
 }
