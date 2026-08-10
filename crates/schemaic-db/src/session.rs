@@ -17,16 +17,24 @@
 //! introspection, live-validate, EXPLAIN, the Live Monitor, AI/MCP — deliberately
 //! keep using fresh connections, so a long-running transaction never blocks them.
 //!
-//! The session doesn't track transaction state; it reports a
-//! [`StmtOutcome`] per operation and the app folds that into
-//! [`schemaic_core::tx::TxState`].
+//! The session reports a [`StmtOutcome`] per operation and the app folds that
+//! into [`schemaic_core::tx::TxState`], which is the *display* model — what the
+//! pill says and which buttons are live.
+//!
+//! The one piece of transaction state the session owns itself is whether a
+//! transaction is open ([`Session::ensure_tx`]). That can't live in `TxState`,
+//! because `TxState` is only folded when an operation *completes*: two runs
+//! started close together would both read "no transaction" and both issue a
+//! `BEGIN`, and on MySQL the second one implicitly commits the first's writes.
 
 use std::sync::Arc;
 
 use mysql_async::Conn;
 use mysql_async::prelude::Queryable;
+use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{GridWrite, RefetchRow, RefetchTemplate, ResultSet, Value};
-use schemaic_core::tx::StmtOutcome;
+use schemaic_core::tx::{self, StmtOutcome};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 use tokio_util::sync::CancellationToken;
@@ -67,14 +75,23 @@ pub struct Session {
     db: Db,
     database: Option<String>,
     inner: Mutex<Backend>,
+    /// Whether a transaction is currently open on this connection.
+    ///
+    /// **Only ever read or written while `inner` is held** — that is what makes
+    /// "is one open?" and the `BEGIN` a single atomic step; the atomic type is
+    /// only so it can be mutated through `&self`. Owning this here rather than
+    /// consulting the UI's `TxState` is the whole point: two operations started
+    /// close together both read a state that isn't folded until each completes,
+    /// so both decided they had to `BEGIN`, and on MySQL a second `BEGIN`
+    /// implicitly commits the first one's writes.
+    in_tx: AtomicBool,
 }
 
 impl Session {
-    /// Open the pinned connection. No transaction is started yet — [`begin`] is
-    /// called lazily on the tab's first statement, so flipping to Manual and then
-    /// changing your mind costs nothing on the server.
-    ///
-    /// [`begin`]: Session::begin
+    /// Open the pinned connection. No transaction is started yet —
+    /// [`Session::ensure_tx`] opens one lazily on the tab's first statement, so
+    /// flipping to Manual and then changing your mind costs nothing on the
+    /// server.
     pub async fn open(db: &Db, database: Option<&str>) -> Result<Arc<Session>, DbError> {
         let backend = match db.engine() {
             Engine::MySql => {
@@ -101,6 +118,7 @@ impl Session {
             db: db.clone(),
             database: database.map(|s| s.to_string()),
             inner: Mutex::new(backend),
+            in_tx: AtomicBool::new(false),
         }))
     }
 
@@ -117,6 +135,11 @@ impl Session {
     /// pinned connection.
     async fn control(&self, sql: &str) -> Result<(), DbError> {
         let mut guard = self.inner.lock().await;
+        Session::control_on(&mut guard, sql).await
+    }
+
+    /// The body of [`Session::control`], for callers already holding the lock.
+    async fn control_on(guard: &mut Backend, sql: &str) -> Result<(), DbError> {
         match &mut *guard {
             Backend::MySql { conn, .. } => conn
                 .query_drop(sql)
@@ -129,18 +152,43 @@ impl Session {
         }
     }
 
-    pub async fn begin(&self) -> Result<(), DbError> {
-        self.control("BEGIN").await
+    /// Open a transaction unless this connection already has one.
+    ///
+    /// **The decision is taken under the same lock the `BEGIN` goes out on**, so
+    /// two operations racing to start the tab's transaction cannot both issue
+    /// one. Callers must use this rather than deciding for themselves from
+    /// `TxState` — that signal is not folded until an operation *completes*, so
+    /// while one is in flight every other caller reads it as "no transaction".
+    ///
+    /// The error is returned, not logged: running the statement outside the
+    /// transaction is exactly the outcome Manual mode exists to prevent, so the
+    /// operation must abort instead.
+    pub async fn ensure_tx(&self) -> Result<(), DbError> {
+        let mut guard = self.inner.lock().await;
+        if self.in_tx.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        Session::control_on(&mut guard, "BEGIN").await?;
+        self.in_tx.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
+    /// Both this and [`Session::rollback`] clear the flag even when the server
+    /// rejects the statement. A redundant `BEGIN` on a connection with no
+    /// transaction is harmless; skipping a needed one is not, so on doubt the
+    /// flag errs toward "there is no transaction".
     pub async fn commit(&self) -> Result<(), DbError> {
-        self.control("COMMIT").await
+        let r = self.control("COMMIT").await;
+        self.in_tx.store(false, Ordering::SeqCst);
+        r
     }
 
     /// Roll the transaction back. Also the way out of a PostgreSQL transaction
     /// that a failed statement aborted (`25P02`).
     pub async fn rollback(&self) -> Result<(), DbError> {
-        self.control("ROLLBACK").await
+        let r = self.control("ROLLBACK").await;
+        self.in_tx.store(false, Ordering::SeqCst);
+        r
     }
 
     /// Close the pinned connection. Any open transaction is rolled back by the
@@ -148,6 +196,7 @@ impl Session {
     /// the intent is explicit rather than implied by a disconnect.
     pub async fn close(&self) {
         let mut guard = self.inner.lock().await;
+        self.in_tx.store(false, Ordering::SeqCst);
         match &mut *guard {
             Backend::MySql { conn, .. } => {
                 // `Conn::disconnect` consumes the connection, which we can't do
@@ -255,7 +304,33 @@ impl Session {
                 }
             }
         };
+        // MySQL DDL commits the open transaction out from under us, so the flag
+        // has to follow — otherwise the next statement would skip its `BEGIN`
+        // and run auto-committed. Same predicate `TxState` folds on, so the
+        // session's view and the pill's can't drift.
+        if result.is_ok() && tx::implicit_commit(self.tx_engine(), sql) {
+            // `BEGIN`/`START TRANSACTION` are on that list because opening one
+            // commits the current one — but they also leave a new transaction
+            // open, so the flag stays set for them.
+            let dialect = match self.db.engine() {
+                Engine::Postgres => SqlDialect::Postgres,
+                Engine::MySql => SqlDialect::MySql,
+            };
+            let opens = matches!(
+                schemaic_core::sql::leading_keyword(sql, dialect).as_deref(),
+                Some("BEGIN") | Some("START")
+            );
+            self.in_tx.store(opens, Ordering::SeqCst);
+        }
         Session::classify(&mut guard, result).await
+    }
+
+    /// This session's engine, in the vocabulary `schemaic_core::tx` speaks.
+    fn tx_engine(&self) -> tx::TxEngine {
+        match self.db.engine() {
+            Engine::Postgres => tx::TxEngine::Postgres,
+            Engine::MySql => tx::TxEngine::MySql,
+        }
     }
 
     // There's deliberately no `run_batch` here. The fresh-connection one collapses
