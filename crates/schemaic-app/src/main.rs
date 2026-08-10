@@ -93,15 +93,16 @@ use schemaic_core::filter::{Order, table_query};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::persist::{self, ConnectionsFile, UiState};
 use schemaic_core::schema::{SchemaState, TableSource};
+use schemaic_core::sql::{GuardPolicy, RunVerdict, run_verdict};
 use schemaic_core::tx::{StmtOutcome, TxEngine, TxMode, TxState};
 use schemaic_db::{Db, DbError, Session};
 use schemaic_ui::theme::{EditorThemeKind, UiThemeKind};
 use schemaic_ui::{
     AiActions, AiEffort, AiModel, AiUi, ChatMessage, Confirm, ConnActions, ConnNode, ConnUi,
     CtxMenu, DraftSignals, HistoryActions, HistoryUi, InlineAiRequest, InlineAiState, LayoutUi,
-    MonitorEntry, OverlayUi, PlanState, ResultPanel, RightPanel, Role, SchemaActions, SchemaScope,
-    SchemaUi, Tab, TabsActions, TabsUi, TermActions, TermCursor, TermUi, TestState, TxChoice,
-    TxPrompt, Ui, pick_connection_color,
+    MonitorEntry, OverlayUi, PendingRun, PlanState, ResultPanel, RightPanel, Role, RunGuard,
+    SchemaActions, SchemaScope, SchemaUi, Tab, TabsActions, TabsUi, TermActions, TermCursor,
+    TermUi, TestState, TxChoice, TxPrompt, Ui, pick_connection_color,
 };
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -2880,6 +2881,106 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         })
     };
 
+    // ── The write guard ─────────────────────────────────────────────────────
+    //
+    // The read-only block, the missing-`WHERE` net and `confirm_writes` used to
+    // live as two closures inside the editor pane's *view body*, which meant
+    // they protected exactly one caller. The command palette's `>run` and the AI
+    // chat's Insert & Run both reached the raw run action and executed writes
+    // past all three — including the read-only block, which by design has no
+    // "Run anyway". So the guard lives here now, wrapping the run actions
+    // themselves: `tab_actions.run`/`run_all` *are* the guarded pair, the raw
+    // ones never leave this crate, and a new caller can't opt out by omission.
+    //
+    // The decision itself is `schemaic_core::sql::run_verdict` — pure and
+    // tested. This closure only supplies the policy and parks what was held
+    // back.
+    let run_guard: RwSignal<Option<RunGuard>> = RwSignal::new(None);
+    let guard_policy = move || {
+        let id = active.get_untracked();
+        let cid = tabs.with_untracked(|v| {
+            v.iter()
+                .find(|t| t.id == id)
+                .map(|t| t.conn_id.get_untracked())
+        });
+        let conn = cid.and_then(|cid| {
+            connections.with_untracked(|cs| cs.iter().find(|c| c.id == cid).cloned())
+        });
+        GuardPolicy {
+            read_only: conn.as_ref().is_some_and(|c| c.read_only),
+            confirm_writes: confirm_writes.get_untracked(),
+            dialect: conn
+                .as_ref()
+                .map(|c| SqlDialect::from_db_type(&c.db_type))
+                .unwrap_or_default(),
+        }
+    };
+    // The connection-gated but *unguarded* pair. Only the two wrappers below and
+    // "Run anyway" reach them; nothing outside this crate can.
+    let gated_run = gate1(&with_conn, &run);
+    let gated_run_all = gate1(&with_conn, &run_all);
+
+    let guarded_run: Rc<dyn Fn(String)> = {
+        let gated_run = gated_run.clone();
+        Rc::new(
+            move |sql: String| match run_verdict(std::slice::from_ref(&sql), guard_policy()) {
+                RunVerdict::Allow => (gated_run)(sql),
+                RunVerdict::Block(message) => run_guard.set(Some(RunGuard {
+                    message,
+                    pending: None,
+                })),
+                RunVerdict::Confirm(message) => run_guard.set(Some(RunGuard {
+                    message,
+                    pending: Some(PendingRun::Single(sql)),
+                })),
+            },
+        )
+    };
+    let guarded_run_all: Rc<dyn Fn(Vec<String>)> = {
+        let gated_run_all = gated_run_all.clone();
+        Rc::new(
+            move |stmts: Vec<String>| match run_verdict(&stmts, guard_policy()) {
+                RunVerdict::Allow => (gated_run_all)(stmts),
+                RunVerdict::Block(message) => run_guard.set(Some(RunGuard {
+                    message,
+                    pending: None,
+                })),
+                RunVerdict::Confirm(message) => run_guard.set(Some(RunGuard {
+                    message,
+                    pending: Some(PendingRun::Batch(stmts)),
+                })),
+            },
+        )
+    };
+    // A held-back run belongs to the tab it was raised in. The guard bar used to
+    // be per-pane and vanished when the pane was rebuilt on a tab switch; now
+    // that the guard is one signal, dropping it here keeps that behaviour — and
+    // stops "Run anyway" replaying a statement into a different tab, which may
+    // be a different connection and database. Guarded against a redundant `set`,
+    // which would rebuild the bar's container on every switch.
+    create_effect(move |_| {
+        active.get();
+        if run_guard.get_untracked().is_some() {
+            run_guard.set(None);
+        }
+    });
+    // "Run anyway": replay what the guard parked. A hard block parked nothing.
+    let run_anyway: Rc<dyn Fn()> = {
+        let gated_run = gated_run.clone();
+        let gated_run_all = gated_run_all.clone();
+        Rc::new(move || {
+            let Some(g) = run_guard.get_untracked() else {
+                return;
+            };
+            run_guard.set(None);
+            match g.pending {
+                Some(PendingRun::Single(sql)) => (gated_run)(sql),
+                Some(PendingRun::Batch(stmts)) => (gated_run_all)(stmts),
+                None => {}
+            }
+        })
+    };
+
     // ── Schema loading ──────────────────────────────────────────────────────
     // For an SSH connection, open (or reuse) a tunnel first, then list the
     // databases through it; the resolved tunnel port is cached and every
@@ -4316,9 +4417,11 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             active_db_anchor,
         },
         tab_actions: Rc::new(TabsActions {
-            run: gate1(&with_conn, &run),
+            // Already connection-gated *and* write-guarded — see `guarded_run`.
+            run: guarded_run.clone(),
             apply_view,
-            run_all: gate1(&with_conn, &run_all),
+            run_all: guarded_run_all.clone(),
+            run_anyway: run_anyway.clone(),
             cancel,
             commit_edits: {
                 // Writes need the same gate, but a `CommitFn` reports back
@@ -4401,6 +4504,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             monitor_error,
             monitor_interval,
             erd: RwSignal::new(None),
+            run_guard,
         },
         schema: SchemaUi {
             db_nodes,

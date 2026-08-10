@@ -400,6 +400,20 @@ Zed-inspired, aiming to replace DataGrip.
 
 Re-introducing the anti-patterns these guard against is a regression:
 
+- **The write guard lives on the run action, not in a caller of it.** Every path that executes
+  user SQL goes through `TabsActions::run`/`run_all`, which *are* the guarded pair: they call
+  `schemaic_core::sql::run_verdict` (pure + tested) and, on anything but `Allow`, park the request
+  in `ui.overlay.run_guard` and execute **nothing**. The unguarded actions never leave
+  `schemaic-app`; `TabsActions::run_anyway` is the only way back to them, and it replays only what
+  the guard parked. The editor pane renders the bar — it does not own the guard.
+  This is written down because the guard used to be two closures inside `editor_pane.rs`'s *view
+  body*, so it protected exactly one caller: the command palette's `>run` and the AI chat's
+  **Insert & Run** both reached the raw action and ran writes past all three protections — the
+  missing-`WHERE` net, `confirm_writes`, and the read-only-connection block that by design has no
+  "Run anyway". **Don't add a run path that takes the raw action, and don't re-implement the
+  verdict** — a new protection is an arm of `run_verdict`, and a `RunVerdict::Block` must stay
+  un-overridable. (`plan_view`'s `contains_write` is not a second guard: it decides whether
+  `EXPLAIN ANALYZE` may run a statement for its timings.)
 - **One SQL boundary lexer.** Any code scanning SQL for string / `-- ` / `#` / `/* */` / backtick /
   `$tag$` boundaries MUST build on `schemaic_core::sql::skip_noncode` (statement split, WHERE guard, AI
   read-only gate, `intel`'s tokenizer, `sql_highlight`, `sqlfmt`). Never hand-roll a second
