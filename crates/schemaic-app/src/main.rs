@@ -4570,6 +4570,15 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         save_db_favorites,
         resources,
     };
+    // Every config file has been loaded by now. If any of them was unreadable it
+    // was preserved as `.corrupt` and recovered from the backup or defaults —
+    // which from the user's side looks like their connections or preferences just
+    // vanished, so say so instead of only logging it.
+    let recoveries = persist::take_recoveries();
+    if !recoveries.is_empty() {
+        error_modal_text.set(Some(recoveries.join("\n\n")));
+        error_modal_open.set(true);
+    }
     schemaic_ui::workspace(ui)
 }
 
