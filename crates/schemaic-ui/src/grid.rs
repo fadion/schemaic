@@ -1169,7 +1169,7 @@ fn set_active(gs: GridState, i: usize, ci: usize, extend: bool) {
 /// `start..end` + `left_pad` + `right_pad` always span the full
 /// `sum(widths[data_cols])`, so rendering only the visible columns between two
 /// spacers leaves the data pane's scroll geometry (and header alignment) unchanged.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct ColWindow {
     start: usize,
     end: usize,
@@ -5278,6 +5278,129 @@ mod tests {
             vec![col("c", ty)],
             cells.into_iter().map(|v| vec![v]).collect(),
         )
+    }
+
+    // ── Column virtualization (`compute_window`) ──
+    //
+    // The invariant CLAUDE.md states for the data pane: `gs.widths` stays
+    // full-length and each row's total width = `sum(widths[data_cols])`, the
+    // spacers making up the hidden columns. If that ever stops holding, nothing
+    // fails — the two panes just drift out of column alignment and
+    // `scroll_active_into_view` scrolls to the wrong x.
+
+    /// `left_pad + Σ widths[data_cols[start..end]] + right_pad` — what must equal
+    /// the full `Σ widths[data_cols]` for every viewport.
+    fn spanned(w: &ColWindow, widths: &[f64], data_cols: &[usize]) -> f64 {
+        let visible: f64 = data_cols[w.start..w.end]
+            .iter()
+            .map(|&c| widths[c])
+            .sum::<f64>();
+        w.left_pad + visible + w.right_pad
+    }
+
+    fn total(widths: &[f64], data_cols: &[usize]) -> f64 {
+        data_cols.iter().map(|&c| widths[c]).sum()
+    }
+
+    // Deliberately uneven, so an off-by-one in either pad shows up as a mismatch
+    // rather than cancelling out.
+    const W: [f64; 8] = [80.0, 120.0, 60.0, 200.0, 90.0, 150.0, 110.0, 70.0];
+
+    fn vp_at(x0: f64, width: f64) -> Rect {
+        Rect::new(x0, 0.0, x0 + width, 400.0)
+    }
+
+    #[test]
+    fn compute_window_spacers_always_make_up_the_hidden_columns() {
+        let all: Vec<usize> = (0..W.len()).collect();
+        let sum = total(&W, &all);
+        // Every scroll position, at three viewport widths, with and without
+        // overscan — the pads must always account for exactly what isn't rendered.
+        for width in [150.0, 400.0, 1200.0] {
+            for overscan in [0, 2] {
+                let mut x0 = 0.0;
+                while x0 <= sum + 100.0 {
+                    let w = compute_window(vp_at(x0, width), &W, &all, overscan);
+                    assert!(
+                        (spanned(&w, &W, &all) - sum).abs() < 1e-9,
+                        "x0={x0} width={width} overscan={overscan} → {w:?}"
+                    );
+                    x0 += 25.0;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compute_window_before_layout_renders_a_non_empty_slice() {
+        // `vp.width() <= 1.0` is the pre-layout branch: the first frame must not be
+        // blank, and its right pad still covers everything it skipped.
+        let all: Vec<usize> = (0..W.len()).collect();
+        let w = compute_window(Rect::ZERO, &W, &all, 2);
+        assert_eq!((w.start, w.end), (0, W.len()));
+        assert_eq!(w.left_pad, 0.0);
+        assert_eq!(w.right_pad, 0.0);
+        // With more columns than the initial slice, the tail is padded, not dropped.
+        let widths: Vec<f64> = (0..40).map(|i| 50.0 + i as f64).collect();
+        let cols: Vec<usize> = (0..40).collect();
+        let w = compute_window(Rect::ZERO, &widths, &cols, 2);
+        assert_eq!((w.start, w.end), (0, 16));
+        assert!((spanned(&w, &widths, &cols) - total(&widths, &cols)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compute_window_at_the_origin_has_no_left_pad() {
+        let all: Vec<usize> = (0..W.len()).collect();
+        let w = compute_window(vp_at(0.0, 200.0), &W, &all, 2);
+        assert_eq!(w.start, 0);
+        assert_eq!(w.left_pad, 0.0);
+    }
+
+    #[test]
+    fn compute_window_scrolled_fully_right_reaches_the_last_column() {
+        let all: Vec<usize> = (0..W.len()).collect();
+        let sum = total(&W, &all);
+        let w = compute_window(vp_at(sum - 150.0, 150.0), &W, &all, 2);
+        assert_eq!(w.end, W.len());
+        assert_eq!(w.right_pad, 0.0);
+        assert!(
+            w.start > 0,
+            "a mid-scroll window should skip leading columns"
+        );
+    }
+
+    #[test]
+    fn compute_window_sums_over_data_cols_only_under_a_freeze() {
+        // The frozen column is absent from `data_cols` but still present in
+        // `widths` — its width must not leak into either spacer.
+        let data_cols: Vec<usize> = (0..W.len()).filter(|&c| c != 3).collect();
+        let sum = total(&W, &data_cols);
+        assert!((sum - (total(&W, &(0..W.len()).collect::<Vec<_>>()) - W[3])).abs() < 1e-9);
+        for x0 in [0.0, 90.0, 250.0, 600.0] {
+            let w = compute_window(vp_at(x0, 200.0), &W, &data_cols, 2);
+            assert!((spanned(&w, &W, &data_cols) - sum).abs() < 1e-9, "x0={x0}");
+        }
+    }
+
+    #[test]
+    fn compute_window_on_no_columns_is_empty_rather_than_panicking() {
+        for vp in [Rect::ZERO, vp_at(0.0, 400.0), vp_at(500.0, 400.0)] {
+            let w = compute_window(vp, &W, &[], 2);
+            assert_eq!((w.start, w.end), (0, 0));
+            assert_eq!((w.left_pad, w.right_pad), (0.0, 0.0));
+        }
+    }
+
+    #[test]
+    fn compute_window_overscan_widens_the_visible_window() {
+        // Same viewport, more overscan → a window at least as wide on each side,
+        // never narrower (that is what keeps a small scroll from exposing a blank).
+        let all: Vec<usize> = (0..W.len()).collect();
+        let vp = vp_at(200.0, 200.0);
+        let tight = compute_window(vp, &W, &all, 0);
+        let loose = compute_window(vp, &W, &all, 2);
+        assert!(loose.start <= tight.start && loose.end >= tight.end);
+        assert!(loose.start < tight.start || loose.end > tight.end);
     }
 
     // ── Keyboard navigation over the display grid (real rows + pending new rows) ──
