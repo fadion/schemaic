@@ -87,8 +87,10 @@ Zed-inspired, aiming to replace DataGrip.
   - `ddl.rs` — **schema editing**. `TableDraft` (the desired table; column/index/FK
     entries each carry the name they had on the server, which is what tells a *rename*
     from a drop-plus-add) → `diff(current, draft, dialect) -> ChangeSet` → `emit()`.
-    Every `Change` answers `summary()` and `is_destructive()`, which is what the preview
-    modal renders. The emitter owns the engine divergence: MySQL coalesces into one
+    Every `Change` answers `summary()` and `risks()`, which is what the preview
+    modal renders — `risks()` returns *every* consequence, not the first, because one edit can
+    narrow a column **and** make it NOT NULL and the NOT-NULL sentence ("the statement fails")
+    otherwise reads as a promise that nothing is lost. The emitter owns the engine divergence: MySQL coalesces into one
     `ALTER TABLE` and restates a whole column via `definition_sql` (`MODIFY` replaces it,
     so anything omitted is destroyed); PostgreSQL splits renames / `DROP INDEX` /
     `CREATE INDEX` / `COMMENT ON` into their own statements and drops a key by

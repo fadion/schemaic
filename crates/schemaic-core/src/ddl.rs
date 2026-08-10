@@ -638,47 +638,65 @@ impl Change {
         }
     }
 
-    /// What this change destroys, in plain language — `None` when nothing is at
-    /// risk. This is the sentence the preview shows above the Apply button, so
-    /// it names the consequence rather than the operation.
-    pub fn is_destructive(&self) -> Option<String> {
+    /// What this change destroys, in plain language — empty when nothing is at
+    /// risk. These are the sentences the preview lists above the Apply button, so
+    /// they name the consequence rather than the operation.
+    ///
+    /// A `Vec` rather than one sentence because a single change can carry more
+    /// than one risk: an `AlterColumn` that narrows a column *and* makes it
+    /// NOT NULL used to disclose only the second, and that sentence says the
+    /// statement will fail — which reads as a promise that nothing can be lost.
+    pub fn risks(&self) -> Vec<String> {
         match self {
-            Change::DropTable => Some("Drops the table and every row in it.".to_string()),
+            Change::DropTable => vec!["Drops the table and every row in it.".to_string()],
             Change::TruncateTable => {
-                Some("Deletes every row in the table. This can't be undone.".to_string())
+                vec!["Deletes every row in the table. This can't be undone.".to_string()]
             }
             Change::DropColumn { name, .. } => {
-                Some(format!("Drops column {name} and all the data in it."))
+                vec![format!("Drops column {name} and all the data in it.")]
             }
-            Change::AlterColumn { from, to, .. } => alter_risk(from, to),
+            Change::AlterColumn { from, to, .. } => alter_risks(from, to),
             Change::PrimaryKey { from, to, .. } if !from.is_empty() && to.is_empty() => {
-                Some("Leaves the table without a primary key — rows can no longer be edited from the grid.".to_string())
+                vec!["Leaves the table without a primary key — rows can no longer be edited from the grid.".to_string()]
             }
-            Change::DropView { materialized } => Some(format!(
+            Change::DropView { materialized } => vec![format!(
                 "Drops the {}view. {VIEW_DROP_COST}",
                 if *materialized { "materialized " } else { "" }
-            )),
+            )],
             // The one place a *redefinition* is destructive: PostgreSQL can only
             // append columns to a view, so an edit that renames, retypes or
             // reorders one can't be applied in place at all. Saying that here is
             // the whole reason the recreate isn't done quietly.
-            Change::ReplaceView { draft, recreate: true } => Some(format!(
+            Change::ReplaceView {
+                draft,
+                recreate: true,
+            } => vec![format!(
                 "Re-creating {} drops it first. {VIEW_DROP_COST} PostgreSQL can't \
                  replace a view whose columns changed name, type or order, so this \
                  is the only way to apply the edit.",
                 draft.name
-            )),
-            _ => None,
+            )],
+            _ => Vec::new(),
         }
+    }
+
+    /// Whether this change destroys anything at all.
+    pub fn is_destructive(&self) -> bool {
+        !self.risks().is_empty()
     }
 }
 
-/// What an in-place column change puts at risk. Narrowing is the one that
+/// Everything an in-place column change puts at risk. Narrowing is the one that
 /// silently loses data; the others fail loudly, which is safer but still worth
 /// saying before the statement runs.
-fn alter_risk(from: &ColumnInfo, to: &ColumnInfo) -> Option<String> {
+///
+/// **All of them, not the first.** Nullability and type are independent halves of
+/// one edit and a designer changes both at once routinely; returning early on the
+/// nullability half hid the narrowing — the more dangerous of the two.
+fn alter_risks(from: &ColumnInfo, to: &ColumnInfo) -> Vec<String> {
+    let mut out = Vec::new();
     if from.nullable && !to.nullable {
-        return Some(format!(
+        out.push(format!(
             "Column {} becomes NOT NULL — the statement fails if any row holds NULL.",
             to.name
         ));
@@ -686,7 +704,7 @@ fn alter_risk(from: &ColumnInfo, to: &ColumnInfo) -> Option<String> {
     let (fb, fa) = split_type(&from.type_name);
     let (tb, ta) = split_type(&to.type_name);
     if fb.is_empty() || tb.is_empty() || from.type_name == to.type_name {
-        return None;
+        return out;
     }
     if fb == tb {
         // Same family: compare the parameters **pairwise**, because the two carry
@@ -705,21 +723,22 @@ fn alter_risk(from: &ColumnInfo, to: &ColumnInfo) -> Option<String> {
         if narrowed(1) {
             lost.push("rounds every value in the column");
         }
-        if lost.is_empty() {
-            return None;
+        if !lost.is_empty() {
+            out.push(format!(
+                "Narrowing {} from {} to {} {}.",
+                to.name,
+                from.type_name,
+                to.type_name,
+                lost.join(" and ")
+            ));
         }
-        return Some(format!(
-            "Narrowing {} from {} to {} {}.",
-            to.name,
-            from.type_name,
-            to.type_name,
-            lost.join(" and ")
-        ));
+        return out;
     }
-    Some(format!(
+    out.push(format!(
         "Changing {} from {} to {} rewrites every value; it can fail or lose precision.",
         to.name, from.type_name, to.type_name
-    ))
+    ));
+    out
 }
 
 /// A set of changes against one table, ready to review and emit.
@@ -742,12 +761,10 @@ impl ChangeSet {
         self.changes.len()
     }
 
-    /// Every destructive consequence in this set, in change order.
+    /// Every destructive consequence in this set, in change order — a change can
+    /// contribute more than one.
     pub fn destructive(&self) -> Vec<String> {
-        self.changes
-            .iter()
-            .filter_map(Change::is_destructive)
-            .collect()
+        self.changes.iter().flat_map(Change::risks).collect()
     }
 
     /// The statements, in the order they must run. Ready to hand to the preview
@@ -3726,14 +3743,62 @@ mod tests {
 
     // ── alter_risk: what an in-place type change costs ───────────────────────
 
-    /// The destructive sentence for `c from → to`, as the preview would show it.
-    fn risk(from: &str, to: &str) -> Option<String> {
+    /// Every destructive sentence for `c from → to`, as the preview lists them.
+    fn risks(from: &str, to: &str) -> Vec<String> {
         Change::AlterColumn {
             from: Box::new(col("c", from)),
             to: Box::new(col("c", to)),
             position: None,
         }
-        .is_destructive()
+        .risks()
+    }
+
+    /// The same, flattened — for the cases that assert on wording rather than count.
+    fn risk(from: &str, to: &str) -> Option<String> {
+        let v = risks(from, to);
+        (!v.is_empty()).then(|| v.join(" "))
+    }
+
+    #[test]
+    fn a_narrowing_that_also_becomes_not_null_discloses_both() {
+        // One edit, two attribute changes, both ordinary in a designer. Reporting
+        // only the NOT NULL half is worse than saying nothing: that sentence says
+        // the statement *fails*, which reads as a promise that nothing is lost.
+        let from = col("c", "varchar(255)");
+        let mut to = col("c", "varchar(10)");
+        to.nullable = false;
+        let got = Change::AlterColumn {
+            from: Box::new(from),
+            to: Box::new(to),
+            position: None,
+        }
+        .risks();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got.iter().any(|r| r.contains("NOT NULL")), "{got:?}");
+        assert!(got.iter().any(|r| r.contains("truncates")), "{got:?}");
+    }
+
+    #[test]
+    fn each_single_attribute_change_still_yields_exactly_one_risk() {
+        assert_eq!(risks("varchar(255)", "varchar(10)").len(), 1);
+        assert_eq!(risks("decimal(10,2)", "decimal(10,0)").len(), 1);
+        assert_eq!(risks("varchar(50)", "int(11)").len(), 1);
+        // Nullability alone.
+        let mut to = col("c", "varchar(255)");
+        to.nullable = false;
+        let got = Change::AlterColumn {
+            from: Box::new(col("c", "varchar(255)")),
+            to: Box::new(to),
+            position: None,
+        }
+        .risks();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].contains("NOT NULL"));
+    }
+
+    #[test]
+    fn a_harmless_alter_yields_no_risk_at_all() {
+        assert!(risks("varchar(10)", "varchar(255)").is_empty());
     }
 
     #[test]
