@@ -188,26 +188,49 @@ pub struct Column {
     pub origin: Option<ColumnOrigin>,
 }
 
+/// Type names that render right-aligned, in both engines' spellings (including
+/// the `intN`/`floatN` internal names). Compared against a declared type's
+/// **leading token**, so `DOUBLE PRECISION` and `INT(11) UNSIGNED` are covered by
+/// `DOUBLE` and `INT`.
+const NUMERIC_TYPES: &[&str] = &[
+    "TINYINT",
+    "SMALLINT",
+    "MEDIUMINT",
+    "INT",
+    "INTEGER",
+    "BIGINT",
+    "INT2",
+    "INT4",
+    "INT8",
+    "DECIMAL",
+    "DEC",
+    "NUMERIC",
+    "FIXED",
+    "FLOAT",
+    "FLOAT4",
+    "FLOAT8",
+    "DOUBLE",
+    "REAL",
+    "YEAR",
+    "BIT",
+];
+
 impl Column {
-    /// Coarse heuristic: is this a numeric column? (Used later for right
-    /// alignment; kept simple for M1.)
+    /// Is this a numeric column? Display-only — it decides right alignment.
+    ///
+    /// Matches the **leading type token** (the name up to the first `(` or space)
+    /// rather than any substring: `t.contains("INT")` made PostgreSQL's `interval`
+    /// and both engines' `point` / `multipoint` numeric, so an ordinary
+    /// `now() - created_at` column right-aligned as though it were a number.
+    /// Parameter lists and `UNSIGNED` / `ZEROFILL` / `PRECISION` suffixes fall
+    /// outside the token and are ignored.
     pub fn is_numeric(&self) -> bool {
-        let t = self.type_name.to_ascii_uppercase();
-        [
-            "TINYINT",
-            "SMALLINT",
-            "MEDIUMINT",
-            "INT",
-            "BIGINT",
-            "DECIMAL",
-            "NUMERIC",
-            "FLOAT",
-            "DOUBLE",
-            "YEAR",
-            "BIT",
-        ]
-        .iter()
-        .any(|k| t.contains(k))
+        let head = self
+            .type_name
+            .split(|c: char| c == '(' || c.is_whitespace())
+            .next()
+            .unwrap_or_default();
+        NUMERIC_TYPES.iter().any(|k| head.eq_ignore_ascii_case(k))
     }
 }
 
@@ -744,6 +767,12 @@ mod tests {
             "YEAR",
             "BIT",
             "MEDIUMINT UNSIGNED",
+            // PostgreSQL spellings, and MySQL's parameter/modifier suffixes.
+            "integer",
+            "double precision",
+            "real",
+            "int(11) unsigned zerofill",
+            "numeric(10,2)",
         ] {
             assert!(col(t).is_numeric(), "{t} should be numeric");
         }
@@ -758,6 +787,16 @@ mod tests {
             "JSON",
             "BLOB",
             "ENUM('a')",
+            // The adversarial cases: each of these *contains* a numeric keyword,
+            // which is what the old substring match matched on. The previous
+            // negative list held six types none of which could collide, so it
+            // could not fail for the reason the function was wrong.
+            "POINT",
+            "MULTIPOINT",
+            "INTERVAL",
+            "GEOMETRY",
+            "TIMESTAMP",
+            "integer[]",
         ] {
             assert!(!col(t).is_numeric(), "{t} should not be numeric");
         }
