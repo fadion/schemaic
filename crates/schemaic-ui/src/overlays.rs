@@ -2026,6 +2026,33 @@ fn build_items(
 
 // Find Anywhere / command palette. No `>` prefix → table/column search; a `>`
 // prefix enters command mode (see `schemaic_core::palette` + `palette_commands`).
+/// The dim tail of `complete` beyond what the user has typed — the inline ghost
+/// showing where Tab would land — or `None` when there is nothing to show.
+///
+/// **Every slice here is taken at a real char boundary of `complete`, and that
+/// is the whole point.** The previous version tested the prefix on the two
+/// strings *lowercased* and then sliced the **original-cased** `complete` at the
+/// typed query's byte length. `char::to_lowercase` is not length-preserving —
+/// `İ` (U+0130) is 2 bytes and lowercases to `i` + U+0307, 3 bytes — so that
+/// index need not be a boundary in `complete`, and `&str` indexing panics. A
+/// table named `İzmir` plus the single typed letter `i` crashed the app.
+///
+/// So walk `complete`'s own boundaries and take the first whose lowercased head
+/// covers the query. Case-insensitive, like the hit test it has to agree with.
+fn ghost_suffix(complete: &str, query: &str) -> Option<String> {
+    let q = query.to_lowercase();
+    if q.is_empty() {
+        return (!complete.is_empty()).then(|| complete.to_string());
+    }
+    complete
+        .char_indices()
+        .map(|(i, c)| i + c.len_utf8())
+        .find(|&i| complete[..i].to_lowercase().starts_with(&q))
+        // A completion equal to what's typed has no tail worth painting.
+        .filter(|&i| i < complete.len())
+        .map(|i| complete[i..].to_string())
+}
+
 pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
     let open = ui.overlay.find_open;
     let query = ui.overlay.find_query;
@@ -2143,10 +2170,9 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                     let q = query.get();
                     let sel = selected.get();
                     items.with(|v| {
-                        v.get(sel).and_then(|it| it.complete.clone()).and_then(|c| {
-                            (c.len() > q.len() && c.to_lowercase().starts_with(&q.to_lowercase()))
-                                .then(|| c[q.len()..].to_string())
-                        })
+                        v.get(sel)
+                            .and_then(|it| it.complete.clone())
+                            .and_then(|c| ghost_suffix(&c, &q))
                     })
                 },
                 move |g| match g {
@@ -2734,4 +2760,53 @@ fn find_matches(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ghost_suffix;
+
+    /// The panic this function exists to prevent: a Turkish schema with a table
+    /// named `İzmir`, and the user types one `i`. Reproduced in
+    /// `review/palettecheck/` before the fix.
+    #[test]
+    fn ghost_suffix_survives_a_name_that_changes_length_when_lowercased() {
+        assert_eq!(ghost_suffix("İzmir", "i").as_deref(), Some("zmir"));
+        // The other two the finding names, for the same reason.
+        assert_eq!(ghost_suffix("ẞtrasse", "ß").as_deref(), Some("trasse"));
+        assert_eq!(ghost_suffix("Kelvin", "k").as_deref(), Some("elvin"));
+    }
+
+    #[test]
+    fn ghost_suffix_is_case_insensitive_and_keeps_the_original_casing() {
+        assert_eq!(ghost_suffix("Orders", "ord").as_deref(), Some("ers"));
+        assert_eq!(ghost_suffix("Orders", "ORD").as_deref(), Some("ers"));
+        assert_eq!(
+            ghost_suffix("orderDetails", "order").as_deref(),
+            Some("Details")
+        );
+    }
+
+    #[test]
+    fn ghost_suffix_has_nothing_to_show_when_there_is_no_tail() {
+        assert_eq!(ghost_suffix("Orders", "orders"), None, "fully typed");
+        assert_eq!(ghost_suffix("Orders", "xyz"), None, "not a prefix");
+        assert_eq!(ghost_suffix("", ""), None, "nothing to complete");
+    }
+
+    #[test]
+    fn ghost_suffix_with_an_empty_query_offers_the_whole_completion() {
+        assert_eq!(ghost_suffix("Orders", "").as_deref(), Some("Orders"));
+    }
+
+    /// Multi-byte names that *don't* change length must still slice correctly.
+    #[test]
+    fn ghost_suffix_handles_ordinary_multibyte_names() {
+        assert_eq!(ghost_suffix("café_log", "caf").as_deref(), Some("é_log"));
+        assert_eq!(ghost_suffix("café_log", "café").as_deref(), Some("_log"));
+        assert_eq!(
+            ghost_suffix("日本語table", "日本").as_deref(),
+            Some("語table")
+        );
+    }
 }

@@ -44,6 +44,17 @@ fn c(s: &str) -> Color {
 /// Fallible hex parser (kept public-ish in spirit for a future JSON loader).
 pub fn parse_hex(s: &str) -> Option<Color> {
     let h = s.strip_prefix('#').unwrap_or(s);
+    // `h.len()` is a **byte** count while the arms below index by byte on the
+    // assumption of one byte per hex digit. One non-ASCII character makes those
+    // disagree — `#aé` is 3 bytes, takes the `#rgb` arm, and slices through the
+    // middle of `é`. `&str` indexing *panics* rather than returning `None`, so
+    // the `Option` return type is not the guard it looks like, and the input is
+    // persisted (a connection colour), so the crash repeats on every launch
+    // during layout of the whole window. Reject non-ASCII up front; hex digits
+    // are ASCII by definition, so nothing valid is lost.
+    if !h.is_ascii() {
+        return None;
+    }
     let n = |i: usize, len: usize| u8::from_str_radix(&h[i..i + len], 16).ok();
     match h.len() {
         3 => {
@@ -711,4 +722,42 @@ pub fn set_editor_word_wrap(wrap: bool) {
         st.editor_word_wrap.set(wrap);
         st.editor_gen.update(|g| *g += 1);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A persisted colour reaches `parse_hex` from `connections.json` /
+    /// `db_colors.json`, which the user can hand-edit and which nothing
+    /// validates. A non-ASCII character used to panic *during layout of the
+    /// whole window*, on every launch, with no way to recover from inside the
+    /// app — so this must return `None`, never crash.
+    #[test]
+    fn parse_hex_rejects_non_ascii_instead_of_panicking() {
+        // Byte lengths that land exactly on the 3 / 6 / 8 arms.
+        assert_eq!(parse_hex("#aé"), None); // 3 bytes, splits inside 'é'
+        assert_eq!(parse_hex("#éa"), None); // 3 bytes, splits at h[0..1]
+        assert_eq!(parse_hex("#aaaaé"), None); // 6 bytes
+        assert_eq!(parse_hex("#aaaaaaé"), None); // 8 bytes
+        assert_eq!(parse_hex("#日本語"), None); // 9 bytes, no arm
+    }
+
+    #[test]
+    fn parse_hex_still_reads_every_valid_form() {
+        assert_eq!(parse_hex("#fff"), Some(Color::rgb8(255, 255, 255)));
+        assert_eq!(parse_hex("#000"), Some(Color::rgb8(0, 0, 0)));
+        assert_eq!(parse_hex("#ff8800"), Some(Color::rgb8(255, 136, 0)));
+        assert_eq!(parse_hex("ff8800"), Some(Color::rgb8(255, 136, 0)));
+        assert_eq!(parse_hex("#ff880080"), Some(Color::rgba8(255, 136, 0, 128)));
+    }
+
+    #[test]
+    fn parse_hex_rejects_malformed_ascii() {
+        assert_eq!(parse_hex("#gg"), None);
+        assert_eq!(parse_hex("#zzz"), None);
+        assert_eq!(parse_hex(""), None);
+        assert_eq!(parse_hex("#"), None);
+        assert_eq!(parse_hex("#aaaa"), None, "no 4-digit form");
+    }
 }
