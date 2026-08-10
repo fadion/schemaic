@@ -1120,6 +1120,9 @@ pub struct TabsActions {
 pub(crate) struct NavKeys {
     pub tabs: RwSignal<Vec<Tab>>,
     pub active: RwSignal<usize>,
+    /// Needed because the strip shows only this connection's tabs, and both
+    /// Ctrl+Tab and Ctrl+1..9 have to move within what's visible.
+    pub active_conn: RwSignal<u64>,
     pub find_open: RwSignal<bool>,
     pub find_query: RwSignal<String>,
     pub add_tab: Rc<dyn Fn()>,
@@ -1179,31 +1182,44 @@ impl NavKeys {
         }
     }
 
-    fn cycle(&self, back: bool) {
+    /// The tab list as `schemaic_core::tabsel` wants it: `(id, conn_id)` pairs.
+    fn tab_refs(&self) -> Vec<(usize, u64)> {
         self.tabs.with_untracked(|v| {
-            let n = v.len();
-            if n == 0 {
-                return;
-            }
-            let pos = v
-                .iter()
-                .position(|t| t.id == self.active.get_untracked())
-                .unwrap_or(0);
-            let next = if back {
-                (pos + n - 1) % n
-            } else {
-                (pos + 1) % n
-            };
-            self.active.set(v[next].id);
-        });
+            v.iter()
+                .map(|t| (t.id, t.conn_id.get_untracked()))
+                .collect()
+        })
     }
 
+    /// Ctrl+Tab / Ctrl+Shift+Tab.
+    ///
+    /// Goes through `tabsel` rather than walking `tabs` directly. Both questions
+    /// it asks — which tabs count, and which is next — are connection-scoped,
+    /// because the strip only shows the active connection's tabs. This used to
+    /// be a private reimplementation over the *unfiltered* list, so it selected
+    /// tabs the strip deliberately hides, including ones on a disconnected
+    /// connection; the command palette's Next/Previous Tab called `tabsel` and
+    /// was correct, so the same user action had two behaviours.
+    fn cycle(&self, back: bool) {
+        let step = if back { -1 } else { 1 };
+        if let Some(next) = schemaic_core::tabsel::cycle(
+            &self.tab_refs(),
+            self.active_conn.get_untracked(),
+            Some(self.active.get_untracked()),
+            step,
+        ) {
+            self.active.set(next);
+        }
+    }
+
+    /// Ctrl+1..9 → the nth tab **of the strip**, which is the nth of this
+    /// connection's tabs, not the nth entry of the flat list.
     fn jump(&self, idx: usize) {
-        self.tabs.with_untracked(|v| {
-            if let Some(t) = v.get(idx) {
-                self.active.set(t.id);
-            }
-        });
+        if let Some(id) =
+            schemaic_core::tabsel::nth(&self.tab_refs(), self.active_conn.get_untracked(), idx)
+        {
+            self.active.set(id);
+        }
     }
 }
 
@@ -1736,6 +1752,7 @@ pub fn workspace(ui: Ui) -> impl IntoView {
     let navkeys = NavKeys {
         tabs: ui.tabs_ui.tabs,
         active: ui.tabs_ui.active,
+        active_conn: ui.conn.active_conn,
         find_open: ui.overlay.find_open,
         find_query: ui.overlay.find_query,
         add_tab: ui.tab_actions.add_tab.clone(),
@@ -2841,6 +2858,7 @@ fn center(ui: Ui) -> impl IntoView {
     let navkeys = NavKeys {
         tabs: ui.tabs_ui.tabs,
         active: ui.tabs_ui.active,
+        active_conn: ui.conn.active_conn,
         find_open: ui.overlay.find_open,
         find_query: ui.overlay.find_query,
         add_tab: ui.tab_actions.add_tab.clone(),
