@@ -674,7 +674,7 @@ impl Change {
 }
 
 /// What an in-place column change puts at risk. Narrowing is the one that
-/// silently truncates; the others fail loudly, which is safer but still worth
+/// silently loses data; the others fail loudly, which is safer but still worth
 /// saying before the statement runs.
 fn alter_risk(from: &ColumnInfo, to: &ColumnInfo) -> Option<String> {
     if from.nullable && !to.nullable {
@@ -689,14 +689,32 @@ fn alter_risk(from: &ColumnInfo, to: &ColumnInfo) -> Option<String> {
         return None;
     }
     if fb == tb {
-        // Same family: only a shrinking first parameter loses data.
-        return match (fa.first(), ta.first()) {
-            (Some(a), Some(b)) if b < a => Some(format!(
-                "Narrowing {} from {} to {} truncates values that no longer fit.",
-                to.name, from.type_name, to.type_name
-            )),
-            _ => None,
-        };
+        // Same family: compare the parameters **pairwise**, because the two carry
+        // different consequences. For `DECIMAL`/`NUMERIC` (and MySQL's
+        // `FLOAT`/`DOUBLE` with parameters) they are `(precision, scale)`: a
+        // smaller precision makes values not fit, but a smaller *scale* silently
+        // **rounds** every value — `decimal(10,2)` → `decimal(10,0)` turns
+        // `1234.56` into `1235`, succeeding with a warning rather than failing.
+        // Looking only at the first parameter missed the rounding case, which is
+        // the one that loses data without the statement complaining.
+        let narrowed = |i: usize| matches!((fa.get(i), ta.get(i)), (Some(a), Some(b)) if b < a);
+        let mut lost = Vec::new();
+        if narrowed(0) {
+            lost.push("truncates values that no longer fit");
+        }
+        if narrowed(1) {
+            lost.push("rounds every value in the column");
+        }
+        if lost.is_empty() {
+            return None;
+        }
+        return Some(format!(
+            "Narrowing {} from {} to {} {}.",
+            to.name,
+            from.type_name,
+            to.type_name,
+            lost.join(" and ")
+        ));
     }
     Some(format!(
         "Changing {} from {} to {} rewrites every value; it can fail or lose precision.",
@@ -3704,5 +3722,74 @@ mod tests {
             assert_eq!(ok("SELECT id, count(*) FROM t GROUP BY id"), None);
             assert_eq!(ok("not sql at all"), None);
         }
+    }
+
+    // ── alter_risk: what an in-place type change costs ───────────────────────
+
+    /// The destructive sentence for `c from → to`, as the preview would show it.
+    fn risk(from: &str, to: &str) -> Option<String> {
+        Change::AlterColumn {
+            from: Box::new(col("c", from)),
+            to: Box::new(col("c", to)),
+            position: None,
+        }
+        .is_destructive()
+    }
+
+    #[test]
+    fn shrinking_a_decimal_scale_warns_that_it_rounds() {
+        // The parameters of DECIMAL are (precision, scale); only the scale
+        // carries the fractional digits, and MySQL *rounds* rather than failing —
+        // 1234.56 becomes 1235 with nothing but a warning on the wire.
+        for (from, to) in [
+            ("decimal(10,2)", "decimal(10,0)"),
+            ("decimal(12,4)", "decimal(12,2)"),
+            ("numeric(9,3)", "numeric(9,1)"),
+        ] {
+            let msg = risk(from, to)
+                .unwrap_or_else(|| panic!("{from} → {to} must be reported as destructive"));
+            assert!(
+                msg.contains("rounds"),
+                "{from} → {to}: a scale reduction rounds, it doesn't truncate — got {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shrinking_a_decimal_precision_warns_that_values_may_not_fit() {
+        let msg = risk("decimal(12,2)", "decimal(6,2)").expect("precision ↓ is destructive");
+        assert!(msg.contains("no longer fit"), "got {msg:?}");
+    }
+
+    #[test]
+    fn shrinking_both_decimal_parameters_names_both_consequences() {
+        let msg = risk("decimal(12,4)", "decimal(6,2)").expect("both ↓ is destructive");
+        assert!(
+            msg.contains("rounds") && msg.contains("no longer fit"),
+            "got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn widening_a_decimal_is_not_destructive() {
+        assert_eq!(risk("decimal(10,2)", "decimal(12,2)"), None);
+        assert_eq!(risk("decimal(10,2)", "decimal(12,4)"), None);
+        assert_eq!(risk("decimal(10,2)", "decimal(10,2)"), None);
+        // Unparameterised on one side: nothing to compare, so nothing claimed.
+        assert_eq!(risk("decimal", "decimal(10,2)"), None);
+    }
+
+    #[test]
+    fn narrowing_a_string_or_time_type_still_warns() {
+        // The controls the finding used — these already worked and must keep working.
+        assert!(risk("varchar(255)", "varchar(10)").is_some());
+        assert!(risk("datetime(6)", "datetime(0)").is_some());
+        assert_eq!(risk("varchar(10)", "varchar(255)"), None);
+    }
+
+    #[test]
+    fn changing_type_family_still_warns_about_the_rewrite() {
+        let msg = risk("varchar(50)", "int(11)").expect("a family change is destructive");
+        assert!(msg.contains("rewrites every value"), "got {msg:?}");
     }
 }
