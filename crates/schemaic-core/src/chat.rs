@@ -9,6 +9,10 @@
 //! replays [`ChatMessage::prose`] into that session's system prompt so
 //! follow-ups still resolve, but tool calls and their results are not replayed
 //! — the assistant re-runs whatever it needs.
+//!
+//! **Tool *results* are never written to this file.** They are query output —
+//! real table rows — and the conversation is what is worth keeping; see
+//! [`ChatFile::of`].
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +21,12 @@ use crate::transcript::ChatMessage;
 /// Messages kept per connection. Generous enough that a working session
 /// survives intact, bounded so the file can't grow without limit.
 pub const MAX_MESSAGES: usize = 100;
+
+/// Stands in for a tool result that was deliberately not written to disk — see
+/// [`ChatFile::of`]. A visible marker rather than an absent field, so a restored
+/// chip still reads as a call that *returned* and anyone opening `chats.json`
+/// can see why there is no data there.
+pub const RESULT_OMITTED: &str = "(result not saved)";
 
 /// One connection's saved conversation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -31,6 +41,52 @@ pub struct SavedChat {
 pub struct ChatFile {
     #[serde(default)]
     pub chats: Vec<SavedChat>,
+}
+
+impl ChatFile {
+    /// The on-disk form of `chats`: every returned tool result replaced with
+    /// [`RESULT_OMITTED`].
+    ///
+    /// **Tool results are query output — real table rows.** A `run_query` result
+    /// is up to 200 rows rendered as a pipe table (names, emails, whatever the
+    /// question selected), and writing it here exported the user's data to a
+    /// plaintext file in the config directory, for the most recent 100 messages
+    /// of every connection, indefinitely, without the UI ever saying the
+    /// conversation was stored at all. Nothing downstream wants it either: the
+    /// replay path already refuses to hand tool results to a new session ("the
+    /// assistant re-runs whatever it needs"), so a restored conversation reads
+    /// exactly as well without them. The call, its SQL and whether it errored are
+    /// kept — that is the scrollback; the rows are re-fetchable.
+    ///
+    /// Stripping happens *here*, where a conversation becomes bytes, rather than
+    /// in [`save`] — so the results still live in memory and switching
+    /// connections and back mid-session shows the session's own scrollback
+    /// intact. Both write paths go through this, so the rows have no other route
+    /// to the file.
+    pub fn of(chats: &[SavedChat]) -> ChatFile {
+        ChatFile {
+            chats: chats
+                .iter()
+                .map(|c| SavedChat {
+                    conn_id: c.conn_id,
+                    messages: c.messages.iter().cloned().map(drop_tool_results).collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Replace every returned tool result with [`RESULT_OMITTED`]. A call that never
+/// returned keeps its `None` — that is "still running", not data withheld.
+fn drop_tool_results(mut m: ChatMessage) -> ChatMessage {
+    for seg in &mut m.segs {
+        if let crate::transcript::Seg::Tool(tc) = seg
+            && tc.result.is_some()
+        {
+            tc.result = Some(RESULT_OMITTED.to_string());
+        }
+    }
+    m
 }
 
 /// Store `messages` as `conn_id`'s conversation, replacing any previous one.
@@ -73,6 +129,9 @@ pub fn clear_conn(chats: &mut Vec<SavedChat>, conn_id: u64) {
 /// that never resolves, so it goes — along with the trailing user message it
 /// was answering, which would otherwise restore as a question that was never
 /// answered.
+///
+/// Tool *results* are kept here — they are the live session's own scrollback —
+/// and dropped where the store becomes a file ([`ChatFile::of`]).
 fn persistable(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     let mut keep: Vec<ChatMessage> = messages.iter().filter(|m| !m.pending).cloned().collect();
     while keep
@@ -198,6 +257,75 @@ mod tests {
             got.last().unwrap().prose(),
             format!("a{}", MAX_MESSAGES + 9)
         );
+    }
+
+    fn tool(sql: &str, result: Option<&str>) -> Seg {
+        Seg::Tool(crate::transcript::ToolCall {
+            name: "mcp__schemaic__run_query".to_string(),
+            sql: Some(sql.to_string()),
+            result: result.map(str::to_string),
+            is_error: false,
+        })
+    }
+
+    fn tool_of(m: &ChatMessage, i: usize) -> &crate::transcript::ToolCall {
+        match &m.segs[i] {
+            Seg::Tool(tc) => tc,
+            other => panic!("expected a tool segment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tool_result_never_reaches_the_file() {
+        // `run_query` returns up to 200 rows of real table data. Writing that to
+        // `chats.json` exported the user's rows to a plaintext file without ever
+        // telling them, and nothing downstream wants it — the replay path refuses
+        // to hand tool results to a new session anyway.
+        let mut chats = Vec::new();
+        let mut msgs = turn("newest orders?", "here they are");
+        msgs[1].segs.push(tool(
+            "SELECT * FROM orders",
+            Some("| id | email |\n| 1 | a@b.c |"),
+        ));
+        save(&mut chats, 1, &msgs);
+
+        let json = serde_json::to_string(&ChatFile::of(&chats)).unwrap();
+        assert!(!json.contains("a@b.c"), "row data reached the file: {json}");
+
+        // What comes back from that file: the call and its SQL — the scrollback —
+        // with a marker where the rows were, so the chip still reads as returned.
+        let back: ChatFile = serde_json::from_str(&json).unwrap();
+        let restored = for_conn(&back.chats, 1);
+        let tc = tool_of(&restored[1], 1);
+        assert_eq!(tc.sql.as_deref(), Some("SELECT * FROM orders"));
+        assert_eq!(tc.result.as_deref(), Some(RESULT_OMITTED));
+    }
+
+    #[test]
+    fn the_live_session_keeps_its_own_tool_results() {
+        // Stripping happens where the store becomes bytes, not on `save` — so
+        // switching connections and back mid-session still shows the results this
+        // session produced.
+        let mut chats = Vec::new();
+        let mut msgs = turn("q", "a");
+        msgs[1].segs.push(tool("SELECT 1", Some("| 1 |")));
+        save(&mut chats, 1, &msgs);
+        assert_eq!(
+            tool_of(&for_conn(&chats, 1)[1], 1).result.as_deref(),
+            Some("| 1 |")
+        );
+    }
+
+    #[test]
+    fn a_tool_call_that_never_returned_keeps_its_empty_result() {
+        // `None` means "still running" — replacing it with the marker would show
+        // a restored chip as finished.
+        let mut chats = Vec::new();
+        let mut msgs = turn("q", "a");
+        msgs[1].segs.push(tool("SELECT 1", None));
+        save(&mut chats, 1, &msgs);
+        let file = ChatFile::of(&chats);
+        assert_eq!(tool_of(&for_conn(&file.chats, 1)[1], 1).result, None);
     }
 
     #[test]
