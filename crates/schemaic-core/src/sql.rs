@@ -340,6 +340,64 @@ pub fn first_unsafe(sql: &str, dialect: SqlDialect) -> Option<String> {
         .find_map(|(lo, hi)| sql.get(lo..hi).and_then(|s| unsafe_reason(s, dialect)))
 }
 
+/// The connection + settings state the write guards read.
+#[derive(Clone, Copy, Debug)]
+pub struct GuardPolicy {
+    /// The connection is marked read-only: a write is blocked outright.
+    pub read_only: bool,
+    /// "Confirm before running writes" — a soft confirmation on any write/DDL.
+    pub confirm_writes: bool,
+    pub dialect: SqlDialect,
+}
+
+/// What the write guards say about a run request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunVerdict {
+    /// Nothing stands in the way — run it.
+    Allow,
+    /// Refused, with **no override**. The read-only connection block: the user
+    /// marked this connection read-only, and the product deliberately offers no
+    /// "Run anyway" for it.
+    Block(String),
+    /// Held back with an override available ("Run anyway") — the missing-`WHERE`
+    /// warning, or `confirm_writes`.
+    Confirm(String),
+}
+
+/// The write guard, as one decision over the statements about to run.
+///
+/// This is *the* answer to "may this run", and it exists as a function because
+/// it used to be two closures inside the editor pane's view body — which meant
+/// every other way of running SQL silently had no guard at all. The command
+/// palette's `>run` and the AI chat's Insert & Run each reached the raw run
+/// action and executed writes past all three protections, including the
+/// read-only block that has no override by design. A guard living in one caller
+/// of a shared path is a guard the next caller opts out of by omission.
+///
+/// `stmts` is what would execute: one element for a single statement, one per
+/// statement for a batch (each element may itself hold several, which
+/// [`first_unsafe`] and [`contains_write`] both handle). Order matters — the
+/// hard block is checked before either soft one, so a read-only connection never
+/// offers "Run anyway", and an unsafe missing-`WHERE` statement reports *that*
+/// rather than the generic "modifies data".
+pub fn run_verdict(stmts: &[String], policy: GuardPolicy) -> RunVerdict {
+    let writes = || stmts.iter().any(|s| contains_write(s, policy.dialect));
+    if policy.read_only && writes() {
+        return RunVerdict::Block("Read-only connection.".to_string());
+    }
+    if let Some(message) = stmts.iter().find_map(|s| first_unsafe(s, policy.dialect)) {
+        return RunVerdict::Confirm(message);
+    }
+    if policy.confirm_writes && writes() {
+        return RunVerdict::Confirm(if stmts.len() == 1 {
+            "This statement modifies data.".to_string()
+        } else {
+            "These statements modify data.".to_string()
+        });
+    }
+    RunVerdict::Allow
+}
+
 /// Bounded Levenshtein edit distance between two ASCII strings.
 pub fn edit_distance(a: &str, b: &str) -> usize {
     let a = a.as_bytes();
@@ -1002,5 +1060,191 @@ mod tests {
         assert_eq!(skip_noncode(b"abc", 0), None);
         // `--` without trailing whitespace is NOT a comment.
         assert_eq!(skip_noncode(b"--x", 0), None);
+    }
+
+    // ── The write guard (`run_verdict`) ──
+    //
+    // These three protections used to live as two closures inside the editor
+    // pane's view body, so the command palette's `>run` and the AI chat's
+    // Insert & Run — both of which reached the raw run action — executed writes
+    // past all of them. The point of the function is that there is now one
+    // answer to "may this run", and it can be asserted without a GUI.
+
+    /// Read-only off, confirm-writes off — nothing but the unsafe-WHERE net.
+    fn open_policy() -> GuardPolicy {
+        GuardPolicy {
+            read_only: false,
+            confirm_writes: false,
+            dialect: SqlDialect::MySql,
+        }
+    }
+
+    fn v(stmts: &[&str], policy: GuardPolicy) -> RunVerdict {
+        let owned: Vec<String> = stmts.iter().map(|s| s.to_string()).collect();
+        run_verdict(&owned, policy)
+    }
+
+    #[test]
+    fn a_plain_select_runs_under_every_policy() {
+        let sql = &["SELECT * FROM orders"];
+        assert_eq!(v(sql, open_policy()), RunVerdict::Allow);
+        assert_eq!(
+            v(
+                sql,
+                GuardPolicy {
+                    read_only: true,
+                    confirm_writes: true,
+                    ..open_policy()
+                }
+            ),
+            RunVerdict::Allow,
+            "read-only and confirm-writes are about writes; a read is neither"
+        );
+    }
+
+    #[test]
+    fn a_read_only_connection_blocks_a_write_with_no_override() {
+        // The repro: `DELETE FROM orders;` on a connection marked read-only.
+        // `Block` carries no pending run — the product offers no "Run anyway"
+        // here on purpose, which is what made the palette's bypass worse than
+        // the others.
+        let p = GuardPolicy {
+            read_only: true,
+            ..open_policy()
+        };
+        assert_eq!(
+            v(&["DELETE FROM orders WHERE id = 1"], p),
+            RunVerdict::Block("Read-only connection.".to_string())
+        );
+        // Even one write among reads blocks the batch.
+        assert_eq!(
+            v(
+                &["SELECT 1", "UPDATE t SET a = 1 WHERE id = 2", "SELECT 2"],
+                p
+            ),
+            RunVerdict::Block("Read-only connection.".to_string())
+        );
+    }
+
+    #[test]
+    fn the_hard_block_wins_over_both_soft_ones() {
+        // A read-only connection must not be offered "Run anyway" just because
+        // the statement also trips the missing-WHERE net.
+        let p = GuardPolicy {
+            read_only: true,
+            confirm_writes: true,
+            dialect: SqlDialect::MySql,
+        };
+        assert!(matches!(
+            v(&["DELETE FROM orders"], p),
+            RunVerdict::Block(_)
+        ));
+    }
+
+    #[test]
+    fn a_missing_where_is_reported_ahead_of_the_generic_write_confirm() {
+        // Both would fire; the specific message is the useful one.
+        let p = GuardPolicy {
+            confirm_writes: true,
+            ..open_policy()
+        };
+        let RunVerdict::Confirm(msg) = v(&["DELETE FROM orders"], p) else {
+            panic!("expected a confirm");
+        };
+        assert!(msg.contains("without WHERE"), "{msg}");
+    }
+
+    #[test]
+    fn the_missing_where_net_fires_even_with_confirm_writes_off() {
+        // It is not a setting — it is the net that catches the mistake.
+        let RunVerdict::Confirm(msg) = v(&["UPDATE t SET a = 1"], open_policy()) else {
+            panic!("expected a confirm");
+        };
+        assert!(msg.contains("without WHERE"), "{msg}");
+        assert!(matches!(
+            v(&["TRUNCATE TABLE t"], open_policy()),
+            RunVerdict::Confirm(_)
+        ));
+    }
+
+    #[test]
+    fn confirm_writes_holds_back_an_otherwise_safe_write() {
+        let p = GuardPolicy {
+            confirm_writes: true,
+            ..open_policy()
+        };
+        assert_eq!(
+            v(&["INSERT INTO t VALUES (1)"], p),
+            RunVerdict::Confirm("This statement modifies data.".to_string())
+        );
+        // …and says so in the plural for a batch.
+        assert_eq!(
+            v(&["SELECT 1", "INSERT INTO t VALUES (1)"], p),
+            RunVerdict::Confirm("These statements modify data.".to_string())
+        );
+        // With the setting off, the same write is allowed straight through.
+        assert_eq!(
+            v(&["INSERT INTO t VALUES (1)"], open_policy()),
+            RunVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn a_data_modifying_cte_is_a_write_to_every_guard() {
+        // The statement reads like a SELECT and writes; all three protections
+        // have to see through it (this is A3-L5-01's statement).
+        let cte = "WITH d AS (DELETE FROM orders RETURNING *) SELECT * FROM d";
+        let pg = SqlDialect::Postgres;
+        assert!(matches!(
+            v(
+                &[cte],
+                GuardPolicy {
+                    read_only: true,
+                    confirm_writes: false,
+                    dialect: pg
+                }
+            ),
+            RunVerdict::Block(_)
+        ));
+        assert!(matches!(
+            v(
+                &[cte],
+                GuardPolicy {
+                    read_only: false,
+                    confirm_writes: true,
+                    dialect: pg
+                }
+            ),
+            RunVerdict::Confirm(_)
+        ));
+    }
+
+    #[test]
+    fn a_write_hidden_in_a_multi_statement_element_is_still_seen() {
+        // A single "statement" handed to the guard may hold several — the
+        // editor's Ctrl+Enter passes the text under the caret, and a paste can
+        // be anything.
+        let p = GuardPolicy {
+            confirm_writes: true,
+            ..open_policy()
+        };
+        assert!(matches!(
+            v(&["SELECT 1; DELETE FROM orders WHERE id = 1"], p),
+            RunVerdict::Confirm(_)
+        ));
+        // And the missing-WHERE net reaches into it too.
+        assert!(matches!(
+            v(&["SELECT 1; DELETE FROM orders"], open_policy()),
+            RunVerdict::Confirm(_)
+        ));
+    }
+
+    #[test]
+    fn nothing_to_run_is_allowed_rather_than_guarded() {
+        assert_eq!(v(&[], open_policy()), RunVerdict::Allow);
+        assert_eq!(
+            v(&["", "   ", "-- just a note"], open_policy()),
+            RunVerdict::Allow
+        );
     }
 }

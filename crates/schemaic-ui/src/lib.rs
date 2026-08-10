@@ -1039,15 +1039,31 @@ pub struct TabsUi {
 
 /// Tabs / query callbacks (owned by the app).
 pub struct TabsActions {
+    /// Run one statement — **through the write guard**
+    /// ([`schemaic_core::sql::run_verdict`]). A refused or held-back run sets
+    /// [`OverlayUi::run_guard`] and executes nothing.
+    ///
+    /// Every way of running SQL goes through this, and there is deliberately no
+    /// unguarded counterpart on this bundle: the guard used to be two closures
+    /// inside the editor pane, so the command palette's `>run` and the AI chat's
+    /// Insert & Run reached the raw action and executed writes past all three
+    /// protections — including the read-only block that has no override by
+    /// design. The raw action never leaves the app crate now; `run_anyway` is
+    /// the only way back to it.
     pub run: Rc<dyn Fn(String)>,
     /// Re-run the active tab with a server-side filter/sort view applied (the grid
     /// filter bar / header sort). Unlike `run`, this does NOT record history, does
     /// NOT touch `tab.base_sql`, and does NOT reset `tab.grid_query` — so the base
     /// statement and the active filter/sort survive the re-run. `sql` is the
     /// already-rewritten statement (see `schemaic_core::filter::build_query`).
+    /// Not guarded: it re-runs the `SELECT` the grid is already showing.
     pub apply_view: Rc<dyn Fn(String)>,
     /// Run several statements in order (Run Everything): one result tab each.
+    /// Guarded exactly as [`Self::run`] is.
     pub run_all: Rc<dyn Fn(Vec<String>)>,
+    /// Replay whatever [`OverlayUi::run_guard`] is holding and clear it — the
+    /// guard bar's "Run anyway". A hard block (`pending: None`) replays nothing.
+    pub run_anyway: Rc<dyn Fn()>,
     pub cancel: Rc<dyn Fn()>,
     /// Commit staged grid changes (cell edits + new-row inserts) transactionally.
     /// Arg 2 is an optional re-fetch request (present ⇒ splice the edited rows
@@ -1478,6 +1494,33 @@ pub struct OverlayUi {
     pub monitor_interval: RwSignal<u64>,
     /// ER-diagram modal: `Some(target)` opens it for that database/seed.
     pub erd: RwSignal<Option<ErdTarget>>,
+    /// A run the write guard held back, or `None`. Set by
+    /// [`TabsActions::run`]/[`TabsActions::run_all`] — which *are* the guarded
+    /// run path — and rendered as the editor's guard bar. It lives here, not in
+    /// the editor pane, because the guard belongs to the run action and the bar
+    /// is only its view: the two closures that used to hold it inside the pane's
+    /// view body meant every other caller of the run action had no guard at all.
+    /// One at a time, since only one tab is on screen.
+    pub run_guard: RwSignal<Option<RunGuard>>,
+}
+
+/// A run request the write guard held back, replayed verbatim on "Run anyway".
+#[derive(Clone, Debug)]
+pub enum PendingRun {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+/// A held-back run: what to tell the user, and what to replay if they insist.
+///
+/// `pending: None` is the **hard block** — a write on a read-only connection —
+/// and the guard bar then shows no "Run anyway", because the product
+/// deliberately offers no override for it. `Some(..)` is a soft warning (the
+/// missing-`WHERE` net, or `confirm_writes`).
+#[derive(Clone, Debug)]
+pub struct RunGuard {
+    pub message: String,
+    pub pending: Option<PendingRun>,
 }
 
 /// One entry in the Live Monitor's change log: a detected
@@ -2759,11 +2802,12 @@ fn center(ui: Ui) -> impl IntoView {
             None => SqlDialect::default(),
         }
     });
-    let confirm_writes = ui.layout.confirm_writes;
     let live_validate = ui.layout.live_validate;
     let validate_stmt = ui.tab_actions.validate_stmt.clone();
     let run = ui.tab_actions.run.clone();
     let run_all = ui.tab_actions.run_all.clone();
+    let run_anyway = ui.tab_actions.run_anyway.clone();
+    let run_guard = ui.overlay.run_guard;
     let cancel = ui.tab_actions.cancel.clone();
     let db_nodes = ui.schema.db_nodes;
     let inline_ai = ui.ai.inline;
@@ -2929,6 +2973,8 @@ fn center(ui: Ui) -> impl IntoView {
                     results: tab.results,
                     run: run.clone(),
                     run_all: run_all.clone(),
+                    run_guard,
+                    run_anyway: run_anyway.clone(),
                     db_nodes,
                     inline_ai,
                     inline_ai_run: inline_ai_run.clone(),
@@ -2945,7 +2991,6 @@ fn center(ui: Ui) -> impl IntoView {
                     active_db_menu_open,
                     active_db_anchor,
                     read_only,
-                    confirm_writes,
                     live_validate,
                     validate_stmt: validate_stmt.clone(),
                     popup_menu: popup,

@@ -36,9 +36,7 @@ use schemaic_core::diff::{DiffTag, build_diff_rows, line_diff};
 use schemaic_core::intel::{self, Diagnostic, Severity, SqlDialect};
 use schemaic_core::model::QueryState;
 use schemaic_core::pairs::{self, PairAction};
-use schemaic_core::sql::{
-    contains_write, first_unsafe, statement_range, statement_ranges, unsafe_reason,
-};
+use schemaic_core::sql::{statement_range, statement_ranges};
 use schemaic_core::text_ops::{
     find_matches, move_line, offset_of_line, replace_all, soft_tab_indent, soft_tab_outdent,
     toggle_line_comment,
@@ -526,23 +524,15 @@ struct CmdK {
 // ── Unsafe-statement guard ───────────────────────────────────────────────────
 //
 // A DELETE or UPDATE with no WHERE clause rewrites/erases every row — almost
-// always a mistake. We detect it before running and make the user confirm.
-
-/// A run request held back by the guard, replayed verbatim on "Run anyway".
-#[derive(Clone)]
-enum Pending {
-    Single(String),
-    Batch(Vec<String>),
-}
-
-/// A held-back run notice: the warning to show + what to run if confirmed.
-/// `pending: None` is a hard block (no "Run anyway") — used for the read-only
-/// connection guard; `Some(..)` is a soft warning (the unsafe-WHERE guard).
-#[derive(Clone)]
-struct Guard {
-    message: String,
-    pending: Option<Pending>,
-}
+// always a mistake, so it is caught before running and confirmed.
+//
+// The guard itself is **not here**. It lives on the run action (the app's
+// `guarded_run`/`guarded_run_all`, over `schemaic_core::sql::run_verdict`), and
+// this pane only renders what it held back — `ui.overlay.run_guard`, arriving as
+// `QueryPaneParams::run_guard`, drawn by `guard_bar`. It used to be two closures
+// in this view body, which is precisely why the command palette and the AI chat
+// could run writes past all three protections: a guard in one caller of a shared
+// action is a guard the next caller opts out of by omission. Don't move it back.
 
 // ── Diagnostics (catalog-aware) ──────────────────────────────────────────────
 
@@ -714,8 +704,15 @@ pub(crate) struct QueryPaneParams {
     /// see [`Tab::diagnostics`](crate::Tab::diagnostics).
     pub syntax: RwSignal<Vec<Diagnostic>>,
     pub results: RwSignal<QueryState>,
+    /// The **guarded** run action ([`crate::TabsActions::run`]) — a held-back run
+    /// lands in `run_guard` and nothing executes.
     pub run: Rc<dyn Fn(String)>,
+    /// The guarded batch run ([`crate::TabsActions::run_all`]).
     pub run_all: Rc<dyn Fn(Vec<String>)>,
+    /// What the write guard is holding, if anything — rendered as the guard bar.
+    pub run_guard: RwSignal<Option<crate::RunGuard>>,
+    /// The guard bar's "Run anyway" ([`crate::TabsActions::run_anyway`]).
+    pub run_anyway: Rc<dyn Fn()>,
     pub db_nodes: RwSignal<Vec<ConnNode>>,
     pub inline_ai: RwSignal<InlineAiState>,
     pub inline_ai_run: Rc<dyn Fn(InlineAiRequest)>,
@@ -735,8 +732,9 @@ pub(crate) struct QueryPaneParams {
     pub dialect: Memo<SqlDialect>,
     pub active_db_menu_open: RwSignal<bool>,
     pub active_db_anchor: RwSignal<Point>,
+    /// The active tab's connection is marked read-only. The *write* guard reads
+    /// this on the run action; the pane only uses it to hide "Create view".
     pub read_only: Memo<bool>,
-    pub confirm_writes: RwSignal<bool>,
     /// Whether to validate the statement under the cursor against the live DB as
     /// you type (Tier-2 diagnostics). Persisted setting.
     pub live_validate: RwSignal<bool>,
@@ -769,6 +767,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         results,
         run,
         run_all,
+        run_guard: guard,
+        run_anyway,
         db_nodes,
         inline_ai,
         inline_ai_run,
@@ -785,7 +785,6 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         active_db_menu_open,
         active_db_anchor,
         read_only,
-        confirm_writes,
         live_validate,
         validate_stmt,
         popup_menu,
@@ -892,10 +891,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         }
     });
 
-    // Unsafe-statement guard: when set, a red bar warns and holds back the run
-    // until "Run anyway". Catalog-aware diagnostics (the squiggles) — recomputed on
+    // Catalog-aware diagnostics (the squiggles) — recomputed on
     // every edit, seeded from the initial text.
-    let guard: RwSignal<Option<Guard>> = RwSignal::new(None);
     // Tier-2 (DB-validated) diagnostics for the statement under the cursor, when
     // `live_validate` is on. Debounced: each edit bumps `val_gen`, and only the
     // latest generation's deferred round-trip fires (and its result is accepted).
@@ -938,92 +935,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         }
     });
 
-    // Run entry points go through these: a DELETE/UPDATE with no WHERE sets the
-    // guard (nothing runs) instead of executing. "Run anyway" replays via the raw
-    // `run`/`run_all`.
-    let guarded_run: Rc<dyn Fn(String)> = {
-        let run = run.clone();
-        Rc::new(move |sql: String| {
-            // Read-only connection: hard-block any write/DDL (no "Run anyway").
-            if read_only.get_untracked() && contains_write(&sql, dialect.get_untracked()) {
-                guard.set(Some(Guard {
-                    message: "Read-only connection.".to_string(),
-                    pending: None,
-                }));
-                return;
-            }
-            match first_unsafe(&sql, dialect.get_untracked()) {
-                Some(message) => guard.set(Some(Guard {
-                    message,
-                    pending: Some(Pending::Single(sql)),
-                })),
-                // "Confirm before running writes": any write/DDL gets a soft
-                // confirm bar (with "Run anyway"), unless it was already flagged
-                // above as an unsafe missing-WHERE statement.
-                None if confirm_writes.get_untracked()
-                    && contains_write(&sql, dialect.get_untracked()) =>
-                {
-                    guard.set(Some(Guard {
-                        message: "This statement modifies data.".to_string(),
-                        pending: Some(Pending::Single(sql)),
-                    }))
-                }
-                None => (run)(sql),
-            }
-        })
-    };
-    let guarded_run_all: Rc<dyn Fn(Vec<String>)> = {
-        let run_all = run_all.clone();
-        Rc::new(move |stmts: Vec<String>| {
-            if read_only.get_untracked()
-                && stmts
-                    .iter()
-                    .any(|s| contains_write(s, dialect.get_untracked()))
-            {
-                guard.set(Some(Guard {
-                    message: "Read-only connection.".to_string(),
-                    pending: None,
-                }));
-                return;
-            }
-            match stmts
-                .iter()
-                .find_map(|s| unsafe_reason(s, dialect.get_untracked()))
-            {
-                Some(message) => guard.set(Some(Guard {
-                    message,
-                    pending: Some(Pending::Batch(stmts)),
-                })),
-                None if confirm_writes.get_untracked()
-                    && stmts
-                        .iter()
-                        .any(|s| contains_write(s, dialect.get_untracked())) =>
-                {
-                    guard.set(Some(Guard {
-                        message: "These statements modify data.".to_string(),
-                        pending: Some(Pending::Batch(stmts)),
-                    }))
-                }
-                None => (run_all)(stmts),
-            }
-        })
-    };
-    let run_anyway: Rc<dyn Fn()> = {
-        let run = run.clone();
-        let run_all = run_all.clone();
-        Rc::new(move || {
-            if let Some(g) = guard.get_untracked() {
-                guard.set(None);
-                match g.pending {
-                    Some(Pending::Single(sql)) => (run)(sql),
-                    Some(Pending::Batch(stmts)) => (run_all)(stmts),
-                    None => {} // hard block (read-only) — nothing to replay
-                }
-            }
-        })
-    };
     // The editor key handler needs its own clone (it's a `move` closure).
-    let guarded_run_key = guarded_run.clone();
+    // `run` is already the guarded run action — see `TabsActions::run`.
+    let guarded_run_key = run.clone();
 
     // Only one menu open at a time: opening any one closes the others. (Their
     // dismiss catchers cover different regions, so a click in one doesn't reach
@@ -2541,8 +2455,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // Current is selected by default), Enter runs it, Escape dismisses. The mouse
     // still works — hovering moves the selection so both share one highlight.
     let run_menu_view = {
-        let run = guarded_run.clone();
-        let run_all = guarded_run_all.clone();
+        let run = run.clone();
+        let run_all = run_all.clone();
         let ed_rm = ed_run;
         dyn_container(
             move || run_menu.get(),
@@ -2867,7 +2781,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // (7px insets). The whole pill is clickable (not just the glyph); hover
     // brightens the play. Runs the current query — Ctrl+Enter still works too.
     let run_overlay = {
-        let run = guarded_run.clone();
+        let run = run.clone();
         let hovered = RwSignal::new(false);
         container(icons::icon(icons::PLAY_LUCIDE, 16.0).style(move |s| {
             // Dimmed to 30% (background stays) when there's nothing to run, or
