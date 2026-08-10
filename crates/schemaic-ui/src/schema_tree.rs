@@ -21,7 +21,7 @@ use schemaic_core::db_color::DbColorRule;
 use schemaic_core::favorite::FavoriteRule;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::schema::{
-    ColumnInfo, ColumnTypeClass, IndexInfo, SchemaState, TableInfo, TableSource,
+    ColumnInfo, ColumnTypeClass, DbSchema, IndexInfo, SchemaState, TableInfo, TableSource,
     classify_column_type,
 };
 use schemaic_core::text::plural;
@@ -159,9 +159,19 @@ impl<'a> TableScope<'a> {
     }
 }
 
-// Build the visible-row list in display order. Mirrors the tree's own render
-// rules: hidden DBs dropped; a non-empty filter force-expands DBs and narrows
-// their tables to name matches; only expanded tables contribute columns+keys.
+/// One database as the nav walk sees it — the signals already read, in display
+/// order. Exists so [`nav_rows`] is a pure function of what the tree renders and
+/// can be tested against it; `visible_nav_rows` is the thin signal-reading shell.
+struct NavDb {
+    database: String,
+    name: String,
+    /// `None` while introspection is still in flight or has failed — the walk
+    /// keeps such a database (its tables aren't knowable yet), like the tree.
+    schema: Option<DbSchema>,
+}
+
+// Build the visible-row list in display order. Reads the signals the walk depends
+// on, then hands plain data to `nav_rows`.
 fn visible_nav_rows(
     db_nodes: RwSignal<Vec<ConnNode>>,
     expanded: RwSignal<HashSet<String>>,
@@ -170,18 +180,45 @@ fn visible_nav_rows(
     db_favorites: RwSignal<Vec<FavoriteRule>>,
     active_conn: RwSignal<u64>,
 ) -> Vec<NavRow> {
-    let filt = filter.get_untracked().trim().to_lowercase();
-    let filtering = !filt.is_empty();
-    let exp = expanded.get_untracked();
-    let hidden = hidden_dbs.get_untracked();
-    let mut rows = Vec::new();
     let mut nodes = db_nodes.get_untracked();
     sort_favorites_first(
         &mut nodes,
         &db_favorites.get_untracked(),
         active_conn.get_untracked(),
     );
-    for n in nodes {
+    let dbs: Vec<NavDb> = nodes
+        .into_iter()
+        .map(|n| NavDb {
+            database: n.database,
+            name: n.name,
+            schema: match n.schema.get_untracked() {
+                SchemaState::Loaded(s) => Some(s),
+                _ => None,
+            },
+        })
+        .collect();
+    nav_rows(
+        &dbs,
+        &expanded.get_untracked(),
+        &hidden_dbs.get_untracked(),
+        &filter.get_untracked(),
+    )
+}
+
+/// The nav walk. Mirrors the tree's own render rules: hidden DBs dropped; a
+/// non-empty filter force-expands DBs and narrows their tables to name matches;
+/// only expanded tables contribute columns. Pure — this is the function that must
+/// stay bug-for-bug identical to the render, so it is the one worth testing.
+fn nav_rows(
+    dbs: &[NavDb],
+    exp: &HashSet<String>,
+    hidden: &HashSet<String>,
+    filter: &str,
+) -> Vec<NavRow> {
+    let filt = filter.trim().to_lowercase();
+    let filtering = !filt.is_empty();
+    let mut rows = Vec::new();
+    for n in dbs {
         if hidden.contains(&n.database) {
             continue;
         }
@@ -189,11 +226,7 @@ fn visible_nav_rows(
         // shown): a DB matches by its own name or by containing a matching table; a
         // DB whose schema is still loading is kept (we can't know its tables yet).
         let db_hit = filtering && n.name.to_lowercase().contains(&filt);
-        let schema_state = n.schema.get_untracked();
-        let schema = match &schema_state {
-            SchemaState::Loaded(s) => Some(s),
-            _ => None,
-        };
+        let schema = n.schema.as_ref();
         if filtering && !db_hit {
             let has_match = match schema {
                 Some(s) => s.tables.iter().any(|t| t.matches_search(&filt)),
@@ -1570,7 +1603,6 @@ fn schema_search(filter: RwSignal<String>) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use schemaic_core::schema::DbSchema;
 
     fn tbl(ns: Option<&str>, name: &str) -> TableInfo {
         TableInfo {
@@ -1578,6 +1610,196 @@ mod tests {
             schema: ns.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    fn tbl_cols(ns: Option<&str>, name: &str, cols: &[&str]) -> TableInfo {
+        TableInfo {
+            columns: cols
+                .iter()
+                .map(|c| ColumnInfo {
+                    name: c.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..tbl(ns, name)
+        }
+    }
+
+    fn db(database: &str, tables: Vec<TableInfo>) -> NavDb {
+        NavDb {
+            database: database.to_string(),
+            name: database.to_string(),
+            schema: Some(DbSchema { tables }),
+        }
+    }
+
+    fn set(keys: &[&str]) -> HashSet<String> {
+        keys.iter().map(|k| k.to_string()).collect()
+    }
+
+    /// The walk's output as `(key, parent)` pairs — the two fields navigation
+    /// actually moves on.
+    fn walk(dbs: &[NavDb], exp: &[&str], hidden: &[&str], filter: &str) -> Vec<(String, String)> {
+        nav_rows(dbs, &set(exp), &set(hidden), filter)
+            .into_iter()
+            .map(|r| (r.key, r.parent.unwrap_or_default()))
+            .collect()
+    }
+
+    // ── the nav walk (`nav_rows`) ─────────────────────────────────────────
+    //
+    // This is the one function that must stay bug-for-bug identical to the
+    // render: arrow-key navigation walks *its* output, so anything it omits is a
+    // row the keyboard can't reach while the tree shows it normally. That is
+    // exactly how the PostgreSQL flat-database bug reached a user.
+
+    #[test]
+    fn nav_walk_reaches_tables_and_columns_on_a_flat_database() {
+        // The regression: a `public`-only PostgreSQL database is rendered flat,
+        // and its tables still carry `Some("public")`. Selecting them by
+        // `schema == None` reached no table or column at all.
+        for ns in [None, Some("public")] {
+            let dbs = vec![db("chinook", vec![tbl_cols(ns, "album", &["id", "title"])])];
+            assert_eq!(
+                walk(&dbs, &["db:chinook", "tbl:chinook:album"], &[], ""),
+                vec![
+                    ("db:chinook".to_string(), String::new()),
+                    ("tbl:chinook:album".to_string(), "db:chinook".to_string()),
+                    (
+                        "col:chinook:album:id".to_string(),
+                        "tbl:chinook:album".to_string()
+                    ),
+                    (
+                        "col:chinook:album:title".to_string(),
+                        "tbl:chinook:album".to_string()
+                    ),
+                ],
+                "namespace {ns:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nav_walk_hangs_tables_off_the_schema_row_when_there_are_several() {
+        let dbs = vec![db(
+            "warehouse",
+            vec![tbl(Some("public"), "staging"), tbl(Some("sales"), "orders")],
+        )];
+        // Only the `sales` group is expanded, so `public`'s table stays hidden.
+        assert_eq!(
+            walk(&dbs, &["db:warehouse", "sch:warehouse:sales"], &[], ""),
+            vec![
+                ("db:warehouse".to_string(), String::new()),
+                ("sch:warehouse:public".to_string(), "db:warehouse".into()),
+                ("sch:warehouse:sales".to_string(), "db:warehouse".into()),
+                (
+                    "tbl:warehouse:sales.orders".to_string(),
+                    "sch:warehouse:sales".into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn nav_walk_stops_at_a_collapsed_row() {
+        let dbs = vec![db("shop", vec![tbl_cols(None, "users", &["id"])])];
+        // Collapsed database → its own row only.
+        assert_eq!(
+            walk(&dbs, &[], &[], ""),
+            vec![("db:shop".to_string(), String::new())]
+        );
+        // Expanded database, collapsed table → no columns.
+        assert_eq!(
+            walk(&dbs, &["db:shop"], &[], ""),
+            vec![
+                ("db:shop".to_string(), String::new()),
+                ("tbl:shop:users".to_string(), "db:shop".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn nav_walk_drops_a_hidden_database_entirely() {
+        let dbs = vec![
+            db("shop", vec![tbl(None, "users")]),
+            db("blog", vec![tbl(None, "posts")]),
+        ];
+        assert_eq!(
+            walk(&dbs, &["db:shop", "db:blog"], &["shop"], ""),
+            vec![
+                ("db:blog".to_string(), String::new()),
+                ("tbl:blog:posts".to_string(), "db:blog".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn nav_walk_keeps_a_database_whose_schema_has_not_loaded() {
+        // Its tables aren't knowable yet, so the database stays reachable rather
+        // than disappearing from navigation until introspection lands.
+        let dbs = vec![NavDb {
+            database: "shop".to_string(),
+            name: "shop".to_string(),
+            schema: None,
+        }];
+        assert_eq!(
+            walk(&dbs, &["db:shop"], &[], ""),
+            vec![("db:shop".to_string(), String::new())]
+        );
+        assert_eq!(walk(&dbs, &[], &[], "any"), walk(&dbs, &[], &[], "other"));
+    }
+
+    #[test]
+    fn nav_walk_under_a_filter_force_expands_and_narrows_to_matches() {
+        let dbs = vec![db(
+            "shop",
+            vec![
+                tbl_cols(None, "users", &["id"]),
+                tbl_cols(None, "orders", &["id"]),
+            ],
+        )];
+        // Nothing expanded, but a filter opens the database and keeps only the
+        // matching table — and a *column* match force-reveals that table's columns.
+        assert_eq!(
+            walk(&dbs, &[], &[], "order"),
+            vec![
+                ("db:shop".to_string(), String::new()),
+                ("tbl:shop:orders".to_string(), "db:shop".to_string()),
+            ]
+        );
+        assert_eq!(
+            walk(&dbs, &[], &[], "id"),
+            vec![
+                ("db:shop".to_string(), String::new()),
+                ("tbl:shop:users".to_string(), "db:shop".to_string()),
+                (
+                    "col:shop:users:id".to_string(),
+                    "tbl:shop:users".to_string()
+                ),
+                ("tbl:shop:orders".to_string(), "db:shop".to_string()),
+                (
+                    "col:shop:orders:id".to_string(),
+                    "tbl:shop:orders".to_string()
+                ),
+            ]
+        );
+        // A database matching by its own name keeps all of its tables.
+        assert_eq!(walk(&dbs, &[], &[], "sho").len(), 3);
+        // No match anywhere → the database is gone from the walk.
+        assert!(walk(&dbs, &[], &[], "zzz").is_empty());
+    }
+
+    #[test]
+    fn nav_walk_marks_expandability_the_way_the_tree_does() {
+        let dbs = vec![db("shop", vec![tbl_cols(None, "users", &["id"])])];
+        let rows = nav_rows(&dbs, &set(&["db:shop", "tbl:shop:users"]), &set(&[]), "");
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.expandable, r.expanded))
+                .collect::<Vec<_>>(),
+            // database (open), table (open), column (a leaf)
+            vec![(true, true), (true, true), (false, false)]
+        );
     }
 
     // ── when the tree grows a schema level ────────────────────────────────
