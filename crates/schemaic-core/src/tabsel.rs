@@ -81,6 +81,15 @@ pub fn cycle(tabs: &[TabRef], conn: u64, current: Option<usize>, step: isize) ->
     ids.get(next as usize).copied()
 }
 
+/// The `n`th (0-based) tab of `conn`, as the strip shows them.
+///
+/// Ctrl+1..9 means "the nth chip", and the chips are the *visible* tabs — so
+/// counting into the flat list picks a different tab whenever one belonging to
+/// another connection precedes it.
+pub fn nth(tabs: &[TabRef], conn: u64, n: usize) -> Option<usize> {
+    visible(tabs, conn).get(n).copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +192,26 @@ mod tests {
     fn a_single_tab_cycles_to_itself() {
         assert_eq!(cycle(&[(1, 10)], 10, Some(1), 1), Some(1));
         assert_eq!(cycle(&[(1, 10)], 10, Some(1), -1), Some(1));
+    }
+
+    /// Ctrl+1..9 counts chips, not entries in the flat list. On `mixed()`,
+    /// connection 10 shows tabs 1, 3, 5 — so the 2nd chip is tab 3, even though
+    /// tab 2 sits between them in the underlying vector.
+    #[test]
+    fn nth_counts_visible_tabs_not_the_flat_list() {
+        let t = mixed();
+        assert_eq!(nth(&t, 10, 0), Some(1));
+        assert_eq!(nth(&t, 10, 1), Some(3));
+        assert_eq!(nth(&t, 10, 2), Some(5));
+        assert_eq!(nth(&t, 20, 0), Some(2));
+        assert_eq!(nth(&t, 20, 1), Some(4));
+    }
+
+    #[test]
+    fn nth_past_the_end_or_on_an_empty_connection_is_none() {
+        let t = mixed();
+        assert_eq!(nth(&t, 10, 3), None, "only three tabs on this connection");
+        assert_eq!(nth(&t, 99, 0), None);
+        assert_eq!(nth(&[], 10, 0), None);
     }
 }
