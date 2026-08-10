@@ -274,6 +274,15 @@ impl Db {
     /// `EXPLAIN ANALYZE` attempt fails we retry with `ANALYZE`. On MySQL the reverse
     /// (`ANALYZE <select>`) is itself a syntax error, so the two servers never both
     /// match — the fallback can't double-execute.
+    ///
+    /// **The analyzing form runs inside a transaction that is always rolled
+    /// back.** The UI gates the Analyze toggle on `sql::contains_write`, but that
+    /// gate reads the statement and any reading of a statement can be wrong — a
+    /// data-modifying CTE fooled it once already. Measuring must not be the thing
+    /// that changes the data, so the rollback holds whether or not the gate above
+    /// it was right. Note the limit this shares with every MySQL write path: on a
+    /// non-transactional table (MyISAM) the rollback does nothing, and on a DDL
+    /// statement the server commits implicitly.
     pub async fn explain(
         &self,
         database: Option<&str>,
@@ -285,17 +294,54 @@ impl Db {
             return pg::explain(self, database, sql, analyze, cancel).await;
         }
         let (primary, fallback) = explain_commands(sql, analyze);
+        if !analyze {
+            return self
+                .fetch_query(database, &primary, EXPLAIN_ROW_CAP, cancel)
+                .await;
+        }
         match self
-            .fetch_query(database, &primary, EXPLAIN_ROW_CAP, cancel.clone())
+            .explain_in_rolled_back_tx(database, &primary, cancel.clone())
             .await
         {
             // MariaDB: `EXPLAIN ANALYZE` is invalid — retry with `ANALYZE <stmt>`.
             Err(DbError::Query(_)) if fallback.is_some() => {
-                self.fetch_query(database, &fallback.unwrap(), EXPLAIN_ROW_CAP, cancel)
+                self.explain_in_rolled_back_tx(database, &fallback.unwrap(), cancel)
                     .await
             }
             other => other,
         }
+    }
+
+    /// Run one analyzing-EXPLAIN command on a single connection, wrapped in a
+    /// transaction that is always rolled back. Separate from [`Db::fetch_query`]
+    /// because that opens a fresh connection per call, which would put the
+    /// `BEGIN`, the measurement and the `ROLLBACK` on three different sessions.
+    async fn explain_in_rolled_back_tx(
+        &self,
+        database: Option<&str>,
+        cmd: &str,
+        cancel: CancellationToken,
+    ) -> Result<ResultSet, DbError> {
+        let mut conn = self.open(database, false).await?;
+        let conn_id = conn.id();
+        if let Err(e) = conn.query_drop("BEGIN").await {
+            let _ = conn.disconnect().await;
+            return Err(DbError::Query(e.to_string()));
+        }
+
+        let outcome = tokio::select! {
+            r = collect_rows(&mut conn, cmd, EXPLAIN_ROW_CAP, true) => r,
+            _ = cancel.cancelled() => {
+                self.kill_query(conn_id).await;
+                Err(DbError::Cancelled)
+            }
+        };
+
+        // Unconditional. Dropping the connection would roll back too, but saying
+        // so explicitly is what makes the guarantee readable at the call site.
+        let _ = conn.query_drop("ROLLBACK").await;
+        let _ = conn.disconnect().await;
+        outcome
     }
 
     /// Validate `sql` against the server **without executing it**: prepare it via
