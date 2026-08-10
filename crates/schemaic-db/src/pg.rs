@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use schemaic_core::model::{
     Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder,
-    ResultSet, RowDelete, RowEdit, RowInsert, Value,
+    ResultSet, RowDelete, RowEdit, RowInsert, Value, WriteStep, one_row_verdict,
 };
 use schemaic_core::schema::{ColumnInfo, DbSchema, IndexColumn, ViewOptions};
 use tokio_postgres::types::Type;
@@ -1135,13 +1135,6 @@ fn build_delete(del: &RowDelete) -> String {
     )
 }
 
-fn one_row_err(action: &str, database: &str, table: &str, n: u64) -> DbError {
-    DbError::Query(format!(
-        "{action} {database}.{table} affected {n} rows (expected exactly 1) — \
-         rolled back all changes"
-    ))
-}
-
 /// The PostgreSQL half of [`crate::Db::import_rows`] — same contract: one
 /// transaction, batched multi-row `INSERT`s, each batch's affected count checked
 /// against its size, everything undone on any failure.
@@ -1282,9 +1275,7 @@ pub(crate) async fn write_on(
         client: &Client,
         scope: TxScope,
         sql: String,
-        action: &str,
-        database: &str,
-        table: &str,
+        step: WriteStep<'_>,
     ) -> Result<u64, DbError> {
         let n = match client.execute(sql.as_str(), &[]).await {
             Ok(n) => n,
@@ -1293,46 +1284,23 @@ pub(crate) async fn write_on(
                 return Err(db_err(&e));
             }
         };
-        if n != 1 {
+        if let Err(msg) = one_row_verdict(step, n) {
             let _ = client.batch_execute(scope.rollback_sql()).await;
-            return Err(one_row_err(action, database, table, n));
+            return Err(DbError::Query(msg));
         }
         Ok(n)
     }
 
     let mut total: u64 = 0;
-    for del in &write.deletes {
-        total += one(
-            client,
-            scope,
-            build_delete(del),
-            "delete on",
-            &del.database,
-            &del.table,
-        )
-        .await?;
-    }
-    for edit in &write.updates {
-        total += one(
-            client,
-            scope,
-            build_update(edit),
-            "update on",
-            &edit.database,
-            &edit.table,
-        )
-        .await?;
-    }
-    for ins in &write.inserts {
-        total += one(
-            client,
-            scope,
-            build_insert(ins),
-            "insert into",
-            &ins.database,
-            &ins.table,
-        )
-        .await?;
+    // Deletes → updates → inserts, ordered by the same `GridWrite::plan` the
+    // MySQL executor runs.
+    for step in write.plan() {
+        let sql = match step {
+            WriteStep::Delete(del) => build_delete(del),
+            WriteStep::Update(edit) => build_update(edit),
+            WriteStep::Insert(ins) => build_insert(ins),
+        };
+        total += one(client, scope, sql, step).await?;
     }
 
     if let Err(e) = client.batch_execute(scope.commit_sql()).await {
