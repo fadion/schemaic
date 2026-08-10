@@ -2770,6 +2770,12 @@ fn is_table_ref_continuation(word: &str) -> bool {
             | "PARTITION"
             | "WINDOW"
             | "AS"
+            // Ends the table reference of a data-modifying statement —
+            // `DELETE FROM zap RETURNING *`. Without it the alias check read
+            // `RETURNING` as an alias for `zap` and, since it is reserved on
+            // PostgreSQL, squiggled the standard archive idiom as broken.
+            // MariaDB supports `RETURNING` too, so this is not dialect-gated.
+            | "RETURNING"
     )
 }
 
@@ -2900,7 +2906,21 @@ fn table_existence_checks(
     dialect: SqlDialect,
     out: &mut Vec<Diagnostic>,
 ) {
+    // A CTE name is a source this statement declares, so it is never a missing
+    // *table* however its body is written. `statement_scope` already collects
+    // them unconditionally — including a `DELETE … RETURNING` body, which the
+    // column resolver's own collector skips, and that disagreement is what
+    // flagged `gone` in the standard archive idiom
+    // `WITH gone AS (DELETE FROM t RETURNING *) SELECT count(*) FROM gone`.
+    let ctes: HashSet<String> = statement_scope(sql, lo, hi, hi, dialect)
+        .ctes
+        .into_iter()
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
     for (r, pos) in table_refs_with_pos(sql, lo, hi, dialect) {
+        if r.db.is_none() && ctes.contains(&r.name.to_ascii_lowercase()) {
+            continue;
+        }
         if let TableStatus::NotFound = catalog.table_status(&r) {
             let where_db =
                 r.db.as_deref()
@@ -4935,6 +4955,61 @@ mod tests {
         let (schema, db) = sample_catalog();
         let cat = Catalog::build(&[(db, &schema)], Some(db));
         diagnostics(sql, &cat, dialect)
+    }
+
+    /// The standard PostgreSQL archive idiom. It is valid, it parses, it runs —
+    /// and the editor drew error squiggles under both `RETURNING` and `gone`,
+    /// telling the user a correct query was broken. Found when the user opened
+    /// the exact statement [A3-L5-01] is about.
+    ///
+    /// Two independent causes: `alias_checks` read `RETURNING` as an alias for
+    /// table `zap`, and `colres` didn't register a CTE whose body is a
+    /// `DELETE … RETURNING` as an in-scope source.
+    #[test]
+    fn a_data_modifying_cte_raises_no_diagnostics() {
+        let sql = "WITH gone AS (DELETE FROM employees RETURNING *) SELECT count(*) FROM gone";
+        for dialect in [SqlDialect::Postgres, SqlDialect::MySql] {
+            let d = diag_d(sql, dialect);
+            assert!(
+                d.is_empty(),
+                "valid data-modifying CTE squiggled on {dialect:?}: {:?}",
+                d.iter().map(|x| &x.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The clause keyword must not be read as an alias — in any of the shapes a
+    /// `RETURNING` can follow a table reference.
+    #[test]
+    fn returning_is_not_flagged_as_an_alias() {
+        for sql in [
+            "WITH x AS (DELETE FROM employees RETURNING *) SELECT * FROM x",
+            "WITH x AS (UPDATE employees SET name='a' RETURNING id) SELECT * FROM x",
+            "WITH x AS (INSERT INTO employees VALUES (1) RETURNING id) SELECT * FROM x",
+        ] {
+            let d = diag_d(sql, SqlDialect::Postgres);
+            assert!(
+                !d.iter().any(|x| x.message.contains("RETURNING")),
+                "RETURNING read as an alias in {sql:?}: {:?}",
+                d.iter().map(|x| &x.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The conservatism rule still has to bite the other way: a genuine typo in
+    /// a table name must still be reported, or widening CTE acceptance would
+    /// have bought the false-positive fix with a false negative.
+    #[test]
+    fn a_cte_fix_does_not_silence_a_real_unknown_table() {
+        let d = diag_d(
+            "WITH gone AS (DELETE FROM employees RETURNING *) SELECT * FROM gnoe",
+            SqlDialect::Postgres,
+        );
+        assert!(
+            d.iter().any(|x| x.message.contains("gnoe")),
+            "a misspelled table must still be flagged: {:?}",
+            d.iter().map(|x| &x.message).collect::<Vec<_>>()
+        );
     }
 
     // ── multi-schema (PostgreSQL namespaces) ──────────────────────────────────
