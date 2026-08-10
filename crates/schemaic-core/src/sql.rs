@@ -293,7 +293,30 @@ pub fn unsafe_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
                 Some(format!("{kind} statement without WHERE clause detected."))
             }
         }
+        // A data-modifying CTE hides the write inside the statement, where
+        // neither the head keyword nor a *top-level* WHERE scan can reach it.
+        "WITH" => cte_unsafe_reason(stmt, dialect),
         _ => None,
+    }
+}
+
+/// The unsafe-statement warning for a `WITH …` whose body modifies data.
+///
+/// The write sits inside parentheses, so `has_top_level_where` can't judge it —
+/// this asks the weaker question *is there a WHERE anywhere in the statement*.
+/// That errs toward silence on an unusual scoped write and toward warning on the
+/// all-rows case, which is the right way round: a false warning costs a click, a
+/// missed one costs the table.
+fn cte_unsafe_reason(stmt: &str, dialect: SqlDialect) -> Option<String> {
+    let (words, _) = word_tokens(stmt, dialect);
+    if words.iter().any(|w| w == "TRUNCATE") {
+        return Some("TRUNCATE removes every row in the table.".to_string());
+    }
+    let kind = words.iter().find(|w| *w == "DELETE" || *w == "UPDATE")?;
+    if words.iter().any(|w| w == "WHERE") {
+        None
+    } else {
+        Some(format!("{kind} statement without WHERE clause detected."))
     }
 }
 
@@ -435,13 +458,36 @@ pub fn read_only_reason(sql: &str, dialect: SqlDialect) -> Result<(), String> {
     Ok(())
 }
 
-/// Does `sql` contain any statement that isn't a plain read? Classifies by each
-/// statement's head keyword (skipping strings/identifiers/comments): a read is
-/// `SELECT`/`SHOW`/`DESCRIBE`/`DESC`/`EXPLAIN`/`WITH`/`VALUES`/`TABLE`; anything
-/// else (UPDATE/DELETE/INSERT/CREATE/DROP/…, or a stored-proc CALL/DO/SET/USE) is
-/// treated as a write. Used to block mutations on a read-only connection. Unlike
-/// the single-statement AI gate (`read_only_reason`), this allows several read
-/// statements and only flags the actual writes.
+/// Keywords that make a statement a write *wherever* they appear in it, not just
+/// at its head — the set that survives the read-head allowlist below.
+///
+/// Deliberately narrower than [`DENY_KEYWORDS`]: this gate allows several read
+/// statements and only needs the ones that change data or write a file, whereas
+/// the AI gate also refuses locks, sleeps and session state. Keeping them
+/// separate is what stops this scan from over-blocking an ordinary query.
+const WRITE_KEYWORDS: &[&str] = &[
+    "INSERT", "UPDATE", "DELETE", "REPLACE", "MERGE", "TRUNCATE", "DROP", "CREATE", "ALTER",
+    "RENAME", "GRANT", "REVOKE", "OUTFILE", "DUMPFILE",
+];
+
+/// Does `sql` contain any statement that isn't a plain read? Used to block
+/// mutations on a read-only connection. Unlike the single-statement AI gate
+/// (`read_only_reason`), this allows several read statements and only flags the
+/// actual writes.
+///
+/// Two tests per statement, because the head keyword alone is not enough. A head
+/// outside the read set (UPDATE/DELETE/INSERT/CREATE/DROP/…, or a stored-proc
+/// CALL/DO/SET/USE) is a write; so is a read-headed statement carrying a
+/// [`WRITE_KEYWORDS`] token anywhere in it. **The second test is what catches a
+/// PostgreSQL data-modifying CTE** — `WITH gone AS (DELETE FROM city RETURNING
+/// *) SELECT …` is headed `WITH`, which is on the read allowlist, and it deletes
+/// every row. It also catches MySQL's `SELECT … INTO OUTFILE`, which writes a
+/// file on the server behind a `SELECT` head.
+///
+/// The scan reads whole tokens outside strings / quoted identifiers / comments,
+/// so `SELECT "delete" FROM t` and `SELECT * FROM delete_log` stay reads. Where
+/// it is imprecise it is imprecise toward blocking, which on a connection the
+/// user marked read-only is the correct direction.
 pub fn contains_write(sql: &str, dialect: SqlDialect) -> bool {
     for (lo, hi) in statement_ranges(sql, dialect) {
         let (words, _) = word_tokens(&sql[lo..hi], dialect);
@@ -459,6 +505,9 @@ pub fn contains_write(sql: &str, dialect: SqlDialect) -> bool {
                         | "VALUES"
                         | "TABLE"
                 ) {
+                    return true;
+                }
+                if words.iter().any(|w| WRITE_KEYWORDS.contains(&w.as_str())) {
                     return true;
                 }
             }
@@ -506,6 +555,74 @@ mod tests {
 
     // ── Postgres dialect boundary tests ──────────────────────────────────────
     const PG: SqlDialect = SqlDialect::Postgres;
+
+    /// A PostgreSQL data-modifying CTE puts the write *inside* the statement,
+    /// where a head-keyword check can't see it — and `WITH` is on the read
+    /// allowlist, so the read-only gate let a DELETE of every row straight
+    /// through.
+    #[test]
+    fn pg_data_modifying_cte_is_a_write() {
+        for s in [
+            "WITH gone AS (DELETE FROM city RETURNING *) SELECT count(*) FROM gone",
+            "WITH x AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM x",
+            "WITH x AS (UPDATE t SET a=1 RETURNING *) SELECT * FROM x",
+        ] {
+            assert!(super::contains_write(s, PG), "must be a write: {s}");
+        }
+    }
+
+    /// Over-blocking is the real risk of a whole-statement scan, so pin the
+    /// shapes that must stay allowed on a read-only connection.
+    #[test]
+    fn a_read_only_cte_and_a_quoted_keyword_are_not_writes() {
+        assert!(!super::contains_write(
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            PG
+        ));
+        // A quoted identifier is skipped by the lexer, in either dialect.
+        assert!(!super::contains_write("SELECT \"delete\" FROM t", PG));
+        assert!(!super::contains_write(
+            "SELECT `delete` FROM t",
+            SqlDialect::MySql
+        ));
+        // An underscore keeps the word whole — `delete_log` is not `DELETE`.
+        assert!(!super::contains_write("SELECT * FROM delete_log", PG));
+    }
+
+    /// Same blind spot, other guard: the no-WHERE warning also classified by
+    /// head keyword, so the CTE form was silently unwarned.
+    #[test]
+    fn a_data_modifying_cte_without_a_where_is_warned() {
+        assert!(
+            super::unsafe_reason(
+                "WITH gone AS (DELETE FROM city RETURNING *) SELECT count(*) FROM gone",
+                PG
+            )
+            .is_some()
+        );
+        assert!(
+            super::unsafe_reason(
+                "WITH gone AS (DELETE FROM city WHERE id < 10 RETURNING *) SELECT * FROM gone",
+                PG
+            )
+            .is_none(),
+            "a scoped delete is not the all-rows case"
+        );
+        assert!(
+            super::unsafe_reason("WITH x AS (SELECT 1) SELECT * FROM x", PG).is_none(),
+            "a read-only CTE warns about nothing"
+        );
+    }
+
+    /// `SELECT … INTO OUTFILE` writes a file on the MySQL server, and passed the
+    /// read-only gate on its `SELECT` head — same root cause.
+    #[test]
+    fn mysql_select_into_outfile_is_a_write() {
+        assert!(super::contains_write(
+            "SELECT * FROM t INTO OUTFILE '/tmp/x'",
+            SqlDialect::MySql
+        ));
+    }
 
     /// MySQL requires whitespace after `--`; PostgreSQL and the SQL standard do
     /// not. Applying MySQL's rule to PostgreSQL means `--WHERE` reads as code.
