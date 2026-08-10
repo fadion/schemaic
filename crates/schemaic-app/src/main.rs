@@ -1055,17 +1055,21 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             );
             // Read the row cap on the UI thread (signals are single-threaded).
             let cap = row_limit.get_untracked();
-            // `BEGIN` is issued lazily, on the first statement of a transaction,
-            // so flipping to Manual and changing your mind costs nothing.
-            let needs_begin = session.is_some() && !tab.tx.get_untracked().is_open();
             handle.spawn(async move {
                 let (res, stmt) = match &session {
                     Some(s) => {
-                        if needs_begin && let Err(e) = s.begin().await {
-                            tracing::error!("BEGIN failed: {e}");
+                        // `BEGIN` is issued lazily, on the first statement of a
+                        // transaction, so flipping to Manual and changing your
+                        // mind costs nothing. The session decides whether one is
+                        // needed under its own lock — asking `TxState` here would
+                        // read a signal that isn't folded until an in-flight
+                        // operation finishes, so two runs could both `BEGIN`.
+                        if let Err(e) = s.ensure_tx().await {
+                            (Err(e), None)
+                        } else {
+                            let out = s.fetch_query(&sql, cap, token).await;
+                            (out.result, Some(out.stmt))
                         }
-                        let out = s.fetch_query(&sql, cap, token).await;
-                        (out.result, Some(out.stmt))
                     }
                     None => (
                         db.fetch_query(database.as_deref(), &sql, cap, token).await,
@@ -1346,14 +1350,18 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 },
             );
             let cap = row_limit.get_untracked();
-            let needs_begin = session.is_some() && !tab.tx.get_untracked().is_open();
             handle.spawn(async move {
                 let mut states: Vec<QueryState> = vec![QueryState::Cancelled; n];
                 let mut outcomes: Vec<Option<StmtOutcome>> = vec![None; n];
                 match &session {
                     Some(s) => {
-                        if needs_begin && let Err(e) = s.begin().await {
-                            tracing::error!("BEGIN failed: {e}");
+                        // See `run_query_core`: the session owns the decision, and
+                        // a failed BEGIN aborts rather than running the batch
+                        // outside the transaction the user asked for.
+                        if let Err(e) = s.ensure_tx().await {
+                            states[0] = QueryState::Failed(e.to_string());
+                            send((states, outcomes));
+                            return;
                         }
                         // The session runs statements one at a time on the pinned
                         // connection, so each outcome is collected as it lands.
@@ -1685,7 +1693,6 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     };
                     (done)(outcome);
                 });
-                let needs_begin = session.is_some() && !tab.tx.get_untracked().is_open();
                 handle.spawn(async move {
                     let token = CancellationToken::new();
                     // Both branches write the rows and then, on success, re-read
@@ -1694,12 +1701,17 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     // hasn't committed.
                     let written = match &session {
                         Some(s) => {
-                            if needs_begin && let Err(e) = s.begin().await {
-                                tracing::error!("BEGIN failed: {e}");
+                            // See `run_query_core`: the session owns the decision.
+                            // A failed BEGIN aborts — writing outside the
+                            // transaction is what Manual mode exists to prevent.
+                            match s.ensure_tx().await {
+                                Err(e) => Err(e),
+                                Ok(()) => {
+                                    let out = s.commit_writes(&write, token.clone()).await;
+                                    fold(out.stmt);
+                                    out.result
+                                }
                             }
-                            let out = s.commit_writes(&write, token.clone()).await;
-                            fold(out.stmt);
-                            out.result
                         }
                         None => db.commit_writes(&write, token.clone()).await,
                     };
