@@ -10,7 +10,13 @@ Zed-inspired, aiming to replace DataGrip.
   - `model.rs` — the shared result-set model everything else is phrased in. `Value` holds text-
     protocol cells parsed into compact numeric variants *only where lossless* (`DECIMAL`/dates/JSON
     stay `Str`, so nothing is rounded or reformatted); `ResultSet` stores them columnar, so
-    `CellRef` reads a cell without allocating. `Column`/`ColumnOrigin`/`ColumnFlags` carry the
+    `CellRef` reads a cell without allocating, and **each column sits behind its own `Arc`** — the
+    grid's `rs` signal and the tab's canonical `QueryState::Loaded` hold the *same*
+    `Arc<ResultSet>` on purpose, so the post-commit splice mutates through `Arc::make_mut` at a
+    strong count of 2; with the columns inline that deep-copied every arena (30 ms and ~160 MB at
+    200k×50, on the UI thread, on the one path built to avoid a rebuild). `splice_rows` replaces
+    only the column `Arc`s whose values actually changed, so an untouched column is never copied —
+    `review/splicebench` is the measurement. `Column`/`ColumnOrigin`/`ColumnFlags` carry the
     write-back provenance the wire reports per column, and a binary column is unconditionally
     read-only (it can't round-trip through text). The write path's shared decisions live here so the
     two engines can't drift: `GridWrite::plan` (the deletes → updates → inserts order),
