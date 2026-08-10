@@ -1094,6 +1094,63 @@ fn cell_in(bounds: Option<(usize, usize, usize, usize)>, i: usize, ci: usize) ->
     matches!(bounds, Some((r0, c0, r1, c1)) if i >= r0 && i <= r1 && ci >= c0 && ci <= c1)
 }
 
+/// A keyboard navigation move, resolved by [`nav_target`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Nav {
+    Down,
+    Up,
+    Right,
+    Left,
+    RowStart,
+    RowEnd,
+    First,
+    Last,
+    PageDown,
+    PageUp,
+}
+
+/// Where `nav` moves the active cell from display position `(r, c)`.
+///
+/// `rows` is the **display** row total — real rows *plus* the pending new rows
+/// rendered below them — because the selection lives in display space. Clamping
+/// to the real-row count instead maps a pending-row position back *up* into the
+/// real rows (Arrow-Down jumping backwards) and leaves a pending row unreachable
+/// by keyboard.
+fn nav_target(
+    rows: usize,
+    cols: usize,
+    page: usize,
+    (r, c): (usize, usize),
+    nav: Nav,
+) -> (usize, usize) {
+    let last_r = rows.saturating_sub(1);
+    let last_c = cols.saturating_sub(1);
+    match nav {
+        Nav::Down => ((r + 1).min(last_r), c),
+        Nav::Up => (r.saturating_sub(1), c),
+        Nav::Right => (r, (c + 1).min(last_c)),
+        Nav::Left => (r, c.saturating_sub(1)),
+        Nav::RowStart => (r, 0),
+        Nav::RowEnd => (r, last_c),
+        Nav::First => (0, 0),
+        Nav::Last => (last_r, last_c),
+        Nav::PageDown => ((r + page).min(last_r), c),
+        Nav::PageUp => (r.saturating_sub(page), c),
+    }
+}
+
+/// The clipboard text for one cell of a pending new row: the staged value, the
+/// literal `NULL` for a staged SQL NULL (matching how the cell renders it), and
+/// empty for a cell still unset — that one has no value yet, only the server
+/// default the cell previews as `<auto>`/`<default>`.
+fn pending_cell_text(row: Option<&HashMap<usize, Option<String>>>, ci: usize) -> &str {
+    match row.and_then(|r| r.get(&ci)) {
+        Some(Some(t)) => t,
+        Some(None) => "NULL",
+        None => "",
+    }
+}
+
 /// Set the focused cell, optionally extending the range (shift) from the anchor.
 fn set_active(gs: GridState, i: usize, ci: usize, extend: bool) {
     if extend {
@@ -1213,18 +1270,26 @@ fn copy_selection(gs: GridState) {
     };
     let rs = gs.rs.get_untracked();
     let order = gs.order.get_untracked();
+    // Display rows past the real ones are the pending new rows, whose values live
+    // in `new_rows` — resolving them through `order` would fall back to the display
+    // index and copy a row of blanks.
+    let nreal = rs.row_count();
+    let new_rows = gs.new_rows.get_untracked();
     let mut out = String::new();
     for i in r0..=r1 {
         if i > r0 {
             out.push('\n');
         }
+        let pending = (i >= nreal).then(|| new_rows.get(i - nreal));
         let di = order.get(i).copied().unwrap_or(i);
         for ci in c0..=c1 {
             if ci > c0 {
                 out.push('\t');
             }
-            let s = rs.cell(di, ci).map(|c| c.display()).unwrap_or_default();
-            out.push_str(s);
+            match pending {
+                Some(row) => out.push_str(pending_cell_text(row, ci)),
+                None => out.push_str(rs.cell(di, ci).map(|c| c.display()).unwrap_or_default()),
+            }
         }
     }
     let _ = floem::Clipboard::set_contents(out);
@@ -3720,7 +3785,11 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
     let Event::KeyDown(ke) = e else {
         return EventPropagation::Continue;
     };
-    if nrows == 0 || ncols == 0 {
+    // The selection lives in *display* space, which is the real rows plus the
+    // pending new rows rendered below them — so that, not `nrows`, is what every
+    // navigation arm clamps against (see `nav_target`).
+    let rows = nrows + gs.new_rows.with_untracked(|v| v.len());
+    if rows == 0 || ncols == 0 {
         return EventPropagation::Continue;
     }
     let m = ke.modifiers;
@@ -3730,9 +3799,13 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
     let ctrl = m.control() || m.meta();
     let active_opt = gs.active.get_untracked();
     let (r, c) = active_opt.unwrap_or((0, 0));
-    let last_r = nrows - 1;
+    let last_r = rows - 1;
     let last_c = ncols - 1;
     let page = ((gs.vp.get_untracked().height() / ROW_H).floor() as usize).max(1);
+    let go = |nav: Nav| {
+        let (nr, nc) = nav_target(rows, ncols, page, (r, c), nav);
+        set_active(gs, nr, nc, shift);
+    };
     // With no cell selected yet, the first navigation keypress selects the
     // origin (0,0) instead of moving off it — otherwise Arrow-Down would skip
     // row 0 (and Arrow-Right column 0) on the very first press (§7.4).
@@ -3754,26 +3827,14 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
         return EventPropagation::Stop;
     }
     match &ke.key.logical_key {
-        Key::Named(NamedKey::ArrowDown) => set_active(gs, (r + 1).min(last_r), c, shift),
-        Key::Named(NamedKey::ArrowUp) => set_active(gs, r.saturating_sub(1), c, shift),
-        Key::Named(NamedKey::ArrowRight) => set_active(gs, r, (c + 1).min(last_c), shift),
-        Key::Named(NamedKey::ArrowLeft) => set_active(gs, r, c.saturating_sub(1), shift),
-        Key::Named(NamedKey::Home) => {
-            if ctrl {
-                set_active(gs, 0, 0, shift)
-            } else {
-                set_active(gs, r, 0, shift)
-            }
-        }
-        Key::Named(NamedKey::End) => {
-            if ctrl {
-                set_active(gs, last_r, last_c, shift)
-            } else {
-                set_active(gs, r, last_c, shift)
-            }
-        }
-        Key::Named(NamedKey::PageDown) => set_active(gs, (r + page).min(last_r), c, shift),
-        Key::Named(NamedKey::PageUp) => set_active(gs, r.saturating_sub(page), c, shift),
+        Key::Named(NamedKey::ArrowDown) => go(Nav::Down),
+        Key::Named(NamedKey::ArrowUp) => go(Nav::Up),
+        Key::Named(NamedKey::ArrowRight) => go(Nav::Right),
+        Key::Named(NamedKey::ArrowLeft) => go(Nav::Left),
+        Key::Named(NamedKey::Home) => go(if ctrl { Nav::First } else { Nav::RowStart }),
+        Key::Named(NamedKey::End) => go(if ctrl { Nav::Last } else { Nav::RowEnd }),
+        Key::Named(NamedKey::PageDown) => go(Nav::PageDown),
+        Key::Named(NamedKey::PageUp) => go(Nav::PageUp),
         Key::Named(NamedKey::Escape) => {
             // Esc closes the find bar first (so it closes from anywhere in the grid,
             // not only when its input is focused), then the row view/edit panel, then
@@ -5217,6 +5278,65 @@ mod tests {
             vec![col("c", ty)],
             cells.into_iter().map(|v| vec![v]).collect(),
         )
+    }
+
+    // ── Keyboard navigation over the display grid (real rows + pending new rows) ──
+
+    // 3 real rows + 2 pending = 5 display rows, 4 columns, one viewport page = 2.
+    fn nav(from: (usize, usize), n: Nav) -> (usize, usize) {
+        nav_target(5, 4, 2, from, n)
+    }
+
+    #[test]
+    fn nav_target_moves_down_into_the_pending_rows() {
+        // The regression: clamping to the *real* row count sent Arrow-Down from the
+        // last real row nowhere, and from a pending row backwards into the real ones.
+        assert_eq!(nav((2, 1), Nav::Down), (3, 1));
+        assert_eq!(nav((3, 1), Nav::Down), (4, 1));
+    }
+
+    #[test]
+    fn nav_target_clamps_at_the_last_display_row() {
+        assert_eq!(nav((4, 1), Nav::Down), (4, 1));
+        assert_eq!(nav((3, 1), Nav::PageDown), (4, 1));
+        assert_eq!(nav((0, 0), Nav::Last), (4, 3));
+    }
+
+    #[test]
+    fn nav_target_clamps_at_the_last_column() {
+        assert_eq!(nav((1, 3), Nav::Right), (1, 3));
+        assert_eq!(nav((1, 0), Nav::RowEnd), (1, 3));
+    }
+
+    #[test]
+    fn nav_target_saturates_at_the_origin() {
+        assert_eq!(nav((0, 0), Nav::Up), (0, 0));
+        assert_eq!(nav((0, 0), Nav::Left), (0, 0));
+        assert_eq!(nav((1, 2), Nav::PageUp), (0, 2));
+        assert_eq!(nav((3, 2), Nav::First), (0, 0));
+        assert_eq!(nav((3, 2), Nav::RowStart), (3, 0));
+    }
+
+    #[test]
+    fn nav_target_on_an_empty_grid_stays_at_the_origin() {
+        // `grid_key` returns early here, but the helper must not underflow.
+        for n in [Nav::Down, Nav::Right, Nav::Last, Nav::RowEnd, Nav::PageDown] {
+            assert_eq!(nav_target(0, 0, 2, (0, 0), n), (0, 0));
+        }
+    }
+
+    #[test]
+    fn pending_cell_text_reads_staged_values() {
+        let mut row: HashMap<usize, Option<String>> = HashMap::new();
+        row.insert(0, Some("hello".to_string()));
+        row.insert(1, None);
+        // Staged text, staged SQL NULL (rendered as the cell does), and an unset
+        // cell — which has no value yet, only the server default.
+        assert_eq!(pending_cell_text(Some(&row), 0), "hello");
+        assert_eq!(pending_cell_text(Some(&row), 1), "NULL");
+        assert_eq!(pending_cell_text(Some(&row), 2), "");
+        // A pending row that no longer exists copies blank rather than panicking.
+        assert_eq!(pending_cell_text(None, 0), "");
     }
 
     #[test]
