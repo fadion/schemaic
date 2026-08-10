@@ -136,6 +136,39 @@ path/to/file.ext:1284
 | **Low** | quality, nits, cosmetic |
 | **Debt** | architectural — no single failing input, real long-term cost |
 
+### Writing to the ledger — non-negotiable
+
+The ledger is gitignored, so there is no `git show HEAD:path` and no `git restore`. It is also the
+review's only durable state. Both facts point the same way.
+
+1. **Append; never splice.** New findings go in at the `**Status:** open` → `---` → `## Rejected`
+   boundary via `Edit`, or with `cat >> … <<'EOF'`. Both are structurally incapable of truncating
+   the file. Reads may use anything.
+2. **Never mutate the ledger from a shell script.** A PowerShell list-splice destroyed this
+   project's ledger mid-review — 9,720 lines to 176 — because `$lines[0..$n]` yields `object[]`,
+   `List[string].AddRange` rejected it, and `$ErrorActionPreference` defaults to `Continue`, so
+   two non-terminating failures still reached the write. The errors *printed*; they just didn't
+   stop anything. The project's own rule against scripted source rewrites applies here with more
+   force, not less, because the ledger isn't in git.
+3. **Snapshot before each pass, and keep the snapshots** —
+   `review/.snapshots/findings-<pass-id>.md`. Not one rolling `.bak`: a corruption nobody notices
+   gets copied over the last good copy on the next edit, and delayed detection is exactly the
+   failure an unattended run invites. A round's snapshots cost a few tens of MB.
+4. **Verify after every edit**, before trusting it:
+   - size delta ≤ ~20% for a single edit (9,720 → 176 fails this instantly);
+   - line count and finding-ID count never *decrease* during a pass. Triage is the exception —
+     it moves settled Debt/Low to the backlog, so it states its expected delta before editing and
+     checks against that;
+   - `## Pass log` and `## Rejected` both still present, `## Rejected` still last.
+
+   Any failure ⇒ restore from the snapshot. Don't retry the same way.
+5. **If it happens anyway**, the Claude Code session transcripts
+   (`~/.claude/projects/<project>/*.jsonl`) are a complete write log: extract every `tool_use`
+   targeting the ledger, sort by timestamp, replay (`Write` → whole file, `Edit` →
+   replace-first-occurrence, appended heredoc → append). **Dedupe by `tool_use` id** — resumed and
+   compacted sessions re-log earlier messages, and an undeduped replay double-applies. Validate
+   against a known line count before trusting the result.
+
 ---
 
 ## 6. Triage and the fix phase
@@ -165,25 +198,89 @@ commit convention, one logical change per commit.
 
 ---
 
-## 7. Automation
+## 7. Orchestration
 
 The pass log is external state, so a pass needs the ledger, not the previous session's context.
-Context compaction and session boundaries are therefore harmless — the usual thing that breaks
-long automated runs.
+Session boundaries and compaction are therefore harmless — the usual thing that breaks long
+automated runs.
 
-Automate the tail, not the head:
+That same fact is what makes delegation correct rather than merely convenient: **each pass runs in
+its own subagent**, started cold with its plan row and this file, instead of in a session carrying
+residue from thirty unrelated slices. The orchestrator (`codebase-review-pass`) never reads a
+findings block in full — only the plan row, the subagent's report, and greps of the ledger — which
+is what lets one session drive a whole segment without drowning.
 
-- **Attended:** setup, Pass 0, all of Tier A, and the highest-blast-radius slices. These set
-  the frame or touch the paths where a miss costs data.
-- **Automated:** the lower-risk slices. `codebase-review-pass` is parameterless by design, so
-  `/loop` pointed at it runs them unattended and is safe to re-fire after an interruption.
-- **Attended:** triage, including the interim checkpoints. It's a ranking judgment, which is the
-  whole output.
+### Attended vs. delegated
 
-Unattended, the "re-run a degraded pass" rule can loop: a pass that degrades for a structural
-reason will degrade again. **Cap it at two attempts** — record the attempt count in the pass
-row, and after the second, stop the loop and surface it rather than trying a third time.
+The attended set exists for decisions that mis-shape everything downstream, not for supervision.
+Keep it minimal.
 
-**Don't fan slices out in parallel.** It looks like the obvious win and isn't: the gate in §3
-needs the whole ledger in view (cross-slice duplicates are common and a parallel run can't see
-them), and the risk ordering is deliberate — early slices inform how later ones are read.
+- **Attended:** the plan sign-off (the slice map determines every later pass and is expensive to
+  discover wrong at pass 12); **A1** (a mistaken call in the invariant census is read as settled
+  by every slice pass after it); every **triage** checkpoint including the final one — triage is a
+  ranking judgment, and the ranking is the deliverable.
+- **Delegated:** everything else, Pass 0 and A2–A5 included.
+
+A pass needing a live GUI or a live database still delegates. It is flagged in its plan row and
+must state in its report which instance or server it exercised — an unstated live check reads
+later as a performed one.
+
+### The loop
+
+Per iteration:
+
+1. `git rev-parse HEAD` still matches the ledger's frozen SHA. If not, stop — every `file:line`
+   is anchored to it.
+2. **Audit the previous row.** Mechanical: the expected number of blocks with that pass's ID
+   prefix landed, each carries Failure / Evidence / Confidence, "Not covered" is non-empty, the
+   row isn't still `in progress`. This audit is what stands in for the checkpoint delegation
+   removed — a degraded pass propagating unnoticed is the failure mode of any unattended chain.
+3. Pick the first row that isn't `done`. **Attended pass or triage checkpoint ⇒ stop and hand
+   back.**
+4. Mark it `in progress`, then snapshot the ledger (§5).
+5. Dispatch the subagent. Wait.
+6. **Guards, on return:** `git status --short` in the frozen tree must be empty — `review/` is
+   gitignored, so anything there means the subagent edited source: revert it, record `attempt 2`,
+   re-run. Then the §5 ledger checks.
+7. Close the row, append the pass's findings to the index, loop.
+
+**Break the loop** on: an attended pass, a triage checkpoint, a Critical, or a pass that degraded
+twice. A Critical does not wait for the next checkpoint (§3) — surfacing it is the whole point of
+escalation, and an orchestrator that keeps going has re-buried it.
+
+**Cap re-runs at two**, recorded in the row. A pass that degrades twice is degrading structurally
+— the slice is too big, the split point is wrong, or the lens doesn't fit — so stop and say which.
+
+### `review/index.md`
+
+One line per finding — `ID | severity | file:line | one-line claim` — plus the running `Rejected`
+one-liners. The orchestrator is its only writer.
+
+It exists because §3's gate assumes the whole ledger is in view, and no subagent can hold a ledger
+that has grown to hundreds of findings. The index is what a pass reads instead: enough to
+recognize a cross-slice duplicate by its claim and then go read that one block. Each triage starts
+from it too.
+
+### The subagent's brief
+
+It inherits nothing. Everything it needs is in the prompt: its plan row (slice, files, lenses,
+split point), this file's §3–§5, the project's architecture/conventions docs, `review/index.md`,
+and the ledger's frozen-SHA header. It appends its own findings block at the `## Rejected`
+boundary and touches nothing else in the ledger — the orchestrator owns the pass log and the
+index, so there is exactly one writer per region.
+
+It returns a compact report, not the findings themselves: pass id, counts by severity, finding IDs
+with one-line claims, "Not covered", and an explicit statement that each finding cleared §3.
+
+The hard rules — edit no source, no scripted or bulk edits, never mutate the ledger from a shell
+script, cap 12, escalate a Critical in the report — must be restated in the prompt every time.
+
+### Why not in parallel
+
+Fanning a segment's slices out concurrently is the obvious speed-up and is deliberately not taken.
+The risk ordering is load-bearing: early slices inform how later ones are read, and cross-slice
+duplicates are common enough that the interim triages exist specifically to catch them. If the
+wall-clock ever justifies it, the only defensible shape is fan-out *within* a triage segment
+(segments stay sequential, dedupe still happens at the checkpoint) with each pass writing
+`review/passes/<pass-id>.md` for the orchestrator to merge — never concurrent writers on the
+ledger.
