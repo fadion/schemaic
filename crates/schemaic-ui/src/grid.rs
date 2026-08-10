@@ -35,7 +35,7 @@ use schemaic_core::intel::SqlDialect;
 use schemaic_core::jsontree::{JsonNode, PathSeg, RowKind, TreeRow};
 use schemaic_core::model::{
     CellRef, CellTag, CommitDone, GridWrite, QueryState, RefetchRequest, RefetchRow, ResultSet,
-    RowDelete, RowEdit, RowInsert, Value,
+    RowDelete, RowEdit, RowInsert, Value, drop_committed,
 };
 use schemaic_core::rowjson::{self, ColSpec};
 use schemaic_core::schema::{ForeignKeyInfo, SchemaState, TableSource};
@@ -1000,11 +1000,16 @@ impl GridState {
     }
 
     /// Splice re-fetched rows into the live result set in place — `(data_row, new
-    /// cells)`, cells aligned to the result columns — then clear the staged edits.
-    /// Updates both the grid's live `rs` (cells re-read reactively) and the tab's
-    /// canonical result set (so a later rebuild is fresh). No rebuild, so scroll /
-    /// selection / widths survive.
-    fn apply_splice(&self, rows: Vec<(usize, Vec<Value>)>) {
+    /// cells)`, cells aligned to the result columns — then un-stage the edits this
+    /// commit covered. Updates both the grid's live `rs` (cells re-read reactively)
+    /// and the tab's canonical result set (so a later rebuild is fresh). No rebuild,
+    /// so scroll / selection / widths survive.
+    ///
+    /// `committed` is the staged-key set the write was assembled from — *not* the
+    /// whole map. The row panel commits on its own path, so wiping the map here
+    /// threw away green cell edits elsewhere in the grid unwritten, and an edit
+    /// staged during a commit's round-trip went the same way.
+    fn apply_splice(&self, rows: Vec<(usize, Vec<Value>)>, committed: &HashSet<(usize, usize)>) {
         if !rows.is_empty() {
             self.rs.update(|arc| {
                 Arc::make_mut(arc).splice_rows(&rows);
@@ -1013,8 +1018,8 @@ impl GridState {
                 (sync)(self.rs.get_untracked());
             }
         }
-        // Edits are now persisted and reflected as originals.
-        self.dirty.update(|d| d.clear());
+        // These edits are now persisted and reflected as originals.
+        self.dirty.update(|d| drop_committed(d, committed));
         self.commit_err.set(None);
     }
 
@@ -2402,6 +2407,9 @@ fn commit_grid(gs: GridState) {
     if gs.edit_cell.get_untracked().is_some() {
         gs.commit_edit();
     }
+    // The staged keys this write is assembled from. Nothing stops the user staging
+    // another edit while the commit is in flight, and that one hasn't been written.
+    let committed: HashSet<(usize, usize)> = gs.dirty.get_untracked().keys().copied().collect();
     let write = GridWrite {
         updates: gs.build_edits(),
         inserts: gs.build_inserts(),
@@ -2427,7 +2435,7 @@ fn commit_grid(gs: GridState) {
         gs.commit_busy.set(false);
         match outcome {
             // Fresh DB values for the edited rows — splice in place, keep scroll.
-            CommitDone::Spliced(rows) => gs.apply_splice(rows),
+            CommitDone::Spliced(rows) => gs.apply_splice(rows, &committed),
             // The app re-ran the query; the grid is rebuilt fresh, nothing to do.
             CommitDone::FullReran => {}
             CommitDone::Failed(msg) => gs.commit_err.set(Some(msg)),
@@ -2539,6 +2547,9 @@ fn commit_row_update(
         gs.edit_row_open.set(false); // nothing changed
         return;
     }
+    // This path writes only this row's changed columns, so only those leave the
+    // staged map — a green edit anywhere else is still uncommitted and stays.
+    let committed: HashSet<(usize, usize)> = changes.iter().map(|(ci, _)| (di, *ci)).collect();
     let Some(commit) = gs.commit.get_untracked() else {
         return;
     };
@@ -2556,7 +2567,7 @@ fn commit_row_update(
         gs.edit_row_saving.set(false);
         match outcome {
             CommitDone::Spliced(rows) => {
-                gs.apply_splice(rows);
+                gs.apply_splice(rows, &committed);
                 gs.edit_row_open.set(false);
             }
             CommitDone::FullReran => gs.edit_row_open.set(false),
