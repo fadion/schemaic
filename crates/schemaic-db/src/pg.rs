@@ -249,9 +249,16 @@ pub(crate) async fn fetch_table(
 
 /// Run `EXPLAIN sql` (or `EXPLAIN ANALYZE sql`) and return the plan as a result
 /// set (the caller parses it with `schemaic_core::plan`). Plain `EXPLAIN` only
-/// plans (safe for any statement); `ANALYZE` **executes** it, so callers gate it
-/// to read-only. Postgres spells the analyzing form `EXPLAIN ANALYZE` natively —
-/// no MariaDB-style `ANALYZE <stmt>` fallback is needed.
+/// plans (safe for any statement); `ANALYZE` **executes** it. Postgres spells the
+/// analyzing form `EXPLAIN ANALYZE` natively — no MariaDB-style `ANALYZE <stmt>`
+/// fallback is needed.
+///
+/// **The analyzing form runs inside a transaction that is always rolled back.**
+/// The UI gates the Analyze toggle on `sql::contains_write`, but that gate reads
+/// the statement and any reading of a statement can be wrong — a data-modifying
+/// CTE fooled it once already. Measuring must not be the thing that changes the
+/// data, so the rollback holds whether or not the gate above it was right.
+/// PostgreSQL is fully transactional here, so the rollback is real.
 pub(crate) async fn explain(
     db: &Db,
     database: Option<&str>,
@@ -260,12 +267,31 @@ pub(crate) async fn explain(
     cancel: CancellationToken,
 ) -> Result<ResultSet, DbError> {
     let stmt = sql.trim().trim_end_matches(';').trim_end();
-    let cmd = if analyze {
-        format!("EXPLAIN ANALYZE {stmt}")
-    } else {
-        format!("EXPLAIN {stmt}")
+    if !analyze {
+        return fetch_query(db, database, &format!("EXPLAIN {stmt}"), 10_000, cancel).await;
+    }
+
+    let client = match database {
+        Some(d) => connect_to(db, d).await?,
+        None => connect_maintenance(db).await?,
     };
-    fetch_query(db, database, &cmd, 10_000, cancel).await
+    // `BEGIN` isn't a preparable statement, so it goes through `batch_execute`.
+    client
+        .batch_execute("BEGIN")
+        .await
+        .map_err(|e| db_err(&e))?;
+    let out = run_statement(
+        &client,
+        database.unwrap_or(""),
+        &format!("EXPLAIN ANALYZE {stmt}"),
+        10_000,
+        &cancel,
+    )
+    .await;
+    // Unconditional, and its own failure can't mask the plan: dropping the
+    // client without a COMMIT would roll back anyway.
+    let _ = client.batch_execute("ROLLBACK").await;
+    out
 }
 
 /// Execute one statement over the text protocol and materialize a [`ResultSet`].
