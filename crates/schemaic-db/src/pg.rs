@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use schemaic_core::model::{
     Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder,
-    ResultSet, RowDelete, RowEdit, RowInsert, Value, WriteStep, one_row_verdict,
+    ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value, WriteStep, one_row_verdict,
 };
 use schemaic_core::schema::{ColumnInfo, DbSchema, IndexColumn, ViewOptions};
 use tokio_postgres::types::Type;
@@ -1199,9 +1199,11 @@ async fn import_on(
         };
         if affected != batch.len() as u64 {
             let _ = client.batch_execute("ROLLBACK").await;
+            // Always `Complete` here — every PostgreSQL table is transactional.
             return Err(DbError::Query(format!(
-                "a batch of {} rows inserted {affected} — rolled back the whole import",
-                batch.len()
+                "a batch of {} rows inserted {affected}{}",
+                batch.len(),
+                Rollback::Complete.note()
             )));
         }
         total += affected;
@@ -1286,7 +1288,14 @@ pub(crate) async fn write_on(
         };
         if let Err(msg) = one_row_verdict(step, n) {
             let _ = client.batch_execute(scope.rollback_sql()).await;
-            return Err(DbError::Query(msg));
+            // Every PostgreSQL table is transactional, so the undo is real and
+            // the note is always `Complete` — unlike MySQL, where the engine
+            // decides. The clause still comes from the shared `Rollback` so the
+            // two executors keep one wording.
+            return Err(DbError::Query(format!(
+                "{msg}{}",
+                Rollback::Complete.note()
+            )));
         }
         Ok(n)
     }
