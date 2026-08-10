@@ -879,11 +879,11 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         saved_chats.update(|chats| {
             schemaic_core::chat::save(chats, conn_id, &ai_messages.get_untracked());
         });
+        // `ChatFile::of` is what drops the tool results — query output, i.e. the
+        // user's own rows — on the way to disk.
         persist::save_json(
             "chats.json",
-            &schemaic_core::chat::ChatFile {
-                chats: saved_chats.get_untracked(),
-            },
+            &schemaic_core::chat::ChatFile::of(&saved_chats.get_untracked()),
         );
     });
     let (ai_tx, ai_rx) = crossbeam_channel::unbounded::<AiStreamMsg>();
@@ -3275,9 +3275,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             saved_chats.update(|chats| schemaic_core::chat::clear_conn(chats, id));
             persist::save_json(
                 "chats.json",
-                &schemaic_core::chat::ChatFile {
-                    chats: saved_chats.get_untracked(),
-                },
+                &schemaic_core::chat::ChatFile::of(&saved_chats.get_untracked()),
             );
             connections.update(|cs| cs.retain(|c| c.id != id));
             let fallback = connections.with_untracked(|cs| cs.first().map(|c| c.id));
