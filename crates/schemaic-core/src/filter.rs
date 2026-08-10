@@ -792,9 +792,108 @@ mod tests {
         let out = build_query("SELECT * FROM t", &cond, &[], SqlDialect::MySql)
             .unwrap()
             .unwrap();
-        let reparsed = Parser::parse_sql(&*SqlDialect::MySql.parser(), &out).unwrap();
+        let mut reparsed = Parser::parse_sql(&*SqlDialect::MySql.parser(), &out).unwrap();
         assert_eq!(reparsed.len(), 1);
         assert!(out.contains("'x''); DROP TABLE t; --'"));
+        // And structurally, not only by text: the WHERE is one comparison whose
+        // right-hand side is a single string literal carrying the value verbatim.
+        let Statement::Query(query) = reparsed.remove(0) else {
+            panic!("expected a query");
+        };
+        let SetExpr::Select(select) = *query.body else {
+            panic!("expected a SELECT");
+        };
+        let Some(Expr::BinaryOp { right, .. }) = select.selection else {
+            panic!("expected one comparison in the WHERE");
+        };
+        match *right {
+            Expr::Value(v) => assert_eq!(
+                v.value,
+                Value::SingleQuotedString("x'); DROP TABLE t; --".to_string())
+            ),
+            other => panic!("expected a string literal, got {other:?}"),
+        }
+    }
+
+    /// The `ORDER BY` expressions of `sql`, re-parsed and read back as **bare**
+    /// identifier values (`Ident::value`, unquoted — the spelling the catalog
+    /// uses). Panics unless `sql` is exactly one statement, which is itself the
+    /// assertion that the emitted quoting closed properly.
+    fn reparsed_sort_idents(sql: &str, dialect: SqlDialect) -> Vec<(String, Option<bool>)> {
+        let mut stmts = Parser::parse_sql(&*dialect.parser(), sql).expect("output must re-parse");
+        assert_eq!(stmts.len(), 1, "expected one statement from {sql:?}");
+        let Statement::Query(query) = stmts.remove(0) else {
+            panic!("expected a query");
+        };
+        let Some(OrderBy {
+            kind: OrderByKind::Expressions(exprs),
+            ..
+        }) = query.order_by
+        else {
+            panic!("expected ORDER BY expressions");
+        };
+        exprs
+            .into_iter()
+            .map(|e| match e.expr {
+                Expr::Identifier(id) => (id.value, e.options.asc),
+                other => panic!("expected a plain identifier, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sort_column_quoting_survives_a_round_trip_through_the_parser() {
+        // The `ORDER BY` identifier's escaping comes from sqlparser's `Display for
+        // Ident`, not from this crate — nothing here pinned it, so a dependency
+        // bump could have turned a column name into injectable SQL with the whole
+        // suite green. Assert the property (re-parses to the same single name)
+        // rather than sqlparser's spelling of it.
+        let out = build_query(
+            "SELECT * FROM t",
+            "",
+            &[("a`b".to_string(), true)],
+            SqlDialect::MySql,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            reparsed_sort_idents(&out, SqlDialect::MySql),
+            vec![("a`b".to_string(), Some(true))]
+        );
+
+        // PostgreSQL: a name carrying its own quote char plus a comment opener —
+        // if the doubling ever stopped, the `--` would swallow the rest.
+        let out = build_query(
+            "SELECT * FROM t",
+            "",
+            &[("a\" OR 1=1 --".to_string(), false)],
+            SqlDialect::Postgres,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            reparsed_sort_idents(&out, SqlDialect::Postgres),
+            vec![("a\" OR 1=1 --".to_string(), Some(false))]
+        );
+    }
+
+    #[test]
+    fn multi_column_sort_keeps_its_order_and_directions() {
+        let out = build_query(
+            "SELECT * FROM t",
+            "",
+            &[("b".to_string(), false), ("a".to_string(), true)],
+            SqlDialect::MySql,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            reparsed_sort_idents(&out, SqlDialect::MySql),
+            vec![
+                ("b".to_string(), Some(false)),
+                ("a".to_string(), Some(true))
+            ]
+        );
     }
 
     #[test]
