@@ -157,24 +157,97 @@ fn endpoint_json(db: &Db, database: Option<&str>, samples: bool) -> String {
     .to_string()
 }
 
+/// Prefix of the per-session MCP config files, in the system temp directory.
+const MCP_FILE_PREFIX: &str = "schemaic-mcp-";
+
+/// How old one has to be before the startup sweep will remove it. Long enough
+/// that a file belonging to another Schemaic instance still running is never
+/// touched — those are deleted by that instance's own `Drop`.
+const MCP_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 /// Write the `claude` MCP config to a per-session temp file and return its path.
 /// The DB endpoint (with credentials) rides in the config's `env`, so it never
 /// appears on a command line where another same-user process could read it
-/// (review C6). Best-effort owner-only permissions; removed when the session
-/// drops. Returns `None` if the file couldn't be written (caller then skips MCP).
+/// (review C6). Owner-only, removed when the session drops. Returns `None` if the
+/// file couldn't be written (caller then skips MCP).
+///
+/// **The name is random and the file is created with `O_EXCL`.** The old name was
+/// `schemaic-mcp-<pid>-<counter>.json`, and `<pid>` is public while the counter
+/// starts at 0 — so on a shared host with a world-writable `/tmp` another user
+/// could pre-create the path (or symlink it into their own directory) before the
+/// AI panel was ever opened. `create` would then have *opened* their file, and
+/// `.mode(0o600)` never applies when nothing is created, so the DB username and
+/// password would have been written somewhere they could read. `O_EXCL` refuses
+/// an existing path and refuses to follow a symlink, which closes both at once;
+/// the random name is what keeps that refusal from being an easy way to block
+/// the panel.
 fn write_mcp_config(endpoint: &str) -> Option<PathBuf> {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
+    sweep_stale_mcp_configs();
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "schemaic".to_string());
     let cfg = mcp_config_json(&exe, endpoint);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("schemaic-mcp-{}-{n}.json", std::process::id()));
+    let dir = std::env::temp_dir();
     // On Windows the user's temp dir is already ACL-scoped to the user; a
     // same-user process can read it, but that's no worse than the env var, and
     // strictly better than a command-line argument (review C6).
-    persist::write_private(&path, cfg.as_bytes()).ok()?;
-    Some(path)
+    for _ in 0..8 {
+        let path = dir.join(format!("{MCP_FILE_PREFIX}{}.json", random_tag()));
+        if persist::create_private_new(&path, cfg.as_bytes()).is_ok() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// A random hex tag for a temp file name. `RandomState` is seeded by the OS, and
+/// the counter plus the clock keep two calls in one process apart.
+fn random_tag() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(SEQ.fetch_add(1, Ordering::Relaxed));
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    format!("{:016x}", h.finish())
+}
+
+/// Is this temp-dir entry one of ours, left behind by a session that never got to
+/// run its `Drop` (a crash, a `SIGKILL`, a power loss)?
+///
+/// Age is the guard against sweeping a *live* instance's config: nothing else
+/// distinguishes them, and deleting one out from under a running session would
+/// break its MCP tools.
+fn stale_mcp_file(name: &str, age: std::time::Duration) -> bool {
+    name.starts_with(MCP_FILE_PREFIX) && name.ends_with(".json") && age > MCP_STALE_AFTER
+}
+
+/// Remove long-abandoned MCP config files. They hold DB credentials, so leaving
+/// them in `/tmp` indefinitely is the same orphaned-file hazard as `persist`'s
+/// `.tmp`. Best effort, once per process.
+fn sweep_stale_mcp_configs() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let now = std::time::SystemTime::now();
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let age = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .unwrap_or_default();
+            if stale_mcp_file(&e.file_name().to_string_lossy(), age) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    });
 }
 
 /// The `claude` MCP config JSON launching `exe --mcp-serve` with the DB endpoint
@@ -964,6 +1037,38 @@ mod tests {
         assert_eq!(server["command"], "/path/schemaic");
         assert_eq!(server["args"][0], "--mcp-serve");
         assert_eq!(server["env"]["SCHEMAIC_MCP_ENDPOINT"], "ENDPOINT_BLOB");
+    }
+
+    #[test]
+    fn mcp_config_names_are_unpredictable() {
+        // The old name was `schemaic-mcp-<pid>-<counter>.json`, with the pid
+        // public and the counter starting at 0 — pre-creatable by another user on
+        // a shared host. `O_EXCL` is the real defence; the random name is what
+        // stops the refusal from being an easy way to block the AI panel.
+        let tags: std::collections::HashSet<String> = (0..64).map(|_| random_tag()).collect();
+        assert_eq!(tags.len(), 64, "tags must not repeat");
+        for t in &tags {
+            assert_eq!(t.len(), 16);
+            assert!(t.chars().all(|c| c.is_ascii_hexdigit()), "{t}");
+        }
+    }
+
+    #[test]
+    fn only_our_own_long_abandoned_temp_files_are_swept() {
+        use std::time::Duration;
+        let old = MCP_STALE_AFTER + Duration::from_secs(1);
+        // Ours, from a session that crashed days ago — it holds DB credentials.
+        assert!(stale_mcp_file("schemaic-mcp-0123abcd0123abcd.json", old));
+        // Ours, but recent: it may belong to another Schemaic still running, and
+        // that instance's own `Drop` is what should remove it.
+        assert!(!stale_mcp_file(
+            "schemaic-mcp-0123abcd0123abcd.json",
+            Duration::from_secs(30)
+        ));
+        // Not ours, however old.
+        assert!(!stale_mcp_file("some-other-tool.json", old));
+        assert!(!stale_mcp_file("schemaic-mcp-notjson.txt", old));
+        assert!(!stale_mcp_file("schemaic-session.json", old));
     }
 
     use schemaic_core::schema::{ColumnInfo, TableInfo};
