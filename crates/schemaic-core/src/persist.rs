@@ -7,10 +7,29 @@
 //! and write failures are swallowed (persistence is a nicety, not correctness).
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
 use crate::connection::Connection;
+
+/// Corrupt-file recoveries that happened during this run, waiting to be shown.
+///
+/// A corrupt config is recoverable — the original is kept as `.corrupt` — but
+/// only if the user knows to look, and from their side connections or
+/// preferences simply vanished. The load path is called from a dozen places
+/// before the UI exists, so it records here instead of returning a notice, and
+/// the app drains it once at startup with [`take_recoveries`].
+static RECOVERIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Take (and clear) the recovery notices recorded so far — one line per file
+/// that failed to parse. The app shows these in the error modal at startup.
+pub fn take_recoveries() -> Vec<String> {
+    RECOVERIES
+        .lock()
+        .map(|mut v| std::mem::take(&mut *v))
+        .unwrap_or_default()
+}
 
 /// Which panel occupies the right column, persisted across sessions.
 ///
@@ -342,13 +361,34 @@ fn read_json<T: Default + for<'de> Deserialize<'de>>(path: Option<PathBuf>) -> T
         classify::<T>(std::fs::read(sibling(&path, ".bak")).ok().as_deref())
     });
     if let Some(err) = corrupt {
-        eprintln!(
-            "schemaic: could not parse {} ({err}); preserving as .corrupt and trying backup",
-            path.display()
+        tracing::warn!(
+            file = %path.display(),
+            error = %err,
+            "config file did not parse; preserving as .corrupt and trying the backup"
         );
+        // A released GUI build discards stderr, so also queue it for the error
+        // modal — otherwise the user just sees their settings gone.
+        if let Ok(mut v) = RECOVERIES.lock() {
+            v.push(recovery_notice(&path, &err));
+        }
         let _ = std::fs::rename(&path, sibling(&path, ".corrupt"));
     }
     value
+}
+
+/// The user-facing notice for a config file that didn't parse: what failed, that
+/// the original was kept, and where it went. Named by file name rather than full
+/// path — the modal is a sentence, not a log line.
+fn recovery_notice(path: &Path, err: &str) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    format!(
+        "{name} could not be read ({err}).\n\
+         The unreadable file was kept as {name}.corrupt; Schemaic fell back to its backup, or \
+         to defaults if the backup was unreadable too."
+    )
 }
 
 fn write_json<T: Serialize>(path: Option<PathBuf>, value: &T) {
@@ -424,7 +464,10 @@ pub fn clear_connections_backup() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectionsFile, Load, RightPanelState, UiState, classify, recover, sibling};
+    use super::{
+        ConnectionsFile, Load, RECOVERIES, RightPanelState, UiState, classify, recover,
+        recovery_notice, sibling, take_recoveries,
+    };
     use std::path::Path;
 
     // ── Forward compatibility: an unknown enum variant must cost one field,
@@ -557,6 +600,30 @@ mod tests {
         });
         assert_eq!(v, 0);
         assert!(corrupt.is_some());
+    }
+
+    #[test]
+    fn recovery_notice_names_the_file_the_error_and_where_the_original_went() {
+        // What the user sees when their connections "vanish" — it has to say the
+        // original is still there, or the recovery is invisible.
+        let n = recovery_notice(
+            Path::new("/cfg/connections.json"),
+            "unknown variant `agent`",
+        );
+        assert!(n.contains("connections.json could not be read"), "{n}");
+        assert!(n.contains("unknown variant `agent`"), "{n}");
+        assert!(n.contains("connections.json.corrupt"), "{n}");
+        // No directory noise — the modal is a sentence, not a log line.
+        assert!(!n.contains("/cfg/"), "{n}");
+    }
+
+    #[test]
+    fn take_recoveries_drains_what_was_queued() {
+        RECOVERIES.lock().unwrap().push("first".to_string());
+        RECOVERIES.lock().unwrap().push("second".to_string());
+        assert_eq!(take_recoveries(), vec!["first", "second"]);
+        // Drained, so a second startup pass shows nothing.
+        assert!(take_recoveries().is_empty());
     }
 
     #[test]
