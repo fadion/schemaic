@@ -881,8 +881,11 @@ pub(crate) fn accept_completion(ed: &Editor, comp: Completion) {
         } else {
             // A function inserts `name()` with the caret between the parens — unless
             // the call parens are already there just ahead (re-accepting over a call).
-            let followed_by_paren = text[offset..].trim_start().starts_with('(');
-            completion_insertion(&word, kind == SuggestKind::Function, followed_by_paren)
+            completion_insertion(
+                &word,
+                kind == SuggestKind::Function,
+                call_parens_follow(&text[offset..]),
+            )
         };
         // Most completions replace the word being typed; a `replace` override (star
         // expansion) swaps a specific range instead (the `*` / `t.*`).
@@ -918,6 +921,16 @@ fn star_expansion(
     }
     let catalog = build_catalog(db_nodes, active_db);
     intel::expand_star(text, lo, hi, offset, &catalog, dialect)
+}
+
+/// Are the call parens already present **just ahead** of the caret — i.e. on this
+/// line, past nothing but spaces and tabs?
+///
+/// Only intra-line whitespace is skipped: `trim_start` also crosses newlines, so a
+/// `(` opening an unrelated statement on the *next* line read as this call's
+/// parens and `COUNT` was accepted without them.
+fn call_parens_follow(after_caret: &str) -> bool {
+    after_caret.trim_start_matches([' ', '\t']).starts_with('(')
 }
 
 /// The text to splice for an accepted completion and the caret offset *within* that
@@ -1175,8 +1188,8 @@ pub(crate) fn signature_popup(comp: Completion) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::{
-        SuggestKind, completion_insertion, database_suggestion_visible, recency_bonus,
-        statement_identifiers,
+        SuggestKind, call_parens_follow, completion_insertion, database_suggestion_visible,
+        recency_bonus, statement_identifiers,
     };
     use std::collections::HashSet;
 
@@ -1241,6 +1254,20 @@ mod tests {
         let (s, c) = completion_insertion("COUNT", true, true);
         assert_eq!(s, "COUNT");
         assert_eq!(c, 5);
+    }
+
+    #[test]
+    fn call_parens_must_be_on_the_same_line() {
+        // "just ahead" means this line. A `(` opening an unrelated statement on the
+        // next one is not this call's parens.
+        assert!(!call_parens_follow("\n(SELECT 1)"));
+        assert!(!call_parens_follow("\r\n  (SELECT 1)"));
+        assert!(!call_parens_follow(""));
+        assert!(!call_parens_follow(" FROM t"));
+        // Spaces and tabs before the parens still count as present.
+        assert!(call_parens_follow("("));
+        assert!(call_parens_follow("  (a, b)"));
+        assert!(call_parens_follow("\t()"));
     }
 
     #[test]
