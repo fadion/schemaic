@@ -110,6 +110,23 @@ impl<'a> CellRef<'a> {
         self.text
     }
 
+    /// Does this stored cell already hold `v`? Answers exactly "would pushing `v`
+    /// produce this cell", by tag and canonical text — the numeric text was
+    /// written with `Display`, so it parses back to the same value. Allocation-free,
+    /// because it runs per replacement cell on the post-commit splice path. An
+    /// unparseable numeric or a NaN compares unequal, which only costs a rebuild
+    /// that wasn't needed.
+    pub fn matches(&self, v: &Value) -> bool {
+        match (self.tag, v) {
+            (CellTag::Null, Value::Null) => true,
+            (CellTag::Str, Value::Str(s)) => self.text == s,
+            (CellTag::Int, Value::Int(n)) => self.text.parse::<i64>() == Ok(*n),
+            (CellTag::UInt, Value::UInt(n)) => self.text.parse::<u64>() == Ok(*n),
+            (CellTag::Float, Value::Float(f)) => self.text.parse::<f64>() == Ok(*f),
+            _ => false,
+        }
+    }
+
     /// Reconstruct the owned, typed [`Value`] by parsing the stored text per the
     /// tag. A numeric cell whose text unexpectedly fails to parse degrades to a
     /// `Str` (defensive — the tag is set from a real parsed value at build time).
@@ -415,6 +432,13 @@ impl ResultSet {
     /// re-fetch), so scroll/selection survive without a full query re-run. Rows
     /// not listed keep their existing cells; a replacement shorter than `columns`
     /// leaves the missing columns' cells unchanged.
+    ///
+    /// A column is rebuilt only when a replacement actually **changes** one of its
+    /// cells. The post-commit re-fetch hands back whole rows, so for the ordinary
+    /// one-cell edit 49 of 50 columns arrive identical to what is stored — and
+    /// rebuilding them meant a fresh arena and a `push_ref` per cell for the whole
+    /// result (10 million of them at the project's 200k × 50 target, on the UI
+    /// thread, immediately after a write).
     pub fn splice_rows(&mut self, rows: &[(usize, Vec<Value>)]) {
         if rows.is_empty() {
             return;
@@ -423,7 +447,17 @@ impl ResultSet {
             rows.iter().map(|(di, v)| (*di, v.as_slice())).collect();
         let n = self.n_rows;
         for (ci, cd) in self.cols.iter_mut().enumerate() {
+            let changed = rows.iter().any(|(di, cells)| match cells.get(ci) {
+                Some(v) => !cd.cell(*di).is_some_and(|c| c.matches(v)),
+                None => false, // this row supplies no cell for this column
+            });
+            if !changed {
+                continue;
+            }
             let mut nb = ColumnData::with_capacity(n);
+            // The new arena is within a cell's length of the old one; reserving it
+            // avoids growing from zero by repeated reallocate-and-copy.
+            nb.arena.reserve(cd.arena.len());
             for r in 0..n {
                 match repl.get(&r).and_then(|cells| cells.get(ci)) {
                     Some(v) => nb.push(v),
@@ -954,6 +988,56 @@ mod tests {
         );
         assert!(matches!(rs.cell(0, 0).unwrap().to_value(), Value::Int(7)));
         assert!(rs.cell(0, 1).unwrap().is_null());
+    }
+
+    #[test]
+    fn splice_rows_leaves_an_unchanged_column_untouched() {
+        // The post-commit re-fetch returns the *whole* row, so a one-cell edit
+        // hands back 49 identical columns and one changed one. Rebuilding the
+        // identical ones is the cost this skips — asserted by the buffer's
+        // identity (its allocation is not replaced), not just its contents.
+        let mut rs = ResultSet::from_rows(
+            vec![col("INT"), col("TEXT")],
+            vec![
+                vec![Value::Int(1), Value::Str("a".to_string())],
+                vec![Value::Int(2), Value::Str("b".to_string())],
+            ],
+        );
+        let untouched_before = rs.cols[0].arena.as_ptr();
+        let changed_before = rs.cols[1].arena.as_ptr();
+        // Column 0's value is unchanged; only the text column moves.
+        rs.splice_rows(&[(1, vec![Value::Int(2), Value::Str("B".to_string())])]);
+        assert_eq!(
+            rs.cols[0].arena.as_ptr(),
+            untouched_before,
+            "an unchanged column must not be rebuilt"
+        );
+        assert_ne!(
+            rs.cols[1].arena.as_ptr(),
+            changed_before,
+            "the changed column is rebuilt"
+        );
+        // …and the data is still right.
+        assert!(matches!(rs.cell(1, 0).unwrap().to_value(), Value::Int(2)));
+        assert_eq!(rs.cell(1, 1).unwrap().display(), "B");
+        assert_eq!(rs.cell(0, 1).unwrap().display(), "a");
+    }
+
+    #[test]
+    fn cell_matches_compares_by_tag_and_canonical_text() {
+        let rs = ResultSet::from_rows(
+            vec![col("INT"), col("TEXT"), col("INT")],
+            vec![vec![Value::Int(-7), Value::Str("hi".into()), Value::Null]],
+        );
+        assert!(rs.cell(0, 0).unwrap().matches(&Value::Int(-7)));
+        assert!(!rs.cell(0, 0).unwrap().matches(&Value::Int(7)));
+        assert!(rs.cell(0, 1).unwrap().matches(&Value::Str("hi".into())));
+        assert!(!rs.cell(0, 1).unwrap().matches(&Value::Str("HI".into())));
+        assert!(rs.cell(0, 2).unwrap().matches(&Value::Null));
+        assert!(!rs.cell(0, 2).unwrap().matches(&Value::Str(String::new())));
+        // A different tag never matches, even when the text would.
+        assert!(!rs.cell(0, 0).unwrap().matches(&Value::Str("-7".into())));
+        assert!(!rs.cell(0, 0).unwrap().matches(&Value::UInt(7)));
     }
 
     #[test]
