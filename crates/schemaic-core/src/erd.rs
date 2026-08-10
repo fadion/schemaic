@@ -63,9 +63,14 @@ impl DiagramColumn {
 /// a cross-database stub.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiagramNode {
+    /// Identity **and** card label. There was a separate `name` field, always
+    /// set to a clone of this one — the label is deliberately the id so two
+    /// same-named tables in different namespaces are told apart on the canvas
+    /// rather than both reading "orders". Two fields that must stay equal is a
+    /// standing invitation for a comparison to use the wrong one, and the
+    /// island sweep already did: it collected `name`s and then tested `id`s
+    /// against them.
     pub id: String,
-    /// Display name (the table name; stubs show the qualified `db.table`).
-    pub name: String,
     pub kind: NodeKind,
     /// Columns, in schema order. Empty for a stub.
     pub columns: Vec<DiagramColumn>,
@@ -237,14 +242,45 @@ pub fn build_graph(schema: &DbSchema, current_db: &str, seed: &DiagramSeed) -> D
     let mut edges: Vec<DiagramEdge> = Vec::new();
     let mut stubs: Vec<String> = Vec::new();
     for child in &included {
+        let from_id = node_id(child);
         for fk in &child.foreign_keys {
             let (to, cross) = target_id(child, fk, current_db);
-            if cross {
-                if !stubs.contains(&to) {
-                    stubs.push(to.clone());
+            if !included_ids.contains(&to) {
+                // The target isn't a node yet. What that means depends on the
+                // seed, and conflating the two cost a whole diagram.
+                match seed {
+                    // The node set is every table in the schema, so an
+                    // unresolvable target isn't a second hop — it isn't in the
+                    // schema at all. That happens whenever the schema is
+                    // partial: MySQL's `information_schema.TABLES` is
+                    // privilege-filtered while `KEY_COLUMN_USAGE` still reports
+                    // the constraint, so `SELECT` on the child but not the
+                    // parent produces exactly this. Skipping the edge also lost
+                    // the *child* to the island sweep below, and the modal then
+                    // reported a database with relationships as having none.
+                    // A stub is what `NodeKind::Stub` already means — named,
+                    // not enumerable — and the cross-database path has always
+                    // done this for the identical situation.
+                    DiagramSeed::Database => {
+                        if !stubs.contains(&to) {
+                            stubs.push(to.clone());
+                        }
+                    }
+                    // One hop from the seed, and no further. A *neighbour's*
+                    // unresolvable target is two hops, so it stays out —
+                    // including a cross-database one, which used to be drawn
+                    // because the `cross` arm ran before any membership test.
+                    // What "one hop" means must not depend on which side of a
+                    // database boundary the second hop happens to sit.
+                    DiagramSeed::Table(seed_id) => {
+                        if !cross || &from_id != seed_id {
+                            continue;
+                        }
+                        if !stubs.contains(&to) {
+                            stubs.push(to.clone());
+                        }
+                    }
                 }
-            } else if !included_ids.contains(&to) {
-                continue; // same-DB target outside the set (a second hop) — skip.
             }
             edges.push(DiagramEdge {
                 from: node_id(child),
@@ -261,10 +297,8 @@ pub fn build_graph(schema: &DbSchema, current_db: &str, seed: &DiagramSeed) -> D
         }
     }
     for id in stubs {
-        let name = id.clone();
         nodes.push(DiagramNode {
             id,
-            name,
             kind: NodeKind::Stub,
             columns: Vec::new(),
         });
@@ -280,7 +314,7 @@ pub fn build_graph(schema: &DbSchema, current_db: &str, seed: &DiagramSeed) -> D
         hidden_islands = nodes
             .iter()
             .filter(|n| n.kind != NodeKind::Stub && !connected.contains(n.id.as_str()))
-            .map(|n| n.name.clone())
+            .map(|n| n.id.clone())
             .collect();
         hidden_islands.sort();
         let hidden: HashSet<&str> = hidden_islands.iter().map(String::as_str).collect();
@@ -314,12 +348,8 @@ fn table_node(t: &TableInfo) -> DiagramNode {
             fk: fk_cols.contains(c.name.as_str()),
         })
         .collect();
-    // Card label = the id, so two same-named tables in different namespaces are
-    // told apart on the canvas rather than both reading "orders".
-    let id = node_id(t);
     DiagramNode {
-        name: id.clone(),
-        id,
+        id: node_id(t),
         kind: if t.is_view {
             NodeKind::View
         } else {
@@ -964,7 +994,7 @@ mod tests {
         let g = build_graph(&shop(), "shop", &DiagramSeed::Database);
         assert_eq!(g.total_tables, 5);
         assert_eq!(g.hidden_islands, vec!["logs".to_string()]);
-        let names: HashSet<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
+        let names: HashSet<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
         assert!(!names.contains("logs"));
         assert!(names.contains("customers") && names.contains("orderdetails"));
         // 3 FKs → 3 edges (orders→customers, orderdetails→orders, orderdetails→products).
@@ -974,7 +1004,7 @@ mod tests {
     #[test]
     fn column_flags_mark_pk_and_fk() {
         let g = build_graph(&shop(), "shop", &DiagramSeed::Database);
-        let orders = g.nodes.iter().find(|n| n.name == "orders").unwrap();
+        let orders = g.nodes.iter().find(|n| n.id == "orders").unwrap();
         let cust = orders
             .columns
             .iter()
@@ -989,7 +1019,7 @@ mod tests {
     fn table_seed_is_one_hop_neighbourhood() {
         // orders neighbours: customers (referenced) + orderdetails (references orders).
         let g = build_graph(&shop(), "shop", &DiagramSeed::Table("orders".into()));
-        let names: HashSet<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
+        let names: HashSet<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
         assert_eq!(
             names,
             ["orders", "customers", "orderdetails"]
@@ -1010,6 +1040,114 @@ mod tests {
         let g = build_graph(&shop(), "shop", &DiagramSeed::Table("nope".into()));
         assert!(g.nodes.is_empty() && g.edges.is_empty());
         assert_eq!(g.total_tables, 5);
+    }
+
+    /// A schema where `orders.customer_id → customers.id` is declared but
+    /// `customers` isn't in `schema.tables` — what MySQL hands back when the
+    /// user holds `SELECT` on one table and not the other, since
+    /// `information_schema.TABLES` is privilege-filtered while
+    /// `KEY_COLUMN_USAGE` still reports the constraint.
+    fn partial_grant() -> DbSchema {
+        DbSchema {
+            tables: vec![
+                table(
+                    "orders",
+                    vec![col("id", "int", true), col("customer_id", "int", false)],
+                    vec![fk(&["customer_id"], "customers", &["id"])],
+                ),
+                table("products", vec![col("id", "int", true)], vec![]),
+            ],
+        }
+    }
+
+    /// The table that *has* a relationship was being deleted as unrelated, and
+    /// the modal then said "No foreign-key relationships to diagram" over
+    /// "0 tables · 0 relationships · 2 unrelated hidden". Every part wrong, with
+    /// no way to tell it from a genuinely FK-free database. Reproduced on the
+    /// user's instance with a MariaDB grant on `world.city` only.
+    #[test]
+    fn database_seed_keeps_a_table_whose_fk_target_is_missing() {
+        let g = build_graph(&partial_grant(), "shop", &DiagramSeed::Database);
+        assert!(
+            g.nodes.iter().any(|n| n.id == "orders"),
+            "the table with the relationship must survive: {:?}",
+            g.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+        assert!(
+            !g.hidden_islands.contains(&"orders".to_string()),
+            "it is not an island — it has an edge"
+        );
+        assert_eq!(g.edges.len(), 1, "the relationship is drawn");
+        assert_eq!(
+            g.hidden_islands,
+            vec!["products".to_string()],
+            "only the genuinely FK-less table is hidden"
+        );
+    }
+
+    /// The cross-database path already did the right thing for the identical
+    /// situation, which is what made this a defect rather than a limitation:
+    /// one character of `ref_schema` decided between a stub plus the edge and
+    /// deleting the table outright.
+    #[test]
+    fn an_unresolvable_same_db_target_becomes_a_stub_like_the_cross_db_one() {
+        let g = build_graph(&partial_grant(), "shop", &DiagramSeed::Database);
+        let stub = g
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Stub)
+            .expect("a named-but-not-enumerable target is exactly what Stub means");
+        assert_eq!(stub.id, "customers");
+        assert!(stub.columns.is_empty());
+    }
+
+    /// "One hop" must not depend on which side of a database boundary the
+    /// second hop sits: `orderdetails` is a neighbour of `orders`, and neither
+    /// its same-database FK (`products`) nor a cross-database one belongs in a
+    /// one-hop diagram.
+    #[test]
+    fn table_seed_does_not_pull_in_a_neighbours_cross_db_stub() {
+        let mut s = shop();
+        let od = s
+            .tables
+            .iter_mut()
+            .find(|t| t.name == "orderdetails")
+            .unwrap();
+        od.foreign_keys.push(ForeignKeyInfo {
+            columns: vec!["wh".into()],
+            ref_schema: Some("warehouse".into()),
+            ref_table: "inventory".into(),
+            ref_columns: vec!["id".into()],
+            ..Default::default()
+        });
+
+        let g = build_graph(&s, "shop", &DiagramSeed::Table("orders".into()));
+        let mut ids: Vec<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["customers", "orderdetails", "orders"],
+            "a neighbour's second hop must not be drawn, cross-database or not"
+        );
+    }
+
+    /// The seed's *own* cross-database FK is one hop, and must still be drawn.
+    #[test]
+    fn table_seed_keeps_the_seeds_own_cross_db_stub() {
+        let mut s = shop();
+        let orders = s.tables.iter_mut().find(|t| t.name == "orders").unwrap();
+        orders.foreign_keys.push(ForeignKeyInfo {
+            columns: vec!["wh".into()],
+            ref_schema: Some("warehouse".into()),
+            ref_table: "inventory".into(),
+            ref_columns: vec!["id".into()],
+            ..Default::default()
+        });
+        let g = build_graph(&s, "shop", &DiagramSeed::Table("orders".into()));
+        assert!(
+            g.nodes.iter().any(|n| n.id == "warehouse.inventory"),
+            "one hop from the seed, so it belongs"
+        );
     }
 
     #[test]
@@ -1166,7 +1304,6 @@ mod tests {
                 .iter()
                 .map(|id| DiagramNode {
                     id: id.to_string(),
-                    name: id.to_string(),
                     kind: NodeKind::Table,
                     columns: Vec::new(),
                 })

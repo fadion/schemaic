@@ -129,7 +129,7 @@ fn node_width(node: &DiagramNode) -> f64 {
     // Header: table icon (13) + gap (7) + bold name (13px). Measured BOLD, as it's
     // drawn — measuring at regular weight under-reports, which sized every card
     // narrower than its own title and ellipsized names nowhere near `NODE_MAX_W`.
-    let mut content = 13.0 + 7.0 + measure_text_px_bold_at(&node.name, 13.0);
+    let mut content = 13.0 + 7.0 + measure_text_px_bold_at(&node.id, 13.0);
     for c in &node.columns {
         // column icon (13) + gap (8) + name + gap (8) + type.
         let row = 13.0
@@ -171,7 +171,7 @@ fn build_placed(graph: &DiagramGraph) -> (Vec<Placed>, f64, f64, HashMap<String,
     for n in &graph.nodes {
         let (w, h) = if n.kind == NodeKind::Stub {
             (
-                (measure_text_px_at(&n.name, 13.0) + 20.0).clamp(NODE_MIN_W, NODE_MAX_W),
+                (measure_text_px_at(&n.id, 13.0) + 20.0).clamp(NODE_MIN_W, NODE_MAX_W),
                 HEADER_H,
             )
         } else {
@@ -611,7 +611,7 @@ fn node_card(
 
     if p.node.kind == NodeKind::Stub {
         let id_s = id.clone();
-        return container(text(p.node.name.clone()).style(move |s| {
+        return container(text(p.node.id.clone()).style(move |s| {
             s.font_size(13.0 * zoom.get() as f32)
                 .color(theme::text_dim())
                 .padding_horiz(10.0 * zoom.get())
@@ -634,7 +634,7 @@ fn node_card(
         .into_any();
     }
 
-    let name = p.node.name.clone();
+    let name = p.node.id.clone();
     // Does the name ellipsize at this card's width? The header lays out as
     // icon (13) + gap (7) + name, inside 10px horizontal padding each side, so the
     // name gets `w - 40`. Measured BOLD, matching how it's drawn — a node id is
@@ -1354,7 +1354,6 @@ mod tests {
     fn node(id: &str) -> DiagramNode {
         DiagramNode {
             id: id.to_string(),
-            name: id.to_string(),
             kind: NodeKind::Table,
             columns: Vec::new(),
         }
@@ -1423,13 +1422,11 @@ mod tests {
         // parent `users`: id(0). child `orders`: id(0), user_id(1, FK→users.id).
         let users = DiagramNode {
             id: "users".into(),
-            name: "users".into(),
             kind: NodeKind::Table,
             columns: vec![col("id", true, false)],
         };
         let orders = DiagramNode {
             id: "orders".into(),
-            name: "orders".into(),
             kind: NodeKind::Table,
             columns: vec![col("id", true, false), col("user_id", false, true)],
         };
@@ -1481,7 +1478,6 @@ mod tests {
         // employees.reports_to (row 1, FK) → employees.id (row 0, PK).
         let employees = DiagramNode {
             id: "employees".into(),
-            name: "employees".into(),
             kind: NodeKind::Table,
             columns: vec![col("id", true, false), col("reports_to", false, true)],
         };
