@@ -364,10 +364,21 @@ impl ColumnData {
 /// Cells are read through [`ResultSet::cell`] (a borrowed [`CellRef`]); the field
 /// is private so the columnar invariant (each column's packed `ends` words stay
 /// in lock-step with its `arena`) can't be violated from outside.
+///
+/// **Each column is behind its own `Arc`, which makes cloning a `ResultSet`
+/// cheap** — a `Vec<Column>` plus one refcount bump per column, not the data.
+/// That matters because the grid's `rs` signal and the tab's canonical
+/// `QueryState::Loaded` deliberately hold the *same* `Arc<ResultSet>`, so the
+/// post-commit splice mutates through `Arc::make_mut` with a strong count of 2:
+/// with the columns inline that deep-copied every arena in the result — seconds
+/// and hundreds of megabytes at the 200k×50 target, on the UI thread, on the one
+/// path built to avoid a rebuild. Now the outer clone is trivial and
+/// [`ResultSet::splice_rows`] replaces only the column `Arc`s it actually
+/// changes, so an untouched column is never copied at all.
 #[derive(Clone, Debug, Default)]
 pub struct ResultSet {
     pub columns: Vec<Column>,
-    cols: Vec<ColumnData>,
+    cols: Vec<Arc<ColumnData>>,
     n_rows: usize,
     pub elapsed_ms: u128,
     /// True if the fetch stopped at the row cap (more rows may exist).
@@ -453,6 +464,8 @@ impl ResultSet {
                 None => false, // this row supplies no cell for this column
             });
             if !changed {
+                // Not even a refcount touched — whoever else holds this column
+                // keeps sharing it.
                 continue;
             }
             let mut nb = ColumnData::with_capacity(n);
@@ -468,7 +481,9 @@ impl ResultSet {
                     },
                 }
             }
-            *cd = nb;
+            // A fresh column replaces the shared one — copy-on-write, so any
+            // other holder of the old `ResultSet` still sees its old values.
+            *cd = Arc::new(nb);
         }
     }
 }
@@ -535,7 +550,9 @@ impl ResultBuilder {
     pub fn finish(self) -> ResultSet {
         ResultSet {
             columns: self.columns,
-            cols: self.cols,
+            // One `Arc` per column, allocated once here at the end of the load —
+            // see [`ResultSet`] for why the columns are shared individually.
+            cols: self.cols.into_iter().map(Arc::new).collect(),
             n_rows: self.n_rows,
             elapsed_ms: self.elapsed_ms,
             truncated: self.truncated,
@@ -1150,6 +1167,48 @@ mod tests {
         assert!(matches!(rs.cell(1, 0).unwrap().to_value(), Value::Int(2)));
         assert_eq!(rs.cell(1, 1).unwrap().display(), "B");
         assert_eq!(rs.cell(0, 1).unwrap().display(), "a");
+    }
+
+    #[test]
+    fn splicing_a_shared_result_set_does_not_copy_the_untouched_columns() {
+        // The grid's `rs` signal and the tab's canonical `QueryState::Loaded`
+        // hold the *same* `Arc`, so the post-commit splice goes through
+        // `Arc::make_mut` with a strong count of 2. That used to deep-copy every
+        // column — the whole result set — on the UI thread, on the path built
+        // specifically to avoid a rebuild. Columns are behind their own `Arc`s
+        // so the outer clone is a handful of refcount bumps.
+        let rs = Arc::new(ResultSet::from_rows(
+            vec![col("INT"), col("TEXT")],
+            vec![
+                vec![Value::Int(1), Value::Str("a".to_string())],
+                vec![Value::Int(2), Value::Str("b".to_string())],
+            ],
+        ));
+        let canonical = Arc::clone(&rs); // the tab still holds it
+        let untouched_before = rs.cols[0].arena.as_ptr();
+
+        let mut spliced = rs;
+        assert!(
+            Arc::strong_count(&spliced) > 1,
+            "the shared-Arc precondition this test is about"
+        );
+        Arc::make_mut(&mut spliced)
+            .splice_rows(&[(1, vec![Value::Int(2), Value::Str("B".to_string())])]);
+
+        assert_eq!(
+            spliced.cols[0].arena.as_ptr(),
+            untouched_before,
+            "the untouched column must still share storage with the original"
+        );
+        assert_eq!(
+            canonical.cols[0].arena.as_ptr(),
+            untouched_before,
+            "…and the original must be unharmed by the splice"
+        );
+        // The changed column is genuinely copy-on-write: the original keeps its
+        // old value, the spliced one has the new.
+        assert_eq!(spliced.cell(1, 1).unwrap().display(), "B");
+        assert_eq!(canonical.cell(1, 1).unwrap().display(), "b");
     }
 
     #[test]
