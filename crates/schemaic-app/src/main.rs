@@ -3678,7 +3678,18 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 },
                 default_tab_target().1.as_deref(),
             );
-            let system = inline_system_prompt(db_nodes, active_db.as_deref(), &req);
+            // Ctrl+K generates SQL that lands straight in the editor, so it has
+            // to be the active connection's dialect — a Postgres tab was being
+            // handed MySQL syntax.
+            let conn_id = active_conn.get_untracked();
+            let dialect = connections
+                .with_untracked(|cs| {
+                    cs.iter()
+                        .find(|c| c.id == conn_id)
+                        .map(|c| SqlDialect::from_db_type(&c.db_type))
+                })
+                .unwrap_or_default();
+            let system = inline_system_prompt(db_nodes, active_db.as_deref(), &req, dialect);
             let intent = req.intent.clone();
             let bin = claude_bin(&ai_cli_path.get_untracked());
             // Follow the AI panel's model choice (one place to change it).
@@ -3752,6 +3763,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         &ddl,
                         &sample,
                         &row_context,
+                        dialect_for(db.engine()),
                     );
                     let system = "You output only the requested raw value — no quotes, \
                                   no markdown, no prose.";
@@ -3829,6 +3841,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         &fill_columns,
                         &sample,
                         count,
+                        dialect_for(db.engine()),
                     );
                     let system = "You output only a JSON array of row objects — no \
                                   markdown, no prose.";

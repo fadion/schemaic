@@ -44,6 +44,19 @@ impl SqlDialect {
         }
     }
 
+    /// How to name this engine when telling a language model what it is
+    /// generating SQL for.
+    ///
+    /// Every AI surface used to hardcode "MySQL/MariaDB", so on a PostgreSQL
+    /// connection the assistant was asked for the wrong engine's SQL — and it
+    /// obliges, producing backticks and `LIMIT x, y` that the server rejects.
+    pub fn engine_label(self) -> &'static str {
+        match self {
+            SqlDialect::MySql => "MySQL/MariaDB",
+            SqlDialect::Postgres => "PostgreSQL",
+        }
+    }
+
     /// Map a saved connection's `db_type` label to a dialect. Anything not
     /// recognizably Postgres falls back to MySQL (the historical default), so old
     /// saved connections keep parsing as before.
