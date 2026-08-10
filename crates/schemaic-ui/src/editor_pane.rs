@@ -709,6 +709,10 @@ pub(crate) struct QueryPaneParams {
     /// When set, jump the caret to this byte offset (move + centre + focus), then
     /// clear it. Driven by the status-bar warning count.
     pub jump_offset: RwSignal<Option<usize>>,
+    /// Where this pane publishes its (debounced) offline diagnostics. Lives on
+    /// the tab so the status bar reads the analysis rather than repeating it —
+    /// see [`Tab::diagnostics`](crate::Tab::diagnostics).
+    pub syntax: RwSignal<Vec<Diagnostic>>,
     pub results: RwSignal<QueryState>,
     pub run: Rc<dyn Fn(String)>,
     pub run_all: Rc<dyn Fn(Vec<String>)>,
@@ -761,6 +765,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         cursor_offset,
         goto_open,
         jump_offset,
+        syntax,
         results,
         run,
         run_all,
@@ -891,12 +896,6 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // until "Run anyway". Catalog-aware diagnostics (the squiggles) — recomputed on
     // every edit, seeded from the initial text.
     let guard: RwSignal<Option<Guard>> = RwSignal::new(None);
-    let syntax: RwSignal<Vec<Diagnostic>> = RwSignal::new(compute_diagnostics(
-        &query.get_untracked(),
-        db_nodes,
-        active_db.get_untracked().as_deref(),
-        dialect.get_untracked(),
-    ));
     // Tier-2 (DB-validated) diagnostics for the statement under the cursor, when
     // `live_validate` is on. Debounced: each edit bumps `val_gen`, and only the
     // latest generation's deferred round-trip fires (and its result is accepted).
@@ -906,6 +905,32 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // `diag_gen` and only the latest generation's deferred pass re-parses, so we
     // don't re-parse the whole document on every character.
     let diag_gen: Rc<std::cell::Cell<u64>> = Rc::new(std::cell::Cell::new(0));
+    // Seed the tab's diagnostics from the text this pane opens on, and re-run when
+    // the *catalog* moves under them — unknown-table/unknown-column errors depend
+    // on it, so a set computed before introspection landed is stale. Tracks
+    // `db_nodes`/`active_db` only (never `query`, which is the debounced path
+    // below), and rides the same generation guard so a burst of per-database
+    // schema arrivals coalesces into one parse.
+    {
+        let dgen = diag_gen.clone();
+        create_effect(move |_| {
+            db_nodes.track();
+            let adb = active_db.get();
+            let g = dgen.get().wrapping_add(1);
+            dgen.set(g);
+            let dgen = dgen.clone();
+            let dia = dialect.get_untracked();
+            floem::action::exec_after(std::time::Duration::from_millis(120), move |_| {
+                if dgen.get() != g || syntax.try_get_untracked().is_none() {
+                    return;
+                }
+                let Some(q) = query.try_get_untracked() else {
+                    return;
+                };
+                syntax.set(compute_diagnostics(&q, db_nodes, adb.as_deref(), dia));
+            });
+        });
+    }
     // Turning validation off clears any lingering DB squiggle.
     create_effect(move |_| {
         if !live_validate.get() {

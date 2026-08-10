@@ -467,6 +467,17 @@ pub struct Tab {
     /// A byte offset the editor should jump the caret to (move + centre + focus),
     /// then clear. Set by the status-bar warning count to reach the first warning.
     pub jump_offset: RwSignal<Option<usize>>,
+    /// This tab's offline diagnostics — the squiggles — published by the editor
+    /// pane's **debounced** analysis (`editor_pane`, 120 ms with a generation
+    /// guard).
+    ///
+    /// It lives on the tab so the status bar can read the result instead of
+    /// re-deriving it: the footer's warning count used to call
+    /// `compute_diagnostics` itself, on every keystroke, undebounced — a full
+    /// catalog rebuild plus a full parse of the whole document, measured at
+    /// 20 ms per keypress on a 500-table schema with a 47 KB script, walking
+    /// straight around the debounce the editor implements for exactly this.
+    pub diagnostics: RwSignal<Vec<schemaic_core::intel::Diagnostic>>,
     /// A column name to select + scroll into view once this tab's grid is loaded,
     /// then clear. Set by double-clicking a column row in the schema tree (open the
     /// table, highlight the column); the grid consumes it reactively (`grid_view`).
@@ -538,6 +549,7 @@ impl Tab {
             cursor_offset: cx.create_rw_signal(0),
             goto_open: cx.create_rw_signal(false),
             jump_offset: cx.create_rw_signal(None),
+            diagnostics: cx.create_rw_signal(Vec::new()),
             highlight_col: cx.create_rw_signal(None),
             results_maximized: cx.create_rw_signal(false),
             tx_mode: cx.create_rw_signal(TxMode::default()),
@@ -2910,6 +2922,7 @@ fn center(ui: Ui) -> impl IntoView {
                     cursor_offset: tab.cursor_offset,
                     goto_open: tab.goto_open,
                     jump_offset: tab.jump_offset,
+                    syntax: tab.diagnostics,
                     results: tab.results,
                     run: run.clone(),
                     run_all: run_all.clone(),
@@ -4454,7 +4467,6 @@ fn footer(ui: Ui) -> impl IntoView {
     let active_conn = ui.conn.active_conn;
     let tabs = ui.tabs_ui.tabs;
     let active = ui.tabs_ui.active;
-    let db_nodes = ui.schema.db_nodes;
     let soft_tabs = ui.layout.soft_tabs;
     let tab_width = ui.layout.tab_width;
     let word_wrap = ui.layout.word_wrap;
@@ -4482,29 +4494,19 @@ fn footer(ui: Ui) -> impl IntoView {
         })
         .unwrap_or((1, 1))
     });
-    // Live count of diagnostics in the active tab's SQL (same analysis as the
-    // editor squiggles). Tracks the query text and the schema list.
+    // Live count of diagnostics in the active tab's SQL — *read* from the editor
+    // pane's debounced analysis, not recomputed. Doing the analysis here meant a
+    // full catalog rebuild and a full parse of the document on every keystroke,
+    // undebounced, defeating the 120 ms debounce the pane implements for exactly
+    // this call (measured at 20 ms per keypress on a 500-table schema).
     let warn_count = create_memo(move |_| {
         let id = active.get();
-        db_nodes.track();
-        let tab = tabs.with(|v| {
+        tabs.with(|v| {
             v.iter()
                 .find(|t| t.id == id)
-                .map(|t| (t.query.get(), t.database.get(), t.conn_id.get()))
-        });
-        match tab {
-            Some((q, adb, cid)) => {
-                let dialect = connections
-                    .with(|cs| {
-                        cs.iter()
-                            .find(|c| c.id == cid)
-                            .map(|c| SqlDialect::from_db_type(&c.db_type))
-                    })
-                    .unwrap_or_default();
-                editor_pane::compute_diagnostics(&q, db_nodes, adb.as_deref(), dialect).len()
-            }
-            None => 0,
-        }
+                .map(|t| t.diagnostics.with(|d| d.len()))
+        })
+        .unwrap_or(0)
     });
     // Is the active tab's connection read-only? (Same derivation as `center`.)
     let read_only = create_memo(move |_| {
@@ -4686,25 +4688,17 @@ fn footer(ui: Ui) -> impl IntoView {
         },
     )
     .on_click_stop(move |_| {
-        // Jump the editor to the first diagnostic (no-op when there are none).
+        // Jump the editor to the first diagnostic (no-op when there are none) —
+        // from the same published list the count came from, rather than a third
+        // full analysis of the document.
         let id = active.get_untracked();
         tabs.with_untracked(|v| {
-            if let Some(t) = v.iter().find(|t| t.id == id) {
-                let q = t.query.get_untracked();
-                let adb = t.database.get_untracked();
-                let cid = t.conn_id.get_untracked();
-                let dialect = connections
-                    .with_untracked(|cs| {
-                        cs.iter()
-                            .find(|c| c.id == cid)
-                            .map(|c| SqlDialect::from_db_type(&c.db_type))
-                    })
-                    .unwrap_or_default();
-                if let Some(d) =
-                    editor_pane::compute_diagnostics(&q, db_nodes, adb.as_deref(), dialect).first()
-                {
-                    t.jump_offset.set(Some(d.range.0));
-                }
+            if let Some(t) = v.iter().find(|t| t.id == id)
+                && let Some(off) = t
+                    .diagnostics
+                    .with_untracked(|d| d.first().map(|d| d.range.0))
+            {
+                t.jump_offset.set(Some(off));
             }
         });
     })
