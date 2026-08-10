@@ -3187,8 +3187,13 @@ fn is_json_type(type_name: &str) -> bool {
 const JSON_INDENT: f64 = 15.0;
 
 /// Is `path` hidden because one of its ancestor container paths is collapsed?
+///
+/// The range starts at 0 because the **root** container's path is the empty
+/// vector — skipping `n = 0` meant collapsing the root flipped its chevron and
+/// hid nothing, which is the one value collapsing exists for. The row's own path
+/// stays out of the range, so a collapsed container still renders itself.
 fn json_path_hidden(path: &[PathSeg], collapsed: &HashSet<Vec<PathSeg>>) -> bool {
-    (1..path.len()).any(|n| collapsed.contains(&path[..n].to_vec()))
+    (0..path.len()).any(|n| collapsed.contains(&path[..n].to_vec()))
 }
 
 /// One rendered row of the JSON tree: indent, disclosure (for containers), key /
@@ -5278,6 +5283,46 @@ mod tests {
             vec![col("c", ty)],
             cells.into_iter().map(|v| vec![v]).collect(),
         )
+    }
+
+    // ── JSON tree collapse ──
+
+    fn key(k: &str) -> PathSeg {
+        PathSeg::Key(k.to_string())
+    }
+
+    #[test]
+    fn collapsing_the_json_root_hides_its_members() {
+        // The root container's path is the empty vector, so it is `n = 0` that
+        // matches it — the range used to start at 1 and the root collapsed to
+        // nothing at all.
+        let collapsed: HashSet<Vec<PathSeg>> = [vec![]].into_iter().collect();
+        assert!(
+            !json_path_hidden(&[], &collapsed),
+            "the root renders itself"
+        );
+        assert!(json_path_hidden(&[key("a")], &collapsed));
+        assert!(json_path_hidden(&[key("a"), PathSeg::Index(0)], &collapsed));
+    }
+
+    #[test]
+    fn collapsing_a_nested_json_container_hides_only_its_own_subtree() {
+        let collapsed: HashSet<Vec<PathSeg>> = [vec![key("a")]].into_iter().collect();
+        assert!(!json_path_hidden(&[], &collapsed));
+        assert!(!json_path_hidden(&[key("a")], &collapsed));
+        assert!(!json_path_hidden(&[key("b")], &collapsed));
+        assert!(json_path_hidden(&[key("a"), key("x")], &collapsed));
+        assert!(json_path_hidden(
+            &[key("a"), key("x"), PathSeg::Index(2)],
+            &collapsed
+        ));
+    }
+
+    #[test]
+    fn nothing_is_hidden_when_nothing_is_collapsed() {
+        let collapsed = HashSet::new();
+        assert!(!json_path_hidden(&[], &collapsed));
+        assert!(!json_path_hidden(&[key("a"), key("b")], &collapsed));
     }
 
     // ── Column virtualization (`compute_window`) ──
