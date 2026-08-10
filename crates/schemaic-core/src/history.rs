@@ -2,10 +2,12 @@
 //! per connection in the UI.
 //!
 //! Each run records the connection id, the database it ran against, the SQL, and
-//! a wall-clock timestamp (unix millis). The store is a flat `Vec` capped at
-//! [`MAX_ENTRIES`] (oldest dropped); the UI filters it to the active connection
-//! and renders newest-first. Pure + tested here; the app owns the signal and
-//! persists the list via `persist::save_json`.
+//! a wall-clock timestamp (unix millis). The store is a flat `Vec`, capped at
+//! [`MAX_PER_CONN`] entries **per connection** (oldest dropped) rather than
+//! globally — so the file grows with the number of connections, and one busy
+//! connection can't evict another's history. The UI filters it to the active
+//! connection and renders newest-first. Pure + tested here; the app owns the
+//! signal and persists the list via `persist::save_json`.
 
 use serde::{Deserialize, Serialize};
 

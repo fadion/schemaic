@@ -34,11 +34,18 @@ pub fn is_favorite(rules: &[FavoriteRule], conn_id: u64, database: &str) -> bool
         .any(|r| r.conn_id == conn_id && r.database == database)
 }
 
-/// Favorite rank (0 = oldest favorite, sorts highest), or `None` if not favorited.
+/// Favorite rank **within `conn_id`** (0 = that connection's oldest favorite,
+/// sorts highest), or `None` if not favorited.
+///
+/// Counted over this connection's entries only. It used to be the index into
+/// the whole vec, so a second connection's favorites ranked 3 and 7 rather than
+/// 0 and 1 — harmless for the one caller, which only sorts by it, and wrong for
+/// anyone reading `rank == 0` as "the top favorite".
 pub fn rank(rules: &[FavoriteRule], conn_id: u64, database: &str) -> Option<usize> {
     rules
         .iter()
-        .position(|r| r.conn_id == conn_id && r.database == database)
+        .filter(|r| r.conn_id == conn_id)
+        .position(|r| r.database == database)
 }
 
 /// Toggle a database's favorite state: remove it if favorited, else append it
@@ -114,6 +121,25 @@ mod tests {
         toggle(&mut rules, 1, "logs");
         assert_eq!(rank(&rules, 1, "app"), Some(0));
         assert_eq!(rank(&rules, 1, "cache"), Some(1));
+    }
+
+    #[test]
+    fn rank_counts_within_the_connection_not_across_the_file() {
+        // Two connections interleaved in one vec. The second connection's
+        // favorites used to rank 1 and 3 (their global indices), so `rank == 0`
+        // meant "the top favorite" only for whichever connection happened to be
+        // first in the file.
+        let mut rules = Vec::new();
+        toggle(&mut rules, 1, "app");
+        toggle(&mut rules, 2, "shop");
+        toggle(&mut rules, 1, "logs");
+        toggle(&mut rules, 2, "orders");
+        assert_eq!(rank(&rules, 2, "shop"), Some(0));
+        assert_eq!(rank(&rules, 2, "orders"), Some(1));
+        assert_eq!(rank(&rules, 1, "app"), Some(0));
+        assert_eq!(rank(&rules, 1, "logs"), Some(1));
+        // A database favorited on another connection is still unranked here.
+        assert_eq!(rank(&rules, 2, "app"), None);
     }
 
     #[test]

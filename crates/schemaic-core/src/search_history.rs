@@ -35,7 +35,9 @@ pub struct SearchHistoryFile {
 }
 
 impl SearchEntry {
-    /// Same target (ignoring `conn_id`) — used for dedup within a connection.
+    /// Same target, **`conn_id` included** — used for dedup. The connection is
+    /// part of the identity on purpose: without it, activating the same table on
+    /// two connections would collapse into one entry.
     fn same_target(&self, other: &SearchEntry) -> bool {
         self.conn_id == other.conn_id
             && self.database == other.database

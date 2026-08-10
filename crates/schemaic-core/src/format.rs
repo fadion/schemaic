@@ -71,13 +71,13 @@ pub struct FormatsFile {
     pub rules: Vec<ColumnFormatRule>,
 }
 
-/// The explicitly-stored format for a column, or `None` if the user has never set
 /// Forget every formatter belonging to `conn_id` — the connection was deleted,
 /// and nothing keyed to it should outlive it.
 pub fn clear_conn(rules: &mut Vec<ColumnFormatRule>, conn_id: u64) {
     rules.retain(|r| r.conn_id != conn_id);
 }
 
+/// The explicitly-stored format for a column, or `None` if the user has never set
 /// one (in which case the caller falls back to [`smart_default`]). An explicit
 /// `Some(ColumnFormat::None)` means the user deliberately chose "raw", overriding
 /// any smart default — distinct from "no rule".

@@ -189,8 +189,6 @@ pub(crate) fn settings_toggle_row(
     .style(|s| s.items_center().width_full().gap(10.0))
 }
 
-// A single selectable option row (check when active), used by the AI settings
-// model/effort lists. Mirrors the terminal shell-picker rows.
 // A themed `<select>`-style dropdown for the settings modal. The closed box
 // looks like an `edit_field` (dark surface, field border, chevron); the popup is
 // a floating menu styled via the dropdown's `ScrollClass` (bg_panel + border).
