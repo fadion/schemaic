@@ -165,6 +165,12 @@ pub(crate) const SEARCH_DEBOUNCE_MS: u64 = 150;
 /// Auto-hide delay (ms) for the overlay scrollbars after scrolling stops.
 pub(crate) const SCROLL_HIDE_MS: u64 = 3000;
 
+/// How close to the bottom (px) a tail-following list counts as "at the bottom":
+/// under this it keeps following new content, past it the user is reading and the
+/// follow is released. Wide enough that a small overshoot while scrolling near the
+/// end doesn't drop the follow.
+pub(crate) const FOLLOW_SLACK: f64 = 30.0;
+
 // ── Menus / misc ────────────────────────────────────────────────────────────
 
 /// Fixed width of the active-database menu (right-aligned under its trigger).

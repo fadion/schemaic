@@ -18,10 +18,11 @@ use floem::unit::PxPct;
 
 use schemaic_core::transcript::{Seg, ToolCall, TurnStats};
 
-use crate::consts::CHAT_PAD_H;
+use crate::consts::{CHAT_PAD_H, FOLLOW_SLACK};
 use crate::markdown::{CodeActions, render_markdown};
 use crate::widgets::{
-    autohide_state, jump_to_bottom_button, section_title, thin_scroll, toolbar_icon, verb_spinner,
+    at_content_bottom, autohide_state, jump_to_bottom_button, section_title, thin_scroll,
+    toolbar_icon, verb_spinner,
 };
 use crate::{ChatMessage, FieldCfg, Role, Ui, edit_field, icons, theme};
 
@@ -168,8 +169,22 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     // latest message. `exec_after(0)` fires after layout, so it reaches the true
     // bottom. The `bump` signal carries that post-layout trigger into `scroll_to`.
     let bump = RwSignal::new(0u64);
+    // Whether to keep following the bottom. Seeded true, cleared the moment the
+    // user scrolls away from it, and re-armed by the jump-to-bottom button or by
+    // sending a new message — the same shape the Live Monitor's log uses. Without
+    // it the effect below fires on every streamed *token*, so scrolling up to
+    // re-read anything during a generation was impossible.
+    let follow = RwSignal::new(true);
+    let last_sent = RwSignal::new(0usize);
     create_effect(move |_| {
-        messages.with(|_| ());
+        // Sending re-arms the follow: the user is asking about what they just
+        // typed. An assistant message arriving does not — that is the case where
+        // they may be reading something further up.
+        let sent = messages.with(|m| m.iter().filter(|msg| msg.role == Role::User).count());
+        if sent != last_sent.get_untracked() {
+            last_sent.set(sent);
+            follow.set(true);
+        }
         floem::action::exec_after(std::time::Duration::ZERO, move |_| {
             bump.try_update(|n| *n = n.wrapping_add(1));
         });
@@ -188,11 +203,20 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
         .scroll_style(move |cs| thin_scroll(cs).hide_bars(!scroll_shown.get()))
         .on_scroll(move |vp| {
             view_rect.set(vp);
+            // Only notify on a real flip: `set` never dedups, and a redundant
+            // notify would re-snap while the user scrolls near the bottom.
+            let at_bottom = at_content_bottom(content_h.get_untracked(), vp.y1, FOLLOW_SLACK);
+            if follow.get_untracked() != at_bottom {
+                follow.set(at_bottom);
+            }
             scroll_poke();
         })
+        // `None` while scrolled up — that is what *releases* the follow. A
+        // `scroll_to` target is sticky, so leaving `bump` un-read wouldn't be
+        // enough: the last target stays applied.
         .scroll_to(move || {
             bump.get();
-            Some(Point::new(0.0, 1.0e9))
+            follow.get().then(|| Point::new(0.0, 1.0e9))
         })
         // Publish the viewport width so the bubble list can size to it (responsive
         // bubbles). The list is clipped by the scroll, so this can't feed back into
@@ -204,15 +228,20 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
         })
         .style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0));
 
-    // Jump-to-bottom: shown once the user has scrolled up off the latest content
-    // (>30px from the bottom). Click bumps the same signal the auto-follow uses.
+    // Jump-to-bottom: shown once the user has scrolled up off the latest content —
+    // the negation of the same predicate that gates the follow, so the button
+    // appears exactly when following has been released. Clicking it re-arms the
+    // follow and bumps the trigger.
     let show_jump = floem::reactive::create_memo(move |_| {
         let vp = view_rect.get();
-        vp.height() > 1.0 && content_h.get() - vp.y1 > 30.0
+        vp.height() > 1.0 && !at_content_bottom(content_h.get(), vp.y1, FOLLOW_SLACK)
     });
     let jump = jump_to_bottom_button(
         move || show_jump.get(),
-        move || bump.update(|n| *n = n.wrapping_add(1)),
+        move || {
+            follow.set(true);
+            bump.update(|n| *n = n.wrapping_add(1));
+        },
     );
     let convo = stack((scrolled, jump))
         .style(|s| s.flex_col().flex_grow(1.0_f32).width_full().min_height(0.0));

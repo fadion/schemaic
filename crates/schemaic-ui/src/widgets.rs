@@ -671,6 +671,21 @@ pub(crate) fn thin_scroll(s: ScrollCustomStyle) -> ScrollCustomStyle {
     s.vertical_track_inset(3.0).horizontal_track_inset(3.0)
 }
 
+/// Is the viewport parked at the bottom of the content, within `slack` px?
+///
+/// The predicate behind every tail-following list (the AI conversation, the Live
+/// Monitor's log): while it holds, new content scrolls into view; once the user
+/// scrolls up it goes false and the follow must be *released*, which — as
+/// `[[floem-scroll-follow]]` records — means the `scroll_to` closure returning
+/// `None`, not merely leaving its trigger un-bumped. A `scroll_to` target is
+/// sticky: the last one stays applied.
+///
+/// It is also what decides whether to offer a jump-to-bottom button, so the two
+/// can't disagree about where "the bottom" is.
+pub(crate) fn at_content_bottom(content_h: f64, viewport_bottom: f64, slack: f64) -> bool {
+    content_h - viewport_bottom <= slack
+}
+
 /// Auto-hide: bars stay hidden until content is scrolled; each scroll shows them
 /// and (re)arms a timer that hides them SCROLL_HIDE_MS after scrolling stops. The
 /// generation guard ensures only the latest scroll's timer fires.
@@ -1414,5 +1429,42 @@ mod menu_placement_tests {
             menu_panel_height(std::slice::from_ref(&sub)),
             menu_panel_height(&[MenuEntry::action("Copy", || {})])
         );
+    }
+}
+
+#[cfg(test)]
+mod follow_tests {
+    use super::*;
+
+    /// A streaming answer grows the content under a parked viewport: the moment
+    /// the gap opens past the slack, following must stop. The AI panel re-pinned
+    /// on every *token*, so scrolling up mid-answer was impossible.
+    #[test]
+    fn following_stops_once_the_viewport_is_off_the_bottom() {
+        assert!(
+            at_content_bottom(1000.0, 1000.0, 30.0),
+            "exactly at the end"
+        );
+        assert!(at_content_bottom(1000.0, 980.0, 30.0), "within the slack");
+        assert!(
+            !at_content_bottom(1000.0, 900.0, 30.0),
+            "scrolled up to read"
+        );
+    }
+
+    /// The boundary is inclusive, so a viewport sitting exactly `slack` px off the
+    /// bottom keeps following rather than flapping between the two states.
+    #[test]
+    fn the_slack_boundary_still_counts_as_the_bottom() {
+        assert!(at_content_bottom(1000.0, 970.0, 30.0));
+        assert!(!at_content_bottom(1000.0, 969.9, 30.0));
+    }
+
+    /// Content shorter than the viewport (a fresh conversation) is trivially at
+    /// the bottom — the follow must not be released before anything arrives.
+    #[test]
+    fn content_shorter_than_the_viewport_is_at_the_bottom() {
+        assert!(at_content_bottom(100.0, 400.0, 30.0));
+        assert!(at_content_bottom(0.0, 0.0, 30.0));
     }
 }
