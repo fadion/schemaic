@@ -387,9 +387,7 @@ fn ask_ai_button(
              output:\n```\n{}\n```",
             plan.to_prompt_text()
         );
-        if !matches!(right_panel.get_untracked(), RightPanel::Ai) {
-            right_panel.set(RightPanel::Ai);
-        }
+        crate::reveal_ai_panel(right_panel);
         (ai_send)(msg);
         (close)();
     })

@@ -417,6 +417,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
     let refresh_db = ui.schema_actions.refresh_db.clone();
     let collapse_db = ui.schema_actions.collapse_db.clone();
     let ai_send = ui.ai_actions.send.clone();
+    let right_panel = ui.layout.right_panel;
     let db_colors = ui.db_colors;
     let save_db_colors = ui.save_db_colors.clone();
     let db_favorites = ui.db_favorites;
@@ -955,7 +956,14 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
             entries.push(MenuEntry::action_icon(
                 "AI Explain",
                 (icons::SPARKLES, theme::key_foreign),
-                move || (ai)(prompt.clone()),
+                // Reveal, then send — as the palette's Ask AI and the grid's AI
+                // Summary already did. Without it, with the right column showing
+                // the Terminal or History (or closed), this sent the prompt into a
+                // panel the user couldn't see and read as doing nothing at all.
+                move || {
+                    crate::reveal_ai_panel(right_panel);
+                    (ai)(prompt.clone());
+                },
             ));
 
             entries
@@ -1620,9 +1628,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                         primary: "Ask AI".to_string(),
                         secondary: prompt.clone(),
                         activate: Rc::new(move || {
-                            if right_panel_allowed() {
-                                right_panel.set(RightPanel::Ai);
-                            }
+                            crate::reveal_ai_panel(right_panel);
                             (ai_send)(prompt.clone());
                             (close)();
                         }),
