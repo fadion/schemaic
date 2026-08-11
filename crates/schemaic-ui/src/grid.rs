@@ -713,6 +713,29 @@ impl GridState {
         }
     }
 
+    /// Do this grid's signals still exist?
+    ///
+    /// **Call this first in anything that runs later than the frame it was
+    /// scheduled in** — an `exec_after` tick, or a callback returned from a
+    /// query, a commit or an AI turn. Every `GridState` signal is created in the
+    /// child scope of a `dyn_container`, so switching tabs, closing one, or
+    /// re-running the query disposes all of them; `get_untracked` is
+    /// `try_get_untracked().unwrap()`, so a read after that **panics and takes
+    /// the app with it**. This was not theoretical: typing one character in the
+    /// find bar and pressing Ctrl+Tab within 150 ms crashed the app on the first
+    /// attempt.
+    ///
+    /// `set` is deliberately asymmetric here — floem silently no-ops writes to a
+    /// disposed signal — which is why the crashes all sit on *reads* and why the
+    /// unguarded callbacks looked fine for so long.
+    ///
+    /// The file had this guard in five places and was missing it in five others,
+    /// each spelled slightly differently. This is the one obvious thing for the
+    /// next deferred callback to call.
+    fn alive(&self) -> bool {
+        self.rs.try_get_untracked().is_some()
+    }
+
     /// Close any open popup menu and clear a lingering commit-error bar. Called
     /// from every grid click surface (cell / gutter / header) so a click anywhere
     /// on the table dismisses the error bar (its own clicks don't reach here).
@@ -1004,6 +1027,19 @@ impl GridState {
     /// threw away green cell edits elsewhere in the grid unwritten, and an edit
     /// staged during a commit's round-trip went the same way.
     fn apply_splice(&self, rows: Vec<(usize, Vec<Value>)>, committed: &HashSet<(usize, usize)>) {
+        // A splice whose target no longer exists is a no-op, not a crash. The
+        // commit is async and the grid it belongs to may be gone by the time it
+        // returns — re-running the query in the *same* tab is enough, and the
+        // app's own `still_active` downgrade only covers the neighbouring case
+        // (switching tabs). On a row another session holds a lock, the window is
+        // `innodb_lock_wait_timeout` wide — 50 s by default, open-ended in a
+        // Manual transaction — so this is not a millisecond race.
+        //
+        // The `set`s below would no-op harmlessly on their own; it is
+        // `sync_canonical.get_untracked()` and `rs.get_untracked()` that panic.
+        if !self.alive() {
+            return;
+        }
         if !rows.is_empty() {
             self.rs.update(|arc| {
                 Arc::make_mut(arc).splice_rows(&rows);
@@ -2265,6 +2301,13 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             if gen_at.get() != g {
                 return; // superseded by a newer query/order/format change
             }
+            // The generation check above can't stand in for this: `gen_at` is an
+            // `Rc<Cell>` owned by the closure, so it survives the grid's disposal
+            // untouched and happily passes. 150 ms is comfortably inside a
+            // Ctrl+Tab after a keystroke — this is the reproduced crash.
+            if !gs.alive() {
+                return;
+            }
             let (hits, more) = grid_find_hits(gs);
             find_total.set(hits.len());
             find_more.set(more);
@@ -2624,6 +2667,11 @@ fn clone_row(gs: GridState, data_idx: usize) {
     let model = gs.edit_model.get_untracked();
     let first = (0..ncols).find(|&ci| model.editable(ci)).unwrap_or(0);
     floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+        // One tick is a smaller window than the find bar's 150 ms, but it is not
+        // no window: `scroll_active_into_view` reads `gs.vp`.
+        if !gs.alive() {
+            return;
+        }
         gs.active.set(Some((disp, first)));
         gs.anchor.set(Some((disp, first)));
         scroll_active_into_view(gs, disp, first);
@@ -2644,6 +2692,10 @@ fn add_pending_row(gs: GridState) {
     match first_editable {
         Some(ci) => {
             floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+                // `start_edit` reads `gs.rs`.
+                if !gs.alive() {
+                    return;
+                }
                 start_edit(gs, disp, ci);
                 scroll_active_into_view(gs, disp, ci);
             });
@@ -3820,12 +3872,36 @@ const FIND_MAX_HITS: usize = 100_000;
 /// thread's keystroke path so a big grid doesn't stutter typing.
 fn grid_find_hits(gs: GridState) -> (Vec<usize>, bool) {
     let q = gs.find_query.get_untracked();
-    if q.is_empty() {
-        return (Vec::new(), false);
-    }
     let rs = gs.rs.get_untracked();
     let order = gs.order.get_untracked();
     let formats = gs.formats.get_untracked();
+    find_hits(&rs, &order, &formats, &q)
+}
+
+/// Which cells match `q`, as **display** positions (`display_row * ncols + col`),
+/// and whether the scan stopped early.
+///
+/// Split out from [`grid_find_hits`] so the decision is testable without a live
+/// grid — it was on A5's untested list, and it is what a 150 ms debounce calls
+/// from a timer that may outlive the grid.
+///
+/// Two things it must get right and neither is obvious from the call site.
+/// `order` is the display→data mapping, so the hits are where the user is
+/// *looking*, not where the row sits in the result. And matching is against the
+/// **displayed** text (`format::apply`), because the find bar searches what is on
+/// screen: an epoch column formatted as a date has to be findable by the date.
+///
+/// `more` is true when either budget cut the scan short, so the bar can say
+/// "500+" rather than reporting a floor as a total.
+fn find_hits(
+    rs: &ResultSet,
+    order: &[usize],
+    formats: &[ColumnFormat],
+    q: &str,
+) -> (Vec<usize>, bool) {
+    if q.is_empty() {
+        return (Vec::new(), false);
+    }
     let ncols = rs.col_count();
     let mut hits = Vec::new();
     let mut more = false;
@@ -3839,7 +3915,7 @@ fn grid_find_hits(gs: GridState) -> (Vec<usize>, bool) {
             scanned += 1;
             if let Some(c) = rs.cell(data, ci) {
                 let fmt = formats.get(ci).copied().unwrap_or_default();
-                if contains_ignore_ascii_case(&format::apply(fmt, &c.to_value()), &q) {
+                if contains_ignore_ascii_case(&format::apply(fmt, &c.to_value()), q) {
                     hits.push(dr * ncols + ci);
                     if hits.len() >= FIND_MAX_HITS {
                         more = true;
@@ -5719,5 +5795,100 @@ mod tests {
             }
         });
         assert_eq!(got, want);
+    }
+}
+
+#[cfg(test)]
+mod find_hits_tests {
+    use super::*;
+    use schemaic_core::model::Column;
+
+    fn c(name: &str) -> Column {
+        Column {
+            name: name.to_string(),
+            type_name: "VARCHAR".to_string(),
+            origin: None,
+        }
+    }
+
+    fn grid(rows: &[[&str; 2]]) -> ResultSet {
+        ResultSet::from_rows(
+            vec![c("a"), c("b")],
+            rows.iter()
+                .map(|r| r.iter().map(|s| Value::Str(s.to_string())).collect())
+                .collect(),
+        )
+    }
+
+    fn fmts() -> Vec<ColumnFormat> {
+        vec![ColumnFormat::None; 2]
+    }
+
+    #[test]
+    fn an_empty_query_matches_nothing() {
+        let rs = grid(&[["alpha", "beta"]]);
+        assert_eq!(find_hits(&rs, &[0], &fmts(), ""), (Vec::new(), false));
+    }
+
+    #[test]
+    fn hits_are_display_positions_not_data_positions() {
+        // `order` is the display→data mapping, so a sorted grid must report the
+        // cell where the user is *looking*. Row 1 of the data is shown first.
+        let rs = grid(&[["zulu", "x"], ["alpha", "y"]]);
+        let (hits, more) = find_hits(&rs, &[1, 0], &fmts(), "zulu");
+        assert!(!more);
+        // "zulu" is data row 0, shown second → display row 1, column 0.
+        assert_eq!(hits, vec![2], "display row 1, column 0");
+    }
+
+    #[test]
+    fn matching_is_case_insensitive_and_substring() {
+        let rs = grid(&[["Alpha", "beta"]]);
+        assert_eq!(find_hits(&rs, &[0], &fmts(), "LPH").0, vec![0]);
+    }
+
+    #[test]
+    fn every_matching_cell_in_a_row_is_its_own_hit() {
+        let rs = grid(&[["match", "match"]]);
+        assert_eq!(find_hits(&rs, &[0], &fmts(), "match").0, vec![0, 1]);
+    }
+
+    /// The two budgets exist so a huge result can't freeze the UI counting, and
+    /// `more` is what lets the bar say "500+" honestly rather than a wrong total.
+    #[test]
+    fn the_hit_cap_reports_more_rather_than_a_wrong_total() {
+        let rows: Vec<[&str; 2]> = vec![["hit", "hit"]; FIND_MAX_HITS];
+        let rs = grid(&rows);
+        let order: Vec<usize> = (0..rows.len()).collect();
+        let (hits, more) = find_hits(&rs, &order, &fmts(), "hit");
+        assert_eq!(hits.len(), FIND_MAX_HITS);
+        assert!(more, "capped, so the count is a floor not a total");
+    }
+
+    #[test]
+    fn the_scan_budget_also_reports_more() {
+        // Enough cells to exhaust the cell budget with no match at all.
+        let rows: Vec<[&str; 2]> = vec![["x", "y"]; FIND_COUNT_CELL_BUDGET];
+        let rs = grid(&rows);
+        let order: Vec<usize> = (0..rows.len()).collect();
+        let (hits, more) = find_hits(&rs, &order, &fmts(), "nomatch");
+        assert!(hits.is_empty());
+        assert!(more, "the scan stopped early, so 0 is not a real total");
+    }
+
+    /// The find bar searches what is on screen, so a formatted column has to be
+    /// matched on its *displayed* text — searching an epoch column for the date
+    /// you can see must work.
+    #[test]
+    fn matching_uses_the_displayed_value_not_the_raw_one() {
+        let rs = ResultSet::from_rows(
+            vec![c("when")],
+            vec![vec![Value::Int(0)], vec![Value::Int(86_400)]],
+        );
+        let formats = vec![ColumnFormat::Timestamp];
+        let (hits, _) = find_hits(&rs, &[0, 1], &formats, "1970");
+        assert_eq!(hits.len(), 2, "both epochs render as 1970 dates");
+        // And the raw value is not what was searched.
+        assert!(find_hits(&rs, &[0, 1], &formats, "86400").0.is_empty());
     }
 }
