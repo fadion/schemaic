@@ -99,7 +99,9 @@ use schemaic_core::intel::SqlDialect;
 use schemaic_core::persist::{self, ConnectionsFile, UiState};
 use schemaic_core::schema::{SchemaState, TableSource};
 use schemaic_core::sql::{GuardPolicy, RunVerdict, run_verdict};
-use schemaic_core::tx::{StmtOutcome, TabTx, TxEngine, TxMode, TxState, ddl_blocking_tabs};
+use schemaic_core::tx::{
+    StmtOutcome, TabTx, TxEngine, TxMode, TxState, ddl_blocking_tabs, session_still_wanted,
+};
 use schemaic_db::{Db, DbError, Session};
 use schemaic_ui::theme::{EditorThemeKind, UiThemeKind};
 use schemaic_ui::{
@@ -459,6 +461,40 @@ fn smallest_free_label(used: &[usize]) -> usize {
         n += 1;
     }
     n
+}
+
+/// What a schema load that has just landed is still allowed to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadLanding {
+    /// Nothing superseded it: install the nodes, bind the tabs, fan the
+    /// per-database fetches out.
+    Install,
+    /// Something newer owns the tree now. The tunnel this load opened is still
+    /// worth caching — it belongs to its *connection*, which the user may return
+    /// to, and dropping it would only force a reconnect — but nothing else it
+    /// carries may touch shared state.
+    KeepTunnelOnly,
+}
+
+/// Is a landed schema load still the one the UI is waiting for?
+///
+/// `started` is the `(connection id, generation)` the load stamped itself with;
+/// `current` is what those are now. A load is a `fetch_databases` and, over an
+/// SSH tunnel, a connect before it — seconds, during which the user can switch
+/// connection or press Refresh again.
+///
+/// Both halves earn their place. The connection id is the case the user sees: a
+/// slow remote load landing after a fast local one repoints the tree, the
+/// active-database menu, the completion index and the grid's key icons at a
+/// connection every query has stopped using. The generation is the case an id
+/// check alone misses — two loads of the *same* connection, where the first to
+/// land installs the older node list and disposes the newer one's scope.
+fn load_landing(started: (u64, u64), current: (u64, u64)) -> LoadLanding {
+    if started == current {
+        LoadLanding::Install
+    } else {
+        LoadLanding::KeepTunnelOnly
+    }
 }
 
 /// The default connection created on first launch (matches the local WSL
@@ -1909,22 +1945,43 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             };
             let database = tab.database.get_untracked();
             let sessions = sessions.clone();
-            let opened =
-                create_ext_action(cx, move |res: Result<Arc<Session>, String>| match res {
+            let closer = handle.clone();
+            let opened = create_ext_action(cx, move |res: Result<Arc<Session>, String>| {
+                // Re-resolve the tab instead of reading the captured copy. An
+                // open is a full connect — seconds through a tunnel — and a tab
+                // closed meanwhile has had its scope disposed one tick later, so
+                // `tab.tx_mode.get_untracked()` would be a read of a freed
+                // signal, which panics. Absent from `tabs` is the answer, and it
+                // is also the answer to "who owns this session now".
+                let mode = tabs.with_untracked(|v| {
+                    v.iter()
+                        .find(|t| t.id == tab_id)
+                        .map(|t| t.tx_mode.get_untracked())
+                });
+                match res {
                     Ok(s) => {
                         // A flip back to Auto (or a tab close) may have raced us;
-                        // don't resurrect a session nobody wants.
-                        if tab.tx_mode.get_untracked().is_manual() {
+                        // don't resurrect a session nobody wants — and don't file
+                        // it under a dead tab id either, where nothing would ever
+                        // remove it and the connection would be held for the life
+                        // of the process.
+                        if session_still_wanted(mode) {
                             sessions.borrow_mut().insert(tab_id, s);
+                        } else {
+                            closer.spawn(async move { s.close().await });
                         }
                     }
+                    // Nothing to flip back, and a modal about a tab the user has
+                    // already closed is noise.
+                    Err(_) if mode.is_none() => {}
                     Err(e) => {
                         tab.tx_mode.set(TxMode::Auto);
                         error_modal_text
                             .set(Some(format!("couldn't open a transaction connection: {e}")));
                         error_modal_open.set(true);
                     }
-                });
+                }
+            });
             handle.spawn(async move {
                 opened(
                     Session::open(&db, database.as_deref())
@@ -3018,12 +3075,21 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // For an SSH connection, open (or reuse) a tunnel first, then list the
     // databases through it; the resolved tunnel port is cached and every
     // downstream `Db` (schema, table-open, editor) is built pointing through it.
+    //
+    // Every call stamps itself `(conn id, generation)`; the completion checks the
+    // stamp against the live one before touching anything shared. See
+    // `load_landing`.
+    let schema_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
     let load_schema: Rc<dyn Fn(Connection)> = {
         let handle = handle.clone();
         let tunnels = tunnels.clone();
         let nodes_scope = nodes_scope.clone();
+        let schema_gen = schema_gen.clone();
         Rc::new(move |conn: Connection| {
             db_nodes.set(Vec::new());
+            let stamp = (conn.id, schema_gen.get() + 1);
+            schema_gen.set(stamp.1);
+            let gen_cb = schema_gen.clone();
             let nodes_scope_cb = nodes_scope.clone();
             let cached_port = tunnels.borrow().get(&conn.id).map(|h| h.port());
             let handle_inner = handle.clone();
@@ -3033,58 +3099,73 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             // Result payload: the effective tunnel port (if SSH), a *newly opened*
             // tunnel handle to cache (None when reusing a cached one), and the db
             // names.
-            let send = create_ext_action(cx, move |res: ConnectResult| match res {
-                Ok((tunnel_port, new_handle, names)) => {
-                    if let Some(handle) = new_handle {
-                        // Dropping any prior handle here tears its listener down.
-                        tunnels_cache.borrow_mut().insert(conn_send.id, handle);
-                    }
-                    // Build these nodes in a fresh child scope; dispose the
-                    // previous set's scope (deferred, so the schema tree —
-                    // keyed on node id — rebuilds off the new nodes before the
-                    // old signals are freed) so schema signals don't leak
-                    // across connection switches / refreshes (C14).
-                    let node_cx = cx.create_child();
-                    let mut nodes = Vec::with_capacity(names.len());
-                    for (i, name) in names.iter().enumerate() {
-                        nodes.push(ConnNode::new(node_cx, i + 1, name, name));
-                    }
-                    db_nodes.set(nodes.clone());
-                    if let Some(old) = nodes_scope_cb.borrow_mut().replace(node_cx) {
-                        exec_after(Duration::ZERO, move |_| old.dispose());
-                    }
-                    // Bind any tab of THIS connection that doesn't yet have a
-                    // database (e.g. the initial tab) to the first database.
-                    if let Some(first) = names.first() {
-                        tabs.with_untracked(|v| {
-                            for t in v {
-                                if t.conn_id.get_untracked() == conn_send.id
-                                    && t.database.get_untracked().is_none()
-                                {
-                                    t.database.set(Some(first.clone()));
+            let send = create_ext_action(cx, move |res: ConnectResult| {
+                let landing = load_landing(stamp, (active_conn.get_untracked(), gen_cb.get()));
+                match res {
+                    Ok((tunnel_port, new_handle, names)) => {
+                        if let Some(handle) = new_handle {
+                            // Dropping any prior handle here tears its listener down.
+                            tunnels_cache.borrow_mut().insert(conn_send.id, handle);
+                        }
+                        // Everything past this point writes state the tree, the
+                        // database menu, the completion index and every open tab
+                        // read — so a load the user has moved on from stops here,
+                        // its tunnel kept.
+                        if landing != LoadLanding::Install {
+                            return;
+                        }
+                        // Build these nodes in a fresh child scope; dispose the
+                        // previous set's scope (deferred, so the schema tree —
+                        // keyed on node id — rebuilds off the new nodes before the
+                        // old signals are freed) so schema signals don't leak
+                        // across connection switches / refreshes (C14).
+                        let node_cx = cx.create_child();
+                        let mut nodes = Vec::with_capacity(names.len());
+                        for (i, name) in names.iter().enumerate() {
+                            nodes.push(ConnNode::new(node_cx, i + 1, name, name));
+                        }
+                        db_nodes.set(nodes.clone());
+                        if let Some(old) = nodes_scope_cb.borrow_mut().replace(node_cx) {
+                            exec_after(Duration::ZERO, move |_| old.dispose());
+                        }
+                        // Bind any tab of THIS connection that doesn't yet have a
+                        // database (e.g. the initial tab) to the first database.
+                        if let Some(first) = names.first() {
+                            tabs.with_untracked(|v| {
+                                for t in v {
+                                    if t.conn_id.get_untracked() == conn_send.id
+                                        && t.database.get_untracked().is_none()
+                                    {
+                                        t.database.set(Some(first.clone()));
+                                    }
                                 }
-                            }
-                        });
+                            });
+                        }
+                        // One `Db` for this connection, cloned per-database fetch.
+                        let db = Db::connect(&conn_send, tunnel_port);
+                        for node in nodes {
+                            let sig = node.schema;
+                            let dbname = node.database.clone();
+                            let db = db.clone();
+                            let send_schema =
+                                create_ext_action(cx, move |st: SchemaState| sig.set(st));
+                            handle_inner.spawn(async move {
+                                let st = match db.fetch_schema(&dbname).await {
+                                    Ok(s) => SchemaState::Loaded(Arc::new(s)),
+                                    Err(e) => SchemaState::Failed(e.to_string()),
+                                };
+                                send_schema(st);
+                            });
+                        }
                     }
-                    // One `Db` for this connection, cloned per-database fetch.
-                    let db = Db::connect(&conn_send, tunnel_port);
-                    for node in nodes {
-                        let sig = node.schema;
-                        let dbname = node.database.clone();
-                        let db = db.clone();
-                        let send_schema = create_ext_action(cx, move |st: SchemaState| sig.set(st));
-                        handle_inner.spawn(async move {
-                            let st = match db.fetch_schema(&dbname).await {
-                                Ok(s) => SchemaState::Loaded(Arc::new(s)),
-                                Err(e) => SchemaState::Failed(e.to_string()),
-                            };
-                            send_schema(st);
-                        });
+                    Err(e) => {
+                        tracing::error!("schema load failed: {e}");
+                        // Same rule on this side: clearing the tree here would empty
+                        // it for a connection that loaded perfectly well.
+                        if landing == LoadLanding::Install {
+                            db_nodes.set(Vec::new());
+                        }
                     }
-                }
-                Err(e) => {
-                    tracing::error!("schema load failed: {e}");
-                    db_nodes.set(Vec::new());
                 }
             });
             let conn_task = conn.clone();
@@ -5088,6 +5169,35 @@ mod app_tests {
         // Gaps are filled: "Query 1" free even though "Query"/"Query 2" taken.
         let existing = vec!["Query".to_string(), "Query 2".to_string()];
         assert_eq!(unique_name("Query", &existing), "Query 1");
+    }
+
+    #[test]
+    fn a_schema_load_nothing_superseded_installs() {
+        use super::{LoadLanding, load_landing};
+        assert_eq!(load_landing((7, 3), (7, 3)), LoadLanding::Install);
+    }
+
+    #[test]
+    fn a_schema_load_for_a_connection_the_user_left_installs_nothing() {
+        use super::{LoadLanding, load_landing};
+        // The slow one lands after the fast one: its nodes, its first-database
+        // binding and its per-database fetches all describe a connection the
+        // user is no longer looking at.
+        assert_eq!(
+            load_landing((7, 3), (8, 4)),
+            LoadLanding::KeepTunnelOnly,
+            "another connection is active now"
+        );
+    }
+
+    #[test]
+    fn an_older_load_of_the_same_connection_installs_nothing_either() {
+        use super::{LoadLanding, load_landing};
+        // The case an `active_conn` check alone misses: Refresh pressed twice,
+        // or switching away and back. Both loads are for the active connection
+        // and the first to land is not the one the tree should show — it would
+        // also dispose the *newer* node scope.
+        assert_eq!(load_landing((7, 3), (7, 4)), LoadLanding::KeepTunnelOnly);
     }
 
     #[test]
