@@ -31,7 +31,6 @@ use std::sync::Arc;
 
 use mysql_async::Conn;
 use mysql_async::prelude::Queryable;
-use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{GridWrite, RefetchRow, RefetchTemplate, ResultSet, Value};
 use schemaic_core::tx::{self, StmtOutcome};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -306,21 +305,14 @@ impl Session {
         };
         // MySQL DDL commits the open transaction out from under us, so the flag
         // has to follow — otherwise the next statement would skip its `BEGIN`
-        // and run auto-committed. Same predicate `TxState` folds on, so the
-        // session's view and the pill's can't drift.
-        if result.is_ok() && tx::implicit_commit(self.tx_engine(), sql) {
-            // `BEGIN`/`START TRANSACTION` are on that list because opening one
-            // commits the current one — but they also leave a new transaction
-            // open, so the flag stays set for them.
-            let dialect = match self.db.engine() {
-                Engine::Postgres => SqlDialect::Postgres,
-                Engine::MySql => SqlDialect::MySql,
-            };
-            let opens = matches!(
-                schemaic_core::sql::leading_keyword(sql, dialect).as_deref(),
-                Some("BEGIN") | Some("START")
-            );
-            self.in_tx.store(opens, Ordering::SeqCst);
+        // and run auto-committed. `tx::tx_open_after` is that decision, pure and
+        // tested, and it is built on the same `implicit_commit` the pill folds
+        // on, so the session's view and the pill's can't drift. `None` = the
+        // statement changed nothing about whether a transaction is open.
+        if result.is_ok()
+            && let Some(open) = tx::tx_open_after(self.tx_engine(), sql)
+        {
+            self.in_tx.store(open, Ordering::SeqCst);
         }
         Session::classify(&mut guard, result).await
     }
