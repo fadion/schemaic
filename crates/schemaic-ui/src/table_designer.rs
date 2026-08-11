@@ -694,10 +694,9 @@ fn table_section(ui: Ui, target: &DesignerTarget) -> AnyView {
 fn columns_list(ui: Ui) -> AnyView {
     let d = ui.ddl;
     let draft = d.draft.get_untracked();
-    let pk = draft.primary_key.clone();
     let ui_rows = ui.clone();
     let rows = v_stack_from_iter(draft.columns.iter().enumerate().map(|(i, c)| {
-        let is_pk = pk.contains(&c.info.name);
+        let is_pk = draft.is_in_primary_key(i);
         list_row(
             ui_rows.clone(),
             i,
@@ -756,7 +755,7 @@ fn column_form(ui: Ui, target: &DesignerTarget) -> AnyView {
         return centered_hint("No column selected.").into_any();
     };
     let pg = target.dialect == SqlDialect::Postgres;
-    let in_pk = draft.primary_key.contains(&c.name);
+    let in_pk = draft.is_in_primary_key(i);
 
     let name = form_setting(
         "Name",
@@ -802,18 +801,7 @@ fn column_form(ui: Ui, target: &DesignerTarget) -> AnyView {
         "Primary key",
         "Part of the table's primary key, appended in the order you add columns.",
         in_pk,
-        move |d, v| {
-            let Some(name) = d.columns.get(i).map(|c| c.info.name.clone()) else {
-                return;
-            };
-            if v {
-                if !d.primary_key.contains(&name) {
-                    d.primary_key.push(name);
-                }
-            } else {
-                d.primary_key.retain(|p| *p != name);
-            }
-        },
+        move |d, v| d.set_in_primary_key(i, v),
     );
     let auto = bound_toggle(
         &ui,
