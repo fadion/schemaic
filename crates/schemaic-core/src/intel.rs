@@ -1181,16 +1181,26 @@ pub fn word_start(text: &str, offset: usize) -> usize {
 /// byte offset where the caret's current word begins. Lexer-based, so it stays
 /// correct mid-edit (when the statement doesn't parse).
 pub fn clause_context(sql: &str, lo: usize, word_lo: usize, dialect: SqlDialect) -> ClauseCtx {
-    // Qualified reference: the char just before the word is a `.`.
-    if word_lo > lo && sql.as_bytes()[word_lo - 1] == b'.' {
-        let q_start = word_start(sql, word_lo - 1);
-        let qualifier = sql.get(q_start..word_lo - 1).unwrap_or("").to_string();
-        if !qualifier.is_empty() {
-            return ClauseCtx::Qualified(qualifier);
-        }
+    let toks = tokenize_range(sql, lo, word_lo, dialect);
+    // Qualified reference: the char just before the word is a `.`. Read the
+    // qualifier off the **tokenizer**, not the raw bytes — stepping back over
+    // word bytes stops at the closing quote of `"Orders"` or `` `orders` ``, so
+    // the qualifier came out empty and the branch fell through to the generic
+    // list. Schemaic writes those quoted forms itself (a mixed-case PostgreSQL
+    // name, a reserved-word MySQL one), so this is the shape you get by opening
+    // a table from the tree. Going through the lexer also gets the qualifier of
+    // a dotted pair (`"sales"."Orders".`) right for free.
+    if word_lo > lo
+        && sql.as_bytes()[word_lo - 1] == b'.'
+        && let [.., q, d] = toks.as_slice()
+        && matches!(d.kind, TkKind::Dot)
+        && d.at == word_lo - 1
+        && let TkKind::Word(name) = &q.kind
+        && !name.is_empty()
+    {
+        return ClauseCtx::Qualified(name.clone());
     }
     // The last clause keyword strictly before the caret's word decides the rest.
-    let toks = tokenize_range(sql, lo, word_lo, dialect);
     let mut last_kw: Option<String> = None;
     for t in &toks {
         if let TkKind::Word(w) = &t.kind {
@@ -1758,14 +1768,18 @@ pub fn statement_scope(
 mod ast_scope {
     use super::{Scope, TableRef};
     use sqlparser::ast::{
-        Cte, FromTable, Query, Select, SetExpr, Statement, TableFactor, TableWithJoins,
+        Cte, FromTable, Query, Select, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
     };
 
     pub(super) fn collect_statement(stmt: &Statement, out: &mut Scope) {
         match stmt {
             Statement::Query(q) => collect_query(q, out),
             Statement::Insert(insert) => {
-                push_object_name(&insert.table.to_string(), None, out);
+                if let TableObject::TableName(name) = &insert.table
+                    && let Some(r) = table_ref_of(name, None)
+                {
+                    push_ref(r, out);
+                }
                 if let Some(src) = &insert.source {
                     collect_query(src, out);
                 }
@@ -1829,23 +1843,10 @@ mod ast_scope {
     fn collect_factor(factor: &TableFactor, out: &mut Scope) {
         match factor {
             TableFactor::Table { name, alias, .. } => {
-                let parts: Vec<String> = super::object_name_parts(name);
-                let (db, table) = match parts.as_slice() {
-                    [t] => (None, t.clone()),
-                    [d, t] => (Some(d.clone()), t.clone()),
-                    // db.schema.table etc. → last is the table, prior is its db.
-                    [.., d, t] => (Some(d.clone()), t.clone()),
-                    [] => return,
-                };
                 let alias = alias.as_ref().map(|a| a.name.value.clone());
-                push_ref(
-                    TableRef {
-                        name: table,
-                        alias,
-                        db,
-                    },
-                    out,
-                );
+                if let Some(r) = table_ref_of(name, alias) {
+                    push_ref(r, out);
+                }
             }
             TableFactor::Derived {
                 subquery, alias, ..
@@ -1863,19 +1864,30 @@ mod ast_scope {
         }
     }
 
-    fn push_object_name(name: &str, alias: Option<String>, out: &mut Scope) {
-        let table = name.rsplit('.').next().unwrap_or(name).trim_matches('`');
-        let db = name
-            .rsplit_once('.')
-            .map(|(d, _)| d.trim_matches('`').to_string());
-        push_ref(
-            TableRef {
-                name: table.to_string(),
-                alias,
-                db,
-            },
-            out,
-        );
+    /// One `ObjectName` → one [`TableRef`], the **only** place that decides how a
+    /// parsed name splits into database and table.
+    ///
+    /// Through [`super::object_name_parts`], per the invariant: `ObjectNamePart`'s
+    /// `Display` re-adds the quoting, so a `` `t` ``/`"t"` name comes back
+    /// quote-wrapped and never matches the catalog, which is keyed on bare names.
+    /// The `INSERT` arm used to do this itself off `Display` plus a
+    /// `trim_matches('`')` that knew MySQL's quote character and no other — so a
+    /// PostgreSQL target kept its quotes — and split on a raw `.`, which cuts
+    /// `"my.table"` in the wrong place. Both are gone by having one implementation.
+    fn table_ref_of(name: &sqlparser::ast::ObjectName, alias: Option<String>) -> Option<TableRef> {
+        let parts: Vec<String> = super::object_name_parts(name);
+        let (db, table) = match parts.as_slice() {
+            [t] => (None, t.clone()),
+            [d, t] => (Some(d.clone()), t.clone()),
+            // db.schema.table etc. → last is the table, prior is its db.
+            [.., d, t] => (Some(d.clone()), t.clone()),
+            [] => return None,
+        };
+        Some(TableRef {
+            name: table,
+            alias,
+            db,
+        })
     }
 
     fn push_ref(r: TableRef, out: &mut Scope) {
@@ -6517,6 +6529,92 @@ mod tests {
             let star = expand_star(sql, 0, sql.len(), 8, &cat, d).expect("a star expands");
             assert_eq!(star.replacement, "id, customer_id", "{d:?}");
         }
+    }
+
+    #[test]
+    fn a_quoted_qualifier_offers_that_tables_columns() {
+        // Schemaic writes the quoted form itself — a mixed-case PostgreSQL table
+        // or a reserved-word MySQL one — so `"Orders".` is a shape the user
+        // reaches by opening a table from the tree, not an exotic one.
+        for (sql, dialect, want) in [
+            (r#"SELECT "Orders"."#, SqlDialect::Postgres, "Orders"),
+            ("SELECT `orders`.", SqlDialect::MySql, "orders"),
+            (
+                r#"SELECT "sales"."Orders"."#,
+                SqlDialect::Postgres,
+                "Orders",
+            ),
+            // Bare must not move.
+            ("SELECT orders.", SqlDialect::MySql, "orders"),
+            ("SELECT orders.", SqlDialect::Postgres, "orders"),
+        ] {
+            let wl = word_start(sql, sql.len());
+            assert_eq!(
+                clause_context(sql, 0, wl, dialect),
+                ClauseCtx::Qualified(want.to_string()),
+                "{sql:?} ({dialect:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn an_insert_target_is_in_scope_unquoted() {
+        // Three of the four statement kinds route through `object_name_parts`;
+        // the INSERT arm unquoted by hand with `trim_matches('`')`, which knows
+        // MySQL's quote character and no other — so a PostgreSQL target stayed
+        // `"Orders"`, quotes included, and never matched the catalog.
+        let cases = [
+            (
+                r#"INSERT INTO "Orders" (id) VALUES (1)"#,
+                SqlDialect::Postgres,
+                "Orders",
+                None,
+            ),
+            (
+                r#"INSERT INTO "sales"."Orders" (id) VALUES (1)"#,
+                SqlDialect::Postgres,
+                "Orders",
+                Some("sales"),
+            ),
+            (
+                "INSERT INTO `orders` (id) VALUES (1)",
+                SqlDialect::MySql,
+                "orders",
+                None,
+            ),
+            (
+                "INSERT INTO orders (id) VALUES (1)",
+                SqlDialect::MySql,
+                "orders",
+                None,
+            ),
+            (
+                "INSERT INTO `shop`.`orders` (id) VALUES (1)",
+                SqlDialect::MySql,
+                "orders",
+                Some("shop"),
+            ),
+        ];
+        for (sql, dialect, table, db) in cases {
+            let scope = statement_scope(sql, 0, sql.len(), sql.len(), dialect);
+            let t = scope
+                .tables
+                .first()
+                .unwrap_or_else(|| panic!("{sql:?}: nothing in scope"));
+            assert_eq!(t.name, table, "{sql:?}");
+            assert_eq!(t.db.as_deref(), db, "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn a_dot_inside_a_quoted_name_is_not_a_qualifier_separator() {
+        // The latent half: splitting the qualified name on a raw `.` splits
+        // `"my.table"` in the wrong place.
+        let sql = r#"INSERT INTO "my.table" (id) VALUES (1)"#;
+        let scope = statement_scope(sql, 0, sql.len(), sql.len(), SqlDialect::Postgres);
+        let t = scope.tables.first().expect("in scope");
+        assert_eq!(t.name, "my.table");
+        assert_eq!(t.db, None);
     }
 
     /// The quoting decision itself, at the one place that makes it.
