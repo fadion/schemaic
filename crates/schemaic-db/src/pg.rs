@@ -520,6 +520,35 @@ fn user_schema_filter(ns: &str) -> String {
     )
 }
 
+/// Every browsable object in the database, as `(namespace, name, "BASE TABLE" |
+/// "VIEW")` — the list that **decides what exists**, since `assemble_schema`
+/// builds its tables from it alone and drops every other row set whose table
+/// isn't in it.
+///
+/// From `pg_catalog`, not `information_schema.tables`, and that is the point:
+/// PostgreSQL 16's own catalogue definition filters that view to
+/// `c.relkind IN ('r','v','f','p')`, so **it cannot return a materialized
+/// view** — they aren't in the SQL standard. Every matview was therefore
+/// invisible in the tree, completion, the ERD, Find-Anywhere and `Catalog`, with
+/// no error and no partial entry, while the four other queries in
+/// [`fetch_schema`] all already reached `'m'` and had their rows discarded. The
+/// view-body query had switched to `pg_get_viewdef` over `pg_class` for exactly
+/// this reason; this one hadn't.
+///
+/// Checked against the live fixtures: identical output to the old query on
+/// `world`, `chinook` and the multi-schema `warehouse`, differing only by the
+/// matview it now returns.
+fn table_list_sql() -> String {
+    format!(
+        "SELECT n.nspname, c.relname, \
+                CASE WHEN c.relkind IN ('v','m') THEN 'VIEW' ELSE 'BASE TABLE' END \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind IN ('r','v','m','p','f') AND {} \
+         ORDER BY n.nspname, c.relname",
+        user_schema_filter("n.nspname")
+    )
+}
+
 use crate::{ColRow, IdxRow};
 /// A catalogue row tagged with the namespace it belongs to, so the whole-database
 /// fetch can be partitioned per schema before folding.
@@ -547,19 +576,14 @@ fn schema_sort_key(name: &str) -> (u8, String) {
 pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, DbError> {
     let client = connect_to(db, database).await?;
 
-    // Tables (BASE TABLE / VIEW), across every user schema.
-    let table_rows: Vec<(String, String, String)> = query_all(
-        &client,
-        &format!(
-            "SELECT table_schema, table_name, table_type FROM information_schema.tables \
-             WHERE {} ORDER BY table_schema, table_name",
-            user_schema_filter("table_schema")
-        ),
-    )
-    .await?
-    .into_iter()
-    .map(|r| (cell(&r, 0), cell(&r, 1), cell(&r, 2)))
-    .collect();
+    // Every browsable object (BASE TABLE / VIEW / materialized view), across
+    // every user schema. See `table_list_sql` for why this can't come from
+    // `information_schema`.
+    let table_rows: Vec<(String, String, String)> = query_all(&client, &table_list_sql())
+        .await?
+        .into_iter()
+        .map(|r| (cell(&r, 0), cell(&r, 1), cell(&r, 2)))
+        .collect();
 
     // Indexes via `pg_catalog` (every index, not just constraint-backed ones),
     // columns in `indkey` order. `unnest(... ) WITH ORDINALITY` preserves column
@@ -1731,5 +1755,53 @@ mod tests {
         // So does an identity column, either form.
         assert!(!pg_no_default(true, false, "a"));
         assert!(!pg_no_default(true, false, "d"));
+    }
+}
+
+#[cfg(test)]
+mod table_list_tests {
+    use super::*;
+
+    /// `information_schema.tables` **cannot** return a materialized view:
+    /// PostgreSQL 16's own catalogue definition filters
+    /// `c.relkind IN ('r','v','f','p')` and `'m'` is absent. Reading the object
+    /// list from it made every matview invisible everywhere — tree, completion,
+    /// ERD, Find-Anywhere, catalog — while the four *other* queries in
+    /// `fetch_schema` all already reached `'m'`, so its columns, body and options
+    /// were fetched over the wire and then silently discarded.
+    #[test]
+    fn the_object_list_does_not_come_from_information_schema() {
+        let sql = table_list_sql();
+        assert!(
+            !sql.contains("information_schema.tables"),
+            "the one view that structurally cannot answer this question"
+        );
+        assert!(sql.contains("pg_class"));
+        assert!(sql.contains("pg_namespace"));
+    }
+
+    #[test]
+    fn the_object_list_reaches_materialized_views() {
+        let sql = table_list_sql();
+        // Ordinary tables, views, matviews, partitioned tables, foreign tables.
+        for kind in ["'r'", "'v'", "'m'", "'p'", "'f'"] {
+            assert!(sql.contains(kind), "relkind {kind} missing from {sql}");
+        }
+    }
+
+    /// A matview has to arrive typed `VIEW`, or `assemble_schema` builds a
+    /// `TableInfo` with `is_view` false and the whole view path — the editor's
+    /// drop-only gate, the context menu — stays unreachable for it.
+    #[test]
+    fn views_and_matviews_are_both_typed_view() {
+        let sql = table_list_sql();
+        assert!(sql.contains("IN ('v','m') THEN 'VIEW'"));
+    }
+
+    #[test]
+    fn the_object_list_uses_the_shared_namespace_filter() {
+        // Same filter as the other four queries, so the five can't diverge on
+        // which schemas are browsable.
+        assert!(table_list_sql().contains(&user_schema_filter("n.nspname")));
     }
 }
