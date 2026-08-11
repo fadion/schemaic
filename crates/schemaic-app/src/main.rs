@@ -4524,6 +4524,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             hidden_dbs,
             db_menu_open,
             schema_menu_open,
+            db_menu_anchor: RwSignal::new(floem::kurbo::Point::ZERO),
+            schema_menu_anchor: RwSignal::new(floem::kurbo::Point::ZERO),
         },
         schema_actions: Rc::new(SchemaActions {
             on_toggle,

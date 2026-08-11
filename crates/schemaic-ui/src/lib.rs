@@ -1273,6 +1273,16 @@ pub struct SchemaUi {
     pub db_menu_open: RwSignal<bool>,
     /// Whether the SCHEMA settings menu (Refresh) is open.
     pub schema_menu_open: RwSignal<bool>,
+    /// Window position of the *bottom-left* of the eye icon that opens the
+    /// visibility menu, and of the gear that opens the settings menu — written by
+    /// the icons themselves (`on_move`/`on_resize`), read by the two overlays.
+    ///
+    /// They used to be placed by arithmetic on `theme::SCHEMA_W`, a build-time
+    /// default, while the panel renders at the live (persisted, and clamped on a
+    /// narrow window) width — so any resize in either direction, or just a narrow
+    /// window, detached both menus from their icons.
+    pub db_menu_anchor: RwSignal<Point>,
+    pub schema_menu_anchor: RwSignal<Point>,
 }
 
 /// Schema-tree callbacks (owned by the app).

@@ -565,6 +565,61 @@ fn menu_stack(entries: Vec<MenuEntry>, close: Rc<dyn Fn()>, width: f64) -> impl 
         })
 }
 
+/// Gap between the cursor and the corner of a menu opened at it.
+pub(crate) const CURSOR_MENU_GAP: f64 = 3.0;
+
+/// Estimated height (px) of the panel [`menu_panel`] builds for `entries`.
+///
+/// Summed per entry *kind*: an action row is ≈30.5px (14px line + 8px padding on
+/// both sides − sub-pixel), a separator ≈9px (a 1px rule + 4px margins), plus the
+/// panel's own 6px vertical padding and 1px border on both sides. Counting
+/// separators as full rows shoved an upward-flipped panel tens of px too high.
+///
+/// It is an estimate on purpose: it decides *placement*, not whether to flip, and
+/// measuring for real would mean laying the panel out first — which is what
+/// produces an open-then-flip flicker.
+pub(crate) fn menu_panel_height(entries: &[MenuEntry]) -> f64 {
+    entries
+        .iter()
+        .map(|e| match e {
+            MenuEntry::Separator => 9.0,
+            _ => 30.5,
+        })
+        .sum::<f64>()
+        + 14.0
+}
+
+/// Top-left corner for a panel opened **at the cursor**: `gap` px down and right
+/// of it, flipped to the other side of the cursor on whichever axis would run past
+/// the window edge, and never negative.
+///
+/// Shared by both menu channels. It used to live in the grid's overlay only, so a
+/// right-click low in the schema tree ran its last entries — Truncate, Drop, AI
+/// Explain — off the bottom of the window with no cue that they existed, while a
+/// grid cell right-clicked at the same height flipped up correctly.
+///
+/// A `window` dimension of 0 (or less than 1) means "not measured yet" and
+/// suppresses the flip on that axis: guessing at an unknown edge is worse than
+/// opening down-right and being off by a frame.
+pub(crate) fn cursor_menu_pos(
+    cursor: (f64, f64),
+    panel: (f64, f64),
+    window: (f64, f64),
+    gap: f64,
+) -> (f64, f64) {
+    let flip = |c: f64, size: f64, win: f64| {
+        if win > 1.0 && c + gap + size > win {
+            (c - size - gap).max(0.0)
+        } else {
+            c + gap
+        }
+    };
+    (
+        flip(cursor.0, panel.0, window.0),
+        flip(cursor.1, panel.1, window.1),
+    )
+}
+
 /// A reusable themed popup menu with nested submenus, `width` px wide. Returns the
 /// panel; the caller positions it absolutely. Escape (and any action) calls `close`.
 pub(crate) fn menu_panel(
@@ -1270,5 +1325,94 @@ mod exit_tests {
     #[test]
     fn busy_and_uncancellable_refuses_the_exit() {
         assert_eq!(exit_action(true, false), ExitAction::Ignore);
+    }
+}
+
+#[cfg(test)]
+mod menu_placement_tests {
+    use super::*;
+
+    const PANEL: (f64, f64) = (170.0, 350.0);
+    const WINDOW: (f64, f64) = (1200.0, 800.0);
+
+    #[test]
+    fn a_menu_with_room_opens_down_and_right_of_the_cursor() {
+        assert_eq!(
+            cursor_menu_pos((100.0, 100.0), PANEL, WINDOW, 3.0),
+            (103.0, 103.0)
+        );
+    }
+
+    /// The schema tree is a full-height left column, so its lower half is where
+    /// most right-clicks land — and a table's menu is a dozen entries.
+    #[test]
+    fn a_menu_near_the_bottom_flips_above_the_cursor() {
+        let (x, y) = cursor_menu_pos((100.0, 700.0), PANEL, WINDOW, 3.0);
+        assert_eq!(x, 103.0, "horizontal is unaffected");
+        assert_eq!(y, 347.0);
+        assert!(y + PANEL.1 <= 700.0, "the panel ends above the cursor");
+    }
+
+    #[test]
+    fn a_menu_near_the_right_edge_flips_left_of_the_cursor() {
+        let (x, _) = cursor_menu_pos((1150.0, 100.0), PANEL, WINDOW, 3.0);
+        assert_eq!(x, 977.0);
+        assert!(x + PANEL.0 <= 1150.0);
+    }
+
+    #[test]
+    fn a_menu_in_the_far_corner_flips_both_ways() {
+        let (x, y) = cursor_menu_pos((1150.0, 700.0), PANEL, WINDOW, 3.0);
+        assert_eq!((x, y), (977.0, 347.0));
+    }
+
+    /// A panel taller (or wider) than the space on either side clamps to the
+    /// window edge rather than going negative, where it would be unreachable.
+    #[test]
+    fn a_panel_bigger_than_the_window_clamps_to_the_origin() {
+        let (x, y) = cursor_menu_pos((50.0, 60.0), (400.0, 900.0), WINDOW, 3.0);
+        assert_eq!((x, y), (53.0, 0.0));
+    }
+
+    /// Before the root has measured itself the window is (0, 0). Flipping against
+    /// an unknown edge would put every menu in the top-left corner.
+    #[test]
+    fn an_unmeasured_window_never_flips() {
+        assert_eq!(
+            cursor_menu_pos((900.0, 700.0), PANEL, (0.0, 0.0), 3.0),
+            (903.0, 703.0)
+        );
+    }
+
+    #[test]
+    fn separators_are_not_counted_as_rows() {
+        let sep = menu_panel_height(&[MenuEntry::Separator]);
+        let row = menu_panel_height(&[MenuEntry::action("x", || {})]);
+        assert!(
+            sep < row,
+            "a separator is a rule, not a row: {sep} vs {row}"
+        );
+        // Chrome is counted once, not per entry.
+        let two =
+            menu_panel_height(&[MenuEntry::action("a", || {}), MenuEntry::action("b", || {})]);
+        assert!((two - (row * 2.0 - 14.0)).abs() < 0.001);
+    }
+
+    /// A submenu row is one row in the panel that hosts it — its children are
+    /// drawn in their own panel and must not be added to this one's height.
+    #[test]
+    fn a_submenu_counts_as_a_single_row() {
+        let sub = MenuEntry::Sub {
+            label: "Copy".into(),
+            icon: None,
+            children: vec![
+                MenuEntry::action("CSV", || {}),
+                MenuEntry::action("JSON", || {}),
+            ],
+        };
+        assert_eq!(
+            menu_panel_height(std::slice::from_ref(&sub)),
+            menu_panel_height(&[MenuEntry::action("Copy", || {})])
+        );
     }
 }
