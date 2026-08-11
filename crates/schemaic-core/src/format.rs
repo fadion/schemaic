@@ -246,7 +246,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 /// Human-readable byte size (`1.5 MB`); negatives fall back to the plain number.
-fn human_bytes(n: i64) -> String {
+pub(crate) fn human_bytes(n: i64) -> String {
     if n < 0 {
         return n.to_string();
     }

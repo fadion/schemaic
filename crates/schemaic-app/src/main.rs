@@ -1473,7 +1473,14 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                             SAMPLE_ROWS,
                         )
                         .map_err(|e| e.to_string())?;
-                        Ok(schemaic_ui::ImportProbeResult { cfg, sample })
+                        // Best-effort: a size we can't read just means no
+                        // large-file warning, never a failed probe.
+                        let file_bytes = std::fs::metadata(&req.path).map(|m| m.len()).unwrap_or(0);
+                        Ok(schemaic_ui::ImportProbeResult {
+                            cfg,
+                            sample,
+                            file_bytes,
+                        })
                     };
                     report(probe());
                 });
@@ -4545,6 +4552,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             empty_is_null: RwSignal::new(true),
             null_tokens: RwSignal::new(String::new()),
             trim: RwSignal::new(false),
+            file_bytes: RwSignal::new(0),
             sample: RwSignal::new(None),
             mapping: RwSignal::new(schemaic_core::import::Mapping {
                 targets: Vec::new(),
