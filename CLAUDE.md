@@ -404,6 +404,15 @@ Zed-inspired, aiming to replace DataGrip.
     and owns *none* of the polling: closing the modal flips `overlay.monitor_open` false, and that
     is what stops the loop.
   - `theme.rs`/`themes.rs`/`icons.rs`/`fonts.rs`/`sql_highlight.rs`.
+  - `contrast.rs` — the **legibility gate** over `themes.rs`: WCAG relative-luminance maths plus
+    `UI_PAIRINGS`/`EDITOR_PAIRINGS`, one row per (foreground, background) combination the UI really
+    paints, each with the floor its role earns. The unit is the **pairing**, not the literal — a
+    grep for hardcoded hex can't see a paired accessor whose two halves are chosen in two different
+    views, which is how three sites shipped at 1.02:1 in *both* themes. Chrome that is below AA
+    today is listed in `UI_SHORTFALL` with the ratio it manages: an unlisted pairing must meet its
+    floor (so a new colour, surface or theme is held to AA), a listed one may never get worse, and
+    a listed one that now passes must be deleted — the baseline can only shrink. Adding a theme
+    needs no work here; painting a role on a new surface means adding its row.
   - `lib.rs` (~5k lines, still the crate's largest) — the `Ui` struct + bundles, shared model/state
     types, `workspace`/`body`/`center`/`header`/`footer`, resize handles, `edit_field`/`FieldCfg`,
     terminal panel. The shared types living in the crate root is what stalls further splitting: the

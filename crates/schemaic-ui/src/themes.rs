@@ -194,6 +194,42 @@ pub struct UiTheme {
     pub plan_warn: Color,
     /// Query-plan modal: background tint behind the warnings panel + flagged rows.
     pub plan_warn_bg: Color,
+    // ── Status bar + the semantic action accents ────────────────────────────
+    // These were fixed literals in `theme.rs`, chosen against the dark footer
+    // and described as "theme-independent by design". `UiTheme::light` then
+    // moved `bg_deepest` from #14151A to #DCDFE6 and none of them moved with
+    // it, so thirteen of fourteen fell under 3:1 — the open-transaction pill at
+    // 1.48:1, on the only always-visible sign that a tab holds uncommitted
+    // work. They are theme fields like everything else now, and
+    // `crate::contrast` is what keeps them legible.
+    /// Muted grey for status-bar text + icons.
+    pub status_text: Color,
+    /// Amber for the syntax-warning icon + count.
+    pub status_warn: Color,
+    /// Brighter amber for hovering the write-mode status segment.
+    pub status_warn_hover: Color,
+    /// Green for the "no warnings" check.
+    pub status_ok: Color,
+    /// Green CTA *fill* for the AI "Seed rows" Generate button (white text).
+    pub seed_button: Color,
+    /// The table designer's "N changes" count, when there are changes.
+    pub change_count: Color,
+    /// A tab in manual-commit mode, and its open-transaction pill.
+    pub tx_open: Color,
+    /// Hover for the clickable manual-mode / Commit / Rollback segments.
+    pub tx_open_hover: Color,
+    /// A transaction that can't go forward (PG aborted it, or the pinned
+    /// connection died).
+    pub tx_danger: Color,
+    /// The status bar's Commit action, resting + hover.
+    pub tx_commit: Color,
+    pub tx_commit_hover: Color,
+    /// The status bar's Rollback action, resting + hover.
+    pub tx_rollback: Color,
+    pub tx_rollback_hover: Color,
+    /// The affirmative (destructive) button in a confirm modal, resting + hover.
+    pub confirm_yes: Color,
+    pub confirm_yes_hover: Color,
     pub conn_ok: Color,
     pub dropdown_hover: Color,
     pub dropdown_active: Color,
@@ -299,6 +335,23 @@ impl UiTheme {
             error: c("#E06C75"),
             plan_warn: c("#E5C07B"),
             plan_warn_bg: c("#1B1818"),
+            status_text: c("#6E7181"),
+            status_warn: c("#E08A4B"),
+            status_warn_hover: c("#FFA461"),
+            status_ok: c("#71C371"),
+            // A fill, not text: white on the old #71C371 was 2.15:1 in both
+            // palettes, the one accent here that needed to go *darker* on dark.
+            seed_button: c("#2E7D32"),
+            change_count: c("#71C371"),
+            tx_open: c("#E0B24B"),
+            tx_open_hover: c("#FFD070"),
+            tx_danger: c("#E05A5A"),
+            tx_commit: c("#71C371"),
+            tx_commit_hover: c("#8FDC8F"),
+            tx_rollback: c("#E05A5A"),
+            tx_rollback_hover: c("#FF7B7B"),
+            confirm_yes: c("#E05A5A"),
+            confirm_yes_hover: c("#FF7B7B"),
             conn_ok: c("#509950"),
             dropdown_hover: c("#272D3E"),
             dropdown_active: c("#1C1F28"),
@@ -406,6 +459,26 @@ impl UiTheme {
             error: c("#C4444A"),
             plan_warn: c("#B7791F"),
             plan_warn_bg: c("#F5E7E7"),
+            // The dark palette's accents inverted for a #DCDFE6 footer: the
+            // greens, ambers and reds all go *darker* (a hover that brightens on
+            // dark has to deepen on light to read as more prominent), and
+            // `seed_button` — the one that is a fill under white text — goes
+            // darker in both palettes instead.
+            status_text: c("#6E7181"),
+            status_warn: c("#8A5200"),
+            status_warn_hover: c("#6F4200"),
+            status_ok: c("#1B6B2E"),
+            seed_button: c("#2E7D32"),
+            change_count: c("#1B6B2E"),
+            tx_open: c("#7D5A00"),
+            tx_open_hover: c("#614600"),
+            tx_danger: c("#A8322F"),
+            tx_commit: c("#1B6B2E"),
+            tx_commit_hover: c("#145423"),
+            tx_rollback: c("#A8322F"),
+            tx_rollback_hover: c("#8A2422"),
+            confirm_yes: c("#A8322F"),
+            confirm_yes_hover: c("#8A2422"),
             conn_ok: c("#2E8C46"),
             dropdown_hover: c("#E4E8F5"),
             dropdown_active: c("#EDEFF4"),
@@ -445,6 +518,11 @@ pub struct EditorTheme {
     pub constant: Color,
     /// Wavy underline under a misspelled keyword.
     pub underline: Color,
+    /// Wavy underline under a *definite* diagnostic error (unknown table or
+    /// column, a syntax error). Semantic rather than a token colour, but it is
+    /// drawn on the editor surface, so it belongs to this axis: a fixed red
+    /// picked against a dark editor sat on Catppuccin Latte's #EFF1F5 at 2.9:1.
+    pub diag_error: Color,
 }
 
 impl EditorTheme {
@@ -464,6 +542,7 @@ impl EditorTheme {
             type_: c("#E5C07B"),
             constant: c("#56B6C2"),
             underline: c("#7E6E11"),
+            diag_error: c("#E06C75"),
         }
     }
 
@@ -483,6 +562,7 @@ impl EditorTheme {
             type_: c("#E0AF68"),
             constant: c("#2AC3DE"),
             underline: c("#8A6D3B"),
+            diag_error: c("#F7768E"),
         }
     }
 
@@ -502,6 +582,7 @@ impl EditorTheme {
             type_: c("#DF8E1D"),
             constant: c("#04A5E5"),
             underline: c("#DF8E1D"),
+            diag_error: c("#D20F39"),
         }
     }
 }
@@ -533,7 +614,7 @@ impl UiThemeKind {
             _ => UiThemeKind::Dark,
         }
     }
-    fn build(self) -> UiTheme {
+    pub(crate) fn build(self) -> UiTheme {
         match self {
             UiThemeKind::Dark => UiTheme::dark(),
             UiThemeKind::Light => UiTheme::light(),
@@ -574,7 +655,7 @@ impl EditorThemeKind {
             _ => EditorThemeKind::OneDarkPro,
         }
     }
-    fn build(self) -> EditorTheme {
+    pub(crate) fn build(self) -> EditorTheme {
         match self {
             EditorThemeKind::OneDarkPro => EditorTheme::one_dark_pro(),
             EditorThemeKind::TokyoNight => EditorTheme::tokyo_night(),
