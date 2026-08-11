@@ -178,3 +178,114 @@ pub(crate) const MASK_CH: char = '*';
 
 /// Terminal font sizes offered in settings (logical px).
 pub(crate) const TERM_FONT_SIZES: [u16; 5] = [12, 13, 14, 16, 18];
+
+// ── Panel width arithmetic ──────────────────────────────────────────────────
+//
+// The stored `schema_w` / `right_w` are the user's *intent* and are never
+// mutated by layout, so a panel restores to its full width when the window grows
+// back. What is rendered is the intent clamped so the center keeps
+// `CENTER_MIN_W`, which on a narrow window is narrower than the intent — and
+// anything that sizes itself to the panel has to use the same number the shell
+// renders it at, or it lays out content into a clipped wrapper.
+
+/// Does the schema panel fit beside the center at this window width? `0` (or any
+/// width under 1) is "not measured yet" and counts as allowed, so nothing is
+/// hidden before the first resize.
+pub(crate) fn schema_panel_fits(window_w: f64) -> bool {
+    !(1.0..PANELS_MIN_SCHEMA_W).contains(&window_w)
+}
+
+/// Does the right (AI / terminal / history) panel fit beside the schema panel and
+/// the center?
+pub(crate) fn right_panel_fits(window_w: f64) -> bool {
+    !(1.0..PANELS_MIN_FULL_W).contains(&window_w)
+}
+
+/// Rendered width of the right panel: 0 when closed or locked away, else the
+/// intent clamped so the center and the schema panel's *minimum* still fit.
+pub(crate) fn effective_right_w(window_w: f64, intended: f64, open: bool) -> f64 {
+    if !open || !right_panel_fits(window_w) {
+        return 0.0;
+    }
+    if window_w < 1.0 {
+        return intended;
+    }
+    intended.clamp(
+        RIGHT_MIN_W,
+        (window_w - CENTER_MIN_W - SCHEMA_MIN_W).max(RIGHT_MIN_W),
+    )
+}
+
+/// Rendered width of the schema panel: 0 when hidden or locked away, else the
+/// intent clamped so the center keeps `CENTER_MIN_W` beside the right panel's
+/// *effective* width (it yields to what the right panel actually takes, while the
+/// right panel yields only to the schema panel's minimum).
+pub(crate) fn effective_schema_w(window_w: f64, intended: f64, right_eff: f64, open: bool) -> f64 {
+    if !open || !schema_panel_fits(window_w) {
+        return 0.0;
+    }
+    if window_w < 1.0 {
+        return intended;
+    }
+    intended.clamp(
+        SCHEMA_MIN_W,
+        (window_w - CENTER_MIN_W - right_eff).max(SCHEMA_MIN_W),
+    )
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::*;
+
+    /// The configuration the finding was observed in: an ordinary laptop window
+    /// with the AI panel open, where the panel renders narrower than it lays
+    /// itself out — the search box's clear button falling off the clipped edge.
+    #[test]
+    fn a_narrow_window_with_the_right_panel_open_clamps_the_schema_panel() {
+        let right = effective_right_w(950.0, 350.0, true);
+        assert_eq!(right, 300.0, "the right panel yields to the schema minimum");
+        assert_eq!(effective_schema_w(950.0, 300.0, right, true), SCHEMA_MIN_W);
+    }
+
+    #[test]
+    fn a_wide_window_renders_both_panels_at_the_intended_width() {
+        let right = effective_right_w(1800.0, 350.0, true);
+        assert_eq!(right, 350.0);
+        assert_eq!(effective_schema_w(1800.0, 400.0, right, true), 400.0);
+    }
+
+    /// A user who has widened the panel meets the clamp at a *wider* window, which
+    /// is the likelier configuration.
+    #[test]
+    fn a_widened_panel_starts_yielding_sooner() {
+        let right = effective_right_w(1200.0, 350.0, true);
+        assert_eq!(effective_schema_w(1200.0, 600.0, right, true), 450.0);
+        assert_eq!(effective_schema_w(1200.0, 400.0, right, true), 400.0);
+    }
+
+    #[test]
+    fn a_closed_or_locked_away_panel_is_zero_wide() {
+        assert_eq!(effective_right_w(1800.0, 350.0, false), 0.0);
+        assert_eq!(effective_schema_w(1800.0, 300.0, 0.0, false), 0.0);
+        // Under the breakpoints the panels are locked away whatever the intent.
+        assert_eq!(effective_right_w(880.0, 350.0, true), 0.0);
+        assert_eq!(effective_schema_w(600.0, 300.0, 0.0, true), 0.0);
+    }
+
+    /// Before the first resize the window is (0, 0): render the intent rather than
+    /// collapsing every panel to its minimum for a frame.
+    #[test]
+    fn an_unmeasured_window_renders_the_intended_widths() {
+        assert_eq!(effective_right_w(0.0, 350.0, true), 350.0);
+        assert_eq!(effective_schema_w(0.0, 300.0, 350.0, true), 300.0);
+        assert!(schema_panel_fits(0.0) && right_panel_fits(0.0));
+    }
+
+    #[test]
+    fn the_panel_breakpoints_are_the_summed_minimums() {
+        assert!(!right_panel_fits(PANELS_MIN_FULL_W - 1.0));
+        assert!(right_panel_fits(PANELS_MIN_FULL_W));
+        assert!(!schema_panel_fits(PANELS_MIN_SCHEMA_W - 1.0));
+        assert!(schema_panel_fits(PANELS_MIN_SCHEMA_W));
+    }
+}

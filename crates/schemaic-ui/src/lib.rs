@@ -49,7 +49,7 @@ use overlays::{
     schema_settings_overlay, tx_prompt_overlay,
 };
 use plan_view::plan_overlay;
-use schema_tree::schema_panel;
+use schema_tree::{schema_panel, schema_panel_w};
 use settings::{ai_settings_overlay, help_overlay, term_settings_overlay, theme_settings_overlay};
 use tabs::tab_bar;
 use widgets::*;
@@ -2452,17 +2452,14 @@ pub fn pick_connection_color(used: &[String]) -> String {
 /// is force-hidden and its toggle is a no-op. `(0,0)` (pre-first-resize) counts
 /// as allowed so nothing is locked at startup before the first resize fires.
 pub(crate) fn schema_panel_allowed() -> bool {
-    // Outside `[1, threshold)` = pre-first-resize `(0,0)` or wide enough.
-    let ww = window_size().get().0;
-    !(1.0..PANELS_MIN_SCHEMA_W).contains(&ww)
+    schema_panel_fits(window_size().get().0)
 }
 
 /// Whether the right (AI/terminal/history) panel currently fits beside the schema
 /// panel and the center — window width ≥ all three min widths. Reactive on
 /// `window_size`.
 pub(crate) fn right_panel_allowed() -> bool {
-    let ww = window_size().get().0;
-    !(1.0..PANELS_MIN_FULL_W).contains(&ww)
+    right_panel_fits(window_size().get().0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2673,31 +2670,26 @@ fn body(
     // `schema_w`/`right_w` are the user's intent and never mutated here, so a panel
     // restores to its full width when the window grows back.
     let eff_right_w = move || {
-        if right_panel.get() == RightPanel::None || !right_panel_allowed() {
-            return 0.0;
-        }
-        let ww = window_size().get().0;
-        if ww < 1.0 {
-            return right_w.get();
-        }
-        right_w.get().clamp(
-            RIGHT_MIN_W,
-            (ww - CENTER_MIN_W - SCHEMA_MIN_W).max(RIGHT_MIN_W),
+        effective_right_w(
+            window_size().get().0,
+            right_w.get(),
+            right_panel.get() != RightPanel::None,
         )
     };
     let eff_schema_w = move || {
-        if !schema_visible.get() || !schema_panel_allowed() {
-            return 0.0;
-        }
-        let ww = window_size().get().0;
-        if ww < 1.0 {
-            return schema_w.get();
-        }
-        schema_w.get().clamp(
-            SCHEMA_MIN_W,
-            (ww - CENTER_MIN_W - eff_right_w()).max(SCHEMA_MIN_W),
+        effective_schema_w(
+            window_size().get().0,
+            schema_w.get(),
+            eff_right_w(),
+            schema_visible.get(),
         )
     };
+    // Publish the width the panel is *rendered* at, for everything inside it that
+    // sizes to the panel (the tree rows' `min_width`, the search box). The panel
+    // used to publish the *intent*, so under the clamp it laid its content out
+    // wider than the wrapper it is clipped by: the search box's clear button was
+    // cut off and the tree kept a horizontal scrollbar it didn't need.
+    create_effect(move |_| schema_panel_w().set(eff_schema_w()));
 
     // Left: the schema tree. Always mounted (it only reads signals; nothing is
     // spawned on build), so hiding is purely the width animation. `clip()` hides

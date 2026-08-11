@@ -371,10 +371,10 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     let db_menu_anchor = ui.schema.db_menu_anchor;
     let schema_menu_anchor = ui.schema.schema_menu_anchor;
     let context_menu = ui.overlay.context_menu;
-    let schema_w = ui.layout.schema_w;
-    // Publish the live panel width so the row styles (`tree_row_min_w`) widen the
-    // rows — and their hover/selection highlight — as the panel is resized.
-    create_effect(move |_| schema_panel_w().set(schema_w.get()));
+    // `schema_panel_w()` — the width the shell renders this panel at — is
+    // published by `body`, which is where the clamp lives. The panel and its rows
+    // read it; nothing in here may size itself from `layout.schema_w`, the
+    // unclamped intent.
     // Close every *other* dropdown when the eye/settings menus open, so all the
     // app's menus are mutually exclusive (the eye/gear absorb their own pointer-down,
     // so the root dismissal handler never runs for them).
@@ -715,7 +715,10 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
         tree,
     ))
     .style(move |s| {
-        s.width(schema_w.get())
+        // The width the shell *renders* the wrapper at, not the user's intent —
+        // the wrapper clips, so laying out to the intent under the clamp put the
+        // search box's clear button past the cut.
+        s.width(schema_panel_w().get())
             .flex_shrink(0.0_f32)
             .height_full()
             // Let the flex-grow tree scroll consume all remaining height down to
@@ -1556,9 +1559,12 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Live schema-panel width, published by [`schema_panel`] and read by the row
-/// styles. Detached scope → lives for the whole process (like `window_size`).
-fn schema_panel_w() -> RwSignal<f64> {
+/// Live schema-panel width — the width the shell *renders* the panel at, which
+/// on a narrow window is narrower than the user's stored intent. Published by
+/// `body` (where the clamp lives) and read by the panel and its row styles, so
+/// there is one answer to "how wide is the schema panel". Detached scope → lives
+/// for the whole process (like `window_size`).
+pub(crate) fn schema_panel_w() -> RwSignal<f64> {
     SCHEMA_PANEL_W.with(|cell| {
         if cell.borrow().is_none() {
             let scope = floem::reactive::Scope::new();
