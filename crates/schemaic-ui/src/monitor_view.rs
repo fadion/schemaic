@@ -23,7 +23,13 @@ use schemaic_core::monitor::{ChangeKind, RowChange};
 
 use crate::settings::settings_dropdown;
 use crate::theme::{FONT_BODY, FONT_LABEL};
-use crate::widgets::{autohide_state, loading_dots, panel_style, shift_hscroll, thin_scroll};
+use crate::widgets::{
+    at_content_bottom, autohide_state, loading_dots, panel_style, shift_hscroll, thin_scroll,
+};
+
+/// The log's rows are shorter than a chat bubble, so it counts as "at the bottom"
+/// a little tighter than the AI panel's `FOLLOW_SLACK`.
+const MONITOR_FOLLOW_SLACK: f64 = 24.0;
 use crate::{MonitorEntry, Ui, icons, theme};
 
 /// Modal size (fixed so the log scrolls within it).
@@ -218,7 +224,11 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                                 // At the bottom? (within 24px). Only notify on a real
                                 // flip — `set` never dedups, and a redundant notify
                                 // would re-snap while the user scrolls near the bottom.
-                                let at_bottom = content_h.get_untracked() - vp.y1 <= 24.0;
+                                let at_bottom = at_content_bottom(
+                                    content_h.get_untracked(),
+                                    vp.y1,
+                                    MONITOR_FOLLOW_SLACK,
+                                );
                                 if follow.get_untracked() != at_bottom {
                                     follow.set(at_bottom);
                                 }
