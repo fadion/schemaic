@@ -372,6 +372,12 @@ struct GridState {
     /// Pending new-row indices currently being AI-generated — the whole row pulses
     /// purple (Insert Row / Seed Table).
     ai_gen_rows: RwSignal<HashSet<usize>>,
+    /// Bumped whenever the pending rows are thrown away wholesale, so an
+    /// in-flight AI seed can tell that the indices it captured no longer mean
+    /// what they meant. `add_new_row` re-allocates from zero, and discard isn't
+    /// blocked during a generation — so discarding mid-generation and adding a
+    /// fresh row landed the reply's values on top of what the user was typing.
+    new_rows_gen: RwSignal<u64>,
     /// Pulse phase (radians) advanced by a ~45ms tick while `ai_busy`; the
     /// generating cells read it to breathe their wash. `pulse_running` guards
     /// against starting a second tick loop.
@@ -470,6 +476,7 @@ impl GridState {
             ai_busy: RwSignal::new(false),
             ai_gen: RwSignal::new(HashSet::new()),
             ai_gen_rows: RwSignal::new(HashSet::new()),
+            new_rows_gen: RwSignal::new(0),
             ai_pulse: RwSignal::new(0.0),
             pulse_running: RwSignal::new(false),
             seed_open: RwSignal::new(false),
@@ -2986,6 +2993,11 @@ fn ai_seed_rows(gs: GridState, count: usize) {
         fill_columns,
         count,
     };
+    // The pending rows these indices refer to, as of now. Discard is not blocked
+    // during a generation, and `add_new_row` hands out indices from zero again —
+    // so without this the reply staged into whatever row now sits at index 0,
+    // overwriting what the user had typed into it.
+    let rows_gen = gs.new_rows_gen.get_untracked();
     let done: crate::AiSeedDoneFn = Rc::new(move |res| {
         if gs.ai_busy.try_update(|b| *b = false).is_none() {
             return; // scope disposed
@@ -2995,6 +3007,9 @@ fn ai_seed_rows(gs: GridState, count: usize) {
                 s.remove(&p);
             }
         });
+        if gs.new_rows_gen.try_get_untracked() != Some(rows_gen) {
+            return; // the rows this reply was for are gone
+        }
         match res {
             crate::AiSeedResult::Rows(rows) => {
                 for (i, &pidx) in pidxs.iter().enumerate() {
@@ -3869,6 +3884,8 @@ fn discard_edits(gs: GridState) {
     gs.edit_cell.set(None);
     gs.dirty.update(|d| d.clear());
     gs.new_rows.update(|r| r.clear());
+    // The pending-row indices are about to be handed out again from zero.
+    gs.new_rows_gen.update(|g| *g = g.wrapping_add(1));
     gs.del_rows.update(|d| d.clear());
     gs.commit_err.set(None);
 }
