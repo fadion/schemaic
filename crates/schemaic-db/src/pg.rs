@@ -988,7 +988,7 @@ async fn fetch_col_meta(
                 a.attnotnull, \
                 (a.attidentity <> '' OR (a.atthasdef AND \
                     COALESCE(pg_get_expr(ad.adbin, ad.adrelid), '') LIKE 'nextval(%')) AS auto_inc, \
-                (NOT a.atthasdef AND a.attidentity = '') AS no_default, \
+                a.atthasdef, a.attidentity, \
                 (pk.attnum IS NOT NULL) AS is_pk \
          FROM pg_attribute a \
          JOIN pg_class c ON c.oid = a.attrelid \
@@ -1008,13 +1008,16 @@ async fn fetch_col_meta(
             continue;
         }
         // Column order: attrelid, attnum, attname, relname, nspname, attnotnull,
-        // auto_inc, no_default, is_pk.
+        // auto_inc, atthasdef, attidentity, is_pk.
+        let not_null = cell(&r, 5) == "t";
         let flags = ColumnFlags {
-            primary_key: cell(&r, 8) == "t",
+            primary_key: cell(&r, 9) == "t",
             unique_key: false, // not surfaced yet (key-icon nicety); PK covers editing
-            not_null: cell(&r, 5) == "t",
+            not_null,
             auto_increment: cell(&r, 6) == "t",
-            no_default: cell(&r, 7) == "t",
+            // Decided in Rust rather than in the `SELECT`, so the rule the flag's
+            // contract states has a test standing on it.
+            no_default: pg_no_default(not_null, cell(&r, 7) == "t", &cell(&r, 8)),
         };
         out.insert(
             (oid, attnum),
@@ -1027,6 +1030,20 @@ async fn fetch_col_meta(
         );
     }
     Ok(out)
+}
+
+/// Must the user supply a value for this column, or will the server?
+///
+/// This is [`schemaic_core::model::ColumnFlags::no_default`]'s contract, and it
+/// is **not** "has no `DEFAULT` clause": a nullable column has an implicit `NULL`
+/// default, so the flag is only set for a NOT-NULL, non-identity column with no
+/// `DEFAULT`. PostgreSQL computed it without the NOT-NULL term, so the grid's
+/// new-row preview marked most nullable columns a red `<required>` — telling the
+/// user a correct action would fail — while MySQL showed `<null>` for the same
+/// column. Pure and tested rather than a term inside the `SELECT`, so the rule
+/// the contract states is the rule a test can check.
+fn pg_no_default(not_null: bool, has_default: bool, identity: &str) -> bool {
+    not_null && !has_default && identity.is_empty()
 }
 
 // ── Write-back (commit + refetch) ────────────────────────────────────────────
@@ -1176,7 +1193,7 @@ async fn import_on(
     loop {
         // Postgres leaves the transaction aborted after any error, so every exit
         // path below rolls back explicitly rather than relying on the drop.
-        let batch = match crate::next_batch(rows) {
+        let batch = match crate::next_batch_off_executor(rows) {
             Ok(Some(b)) => b,
             Ok(None) => break,
             Err(e) => {
@@ -1666,5 +1683,22 @@ mod tests {
         let mut v = vec!["sales", "public", "analytics"];
         v.sort_by_key(|s| schema_sort_key(s));
         assert_eq!(v, vec!["public", "analytics", "sales"]);
+    }
+
+    /// `no_default` means "the user must supply this", not "there is no DEFAULT
+    /// clause" — the difference is the NOT-NULL term, and PostgreSQL was missing
+    /// it, so the grid's new-row preview called most nullable columns
+    /// `<required>` in red.
+    #[test]
+    fn pg_no_default_means_the_user_must_supply_it() {
+        // NOT NULL, no default, not identity → the user must fill it in.
+        assert!(pg_no_default(true, false, ""));
+        // Nullable is the case that regressed: NULL is its implicit default.
+        assert!(!pg_no_default(false, false, ""));
+        // A DEFAULT clause supplies it.
+        assert!(!pg_no_default(true, true, ""));
+        // So does an identity column, either form.
+        assert!(!pg_no_default(true, false, "a"));
+        assert!(!pg_no_default(true, false, "d"));
     }
 }
