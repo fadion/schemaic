@@ -25,8 +25,8 @@ use schemaic_core::model::engine_is_transactional;
 use crate::consts::ROW_H;
 use crate::settings::{dropdown_box_style, settings_dropdown, settings_toggle_row};
 use crate::widgets::{
-    FORM_GAP, autohide, control_button, footer_button, form_section, form_separator, form_setting,
-    modal_footer, modal_title_owned, panel_style, shift_hscroll,
+    ExitAction, FORM_GAP, autohide, control_button, exit_action, footer_button, form_section,
+    form_separator, form_setting, modal_footer, modal_title_owned, panel_style, shift_hscroll,
 };
 use crate::{
     FieldCfg, ImportProbeRequest, ImportRunRequest, ImportStep, ImportTargetInfo, ImportUi, Ui,
@@ -757,7 +757,27 @@ fn run_import(ui: Ui) {
 /// `ui.import.target` is `Some`.
 pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
     let i = ui.import;
-    let close = move || i.target.set(None);
+    // Every exit — footer, Escape, ✕ — goes through one decision. While a load
+    // is running this cancels (rolling the transaction back) instead of closing:
+    // closing would hide a bulk write that is still going and would leave its
+    // outcome with no reader, since the modal's signals are the only channel
+    // `import_run` reports to. The footer used to be the only exit that knew.
+    let exit: Rc<dyn Fn()> = {
+        let stop = ui.schema_actions.clone();
+        Rc::new(move || match exit_action(i.busy.get_untracked(), true) {
+            ExitAction::Close => i.target.set(None),
+            ExitAction::Cancel => (stop.import_cancel)(),
+            // Unreachable for this modal (an import is always cancellable), but
+            // matched explicitly so a future caller can't fall through to close.
+            ExitAction::Ignore => {}
+        })
+    };
+    // Handed to each exit site. `Rc` rather than a plain closure because it now
+    // captures the cancel action; the sites clone it.
+    let exit_at = move |e: &Rc<dyn Fn()>| {
+        let e = e.clone();
+        move || (e)()
+    };
 
     // A setting that changes how the file *parses* re-reads it. One effect over
     // all of them, created once here rather than per rebuild, so switching steps
@@ -868,13 +888,26 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
             let ui_back = ui.clone();
             let ui_next = ui.clone();
             let ui_run = ui.clone();
+            let (exit_src, exit_map, exit_done, exit_x, exit_esc) = (
+                exit.clone(),
+                exit.clone(),
+                exit.clone(),
+                exit.clone(),
+                exit.clone(),
+            );
             let actions = match step {
                 ImportStep::Source => dyn_container(
                     move || (i.sample.get().is_some(), i.busy.get()),
                     move |(has_sample, busy)| {
                         let ui = ui_next.clone();
                         h_stack((
-                            footer_button("Cancel", theme::text_dim, theme::text, true, close),
+                            footer_button(
+                                "Cancel",
+                                theme::text_dim,
+                                theme::text,
+                                true,
+                                exit_at(&exit_src),
+                            ),
                             footer_button(
                                 if busy { "Reading…" } else { "Next" },
                                 theme::conn_save,
@@ -893,7 +926,6 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                     move |(busy, mapping, target)| {
                         let ui = ui_run.clone();
                         let back = ui_back.clone();
-                        let stop = ui_run.schema_actions.clone();
                         let ready = target
                             .map(|t| !import::insert_columns(&mapping, &t.table).is_empty())
                             .unwrap_or(false);
@@ -904,19 +936,16 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                             // While a load is running this stops it (rolling the
                             // transaction back) instead of closing — closing would
                             // hide a write that's still going, which is the one
-                            // thing the user pressing Cancel doesn't want.
+                            // thing the user pressing Cancel doesn't want. That
+                            // rule now lives in `exit`, which Escape and the ✕
+                            // share; this button used to be the only one that had
+                            // it.
                             footer_button(
                                 "Cancel",
                                 theme::text_dim,
                                 theme::text,
                                 true,
-                                move || {
-                                    if busy {
-                                        (stop.import_cancel)()
-                                    } else {
-                                        close()
-                                    }
-                                },
+                                exit_at(&exit_map),
                             ),
                             footer_button(
                                 if busy { "Importing…" } else { "Import" },
@@ -936,13 +965,13 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                     theme::conn_save,
                     theme::conn_save_hover,
                     true,
-                    close,
+                    exit_at(&exit_done),
                 )
                 .into_any(),
             };
             let footer = modal_footer(actions);
 
-            let close_x: Rc<dyn Fn()> = Rc::new(close);
+            let close_x: Rc<dyn Fn()> = exit_x.clone();
             let panel = v_stack((
                 modal_title_owned(format!("Import into {title}"), close_x),
                 // `autohide`, not a plain `scroll`: each section inside scrolls on
@@ -970,7 +999,11 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
             container(panel)
                 .keyboard_navigable()
                 .request_focus(|| {})
-                .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())
+                .on_key_down(
+                    Key::Named(NamedKey::Escape),
+                    |_| true,
+                    move |_| (exit_esc)(),
+                )
                 .style(|s| {
                     s.size_full()
                         .flex_col()

@@ -18,7 +18,8 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 
 use crate::widgets::{
-    autohide, footer_button, form_section, modal_footer, modal_title_owned, panel_style,
+    ExitAction, autohide, exit_action, footer_button, form_section, modal_footer,
+    modal_title_owned, panel_style,
 };
 use crate::{DdlPreview, DdlRunRequest, FieldCfg, Ui, edit_field, icons, theme};
 
@@ -185,7 +186,19 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
     let d = ui.ddl;
     // Closing returns to the designer when it's still open behind — the draft is
     // untouched, so Cancel here means "not yet", not "throw it away".
-    let close = move || d.preview.set(None);
+    //
+    // While an apply is in flight, every exit refuses. `run_ddl` is handed a
+    // fresh token nothing holds, and on MySQL each DDL statement has already
+    // committed, so there is nothing to cancel — and `d.error` is the *only*
+    // reader of "statement 3 of 5 failed, 2 already stuck". Closing would leave
+    // a half-migrated table, a stale schema tree and no indication at all. The
+    // footer button was already disabled for this reason; Escape and the ✕
+    // weren't.
+    let exit = move || {
+        if exit_action(d.applying.get_untracked(), false) == ExitAction::Close {
+            d.preview.set(None);
+        }
+    };
 
     dyn_container(
         move || (d.preview.get().is_some(), d.applied.get()),
@@ -279,7 +292,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             theme::conn_save,
                             theme::conn_save_hover,
                             true,
-                            close,
+                            exit,
                         )
                         .into_any();
                     }
@@ -305,7 +318,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             theme::text_dim,
                             theme::text,
                             !busy,
-                            close,
+                            exit,
                         ),
                         footer_button("Copy", theme::text_dim, theme::text, !busy, move || {
                             let _ = floem::Clipboard::set_contents(sql.clone());
@@ -365,7 +378,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                 }
             });
 
-            let close_x: Rc<dyn Fn()> = Rc::new(close);
+            let close_x: Rc<dyn Fn()> = Rc::new(exit);
             let panel = v_stack((
                 modal_title_owned(format!("Apply changes to {}", p.subject), close_x),
                 autohide(scroll(v_stack((body, err)).style(|s| {
@@ -385,7 +398,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
             container(panel)
                 .keyboard_navigable()
                 .request_focus(|| {})
-                .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())
+                .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| exit())
                 .style(|s| {
                     s.size_full()
                         .flex_col()
