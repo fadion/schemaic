@@ -1379,6 +1379,26 @@ impl std::fmt::Display for DdlError {
     }
 }
 
+/// Did this DDL run leave the database different from how the caller last read
+/// it — and so must the schema be re-introspected?
+///
+/// The only outcome that changed nothing is a plan that stopped before its first
+/// statement took effect. Every other outcome did: a success obviously, and a
+/// half-applied MySQL plan because [`DdlError::applied`] statements are in force
+/// on the server and cannot be rolled back.
+///
+/// This exists as a function rather than an `is_ok()` at the call site because
+/// the caller sees the error as a display string by then, where "nothing was
+/// applied" and "half the plan was applied" look identical — and `db_nodes` is
+/// what the schema tree, the grid's key icons, the completion index and
+/// `intel`'s catalog all read.
+pub fn ddl_changed_schema(res: &Result<(), DdlError>) -> bool {
+    match res {
+        Ok(()) => true,
+        Err(e) => e.applied > 0,
+    }
+}
+
 impl Db {
     /// Run a generated DDL plan against `database`.
     ///
@@ -2712,5 +2732,35 @@ mod tests {
     fn explain_commands_strips_trailing_semicolon_and_space() {
         let (primary, _) = explain_commands("  SELECT 1 ;  ", false);
         assert_eq!(primary, "EXPLAIN SELECT 1");
+    }
+
+    #[test]
+    fn a_successful_plan_changed_the_schema() {
+        assert!(ddl_changed_schema(&Ok(())));
+    }
+
+    #[test]
+    fn a_half_applied_mysql_plan_changed_the_schema() {
+        // The whole reason `applied` exists: statement 2 failed, statement 1 is
+        // in effect and cannot be rolled back, so the introspected model is now
+        // wrong and the caller must re-read it.
+        let err = DdlError {
+            message: "Duplicate key name 'ix'".to_string(),
+            at: 1,
+            applied: 1,
+        };
+        assert!(ddl_changed_schema(&Err(err)));
+    }
+
+    #[test]
+    fn a_plan_that_failed_on_its_first_statement_changed_nothing() {
+        // Also PostgreSQL's every failure — the transaction rolled the plan back,
+        // so `applied` is 0 whichever statement failed.
+        let err = DdlError {
+            message: "syntax error".to_string(),
+            at: 3,
+            applied: 0,
+        };
+        assert!(!ddl_changed_schema(&Err(err)));
     }
 }

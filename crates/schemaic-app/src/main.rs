@@ -3166,6 +3166,11 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // schema tree, the grid's key icons, the completion index and `intel`'s
     // catalog all read, so leaving it stale after an `ALTER` would have the
     // editor flagging columns that now exist as unknown.
+    //
+    // Which is why the gate is `ddl_changed_schema`, not success: MySQL has no
+    // transactional DDL, so a plan that fails halfway has genuinely half-applied
+    // and the stale model is the *worse* half — it describes a column that was
+    // just dropped.
     let run_ddl: schemaic_ui::DdlFn = {
         let handle = handle.clone();
         let db_for = db_for.clone();
@@ -3181,20 +3186,23 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 };
                 let refresh_db = refresh_db.clone();
                 let database = req.database.clone();
-                let report = create_ext_action(cx, move |res: Result<(), String>| {
-                    // Refresh before reporting, so the modal's success state and
-                    // the tree can't be seen disagreeing for a frame.
-                    if res.is_ok() {
-                        (refresh_db)(database.clone());
-                    }
-                    (done)(res);
-                });
+                let report =
+                    create_ext_action(cx, move |(changed, res): (bool, Result<(), String>)| {
+                        // Refresh before reporting, so the modal's success state
+                        // and the tree can't be seen disagreeing for a frame.
+                        // `changed`, not `is_ok()`: a MySQL plan that failed
+                        // halfway still moved the schema out from under us.
+                        if changed {
+                            (refresh_db)(database.clone());
+                        }
+                        (done)(res);
+                    });
                 handle.spawn(async move {
                     let out = db
                         .run_ddl(&req.database, &req.statements, CancellationToken::new())
-                        .await
-                        .map_err(|e| e.to_string());
-                    report(out);
+                        .await;
+                    let changed = schemaic_db::ddl_changed_schema(&out);
+                    report((changed, out.map_err(|e| e.to_string())));
                 });
             },
         )
