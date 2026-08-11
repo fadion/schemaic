@@ -1497,6 +1497,10 @@ pub struct OverlayUi {
     pub monitor_cols: RwSignal<Vec<String>>,
     pub monitor_log: RwSignal<Vec<MonitorEntry>>,
     pub monitor_error: RwSignal<Option<String>>,
+    /// The last poll filled its row cap, so the monitor is watching a *page* of
+    /// the table rather than the table. Said in the status line, because a change
+    /// beyond that page is invisible and no amount of diffing can recover it.
+    pub monitor_partial: RwSignal<bool>,
     /// Poll interval in seconds (the popup's dropdown). Read by the poll loop on
     /// each re-arm, so a change takes effect on the next tick. Session-only.
     pub monitor_interval: RwSignal<u64>,

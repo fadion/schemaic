@@ -232,26 +232,37 @@ impl Db {
     }
 
     /// Fetch up to `limit` rows of a single table for the Live Monitor:
-    /// `SELECT * FROM `db`.`table` LIMIT n`. Bounded by construction — the monitor
-    /// never polls an unbounded table. Column provenance is populated as for any
-    /// query, so the caller derives the row-identity key via `analyze_edit`.
+    /// `SELECT * FROM `db`.`table` [ORDER BY …] LIMIT n`. Bounded by construction
+    /// — the monitor never polls an unbounded table. Column provenance is
+    /// populated as for any query, so the caller derives the row-identity key via
+    /// `analyze_edit`.
+    ///
+    /// **`order_by` is what makes the window comparable between polls.** Without
+    /// it the engine may return any `limit` rows in any order, so a table over the
+    /// limit produced insert/delete pairs that never happened — and on PostgreSQL
+    /// an `UPDATE` moves its tuple to the end of the heap, so the next scan
+    /// reorders and the updated row is logged as *deleted* while an untouched one
+    /// is logged as *inserted*. Pass the row-identity key; `None` only when the
+    /// table has none, where the monitor can't track changes anyway.
     pub async fn fetch_table(
         &self,
         database: &str,
         schema: Option<&str>,
         table: &str,
+        order_by: Option<&[String]>,
         limit: usize,
         cancel: CancellationToken,
     ) -> Result<ResultSet, DbError> {
         if self.engine == Engine::Postgres {
-            return pg::fetch_table(self, database, schema, table, limit, cancel).await;
+            return pg::fetch_table(self, database, schema, table, order_by, limit, cancel).await;
         }
         // MySQL has no namespace level — the database already is one.
         debug_assert!(schema.is_none(), "MySQL tables carry no namespace");
         let sql = format!(
-            "SELECT * FROM {}.{} LIMIT {}",
+            "SELECT * FROM {}.{}{} LIMIT {}",
             ident(database),
             ident(table),
+            order_by_clause(order_by, ident),
             limit
         );
         self.fetch_query(Some(database), &sql, limit, cancel).await
@@ -1484,6 +1495,19 @@ impl Db {
         };
         let _ = conn.disconnect().await;
         outcome
+    }
+}
+
+/// ` ORDER BY a, b` for the Live Monitor's window, or `""` when there is no key
+/// to order by. `quote` is the engine's identifier quoter, so the two callers
+/// can't drift on quoting.
+fn order_by_clause(cols: Option<&[String]>, quote: fn(&str) -> String) -> String {
+    match cols.filter(|c| !c.is_empty()) {
+        Some(cols) => format!(
+            " ORDER BY {}",
+            cols.iter().map(|c| quote(c)).collect::<Vec<_>>().join(", ")
+        ),
+        None => String::new(),
     }
 }
 

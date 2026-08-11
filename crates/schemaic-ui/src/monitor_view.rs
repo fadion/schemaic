@@ -51,6 +51,7 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
     let cols = ui.overlay.monitor_cols;
     let log = ui.overlay.monitor_log;
     let error = ui.overlay.monitor_error;
+    let partial = ui.overlay.monitor_partial;
     let interval = ui.overlay.monitor_interval;
 
     dyn_container(
@@ -125,11 +126,22 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
             // on the left, and the poll-interval dropdown on the right — inline with
             // the subtitle, below the header's X.
             let status_text = dyn_container(
-                move || error.get(),
-                move |err| match err {
+                move || (error.get(), partial.get()),
+                move |(err, partial)| match err {
                     Some(msg) => text(msg)
                         .style(|s| s.color(theme::reject_text()).font_size(FONT_LABEL))
                         .into_any(),
+                    // A table bigger than the poll's cap is watched a page at a
+                    // time, ordered by its key. Changes past that page can't be
+                    // seen at all, so the status line says which rows are covered
+                    // rather than implying the whole table is.
+                    None if partial => text(format!(
+                        "Watching the first {} rows by primary key — changes beyond \
+                         them aren't visible.",
+                        schemaic_core::monitor::ROW_CAP
+                    ))
+                    .style(|s| s.color(theme::plan_warn()).font_size(FONT_LABEL))
+                    .into_any(),
                     None => {
                         text("Watching for inserts, updates and deletes — newest at the bottom.")
                             .style(|s| s.color(theme::text_dim()).font_size(FONT_LABEL))
