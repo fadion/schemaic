@@ -88,6 +88,21 @@ pub fn clear_conn(entries: &mut Vec<HistoryEntry>, conn_id: u64) {
     entries.retain(|e| e.conn_id != conn_id);
 }
 
+/// How many entries [`clear_conn`] would delete for `conn_id`.
+///
+/// This exists so the confirmation modal's count and the deletion itself can't
+/// answer to different predicates. Clearing history is destructive and has no
+/// undo, so "Delete 12 recorded queries for this connection?" is a promise about
+/// what the next click does — and the panel used to make that promise with its
+/// own inline filter, several files away from the `retain` that fulfils it.
+/// `count_conn_agrees_with_clear_conn` is the test that keeps the pair honest.
+///
+/// The count is the connection's **total**: the panel's search box narrows the
+/// list on screen, not the delete.
+pub fn count_conn(entries: &[HistoryEntry], conn_id: u64) -> usize {
+    entries.iter().filter(|e| e.conn_id == conn_id).count()
+}
+
 /// A compact single-line preview of a SQL statement: runs of whitespace
 /// (including newlines) collapse to one space, so a multi-line statement reads as
 /// one flowing line that the UI can wrap to a few rows.
@@ -263,6 +278,42 @@ mod tests {
         clear_conn(&mut v, 1);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].conn_id, 2);
+    }
+
+    #[test]
+    fn count_conn_counts_only_that_connection() {
+        let v = vec![entry(1, "a", 1), entry(2, "b", 2), entry(1, "c", 3)];
+        assert_eq!(count_conn(&v, 1), 2);
+        assert_eq!(count_conn(&v, 2), 1);
+        // A connection with no history: the panel's trash is inert here.
+        assert_eq!(count_conn(&v, 3), 0);
+        assert_eq!(count_conn(&[], 1), 0);
+    }
+
+    /// The confirmation modal names a number and the next click deletes; if the
+    /// two ever answered to different predicates the modal would be lying about
+    /// a destructive action with no undo.
+    #[test]
+    fn count_conn_agrees_with_clear_conn() {
+        let base = vec![
+            entry(1, "a", 1),
+            entry(2, "b", 2),
+            entry(1, "c", 3),
+            entry(3, "d", 4),
+            entry(1, "e", 5),
+        ];
+        for conn in [1, 2, 3, 99] {
+            let mut v = base.clone();
+            let promised = count_conn(&v, conn);
+            let before = v.len();
+            clear_conn(&mut v, conn);
+            assert_eq!(
+                before - v.len(),
+                promised,
+                "conn {conn}: modal promised {promised} deletions"
+            );
+            assert_eq!(count_conn(&v, conn), 0, "conn {conn}: nothing left over");
+        }
     }
 
     #[test]
