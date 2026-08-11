@@ -86,6 +86,22 @@ pub(crate) fn editor_placeholder(
     })
 }
 
+/// Track height, thumb height and maximum scroll for a vertical scrollbar over
+/// `lines` rows of `line_h` in a `viewport_h`-tall viewport — or `None` when
+/// there is nothing to scroll, which is what hides the bar.
+///
+/// Lifted out of the editor's `v_geo` so the arithmetic can be asserted: the bug
+/// it carried was in the *input* (buffer lines instead of visual ones), but the
+/// threshold and the thumb ratio had never been tested either.
+fn scrollbar_geo(lines: usize, line_h: f64, viewport_h: f64) -> Option<(f64, f64, f64)> {
+    let content_h = lines as f64 * line_h;
+    if content_h <= viewport_h + 1.0 || viewport_h <= 0.0 {
+        return None;
+    }
+    let thumb_h = thumb_len(viewport_h / content_h * viewport_h, viewport_h);
+    Some((viewport_h, thumb_h, (content_h - viewport_h).max(1.0)))
+}
+
 /// Apply an edit the user did **not** type, without popping the completion list.
 ///
 /// Every document change re-runs the completion recompute a tick later, and that
@@ -2225,14 +2241,19 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // returns `(track_h, thumb_h, max_scroll)` for the current viewport/content, or
     // `None` when there's no vertical overflow.
     let v_geo = move |ed: &floem::views::editor::Editor| -> Option<(f64, f64, f64)> {
-        let vp = ed.viewport.get_untracked();
-        let vh = vp.height();
-        let content_h = ((ed.last_line() + 1) as f64) * ed.line_height(0) as f64;
-        if content_h <= vh + 1.0 || vh <= 0.0 {
-            return None;
-        }
-        let thumb_h = thumb_len(vh / content_h * vh, vh);
-        Some((vh, thumb_h, (content_h - vh).max(1.0)))
+        // **Visual** lines, not buffer lines. Under word wrap one buffer line can
+        // occupy thirty visual rows, and counting newlines said the content fit —
+        // so the thumb was hidden and, since the editor's own bars are disabled,
+        // a wrapped document had no vertical scrollbar at all while the wheel
+        // still scrolled it. `last_vline` degrades to `last_line` with wrap off.
+        // (The horizontal twin was always right: `max_line_width` is measured
+        // from laid-out text, which is what made the asymmetry visible.)
+        let lines = ed.last_vline().get() + 1;
+        scrollbar_geo(
+            lines,
+            ed.line_height(0) as f64,
+            ed.viewport.get_untracked().height(),
+        )
     };
     // Drag state: hover (for the hover tint), whether a drag is in flight, and the
     // grab offset within the thumb captured on press.
@@ -2691,11 +2712,18 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     move |_| run_sel.update(|i| *i = (*i + RUN_MENU_N - 1) % RUN_MENU_N),
                 )
                 .on_key_down(Key::Named(NamedKey::Enter), |_| true, move |_| (activate)())
-                .on_key_down(
-                    Key::Named(NamedKey::Escape),
-                    |_| true,
-                    move |_| run_menu.set(None),
-                )
+                // Dismissing has to hand focus back, exactly as running does.
+                // The panel took focus so ↑/↓/Enter drive it, and floem clears
+                // `app_state.focus` on no path when a focused view is *removed* —
+                // so Escape left the keyboard pointing at a destroyed view and
+                // typing went nowhere until the user clicked into the editor.
+                .on_key_down(Key::Named(NamedKey::Escape), |_| true, {
+                    let refocus = refocus.clone();
+                    move |_| {
+                        run_menu.set(None);
+                        (refocus)();
+                    }
+                })
                 .on_event_stop(EventListener::PointerDown, |_| {})
                 .style(|s| {
                     panel_style(s)
@@ -2715,8 +2743,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     };
                     s.absolute().inset_left(x).inset_top(pos.y)
                 });
+                // Same for a click outside: the catcher stops propagation, so the
+                // click that dismissed the menu never reaches the editor either.
                 let catcher = empty()
-                    .on_event_stop(EventListener::PointerDown, move |_| run_menu.set(None))
+                    .on_event_stop(EventListener::PointerDown, move |_| {
+                        run_menu.set(None);
+                        (refocus)();
+                    })
                     .style(|s| s.absolute().inset(0.0));
                 stack((catcher, positioned))
                     .style(|s| s.absolute().inset(0.0))
@@ -3592,6 +3625,44 @@ mod geometry_tests {
     }
 
     const SQL: &str = "SELECT 1;\nSELECT 2;\nSELECT * FROM nosuchtbl;";
+
+    // ── The vertical scrollbar's geometry ─────────────────────────────────
+
+    /// The observed case: one long statement on a single buffer line, wrapped to
+    /// thirty visual rows in a 187px editor. Counting buffer lines said it fit,
+    /// so no scrollbar was drawn at all — while the wheel still scrolled it.
+    #[test]
+    fn a_wrapped_line_overflows_even_though_its_buffer_line_does_not() {
+        assert!(scrollbar_geo(30, 18.0, 187.0).is_some(), "30 visual rows");
+        assert!(scrollbar_geo(2, 18.0, 187.0).is_none(), "2 buffer lines");
+    }
+
+    #[test]
+    fn content_that_fits_hides_the_bar() {
+        assert!(scrollbar_geo(10, 18.0, 187.0).is_none());
+        // Exactly filling the viewport is not overflow.
+        assert!(scrollbar_geo(10, 18.0, 180.0).is_none());
+        assert!(scrollbar_geo(11, 18.0, 180.0).is_some());
+    }
+
+    /// An unmeasured (zero-height) viewport has no bar rather than a bar of
+    /// nonsense size.
+    #[test]
+    fn an_unmeasured_viewport_has_no_bar() {
+        assert!(scrollbar_geo(100, 18.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn the_thumb_shrinks_with_the_visible_fraction_but_stays_grabbable() {
+        let (track, thumb, max_scroll) = scrollbar_geo(30, 18.0, 180.0).expect("overflows");
+        assert_eq!(track, 180.0);
+        assert_eq!(max_scroll, 540.0 - 180.0);
+        // A third of the content is visible → a third of the track.
+        assert!((thumb - 60.0).abs() < 0.01, "{thumb}");
+        // A very long document keeps a minimum thumb rather than a hairline.
+        let (_, thumb, _) = scrollbar_geo(10_000, 18.0, 180.0).expect("overflows");
+        assert!(thumb >= 24.0, "{thumb}");
+    }
 
     // ── The off-screen rule ───────────────────────────────────────────────
     //
