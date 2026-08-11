@@ -492,6 +492,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   batch without ending the user's transaction, and the transaction *state* is the pure, tested
   `schemaic_core::tx::TxState` — engine divergence (PG poisons on error, MySQL implicitly commits on
   DDL) belongs there, not in UI conditionals.
+  **Schema-editing DDL is the case that fits neither half** — it is the tab's own work *and* a write,
+  so it takes the fresh connection and then queues there behind the lock the tab's own uncommitted
+  `SELECT` holds. Two things keep that from being an unexplained hang, and a new write path off the
+  session should ask both questions: the app raises a `TxPrompt` per `tx::ddl_blocking_tabs` (open
+  transactions on the *connection* — Schemaic doesn't track which tables one has touched, so anything
+  narrower would miss the case) before applying, and `run_ddl`'s connection carries
+  `db::lock_wait_sql` so a lock nobody could ask about comes back as an error instead of never.
 - **Connection identity is the `Db` handle / `conn_id`, never a `mysql://user:pass@host/db` URL.**
   Credentials go through `OptsBuilder`; never in a URL, argv, or log. The MCP subprocess gets its
   endpoint via a temp `--mcp-config` file, not argv. Don't add new plaintext-secret surfaces.

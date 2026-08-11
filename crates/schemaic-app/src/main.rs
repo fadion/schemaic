@@ -86,23 +86,28 @@ type RecordHistoryFn = Rc<dyn Fn(u64, Option<String>, String, Option<String>)>;
 type SessionForFn = Rc<dyn Fn(&Tab) -> Result<Option<Arc<Session>>, String>>;
 /// End a tab's transaction — `(tab id, commit?, what to run once it's settled)`.
 type EndTxFn = Rc<dyn Fn(usize, bool, Option<Rc<dyn Fn()>>)>;
-/// Settle an open transaction before an action that would strand it —
-/// `(tab id, the action to resume once it's settled)`.
-type GuardTxFn = Rc<dyn Fn(usize, Rc<dyn Fn()>)>;
+/// Settle an open transaction before an action that would strand it (or wait
+/// behind it) — `(tab id, the action to resume once it's settled, what to do if
+/// the user backs out)`.
+///
+/// The cancel arm is `None` for every caller whose action simply doesn't happen
+/// (a tab isn't closed, a mode isn't switched). It is `Some` for the one caller
+/// that has already told a modal work is under way and has to take that back.
+type GuardTxFn = Rc<dyn Fn(usize, Rc<dyn Fn()>, Option<Rc<dyn Fn()>>)>;
 use schemaic_core::filter::{Order, table_query};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::persist::{self, ConnectionsFile, UiState};
 use schemaic_core::schema::{SchemaState, TableSource};
 use schemaic_core::sql::{GuardPolicy, RunVerdict, run_verdict};
-use schemaic_core::tx::{StmtOutcome, TxEngine, TxMode, TxState};
+use schemaic_core::tx::{StmtOutcome, TabTx, TxEngine, TxMode, TxState, ddl_blocking_tabs};
 use schemaic_db::{Db, DbError, Session};
 use schemaic_ui::theme::{EditorThemeKind, UiThemeKind};
 use schemaic_ui::{
     AiActions, AiEffort, AiModel, AiUi, ChatMessage, Confirm, ConnActions, ConnNode, ConnUi,
-    CtxMenu, DraftSignals, HistoryActions, HistoryUi, InlineAiRequest, InlineAiState, LayoutUi,
-    MonitorEntry, OverlayUi, PendingRun, PlanState, ResultPanel, RightPanel, Role, RunGuard,
-    SchemaActions, SchemaScope, SchemaUi, Tab, TabsActions, TabsUi, TermActions, TermCursor,
-    TermUi, TestState, TxChoice, TxPrompt, Ui, pick_connection_color,
+    CtxMenu, DdlOutcome, DraftSignals, HistoryActions, HistoryUi, InlineAiRequest, InlineAiState,
+    LayoutUi, MonitorEntry, OverlayUi, PendingRun, PlanState, ResultPanel, RightPanel, Role,
+    RunGuard, SchemaActions, SchemaScope, SchemaUi, Tab, TabsActions, TabsUi, TermActions,
+    TermCursor, TermUi, TestState, TxChoice, TxPrompt, Ui, pick_connection_color,
 };
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -1842,33 +1847,39 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // so the UI never has to remember to ask.
     let guard_tx: GuardTxFn = {
         let end_tx = end_tx.clone();
-        Rc::new(move |tab_id: usize, proceed: Rc<dyn Fn()>| {
-            let found = tabs.with_untracked(|v| {
-                v.iter()
-                    .find(|t| t.id == tab_id)
-                    .map(|t| (t.tx.get_untracked(), t.title()))
-            });
-            let (state, tab_title) = found.unwrap_or_default();
-            if !state.is_open() {
-                proceed();
-                return;
-            }
-            let end_tx = end_tx.clone();
-            tx_prompt.set(Some(TxPrompt {
-                tab_id,
-                tab: tab_title,
-                stmts: state.stmts(),
-                can_commit: state.can_commit(),
-                resolve: Rc::new(move |choice| {
-                    tx_prompt.set(None);
-                    match choice {
-                        TxChoice::Commit => (end_tx)(tab_id, true, Some(proceed.clone())),
-                        TxChoice::Rollback => (end_tx)(tab_id, false, Some(proceed.clone())),
-                        TxChoice::Cancel => {}
-                    }
-                }),
-            }));
-        })
+        Rc::new(
+            move |tab_id: usize, proceed: Rc<dyn Fn()>, on_cancel: Option<Rc<dyn Fn()>>| {
+                let found = tabs.with_untracked(|v| {
+                    v.iter()
+                        .find(|t| t.id == tab_id)
+                        .map(|t| (t.tx.get_untracked(), t.title()))
+                });
+                let (state, tab_title) = found.unwrap_or_default();
+                if !state.is_open() {
+                    proceed();
+                    return;
+                }
+                let end_tx = end_tx.clone();
+                tx_prompt.set(Some(TxPrompt {
+                    tab_id,
+                    tab: tab_title,
+                    stmts: state.stmts(),
+                    can_commit: state.can_commit(),
+                    resolve: Rc::new(move |choice| {
+                        tx_prompt.set(None);
+                        match choice {
+                            TxChoice::Commit => (end_tx)(tab_id, true, Some(proceed.clone())),
+                            TxChoice::Rollback => (end_tx)(tab_id, false, Some(proceed.clone())),
+                            TxChoice::Cancel => {
+                                if let Some(cancel) = on_cancel.clone() {
+                                    cancel();
+                                }
+                            }
+                        }
+                    }),
+                }));
+            },
+        )
     };
 
     // Pin a fresh connection for a Manual tab, replacing any it already had.
@@ -1956,6 +1967,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                             tab.tx_mode.set(TxMode::Auto);
                             (drop_session)(tab_id);
                         }),
+                        None,
                     );
                 }
             }
@@ -2014,6 +2026,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         (open_session)(id);
                     }
                 }),
+                None,
             );
         })
     };
@@ -2209,7 +2222,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         let guard_tx = guard_tx.clone();
         Rc::new(move |id: usize| {
             let close_tab_now = close_tab_now.clone();
-            (guard_tx)(id, Rc::new(move || (close_tab_now)(id)));
+            (guard_tx)(id, Rc::new(move || (close_tab_now)(id)), None);
         })
     };
 
@@ -2230,6 +2243,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 (c)(id);
                 close_tabs_seq(rest.clone(), g.clone(), c.clone());
             }),
+            None,
         );
     }
 
@@ -3175,35 +3189,88 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         let handle = handle.clone();
         let db_for = db_for.clone();
         let refresh_db = refresh_db.clone();
+        let guard_tx = guard_tx.clone();
         Rc::new(
             move |req: schemaic_ui::DdlRunRequest, done: schemaic_ui::DdlDoneFn| {
                 let db = match db_for(req.conn_id) {
                     Ok(db) => db,
                     Err(e) => {
-                        (done)(Err(e));
+                        (done)(DdlOutcome::Failed(e));
                         return;
                     }
                 };
-                let refresh_db = refresh_db.clone();
-                let database = req.database.clone();
-                let report =
-                    create_ext_action(cx, move |(changed, res): (bool, Result<(), String>)| {
-                        // Refresh before reporting, so the modal's success state
-                        // and the tree can't be seen disagreeing for a frame.
-                        // `changed`, not `is_ok()`: a MySQL plan that failed
-                        // halfway still moved the schema out from under us.
-                        if changed {
-                            (refresh_db)(database.clone());
-                        }
-                        (done)(res);
-                    });
-                handle.spawn(async move {
-                    let out = db
-                        .run_ddl(&req.database, &req.statements, CancellationToken::new())
-                        .await;
-                    let changed = schemaic_db::ddl_changed_schema(&out);
-                    report((changed, out.map_err(|e| e.to_string())));
+                let conn_id = req.conn_id;
+                let req = Rc::new(req);
+
+                // The apply itself, run once nothing is in its way.
+                let start: Rc<dyn Fn()> = {
+                    let handle = handle.clone();
+                    let refresh_db = refresh_db.clone();
+                    let done = done.clone();
+                    Rc::new(move || {
+                        let db = db.clone();
+                        let req = req.clone();
+                        let done = done.clone();
+                        let refresh_db = refresh_db.clone();
+                        let database = req.database.clone();
+                        let report = create_ext_action(
+                            cx,
+                            move |(changed, res): (bool, Result<(), String>)| {
+                                // Refresh before reporting, so the modal's success
+                                // state and the tree can't be seen disagreeing for
+                                // a frame. `changed`, not `is_ok()`: a MySQL plan
+                                // that failed halfway still moved the schema out
+                                // from under us.
+                                if changed {
+                                    (refresh_db)(database.clone());
+                                }
+                                (done)(match res {
+                                    Ok(()) => DdlOutcome::Applied,
+                                    Err(e) => DdlOutcome::Failed(e),
+                                });
+                            },
+                        );
+                        // Owned copies: the plan crosses onto a runtime worker,
+                        // and the `Rc` holding it can't.
+                        let (database, statements) = (req.database.clone(), req.statements.clone());
+                        handle.spawn(async move {
+                            let out = db
+                                .run_ddl(&database, &statements, CancellationToken::new())
+                                .await;
+                            let changed = schemaic_db::ddl_changed_schema(&out);
+                            report((changed, out.map_err(|e| e.to_string())));
+                        });
+                    })
+                };
+
+                // A schema change is the tab's own work *and* a write, so it
+                // takes neither branch of the one-connection-per-operation rule
+                // cleanly: it runs on a fresh connection, and then waits there
+                // for the lock the user's own uncommitted transaction is holding
+                // — with no timeout on either engine and every modal exit
+                // refusing while an apply is in flight. So ask first, one prompt
+                // per open transaction on this connection, chained the way
+                // `close_tabs_seq` chains its closes (`tx_prompt` holds one
+                // question at a time).
+                let snapshot = tabs.with_untracked(|v| {
+                    v.iter()
+                        .map(|t| TabTx {
+                            tab_id: t.id,
+                            conn_id: t.conn_id.get_untracked(),
+                            state: t.tx.get_untracked(),
+                        })
+                        .collect::<Vec<_>>()
                 });
+                let declined: Rc<dyn Fn()> = Rc::new(move || (done)(DdlOutcome::Declined));
+                let mut proceed = start;
+                for tab_id in ddl_blocking_tabs(&snapshot, conn_id).into_iter().rev() {
+                    let guard_tx = guard_tx.clone();
+                    let next = proceed.clone();
+                    let declined = declined.clone();
+                    proceed =
+                        Rc::new(move || (guard_tx)(tab_id, next.clone(), Some(declined.clone())));
+                }
+                proceed();
             },
         )
     };

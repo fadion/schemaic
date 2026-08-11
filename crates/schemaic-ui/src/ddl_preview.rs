@@ -21,7 +21,7 @@ use crate::widgets::{
     ExitAction, autohide, exit_action, footer_button, form_section, modal_footer,
     modal_title_owned, panel_style,
 };
-use crate::{DdlPreview, DdlRunRequest, FieldCfg, Ui, edit_field, icons, theme};
+use crate::{DdlOutcome, DdlPreview, DdlRunRequest, FieldCfg, Ui, edit_field, icons, theme};
 
 const PANEL_W: f64 = 660.0;
 const PANEL_H: f64 = 560.0;
@@ -167,14 +167,18 @@ fn apply(ui: Ui) {
             }
             d.applying.set(false);
             match res {
-                Ok(()) => {
+                DdlOutcome::Applied => {
                     d.applied.set(true);
                     // The draft behind this is now the server's state, so
                     // whichever editor opened it has nothing left to show.
                     d.designer.set(None);
                     d.view.set(None);
                 }
-                Err(e) => d.error.set(Some(e)),
+                DdlOutcome::Failed(e) => d.error.set(Some(e)),
+                // The user answered "Cancel" to a question the apply raised, so
+                // the modal goes back to where it was — nothing to report, and
+                // an error banner would name a failure that never happened.
+                DdlOutcome::Declined => {}
             }
         }),
     );

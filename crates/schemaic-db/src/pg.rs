@@ -329,6 +329,11 @@ pub(crate) async fn run_ddl(
         .batch_execute("BEGIN")
         .await
         .map_err(|e| fail(0, e.to_string()))?;
+    // Inside the transaction, so it reverts with it — and the connection is
+    // this plan's alone either way. Best-effort, as on MySQL.
+    let _ = client
+        .batch_execute(&crate::lock_wait_sql(crate::Engine::Postgres))
+        .await;
     for (i, sql) in stmts.iter().enumerate() {
         let step = tokio::select! {
             r = client.batch_execute(sql) => r.map_err(|e| e.to_string()),
