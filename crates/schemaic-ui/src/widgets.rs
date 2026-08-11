@@ -1156,6 +1156,48 @@ pub(crate) fn jump_to_bottom_button(
         .pointer_events(show)
 }
 
+/// What a modal's Escape / ✕ should do, given whether work it started is still
+/// running.
+///
+/// This exists because two modals got it wrong the same way. The import modal
+/// and the DDL preview each have **three** exits — a footer button, Escape, and
+/// the title bar's ✕ — and in both, only the footer button knew that closing
+/// mid-flight is not allowed. The other two called a bare `close`, so pressing
+/// Escape during a bulk import hid a transaction that then ran to completion and
+/// committed, reporting its outcome into signals whose only reader had just been
+/// unmounted; and pressing Escape during a MySQL `ALTER` threw away the
+/// "statement 3 of 5 failed, 2 already stuck" report, leaving a half-migrated
+/// table and a stale schema tree with no indication anything had happened.
+///
+/// Both modals' footers carried a comment explaining why the guard was there.
+/// Neither comment could reach the other two exits, which is the argument for a
+/// named function over a repeated `if busy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExitAction {
+    /// Nothing in flight — close.
+    Close,
+    /// Work is running and *can* be stopped: stop it and stay open, so the
+    /// outcome still has a reader.
+    Cancel,
+    /// Work is running and cannot be stopped: refuse. Closing would orphan the
+    /// outcome, and there is nothing to cancel.
+    Ignore,
+}
+
+/// The exit decision. See [`ExitAction`].
+///
+/// `cancellable` is what separates the two callers: the import modal holds a
+/// cancellation token the load actually observes, while `run_ddl` is handed a
+/// fresh token nothing holds — and on MySQL each DDL statement has already
+/// committed anyway, so there is no meaningful "stop".
+pub(crate) fn exit_action(busy: bool, cancellable: bool) -> ExitAction {
+    match (busy, cancellable) {
+        (false, _) => ExitAction::Close,
+        (true, true) => ExitAction::Cancel,
+        (true, false) => ExitAction::Ignore,
+    }
+}
+
 #[cfg(test)]
 mod measure_tests {
     use super::*;
@@ -1187,5 +1229,46 @@ mod measure_tests {
             measure_text_px_bold_at(n, 13.0) - measure_text_px_at(n, 13.0) > 6.0,
             "the regression this guards needs the drift to exceed node_width's slack"
         );
+    }
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::*;
+
+    /// The property both [B7.2-L1-01] and [B2-L1-01] are about: while work the
+    /// modal started is still running, **no exit closes it**. Two modals had
+    /// three exits each, and in both only the footer button knew this.
+    #[test]
+    fn no_exit_closes_a_modal_while_its_work_is_running() {
+        for cancellable in [true, false] {
+            assert_ne!(
+                exit_action(true, cancellable),
+                ExitAction::Close,
+                "cancellable={cancellable}"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_always_closes() {
+        assert_eq!(exit_action(false, true), ExitAction::Close);
+        assert_eq!(exit_action(false, false), ExitAction::Close);
+    }
+
+    /// The import modal: the load holds a cancellation token, so Escape means
+    /// "stop the write and roll it back", not "hide it".
+    #[test]
+    fn busy_and_cancellable_cancels_rather_than_closing() {
+        assert_eq!(exit_action(true, true), ExitAction::Cancel);
+    }
+
+    /// The DDL preview: `run_ddl` is handed a token nothing holds, and MySQL
+    /// commits each statement implicitly, so there is nothing to cancel — the
+    /// only honest answer is to refuse the exit and keep the modal that owns the
+    /// outcome on screen.
+    #[test]
+    fn busy_and_uncancellable_refuses_the_exit() {
+        assert_eq!(exit_action(true, false), ExitAction::Ignore);
     }
 }
