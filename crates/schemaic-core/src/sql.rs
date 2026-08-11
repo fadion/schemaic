@@ -348,6 +348,13 @@ pub struct GuardPolicy {
     /// "Confirm before running writes" — a soft confirmation on any write/DDL.
     pub confirm_writes: bool,
     pub dialect: SqlDialect,
+    /// The tab has no database selected. On PostgreSQL that is not the same as
+    /// "nowhere to run": the connection falls back to a *maintenance* database
+    /// (`postgres`, then the user's own, then `template1`), which is hidden from
+    /// the schema tree — so an unscoped `CREATE TABLE` succeeds into a database
+    /// Schemaic can never show again, and one landing in `template1` is inherited
+    /// by every database created afterwards. See [`needs_database`].
+    pub no_database: bool,
 }
 
 /// What the write guards say about a run request.
@@ -362,6 +369,70 @@ pub enum RunVerdict {
     /// Held back with an override available ("Run anyway") — the missing-`WHERE`
     /// warning, or `confirm_writes`.
     Confirm(String),
+}
+
+/// Does `sql` need a database to run *in*, as opposed to being a server-level or
+/// read-only statement that is fine without one?
+///
+/// Only PostgreSQL asks. On MySQL a connection with no database has none, and the
+/// server answers with ERROR 1046; on PostgreSQL every connection is inside some
+/// database, so with none selected the statement silently lands in the hidden
+/// maintenance one. The natural first-run sequence on a fresh server —
+/// `CREATE DATABASE app;` then `CREATE TABLE …` — is exactly the shape that
+/// breaks: the first statement is correct and *needs* the maintenance
+/// connection, the second creates a table nothing in Schemaic can reach again.
+///
+/// So: server-level `CREATE`/`DROP`/`ALTER DATABASE` (and the other cluster-wide
+/// objects, which don't live in a database either) are allowed, as is anything
+/// that can't leave a persistent object behind. Everything else is refused.
+pub fn needs_database(sql: &str, dialect: SqlDialect) -> bool {
+    if dialect != SqlDialect::Postgres {
+        return false;
+    }
+    let Some(kw) = leading_keyword(sql, dialect) else {
+        return false; // empty, or comments only — nothing will run
+    };
+    // Reads and session/transaction control can't create anything that outlives
+    // the connection, so where they run doesn't matter. A read of a table that
+    // isn't there fails on its own, which is a clearer error than ours.
+    if matches!(
+        kw.as_str(),
+        "SELECT"
+            | "SHOW"
+            | "EXPLAIN"
+            | "VALUES"
+            | "TABLE"
+            | "BEGIN"
+            | "START"
+            | "COMMIT"
+            | "END"
+            | "ROLLBACK"
+            | "ABORT"
+            | "SAVEPOINT"
+            | "RELEASE"
+            | "SET"
+            | "RESET"
+            | "DISCARD"
+            | "LISTEN"
+            | "UNLISTEN"
+            | "NOTIFY"
+            | "CHECKPOINT"
+    ) {
+        return false;
+    }
+    if matches!(kw.as_str(), "CREATE" | "DROP" | "ALTER") {
+        let rest = leading_keyword_end(sql, dialect)
+            .map(|e| &sql[e..])
+            .unwrap_or("");
+        let obj = leading_keyword(rest, dialect).unwrap_or_default();
+        // Cluster-wide objects: they don't live in a database, so they are the
+        // statements a database-less tab exists to run.
+        return !matches!(
+            obj.as_str(),
+            "DATABASE" | "ROLE" | "USER" | "GROUP" | "TABLESPACE"
+        );
+    }
+    true
 }
 
 /// The write guard, as one decision over the statements about to run.
@@ -384,6 +455,13 @@ pub fn run_verdict(stmts: &[String], policy: GuardPolicy) -> RunVerdict {
     let writes = || stmts.iter().any(|s| contains_write(s, policy.dialect));
     if policy.read_only && writes() {
         return RunVerdict::Block("Read-only connection.".to_string());
+    }
+    if policy.no_database && stmts.iter().any(|s| needs_database(s, policy.dialect)) {
+        // MySQL's own message, deliberately: there it is the *server* that
+        // refuses (ERROR 1046), because the connection simply carries no
+        // database. PostgreSQL's carries a hidden one instead, so the refusal has
+        // to come from here — and it should read the same either way.
+        return RunVerdict::Block("No database selected.".to_string());
     }
     if let Some(message) = stmts.iter().find_map(|s| first_unsafe(s, policy.dialect)) {
         return RunVerdict::Confirm(message);
@@ -1076,6 +1154,7 @@ mod tests {
             read_only: false,
             confirm_writes: false,
             dialect: SqlDialect::MySql,
+            no_database: false,
         }
     }
 
@@ -1126,6 +1205,123 @@ mod tests {
         );
     }
 
+    // ── No database selected (PostgreSQL's hidden maintenance database) ──
+
+    /// The sequence a fresh server invites: create the database, then create a
+    /// table in it. The first statement *needs* the maintenance connection; the
+    /// second used to run on it too, creating a table inside `postgres` — which
+    /// is filtered out of the schema tree, so it could never be reached again.
+    #[test]
+    fn the_first_run_sequence_on_an_empty_postgres_server() {
+        assert!(!needs_database("CREATE DATABASE app", SqlDialect::Postgres));
+        assert!(needs_database(
+            "CREATE TABLE users (id serial primary key)",
+            SqlDialect::Postgres
+        ));
+    }
+
+    #[test]
+    fn cluster_wide_objects_do_not_need_a_database() {
+        for sql in [
+            "CREATE DATABASE app",
+            "DROP DATABASE IF EXISTS app",
+            "ALTER DATABASE app OWNER TO bob",
+            "CREATE ROLE app_rw LOGIN",
+            "CREATE USER bob",
+            "DROP TABLESPACE fast",
+        ] {
+            assert!(!needs_database(sql, SqlDialect::Postgres), "{sql}");
+        }
+    }
+
+    #[test]
+    fn anything_that_would_land_in_the_maintenance_database_needs_one() {
+        for sql in [
+            "CREATE TABLE users (id int)",
+            "CREATE INDEX ix ON users (id)",
+            "CREATE SCHEMA sales",
+            "INSERT INTO users VALUES (1)",
+            "UPDATE users SET id = 2",
+            "DELETE FROM users",
+            "TRUNCATE users",
+            "GRANT SELECT ON users TO bob",
+        ] {
+            assert!(needs_database(sql, SqlDialect::Postgres), "{sql}");
+        }
+    }
+
+    /// A read leaves nothing behind, and one against a table that isn't there
+    /// fails on its own with a clearer message than ours.
+    #[test]
+    fn reads_and_session_control_run_without_a_database() {
+        for sql in [
+            "SELECT datname FROM pg_database",
+            "  -- which server is this?\n SHOW server_version",
+            "EXPLAIN SELECT 1",
+            "BEGIN",
+            "COMMIT",
+            "SET search_path TO public",
+        ] {
+            assert!(!needs_database(sql, SqlDialect::Postgres), "{sql}");
+        }
+    }
+
+    /// MySQL's connection genuinely has no database, and the server says so
+    /// (ERROR 1046). Answering first would only add a second voice.
+    #[test]
+    fn mysql_leaves_the_refusal_to_its_server() {
+        assert!(!needs_database(
+            "CREATE TABLE users (id int)",
+            SqlDialect::MySql
+        ));
+    }
+
+    #[test]
+    fn the_guard_blocks_a_database_less_run_with_no_override() {
+        let p = GuardPolicy {
+            dialect: SqlDialect::Postgres,
+            no_database: true,
+            ..open_policy()
+        };
+        assert_eq!(
+            v(&["CREATE TABLE users (id int)"], p),
+            RunVerdict::Block("No database selected.".to_string()),
+            "the same message MySQL's server gives"
+        );
+        // The statement that fixes the situation still runs.
+        assert_eq!(v(&["CREATE DATABASE app"], p), RunVerdict::Allow);
+        // One offender in a batch stops the batch: the rest would run in the
+        // maintenance database too.
+        assert!(matches!(
+            v(&["SELECT 1", "CREATE TABLE t (id int)"], p),
+            RunVerdict::Block(_)
+        ));
+    }
+
+    #[test]
+    fn a_bound_database_gates_nothing() {
+        let p = GuardPolicy {
+            dialect: SqlDialect::Postgres,
+            ..open_policy()
+        };
+        assert_eq!(v(&["CREATE TABLE users (id int)"], p), RunVerdict::Allow);
+    }
+
+    /// Read-only is the harder refusal and must be the one reported.
+    #[test]
+    fn a_read_only_connection_still_wins_over_the_missing_database() {
+        let p = GuardPolicy {
+            read_only: true,
+            dialect: SqlDialect::Postgres,
+            no_database: true,
+            ..open_policy()
+        };
+        assert_eq!(
+            v(&["CREATE TABLE users (id int)"], p),
+            RunVerdict::Block("Read-only connection.".to_string())
+        );
+    }
+
     #[test]
     fn the_hard_block_wins_over_both_soft_ones() {
         // A read-only connection must not be offered "Run anyway" just because
@@ -1133,7 +1329,7 @@ mod tests {
         let p = GuardPolicy {
             read_only: true,
             confirm_writes: true,
-            dialect: SqlDialect::MySql,
+            ..open_policy()
         };
         assert!(matches!(
             v(&["DELETE FROM orders"], p),
@@ -1200,8 +1396,8 @@ mod tests {
                 &[cte],
                 GuardPolicy {
                     read_only: true,
-                    confirm_writes: false,
-                    dialect: pg
+                    dialect: pg,
+                    ..open_policy()
                 }
             ),
             RunVerdict::Block(_)
@@ -1210,9 +1406,9 @@ mod tests {
             v(
                 &[cte],
                 GuardPolicy {
-                    read_only: false,
                     confirm_writes: true,
-                    dialect: pg
+                    dialect: pg,
+                    ..open_policy()
                 }
             ),
             RunVerdict::Confirm(_)
