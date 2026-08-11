@@ -38,8 +38,8 @@ use schemaic_core::model::QueryState;
 use schemaic_core::pairs::{self, PairAction};
 use schemaic_core::sql::{statement_range, statement_ranges};
 use schemaic_core::text_ops::{
-    find_matches, move_line, offset_of_line, replace_all, soft_tab_indent, soft_tab_outdent,
-    toggle_line_comment,
+    find_matches, matches_at, move_line, offset_of_line, replace_all, soft_tab_indent,
+    soft_tab_outdent, toggle_line_comment,
 };
 
 use crate::completion::{
@@ -86,12 +86,31 @@ pub(crate) fn editor_placeholder(
     })
 }
 
+/// Apply an edit the user did **not** type, without popping the completion list.
+///
+/// Every document change re-runs the completion recompute a tick later, and that
+/// recompute has no way to tell a keystroke from a Replace, a comment toggle, a
+/// line move or a reformat. So clicking **Replace** in the find bar opened a list
+/// of every table in the database, anchored at line 1, while the find counter
+/// read `0/0` — a suggestion list for a caret the user had not put there.
+///
+/// `comp.suppress` is the one-shot the accept path already uses so its own splice
+/// doesn't re-open the popup over the word it just inserted. This is the one
+/// place that remembers to set it, which is the difference between a fix and a
+/// rule every future programmatic edit has to be told about. **Typed** edits —
+/// auto-pair insertion, the paired backspace — deliberately do not come through
+/// here: there the popup *should* follow the caret.
+fn edit_untyped(ed: &Editor, comp: Completion, sel: Selection, text: &str, ty: EditType) {
+    comp.suppress.set(true);
+    ed.doc().edit_single(sel, text, ty);
+}
+
 /// Reformat the SQL in `ed` (the Ctrl+Alt+L action, also the editor's right-click
 /// "Format SQL"). Formats the current selection if there is one, else the whole
 /// document; indentation follows the editor's tab-width / soft-tabs settings and
 /// keyword case is preserved. Applied as one `edit_single` (a single undo step);
 /// a no-op when the text is already formatted.
-fn format_editor(ed: &Editor, dialect: SqlDialect) {
+fn format_editor(ed: &Editor, comp: Completion, dialect: SqlDialect) {
     let doc = ed.doc();
     let full = doc.text().to_string();
     let (a, b) = ed.cursor.get_untracked().get_selection().unwrap_or((0, 0));
@@ -110,7 +129,13 @@ fn format_editor(ed: &Editor, dialect: SqlDialect) {
     if formatted == full[start..end] {
         return;
     }
-    doc.edit_single(Selection::region(start, end), &formatted, EditType::Other);
+    edit_untyped(
+        ed,
+        comp,
+        Selection::region(start, end),
+        &formatted,
+        EditType::Other,
+    );
     let caret = start + formatted.len();
     ed.cursor.update(|cc| cc.set_offset(caret, false, false));
 }
@@ -147,6 +172,9 @@ fn cmdk_popup(
     cancel: Rc<dyn Fn()>,
     query: RwSignal<String>,
     ed: Editor,
+    // Approving a diff is an edit nobody typed, so it goes through
+    // `edit_untyped` — which needs the completion state to suppress the popup.
+    comp: Completion,
     // Editor-area height (tracked via on_resize), so the expanded overlay fills
     // it exactly with an explicit `height` — needed because animating requires a
     // definite height (can't interpolate to `inset(0)`'s auto height).
@@ -230,7 +258,7 @@ fn cmdk_popup(
                     let full = doc.text().to_string();
                     let s = floor_char_boundary(&full, s);
                     let e = floor_char_boundary(&full, e);
-                    doc.edit_single(Selection::region(s, e), &sql, EditType::Paste);
+                    edit_untyped(&ed, comp, Selection::region(s, e), &sql, EditType::Paste);
                     ed.cursor
                         .update(|c| c.set_offset(s + sql.len(), false, false));
                 }
@@ -1160,7 +1188,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     (o, o)
                 });
                 let ed = soft_tab_indent(&full, a, b, tw);
-                e.doc().edit_single(
+                edit_untyped(
+                    e,
+                    comp,
                     Selection::region(ed.start, ed.end),
                     &ed.text,
                     EditType::InsertChars,
@@ -1191,7 +1221,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 // consume the key so it never falls through to floem's fixed-width
                 // outdent.
                 if ed.text != full[ed.start..ed.end] {
-                    e.doc().edit_single(
+                    edit_untyped(
+                        e,
+                        comp,
                         Selection::region(ed.start, ed.end),
                         &ed.text,
                         EditType::InsertChars,
@@ -1266,7 +1298,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 kp.key,
                 KeyInput::Keyboard(_, PhysicalKey::Code(KeyCode::KeyL))
             ) {
-                editor_sig.with_untracked(|e| format_editor(e, dialect.get_untracked()));
+                editor_sig.with_untracked(|e| format_editor(e, comp, dialect.get_untracked()));
                 return CommandExecuted::Yes;
             }
         }
@@ -1289,7 +1321,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let off = cur.offset();
                     let (a, b) = cur.get_selection().unwrap_or((off, off));
                     let edit = toggle_line_comment(&full, a.min(b), a.max(b));
-                    doc.edit_single(
+                    edit_untyped(
+                        e,
+                        comp,
                         Selection::region(0, full.len()),
                         &edit.text,
                         EditType::ToggleComment,
@@ -1330,7 +1364,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             .map(|i| off + i)
                             .unwrap_or(full.len());
                         let insert = format!("\n{}", &full[ls..le]);
-                        doc.edit_single(Selection::region(le, le), &insert, EditType::InsertChars);
+                        edit_untyped(
+                            e,
+                            comp,
+                            Selection::region(le, le),
+                            &insert,
+                            EditType::InsertChars,
+                        );
                         // Keep the caret at the same column on the duplicated line.
                         let new_caret = le + 1 + (off - ls);
                         e.cursor.update(|c| c.set_offset(new_caret, false, false));
@@ -1482,7 +1522,9 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 let off = cur.offset();
                 let (a, b) = cur.get_selection().unwrap_or((off, off));
                 if let Some(edit) = move_line(&full, a.min(b), a.max(b), up) {
-                    doc.edit_single(
+                    edit_untyped(
+                        e,
+                        comp,
                         Selection::region(0, full.len()),
                         &edit.text,
                         EditType::MoveLine,
@@ -1751,7 +1793,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     }
                 }),
                 MenuEntry::action("Format", move || {
-                    format_editor(&ed_format, dialect.get_untracked())
+                    format_editor(&ed_format, comp, dialect.get_untracked())
                 }),
             ];
             // "Create view" only when there's a query to make one *out of* — the
@@ -2374,6 +2416,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         inline_ai_cancel,
         query,
         ed_cmdk,
+        comp,
         area_h,
         dialect.get_untracked(),
     );
@@ -2955,21 +2998,38 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // to the first. The haystack is read from `query` (kept in sync with the doc).
     {
         let reveal = reveal.clone();
-        create_effect(move |_| {
+        // The document is **tracked**: an edit while the bar is open moves every
+        // later match, and the hit list is what Replace edits by. Reading it
+        // untracked meant a hit computed before the edit was used after it —
+        // typing `-- ` at the head of a query turned `SELECT a FROM t;` into
+        // `-- SELECT a FRx t;`, destroying the `OM` of `FROM` while the `t;` the
+        // user searched for was left alone. It also froze the `n/total` counter
+        // on the document as it was when the bar opened.
+        //
+        // The effect's previous value is the query it last ran for, which is what
+        // separates the two reasons it runs: a *new query* starts at match 1 and
+        // reveals it, an *edit* keeps the user where they are and scrolls nothing.
+        create_effect(move |prev: Option<String>| {
             if !find_open.get() {
-                return;
+                return prev.unwrap_or_default();
             }
             let q = find_query.get();
             let hits = if q.is_empty() {
                 Vec::new()
             } else {
-                find_matches(&query.get_untracked(), &q)
+                find_matches(&query.get(), &q)
             };
-            find_idx.set(0);
-            if let Some(&first) = hits.first() {
-                reveal(first, q.len());
+            if prev.as_deref() != Some(q.as_str()) {
+                find_idx.set(0);
+                if let Some(&first) = hits.first() {
+                    reveal(first, q.len());
+                }
+            } else if !hits.is_empty() {
+                // Same query, edited document: hold the position, clamped.
+                find_idx.update(|i| *i = (*i).min(hits.len() - 1));
             }
             find_hits.set(hits);
+            q
         });
     }
     // Step to the next (+1) / previous (-1) match, wrapping.
@@ -3047,9 +3107,26 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 return;
             }
             let idx = find_idx.get_untracked().min(hits.len() - 1);
-            let off = hits[idx];
             let repl = find_replace.get_untracked();
-            ed.doc().edit_single(
+            // Belt and braces over the effect above: never edit a span that isn't
+            // the needle any more. The document is the authority at this instant —
+            // the hit list is a signal, and one stale offset here rewrites text
+            // the user never searched for.
+            let text_now = ed.doc().text().to_string();
+            let off = if matches_at(&text_now, hits[idx], &q) {
+                hits[idx]
+            } else {
+                let fresh = find_matches(&text_now, &q);
+                let Some(&off) = fresh.get(idx).or(fresh.first()) else {
+                    find_hits.set(Vec::new());
+                    find_idx.set(0);
+                    return;
+                };
+                off
+            };
+            edit_untyped(
+                &ed,
+                comp,
                 Selection::region(off, off + q.len()),
                 &repl,
                 EditType::Other,
@@ -3085,8 +3162,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             if n == 0 {
                 return;
             }
-            ed.doc()
-                .edit_single(Selection::region(0, text.len()), &new_text, EditType::Other);
+            edit_untyped(
+                &ed,
+                comp,
+                Selection::region(0, text.len()),
+                &new_text,
+                EditType::Other,
+            );
             find_hits.set(find_matches(&new_text, &q));
             find_idx.set(0);
         })

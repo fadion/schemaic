@@ -180,6 +180,31 @@ pub fn find_matches(hay: &str, needle: &str) -> Vec<usize> {
     out
 }
 
+/// Is `needle` still exactly at byte offset `off` in `hay`, by the same
+/// ASCII-case-insensitive rule [`find_matches`] uses?
+///
+/// The question a *stored* match offset has to answer before anything edits it.
+/// The find bar keeps its hit list in a signal, and an edit elsewhere in the
+/// document moves every later match: replacing at a remembered offset then
+/// rewrites whatever now occupies those bytes. It really happened — inserting
+/// `-- ` at the head of a two-line query turned `SELECT a FROM t;` into
+/// `-- SELECT a FRx t;`, destroying the `OM` of `FROM` while the `t;` the user
+/// searched for was left alone.
+///
+/// `false` for an out-of-range offset or one that isn't a char boundary, so the
+/// caller can treat "not a match any more" and "not addressable any more" the
+/// same way: re-derive.
+pub fn matches_at(hay: &str, off: usize, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let end = off + needle.len();
+    end <= hay.len()
+        && hay.is_char_boundary(off)
+        && hay.is_char_boundary(end)
+        && hay.as_bytes()[off..end].eq_ignore_ascii_case(needle.as_bytes())
+}
+
 /// Replace every non-overlapping ASCII-case-insensitive occurrence of `needle`
 /// in `hay` with `replacement`, returning the new string and the number of
 /// replacements. Matches are the same ones [`find_matches`] reports (so the UI's
@@ -519,6 +544,41 @@ mod tests {
         assert_eq!(find_matches("abc", "xyz"), Vec::<usize>::new());
         // Offsets index into the original string (é is 2 bytes → bar at byte 6).
         assert_eq!(find_matches("café bar", "bar"), vec![6]);
+    }
+
+    /// The corruption this exists to prevent, as bytes: hits taken over one
+    /// document, then used against the next one.
+    #[test]
+    fn a_hit_offset_does_not_survive_an_edit_before_it() {
+        let before = "SELECT a FROM t;\nSELECT b FROM t;";
+        let hits = find_matches(before, "t;");
+        assert_eq!(hits, vec![14, 31]);
+        let after = format!("-- {before}");
+        assert!(
+            !matches_at(&after, hits[0], "t;"),
+            "offset 14 is now the OM of FROM"
+        );
+        assert!(
+            matches_at(&after, hits[0] + 3, "t;"),
+            "it moved by the edit"
+        );
+    }
+
+    #[test]
+    fn matches_at_agrees_with_find_matches_everywhere_it_reports_one() {
+        let hay = "SELECT select SeLeCt";
+        for off in find_matches(hay, "select") {
+            assert!(matches_at(hay, off, "select"), "at {off}");
+        }
+        assert!(!matches_at(hay, 1, "select"), "one byte off is not a match");
+    }
+
+    #[test]
+    fn matches_at_refuses_an_unaddressable_offset() {
+        assert!(!matches_at("abc", 2, "bc"), "past the end");
+        assert!(!matches_at("abc", 9, "a"), "beyond the string");
+        assert!(!matches_at("café", 4, "é"), "not a char boundary");
+        assert!(!matches_at("abc", 0, ""), "an empty needle matches nothing");
     }
 
     #[test]
