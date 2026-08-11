@@ -2390,8 +2390,8 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
                 }
             }
         }
-        typo_checks(sql, lo, hi, catalog, &mut out);
-        function_typo_checks(sql, lo, hi, catalog, &mut out);
+        typo_checks(sql, lo, hi, catalog, dialect, &mut out);
+        function_typo_checks(sql, lo, hi, catalog, dialect, &mut out);
         // Reserved-keyword aliases (`orders AS or`, `orders or`) run unconditionally:
         // sqlparser is laxer than MySQL here (it *accepts* `AS or`), so gating on a
         // parse failure would miss the very case we want to flag.
@@ -3744,7 +3744,14 @@ fn resolve_qualifier(q: &str, refs: &[(TableRef, (usize, usize))]) -> Option<Tab
 
 /// Probable keyword-typo warnings across `sql[lo..hi]` (skips the identifier after
 /// a `.` and real schema names).
-fn typo_checks(sql: &str, lo: usize, hi: usize, catalog: &Catalog, out: &mut Vec<Diagnostic>) {
+fn typo_checks(
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    catalog: &Catalog,
+    dialect: SqlDialect,
+    out: &mut Vec<Diagnostic>,
+) {
     let mut known: HashSet<String> = SQL_KEYWORDS
         .iter()
         .chain(STMT_KEYWORDS.iter())
@@ -3756,7 +3763,7 @@ fn typo_checks(sql: &str, lo: usize, hi: usize, catalog: &Catalog, out: &mut Vec
     let b = sql.as_bytes();
     let mut i = lo;
     while i < hi {
-        if let Some(j) = skip_noncode(b, i, SqlDialect::MySql) {
+        if let Some(j) = skip_noncode(b, i, dialect) {
             i = j.min(hi);
             continue;
         }
@@ -3793,12 +3800,13 @@ fn function_typo_checks(
     lo: usize,
     hi: usize,
     catalog: &Catalog,
+    dialect: SqlDialect,
     out: &mut Vec<Diagnostic>,
 ) {
     let b = sql.as_bytes();
     let mut i = lo;
     while i < hi {
-        if let Some(j) = skip_noncode(b, i, SqlDialect::MySql) {
+        if let Some(j) = skip_noncode(b, i, dialect) {
             i = j.min(hi);
             continue;
         }
@@ -3940,15 +3948,19 @@ fn build_predicate(
     lcols: &[String],
     right: &TableRef,
     rcols: &[String],
+    dialect: SqlDialect,
 ) -> String {
+    let q = |s: &str| crate::export::ident_if_needed(s, dialect);
     lcols
         .iter()
         .zip(rcols)
         .map(|(lc, rc)| {
             format!(
-                "{}.{lc} = {}.{rc}",
-                ref_qualifier(left),
-                ref_qualifier(right)
+                "{}.{} = {}.{}",
+                q(ref_qualifier(left)),
+                q(lc),
+                q(ref_qualifier(right)),
+                q(rc)
             )
         })
         .collect::<Vec<_>>()
@@ -3957,18 +3969,23 @@ fn build_predicate(
 
 /// The FK predicate linking two table references, in either direction (`a`→`b` or
 /// `b`→`a`), or `None` if no foreign key connects them.
-fn fk_predicate(catalog: &Catalog, a: &TableRef, b: &TableRef) -> Option<String> {
+fn fk_predicate(
+    catalog: &Catalog,
+    a: &TableRef,
+    b: &TableRef,
+    dialect: SqlDialect,
+) -> Option<String> {
     if let Some(edges) = catalog.fks_of(&a.name) {
         for e in edges {
             if e.ref_table.eq_ignore_ascii_case(&b.name) {
-                return Some(build_predicate(a, &e.columns, b, &e.ref_columns));
+                return Some(build_predicate(a, &e.columns, b, &e.ref_columns, dialect));
             }
         }
     }
     if let Some(edges) = catalog.fks_of(&b.name) {
         for e in edges {
             if e.ref_table.eq_ignore_ascii_case(&a.name) {
-                return Some(build_predicate(b, &e.columns, a, &e.ref_columns));
+                return Some(build_predicate(b, &e.columns, a, &e.ref_columns, dialect));
             }
         }
     }
@@ -4035,7 +4052,7 @@ pub fn join_condition(
         if other.name.eq_ignore_ascii_case(&joined.name) && other.alias == joined.alias {
             continue;
         }
-        if let Some(pred) = fk_predicate(catalog, &joined, other) {
+        if let Some(pred) = fk_predicate(catalog, &joined, other, dialect) {
             return Some(pred);
         }
     }
@@ -4046,8 +4063,13 @@ pub fn join_condition(
 /// the ready-to-write `ON` predicate linking it to a table already in scope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JoinTarget {
-    /// Candidate table name to join.
+    /// Candidate table name to join, bare — what the popup shows and matches the
+    /// typed prefix against. Quoting it here would put a leading `"` in front of
+    /// every mixed-case PostgreSQL name the user is trying to type.
     pub table: String,
+    /// The same name quoted for the dialect where that matters — what gets
+    /// **inserted**, ahead of the predicate.
+    pub table_sql: String,
     /// The `ON` predicate (without the `ON` keyword), e.g. `orders.customer_id = c.id`.
     pub predicate: String,
 }
@@ -4092,13 +4114,13 @@ pub fn join_targets(
             return Vec::new();
         }
     }
-    let scope = statement_scope(sql, lo, hi, caret, SqlDialect::MySql).tables;
-    join_targets_for(&scope, catalog)
+    let scope = statement_scope(sql, lo, hi, caret, dialect).tables;
+    join_targets_for(&scope, catalog, dialect)
 }
 
 /// The FK-connected join candidates for a set of in-scope tables (both edge
 /// directions), deduped by candidate table.
-fn join_targets_for(scope: &[TableRef], catalog: &Catalog) -> Vec<JoinTarget> {
+fn join_targets_for(scope: &[TableRef], catalog: &Catalog, dialect: SqlDialect) -> Vec<JoinTarget> {
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let in_scope = |name: &str| scope.iter().any(|s| s.name.eq_ignore_ascii_case(name));
@@ -4116,7 +4138,8 @@ fn join_targets_for(scope: &[TableRef], catalog: &Catalog) -> Vec<JoinTarget> {
                 };
                 out.push(JoinTarget {
                     table: e.ref_table.clone(),
-                    predicate: build_predicate(s, &e.columns, &cand, &e.ref_columns),
+                    table_sql: crate::export::ident_if_needed(&e.ref_table, dialect),
+                    predicate: build_predicate(s, &e.columns, &cand, &e.ref_columns, dialect),
                 });
             }
         }
@@ -4139,7 +4162,8 @@ fn join_targets_for(scope: &[TableRef], catalog: &Catalog) -> Vec<JoinTarget> {
                 if seen.insert(t.clone()) {
                     out.push(JoinTarget {
                         table: t.clone(),
-                        predicate: build_predicate(&cand, &e.columns, s, &e.ref_columns),
+                        table_sql: crate::export::ident_if_needed(t, dialect),
+                        predicate: build_predicate(&cand, &e.columns, s, &e.ref_columns, dialect),
                     });
                 }
                 break;
@@ -4231,11 +4255,14 @@ pub fn expand_star(
             return None;
         }
     }
-    let scope = statement_scope(sql, lo, hi, caret, SqlDialect::MySql).tables;
+    let scope = statement_scope(sql, lo, hi, caret, dialect).tables;
     if scope.is_empty() {
         return None;
     }
     let mut parts: Vec<String> = Vec::new();
+    // Quoted per dialect: the expansion is spliced into the editor and run, and
+    // PostgreSQL folds a bare `ArtistId` to `artistid`, which resolves to nothing.
+    let q = |s: &str| crate::export::ident_if_needed(s, dialect);
     match &qualifier {
         Some(qual) => {
             let tref = scope.iter().find(|r| {
@@ -4245,7 +4272,7 @@ pub fn expand_star(
                     || (r.alias.is_none() && r.name.eq_ignore_ascii_case(qual))
             })?;
             for c in catalog.columns_of(tref)? {
-                parts.push(format!("{qual}.{c}"));
+                parts.push(format!("{}.{}", q(qual), q(c)));
             }
         }
         None => {
@@ -4255,9 +4282,9 @@ pub fn expand_star(
                 let qual = r.alias.clone().unwrap_or_else(|| r.name.clone());
                 for c in cols {
                     if multi {
-                        parts.push(format!("{qual}.{c}"));
+                        parts.push(format!("{}.{}", q(&qual), q(c)));
                     } else {
-                        parts.push(c.clone());
+                        parts.push(q(c));
                     }
                 }
             }
@@ -6385,6 +6412,137 @@ mod tests {
         let (lo, hi) = (10, sql.len());
         let d = db_error_diagnostic(sql, lo, hi, "Unknown column 'salery' in 'field list'");
         assert_eq!(&sql[d.range.0..d.range.1], "salery");
+    }
+
+    // ── generated SQL is dialect-correct ─────────────────────────────────────
+
+    use crate::schema::ForeignKeyInfo;
+
+    /// A chinook-shaped catalog: mixed-case names throughout, an FK from
+    /// `Album.ArtistId` to `Artist.ArtistId`. This is the shape of the project's
+    /// own PostgreSQL fixture, where every generated identifier has to be quoted.
+    fn chinook(dialect: SqlDialect) -> Catalog {
+        let mut album = tbl("Album", &["AlbumId", "Title", "ArtistId"]);
+        album.foreign_keys = vec![ForeignKeyInfo {
+            name: "album_artist_fk".into(),
+            columns: vec!["ArtistId".into()],
+            ref_table: "Artist".into(),
+            ref_columns: vec!["ArtistId".into()],
+            ..Default::default()
+        }];
+        let schema = DbSchema {
+            tables: vec![album, tbl("Artist", &["ArtistId", "Name"])],
+        };
+        let _ = dialect;
+        Catalog::build(&[("chinook", &schema)], Some("chinook"))
+    }
+
+    #[test]
+    fn a_quoted_table_is_in_scope_for_join_completion() {
+        // `join_targets` and `expand_star` resolved scope under a hardcoded MySQL
+        // dialect, where `"Orders"` is a *string literal*. On the incomplete
+        // statement that triggers completion the lexer fallback runs, swallows the
+        // name and promotes the alias — so the scope came back as `o` and the FK
+        // lookup found nothing.
+        let cat = chinook(SqlDialect::Postgres);
+        let sql = r#"SELECT * FROM "Album" a JOIN "#;
+        let got = join_targets(sql, 0, sql.len(), sql.len(), &cat, SqlDialect::Postgres);
+        let t = got
+            .iter()
+            .find(|t| t.table == "Artist")
+            .unwrap_or_else(|| panic!("the FK neighbour must be offered: {got:?}"));
+        // Bare for the popup to display and prefix-match, quoted for insertion.
+        assert_eq!(t.table_sql, r#""Artist""#);
+        assert_eq!(t.predicate, r#"a."ArtistId" = "Artist"."ArtistId""#);
+    }
+
+    #[test]
+    fn postgres_generated_sql_quotes_every_identifier() {
+        let cat = chinook(SqlDialect::Postgres);
+        let pg = SqlDialect::Postgres;
+
+        let sql = r#"SELECT * FROM "Album" JOIN "Artist" ON "#;
+        assert_eq!(
+            join_condition(sql, 0, sql.len(), sql.len(), &cat, pg).as_deref(),
+            Some(r#""Album"."ArtistId" = "Artist"."ArtistId""#)
+        );
+
+        // The aliases are plain lower-case, so they stay bare — that is valid
+        // PostgreSQL, and quoting them would only add noise. The *columns* are
+        // what has to be quoted, and they are.
+        let sql = r#"SELECT * FROM "Album" a JOIN "Artist" b ON "#;
+        assert_eq!(
+            join_condition(sql, 0, sql.len(), sql.len(), &cat, pg).as_deref(),
+            Some(r#"a."ArtistId" = b."ArtistId""#)
+        );
+
+        let sql = r#"SELECT * FROM "Album""#;
+        let star = expand_star(sql, 0, sql.len(), 8, &cat, pg).expect("a star expands");
+        assert_eq!(star.replacement, r#""AlbumId", "Title", "ArtistId""#);
+
+        let sql = r#"SELECT * FROM "Album" a, "Artist" b"#;
+        let star = expand_star(sql, 0, sql.len(), 8, &cat, pg).expect("a star expands");
+        assert_eq!(
+            star.replacement,
+            r#"a."AlbumId", a."Title", a."ArtistId", b."ArtistId", b."Name""#
+        );
+    }
+
+    #[test]
+    fn an_ordinary_lower_case_name_is_left_bare() {
+        // The narrowing: quoting is what a *bare* name would get wrong, and a
+        // plain lower-case identifier gets nothing wrong on either engine. This
+        // keeps MySQL's generated SQL reading the way a person would write it,
+        // and matches what `filter::table_query` already chose to do.
+        let mut orders = tbl("orders", &["id", "customer_id"]);
+        orders.foreign_keys = vec![ForeignKeyInfo {
+            name: "fk".into(),
+            columns: vec!["customer_id".into()],
+            ref_table: "customers".into(),
+            ref_columns: vec!["id".into()],
+            ..Default::default()
+        }];
+        let schema = DbSchema {
+            tables: vec![orders, tbl("customers", &["id", "name"])],
+        };
+        let cat = Catalog::build(&[("shop", &schema)], Some("shop"));
+        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+            let sql = "SELECT * FROM orders JOIN customers ON ";
+            assert_eq!(
+                join_condition(sql, 0, sql.len(), sql.len(), &cat, d).as_deref(),
+                Some("orders.customer_id = customers.id"),
+                "{d:?}"
+            );
+            let sql = "SELECT * FROM orders";
+            let star = expand_star(sql, 0, sql.len(), 8, &cat, d).expect("a star expands");
+            assert_eq!(star.replacement, "id, customer_id", "{d:?}");
+        }
+    }
+
+    /// The quoting decision itself, at the one place that makes it.
+    #[test]
+    fn ident_if_needed_quotes_exactly_what_a_bare_name_would_get_wrong() {
+        use crate::export::ident_if_needed as q;
+        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+            // Plain lower-case words are safe bare on both engines.
+            assert_eq!(q("orders", d), "orders", "{d:?}");
+            assert_eq!(q("customer_id", d), "customer_id", "{d:?}");
+            assert_eq!(q("t2", d), "t2", "{d:?}");
+            // Anything PostgreSQL would fold, or that isn't a plain word.
+            assert_ne!(q("ArtistId", d), "ArtistId", "{d:?}");
+            assert_ne!(q("Order Details", d), "Order Details", "{d:?}");
+            assert_ne!(q("naïve", d), "naïve", "{d:?}");
+            assert_ne!(q("2fast", d), "2fast", "{d:?}");
+            assert_ne!(q("", d), "", "{d:?}");
+            // Reserved on both — a bare one is a syntax error however spelled.
+            assert_ne!(q("select", d), "select", "{d:?}");
+            assert_ne!(q("order", d), "order", "{d:?}");
+        }
+        // Each engine's own quote character, with the embedded one doubled.
+        assert_eq!(q("ArtistId", SqlDialect::MySql), "`ArtistId`");
+        assert_eq!(q("ArtistId", SqlDialect::Postgres), "\"ArtistId\"");
+        assert_eq!(q("we`ird", SqlDialect::MySql), "`we``ird`");
+        assert_eq!(q("we\"ird", SqlDialect::Postgres), "\"we\"\"ird\"");
     }
 
     // ── CatalogCache ─────────────────────────────────────────────────────────

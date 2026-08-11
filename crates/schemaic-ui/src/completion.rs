@@ -694,7 +694,7 @@ pub(crate) fn recompute_completions(
                     icon: icons::KEY_SQUARE,
                     key: KeyKind::Foreign,
                     tier: 0,
-                    insert: Some(format!("{} ON {}", jt.table, jt.predicate)),
+                    insert: Some(format!("{} ON {}", jt.table_sql, jt.predicate)),
                     replace: None,
                 });
             }

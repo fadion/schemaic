@@ -45,7 +45,14 @@ Zed-inspired, aiming to replace DataGrip.
     `STMT_KEYWORDS` (the UI's completion + editor build on these). Also `join_condition` (FK-aware
     `JOIN … ON` auto-fill), `db_error_diagnostic` (positions a live DB error within the statement),
     `parses` (Tier-2 gate), and `select_output_names` (a projection's column names *in order*, or
-    `None` when the statement alone can't say — what `ddl::pg_replaceable` reads). The live DB stays the semantic authority: **Tier-2 live validation**
+    `None` when the statement alone can't say — what `ddl::pg_replaceable` reads).
+    **Every SQL fragment this module generates** (`join_condition`, `join_targets`, `expand_star`)
+    is quoted through `export::ident_if_needed`, which quotes only what a bare name would get wrong
+    — anything that isn't a plain lower-case non-reserved word. PostgreSQL folds an unquoted
+    `ArtistId` to `artistid`, so unquoted output couldn't run on any mixed-case schema, while
+    unconditional quoting would backtick every ordinary MySQL name in text the user is about to
+    edit. `JoinTarget` therefore carries the **bare** name for the popup to display and prefix-match
+    and `table_sql` for what is actually inserted. The live DB stays the semantic authority: **Tier-2 live validation**
     PREPAREs the statement under the cursor (`Db::prepare_check`, non-executing) behind the
     `live_validate` setting (off by default), merging dialect-exact errors into the editor squiggles.
   - `filter.rs` — the header filter/sort bar: a dialect-aware `sqlparser` **AST rewrite** that

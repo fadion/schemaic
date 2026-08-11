@@ -270,6 +270,33 @@ pub fn ident_sql(name: &str, dialect: SqlDialect) -> String {
     }
 }
 
+/// The same, but only when leaving the name bare would name something else.
+///
+/// A bare identifier is safe exactly when it is a plain lower-case ASCII word and
+/// not reserved: PostgreSQL folds an unquoted name to lower case, so anything with
+/// an upper-case letter, a space, punctuation or a non-ASCII byte has to be quoted
+/// there, and a reserved word has to be quoted on either engine.
+///
+/// This is the rule for SQL Schemaic *generates for the user to read* — the
+/// completion layer's auto-join and star expansion, and `filter::table_query`'s
+/// `ORDER BY`. Quoting unconditionally would be simpler, but it would put
+/// backticks around every ordinary MySQL name in text the user is about to edit.
+/// For SQL that is only executed, [`ident_sql`] and its unconditional quoting is
+/// the right choice and stays what the write paths use.
+pub fn ident_if_needed(name: &str, dialect: SqlDialect) -> String {
+    let plain = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        && !name.as_bytes()[0].is_ascii_digit()
+        && !crate::intel::is_reserved_word(name, dialect);
+    if plain {
+        name.to_string()
+    } else {
+        ident_sql(name, dialect)
+    }
+}
+
 /// The whole result as a pretty JSON array of row objects (keyed by column name).
 /// Duplicate column names (e.g. `a.id, b.id` from a join) are suffixed `_2`,
 /// `_3`, … so a JSON object doesn't silently drop all but the last (§7.4).
