@@ -849,6 +849,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let monitor_cols: RwSignal<Vec<String>> = RwSignal::new(Vec::new());
     let monitor_log: RwSignal<Vec<MonitorEntry>> = RwSignal::new(Vec::new());
     let monitor_error: RwSignal<Option<String>> = RwSignal::new(None);
+    let monitor_partial: RwSignal<bool> = RwSignal::new(false);
     let monitor_interval: RwSignal<u64> = RwSignal::new(MONITOR_INTERVAL_SECS);
 
     // AI panel state. `ai_session` holds the live CLI conversation (bound to a
@@ -1248,6 +1249,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             monitor_log.set(Vec::new());
             monitor_cols.set(Vec::new());
             monitor_error.set(None);
+            monitor_partial.set(false);
             monitor_title.set(Some(format!("{}.{}", source.database, source.display())));
             monitor_open.set(true);
             let ctx = MonitorCtx {
@@ -1259,6 +1261,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 cols: monitor_cols,
                 log: monitor_log,
                 error: monitor_error,
+                partial: monitor_partial,
                 prev: monitor_prev.clone(),
                 key_cols: monitor_key_cols.clone(),
                 generation: monitor_gen.clone(),
@@ -4509,6 +4512,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             monitor_cols,
             monitor_log,
             monitor_error,
+            monitor_partial,
             monitor_interval,
             erd: RwSignal::new(None),
             run_guard,
@@ -4707,7 +4711,9 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
 /// construction — it never polls an unbounded table), and the max change-log
 /// length kept in memory (older entries drop off the top).
 const MONITOR_INTERVAL_SECS: u64 = 2;
-const MONITOR_LIMIT: usize = 1000;
+/// The per-poll row cap lives in `core::monitor` — the modal names it in the
+/// status line when a table is bigger than it.
+use schemaic_core::monitor::ROW_CAP as MONITOR_LIMIT;
 const MONITOR_LOG_MAX: usize = 1000;
 
 /// Everything a Live Monitor poll tick needs, so it can re-arm itself across ticks
@@ -4723,6 +4729,8 @@ struct MonitorCtx {
     cols: RwSignal<Vec<String>>,
     log: RwSignal<Vec<MonitorEntry>>,
     error: RwSignal<Option<String>>,
+    /// The last poll filled the row cap — the modal says the window is a page.
+    partial: RwSignal<bool>,
     prev: Rc<RefCell<Option<Snapshot>>>,
     key_cols: Rc<RefCell<Vec<usize>>>,
     generation: Rc<Cell<u64>>,
@@ -4751,6 +4759,11 @@ fn monitor_tick(ctx: MonitorCtx, my_gen: u64) {
             return;
         }
     };
+    // The window has to be the *same* window each poll, or the diff reports the
+    // window sliding as data changing. Ordering needs the key before the first
+    // fetch, and `analyze_edit` can only answer after one — so take it from the
+    // already-introspected schema, which is where `analyze_edit` would get it too.
+    let order_by = monitor_order_key(ctx.db_nodes, &source);
     let ctx2 = ctx.clone();
     let send = create_ext_action(ctx.cx, move |out: Result<ResultSet, String>| {
         monitor_apply(ctx2.clone(), my_gen, out);
@@ -4761,6 +4774,7 @@ fn monitor_tick(ctx: MonitorCtx, my_gen: u64) {
                 &source.database,
                 source.schema.as_deref(),
                 &source.table,
+                order_by.as_deref(),
                 MONITOR_LIMIT,
                 CancellationToken::new(),
             )
@@ -4768,6 +4782,35 @@ fn monitor_tick(ctx: MonitorCtx, my_gen: u64) {
             .map_err(|e| e.to_string());
         send(out);
     });
+}
+
+/// The monitored table's primary-key column names, for the poll's `ORDER BY`.
+///
+/// `None` when the schema isn't loaded or the table has no primary key — the
+/// monitor then polls unordered, exactly as before, and (because the snapshot
+/// isn't flagged as an ordered window) claims nothing about its tail.
+fn monitor_order_key(
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    source: &TableSource,
+) -> Option<Vec<String>> {
+    let table = db_nodes.with_untracked(|nodes| {
+        nodes
+            .iter()
+            .find(|n| n.database == source.database)
+            .and_then(|n| match n.schema.get_untracked() {
+                SchemaState::Loaded(s) => s
+                    .find_table(source.schema.as_deref(), &source.table)
+                    .cloned(),
+                _ => None,
+            })
+    })?;
+    let key: Vec<String> = table
+        .columns
+        .iter()
+        .filter(|c| c.primary_key)
+        .map(|c| c.name.clone())
+        .collect();
+    (!key.is_empty()).then_some(key)
 }
 
 /// UI-thread half of a poll: on the first result, record the columns + resolve the
@@ -4809,7 +4852,13 @@ fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
             }
             ctx.error.set(None);
             let key_cols = ctx.key_cols.borrow().clone();
-            let snap = Snapshot::from_result(&rs, &key_cols);
+            // Flagged as an ordered window only when the poll really was ordered
+            // (a resolvable primary key) *and* came back full — that pair is what
+            // licenses the diff to treat the tail as the window sliding.
+            let full = rs.row_count() >= MONITOR_LIMIT;
+            let ordered_full = full && monitor_order_key(ctx.db_nodes, &ctx.target.1).is_some();
+            ctx.partial.set(full);
+            let snap = Snapshot::from_result(&rs, &key_cols).ordered_window(ordered_full);
             if let Some(prev) = ctx.prev.borrow().as_ref() {
                 let changes = diff_snapshots(prev, &snap);
                 if !changes.is_empty() {

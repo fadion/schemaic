@@ -16,6 +16,12 @@ use std::collections::HashMap;
 
 use crate::model::ResultSet;
 
+/// Rows per poll. The monitor is bounded by construction — it never polls an
+/// unbounded table — and this is that bound. Here rather than in the app because
+/// the modal has to *name* it: past this many rows the monitor watches a page,
+/// and the status line says so.
+pub const ROW_CAP: usize = 1000;
+
 /// One captured row: its identity `key` (the key columns' values, stringified,
 /// in key order) and every column's value (`None` = NULL) in result-column order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,11 +31,23 @@ pub struct SnapshotRow {
 }
 
 /// A point-in-time capture of the monitored rows, in fetch order. Diffed against
-/// the next capture to find what changed. Order is preserved only so emitted
-/// changes have a stable, sensible sequence — the diff itself matches by `key`.
+/// the next capture to find what changed. Order carries meaning only when
+/// [`Snapshot::ordered_window_full`] is set — otherwise the diff matches by `key`
+/// and the sequence is just for display.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub rows: Vec<SnapshotRow>,
+    /// These rows are the **first N of a deterministic total order**, and the
+    /// table has more beyond them — i.e. an `ORDER BY key LIMIT n` that came back
+    /// full.
+    ///
+    /// A bounded window has to be a *stable* one, and knowing it was full is what
+    /// lets [`diff_snapshots`] tell a real change from the window sliding: delete
+    /// a row inside the window and the next row is promoted into it, which reads
+    /// as an insert of a row that existed all along. Only set this when the poll
+    /// really was ordered — with an arbitrary order the tail suppression below
+    /// would swallow real changes.
+    pub ordered_window_full: bool,
 }
 
 impl Snapshot {
@@ -57,7 +75,19 @@ impl Snapshot {
                 .collect();
             rows.push(SnapshotRow { key, cells });
         }
-        Snapshot { rows }
+        Snapshot {
+            rows,
+            ordered_window_full: false,
+        }
+    }
+
+    /// Mark this capture as the full, ordered first page of a larger table — see
+    /// [`Snapshot::ordered_window_full`]. The caller sets it only when it ordered
+    /// the query *and* got back exactly the limit.
+    #[must_use]
+    pub fn ordered_window(mut self, full: bool) -> Self {
+        self.ordered_window_full = full;
+        self
     }
 }
 
@@ -111,9 +141,30 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<RowChange> {
     let mut seen = vec![false; old.rows.len()];
     let mut changes = Vec::new();
 
+    // When both captures are full ordered windows, the tail is where the window
+    // *slid* rather than where the data changed: deleting a row inside the window
+    // promotes the next row in, and inserting one demotes the last row out.
+    // Neither is a change to the table, and reporting them was the whole defect —
+    // a table over the limit logged insert/delete pairs that never happened.
+    //
+    // Both windows are the same ordered prefix, so everything up to the last row
+    // they share is directly comparable and everything after it is not. That
+    // boundary is positional, which matters: the keys are text, and comparing
+    // them here would order `"1000"` before `"500"` where the server did not.
+    let bounded = old.ordered_window_full && new.ordered_window_full;
+    let (old_cut, new_cut) = if bounded {
+        (
+            last_common(&old.rows, &new.rows),
+            last_common(&new.rows, &old.rows),
+        )
+    } else {
+        (old.rows.len(), new.rows.len())
+    };
+
     // Inserts + updates, in the new snapshot's order.
-    for nr in &new.rows {
+    for (ni, nr) in new.rows.iter().enumerate() {
         match old_idx.get(nr.key.as_slice()) {
+            None if ni >= new_cut => {} // promoted into the window, not inserted
             None => changes.push(RowChange {
                 kind: ChangeKind::Insert,
                 key: nr.key.clone(),
@@ -137,7 +188,7 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<RowChange> {
 
     // Deletes: old rows never matched, in the old snapshot's order.
     for (oi, or) in old.rows.iter().enumerate() {
-        if !seen[oi] {
+        if !seen[oi] && oi < old_cut {
             changes.push(RowChange {
                 kind: ChangeKind::Delete,
                 key: or.key.clone(),
@@ -148,6 +199,20 @@ pub fn diff_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<RowChange> {
     }
 
     changes
+}
+
+/// One past the index of the last row of `rows` whose key also appears in
+/// `other` — the point beyond which two ordered windows stop being comparable.
+///
+/// `rows.len()` when the last row is shared (nothing to suppress); `0` when they
+/// share nothing at all, which is a window that moved entirely and where no
+/// insert or delete can be attributed.
+fn last_common(rows: &[SnapshotRow], other: &[SnapshotRow]) -> usize {
+    let keys: std::collections::HashSet<&[String]> =
+        other.iter().map(|r| r.key.as_slice()).collect();
+    rows.iter()
+        .rposition(|r| keys.contains(r.key.as_slice()))
+        .map_or(0, |i| i + 1)
 }
 
 /// Per-column `old → new` differences between two rows' cells. A missing index
@@ -180,7 +245,140 @@ mod tests {
     }
 
     fn snap(rows: Vec<SnapshotRow>) -> Snapshot {
-        Snapshot { rows }
+        Snapshot {
+            rows,
+            ordered_window_full: false,
+        }
+    }
+
+    /// The same, but flagged as the first N rows of an ordered table with more
+    /// beyond — what a full `ORDER BY key LIMIT n` poll produces.
+    fn window(rows: Vec<SnapshotRow>) -> Snapshot {
+        Snapshot {
+            rows,
+            ordered_window_full: true,
+        }
+    }
+
+    // ── a bounded window is not the whole table ──────────────────────────────
+
+    #[test]
+    fn a_row_promoted_into_the_window_is_not_an_insert() {
+        // Case A from the finding: a 1,001-row table watched with LIMIT 3.
+        // Deleting id 2 lets id 4 slide into the window. The delete is real; the
+        // "insert" is a row that existed throughout.
+        let old = window(vec![
+            row("1", &[Some("a")]),
+            row("2", &[Some("b")]),
+            row("3", &[Some("c")]),
+        ]);
+        let new = window(vec![
+            row("1", &[Some("a")]),
+            row("3", &[Some("c")]),
+            row("4", &[Some("d")]),
+        ]);
+        let out = diff_snapshots(&old, &new);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].kind, ChangeKind::Delete);
+        assert_eq!(out[0].key, vec!["2"]);
+    }
+
+    #[test]
+    fn a_row_pushed_out_of_the_window_is_not_a_delete() {
+        // The mirror: a real insert inside the window demotes the last row.
+        let old = window(vec![
+            row("1", &[Some("a")]),
+            row("3", &[Some("c")]),
+            row("4", &[Some("d")]),
+        ]);
+        let new = window(vec![
+            row("1", &[Some("a")]),
+            row("2", &[Some("b")]),
+            row("3", &[Some("c")]),
+        ]);
+        let out = diff_snapshots(&old, &new);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].kind, ChangeKind::Insert);
+        assert_eq!(out[0].key, vec!["2"]);
+    }
+
+    #[test]
+    fn an_update_inside_a_full_window_is_still_reported() {
+        // Case B is fixed by ordering the query, but the update must survive the
+        // tail suppression: it is matched by key on both sides.
+        let old = window(vec![
+            row("1", &[Some("a")]),
+            row("2", &[Some("b")]),
+            row("3", &[Some("c")]),
+        ]);
+        let new = window(vec![
+            row("1", &[Some("a")]),
+            row("2", &[Some("B!")]),
+            row("3", &[Some("c")]),
+        ]);
+        let out = diff_snapshots(&old, &new);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].kind, ChangeKind::Update);
+        assert_eq!(out[0].key, vec!["2"]);
+    }
+
+    #[test]
+    fn a_window_that_is_not_full_reports_everything() {
+        // The control, and the case the sample databases hit: below the limit the
+        // window *is* the table, so nothing may be suppressed.
+        let old = snap(vec![row("1", &[Some("a")]), row("2", &[Some("b")])]);
+        let new = snap(vec![row("1", &[Some("a")]), row("3", &[Some("c")])]);
+        let out = diff_snapshots(&old, &new);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(
+            out.iter()
+                .any(|c| c.kind == ChangeKind::Insert && c.key == vec!["3"])
+        );
+        assert!(
+            out.iter()
+                .any(|c| c.kind == ChangeKind::Delete && c.key == vec!["2"])
+        );
+    }
+
+    #[test]
+    fn suppression_needs_both_snapshots_to_be_full_windows() {
+        // A table that fell below the limit between polls: the tail of the *old*
+        // window really did go, so those deletes are real.
+        let old = window(vec![
+            row("1", &[Some("a")]),
+            row("2", &[Some("b")]),
+            row("3", &[Some("c")]),
+        ]);
+        let new = snap(vec![row("1", &[Some("a")])]);
+        let out = diff_snapshots(&old, &new);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out.iter().all(|c| c.kind == ChangeKind::Delete));
+    }
+
+    #[test]
+    fn a_change_before_the_last_common_row_is_never_suppressed() {
+        // Suppression is confined to the tail: an insert and a delete in the
+        // middle of a full window are both real and both reported.
+        let old = window(vec![
+            row("1", &[Some("a")]),
+            row("2", &[Some("b")]),
+            row("5", &[Some("e")]),
+        ]);
+        let new = window(vec![
+            row("1", &[Some("a")]),
+            row("3", &[Some("c")]),
+            row("5", &[Some("e")]),
+        ]);
+        let out = diff_snapshots(&old, &new);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(
+            out.iter()
+                .any(|c| c.kind == ChangeKind::Insert && c.key == vec!["3"])
+        );
+        assert!(
+            out.iter()
+                .any(|c| c.kind == ChangeKind::Delete && c.key == vec!["2"])
+        );
     }
 
     #[test]

@@ -240,10 +240,16 @@ pub(crate) async fn fetch_table(
     database: &str,
     schema: Option<&str>,
     table: &str,
+    order_by: Option<&[String]>,
     limit: usize,
     cancel: CancellationToken,
 ) -> Result<ResultSet, DbError> {
-    let sql = format!("SELECT * FROM {} LIMIT {}", pg_qname(schema, table), limit);
+    let sql = format!(
+        "SELECT * FROM {}{} LIMIT {}",
+        pg_qname(schema, table),
+        crate::order_by_clause(order_by, pg_ident),
+        limit
+    );
     fetch_query(db, Some(database), &sql, limit, cancel).await
 }
 
