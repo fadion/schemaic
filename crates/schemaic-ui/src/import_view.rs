@@ -103,6 +103,7 @@ pub(crate) fn open_import(ui: &Ui, target: ImportTargetInfo) {
     i.empty_is_null.set(true);
     i.null_tokens.set(String::new());
     i.trim.set(false);
+    i.file_bytes.set(0);
     i.sample.set(None);
     i.mapping.set(Mapping {
         targets: Vec::new(),
@@ -144,6 +145,7 @@ fn probe(ui: Ui, sniff: bool) {
             match res {
                 Err(e) => {
                     i.error.set(Some(e));
+                    i.file_bytes.set(0);
                     i.sample.set(None);
                 }
                 Ok(p) => {
@@ -178,6 +180,7 @@ fn probe(ui: Ui, sniff: bool) {
                             p.cfg.dialect.has_header || format == ImportFormat::Json,
                         ));
                     }
+                    i.file_bytes.set(p.file_bytes);
                     i.sample.set(Some(p.sample));
                 }
             }
@@ -636,6 +639,28 @@ fn mapping_step(ui: Ui) -> impl IntoView {
         },
     );
 
+    // A JSON load can't stream — the columns are the union of every object's
+    // keys — so it is held in memory at roughly five times the file's size,
+    // measured. Said here, before the load, because the alternative was the user
+    // discovering it when the app died; CSV of the same data is constant-memory,
+    // which the message names as the way out.
+    let json_size_note = dyn_container(
+        move || import::json_memory_warning(i.format.get(), i.file_bytes.get()),
+        move |warning| {
+            let Some(warning) = warning else {
+                return empty().into_any();
+            };
+            text(warning)
+                .style(|s| {
+                    s.color(theme::plan_warn())
+                        .font_size(theme::FONT_BODY)
+                        .max_width(560.0)
+                        .margin_top(20.0)
+                })
+                .into_any()
+        },
+    );
+
     // The load runs in one transaction and undoes itself on any failure — but
     // MyISAM/MEMORY/ARCHIVE/CSV ignore `BEGIN`/`ROLLBACK`, so on those the rows
     // written before a bad record stay. Said here, in the same place the preview
@@ -673,6 +698,7 @@ fn mapping_step(ui: Ui) -> impl IntoView {
         form_section("Columns"),
         autohide(scroll(rows)).style(|s| s.max_height(MAPPING_LIST_H).width_full()),
         missing,
+        json_size_note,
         engine_note,
         form_separator(GAP),
         form_section("Preview"),

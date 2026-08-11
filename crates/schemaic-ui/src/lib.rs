@@ -143,6 +143,11 @@ pub struct ImportProbeRequest {
 pub struct ImportProbeResult {
     pub cfg: schemaic_core::import::ReadConfig,
     pub sample: schemaic_core::import::Sample,
+    /// The file's size on disk. Stat'd here rather than in the view because the
+    /// probe is already the thread that touches the filesystem; the modal only
+    /// needs it to warn about a large JSON load
+    /// ([`schemaic_core::import::json_memory_warning`]).
+    pub file_bytes: u64,
 }
 
 pub type ImportProbeDoneFn = Rc<dyn Fn(Result<ImportProbeResult, String>)>;
@@ -640,6 +645,9 @@ pub struct ImportUi {
     /// Strip whitespace around every field. Off by default — see
     /// [`schemaic_core::import::ReadConfig::trim`].
     pub trim: RwSignal<bool>,
+    /// The chosen file's size on disk, from the probe. Only used to warn that a
+    /// large JSON load is held in memory — 0 when unknown.
+    pub file_bytes: RwSignal<u64>,
     /// The file's columns and first rows, under the current settings.
     pub sample: RwSignal<Option<schemaic_core::import::Sample>>,
     pub mapping: RwSignal<schemaic_core::import::Mapping>,
