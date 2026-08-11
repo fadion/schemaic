@@ -315,6 +315,20 @@ fn set_commits(sql: &str, dialect: crate::intel::SqlDialect) -> bool {
     matches!(words.next().as_deref(), Some("1" | "ON" | "TRUE"))
 }
 
+/// A pinned session has finished connecting — does the tab that asked for it
+/// still want it?
+///
+/// `mode` is the tab's current mode, or `None` when the tab is **gone**: opening
+/// a session is a full connect (seconds through an SSH tunnel), and the tab can
+/// be closed or flipped back to Auto while it is in flight. Both answers are
+/// "close it", and the `None` one is the reason this is a function: a session
+/// filed under a closed tab's id is a connection — and any transaction on it —
+/// held until the process exits, because the `drop_session` that would have
+/// removed it already ran, before the entry existed.
+pub fn session_still_wanted(mode: Option<TxMode>) -> bool {
+    matches!(mode, Some(TxMode::Manual))
+}
+
 /// One tab's transaction, as much of it as [`ddl_blocking_tabs`] needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TabTx {
@@ -800,6 +814,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Whether a session that finished connecting still has an owner ─────
+
+    #[test]
+    fn a_session_is_kept_only_by_a_tab_that_is_still_manual() {
+        assert!(session_still_wanted(Some(TxMode::Manual)));
+    }
+
+    #[test]
+    fn a_tab_that_flipped_back_to_auto_does_not_want_it() {
+        assert!(!session_still_wanted(Some(TxMode::Auto)));
+    }
+
+    #[test]
+    fn a_tab_that_closed_while_connecting_does_not_want_it() {
+        // The case that leaks: `None` is "the tab isn't in the list any more",
+        // and keying the map by its id would pin a connection nothing can ever
+        // remove — `drop_session` already ran, before the entry existed.
+        assert!(!session_still_wanted(None));
     }
 
     // ── Which transactions a schema change has to wait behind ─────────────
