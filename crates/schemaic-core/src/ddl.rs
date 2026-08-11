@@ -397,7 +397,10 @@ impl TableDraft {
                 out.push(format!("Index {} has no columns.", ix.info.name));
             }
             for c in &ix.info.columns {
-                if !known(&c.name) {
+                // An expression key names no column by design, so there is
+                // nothing to look up — `(lower(email))` is the index's *value*,
+                // not a reference to something in the table above.
+                if !c.expression && !known(&c.name) {
                     out.push(format!(
                         "Index {} names {}, which isn't a column.",
                         ix.info.name, c.name
@@ -1598,7 +1601,14 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
 pub fn key_list_text(cols: &[crate::schema::IndexColumn]) -> String {
     cols.iter()
         .map(|c| {
-            let mut s = c.name.clone();
+            // Parenthesised, which is both how PostgreSQL writes it and what
+            // tells `parse_key_list` this piece is an expression rather than a
+            // column whose name happens to contain brackets.
+            let mut s = if c.expression {
+                format!("({})", c.name)
+            } else {
+                c.name.clone()
+            };
             if let Some(n) = c.prefix {
                 s.push_str(&format!("({n})"));
             }
@@ -1615,8 +1625,9 @@ pub fn key_list_text(cols: &[crate::schema::IndexColumn]) -> String {
 /// column name, so a typo surfaces as "that isn't a column"
 /// ([`TableDraft::validate`]) rather than as silently dropped input.
 pub fn parse_key_list(s: &str) -> Vec<crate::schema::IndexColumn> {
-    s.split(',')
-        .map(str::trim)
+    split_keys(s)
+        .into_iter()
+        .map(|p| p.trim())
         .filter(|p| !p.is_empty())
         .map(|p| {
             // ` DESC` / ` ASC` suffix first, then a `(n)` prefix length.
@@ -1625,6 +1636,15 @@ pub fn parse_key_list(s: &str) -> Vec<crate::schema::IndexColumn> {
                 Some((h, tail)) if tail.eq_ignore_ascii_case("asc") => (h.trim(), false),
                 _ => (p, false),
             };
+            // A piece wrapped in its own parentheses is an expression key —
+            // `(lower(email))`. Checked before the prefix rule below, which reads
+            // `(` as the start of a MySQL prefix length.
+            if let Some(inner) = unwrap_parens(head) {
+                return crate::schema::IndexColumn {
+                    descending,
+                    ..crate::schema::IndexColumn::expr(inner)
+                };
+            }
             let prefix = match (head.find('('), head.ends_with(')')) {
                 (Some(i), true) => head[i + 1..head.len() - 1].trim().parse::<u32>().ok(),
                 _ => None,
@@ -1640,9 +1660,59 @@ pub fn parse_key_list(s: &str) -> Vec<crate::schema::IndexColumn> {
                 name: name.to_string(),
                 prefix,
                 descending,
+                expression: false,
             }
         })
         .collect()
+}
+
+/// `s` without the parentheses enclosing the **whole** of it, or `None` when it
+/// isn't enclosed by a single matching pair.
+///
+/// The matching part is the point: `(a) + (b)` starts with `(` and ends with `)`
+/// and stripping both leaves `a) + (b`. Shared by the designer's key-list parser
+/// and PostgreSQL's index introspection, which both have to decide whether a
+/// piece of SQL is a parenthesised expression, and got different answers when
+/// each had its own copy.
+pub fn unwrap_parens(s: &str) -> Option<&str> {
+    let s = s.trim();
+    if !s.starts_with('(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (i + 1 == s.len()).then(|| s[1..i].trim());
+                }
+            }
+            _ => {}
+        }
+    }
+    None // unbalanced
+}
+
+/// Split a key list on the commas that separate *keys*, ignoring those inside
+/// parentheses — `coalesce(a, b)` is one key, not two.
+fn split_keys(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut depth) = (0usize, 0i32);
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            ',' if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
 }
 
 /// A comma-separated list of bare names (a foreign key's columns), trimmed and
@@ -3215,12 +3285,12 @@ mod tests {
             IndexColumn {
                 name: "bio".into(),
                 prefix: Some(20),
-                descending: false,
+                ..Default::default()
             },
             IndexColumn {
                 name: "age".into(),
-                prefix: None,
                 descending: true,
+                ..Default::default()
             },
             IndexColumn::plain("id"),
         ];
@@ -3237,12 +3307,14 @@ mod tests {
                 IndexColumn {
                     name: "bio".into(),
                     prefix: Some(20),
-                    descending: false
+                    descending: false,
+                    expression: false,
                 },
                 IndexColumn {
                     name: "age".into(),
                     prefix: None,
-                    descending: true
+                    descending: true,
+                    expression: false,
                 },
                 IndexColumn::plain("id"),
             ]
@@ -3252,6 +3324,58 @@ mod tests {
         assert!(parse_key_list("   ").is_empty());
         // Junk stays a name, so validation can say it isn't a column.
         assert_eq!(parse_key_list("bio(x)"), vec![IndexColumn::plain("bio(x)")]);
+    }
+
+    /// The designer's key-list field is where an index the user *isn't* editing
+    /// has to survive being shown and read back. An expression key is written
+    /// parenthesised, and the commas inside it are not separators.
+    #[test]
+    fn an_expression_key_round_trips_through_the_designer_field() {
+        let cols = vec![
+            IndexColumn::expr("lower(email)"),
+            IndexColumn {
+                descending: true,
+                ..IndexColumn::expr("coalesce(nick, name)")
+            },
+            IndexColumn::plain("id"),
+        ];
+        let text = key_list_text(&cols);
+        assert_eq!(text, "(lower(email)), (coalesce(nick, name)) DESC, id");
+        assert_eq!(parse_key_list(&text), cols, "read back unchanged");
+    }
+
+    /// A column whose name merely contains brackets is not an expression: only a
+    /// piece the parens *enclose* is, which is exactly what `key_list_text`
+    /// writes.
+    #[test]
+    fn parse_key_list_only_treats_an_enclosed_piece_as_an_expression() {
+        assert_eq!(parse_key_list("bio(x)"), vec![IndexColumn::plain("bio(x)")]);
+        assert_eq!(
+            parse_key_list("(a) + (b)"),
+            vec![IndexColumn::plain("(a) + (b)")],
+            "not enclosed by one pair, so it stays a (bad) name for validation"
+        );
+    }
+
+    /// An expression names no column, so the designer must not demand one — the
+    /// check that would otherwise refuse to save any table carrying such an index.
+    #[test]
+    fn validate_does_not_look_for_a_column_behind_an_expression_key() {
+        let mut d = TableDraft::from_table(&TableInfo {
+            name: "t".into(),
+            columns: vec![col("email", "text")],
+            ..Default::default()
+        });
+        d.indexes = vec![IndexDraft::new(IndexInfo {
+            name: "ix_lower_email".into(),
+            columns: vec![IndexColumn::expr("lower(email)")],
+            ..Default::default()
+        })];
+        assert!(
+            !d.validate().iter().any(|e| e.contains("isn't a column")),
+            "{:?}",
+            d.validate()
+        );
     }
 
     #[test]
@@ -3514,7 +3638,7 @@ mod tests {
                         columns: vec![IndexColumn {
                             name: "body".into(),
                             prefix: Some(64),
-                            descending: false,
+                            ..Default::default()
                         }],
                         ..Default::default()
                     },
@@ -3522,8 +3646,8 @@ mod tests {
                         name: "slug_desc".into(),
                         columns: vec![IndexColumn {
                             name: "slug".into(),
-                            prefix: None,
                             descending: true,
+                            ..Default::default()
                         }],
                         unique: true,
                         ..Default::default()
@@ -3659,7 +3783,55 @@ mod tests {
                 // named: without these the round-trip gate never sees one.
                 (MySql, backslashes(MySql)),
                 (Postgres, backslashes(Postgres)),
+                (Postgres, pg_expression_index()),
             ]
+        }
+
+        /// A PostgreSQL table with the two index shapes the model only learned to
+        /// hold in [B5-L5-02]'s second half: an **expression** key and a
+        /// **descending** one. Both used to come back wrong — the expression
+        /// silently missing (no `pg_attribute` row to join to) and DESC read as
+        /// ASC — which is why such an index had to be refused as lossy rather
+        /// than recreated.
+        fn pg_expression_index() -> TableInfo {
+            TableInfo {
+                name: "person".into(),
+                schema: Some("public".into()),
+                columns: vec![
+                    pk(auto(c("id", "integer", false))),
+                    c("email", "text", true),
+                    c("last_name", "text", true),
+                    c("created_at", "timestamp with time zone", true),
+                ],
+                indexes: vec![
+                    ix("PRIMARY", vec!["id"], true),
+                    IndexInfo {
+                        name: "ix_person_lower_email".into(),
+                        columns: vec![IndexColumn::expr("lower(email)")],
+                        unique: true,
+                        ..Default::default()
+                    },
+                    IndexInfo {
+                        name: "ix_person_created_desc".into(),
+                        columns: vec![IndexColumn {
+                            name: "created_at".into(),
+                            descending: true,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    // Mixed: a column and an expression in one key.
+                    IndexInfo {
+                        name: "ix_person_name_email".into(),
+                        columns: vec![
+                            IndexColumn::plain("last_name"),
+                            IndexColumn::expr("lower(email)"),
+                        ],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }
         }
 
         #[test]

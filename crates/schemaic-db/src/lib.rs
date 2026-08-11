@@ -676,6 +676,11 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
                 prefix: sub.and_then(|n| u32::try_from(n).ok()),
                 // `COLLATION` is 'A' ascending, 'D' descending, NULL unsorted.
                 descending: coll.as_deref() == Some("D"),
+                // MySQL 8 does have functional key parts, but `STATISTICS` names
+                // the hidden generated column they create rather than the
+                // expression, so nothing here can read one back — it stays a
+                // column, as it was before this field existed.
+                expression: false,
             },
             // MySQL's index type is only worth restating when it isn't the
             // default; BTREE is, so emitting `USING BTREE` everywhere would be
