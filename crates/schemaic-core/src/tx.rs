@@ -243,6 +243,37 @@ pub fn implicit_commit(engine: TxEngine, sql: &str) -> bool {
     )
 }
 
+/// After `sql` ran **successfully**, does the connection still have an open
+/// transaction? `None` means "unchanged" — the ordinary case.
+///
+/// This is the pinned session's own flag ([`schemaic_db::Session::ensure_tx`]),
+/// not the pill's [`TxState`]: the session has to know whether to issue a
+/// `BEGIN` *before* the next statement, and it decides that under the same lock
+/// the `BEGIN` goes out on.
+///
+/// The whole reason this isn't just [`implicit_commit`] is the last arm of that
+/// list. `BEGIN` and `START TRANSACTION` implicitly commit — opening a
+/// transaction ends the current one — but unlike every other entry they leave a
+/// **new** transaction open. Treating them like `DROP TABLE` would clear the
+/// flag, the next statement would decide it needed its own `BEGIN`, and on MySQL
+/// that second `BEGIN` would implicitly commit everything in between. That is
+/// [B12.1-L1-01] arriving from the other direction, which is why the carve-out
+/// is a named function with tests rather than a `matches!` inside the session.
+///
+/// [`schemaic_db::Session::ensure_tx`]: https://docs.rs/schemaic-db
+pub fn tx_open_after(engine: TxEngine, sql: &str) -> Option<bool> {
+    if !implicit_commit(engine, sql) {
+        return None;
+    }
+    // `implicit_commit` is false for every non-MySQL engine, so reaching here
+    // means MySQL and the dialect is settled.
+    let opens = matches!(
+        crate::sql::leading_keyword(sql, crate::intel::SqlDialect::MySql).as_deref(),
+        Some("BEGIN") | Some("START")
+    );
+    Some(opens)
+}
+
 /// Does this `SET …` statement implicitly commit? Only two forms do, so `SET`
 /// can't join the list wholesale — `SET NAMES`, `SET @x`, `SET SESSION sql_mode`
 /// and the rest leave the transaction exactly where it was.
@@ -644,5 +675,96 @@ mod tests {
         assert!(!TxMode::default().is_manual());
         assert_eq!(TxMode::Auto.label(), "Auto-commit");
         assert_eq!(TxMode::Manual.label(), "Manual");
+    }
+
+    // ── The pinned session's "is a transaction still open?" flag ──────────
+
+    #[test]
+    fn an_ordinary_statement_leaves_the_flag_alone() {
+        // The overwhelmingly common case: nothing implicitly committed, so the
+        // session must not touch what it believes about the connection.
+        for sql in [
+            "UPDATE t SET a = 1 WHERE id = 2",
+            "SELECT * FROM t",
+            "INSERT INTO t VALUES (1)",
+            "DELETE FROM t WHERE id = 1",
+            "SET NAMES utf8mb4",
+            "SET @x = 1",
+        ] {
+            assert_eq!(tx_open_after(TxEngine::MySql, sql), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn mysql_ddl_implicitly_commits_and_leaves_nothing_open() {
+        for sql in [
+            "CREATE TABLE t (a INT)",
+            "ALTER TABLE t ADD b INT",
+            "DROP TABLE t",
+            "TRUNCATE TABLE t",
+            "FLUSH TABLES",
+            "SET autocommit = 1",
+        ] {
+            assert_eq!(tx_open_after(TxEngine::MySql, sql), Some(false), "{sql}");
+        }
+    }
+
+    /// The carve-out this function exists for, and the one with teeth.
+    ///
+    /// `BEGIN`/`START TRANSACTION` are on the implicit-commit list because
+    /// opening a transaction commits the current one — but they leave a *new*
+    /// one open. Reporting `Some(false)` for them would clear the session's
+    /// flag, the next statement would decide it needed its own `BEGIN`, and on
+    /// MySQL that second `BEGIN` would implicitly commit the work in between:
+    /// exactly [B12.1-L1-01], reintroduced from the other side.
+    #[test]
+    fn opening_a_transaction_commits_the_old_one_but_leaves_a_new_one_open() {
+        for sql in [
+            "BEGIN",
+            "begin",
+            "START TRANSACTION",
+            "start transaction read write",
+            "/* comment first */ BEGIN",
+            "-- leading line comment\nSTART TRANSACTION",
+        ] {
+            assert_eq!(tx_open_after(TxEngine::MySql, sql), Some(true), "{sql}");
+        }
+    }
+
+    #[test]
+    fn postgres_never_implicitly_commits_so_the_flag_never_moves() {
+        // Transactional DDL: the transaction survives all of these, including
+        // the ones that would end it on MySQL.
+        for sql in [
+            "CREATE TABLE t (a INT)",
+            "DROP TABLE t",
+            "TRUNCATE t",
+            "UPDATE t SET a = 1",
+        ] {
+            assert_eq!(tx_open_after(TxEngine::Postgres, sql), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn the_flag_rule_agrees_with_implicit_commit_by_construction() {
+        // `tx_open_after` says "unchanged" exactly when `implicit_commit` says
+        // no. The two are read together by the session and the pill; a
+        // disagreement is the drift the shared predicate exists to prevent.
+        for sql in [
+            "CREATE TABLE t (a INT)",
+            "UPDATE t SET a = 1",
+            "BEGIN",
+            "SET NAMES utf8mb4",
+            "SET autocommit = 0",
+            "FLUSH TABLES",
+        ] {
+            for engine in [TxEngine::MySql, TxEngine::Postgres] {
+                assert_eq!(
+                    tx_open_after(engine, sql).is_some(),
+                    implicit_commit(engine, sql),
+                    "{engine:?} {sql}"
+                );
+            }
+        }
     }
 }
