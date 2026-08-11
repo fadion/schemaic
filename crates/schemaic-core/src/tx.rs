@@ -315,6 +315,40 @@ fn set_commits(sql: &str, dialect: crate::intel::SqlDialect) -> bool {
     matches!(words.next().as_deref(), Some("1" | "ON" | "TRUE"))
 }
 
+/// One tab's transaction, as much of it as [`ddl_blocking_tabs`] needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TabTx {
+    pub tab_id: usize,
+    /// The connection the tab's pinned session is on.
+    pub conn_id: u64,
+    pub state: TxState,
+}
+
+/// Which tabs' open transactions a schema change against `conn_id` would have to
+/// queue behind — the tabs to ask about before applying, in tab order.
+///
+/// A schema change falls between the two halves of the one-connection-per-
+/// operation rule: it is the tab's own work *and* a write, so it runs on a fresh
+/// connection like every side channel — and then waits, on that connection, for
+/// the metadata lock (MySQL) or `ACCESS EXCLUSIVE` (PostgreSQL) that the user's
+/// own uncommitted `SELECT` is holding. Nothing times out, so Apply simply never
+/// returns.
+///
+/// **Scope is the connection, not the database or the table.** Schemaic doesn't
+/// track which tables a transaction has touched, and a MySQL statement can name
+/// any database on the server, so anything narrower would silently miss the case
+/// the prompt exists for. The cost of being conservative is a question the user
+/// answers with "apply anyway"; the cost of being precise-but-wrong is the hang.
+///
+/// [`TxState::Lost`] is not blocking: the connection that held the locks is gone,
+/// so the server released them.
+pub fn ddl_blocking_tabs(tabs: &[TabTx], conn_id: u64) -> Vec<usize> {
+    tabs.iter()
+        .filter(|t| t.conn_id == conn_id && t.state.is_open())
+        .map(|t| t.tab_id)
+        .collect()
+}
+
 /// The status-bar pill for a transaction, or `None` when there's nothing to say
 /// (no transaction open).
 pub fn pill_text(state: TxState) -> Option<String> {
@@ -766,5 +800,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Which transactions a schema change has to wait behind ─────────────
+
+    fn tab(tab_id: usize, conn_id: u64, state: TxState) -> TabTx {
+        TabTx {
+            tab_id,
+            conn_id,
+            state,
+        }
+    }
+
+    #[test]
+    fn a_tab_with_no_transaction_blocks_nothing() {
+        let tabs = [
+            tab(1, 7, TxState::Idle),
+            // The connection died with the transaction open, so the server has
+            // already released everything it held.
+            tab(2, 7, TxState::Lost),
+        ];
+        assert!(ddl_blocking_tabs(&tabs, 7).is_empty());
+    }
+
+    #[test]
+    fn an_open_transaction_on_this_connection_blocks() {
+        let tabs = [tab(3, 7, TxState::Open { stmts: 1 })];
+        assert_eq!(ddl_blocking_tabs(&tabs, 7), vec![3]);
+    }
+
+    #[test]
+    fn a_poisoned_transaction_blocks_too() {
+        // PostgreSQL rejects statements in it, but the locks it took are held
+        // until `ROLLBACK` — which is exactly what the prompt offers.
+        let tabs = [tab(3, 7, TxState::Poisoned { stmts: 2 })];
+        assert_eq!(ddl_blocking_tabs(&tabs, 7), vec![3]);
+    }
+
+    #[test]
+    fn another_connections_transaction_is_not_ours_to_ask_about() {
+        let tabs = [tab(4, 8, TxState::Open { stmts: 1 })];
+        assert!(ddl_blocking_tabs(&tabs, 7).is_empty());
+    }
+
+    #[test]
+    fn every_open_transaction_on_the_connection_is_reported_in_tab_order() {
+        // One prompt per tab, chained: `tx_prompt` holds one question at a time,
+        // and settling the first tab doesn't settle the second.
+        let tabs = [
+            tab(1, 7, TxState::Open { stmts: 1 }),
+            tab(2, 8, TxState::Open { stmts: 1 }),
+            tab(3, 7, TxState::Idle),
+            tab(4, 7, TxState::Poisoned { stmts: 3 }),
+        ];
+        assert_eq!(ddl_blocking_tabs(&tabs, 7), vec![1, 4]);
     }
 }

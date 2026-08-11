@@ -1379,6 +1379,39 @@ impl std::fmt::Display for DdlError {
     }
 }
 
+/// How long a DDL statement may wait for a lock before giving up.
+///
+/// Short on purpose: this bounds *acquiring* the lock, not holding it, so a
+/// legitimately long `ALTER` on a large table is unaffected — only one that never
+/// starts because something else holds the table. Ten seconds is the point past
+/// which a modal that refuses every exit while it works has stopped being a
+/// progress indicator.
+const DDL_LOCK_WAIT_SECS: u32 = 10;
+
+// Zero doesn't mean "fail immediately" on either engine: PostgreSQL reads
+// `lock_timeout = 0` as *disabled*, which would silently restore the unbounded
+// wait this exists to prevent, and MySQL rejects it outright. Retuning the
+// constant to 0 is a compile error rather than a quiet regression.
+const _: () = assert!(DDL_LOCK_WAIT_SECS >= 1);
+
+/// The statement that applies [`DDL_LOCK_WAIT_SECS`] to a DDL connection.
+///
+/// Without it, Apply can hang forever with no diagnosis and no way out: MySQL's
+/// `lock_wait_timeout` defaults to a year (a day on MariaDB) and PostgreSQL's
+/// `lock_timeout` defaults to *disabled*, so a plan queued behind a lock — the
+/// user's own uncommitted transaction, another session's long read — simply never
+/// returns. Bounded, it comes back as a server error the preview can show.
+///
+/// MySQL's variable is `lock_wait_timeout`, not `innodb_lock_wait_timeout`: what
+/// an `ALTER TABLE` waits on is the **metadata** lock, and the InnoDB one covers
+/// row locks (and is already bounded at 50s by default).
+fn lock_wait_sql(engine: Engine) -> String {
+    match engine {
+        Engine::MySql => format!("SET SESSION lock_wait_timeout = {DDL_LOCK_WAIT_SECS}"),
+        Engine::Postgres => format!("SET lock_timeout = '{DDL_LOCK_WAIT_SECS}s'"),
+    }
+}
+
 /// Did this DDL run leave the database different from how the caller last read
 /// it — and so must the schema be re-introspected?
 ///
@@ -1414,7 +1447,10 @@ impl Db {
     ///   path). The caller is told which statement failed and how many stuck.
     ///
     /// Runs on a fresh connection, like every other operation — a designer's
-    /// Apply must not be blocked behind, or ride inside, a tab's transaction.
+    /// Apply must not ride inside a tab's transaction. It can still *queue*
+    /// behind one, which is what [`lock_wait_sql`] bounds: the app asks about
+    /// open transactions before applying, but nothing can ask about the locks
+    /// another client holds.
     pub async fn run_ddl(
         &self,
         database: &str,
@@ -1437,6 +1473,9 @@ impl Db {
             .await
             .map_err(|e| fail(0, 0, e))?;
         let conn_id = conn.id();
+        // Best-effort: a server old enough not to have the variable keeps its own
+        // default rather than failing the plan over the bound.
+        let _ = conn.query_drop(lock_wait_sql(self.engine)).await;
         let mut applied = 0usize;
         let mut out = Ok(());
         for (i, sql) in stmts.iter().enumerate() {
@@ -2732,6 +2771,15 @@ mod tests {
     fn explain_commands_strips_trailing_semicolon_and_space() {
         let (primary, _) = explain_commands("  SELECT 1 ;  ", false);
         assert_eq!(primary, "EXPLAIN SELECT 1");
+    }
+
+    #[test]
+    fn lock_wait_sql_bounds_the_wait_on_both_engines() {
+        assert_eq!(
+            lock_wait_sql(Engine::MySql),
+            "SET SESSION lock_wait_timeout = 10"
+        );
+        assert_eq!(lock_wait_sql(Engine::Postgres), "SET lock_timeout = '10s'");
     }
 
     #[test]

@@ -299,10 +299,26 @@ pub struct DdlRunRequest {
     pub statements: Vec<String>,
 }
 
-/// Reports a DDL run's outcome on the UI thread. `Err` carries a message that
-/// already says which statement failed and how much of the plan stuck (see
-/// `schemaic_db::DdlError`).
-pub type DdlDoneFn = Rc<dyn Fn(Result<(), String>)>;
+/// How a DDL apply ended.
+///
+/// Three outcomes rather than a `Result`, because the modal has to tell "it
+/// didn't run" from "it ran and failed": while an apply is in flight every exit
+/// refuses (see [`widgets::exit_action`]), so an outcome the modal can't
+/// recognise leaves it stuck on "Applying…" with no way out.
+pub enum DdlOutcome {
+    /// The whole plan is in effect.
+    Applied,
+    /// Carries a message that already says which statement failed and how much
+    /// of the plan stuck (see `schemaic_db::DdlError`).
+    Failed(String),
+    /// Nothing ran — the app asked something first (an open transaction on this
+    /// connection) and the user backed out. The plan is untouched and Apply is
+    /// live again, which is what "Cancel" meant.
+    Declined,
+}
+
+/// Reports a DDL run's outcome on the UI thread.
+pub type DdlDoneFn = Rc<dyn Fn(DdlOutcome)>;
 /// Apply a DDL plan off the UI thread, then re-introspect the database.
 pub type DdlFn = Rc<dyn Fn(DdlRunRequest, DdlDoneFn)>;
 
