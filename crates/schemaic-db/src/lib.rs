@@ -682,6 +682,11 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
             // noise in every generated statement.
             method: None,
             predicate: None,
+            // MySQL's `STATISTICS` gives the whole key — prefix and direction
+            // included — so nothing is being read past here. (Functional indexes
+            // exist on MySQL 8 / MariaDB 10.5 too, but they appear as hidden
+            // generated columns and so arrive as ordinary column names.)
+            lossy: false,
         })
         .collect();
 
@@ -942,6 +947,9 @@ pub(crate) struct IdxRow {
     pub method: Option<String>,
     /// Partial-index predicate (PostgreSQL).
     pub predicate: Option<String>,
+    /// This index holds something the model can't represent — see
+    /// [`schemaic_core::schema::IndexInfo::lossy`]. Always false on MySQL.
+    pub lossy: bool,
 }
 
 /// One `KEY_COLUMN_USAGE` row for a foreign key: `(table, constraint, column,
@@ -1045,6 +1053,7 @@ pub(crate) fn assemble_schema(
                 foreign: false, // set by the column-match pass below
                 method: r.method.clone(),
                 predicate: r.predicate.clone(),
+                lossy: r.lossy,
                 // Constraint-backed indexes are tagged by the engine's own fetch
                 // afterwards (PostgreSQL only); the catalogue rows folded here
                 // don't carry it.
@@ -2473,6 +2482,7 @@ mod tests {
             column: schemaic_core::schema::IndexColumn::plain(col),
             method: None,
             predicate: None,
+            lossy: false,
         }
     }
 

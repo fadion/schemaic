@@ -565,6 +565,24 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
     // columns in `indkey` order. `unnest(... ) WITH ORDINALITY` preserves column
     // order; the primary-key index is renamed "PRIMARY" so `IndexInfo::is_primary()`
     // (and `create_ddl`) treat it the MySQL way. `pk_set` is derived from it.
+    //
+    // The trailing `lossy` flag is what stops an index edit destroying the parts
+    // of an index this query can't see (see `IndexInfo::lossy`). Its three arms
+    // are the three ways that happens, and all were measured against
+    // PostgreSQL 16 rather than reasoned about:
+    //
+    // - `0 = ANY(indkey)` — an **expression** key column. PostgreSQL stores 0
+    //   there, `pg_attribute` has no such row, and the join below drops it.
+    // - a non-default **operator class** (`… text_pattern_ops`). Nothing
+    //   per-column returns it, not even `pg_get_indexdef(oid, colno, …)`.
+    // - `indoption <> 0` — anything but the default `ASC NULLS LAST`. That
+    //   covers `DESC` (which the model has a field for but this query never
+    //   fills) *and* a non-default `NULLS FIRST`/`LAST` (which it has no field
+    //   for at all). Widening the model for `DESC` narrows this arm; it does not
+    //   remove it.
+    //
+    // Verified to flag all five shapes on a fixture and to fire **zero** times
+    // across the 108 indexes of the `world` and `chinook` sample databases.
     let idx_all = query_all(
         &client,
         &format!(
@@ -573,7 +591,13 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
                     CASE WHEN ix.indisunique THEN 0 ELSE 1 END AS non_unique, \
                     a.attname, ix.indisprimary, \
                     am.amname, pg_get_expr(ix.indpred, ix.indrelid), \
-                    pgc.conname \
+                    pgc.conname, \
+                    (0 = ANY(ix.indkey::int2[]) \
+                     OR EXISTS (SELECT 1 FROM unnest(ix.indclass::oid[]) AS q(oid) \
+                                  JOIN pg_opclass o ON o.oid = q.oid \
+                                 WHERE NOT o.opcdefault) \
+                     OR EXISTS (SELECT 1 FROM unnest(ix.indoption::int2[]) AS p(opt) \
+                                 WHERE opt <> 0)) AS lossy \
              FROM pg_index ix \
              JOIN pg_class c ON c.oid = ix.indrelid \
              JOIN pg_class ic ON ic.oid = ix.indexrelid \
@@ -607,6 +631,7 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
                     // generated statement carries a redundant `USING btree`.
                     method: (method != "btree" && !method.is_empty()).then_some(method),
                     predicate: r.get(7).cloned().flatten(),
+                    lossy: cell(r, 9) == "t",
                 },
             )
         })
