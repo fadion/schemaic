@@ -1487,6 +1487,31 @@ impl Db {
     }
 }
 
+/// Pull the next batch **off the executor**. `Ok(None)` at the end.
+///
+/// The source is a `std::io::BufReader` over the import file, so every pull is a
+/// blocking `read` — and it happens between awaited DB round-trips, inside an
+/// async task. Without this the read stalls a runtime worker for its duration,
+/// and every unrelated task scheduled on that worker (the health ping, a schema
+/// fetch, another tab's query) waits behind file IO on a slow disk or a network
+/// share. That is exactly what `export_file` and `import_probe` use
+/// `spawn_blocking` to avoid; this path is the one that reads the most and runs
+/// the longest.
+///
+/// `block_in_place` rather than a reader thread feeding a channel: it is the
+/// interleaved shape here (blocking pull, awaited write, repeat), and it doesn't
+/// restructure the bulk-write loop. It **panics** on a current-thread runtime,
+/// and the `--mcp-serve` mode builds one, so the flavour is checked rather than
+/// assumed — the MCP server has no import path today, and this stays correct if
+/// it ever gets one.
+fn next_batch_off_executor(rows: RowSource<'_>) -> Result<Option<Vec<Vec<Value>>>, DbError> {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| next_batch(rows)),
+        _ => next_batch(rows),
+    }
+}
+
 /// Pull the next batch of rows from the source. `Ok(None)` at the end.
 fn next_batch(rows: RowSource<'_>) -> Result<Option<Vec<Vec<Value>>>, DbError> {
     let mut batch = Vec::with_capacity(schemaic_core::import::INSERT_BATCH_ROWS);
@@ -1517,7 +1542,7 @@ async fn import_on(
         // A reader error (a bad record, a value that wouldn't coerce) has to undo
         // the transaction too — returning straight out would leave it open until
         // the connection drops, which is a lock held for no reason.
-        let batch = match next_batch(rows) {
+        let batch = match next_batch_off_executor(rows) {
             Ok(Some(b)) => b,
             Ok(None) => break,
             Err(e) => {
