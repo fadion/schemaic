@@ -51,7 +51,8 @@ use crate::diff_view::diff_view;
 use crate::widgets::*;
 use crate::{
     ConnNode, CtxMenu, FieldCfg, InlineAiRequest, InlineAiState, NavKeys, PopupAnchor, RightPanel,
-    ValidateDoneFn, ValidateFn, bg_transparent, edit_field, icons, sql_highlight, theme, thumb_len,
+    ValidateDoneFn, ValidateFn, bg_transparent, edit_field, icons, reveal_ai_panel, sql_highlight,
+    theme, thumb_len,
 };
 
 /// Editor font-zoom (Ctrl+scroll): px bounds + per-notch step. Temporary, per-tab.
@@ -1759,11 +1760,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                             dialect.get_untracked(),
                         );
                         if let Some(stmt) = sql.get(lo..hi).filter(|s| !s.is_empty()) {
-                            // Reveal the AI panel only if it isn't already showing — a
-                            // redundant `set(Ai)` disposes the live panel mid-update.
-                            if !matches!(right_panel.get_untracked(), RightPanel::Ai) {
-                                right_panel.set(RightPanel::Ai);
-                            }
+                            reveal_ai_panel(right_panel);
                             (ai_explain)(format!("Explain this SQL query:\n```sql\n{stmt}\n```"));
                             highlight_pick(&sql, lo, hi, highlight);
                         }

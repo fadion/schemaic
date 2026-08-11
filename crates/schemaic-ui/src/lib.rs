@@ -2462,6 +2462,26 @@ pub(crate) fn right_panel_allowed() -> bool {
     right_panel_fits(window_size().get().0)
 }
 
+/// Reveal the AI panel before sending it a message — every "Ask AI" / "AI
+/// Explain" / "AI Summary" entry point goes through here.
+///
+/// Two things it gets right that a bare `set(Ai)` does not. **`RwSignal::set`
+/// never dedups**, so setting `Ai` while the AI panel is *already* open notifies
+/// anyway, and the `dyn_container` keyed on it disposes the live panel and
+/// rebuilds it — mid-turn, taking the running turn's `elapsed_ms` with it, which
+/// panicked the footer that was still updating from it. And on a window too
+/// narrow for the right column the panel is locked away, so revealing it means
+/// changing a signal that nothing will show.
+///
+/// The schema tree's **AI Explain** didn't reveal at all: with the right column
+/// on Terminal, History or closed, it sent the prompt into a panel the user
+/// couldn't see and looked like it had done nothing.
+pub(crate) fn reveal_ai_panel(right_panel: RwSignal<RightPanel>) {
+    if right_panel_allowed() && right_panel.get_untracked() != RightPanel::Ai {
+        right_panel.set(RightPanel::Ai);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn h_resize_handle(
     from_right: bool,
@@ -2881,9 +2901,7 @@ fn center(ui: Ui) -> impl IntoView {
     let summarize: Rc<dyn Fn(String)> = {
         let ai = ai_send.clone();
         Rc::new(move |msg: String| {
-            if !matches!(right_panel.get_untracked(), RightPanel::Ai) {
-                right_panel.set(RightPanel::Ai);
-            }
+            reveal_ai_panel(right_panel);
             (ai)(msg);
         })
     };
