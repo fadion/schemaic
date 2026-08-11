@@ -128,8 +128,11 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
             let status_text = dyn_container(
                 move || (error.get(), partial.get()),
                 move |(err, partial)| match err {
+                    // `error()`, not `reject_text()`: the latter is the foreground
+                    // for a `reject_bg` pill and measures ~1.03:1 free-standing on
+                    // the panel in *both* themes — legible nowhere.
                     Some(msg) => text(msg)
-                        .style(|s| s.color(theme::reject_text()).font_size(FONT_LABEL))
+                        .style(|s| s.color(theme::error()).font_size(FONT_LABEL))
                         .into_any(),
                     // A table bigger than the poll's cap is watched a page at a
                     // time, ordered by its key. Changes past that page can't be

@@ -1668,8 +1668,11 @@ pub(crate) struct GridCtx {
     /// running the given filter `sql` (built by the grid from a FK + the row).
     pub(crate) follow_fk: FollowFn,
     /// Open the Live Monitor for `(conn_id, database, table)` — watch the result's
-    /// base table for row changes. Offered only when the result has a single
-    /// writable base table (`insert_target`), same as the row-action group.
+    /// base table for row changes. Offered whenever the *tab* has a source table
+    /// (`results_section`'s button is gated on `source.is_some()`), which is
+    /// deliberately weaker than the row-action group's `insert_target`: a table
+    /// with no usable row key passes it, and the monitor answers with "No row key
+    /// for this table" rather than the button being silently absent.
     pub(crate) open_monitor: crate::MonitorFn,
     /// AI-fill a single cell (sample base table → one-shot AI → stage the result).
     pub(crate) ai_fill: crate::AiFillFn,
