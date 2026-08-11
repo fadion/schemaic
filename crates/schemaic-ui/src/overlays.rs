@@ -2117,8 +2117,18 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                 let open_table = open_table.clone();
                 let open_table_col = open_table_col.clone();
                 let close = close.clone();
-                create_effect(move |_| {
+                create_effect(move |prev: Option<String>| {
                     let raw = query.get();
+                    // Everything the results are built from, tracked. `build_items`
+                    // reads all of this *untracked* underneath, so the effect used
+                    // to re-run on a keystroke and nothing else: searching while the
+                    // per-database schemas were still landing (they arrive one
+                    // signal at a time, seconds apart) said "Nothing found" and
+                    // stayed there until the user typed another character. It costs
+                    // nothing per keystroke — it adds exactly the missing re-run.
+                    db_nodes.with(|nodes| nodes.iter().for_each(|n| n.schema.track()));
+                    hidden.track();
+                    active_conn.track();
                     let parsed = schemaic_core::palette::parse(&raw, &arg_names);
                     items.set(build_items(
                         parsed,
@@ -2133,7 +2143,13 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                         query,
                         caret_end,
                     ));
-                    selected.set(0); // reset the cursor to the top on every new query
+                    // Reset the cursor to the top for a new *query* only — a schema
+                    // landing now re-runs this too, and it must not yank the
+                    // selection out from under someone mid-arrow-key.
+                    if prev.as_deref() != Some(raw.as_str()) {
+                        selected.set(0);
+                    }
+                    raw
                 });
             }
 

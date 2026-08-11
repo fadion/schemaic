@@ -2128,9 +2128,39 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                 },
             )
             .style(|s| s.flex_row().background(theme::bg_header_row()));
+            let wheel_cols = data_cols.clone();
             let data_header = scroll(data_header_row)
                 .scroll_to(move || Some(Point::new(h_off.get(), 0.0)))
-                .scroll_style(|s| s.hide_bars(true).propagate_pointer_wheel(true))
+                // A pure follower of `h_off`, which only the data pane writes — so
+                // like the frozen pane it must not scroll itself. `propagate_pointer_wheel`
+                // is not that guard: floem applies the delta *first* and propagates
+                // only if the viewport didn't move, so a vertical delta propagated
+                // (a 40px-tall header has no room) while a **horizontal** one
+                // scrolled the header alone and stayed there. Every header cell then
+                // sat over the wrong column — including its sort target and its
+                // resize divider — until the body happened to be scrolled.
+                //
+                // Forward both axes into the shared channel the data pane follows
+                // instead, exactly as the frozen pane forwards its vertical wheel.
+                .on_event(EventListener::PointerWheel, move |e| {
+                    if let Event::PointerWheel(pe) = e {
+                        let vp = gs.vp.get_untracked();
+                        let content_w = gs.widths.with_untracked(|w| {
+                            wheel_cols
+                                .iter()
+                                .map(|&ci| w.get(ci).copied().unwrap_or(0.0))
+                                .sum::<f64>()
+                        });
+                        let max_x = (content_w - vp.width()).max(0.0);
+                        let max_y = ((total as f64 * ROW_H) - vp.height()).max(0.0);
+                        gs.scroll_to.set(Some(Point::new(
+                            (h_off.get_untracked() + pe.delta.x).clamp(0.0, max_x),
+                            (vscroll.get_untracked() + pe.delta.y).clamp(0.0, max_y),
+                        )));
+                    }
+                    EventPropagation::Stop
+                })
+                .scroll_style(|s| s.hide_bars(true))
                 .style(|s| {
                     s.flex_grow(1.0_f32)
                         .height(GRID_HEADER_H)
