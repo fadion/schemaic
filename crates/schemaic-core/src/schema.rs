@@ -65,10 +65,21 @@ pub struct ColumnInfo {
 /// serves an `ORDER BY` into one that doesn't.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IndexColumn {
+    /// The column's name — or, when [`IndexColumn::expression`] is set, the
+    /// expression's SQL text (`lower(email)`), which is not a name at all.
     pub name: String,
     /// MySQL prefix length — `KEY (bio(20))`. Always `None` on PostgreSQL.
     pub prefix: Option<u32>,
     pub descending: bool,
+    /// This key is an **expression**, not a column (PostgreSQL: `CREATE INDEX …
+    /// ON t (lower(email))`).
+    ///
+    /// It changes three things, and each is a way the two are not
+    /// interchangeable: it is emitted parenthesised and **unquoted** (quoting it
+    /// would make the whole expression an identifier); it is not a row key, so
+    /// [`IndexInfo::column_names`] skips it; and no table column has to exist by
+    /// that name, so the designer's validation must not look for one.
+    pub expression: bool,
 }
 
 impl IndexColumn {
@@ -76,6 +87,15 @@ impl IndexColumn {
     pub fn plain(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    /// An expression key — `sql` without the wrapping parentheses.
+    pub fn expr(sql: impl Into<String>) -> Self {
+        Self {
+            name: sql.into(),
+            expression: true,
             ..Default::default()
         }
     }
@@ -136,8 +156,16 @@ impl IndexInfo {
     /// Just the key column names, for the callers that don't care about prefixes
     /// or sort order (edit-model key selection, the schema tree, the grid's key
     /// icons).
+    ///
+    /// An **expression** key is skipped: no result column carries its value, so
+    /// nothing downstream could match it — and a caller that treated it as a
+    /// column name would build a `WHERE lower(email) = …` keyed on a column that
+    /// doesn't exist.
     pub fn column_names(&self) -> impl Iterator<Item = &str> {
-        self.columns.iter().map(|c| c.name.as_str())
+        self.columns
+            .iter()
+            .filter(|c| !c.expression)
+            .map(|c| c.name.as_str())
     }
 
     /// An index over whole columns, ascending — the shape most call sites mean.
@@ -156,7 +184,15 @@ impl IndexInfo {
         self.columns
             .iter()
             .map(|c| {
-                let mut s = ddl_ident_in(&c.name, dialect);
+                // An expression is SQL, not a name: quoting it would turn the
+                // whole thing into one identifier. Parenthesised because
+                // PostgreSQL requires it for anything but a bare function call,
+                // and accepts it for those too.
+                let mut s = if c.expression {
+                    format!("({})", c.name)
+                } else {
+                    ddl_ident_in(&c.name, dialect)
+                };
                 if let Some(n) = c.prefix {
                     s.push_str(&format!("({n})"));
                 }
@@ -932,12 +968,12 @@ mod tests {
                 IndexColumn {
                     name: "bio".into(),
                     prefix: Some(20),
-                    descending: false,
+                    ..Default::default()
                 },
                 IndexColumn {
                     name: "age".into(),
-                    prefix: None,
                     descending: true,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -946,6 +982,45 @@ mod tests {
             ix.key_sql(crate::intel::SqlDialect::MySql),
             "`bio`(20), `age` DESC"
         );
+    }
+
+    /// An expression key is SQL, not a name: quoting it would make the whole
+    /// expression one identifier, and PostgreSQL needs the parentheses back.
+    #[test]
+    fn an_expression_key_is_emitted_parenthesised_and_unquoted() {
+        let ix = IndexInfo {
+            name: "ix".into(),
+            columns: vec![
+                IndexColumn::plain("last_name"),
+                IndexColumn {
+                    descending: true,
+                    ..IndexColumn::expr("lower(email)")
+                },
+            ],
+            ..Default::default()
+        };
+        // The column beside it is still quoted as an identifier — the difference
+        // between the two halves is the whole point.
+        assert_eq!(
+            ix.key_sql(crate::intel::SqlDialect::Postgres),
+            r#""last_name", (lower(email)) DESC"#
+        );
+    }
+
+    /// An expression is not a row key: nothing in a result carries its value, and
+    /// a caller that took it for a column name would build a `WHERE` on a column
+    /// that doesn't exist. The columns beside it are still keys.
+    #[test]
+    fn column_names_skips_an_expression_key() {
+        let ix = IndexInfo {
+            name: "ix".into(),
+            columns: vec![
+                IndexColumn::plain("last_name"),
+                IndexColumn::expr("lower(email)"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(ix.column_names().collect::<Vec<_>>(), vec!["last_name"]);
     }
 
     fn col(name: &str, ty: &str, nullable: bool, pk: bool) -> ColumnInfo {

@@ -556,6 +556,41 @@ type InSchema<T> = (String, T);
 
 /// Order schemas for display: `public` first (it's the default namespace and
 /// where most work happens), everything else alphabetically.
+/// Every index of every browsable schema, one row per **key position** in
+/// `indkey` order (`unnest(…) WITH ORDINALITY` preserves it). See the comment at
+/// its call site for what each of the trailing columns is for.
+fn index_list_sql() -> String {
+    format!(
+        "SELECT n.nspname, c.relname, \
+                CASE WHEN ix.indisprimary THEN 'PRIMARY' ELSE ic.relname END AS iname, \
+                CASE WHEN ix.indisunique THEN 0 ELSE 1 END AS non_unique, \
+                a.attname, ix.indisprimary, \
+                am.amname, pg_get_expr(ix.indpred, ix.indrelid), \
+                pgc.conname, \
+                (EXISTS (SELECT 1 FROM unnest(ix.indclass::oid[]) AS q(oid) \
+                           JOIN pg_opclass o ON o.oid = q.oid \
+                          WHERE NOT o.opcdefault) \
+                 OR EXISTS (SELECT 1 FROM unnest(ix.indoption::int2[]) AS p(opt) \
+                             WHERE opt NOT IN (0, 3))) AS lossy, \
+                pg_get_indexdef(ix.indexrelid, k.ord::int, true) AS keydef, \
+                (o.opt & 1) <> 0 AS descending \
+         FROM pg_index ix \
+         JOIN pg_class c ON c.oid = ix.indrelid \
+         JOIN pg_class ic ON ic.oid = ix.indexrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_am am ON am.oid = ic.relam \
+         LEFT JOIN pg_constraint pgc \
+                ON pgc.conindid = ic.oid AND pgc.contype IN ('p', 'u') \
+         JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true \
+         JOIN unnest(ix.indoption) WITH ORDINALITY AS o(opt, oord) ON o.oord = k.ord \
+         LEFT JOIN pg_attribute a \
+                ON a.attrelid = ix.indrelid AND a.attnum = k.attnum AND a.attnum > 0 \
+         WHERE {} \
+         ORDER BY n.nspname, c.relname, iname, k.ord",
+        user_schema_filter("n.nspname")
+    )
+}
+
 fn schema_sort_key(name: &str) -> (u8, String) {
     if name == schemaic_core::schema::PG_DEFAULT_SCHEMA {
         (0, String::new())
@@ -590,53 +625,30 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
     // order; the primary-key index is renamed "PRIMARY" so `IndexInfo::is_primary()`
     // (and `create_ddl`) treat it the MySQL way. `pk_set` is derived from it.
     //
-    // The trailing `lossy` flag is what stops an index edit destroying the parts
-    // of an index this query can't see (see `IndexInfo::lossy`). Its three arms
-    // are the three ways that happens, and all were measured against
-    // PostgreSQL 16 rather than reasoned about:
+    // Two per-key-position columns do the widening the model gained for them:
     //
-    // - `0 = ANY(indkey)` — an **expression** key column. PostgreSQL stores 0
-    //   there, `pg_attribute` has no such row, and the join below drops it.
+    // - `pg_get_indexdef(indexrelid, ord, true)` is the key's SQL — the column's
+    //   name for an ordinary key, the **expression** for a computed one. The
+    //   `pg_attribute` join is LEFT so an expression position survives it at
+    //   all: PostgreSQL stores `0` in `indkey` there and has no `pg_attribute`
+    //   row to join to.
+    // - `indoption`'s bit 0 is **DESC**, joined by ordinality rather than
+    //   subscripted so the pairing can't drift.
+    //
+    // The trailing `lossy` flag is what stops an index edit destroying the parts
+    // of an index this query *still* can't see (see `IndexInfo::lossy`). What
+    // remains, measured against PostgreSQL 16:
+    //
     // - a non-default **operator class** (`… text_pattern_ops`). Nothing
     //   per-column returns it, not even `pg_get_indexdef(oid, colno, …)`.
-    // - `indoption <> 0` — anything but the default `ASC NULLS LAST`. That
-    //   covers `DESC` (which the model has a field for but this query never
-    //   fills) *and* a non-default `NULLS FIRST`/`LAST` (which it has no field
-    //   for at all). Widening the model for `DESC` narrows this arm; it does not
-    //   remove it.
+    // - a **NULLS** ordering that isn't the default for its direction. The
+    //   defaults are `ASC NULLS LAST` (`indoption` 0) and `DESC NULLS FIRST`
+    //   (3); 1 and 2 are the two spellings that would be lost, since the model
+    //   has a field for the direction but none for the nulls ordering.
     //
     // Verified to flag all five shapes on a fixture and to fire **zero** times
     // across the 108 indexes of the `world` and `chinook` sample databases.
-    let idx_all = query_all(
-        &client,
-        &format!(
-            "SELECT n.nspname, c.relname, \
-                    CASE WHEN ix.indisprimary THEN 'PRIMARY' ELSE ic.relname END AS iname, \
-                    CASE WHEN ix.indisunique THEN 0 ELSE 1 END AS non_unique, \
-                    a.attname, ix.indisprimary, \
-                    am.amname, pg_get_expr(ix.indpred, ix.indrelid), \
-                    pgc.conname, \
-                    (0 = ANY(ix.indkey::int2[]) \
-                     OR EXISTS (SELECT 1 FROM unnest(ix.indclass::oid[]) AS q(oid) \
-                                  JOIN pg_opclass o ON o.oid = q.oid \
-                                 WHERE NOT o.opcdefault) \
-                     OR EXISTS (SELECT 1 FROM unnest(ix.indoption::int2[]) AS p(opt) \
-                                 WHERE opt <> 0)) AS lossy \
-             FROM pg_index ix \
-             JOIN pg_class c ON c.oid = ix.indrelid \
-             JOIN pg_class ic ON ic.oid = ix.indexrelid \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             JOIN pg_am am ON am.oid = ic.relam \
-             LEFT JOIN pg_constraint pgc \
-                    ON pgc.conindid = ic.oid AND pgc.contype IN ('p', 'u') \
-             JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true \
-             JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.attnum \
-             WHERE {} AND a.attnum > 0 \
-             ORDER BY n.nspname, c.relname, iname, k.ord",
-            user_schema_filter("n.nspname")
-        ),
-    )
-    .await?;
+    let idx_all = query_all(&client, &index_list_sql()).await?;
     let idx_rows: Vec<InSchema<IdxRow>> = idx_all
         .iter()
         .map(|r| {
@@ -647,10 +659,20 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
                     table: cell(r, 1),
                     index: cell(r, 2),
                     unique: cell(r, 3) == "0",
-                    // PostgreSQL records a key column's sort direction in
-                    // `indoption`, which isn't read here — a DESC index
-                    // round-trips as ASC. Prefixes don't exist on PG at all.
-                    column: IndexColumn::plain(cell(r, 4)),
+                    // A key is either a column (`attname` from the LEFT JOIN) or
+                    // an expression, in which case there is no `pg_attribute`
+                    // row and `pg_get_indexdef`'s per-position text is the key
+                    // itself. Prefixes don't exist on PG at all.
+                    column: {
+                        let name = cell(r, 4);
+                        let mut col = if name.is_empty() {
+                            IndexColumn::expr(expr_key(&cell(r, 10)))
+                        } else {
+                            IndexColumn::plain(name)
+                        };
+                        col.descending = cell(r, 11) == "t";
+                        col
+                    },
                     // Only worth restating when it isn't the default, or every
                     // generated statement carries a redundant `USING btree`.
                     method: (method != "btree" && !method.is_empty()).then_some(method),
@@ -664,7 +686,7 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
     // keyed by (schema, table, column) so two namespaces don't share a PK set.
     let pk_set: HashSet<(String, String, String)> = idx_all
         .iter()
-        .filter(|r| cell(r, 5) == "t")
+        .filter(|r| cell(r, 5) == "t" && !cell(r, 4).is_empty())
         .map(|r| (cell(r, 0), cell(r, 1), cell(r, 4)))
         .collect();
 
@@ -959,6 +981,20 @@ async fn query_all(client: &Client, sql: &str) -> Result<Vec<Vec<Option<String>>
 }
 
 /// Column `i` of a text row as an owned `String` (empty when NULL/missing).
+/// The expression text for one index key position, as `pg_get_indexdef(oid, n,
+/// true)` renders it, without the parentheses it wraps a compound expression in.
+///
+/// [`IndexInfo::key_sql`](schemaic_core::schema::IndexInfo::key_sql) puts exactly
+/// one pair back, which is what PostgreSQL requires when the index is recreated —
+/// so the stored form is the bare expression and the emitted form is
+/// parenthesised, rather than each site guessing.
+fn expr_key(def: &str) -> String {
+    let s = def.trim();
+    schemaic_core::ddl::unwrap_parens(s)
+        .unwrap_or(s)
+        .to_string()
+}
+
 fn cell(row: &[Option<String>], i: usize) -> String {
     row.get(i).and_then(|c| c.clone()).unwrap_or_default()
 }
@@ -1803,5 +1839,76 @@ mod table_list_tests {
         // Same filter as the other four queries, so the five can't diverge on
         // which schemas are browsable.
         assert!(table_list_sql().contains(&user_schema_filter("n.nspname")));
+    }
+}
+
+#[cfg(test)]
+mod index_key_tests {
+    use super::*;
+
+    /// `pg_get_indexdef(oid, n, true)` gives an ordinary key as a bare name and a
+    /// computed one as its expression — wrapped when it is a compound. The model
+    /// stores the bare expression because `IndexInfo::key_sql` adds exactly one
+    /// pair back; leaving PostgreSQL's pair on would double them.
+    #[test]
+    fn an_expression_key_is_stored_without_its_wrapping_parens() {
+        assert_eq!(expr_key("lower(email)"), "lower(email)");
+        assert_eq!(
+            expr_key("((first_name || last_name))"),
+            "(first_name || last_name)"
+        );
+        assert_eq!(expr_key("  (created_at::date)  "), "created_at::date");
+    }
+
+    /// Only the pair that wraps the *whole* expression comes off. Stripping the
+    /// first `(` and the last `)` of `(a) + (b)` would leave `a) + (b`.
+    #[test]
+    fn only_a_pair_enclosing_the_whole_expression_is_stripped() {
+        assert_eq!(expr_key("(a) + (b)"), "(a) + (b)");
+        assert_eq!(expr_key("coalesce(a, b) || c"), "coalesce(a, b) || c");
+        assert_eq!(expr_key("(unbalanced"), "(unbalanced");
+    }
+
+    /// The three things the index query has to read per key position, and the one
+    /// join that has to stay LEFT. An expression key has no `pg_attribute` row at
+    /// all (PostgreSQL stores `0` in `indkey`), so an inner join drops the whole
+    /// position — which is how those indexes came back missing a key and had to
+    /// be refused as lossy.
+    #[test]
+    fn the_index_query_reads_each_key_position_in_full() {
+        let sql = index_list_sql();
+        assert!(
+            sql.contains("pg_get_indexdef(ix.indexrelid, k.ord::int, true)"),
+            "the per-position key text, which is the expression for a computed key"
+        );
+        assert!(
+            sql.contains("LEFT JOIN pg_attribute a"),
+            "an expression position has no pg_attribute row to join to"
+        );
+        assert!(
+            sql.contains("unnest(ix.indoption) WITH ORDINALITY"),
+            "DESC comes from indoption, paired by ordinality rather than subscript"
+        );
+    }
+
+    /// What `lossy` still has to cover, and what it must no longer claim.
+    /// `indoption` 0 is `ASC NULLS LAST` and 3 is `DESC NULLS FIRST` — the two
+    /// defaults, both of which the model can now express. 1 and 2 are the
+    /// spellings whose NULLS ordering would be lost.
+    #[test]
+    fn lossy_no_longer_covers_what_the_model_can_hold() {
+        let sql = index_list_sql();
+        assert!(
+            !sql.contains("0 = ANY(ix.indkey"),
+            "an expression key is read now, not refused"
+        );
+        assert!(
+            sql.contains("opt NOT IN (0, 3)"),
+            "only a non-default NULLS ordering is lossy, not every non-zero option"
+        );
+        assert!(
+            sql.contains("NOT o.opcdefault"),
+            "a non-default operator class is still unreadable per column"
+        );
     }
 }
