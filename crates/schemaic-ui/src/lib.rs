@@ -3640,7 +3640,11 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
     let (paste_key, paste_ctx) = (paste.clone(), paste);
     let sel_clear_up = sel_clear.clone();
 
-    let surface = shift_hscroll(grid)
+    let surface = shift_hscroll(grid);
+    // The surface's own id, so a selection drag can capture the pointer (see the
+    // `PointerDown` arm below) — the same idiom as the resize handles.
+    let surface_id = surface.id();
+    let surface = surface
         .style(|s| {
             s.flex_grow(1.0_f32)
                 .width_full()
@@ -3710,6 +3714,14 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
                 (sel_start)(r, c);
                 dragging.set(true);
                 moved.set(false);
+                // Capture the pointer, as both resize-handle drags do. The
+                // terminal is a narrow right-hand column and a selection
+                // naturally runs off its left edge, so the release lands outside
+                // the surface — which never saw it, leaving `dragging` true. The
+                // selection then kept extending under a pointer with no button
+                // held, and with copy-on-select each stray release pushed the
+                // accident to the clipboard.
+                surface_id.request_active();
             }
             EventPropagation::Continue
         })
@@ -3726,6 +3738,7 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
         .on_event(EventListener::PointerUp, move |_| {
             if dragging.get_untracked() {
                 dragging.set(false);
+                surface_id.clear_active();
                 if moved.get_untracked() {
                     // Copy-on-select: mirror the finished selection to the
                     // clipboard (keep it highlighted so the user sees what stuck).
