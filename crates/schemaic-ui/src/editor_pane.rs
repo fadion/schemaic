@@ -15,7 +15,7 @@ use floem::event::{Event, EventListener, EventPropagation};
 use floem::keyboard::{Key, NamedKey};
 use floem::kurbo::Point;
 use floem::prelude::*;
-use floem::reactive::{Memo, create_effect};
+use floem::reactive::{Memo, create_effect, create_memo};
 use floem::style::{CursorStyle, Height, InsetLeft, InsetRight, InsetTop, Transition};
 use floem::unit::Px;
 use floem::views::editor::Editor;
@@ -591,48 +591,124 @@ fn single_char(s: &str) -> Option<char> {
     }
 }
 
-/// Pixel box `(x, y, w, h)` in `editor_area` coords around the single-line byte
-/// span `[lo, hi]`, for the caret-driven highlight overlays (bracket matching,
-/// identifier occurrences). Same gutter math as `statement_line_boxes`; subtracts
-/// the editor's scroll offset (`viewport`) so the box follows the caret when the
-/// editor is scrolled. The horizontal edges are **snapped to whole pixels** (floor
-/// left, ceil right) so the 1px border lands crisply on the device grid —
-/// otherwise a glyph at a fractional x antialiases ~1px off (looked like the box
-/// was biased right).
-fn span_box(sql: &str, ed: &Editor, lo: usize, hi: usize) -> (f64, f64, f64, f64) {
+// ── Overlay geometry ─────────────────────────────────────────────────────
+//
+// Every overlay pinned in `editor_area` (which does not scroll) has the same two
+// problems to solve, and three of the four used to solve neither.
+//
+// 1. **`Editor::points_of_offset` returns absolute *document* y**, so the result
+//    has to have the viewport origin subtracted or the overlay is drawn wherever
+//    the text would be if the editor were scrolled to the top.
+// 2. **It answers `(Point::ZERO, Point::ZERO)` for an offset it cannot place** —
+//    `screen_lines` is built with no overscan, so anything outside the visible
+//    range falls into that arm. Consumed as a position, that draws the overlay
+//    at the editor's top-left: a 2px squiggle stub carrying the tooltip of an
+//    error twenty lines away, and nothing at all under the actual error.
+//
+// So the arithmetic lives in `*_at` functions that take the point lookup as a
+// closure and the viewport origin as a pair. That makes them pure and testable
+// without an `Editor`, which is the whole reason the rules above were never
+// pinned before. The `ed`-taking wrappers below are the adapters.
+
+/// The x origin of the code column in `editor_area` coords: the gutter widens
+/// with the line-number digit count, since it sizes to the last line number.
+/// `points_of_offset().x` is text-layout-relative (0 = code start), so this is
+/// what turns it into editor-area x.
+fn content_x_of(sql: &str) -> f64 {
     let total_lines = sql.bytes().filter(|&c| c == b'\n').count() + 1;
     let digits = total_lines.to_string().len();
-    let content_x = HL_GUTTER + digits.saturating_sub(1) as f64 * HL_DIGIT_W;
-    let vp = ed.viewport.get();
-    let (top, bot) = ed.points_of_offset(lo, CursorAffinity::Backward);
-    let (end, _) = ed.points_of_offset(hi, CursorAffinity::Backward);
-    let left = (content_x + top.x - vp.x0).floor();
-    let right = (content_x + end.x - vp.x0).ceil();
+    HL_GUTTER + digits.saturating_sub(1) as f64 * HL_DIGIT_W
+}
+
+/// Did the editor actually place this offset?
+///
+/// floem's "not on screen" answer is *both* points at the origin. A genuinely
+/// placed offset 0 is distinguishable without knowing the offset: its **bottom**
+/// point carries the line height, so only an unplaced lookup yields the pair
+/// `(ZERO, ZERO)`.
+fn placed(top: Point, bot: Point) -> bool {
+    !(top == Point::ZERO && bot == Point::ZERO)
+}
+
+/// Adapt an [`Editor`] to the point lookup the `*_at` functions take: `None`
+/// when the offset isn't on screen.
+///
+/// **Tracks `screen_lines`, and that is not incidental.** `points_of_offset`
+/// reads it *untracked*, so an overlay whose style closure tracked only
+/// `viewport` re-ran with last frame's line positions: boxes drifted a few rows
+/// onto unrelated text and — the tell — did **not** return to their old places
+/// when the editor scrolled back, because the staleness was carried rather than
+/// computed. Tracking it here fixes every caller at once, since this is the one
+/// funnel they all go through.
+fn editor_points(ed: &Editor) -> impl Fn(usize) -> Option<(Point, Point)> + '_ {
+    ed.screen_lines.track();
+    move |off| {
+        let (top, bot) = ed.points_of_offset(off, CursorAffinity::Backward);
+        placed(top, bot).then_some((top, bot))
+    }
+}
+
+/// Pixel box `(x, y, w, h)` in `editor_area` coords around the single-line byte
+/// span `[lo, hi]`, for the caret-driven highlight overlays (bracket matching,
+/// identifier occurrences). `None` when either end is off screen.
+///
+/// The horizontal edges are **snapped to whole pixels** (floor left, ceil right)
+/// so the 1px border lands crisply on the device grid — otherwise a glyph at a
+/// fractional x antialiases ~1px off (looked like the box was biased right).
+fn span_box_at(
+    points: impl Fn(usize) -> Option<(Point, Point)>,
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    vp: (f64, f64),
+) -> Option<(f64, f64, f64, f64)> {
+    let content_x = content_x_of(sql);
+    let (top, bot) = points(lo)?;
+    let (end, _) = points(hi)?;
+    let left = (content_x + top.x - vp.0).floor();
+    let right = (content_x + end.x - vp.0).ceil();
     let w = (right - left).max(4.0);
-    let y = top.y + EDITOR_PAD_TOP - vp.y0;
-    (left, y, w, bot.y - top.y)
+    let y = top.y + EDITOR_PAD_TOP - vp.1;
+    Some((left, y, w, bot.y - top.y))
 }
 
 /// Pixel underline segment `(x, y, width)` in `editor_area` coords for the word
-/// `[lo, hi]` (assumed single-line). Same gutter math as `statement_line_boxes`.
-fn underline_seg(sql: &str, ed: &Editor, lo: usize, hi: usize) -> (f64, f64, f64) {
-    let total_lines = sql.bytes().filter(|&c| c == b'\n').count() + 1;
-    let digits = total_lines.to_string().len();
-    let content_x = HL_GUTTER + digits.saturating_sub(1) as f64 * HL_DIGIT_W;
-    let (top, bot) = ed.points_of_offset(lo, CursorAffinity::Backward);
-    let (end, _) = ed.points_of_offset(hi, CursorAffinity::Backward);
+/// `[lo, hi]` (assumed single-line). `None` when either end is off screen — a
+/// diagnostic outside the visible region must render *nothing*, not a stub.
+fn underline_seg_at(
+    points: impl Fn(usize) -> Option<(Point, Point)>,
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    vp: (f64, f64),
+) -> Option<(f64, f64, f64)> {
+    let content_x = content_x_of(sql);
+    let (top, bot) = points(lo)?;
+    let (end, _) = points(hi)?;
     // `content_x` slightly over-estimates the code start (the padded statement-
     // highlight border masked it; a tight underline exposes it), so nudge left to
     // sit flush with the glyphs.
     const WAVE_X_ADJUST: f64 = 3.0;
-    let x0 = content_x + top.x - WAVE_X_ADJUST;
-    let x1 = content_x + end.x - WAVE_X_ADJUST;
+    let x0 = content_x + top.x - WAVE_X_ADJUST - vp.0;
+    let x1 = content_x + end.x - WAVE_X_ADJUST - vp.0;
     // Sit the wave ~2px below the glyphs (bot.y is the line's bottom; the
     // descenders end a few px above it, so drop the wave's top to just past them).
-    // +`EDITOR_PAD_TOP` for the editor's top padding.
-    let y = bot.y - WAVE_H + 2.0 + EDITOR_PAD_TOP;
-    (x0, y, (x1 - x0).max(2.0))
+    // +`EDITOR_PAD_TOP` for the editor's top padding, −`vp.1` for the scroll.
+    let y = bot.y - WAVE_H + 2.0 + EDITOR_PAD_TOP - vp.1;
+    Some((x0, y, (x1 - x0).max(2.0)))
 }
+
+/// Pixel box in `editor_area` coords around the single-line span `[lo, hi]`.
+/// `None` when off screen.
+fn span_box(sql: &str, ed: &Editor, lo: usize, hi: usize) -> Option<(f64, f64, f64, f64)> {
+    let vp = ed.viewport.get();
+    span_box_at(editor_points(ed), sql, lo, hi, (vp.x0, vp.y0))
+}
+
+// (There is no `ed`-taking `underline_seg` wrapper: the squiggle overlay has to
+// rebuild its view when the geometry moves — the wave's width is baked into the
+// SVG markup — so it calls `underline_seg_at` from inside a memo instead. See
+// `syntax_view`.)
 
 /// Set the picked-statement highlight to `[lo, hi]` — but only when it's ONE OF
 /// SEVERAL statements (a lone query needs no highlight, per the spec). "Several"
@@ -648,14 +724,14 @@ fn highlight_pick(sql: &str, lo: usize, hi: usize, highlight: RwSignal<Option<(u
 /// line the statement touches, sized to that line's slice of the statement, so
 /// the right edges "staircase". `points_of_offset` gives the caret top/bottom at
 /// an offset; `.x` is content-relative (add the gutter), `.y` is editor-relative.
-fn statement_line_boxes(sql: &str, ed: &Editor, lo: usize, hi: usize) -> Vec<(f64, f64, f64, f64)> {
-    // The gutter widens with the line-number digit count (it sizes to the last
-    // line number). `points_of_offset().x` is text-layout-relative (0 = code
-    // start), so add this to reach editor-area coords.
-    let total_lines = sql.bytes().filter(|&c| c == b'\n').count() + 1;
-    let digits = total_lines.to_string().len();
-    let content_x = HL_GUTTER + digits.saturating_sub(1) as f64 * HL_DIGIT_W;
-
+fn statement_line_boxes_at(
+    points: impl Fn(usize) -> Option<(Point, Point)>,
+    sql: &str,
+    lo: usize,
+    hi: usize,
+    vp: (f64, f64),
+) -> Vec<(f64, f64, f64, f64)> {
+    let content_x = content_x_of(sql);
     let mut boxes = Vec::new();
     let mut pos = lo;
     loop {
@@ -664,18 +740,21 @@ fn statement_line_boxes(sql: &str, ed: &Editor, lo: usize, hi: usize) -> Vec<(f6
         let line_end = nl.unwrap_or(sql.len());
         let seg_lo = lo.max(line_start);
         let seg_hi = hi.min(line_end);
-        if seg_hi >= seg_lo {
-            let (top, bot) = ed.points_of_offset(seg_lo, CursorAffinity::Backward);
-            let (end, _) = ed.points_of_offset(seg_hi, CursorAffinity::Backward);
+        // A line the editor can't place contributes no box. Skipping it is what
+        // makes the border stop at the fold instead of drawing a stray rectangle
+        // over the gutter.
+        if seg_hi >= seg_lo
+            && let (Some((top, bot)), Some((end, _))) = (points(seg_lo), points(seg_hi))
+        {
             // Inflate horizontally by HL_PAD so the border clears the glyphs (a
             // tight box clips them). Only horizontal — the vertical extent must
             // stay one line tall (+1) so adjacent lines' borders overlap into a
             // single 1px middle border.
-            let x0 = content_x + top.x - HL_PAD;
-            let x1 = content_x + end.x + HL_PAD;
+            let x0 = content_x + top.x - HL_PAD - vp.0;
+            let x1 = content_x + end.x + HL_PAD - vp.0;
             boxes.push((
                 x0,
-                top.y + EDITOR_PAD_TOP,
+                top.y + EDITOR_PAD_TOP - vp.1,
                 (x1 - x0).max(6.0),
                 bot.y - top.y,
             ));
@@ -686,6 +765,12 @@ fn statement_line_boxes(sql: &str, ed: &Editor, lo: usize, hi: usize) -> Vec<(f6
         }
     }
     boxes
+}
+
+/// Per-line boxes for the picked statement, in `editor_area` coords.
+fn statement_line_boxes(sql: &str, ed: &Editor, lo: usize, hi: usize) -> Vec<(f64, f64, f64, f64)> {
+    let vp = ed.viewport.get();
+    statement_line_boxes_at(editor_points(ed), sql, lo, hi, (vp.x0, vp.y0))
 }
 
 /// The full set of signals/callbacks `query_pane` threads into the editor and its
@@ -2653,27 +2738,31 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let (edp, edq) = (ed.clone(), ed.clone());
                     let (sqp, sqq) = (sql.clone(), sql);
                     v_stack((
-                        empty().style(move |s| {
-                            let (x, y, w, h) = span_box(&sqp, &edp, p, p + 1);
-                            s.absolute()
+                        empty().style(move |s| match span_box(&sqp, &edp, p, p + 1) {
+                            // Scrolled out of view: draw nothing rather than a
+                            // box at the editor's origin.
+                            None => s.hide(),
+                            Some((x, y, w, h)) => s
+                                .absolute()
                                 .inset_left(x)
                                 .inset_top(y)
                                 .width(w)
                                 .height(h)
                                 .border(1.0)
                                 .border_radius(2.0)
-                                .border_color(theme::bracket_match().multiply_alpha(0.5))
+                                .border_color(theme::bracket_match().multiply_alpha(0.5)),
                         }),
-                        empty().style(move |s| {
-                            let (x, y, w, h) = span_box(&sqq, &edq, q, q + 1);
-                            s.absolute()
+                        empty().style(move |s| match span_box(&sqq, &edq, q, q + 1) {
+                            None => s.hide(),
+                            Some((x, y, w, h)) => s
+                                .absolute()
                                 .inset_left(x)
                                 .inset_top(y)
                                 .width(w)
                                 .height(h)
                                 .border(1.0)
                                 .border_radius(2.0)
-                                .border_color(theme::bracket_match().multiply_alpha(0.5))
+                                .border_color(theme::bracket_match().multiply_alpha(0.5)),
                         }),
                     ))
                     .style(|s| s.absolute().inset(0.0))
@@ -2701,16 +2790,19 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 v_stack_from_iter(ranges.into_iter().map(move |(lo, hi)| {
                     let ed = ed.clone();
                     let sql = sql.clone();
-                    empty().style(move |s| {
-                        let (x, y, w, h) = span_box(&sql, &ed, lo, hi);
-                        s.absolute()
+                    empty().style(move |s| match span_box(&sql, &ed, lo, hi) {
+                        // An occurrence scrolled out of view draws nothing —
+                        // this is what produced stray boxes over unrelated text.
+                        None => s.hide(),
+                        Some((x, y, w, h)) => s
+                            .absolute()
                             .inset_left(x)
                             .inset_top(y)
                             .width(w)
                             .height(h)
                             .border(1.0)
                             .border_radius(2.0)
-                            .border_color(theme::bracket_match().multiply_alpha(0.5))
+                            .border_color(theme::bracket_match().multiply_alpha(0.5)),
                     })
                 }))
                 .style(|s| s.absolute().inset(0.0))
@@ -2730,25 +2822,37 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // the message without stealing clicks meant for the text.
     let syntax_view = {
         let ed = ed_syntax;
+        // The squiggle's *width* is baked into the SVG markup (floem's `svg()`
+        // takes a `String`, not a signal), so unlike the other overlays this one
+        // can't just recompute inside a `.style()` closure — the view itself has
+        // to be rebuilt when the geometry moves. A memo is what makes that
+        // affordable: it tracks `viewport`/`screen_lines` and so re-runs on every
+        // scroll, but memos dedup on `PartialEq`, so the container below only
+        // rebuilds when a squiggle actually changes position, width, severity or
+        // message. Same trick the grid uses for its column window.
+        let segs = create_memo(move |_| {
+            let mut diags = syntax.get();
+            diags.extend(db_diag.get());
+            let sql = query.get();
+            let vp = ed.viewport.get();
+            let points = editor_points(&ed);
+            diags
+                .iter()
+                .filter_map(|d| {
+                    // `None` = off screen. Rendering nothing is the point: this
+                    // used to collapse to a 2px stub at the editor's top-left
+                    // carrying the tooltip of an error twenty lines away.
+                    underline_seg_at(&points, &sql, d.range.0, d.range.1, (vp.x0, vp.y0))
+                        .map(|(x, y, w)| (x, y, w, d.severity, d.message.clone()))
+                })
+                .collect::<Vec<_>>()
+        });
         dyn_container(
-            move || {
-                // Offline diagnostics + live DB-validation diagnostics, merged.
-                let mut d = syntax.get();
-                d.extend(db_diag.get());
-                d
-            },
-            move |diags| {
-                if diags.is_empty() {
+            move || segs.get(),
+            move |segs: Vec<(f64, f64, f64, Severity, String)>| {
+                if segs.is_empty() {
                     return empty().into_any();
                 }
-                let sql = query.get_untracked();
-                let segs: Vec<(f64, f64, f64, Severity, String)> = diags
-                    .iter()
-                    .map(|d| {
-                        let (x, y, w) = underline_seg(&sql, &ed, d.range.0, d.range.1);
-                        (x, y, w, d.severity, d.message.clone())
-                    })
-                    .collect();
                 v_stack_from_iter(segs.into_iter().map(|(x, y, w, sev, msg)| {
                     floem::views::svg(wavy_svg(w))
                         .style(move |s| {
@@ -3388,4 +3492,108 @@ fn floor_char_boundary(s: &str, i: usize) -> usize {
         i -= 1;
     }
     i
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    /// A stand-in for `Editor::points_of_offset` that places every offset on one
+    /// line at a fixed document y — enough to check the viewport arithmetic.
+    fn at(y: f64) -> impl Fn(usize) -> Option<(Point, Point)> {
+        move |off| {
+            Some((
+                Point::new(off as f64 * 8.0, y),
+                Point::new(off as f64 * 8.0, y + 18.0),
+            ))
+        }
+    }
+
+    const SQL: &str = "SELECT 1;\nSELECT 2;\nSELECT * FROM nosuchtbl;";
+
+    // ── The off-screen rule ───────────────────────────────────────────────
+    //
+    // `points_of_offset` answers `(ZERO, ZERO)` for an offset outside
+    // `screen_lines`, which the old code consumed as a real position — a
+    // 2px stub pinned at the editor's top-left carrying a tooltip for an
+    // error 25 lines away.
+
+    #[test]
+    fn an_offset_the_editor_cannot_place_produces_no_segment() {
+        assert_eq!(underline_seg_at(|_| None, SQL, 30, 40, (0.0, 0.0)), None);
+        assert_eq!(span_box_at(|_| None, SQL, 30, 40, (0.0, 0.0)), None);
+        assert!(statement_line_boxes_at(|_| None, SQL, 0, SQL.len(), (0.0, 0.0)).is_empty());
+    }
+
+    #[test]
+    fn the_origin_pair_means_unplaced_but_a_real_offset_zero_does_not() {
+        // floem's "not on screen" answer is both points at the origin. A
+        // genuinely placed offset 0 differs: its *bottom* carries the line
+        // height, so the two cases are distinguishable without knowing `off`.
+        assert!(!placed(Point::ZERO, Point::ZERO));
+        assert!(placed(Point::ZERO, Point::new(0.0, 18.0)));
+    }
+
+    // ── The viewport rule ─────────────────────────────────────────────────
+
+    #[test]
+    fn a_placed_segment_is_relative_to_the_visible_area_not_the_document() {
+        // Line ~25 of a long script: document y 450, viewport scrolled to 400.
+        // The old code returned the document y, putting the squiggle hundreds
+        // of pixels below a ~190px pane.
+        let seg = underline_seg_at(at(450.0), SQL, 10, 18, (0.0, 400.0)).unwrap();
+        assert!(seg.1 < 200.0, "y must be viewport-relative, got {}", seg.1);
+
+        let b = span_box_at(at(450.0), SQL, 10, 18, (0.0, 400.0)).unwrap();
+        assert!(b.1 < 200.0, "y must be viewport-relative, got {}", b.1);
+
+        let boxes = statement_line_boxes_at(at(450.0), SQL, 10, 18, (0.0, 400.0));
+        assert!(boxes.iter().all(|b| b.1 < 200.0), "{boxes:?}");
+    }
+
+    #[test]
+    fn horizontal_scroll_shifts_every_overlay_left() {
+        let unscrolled = span_box_at(at(0.0), SQL, 10, 18, (0.0, 0.0)).unwrap();
+        let scrolled = span_box_at(at(0.0), SQL, 10, 18, (120.0, 0.0)).unwrap();
+        assert!(
+            (unscrolled.0 - scrolled.0 - 120.0).abs() < 1.5,
+            "{} vs {}",
+            unscrolled.0,
+            scrolled.0
+        );
+        let u = underline_seg_at(at(0.0), SQL, 10, 18, (0.0, 0.0)).unwrap();
+        let s = underline_seg_at(at(0.0), SQL, 10, 18, (120.0, 0.0)).unwrap();
+        assert!((u.0 - s.0 - 120.0).abs() < 1.5, "{} vs {}", u.0, s.0);
+    }
+
+    // ── Per-line boxes ────────────────────────────────────────────────────
+
+    #[test]
+    fn a_multi_line_statement_gets_one_box_per_line() {
+        let boxes = statement_line_boxes_at(at(0.0), SQL, 0, SQL.len(), (0.0, 0.0));
+        assert_eq!(boxes.len(), 3, "three lines in the fixture");
+    }
+
+    #[test]
+    fn a_line_the_editor_cannot_place_is_skipped_not_collapsed_to_the_origin() {
+        // Only the first line is on screen. The other two must contribute no
+        // box at all rather than a box at (0,0) — that is the difference
+        // between a border that stops at the fold and one that draws a stray
+        // rectangle over the gutter.
+        let first_line_only = |off: usize| {
+            (off < 10).then(|| (Point::new(off as f64 * 8.0, 0.0), Point::new(0.0, 18.0)))
+        };
+        let boxes = statement_line_boxes_at(first_line_only, SQL, 0, SQL.len(), (0.0, 0.0));
+        assert_eq!(boxes.len(), 1);
+    }
+
+    // ── The gutter ────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_code_column_widens_with_the_line_number_digit_count() {
+        let one_digit = content_x_of("SELECT 1;");
+        let two_digit = content_x_of(&"x\n".repeat(20));
+        assert!(two_digit > one_digit);
+        assert_eq!(two_digit - one_digit, HL_DIGIT_W);
+    }
 }
