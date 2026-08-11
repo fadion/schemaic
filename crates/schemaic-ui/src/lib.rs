@@ -3254,8 +3254,10 @@ fn results_multi(
             Some(QueryState::Idle) => empty().into_any(),
             Some(QueryState::Running) => running_view(cancel.clone()).into_any(),
             // Unlike single runs (whose error shows in the editor bar), a batch
-            // statement's error has nowhere else to go, so show it here.
-            Some(QueryState::Failed(m)) => centered_msg(m, theme::reject_text()).into_any(),
+            // statement's error has nowhere else to go, so show it here. Free-
+            // standing text on the results background, so `error()` — see the
+            // note in `monitor_view`'s status line.
+            Some(QueryState::Failed(m)) => centered_msg(m, theme::error()).into_any(),
             Some(QueryState::Cancelled) => {
                 centered_msg("Query cancelled.", theme::text_dim()).into_any()
             }
@@ -3345,8 +3347,11 @@ fn result_tab_chip(
             } else {
                 s.background(theme::bg_chrome())
             };
+            // The chip's own background is `tab_active`/`bg_chrome`, never
+            // `reject_bg`, so a failed statement's label needs the free-standing
+            // error colour rather than the red pill's foreground.
             if is_err() {
-                s.color(theme::reject_text())
+                s.color(theme::error())
             } else if active_result.get() == idx {
                 s.color(theme::text())
             } else {
