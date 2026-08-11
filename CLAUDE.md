@@ -177,7 +177,9 @@ Zed-inspired, aiming to replace DataGrip.
     `materialized`) — `CREATE OR REPLACE VIEW` replaces the whole view, so what isn't restated
     resets, and `SQL SECURITY DEFINER → INVOKER` is a privilege change. `definer_sql` quotes the
     two halves of a MySQL account. `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the
-    above.
+    above; its **view** branch delegates to `ddl::view_ddl` so Copy DDL, the MCP table-info tool
+    and the apply path all emit through one view emitter (it used to have its own, which restated
+    none of the options).
   - `secrets.rs` — keeps connection secrets (DB/SSH passwords + SSH key passphrase) out of the
     plaintext `connections.json`: the `SecretStore` seam + pure transforms `hydrate_file` (load →
     fill empty fields from the store, flag legacy plaintext for migration), `sanitize_file` (save →

@@ -406,13 +406,18 @@ pub fn definer_sql(definer: &str) -> String {
 
 impl TableInfo {
     /// A `CREATE TABLE`/`CREATE VIEW` skeleton from the introspected schema. Not
-    /// a round-trip of the server's DDL (no FK references, engine, charset, or
-    /// column defaults), but a valid, useful skeleton in the connection's dialect:
+    /// a round-trip of the server's DDL — no FK references, engine or charset —
+    /// but a valid, useful skeleton in the connection's dialect:
     /// MySQL backtick-quotes and inlines `KEY`/`UNIQUE KEY`; PostgreSQL
     /// double-quotes and emits non-PK indexes as separate `CREATE INDEX`
     /// statements (its `CREATE TABLE` can't inline them). A table outside
     /// PostgreSQL's `public` is emitted schema-qualified, so the DDL recreates it
     /// in the namespace it came from rather than wherever `search_path` points.
+    ///
+    /// A **view** goes through [`crate::ddl::view_ddl`], the same emitter the
+    /// apply path uses, so the copied statement carries the options a
+    /// re-creation would otherwise reset. This branch used to build its own
+    /// statement and drop all of them.
     pub fn create_ddl(&self, dialect: crate::intel::SqlDialect) -> String {
         let pg = dialect == crate::intel::SqlDialect::Postgres;
         let q = |s: &str| -> String {
@@ -428,13 +433,18 @@ impl TableInfo {
             None => q(&self.name),
         };
         if self.is_view {
-            return match &self.view_definition {
-                Some(def) => {
-                    format!("CREATE OR REPLACE VIEW {qname} AS\n{def};")
-                }
-                // View flagged but its definition wasn't readable (e.g. privileges).
+            // Through `ddl::view_ddl`, so the copy path and the apply path share
+            // one emitter: this branch used to build its own statement and drop
+            // every view option on the floor. `None` only when the definition
+            // wasn't readable (e.g. privileges), which has nothing to restate.
+            return match crate::ddl::view_ddl(self, dialect).filter(|_| {
+                self.view_definition
+                    .as_deref()
+                    .is_some_and(|d| !d.trim().is_empty())
+            }) {
+                Some(sql) => sql,
                 None => format!(
-                    "-- View definition for {qname} was not available.\nCREATE OR REPLACE VIEW {qname} AS\nSELECT ...;"
+                    "-- View definition for {qname} was not available.\nCREATE VIEW {qname} AS\nSELECT ...;"
                 ),
             };
         }
@@ -1026,9 +1036,11 @@ mod tests {
             view_definition: Some("SELECT 1".to_string()),
             ..Default::default()
         };
+        // Plain `CREATE VIEW`: a copied skeleton recreates the object elsewhere,
+        // and failing on a name collision beats silently replacing a view.
         assert_eq!(
             t.create_ddl(crate::intel::SqlDialect::MySql),
-            "CREATE OR REPLACE VIEW `v` AS\nSELECT 1;"
+            "CREATE VIEW `v` AS\nSELECT 1;"
         );
     }
 
@@ -1074,7 +1086,7 @@ mod tests {
         };
         let ddl = t.create_ddl(crate::intel::SqlDialect::MySql);
         assert!(ddl.contains("-- View definition for `v` was not available."));
-        assert!(ddl.contains("CREATE OR REPLACE VIEW `v` AS\nSELECT ...;"));
+        assert!(ddl.contains("CREATE VIEW `v` AS\nSELECT ...;"));
     }
 
     // ── multi-schema (PostgreSQL namespaces) ──────────────────────────────
@@ -1146,7 +1158,7 @@ mod tests {
         };
         assert_eq!(
             t.create_ddl(crate::intel::SqlDialect::Postgres),
-            "CREATE OR REPLACE VIEW \"analytics\".\"daily\" AS\nSELECT 1;"
+            "CREATE VIEW \"analytics\".\"daily\" AS\nSELECT 1;"
         );
     }
 
@@ -1291,7 +1303,7 @@ mod tests {
         };
         let out = s.create_ddl_script(Some("sales"), Postgres);
         let table_at = out.find("CREATE TABLE").expect("table emitted");
-        let view_at = out.find("CREATE OR REPLACE VIEW").expect("view emitted");
+        let view_at = out.find("CREATE VIEW").expect("view emitted");
         assert!(table_at < view_at, "base tables must precede views:\n{out}");
         // Only this namespace's tables, blank-line separated.
         assert!(!out.contains("elsewhere"), "{out}");
