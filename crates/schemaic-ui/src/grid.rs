@@ -38,7 +38,7 @@ use schemaic_core::model::{
     RowDelete, RowEdit, RowInsert, Value, drop_committed,
 };
 use schemaic_core::rowjson::{self, ColSpec};
-use schemaic_core::schema::{ForeignKeyInfo, SchemaState, TableSource};
+use schemaic_core::schema::{DbSchema, ForeignKeyInfo, SchemaState, TableInfo, TableSource};
 use schemaic_core::summary;
 use schemaic_core::text::plural;
 use schemaic_core::text_ops::contains_ignore_ascii_case;
@@ -391,13 +391,12 @@ struct GridState {
 }
 
 impl GridState {
-    fn new(rs: Arc<ResultSet>, gctx: &GridCtx, key_map: &HashMap<String, ColKey>) -> Self {
+    fn new(rs: Arc<ResultSet>, gctx: &GridCtx, key_map: &HashMap<usize, ColKey>) -> Self {
         let widths = init_widths(&rs, key_map);
         // Seed each column's display formatter from the persisted rules, keyed by
-        // (conn_id, source table, column). Columns of an unsourced query (or with
-        // no saved rule) start raw.
+        // (conn_id, the column's own table, its real name) — see `format_key`. A
+        // column with no saved rule (or no table) starts on the smart default.
         let conn = gctx.conn_id.get_untracked();
-        let src = gctx.source.get_untracked();
         // This tab's SQL dialect, from its connection's engine (drives Follow-FK SQL).
         let dialect = gctx
             .connections
@@ -416,14 +415,10 @@ impl GridState {
                     .unwrap_or(("", ""));
                 // An explicit saved rule wins; otherwise fall back to the name/type
                 // smart default (e.g. an int `*_at` column → Timestamp).
-                // Keyed by the *display* name, so a rule saved for `sales.orders`
-                // doesn't leak onto `public.orders`.
-                let saved = match &src {
-                    Some(s) => gctx.formats.with_untracked(|rules| {
-                        format::lookup(rules, conn, &s.database, &s.display(), name)
-                    }),
-                    None => None,
-                };
+                let saved = format_key(&rs, ci).and_then(|(db, table, col)| {
+                    gctx.formats
+                        .with_untracked(|rules| format::lookup(rules, conn, &db, &table, &col))
+                });
                 saved.unwrap_or_else(|| format::smart_default(name, ty))
             })
             .collect();
@@ -1079,7 +1074,7 @@ impl GridState {
 /// Exact rendered pixel width of `text` in the grid's cell font (the app default
 /// sans — IBM Plex Sans — at `FONT_BODY`), via a throwaway `TextLayout`. Used to
 /// Estimate a column's initial width from its header + a sample of cell values.
-fn init_widths(rs: &ResultSet, key_map: &HashMap<String, ColKey>) -> Vec<f64> {
+fn init_widths(rs: &ResultSet, key_map: &HashMap<usize, ColKey>) -> Vec<f64> {
     let sample = rs.row_count().min(200);
     rs.columns
         .iter()
@@ -1094,7 +1089,7 @@ fn init_widths(rs: &ResultSet, key_map: &HashMap<String, ColKey>) -> Vec<f64> {
             }
             // A key column's header carries a leading key icon; budget for it so the
             // name/type line isn't squeezed (and clipped) by the icon + gap.
-            let icon = if key_map.contains_key(&col.name) {
+            let icon = if key_map.contains_key(&ci) {
                 HEADER_KEY_ICON_W
             } else {
                 0.0
@@ -1496,7 +1491,7 @@ fn col_resize_handle(gs: GridState, ci: usize, has_key: bool) -> impl IntoView {
 }
 
 /// A result column's key role in its source table (drives the header key icon).
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum ColKey {
     Primary,
     Foreign,
@@ -1519,46 +1514,96 @@ impl ColKey {
     }
 }
 
-/// Per-column key roles for the result's source table, keyed by column name.
-/// Empty when the tab wasn't opened from a table or its schema isn't loaded yet.
-/// Primary keys win; single-column indexes are Foreign (if they back an FK) else
-/// Index. Multi-column indexes are ignored (only single-column ones get a marker).
-fn column_key_map(
+/// Where a persisted column formatter lives for result column `ci`: the real
+/// `(database, table, column)` its value came from, with the table under the name
+/// the UI shows it by (`schema.table` outside PostgreSQL's `public`, so a rule on
+/// `sales.orders` can't leak onto `public.orders`).
+///
+/// The identity is the column's **own** provenance, not the tab's source table.
+/// Keying on the source meant a hand-written query in a table-opened tab both
+/// read and wrote rules under a table its columns never came from: a Timestamp
+/// saved on `customers.created_at` rendered `orders.created_at` as a datetime.
+/// `None` for an expression column — it belongs to no table, so there is nothing
+/// to save a rule against; it still formats for the life of the result.
+fn format_key(rs: &ResultSet, ci: usize) -> Option<(String, String, String)> {
+    let o = rs.columns.get(ci)?.origin.as_ref()?;
+    let table = TableSource::new(o.database.clone(), o.schema.clone(), o.table.clone());
+    Some((o.database.clone(), table.display(), o.column.clone()))
+}
+
+/// The tab's source table and the loaded schema it lives in — the five steps
+/// every "what does this result inherit from its table" question starts with.
+///
+/// It is one function because it used to be four copies, and the copies drifted:
+/// the namespace check that keeps `public.orders` apart from `sales.orders` was
+/// added to one of them and not the others.
+fn source_schema(
     source: RwSignal<Option<TableSource>>,
     db_nodes: RwSignal<Vec<ConnNode>>,
-) -> HashMap<String, ColKey> {
-    let mut map = HashMap::new();
-    let Some(src) = source.get_untracked() else {
-        return map;
-    };
-    let (db, table) = (&src.database, &src.table);
+) -> Option<(TableSource, Arc<DbSchema>)> {
+    let src = source.get_untracked()?;
     let nodes = db_nodes.get_untracked();
-    let Some(node) = nodes.iter().find(|n| &n.database == db) else {
-        return map;
-    };
+    let node = nodes.iter().find(|n| n.database == src.database)?;
     let SchemaState::Loaded(schema) = node.schema.get_untracked() else {
-        return map;
+        return None;
     };
-    let Some(t) = schema.find_table(src.schema.as_deref(), table) else {
-        return map;
+    Some((src, schema))
+}
+
+/// Per-column key roles for the result's source table, keyed by **result-column
+/// index**. Empty when the tab wasn't opened from a table or its schema isn't
+/// loaded yet. Primary keys win; single-column indexes are Foreign (if they back
+/// an FK) else Index. Multi-column indexes are ignored (only single-column ones
+/// get a marker).
+///
+/// Indices, not names: a tab keeps its source when the user types a different
+/// query into it, so `SELECT o.customerNumber FROM orders o` in a tab opened from
+/// `customers` used to paint that column with `customers`' gold primary-key icon,
+/// and `SELECT 1 AS customerNumber` earned it on a literal.
+/// [`ResultSet::origin_columns`] is the identity rule.
+fn column_key_map(
+    rs: &ResultSet,
+    source: RwSignal<Option<TableSource>>,
+    db_nodes: RwSignal<Vec<ConnNode>>,
+) -> HashMap<usize, ColKey> {
+    let Some((src, schema)) = source_schema(source, db_nodes) else {
+        return HashMap::new();
     };
+    let Some(t) = schema.find_table(src.schema.as_deref(), &src.table) else {
+        return HashMap::new();
+    };
+    key_roles(
+        t,
+        &rs.origin_columns(&src.database, src.schema.as_deref(), &src.table),
+    )
+}
+
+/// The role precedence, over a table's own columns and the result columns they
+/// landed in (`real name → result index`). Pure half of [`column_key_map`].
+fn key_roles(t: &TableInfo, by_name: &HashMap<&str, usize>) -> HashMap<usize, ColKey> {
+    let mut map = HashMap::new();
+    let at = |col: &str| by_name.get(col).copied();
     for c in &t.columns {
-        if c.primary_key {
-            map.insert(c.name.clone(), ColKey::Primary);
+        if c.primary_key
+            && let Some(ci) = at(&c.name)
+        {
+            map.insert(ci, ColKey::Primary);
         }
     }
     for ix in &t.indexes {
         if ix.is_primary() || ix.columns.len() != 1 {
             continue;
         }
-        let col = &ix.columns[0].name;
-        if map.get(col) == Some(&ColKey::Primary) {
+        let Some(ci) = at(&ix.columns[0].name) else {
+            continue;
+        };
+        if map.get(&ci) == Some(&ColKey::Primary) {
             continue;
         }
         if ix.foreign {
-            map.insert(col.clone(), ColKey::Foreign); // FK wins over a plain index
+            map.insert(ci, ColKey::Foreign); // FK wins over a plain index
         } else {
-            map.entry(col.clone()).or_insert(ColKey::Index);
+            map.entry(ci).or_insert(ColKey::Index);
         }
     }
     map
@@ -1587,17 +1632,10 @@ fn build_follow_specs(
     db_nodes: RwSignal<Vec<ConnNode>>,
 ) -> HashMap<usize, Rc<FollowSpec>> {
     let mut map = HashMap::new();
-    let Some(src) = source.get_untracked() else {
+    let Some((src, schema)) = source_schema(source, db_nodes) else {
         return map;
     };
     let (db, table) = (&src.database, &src.table);
-    let nodes = db_nodes.get_untracked();
-    let Some(node) = nodes.iter().find(|n| &n.database == db) else {
-        return map;
-    };
-    let SchemaState::Loaded(schema) = node.schema.get_untracked() else {
-        return map;
-    };
     let Some(t) = schema.find_table(src.schema.as_deref(), table) else {
         return map;
     };
@@ -1605,18 +1643,7 @@ fn build_follow_specs(
         return map;
     }
     // Real column name (of this source table) → its result-column index.
-    let mut real_to_ci: HashMap<&str, usize> = HashMap::new();
-    for (ci, col) in rs.columns.iter().enumerate() {
-        if let Some(o) = &col.origin
-            && &o.table == table
-            && &o.database == db
-            // Namespace too, or a self-join-shaped result spanning `public.orders`
-            // and `sales.orders` would map the wrong side's values.
-            && o.schema == src.schema
-        {
-            real_to_ci.entry(o.column.as_str()).or_insert(ci);
-        }
-    }
+    let real_to_ci = rs.origin_columns(db, src.schema.as_deref(), table);
     for fk in &t.foreign_keys {
         let value_cols: Option<Vec<usize>> = fk
             .columns
@@ -1927,7 +1954,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     let ncols = rs.col_count();
     let nrows = rs.row_count();
     // Per-column key roles (snapshot from the source table's schema at build).
-    let key_map = Arc::new(column_key_map(gctx.source, gctx.db_nodes));
+    let key_map = Arc::new(column_key_map(&rs, gctx.source, gctx.db_nodes));
     let elapsed = rs.elapsed_ms;
     let truncated = rs.truncated;
     // Signals for the identity-colour rule at the table's top edge (below the
@@ -4610,20 +4637,14 @@ fn set_format(gs: GridState, ci: usize, fmt: ColumnFormat) {
             v[ci] = fmt;
         }
     });
-    if let Some(src) = gs.source.get_untracked()
-        && let Some(col) = gs
-            .rs
-            .get_untracked()
-            .columns
-            .get(ci)
-            .map(|c| c.name.clone())
-    {
+    // Saved against the column's *own* table, which is what `GridState::new` then
+    // looks it up by — so the rule is found again wherever that column appears,
+    // and never applied to a same-named column of another table. An expression
+    // column belongs to no table: it formats for this result and is not persisted.
+    if let Some((db, table, col)) = format_key(&gs.rs.get_untracked(), ci) {
         let conn = gs.conn_id.get_untracked();
-        // Keyed by the display name (see `GridState::new`) so the rule belongs to
-        // this namespace's table, not a same-named one in another schema.
-        let table = src.display();
         gs.fmt_rules
-            .update(|rules| format::upsert(rules, conn, &src.database, &table, &col, fmt));
+            .update(|rules| format::upsert(rules, conn, &db, &table, &col, fmt));
         if let Some(save) = gs.save_formats.get_untracked() {
             (save)();
         }
@@ -4658,7 +4679,7 @@ fn header_cell(
     ci: usize,
     sort_val: SortState,
     sort: RwSignal<SortState>,
-    key_map: Arc<HashMap<String, ColKey>>,
+    key_map: Arc<HashMap<usize, ColKey>>,
 ) -> impl IntoView {
     let rs = gs.rs.get_untracked();
     let col = rs.columns.get(ci);
@@ -4674,7 +4695,7 @@ fn header_cell(
         Some(a) => a,
         None => matches!(sort_val, Some((c, true)) if c == ci),
     };
-    let key = key_map.get(&name).copied();
+    let key = key_map.get(&ci).copied();
 
     // Name + (when sorted) a chevron 7px to its right, both in the sort colour.
     let name_line = text(name).style(move |s| {
@@ -5417,6 +5438,7 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use schemaic_core::model::Column;
+    use schemaic_core::schema::{ColumnInfo, IndexColumn, IndexInfo};
 
     fn col(name: &str, ty: &str) -> Column {
         Column {
@@ -5432,6 +5454,97 @@ mod tests {
             vec![col("c", ty)],
             cells.into_iter().map(|v| vec![v]).collect(),
         )
+    }
+
+    // ── Header key icons (`key_roles`) ──
+
+    fn table_with(cols: &[(&str, bool)], indexes: Vec<IndexInfo>) -> TableInfo {
+        TableInfo {
+            name: "t".into(),
+            columns: cols
+                .iter()
+                .map(|(n, pk)| ColumnInfo {
+                    name: n.to_string(),
+                    primary_key: *pk,
+                    ..Default::default()
+                })
+                .collect(),
+            indexes,
+            ..Default::default()
+        }
+    }
+
+    fn index(name: &str, cols: &[&str], foreign: bool) -> IndexInfo {
+        IndexInfo {
+            name: name.into(),
+            columns: cols
+                .iter()
+                .map(|c| IndexColumn {
+                    name: c.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            foreign,
+            ..Default::default()
+        }
+    }
+
+    fn at(pairs: &[(&'static str, usize)]) -> HashMap<&'static str, usize> {
+        pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn key_roles_marks_the_result_column_a_key_landed_in() {
+        let t = table_with(
+            &[("id", true), ("owner_id", false)],
+            vec![index("fk_owner", &["owner_id"], true)],
+        );
+        // The result selected them in the other order, and aliased both.
+        let roles = key_roles(&t, &at(&[("owner_id", 0), ("id", 1)]));
+        assert_eq!(roles.get(&0), Some(&ColKey::Foreign));
+        assert_eq!(roles.get(&1), Some(&ColKey::Primary));
+    }
+
+    /// The bug: a key column of the *source* table that the result doesn't
+    /// actually contain must not decorate whatever column shares its name.
+    #[test]
+    fn key_roles_skips_a_key_column_that_is_not_in_the_result() {
+        let t = table_with(&[("customerNumber", true)], Vec::new());
+        assert!(key_roles(&t, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn key_roles_ranks_primary_over_foreign_over_index() {
+        let t = table_with(
+            &[("id", true), ("owner_id", false), ("email", false)],
+            vec![
+                index("PRIMARY", &["id"], false),
+                index("ix_owner", &["owner_id"], false),
+                index("fk_owner", &["owner_id"], true),
+                index("ix_email", &["email"], false),
+            ],
+        );
+        let roles = key_roles(&t, &at(&[("id", 0), ("owner_id", 1), ("email", 2)]));
+        assert_eq!(
+            roles.get(&0),
+            Some(&ColKey::Primary),
+            "PK is not downgraded"
+        );
+        assert_eq!(
+            roles.get(&1),
+            Some(&ColKey::Foreign),
+            "FK beats plain index"
+        );
+        assert_eq!(roles.get(&2), Some(&ColKey::Index));
+    }
+
+    #[test]
+    fn key_roles_ignores_a_multi_column_index() {
+        let t = table_with(
+            &[("a", false), ("b", false)],
+            vec![index("ix_ab", &["a", "b"], false)],
+        );
+        assert!(key_roles(&t, &at(&[("a", 0), ("b", 1)])).is_empty());
     }
 
     // ── JSON tree collapse ──

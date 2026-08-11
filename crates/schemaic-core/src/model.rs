@@ -438,6 +438,41 @@ impl ResultSet {
         self.cols.get(col)?.cell(row)
     }
 
+    /// For one base table, the *real* column name → result-column index, matched
+    /// on the wire **provenance** each column carries rather than on the name it
+    /// is displayed under.
+    ///
+    /// This is the identity rule for anything a result inherits from a table:
+    /// key icons, saved column formatters, FK "Follow". A name match is not that
+    /// rule — a tab opened from `customers` keeps its source when the user types
+    /// a different query into it, so `SELECT o.customerNumber FROM orders o`
+    /// would take `customers`' primary-key icon, and `SELECT 1 AS customerNumber`
+    /// would take it on a literal.
+    ///
+    /// `schema` is the PostgreSQL namespace and is **part of the identity**:
+    /// without it, a result spanning `public.orders` and `sales.orders` maps the
+    /// wrong side. An expression column (no origin) is in no table and is
+    /// deliberately absent. First occurrence wins, so a column selected twice
+    /// resolves to its leftmost appearance.
+    pub fn origin_columns(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+        table: &str,
+    ) -> std::collections::HashMap<&str, usize> {
+        let mut map = std::collections::HashMap::new();
+        for (ci, col) in self.columns.iter().enumerate() {
+            if let Some(o) = &col.origin
+                && o.table == table
+                && o.database == database
+                && o.schema.as_deref() == schema
+            {
+                map.entry(o.column.as_str()).or_insert(ci);
+            }
+        }
+        map
+    }
+
     /// Replace whole data rows in place — `(data_row, new cells)` with cells
     /// aligned to the columns — rebuilding each column buffer with the
     /// substitutions applied. Used by the grid's in-place edit splice (post-commit
@@ -863,6 +898,96 @@ mod tests {
             type_name: type_name.to_string(),
             origin: None,
         }
+    }
+
+    // ── Result-column provenance (`origin_columns`) ──
+
+    /// A result column displayed as `shown`, really `db[.schema].table.real`.
+    fn sourced(shown: &str, db: &str, schema: Option<&str>, table: &str, real: &str) -> Column {
+        Column {
+            name: shown.to_string(),
+            type_name: "int".to_string(),
+            origin: Some(ColumnOrigin {
+                database: db.to_string(),
+                schema: schema.map(str::to_string),
+                table: table.to_string(),
+                column: real.to_string(),
+                flags: ColumnFlags::default(),
+                binary: false,
+            }),
+        }
+    }
+
+    fn rs_of(columns: Vec<Column>) -> ResultSet {
+        ResultSet::from_rows(columns, Vec::new())
+    }
+
+    /// The bug: a tab opened from `customers` keeps its source when the user runs
+    /// a different query in it, so matching by name gave `orders.customerNumber`
+    /// the customers primary-key icon and its saved formatter.
+    #[test]
+    fn origin_columns_ignores_a_same_named_column_from_another_table() {
+        let rs = rs_of(vec![
+            sourced("orderNumber", "shop", None, "orders", "orderNumber"),
+            sourced("customerNumber", "shop", None, "orders", "customerNumber"),
+        ]);
+        assert!(
+            rs.origin_columns("shop", None, "customers").is_empty(),
+            "nothing in this result came from customers"
+        );
+        assert_eq!(rs.origin_columns("shop", None, "orders").len(), 2);
+    }
+
+    #[test]
+    fn origin_columns_sees_through_an_alias() {
+        let rs = rs_of(vec![sourced("ts", "shop", None, "customers", "created_at")]);
+        let map = rs.origin_columns("shop", None, "customers");
+        assert_eq!(map.get("created_at"), Some(&0));
+        assert_eq!(map.get("ts"), None, "the display name is not the identity");
+    }
+
+    /// An expression column has no origin at all: `SELECT 1 AS customerNumber`
+    /// used to earn the gold key.
+    #[test]
+    fn origin_columns_skips_a_column_with_no_provenance() {
+        let rs = rs_of(vec![col("int"), sourced("id", "shop", None, "t", "id")]);
+        let map = rs.origin_columns("shop", None, "t");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("id"), Some(&1));
+    }
+
+    /// The namespace is part of the table's identity — the case `build_follow_specs`
+    /// already guarded and the icon map didn't.
+    #[test]
+    fn origin_columns_separates_two_schemas_with_the_same_table_name() {
+        let rs = rs_of(vec![
+            sourced("id", "app", Some("public"), "orders", "id"),
+            sourced("sales_id", "app", Some("sales"), "orders", "id"),
+        ]);
+        assert_eq!(
+            rs.origin_columns("app", Some("public"), "orders").get("id"),
+            Some(&0)
+        );
+        assert_eq!(
+            rs.origin_columns("app", Some("sales"), "orders").get("id"),
+            Some(&1)
+        );
+        assert!(rs.origin_columns("app", None, "orders").is_empty());
+    }
+
+    #[test]
+    fn origin_columns_takes_the_leftmost_of_a_repeated_column() {
+        let rs = rs_of(vec![
+            sourced("a", "shop", None, "t", "id"),
+            sourced("b", "shop", None, "t", "id"),
+        ]);
+        assert_eq!(rs.origin_columns("shop", None, "t").get("id"), Some(&0));
+    }
+
+    #[test]
+    fn origin_columns_separates_two_databases() {
+        let rs = rs_of(vec![sourced("id", "shop", None, "t", "id")]);
+        assert!(rs.origin_columns("other", None, "t").is_empty());
     }
 
     // ── Clearing the staged map after a commit (`drop_committed`) ──
