@@ -107,10 +107,13 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
     // modal, same as Drop/Truncate) and is inert when there's nothing to clear.
     // The count is the connection's *total* — the search box narrows the list, not
     // the delete.
+    // The count goes through `history::count_conn` rather than an inline filter:
+    // it is a promise about what the next click deletes, and `clear_conn` is what
+    // fulfils it — a test pins the two together.
     let confirm = ui.overlay.confirm;
     let clearable = create_memo(move |_| {
         let conn = active_conn.get();
-        entries.with(|v| v.iter().filter(|e| e.conn_id == conn).count())
+        entries.with(|v| history::count_conn(v, conn))
     });
     let trash = toolbar_icon(
         icons::TRASH_2,
@@ -124,7 +127,7 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
                 title: "Clear query history".to_string(),
                 message: format!(
                     "Delete {n} recorded {} for this connection? This can't be undone.",
-                    if n == 1 { "query" } else { "queries" }
+                    schemaic_core::text::plural(n, "query", "queries")
                 ),
                 resolve: Rc::new(move |yes| {
                     if yes {
