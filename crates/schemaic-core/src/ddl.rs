@@ -629,6 +629,17 @@ pub enum Change {
         /// `DROP INDEX` on those.
         constraint: Option<String>,
     },
+    /// An edit to an index [`IndexInfo::lossy`] marks as only partly readable was
+    /// **withheld**. Emits no SQL.
+    ///
+    /// This is a change rather than a silent omission on purpose. The user asked
+    /// for something and it isn't in the plan; a preview that simply didn't
+    /// mention it would be the same class of dishonesty as the destruction it
+    /// replaces. So it carries a summary and a risk line, and the modal renders
+    /// both.
+    KeepLossyIndex {
+        name: String,
+    },
     AddForeignKey(Box<ForeignKeyInfo>),
     DropForeignKey {
         name: String,
@@ -717,6 +728,9 @@ impl Change {
                 ix.column_names().collect::<Vec<_>>().join(", ")
             ),
             Change::DropIndex { name, .. } => format!("Drop index {name}"),
+            Change::KeepLossyIndex { name } => {
+                format!("Leave index {name} unchanged — Schemaic can't read all of it")
+            }
             Change::AddForeignKey(fk) => format!(
                 "Add foreign key {} → {}({})",
                 fk.name,
@@ -803,6 +817,16 @@ impl Change {
                  replace a view whose columns changed name, type or order, so this \
                  is the only way to apply the edit.",
                 draft.name
+            )],
+            // Not destructive — the *opposite* — but it belongs in the same
+            // block, because the block is where the preview says what the plan
+            // won't do for you. Silently omitting the user's edit would be the
+            // dishonesty this change exists to avoid.
+            Change::KeepLossyIndex { name } => vec![format!(
+                "Your edit to index {name} is not included. It uses something \
+                 Schemaic can't read back — an expression key column, an operator \
+                 class, or a NULLS ordering — and applying the edit would mean \
+                 re-creating the index without it. Edit this index in SQL instead."
             )],
             _ => Vec::new(),
         }
@@ -2022,6 +2046,17 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, dialect: SqlDialect) -> Cha
         // renamed column doesn't read as a changed index.
         match current_ix {
             Some(ix) if indexes_equal(&rename_index(ix, &renamed), &d.info) => {}
+            // An index we could only partly read: recreating it from this model
+            // would silently destroy the parts introspection never saw (an
+            // expression key column, an operator class, a NULLS ordering). The
+            // edit is withheld and said out loud instead. Removing the index
+            // outright is still allowed — that path doesn't come through here,
+            // because a deleted draft index leaves nothing to compare against.
+            Some(ix) if ix.lossy => {
+                changes.push(Change::KeepLossyIndex {
+                    name: ix.name.clone(),
+                });
+            }
             Some(ix) => {
                 dropped_ix.push(ix);
                 added_ix.push(d.info.clone());
@@ -4446,5 +4481,157 @@ mod tests {
     fn changing_type_family_still_warns_about_the_rewrite() {
         let msg = risk("varchar(50)", "int(11)").expect("a family change is destructive");
         assert!(msg.contains("rewrites every value"), "got {msg:?}");
+    }
+}
+
+#[cfg(test)]
+mod lossy_index_tests {
+    use super::*;
+    use crate::intel::SqlDialect::Postgres;
+    use crate::schema::IndexColumn;
+
+    /// A PostgreSQL table whose one secondary index carries something the
+    /// introspected model can't hold — an expression key column, a non-default
+    /// operator class, or a NULLS ordering. All three really occur and all three
+    /// are invisible in `IndexInfo`.
+    fn table_with_lossy_index() -> TableInfo {
+        TableInfo {
+            name: "person".into(),
+            schema: Some("public".into()),
+            columns: vec![
+                ColumnInfo {
+                    name: "id".into(),
+                    type_name: "integer".into(),
+                    nullable: false,
+                    primary_key: true,
+                    ..Default::default()
+                },
+                ColumnInfo {
+                    name: "last_name".into(),
+                    type_name: "text".into(),
+                    nullable: true,
+                    ..Default::default()
+                },
+            ],
+            indexes: vec![
+                IndexInfo::plain("PRIMARY", vec!["id"], true),
+                IndexInfo {
+                    name: "idx_person".into(),
+                    // What survived introspection: `lower(email)` was silently
+                    // dropped by the join, so the model holds only `last_name`.
+                    columns: vec![IndexColumn::plain("last_name")],
+                    lossy: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// The finding's own repro: edit *something else* about the index and the
+    /// plan would drop it and recreate it from the half of it that survived
+    /// introspection, silently destroying `lower(email)`.
+    #[test]
+    fn an_index_we_cannot_fully_read_is_never_dropped_and_recreated() {
+        let cur = table_with_lossy_index();
+        let mut draft = TableDraft::from_table(&cur);
+        // Any edit at all: make it unique.
+        let ix = draft
+            .indexes
+            .iter_mut()
+            .find(|d| d.info.name == "idx_person")
+            .unwrap();
+        ix.info.unique = true;
+
+        let cs = diff(&cur, &draft, Postgres);
+        assert!(
+            !cs.changes.iter().any(|c| matches!(
+                c,
+                Change::DropIndex { name, .. } if name == "idx_person"
+            )),
+            "a lossy index must not be dropped: {:?}",
+            cs.changes
+        );
+        assert!(
+            !cs.changes.iter().any(|c| matches!(
+                c,
+                Change::AddIndex(ix) if ix.name == "idx_person"
+            )),
+            "…nor recreated from the lossy model: {:?}",
+            cs.changes
+        );
+    }
+
+    /// Withholding the statement silently would be its own bug: the user asked
+    /// for a change and has to be told why it isn't in the plan.
+    #[test]
+    fn the_refusal_is_stated_in_the_preview() {
+        let cur = table_with_lossy_index();
+        let mut draft = TableDraft::from_table(&cur);
+        draft
+            .indexes
+            .iter_mut()
+            .find(|d| d.info.name == "idx_person")
+            .unwrap()
+            .info
+            .unique = true;
+
+        let cs = diff(&cur, &draft, Postgres);
+        let kept = cs
+            .changes
+            .iter()
+            .find(|c| matches!(c, Change::KeepLossyIndex { .. }))
+            .expect("the refusal is a change the preview can render");
+        assert!(kept.summary().contains("idx_person"));
+        assert!(
+            !kept.risks().is_empty(),
+            "it belongs in the destructive block — the user's edit is not being applied"
+        );
+        // And it emits no SQL.
+        assert!(
+            ChangeSet {
+                changes: vec![kept.clone()],
+                ..cs.clone()
+            }
+            .emit()
+            .is_empty()
+        );
+    }
+
+    /// An ordinary index is unaffected — the refusal must not become a general
+    /// freeze on index editing.
+    #[test]
+    fn an_ordinary_index_still_drops_and_recreates() {
+        let mut cur = table_with_lossy_index();
+        cur.indexes[1].lossy = false;
+        let mut draft = TableDraft::from_table(&cur);
+        draft
+            .indexes
+            .iter_mut()
+            .find(|d| d.info.name == "idx_person")
+            .unwrap()
+            .info
+            .unique = true;
+
+        let cs = diff(&cur, &draft, Postgres);
+        assert!(cs.changes.iter().any(|c| matches!(
+            c,
+            Change::DropIndex { name, .. } if name == "idx_person"
+        )));
+    }
+
+    /// Deleting a lossy index outright is the user saying so explicitly, and is
+    /// allowed — the rule is "don't destroy it as a side effect of an edit".
+    #[test]
+    fn deliberately_removing_a_lossy_index_is_still_allowed() {
+        let cur = table_with_lossy_index();
+        let mut draft = TableDraft::from_table(&cur);
+        draft.indexes.retain(|d| d.info.name != "idx_person");
+
+        let cs = diff(&cur, &draft, Postgres);
+        assert!(cs.changes.iter().any(|c| matches!(
+            c,
+            Change::DropIndex { name, .. } if name == "idx_person"
+        )));
     }
 }

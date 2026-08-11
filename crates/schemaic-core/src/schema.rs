@@ -104,6 +104,27 @@ pub struct IndexInfo {
     /// isn't it (the primary index is renamed `PRIMARY` so
     /// [`IndexInfo::is_primary`] works the MySQL way).
     pub constraint: Option<String>,
+    /// **This index holds something the model above cannot represent**, so what
+    /// is in `columns` is not the whole index.
+    ///
+    /// It matters because an index edit is a `DROP` plus a `CREATE` built from
+    /// this model: recreating a partly-read index silently destroys the parts
+    /// that were never read. Measured against PostgreSQL 16, three things do
+    /// this and none is exotic —
+    ///
+    /// - an **expression** key column (`lower(email)`): stored as `0` in
+    ///   `pg_index.indkey`, which has no `pg_attribute` row, so it vanishes;
+    /// - a non-default **operator class** (`last_name text_pattern_ops`), which
+    ///   no per-column catalogue accessor returns;
+    /// - a **`NULLS FIRST`/`LAST`** that isn't the default for the direction,
+    ///   which lives in a bit of `pg_index.indoption`.
+    ///
+    /// `false` is the default so a hand-built or MySQL index behaves normally;
+    /// the introspection that *can* be lossy is the one that sets it. `ddl::diff`
+    /// then refuses to drop-and-recreate such an index as a side effect of an
+    /// unrelated edit — the same "uncertainty resolves to don't destroy" rule
+    /// `ddl::pg_replaceable` follows for views.
+    pub lossy: bool,
 }
 
 impl IndexInfo {
