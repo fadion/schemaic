@@ -14,6 +14,7 @@ use floem::AnyView;
 use floem::action::exec_after;
 use floem::event::{Event, EventListener, EventPropagation};
 use floem::keyboard::{Key, NamedKey};
+use floem::kurbo::Point;
 use floem::prelude::*;
 use floem::reactive::{Memo, create_effect};
 
@@ -367,6 +368,8 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     let hidden_dbs = ui.schema.hidden_dbs;
     let db_menu_open = ui.schema.db_menu_open;
     let schema_menu_open = ui.schema.schema_menu_open;
+    let db_menu_anchor = ui.schema.db_menu_anchor;
+    let schema_menu_anchor = ui.schema.schema_menu_anchor;
     let context_menu = ui.overlay.context_menu;
     let schema_w = ui.layout.schema_w;
     // Publish the live panel width so the row styles (`tree_row_min_w`) widen the
@@ -626,6 +629,20 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     // other is open switches in a single click. The icons absorb their own
     // PointerDown so the root-level dismiss handler (see `workspace`) doesn't
     // pre-close the menu and cause a toggle to immediately reopen it.
+    // Each icon publishes its own box (window coords) so its dropdown can hang off
+    // it. The panel's width is a live, persisted, window-clamped signal, so
+    // anything derived from the `SCHEMA_W` default detaches the moment it differs —
+    // which includes a narrow window with no resize at all.
+    let (eye_origin, eye_size) = (RwSignal::new(Point::ZERO), RwSignal::new((0.0, 0.0)));
+    let (gear_origin, gear_size) = (RwSignal::new(Point::ZERO), RwSignal::new((0.0, 0.0)));
+    create_effect(move |_| {
+        let (o, (_, h)) = (eye_origin.get(), eye_size.get());
+        db_menu_anchor.set(Point::new(o.x, o.y + h));
+    });
+    create_effect(move |_| {
+        let (o, (_, h)) = (gear_origin.get(), gear_size.get());
+        schema_menu_anchor.set(Point::new(o.x, o.y + h));
+    });
     let eye_hov = RwSignal::new(false);
     let eye = container(icons::icon(icons::EYE, 16.0).style(move |s| {
         s.flex_shrink(0.0_f32).color(if eye_hov.get() {
@@ -634,6 +651,8 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
             theme::text_muted()
         })
     }))
+    .on_move(move |p| eye_origin.set(p))
+    .on_resize(move |r| eye_size.set((r.width(), r.height())))
     .on_click_stop(move |_| {
         close_other_menus();
         schema_menu_open.set(false);
@@ -657,6 +676,8 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
             theme::text_muted()
         })
     }))
+    .on_move(move |p| gear_origin.set(p))
+    .on_resize(move |r| gear_size.set((r.width(), r.height())))
     .on_click_stop(move |_| {
         close_other_menus();
         db_menu_open.set(false);

@@ -20,12 +20,21 @@ use schemaic_core::schema::{SchemaState, TableSource};
 
 use crate::consts::{CHAT_PAD_H, CHAT_PAD_V, DB_MENU_W};
 use crate::widgets::{
-    MenuEntry, autohide, measure_text_px_at, menu_item_style, menu_panel, panel_style, window_size,
+    CURSOR_MENU_GAP, MenuEntry, autohide, cursor_menu_pos, measure_text_px_at, menu_item_style,
+    menu_panel, menu_panel_height, panel_style, window_size,
 };
 use crate::{
-    ConnNode, CtxKind, PopupAnchor, RightPanel, TxChoice, Ui, icons, right_panel_allowed,
+    ConnNode, CtxKind, CtxMenu, PopupAnchor, RightPanel, TxChoice, Ui, icons, right_panel_allowed,
     schema_panel_allowed, search_box, theme,
 };
+
+/// Width of the schema tree's context menu (its panel's `min_width`), which is
+/// also what its placement flips against.
+const CTX_MENU_W: f64 = 170.0;
+
+/// How far left of its icon a SCHEMA dropdown opens, so the panel overlaps the
+/// glyph it belongs to rather than starting beside it.
+const MENU_ICON_TUCK: f64 = 30.0;
 
 /// Is the active connection read-only? Every schema-editing menu entry asks,
 /// because a write it can't perform is shown dimmed rather than hidden — a
@@ -251,6 +260,7 @@ pub(crate) fn active_db_menu_overlay(ui: Ui) -> impl IntoView {
 // connection menu, positioned 3px below the gear.
 pub(crate) fn db_visibility_overlay(ui: Ui) -> impl IntoView {
     let open = ui.schema.db_menu_open;
+    let anchor = ui.schema.db_menu_anchor;
     let db_nodes = ui.schema.db_nodes;
     let hidden = ui.schema.hidden_dbs;
     let toggle = ui.schema_actions.toggle_db_hidden.clone();
@@ -313,12 +323,14 @@ pub(crate) fn db_visibility_overlay(ui: Ui) -> impl IntoView {
                 .into_any()
         },
     )
-    // Positioned just below the SCHEMA eye (2nd-from-right icon).
+    // Hung off the SCHEMA eye's own box, tucked 30px left of it so it overlaps the
+    // icon like the other dropdowns.
     .style(move |s| {
         if open.get() {
+            let a = anchor.get();
             s.absolute()
-                .inset_left(theme::SCHEMA_W - 50.0 - 30.0)
-                .inset_top(theme::HEADER_H + 7.0 + 16.0 + 3.0)
+                .inset_left((a.x - MENU_ICON_TUCK).max(0.0))
+                .inset_top(a.y + 3.0)
         } else {
             s
         }
@@ -329,6 +341,7 @@ pub(crate) fn db_visibility_overlay(ui: Ui) -> impl IntoView {
 // for now. Same style as the other dropdowns, dropped 3px below the gear.
 pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
     let open = ui.schema.schema_menu_open;
+    let anchor = ui.schema.schema_menu_anchor;
     let refresh = ui.schema_actions.refresh_schema.clone();
     let collapse_all = ui.schema_actions.collapse_all.clone();
 
@@ -374,12 +387,13 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
                 .into_any()
         },
     )
-    // Just below the SCHEMA gear (rightmost icon).
+    // Hung off the SCHEMA gear's own box, same tuck as the eye's menu.
     .style(move |s| {
         if open.get() {
+            let a = anchor.get();
             s.absolute()
-                .inset_left(theme::SCHEMA_W - 24.0 - 30.0)
-                .inset_top(theme::HEADER_H + 7.0 + 16.0 + 3.0)
+                .inset_left((a.x - MENU_ICON_TUCK).max(0.0))
+                .inset_top(a.y + 3.0)
         } else {
             s
         }
@@ -411,12 +425,13 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
     let connections = ui.conn.connections;
     let import_ui = ui.clone();
 
-    dyn_container(
-        move || ctx.get(),
-        move |menu| {
-            let Some(menu) = menu else {
-                return empty().into_any();
-            };
+    // The entries for one target, built on demand. It is a closure rather than the
+    // body of the `dyn_container` because the *placement* needs them too: how far
+    // down the menu may open depends on how many rows it has, and that varies from
+    // 4 to 13 by target kind. Called twice per open (once to place, once to
+    // render), which is a dozen `Rc` clones.
+    let build: Rc<dyn Fn(CtxMenu) -> Vec<MenuEntry>> = Rc::new(move |menu: CtxMenu| {
+        {
             // Clipboard action for a string.
             let copy = |s: String| {
                 move || {
@@ -943,19 +958,38 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                 move || (ai)(prompt.clone()),
             ));
 
+            entries
+        }
+    });
+
+    let render = build.clone();
+    dyn_container(
+        move || ctx.get(),
+        move |menu| {
+            let Some(menu) = menu else {
+                return empty().into_any();
+            };
             // Dismissal is a root-level pointer-down handler (see `workspace`); the
             // panel absorbs its own pointer-downs so it isn't closed mid-click.
-            menu_panel(entries, Rc::new(move || ctx.set(None)), 170.0).into_any()
+            menu_panel((render)(menu), Rc::new(move || ctx.set(None)), CTX_MENU_W).into_any()
         },
     )
-    // Anchor 3px below-right of the cursor (window coords tracked at root).
+    // Open at the cursor, flipping to the other side of it at a window edge — the
+    // same rule as the grid's menus. Without it, a right-click low in a full tree
+    // ran Truncate, Drop and AI Explain off the bottom of the window, with no cue
+    // that they were there.
     .style(move |s| {
-        if ctx.get().is_some() {
-            let (mx, my) = last_mouse.get_untracked();
-            s.absolute().inset_left(mx + 3.0).inset_top(my + 3.0)
-        } else {
-            s
-        }
+        let Some(menu) = ctx.get() else {
+            return s;
+        };
+        let h = menu_panel_height(&(build)(menu));
+        let (x, y) = cursor_menu_pos(
+            last_mouse.get_untracked(),
+            (CTX_MENU_W, h),
+            window_size().get(),
+            CURSOR_MENU_GAP,
+        );
+        s.absolute().inset_left(x).inset_top(y)
     })
 }
 
@@ -988,21 +1022,7 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
         // as full rows shoved the flipped panel tens of px too high. `+14` = the
         // panel's 6px vertical padding (both sides) + 1px border (both sides). These
         // are placement estimates, not the flip *decision*, so being close matters.
-        let Some(ph) = popup.with(|p| {
-            p.as_ref().map(|entries| {
-                entries
-                    .iter()
-                    .map(|e| {
-                        if matches!(e, MenuEntry::Separator) {
-                            9.0
-                        } else {
-                            30.5
-                        }
-                    })
-                    .sum::<f64>()
-                    + 14.0
-            })
-        }) else {
+        let Some(ph) = popup.with(|p| p.as_ref().map(|e| menu_panel_height(e))) else {
             return s;
         };
         let (ww, wh) = window_size().get();
@@ -1042,21 +1062,16 @@ pub(crate) fn popup_menu_overlay(ui: Ui) -> impl IntoView {
                 };
                 s.absolute().inset_left(x).inset_top(y)
             }
-            // Cursor menus (right-click): open at the pointer. A right-edge flip
-            // lands the menu's right edge ~3px from the cursor — mirroring the 3px
-            // gap on the non-flipped side.
+            // Cursor menus (right-click): open at the pointer, flipping to the
+            // other side of it at either edge — the shared rule, which the schema
+            // tree's menu now uses too.
             None => {
-                let (mx, my) = last_mouse.get_untracked();
-                let x = if ww > 1.0 && mx + 3.0 + pw > ww {
-                    (mx - pw - 3.0).max(0.0)
-                } else {
-                    mx + 3.0
-                };
-                let y = if wh > 1.0 && my + 3.0 + ph > wh {
-                    (my - ph - 3.0).max(0.0)
-                } else {
-                    my + 3.0
-                };
+                let (x, y) = cursor_menu_pos(
+                    last_mouse.get_untracked(),
+                    (pw, ph),
+                    (ww, wh),
+                    CURSOR_MENU_GAP,
+                );
                 s.absolute().inset_left(x).inset_top(y)
             }
         }
