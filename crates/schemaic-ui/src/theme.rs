@@ -77,10 +77,11 @@ pub fn syntax_underline() -> Color {
 }
 
 // Wavy underline under a definite diagnostic error (unknown table/column, a
-// syntax error). A fixed red accent — semantic like the status-bar colours, so it
-// reads the same across editor themes and stands apart from the amber warning.
+// syntax error). Red, and *editor*-themed like the amber warning beside it: it
+// is drawn on the editor surface, so a light editor theme has to be able to move
+// it (a fixed red sat on Catppuccin Latte's near-white at 2.9:1).
 pub fn diag_error() -> Color {
-    Color::rgb8(0xE0, 0x5A, 0x5A)
+    editor().diag_error
 }
 
 /// Text on the top-bar environment badge — always white; it sits on the
@@ -421,87 +422,92 @@ pub fn plan_warn_bg() -> Color {
 }
 
 // ── Status bar (footer) ──────────────────────────────────────────────────
-// Fixed accents, theme-independent by design: the footer reads the same muted
-// grey and the two semantic accents in every theme.
+// These used to be fixed literals, "theme-independent by design". They were
+// chosen against a dark footer, and `UiTheme::light` later moved that footer to
+// #DCDFE6 without them: thirteen of the fourteen ended up under 3:1, the
+// open-transaction pill at 1.48:1. They are ordinary theme fields now, and
+// `crate::contrast` is the gate that keeps every one of them legible on the
+// surface it is actually painted on.
 
-/// Muted grey for status-bar text + icons (`#6E7181`).
+/// Muted grey for status-bar text + icons.
 pub fn status_text() -> Color {
-    Color::rgb8(0x6E, 0x71, 0x81)
+    ui().status_text
 }
-/// Amber for the syntax-warning icon + count (`#E08A4B`).
+/// Amber for the syntax-warning icon + count.
 pub fn status_warn() -> Color {
-    Color::rgb8(0xE0, 0x8A, 0x4B)
+    ui().status_warn
 }
-/// Brighter amber for hovering the write-mode status segment (`#FFA461`).
+/// Brighter amber for hovering the write-mode status segment.
 pub fn status_warn_hover() -> Color {
-    Color::rgb8(0xFF, 0xA4, 0x61)
+    ui().status_warn_hover
 }
-/// Green for the "no warnings" check (`#71C371`).
+/// Green for the "no warnings" check.
 pub fn status_ok() -> Color {
-    Color::rgb8(0x71, 0xC3, 0x71)
+    ui().status_ok
 }
-/// Green CTA for the AI "Seed rows" popover Generate button (`#71C371`).
+/// Green CTA *fill* for the AI "Seed rows" popover Generate button — the one
+/// here that is a background (white text sits on it), so on a light theme it
+/// wants the opposite treatment to the others.
 pub fn seed_button() -> Color {
-    Color::rgb8(0x71, 0xC3, 0x71)
+    ui().seed_button
 }
-/// The table designer's "N changes" count, when there *are* changes (`#71C371`).
-/// Same hex as `status_ok` and kept separate for the usual reason: that one says
-/// "your SQL is clean", this one says "you have unsaved schema edits" — they'd
-/// want retuning apart the moment either is touched.
+/// The table designer's "N changes" count, when there *are* changes. Same value
+/// as `status_ok` in both palettes and kept separate for the usual reason: that
+/// one says "your SQL is clean", this one says "you have unsaved schema edits" —
+/// they'd want retuning apart the moment either is touched.
 pub fn change_count() -> Color {
-    Color::rgb8(0x71, 0xC3, 0x71)
+    ui().change_count
 }
 
-/// A tab in manual-commit mode, and its open-transaction pill (`#E0B24B`). Its
-/// own colour rather than `status_warn`'s amber: an open transaction is a
-/// *state you're holding*, not a warning about your SQL, and the two want to be
-/// retunable apart.
+/// A tab in manual-commit mode, and its open-transaction pill. Its own colour
+/// rather than `status_warn`'s amber: an open transaction is a *state you're
+/// holding*, not a warning about your SQL, and the two want to be retunable
+/// apart.
 pub fn tx_open() -> Color {
-    Color::rgb8(0xE0, 0xB2, 0x4B)
+    ui().tx_open
 }
-/// Hover for the clickable manual-mode / Commit / Rollback footer segments
-/// (`#FFD070`).
+/// Hover for the clickable manual-mode / Commit / Rollback footer segments.
 pub fn tx_open_hover() -> Color {
-    Color::rgb8(0xFF, 0xD0, 0x70)
+    ui().tx_open_hover
 }
 /// A transaction that can't go forward — PostgreSQL aborted it, or the pinned
-/// connection died (`#E05A5A`, matching `diag_error`'s red but independent of
-/// the editor's diagnostics). Used on the modal, where red reads cleanly against
-/// the panel; the status bar's Rollback uses `tx_rollback` instead.
+/// connection died. Used on the modal, where red reads cleanly against the
+/// panel; the status bar's Rollback uses `tx_rollback` instead.
 pub fn tx_danger() -> Color {
-    Color::rgb8(0xE0, 0x5A, 0x5A)
+    ui().tx_danger
 }
-/// Green for the status bar's Commit action (`#71C371`). Same hex as
-/// `status_ok`, kept separate: one is "your SQL is clean", this is an action.
+/// Green for the status bar's Commit action. Same value as `status_ok`, kept
+/// separate: one is "your SQL is clean", this is an action.
 pub fn tx_commit() -> Color {
-    Color::rgb8(0x71, 0xC3, 0x71)
+    ui().tx_commit
 }
-/// Brighter green for hovering Commit (`#8FDC8F`).
+/// Brighter green for hovering Commit.
 pub fn tx_commit_hover() -> Color {
-    Color::rgb8(0x8F, 0xDC, 0x8F)
+    ui().tx_commit_hover
 }
-/// Red for the status bar's Rollback action (`#E05A5A`) — the same red as the
-/// confirmation modal's Roll back, so the discard action reads the same in both
-/// places. Kept as its own fn so it can be warmed up (or taken back to the
-/// write-mode amber `#E08A4B`) without touching the modal.
+/// Red for the status bar's Rollback action — the same red as the confirmation
+/// modal's Roll back, so the discard action reads the same in both places. Kept
+/// as its own fn so it can be warmed up (or taken back to the write-mode amber)
+/// without touching the modal.
 pub fn tx_rollback() -> Color {
-    Color::rgb8(0xE0, 0x5A, 0x5A)
+    ui().tx_rollback
 }
-/// Brighter red for hovering Rollback (`#FF7B7B`).
+/// Brighter red for hovering Rollback.
 pub fn tx_rollback_hover() -> Color {
-    Color::rgb8(0xFF, 0x7B, 0x7B)
+    ui().tx_rollback_hover
 }
 
-/// The affirmative button in the generic confirm modal (`#E05A5A`). Starts at
-/// the same red as the transaction reds, but kept separate on purpose: this one
-/// answers "yes, do the destructive thing" for *any* action, so it should be
-/// retunable without dragging Rollback along with it.
+/// The affirmative button in the generic confirm modal, and the destructive
+/// Apply in the DDL preview. Starts at the same red as the transaction reds, but
+/// kept separate on purpose: this one answers "yes, do the destructive thing"
+/// for *any* action, so it should be retunable without dragging Rollback along
+/// with it. It is **text**, not a fill — `footer_button` takes it as a colour.
 pub fn confirm_yes() -> Color {
-    Color::rgb8(0xE0, 0x5A, 0x5A)
+    ui().confirm_yes
 }
-/// Brighter red for hovering the confirm modal's Yes (`#FF7B7B`).
+/// Brighter red for hovering the confirm modal's Yes.
 pub fn confirm_yes_hover() -> Color {
-    Color::rgb8(0xFF, 0x7B, 0x7B)
+    ui().confirm_yes_hover
 }
 
 // Connection status: reachable (unreachable reuses `reject_bg`).

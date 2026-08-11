@@ -11,6 +11,7 @@ pub use ai_panel::mark_messages_seen;
 mod completion;
 mod connection_form;
 mod consts;
+pub mod contrast;
 mod ddl_preview;
 mod diff_view;
 mod editor_pane;
