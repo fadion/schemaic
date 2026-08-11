@@ -532,7 +532,11 @@ pub enum Change {
     DropForeignKey {
         name: String,
     },
-    /// MySQL table options / the table comment.
+    /// MySQL table options / the table comment. Each field carries **only what
+    /// changed**: `None` means "not part of this change", so the emitter restates
+    /// nothing the user didn't edit. An empty `comment` clears it — that is a
+    /// real state, unlike an empty engine or collation, which the differ treats
+    /// as "leave it alone".
     TableOptions {
         engine: Option<String>,
         collation: Option<String>,
@@ -619,7 +623,30 @@ impl Change {
                 fk.ref_columns.join(", ")
             ),
             Change::DropForeignKey { name } => format!("Drop foreign key {name}"),
-            Change::TableOptions { .. } => "Change the table's options".to_string(),
+            // Name the options this change actually carries — "change the
+            // table's options" couldn't say which, and used to be shown for an
+            // edit the statement didn't make.
+            Change::TableOptions {
+                engine,
+                collation,
+                comment,
+            } => {
+                let mut parts = Vec::new();
+                if let Some(e) = engine {
+                    parts.push(format!("engine to {e}"));
+                }
+                if let Some(c) = collation {
+                    parts.push(format!("collation to {c}"));
+                }
+                if let Some(cm) = comment {
+                    parts.push(if cm.is_empty() {
+                        "comment (cleared)".to_string()
+                    } else {
+                        "comment".to_string()
+                    });
+                }
+                format!("Set the table's {}", parts.join(", "))
+            }
             Change::CreateView(d) => format!("Create view {}", d.name),
             Change::ReplaceView { draft, recreate } => {
                 if *recreate {
@@ -891,16 +918,16 @@ impl ChangeSet {
                 comment,
             } = c
             {
-                if let Some(e) = engine.as_deref().filter(|e| !e.is_empty()) {
+                // Each is present only when it changed, so nothing is restated.
+                if let Some(e) = engine {
                     cl.push(format!("ENGINE={e}"));
                 }
-                if let Some(coll) = collation.as_deref().filter(|c| !c.is_empty()) {
+                if let Some(coll) = collation {
                     cl.push(format!("COLLATE={coll}"));
                 }
-                cl.push(format!(
-                    "COMMENT={}",
-                    ddl_string(comment.as_deref().unwrap_or(""), SqlDialect::MySql)
-                ));
+                if let Some(cm) = comment {
+                    cl.push(format!("COMMENT={}", ddl_string(cm, SqlDialect::MySql)));
+                }
             }
         }
         if !cl.is_empty() {
@@ -1058,10 +1085,15 @@ impl ChangeSet {
                         d,
                     ));
                 }
-                Change::TableOptions { comment, .. } => out.push(format!(
+                // An emptied comment means *no* comment, so `IS NULL` rather than
+                // `IS ''` — the two are distinct to `pg_description`, and an
+                // empty one would re-read as a comment the user didn't write.
+                Change::TableOptions {
+                    comment: Some(cm), ..
+                } => out.push(format!(
                     "COMMENT ON TABLE {} IS {};",
                     self.qname(),
-                    comment_literal(comment.as_deref(), d)
+                    comment_literal(Some(cm.as_str()).filter(|c| !c.is_empty()), d)
                 )),
                 _ => {}
             }
@@ -1913,17 +1945,34 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, dialect: SqlDialect) -> Cha
 
     // Table-level options. On PostgreSQL only the comment exists, and the draft
     // carries `None` for the other two on both sides, so nothing is emitted.
-    let opt = |a: &Option<String>, b: &Option<String>| {
-        blank_as_none(a.as_deref()) != blank_as_none(b.as_deref())
+    //
+    // Each field of the change carries **only what changed** — `None` means "not
+    // part of this change" — so the summary, the change count and the emitted SQL
+    // can't disagree. They did: clearing the Engine field counted as a change,
+    // but the emitter skips an empty clause, so the statement didn't touch the
+    // engine.
+    //
+    // Clearing engine or collation is therefore *not* a change at all: a MySQL
+    // table always has both, so an emptied field means "leave it". A cleared
+    // comment is different — "no comment" is a state a table can really be in.
+    let set_to = |cur: &Option<String>, dr: &Option<String>| -> Option<String> {
+        let dr = dr.as_deref().map(str::trim).filter(|v| !v.is_empty())?;
+        (blank_as_none(cur.as_deref()).map(str::trim) != Some(dr)).then(|| dr.to_string())
     };
-    if opt(&current.engine, &draft.engine)
-        || opt(&current.collation, &draft.collation)
-        || opt(&current.comment, &draft.comment)
-    {
+    let engine = set_to(&current.engine, &draft.engine);
+    let collation = set_to(&current.collation, &draft.collation);
+    let comment = {
+        let (cur, dr) = (
+            blank_as_none(current.comment.as_deref()),
+            blank_as_none(draft.comment.as_deref()),
+        );
+        (cur != dr).then(|| dr.unwrap_or_default().to_string())
+    };
+    if engine.is_some() || collation.is_some() || comment.is_some() {
         changes.push(Change::TableOptions {
-            engine: draft.engine.clone(),
-            collation: draft.collation.clone(),
-            comment: draft.comment.clone(),
+            engine,
+            collation,
+            comment,
         });
     }
 
@@ -2490,15 +2539,29 @@ mod tests {
     }
 
     #[test]
-    fn table_options_change_together() {
+    fn table_options_are_one_change_but_restate_only_what_moved() {
         let t = users();
         let mut draft = TableDraft::from_table(&t);
         draft.comment = Some("staff".into());
         let cs = diff(&t, &draft, MySql);
+        assert_eq!(cs.len(), 1, "the options are one change, not three");
+        let sql = cs.script();
+        assert!(sql.contains("COMMENT='staff'"), "{sql}");
+        // The engine didn't change, so it isn't restated — a restated clause
+        // reads as an edit the user didn't ask for.
+        assert!(!sql.contains("ENGINE="), "{sql}");
+
+        // …and two options edited at once still travel as one change.
+        let mut draft = TableDraft::from_table(&t);
+        draft.comment = Some("staff".into());
+        draft.engine = Some("MyISAM".into());
+        let cs = diff(&t, &draft, MySql);
         assert_eq!(cs.len(), 1);
         let sql = cs.script();
-        assert!(sql.contains("ENGINE=InnoDB"), "{sql}");
-        assert!(sql.contains("COMMENT='staff'"), "{sql}");
+        assert!(
+            sql.contains("ENGINE=MyISAM") && sql.contains("COMMENT='staff'"),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -2687,6 +2750,98 @@ mod tests {
         assert_eq!(
             normalize_type(" DECIMAL ( 10 , 2 ) ", MySql),
             "decimal(10,2)"
+        );
+    }
+
+    // ── table options: what the differ reports is what the emitter does ─────
+
+    /// `users()` and a draft of it, ready to have one option changed.
+    fn users_and_draft() -> (TableInfo, TableDraft) {
+        let t = users();
+        let d = TableDraft::from_table(&t);
+        (t, d)
+    }
+
+    #[test]
+    fn clearing_the_engine_or_collation_is_not_a_change() {
+        // A MySQL table always has both, so an emptied field means "leave it" —
+        // and it must, because the emitter skips an empty clause. Reporting a
+        // change here claimed an edit the statement doesn't perform.
+        for clear in [
+            (|d: &mut TableDraft| d.engine = None) as fn(&mut TableDraft),
+            |d: &mut TableDraft| d.engine = Some(String::new()),
+            |d: &mut TableDraft| d.engine = Some("   ".into()),
+            |d: &mut TableDraft| d.collation = None,
+            |d: &mut TableDraft| d.collation = Some(String::new()),
+        ] {
+            let (t, mut d) = users_and_draft();
+            clear(&mut d);
+            let cs = diff(&t, &d, MySql);
+            assert!(cs.is_empty(), "clearing an option is not a change: {cs:?}");
+        }
+    }
+
+    #[test]
+    fn changing_the_engine_emits_only_the_engine() {
+        let (t, mut d) = users_and_draft();
+        d.engine = Some("MyISAM".into());
+        let cs = diff(&t, &d, MySql);
+        assert_eq!(cs.len(), 1);
+        let sql = cs.emit().join("\n");
+        assert!(sql.contains("ENGINE=MyISAM"), "{sql}");
+        // The two options that didn't change are not restated. `COMMENT=` in
+        // particular used to be pushed unconditionally.
+        assert!(!sql.contains("COLLATE="), "{sql}");
+        assert!(!sql.contains("COMMENT="), "{sql}");
+    }
+
+    #[test]
+    fn the_options_summary_names_what_actually_changed() {
+        let (t, mut d) = users_and_draft();
+        d.engine = Some("MyISAM".into());
+        assert_eq!(
+            diff(&t, &d, MySql).changes[0].summary(),
+            "Set the table's engine to MyISAM"
+        );
+
+        let (t, mut d) = users_and_draft();
+        d.comment = Some("staff".into());
+        assert_eq!(
+            diff(&t, &d, MySql).changes[0].summary(),
+            "Set the table's comment"
+        );
+    }
+
+    #[test]
+    fn clearing_the_comment_is_a_change_and_clears_it() {
+        // Unlike the engine, "no comment" is a real state a table can be in.
+        let (t, mut d) = users_and_draft();
+        d.comment = None;
+        let sql = diff(&t, &d, MySql).emit().join("\n");
+        assert!(sql.contains("COMMENT=''"), "{sql}");
+        assert!(!sql.contains("ENGINE="), "{sql}");
+    }
+
+    #[test]
+    fn postgres_comments_are_their_own_statement_and_distinguish_empty_from_none() {
+        let mut t = users();
+        t.schema = Some("public".into());
+        t.engine = None;
+        t.collation = None;
+        let base = TableDraft::from_table(&t);
+
+        let mut d = base.clone();
+        d.comment = Some("staff".into());
+        let sql = diff(&t, &d, Postgres).emit().join("\n");
+        assert!(sql.contains("COMMENT ON TABLE"), "{sql}");
+        assert!(sql.contains("'staff'"), "{sql}");
+
+        let mut d = base.clone();
+        d.comment = None;
+        let sql = diff(&t, &d, Postgres).emit().join("\n");
+        assert!(
+            sql.contains("IS NULL"),
+            "cleared → no comment, not an empty one: {sql}"
         );
     }
 
