@@ -620,20 +620,59 @@ pub fn place(
         .collect()
 }
 
-/// Zoom + pan that fits `content` `(w, h)` centred in `viewport` `(w, h)`: the
-/// largest zoom in `[zoom_min, 1.0]` that shows the whole diagram — never
-/// magnifying past 100% — then the pan that centres the scaled content. Drives both
-/// the "Fit" control and the fit-on-open behaviour. A zero content dimension yields
-/// zoom 1.0 (nothing to scale). Returns `(zoom, (pan_x, pan_y))`.
-pub fn fit_view(content: (f64, f64), viewport: (f64, f64), zoom_min: f64) -> (f64, (f64, f64)) {
-    let (cw, ch) = content;
+/// The bounding box of a laid-out diagram: the union of every sized node's rect,
+/// grown by `pad` on all four sides. `None` when there is nothing to frame.
+///
+/// This is the **live** extent, which is the whole point: the UI's `sizes` and
+/// `positions` signals are what the cards actually render from, and both change
+/// under a drag and a collapse toggle. Fit used to be handed the extent captured
+/// when the modal opened, so after one drag it framed an arrangement that no
+/// longer existed — and since the dragged layout is what persists, it was wrong
+/// from the first click on the next open too.
+///
+/// A node the canvas has a size for but no position sits at the origin, matching
+/// how the card renders. Positions may be **negative** (dragging up/left is not
+/// clamped), which is why this returns an origin as well as a size — a bare
+/// `(w, h)` cannot express it.
+pub fn content_bounds(
+    positions: &HashMap<String, (f64, f64)>,
+    sizes: &HashMap<String, (f64, f64)>,
+    pad: f64,
+) -> Option<Rect> {
+    let mut bounds: Option<(f64, f64, f64, f64)> = None;
+    for (id, &(w, h)) in sizes {
+        let (x, y) = positions.get(id).copied().unwrap_or((0.0, 0.0));
+        bounds = Some(match bounds {
+            None => (x, y, x + w, y + h),
+            Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x + w), y1.max(y + h)),
+        });
+    }
+    bounds.map(|(x0, y0, x1, y1)| Rect {
+        x: x0 - pad,
+        y: y0 - pad,
+        w: (x1 - x0) + pad * 2.0,
+        h: (y1 - y0) + pad * 2.0,
+    })
+}
+
+/// Zoom + pan that fits `content` centred in `viewport` `(w, h)`: the largest
+/// zoom in `[zoom_min, 1.0]` that shows the whole diagram — never magnifying past
+/// 100% — then the pan that centres the scaled content. Drives both the "Fit"
+/// control and the fit-on-open behaviour. A zero content dimension yields zoom
+/// 1.0 (nothing to scale). Returns `(zoom, (pan_x, pan_y))`.
+///
+/// The canvas draws a card at `pan + (x, y) * zoom`, so the pan subtracts the
+/// content's own scaled origin — a diagram whose top-left has been dragged into
+/// negative space still lands centred.
+pub fn fit_bounds(content: Rect, viewport: (f64, f64), zoom_min: f64) -> (f64, (f64, f64)) {
+    let Rect { x, y, w, h } = content;
     let (vw, vh) = viewport;
-    let z = if cw > 0.0 && ch > 0.0 {
-        (vw / cw).min(vh / ch).clamp(zoom_min, 1.0)
+    let z = if w > 0.0 && h > 0.0 {
+        (vw / w).min(vh / h).clamp(zoom_min, 1.0)
     } else {
         1.0
     };
-    (z, ((vw - cw * z) / 2.0, (vh - ch * z) / 2.0))
+    (z, ((vw - w * z) / 2.0 - x * z, (vh - h * z) / 2.0 - y * z))
 }
 
 /// Does `content` `(w, h)` overflow `viewport` `(w, h)` in either dimension — i.e.
@@ -1439,31 +1478,112 @@ mod tests {
 
     // ── fit-to-view ──
 
+    fn origin(w: f64, h: f64) -> Rect {
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            w,
+            h,
+        }
+    }
+
     #[test]
-    fn fit_view_never_magnifies_and_centres_small_content() {
+    fn fit_bounds_never_magnifies_and_centres_small_content() {
         // Content smaller than the viewport → zoom stays 1.0 (no magnify), centred.
-        let (z, (px, py)) = fit_view((200.0, 100.0), (800.0, 600.0), 0.25);
+        let (z, (px, py)) = fit_bounds(origin(200.0, 100.0), (800.0, 600.0), 0.25);
         assert_eq!(z, 1.0);
         assert_eq!((px, py), (300.0, 250.0));
     }
 
     #[test]
-    fn fit_view_scales_down_overflowing_content() {
+    fn fit_bounds_scales_down_overflowing_content() {
         // Wide content: limited by the width ratio 800/1600 = 0.5; centred vertically.
-        let (z, (px, py)) = fit_view((1600.0, 600.0), (800.0, 600.0), 0.25);
+        let (z, (px, py)) = fit_bounds(origin(1600.0, 600.0), (800.0, 600.0), 0.25);
         assert_eq!(z, 0.5);
         assert_eq!((px, py), (0.0, 150.0));
         // Huge content clamps at the zoom floor rather than going smaller.
-        let (z2, _) = fit_view((8000.0, 8000.0), (800.0, 600.0), 0.25);
+        let (z2, _) = fit_bounds(origin(8000.0, 8000.0), (800.0, 600.0), 0.25);
         assert_eq!(z2, 0.25);
     }
 
     #[test]
-    fn fit_view_handles_zero_content() {
+    fn fit_bounds_handles_zero_content() {
         // No content → zoom 1.0, no NaN/inf.
-        let (z, (px, py)) = fit_view((0.0, 0.0), (800.0, 600.0), 0.25);
+        let (z, (px, py)) = fit_bounds(origin(0.0, 0.0), (800.0, 600.0), 0.25);
         assert_eq!(z, 1.0);
         assert_eq!((px, py), (400.0, 300.0));
+    }
+
+    /// The reason `fit_view((w, h), …)` was replaced: a diagram dragged up and to
+    /// the left has a negative origin, and centring its *size* leaves it off
+    /// screen. The card at the content's top-left must land at the same viewport
+    /// point it would have if the diagram started at (0, 0).
+    #[test]
+    fn fit_bounds_centres_content_whose_origin_is_not_zero() {
+        let shifted = Rect {
+            x: -500.0,
+            y: -200.0,
+            w: 200.0,
+            h: 100.0,
+        };
+        let (z, (px, py)) = fit_bounds(shifted, (800.0, 600.0), 0.25);
+        assert_eq!(z, 1.0);
+        // A card at the content origin draws at pan + origin*z — dead centre.
+        assert_eq!((px + shifted.x * z, py + shifted.y * z), (300.0, 250.0));
+    }
+
+    // ── live content bounds ──
+
+    fn xy(pairs: &[(&str, f64, f64)]) -> HashMap<String, (f64, f64)> {
+        pairs
+            .iter()
+            .map(|(id, a, b)| (id.to_string(), (*a, *b)))
+            .collect()
+    }
+
+    #[test]
+    fn content_bounds_covers_every_card_plus_the_pad() {
+        let pos = xy(&[("a", 0.0, 0.0), ("b", 300.0, 100.0)]);
+        let sizes = xy(&[("a", 200.0, 80.0), ("b", 200.0, 80.0)]);
+        let b = content_bounds(&pos, &sizes, 40.0).expect("two cards");
+        assert_eq!((b.x, b.y), (-40.0, -40.0));
+        assert_eq!((b.w, b.h), (500.0 + 80.0, 180.0 + 80.0));
+    }
+
+    /// The bug this replaced: Fit used the extent captured when the modal opened,
+    /// so a card dragged far to the right stayed outside the frame.
+    #[test]
+    fn content_bounds_follows_a_dragged_node() {
+        let sizes = xy(&[("a", 200.0, 80.0), ("b", 200.0, 80.0)]);
+        let before = content_bounds(&xy(&[("a", 0.0, 0.0), ("b", 300.0, 0.0)]), &sizes, 0.0);
+        let after = content_bounds(&xy(&[("a", 0.0, 0.0), ("b", 1800.0, 0.0)]), &sizes, 0.0);
+        assert_eq!(before.unwrap().w, 500.0);
+        assert_eq!(after.unwrap().w, 2000.0);
+    }
+
+    #[test]
+    fn content_bounds_covers_negative_positions() {
+        let b = content_bounds(
+            &xy(&[("a", -300.0, -150.0), ("b", 100.0, 0.0)]),
+            &xy(&[("a", 200.0, 80.0), ("b", 200.0, 80.0)]),
+            0.0,
+        )
+        .expect("two cards");
+        assert_eq!((b.x, b.y), (-300.0, -150.0));
+        assert_eq!((b.w, b.h), (600.0, 230.0));
+    }
+
+    /// A card the canvas has a size for but no position renders at the origin, so
+    /// the bounds have to include it there rather than skipping it.
+    #[test]
+    fn content_bounds_places_an_unpositioned_card_at_the_origin() {
+        let b = content_bounds(&HashMap::new(), &xy(&[("a", 200.0, 80.0)]), 0.0).expect("one card");
+        assert_eq!((b.x, b.y, b.w, b.h), (0.0, 0.0, 200.0, 80.0));
+    }
+
+    #[test]
+    fn content_bounds_is_none_when_there_is_nothing_to_frame() {
+        assert!(content_bounds(&xy(&[("a", 10.0, 10.0)]), &HashMap::new(), 40.0).is_none());
     }
 
     #[test]

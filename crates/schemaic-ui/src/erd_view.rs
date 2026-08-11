@@ -164,9 +164,15 @@ fn card_metrics(node: &DiagramNode, collapsed: bool) -> (Vec<usize>, bool, f64) 
 }
 
 /// Size each node (default-collapse height + measured width), lay them out
-/// deterministically, and offset by the canvas padding. Returns the placed nodes,
-/// the content size, and each real node's default collapse state.
-fn build_placed(graph: &DiagramGraph) -> (Vec<Placed>, f64, f64, HashMap<String, bool>) {
+/// deterministically, and offset by the canvas padding. Returns the placed nodes
+/// and each real node's default collapse state.
+///
+/// It deliberately does **not** return the content extent any more. It used to,
+/// and Fit closed over that value: one drag or collapse toggle later it framed an
+/// arrangement that no longer existed. The extent is a property of the live
+/// `positions`/`sizes` signals — `erd::content_bounds` — not of the initial
+/// layout.
+fn build_placed(graph: &DiagramGraph) -> (Vec<Placed>, HashMap<String, bool>) {
     let total = graph.nodes.len();
     let opts = erd::DensityOpts::default();
     let mut sizes: HashMap<String, (f64, f64)> = HashMap::new();
@@ -190,14 +196,11 @@ fn build_placed(graph: &DiagramGraph) -> (Vec<Placed>, f64, f64, HashMap<String,
     let positions = erd::place(&cells, &sizes, erd::LayoutOpts::default());
     let pos: HashMap<&str, &erd::NodePos> = positions.iter().map(|p| (p.id.as_str(), p)).collect();
 
-    let (mut cw, mut ch) = (0.0_f64, 0.0_f64);
     let mut placed = Vec::with_capacity(graph.nodes.len());
     for n in &graph.nodes {
         let p = pos[n.id.as_str()];
         let (w, h) = sizes[&n.id];
         let (x, y) = (p.x + CANVAS_PAD, p.y + CANVAS_PAD);
-        cw = cw.max(x + w);
-        ch = ch.max(y + h);
         placed.push(Placed {
             node: n.clone(),
             x,
@@ -206,7 +209,7 @@ fn build_placed(graph: &DiagramGraph) -> (Vec<Placed>, f64, f64, HashMap<String,
             h,
         });
     }
-    (placed, cw + CANVAS_PAD, ch + CANVAS_PAD, collapsed)
+    (placed, collapsed)
 }
 
 /// Crow's-foot / bar / optionality-circle marker line segments for an edge
@@ -784,6 +787,18 @@ fn node_card(
                 m.insert(id_move.clone(), (nx, ny));
             });
             moved.set(true);
+        } else if hovered.get_untracked().is_some() {
+            // Consuming the move (below) means the canvas hit-test — the only other
+            // writer of `hovered` — never runs while the cursor is over a card, so a
+            // hovered edge and both its highlighted column rows stayed lit while the
+            // pointer sat on an unrelated table. Clear it on the way past.
+            //
+            // The `is_some()` guard is the load-bearing half: `RwSignal::set` never
+            // dedups, and this runs on *every* pointer move over a card, so an
+            // unguarded `set(None)` would repaint the edge canvas and re-run every
+            // column row's style closure per move — [B17.2-L4-01] from a new
+            // direction.
+            hovered.set(None);
         }
         // Consume moves over the card so the canvas edge-hover test fires only in
         // the gaps between cards.
@@ -938,18 +953,20 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                 return modal_frame(win, close, scope, chips(&graph), Vec::new(), body).into_any();
             }
 
-            let (placed, cw, ch, collapsed_defaults) = build_placed(&graph);
+            let (placed, collapsed_defaults) = build_placed(&graph);
             // Left-side count pills (tables / relationships / hidden).
             let counts = chips(&graph);
             let graph = Rc::new(graph);
             // Sizes + collapse state are reactive so the expand/collapse toggle
             // resizes a card and the edges re-route.
-            let sizes: RwSignal<HashMap<String, (f64, f64)>> = RwSignal::new(
-                placed
-                    .iter()
-                    .map(|p| (p.node.id.clone(), (p.w, p.h)))
-                    .collect(),
-            );
+            let auto_sizes: HashMap<String, (f64, f64)> = placed
+                .iter()
+                .map(|p| (p.node.id.clone(), (p.w, p.h)))
+                .collect();
+            let sizes: RwSignal<HashMap<String, (f64, f64)>> = RwSignal::new(auto_sizes.clone());
+            // Kept alongside `auto_positions` for "Reset layout": these are the
+            // sizes `place()` stacked the auto positions with.
+            let auto_collapsed = collapsed_defaults.clone();
             let collapsed = RwSignal::new(collapsed_defaults);
             let zoom = RwSignal::new(1.0_f64);
             // Free-pan offset (screen px): a card/edge at logical (x,y) draws at
@@ -971,13 +988,6 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                 zoom.set(z1);
             };
 
-            // Fit the whole diagram in the measured viewport and centre it.
-            let fit: Rc<dyn Fn()> = Rc::new(move || {
-                let (z, p) = erd::fit_view((cw, ch), viewport_size.get_untracked(), ZOOM_MIN);
-                zoom.set(z);
-                pan.set(p);
-            });
-
             // Positions: auto-layout, overridden by any saved manual layout for this
             // (connection, database). Unknown/stale saved ids are ignored.
             let mut pos_map: HashMap<String, (f64, f64)> = placed
@@ -998,6 +1008,25 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                 }
             }
             let positions = RwSignal::new(pos_map);
+
+            // The diagram's live extent: the union of the cards as they are *now*,
+            // read from the same two signals they render from. Not the open-time
+            // `cw`/`ch`, which one drag or collapse toggle makes wrong — and since
+            // the dragged layout is what persists, wrong again from the first click
+            // on the next open.
+            let live_bounds = move || {
+                positions.with_untracked(|p| {
+                    sizes.with_untracked(|s| erd::content_bounds(p, s, CANVAS_PAD))
+                })
+            };
+
+            // Fit the whole diagram in the measured viewport and centre it.
+            let fit: Rc<dyn Fn()> = Rc::new(move || {
+                let Some(b) = live_bounds() else { return };
+                let (z, p) = erd::fit_bounds(b, viewport_size.get_untracked(), ZOOM_MIN);
+                zoom.set(z);
+                pan.set(p);
+            });
 
             // Persist the manual layout (called when a drag ends).
             let persist: Rc<dyn Fn()> = {
@@ -1034,13 +1063,21 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                 })
             };
 
-            // Reset layout → auto positions, and reset the view so the arrangement
-            // is centred/on-screen again.
+            // Reset layout → the arrangement the diagram opened with, and the view
+            // reset so it is centred/on-screen again.
+            //
+            // That means the collapse state and the card sizes too, not just the
+            // positions: `place()` stacked those positions using the *default*
+            // collapse heights, so restoring the positions under a card the user
+            // has expanded drops it on top of the card below it. The three signals
+            // were laid out together and have to come back together.
             let reset: Rc<dyn Fn()> = {
                 let auto = auto_positions;
                 let persist = persist.clone();
                 Rc::new(move || {
                     positions.set(auto.clone());
+                    collapsed.set(auto_collapsed.clone());
+                    sizes.set(auto_sizes.clone());
                     pan.set((0.0, 0.0));
                     zoom.set(1.0);
                     (persist)();
@@ -1240,7 +1277,10 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                     // window resize never yanks the user's zoom/pan.
                     if !did_autofit.get_untracked() && w > 1.0 && h > 1.0 {
                         did_autofit.set(true);
-                        if erd::view_overflows((cw, ch), (w, h)) {
+                        // The *restored* extent, not the auto-layout one: a saved
+                        // layout is already in `positions` by now, and it is exactly
+                        // the case where the two disagree.
+                        if live_bounds().is_some_and(|b| erd::view_overflows((b.w, b.h), (w, h))) {
                             (fit_on_open)();
                         }
                     }
