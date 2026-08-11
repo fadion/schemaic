@@ -2913,6 +2913,14 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 .find(|t| t.id == id)
                 .map(|t| t.conn_id.get_untracked())
         });
+        // No database bound to this tab. On PostgreSQL the connection still lands
+        // *somewhere* — the hidden maintenance database — so the guard has to say
+        // so; `needs_database` decides which statements that actually stops.
+        let no_database = tabs.with_untracked(|v| {
+            v.iter()
+                .find(|t| t.id == id)
+                .is_none_or(|t| t.database.get_untracked().is_none())
+        });
         let conn = cid.and_then(|cid| {
             connections.with_untracked(|cs| cs.iter().find(|c| c.id == cid).cloned())
         });
@@ -2923,6 +2931,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 .as_ref()
                 .map(|c| SqlDialect::from_db_type(&c.db_type))
                 .unwrap_or_default(),
+            no_database,
         }
     };
     // The connection-gated but *unguarded* pair. Only the two wrappers below and
