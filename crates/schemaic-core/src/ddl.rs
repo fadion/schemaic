@@ -28,6 +28,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::intel::SqlDialect;
+use crate::pairs;
 use crate::schema::{
     ColumnInfo, ForeignKeyInfo, IndexInfo, TableInfo, ViewOptions, ddl_ident_in, ddl_string,
     definer_sql, sql_qualifier,
@@ -1271,6 +1272,27 @@ impl ChangeSet {
     }
 }
 
+/// The `CREATE VIEW` for an introspected view — the **display and copy** path's
+/// emitter, which is deliberately the same one the apply path uses. `None` for a
+/// base table, which has no view to emit.
+///
+/// This exists because there used to be two view emitters. The other one — the
+/// view branch of [`TableInfo::create_ddl`] — never read `view_options`, so
+/// "Copy DDL" handed over a `CREATE OR REPLACE VIEW` stripped of `ALGORITHM`,
+/// `DEFINER`, `SQL SECURITY` and the check option. Run, it *succeeded* (the
+/// `OR REPLACE` saw to that) and silently turned an `INVOKER` view into a
+/// `DEFINER` one — a privilege change — and stopped an updatable view checking
+/// its own `WHERE`. The same text reached the AI through the MCP table-info tool
+/// and every view at once through "Copy DDL" on a schema.
+///
+/// Plain `CREATE VIEW`, not `OR REPLACE`: a copied skeleton is meant to recreate
+/// the object somewhere, and failing loudly on a name collision beats
+/// overwriting whatever is already there.
+pub fn view_ddl(t: &TableInfo, dialect: SqlDialect) -> Option<String> {
+    let v = ViewDraft::from_table(t)?;
+    Some(create_view_sql(&v, &v.name, dialect, false))
+}
+
 /// `CREATE [OR REPLACE] VIEW`, with every option restated.
 ///
 /// `name` is the view the statement addresses, which isn't always
@@ -1315,6 +1337,14 @@ fn create_view_sql(v: &ViewDraft, name: &str, dialect: SqlDialect, replace: bool
         && let Some(co) = set(&o.check_option).filter(|c| !c.eq_ignore_ascii_case("NONE"))
     {
         sql.push_str(&format!("\nWITH {} CHECK OPTION", co.to_ascii_uppercase()));
+    }
+    // The body is the user's own SQL and may end in a line comment — a trailing
+    // `-- note` is ordinary. Pushing `;` straight onto it puts the terminator
+    // *inside* the comment, and then "Open in editor" hands over a script whose
+    // splitter runs this statement joined to the next one. Asked of the shared
+    // lexer rather than hand-checked for `--`/`#`, so the dialects can't drift.
+    if pairs::region_at(&sql, sql.len().saturating_sub(1), dialect) == pairs::Region::Comment {
+        sql.push('\n');
     }
     sql.push(';');
     sql
@@ -3890,6 +3920,90 @@ mod tests {
 
         pub(super) fn view_fixtures() -> Vec<(SqlDialect, TableInfo)> {
             vec![(MySql, my_view()), (Postgres, pg_view())]
+        }
+
+        #[test]
+        fn a_body_ending_in_a_line_comment_still_terminates() {
+            // A trailing `-- note` is ordinary hand-written SQL, and the `;` was
+            // pushed straight onto it — landing *inside* the comment. Down the
+            // "Open in editor" / Copy path that means the shared splitter finds
+            // no terminator, and this statement runs joined to the next one.
+            // `#` is a MySQL comment and a Postgres operator, so it is only the
+            // same shape on MySQL — which is why the dialect is threaded through.
+            for (dialect, comment) in [
+                (MySql, "-- the active ones"),
+                (Postgres, "-- the active ones"),
+                (MySql, "# the active ones"),
+            ] {
+                let mut v = ViewDraft::blank("v", None);
+                v.select = format!("select id from t {comment}");
+                let script = create_view(&v, dialect).script();
+                let joined = format!("{script}\n\nSELECT 1");
+                let pos = joined.rfind("SELECT 1").unwrap();
+                let (lo, hi) = crate::sql::statement_range(&joined, pos, dialect);
+                assert_eq!(
+                    &joined[lo..hi],
+                    "SELECT 1",
+                    "the view statement swallowed its terminator and ran on: {joined:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn an_ordinary_body_keeps_its_semicolon_where_it_was() {
+            let mut v = ViewDraft::blank("v", None);
+            v.select = "select id from t".into();
+            assert!(create_view(&v, MySql).script().ends_with("from t;"));
+        }
+
+        /// The anti-drift test: the display/copy emitter and the apply emitter
+        /// must agree, because there is only supposed to be one of them.
+        #[test]
+        fn copy_ddl_and_the_apply_path_emit_the_same_view() {
+            for (dialect, t) in view_fixtures() {
+                let draft = ViewDraft::from_table(&t).expect("a view drafts");
+                let applied = create_view(&draft, dialect).script();
+                let copied = t.create_ddl(dialect);
+                assert_eq!(
+                    copied.trim(),
+                    applied.trim(),
+                    "two view emitters disagreed on {} ({dialect:?})",
+                    t.name
+                );
+            }
+        }
+
+        #[test]
+        fn copy_ddl_restates_the_options_a_replace_would_reset() {
+            // Omitting SQL SECURITY turns an INVOKER view into a DEFINER one —
+            // a privilege change — and the copied statement says OR REPLACE, so
+            // it lands silently on the existing view.
+            let mut t = my_view();
+            t.view_options = Some(ViewOptions {
+                check_option: Some("CASCADED".into()),
+                definer: Some("app@localhost".into()),
+                security: Some("INVOKER".into()),
+                algorithm: Some("MERGE".into()),
+                ..Default::default()
+            });
+            let sql = t.create_ddl(MySql);
+            assert!(sql.contains("SQL SECURITY INVOKER"), "{sql}");
+            assert!(sql.contains("DEFINER = `app`@`localhost`"), "{sql}");
+            assert!(sql.contains("WITH CASCADED CHECK OPTION"), "{sql}");
+            assert!(sql.contains("ALGORITHM = MERGE"), "{sql}");
+        }
+
+        #[test]
+        fn copy_ddl_of_a_materialized_view_says_so() {
+            let mut t = pg_view();
+            t.view_options = Some(ViewOptions {
+                materialized: true,
+                ..Default::default()
+            });
+            let sql = t.create_ddl(Postgres);
+            assert!(sql.contains("MATERIALIZED VIEW"), "{sql}");
+            // There is no `CREATE OR REPLACE MATERIALIZED VIEW`.
+            assert!(!sql.contains("OR REPLACE"), "{sql}");
         }
 
         /// The draft is the view; a base table has no view to draft.
