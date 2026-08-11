@@ -62,6 +62,21 @@ pub struct ColumnDraft {
     /// from a drop-plus-add.
     pub original: Option<String>,
     pub info: ColumnInfo,
+    /// The name this column's primary-key, index and foreign-key references
+    /// currently spell — the draft's answer to "which column is that entry?".
+    ///
+    /// Normally identical to `info.name`. The two diverge for exactly as long as
+    /// the user is typing *through* a name another column already holds: the
+    /// designer writes back on every keystroke, so renaming `b` to `ab` walks the
+    /// draft through `""`, `"a"`, `"ab"`, and while `info.name` reads `a` this
+    /// column's dependents still say what they said before. Rewriting them then
+    /// would have claimed the *other* `a`'s key membership.
+    ///
+    /// Private because it is bookkeeping, not state a caller should set:
+    /// [`TableDraft::rename_column`] is the only thing that moves it, and it
+    /// maintains the invariant the whole scheme rests on — **`key_name` is unique
+    /// across a draft's columns even when `info.name` is not.**
+    key_name: String,
 }
 
 impl ColumnDraft {
@@ -69,6 +84,7 @@ impl ColumnDraft {
     pub fn existing(info: ColumnInfo) -> Self {
         Self {
             original: Some(info.name.clone()),
+            key_name: info.name.clone(),
             info,
         }
     }
@@ -77,6 +93,7 @@ impl ColumnDraft {
     pub fn new(info: ColumnInfo) -> Self {
         Self {
             original: None,
+            key_name: info.name.clone(),
             info,
         }
     }
@@ -213,17 +230,44 @@ impl TableDraft {
     /// draft columns. Renaming the column alone would leave them pointing at a
     /// name that no longer exists — which reads to [`diff`] as "the index
     /// changed", and turns a free rename into a rebuild of every index over it.
+    ///
+    /// **References move by identity, not by name.** The designer writes back on
+    /// every keystroke, so a rename routinely passes *through* names other
+    /// columns hold: renaming `b` to `ab` in a table that also has an `a` walks
+    /// the draft through `""`, `"a"`, `"ab"`. A plain string match then rewrote
+    /// `a`'s key membership to point at `ab` — and the draft validated clean
+    /// afterwards, because the clash it would have complained about was gone. So
+    /// the dependents follow [`ColumnDraft::key_name`], and it only advances to a
+    /// name no *other* column's `key_name` already claims. Uniqueness of
+    /// `key_name` is therefore preserved by induction, which is what makes a
+    /// reference unambiguous however tangled `info.name` gets in between.
     pub fn rename_column(&mut self, idx: usize, new_name: &str) {
-        let Some(c) = self.columns.get_mut(idx) else {
-            return;
-        };
-        let old = std::mem::replace(&mut c.info.name, new_name.to_string());
-        if old == new_name {
+        if idx >= self.columns.len() {
             return;
         }
+        let taken = self
+            .columns
+            .iter()
+            .enumerate()
+            .any(|(i, c)| i != idx && c.key_name == new_name);
+        let c = &mut self.columns[idx];
+        c.info.name = new_name.to_string();
+        if taken || c.key_name == new_name {
+            // Mid-flight through another column's identity: show what the user
+            // typed, but leave the dependents where they are. `validate` is what
+            // surfaces the clash if the user stops here.
+            return;
+        }
+        let old = std::mem::replace(&mut c.key_name, new_name.to_string());
+        self.move_references(&old, new_name);
+        self.settle_key_names();
+    }
+
+    /// Point every key, index and foreign-key reference to `old` at `new`.
+    fn move_references(&mut self, old: &str, new: &str) {
         let swap = |s: &mut String| {
-            if *s == old {
-                *s = new_name.to_string();
+            if s == old {
+                *s = new.to_string();
             }
         };
         self.primary_key.iter_mut().for_each(swap);
@@ -235,6 +279,58 @@ impl TableDraft {
         }
     }
 
+    /// Let any column whose `key_name` is still behind its `info.name` catch up,
+    /// now that some other edit may have freed the name it was waiting for.
+    ///
+    /// Without this the divergence outlives the clash that caused it: rename `b`
+    /// to `a` (blocked by the existing `a`), then rename that `a` to something
+    /// else, and `b`'s references would sit on `b` forever — a name no column
+    /// answers to any more, which `validate` reports as a primary key naming a
+    /// column the user can no longer see. Repeated because one column catching up
+    /// frees its old name for the next.
+    fn settle_key_names(&mut self) {
+        for _ in 0..self.columns.len() {
+            let Some((idx, old, new)) = self.columns.iter().enumerate().find_map(|(i, c)| {
+                (c.key_name != c.info.name
+                    && !self
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .any(|(j, o)| j != i && o.key_name == c.info.name))
+                .then(|| (i, c.key_name.clone(), c.info.name.clone()))
+            }) else {
+                return;
+            };
+            self.columns[idx].key_name = new.clone();
+            self.move_references(&old, &new);
+        }
+    }
+
+    /// Is the column at `idx` part of the primary key?
+    ///
+    /// By identity, not by name — asking with `primary_key.contains(&name)` gets
+    /// the wrong answer while a rename is passing through another column's name.
+    pub fn is_in_primary_key(&self, idx: usize) -> bool {
+        self.columns
+            .get(idx)
+            .is_some_and(|c| self.primary_key.contains(&c.key_name))
+    }
+
+    /// Add the column at `idx` to the primary key (appended in click order) or
+    /// take it out. The counterpart to [`TableDraft::is_in_primary_key`], and for
+    /// the same reason: a by-name `retain` mid-rename removes the *other*
+    /// column's membership.
+    pub fn set_in_primary_key(&mut self, idx: usize, member: bool) {
+        let Some(name) = self.columns.get(idx).map(|c| c.key_name.clone()) else {
+            return;
+        };
+        match member {
+            true if !self.primary_key.contains(&name) => self.primary_key.push(name),
+            true => {}
+            false => self.primary_key.retain(|p| *p != name),
+        }
+    }
+
     /// Drop the column at `idx` and every key, index and foreign key that stood
     /// on it — an index over a column that no longer exists can't be created,
     /// and both engines drop one on the user's behalf anyway.
@@ -242,12 +338,16 @@ impl TableDraft {
         if idx >= self.columns.len() {
             return;
         }
-        let name = self.columns.remove(idx).info.name;
+        // By `key_name`, for the same reason [`TableDraft::rename_column`] moves
+        // references by it: mid-rename `info.name` can be another column's.
+        let name = self.columns.remove(idx).key_name;
         self.primary_key.retain(|c| *c != name);
         self.indexes
             .retain(|ix| !ix.info.columns.iter().any(|c| c.name == name));
         self.foreign_keys
             .retain(|fk| !fk.info.columns.contains(&name));
+        // Removing a column frees its name for anyone mid-rename onto it.
+        self.settle_key_names();
     }
 
     /// Problems that would make the generated SQL nonsense, in plain language —
@@ -2750,6 +2850,147 @@ mod tests {
         assert_eq!(
             normalize_type(" DECIMAL ( 10 , 2 ) ", MySql),
             "decimal(10,2)"
+        );
+    }
+
+    // ── renaming a column carries its dependents by identity ────────────────
+
+    /// Two columns, both in the primary key, with an index and a foreign key
+    /// standing on the second one.
+    fn ab_table() -> TableInfo {
+        TableInfo {
+            name: "t".into(),
+            columns: vec![col("a", "int"), col("b", "int")],
+            indexes: vec![
+                IndexInfo::plain("PRIMARY", vec!["a", "b"], true),
+                IndexInfo::plain("b_ix", vec!["b"], false),
+            ],
+            foreign_keys: vec![ForeignKeyInfo {
+                name: "fk_b".into(),
+                columns: vec!["b".into()],
+                ref_table: "other".into(),
+                ref_columns: vec!["id".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn renaming_a_column_carries_its_key_index_and_foreign_key() {
+        // The control: with no clash on the way, everything follows the name.
+        let mut d = TableDraft::from_table(&ab_table());
+        d.rename_column(1, "renamed");
+        assert_eq!(d.primary_key, vec!["a", "renamed"]);
+        assert_eq!(d.indexes[0].info.columns[0].name, "renamed");
+        assert_eq!(d.foreign_keys[0].info.columns, vec!["renamed"]);
+    }
+
+    #[test]
+    fn renaming_through_another_columns_name_leaves_that_column_alone() {
+        // The designer writes back on every keystroke, so renaming `b` to `ab`
+        // walks the draft through "", "a" and "ab" — and "a" is the *other*
+        // column's name. Matching dependents by name rewrote `a`'s primary-key
+        // membership to point at `ab`, and the draft then validated clean.
+        let mut d = TableDraft::from_table(&ab_table());
+        for keystroke in ["", "a", "ab"] {
+            d.rename_column(1, keystroke);
+        }
+        assert_eq!(d.column_names(), vec!["a", "ab"]);
+        assert_eq!(
+            d.primary_key,
+            vec!["a", "ab"],
+            "column a's key membership must survive the transient clash"
+        );
+        // `from_table` lifts PRIMARY into `primary_key`, so `indexes` is b_ix alone.
+        assert_eq!(d.indexes[0].info.columns[0].name, "ab");
+        assert_eq!(d.foreign_keys[0].info.columns, vec!["ab"]);
+        assert!(d.validate().is_empty(), "{:?}", d.validate());
+    }
+
+    #[test]
+    fn two_columns_can_swap_names_a_keystroke_at_a_time() {
+        // The harder shape: both halves pass through the other's name.
+        let mut d = TableDraft::from_table(&ab_table());
+        d.rename_column(1, "a"); // clash — b's dependents must not move
+        d.rename_column(0, "b"); // clash the other way
+        d.rename_column(1, "aa");
+        d.rename_column(0, "bb");
+        assert_eq!(d.column_names(), vec!["bb", "aa"]);
+        assert_eq!(d.primary_key, vec!["bb", "aa"]);
+        assert_eq!(d.foreign_keys[0].info.columns, vec!["aa"]);
+    }
+
+    #[test]
+    fn a_column_catches_up_once_the_name_it_wanted_is_freed() {
+        // b is renamed onto a's name (blocked), and then *a* moves away. b's
+        // references must follow it to `a` rather than sitting on `b` forever —
+        // a name no column answers to, which would block Preview with a message
+        // naming a column the user can no longer see.
+        let mut d = TableDraft::from_table(&ab_table());
+        d.rename_column(1, "a");
+        d.rename_column(0, "z");
+        assert_eq!(d.column_names(), vec!["z", "a"]);
+        assert_eq!(d.primary_key, vec!["z", "a"]);
+        assert_eq!(d.foreign_keys[0].info.columns, vec!["a"]);
+        assert!(d.validate().is_empty(), "{:?}", d.validate());
+    }
+
+    #[test]
+    fn deleting_a_column_frees_its_name_for_one_mid_rename() {
+        let mut d = TableDraft::from_table(&ab_table());
+        d.rename_column(1, "a"); // blocked by column 0
+        d.remove_column(0);
+        assert_eq!(d.column_names(), vec!["a"]);
+        assert_eq!(d.primary_key, vec!["a"]);
+        assert_eq!(d.foreign_keys[0].info.columns, vec!["a"]);
+        assert!(d.validate().is_empty(), "{:?}", d.validate());
+    }
+
+    #[test]
+    fn a_rename_that_stops_on_a_duplicate_is_still_reported() {
+        // The clash isn't silently swallowed — validate() is what blocks Preview.
+        let mut d = TableDraft::from_table(&ab_table());
+        d.rename_column(1, "a");
+        assert!(
+            d.validate().iter().any(|m| m.contains("both called a")),
+            "{:?}",
+            d.validate()
+        );
+    }
+
+    #[test]
+    fn the_primary_key_toggle_answers_for_the_column_it_was_asked_about() {
+        // The designer's "Primary key" tick is the second door onto the same
+        // defect: mid-rename, a by-name `retain` took the *other* column out.
+        let mut d = TableDraft::from_table(&ab_table());
+        d.rename_column(1, "a"); // column 1 now displays `a`, as does column 0
+        assert!(d.is_in_primary_key(0) && d.is_in_primary_key(1));
+        d.set_in_primary_key(1, false);
+        assert!(d.is_in_primary_key(0), "column a keeps its membership");
+        assert!(!d.is_in_primary_key(1));
+        assert_eq!(d.primary_key, vec!["a"]);
+        // Finishing the rename doesn't resurrect it.
+        d.rename_column(1, "ab");
+        assert_eq!(d.primary_key, vec!["a"]);
+        d.set_in_primary_key(1, true);
+        assert_eq!(d.primary_key, vec!["a", "ab"]);
+    }
+
+    #[test]
+    fn removing_a_column_takes_the_dependents_it_still_owns() {
+        let mut d = TableDraft::from_table(&ab_table());
+        for keystroke in ["", "a", "ab"] {
+            d.rename_column(1, keystroke);
+        }
+        d.remove_column(1);
+        assert_eq!(d.column_names(), vec!["a"]);
+        assert_eq!(d.primary_key, vec!["a"], "only ab's membership goes");
+        assert!(d.foreign_keys.is_empty());
+        assert!(
+            d.indexes.is_empty(),
+            "b_ix went with the column: {:?}",
+            d.indexes
         );
     }
 
