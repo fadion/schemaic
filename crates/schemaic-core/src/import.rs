@@ -203,23 +203,29 @@ impl Mapping {
             .collect()
     }
 
-    /// Unmapped NOT NULL columns — the ones likely to fail on insert. "Likely",
-    /// not "certainly": a NOT NULL column with a server-side default is fine, and
-    /// the introspected schema doesn't record defaults, so this is a warning for
-    /// the user to weigh rather than a blocking error.
+    /// Unmapped NOT NULL columns the server won't fill in — the ones likely to
+    /// fail on insert. Still "likely", not "certainly": a trigger can supply a
+    /// value and nothing here can see one, so this stays a warning to weigh
+    /// rather than a blocking error.
     ///
-    /// An **integer** primary key is excluded, because that's the auto-increment
-    /// shape and warning about it on every import would train the user to ignore
-    /// the warning. A non-integer key is not: a `varchar` primary key is never
-    /// auto-assigned, so leaving it unmapped fails every time.
+    /// The rule is what the *server* will supply, read off the model rather than
+    /// guessed from the type text: a column needs warning about when it is
+    /// unmapped and NOT NULL and nothing will fill it — no `DEFAULT`, not
+    /// auto-increment/identity, not generated.
+    ///
+    /// This used to approximate auto-increment as "integer primary key", which is
+    /// neither necessary nor sufficient. It stayed **silent** on a natural `INT`
+    /// key (`year INT PRIMARY KEY`), where the import then fails on the second
+    /// row with a duplicate key or on the first with a NOT NULL violation; and it
+    /// **warned** about `status VARCHAR(10) NOT NULL DEFAULT 'new'` left unmapped,
+    /// which is the ordinary, correct thing to do — training the user to ignore
+    /// the warning, the exact outcome the heuristic existed to avoid.
     pub fn missing_required(&self, table: &TableInfo) -> Vec<String> {
         self.unmapped_columns(table)
             .into_iter()
             .filter(|&i| {
                 let c = &table.columns[i];
-                let auto_key =
-                    c.primary_key && matches!(classify(&c.type_name), ColKind::Int | ColKind::Uint);
-                !c.nullable && !auto_key
+                !c.nullable && !c.auto_increment && c.default.is_none() && c.generated.is_none()
             })
             .map(|i| table.columns[i].name.clone())
             .collect()
@@ -234,11 +240,20 @@ impl Mapping {
 /// the only signal there is. Anything unmatched starts as [`Target::Skip`] so the
 /// mapping step shows the gap instead of quietly inventing a pairing.
 pub fn auto_map(file_columns: &[String], table: &TableInfo, has_header: bool) -> Mapping {
+    // A column the server assigns and refuses an explicit value for is never a
+    // candidate. `insert_columns` filters it out regardless, but leaving it
+    // mapped here would show the user a plan that isn't the one that runs.
+    let writable = |i: usize| {
+        table
+            .columns
+            .get(i)
+            .is_some_and(|c| !c.is_server_assigned())
+    };
     if !has_header {
         return Mapping {
             targets: (0..file_columns.len())
                 .map(|i| {
-                    if i < table.columns.len() {
+                    if writable(i) {
                         Target::Column(i)
                     } else {
                         Target::Skip
@@ -259,7 +274,7 @@ pub fn auto_map(file_columns: &[String], table: &TableInfo, has_header: bool) ->
                 .columns
                 .iter()
                 .enumerate()
-                .find(|(i, tc)| !used[*i] && norm(&tc.name) == want)
+                .find(|(i, tc)| !used[*i] && writable(*i) && norm(&tc.name) == want)
                 .map(|(i, _)| i);
             match found {
                 Some(i) => {
@@ -868,12 +883,23 @@ fn read_json_sample<R: std::io::Read>(r: R, limit: usize) -> Result<Sample, Impo
 ///
 /// Table order rather than file order so the generated `INSERT` reads naturally
 /// and every batch lists its columns identically.
+///
+/// A **server-assigned** column is excluded however it got mapped
+/// ([`crate::schema::ColumnInfo::is_server_assigned`]). This is the single authority `validate`,
+/// `row_iter` and `build_insert` all funnel through, so filtering here is what
+/// makes it impossible to write one: a generated column matched by name from a
+/// file Schemaic itself exported used to sail through validation and then fail
+/// the entire transaction on the first batch.
 pub fn insert_columns(mapping: &Mapping, table: &TableInfo) -> Vec<usize> {
     let mut cols: Vec<usize> = mapping
         .targets
         .iter()
         .filter_map(|t| match t {
-            Target::Column(i) if *i < table.columns.len() => Some(*i),
+            Target::Column(i)
+                if *i < table.columns.len() && !table.columns[*i].is_server_assigned() =>
+            {
+                Some(*i)
+            }
             _ => None,
         })
         .collect();
@@ -1363,18 +1389,72 @@ mod tests {
         assert_eq!(m.unmapped_columns(&t), vec![0, 2]);
     }
 
-    /// An unmapped NOT NULL column is worth warning about — but an *integer*
-    /// primary key is excluded, since that's the auto-increment case and warning
-    /// about it every time would train the user to ignore the warning.
+    /// An unmapped NOT NULL column is worth warning about — unless the server
+    /// fills it in. That is read off the model, not guessed from the type.
     #[test]
     fn missing_required_warns_about_not_null_but_not_an_auto_key() {
-        let t = tbl(&[
+        let mut t = tbl(&[
             ("id", "int", false),
             ("name", "varchar", false),
             ("note", "text", true),
         ]);
+        t.columns[0].auto_increment = true;
         let m = auto_map(&["note".into()], &t, true);
         assert_eq!(m.missing_required(&t), vec!["name".to_string()]);
+    }
+
+    /// The false negative the old "integer primary key ⇒ auto-increment"
+    /// approximation produced: a natural key isn't assigned by anyone. MySQL
+    /// inserts `year = 0` and fails the second row on a duplicate key;
+    /// PostgreSQL fails the first on NOT NULL. Validation said the file was clean.
+    #[test]
+    fn a_natural_integer_key_is_still_required() {
+        let mut t = tbl(&[("year", "int", false), ("value", "int", false)]);
+        t.columns[0].primary_key = true; // …but not auto_increment
+        let m = auto_map(&["value".into()], &t, true);
+        assert_eq!(m.missing_required(&t), vec!["year".to_string()]);
+    }
+
+    /// The false positive: leaving a defaulted column out is the ordinary,
+    /// correct thing to do, and warning about it teaches the user to ignore the
+    /// warning — the outcome the heuristic existed to avoid.
+    #[test]
+    fn a_not_null_column_with_a_default_is_not_required() {
+        let mut t = tbl(&[("id", "int", false), ("status", "varchar(10)", false)]);
+        t.columns[0].auto_increment = true;
+        t.columns[1].default = Some("'new'".into());
+        let m = auto_map(&["id".into()], &t, true);
+        assert!(
+            m.missing_required(&t).is_empty(),
+            "{:?}",
+            m.missing_required(&t)
+        );
+    }
+
+    /// A generated column is never "missing" — it is also never insertable, so
+    /// skipping it must not then warn that it wasn't supplied.
+    #[test]
+    fn a_generated_column_is_not_reported_as_missing() {
+        let mut t = tbl(&[("id", "int", false), ("full_name", "varchar", false)]);
+        t.columns[0].auto_increment = true;
+        t.columns[1].generated = Some("concat(a,b)".into());
+        let m = auto_map(&["id".into(), "full_name".into()], &t, true);
+        assert!(
+            m.missing_required(&t).is_empty(),
+            "{:?}",
+            m.missing_required(&t)
+        );
+    }
+
+    /// A non-key `AUTO_INCREMENT` column — which the old predicate missed in the
+    /// other direction, since it required `primary_key`.
+    #[test]
+    fn a_non_key_auto_increment_column_is_not_required() {
+        let mut t = tbl(&[("id", "int", false), ("seq", "bigint", false)]);
+        t.columns[0].auto_increment = true;
+        t.columns[1].auto_increment = true;
+        let m = auto_map(&["id".into()], &t, true);
+        assert!(m.missing_required(&t).is_empty());
     }
 
     /// A `varchar` primary key is never auto-assigned — `classicmodels.offices`
@@ -2068,6 +2148,85 @@ mod tests {
                 found: 3
             }]
         );
+    }
+
+    // ── server-assigned columns are never written ────────────────────────────
+
+    #[test]
+    fn a_generated_column_is_never_written_even_when_the_file_has_it() {
+        // Export a table with a generated column and import the file back: the
+        // mapping matched `full_name` by name, validation reported it clean, and
+        // the server rejected the whole transaction on the first batch.
+        let mut t = tbl(&[
+            ("id", "int", false),
+            ("first", "varchar", false),
+            ("full_name", "varchar", true),
+        ]);
+        t.columns[2].generated = Some("concat(first,' ',last)".into());
+        let cols = [
+            "id".to_string(),
+            "first".to_string(),
+            "full_name".to_string(),
+        ];
+        let m = auto_map(&cols, &t, true);
+        assert_eq!(
+            insert_columns(&m, &t),
+            vec![0, 1],
+            "a generated column must stay out of the INSERT"
+        );
+        // …and the mapping the user approves says so, rather than promising a
+        // write that then gets filtered out behind their back.
+        assert_eq!(m.targets[2], Target::Skip);
+    }
+
+    #[test]
+    fn an_always_identity_is_skipped_but_a_by_default_one_is_written() {
+        // PostgreSQL's two identity forms differ exactly here: ALWAYS rejects an
+        // explicit value, BY DEFAULT accepts it — and someone re-importing rows
+        // usually wants their keys. MySQL AUTO_INCREMENT and `serial` behave like
+        // BY DEFAULT.
+        let mut always = tbl(&[("id", "int", false), ("name", "varchar", true)]);
+        always.columns[0].auto_increment = true;
+        always.columns[0].identity_always = true;
+        let cols = ["id".to_string(), "name".to_string()];
+        let m = auto_map(&cols, &always, true);
+        assert_eq!(insert_columns(&m, &always), vec![1]);
+
+        let mut by_default = tbl(&[("id", "int", false), ("name", "varchar", true)]);
+        by_default.columns[0].auto_increment = true;
+        let m = auto_map(&cols, &by_default, true);
+        assert_eq!(
+            insert_columns(&m, &by_default),
+            vec![0, 1],
+            "an AUTO_INCREMENT / BY DEFAULT key accepts an explicit value"
+        );
+    }
+
+    #[test]
+    fn a_headerless_file_also_skips_a_server_assigned_column() {
+        // Without a header the mapping is positional, so the generated column
+        // would otherwise take whichever field lands on it.
+        let mut t = tbl(&[
+            ("id", "int", false),
+            ("first", "varchar", false),
+            ("full_name", "varchar", true),
+        ]);
+        t.columns[2].generated = Some("x".into());
+        let m = auto_map(&["a".into(), "b".into(), "c".into()], &t, false);
+        assert_eq!(insert_columns(&m, &t), vec![0, 1]);
+    }
+
+    #[test]
+    fn a_deliberately_mapped_generated_column_is_still_not_written() {
+        // `insert_columns` is the single authority every path funnels through,
+        // so it has to hold even when the mapping says otherwise — the target
+        // picker will let a user pick one until B7.2's half lands.
+        let mut t = tbl(&[("id", "int", false), ("g", "varchar", true)]);
+        t.columns[1].generated = Some("x".into());
+        let m = Mapping {
+            targets: vec![Target::Column(0), Target::Column(1)],
+        };
+        assert_eq!(insert_columns(&m, &t), vec![0]);
     }
 
     #[test]

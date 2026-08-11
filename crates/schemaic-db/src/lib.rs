@@ -890,6 +890,9 @@ pub(crate) fn mysql_column(r: MyColRow, mariadb: bool) -> ColRow {
             primary_key: key == "PRI",
             default,
             auto_increment: extra_lc.contains("auto_increment"),
+            // MySQL has no `GENERATED ALWAYS AS IDENTITY`: `AUTO_INCREMENT`
+            // always accepts an explicit value.
+            identity_always: false,
             // `GENERATION_EXPRESSION` is the empty string, not NULL, for an
             // ordinary column.
             generated: generated.filter(|g| !g.is_empty()),

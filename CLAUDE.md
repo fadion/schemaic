@@ -80,7 +80,14 @@ Zed-inspired, aiming to replace DataGrip.
     inference, delimiter/header `sniff` (by *consistency*, quote-aware), `auto_map` (name-match with
     a header, positional without), per-column `coerce` (only the families a wrong answer would
     definitely break — int/uint/float/exact/bool; everything else passes through, the **server stays
-    the type authority**), and a two-pass contract: `validate` reads the whole file and returns
+    the type authority**), and a two-pass contract:
+    What a write may touch is read off the model, never guessed from the type text:
+    `insert_columns` — the single authority `validate`/`row_iter`/`build_insert` all funnel through —
+    drops any `ColumnInfo::is_server_assigned` column, so a file Schemaic exported can be imported
+    back (a generated column matched by name used to pass validation and then fail the whole
+    transaction); and `missing_required` warns on `!nullable && !auto_increment && default.is_none()
+    && generated.is_none()` rather than on "integer primary key", which was silent on a natural
+    `INT` key and noisy about every defaulted column. `validate` reads the whole file and returns
     *every* `Issue` with its line before anything is written, then `row_iter` streams coerced rows
     for the load. `build_insert` reuses `export::ident_sql`/`sql_literal`, so quoting can't drift
     from the SQL export. Note JSON columns are the union of every object's keys and the mapping is
@@ -178,7 +185,10 @@ Zed-inspired, aiming to replace DataGrip.
     expression, `ON UPDATE`, comment, collation) because MySQL's `MODIFY COLUMN` replaces a column
     outright — anything not restated is silently destroyed, so a schema editor can't stand on a
     thinner model. `ColumnInfo::definition_sql` is that one emitter, shared by `CREATE` and (later)
-    `MODIFY` so they can't drift. `IndexColumn` keeps prefix lengths + `DESC`; `ForeignKeyInfo`
+    `MODIFY` so they can't drift. `identity_always` separates PostgreSQL's `GENERATED ALWAYS AS
+    IDENTITY` from `BY DEFAULT`/`serial`/MySQL `AUTO_INCREMENT`, because only the first **rejects**
+    an explicit value — `is_server_assigned()` is that question (`generated.is_some() ||
+    identity_always`) and is what a write path must ask before naming a column. `IndexColumn` keeps prefix lengths + `DESC`; `ForeignKeyInfo`
     keeps its name (both engines drop by name) + referential actions. `ViewOptions` is the same
     idea for a view (check option, MySQL definer/security/algorithm, PG storage params +
     `materialized`) — `CREATE OR REPLACE VIEW` replaces the whole view, so what isn't restated

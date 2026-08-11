@@ -675,6 +675,10 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
                 || default
                     .as_deref()
                     .is_some_and(|d| d.starts_with("nextval(")),
+            // …but they are *not* the same to a writer: `attidentity = 'a'`
+            // (`GENERATED ALWAYS`) rejects an explicit value, where `'d'`
+            // (`BY DEFAULT`) and `serial` accept one.
+            identity_always: cell(&r, 6) == "a",
             comment: r.get(8).cloned().flatten(),
             collation: r.get(9).cloned().flatten(),
             on_update: None,
