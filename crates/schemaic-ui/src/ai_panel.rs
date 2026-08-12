@@ -258,8 +258,17 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     // isn't reachable, or the database isn't. The second is recoverable from the
     // header's Retry, so say which it is rather than showing one dead box.
     let conn_status = ui.conn.conn_status;
+    // Memoised, and that is load-bearing rather than an optimisation: the health
+    // poll re-`set`s `conn_status` every tick, usually to the value it already
+    // held, and a `set` never dedups. Read straight into the `dyn_container` key,
+    // that rebuilt the whole input row on a timer — which destroys the message
+    // field mid-sentence, so the box lost focus and re-measured its own height
+    // from an unlaid-out editor. A memo only notifies when the pair really
+    // changes. (Note it must stay a *pair* memo: two memos would be two keys.)
+    let input_state =
+        floem::reactive::create_memo(move |_| (available.get(), conn_status.get().is_down()));
     let input_row = dyn_container(
-        move || (available.get(), conn_status.get().is_down()),
+        move || input_state.get(),
         move |(claude_ok, db_down)| match (claude_ok, db_down) {
             (true, false) => ai_input_row(input, busy, send.clone(), cancel.clone()).into_any(),
             (_, true) => ai_input_disabled("Not connected to the database").into_any(),
