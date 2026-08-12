@@ -9,6 +9,7 @@ use schemaic_core::diff::{DiffRow, DiffTag};
 use schemaic_core::intel::SqlDialect;
 
 use crate::consts::MONO_FAMILY;
+use crate::widgets::measure_mono_px_at;
 use crate::{sql_highlight, theme};
 
 // ===== moved from lib.rs (Ctrl+K diff view) =====
@@ -61,22 +62,26 @@ pub(crate) fn diff_view(rows: Vec<DiffRow>, dialect: SqlDialect) -> impl IntoVie
     // Give the diff a DEFINITE content width so the scroll can detect horizontal
     // overflow: Floem's scroll measures its child's laid-out size (clamped to the
     // viewport), not max-content, so variable-width text otherwise just clips with
-    // no scrollbar. The font is monospace (IBM Plex Mono, ~0.602em advance), so a
-    // char count maps exactly to pixels — same trick as the results grid's fixed
-    // `CELL_W` columns. `min_width_full` keeps it ≥ viewport when lines are short;
+    // no scrollbar. `min_width_full` keeps it ≥ viewport when lines are short;
     // rows stretch to this width (default `align-items: stretch`) so tints stay
     // uniform.
-    const DIFF_CELL_W: f64 = 8.43; // IBM Plex Mono advance at FONT_TITLE (14px)
+    //
+    // **Measured, not counted.** This used to be `chars().count() * 8.43`, a
+    // comment-documented advance for IBM Plex Mono at 14px — exact for ASCII and
+    // wrong for anything else, because a monospace font renders a full-width
+    // glyph at *two* advances while it counts as one `char`, and a combining mark
+    // at zero. Ctrl+K sends the editor buffer, so a CJK string literal in the
+    // user's own SQL reaches this path and the scrollbar stopped short of the end
+    // of the line. Two advances of slack replace the old `+ 2.0` columns.
     const DIFF_GUTTER_W: f64 = 60.0; // line-number cell (46) + marker (14)
-    let max_cols = rows
+    let widest = rows
         .iter()
         .map(|r| match r {
-            DiffRow::Line { text, .. } => text.chars().count(),
-            DiffRow::Gap(_) => 0,
+            DiffRow::Line { text, .. } => measure_mono_px_at(text, theme::FONT_TITLE),
+            DiffRow::Gap(_) => 0.0,
         })
-        .max()
-        .unwrap_or(0);
-    let content_w = DIFF_GUTTER_W + (max_cols as f64 + 2.0) * DIFF_CELL_W;
+        .fold(0.0f64, f64::max);
+    let content_w = DIFF_GUTTER_W + widest + 2.0 * measure_mono_px_at("0", theme::FONT_TITLE);
     let views = rows.into_iter().map(move |row| match row {
         DiffRow::Line {
             tag,
