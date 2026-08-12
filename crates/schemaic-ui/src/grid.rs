@@ -394,6 +394,35 @@ struct GridState {
     edit_row_saving: RwSignal<bool>,
 }
 
+/// A result column's **real** name on its base table, from the wire provenance.
+/// Empty for an expression column, which is never written to.
+fn origin_column(rs: &ResultSet, ci: usize) -> String {
+    rs.columns
+        .get(ci)
+        .and_then(|c| c.origin.as_ref())
+        .map(|o| o.column.clone())
+        .unwrap_or_default()
+}
+
+/// The `WHERE` identity of data row `di`: each key column's real name paired
+/// with the row's **original** value.
+///
+/// The one builder for it. Every write this grid issues — update, delete, and
+/// the row panel's immediate save — is aimed at the row this names, so a
+/// difference between copies is a statement aimed somewhere else.
+fn row_key(rs: &ResultSet, key_cols: &[usize], di: usize) -> Vec<(String, Value)> {
+    key_cols
+        .iter()
+        .map(|&kci| {
+            let val = rs
+                .cell(di, kci)
+                .map(|c| c.to_value())
+                .unwrap_or(Value::Null);
+            (origin_column(rs, kci), val)
+        })
+        .collect()
+}
+
 impl GridState {
     fn new(rs: Arc<ResultSet>, gctx: &GridCtx, key_map: &HashMap<usize, ColKey>) -> Self {
         let widths = init_widths(&rs, key_map);
@@ -771,6 +800,38 @@ impl GridState {
 
     /// Turn the staged `dirty` map into one [`RowEdit`] per (base table, row),
     /// using the edit model's provenance for real column names + the WHERE key.
+    /// One base table's `UPDATE` for data row `di`: the `SET` list from `sets`
+    /// (result-column index → new value, `None` = SQL NULL) and the `WHERE` key
+    /// from the row's **original** values.
+    ///
+    /// Shared by the staged-batch builder and the row panel's immediate save,
+    /// which had ~35 identical lines each. The WHERE key's construction is the
+    /// part that matters: it is the identity every write on this path is aimed
+    /// at, and it had drifted into three copies (a fourth, `build_refetch`,
+    /// deliberately differs — it keys by the *post-edit* value, because the
+    /// re-fetch has to find the row the write just left).
+    fn row_edit_for(
+        model: &schemaic_core::edit::EditModel,
+        rs: &ResultSet,
+        ti: usize,
+        di: usize,
+        mut sets: Vec<(usize, Option<String>)>,
+    ) -> Option<RowEdit> {
+        let tbl = model.table(ti)?;
+        sets.sort_by_key(|(ci, _)| *ci); // stable SET-clause order
+        let set = sets
+            .into_iter()
+            .map(|(ci, v)| (origin_column(rs, ci), v))
+            .collect();
+        Some(RowEdit {
+            database: tbl.database.clone(),
+            schema: tbl.schema.clone(),
+            table: tbl.table.clone(),
+            set,
+            key: row_key(rs, &tbl.key_cols, di),
+        })
+    }
+
     fn build_edits(&self) -> Vec<RowEdit> {
         let model = self.edit_model.get_untracked();
         let rs = self.rs.get_untracked();
@@ -788,39 +849,10 @@ impl GridState {
                 .or_default()
                 .push((*ci, new.clone()));
         }
-        let real_col = |ci: usize| -> String {
-            rs.columns
-                .get(ci)
-                .and_then(|c| c.origin.as_ref())
-                .map(|o| o.column.clone())
-                .unwrap_or_default()
-        };
-        let mut edits = Vec::with_capacity(groups.len());
-        for ((ti, di), mut sets) in groups {
-            let Some(tbl) = model.table(ti) else { continue };
-            sets.sort_by_key(|(ci, _)| *ci); // stable SET-clause order
-            let set: Vec<(String, Option<String>)> =
-                sets.into_iter().map(|(ci, v)| (real_col(ci), v)).collect();
-            let key: Vec<(String, Value)> = tbl
-                .key_cols
-                .iter()
-                .map(|&kci| {
-                    let val = rs
-                        .cell(di, kci)
-                        .map(|c| c.to_value())
-                        .unwrap_or(Value::Null);
-                    (real_col(kci), val)
-                })
-                .collect();
-            edits.push(RowEdit {
-                database: tbl.database.clone(),
-                schema: tbl.schema.clone(),
-                table: tbl.table.clone(),
-                set,
-                key,
-            });
-        }
-        edits
+        groups
+            .into_iter()
+            .filter_map(|((ti, di), sets)| Self::row_edit_for(&model, &rs, ti, di, sets))
+            .collect()
     }
 
     /// Like [`build_edits`], but for one data row `di` from an explicit change set
@@ -831,13 +863,6 @@ impl GridState {
     fn build_row_edits(&self, di: usize, changes: &[(usize, Option<String>)]) -> Vec<RowEdit> {
         let model = self.edit_model.get_untracked();
         let rs = self.rs.get_untracked();
-        let real_col = |ci: usize| -> String {
-            rs.columns
-                .get(ci)
-                .and_then(|c| c.origin.as_ref())
-                .map(|o| o.column.clone())
-                .unwrap_or_default()
-        };
         // Group changed columns by their base table (deterministic SQL via BTreeMap).
         let mut groups: BTreeMap<usize, Vec<(usize, Option<String>)>> = BTreeMap::new();
         for (ci, v) in changes {
@@ -845,32 +870,10 @@ impl GridState {
                 groups.entry(ti).or_default().push((*ci, v.clone()));
             }
         }
-        let mut edits = Vec::with_capacity(groups.len());
-        for (ti, mut sets) in groups {
-            let Some(tbl) = model.table(ti) else { continue };
-            sets.sort_by_key(|(ci, _)| *ci);
-            let set: Vec<(String, Option<String>)> =
-                sets.into_iter().map(|(ci, v)| (real_col(ci), v)).collect();
-            let key: Vec<(String, Value)> = tbl
-                .key_cols
-                .iter()
-                .map(|&kci| {
-                    let val = rs
-                        .cell(di, kci)
-                        .map(|c| c.to_value())
-                        .unwrap_or(Value::Null);
-                    (real_col(kci), val)
-                })
-                .collect();
-            edits.push(RowEdit {
-                database: tbl.database.clone(),
-                schema: tbl.schema.clone(),
-                table: tbl.table.clone(),
-                set,
-                key,
-            });
-        }
-        edits
+        groups
+            .into_iter()
+            .filter_map(|(ti, sets)| Self::row_edit_for(&model, &rs, ti, di, sets))
+            .collect()
     }
 
     /// A single-row refetch (splice in place after the whole-row edit commits).
@@ -947,13 +950,6 @@ impl GridState {
             return Vec::new();
         };
         let rs = self.rs.get_untracked();
-        let real_col = |ci: usize| -> String {
-            rs.columns
-                .get(ci)
-                .and_then(|c| c.origin.as_ref())
-                .map(|o| o.column.clone())
-                .unwrap_or_default()
-        };
         let mut dis: Vec<usize> = del.into_iter().collect();
         dis.sort_unstable(); // deterministic DELETE order
         dis.into_iter()
@@ -961,23 +957,11 @@ impl GridState {
                 if di >= rs.row_count() {
                     return None;
                 }
-                let key: Vec<(String, Value)> = tbl
-                    .key_cols
-                    .iter()
-                    .map(|&kci| {
-                        (
-                            real_col(kci),
-                            rs.cell(di, kci)
-                                .map(|c| c.to_value())
-                                .unwrap_or(Value::Null),
-                        )
-                    })
-                    .collect();
                 Some(RowDelete {
                     database: tbl.database.clone(),
                     schema: tbl.schema.clone(),
                     table: tbl.table.clone(),
-                    key,
+                    key: row_key(&rs, &tbl.key_cols, di),
                 })
             })
             .collect()
