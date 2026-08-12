@@ -20,8 +20,8 @@ use schemaic_core::schema::{SchemaState, TableSource};
 
 use crate::consts::{CHAT_PAD_H, CHAT_PAD_V, DB_MENU_W};
 use crate::widgets::{
-    CURSOR_MENU_GAP, MenuEntry, autohide, cursor_menu_pos, measure_text_px_at, menu_item_style,
-    menu_panel, menu_panel_height, panel_style, window_size,
+    CURSOR_MENU_GAP, MenuEntry, autohide, cursor_menu_pos, dialog_button, measure_text_px_at,
+    menu_item_style, menu_panel, menu_panel_height, panel_style, window_size,
 };
 use crate::{
     ConnNode, CtxKind, CtxMenu, PopupAnchor, RightPanel, TxChoice, Ui, icons, right_panel_allowed,
@@ -2430,14 +2430,7 @@ pub(crate) fn tx_prompt_overlay(ui: Ui) -> impl IntoView {
                        color: fn() -> Color,
                        hover: fn() -> Color,
                        act: Rc<dyn Fn()>| {
-                text(label).on_click_stop(move |_| (act)()).style(move |s| {
-                    s.font_size(theme::FONT_BODY)
-                        .padding_horiz(10.0)
-                        .padding_vert(5.0)
-                        .border_radius(6.0)
-                        .color(color())
-                        .hover(move |s| s.color(hover()))
-                })
+                dialog_button(label, color, hover, move || (act)())
             };
             let resolve = p.resolve.clone();
             let cancel = {
@@ -2566,14 +2559,7 @@ pub(crate) fn confirm_overlay(ui: Ui) -> impl IntoView {
                        color: fn() -> Color,
                        hover: fn() -> Color,
                        act: Rc<dyn Fn()>| {
-                text(label).on_click_stop(move |_| (act)()).style(move |s| {
-                    s.font_size(theme::FONT_BODY)
-                        .padding_horiz(10.0)
-                        .padding_vert(5.0)
-                        .border_radius(6.0)
-                        .color(color())
-                        .hover(move |s| s.color(hover()))
-                })
+                dialog_button(label, color, hover, move || (act)())
             };
             let no = {
                 let a = answer.clone();

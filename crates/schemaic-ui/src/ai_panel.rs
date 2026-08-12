@@ -534,16 +534,6 @@ fn render_segments(segs: Vec<Seg>, role: Role, actions: CodeActions) -> impl Int
     .style(|s| s.flex_col().gap(6.0).width_full())
 }
 
-/// Live elapsed time (while a turn runs) formatted like `TurnStats::summary`'s
-/// time part: `450ms` under a second, `1.2s` above.
-fn format_elapsed(ms: u64) -> String {
-    if ms >= 1000 {
-        format!("{:.1}s", ms as f64 / 1000.0)
-    } else {
-        format!("{ms}ms")
-    }
-}
-
 /// A footer action icon (copy / regenerate): 16px, footer-text colour, brightens
 /// on hover. No pointer cursor (native feel — see CLAUDE.md).
 fn footer_icon(svg: &'static str, on_click: impl Fn() + 'static) -> impl IntoView {
@@ -581,7 +571,13 @@ fn assistant_footer(
     } else if pending {
         dyn_container(
             move || elapsed_ms.get(),
-            move |ms| text(format_elapsed(ms)).style(style).into_any(),
+            // The same formatter the finished turn's footer uses — the live
+            // counter is replaced by it in place when the turn ends.
+            move |ms| {
+                text(schemaic_core::transcript::elapsed_text(ms))
+                    .style(style)
+                    .into_any()
+            },
         )
         .into_any()
     } else {
