@@ -1352,24 +1352,32 @@ mod measure_tests {
     }
 
     #[test]
-    fn a_wide_glyph_is_wider_than_a_char_count_predicts() {
+    fn a_char_count_does_not_predict_the_width() {
         // The Ctrl+K diff used to size its scroll extent as `chars().count()`
-        // times a fixed advance. In a monospace font a full-width glyph occupies
-        // *two* advances while counting as one `char`, so the content width came
-        // out at half the truth and the h-scrollbar stopped before the end of the
-        // line. Ctrl+K sends the editor buffer, so any CJK string literal in the
-        // user's own SQL reaches it.
+        // times a fixed advance. `char` is not the unit text is laid out in: a
+        // combining mark is a `char` of its own and adds no advance at all, so
+        // the width came out over the truth for any accented line. Ctrl+K sends
+        // the editor buffer, so a literal in the user's own SQL reaches it.
+        //
+        // The mirror case — a full-width CJK glyph taking *two* advances for one
+        // `char` — is what this test used to assert, and it can't be pinned here:
+        // `MONO_FAMILY` carries no CJK coverage, so those glyphs resolve through
+        // whatever the machine happens to have installed. It failed on the bare
+        // Linux CI runner, which has nothing, while passing locally on a fallback
+        // box that measures identically to an unrenderable private-use codepoint
+        // — so it was asserting on the fallback, not on a glyph. The combining
+        // mark is in the bundled font and therefore measures the same everywhere.
         crate::fonts::load_fonts();
         let advance = measure_mono_px_at("0", 14.0);
-        let ascii = "abcdefgh"; // 8 chars
-        let wide = "日本語"; // 3 chars, ~6 advances
+        let ascii = "abcdefgh"; // 8 chars, 8 advances
+        let accented = "e\u{0301}"; // 2 chars, 1 advance
 
         // The baseline the old arithmetic assumed, and where it held.
         assert!((measure_mono_px_at(ascii, 14.0) - 8.0 * advance).abs() < 1.0);
-        // …and where it didn't: 3 chars measuring well past 3 advances.
+        // …and where it didn't: two chars occupying a single advance.
         assert!(
-            measure_mono_px_at(wide, 14.0) > 3.0 * advance * 1.5,
-            "a full-width glyph must measure wider than its char count implies"
+            measure_mono_px_at(accented, 14.0) < 1.5 * advance,
+            "a combining mark must not measure as an advance of its own"
         );
     }
 
