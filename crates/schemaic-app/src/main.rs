@@ -4937,7 +4937,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             view_draft: RwSignal::new(schemaic_core::ddl::ViewDraft::default()),
             view_rows: RwSignal::new(14),
             trigger: RwSignal::new(None),
-            trigger_draft: RwSignal::new(schemaic_core::ddl::TriggerDraft::default()),
+            trigger_draft: RwSignal::new(schemaic_core::ddl::TriggerSetDraft::default()),
             function: RwSignal::new(None),
             function_draft: RwSignal::new(schemaic_core::ddl::FunctionDraft::default()),
             functions: RwSignal::new(Vec::new()),

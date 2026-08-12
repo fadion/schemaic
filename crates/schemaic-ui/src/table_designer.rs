@@ -468,7 +468,7 @@ fn bound_toggle(
 }
 
 /// The +/−/↑/↓ bar under an item list.
-fn list_actions(
+pub(crate) fn list_actions(
     add: impl Fn() + 'static,
     remove: impl Fn() + 'static,
     move_up: Option<Rc<dyn Fn()>>,
@@ -509,7 +509,7 @@ fn list_actions(
 }
 
 /// One row of an item list.
-fn list_row(
+pub(crate) fn list_row(
     ui: Ui,
     idx: usize,
     label: String,
@@ -572,7 +572,10 @@ fn list_row(
 }
 
 /// The list + its action bar, boxed like the import preview's table.
-fn list_pane(rows: impl IntoView + 'static, actions: impl IntoView + 'static) -> impl IntoView {
+pub(crate) fn list_pane(
+    rows: impl IntoView + 'static,
+    actions: impl IntoView + 'static,
+) -> impl IntoView {
     v_stack((
         autohide(scroll(rows)).style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0)),
         actions,
