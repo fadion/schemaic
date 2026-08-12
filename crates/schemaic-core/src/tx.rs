@@ -363,6 +363,86 @@ pub fn ddl_blocking_tabs(tabs: &[TabTx], conn_id: u64) -> Vec<usize> {
         .collect()
 }
 
+/// Which of *our own* tabs' transactions could be holding a lock that a write
+/// from `writer_tab` is queued behind, in tab order.
+///
+/// The writer's own tab is excluded, and that is the whole difference from
+/// [`ddl_blocking_tabs`]: a grid write from a Manual tab runs on that tab's
+/// pinned session, *inside* its own transaction, so it cannot wait on itself. A
+/// schema change runs on a fresh connection and therefore does queue behind the
+/// tab's own uncommitted work — hence two functions rather than one.
+///
+/// Scope is the connection, for the reason spelled out on `ddl_blocking_tabs`.
+/// Over-reporting is cheaper here than there: this answers a wait that is
+/// already happening rather than gating an action, and what it produces is a
+/// sentence saying a transaction *may* be responsible.
+pub fn write_blocking_tabs(tabs: &[TabTx], conn_id: u64, writer_tab: usize) -> Vec<usize> {
+    tabs.iter()
+        .filter(|t| t.tab_id != writer_tab && t.conn_id == conn_id && t.state.is_open())
+        .map(|t| t.tab_id)
+        .collect()
+}
+
+/// What to say about a write that hasn't come back yet — see [`write_wait_note`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitNote {
+    pub text: String,
+    /// The tab (id + title) to offer a one-click `ROLLBACK` for, when exactly
+    /// one of ours is a candidate.
+    ///
+    /// `None` for none — there is nothing of ours to end — and `None` for
+    /// several, where one button would have to choose, and choosing wrong
+    /// discards a transaction the user never meant to end. They can still roll
+    /// back any of the named tabs from its own status bar.
+    pub rollback: Option<(usize, String)>,
+}
+
+/// How long a grid write may be outstanding before Schemaic narrates the wait.
+///
+/// A commit that returns promptly needs no narration, and a note on every commit
+/// is noise the user learns to look past. Past this, round-trip time no longer
+/// explains it: a write batch is a handful of single-row statements, so what's
+/// left is a slow server or a lock — and the lock is the one the user can act on.
+pub const WRITE_WAIT_MS: u128 = 1500;
+
+/// The note for a write that has been outstanding `waited_ms`, given the tabs of
+/// ours holding a transaction on the same connection ([`write_blocking_tabs`],
+/// resolved to titles). `None` while the wait is still short enough to be
+/// ordinary.
+///
+/// Deliberately hedged ("may be holding"): Schemaic doesn't track which rows a
+/// transaction has touched, so an open transaction elsewhere is a *candidate*,
+/// not the diagnosis. Saying so plainly is still the difference between a hang
+/// with no explanation and a hang with one thing to try — and when the holder is
+/// the user's own second tab, which is the common case, it usually is the answer.
+/// The sentence deliberately doesn't name the tab: the **button** does, and a
+/// custom tab name is arbitrarily long — spelled into the sentence it pushed the
+/// bar's own action off the edge.
+pub fn write_wait_note(waited_ms: u128, holders: &[(usize, String)]) -> Option<WaitNote> {
+    if waited_ms < WRITE_WAIT_MS {
+        return None;
+    }
+    let (text, rollback) = match holders {
+        // Nothing of ours is a candidate, so there's no tab to offer and the
+        // sentence has to carry the whole answer.
+        [] => ("Another session may be holding the lock.", None),
+        [(id, title)] => (
+            "A transaction may be holding the lock.",
+            Some((*id, title.clone())),
+        ),
+        // No button (see `WaitNote::rollback`), so say that it's one of theirs —
+        // which tab is a question their own status bars answer.
+        _ => (
+            "One of your open transactions may be holding the lock.",
+            None,
+        ),
+    };
+    Some(WaitNote {
+        text: text.to_string(),
+        rollback,
+    })
+}
+
 /// The status-bar pill for a transaction, or `None` when there's nothing to say
 /// (no transaction open).
 pub fn pill_text(state: TxState) -> Option<String> {
@@ -888,5 +968,78 @@ mod tests {
             tab(4, 7, TxState::Poisoned { stmts: 3 }),
         ];
         assert_eq!(ddl_blocking_tabs(&tabs, 7), vec![1, 4]);
+    }
+
+    // ── Which transactions a *grid write* could be waiting behind ─────────
+
+    #[test]
+    fn a_writers_own_transaction_never_blocks_its_own_write() {
+        // The one case that parts from the DDL rule: the write runs on tab 3's
+        // own pinned session, inside that transaction. Naming it would send the
+        // user to roll back the very transaction they're writing into.
+        let tabs = [tab(3, 7, TxState::Open { stmts: 1 })];
+        assert!(write_blocking_tabs(&tabs, 7, 3).is_empty());
+        // …and the DDL path, which runs on a fresh connection, still queues
+        // behind it.
+        assert_eq!(ddl_blocking_tabs(&tabs, 7), vec![3]);
+    }
+
+    #[test]
+    fn another_tabs_transaction_on_the_connection_is_a_candidate() {
+        let tabs = [
+            tab(1, 7, TxState::Open { stmts: 2 }),
+            tab(2, 7, TxState::Idle),
+            tab(3, 8, TxState::Open { stmts: 1 }), // another connection
+            tab(4, 7, TxState::Lost),              // released on disconnect
+            tab(5, 7, TxState::Poisoned { stmts: 1 }),
+        ];
+        assert_eq!(write_blocking_tabs(&tabs, 7, 2), vec![1, 5]);
+    }
+
+    // ── What the user is told while a write waits ─────────────────────────
+
+    fn holder(id: usize, title: &str) -> (usize, String) {
+        (id, title.to_string())
+    }
+
+    #[test]
+    fn a_short_wait_says_nothing() {
+        // Every commit crosses the network; narrating that is noise.
+        assert_eq!(write_wait_note(WRITE_WAIT_MS - 1, &[]), None);
+        assert_eq!(write_wait_note(0, &[holder(3, "Query 3")]), None);
+    }
+
+    #[test]
+    fn a_wait_with_no_transaction_of_ours_still_names_the_likely_cause() {
+        // Nothing to offer, but "a lock" is the difference between a hang the
+        // user can reason about and one they can't.
+        let n = write_wait_note(WRITE_WAIT_MS, &[]).expect("note past the threshold");
+        assert_eq!(n.text, "Another session may be holding the lock.");
+        assert_eq!(n.rollback, None);
+    }
+
+    #[test]
+    fn one_open_transaction_is_offered_for_rollback() {
+        // The tab is named by the button, never by the sentence — a custom tab
+        // name is arbitrarily long.
+        let n = write_wait_note(WRITE_WAIT_MS, &[holder(3, "orders")]).expect("note");
+        assert_eq!(n.text, "A transaction may be holding the lock.");
+        assert_eq!(n.rollback, Some((3, "orders".to_string())));
+    }
+
+    #[test]
+    fn several_open_transactions_leave_the_choice_to_the_user() {
+        // A single button would have to choose one, and choosing wrong throws
+        // away a transaction the user never meant to end.
+        let n = write_wait_note(
+            WRITE_WAIT_MS * 4,
+            &[holder(3, "Query 3"), holder(5, "customers")],
+        )
+        .expect("note");
+        assert_eq!(
+            n.text,
+            "One of your open transactions may be holding the lock."
+        );
+        assert_eq!(n.rollback, None);
     }
 }

@@ -168,7 +168,16 @@ Zed-inspired, aiming to replace DataGrip.
     is not harmless** — after one, a Rollback runs as a successful no-op and reports an undo that
     never happened. `StmtOutcome::FailedIsolated` is what a `SAVEPOINT`-wrapped grid write reports,
     and it must not poison PostgreSQL, or one bad cell edit would tell the user their whole
-    transaction died. `pill_text` is the status-bar string.
+    transaction died. `pill_text` is the status-bar string. It also owns what the user is told
+    while a write **waits**: `write_blocking_tabs` (which of our own tabs' transactions a grid
+    write could be queued behind — same connection scope as `ddl_blocking_tabs`, but excluding
+    the writer's own tab, whose write runs *inside* that transaction) and `write_wait_note` →
+    `WaitNote` (the sentence after `WRITE_WAIT_MS`, plus the one tab to offer a `ROLLBACK` for —
+    `None` for several, since one button would have to pick and picking wrong ends a transaction
+    the user didn't mean to). The sentence never names the tab; **the button does**, clipped by
+    the bar — a custom tab name is arbitrarily long, and spelled into the sentence it pushed the
+    button off the edge. Deliberately hedged: Schemaic doesn't track which rows a
+    transaction touched, so an open one elsewhere is a *candidate*, not a diagnosis.
   - `format.rs` — per-column display formatters (`ColumnFormat`/`apply`: epoch→datetime, bytes,
     bool). Display-only; edit/copy stay raw. Persisted to `format.json`.
   - `connection.rs` — the saved-connection model. A `Connection` is a database **server**, not one
@@ -900,6 +909,18 @@ for keyboard nav.
   Inserts/deletes change membership/order → those commits **full-re-run** the query (pure-UPDATE
   splices in place). A NOT-NULL-no-default omission or duplicate-key clone fails the transaction and
   surfaces the error — nothing half-applied.
+- **A write that waits says so.** A commit can block indefinitely on another session's row lock,
+  and the grid used to sit there silently until `innodb_lock_wait_timeout` (50 s) turned it into a
+  bare error. Both write paths therefore `arm_wait_note` when they hand the write off: if it is
+  still in flight `WRITE_WAIT_MS` later, `tx::write_wait_note` fills `commit_wait` and the
+  panel-level bar (`grid_error_bar`, the same bar as a commit error — a write is either still
+  waiting or has failed, never both) states the wait and, when exactly one of the user's own
+  transactions could be the holder, offers **Roll back _tab_** straight into `rollback_tx`. That
+  last part is why the note is worth having: Schemaic owns both transactions, so it can name the
+  user's own second tab where every other tool can only hang. The bar is deliberately **not**
+  bounded like `run_ddl`'s `lock_wait_sql` — a timeout is right for a modal that refuses every
+  exit, wrong for a cell edit that could just have waited a moment longer. `commit_seq` is what
+  keeps an earlier commit's timer from narrating a later one.
 - **Type-aware headers** show `type_name` under the name (two-line, `GRID_HEADER_H`). A sorted column's
   name + chevron use `grid_sort()`; a column with selected cells gets a `grid_col_sel()` header
   background. **Key icons** (PK = gold key-round, single-col index = blue key-square, FK = purple
