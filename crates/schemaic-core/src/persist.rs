@@ -423,14 +423,23 @@ fn read_json<T: Default + for<'de> Deserialize<'de>>(path: Option<PathBuf>) -> T
     let Some(path) = path else {
         return T::default();
     };
+    read_bytes(&Fs, &path)
+}
+
+/// The load-and-recover ordering, over any [`FileStore`] — the other half of
+/// [`write_bytes`], and what makes the pair testable together.
+pub(crate) fn read_bytes<T: Default + for<'de> Deserialize<'de>>(
+    store: &dyn FileStore,
+    path: &Path,
+) -> T {
     // A crash between the staged write and the rename leaves a `.tmp` holding a
     // full copy of the file — nothing reads it, and only the rename-failure path
     // removed it, so it would sit there forever. Loading is the natural sweep
     // point: the next save re-creates its own.
-    let _ = std::fs::remove_file(sibling(&path, ".tmp"));
-    let primary = classify::<T>(std::fs::read(&path).ok().as_deref());
+    store.remove(&sibling(path, ".tmp"));
+    let primary = classify::<T>(store.read(path).ok().as_deref());
     let (value, corrupt) = recover(primary, || {
-        classify::<T>(std::fs::read(sibling(&path, ".bak")).ok().as_deref())
+        classify::<T>(store.read(&sibling(path, ".bak")).ok().as_deref())
     });
     if let Some(err) = corrupt {
         tracing::warn!(
@@ -441,9 +450,9 @@ fn read_json<T: Default + for<'de> Deserialize<'de>>(path: Option<PathBuf>) -> T
         // A released GUI build discards stderr, so also queue it for the error
         // modal — otherwise the user just sees their settings gone.
         if let Ok(mut v) = RECOVERIES.lock() {
-            v.push(recovery_notice(&path, &err));
+            v.push(recovery_notice(path, &err));
         }
-        let _ = std::fs::rename(&path, sibling(&path, ".corrupt"));
+        let _ = store.rename(path, &sibling(path, ".corrupt"));
     }
     value
 }
@@ -463,36 +472,85 @@ fn recovery_notice(path: &Path, err: &str) -> String {
     )
 }
 
+/// The filesystem operations the save/load dance needs, behind a seam.
+///
+/// The *decisions* on either side of this file are pure and tested — `classify`,
+/// `recover`, `sibling`. What had no test was the **composition**: that what
+/// `write_json` produces is what `recover` can actually recover from. That is
+/// the part deciding whether a user's connections, tabs and history survive a
+/// crash or a full disk, and it can't be reached without a filesystem.
+///
+/// So the filesystem becomes an argument, the way [`crate::secrets::SecretStore`]
+/// already does for the keyring — same reason, same shape. The house rule that
+/// tests stay off the disk stays intact, and the ordering can be asserted
+/// against an in-memory fake, including the failures a real disk won't stage on
+/// demand (a rename that won't work, a write that fails).
+pub(crate) trait FileStore {
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>>;
+    fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()>;
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
+    fn remove(&self, path: &Path);
+    /// Create the file's directory, owner-only where the platform has modes.
+    fn ensure_parent(&self, path: &Path);
+}
+
+/// The real filesystem.
+pub(crate) struct Fs;
+
+impl FileStore for Fs {
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        std::fs::read(path)
+    }
+    fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        write_private(path, bytes)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::rename(from, to)
+    }
+    fn remove(&self, path: &Path) {
+        let _ = std::fs::remove_file(path);
+    }
+    fn ensure_parent(&self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+            make_dir_private(parent);
+        }
+    }
+}
+
 fn write_json<T: Serialize>(path: Option<PathBuf>, value: &T) {
     let Some(path) = path else {
         return;
     };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-        make_dir_private(parent);
-    }
     let Ok(json) = serde_json::to_vec_pretty(value) else {
         return;
     };
-    // Write to a temp file then atomically rename over the target, so a crash
-    // mid-write can't truncate the real file (this JSON is the only copy). Keep
-    // the prior good version as `.bak` for recovery. All three paths hold the same
-    // bytes, so all three go through `write_private` — the rename carries the
-    // temp's mode onto the target.
-    let tmp = sibling(&path, ".tmp");
-    if write_private(&tmp, &json).is_err() {
+    write_bytes(&Fs, &path, &json);
+}
+
+/// The save ordering, over any [`FileStore`].
+///
+/// Write to a temp file, then atomically rename over the target, so a crash
+/// mid-write can't truncate the real file (this JSON is the only copy). Keep the
+/// prior good version as `.bak` for recovery. All three paths hold the same
+/// bytes, so all three go through the store's `write` — the rename carries the
+/// temp's mode onto the target.
+pub(crate) fn write_bytes(store: &dyn FileStore, path: &Path, json: &[u8]) {
+    store.ensure_parent(path);
+    let tmp = sibling(path, ".tmp");
+    if store.write(&tmp, json).is_err() {
         return;
     }
     // Re-write rather than `fs::copy`, which would carry the *old* file's mode
     // onto the backup — including a 0644 left by a build from before this.
-    if let Ok(prev) = std::fs::read(&path) {
-        let _ = write_private(&sibling(&path, ".bak"), &prev);
+    if let Ok(prev) = store.read(path) {
+        let _ = store.write(&sibling(path, ".bak"), &prev);
     }
-    if std::fs::rename(&tmp, &path).is_err() {
+    if store.rename(&tmp, path).is_err() {
         // Cross-device or transient rename failure: fall back to a direct write
         // rather than leaving only the temp file.
-        let _ = write_private(&path, &json);
-        let _ = std::fs::remove_file(&tmp);
+        let _ = store.write(path, json);
+        store.remove(&tmp);
     }
 }
 
@@ -581,10 +639,173 @@ pub fn clear_connections_backup() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectionsFile, Load, RECOVERIES, RightPanelState, UiState, classify, recover,
-        recovery_notice, sibling, take_recoveries,
+        ConnectionsFile, FileStore, Load, RECOVERIES, RightPanelState, UiState, classify,
+        read_bytes, recover, recovery_notice, sibling, take_recoveries, write_bytes,
     };
-    use std::path::Path;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    // ── The save/load composition ─────────────────────────────────────────
+    //
+    // `classify`, `recover` and `sibling` are each tested below. What wasn't,
+    // until this fake existed, is whether what `write_bytes` *produces* is what
+    // `recover` can actually recover *from* — the pair that decides whether a
+    // user's connections, tabs and history survive a crash or a full disk. The
+    // filesystem is the boundary being tested, so it is modelled rather than
+    // used, which keeps the no-disk rule intact and makes failures that a real
+    // disk won't stage on demand (a rename that won't work, a write that fails)
+    // ordinary test setup.
+
+    #[derive(Default)]
+    struct FakeFs {
+        files: RefCell<HashMap<PathBuf, Vec<u8>>>,
+        /// Paths whose `write` fails, and whether `rename` fails at all.
+        unwritable: RefCell<Vec<PathBuf>>,
+        rename_fails: RefCell<bool>,
+    }
+
+    impl FakeFs {
+        fn get(&self, path: &str) -> Option<Vec<u8>> {
+            self.files.borrow().get(Path::new(path)).cloned()
+        }
+        fn put(&self, path: &str, bytes: &str) {
+            self.files
+                .borrow_mut()
+                .insert(PathBuf::from(path), bytes.as_bytes().to_vec());
+        }
+        fn err() -> std::io::Error {
+            std::io::Error::other("fake")
+        }
+    }
+
+    impl FileStore for FakeFs {
+        fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            self.files
+                .borrow()
+                .get(path)
+                .cloned()
+                .ok_or_else(FakeFs::err)
+        }
+        fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+            if self.unwritable.borrow().iter().any(|p| p == path) {
+                return Err(FakeFs::err());
+            }
+            self.files
+                .borrow_mut()
+                .insert(path.to_path_buf(), bytes.to_vec());
+            Ok(())
+        }
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            if *self.rename_fails.borrow() {
+                return Err(FakeFs::err());
+            }
+            let Some(bytes) = self.files.borrow_mut().remove(from) else {
+                return Err(FakeFs::err());
+            };
+            self.files.borrow_mut().insert(to.to_path_buf(), bytes);
+            Ok(())
+        }
+        fn remove(&self, path: &Path) {
+            self.files.borrow_mut().remove(path);
+        }
+        fn ensure_parent(&self, _path: &Path) {}
+    }
+
+    const CFG: &str = "/cfg/ui.json";
+
+    /// Serialises the tests that touch [`RECOVERIES`], which is a process global:
+    /// one test asserting it holds exactly what it queued, and another whose
+    /// subject *is* a recovery and so queues a notice as a side effect. Without
+    /// this they race, and the failure looks like the wrong test's bug.
+    fn recovery_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn a_second_save_keeps_the_first_as_the_backup() {
+        let fs = FakeFs::default();
+        write_bytes(&fs, Path::new(CFG), br#""A""#);
+        write_bytes(&fs, Path::new(CFG), br#""B""#);
+        assert_eq!(fs.get(CFG).as_deref(), Some(&br#""B""#[..]));
+        assert_eq!(fs.get("/cfg/ui.json.bak").as_deref(), Some(&br#""A""#[..]));
+        // The staging file never survives a successful save.
+        assert!(fs.get("/cfg/ui.json.tmp").is_none());
+    }
+
+    #[test]
+    fn a_corrupt_primary_is_recovered_from_the_backup_a_save_left() {
+        // The whole point of the composition: these two halves have to agree
+        // about where the previous version lives.
+        let _guard = recovery_lock();
+        let fs = FakeFs::default();
+        write_bytes(&fs, Path::new(CFG), br#""A""#);
+        write_bytes(&fs, Path::new(CFG), br#""B""#);
+        fs.put(CFG, "{ this is not json");
+
+        let v: String = read_bytes(&fs, Path::new(CFG));
+        assert_eq!(v, "A", "the backup is what recovery reads");
+        // The unreadable original is preserved, not overwritten.
+        assert!(fs.get("/cfg/ui.json.corrupt").is_some());
+        // …and the user is told, in the notice the startup modal drains.
+        let notices = take_recoveries();
+        assert!(notices.iter().any(|n| n.contains("ui.json")), "{notices:?}");
+    }
+
+    #[test]
+    fn a_failed_rename_still_leaves_the_new_value_and_no_orphan() {
+        // The non-atomic fallback. It is the one path that writes the target
+        // directly, and the thing that must not happen is losing the value *and*
+        // leaving a stray `.tmp` holding it.
+        let fs = FakeFs::default();
+        write_bytes(&fs, Path::new(CFG), br#""A""#);
+        *fs.rename_fails.borrow_mut() = true;
+        write_bytes(&fs, Path::new(CFG), br#""B""#);
+
+        assert_eq!(fs.get(CFG).as_deref(), Some(&br#""B""#[..]));
+        assert!(fs.get("/cfg/ui.json.tmp").is_none(), "no orphaned temp");
+        let v: String = read_bytes(&fs, Path::new(CFG));
+        assert_eq!(v, "B");
+    }
+
+    #[test]
+    fn a_save_that_cannot_stage_leaves_the_previous_value_untouched() {
+        // A full disk. Failing before the rename is what makes this safe — the
+        // target and its backup must both still hold the last good version.
+        let fs = FakeFs::default();
+        write_bytes(&fs, Path::new(CFG), br#""A""#);
+        fs.unwritable
+            .borrow_mut()
+            .push(PathBuf::from("/cfg/ui.json.tmp"));
+        write_bytes(&fs, Path::new(CFG), br#""B""#);
+
+        assert_eq!(fs.get(CFG).as_deref(), Some(&br#""A""#[..]));
+        let v: String = read_bytes(&fs, Path::new(CFG));
+        assert_eq!(v, "A");
+    }
+
+    #[test]
+    fn loading_sweeps_an_orphaned_temp_from_a_crash() {
+        let fs = FakeFs::default();
+        write_bytes(&fs, Path::new(CFG), br#""A""#);
+        fs.put("/cfg/ui.json.tmp", r#""half-written"#);
+        let v: String = read_bytes(&fs, Path::new(CFG));
+        assert_eq!(v, "A");
+        assert!(fs.get("/cfg/ui.json.tmp").is_none());
+    }
+
+    #[test]
+    fn a_first_run_reads_defaults_and_writes_nothing() {
+        // An absent file is not a corrupt one: no `.corrupt` is left behind.
+        // (The recovery *notice* isn't asserted here — `RECOVERIES` is a process
+        // global, so a test that drains it steals from whichever test is running
+        // beside it.)
+        let fs = FakeFs::default();
+        let v: String = read_bytes(&fs, Path::new(CFG));
+        assert_eq!(v, String::default());
+        assert!(fs.get("/cfg/ui.json.corrupt").is_none());
+    }
 
     // ── Forward compatibility: an unknown enum variant must cost one field,
     //    not the whole file ───────────────────────────────────────────────────
@@ -735,6 +956,7 @@ mod tests {
 
     #[test]
     fn take_recoveries_drains_what_was_queued() {
+        let _guard = recovery_lock();
         RECOVERIES.lock().unwrap().push("first".to_string());
         RECOVERIES.lock().unwrap().push("second".to_string());
         assert_eq!(take_recoveries(), vec!["first", "second"]);
