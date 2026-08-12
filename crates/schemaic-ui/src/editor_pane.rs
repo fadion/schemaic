@@ -1981,19 +1981,22 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         });
     }
     // Floem's editor over-reports its content width on the first layout, so a
-    // spurious horizontal scrollbar flashes until the first scroll. Once the
-    // layout has settled, replay a tiny horizontal scroll (exactly what a manual
-    // scroll does) to force the content re-measure that clears it; empty/short
-    // content simply clamps back to the origin.
-    {
-        let ed_poke = ed.clone();
-        floem::action::exec_after(std::time::Duration::from_millis(200), move |_| {
-            // Guard: the tab (and this editor's scope) may be gone within 200 ms.
-            let _ = ed_poke
-                .scroll_delta
-                .try_update(|d| *d = floem::kurbo::Vec2::new(1.0, 0.0));
-        });
-    }
+    // spurious horizontal scrollbar shows until something makes the bars look
+    // again. Neither input the bars measure is a signal — `max_line_width()` is a
+    // plain read and the viewport is only correct once the final editor style has
+    // been applied — so the bar closures have no way to see the layout settle.
+    // This generation is what tells them: bumped once the layout has, it re-runs
+    // both style closures against the settled numbers.
+    //
+    // It must NOT be a scroll. This was a 1px `scroll_delta`, which re-ran the
+    // closures as a side effect of moving the viewport — and left it moved: a
+    // document wide enough to scroll stayed parked 1px in, so every tab switch
+    // nudged the text left by a pixel and only a short document clamped back.
+    let bar_gen: RwSignal<u64> = RwSignal::new(0);
+    floem::action::exec_after(std::time::Duration::from_millis(200), move |_| {
+        // Guard: the tab (and this editor's scope) may be gone within 200 ms.
+        let _ = bar_gen.try_update(|g| *g += 1);
+    });
     let doc = editor.doc();
     let input = editor
         .styling(sql_highlight::SqlStyling::new(
@@ -2301,6 +2304,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         let vid = v.id();
         v.style(move |s| {
             let _ = query.get(); // re-run on edits (content height isn't a signal)
+            let _ = bar_gen.get(); // re-run once the first layout has settled
             let vp = ed_vbar.viewport.get();
             let Some((track_h, thumb_h, max_scroll)) = v_geo(&ed_vbar) else {
                 return s.hide();
@@ -2393,6 +2397,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         h.style(move |s| {
             let _ = query.get(); // re-run on edits (content width isn't a signal)
             let _ = area_w.get(); // re-run on pane resize
+            let _ = bar_gen.get(); // re-run once the first layout has settled
             let vp = ed_hbar.viewport.get();
             let Some((avail, thumb_w, max_scroll)) = h_geo(&ed_hbar) else {
                 return s.hide();
