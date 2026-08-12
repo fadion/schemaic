@@ -19,7 +19,7 @@ use schemaic_core::connection::SshAuth;
 use crate::consts::MASK_CH;
 use crate::settings::{settings_dropdown, settings_toggle_row};
 use crate::widgets::{
-    autohide, loading_dots, measure_px, menu_item_style, modal_title, panel_style,
+    autohide, loading_dots, measure_text_px_at, menu_item_style, modal_title, panel_style,
 };
 use crate::{DraftSignals, FieldCfg, Ui, edit_field, icons, theme};
 
@@ -665,7 +665,7 @@ fn conn_form(
         // (left-anchored) so entering/leaving the testing state — and the dots
         // cycling within it — never shift the text.
         {
-            let reserved = measure_px("Test...", theme::FONT_BODY) + 2.0;
+            let reserved = measure_text_px_at("Test...", theme::FONT_BODY) + 2.0;
             dyn_container(
                 move || conn_test.get() == crate::TestState::Testing,
                 move |testing| {
@@ -700,7 +700,7 @@ fn conn_form(
     // Fixed width sized for the widest state ("✓ Saved": 15px icon + 6px gap +
     // text), with the content right-aligned, so swapping in the confirm icon never
     // widens the button and shifts the Test button sitting to its left.
-    let saved_w = 15.0 + 6.0 + measure_px("Saved", theme::FONT_BODY) + 2.0;
+    let saved_w = 15.0 + 6.0 + measure_text_px_at("Saved", theme::FONT_BODY) + 2.0;
     let save_btn = container(dyn_container(
         move || save_flash.get(),
         move |flashed| {

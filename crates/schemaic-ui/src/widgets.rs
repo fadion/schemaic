@@ -680,11 +680,32 @@ pub(crate) fn measure_text_px_bold_at(text: &str, size: f32) -> f64 {
     measure_text_px_weighted(text, size, true)
 }
 
+/// As [`measure_text_px_at`], but in the app's monospace family — what the SQL
+/// surfaces (the Ctrl+K diff, the DDL preview's script box) actually render with.
+///
+/// A measurement in the wrong family is the same class of error as one in the
+/// wrong weight, and it is the one the diff used to make *without* measuring at
+/// all: it multiplied a `chars().count()` by a comment-documented advance
+/// (`8.43`). That is exact for ASCII and half the truth for a full-width glyph,
+/// so a line with CJK text in a string literal reported a content width narrower
+/// than it draws, and the horizontal scrollbar stopped before the end of the line.
+pub(crate) fn measure_mono_px_at(text: &str, size: f32) -> f64 {
+    measure_text_px_styled(text, size, false, true)
+}
+
 fn measure_text_px_weighted(text: &str, size: f32, bold: bool) -> f64 {
-    use floem::text::{Attrs, AttrsList, TextLayout, Weight};
+    measure_text_px_styled(text, size, bold, false)
+}
+
+fn measure_text_px_styled(text: &str, size: f32, bold: bool, mono: bool) -> f64 {
+    use floem::text::{Attrs, AttrsList, FamilyOwned, TextLayout, Weight};
+    let family = [FamilyOwned::Name(crate::consts::MONO_FAMILY.into())];
     let mut attrs = Attrs::new().font_size(size);
     if bold {
         attrs = attrs.weight(Weight::BOLD);
+    }
+    if mono {
+        attrs = attrs.family(&family);
     }
     let mut layout = TextLayout::new();
     layout.set_text(text, AttrsList::new(attrs));
@@ -1080,15 +1101,6 @@ pub(crate) fn debounced(src: RwSignal<String>, delay: std::time::Duration) -> Rw
     out
 }
 
-/// Rendered pixel width of `text` at `font_size` in the app's default font, via a
-/// throwaway `TextLayout` (same global `FontSystem` the label renders with).
-pub(crate) fn measure_px(text: &str, font_size: f32) -> f64 {
-    use floem::text::{Attrs, AttrsList, TextLayout};
-    let mut layout = TextLayout::new();
-    layout.set_text(text, AttrsList::new(Attrs::new().font_size(font_size)));
-    layout.size().width
-}
-
 /// A wrapping text view that tints every case-insensitive occurrence of `term`
 /// with the search-match colour (bold), the rest in `base` — the same match rule
 /// (`text_ops::find_matches`) and colour as the global-search palette, but built on
@@ -1147,7 +1159,7 @@ pub(crate) fn loading_dots(
     // as the dots cycle (1→2→3) — otherwise it reflows, jittering when centred (the
     // query runner) or shoving a neighbour (Ctrl+K's Cancel). +2px guards sub-pixel
     // rounding so the 3-dot state never exceeds the reserved box.
-    let w = measure_px(&format!("{prefix}..."), font_size) + 2.0;
+    let w = measure_text_px_at(&format!("{prefix}..."), font_size) + 2.0;
     fn tick(step: RwSignal<usize>) {
         floem::action::exec_after(std::time::Duration::from_millis(400), move |_| {
             if step
@@ -1336,6 +1348,40 @@ mod measure_tests {
         assert!(
             measure_text_px_bold_at(n, 13.0) - measure_text_px_at(n, 13.0) > 6.0,
             "the regression this guards needs the drift to exceed node_width's slack"
+        );
+    }
+
+    #[test]
+    fn a_wide_glyph_is_wider_than_a_char_count_predicts() {
+        // The Ctrl+K diff used to size its scroll extent as `chars().count()`
+        // times a fixed advance. In a monospace font a full-width glyph occupies
+        // *two* advances while counting as one `char`, so the content width came
+        // out at half the truth and the h-scrollbar stopped before the end of the
+        // line. Ctrl+K sends the editor buffer, so any CJK string literal in the
+        // user's own SQL reaches it.
+        crate::fonts::load_fonts();
+        let advance = measure_mono_px_at("0", 14.0);
+        let ascii = "abcdefgh"; // 8 chars
+        let wide = "日本語"; // 3 chars, ~6 advances
+
+        // The baseline the old arithmetic assumed, and where it held.
+        assert!((measure_mono_px_at(ascii, 14.0) - 8.0 * advance).abs() < 1.0);
+        // …and where it didn't: 3 chars measuring well past 3 advances.
+        assert!(
+            measure_mono_px_at(wide, 14.0) > 3.0 * advance * 1.5,
+            "a full-width glyph must measure wider than its char count implies"
+        );
+    }
+
+    #[test]
+    fn the_mono_measurement_is_not_the_proportional_one() {
+        // Measuring monospace text with the default family is the same class of
+        // error as measuring bold text at regular weight — silently narrow.
+        crate::fonts::load_fonts();
+        let s = "iiiiiiiiii"; // the letter proportional fonts make narrowest
+        assert!(
+            measure_mono_px_at(s, 14.0) > measure_text_px_at(s, 14.0),
+            "monospace must not be measured with the proportional family"
         );
     }
 }

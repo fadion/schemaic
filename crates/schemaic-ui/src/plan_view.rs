@@ -25,7 +25,8 @@ use schemaic_core::plan::{PlanWarningKind, QueryPlan};
 use crate::settings::themed_toggle;
 use crate::theme::{FONT_BODY, FONT_LABEL};
 use crate::widgets::{
-    autohide, loading_dots, measure_px, modal_title_borderless, panel_style, shift_hscroll,
+    autohide, loading_dots, measure_text_px_at, measure_text_px_bold_at, modal_title_borderless,
+    panel_style, shift_hscroll,
 };
 use crate::{PlanState, RightPanel, Ui, icons, theme};
 
@@ -237,12 +238,17 @@ fn plan_table(plan: &QueryPlan) -> AnyView {
     let ncols = plan.columns.len();
     let mut widths = vec![0.0f64; ncols];
     for (i, h) in plan.columns.iter().enumerate() {
-        widths[i] = measure_px(h, FONT_BODY);
+        // Measured the way it is *drawn*: bold, at `FONT_LABEL`. It used to be
+        // measured regular at `FONT_BODY` — two mismatches, one of them silent
+        // only because the two sizes happen to be equal today. Bold glyphs are
+        // wider, so a header sized from the regular measurement ellipsizes its
+        // own title, which is the bug the ER-diagram cards had.
+        widths[i] = measure_text_px_bold_at(h, FONT_LABEL);
     }
     for row in &plan.rows {
         for (i, cell) in row.iter().enumerate() {
             if i < ncols {
-                widths[i] = widths[i].max(measure_px(cell, FONT_BODY));
+                widths[i] = widths[i].max(measure_text_px_at(cell, FONT_BODY));
             }
         }
     }
