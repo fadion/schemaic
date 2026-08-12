@@ -3,6 +3,8 @@
 //! selection the caret should occupy, which the UI applies in a single
 //! `edit_single` (so it's one undo step).
 
+use crate::intel::SqlDialect;
+
 /// SQL line-comment token.
 const TOKEN: &str = "--";
 
@@ -26,7 +28,22 @@ pub struct LineEdit {
 ///   into the span (matches typical editor behaviour when shift-selecting down).
 /// - The returned selection spans the affected lines' new extent, so a repeated
 ///   Ctrl+/ keeps toggling the same block.
-pub fn toggle_line_comment(text: &str, sel_start: usize, sel_end: usize) -> LineEdit {
+/// - **A line whose first non-whitespace column is inside a string literal is
+///   left untouched**, and is not counted when deciding comment-vs-uncomment.
+///   Inserting `-- ` there doesn't comment anything out: it edits the *data* the
+///   statement writes, silently, and the statement still parses and still runs.
+///   That is what `dialect` is for — `$$…$$` is a string on PostgreSQL and two
+///   operators on MySQL, so the same buffer has two different answers.
+///
+/// A line inside a **block comment** does toggle. A nested `--` there is inert,
+/// and refusing would make Ctrl+/ do nothing on a commented-out block, which is
+/// where people reach for it most.
+pub fn toggle_line_comment(
+    text: &str,
+    sel_start: usize,
+    sel_end: usize,
+    dialect: SqlDialect,
+) -> LineEdit {
     let len = text.len();
     let lo = sel_start.min(sel_end).min(len);
     let hi = sel_start.max(sel_end).min(len);
@@ -40,12 +57,36 @@ pub fn toggle_line_comment(text: &str, sel_start: usize, sel_end: usize) -> Line
         last -= 1;
     }
 
+    // Which lines in the span are ours to touch.
+    //
+    // Only a string that opened *before* the span protects its lines. If the
+    // span starts in code, every literal inside it is being commented out whole,
+    // token and all — so commenting each of its lines is exactly what was asked
+    // and it round-trips. If the span starts inside a literal, the opening quote
+    // is staying put and a `-- ` would land in the data, so those lines are left
+    // alone. That is the difference between "comment out this statement" and
+    // "comment out the middle of the string it writes".
+    let span_starts_in_string =
+        crate::pairs::region_at(text, starts[first], dialect) == crate::pairs::Region::Str;
+    let in_string: Vec<bool> = (first..=last)
+        .map(|i| {
+            if !span_starts_in_string {
+                return false;
+            }
+            let content = lines[i];
+            let indent_len = content.len() - content.trim_start().len();
+            crate::pairs::region_at(text, starts[i] + indent_len, dialect)
+                == crate::pairs::Region::Str
+        })
+        .collect();
+    let editable = |i: usize| !in_string[i - first];
+
     // Decide comment vs uncomment from the non-blank lines in the span.
     let mut all_commented = true;
     let mut any_nonblank = false;
-    for line in &lines[first..=last] {
+    for (i, line) in lines[first..=last].iter().enumerate() {
         let trimmed = line.trim_start();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || in_string[i] {
             continue;
         }
         any_nonblank = true;
@@ -62,8 +103,9 @@ pub fn toggle_line_comment(text: &str, sel_start: usize, sel_end: usize) -> Line
             continue;
         }
         let trimmed = content.trim_start();
-        // Leave blank lines untouched when toggling a real (has-content) block.
-        if trimmed.is_empty() && any_nonblank {
+        // Leave blank lines untouched when toggling a real (has-content) block,
+        // and lines that are string contents rather than code.
+        if (trimmed.is_empty() && any_nonblank) || !editable(i) {
             out.push(content.to_string());
             continue;
         }
@@ -456,7 +498,76 @@ mod tests {
     use super::*;
 
     fn toggled(text: &str, a: usize, b: usize) -> String {
-        toggle_line_comment(text, a, b).text
+        toggle_line_comment(text, a, b, SqlDialect::MySql).text
+    }
+
+    // ── A comment token inside a string literal is data, not a comment ────
+
+    #[test]
+    fn a_line_inside_a_string_literal_is_left_alone() {
+        // The whole defect: this still parses and still runs, and writes
+        // `alpha\n-- beta` where the user wrote `alpha\nbeta`. Nothing on screen
+        // says the token landed in data rather than in code.
+        let src = "INSERT INTO t VALUES ('alpha\nbeta');";
+        let line2 = src.find("beta").unwrap();
+        assert_eq!(toggled(src, line2, line2), src);
+    }
+
+    #[test]
+    fn the_line_that_opens_the_string_still_comments() {
+        // Only the *continuation* lines are inside the literal. Line 1 starts in
+        // code, so commenting it out is exactly what the user asked for.
+        let src = "INSERT INTO t VALUES ('alpha\nbeta');";
+        assert_eq!(
+            toggled(src, 0, 0),
+            "-- INSERT INTO t VALUES ('alpha\nbeta');"
+        );
+    }
+
+    #[test]
+    fn commenting_a_whole_statement_takes_its_string_with_it_and_round_trips() {
+        // The span starts in code, so the literal is being commented out whole —
+        // opening quote included. Every line gets the token, which is what the
+        // user asked for and is inert, and toggling back restores the original.
+        // Protecting the continuation line here would be *worse* than not: the
+        // block would half-comment, and the uncomment pass would then see a line
+        // that is no longer inside any string and comment everything again.
+        let src = "SELECT 1;\nINSERT INTO t VALUES ('alpha\nbeta');\nSELECT 2;";
+        let out = toggled(src, 0, src.len());
+        assert_eq!(
+            out,
+            "-- SELECT 1;\n-- INSERT INTO t VALUES ('alpha\n-- beta');\n-- SELECT 2;"
+        );
+        assert_eq!(toggled(&out, 0, out.len()), src);
+    }
+
+    #[test]
+    fn a_selection_starting_inside_a_string_protects_it_and_still_comments_the_code_after() {
+        // Drag from inside the literal past its end. The opening quote isn't
+        // moving, so the lines still inside it are data; the statement after it
+        // is code and comments normally.
+        let src = "INSERT INTO t VALUES ('alpha\nbeta');\nSELECT 2;";
+        let from = src.find("beta").unwrap();
+        assert_eq!(
+            toggled(src, from, src.len()),
+            "INSERT INTO t VALUES ('alpha\nbeta');\n-- SELECT 2;"
+        );
+    }
+
+    #[test]
+    fn a_dollar_quoted_body_is_protected_on_postgres_only() {
+        // `$$…$$` is a string on PG and not on MySQL, so the same buffer answers
+        // differently — which is why this takes a dialect rather than assuming.
+        let src = "CREATE FUNCTION f() RETURNS int AS $$\nSELECT 1;\n$$ LANGUAGE sql;";
+        let line2 = src.find("SELECT 1").unwrap();
+        assert_eq!(
+            toggle_line_comment(src, line2, line2, SqlDialect::Postgres).text,
+            src
+        );
+        assert_ne!(
+            toggle_line_comment(src, line2, line2, SqlDialect::MySql).text,
+            src
+        );
     }
 
     #[test]
@@ -475,7 +586,7 @@ mod tests {
         let once = toggled(src, 0, 0);
         assert_eq!(once, "-- SELECT 1");
         // Re-toggle the same line (whole-line selection returned by the first call).
-        let sel = toggle_line_comment(src, 0, 0).sel;
+        let sel = toggle_line_comment(src, 0, 0, SqlDialect::MySql).sel;
         assert_eq!(toggled(&once, sel.0, sel.1), "SELECT 1");
     }
 
@@ -613,7 +724,7 @@ mod tests {
     #[test]
     fn selection_spans_affected_lines() {
         let src = "SELECT a\nFROM t";
-        let ed = toggle_line_comment(src, 0, src.len());
+        let ed = toggle_line_comment(src, 0, src.len(), SqlDialect::MySql);
         // Whole new text is two commented lines; selection covers both.
         assert_eq!(ed.sel, (0, ed.text.len()));
     }
