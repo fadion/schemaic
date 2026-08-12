@@ -89,7 +89,7 @@ use schemaic_core::history::HistoryEntry;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{CommitDone, GridWrite, QueryState, RefetchRequest};
 use schemaic_core::resource::ResourceSample;
-use schemaic_core::tx::{TxMode, TxState};
+use schemaic_core::tx::{TabTx, TxMode, TxState, write_blocking_tabs};
 
 /// The grid-commit completion callback, invoked on the UI thread with the outcome.
 pub type CommitDoneFn = Rc<dyn Fn(CommitDone)>;
@@ -2886,6 +2886,9 @@ fn center(ui: Ui) -> impl IntoView {
     let run_anyway = ui.tab_actions.run_anyway.clone();
     let run_guard = ui.overlay.run_guard;
     let cancel = ui.tab_actions.cancel.clone();
+    // For the results bar's wait note: the way out when the transaction holding
+    // a write up is one of the user's own.
+    let rollback_tx = ui.tab_actions.rollback_tx.clone();
     let db_nodes = ui.schema.db_nodes;
     let inline_ai = ui.ai.inline;
     let inline_ai_run = ui.ai_actions.inline_run.clone();
@@ -3141,9 +3144,37 @@ fn center(ui: Ui) -> impl IntoView {
                     find_total: RwSignal::new(0),
                     find_pos: RwSignal::new(0),
                     find_more: RwSignal::new(false),
-                    // Commit-error bar (bottom) — its own per-tab-render signal;
+                    // Commit-status bar (bottom) — its own per-tab-render signals;
                     // "View" opens the shared workspace error modal with its text.
                     commit_err: RwSignal::new(None),
+                    commit_wait: RwSignal::new(None),
+                    tx_holders: {
+                        // Answered when a write has been waiting a while, not at
+                        // build time: the user can open (or end) a transaction in
+                        // another tab while this one is queued behind it.
+                        let tabs = tabs;
+                        Rc::new(move || {
+                            let conn = tab.conn_id.get_untracked();
+                            let snapshot = tabs.with_untracked(|v| {
+                                v.iter()
+                                    .map(|t| TabTx {
+                                        tab_id: t.id,
+                                        conn_id: t.conn_id.get_untracked(),
+                                        state: t.tx.get_untracked(),
+                                    })
+                                    .collect::<Vec<_>>()
+                            });
+                            write_blocking_tabs(&snapshot, conn, tab.id)
+                                .into_iter()
+                                .filter_map(|id| {
+                                    tabs.with_untracked(|v| {
+                                        v.iter().find(|t| t.id == id).map(|t| (id, t.title()))
+                                    })
+                                })
+                                .collect()
+                        })
+                    },
+                    rollback_tx: rollback_tx.clone(),
                     error_open: error_modal_open,
                     error_text: error_modal_text,
                 },
@@ -3221,6 +3252,7 @@ fn results_section(
     let (find_open, find_query, find_step) = (gctx.find_open, gctx.find_query, gctx.find_step);
     let (find_total, find_pos, find_more) = (gctx.find_total, gctx.find_pos, gctx.find_more);
     let (commit_err, error_open, error_text) = (gctx.commit_err, gctx.error_open, gctx.error_text);
+    let (commit_wait, rollback_tx) = (gctx.commit_wait, gctx.rollback_tx.clone());
     let view_err = gctx.view_err;
     // Live Monitor: watch the tab's source table. Captured before `gctx` moves.
     let open_monitor = gctx.open_monitor.clone();
@@ -3289,7 +3321,14 @@ fn results_section(
         grid_find_bar(
             find_open, find_query, find_step, find_total, find_pos, find_more,
         ),
-        grid_error_bar(commit_err, view_err, error_open, error_text),
+        grid_error_bar(
+            commit_err,
+            view_err,
+            commit_wait,
+            rollback_tx,
+            error_open,
+            error_text,
+        ),
     ))
     .style(|s| {
         s.width_full()

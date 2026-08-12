@@ -42,11 +42,12 @@ use schemaic_core::schema::{DbSchema, ForeignKeyInfo, SchemaState, TableInfo, Ta
 use schemaic_core::summary;
 use schemaic_core::text::plural;
 use schemaic_core::text_ops::contains_ignore_ascii_case;
+use schemaic_core::tx::{WRITE_WAIT_MS, WaitNote, write_wait_note};
 
 use crate::consts::*;
 use crate::widgets::{
-    MenuEntry, autohide, autohide_state, centered_msg, measure_text_px, shift_hscroll, thin_scroll,
-    toolbar_icon, verb_spinner,
+    MenuEntry, autohide, autohide_state, centered_msg, loading_dots, measure_text_px,
+    shift_hscroll, thin_scroll, toolbar_icon, verb_spinner,
 };
 use crate::{ConnNode, FieldCfg, PopupAnchor, edit_field, icons, theme};
 
@@ -298,6 +299,16 @@ struct GridState {
     edit_model: RwSignal<Arc<EditModel>>,
     /// True while a commit is executing (disables re-entry).
     commit_busy: RwSignal<bool>,
+    /// Bumped per commit, so a wait-note timer armed for an earlier one is
+    /// recognisable as stale when it fires during a later one.
+    commit_seq: RwSignal<u64>,
+    /// Set once the in-flight commit has been outstanding long enough to be
+    /// worth explaining (see [`write_wait_note`]); rendered in the same bottom
+    /// bar as `commit_err`, cleared when the write returns.
+    commit_wait: RwSignal<Option<WaitNote>>,
+    /// Which of the user's other tabs hold an open transaction that this tab's
+    /// write could be queued behind — the wait note's subject.
+    tx_holders: RwSignal<Option<TxHoldersFn>>,
     /// Last commit error, shown in the toolbar until the next edit/commit.
     commit_err: RwSignal<Option<String>>,
     /// Ui-level popup-menu signal, for the header/cell right-click menus.
@@ -472,7 +483,10 @@ impl GridState {
             del_rows: RwSignal::new(HashSet::new()),
             edit_model: RwSignal::new(Arc::new(EditModel::default())),
             commit_busy: RwSignal::new(false),
+            commit_seq: RwSignal::new(0),
             // Shared with the panel-level error bar (rendered in `results_section`).
+            commit_wait: gctx.commit_wait,
+            tx_holders: RwSignal::new(Some(gctx.tx_holders.clone())),
             commit_err: gctx.commit_err,
             popup: gctx.popup,
             popup_anchor: gctx.popup_anchor,
@@ -1677,6 +1691,12 @@ fn follow_relation(gs: GridState, data_idx: usize, spec: &FollowSpec) {
     }
 }
 
+/// Which of the user's *other* tabs hold an open transaction on this tab's
+/// connection — `(tab id, title)`, in tab order. Answered live (the set changes
+/// under the write), by the UI root, which is what holds the tab list; the rule
+/// itself is `schemaic_core::tx::write_blocking_tabs`.
+pub(crate) type TxHoldersFn = Rc<dyn Fn() -> Vec<(usize, String)>>;
+
 /// Bundle of app-provided context the results grid needs, threaded from
 /// `query_pane` down through the results-view chain.
 #[derive(Clone)]
@@ -1771,6 +1791,16 @@ pub(crate) struct GridCtx {
     /// Last commit error (grid write-back), shown in a bottom error bar at the
     /// panel level (like the find bar at the top). Cleared by the next edit/commit.
     pub(crate) commit_err: RwSignal<Option<String>>,
+    /// What to say about a write that hasn't come back yet, once it has been
+    /// waiting long enough to be worth saying anything (`tx::write_wait_note`).
+    /// Shares the bottom bar with `commit_err` — a write is either still waiting
+    /// or has failed, never both.
+    pub(crate) commit_wait: RwSignal<Option<WaitNote>>,
+    /// The tabs the wait note can name (see [`TxHoldersFn`]).
+    pub(crate) tx_holders: TxHoldersFn,
+    /// `ROLLBACK` another tab's transaction — the wait note's one-click way out
+    /// when exactly one transaction of the user's own could be the holder.
+    pub(crate) rollback_tx: Rc<dyn Fn(usize)>,
     /// The workspace error modal (shared with the editor error bar): `error_open`
     /// reveals it; the grid's "View" first sets `error_text` to the full commit
     /// error so the modal shows that instead of the tab's query error.
@@ -1778,23 +1808,43 @@ pub(crate) struct GridCtx {
     pub(crate) error_text: RwSignal<Option<String>>,
 }
 
-/// The grid's commit-error bar, rendered at the RESULTS-panel level so it pins to
+/// The grid's commit-status bar, rendered at the RESULTS-panel level so it pins to
 /// the panel's bottom edge — same look/position as the editor error bar (the red
 /// `reject_bg` fill, rounded, 5px insets, 35px tall). The one-lined message on the
 /// left, a right-aligned **View** that opens the full error in the shared modal
 /// (via a text override). Absolute → overlays the panel out of flow.
+///
+/// It carries two things, and they can't coincide — a write is either still
+/// waiting or has come back and failed:
+/// - an **error** (commit write-back, or a filter/sort re-run), in the red fill;
+/// - a **wait note** for a write that is taking long enough to need explaining
+///   ([`arm_wait_note`]), on the ordinary chrome surface, with a one-click
+///   `Rollback` when exactly one transaction of the user's own could be the
+///   holder. It uses the footer's `tx_rollback` colour deliberately: it is the
+///   same action on the same surface, and the two should never diverge.
 pub(crate) fn grid_error_bar(
     commit_err: RwSignal<Option<String>>,
     view_err: RwSignal<Option<String>>,
+    commit_wait: RwSignal<Option<WaitNote>>,
+    rollback_tx: Rc<dyn Fn(usize)>,
     error_open: RwSignal<bool>,
     error_text: RwSignal<Option<String>>,
 ) -> impl IntoView {
-    // Shows a commit write-back error or a filter/sort re-run error (commit first).
-    // Both use the same style/position + View → full text in the shared modal.
-    let current = move || commit_err.get().or_else(|| view_err.get());
-    dyn_container(current, move |err| {
-        let Some(msg) = err else {
-            return empty().into_any();
+    // An error wins: it describes a write that is already over, while the wait
+    // note describes one still in flight (and every path clears the note before
+    // reporting a failure anyway).
+    let current = move || {
+        commit_err
+            .get()
+            .or_else(|| view_err.get())
+            .map(Err)
+            .or_else(|| commit_wait.get().map(Ok))
+    };
+    dyn_container(current, move |state| {
+        let msg = match state {
+            None => return empty().into_any(),
+            Some(Ok(note)) => return wait_bar(note, rollback_tx.clone()).into_any(),
+            Some(Err(msg)) => msg,
         };
         // Collapse to a single line (a multi-line server error would spill out
         // the top); the full text stays available in the View modal.
@@ -1831,7 +1881,7 @@ pub(crate) fn grid_error_bar(
         .into_any()
     })
     .style(move |s| {
-        if commit_err.get().is_some() || view_err.get().is_some() {
+        if commit_err.get().is_some() || view_err.get().is_some() || commit_wait.get().is_some() {
             s.absolute()
                 .inset_left(5.0)
                 .inset_right(5.0)
@@ -1840,6 +1890,54 @@ pub(crate) fn grid_error_bar(
         } else {
             s
         }
+    })
+}
+
+/// The wait-note half of [`grid_error_bar`]: the sentence, and — when there is
+/// exactly one candidate — the button that ends it.
+///
+/// The tab name is the user's to choose and can be any length, so the button
+/// clips it: an untruncated one pushed the button past the bar's right edge and
+/// squeezed the sentence out.
+fn wait_bar(note: WaitNote, rollback_tx: Rc<dyn Fn(usize)>) -> impl IntoView {
+    const TAB_NAME_MAX: usize = 10;
+    let action = match note.rollback {
+        None => empty().into_any(),
+        Some((tab_id, title)) => text(format!("Roll back {}", truncate(&title, TAB_NAME_MAX)))
+            .on_click_stop(move |_| (rollback_tx)(tab_id))
+            .style(|s| {
+                // Never shrinks: the sentence is the part that may ellipsize, and
+                // `margin_left` is a real gap even when the flex spacer between
+                // them has been squeezed to nothing.
+                s.color(theme::tx_rollback())
+                    .font_size(theme::FONT_BODY)
+                    .flex_shrink(0.0_f32)
+                    .margin_left(12.0)
+                    .margin_right(8.0)
+                    .hover(|s| s.color(theme::tx_rollback_hover()))
+            })
+            .into_any(),
+    };
+    h_stack((
+        text(note.text).style(|s| {
+            s.color(theme::text())
+                .font_size(theme::FONT_BODY)
+                .max_width_pct(80.0)
+                .text_ellipsis()
+                .margin_left(8.0)
+        }),
+        empty().style(|s| s.flex_grow(1.0_f32)),
+        action,
+    ))
+    .style(|s| {
+        s.flex_row()
+            .items_center()
+            .width_full()
+            .height_full()
+            .background(theme::bg_deepest())
+            .border(1.0)
+            .border_color(theme::border())
+            .border_radius(5.0)
     })
 }
 
@@ -2486,6 +2584,40 @@ fn start_edit(gs: GridState, i: usize, ci: usize) {
     gs.edit_cell.set(Some((i, ci)));
 }
 
+/// Start the clock on a write that has just been handed to the app: if it is
+/// still in flight [`WRITE_WAIT_MS`] from now, say so — and name what of the
+/// user's own might be holding it up.
+///
+/// The wait is the *point* of this, so there is no cancelling and no timeout;
+/// the write keeps waiting and the note keeps standing until it returns. Called
+/// by both write paths (the staged batch and the row panel's Save), and the
+/// per-commit `commit_seq` is what stops an earlier commit's timer from
+/// narrating a later one.
+fn arm_wait_note(gs: GridState) {
+    let seq = gs.commit_seq.get_untracked().wrapping_add(1);
+    gs.commit_seq.set(seq);
+    gs.commit_wait.set(None);
+    floem::action::exec_after(
+        std::time::Duration::from_millis(WRITE_WAIT_MS as u64),
+        move |_| {
+            // Fires later than the frame that scheduled it, so the grid may be
+            // gone (tab switched, query re-run) — see `GridState::alive`.
+            if !gs.alive()
+                || gs.commit_seq.get_untracked() != seq
+                || !gs.commit_busy.get_untracked()
+            {
+                return;
+            }
+            let holders = gs
+                .tx_holders
+                .get_untracked()
+                .map(|f| (f)())
+                .unwrap_or_default();
+            gs.commit_wait.set(write_wait_note(WRITE_WAIT_MS, &holders));
+        },
+    );
+}
+
 /// Execute all staged edits (Ctrl+Enter or the toolbar ✓). The app runs them
 /// transactionally, then — when the result is a spliceable single table — re-
 /// fetches just the edited rows and hands them back so the grid splices them in
@@ -2523,8 +2655,10 @@ fn commit_grid(gs: GridState) {
     };
     gs.commit_busy.set(true);
     gs.commit_err.set(None);
+    arm_wait_note(gs);
     let done: Rc<dyn Fn(CommitDone)> = Rc::new(move |outcome| {
         gs.commit_busy.set(false);
+        gs.commit_wait.set(None);
         match outcome {
             // Fresh DB values for the edited rows — splice in place, keep scroll.
             CommitDone::Spliced(rows) => gs.apply_splice(rows, &committed),
@@ -2654,8 +2788,10 @@ fn commit_row_update(
     gs.edit_row_saving.set(true);
     gs.commit_busy.set(true);
     gs.edit_row_err.set(None);
+    arm_wait_note(gs);
     let done: Rc<dyn Fn(CommitDone)> = Rc::new(move |outcome| {
         gs.commit_busy.set(false);
+        gs.commit_wait.set(None);
         gs.edit_row_saving.set(false);
         match outcome {
             CommitDone::Spliced(rows) => {
@@ -3835,13 +3971,21 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
             ))
             .style(move |s| s.width_full().max_height(max_rows.get() as f64));
 
+            // Status line: the validation/DB error, or — while the save is in
+            // flight — that it is. Save commits over the network and can queue
+            // behind another session's lock, so without this the ✓ looks dead.
+            // (What the wait is, once it's long enough to have a cause worth
+            // naming, is the panel-level bar's job — see `arm_wait_note`.)
             let err_line = dyn_container(
-                move || gs.edit_row_err.get(),
-                move |e| match e {
-                    Some(msg) => text(msg)
+                move || (gs.edit_row_err.get(), gs.edit_row_saving.get()),
+                move |(e, saving)| match (e, saving) {
+                    (Some(msg), _) => text(msg)
                         .style(|s| s.font_size(theme::FONT_LABEL).color(theme::conn_delete()))
                         .into_any(),
-                    None => empty().into_any(),
+                    (None, true) => {
+                        loading_dots("Saving", theme::text_dim, theme::FONT_LABEL).into_any()
+                    }
+                    (None, false) => empty().into_any(),
                 },
             )
             .style(|s| s.width_full().padding_horiz(10.0));
