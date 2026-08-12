@@ -217,11 +217,18 @@ fn quote_char(dialect: SqlDialect) -> char {
 }
 
 /// Quote an identifier as a string, doubling any embedded quote character.
-fn quote_ident(name: &str, dialect: SqlDialect) -> String {
-    match dialect {
-        SqlDialect::MySql => format!("`{}`", name.replace('`', "``")),
-        SqlDialect::Postgres => format!("\"{}\"", name.replace('"', "\"\"")),
-    }
+///
+/// Delegates: identifier quoting is [`crate::export::ident_sql`]'s, here as
+/// everywhere. This was a second implementation that had independently reached
+/// the same rules — which is the drift hazard, not the reassurance.
+use crate::export::ident_sql as quote_ident;
+
+/// What this module quotes identifiers with, exposed so the workspace-wide
+/// agreement test can reach it. Not a second implementation — it *is* the
+/// import above, which is the point being asserted.
+#[cfg(test)]
+pub(crate) fn quoted_ident_for_test(name: &str, dialect: SqlDialect) -> String {
+    quote_ident(name, dialect)
 }
 
 /// Quote a value as a single-quoted SQL string literal. Single quotes are doubled

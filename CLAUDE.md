@@ -544,6 +544,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   executors call them: `GridWrite::plan` is the statement order and `one_row_verdict` is the
   per-statement verdict *and* its message — so neither can drift between MySQL and PostgreSQL, and
   a change to `affected != 1` fails a test rather than passing silently.
+- **One identifier quoter, as there is one boundary lexer.** Every path that quotes an identifier
+  ends at `export::ident_sql` (unconditional — for SQL that is only executed) or its sibling
+  `export::ident_if_needed` (only when a bare name would name something else — for SQL the user
+  reads and edits). `filter::quote_ident`, `schema::ddl_ident_in`, `db::pg::pg_ident` and
+  `db::ident` are all thin delegations; the two engine-fixed ones in `schemaic-db` are bound by a
+  test in that crate, since they can't take a dialect. **Don't write a fifth** — there were four,
+  each having independently arrived at the same escaping, which is the drift hazard rather than the
+  reassurance: the literal half of the same split (`schema::ddl_string` missing MySQL's backslash
+  escaping while `export::sql_literal` had it) shipped as a High.
 - **Identifier scanning treats bytes `>= 0x80` as word bytes** so Unicode identifiers tokenize whole.
   `sql::is_word_byte` (continues a word) and `sql::is_word_start` (begins one — `alphabetic`, since a
   digit can't start a name) are the **only** definitions, next to `skip_noncode` because they answer

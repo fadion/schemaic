@@ -234,16 +234,21 @@ pub struct ForeignKeyInfo {
 }
 
 /// Backtick-quote a SQL identifier, doubling any embedded backtick.
+/// Backtick-quote for the MySQL-only corners of generated DDL (a `DEFINER`
+/// account, which no other engine has).
 fn ddl_ident(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
+    ddl_ident_in(name, crate::intel::SqlDialect::MySql)
 }
 
 /// Quote an identifier for generated DDL in `dialect`.
+///
+/// Delegates to [`crate::export::ident_sql`] — the one identifier-quoting rule.
+/// The literal half of this module already went that way when `ddl_string`
+/// turned out to be missing MySQL's backslash escaping while `sql_literal` had
+/// it; this is the same consolidation for identifiers, done before rather than
+/// after the divergence.
 pub fn ddl_ident_in(name: &str, dialect: crate::intel::SqlDialect) -> String {
-    match dialect {
-        crate::intel::SqlDialect::Postgres => format!("\"{}\"", name.replace('"', "\"\"")),
-        _ => ddl_ident(name),
-    }
+    crate::export::ident_sql(name, dialect)
 }
 
 /// Quote a string as a SQL literal for generated DDL (comments, and defaults we
