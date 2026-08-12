@@ -1337,7 +1337,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let cur = e.cursor.get_untracked();
                     let off = cur.offset();
                     let (a, b) = cur.get_selection().unwrap_or((off, off));
-                    let edit = toggle_line_comment(&full, a.min(b), a.max(b));
+                    let edit =
+                        toggle_line_comment(&full, a.min(b), a.max(b), dialect.get_untracked());
                     edit_untyped(
                         e,
                         comp,
