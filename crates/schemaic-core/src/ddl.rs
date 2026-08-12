@@ -30,8 +30,9 @@ use std::collections::{HashMap, HashSet};
 use crate::intel::SqlDialect;
 use crate::pairs;
 use crate::schema::{
-    CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo, TableInfo, ViewOptions, ddl_ident_in,
-    ddl_string, definer_sql, sql_qualifier,
+    CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo, TableInfo, TriggerAction, TriggerEvent,
+    TriggerInfo, TriggerLevel, TriggerTiming, ViewOptions, ddl_ident_in, ddl_string, definer_sql,
+    sql_qualifier,
 };
 use crate::sql;
 
@@ -622,6 +623,136 @@ pub fn primary_key_of(t: &TableInfo) -> Vec<String> {
     }
 }
 
+// ── The desired state of a trigger ───────────────────────────────────────────
+
+/// The whole desired shape of one trigger.
+///
+/// Carries a whole [`TriggerInfo`] rather than the fields someone might edit,
+/// for the reason [`ViewDraft`] carries [`ViewOptions`]: **a trigger is
+/// replaced, never altered.** Neither engine has an `ALTER` that can change a
+/// trigger's timing, events or action, so every edit is a drop-and-create and
+/// anything the draft doesn't hold is gone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TriggerDraft {
+    /// The trigger's name on the server, or `None` when this draft is a new
+    /// trigger. Identity, not a name: editing `info.name` is a rename — which,
+    /// on both engines, is still a drop and a create.
+    pub original: Option<String>,
+    pub info: TriggerInfo,
+}
+
+impl TriggerDraft {
+    /// The draft that describes an introspected trigger exactly — the editor's
+    /// starting point, and the input to the round-trip gate.
+    pub fn from_info(t: &TriggerInfo) -> TriggerDraft {
+        TriggerDraft {
+            original: Some(t.name.clone()),
+            info: t.clone(),
+        }
+    }
+
+    /// An empty draft for a brand-new trigger on `table`.
+    pub fn blank(
+        name: impl Into<String>,
+        table: impl Into<String>,
+        schema: Option<String>,
+    ) -> Self {
+        TriggerDraft {
+            original: None,
+            info: TriggerInfo {
+                name: name.into(),
+                table: table.into(),
+                schema,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Problems that would make the generated SQL nonsense, in plain language.
+    ///
+    /// Empty means "emittable", not "the server will accept it" — whether the
+    /// body compiles and the columns exist stays the server's judgement, as
+    /// everywhere else here. What this *does* own is the divergence between the
+    /// engines, because the model deliberately holds both shapes: introspection
+    /// must never have to lie about what a server reported, so the refusal lives
+    /// here instead.
+    pub fn validate(&self, dialect: SqlDialect) -> Vec<String> {
+        let t = &self.info;
+        let pg = dialect == SqlDialect::Postgres;
+        let mut out = Vec::new();
+        if t.name.trim().is_empty() {
+            out.push("The trigger needs a name.".to_string());
+        }
+        if t.table.trim().is_empty() {
+            out.push("A trigger needs a table to fire on.".to_string());
+        }
+        if t.events.is_empty() {
+            out.push("A trigger needs at least one event to fire on.".to_string());
+        }
+        if t.constraint {
+            out.push(
+                "Schemaic can't edit a constraint trigger — it doesn't model the \
+                 deferral settings one carries."
+                    .to_string(),
+            );
+        }
+        if pg {
+            match &t.action {
+                TriggerAction::Function { name, .. } if name.trim().is_empty() => {
+                    out.push("A PostgreSQL trigger needs a function to execute.".to_string())
+                }
+                TriggerAction::Body(_) => out.push(
+                    "A PostgreSQL trigger runs a function, not a body — pick or write \
+                     one to execute."
+                        .to_string(),
+                ),
+                _ => {}
+            }
+            // TRUNCATE fires once per statement; there are no rows to hand it.
+            if t.events.contains(&TriggerEvent::Truncate) && t.level == TriggerLevel::Row {
+                out.push("A TRUNCATE trigger has to be FOR EACH STATEMENT.".to_string());
+            }
+            if t.timing == TriggerTiming::InsteadOf && t.level != TriggerLevel::Row {
+                out.push("An INSTEAD OF trigger has to be FOR EACH ROW.".to_string());
+            }
+        } else {
+            if t.events.len() > 1 {
+                out.push(
+                    "MySQL fires a trigger on one event — make a separate trigger per event."
+                        .to_string(),
+                );
+            }
+            if t.events.contains(&TriggerEvent::Truncate) {
+                out.push("MySQL has no TRUNCATE trigger.".to_string());
+            }
+            if t.timing == TriggerTiming::InsteadOf {
+                out.push("MySQL has no INSTEAD OF trigger — those are PostgreSQL's.".to_string());
+            }
+            if t.condition.as_deref().is_some_and(|c| !c.trim().is_empty()) {
+                out.push(
+                    "MySQL has no WHEN condition — put the test inside the body with IF."
+                        .to_string(),
+                );
+            }
+            if !t.update_columns.is_empty() {
+                out.push("MySQL has no UPDATE OF — a trigger sees every column.".to_string());
+            }
+            match &t.action {
+                TriggerAction::Body(b) if b.trim().is_empty() => {
+                    out.push("A MySQL trigger needs a body.".to_string())
+                }
+                TriggerAction::Function { .. } => out.push(
+                    "A MySQL trigger runs a body, not a function — write the statements \
+                     to run."
+                        .to_string(),
+                ),
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
 // ── The difference ───────────────────────────────────────────────────────────
 
 /// One reviewable step between the table that's there and the table that's
@@ -715,6 +846,17 @@ pub enum Change {
     },
     DropView {
         materialized: bool,
+    },
+    /// Create a trigger that doesn't exist yet.
+    CreateTrigger(Box<TriggerDraft>),
+    /// Redefine an existing trigger — always a `DROP` followed by a `CREATE`,
+    /// because neither engine can alter one in place. One change, because it's
+    /// one edit, with the cost stated in [`Change::risks`].
+    ReplaceTrigger {
+        draft: Box<TriggerDraft>,
+    },
+    DropTrigger {
+        name: String,
     },
 }
 
@@ -825,6 +967,16 @@ impl Change {
                     if *materialized { "materialized " } else { "" }
                 )
             }
+            Change::CreateTrigger(d) => format!("Create trigger {}", d.info.name),
+            Change::ReplaceTrigger { draft } => {
+                let server = draft.original.as_deref().unwrap_or(&draft.info.name);
+                if server != draft.info.name {
+                    format!("Re-create trigger {server} as {}", draft.info.name)
+                } else {
+                    format!("Re-create trigger {}", draft.info.name)
+                }
+            }
+            Change::DropTrigger { name } => format!("Drop trigger {name}"),
         }
     }
 
@@ -882,6 +1034,23 @@ impl Change {
                  Schemaic can't read back — an expression key column, an operator \
                  class, or a NULLS ordering — and applying the edit would mean \
                  re-creating the index without it. Edit this index in SQL instead."
+            )],
+            // Like `DropCheck`, this destroys no data and still has to be said:
+            // whatever the trigger maintained — an audit row, a denormalized
+            // total, a guard — silently stops happening on the next write.
+            Change::DropTrigger { name } => vec![format!(
+                "Drops trigger {name}. Whatever it did on each write stops \
+                 happening, and rows written from now on won't have it applied."
+            )],
+            // Neither engine can alter a trigger, so a redefinition is a drop and
+            // a create. That is safe where DDL is transactional and *isn't* on
+            // MySQL, which commits each statement as it runs — so a rejected new
+            // definition there leaves the table with no trigger at all.
+            Change::ReplaceTrigger { draft } => vec![format!(
+                "Re-creating trigger {} drops it first. Where DDL isn't \
+                 transactional (MySQL), a new definition the server rejects \
+                 leaves the table with no trigger.",
+                draft.info.name
             )],
             _ => Vec::new(),
         }
@@ -1014,6 +1183,7 @@ impl ChangeSet {
     fn emit_mysql(&self) -> Vec<String> {
         let d = self.dialect;
         let mut out = self.view_statements();
+        out.extend(self.trigger_statements());
         // Whole-table statements stand alone; they never share an ALTER.
         for c in &self.changes {
             match c {
@@ -1156,6 +1326,7 @@ impl ChangeSet {
         let d = self.dialect;
         let q = |s: &str| ddl_ident_in(s, d);
         let mut out = self.view_statements();
+        out.extend(self.trigger_statements());
         for c in &self.changes {
             match c {
                 Change::CreateTable(draft) => out.extend(create_table_sql(draft, d)),
@@ -1364,6 +1535,51 @@ impl ChangeSet {
                         qualified(to, self.schema.as_deref(), d)
                     ),
                 }),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The trigger statements, in the order they must run.
+    ///
+    /// Separate from the `ALTER TABLE` builders for the same reason
+    /// [`ChangeSet::view_statements`] is: these are whole statements that can
+    /// never share an `ALTER`, and a trigger change set contains nothing else.
+    ///
+    /// A replace emits `DROP` then `CREATE` on **both** engines. PostgreSQL 14
+    /// grew `CREATE OR REPLACE TRIGGER`, but using it would mean two apply paths
+    /// for one edit and a version check to pick between them — and on PG the
+    /// whole plan already runs in one transaction, so the drop-and-create is
+    /// atomic anyway.
+    fn trigger_statements(&self) -> Vec<String> {
+        let d = self.dialect;
+        let drop = |name: &str| -> String {
+            match d {
+                // PostgreSQL scopes a trigger to its table and needs it named;
+                // MySQL scopes it to the database and refuses the `ON` clause.
+                SqlDialect::Postgres => format!(
+                    "DROP TRIGGER {} ON {};",
+                    ddl_ident_in(name, d),
+                    self.qname()
+                ),
+                _ => format!(
+                    "DROP TRIGGER {};",
+                    qualified(name, self.schema.as_deref(), d)
+                ),
+            }
+        };
+        let mut out = Vec::new();
+        for c in &self.changes {
+            match c {
+                Change::CreateTrigger(draft) => out.push(draft.info.create_sql(d)),
+                Change::ReplaceTrigger { draft } => {
+                    // The drop addresses the name the server knows; the create
+                    // builds the draft's, which is how a rename comes for free.
+                    out.push(drop(draft.original.as_deref().unwrap_or(&draft.info.name)));
+                    out.push(draft.info.create_sql(d));
+                }
+                Change::DropTrigger { name } => out.push(drop(name)),
                 _ => {}
             }
         }
@@ -2617,6 +2833,53 @@ pub fn diff_view(current: &TableInfo, draft: &ViewDraft, dialect: SqlDialect) ->
     }
 }
 
+/// Everything that has to happen to turn the trigger `current` into `draft`.
+///
+/// Same round-trip gate as [`diff`] and [`diff_view`]: a trigger diffed against
+/// its own draft must produce nothing.
+///
+/// There is no partial edit to detect here, and that is the whole design.
+/// Neither engine can alter a trigger, so *any* difference — the name included —
+/// costs the same drop-and-create, and splitting a rename out into its own
+/// change would be a distinction with no consequence.
+pub fn diff_trigger(current: &TriggerInfo, draft: &TriggerDraft, dialect: SqlDialect) -> ChangeSet {
+    let changes = if draft.info == *current {
+        Vec::new()
+    } else {
+        vec![Change::ReplaceTrigger {
+            draft: Box::new(draft.clone()),
+        }]
+    };
+    ChangeSet {
+        table: current.table.clone(),
+        schema: current.schema.clone(),
+        dialect,
+        changes,
+    }
+}
+
+/// The `CREATE TRIGGER` for a brand-new trigger.
+pub fn create_trigger(draft: &TriggerDraft, dialect: SqlDialect) -> ChangeSet {
+    ChangeSet {
+        table: draft.info.table.clone(),
+        schema: draft.info.schema.clone(),
+        dialect,
+        changes: vec![Change::CreateTrigger(Box::new(draft.clone()))],
+    }
+}
+
+/// The `DROP TRIGGER` for one trigger.
+pub fn drop_trigger(t: &TriggerInfo, dialect: SqlDialect) -> ChangeSet {
+    ChangeSet {
+        table: t.table.clone(),
+        schema: t.schema.clone(),
+        dialect,
+        changes: vec![Change::DropTrigger {
+            name: t.name.clone(),
+        }],
+    }
+}
+
 /// The `CREATE VIEW` for a brand-new view.
 pub fn create_view(draft: &ViewDraft, dialect: SqlDialect) -> ChangeSet {
     ChangeSet {
@@ -3741,6 +4004,149 @@ mod tests {
                 "checked_at IS NOT NULL"
             );
             assert_eq!(check_predicate("(checkout > 0)", MySql), "checkout > 0");
+        }
+
+        fn my_trigger() -> TriggerInfo {
+            TriggerInfo {
+                name: "t_ins".into(),
+                table: "orders".into(),
+                timing: TriggerTiming::Before,
+                events: vec![TriggerEvent::Insert],
+                action: TriggerAction::Body("SET NEW.x = 1".into()),
+                ..Default::default()
+            }
+        }
+
+        fn pg_trigger() -> TriggerInfo {
+            TriggerInfo {
+                name: "t_upd".into(),
+                schema: Some("public".into()),
+                table: "orders".into(),
+                timing: TriggerTiming::After,
+                events: vec![TriggerEvent::Update],
+                action: TriggerAction::Function {
+                    name: "audit".into(),
+                    args: vec![],
+                },
+                ..Default::default()
+            }
+        }
+
+        /// The gate: a draft taken straight off a trigger has nothing to say.
+        #[test]
+        fn an_untouched_trigger_is_not_a_change() {
+            for (t, d) in [(my_trigger(), MySql), (pg_trigger(), Postgres)] {
+                let draft = TriggerDraft::from_info(&t);
+                assert!(
+                    diff_trigger(&t, &draft, d).changes.is_empty(),
+                    "{d:?} reported a phantom change"
+                );
+            }
+        }
+
+        /// Any difference costs the same drop-and-create, so a rename is not a
+        /// change of its own — it rides the replace.
+        #[test]
+        fn a_rename_is_one_replace_not_a_rename_change() {
+            let t = my_trigger();
+            let mut draft = TriggerDraft::from_info(&t);
+            draft.info.name = "t_ins2".into();
+            let cs = diff_trigger(&t, &draft, MySql);
+            assert_eq!(cs.changes.len(), 1);
+            assert!(matches!(cs.changes[0], Change::ReplaceTrigger { .. }));
+            // The drop names what the server has; the create names the new one.
+            let sql = cs.emit();
+            assert_eq!(sql[0], "DROP TRIGGER `t_ins`;");
+            assert!(sql[1].contains("TRIGGER `t_ins2`"), "{sql:?}");
+        }
+
+        /// PostgreSQL scopes a trigger to its table and needs it named; MySQL
+        /// scopes it to the database and refuses the `ON` clause.
+        #[test]
+        fn drop_trigger_is_spelled_per_engine() {
+            assert_eq!(
+                drop_trigger(&my_trigger(), MySql).emit(),
+                vec!["DROP TRIGGER `t_ins`;"]
+            );
+            assert_eq!(
+                drop_trigger(&pg_trigger(), Postgres).emit(),
+                vec!["DROP TRIGGER \"t_upd\" ON \"orders\";"]
+            );
+        }
+
+        #[test]
+        fn create_trigger_emits_one_statement() {
+            let cs = create_trigger(&TriggerDraft::from_info(&my_trigger()), MySql);
+            let sql = cs.emit();
+            assert_eq!(sql.len(), 1);
+            assert!(sql[0].starts_with("CREATE TRIGGER `t_ins` BEFORE INSERT ON `orders`"));
+        }
+
+        /// A replace destroys nothing on PostgreSQL, where the plan is one
+        /// transaction — but MySQL commits each DDL statement as it runs, so the
+        /// preview has to say the table can end up with no trigger at all.
+        #[test]
+        fn replacing_a_trigger_states_the_drop_first_cost() {
+            let t = my_trigger();
+            let mut draft = TriggerDraft::from_info(&t);
+            draft.info.action = TriggerAction::Body("SET NEW.x = 2".into());
+            let risks = diff_trigger(&t, &draft, MySql).destructive();
+            assert_eq!(risks.len(), 1);
+            assert!(risks[0].contains("drops it first"), "{risks:?}");
+        }
+
+        #[test]
+        fn dropping_a_trigger_says_what_stops_happening() {
+            let risks = drop_trigger(&my_trigger(), MySql).destructive();
+            assert_eq!(risks.len(), 1);
+            assert!(risks[0].contains("stops"), "{risks:?}");
+        }
+
+        /// The model holds both engines' shapes so introspection never lies about
+        /// what a server reported; refusing the impossible one is `validate`'s job.
+        #[test]
+        fn validate_refuses_each_engine_the_other_s_shape() {
+            let mut t = my_trigger();
+            t.events = vec![TriggerEvent::Insert, TriggerEvent::Update];
+            t.condition = Some("NEW.x > 0".into());
+            let msgs = TriggerDraft::from_info(&t).validate(MySql).join(" | ");
+            assert!(msgs.contains("one event"), "{msgs}");
+            assert!(msgs.contains("no WHEN"), "{msgs}");
+
+            let mut p = pg_trigger();
+            p.action = TriggerAction::Body("SET x = 1".into());
+            let msgs = TriggerDraft::from_info(&p).validate(Postgres).join(" | ");
+            assert!(msgs.contains("runs a function"), "{msgs}");
+        }
+
+        #[test]
+        fn validate_catches_the_level_rules_postgresql_enforces() {
+            let mut p = pg_trigger();
+            p.events = vec![TriggerEvent::Truncate];
+            p.level = TriggerLevel::Row;
+            let msgs = TriggerDraft::from_info(&p).validate(Postgres).join(" | ");
+            assert!(msgs.contains("FOR EACH STATEMENT"), "{msgs}");
+
+            let mut p = pg_trigger();
+            p.timing = TriggerTiming::InsteadOf;
+            p.level = TriggerLevel::Statement;
+            let msgs = TriggerDraft::from_info(&p).validate(Postgres).join(" | ");
+            assert!(msgs.contains("FOR EACH ROW"), "{msgs}");
+        }
+
+        #[test]
+        fn validate_refuses_a_constraint_trigger_and_the_empty_draft() {
+            let mut p = pg_trigger();
+            p.constraint = true;
+            let msgs = TriggerDraft::from_info(&p).validate(Postgres).join(" | ");
+            assert!(msgs.contains("constraint trigger"), "{msgs}");
+
+            let msgs = TriggerDraft::blank("", "", None)
+                .validate(MySql)
+                .join(" | ");
+            assert!(msgs.contains("needs a name"), "{msgs}");
+            assert!(msgs.contains("needs a table"), "{msgs}");
+            assert!(msgs.contains("at least one event"), "{msgs}");
         }
 
         /// A trigger's `WHEN` normalizes by the same rule, and has to survive the
