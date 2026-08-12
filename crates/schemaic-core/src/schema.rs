@@ -454,6 +454,10 @@ pub struct TableInfo {
     /// one — but a `CREATE TABLE` built from a draft that doesn't carry them
     /// loses every invariant the table was written to guarantee.
     pub check_constraints: Vec<CheckInfo>,
+    /// Triggers declared on this table. Table-owned on both engines, so they
+    /// hang here rather than off [`DbSchema`] — a trigger has no independent
+    /// existence to hang anywhere else.
+    pub triggers: Vec<TriggerInfo>,
 }
 
 /// One `CHECK` constraint: a name and the predicate it enforces.
@@ -557,6 +561,317 @@ pub fn definer_sql(definer: &str) -> String {
         Some((user, host)) => format!("DEFINER = {}@{}", ddl_ident(user), ddl_ident(host)),
         // No host part: emit the account as given, still quoted.
         None => format!("DEFINER = {}", ddl_ident(definer)),
+    }
+}
+
+// ── Triggers ────────────────────────────────────────────────────────────────
+
+/// When a trigger fires relative to the statement that set it off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TriggerTiming {
+    #[default]
+    Before,
+    After,
+    /// **PostgreSQL only**, and only on a view: it *replaces* the write rather
+    /// than running alongside it.
+    InsteadOf,
+}
+
+impl TriggerTiming {
+    pub fn sql(self) -> &'static str {
+        match self {
+            TriggerTiming::Before => "BEFORE",
+            TriggerTiming::After => "AFTER",
+            TriggerTiming::InsteadOf => "INSTEAD OF",
+        }
+    }
+
+    /// Read a server's spelling. MySQL's `ACTION_TIMING` says `BEFORE`/`AFTER`;
+    /// PostgreSQL's `tgtype` is decoded in `schemaic-db` and arrives here as one
+    /// of these words. Unknown ⇒ `None`, so a server that grows a new timing
+    /// surfaces rather than being silently filed as `BEFORE`.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        [
+            TriggerTiming::Before,
+            TriggerTiming::After,
+            TriggerTiming::InsteadOf,
+        ]
+        .into_iter()
+        .find(|t| {
+            s.eq_ignore_ascii_case(t.sql())
+                // PostgreSQL's catalogues spell it with an underscore.
+                || (*t == TriggerTiming::InsteadOf && s.eq_ignore_ascii_case("INSTEAD_OF"))
+        })
+    }
+}
+
+/// What a trigger fires on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TriggerEvent {
+    #[default]
+    Insert,
+    Update,
+    Delete,
+    /// **PostgreSQL only**, and only `FOR EACH STATEMENT`.
+    Truncate,
+}
+
+impl TriggerEvent {
+    pub fn sql(self) -> &'static str {
+        match self {
+            TriggerEvent::Insert => "INSERT",
+            TriggerEvent::Update => "UPDATE",
+            TriggerEvent::Delete => "DELETE",
+            TriggerEvent::Truncate => "TRUNCATE",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        [
+            TriggerEvent::Insert,
+            TriggerEvent::Update,
+            TriggerEvent::Delete,
+            TriggerEvent::Truncate,
+        ]
+        .into_iter()
+        .find(|e| s.eq_ignore_ascii_case(e.sql()))
+    }
+}
+
+/// Once per affected row, or once per statement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TriggerLevel {
+    #[default]
+    Row,
+    Statement,
+}
+
+impl TriggerLevel {
+    pub fn sql(self) -> &'static str {
+        match self {
+            TriggerLevel::Row => "FOR EACH ROW",
+            TriggerLevel::Statement => "FOR EACH STATEMENT",
+        }
+    }
+}
+
+/// MySQL's `FOLLOWS`/`PRECEDES`: where this trigger sits among the others on the
+/// same table and event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TriggerOrder {
+    Follows(String),
+    Precedes(String),
+}
+
+/// What the trigger runs when it fires — the one place the two engines differ in
+/// *kind* rather than in spelling, which is why this is an enum and not a
+/// `String` both sides pretend to understand.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TriggerAction {
+    /// MySQL/MariaDB: the statement body as `information_schema.TRIGGERS`
+    /// reports it — one statement or a `BEGIN … END` block, no trailing `;`.
+    Body(String),
+    /// PostgreSQL: the function to call. A PG trigger holds no body of its own,
+    /// so the function is a separate object with its own lifetime — dropping the
+    /// trigger leaves it behind, and dropping it out from under the trigger
+    /// breaks every write to the table.
+    Function { name: String, args: Vec<String> },
+}
+
+impl Default for TriggerAction {
+    fn default() -> Self {
+        TriggerAction::Body(String::new())
+    }
+}
+
+/// One trigger on a table.
+///
+/// Carries its whole definition for the reason [`ColumnInfo`] does: **neither
+/// engine can alter a trigger in place.** MySQL has no `CREATE OR REPLACE
+/// TRIGGER` at all, and PostgreSQL's replaces the entire object — so every edit
+/// is a drop-and-create, and anything this model doesn't hold is destroyed the
+/// first time a user changes the timing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TriggerInfo {
+    pub name: String,
+    /// The namespace of the table it hangs off — PostgreSQL's schema, `None` on
+    /// MySQL. A trigger has no namespace of its own on either engine: its name
+    /// is unique per table (PG) or per database (MySQL).
+    pub schema: Option<String>,
+    pub table: String,
+    pub timing: TriggerTiming,
+    /// The events it fires on. PostgreSQL allows several on one trigger
+    /// (`BEFORE INSERT OR UPDATE`); MySQL allows exactly one. The model holds
+    /// both shapes and `TriggerDraft::validate` is what refuses the impossible
+    /// one, so introspection never has to lie about what the server reported.
+    pub events: Vec<TriggerEvent>,
+    /// `UPDATE OF a, b` — narrows an `Update` event to named columns.
+    /// **PostgreSQL only**; empty means every column.
+    pub update_columns: Vec<String>,
+    pub level: TriggerLevel,
+    /// PostgreSQL's `WHEN (…)` guard, held **bare** — without the parens the
+    /// server prints around it and the emitter adds back. Same rule as
+    /// [`crate::ddl::check_predicate`]: normalize on the way in, wrap exactly
+    /// once on the way out, so a round trip doesn't grow a layer per edit.
+    pub condition: Option<String>,
+    pub action: TriggerAction,
+    /// MySQL's `DEFINER`, unquoted (`root@localhost`). Modelled for the reason
+    /// [`ViewOptions::definer`] is: a trigger recreated without it runs as
+    /// whoever recreated it, and nothing in the statement says a privilege
+    /// changed.
+    pub definer: Option<String>,
+    /// MySQL's ordering clause. Dropping it on a recreate silently reorders the
+    /// triggers on that event — and order is the entire point when two of them
+    /// write the same row.
+    pub order: Option<TriggerOrder>,
+    /// **PostgreSQL**: the trigger is disabled and does not fire. Recreating a
+    /// disabled trigger as enabled starts firing it against writes it was
+    /// deliberately kept out of, so [`TriggerInfo::create_sql`] restates it.
+    pub enabled: bool,
+    /// **PostgreSQL**: a `CREATE CONSTRAINT TRIGGER`. Schemaic doesn't model the
+    /// deferral options one carries, so these are shown and droppable but not
+    /// editable — the same call [`ViewOptions::materialized`] gets.
+    pub constraint: bool,
+}
+
+impl Default for TriggerInfo {
+    /// A trigger fires unless the server says otherwise; defaulting `enabled` to
+    /// `false` would emit a `DISABLE TRIGGER` after every create.
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            schema: None,
+            table: String::new(),
+            timing: TriggerTiming::default(),
+            events: Vec::new(),
+            update_columns: Vec::new(),
+            level: TriggerLevel::default(),
+            condition: None,
+            action: TriggerAction::default(),
+            definer: None,
+            order: None,
+            enabled: true,
+            constraint: false,
+        }
+    }
+}
+
+impl TriggerInfo {
+    /// The `CREATE TRIGGER` that recreates this trigger exactly — the **one**
+    /// trigger emitter, shared by Copy DDL, the round-trip gate and the apply
+    /// path, for the same reason [`crate::ddl::view_ddl`] is one.
+    ///
+    /// A disabled PostgreSQL trigger emits its `ALTER TABLE … DISABLE TRIGGER`
+    /// too: `CREATE TRIGGER` always produces an enabled one, so a plan that
+    /// stopped at the create would quietly switch it back on.
+    pub fn create_sql(&self, dialect: crate::intel::SqlDialect) -> String {
+        let pg = dialect == crate::intel::SqlDialect::Postgres;
+        let q = |s: &str| ddl_ident_in(s, dialect);
+        let qtable = match sql_qualifier(self.schema.as_deref()) {
+            Some(s) => format!("{}.{}", q(s), q(&self.table)),
+            None => q(&self.table),
+        };
+        // `UPDATE OF a, b` is part of the event, not a clause after it.
+        let events = self
+            .events
+            .iter()
+            .map(|e| {
+                if pg && *e == TriggerEvent::Update && !self.update_columns.is_empty() {
+                    let cols = self
+                        .update_columns
+                        .iter()
+                        .map(|c| q(c))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("UPDATE OF {cols}")
+                } else {
+                    e.sql().to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+
+        if !pg {
+            let mut out = String::from("CREATE ");
+            if let Some(d) = &self.definer {
+                out.push_str(&definer_sql(d));
+                out.push(' ');
+            }
+            out.push_str(&format!(
+                "TRIGGER {} {} {} ON {}\nFOR EACH ROW",
+                q(&self.name),
+                self.timing.sql(),
+                events,
+                qtable,
+            ));
+            // MySQL puts the ordering between FOR EACH ROW and the body.
+            match &self.order {
+                Some(TriggerOrder::Follows(n)) => out.push_str(&format!(" FOLLOWS {}", q(n))),
+                Some(TriggerOrder::Precedes(n)) => out.push_str(&format!(" PRECEDES {}", q(n))),
+                None => {}
+            }
+            let body = match &self.action {
+                TriggerAction::Body(b) => b.trim().to_string(),
+                // A PG-shaped action on MySQL can't be spelled; say so rather
+                // than emit a statement that looks fine and isn't.
+                TriggerAction::Function { name, .. } => {
+                    format!("-- Schemaic can't call the function {name} from a MySQL trigger.")
+                }
+            };
+            out.push('\n');
+            out.push_str(&body);
+            out.push(';');
+            return out;
+        }
+
+        let mut out = String::from("CREATE ");
+        if self.constraint {
+            out.push_str("CONSTRAINT ");
+        }
+        out.push_str(&format!(
+            "TRIGGER {} {} {} ON {}\n{}",
+            q(&self.name),
+            self.timing.sql(),
+            events,
+            qtable,
+            self.level.sql(),
+        ));
+        if let Some(w) = self
+            .condition
+            .as_deref()
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+        {
+            out.push_str(&format!("\nWHEN ({w})"));
+        }
+        let call = match &self.action {
+            TriggerAction::Function { name, args } => {
+                let args = args
+                    .iter()
+                    .map(|a| ddl_string(a, dialect))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{name}({args})")
+            }
+            // Symmetric to the MySQL branch: PostgreSQL has nowhere to put a body.
+            TriggerAction::Body(_) => {
+                return format!(
+                    "-- Schemaic can't emit a PostgreSQL trigger without a function to call.\n\
+                     -- Trigger {} on {qtable} has an inline body, which PostgreSQL has no place for.",
+                    self.name
+                );
+            }
+        };
+        out.push_str(&format!("\nEXECUTE FUNCTION {call};"));
+        if !self.enabled {
+            out.push_str(&format!(
+                "\nALTER TABLE {qtable} DISABLE TRIGGER {};",
+                q(&self.name)
+            ));
+        }
+        out
     }
 }
 
@@ -933,6 +1248,185 @@ pub enum SchemaState {
     Loading,
     Loaded(std::sync::Arc<DbSchema>),
     Failed(String),
+}
+
+#[cfg(test)]
+mod trigger_tests {
+    use super::*;
+    use crate::intel::SqlDialect;
+
+    fn mysql_trigger() -> TriggerInfo {
+        TriggerInfo {
+            name: "audit_ins".into(),
+            table: "orders".into(),
+            timing: TriggerTiming::Before,
+            events: vec![TriggerEvent::Insert],
+            action: TriggerAction::Body("SET NEW.created = NOW()".into()),
+            definer: Some("root@localhost".into()),
+            ..Default::default()
+        }
+    }
+
+    fn pg_trigger() -> TriggerInfo {
+        TriggerInfo {
+            name: "audit_upd".into(),
+            schema: Some("public".into()),
+            table: "orders".into(),
+            timing: TriggerTiming::After,
+            events: vec![TriggerEvent::Insert, TriggerEvent::Update],
+            level: TriggerLevel::Row,
+            action: TriggerAction::Function {
+                name: "audit_fn".into(),
+                args: vec![],
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn default_trigger_is_enabled() {
+        // The opposite default would append a DISABLE TRIGGER to every create.
+        assert!(TriggerInfo::default().enabled);
+    }
+
+    #[test]
+    fn mysql_create_carries_definer_and_body() {
+        let sql = mysql_trigger().create_sql(SqlDialect::MySql);
+        assert!(sql.starts_with("CREATE DEFINER = `root`@`localhost` TRIGGER `audit_ins` "));
+        assert!(sql.contains("BEFORE INSERT ON `orders`"));
+        assert!(sql.contains("FOR EACH ROW"));
+        assert!(sql.trim_end().ends_with("SET NEW.created = NOW();"));
+    }
+
+    #[test]
+    fn mysql_ordering_sits_between_for_each_row_and_the_body() {
+        let mut t = mysql_trigger();
+        t.order = Some(TriggerOrder::Follows("other".into()));
+        let sql = t.create_sql(SqlDialect::MySql);
+        assert!(
+            sql.contains("FOR EACH ROW FOLLOWS `other`\nSET NEW.created"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn pg_joins_events_with_or_and_omits_public() {
+        let sql = pg_trigger().create_sql(SqlDialect::Postgres);
+        assert!(
+            sql.contains("AFTER INSERT OR UPDATE ON \"orders\""),
+            "{sql}"
+        );
+        // `public` is on the default search_path — same rule as sql_qualifier.
+        assert!(!sql.contains("\"public\""), "{sql}");
+        assert!(sql.contains("EXECUTE FUNCTION audit_fn();"), "{sql}");
+    }
+
+    #[test]
+    fn pg_update_of_columns_rides_inside_the_event() {
+        let mut t = pg_trigger();
+        t.events = vec![TriggerEvent::Update];
+        t.update_columns = vec!["total".into(), "status".into()];
+        let sql = t.create_sql(SqlDialect::Postgres);
+        assert!(
+            sql.contains("AFTER UPDATE OF \"total\", \"status\" ON"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn pg_when_is_wrapped_exactly_once() {
+        let mut t = pg_trigger();
+        // Held bare in the model; the emitter is the only thing that parenthesises.
+        t.condition = Some("new.total > 0".into());
+        let sql = t.create_sql(SqlDialect::Postgres);
+        assert!(sql.contains("\nWHEN (new.total > 0)\n"), "{sql}");
+        assert!(!sql.contains("((new.total > 0))"), "{sql}");
+    }
+
+    #[test]
+    fn pg_disabled_trigger_restates_the_disable() {
+        let mut t = pg_trigger();
+        t.enabled = false;
+        let sql = t.create_sql(SqlDialect::Postgres);
+        // CREATE TRIGGER always makes an enabled one, so stopping at the create
+        // would silently switch it back on.
+        assert!(
+            sql.contains("ALTER TABLE \"orders\" DISABLE TRIGGER \"audit_upd\";"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn pg_function_args_are_quoted_as_literals() {
+        let mut t = pg_trigger();
+        t.action = TriggerAction::Function {
+            name: "audit_fn".into(),
+            args: vec!["orders".into(), "it's".into()],
+        };
+        let sql = t.create_sql(SqlDialect::Postgres);
+        assert!(
+            sql.contains("EXECUTE FUNCTION audit_fn('orders', 'it''s');"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn constraint_trigger_keeps_its_keyword() {
+        let mut t = pg_trigger();
+        t.constraint = true;
+        assert!(
+            t.create_sql(SqlDialect::Postgres)
+                .starts_with("CREATE CONSTRAINT TRIGGER ")
+        );
+    }
+
+    /// The engines can't hold each other's action shape. Emitting something that
+    /// looks like SQL and isn't is worse than saying so.
+    #[test]
+    fn a_mismatched_action_reports_instead_of_emitting_nonsense() {
+        let mut my = mysql_trigger();
+        my.action = TriggerAction::Function {
+            name: "f".into(),
+            args: vec![],
+        };
+        assert!(
+            my.create_sql(SqlDialect::MySql)
+                .contains("can't call the function f")
+        );
+
+        let mut pg = pg_trigger();
+        pg.action = TriggerAction::Body("SET x = 1".into());
+        let sql = pg.create_sql(SqlDialect::Postgres);
+        assert!(sql.starts_with("-- Schemaic can't emit"), "{sql}");
+        assert!(!sql.contains("EXECUTE FUNCTION"), "{sql}");
+    }
+
+    #[test]
+    fn timing_and_event_parse_round_trip_and_reject_the_unknown() {
+        for t in [
+            TriggerTiming::Before,
+            TriggerTiming::After,
+            TriggerTiming::InsteadOf,
+        ] {
+            assert_eq!(TriggerTiming::parse(t.sql()), Some(t));
+            assert_eq!(TriggerTiming::parse(&t.sql().to_ascii_lowercase()), Some(t));
+        }
+        assert_eq!(
+            TriggerTiming::parse("INSTEAD_OF"),
+            Some(TriggerTiming::InsteadOf)
+        );
+        assert_eq!(TriggerTiming::parse("SIDEWAYS"), None);
+
+        for e in [
+            TriggerEvent::Insert,
+            TriggerEvent::Update,
+            TriggerEvent::Delete,
+            TriggerEvent::Truncate,
+        ] {
+            assert_eq!(TriggerEvent::parse(e.sql()), Some(e));
+        }
+        assert_eq!(TriggerEvent::parse("MERGE"), None);
+    }
 }
 
 #[cfg(test)]

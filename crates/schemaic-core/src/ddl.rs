@@ -2140,6 +2140,27 @@ pub fn check_predicate(raw: &str, dialect: SqlDialect) -> String {
     peel_parens(t, dialect).to_string()
 }
 
+/// The bare `WHEN` guard of a trigger, as the model stores it — the same
+/// normalize-on-the-way-in rule as [`check_predicate`], for the same reason.
+///
+/// PostgreSQL's `pg_get_expr(tgqual, tgrelid)` re-prints the guard from its parse
+/// tree and parenthesises it (`(new.total > 0)`), `pg_get_triggerdef` spells it
+/// `WHEN ((new.total > 0))`, and a person types `new.total > 0`. Stored verbatim
+/// and wrapped at emit, those become `WHEN (((new.total > 0)))` — valid, and read
+/// by the user in the preview. So the model holds it bare and
+/// [`crate::schema::TriggerInfo::create_sql`] is the only thing that wraps it.
+pub fn trigger_condition(raw: &str, dialect: SqlDialect) -> String {
+    let t = raw.trim();
+    // `WHEN` only as a leading *word*: a guard may start with a column called
+    // `when_due`, exactly as a check predicate may start with `checked_at`.
+    let t = t
+        .strip_prefix("WHEN")
+        .or_else(|| t.strip_prefix("when"))
+        .filter(|rest| rest.starts_with(['(', ' ', '\t', '\n']))
+        .unwrap_or(t);
+    peel_parens(t, dialect).to_string()
+}
+
 /// The comparison form: peeled, and with the whitespace runs the server re-prints
 /// with squashed to one space.
 ///
@@ -3720,6 +3741,35 @@ mod tests {
                 "checked_at IS NOT NULL"
             );
             assert_eq!(check_predicate("(checkout > 0)", MySql), "checkout > 0");
+        }
+
+        /// A trigger's `WHEN` normalizes by the same rule, and has to survive the
+        /// same three input shapes: the server's `pg_get_expr`, the whole clause
+        /// out of `pg_get_triggerdef`, and what a person types.
+        #[test]
+        fn trigger_condition_reduces_every_shape_to_the_bare_guard() {
+            assert_eq!(
+                trigger_condition("(new.total > 0)", Postgres),
+                "new.total > 0"
+            );
+            assert_eq!(
+                trigger_condition("WHEN ((new.total > 0))", Postgres),
+                "new.total > 0"
+            );
+            assert_eq!(
+                trigger_condition("new.total > 0", Postgres),
+                "new.total > 0"
+            );
+        }
+
+        #[test]
+        fn trigger_condition_keeps_a_column_named_like_the_keyword() {
+            assert_eq!(
+                trigger_condition("when_due IS NOT NULL", Postgres),
+                "when_due IS NOT NULL"
+            );
+            // Two groups that are not each other's match must not be peeled.
+            assert_eq!(trigger_condition("(a) AND (b)", Postgres), "(a) AND (b)");
         }
 
         /// The gate: a draft taken straight off a table has nothing to say.

@@ -30,7 +30,8 @@ use schemaic_core::model::{
     one_row_verdict,
 };
 use schemaic_core::schema::{
-    CheckInfo, ColumnInfo, DbSchema, ForeignKeyInfo, IndexInfo, TableInfo, ViewOptions,
+    CheckInfo, ColumnInfo, DbSchema, ForeignKeyInfo, IndexInfo, TableInfo, TriggerAction,
+    TriggerEvent, TriggerInfo, TriggerOrder, TriggerTiming, ViewOptions,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -840,6 +841,24 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         Err(e) => return Err(qerr(e)),
     };
 
+    // Triggers. `information_schema.TRIGGERS` has been there since MySQL 5.0 and
+    // `ACTION_ORDER` since 5.7.2 / MariaDB 10.2.3, both well below anything this
+    // app connects to — so unlike CHECK_CONSTRAINTS there is no missing-table
+    // case to degrade for, and a failure here is a real failure.
+    let trigger_rows: Vec<MyTriggerRow> = conn
+        .exec_map(
+            "SELECT CAST(EVENT_OBJECT_TABLE AS CHAR) AS t, CAST(TRIGGER_NAME AS CHAR) AS n, \
+                    CAST(ACTION_TIMING AS CHAR) AS ti, CAST(EVENT_MANIPULATION AS CHAR) AS ev, \
+                    CAST(ACTION_STATEMENT AS CHAR) AS st, CAST(DEFINER AS CHAR) AS df, \
+                    COALESCE(ACTION_ORDER, 0) AS ord \
+             FROM information_schema.TRIGGERS \
+             WHERE TRIGGER_SCHEMA = ?",
+            (database,),
+            |r: MyTriggerRow| r,
+        )
+        .await
+        .map_err(qerr)?;
+
     let mut schema = assemble_schema(
         // MySQL: the database is the namespace, so tables carry none.
         None,
@@ -853,6 +872,7 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
     apply_view_options(&mut schema, &view_opt_rows);
     apply_fk_rules(&mut schema, &fk_rule_rows);
     apply_check_constraints(&mut schema, &check_rows, mariadb);
+    apply_triggers(&mut schema, mysql_triggers(&trigger_rows));
     Ok(schema)
 }
 
@@ -951,6 +971,76 @@ fn apply_check_constraints(schema: &mut DbSchema, rows: &[MyCheckRow], mariadb: 
                 // there, so this reads as enforced on both.
                 enforced: !enforced.eq_ignore_ascii_case("NO"),
             })
+            .collect();
+    }
+}
+
+/// One `information_schema.TRIGGERS` row: `(table, name, timing, event,
+/// statement, definer, action order)`.
+type MyTriggerRow = (String, String, String, String, String, String, u64);
+
+/// Fold MySQL's trigger rows into [`TriggerInfo`]s, per table.
+///
+/// **The ordering has to be reconstructed, not read.** MySQL has no
+/// `FOLLOWS`/`PRECEDES` column: `ACTION_ORDER` reports a trigger's *position*
+/// within its `(table, timing, event)` group, and that is all. A recreate that
+/// ignored it would silently reorder triggers that write the same row, which is
+/// the whole reason anyone sets an order in the first place — so position 2 and
+/// up become `FOLLOWS <the row before them>`, the same chain MySQL was given.
+///
+/// A server too old to report the column sends `0` for every row. `0` means "no
+/// ordering information", not "first", so those get no clause at all rather than
+/// a fabricated chain.
+fn mysql_triggers(rows: &[MyTriggerRow]) -> Vec<TriggerInfo> {
+    // Group key then position, so the previous row in iteration order *is* the
+    // trigger this one follows. Name last, to keep it deterministic when a stale
+    // server reports ties.
+    let mut sorted: Vec<&MyTriggerRow> = rows.iter().collect();
+    sorted.sort_by(|a, b| (&a.0, &a.2, &a.3, a.6, &a.1).cmp(&(&b.0, &b.2, &b.3, b.6, &b.1)));
+    let mut out: Vec<TriggerInfo> = Vec::with_capacity(sorted.len());
+    // (table, timing, event, the name of the last trigger emitted in that group)
+    let mut prev: Option<(String, String, String, String)> = None;
+    for (table, name, timing, event, stmt, definer, order) in sorted {
+        let same_group = prev
+            .as_ref()
+            .is_some_and(|(t, ti, e, _)| t == table && ti == timing && e == event);
+        let order_clause = match (&prev, same_group, *order > 1) {
+            (Some((.., last)), true, true) => Some(TriggerOrder::Follows(last.clone())),
+            _ => None,
+        };
+        out.push(TriggerInfo {
+            name: name.clone(),
+            // MySQL has no namespace level between database and table.
+            schema: None,
+            table: table.clone(),
+            // An unreadable timing/event would be a server that grew a new one;
+            // fall back to the model's default rather than drop the trigger, so
+            // it still shows up and can still be dropped.
+            timing: TriggerTiming::parse(timing).unwrap_or_default(),
+            events: TriggerEvent::parse(event).into_iter().collect(),
+            update_columns: Vec::new(),
+            // `ACTION_ORIENTATION` is always ROW on MySQL; there is no other.
+            level: schemaic_core::schema::TriggerLevel::Row,
+            condition: None,
+            action: TriggerAction::Body(stmt.clone()),
+            definer: Some(definer.clone()).filter(|d| !d.is_empty()),
+            order: order_clause,
+            enabled: true,
+            constraint: false,
+        });
+        prev = Some((table.clone(), timing.clone(), event.clone(), name.clone()));
+    }
+    out
+}
+
+/// Hang each trigger off the table it fires on, dropping any whose table wasn't
+/// in this fetch — the same rule [`assemble_schema`] applies to column rows.
+fn apply_triggers(schema: &mut DbSchema, triggers: Vec<TriggerInfo>) {
+    for t in schema.tables.iter_mut() {
+        t.triggers = triggers
+            .iter()
+            .filter(|g| g.table == t.name)
+            .cloned()
             .collect();
     }
 }
@@ -2851,6 +2941,84 @@ mod tests {
             predicate: None,
             lossy: false,
         }
+    }
+
+    fn tr(table: &str, name: &str, timing: &str, event: &str, order: u64) -> MyTriggerRow {
+        (
+            s(table),
+            s(name),
+            s(timing),
+            s(event),
+            s("SET NEW.x = 1"),
+            s("root@localhost"),
+            order,
+        )
+    }
+
+    /// The ordering is the point: MySQL reports positions, and only a
+    /// reconstructed FOLLOWS chain recreates the order it was given.
+    #[test]
+    fn mysql_triggers_rebuild_the_follows_chain_from_action_order() {
+        let rows = [
+            tr("orders", "third", "BEFORE", "INSERT", 3),
+            tr("orders", "first", "BEFORE", "INSERT", 1),
+            tr("orders", "second", "BEFORE", "INSERT", 2),
+        ];
+        let out = mysql_triggers(&rows);
+        let by = |n: &str| out.iter().find(|t| t.name == n).unwrap().order.clone();
+        // Position 1 starts the chain; each later one follows its predecessor.
+        assert_eq!(by("first"), None);
+        assert_eq!(by("second"), Some(TriggerOrder::Follows(s("first"))));
+        assert_eq!(by("third"), Some(TriggerOrder::Follows(s("second"))));
+    }
+
+    #[test]
+    fn mysql_triggers_do_not_chain_across_groups() {
+        // Same table, different event — and same event, different table. Neither
+        // is a group, so neither may produce a FOLLOWS.
+        let rows = [
+            tr("orders", "a", "BEFORE", "INSERT", 1),
+            tr("orders", "b", "BEFORE", "UPDATE", 1),
+            tr("orders", "c", "AFTER", "INSERT", 1),
+            tr("lines", "d", "BEFORE", "INSERT", 1),
+        ];
+        assert!(mysql_triggers(&rows).iter().all(|t| t.order.is_none()));
+    }
+
+    #[test]
+    fn mysql_triggers_treat_zero_action_order_as_no_information() {
+        // A server too old to report the column sends 0 for every row. Inventing
+        // a chain there would order triggers the server never ordered.
+        let rows = [
+            tr("orders", "a", "BEFORE", "INSERT", 0),
+            tr("orders", "b", "BEFORE", "INSERT", 0),
+        ];
+        assert!(mysql_triggers(&rows).iter().all(|t| t.order.is_none()));
+    }
+
+    #[test]
+    fn mysql_triggers_carry_definer_timing_event_and_body() {
+        let out = mysql_triggers(&[tr("orders", "a", "AFTER", "DELETE", 1)]);
+        let t = &out[0];
+        assert_eq!(t.timing, TriggerTiming::After);
+        assert_eq!(t.events, vec![TriggerEvent::Delete]);
+        assert_eq!(t.action, TriggerAction::Body(s("SET NEW.x = 1")));
+        assert_eq!(t.definer.as_deref(), Some("root@localhost"));
+        assert!(t.schema.is_none()); // MySQL has no namespace level
+        assert!(t.enabled);
+    }
+
+    #[test]
+    fn apply_triggers_drops_rows_for_tables_not_in_this_fetch() {
+        let tables = [(s("orders"), s("BASE TABLE"))];
+        let mut schema = assemble_schema(None, &tables, &[], &[], &[], &[]);
+        let triggers = mysql_triggers(&[
+            tr("orders", "keep", "BEFORE", "INSERT", 1),
+            tr("ghost", "drop", "BEFORE", "INSERT", 1),
+        ]);
+        apply_triggers(&mut schema, triggers);
+        assert_eq!(schema.tables[0].triggers.len(), 1);
+        assert_eq!(schema.tables[0].triggers[0].name, "keep");
     }
 
     #[test]
