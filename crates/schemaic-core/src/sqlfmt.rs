@@ -36,11 +36,7 @@ enum Kind {
     Punct,
 }
 
-fn is_word_byte(c: u8) -> bool {
-    // Bytes >= 0x80 are treated as word bytes so Unicode identifiers tokenize
-    // whole (same rule as the editor's `tokenize_range`).
-    c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80
-}
+use crate::sql::is_word_byte;
 
 /// Multi-character operators, longest first, so `->>` beats `->` beats `>`.
 const OPS: &[&str] = &[

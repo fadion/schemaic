@@ -108,11 +108,7 @@ pub(crate) struct Suggestion {
     replace: Option<(usize, usize)>,
 }
 
-fn is_word_byte(b: u8) -> bool {
-    // `>= 0x80` = any UTF-8 lead/continuation byte, so Unicode identifiers count
-    // as one word instead of splitting at the first non-ASCII byte (review B6).
-    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
-}
+use schemaic_core::sql::{is_word_byte, is_word_start};
 
 /// Byte offset where the identifier ending at `offset` begins.
 fn word_start(text: &str, offset: usize) -> usize {
@@ -335,7 +331,7 @@ fn statement_identifiers(
     let mut i = lo;
     while i < hi {
         let c = b[i];
-        if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 {
+        if is_word_start(c) {
             let s = i;
             let mut j = i + 1;
             while j < hi && is_word_byte(b[j]) {
