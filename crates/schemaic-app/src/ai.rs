@@ -913,11 +913,44 @@ fn render_ai_context(
 
 /// Pull a bare SQL statement out of the assistant's reply, stripping a markdown
 /// code fence if the model wrapped it despite instructions.
+/// Drop a fenced block's language tag from `after` (everything past the opening
+/// backticks), leaving the body.
+///
+/// Two shapes, because the model writes both: the tag alone on the fence line
+/// with the body below, and the tag followed by SQL on the same line. The first
+/// is recognised structurally — *one word, then a newline* — so an untagged
+/// fence whose first line is real SQL keeps it. The second can only be
+/// recognised by name, since `SELECT` alone on a line is indistinguishable from
+/// a tag; the list is the tags a model plausibly picks for this prompt.
+fn strip_fence_tag(after: &str) -> &str {
+    const TAGS: &[&str] = &["sql", "postgresql", "postgres", "psql", "mysql", "mariadb"];
+    let (line, rest) = after.split_once('\n').unwrap_or((after, ""));
+    let word = line.trim();
+    if !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '+')
+    {
+        return rest;
+    }
+    // Tag and statement on one line: strip only the tag word.
+    let head = line.split_whitespace().next().unwrap_or("");
+    if TAGS.iter().any(|t| head.eq_ignore_ascii_case(t)) {
+        return &after[head.len()..];
+    }
+    after
+}
+
 pub(crate) fn extract_sql(text: &str) -> String {
     let t = text.trim();
     if t.starts_with("```") {
         let after = t.trim_start_matches('`');
-        let after = after.strip_prefix("sql").unwrap_or(after);
+        // Drop the language tag, whatever the model called it. This was
+        // `strip_prefix("sql")` — exact and case-sensitive — so ```SQL,
+        // ```postgresql and ```mysql all left their tag at the head of the
+        // statement, and Ctrl+K's output goes straight into the editor.
+        //
+        let after = strip_fence_tag(after);
         let after = after.trim_start();
         let body = match after.rfind("```") {
             Some(idx) => &after[..idx],
@@ -1025,6 +1058,42 @@ mod tests {
     fn extract_sql_handles_unclosed_fence() {
         // No closing fence → take everything after the opening fence + tag.
         assert_eq!(extract_sql("```sql\nSELECT 4"), "SELECT 4");
+    }
+
+    #[test]
+    fn extract_sql_strips_any_language_tag_the_model_might_pick() {
+        // Ctrl+K's output goes straight into the editor, so a tag left behind
+        // isn't cosmetic — it's a stray token at the head of the statement and a
+        // syntax error from the server. `sql` was matched case-sensitively and
+        // exactly, so every one of these leaked.
+        for tag in ["SQL", "Sql", "postgresql", "mysql", "psql", "mariadb"] {
+            assert_eq!(
+                extract_sql(&format!("```{tag}\nSELECT 1\n```")),
+                "SELECT 1",
+                "tag {tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_sql_keeps_a_first_line_that_is_actually_sql() {
+        // A one-word fence line is a tag; anything else is the statement, so an
+        // untagged fence that starts inline keeps its first line.
+        assert_eq!(extract_sql("```\nSELECT 1\n```"), "SELECT 1");
+        assert_eq!(extract_sql("```SELECT 1\n```"), "SELECT 1");
+        assert_eq!(
+            extract_sql("```SELECT a, b FROM t\n```"),
+            "SELECT a, b FROM t"
+        );
+    }
+
+    #[test]
+    fn extract_sql_strips_a_tag_that_shares_its_line_with_the_statement() {
+        // `SELECT` alone on a line can't be told from a tag structurally, so
+        // this shape is recognised by name — which is what the old
+        // `strip_prefix("sql")` did, and the reason it can't simply be dropped.
+        assert_eq!(extract_sql("```sql SELECT 1\n```"), "SELECT 1");
+        assert_eq!(extract_sql("```SQL SELECT 1\n```"), "SELECT 1");
     }
 
     #[test]
