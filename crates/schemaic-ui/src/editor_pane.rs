@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use floem::event::{Event, EventListener, EventPropagation};
 use floem::keyboard::{Key, NamedKey};
-use floem::kurbo::Point;
+use floem::kurbo::{Point, Rect};
 use floem::prelude::*;
 use floem::reactive::{Memo, create_effect, create_memo};
 use floem::style::{CursorStyle, Height, InsetLeft, InsetRight, InsetTop, Transition};
@@ -769,14 +769,30 @@ fn highlight_pick(sql: &str, lo: usize, hi: usize, highlight: RwSignal<Option<(u
 /// line the statement touches, sized to that line's slice of the statement, so
 /// the right edges "staircase". `points_of_offset` gives the caret top/bottom at
 /// an offset; `.x` is content-relative (add the gutter), `.y` is editor-relative.
+///
+/// Boxes are **clamped to the viewport's visible width**. These overlays are laid
+/// out in `editor_area`, which doesn't scroll and doesn't clip, so a statement
+/// wider than the visible code column drew its border straight out of the editor
+/// and across whatever sits beside it. Vertical needs no such clamp: floem won't
+/// place an offset outside its screen lines, and `editor_points` drops those.
+///
+/// `vp` is the editor's viewport rect — origin *and* size, since the clamp needs
+/// the width. A zero-width one (before first layout) means "unknown", not "no
+/// room": it clamps nothing, rather than blanking the highlight.
 fn statement_line_boxes_at(
     points: impl Fn(usize) -> Option<(Point, Point)>,
     sql: &str,
     lo: usize,
     hi: usize,
-    vp: (f64, f64),
+    vp: Rect,
 ) -> Vec<(f64, f64, f64, f64)> {
     let content_x = content_x_of(sql);
+    // The visible slice of the code column, in `editor_area` coords.
+    let vis_hi = if vp.width() > 0.0 {
+        content_x + vp.width()
+    } else {
+        f64::INFINITY
+    };
     let mut boxes = Vec::new();
     let mut pos = lo;
     loop {
@@ -795,14 +811,16 @@ fn statement_line_boxes_at(
             // tight box clips them). Only horizontal — the vertical extent must
             // stay one line tall (+1) so adjacent lines' borders overlap into a
             // single 1px middle border.
-            let x0 = content_x + top.x - HL_PAD - vp.0;
-            let x1 = content_x + end.x + HL_PAD - vp.0;
-            boxes.push((
-                x0,
-                top.y + EDITOR_PAD_TOP - vp.1,
-                (x1 - x0).max(6.0),
-                bot.y - top.y,
-            ));
+            // Clamped left to the code column (never over the line-number gutter)
+            // and right to the fold.
+            let x0 = (content_x + top.x - HL_PAD - vp.x0).max(content_x);
+            let x1 = content_x + end.x + HL_PAD - vp.x0;
+            // The 6px floor keeps an empty statement visible, but never at the
+            // cost of reaching past the fold.
+            let w = (x1 - x0).max(6.0).min(vis_hi - x0);
+            if w > 0.0 {
+                boxes.push((x0, top.y + EDITOR_PAD_TOP - vp.y0, w, bot.y - top.y));
+            }
         }
         match nl {
             Some(n) if n < hi => pos = n + 1,
@@ -814,8 +832,7 @@ fn statement_line_boxes_at(
 
 /// Per-line boxes for the picked statement, in `editor_area` coords.
 fn statement_line_boxes(sql: &str, ed: &Editor, lo: usize, hi: usize) -> Vec<(f64, f64, f64, f64)> {
-    let vp = ed.viewport.get();
-    statement_line_boxes_at(editor_points(ed), sql, lo, hi, (vp.x0, vp.y0))
+    statement_line_boxes_at(editor_points(ed), sql, lo, hi, ed.viewport.get())
 }
 
 /// The full set of signals/callbacks `query_pane` threads into the editor and its
@@ -2662,6 +2679,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         if let Some(stmt) = sql.get(lo..hi).filter(|s| !s.trim().is_empty()) {
                             (run)(stmt.to_string());
                         }
+                        // Down with the menu, as on Escape and Run Everything. The
+                        // outline is the menu's selection — what is *about* to run —
+                        // so once it has run it has nothing left to say, and there
+                        // is no gesture that dismisses it: Escape and arrow keys
+                        // don't reach it, leaving it up until the next click or
+                        // keystroke in the editor.
+                        highlight.set(None);
                         run_menu.set(None);
                         (refocus)();
                     })
@@ -2719,6 +2743,12 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     let refocus = refocus.clone();
                     move |_| {
                         run_menu.set(None);
+                        // The highlight came up with the menu (it is what "Run
+                        // Current" is pointing at), so it goes down with it —
+                        // dismissing ran nothing, and an outline left standing
+                        // over a statement reads as one about to run. It used to
+                        // linger until the next keystroke.
+                        highlight.set(None);
                         (refocus)();
                     }
                 })
@@ -2746,6 +2776,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 let catcher = empty()
                     .on_event_stop(EventListener::PointerDown, move |_| {
                         run_menu.set(None);
+                        // Same as Escape — and needed here for the same reason the
+                        // catcher exists: it stops the event, so the editor's own
+                        // pointer-down (which clears the highlight) never runs.
+                        highlight.set(None);
                         (refocus)();
                     })
                     .style(|s| s.absolute().inset(0.0));
@@ -3624,6 +3658,10 @@ mod geometry_tests {
 
     const SQL: &str = "SELECT 1;\nSELECT 2;\nSELECT * FROM nosuchtbl;";
 
+    /// An unscrolled viewport wide enough that nothing in these fixtures clamps —
+    /// the cases that *do* clamp pass their own.
+    const VP: Rect = Rect::new(0.0, 0.0, 800.0, 180.0);
+
     // ── The vertical scrollbar's geometry ─────────────────────────────────
 
     /// The observed case: one long statement on a single buffer line, wrapped to
@@ -3673,7 +3711,7 @@ mod geometry_tests {
     fn an_offset_the_editor_cannot_place_produces_no_segment() {
         assert_eq!(underline_seg_at(|_| None, SQL, 30, 40, (0.0, 0.0)), None);
         assert_eq!(span_box_at(|_| None, SQL, 30, 40, (0.0, 0.0)), None);
-        assert!(statement_line_boxes_at(|_| None, SQL, 0, SQL.len(), (0.0, 0.0)).is_empty());
+        assert!(statement_line_boxes_at(|_| None, SQL, 0, SQL.len(), VP).is_empty());
     }
 
     #[test]
@@ -3698,7 +3736,8 @@ mod geometry_tests {
         let b = span_box_at(at(450.0), SQL, 10, 18, (0.0, 400.0)).unwrap();
         assert!(b.1 < 200.0, "y must be viewport-relative, got {}", b.1);
 
-        let boxes = statement_line_boxes_at(at(450.0), SQL, 10, 18, (0.0, 400.0));
+        let boxes =
+            statement_line_boxes_at(at(450.0), SQL, 10, 18, Rect::new(0.0, 400.0, 800.0, 590.0));
         assert!(boxes.iter().all(|b| b.1 < 200.0), "{boxes:?}");
     }
 
@@ -3721,7 +3760,7 @@ mod geometry_tests {
 
     #[test]
     fn a_multi_line_statement_gets_one_box_per_line() {
-        let boxes = statement_line_boxes_at(at(0.0), SQL, 0, SQL.len(), (0.0, 0.0));
+        let boxes = statement_line_boxes_at(at(0.0), SQL, 0, SQL.len(), VP);
         assert_eq!(boxes.len(), 3, "three lines in the fixture");
     }
 
@@ -3734,8 +3773,58 @@ mod geometry_tests {
         let first_line_only = |off: usize| {
             (off < 10).then(|| (Point::new(off as f64 * 8.0, 0.0), Point::new(0.0, 18.0)))
         };
-        let boxes = statement_line_boxes_at(first_line_only, SQL, 0, SQL.len(), (0.0, 0.0));
+        let boxes = statement_line_boxes_at(first_line_only, SQL, 0, SQL.len(), VP);
         assert_eq!(boxes.len(), 1);
+    }
+
+    // ── Staying inside the editor ─────────────────────────────────────────
+    //
+    // These overlays are absolutely positioned in `editor_area`, which neither
+    // scrolls nor clips — so a box wider than the visible code column drew its
+    // border out of the editor and across the panel beside it.
+
+    #[test]
+    fn a_statement_wider_than_the_viewport_stops_at_the_fold() {
+        // One line, 400px of text, in a viewport only 200px wide.
+        let wide = |off: usize| Some((Point::new(off as f64 * 8.0, 0.0), Point::new(0.0, 18.0)));
+        let sql = "x".repeat(50);
+        let vp = Rect::new(0.0, 0.0, 200.0, 180.0);
+        let content_x = content_x_of(&sql);
+        let b = statement_line_boxes_at(wide, &sql, 0, sql.len(), vp)[0];
+        assert!(
+            b.0 + b.2 <= content_x + 200.0 + 0.01,
+            "right edge {} past the fold at {}",
+            b.0 + b.2,
+            content_x + 200.0
+        );
+    }
+
+    #[test]
+    fn a_box_scrolled_off_to_the_left_never_covers_the_gutter() {
+        // Scrolled 300px right, so the statement's start is off-screen left. The
+        // box begins at the code column, not over the line numbers.
+        let wide = |off: usize| Some((Point::new(off as f64 * 8.0, 0.0), Point::new(0.0, 18.0)));
+        let sql = "x".repeat(50);
+        let content_x = content_x_of(&sql);
+        let b = statement_line_boxes_at(
+            wide,
+            &sql,
+            0,
+            sql.len(),
+            Rect::new(300.0, 0.0, 500.0, 180.0),
+        )[0];
+        assert!(b.0 >= content_x, "{} is left of the code column", b.0);
+    }
+
+    #[test]
+    fn an_unmeasured_viewport_clamps_nothing_rather_than_blanking_the_highlight() {
+        // Before first layout the width is 0. Treating that as "no room" would
+        // drop every box; it means "unknown".
+        let wide = |off: usize| Some((Point::new(off as f64 * 8.0, 0.0), Point::new(0.0, 18.0)));
+        let sql = "x".repeat(50);
+        let boxes = statement_line_boxes_at(wide, &sql, 0, sql.len(), Rect::ZERO);
+        assert_eq!(boxes.len(), 1);
+        assert!(boxes[0].2 > 300.0, "{:?}", boxes[0]);
     }
 
     // ── The gutter ────────────────────────────────────────────────────────

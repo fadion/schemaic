@@ -796,10 +796,13 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
   `editor_pane`). Named keys (Backspace) never hit `receive_char`, so returning `Yes` is enough there.
 - **`Editor::points_of_offset` returns *content* coords, not viewport-relative** (`.y` is `vline_y`,
   the absolute document y; the gutter view subtracts `viewport.y0` itself). Overlays pinned in
-  `editor_area` (which doesn't scroll) must subtract `ed.viewport.get()` `x0`/`y0` to follow scroll —
-  see `char_box` (bracket matching). The older `statement_line_boxes`/`underline_seg` overlays skip
-  this (they're transient / usually unscrolled), so they drift when the editor is scrolled; don't copy
-  that for anything persistent.
+  `editor_area` must subtract `ed.viewport.get()` `x0`/`y0` to follow scroll — see `char_box`
+  (bracket matching), `underline_seg_at`, `statement_line_boxes_at`, all tested against a scrolled
+  viewport. **`editor_area` also doesn't clip**, so an overlay must bound itself: a box wider than
+  the visible code column paints straight out of the editor and over the panel beside it, which is
+  what `statement_line_boxes_at` clamps against `vp.width()` (a zero width means "not laid out yet",
+  so it clamps nothing rather than blanking the overlay). The vertical half needs no clamp — floem
+  won't place an offset outside its screen lines, and `editor_points` drops what it won't place.
 
 ## Popup menus (`menu_panel`)
 
