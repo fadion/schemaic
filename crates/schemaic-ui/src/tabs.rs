@@ -279,6 +279,16 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                     let toggle = toggle_pin.clone();
                     move || (toggle)(tab.id)
                 }),
+                // Same inline rename the double-click opens — the field carries
+                // its own commit/discard rules, so this only has to seed the
+                // buffer and switch the chip into edit mode. Offered on a pinned
+                // tab too: a name has nothing to do with whether it can close.
+                MenuEntry::action("Rename", move || {
+                    if !tab.editing.get_untracked() {
+                        tab.edit_buf.set(tab.title());
+                        tab.editing.set(true);
+                    }
+                }),
                 MenuEntry::action("Duplicate", {
                     let duplicate = duplicate.clone();
                     move || (duplicate)(tab.id)
