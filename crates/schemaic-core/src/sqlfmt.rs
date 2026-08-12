@@ -592,4 +592,87 @@ mod tests {
         let twice = format_sql(&once, IND);
         assert_eq!(once, twice);
     }
+
+    // ── The headline contract, and the dialects it has to hold under ──────
+    //
+    // Ctrl+Alt+L rewrites the user's buffer in place, so a formatter that
+    // mangles a token doesn't produce ugly SQL — it produces *different* SQL,
+    // and the one class of that which is dangerous (a PostgreSQL `--` read as
+    // MySQL, uncommenting a statement) was a Critical in this review. These are
+    // the tests that would have failed the day it was introduced.
+
+    /// Every non-whitespace character, in order. Formatting may re-flow
+    /// whitespace and nothing else, so this string is an invariant.
+    fn tokens(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    fn assert_preserves(sql: &str, dialect: SqlDialect) {
+        let out = super::format_sql(sql, IND, dialect);
+        assert_eq!(
+            tokens(&out),
+            tokens(sql),
+            "{dialect:?} mangled: {sql}\n{out}"
+        );
+    }
+
+    #[test]
+    fn formatting_preserves_every_token_on_both_dialects() {
+        let shared = [
+            "select a,b from t where x=1 and y=2",
+            "select 'a string with  spaces and -- a fake comment' from t",
+            "select /* block */ a from t /* trailing */",
+            "insert into t values ('multi\nline'), ('x')",
+            "select \"quoted\" from t",
+            "select a from t where b in (1,2,3) order by a desc",
+        ];
+        for sql in shared {
+            assert_preserves(sql, SqlDialect::MySql);
+            assert_preserves(sql, SqlDialect::Postgres);
+        }
+        // Dialect-only shapes, each meaningless or differently-lexed elsewhere.
+        assert_preserves(
+            "select `back ticked` from t # trailing\nselect 2",
+            SqlDialect::MySql,
+        );
+        for sql in [
+            "select E'esc\\'aped' from t",
+            "create function f() returns int as $$ select 1; $$ language sql",
+            "select data #> '{a,b}' from t",
+        ] {
+            assert_preserves(sql, SqlDialect::Postgres);
+        }
+    }
+
+    #[test]
+    fn a_line_comment_keeps_the_newline_that_ends_it() {
+        // Token preservation alone can't see this: strip the whitespace and a
+        // swallowed newline looks identical. But losing it puts the next
+        // statement *inside* the comment, which is the same class of harm as
+        // reading `--` on the wrong dialect.
+        for dialect in [SqlDialect::MySql, SqlDialect::Postgres] {
+            let out = super::format_sql("-- note\nselect 1", IND, dialect);
+            let after = out.split_once("-- note").expect("comment survived").1;
+            assert!(after.starts_with('\n'), "{dialect:?}: {out:?}");
+        }
+        // MySQL's `#` is the same shape; on PostgreSQL it is an operator, and
+        // the token-preservation test above covers that side.
+        let out = super::format_sql("# note\nselect 1", IND, SqlDialect::MySql);
+        let after = out.split_once("# note").expect("comment survived").1;
+        assert!(after.starts_with('\n'), "{out:?}");
+    }
+
+    #[test]
+    fn a_postgres_dash_comment_is_never_treated_as_code() {
+        // The regression guard for the Critical: `-- ` hides the rest of its
+        // line on *both* engines. If the formatter ever re-flows a PG statement
+        // as if `--` weren't a comment, the `select 2` here moves onto the
+        // comment's line and silently becomes part of it.
+        let out = super::format_sql("select 1 -- hidden\nselect 2", IND, SqlDialect::Postgres);
+        let line = out
+            .lines()
+            .find(|l| l.contains("-- hidden"))
+            .expect("comment survived");
+        assert!(!line.contains("select 2"), "{out:?}");
+    }
 }
