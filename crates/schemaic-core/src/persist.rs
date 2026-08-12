@@ -112,12 +112,18 @@ fn default_ai_scope() -> String {
     "active".to_string()
 }
 
-// Theme defaults: dark UI + One Dark Pro editor (the original look).
+// Theme defaults: dark UI + Tokyo Night editor. Tokyo Night rather than the
+// original One Dark Pro because it reads better against the app's chrome — the
+// editor-adjacent surfaces (completion popup, run menu, context menus) are
+// chrome-themed, and One Dark Pro's background sits close enough to the editor's
+// own that the popup barely separates from it.
+//
+// Only affects a config with no `editor_theme` saved; nobody's choice changes.
 fn default_ui_theme() -> String {
     "dark".to_string()
 }
 fn default_editor_theme() -> String {
-    "one-dark-pro".to_string()
+    "tokyo-night".to_string()
 }
 fn default_editor_font() -> f32 {
     14.0
@@ -175,7 +181,7 @@ pub struct UiState {
     /// Interface (chrome) theme key: `dark` / `light`.
     #[serde(default = "default_ui_theme")]
     pub ui_theme: String,
-    /// SQL-editor theme key: `one-dark-pro` / `tokyo-night` / `catppuccin-latte`.
+    /// SQL-editor theme key: `tokyo-night` / `one-dark-pro` / `catppuccin-latte`.
     #[serde(default = "default_editor_theme")]
     pub editor_theme: String,
     /// SQL-editor font size (px).
