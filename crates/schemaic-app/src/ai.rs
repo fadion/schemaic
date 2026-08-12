@@ -327,6 +327,20 @@ pub(crate) fn start_ai_session(
         tools,
     );
 
+    // Before the spawn, because afterwards it is unrecognisable: the OS returns
+    // a generic failure and the arm below blames the installation.
+    if let Some(why) = schemaic_ai::oversize_reason(&args, schemaic_ai::arg_limit()) {
+        let _ = ai_tx.send(AiStreamMsg {
+            segs: vec![schemaic_core::transcript::Seg::Text(why)],
+            done: true,
+            is_error: true,
+            stats: None,
+        });
+        // A live sender with no process behind it: the panel shows the message
+        // and the next question re-enters here, where the same check applies.
+        return (tx, mcp_cfg);
+    }
+
     handle.spawn(async move {
         let mut child = match Command::new(claude_bin(&cli_path))
             .args(&args)
@@ -757,35 +771,65 @@ fn render_schema_outline(
     if scope == SchemaScope::None {
         return outline;
     }
+    // Bytes spent so far. Charged per *name* rather than checked per line, so
+    // one enormous database can't spend the whole allowance before anyone looks
+    // — and so the databases after it are still named.
+    let mut used = 0usize;
+    let mut omitted = 0usize;
     for (database, schema) in databases {
         if scope == SchemaScope::Active && Some(database.as_str()) != active_db {
             continue;
         }
+        let db_label = inline_datum(database);
+        used += db_label.len() + 4;
         match schema {
             Some(s) => {
                 // Qualified outside PostgreSQL's `public` — the assistant has to
                 // be able to name the table it's told about.
-                let tables: Vec<String> = s
-                    .tables
-                    .iter()
-                    .map(|t| {
-                        inline_datum(&schemaic_core::schema::display_name(
-                            t.schema.as_deref(),
-                            &t.name,
-                        ))
-                    })
-                    .collect();
-                outline.push_str(&format!(
-                    "- {}: {}\n",
-                    inline_datum(database),
-                    tables.join(", ")
-                ));
+                let mut tables: Vec<String> = Vec::new();
+                for t in &s.tables {
+                    let name = inline_datum(&schemaic_core::schema::display_name(
+                        t.schema.as_deref(),
+                        &t.name,
+                    ));
+                    if used + name.len() + 2 > OUTLINE_BYTES {
+                        omitted += 1;
+                        continue;
+                    }
+                    used += name.len() + 2;
+                    tables.push(name);
+                }
+                outline.push_str(&format!("- {db_label}: {}\n", tables.join(", ")));
             }
-            None => outline.push_str(&format!("- {}\n", inline_datum(database))),
+            None => outline.push_str(&format!("- {db_label}\n")),
         }
+    }
+    if omitted > 0 {
+        outline.push_str(&format!(
+            "- … and {omitted} more {} not listed here (the schema is too large for one \
+             prompt); call list_schema on a database to see all of its tables.\n",
+            schemaic_core::text::plural(omitted, "table", "tables")
+        ));
     }
     outline
 }
+
+/// How much of the command line the schema outline may spend.
+///
+/// The whole system prompt travels as **one argv entry** (`--append-system-prompt`),
+/// and Windows caps an entire command line at 32,767 characters; Linux caps a
+/// single argument at 128 KiB. Past either, the spawn fails and the user is told
+/// to check that Claude Code is installed — the one cause that isn't the problem.
+///
+/// The module already budgets its two *small* sections (`RECAP_CHARS`,
+/// `HISTORY_MSG_CHARS`) and left the large one open. At ~15 characters per
+/// qualified name, 8 KiB is around 500 tables — enough that ordinary catalogs are
+/// listed whole, and bounded enough that the editor buffer, history and
+/// instructions all still fit beside it.
+///
+/// Measured in **bytes**, which is the conservative side of Windows' UTF-16
+/// count: a non-ASCII name costs at least as many UTF-8 bytes as code units.
+pub(crate) const OUTLINE_BYTES: usize = 8_192;
 
 /// One database and its loaded schema, as the pure prompt builders take it —
 /// `None` while introspection is still in flight. The schema is the `Arc` out of
@@ -1559,6 +1603,52 @@ mod tests {
             render_schema_outline(&dbs, Some("shop"), SchemaScope::None),
             ""
         );
+    }
+
+    #[test]
+    fn a_large_catalog_is_bounded_and_says_what_it_left_out() {
+        // The prompt travels as one argv entry, and Windows caps a whole command
+        // line at 32,767 characters — so an unbounded outline doesn't degrade
+        // the answer, it stops the panel launching, with an error naming the one
+        // cause that isn't the problem ("Ensure Claude Code is installed").
+        let many: Vec<TableInfo> = (0..4000)
+            .map(|i| table(&format!("table_number_{i}"), &["id"]))
+            .collect();
+        let dbs = vec![
+            ("big".to_string(), Some(schema(many))),
+            (
+                "small".to_string(),
+                Some(schema(vec![table("orders", &["id"])])),
+            ),
+        ];
+        let out = render_schema_outline(&dbs, Some("big"), SchemaScope::All);
+
+        assert!(
+            out.len() <= OUTLINE_BYTES + 200,
+            "outline ran to {} bytes",
+            out.len()
+        );
+        // Every database is still *named*, including one whose turn came after
+        // the budget was gone: the assistant can only call `list_schema` on a
+        // database it has been told exists.
+        assert!(out.contains("- big:"), "{out}");
+        assert!(out.contains("- small"), "{out}");
+        // And the omission is stated, with the tool that recovers it.
+        assert!(out.contains("more table"), "{out}");
+        assert!(out.contains("list_schema"), "{out}");
+    }
+
+    #[test]
+    fn a_catalog_that_fits_is_listed_whole_with_no_marker() {
+        let dbs = vec![(
+            "shop".to_string(),
+            Some(schema(vec![
+                table("orders", &["id"]),
+                table("items", &["id"]),
+            ])),
+        )];
+        let out = render_schema_outline(&dbs, Some("shop"), SchemaScope::All);
+        assert_eq!(out, "- shop: orders, items\n");
     }
 
     #[test]
