@@ -2512,7 +2512,6 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // table under a different connection doesn't wrongly steal focus (H13).
     let open_table: Rc<dyn Fn(TableSource)> = {
         let spawn = spawn_table_tab.clone();
-        let run = run.clone();
         Rc::new(move |source: TableSource| {
             let existing = tabs.with_untracked(|v| {
                 v.iter()
@@ -2524,13 +2523,12 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             });
             if let Some(tab) = existing {
                 active.set(tab.id);
-                // A restored tab keeps its query text but hasn't run (restore never
-                // auto-runs), so switching to it would show an empty grid. Run it now
-                // — a freshly-opened table tab always runs on open, so reusing one
-                // should match. (`run` targets the now-active tab.)
-                if matches!(tab.results.get_untracked(), QueryState::Idle) {
-                    (run)(tab.query.get_untracked());
-                }
+                // Deliberately *not* running the tab's query, even though a restored
+                // tab is `Idle` and so shows an empty grid. A table tab keeps its
+                // `source` however the user edits its text, so "open the table" would
+                // execute whatever that tab is now holding — `DELETE FROM orders;`
+                // included. Executing SQL is the user's call; the empty grid is one
+                // Ctrl+Enter away from filled.
                 return;
             }
             (spawn)(source, None);
@@ -2543,7 +2541,6 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // switch to it — switching rebuilds that tab's grid, whose effect consumes it.
     let open_table_col: Rc<dyn Fn(TableSource, String)> = {
         let spawn = spawn_table_tab.clone();
-        let run = run.clone();
         Rc::new(move |source: TableSource, column: String| {
             let existing = tabs.with_untracked(|v| {
                 v.iter()
@@ -2563,12 +2560,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 if active.get_untracked() != tab.id {
                     active.set(tab.id);
                 }
-                // A restored tab has its query but hasn't run — run it now so the
-                // grid loads and the highlight effect can fire (it consumes
-                // `highlight_col` once the results are `Loaded`).
-                if matches!(tab.results.get_untracked(), QueryState::Idle) {
-                    (run)(tab.query.get_untracked());
-                }
+                // Same rule as `open_table`: a restored tab is not run for the user
+                // (its text is no longer necessarily the table's `SELECT`). The
+                // highlight stays pending — the effect consumes it whenever the
+                // results reach `Loaded`, whether that's now or after the user runs.
                 return;
             }
             (spawn)(source, Some(column));
