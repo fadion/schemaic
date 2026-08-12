@@ -93,14 +93,12 @@ pub(crate) fn results_view(
     dyn_container(
         move || phase.get(),
         move |(ph, _gen)| match ph {
-            Phase::Idle => {
-                centered_msg("Run a query  (Ctrl+Enter)", theme::text_muted()).into_any()
-            }
+            Phase::Idle => centered_msg("Run a query  (Ctrl+Enter)", theme::text_muted).into_any(),
             Phase::Running => running_view(cancel.clone()).into_any(),
             // The error text now lives in the editor's error bar (with View /
             // AI Fix), so Results just notes the failure.
-            Phase::Failed => centered_msg("Query failed.", theme::text_dim()).into_any(),
-            Phase::Cancelled => centered_msg("Query cancelled.", theme::text_dim()).into_any(),
+            Phase::Failed => centered_msg("Query failed.", theme::text_dim).into_any(),
+            Phase::Cancelled => centered_msg("Query cancelled.", theme::text_dim).into_any(),
             Phase::Loaded => {
                 // The Arc is read untracked — the phase Memo, not the Arc, drives
                 // rebuilds; a splice updates the grid's live `rs` + this canonical.
@@ -237,7 +235,7 @@ pub(crate) fn loaded_view(rs: Arc<ResultSet>, gctx: GridCtx) -> AnyView {
             let s = if n == 1 { "" } else { "s" };
             centered_msg(
                 format!("{n} row{s} affected · {} ms", rs.elapsed_ms),
-                theme::text_dim(),
+                theme::text_dim,
             )
             .into_any()
         }

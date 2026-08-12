@@ -917,7 +917,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                         .padding_vert(3.0)
                 })
                 .into_any(),
-                SchemaState::Failed(e) => info_row(e, theme::error()).into_any(),
+                SchemaState::Failed(e) => info_row(e, theme::error).into_any(),
                 SchemaState::Loaded(schema) => {
                     let db = database.clone();
                     let child_ctx = |indent: f64| SchemaTreeCtx {
@@ -981,7 +981,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                         return if filtering {
                             empty().into_any()
                         } else {
-                            info_row("No tables", theme::text_muted()).into_any()
+                            info_row("No tables", theme::text_muted).into_any()
                         };
                     }
                     v_stack_from_iter(
@@ -1117,7 +1117,7 @@ fn schema_node(
                 return if filtering {
                     empty().into_any()
                 } else {
-                    info_row("No tables", theme::text_muted()).into_any()
+                    info_row("No tables", theme::text_muted).into_any()
                 };
             }
             let db = database.clone();
@@ -1606,9 +1606,14 @@ fn tree_row_static(s: floem::style::Style, pad_left: f64) -> floem::style::Style
 }
 
 // A non-interactive status line inside the tree (Loading / error / empty).
-fn info_row(msg: impl Into<String>, color: floem::peniko::Color) -> impl IntoView {
+// `color` is a fn for the same reason `widgets::centered_msg`'s is: a captured
+// `Color` freezes at build and stops following a live theme switch.
+fn info_row(
+    msg: impl Into<String>,
+    color: impl Fn() -> floem::peniko::Color + 'static,
+) -> impl IntoView {
     let msg = msg.into();
-    container(text(msg).style(move |s| s.color(color).font_size(theme::FONT_LABEL))).style(
+    container(text(msg).style(move |s| s.color(color()).font_size(theme::FONT_LABEL))).style(
         move |s| {
             s.min_width(tree_row_min_w())
                 .padding_left(LEAF_PAD)

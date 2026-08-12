@@ -364,8 +364,15 @@ fn entry_row(entry: MonitorEntry, cols: RwSignal<Vec<String>>) -> impl IntoView 
 /// remaining record of what it held, so the core's answer was the right one.
 fn data_view(change: &RowChange, cols: &[String]) -> impl IntoView + use<> {
     let name = |ci: usize| cols.get(ci).cloned().unwrap_or_else(|| "?".to_string());
-    let dim = theme::text_dim();
-    let span = move |t: String, c: Color| text(t).style(move |s| s.color(c).font_size(FONT_BODY));
+    // The colour arrives as a fn and is called *inside* the style closure. These
+    // rows are keyed on the log index, so a theme switch rebuilds none of them —
+    // a `Color` read here would be the old theme's for as long as the modal
+    // stays open. `old_color`/`new_color` are fixed red/green by design and pass
+    // as fns too, so there is one shape rather than two.
+    let dim: fn() -> Color = theme::text_dim;
+    let span = move |t: String, c: fn() -> Color| {
+        text(t).style(move |s| s.color(c()).font_size(FONT_BODY))
+    };
     let mut spans: Vec<AnyView> = Vec::new();
     match change.kind {
         ChangeKind::Update => {
@@ -374,18 +381,18 @@ fn data_view(change: &RowChange, cols: &[String]) -> impl IntoView + use<> {
                     spans.push(span(",   ".to_string(), dim).into_any());
                 }
                 spans.push(span(format!("{}: ", name(f.col)), dim).into_any());
-                spans.push(span(cell(&f.old), old_color()).into_any());
+                spans.push(span(cell(&f.old), old_color).into_any());
                 spans.push(span(" → ".to_string(), dim).into_any());
-                spans.push(span(cell(&f.new), new_color()).into_any());
+                spans.push(span(cell(&f.new), new_color).into_any());
             }
         }
         // Same shape for both, differing only in the colour that says whether
         // the values are arriving or leaving.
         ChangeKind::Insert | ChangeKind::Delete => {
-            let value_color = if change.kind == ChangeKind::Insert {
-                new_color()
+            let value_color: fn() -> Color = if change.kind == ChangeKind::Insert {
+                new_color
             } else {
-                old_color()
+                old_color
             };
             for (i, (n, c)) in cols.iter().zip(&change.cells).enumerate() {
                 if i > 0 {

@@ -101,9 +101,15 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
 
     // Whole list rebuilds on any change (few messages; also lets the pending
     // bubble flip to its answer in place without stale-view issues).
+    //
+    // Also keyed on the UI-theme generation. `render_markdown` bakes its body
+    // colour into a text `Attrs` list rather than a style closure, so it is the
+    // one place a live theme switch cannot reach by re-reading — without the
+    // rebuild, every message already on screen keeps the old theme's text colour
+    // against the new background and the panel goes two-toned.
     let convo = dyn_container(
-        move || messages.get(),
-        move |msgs| {
+        move || (messages.get(), theme::ui_generation()),
+        move |(msgs, _)| {
             if msgs.is_empty() {
                 ai_seen().set(0); // new/cleared conversation → next messages pop in
                 // Left-aligned placeholder: 10px below the title, 15px from the
