@@ -1658,9 +1658,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                         primary: "Run in Terminal".to_string(),
                         secondary: cmd.clone(),
                         activate: Rc::new(move || {
-                            if right_panel_allowed() {
-                                right_panel.set(RightPanel::Terminal);
-                            }
+                            crate::reveal_panel(right_panel, RightPanel::Terminal);
                             (term_input)(format!("{cmd}\r").into_bytes());
                             (close)();
                         }),

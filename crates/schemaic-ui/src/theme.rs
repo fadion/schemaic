@@ -18,6 +18,7 @@ pub use crate::themes::{
     EditorThemeKind, UiThemeKind, bump_editor_generation, editor_font_size, editor_generation,
     editor_soft_tabs, editor_tab_width, editor_word_wrap, init, parse_hex, set_editor,
     set_editor_font, set_editor_soft_tabs, set_editor_tab_width, set_editor_word_wrap, set_ui,
+    ui_generation,
 };
 
 /// The active editor theme struct (surface + token palette) — for the SQL editor

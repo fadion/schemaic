@@ -930,7 +930,7 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
             let Some(schema) = resolve_schema(db_nodes, &target.database) else {
                 let body = centered_msg(
                     "Schema isn't loaded for this database yet.",
-                    theme::text_dim(),
+                    theme::text_dim,
                 )
                 .into_any();
                 return modal_frame(win, close, "—".to_string(), Vec::new(), Vec::new(), body)
@@ -945,11 +945,9 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
 
             // Empty graph (e.g. a table with no relationships, or unknown seed).
             if graph.nodes.is_empty() {
-                let body = centered_msg(
-                    "No foreign-key relationships to diagram.",
-                    theme::text_dim(),
-                )
-                .into_any();
+                let body =
+                    centered_msg("No foreign-key relationships to diagram.", theme::text_dim)
+                        .into_any();
                 return modal_frame(win, close, scope, chips(&graph), Vec::new(), body).into_any();
             }
 

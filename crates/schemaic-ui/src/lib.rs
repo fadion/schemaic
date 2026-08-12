@@ -2493,8 +2493,19 @@ pub(crate) fn right_panel_allowed() -> bool {
 /// on Terminal, History or closed, it sent the prompt into a panel the user
 /// couldn't see and looked like it had done nothing.
 pub(crate) fn reveal_ai_panel(right_panel: RwSignal<RightPanel>) {
-    if right_panel_allowed() && right_panel.get_untracked() != RightPanel::Ai {
-        right_panel.set(RightPanel::Ai);
+    reveal_panel(right_panel, RightPanel::Ai);
+}
+
+/// Show `which` in the right column — the one door, for every panel.
+///
+/// Two guards, and both have bitten. A redundant `set` still notifies (floem
+/// never dedups), which disposes the open panel's child scope and rebuilds it
+/// mid-turn — that is how a `set(Ai)` while the AI panel was streaming freed the
+/// `elapsed_ms` its footer was reading. And a window too narrow to show the
+/// column at all would otherwise have a signal set that nothing renders.
+pub(crate) fn reveal_panel(right_panel: RwSignal<RightPanel>, which: RightPanel) {
+    if right_panel_allowed() && right_panel.get_untracked() != which {
+        right_panel.set(which);
     }
 }
 
@@ -3294,9 +3305,9 @@ fn results_multi(
             // statement's error has nowhere else to go, so show it here. Free-
             // standing text on the results background, so `error()` — see the
             // note in `monitor_view`'s status line.
-            Some(QueryState::Failed(m)) => centered_msg(m, theme::error()).into_any(),
+            Some(QueryState::Failed(m)) => centered_msg(m, theme::error).into_any(),
             Some(QueryState::Cancelled) => {
-                centered_msg("Query cancelled.", theme::text_dim()).into_any()
+                centered_msg("Query cancelled.", theme::text_dim).into_any()
             }
             Some(QueryState::Loaded(rs)) => loaded_view(rs, gctx.clone()),
         },

@@ -670,6 +670,9 @@ struct ThemeState {
     // Held only so the detached scope (and thus the signals) never gets dropped.
     _scope: Scope,
     ui: RwSignal<Rc<UiTheme>>,
+    // Bumped on every UI-theme change, for views that *can't* re-read a colour
+    // reactively and have to be rebuilt instead. See `ui_generation`.
+    ui_gen: RwSignal<u64>,
     editor: RwSignal<Rc<EditorTheme>>,
     // Bumped on every editor-theme change; the SQL editor's `Styling::id` reads
     // this so the editor invalidates its cached layout and re-highlights.
@@ -696,6 +699,7 @@ fn with_state<R>(f: impl FnOnce(&ThemeState) -> R) -> R {
             let state = ThemeState {
                 ui: scope.create_rw_signal(Rc::new(UiTheme::dark())),
                 editor: scope.create_rw_signal(Rc::new(EditorTheme::one_dark_pro())),
+                ui_gen: scope.create_rw_signal(0u64),
                 editor_gen: scope.create_rw_signal(0u64),
                 editor_font: scope.create_rw_signal(14.0_f32),
                 editor_tab_width: scope.create_rw_signal(4usize),
@@ -718,7 +722,10 @@ pub fn init(ui: UiThemeKind, editor: EditorThemeKind) {
 
 /// Swap the active UI theme (re-runs every reactive style closure).
 pub fn set_ui(kind: UiThemeKind) {
-    with_state(|st| st.ui.set(Rc::new(kind.build())));
+    with_state(|st| {
+        st.ui.set(Rc::new(kind.build()));
+        st.ui_gen.update(|g| *g += 1);
+    });
 }
 
 /// Swap the active editor theme (bumps the generation so the editor re-highlights).
@@ -737,6 +744,22 @@ pub fn ui() -> Rc<UiTheme> {
 /// The active editor theme.
 pub fn editor() -> Rc<EditorTheme> {
     with_state(|st| st.editor.get())
+}
+
+/// Monotonic UI-theme generation, for the views a live switch can't reach.
+///
+/// The normal rule — pass `fn() -> Color` and call it *inside* the `.style`
+/// closure — works because reading the theme signal there subscribes that
+/// closure. It has one blind spot: a colour baked into a text `Attrs` list
+/// (`markdown.rs`) isn't a style closure at all and can never re-evaluate, so
+/// the only way to repaint it is to rebuild the view. Keying a `dyn_container`
+/// on this is that rebuild, and it's the same trick `editor_generation` plays
+/// for the SQL editor's cached layout.
+///
+/// Use it **only** where re-reading is impossible — a `dyn_container` keyed on
+/// this discards and recreates its whole child scope on every theme switch.
+pub fn ui_generation() -> u64 {
+    with_state(|st| st.ui_gen.get())
 }
 
 /// Monotonic editor-theme generation (SQL editor `Styling::id`). Bumped by theme

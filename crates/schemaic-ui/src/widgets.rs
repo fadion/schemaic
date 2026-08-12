@@ -807,9 +807,20 @@ pub(crate) fn section_title(t: &'static str) -> impl IntoView {
     })
 }
 
-pub(crate) fn centered_msg(msg: impl Into<String>, color: floem::peniko::Color) -> impl IntoView {
+/// A centred status line filling its container (empty state, failure, cancel).
+///
+/// `color` is a **function**, not a `Color`: a colour read once at build freezes
+/// at the theme that was active then, so every caller of this — eleven of them —
+/// would keep painting the old palette after a live theme switch. Passing the
+/// accessor and calling it *inside* the reactive `.style` closure is what makes
+/// the switch free (CLAUDE.md → *Themable colors reach reactive styles as
+/// `fn() -> Color`*).
+pub(crate) fn centered_msg(
+    msg: impl Into<String>,
+    color: impl Fn() -> floem::peniko::Color + 'static,
+) -> impl IntoView {
     let msg = msg.into();
-    container(text(msg).style(move |s| s.color(color))).style(|s| {
+    container(text(msg).style(move |s| s.color(color()))).style(|s| {
         s.flex_grow(1.0_f32)
             .width_full()
             .items_center()
