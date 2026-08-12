@@ -6,14 +6,23 @@
 //! to point at", and offering the trigger form without a way to write one would
 //! be a dead end.
 //!
-//! Same shape as [`crate::view_editor`], for the same reason it isn't a designer
-//! tab: a trigger has no columns, indexes or keys to list, so the
-//! list-plus-form layout would be empty panes beside one text box. It wears the
-//! shared modal chrome, computes its footer count from the same
-//! [`TriggerDraft`] the preview emits from, and ends at [`crate::ddl_preview`]
-//! like every other schema edit.
+//! The trigger modal is the designer's **list-plus-form** shape — a table's
+//! triggers on the left, the selected one's details on the right, with `+`/`−`
+//! under the list — because that is what they are: several sibling objects on
+//! one table, edited together. It wears the shared modal chrome, computes its
+//! footer count from the same [`TriggerSetDraft`] the preview emits from, and
+//! ends at [`crate::ddl_preview`] like every other schema edit.
 //!
-//! Three things here are load-bearing rather than cosmetic:
+//! **It is not a designer tab, and that is the point.** What belongs in the
+//! designer is what can be a *clause* of `ALTER TABLE` — columns, indexes,
+//! foreign keys, checks — because MySQL's emitter coalesces those into one
+//! statement, which is the only atomicity that engine offers. A trigger needs a
+//! statement of its own, so folding it in would turn one `ALTER TABLE` into an
+//! `ALTER` plus N trigger statements that commit one at a time, and
+//! `DdlError::applied` would stop meaning much. Keeping this a separate plan
+//! costs a menu entry and buys that back.
+//!
+//! Four things here are load-bearing rather than cosmetic:
 //!
 //! * **The form is per-engine because the objects are.** MySQL's trigger owns a
 //!   body and fires on exactly one event; PostgreSQL's calls a function, may
@@ -30,6 +39,12 @@
 //!   asynchronously ([`crate::TriggerFnFn`]), so it is empty for the first
 //!   frames; a dropdown that selected its first entry on arrival would silently
 //!   re-point a trigger the user had already aimed.
+//! * **The list re-renders on every draft change; the form must not.** Same
+//!   split, and the same reason, as the designer's: a draft-keyed form is torn
+//!   down mid-keystroke. The form is keyed on `(selected, rev)`, with `rev`
+//!   bumped on add/remove because deleting the selected row leaves `selected`
+//!   unchanged while the item at that index is now a different trigger. The
+//!   two modals share `selected`/`rev` — only one of them is ever open.
 
 use std::rc::Rc;
 
@@ -38,14 +53,16 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::create_effect;
 
-use schemaic_core::ddl::{self, FunctionDraft, TriggerDraft};
+use schemaic_core::ddl::{self, FunctionDraft, TriggerDraft, TriggerSetDraft};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::schema::{
     RoutineInfo, TriggerAction, TriggerEvent, TriggerInfo, TriggerLevel, TriggerTiming,
 };
 
 use crate::settings::settings_toggle_row;
-use crate::table_designer::{edit_ctx, owned_dropdown};
+use crate::table_designer::{
+    edit_ctx, list_actions, list_pane, list_row, loaded_table, owned_dropdown,
+};
 use crate::widgets::{
     FORM_GAP, footer_button, form_section, form_setting, form_setting_owned, modal_footer_split,
     modal_title_owned, panel_style,
@@ -66,27 +83,24 @@ const NEW_BODY: &str = "BEGIN\n    \nEND";
 
 // ── opening ──────────────────────────────────────────────────────────────────
 
-fn open_editor(ui: &Ui, target: TriggerTarget, draft: TriggerDraft) {
+fn open_editor(ui: &Ui, target: TriggerTarget, draft: TriggerSetDraft) {
     let d = ui.ddl;
+    let pg = target.dialect == SqlDialect::Postgres;
     d.trigger_draft.set(draft);
     d.view_rows.set(BODY_ROWS);
+    d.selected.set(0);
+    d.rev.update(|r| *r += 1);
     d.error.set(None);
     d.preview.set(None);
     // Each overlay knows only its own flag, so two open would paint two panels.
     d.designer.set(None);
     d.view.set(None);
     d.function.set(None);
+    d.functions.set(Vec::new());
     d.trigger.set(Some(target));
-    if target_is_pg(ui) {
+    if pg {
         fetch_functions(ui);
     }
-}
-
-fn target_is_pg(ui: &Ui) -> bool {
-    ui.ddl.trigger.with_untracked(|t| {
-        t.as_ref()
-            .is_some_and(|t| t.dialect == SqlDialect::Postgres)
-    })
 }
 
 /// Load the database's trigger functions once the editor is already open.
@@ -111,52 +125,58 @@ fn fetch_functions(ui: &Ui) {
     (ui.schema_actions.trigger_functions)(TriggerFnRequest { conn_id, database }, done);
 }
 
-/// Open the editor on an existing trigger.
-pub(crate) fn open_for_trigger(ui: &Ui, database: &str, trigger: &TriggerInfo) {
+/// Open the editor on a table's triggers.
+pub(crate) fn open_for_table(ui: &Ui, database: &str, schema: Option<&str>, table: &str) {
+    let Some(info) = loaded_table(ui, database, schema, table) else {
+        return;
+    };
     let ctx = edit_ctx(ui);
     open_editor(
         ui,
         TriggerTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
+            schema: info.schema.clone(),
+            table: info.name.clone(),
             dialect: ctx.dialect,
-            current: Some(trigger.clone()),
+            current: info.triggers.clone(),
             read_only: ctx.read_only,
         },
-        TriggerDraft::from_info(trigger),
+        TriggerSetDraft::from_table(&info),
     );
 }
 
-/// Open the editor on a blank draft for `table` — Create trigger.
-pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>, table: &str) {
-    let ctx = edit_ctx(ui);
-    let mut draft = TriggerDraft::blank("new_trigger", table, schema.map(str::to_string));
+/// A blank trigger for the list's `+` — pre-shaped per engine, so the form opens
+/// on something the preview can emit rather than on three validation errors.
+fn blank_trigger(
+    existing: &[TriggerDraft],
+    table: &str,
+    schema: Option<String>,
+    pg: bool,
+) -> TriggerDraft {
+    let taken: Vec<String> = existing.iter().map(|t| t.info.name.clone()).collect();
+    let mut name = "new_trigger".to_string();
+    let mut n = 2;
+    while taken.iter().any(|t| t.eq_ignore_ascii_case(&name)) {
+        name = format!("new_trigger_{n}");
+        n += 1;
+    }
+    let mut draft = TriggerDraft::blank(name, table, schema);
     draft.info.events = vec![TriggerEvent::Insert];
-    if ctx.dialect == SqlDialect::Postgres {
-        draft.info.action = TriggerAction::Function {
+    draft.info.action = if pg {
+        TriggerAction::Function {
             name: String::new(),
             args: Vec::new(),
-        };
+        }
     } else {
-        draft.info.action = TriggerAction::Body(NEW_BODY.to_string());
-    }
-    open_editor(
-        ui,
-        TriggerTarget {
-            conn_id: ctx.conn_id,
-            database: database.to_string(),
-            dialect: ctx.dialect,
-            current: None,
-            read_only: ctx.read_only,
-        },
-        draft,
-    );
+        TriggerAction::Body(NEW_BODY.to_string())
+    };
+    draft
 }
 
-/// Whether this trigger is one Schemaic can edit — the entry point's gate, and
-/// the reason a constraint trigger doesn't open a half-populated form: the
-/// deferral settings one carries aren't modelled, so re-creating it would drop
-/// them.
+/// Whether this trigger is one Schemaic can edit — the form's gate, and the
+/// reason a constraint trigger shows its details read-only: the deferral
+/// settings one carries aren't modelled, so re-creating it would drop them.
 pub(crate) fn is_editable_trigger(t: &TriggerInfo) -> bool {
     !t.constraint
 }
@@ -224,6 +244,7 @@ pub(crate) fn open_for_new_function(ui: &Ui, database: &str, schema: Option<&str
 /// because a draft-keyed field would be torn down mid-keystroke.
 fn bound_field(
     ui: &Ui,
+    i: usize,
     initial: String,
     cfg: FieldCfg,
     apply: impl Fn(&mut TriggerDraft, &str) + 'static,
@@ -233,7 +254,14 @@ fn bound_field(
     create_effect(move |prev: Option<String>| {
         let v = sig.get();
         if prev.is_some_and(|p| p != v) {
-            draft.update(|d| apply(d, &v));
+            // `get_mut`, not indexing: the form is keyed on `(selected, rev)`,
+            // but an effect can still fire once against a list the removal has
+            // already shortened.
+            draft.update(|d| {
+                if let Some(t) = d.triggers.get_mut(i) {
+                    apply(t, &v)
+                }
+            });
         }
         v
     });
@@ -242,6 +270,7 @@ fn bound_field(
 
 fn bound_choice(
     ui: &Ui,
+    i: usize,
     initial: String,
     options: Vec<String>,
     apply: impl Fn(&mut TriggerDraft, &str) + 'static,
@@ -255,7 +284,11 @@ fn bound_choice(
         move |v: String| {
             if sig.get_untracked() != v {
                 sig.set(v.clone());
-                draft.update(|d| apply(d, &v));
+                draft.update(|d| {
+                    if let Some(t) = d.triggers.get_mut(i) {
+                        apply(t, &v)
+                    }
+                });
             }
         },
     )
@@ -283,32 +316,47 @@ fn bound_fn_field(
 
 // ── the trigger form ─────────────────────────────────────────────────────────
 
-fn events_of(draft: &TriggerDraft) -> Vec<TriggerEvent> {
-    draft.info.events.clone()
-}
-
-fn form(ui: Ui, target: &TriggerTarget) -> AnyView {
+/// The detail form for the trigger at `i`.
+///
+/// Built once per `(selected, rev)` — never keyed on the draft — for the reason
+/// the designer's form isn't: a draft-keyed form is torn down mid-keystroke.
+fn form(ui: Ui, target: &TriggerTarget, i: usize) -> AnyView {
     let d = ui.ddl.trigger_draft;
-    let draft = d.get_untracked();
+    let Some(draft) = d.with_untracked(|s| s.triggers.get(i).cloned()) else {
+        return empty().into_any();
+    };
     let pg = target.dialect == SqlDialect::Postgres;
 
-    let place = form_setting_owned(
-        if target.current.is_some() {
-            "On".to_string()
-        } else {
-            "Creating on".to_string()
-        },
-        text(match &draft.info.schema {
-            Some(s) => format!("{}.{s}.{}", target.database, draft.info.table),
-            None => format!("{}.{}", target.database, draft.info.table),
-        })
-        .style(|s| s.color(theme::text_dim()).font_size(theme::FONT_BODY)),
-    );
+    // A constraint trigger is shown so it can be seen and removed, but its
+    // deferral settings aren't modelled, so editing it would silently drop them.
+    if !is_editable_trigger(&draft.info) {
+        return v_stack((
+            form_section("Trigger"),
+            form_setting_owned(
+                "Name".to_string(),
+                text(draft.info.name.clone())
+                    .style(|s| s.color(theme::text()).font_size(theme::FONT_BODY)),
+            ),
+            text(
+                "This is a constraint trigger. Schemaic doesn't model the deferral \
+                 settings one carries, so it can be removed here but not edited — \
+                 change it in SQL instead.",
+            )
+            .style(|s| {
+                s.color(theme::text_dim())
+                    .font_size(theme::FONT_LABEL)
+                    .max_width(420.0)
+            }),
+        ))
+        .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+        .into_any();
+    }
 
     let name = form_setting(
         "Name",
         bound_field(
             &ui,
+            i,
             draft.info.name.clone(),
             FieldCfg {
                 placeholder: "trigger_name",
@@ -327,9 +375,15 @@ fn form(ui: Ui, target: &TriggerTarget) -> AnyView {
     };
     let timing = form_setting(
         "Timing",
-        bound_choice(&ui, draft.info.timing.sql().to_string(), timings, |d, v| {
-            d.info.timing = TriggerTiming::parse(v).unwrap_or_default();
-        }),
+        bound_choice(
+            &ui,
+            i,
+            draft.info.timing.sql().to_string(),
+            timings,
+            |d, v| {
+                d.info.timing = TriggerTiming::parse(v).unwrap_or_default();
+            },
+        ),
     );
 
     // MySQL fires on exactly one event, PostgreSQL on any combination — so this
@@ -343,11 +397,14 @@ fn form(ui: Ui, target: &TriggerTarget) -> AnyView {
             TriggerEvent::Delete,
             TriggerEvent::Truncate,
         ] {
-            let on = floem::reactive::create_rw_signal(events_of(&draft).contains(&ev));
+            let on = floem::reactive::create_rw_signal(draft.info.events.contains(&ev));
             create_effect(move |prev: Option<bool>| {
                 let v = on.get();
                 if prev.is_some_and(|p| p != v) {
-                    d.update(|dr| {
+                    d.update(|s| {
+                        let Some(dr) = s.triggers.get_mut(i) else {
+                            return;
+                        };
                         dr.info.events.retain(|e| *e != ev);
                         if v {
                             dr.info.events.push(ev);
@@ -379,6 +436,7 @@ fn form(ui: Ui, target: &TriggerTarget) -> AnyView {
             "Event",
             bound_choice(
                 &ui,
+                i,
                 draft
                     .info
                     .events
@@ -399,6 +457,7 @@ fn form(ui: Ui, target: &TriggerTarget) -> AnyView {
         "Fires",
         bound_choice(
             &ui,
+            i,
             draft.info.level.sql().to_string(),
             vec!["FOR EACH ROW".into(), "FOR EACH STATEMENT".into()],
             |d, v| {
@@ -416,6 +475,7 @@ fn form(ui: Ui, target: &TriggerTarget) -> AnyView {
         "When",
         bound_field(
             &ui,
+            i,
             draft.info.condition.clone().unwrap_or_default(),
             FieldCfg {
                 placeholder: "new.total > 0",
@@ -432,12 +492,13 @@ fn form(ui: Ui, target: &TriggerTarget) -> AnyView {
 
     // The action: a body on MySQL, a function to call on PostgreSQL.
     let action: AnyView = if pg {
-        pg_action(&ui, &draft, target).into_any()
+        pg_action(&ui, i, &draft, target).into_any()
     } else {
         form_setting(
             "Body",
             bound_field(
                 &ui,
+                i,
                 match &draft.info.action {
                     TriggerAction::Body(b) => b.clone(),
                     TriggerAction::Function { .. } => String::new(),
@@ -458,7 +519,6 @@ fn form(ui: Ui, target: &TriggerTarget) -> AnyView {
 
     v_stack((
         form_section("Trigger"),
-        place,
         name,
         timing,
         events,
@@ -481,7 +541,7 @@ fn form(ui: Ui, target: &TriggerTarget) -> AnyView {
 /// already names** if that isn't in the list yet — the list arrives a round trip
 /// after the modal, and re-pointing a trigger the user had already aimed would
 /// be a silent edit.
-fn pg_action(ui: &Ui, draft: &TriggerDraft, target: &TriggerTarget) -> AnyView {
+fn pg_action(ui: &Ui, i: usize, draft: &TriggerDraft, target: &TriggerTarget) -> AnyView {
     let d = ui.ddl.trigger_draft;
     let fns = ui.ddl.functions;
     let current = match &draft.info.action {
@@ -494,9 +554,9 @@ fn pg_action(ui: &Ui, draft: &TriggerDraft, target: &TriggerTarget) -> AnyView {
     // control's own state independent of the list arriving.
     let sel = floem::reactive::create_rw_signal(current);
     create_effect(move |_| {
-        let named = d.with(|dr| match &dr.info.action {
-            TriggerAction::Function { name, .. } => name.clone(),
-            TriggerAction::Body(_) => String::new(),
+        let named = d.with(|s| match s.triggers.get(i).map(|t| &t.info.action) {
+            Some(TriggerAction::Function { name, .. }) => name.clone(),
+            _ => String::new(),
         });
         if sel.get_untracked() != named {
             sel.set(named);
@@ -516,7 +576,10 @@ fn pg_action(ui: &Ui, draft: &TriggerDraft, target: &TriggerTarget) -> AnyView {
                 options,
                 FIELD_W,
                 move |v: String| {
-                    d.update(|dr| {
+                    d.update(|s| {
+                        let Some(dr) = s.triggers.get_mut(i) else {
+                            return;
+                        };
                         let args = match &dr.info.action {
                             TriggerAction::Function { args, .. } => args.clone(),
                             TriggerAction::Body(_) => Vec::new(),
@@ -578,6 +641,7 @@ fn pg_action(ui: &Ui, draft: &TriggerDraft, target: &TriggerTarget) -> AnyView {
             "Arguments",
             bound_field(
                 ui,
+                i,
                 match &draft.info.action {
                     TriggerAction::Function { args, .. } => args.join(", "),
                     TriggerAction::Body(_) => String::new(),
@@ -728,11 +792,74 @@ fn function_form(ui: Ui, target: &FunctionTarget) -> AnyView {
 
 /// The change set the trigger draft currently describes — the same call the
 /// preview emits from, so the footer's count can't disagree with the SQL.
-fn change_set(target: &TriggerTarget, draft: &TriggerDraft) -> ddl::ChangeSet {
-    match &target.current {
-        Some(cur) => ddl::diff_trigger(cur, draft, target.dialect),
-        None => ddl::create_trigger(draft, target.dialect),
-    }
+fn change_set(target: &TriggerTarget, draft: &TriggerSetDraft) -> ddl::ChangeSet {
+    ddl::diff_triggers(&target.current, draft, target.dialect)
+}
+
+/// The list of the table's triggers, with the `+`/`−` bar under it.
+///
+/// Re-renders on every draft change — unlike the form, which must not — so a
+/// rename shows in the list as you type it. Same split as the designer's.
+fn trigger_list(ui: Ui, pg: bool, table: String, schema: Option<String>) -> impl IntoView {
+    let d = ui.ddl.trigger_draft;
+    let selected = ui.ddl.selected;
+    let rev = ui.ddl.rev;
+
+    let rows_ui = ui.clone();
+    let rows = dyn_container(
+        move || d.get(),
+        move |draft| {
+            let rows: Vec<AnyView> = draft
+                .triggers
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let detail = format!(
+                        "{} {}",
+                        t.info.timing.sql(),
+                        t.info
+                            .events
+                            .iter()
+                            .map(|e| e.sql())
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    );
+                    list_row(rows_ui.clone(), i, t.info.name.clone(), detail, None).into_any()
+                })
+                .collect();
+            v_stack_from_iter(rows)
+                .style(|s| s.flex_col().width_full())
+                .into_any()
+        },
+    );
+
+    let add = move || {
+        d.update(|s| {
+            let fresh = blank_trigger(&s.triggers, &table, schema.clone(), pg);
+            s.triggers.push(fresh);
+        });
+        // Select what was just added, and bump `rev`: `selected` may be
+        // unchanged in value while pointing at a different item.
+        let n = d.with_untracked(|s| s.triggers.len());
+        selected.set(n.saturating_sub(1));
+        rev.update(|r| *r += 1);
+    };
+    let remove = move || {
+        let i = selected.get_untracked();
+        d.update(|s| {
+            if i < s.triggers.len() {
+                s.triggers.remove(i);
+            }
+        });
+        let n = d.with_untracked(|s| s.triggers.len());
+        selected.set(i.min(n.saturating_sub(1)));
+        rev.update(|r| *r += 1);
+    };
+    // No arrows: a trigger's position in this list is display order, not
+    // execution order — MySQL's ordering is the `FOLLOWS` clause and
+    // PostgreSQL fires alphabetically. Offering ↑/↓ here would imply a control
+    // over firing order that moving a row does not have.
+    list_pane(rows, list_actions(add, remove, None, None))
 }
 
 fn fn_change_set(target: &FunctionTarget, draft: &FunctionDraft) -> ddl::ChangeSet {
@@ -742,15 +869,13 @@ fn fn_change_set(target: &FunctionTarget, draft: &FunctionDraft) -> ddl::ChangeS
     }
 }
 
-fn preview_from(target: &TriggerTarget, draft: &TriggerDraft, cs: &ddl::ChangeSet) -> DdlPreview {
-    let subject = match target.current {
-        Some(_) => target.display(),
-        None => draft.info.name.clone(),
-    };
+fn preview_from(target: &TriggerTarget, cs: &ddl::ChangeSet) -> DdlPreview {
     ddl_preview::preview_of(
         target.conn_id,
         &target.database,
-        subject,
+        // The subject is the table: a plan here can touch several triggers, so
+        // heading it with one of their names would misdescribe it.
+        format!("triggers on {}", target.display()),
         cs,
         target.read_only,
     )
@@ -796,16 +921,46 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                 return empty().into_any();
             };
             let ui = ui.clone();
-            let title = match &target.current {
-                Some(_) => format!("Edit trigger {}", target.display()),
-                None => format!("Create trigger in {}", target.database),
-            };
+            let title = format!("Triggers on {}", target.display());
 
-            let body = crate::widgets::autohide(scroll(
-                form(ui.clone(), &target)
-                    .style(|s| s.width_full().padding_horiz(20.0).padding_vert(18.0)),
+            // The form is keyed on `(selected, rev)` and NOT on the draft: a
+            // draft-keyed form is torn down mid-keystroke. `rev` is in the key
+            // because removing the selected row leaves `selected` unchanged
+            // while the item at that index is now a different trigger.
+            let form_ui = ui.clone();
+            let form_target = target.clone();
+            let (selected, rev) = (ui.ddl.selected, ui.ddl.rev);
+            let detail = dyn_container(
+                move || (selected.get(), rev.get()),
+                move |(i, _)| {
+                    form(form_ui.clone(), &form_target, i)
+                        .style(|s| s.width_full())
+                        .into_any()
+                },
+            );
+
+            let body = h_stack((
+                trigger_list(
+                    ui.clone(),
+                    target.dialect == SqlDialect::Postgres,
+                    target.table.clone(),
+                    target.schema.clone(),
+                ),
+                crate::widgets::autohide(scroll(
+                    container(detail)
+                        .style(|s| s.width_full().padding_left(18.0).padding_right(4.0)),
+                ))
+                .style(|s| s.flex_grow(1.0_f32).min_width(0.0).height_full()),
             ))
-            .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
+            .style(|s| {
+                s.flex_row()
+                    .width_full()
+                    .flex_grow(1.0_f32)
+                    .min_height(0.0)
+                    .padding_horiz(20.0)
+                    .padding_vert(18.0)
+                    .gap(0.0)
+            });
 
             let status_target = target.clone();
             let status = dyn_container(
@@ -856,7 +1011,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                             ready,
                             move || {
                                 let cs = change_set(&target, &draft);
-                                ddl_preview::open_preview(&ui, preview_from(&target, &draft, &cs));
+                                ddl_preview::open_preview(&ui, preview_from(&target, &cs));
                             },
                         ),
                     ))

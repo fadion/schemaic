@@ -755,40 +755,35 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 }),
                             );
                         }
-                        // Triggers: one submenu per table — a "Create trigger"
-                        // and an entry per trigger already on it. They hang off
-                        // the table because that is where they live on both
-                        // engines, and a constraint trigger is listed but not
-                        // editable, the same call a materialized view gets.
+                        // Triggers: one entry opening a modal over the table's
+                        // whole set — list on the left, the selected trigger's
+                        // form on the right. Its own plan rather than a designer
+                        // tab, because a trigger needs its own statement and
+                        // can't join the table's coalesced `ALTER TABLE`.
                         {
                             let ui = import_ui.clone();
                             let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
-                            let mut items = vec![
-                                MenuEntry::action("Create trigger", {
-                                    let (ui, db, ns, tbl) =
-                                        (ui.clone(), db.clone(), ns.clone(), tbl.clone());
+                            let n = triggers.len();
+                            entries.push(
+                                MenuEntry::action(
+                                    if n == 0 {
+                                        "Triggers…".to_string()
+                                    } else {
+                                        format!("Triggers… ({n})")
+                                    },
                                     move || {
-                                        crate::trigger_editor::open_for_new(
+                                        crate::trigger_editor::open_for_table(
                                             &ui,
                                             &db,
                                             ns.as_deref(),
                                             &tbl,
                                         )
-                                    }
-                                })
-                                .disabled(read_only || is_view),
-                            ];
-                            for t in triggers {
-                                let (ui, db) = (ui.clone(), db.clone());
-                                let editable = crate::trigger_editor::is_editable_trigger(&t);
-                                items.push(
-                                    MenuEntry::action(t.name.clone(), move || {
-                                        crate::trigger_editor::open_for_trigger(&ui, &db, &t)
-                                    })
-                                    .disabled(!editable),
-                                );
-                            }
-                            entries.push(MenuEntry::sub("Triggers", items).disabled(!has_columns));
+                                    },
+                                )
+                                // An unloaded schema has no trigger list to show,
+                                // and a view can't carry one on either engine.
+                                .disabled(!has_columns || is_view),
+                            );
                         }
                         // Truncate and drop are the two that can't be taken back
                         // and sit next to harmless entries, so they ask first and

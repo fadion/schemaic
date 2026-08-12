@@ -753,6 +753,67 @@ impl TriggerDraft {
     }
 }
 
+/// The desired state of **all** of one table's triggers.
+///
+/// A set rather than one trigger because that is how they're edited: the modal
+/// lists a table's triggers and you add, remove and change them together, so one
+/// plan carries the lot. [`ChangeSet`] already holds a `Vec<Change>`, and every
+/// trigger change is a whole statement, so nothing had to bend to allow it.
+///
+/// Deliberately **not** part of [`TableDraft`]. A trigger can't be a clause of
+/// `ALTER TABLE` — it needs its own statement — so folding it in would turn the
+/// designer's single coalesced `ALTER TABLE` into an `ALTER` plus N trigger
+/// statements, which on MySQL commit one at a time. Keeping the two plans apart
+/// is what lets `DdlError::applied` still mean something.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TriggerSetDraft {
+    /// PostgreSQL namespace of the table; `None` on MySQL.
+    pub schema: Option<String>,
+    pub table: String,
+    /// Every trigger the table should end up with. Each carries its own
+    /// `original`, which is what tells an edit from an addition — and a trigger
+    /// *missing* from here is a drop.
+    pub triggers: Vec<TriggerDraft>,
+}
+
+impl TriggerSetDraft {
+    /// The draft that describes a table's triggers exactly — the modal's
+    /// starting point, and the input to the round-trip gate.
+    pub fn from_table(t: &TableInfo) -> TriggerSetDraft {
+        TriggerSetDraft {
+            schema: t.schema.clone(),
+            table: t.name.clone(),
+            triggers: t.triggers.iter().map(TriggerDraft::from_info).collect(),
+        }
+    }
+
+    /// Problems across the whole set, in plain language: each trigger's own,
+    /// plus the one that only exists for a set — two triggers can't share a
+    /// name, and a list-plus-form makes that easy to do by accident.
+    pub fn validate(&self, dialect: SqlDialect) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for t in &self.triggers {
+            out.extend(t.validate(dialect));
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for t in &self.triggers {
+            let name = t.info.name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            // MySQL scopes a trigger name to the database, PostgreSQL to the
+            // table — but within one table both refuse a duplicate, and that is
+            // the only scope this set covers.
+            if seen.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+                out.push(format!("Two triggers are both called {name}."));
+            } else {
+                seen.push(name);
+            }
+        }
+        out
+    }
+}
+
 // ── The desired state of a function ──────────────────────────────────────────
 
 /// The whole desired shape of one PostgreSQL function.
@@ -3012,6 +3073,58 @@ pub fn diff_trigger(current: &TriggerInfo, draft: &TriggerDraft, dialect: SqlDia
     }
 }
 
+/// Everything that has to happen to turn a table's triggers `current` into
+/// `draft` — the whole set in one plan.
+///
+/// Same round-trip gate as [`diff`]: a set diffed against its own draft must
+/// produce nothing.
+///
+/// **Drops are emitted first**, before any create or re-create. A user who
+/// deletes one trigger and names a new one after it is doing something the
+/// server would otherwise refuse — the name is still taken when the create runs
+/// — and there is no reason to make them apply it in two passes.
+pub fn diff_triggers(
+    current: &[TriggerInfo],
+    draft: &TriggerSetDraft,
+    dialect: SqlDialect,
+) -> ChangeSet {
+    let mut changes: Vec<Change> = Vec::new();
+    for cur in current {
+        let kept = draft
+            .triggers
+            .iter()
+            .any(|d| d.original.as_deref() == Some(cur.name.as_str()));
+        if !kept {
+            changes.push(Change::DropTrigger {
+                name: cur.name.clone(),
+            });
+        }
+    }
+    for d in &draft.triggers {
+        match d
+            .original
+            .as_deref()
+            .and_then(|n| current.iter().find(|c| c.name == n))
+        {
+            // Unchanged: no statement. This is what the gate rests on.
+            Some(cur) if d.info == *cur => {}
+            Some(_) => changes.push(Change::ReplaceTrigger {
+                draft: Box::new(d.clone()),
+            }),
+            // Either genuinely new, or naming a server trigger that has since
+            // gone. Emitting a create either way lets the server be the one to
+            // say so, rather than guessing from a stale schema.
+            None => changes.push(Change::CreateTrigger(Box::new(d.clone()))),
+        }
+    }
+    ChangeSet {
+        table: draft.table.clone(),
+        schema: draft.schema.clone(),
+        dialect,
+        changes,
+    }
+}
+
 /// The `CREATE TRIGGER` for a brand-new trigger.
 pub fn create_trigger(draft: &TriggerDraft, dialect: SqlDialect) -> ChangeSet {
     ChangeSet {
@@ -4389,6 +4502,99 @@ mod tests {
                 },
                 ..Default::default()
             }
+        }
+
+        fn table_with_triggers(ts: Vec<TriggerInfo>) -> TableInfo {
+            TableInfo {
+                name: "orders".into(),
+                triggers: ts,
+                ..Default::default()
+            }
+        }
+
+        /// The gate, for the whole set: a draft off a table says nothing.
+        #[test]
+        fn an_untouched_trigger_set_is_not_a_change() {
+            let t = table_with_triggers(vec![my_trigger(), {
+                let mut b = my_trigger();
+                b.name = "t_two".into();
+                b
+            }]);
+            let d = TriggerSetDraft::from_table(&t);
+            assert!(diff_triggers(&t.triggers, &d, MySql).changes.is_empty());
+        }
+
+        #[test]
+        fn removing_a_trigger_from_the_set_drops_it() {
+            let t = table_with_triggers(vec![my_trigger()]);
+            let mut d = TriggerSetDraft::from_table(&t);
+            d.triggers.clear();
+            let cs = diff_triggers(&t.triggers, &d, MySql);
+            assert_eq!(cs.emit(), vec!["DROP TRIGGER `t_ins`;"]);
+        }
+
+        #[test]
+        fn adding_a_trigger_to_the_set_creates_it() {
+            let t = table_with_triggers(vec![my_trigger()]);
+            let mut d = TriggerSetDraft::from_table(&t);
+            let mut fresh = TriggerDraft::from_info(&my_trigger());
+            fresh.original = None; // new: never on the server
+            fresh.info.name = "t_new".into();
+            d.triggers.push(fresh);
+            let cs = diff_triggers(&t.triggers, &d, MySql);
+            assert_eq!(cs.len(), 1);
+            assert!(
+                cs.emit()[0].contains("CREATE TRIGGER `t_new`"),
+                "{:?}",
+                cs.emit()
+            );
+        }
+
+        /// Deleting one and naming its replacement after it is a thing people do,
+        /// and it only works if the drop runs first.
+        #[test]
+        fn a_drop_is_emitted_before_a_create_that_reuses_the_name() {
+            let t = table_with_triggers(vec![my_trigger()]);
+            let mut d = TriggerSetDraft::from_table(&t);
+            d.triggers.clear();
+            let mut fresh = TriggerDraft::from_info(&my_trigger());
+            fresh.original = None;
+            d.triggers.push(fresh); // same name, `t_ins`
+            let sql = diff_triggers(&t.triggers, &d, MySql).emit();
+            assert_eq!(sql.len(), 2);
+            assert_eq!(sql[0], "DROP TRIGGER `t_ins`;");
+            assert!(sql[1].starts_with("CREATE TRIGGER `t_ins`"), "{sql:?}");
+        }
+
+        /// One plan, three kinds of change — the point of editing the set at once.
+        #[test]
+        fn a_set_carries_a_drop_an_edit_and_an_add_together() {
+            let (a, mut b) = (my_trigger(), my_trigger());
+            b.name = "t_two".into();
+            let t = table_with_triggers(vec![a, b]);
+            let mut d = TriggerSetDraft::from_table(&t);
+            d.triggers.remove(0); // drop `t_ins`
+            d.triggers[0].info.action = TriggerAction::Body("SET NEW.x = 9".into()); // edit
+            let mut fresh = TriggerDraft::from_info(&my_trigger());
+            fresh.original = None;
+            fresh.info.name = "t_three".into();
+            d.triggers.push(fresh); // add
+            let cs = diff_triggers(&t.triggers, &d, MySql);
+            assert_eq!(cs.len(), 3);
+            assert!(matches!(cs.changes[0], Change::DropTrigger { .. }));
+            assert!(matches!(cs.changes[1], Change::ReplaceTrigger { .. }));
+            assert!(matches!(cs.changes[2], Change::CreateTrigger(_)));
+        }
+
+        /// Only a set can produce this one, and a list-plus-form makes it easy
+        /// to do by accident.
+        #[test]
+        fn validate_catches_two_triggers_sharing_a_name() {
+            let (a, mut b) = (my_trigger(), my_trigger());
+            b.name = "T_INS".into(); // both engines fold case here
+            let t = table_with_triggers(vec![a, b]);
+            let msgs = TriggerSetDraft::from_table(&t).validate(MySql).join(" | ");
+            assert!(msgs.contains("both called"), "{msgs}");
         }
 
         /// The gate: a draft taken straight off a trigger has nothing to say.

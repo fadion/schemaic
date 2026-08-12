@@ -426,9 +426,18 @@ Zed-inspired, aiming to replace DataGrip.
     override for the cases `ddl::pg_replaceable` can't read off the statement.
     `is_editable_view` is the entry point's gate — a materialized view is drop-only.
   - `trigger_editor.rs` — the **trigger** modal *and* the **function** modal, over `core::ddl`'s
-    `TriggerDraft`/`FunctionDraft`. Reached from the schema context menu's per-table **Triggers**
-    submenu (Create trigger + an entry per existing one); same chrome, same
-    seed-local-signals-then-write-back rule and same `ddl_preview` ending as `view_editor`.
+    `TriggerSetDraft`/`FunctionDraft`. Reached from the schema context menu's per-table
+    **Triggers…** entry; same chrome, same seed-local-signals-then-write-back rule and same
+    `ddl_preview` ending as `view_editor`. The trigger modal is the **designer's list-plus-form
+    shape** — the table's triggers on the left, the selected one's form on the right, `+`/`−`
+    under the list (no ↑/↓: list position is display order, while firing order is MySQL's
+    `FOLLOWS` and PostgreSQL's alphabetical) — so one plan can drop one trigger, edit another and
+    add a third. It shares the designer's `selected`/`rev` signals, since only one of the two is
+    ever open, and splits list-vs-form re-rendering the same way for the same reason.
+    **It is deliberately not a designer tab**: what belongs there is what can be a *clause* of
+    `ALTER TABLE`, which is why checks are and triggers aren't — a trigger needs its own
+    statement, so folding it in would turn MySQL's one coalesced `ALTER TABLE` into an `ALTER`
+    plus N statements that commit one at a time, and `DdlError::applied` would stop meaning much.
     Two modals in one module because the second only exists to serve the first: a PG trigger has
     no body, only a **function** to call, so the trigger form would be a dead end without a way to
     write one. Three rules are written down because each was a bug waiting: **the form is

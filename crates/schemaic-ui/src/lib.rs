@@ -252,25 +252,32 @@ impl ViewTarget {
     }
 }
 
-/// What the trigger editor is editing. Doubles as its open flag.
+/// What the trigger editor is editing: **one table's whole set of triggers**.
+/// Doubles as its open flag.
+///
+/// A set rather than one trigger because that's how the modal works — a list of
+/// the table's triggers with the selected one's form beside it, so a single plan
+/// can drop one, edit another and add a third. It is still its own plan, not a
+/// designer tab: a trigger needs its own statement and can't join the table's
+/// coalesced `ALTER TABLE`.
 #[derive(Clone, Debug)]
 pub struct TriggerTarget {
     pub conn_id: u64,
     pub database: String,
+    /// PostgreSQL namespace of the table; `None` on MySQL.
+    pub schema: Option<String>,
+    pub table: String,
     pub dialect: SqlDialect,
-    /// The introspected trigger the draft started from — the left-hand side of
-    /// the diff. `None` means a new trigger, which emits `CREATE TRIGGER`.
-    pub current: Option<schemaic_core::schema::TriggerInfo>,
+    /// The introspected triggers the draft started from — the left-hand side of
+    /// the diff.
+    pub current: Vec<schemaic_core::schema::TriggerInfo>,
     pub read_only: bool,
 }
 
 impl TriggerTarget {
-    /// The modal's title subject.
+    /// The modal's title subject: the table whose triggers these are.
     pub fn display(&self) -> String {
-        match &self.current {
-            Some(t) => t.name.clone(),
-            None => self.database.clone(),
-        }
+        schemaic_core::schema::display_name(self.schema.as_deref(), &self.table)
     }
 }
 
@@ -430,10 +437,12 @@ pub struct DdlUi {
     pub view_rows: RwSignal<usize>,
     /// The trigger editor's target; doubles as its open flag.
     pub trigger: RwSignal<Option<TriggerTarget>>,
-    /// The trigger being edited. Same rule as `draft`: one value, because the
-    /// footer's change count is [`schemaic_core::ddl::diff_trigger`] of exactly
-    /// it.
-    pub trigger_draft: RwSignal<schemaic_core::ddl::TriggerDraft>,
+    /// The table's triggers being edited. Same rule as `draft`: one value,
+    /// because the footer's change count is
+    /// [`schemaic_core::ddl::diff_triggers`] of exactly it. The selected row and
+    /// the structural-edit counter are the designer's `selected`/`rev` — the two
+    /// modals are mutually exclusive, so there is nothing to keep apart.
+    pub trigger_draft: RwSignal<schemaic_core::ddl::TriggerSetDraft>,
     /// The function editor's target; doubles as its open flag.
     pub function: RwSignal<Option<FunctionTarget>>,
     pub function_draft: RwSignal<schemaic_core::ddl::FunctionDraft>,
