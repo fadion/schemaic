@@ -2054,6 +2054,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let set_active_db: Rc<dyn Fn(String)> = {
         let guard_tx = guard_tx.clone();
         let open_session = open_session.clone();
+        let tokens = tokens.clone();
         Rc::new(move |name: String| {
             // The DB selector lists the active connection's databases, so picking
             // one binds the active tab to the active connection + that database.
@@ -2063,12 +2064,24 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             }
             let id = active.get_untracked();
             let open_session = open_session.clone();
+            let tokens = tokens.clone();
             // A pinned session belongs to one database — PostgreSQL can't switch
             // and MySQL's transaction context wouldn't survive the move — so an
             // open transaction has to be settled before the tab moves.
             (guard_tx)(
                 id,
                 Rc::new(move || {
+                    // Rebinding the tab is the same kind of event as closing it:
+                    // a run started against the old `(conn_id, database)` is
+                    // still outstanding, and its generation check can't see the
+                    // difference because no *new* run was started. Left alone it
+                    // lands in a tab that now says another database, so the rows
+                    // are right and everything around them — footer, schema
+                    // context, completion, key icons — describes somewhere else.
+                    // Cancelled is the honest outcome; the user asked to move.
+                    if let Some((_, tok)) = tokens.borrow_mut().remove(&id) {
+                        tok.cancel();
+                    }
                     let manual = tabs.with_untracked(|v| {
                         if let Some(t) = v.iter().find(|t| t.id == id) {
                             t.conn_id.set(active_conn.get_untracked());
@@ -2856,7 +2869,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let collapse_db: Rc<dyn Fn(String)> = {
         let save_ui = save_ui.clone();
         Rc::new(move |db: String| {
-            let prefix = format!("tbl:{db}:");
+            let prefix = schemaic_ui::table_key_prefix(&db);
             expanded.update(|set| set.retain(|k| !k.starts_with(&prefix)));
             save_ui();
         })
