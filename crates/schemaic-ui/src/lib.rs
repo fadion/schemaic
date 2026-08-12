@@ -4514,36 +4514,70 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         editor.into_any()
     };
 
-    stack((inner, placeholder)).style(move |s| {
-        // Fixed height when given; else derive from content. +3 (auto case): the
-        // 1px top/bottom borders (border-box) plus a hair of slack so the editor's
-        // viewport fully contains its content and no phantom scrollbar shows.
-        let h = match height {
-            Some(hh) => hh,
-            None => {
-                // Effective cap: a reactive `max_rows` (viewer) else the default.
-                let cap_n = max_rows.map(|m| m.get()).unwrap_or(cap).max(1);
-                rows.get().clamp(1, cap_n) as f64 * line_h + pad_v * 2.0 + 3.0
+    // A click anywhere in the BOX focuses the field. The editor is the only child
+    // that takes focus and it doesn't reach under the box's horizontal padding or
+    // the trailing gutter, so those were dead: a text cursor, and nothing on click.
+    // The schema search is where that got noticed because `clearable` makes the
+    // gutter widest — 10px padding + a 22px button slot, ~32px of dead right edge.
+    //
+    // Gated on the editor's own span rather than on propagation: floem's editor
+    // handles `PointerDown` with `on_event_cont`, so it does NOT consume the event
+    // and this listener runs for in-text clicks too. Without the gate, clicking
+    // mid-text would focus correctly and then have the caret yanked to the end.
+    let ed_click = ed.clone();
+    stack((inner, placeholder))
+        .on_event_cont(EventListener::PointerDown, move |e| {
+            let Event::PointerDown(pe) = e else { return };
+            // The editor sits at the content origin (1px border + the box padding) and
+            // is as wide as its own viewport; the rest of the row is the gutter.
+            let left = 1.0 + CHAT_PAD_H;
+            let width = ed_click.viewport.get_untracked().width();
+            if pe.pos.x >= left && pe.pos.x <= left + width {
+                return; // on the text — the editor already placed the caret
             }
-        };
-        // No flex_grow baked in: in a vertical stack that would stretch the box's
-        // HEIGHT and blow past `h`. Callers that need to fill a row (the chat box)
-        // add flex_grow themselves.
-        let s = s
-            .min_width(0.0)
-            .height(h)
-            .padding_horiz(CHAT_PAD_H)
-            .padding_vert(pad_v)
-            .background(background())
-            .border(1.0)
-            .border_radius(border_radius)
-            .cursor(CursorStyle::Text);
-        match border_color {
-            Some(c) => s.border_color(c()),
-            None if focused.get() => s.border_color(theme::field_border_active()),
-            None => s.border_color(theme::field_border()),
-        }
-    })
+            let Some(Some(vid)) = ed_click.editor_view_id.try_get_untracked() else {
+                return;
+            };
+            vid.request_focus();
+            // Caret to the side of the text the click was on. (Both the same while
+            // the field is empty, which is when the dead zone is widest.)
+            let off = if pe.pos.x < left {
+                0
+            } else {
+                ed_click.doc().text().to_string().len()
+            };
+            ed_click.cursor.update(|c| c.set_offset(off, false, false));
+        })
+        .style(move |s| {
+            // Fixed height when given; else derive from content. +3 (auto case): the
+            // 1px top/bottom borders (border-box) plus a hair of slack so the editor's
+            // viewport fully contains its content and no phantom scrollbar shows.
+            let h = match height {
+                Some(hh) => hh,
+                None => {
+                    // Effective cap: a reactive `max_rows` (viewer) else the default.
+                    let cap_n = max_rows.map(|m| m.get()).unwrap_or(cap).max(1);
+                    rows.get().clamp(1, cap_n) as f64 * line_h + pad_v * 2.0 + 3.0
+                }
+            };
+            // No flex_grow baked in: in a vertical stack that would stretch the box's
+            // HEIGHT and blow past `h`. Callers that need to fill a row (the chat box)
+            // add flex_grow themselves.
+            let s = s
+                .min_width(0.0)
+                .height(h)
+                .padding_horiz(CHAT_PAD_H)
+                .padding_vert(pad_v)
+                .background(background())
+                .border(1.0)
+                .border_radius(border_radius)
+                .cursor(CursorStyle::Text);
+            match border_color {
+                Some(c) => s.border_color(c()),
+                None if focused.get() => s.border_color(theme::field_border_active()),
+                None => s.border_color(theme::field_border()),
+            }
+        })
 }
 
 // ── Results pane: reactive on QueryState ────────────────────────────────────
