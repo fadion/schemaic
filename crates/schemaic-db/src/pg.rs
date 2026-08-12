@@ -51,7 +51,10 @@ use schemaic_core::model::{
     Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder,
     ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value, WriteStep, one_row_verdict,
 };
-use schemaic_core::schema::{CheckInfo, ColumnInfo, DbSchema, IndexColumn, TableInfo, ViewOptions};
+use schemaic_core::schema::{
+    CheckInfo, ColumnInfo, DbSchema, IndexColumn, TableInfo, TriggerAction, TriggerEvent,
+    TriggerInfo, TriggerLevel, TriggerTiming, ViewOptions,
+};
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
@@ -925,6 +928,38 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
     )
     .await?;
 
+    // Triggers. `NOT tgisinternal` is doing real work: every foreign key is
+    // implemented as a pair of hidden triggers, so without it each FK would show
+    // up as two triggers the user never wrote and a designer would offer to drop
+    // — taking the constraint with them. It keeps user-written `CREATE
+    // CONSTRAINT TRIGGER`s, which are visible objects and `tgconstraint <> 0`.
+    //
+    // `tgattr` is an `int2vector` whose text form is space-separated attnums;
+    // going through `string_to_array` avoids depending on an int2vector→array
+    // cast, and `NULLIF` makes the empty case yield no rows rather than one
+    // empty element.
+    let trigger_all = query_all(
+        &client,
+        &format!(
+            "SELECT n.nspname, c.relname, t.tgname, t.tgtype::int, t.tgenabled, \
+                    (t.tgconstraint <> 0)::int, t.tgfoid::regproc::text, \
+                    pg_get_triggerdef(t.oid), \
+                    COALESCE(pg_get_expr(t.tgqual, t.tgrelid), ''), \
+                    COALESCE((SELECT string_agg(a.attname, ',' ORDER BY x.ord) \
+                              FROM unnest(string_to_array(NULLIF(t.tgattr::text, ''), ' ')) \
+                                   WITH ORDINALITY AS x(attnum, ord) \
+                              JOIN pg_attribute a ON a.attrelid = t.tgrelid \
+                                                 AND a.attnum = x.attnum::smallint), '') \
+             FROM pg_trigger t \
+             JOIN pg_class c ON c.oid = t.tgrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE NOT t.tgisinternal AND {} \
+             ORDER BY n.nspname, c.relname, t.tgname",
+            user_schema_filter("n.nspname")
+        ),
+    )
+    .await?;
+
     // Post-fold enrichment: the things `assemble_schema` can't carry because
     // MySQL has no equivalent — an index's backing constraint, and each foreign
     // key's referential actions — plus the checks, which it has no field for on
@@ -964,6 +999,43 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
                 enforced: true,
             })
             .collect();
+        t.triggers = trigger_all
+            .iter()
+            .filter(|r| cell(r, 0) == ns && cell(r, 1) == t.name)
+            .map(|r| {
+                let (timing, events, level) =
+                    pg_trigger_type(cell(r, 3).parse::<i32>().unwrap_or_default());
+                TriggerInfo {
+                    name: cell(r, 2),
+                    schema: t.schema.clone(),
+                    table: t.name.clone(),
+                    timing,
+                    events,
+                    update_columns: cell(r, 9)
+                        .split(',')
+                        .filter(|c| !c.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                    level,
+                    // Held bare; `create_sql` is the only thing that wraps it.
+                    condition: Some(schemaic_core::ddl::trigger_condition(
+                        &cell(r, 8),
+                        schemaic_core::intel::SqlDialect::Postgres,
+                    ))
+                    .filter(|w| !w.is_empty()),
+                    action: TriggerAction::Function {
+                        name: cell(r, 6),
+                        args: pg_trigger_args(&cell(r, 7)),
+                    },
+                    // MySQL's alone.
+                    definer: None,
+                    order: None,
+                    // `tgenabled` is O/A/R (fires) or D (doesn't).
+                    enabled: cell(r, 4) != "D",
+                    constraint: cell(r, 5) == "1",
+                }
+            })
+            .collect();
         for ix in &mut t.indexes {
             ix.constraint = idx_constraints
                 .get(&(ns.clone(), t.name.clone(), ix.name.clone()))
@@ -980,6 +1052,99 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
         }
     }
     Ok(DbSchema { tables })
+}
+
+/// Decode `pg_trigger.tgtype` into the three things it packs: when the trigger
+/// fires, what it fires on, and how often.
+///
+/// The bits are PostgreSQL's own (`ROW = 1`, `BEFORE = 2`, `INSERT = 4`,
+/// `DELETE = 8`, `UPDATE = 16`, `TRUNCATE = 32`, `INSTEAD = 64`) and there is no
+/// catalogue view that spells them out, so this is the only place they're read.
+/// Timing is a three-way choice off two bits: `BEFORE` set means before,
+/// `INSTEAD` set means instead-of, and neither means after — checked in that
+/// order because `INSTEAD` is never set together with `BEFORE`.
+///
+/// Events come out in PostgreSQL's own print order (INSERT, DELETE, UPDATE,
+/// TRUNCATE) rather than declaration order, which nothing records. That matters
+/// for the round-trip gate: a re-emitted `INSERT OR UPDATE` has to come back
+/// byte-identical, and only a fixed order can promise that.
+fn pg_trigger_type(tgtype: i32) -> (TriggerTiming, Vec<TriggerEvent>, TriggerLevel) {
+    let level = if tgtype & 1 != 0 {
+        TriggerLevel::Row
+    } else {
+        TriggerLevel::Statement
+    };
+    let timing = if tgtype & 2 != 0 {
+        TriggerTiming::Before
+    } else if tgtype & 64 != 0 {
+        TriggerTiming::InsteadOf
+    } else {
+        TriggerTiming::After
+    };
+    let mut events = Vec::new();
+    for (bit, ev) in [
+        (4, TriggerEvent::Insert),
+        (8, TriggerEvent::Delete),
+        (16, TriggerEvent::Update),
+        (32, TriggerEvent::Truncate),
+    ] {
+        if tgtype & bit != 0 {
+            events.push(ev);
+        }
+    }
+    (timing, events, level)
+}
+
+/// The literal arguments a trigger passes to its function, read out of
+/// `pg_get_triggerdef`.
+///
+/// They live in `pg_trigger.tgargs` as a NUL-separated `bytea`, which SQL has no
+/// clean way to split and this driver surfaces as escaped text — so the server's
+/// own rendering is the thing to read, exactly as it is for a check predicate.
+/// Trigger arguments are always string literals, so the only escape that can
+/// appear is a doubled quote.
+///
+/// Returns the values **unquoted**: the model holds raw strings and
+/// [`schemaic_core::schema::TriggerInfo::create_sql`] re-quotes them, so a value
+/// containing a quote survives a round trip instead of gaining a backslash per
+/// edit.
+fn pg_trigger_args(def: &str) -> Vec<String> {
+    // `EXECUTE PROCEDURE` is the pre-11 spelling; servers still accept it and
+    // older ones still print it.
+    let tail = ["EXECUTE FUNCTION ", "EXECUTE PROCEDURE "]
+        .iter()
+        .find_map(|kw| def.rfind(kw).map(|i| &def[i + kw.len()..]));
+    let Some(tail) = tail else {
+        return Vec::new();
+    };
+    let Some(open) = tail.find('(') else {
+        return Vec::new();
+    };
+    let inner = &tail[open + 1..];
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_str = false;
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if in_str => {
+                // A doubled quote is one literal quote, not the end of the value.
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    cur.push('\'');
+                } else {
+                    in_str = false;
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            '\'' => in_str = true,
+            // The close-paren that ends the call — only outside a literal.
+            ')' if !in_str => break,
+            _ if in_str => cur.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// A view's options from its `pg_class` row: the relation kind (`v` a view, `m`
@@ -1709,6 +1874,81 @@ mod tests {
 
     /// `check_option` is lifted out (it's a DDL clause on both engines); the
     /// rest is restated verbatim inside the `WITH (…)` it came from.
+    /// The bits are PostgreSQL's own and nothing else reads them, so every
+    /// combination that changes behaviour is pinned here.
+    #[test]
+    fn pg_trigger_type_decodes_timing_events_and_level() {
+        // ROW|BEFORE|INSERT = 1|2|4
+        let (timing, events, level) = pg_trigger_type(7);
+        assert_eq!(timing, TriggerTiming::Before);
+        assert_eq!(events, vec![TriggerEvent::Insert]);
+        assert_eq!(level, TriggerLevel::Row);
+
+        // ROW|INSERT|UPDATE with neither BEFORE nor INSTEAD ⇒ AFTER.
+        let (timing, events, _) = pg_trigger_type(1 | 4 | 16);
+        assert_eq!(timing, TriggerTiming::After);
+        assert_eq!(events, vec![TriggerEvent::Insert, TriggerEvent::Update]);
+
+        // INSTEAD OF on a view: ROW|INSTEAD|DELETE.
+        let (timing, events, _) = pg_trigger_type(1 | 64 | 8);
+        assert_eq!(timing, TriggerTiming::InsteadOf);
+        assert_eq!(events, vec![TriggerEvent::Delete]);
+
+        // TRUNCATE is statement-level: no ROW bit.
+        let (_, events, level) = pg_trigger_type(32);
+        assert_eq!(events, vec![TriggerEvent::Truncate]);
+        assert_eq!(level, TriggerLevel::Statement);
+    }
+
+    /// Events must come out in a fixed order or the round-trip gate can't hold:
+    /// nothing records the order they were declared in.
+    #[test]
+    fn pg_trigger_type_orders_events_the_way_postgresql_prints_them() {
+        let (_, events, _) = pg_trigger_type(1 | 4 | 8 | 16 | 32);
+        assert_eq!(
+            events,
+            vec![
+                TriggerEvent::Insert,
+                TriggerEvent::Delete,
+                TriggerEvent::Update,
+                TriggerEvent::Truncate
+            ]
+        );
+    }
+
+    #[test]
+    fn pg_trigger_args_reads_the_literals_unquoted() {
+        let def = "CREATE TRIGGER a AFTER INSERT ON public.t FOR EACH ROW \
+                   EXECUTE FUNCTION public.audit('orders', 'ins')";
+        assert_eq!(pg_trigger_args(def), vec!["orders", "ins"]);
+    }
+
+    #[test]
+    fn pg_trigger_args_unescapes_a_doubled_quote() {
+        // The model holds raw values and `create_sql` re-quotes them, so this has
+        // to come back as one quote or a round trip grows an escape per edit.
+        let def = "… EXECUTE FUNCTION f('it''s', 'b')";
+        assert_eq!(pg_trigger_args(def), vec!["it's", "b"]);
+    }
+
+    #[test]
+    fn pg_trigger_args_handles_no_args_and_the_pre_11_spelling() {
+        assert!(pg_trigger_args("… EXECUTE FUNCTION f()").is_empty());
+        assert_eq!(pg_trigger_args("… EXECUTE PROCEDURE f('x')"), vec!["x"]);
+        // Nothing to read at all rather than a panic.
+        assert!(pg_trigger_args("CREATE TRIGGER a AFTER INSERT ON t").is_empty());
+    }
+
+    /// A close-paren inside a literal must not end the argument list — the same
+    /// hazard `peel_parens` goes through `skip_noncode` for.
+    #[test]
+    fn pg_trigger_args_ignores_a_paren_inside_a_literal() {
+        assert_eq!(
+            pg_trigger_args("… EXECUTE FUNCTION f('a)b', 'c')"),
+            vec!["a)b", "c"]
+        );
+    }
+
     #[test]
     fn pg_view_options_splits_check_option_from_the_storage_parameters() {
         let o = pg_view_options("v", "security_barrier=true,check_option=cascaded");
