@@ -29,6 +29,28 @@ use tokio_util::sync::CancellationToken;
 // model reasons over a sample, not the full result). Distinct from QUERY_ROW_CAP.
 const MCP_ROW_CAP: usize = 200;
 
+/// The MCP protocol revisions this server actually implements, newest first.
+const SUPPORTED_PROTOCOLS: &[&str] = &["2024-11-05"];
+
+/// Answer the `initialize` handshake with a version this server really speaks.
+///
+/// It used to echo whatever the client asked for, which makes the handshake a
+/// mirror: a future `claude` negotiating a revised protocol — different
+/// tool-result shape, different error convention — would be told "yes, I speak
+/// that" and then get `2024-11-05` behaviour. The failure mode isn't a crash but
+/// a silent skew: results that parse as empty, or tools reported unavailable,
+/// with nothing pointing at the version.
+///
+/// Per the MCP spec the server replies with a version it supports; if that isn't
+/// the one requested, the client decides whether to proceed. So an unknown
+/// request gets our newest rather than an error — the client can still walk away,
+/// and it is told the truth either way.
+fn negotiate_protocol(requested: Option<&str>) -> &'static str {
+    requested
+        .and_then(|r| SUPPORTED_PROTOCOLS.iter().find(|s| **s == r).copied())
+        .unwrap_or(SUPPORTED_PROTOCOLS[0])
+}
+
 /// Run the stdio JSON-RPC loop until stdin closes, against the resolved
 /// endpoint (its `database` is the default schema `USE`d for `run_query`).
 pub async fn serve(endpoint: crate::ai::McpEndpoint) {
@@ -52,11 +74,10 @@ pub async fn serve(endpoint: crate::ai::McpEndpoint) {
 
         let result: Option<Value> = match method {
             "initialize" => {
-                let ver = req
-                    .pointer("/params/protocolVersion")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("2024-11-05")
-                    .to_string();
+                let ver = negotiate_protocol(
+                    req.pointer("/params/protocolVersion")
+                        .and_then(|v| v.as_str()),
+                );
                 Some(json!({
                     "protocolVersion": ver,
                     "capabilities": { "tools": {} },
@@ -502,8 +523,9 @@ async fn describe_table(
 #[cfg(test)]
 mod tests {
     use super::{
-        find_described, format_database_list, format_database_schema, format_table,
-        format_table_detail, format_table_heading, normalize_stmt,
+        SUPPORTED_PROTOCOLS, find_described, format_database_list, format_database_schema,
+        format_table, format_table_detail, format_table_heading, negotiate_protocol,
+        normalize_stmt,
     };
     use schemaic_core::intel::SqlDialect;
     use schemaic_core::model::{Column, ResultSet, Value};
@@ -815,5 +837,35 @@ mod tests {
         let rs =
             ResultSet::from_rows(vec![col("id")], vec![vec![Value::Int(1)]]).with_truncated(true);
         assert!(format_table(&rs).ends_with("(1+ rows, capped)"));
+    }
+
+    #[test]
+    fn a_supported_protocol_is_agreed_to() {
+        assert_eq!(negotiate_protocol(Some("2024-11-05")), "2024-11-05");
+    }
+
+    #[test]
+    fn an_unknown_protocol_gets_one_we_really_speak() {
+        // The handshake exists to catch a skew. Echoing the request back claims
+        // fluency in a protocol whose tool-result shape and error convention we
+        // don't implement, and the failure that follows looks like empty results
+        // rather than a version mismatch.
+        assert_eq!(
+            negotiate_protocol(Some("2099-01-01")),
+            SUPPORTED_PROTOCOLS[0]
+        );
+        assert_eq!(negotiate_protocol(Some("")), SUPPORTED_PROTOCOLS[0]);
+        // A client that names no version gets the same answer.
+        assert_eq!(negotiate_protocol(None), SUPPORTED_PROTOCOLS[0]);
+    }
+
+    #[test]
+    fn the_supported_list_is_newest_first_and_never_empty() {
+        // `SUPPORTED_PROTOCOLS[0]` is what an unknown request is answered with,
+        // so the ordering is load-bearing rather than cosmetic.
+        assert!(!SUPPORTED_PROTOCOLS.is_empty());
+        let mut sorted = SUPPORTED_PROTOCOLS.to_vec();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(sorted, SUPPORTED_PROTOCOLS);
     }
 }

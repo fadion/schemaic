@@ -112,6 +112,22 @@ pub struct TurnStats {
     pub output_tokens: Option<u64>,
 }
 
+/// A duration for a turn footer: `450ms` under a second, `1.2s` above.
+///
+/// Shared by [`TurnStats::summary`] (the finished turn) and the AI panel's live
+/// counter (the turn in progress), which had its own copy — with a doc comment
+/// saying it formatted "like `TurnStats::summary`'s time part", which is a
+/// promise nothing enforced. The two sit next to each other on screen, one
+/// replacing the other when the turn ends, so a drift between them would show
+/// as the number changing format at the moment it stops moving.
+pub fn elapsed_text(ms: u64) -> String {
+    if ms >= 1000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{ms}ms")
+    }
+}
+
 impl TurnStats {
     /// True when there's nothing worth showing in a footer.
     pub fn is_empty(&self) -> bool {
@@ -122,11 +138,7 @@ impl TurnStats {
     pub fn summary(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         if let Some(ms) = self.duration_ms {
-            parts.push(if ms >= 1000 {
-                format!("{:.1}s", ms as f64 / 1000.0)
-            } else {
-                format!("{ms}ms")
-            });
+            parts.push(elapsed_text(ms));
         }
         let tok = match (self.input_tokens, self.output_tokens) {
             (Some(i), Some(o)) => Some(format!("↑{} ↓{}", human_count(i), human_count(o))),

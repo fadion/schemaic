@@ -143,6 +143,33 @@ pub(crate) fn footer_button(
     enabled: bool,
     on_click: impl Fn() + 'static,
 ) -> impl IntoView {
+    text_button(label, color, hover, enabled, (6.0, 4.0), on_click)
+}
+
+/// [`footer_button`] at the roomier size the question dialogs use.
+///
+/// The transaction prompt and the confirm modal each carried a private copy of
+/// this — same colour-fn signature, same hover, same radius, differing only in
+/// padding, which is the reason they weren't already sharing one. The size is a
+/// parameter now rather than a third implementation, so a change to how a text
+/// button behaves reaches all of them.
+pub(crate) fn dialog_button(
+    label: impl Into<String>,
+    color: fn() -> floem::peniko::Color,
+    hover: fn() -> floem::peniko::Color,
+    on_click: impl Fn() + 'static,
+) -> impl IntoView {
+    text_button(label, color, hover, true, (10.0, 5.0), on_click)
+}
+
+fn text_button(
+    label: impl Into<String>,
+    color: fn() -> floem::peniko::Color,
+    hover: fn() -> floem::peniko::Color,
+    enabled: bool,
+    (pad_h, pad_v): (f64, f64),
+    on_click: impl Fn() + 'static,
+) -> impl IntoView {
     text(label.into())
         .on_click_stop(move |_| {
             if enabled {
@@ -152,8 +179,8 @@ pub(crate) fn footer_button(
         .style(move |s| {
             let s = s
                 .font_size(theme::FONT_BODY)
-                .padding_horiz(6.0)
-                .padding_vert(4.0)
+                .padding_horiz(pad_h)
+                .padding_vert(pad_v)
                 .border_radius(6.0);
             if enabled {
                 s.color(color()).hover(move |s| s.color(hover()))
