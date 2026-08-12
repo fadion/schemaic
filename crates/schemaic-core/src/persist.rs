@@ -511,6 +511,45 @@ pub fn load_json<T: Default + for<'de> Deserialize<'de>>(file: &str) -> T {
     read_json(config_dir().map(|d| d.join(file)))
 }
 
+/// Load `<config>/<file>` as **security state** rather than configuration:
+/// `Err` when there is a file and nothing readable could be got out of it.
+///
+/// [`load_json`] is the right loader for a window size — an unreadable file
+/// becomes `T::default()` and the user loses a preference. It is the wrong one
+/// for a trust store, where the default value *is* the insecure answer: an empty
+/// known-hosts map trusts every host on first sight, so "I could not read my
+/// records" would silently mean "I have no records" and a previously-verified
+/// host would be re-trusted with whatever key it now offers.
+///
+/// `Ok(T::default())` still means genuinely absent — no file, or no config
+/// directory at all, both of which are a first run. The differences from
+/// `load_json` are that an I/O error on an existing file is an error rather than
+/// an absence, and that a corrupt file is **not** renamed to `.corrupt`: doing so
+/// would turn a transient unreadable store into a permanently empty one, which is
+/// the very downgrade this exists to refuse.
+pub fn load_json_strict<T: Default + for<'de> Deserialize<'de>>(file: &str) -> Result<T, String> {
+    let Some(path) = config_dir().map(|d| d.join(file)) else {
+        return Ok(T::default());
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => Some(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    match classify::<T>(bytes.as_deref()) {
+        Load::Ok(v) => Ok(v),
+        Load::Absent => Ok(T::default()),
+        // The `.bak` is Schemaic's own snapshot of the same file, so recovering
+        // from it is recovering the records — not defaulting past them.
+        Load::Corrupt(err) => {
+            match classify::<T>(std::fs::read(sibling(&path, ".bak")).ok().as_deref()) {
+                Load::Ok(v) => Ok(v),
+                _ => Err(err),
+            }
+        }
+    }
+}
+
 /// Persist a JSON value to `<config>/<file>` (best effort).
 pub fn save_json<T: Serialize>(file: &str, value: &T) {
     write_json(config_dir().map(|d| d.join(file)), value);

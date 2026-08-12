@@ -20,7 +20,7 @@
 //! protected), and delegation to the running SSH agent (see [`authenticate`]).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use russh::client::{self, Handler};
@@ -57,32 +57,105 @@ impl Drop for TunnelHandle {
 struct TunnelClient {
     /// `"host:port"` of the SSH server, for the known-hosts lookup.
     host_port: String,
+    /// Filled by [`TunnelClient::check_server_key`] when it refuses a key.
+    ///
+    /// russh has **one** error for a rejected host key — `UnknownKey`, whose text
+    /// is *"Unknown server key"* — so a changed key and a first-contact rejection
+    /// are indistinguishable from the error alone. That text describes the
+    /// opposite of a mismatch, and the natural remedy for it (clear the trust
+    /// record) is exactly what hands the attacker's key a permanent welcome. So
+    /// the verdict travels out of band and `open_tunnel` reports *that* instead.
+    refusal: Arc<Mutex<Option<String>>>,
 }
+
+/// Serialises the known-hosts read-modify-write.
+///
+/// `check_server_key` loads the whole store, inserts one host and writes it all
+/// back. Two tunnels opening at once — two connections restored at startup, or
+/// **Test** pressed while another connects — would each load the same map and
+/// each write their own, and the later write would drop the earlier host's
+/// fingerprint. That host is then "unknown" on its next connection and silently
+/// re-trusted, which is the same downgrade an unreadable store causes.
+static STORE_LOCK: Mutex<()> = Mutex::new(());
 
 /// The trust-on-first-use verdict for an offered server key (review H10). Pure
 /// so the security decision can be exhaustively unit-tested; the I/O wrapper in
-/// [`TunnelClient::check_server_key`] loads the store, logs, and persists.
+/// [`TunnelClient::check_server_key`] loads the store, reports, and persists.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum HostKeyVerdict {
     /// Known host, key still matches → accept without touching the store.
     Accept,
     /// Known host, key changed → refuse (the MITM signal).
-    Refuse,
+    Mismatch,
+    /// The store exists and could not be read → refuse. **Not** the same as an
+    /// empty store: this host may well be recorded in the bytes we can't parse.
+    StoreUnreadable,
     /// Unknown host → record the key, then accept (first-use trust).
     RecordAndAccept,
 }
 
 /// Decide how to treat `fingerprint` offered by `host_port`, given the current
 /// known-hosts `store`. No I/O — the caller applies the verdict.
+///
+/// `store` is a `Result` on purpose. A general config loader answers "unreadable"
+/// with `Default::default()`, which for a trust store is an *empty* one — and an
+/// empty trust store trusts everything on first use. That is the right policy for
+/// a window size and the wrong one here, so the failure has to survive as far as
+/// this decision instead of being flattened into a value on the way.
 fn known_host_decision(
-    store: &HashMap<String, String>,
+    store: Result<&HashMap<String, String>, &str>,
     host_port: &str,
     fingerprint: &str,
 ) -> HostKeyVerdict {
+    let Ok(store) = store else {
+        return HostKeyVerdict::StoreUnreadable;
+    };
     match store.get(host_port) {
         Some(known) if known == fingerprint => HostKeyVerdict::Accept,
-        Some(_) => HostKeyVerdict::Refuse,
+        Some(_) => HostKeyVerdict::Mismatch,
         None => HostKeyVerdict::RecordAndAccept,
+    }
+}
+
+/// What to tell the user about a refusal, or `None` when the key was accepted.
+///
+/// This is the security control's actual output. The refusal itself has always
+/// worked; what didn't was saying so — the diagnosis went to `tracing::error!`,
+/// and a released build has no console (`windows_subsystem = "windows"`) and no
+/// log file, so the one message that matters most was written where nobody could
+/// read it while the user saw "Unknown server key" and was invited to conclude
+/// the host was merely new.
+///
+/// The order of the sentences is load-bearing and is asserted by a test: the
+/// out-of-band verification comes *before* the file that re-trusts, because a
+/// remedy read first is a remedy applied first.
+fn refusal_message(
+    verdict: HostKeyVerdict,
+    host_port: &str,
+    known: Option<&str>,
+    offered: &str,
+) -> Option<String> {
+    match verdict {
+        HostKeyVerdict::Accept | HostKeyVerdict::RecordAndAccept => None,
+        HostKeyVerdict::Mismatch => Some(format!(
+            "The SSH host key for {host_port} has CHANGED since Schemaic first trusted it.\n\n\
+             Expected {}\nOffered  {offered}\n\n\
+             This can mean the server was rebuilt or its key rotated — or that something is \
+             intercepting the connection. Nothing was sent to it. Verify the new fingerprint out \
+             of band (on the server's own console, or with whoever administers it) before \
+             trusting it. Once you have, remove this host's entry from {KNOWN_HOSTS_FILE} in \
+             Schemaic's config directory to record the new key.",
+            known.unwrap_or("(no recorded key)")
+        )),
+        HostKeyVerdict::StoreUnreadable => Some(format!(
+            "Schemaic could not read its record of trusted SSH host keys \
+             ({KNOWN_HOSTS_FILE}), so it can't tell whether {host_port}'s key \
+             ({offered}) is the one you trusted before.\n\n\
+             The connection was refused rather than trusting the key on sight. Repair or delete \
+             {KNOWN_HOSTS_FILE} in Schemaic's config directory — deleting it means every SSH host \
+             is trusted afresh on its next connection, so do that only if you can verify the \
+             fingerprints."
+        )),
     }
 }
 
@@ -94,29 +167,51 @@ impl Handler for TunnelClient {
     // refuse a changed key (the MITM signal). Fingerprints are SHA256.
     async fn check_server_key(&mut self, key: &ssh_key::PublicKey) -> Result<bool, Self::Error> {
         let fingerprint = key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
-        let mut store: HashMap<String, String> =
-            schemaic_core::persist::load_json(KNOWN_HOSTS_FILE);
-        match known_host_decision(&store, &self.host_port, &fingerprint) {
-            HostKeyVerdict::Accept => Ok(true),
-            HostKeyVerdict::Refuse => {
-                let known = store.get(&self.host_port).map(String::as_str).unwrap_or("");
-                tracing::error!(
-                    "SSH host-key MISMATCH for {}: known {known}, offered {fingerprint} — refusing \
-                     (possible MITM; remove it from {KNOWN_HOSTS_FILE} to re-trust)",
-                    self.host_port
+        // Held across load → decide → insert → save, so a concurrent tunnel
+        // can't read the same map and write back a version missing this host.
+        // A poisoned lock means another thread panicked mid-update, which is
+        // precisely when the store's contents are least worth trusting.
+        let _guard = match STORE_LOCK.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                *self.refusal.lock().unwrap_or_else(|e| e.into_inner()) = refusal_message(
+                    HostKeyVerdict::StoreUnreadable,
+                    &self.host_port,
+                    None,
+                    &fingerprint,
                 );
-                Ok(false)
+                return Ok(false);
             }
-            HostKeyVerdict::RecordAndAccept => {
-                tracing::info!(
-                    "SSH host {} not seen before; trusting key {fingerprint} (TOFU)",
-                    self.host_port
-                );
-                store.insert(self.host_port.clone(), fingerprint);
-                schemaic_core::persist::save_json(KNOWN_HOSTS_FILE, &store);
-                Ok(true)
-            }
+        };
+        let loaded: Result<HashMap<String, String>, String> =
+            schemaic_core::persist::load_json_strict(KNOWN_HOSTS_FILE);
+        let verdict = known_host_decision(
+            loaded.as_ref().map_err(String::as_str),
+            &self.host_port,
+            &fingerprint,
+        );
+        let known = loaded
+            .as_ref()
+            .ok()
+            .and_then(|s| s.get(&self.host_port))
+            .map(String::as_str);
+        if let Some(msg) = refusal_message(verdict, &self.host_port, known, &fingerprint) {
+            // Still logged for anyone running with a console; the connection
+            // error is what the user actually sees.
+            tracing::error!("SSH host-key refusal for {}: {msg}", self.host_port);
+            *self.refusal.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+            return Ok(false);
         }
+        if verdict == HostKeyVerdict::RecordAndAccept {
+            tracing::info!(
+                "SSH host {} not seen before; trusting key {fingerprint} (TOFU)",
+                self.host_port
+            );
+            let mut store = loaded.unwrap_or_default();
+            store.insert(self.host_port.clone(), fingerprint);
+            schemaic_core::persist::save_json(KNOWN_HOSTS_FILE, &store);
+        }
+        Ok(true)
     }
 }
 
@@ -256,10 +351,21 @@ pub async fn open_tunnel(
         ..Default::default()
     });
     let host_port = format!("{}:{}", ssh.host, ssh.port);
-    let handler = TunnelClient { host_port };
+    let refusal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let handler = TunnelClient {
+        host_port,
+        refusal: refusal.clone(),
+    };
     let mut session = client::connect(config, (ssh.host.as_str(), ssh.port), handler)
         .await
-        .map_err(|e| DbError::Connect(format!("SSH connect failed: {e}")))?;
+        .map_err(|e| {
+            // A host-key refusal reaches here as russh's generic `UnknownKey`.
+            // Our own verdict is the one worth showing.
+            match refusal.lock().ok().and_then(|g| g.clone()) {
+                Some(msg) => DbError::Connect(msg),
+                None => DbError::Connect(format!("SSH connect failed: {e}")),
+            }
+        })?;
 
     authenticate(&mut session, ssh).await?;
 
@@ -312,7 +418,7 @@ pub async fn open_tunnel(
 
 #[cfg(test)]
 mod tests {
-    use super::{HostKeyVerdict, known_host_decision};
+    use super::{HostKeyVerdict, known_host_decision, refusal_message};
     use std::collections::HashMap;
 
     fn store(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -326,7 +432,7 @@ mod tests {
     fn unknown_host_is_recorded_and_accepted() {
         let s = store(&[]);
         assert_eq!(
-            known_host_decision(&s, "db.example:22", "SHA256:abc"),
+            known_host_decision(Ok(&s), "db.example:22", "SHA256:abc"),
             HostKeyVerdict::RecordAndAccept
         );
     }
@@ -335,7 +441,7 @@ mod tests {
     fn known_host_matching_key_is_accepted() {
         let s = store(&[("db.example:22", "SHA256:abc")]);
         assert_eq!(
-            known_host_decision(&s, "db.example:22", "SHA256:abc"),
+            known_host_decision(Ok(&s), "db.example:22", "SHA256:abc"),
             HostKeyVerdict::Accept
         );
     }
@@ -344,8 +450,8 @@ mod tests {
     fn known_host_changed_key_is_refused_as_mitm() {
         let s = store(&[("db.example:22", "SHA256:abc")]);
         assert_eq!(
-            known_host_decision(&s, "db.example:22", "SHA256:DIFFERENT"),
-            HostKeyVerdict::Refuse
+            known_host_decision(Ok(&s), "db.example:22", "SHA256:DIFFERENT"),
+            HostKeyVerdict::Mismatch
         );
     }
 
@@ -354,14 +460,85 @@ mod tests {
         // Same fingerprint recorded for a different host must not vouch for this one.
         let s = store(&[("other:22", "SHA256:abc")]);
         assert_eq!(
-            known_host_decision(&s, "db.example:22", "SHA256:abc"),
+            known_host_decision(Ok(&s), "db.example:22", "SHA256:abc"),
             HostKeyVerdict::RecordAndAccept
         );
         // Same host, different port is a distinct entry.
         let s = store(&[("db.example:22", "SHA256:abc")]);
         assert_eq!(
-            known_host_decision(&s, "db.example:2222", "SHA256:abc"),
+            known_host_decision(Ok(&s), "db.example:2222", "SHA256:abc"),
             HostKeyVerdict::RecordAndAccept
         );
+    }
+
+    #[test]
+    fn an_unreadable_store_is_not_an_empty_store() {
+        // The whole point: "I have no record" and "I could not read my records"
+        // must not mean the same thing. An empty store trusts on first use; an
+        // unreadable one refuses, because a previously-trusted host would
+        // otherwise be silently re-trusted with whatever key is offered.
+        assert_eq!(
+            known_host_decision(Err("bad json"), "db.example:22", "SHA256:abc"),
+            HostKeyVerdict::StoreUnreadable
+        );
+        let empty = store(&[]);
+        assert_eq!(
+            known_host_decision(Ok(&empty), "db.example:22", "SHA256:abc"),
+            HostKeyVerdict::RecordAndAccept
+        );
+    }
+
+    #[test]
+    fn a_mismatch_says_the_key_changed_and_carries_both_fingerprints() {
+        let msg = refusal_message(
+            HostKeyVerdict::Mismatch,
+            "jump.example:22",
+            Some("SHA256:old"),
+            "SHA256:new",
+        )
+        .expect("a refusal must be explainable");
+        assert!(msg.contains("CHANGED"), "{msg}");
+        assert!(msg.contains("jump.example:22"), "{msg}");
+        assert!(
+            msg.contains("SHA256:old") && msg.contains("SHA256:new"),
+            "{msg}"
+        );
+        // The remedy must not come before the verification that makes it safe.
+        let verify = msg
+            .find("erify")
+            .expect("must ask for out-of-band checking");
+        let remedy = msg
+            .find(super::KNOWN_HOSTS_FILE)
+            .expect("must say how to re-trust");
+        assert!(
+            verify < remedy,
+            "the file is named before the warning: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_store_does_not_claim_the_key_changed() {
+        // Naming the wrong cause is the defect being fixed, not a lesser version
+        // of it: "the key changed" would send the user hunting an intruder, and
+        // "unknown host" invites them to delete the record that protects them.
+        let msg = refusal_message(
+            HostKeyVerdict::StoreUnreadable,
+            "jump.example:22",
+            None,
+            "SHA256:new",
+        )
+        .expect("a refusal must be explainable");
+        assert!(!msg.contains("CHANGED"), "{msg}");
+        assert!(msg.contains(super::KNOWN_HOSTS_FILE), "{msg}");
+    }
+
+    #[test]
+    fn an_accepted_key_has_nothing_to_explain() {
+        for v in [HostKeyVerdict::Accept, HostKeyVerdict::RecordAndAccept] {
+            assert_eq!(
+                refusal_message(v, "h:22", Some("SHA256:a"), "SHA256:a"),
+                None
+            );
+        }
     }
 }
