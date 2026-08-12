@@ -26,7 +26,7 @@ static GLOBAL: heap::Tracking = heap::Tracking;
 use ai::{
     AiContextParams, AiSession, AiSettings, AiStreamMsg, RECAP_QUESTIONS, StartAiParams,
     active_tab_database, ai_context, apply_turn_delta, extract_sql, inline_system_prompt,
-    mcp_endpoint_from_env, render_recap, start_ai_session, turn_context,
+    mcp_endpoint_from_env, render_recap, scoped_database, start_ai_session, turn_context,
 };
 use claude_cli::{claude_bin, claude_reachable, detect_claude_bin};
 
@@ -178,42 +178,71 @@ fn app_icon() -> Option<Icon> {
     Icon::from_rgba(img.into_raw(), w, h).ok()
 }
 
-/// Build the terminal shell that launches the DB CLI for `conn`, optionally
-/// scoped to `db`. Prefers a native `mysql` then `mariadb` on `PATH`, else falls
-/// back to the WSL-side client (`wsl.exe -e mysql …`). Returns `None` when no
-/// client is found anywhere. The password rides `MYSQL_PWD` (via `WSLENV` for the
-/// WSL case) so it never appears on the command line or in shell history.
+/// Which client binary a DB-CLI session resolved to, and how it is reached.
+enum CliLauncher<'a> {
+    /// A native client on `PATH`.
+    Native(&'a str),
+    /// The client inside WSL, via `wsl.exe -e <prog>` — the fallback on a
+    /// Windows box with the server (and its client) installed under WSL.
+    Wsl(&'a str),
+}
+
+/// Find a client: the first of `progs` on `PATH`, else the first one inside WSL.
+/// `None` when neither exists, which is the caller's cue to say so in the
+/// terminal rather than spawn something that dies immediately.
+fn resolve_cli<'a>(progs: &[&'a str]) -> Option<CliLauncher<'a>> {
+    use schemaic_term::shell::which;
+    for prog in progs {
+        if which(prog).is_some() {
+            return Some(CliLauncher::Native(prog));
+        }
+    }
+    which("wsl.exe")
+        .is_some()
+        .then(|| CliLauncher::Wsl(progs[0]))
+}
+
+/// Build the terminal shell that launches the MySQL/MariaDB CLI for `conn`,
+/// optionally scoped to `db`. The password rides `MYSQL_PWD` (via `WSLENV` for
+/// the WSL case) so it never appears on the command line or in shell history.
 fn mysql_shell(
     conn: &schemaic_core::connection::Connection,
     db: Option<&str>,
 ) -> Option<schemaic_term::ShellConfig> {
-    use schemaic_term::shell::which;
-    // Native client on PATH, else the WSL-side client.
-    for prog in ["mysql", "mariadb"] {
-        if which(prog).is_some() {
-            return Some(mysql_shell_config(MysqlLauncher::Native(prog), conn, db));
-        }
-    }
-    if which("wsl.exe").is_some() {
-        return Some(mysql_shell_config(MysqlLauncher::Wsl, conn, db));
-    }
-    None
+    resolve_cli(&["mysql", "mariadb"]).map(|l| mysql_shell_config(l, conn, db))
 }
 
-/// Which DB client `mysql_shell` resolved to run.
-enum MysqlLauncher<'a> {
-    /// A native `mysql`/`mariadb` on PATH.
-    Native(&'a str),
-    /// The WSL-side client via `wsl.exe -e mysql`.
-    Wsl,
+/// The PostgreSQL half of [`mysql_shell`]. `db` is required — see
+/// [`psql_database`] for how the caller arrives at one.
+fn psql_shell(
+    conn: &schemaic_core::connection::Connection,
+    db: &str,
+) -> Option<schemaic_term::ShellConfig> {
+    resolve_cli(&["psql"]).map(|l| psql_shell_config(l, conn, db))
 }
 
-/// Build the launch config for the resolved DB client — pure argv + credential
-/// env construction, split from the PATH probing in [`mysql_shell`] so it's
-/// unit-tested. The password always rides `MYSQL_PWD` (forwarded across `WSLENV`
-/// in the WSL case) and never lands on the argv.
+/// Which database `psql` should open.
+///
+/// Unlike the MySQL client, psql cannot start a session with no database: given
+/// none it connects to one named after the user, which on most servers doesn't
+/// exist. So take the caller's explicit choice (the schema tree's "Open in CLI"),
+/// else whatever database the user is looking at, else `postgres` — the
+/// maintenance database every server is created with.
+fn psql_database(explicit: Option<&str>, active: Option<&str>) -> String {
+    [explicit, active]
+        .into_iter()
+        .flatten()
+        .find(|d| !d.trim().is_empty())
+        .unwrap_or("postgres")
+        .to_string()
+}
+
+/// Build the launch config for the resolved MySQL client — pure argv +
+/// credential env construction, split from the `PATH` probing in [`mysql_shell`]
+/// so it's unit-tested. The password always rides `MYSQL_PWD` (forwarded across
+/// `WSLENV` in the WSL case) and never lands on the argv.
 fn mysql_shell_config(
-    launcher: MysqlLauncher,
+    launcher: CliLauncher,
     conn: &schemaic_core::connection::Connection,
     db: Option<&str>,
 ) -> schemaic_term::ShellConfig {
@@ -228,23 +257,59 @@ fn mysql_shell_config(
     if let Some(d) = db {
         cli_args.push(d.to_string());
     }
+    wrap_launcher(launcher, cli_args, "MYSQL_PWD", &conn.password)
+}
+
+/// [`mysql_shell_config`]'s PostgreSQL twin. Every parameter takes a different
+/// flag here (`-p`/`-U`/`-d`, against MySQL's `-P`/`-u`/positional) and the
+/// password variable differs too, so the two builders stay separate rather than
+/// growing an engine conditional per argument.
+fn psql_shell_config(
+    launcher: CliLauncher,
+    conn: &schemaic_core::connection::Connection,
+    db: &str,
+) -> schemaic_term::ShellConfig {
+    let cli_args: Vec<String> = vec![
+        "-h".into(),
+        conn.host.clone(),
+        "-p".into(),
+        conn.port.to_string(),
+        "-U".into(),
+        conn.user.clone(),
+        "-d".into(),
+        db.to_string(),
+    ];
+    wrap_launcher(launcher, cli_args, "PGPASSWORD", &conn.password)
+}
+
+/// Turn a client's argv into a spawnable config, native or through WSL, with the
+/// password in `var` — the half both engines share, so neither can lose the
+/// rule that the password never reaches the command line.
+fn wrap_launcher(
+    launcher: CliLauncher,
+    cli_args: Vec<String>,
+    var: &str,
+    password: &str,
+) -> schemaic_term::ShellConfig {
     match launcher {
-        MysqlLauncher::Native(prog) => schemaic_term::ShellConfig {
+        CliLauncher::Native(prog) => schemaic_term::ShellConfig {
             program: prog.into(),
             args: cli_args,
             cwd: None,
-            env: vec![("MYSQL_PWD".into(), conn.password.clone())],
+            env: vec![(var.into(), password.to_string())],
         },
-        MysqlLauncher::Wsl => {
-            let mut args: Vec<String> = vec!["-e".into(), "mysql".into()];
+        CliLauncher::Wsl(prog) => {
+            let mut args: Vec<String> = vec!["-e".into(), prog.into()];
             args.extend(cli_args);
             schemaic_term::ShellConfig {
                 program: "wsl.exe".into(),
                 args,
                 cwd: None,
+                // WSLENV is what carries the variable across the boundary; without
+                // it the password simply doesn't arrive and psql/mysql prompts.
                 env: vec![
-                    ("WSLENV".into(), "MYSQL_PWD/u".into()),
-                    ("MYSQL_PWD".into(), conn.password.clone()),
+                    ("WSLENV".into(), format!("{var}/u")),
+                    (var.into(), password.to_string()),
                 ],
             }
         }
@@ -4492,9 +4557,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             }
         })
     };
-    // Open the DB CLI (mysql/mariadb) for the active connection in the terminal,
-    // optionally scoped to a database. Reveals the terminal panel and respawns it
-    // as a dedicated client session.
+    // Open the DB CLI for the active connection in the terminal — `mysql`/
+    // `mariadb` or `psql`, per the connection's engine — optionally scoped to a
+    // database. Reveals the terminal panel and respawns it as a dedicated client
+    // session.
     let open_db_cli: Rc<dyn Fn(Option<String>)> = {
         let terminal = terminal.clone();
         let term_dims = term_dims.clone();
@@ -4541,8 +4607,25 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             } else {
                 conn
             };
-            let cfg = mysql_shell(&conn, db.as_deref())
-                .unwrap_or_else(|| message_shell("No mysql/mariadb client found (PATH or WSL)."));
+            let cfg = if schemaic_core::connection::is_postgres(&conn.db_type) {
+                // The button on the terminal's toolbar passes no database, and
+                // psql needs one. Fall back to the focused tab's — but only when
+                // that tab is on this connection, or we'd name a database from
+                // another server (`scoped_database`'s whole reason for being).
+                let tab = tabs.with_untracked(|v| {
+                    v.iter()
+                        .find(|t| t.id == active.get_untracked())
+                        .map(|t| (t.conn_id.get_untracked(), t.database.get_untracked()))
+                });
+                let scoped = scoped_database(tab, active_conn.get_untracked(), None);
+                let target = psql_database(db.as_deref(), scoped.as_deref());
+                psql_shell(&conn, &target)
+                    .unwrap_or_else(|| message_shell("No psql client found (PATH or WSL)."))
+            } else {
+                mysql_shell(&conn, db.as_deref()).unwrap_or_else(|| {
+                    message_shell("No mysql/mariadb client found (PATH or WSL).")
+                })
+            };
             let (cols, rows) = term_dims.get();
             match schemaic_term::Terminal::spawn(&cfg, cols, rows, term_notify.clone()) {
                 Ok(t) => {
@@ -5185,7 +5268,10 @@ fn open_url(url: &str) {
 
 #[cfg(test)]
 mod app_tests {
-    use super::{MysqlLauncher, inline_outcome, mysql_shell_config, unique_name};
+    use super::{
+        CliLauncher, inline_outcome, mysql_shell_config, psql_database, psql_shell_config,
+        unique_name,
+    };
     use schemaic_core::connection::Connection;
     use schemaic_ui::InlineAiState;
 
@@ -5266,7 +5352,7 @@ mod app_tests {
 
     #[test]
     fn native_shell_puts_password_in_env_not_argv() {
-        let cfg = mysql_shell_config(MysqlLauncher::Native("mysql"), &conn(), Some("shop"));
+        let cfg = mysql_shell_config(CliLauncher::Native("mysql"), &conn(), Some("shop"));
         assert_eq!(cfg.program, "mysql");
         assert_eq!(
             cfg.args,
@@ -5282,13 +5368,13 @@ mod app_tests {
 
     #[test]
     fn native_shell_omits_db_when_none() {
-        let cfg = mysql_shell_config(MysqlLauncher::Native("mariadb"), &conn(), None);
+        let cfg = mysql_shell_config(CliLauncher::Native("mariadb"), &conn(), None);
         assert_eq!(cfg.args, vec!["-h", "10.0.0.5", "-P", "3307", "-u", "root"]);
     }
 
     #[test]
     fn wsl_shell_prepends_client_and_forwards_password_via_wslenv() {
-        let cfg = mysql_shell_config(MysqlLauncher::Wsl, &conn(), Some("shop"));
+        let cfg = mysql_shell_config(CliLauncher::Wsl("mysql"), &conn(), Some("shop"));
         assert_eq!(cfg.program, "wsl.exe");
         assert_eq!(
             cfg.args,
@@ -5304,6 +5390,65 @@ mod app_tests {
             ]
         );
         assert!(!cfg.args.iter().any(|a| a.contains("s3cr3t")));
+    }
+
+    // ── The PostgreSQL client ─────────────────────────────────────────────
+    // psql takes a different flag for every one of the four parameters (`-p`
+    // not `-P`, `-U` not `-u`, `-d` not a bare argument) and a different
+    // password variable, which is why it can't share the MySQL builder.
+
+    #[test]
+    fn psql_shell_puts_password_in_env_not_argv() {
+        let cfg = psql_shell_config(CliLauncher::Native("psql"), &conn(), "chinook");
+        assert_eq!(cfg.program, "psql");
+        assert_eq!(
+            cfg.args,
+            vec![
+                "-h", "10.0.0.5", "-p", "3307", "-U", "root", "-d", "chinook"
+            ]
+        );
+        assert_eq!(
+            cfg.env,
+            vec![("PGPASSWORD".to_string(), "s3cr3t".to_string())]
+        );
+        assert!(!cfg.args.iter().any(|a| a.contains("s3cr3t")));
+    }
+
+    #[test]
+    fn psql_wsl_shell_prepends_client_and_forwards_password_via_wslenv() {
+        let cfg = psql_shell_config(CliLauncher::Wsl("psql"), &conn(), "world");
+        assert_eq!(cfg.program, "wsl.exe");
+        assert_eq!(
+            cfg.args,
+            vec![
+                "-e", "psql", "-h", "10.0.0.5", "-p", "3307", "-U", "root", "-d", "world"
+            ]
+        );
+        assert_eq!(
+            cfg.env,
+            vec![
+                ("WSLENV".to_string(), "PGPASSWORD/u".to_string()),
+                ("PGPASSWORD".to_string(), "s3cr3t".to_string()),
+            ]
+        );
+        assert!(!cfg.args.iter().any(|a| a.contains("s3cr3t")));
+    }
+
+    #[test]
+    fn psql_database_prefers_the_explicit_choice_then_the_active_one() {
+        assert_eq!(psql_database(Some("chinook"), Some("world")), "chinook");
+        assert_eq!(psql_database(None, Some("world")), "world");
+    }
+
+    #[test]
+    fn psql_database_falls_back_to_the_maintenance_database() {
+        // The terminal toolbar's button passes no database and there may be no
+        // active one. psql with no `-d` tries a database named after the user,
+        // which is what made the button do nothing at all.
+        assert_eq!(psql_database(None, None), "postgres");
+        // A blank is not a choice.
+        assert_eq!(psql_database(Some("  "), None), "postgres");
+        assert_eq!(psql_database(Some(""), Some("world")), "world");
     }
 
     #[test]
