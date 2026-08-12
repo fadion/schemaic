@@ -987,6 +987,15 @@ enum TkKind {
 /// A token plus its absolute byte offset in `sql`.
 struct Token {
     at: usize,
+    /// One past the token's last byte **in the source**, quotes included.
+    ///
+    /// Carried rather than recomputed as `at + text.len()`, which is wrong for
+    /// exactly the tokens that need it most: a quoted identifier's `at` is the
+    /// opening quote while its payload is the *inner* text, so the arithmetic
+    /// underlined `"NoSuchTb` — starting on the quote and stopping two bytes
+    /// short — and a doubled quote inside the name widened the error further.
+    /// The tokenizer is the only place that knows what it consumed.
+    end: usize,
     kind: TkKind,
     /// The word came from a quoted identifier (`` `select` ``). Quoting is what
     /// makes a reserved word legal as a name, so the alias checks must not flag
@@ -1046,9 +1055,10 @@ fn tokenize_range(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<T
     let quote = ident_quote(dialect);
     let mut out = Vec::new();
     let mut i = lo;
-    let push = |out: &mut Vec<Token>, at: usize, kind: TkKind| {
+    let push = |out: &mut Vec<Token>, at: usize, end: usize, kind: TkKind| {
         out.push(Token {
             at,
+            end,
             kind,
             quoted: false,
         })
@@ -1074,6 +1084,8 @@ fn tokenize_range(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<T
                 let single = std::str::from_utf8(&single).unwrap_or("");
                 out.push(Token {
                     at: i,
+                    // Past the closing quote — the span the user sees.
+                    end,
                     kind: TkKind::Word(inner.replace(doubled, single)),
                     quoted: true,
                 });
@@ -1092,15 +1104,15 @@ fn tokenize_range(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<T
             while j < hi && is_word_byte(b[j]) {
                 j += 1;
             }
-            push(&mut out, s, TkKind::Word(sql[s..j].to_string()));
+            push(&mut out, s, j, TkKind::Word(sql[s..j].to_string()));
             i = j;
             continue;
         }
         match c {
-            b'.' => push(&mut out, i, TkKind::Dot),
-            b',' => push(&mut out, i, TkKind::Comma),
-            b'(' => push(&mut out, i, TkKind::LParen),
-            b')' => push(&mut out, i, TkKind::RParen),
+            b'.' => push(&mut out, i, i + 1, TkKind::Dot),
+            b',' => push(&mut out, i, i + 1, TkKind::Comma),
+            b'(' => push(&mut out, i, i + 1, TkKind::LParen),
+            b')' => push(&mut out, i, i + 1, TkKind::RParen),
             _ => {}
         }
         i += 1;
@@ -2292,7 +2304,10 @@ fn table_refs_with_pos(
             if is_reserved_word(&name, dialect) {
                 break;
             }
-            let mut pos = (toks[i].at, toks[i].at + name.len());
+            // The token's own span, not `at + name.len()`: `name` is the
+            // *unquoted* text, so recomputing underlines `"NoSuchTb` for a
+            // quoted identifier.
+            let mut pos = (toks[i].at, toks[i].end);
             let mut db = None;
             i += 1;
             if matches!(toks.get(i).map(|t| &t.kind), Some(TkKind::Dot))
@@ -2300,7 +2315,7 @@ fn table_refs_with_pos(
             {
                 db = Some(name);
                 name = second;
-                pos = (toks[i + 1].at, toks[i + 1].at + name.len());
+                pos = (toks[i + 1].at, toks[i + 1].end);
                 i += 2;
             }
             let mut alias = None;
@@ -2906,7 +2921,7 @@ fn alias_checks(sql: &str, lo: usize, hi: usize, dialect: SqlDialect, out: &mut 
         // The alias must sit immediately after AS (whitespace only between). A
         // skipped quote/comment in the gap means `b` is the *following* token
         // (e.g. FROM) rather than the alias — never flag that.
-        let as_end = w[0].at + a.len();
+        let as_end = w[0].end;
         if sql
             .get(as_end..w[1].at)
             .is_some_and(|g| g.trim().is_empty())
@@ -3042,7 +3057,7 @@ fn qualified_column_checks(
             && !cols.iter().any(|c| c.eq_ignore_ascii_case(col))
         {
             out.push(Diagnostic {
-                range: (w[2].at, w[2].at + col.len()),
+                range: (w[2].at, w[2].end),
                 severity: Severity::Error,
                 message: format!("Column `{col}` not found in `{}`", table.name),
             });
@@ -4504,25 +4519,39 @@ fn is_error_phrase(s: &str) -> bool {
 /// `stmt`: the `near '<tok>'` clause of a syntax error, or the first quoted object
 /// name of a name error (`Unknown column 'x'`, `Table 'db.t' doesn't exist`).
 fn locate_db_error(stmt: &str, message: &str) -> Option<(usize, usize)> {
-    // Syntax error: `... near 'FRM employees' at line 1` → first word `FRM`.
-    if let Some(idx) = message.find("near '") {
-        let rest = &message[idx + 6..];
-        if let Some(end) = rest.find('\'') {
-            let tok = rest[..end].split_whitespace().next().unwrap_or("");
-            let tok = tok.trim_matches('`');
-            if !tok.is_empty() {
-                return find_ci(stmt, tok);
+    // Syntax error: MySQL's `… near 'FRM employees' at line 1`, PostgreSQL's
+    // `syntax error at or near "FRM"` → first word of the quoted run.
+    const NEAR: &str = "near ";
+    for q in ['\'', '"'] {
+        if let Some(idx) = message.find(&format!("{NEAR}{q}")) {
+            let rest = &message[idx + NEAR.len() + q.len_utf8()..];
+            if let Some(end) = rest.find(q) {
+                let tok = rest[..end].split_whitespace().next().unwrap_or("");
+                let tok = tok.trim_matches('`');
+                if !tok.is_empty()
+                    && let Some(r) = find_ci(stmt, tok)
+                {
+                    return r.into();
+                }
             }
         }
     }
-    // Name error: first single-quoted object name, last `.`-segment (skip generic
-    // phrases like 'field list').
+    // Name error: the first quoted object name, last `.`-segment (skipping
+    // generic phrases like 'field list').
+    //
+    // **Both quote styles**, because the engines differ and this used to know
+    // only MySQL's: PostgreSQL writes `column "nosuchcol" does not exist` and
+    // `relation "Orders" does not exist`, so every PG squiggle fell through to
+    // the caller's fallback and landed on the statement's first word — under
+    // `SELECT`, for a feature whose whole job is putting the error where the
+    // mistake is.
     let mut i = 0;
-    while let Some(open) = message[i..].find('\'') {
-        let start = i + open + 1;
-        if let Some(close_rel) = message[start..].find('\'') {
+    while let Some(open) = message[i..].find(['\'', '"']) {
+        let quote = message[i + open..].chars().next().unwrap_or('\'');
+        let start = i + open + quote.len_utf8();
+        if let Some(close_rel) = message[start..].find(quote) {
             let content = &message[start..start + close_rel];
-            i = start + close_rel + 1;
+            i = start + close_rel + quote.len_utf8();
             if is_error_phrase(content) {
                 continue;
             }
@@ -5229,6 +5258,48 @@ mod tests {
             &"SELECT * FROM employes"[d[0].range.0..d[0].range.1],
             "employes"
         );
+    }
+
+    #[test]
+    fn diag_on_a_quoted_table_underlines_the_whole_quoted_name() {
+        // The span used to be the *unquoted* length measured from the opening
+        // quote, so it started on the quote and stopped two bytes short:
+        // `"NoSuchTb`. The last character and the closing quote had no squiggle
+        // and no hover tooltip. PostgreSQL feels this most — every mixed-case
+        // name must be quoted, and Schemaic writes the quoted form itself.
+        for (sql, dialect) in [
+            (r#"SELECT 1 FROM "NoSuchTbl""#, SqlDialect::Postgres),
+            ("SELECT 1 FROM `NoSuchTbl`", SqlDialect::MySql),
+        ] {
+            let d = diag_d(sql, dialect);
+            let found = d
+                .iter()
+                .find(|x| x.message.contains("not found"))
+                .unwrap_or_else(|| panic!("no unknown-table diagnostic for {sql}"));
+            let quote = if dialect == SqlDialect::Postgres {
+                '"'
+            } else {
+                '`'
+            };
+            assert_eq!(
+                &sql[found.range.0..found.range.1],
+                format!("{quote}NoSuchTbl{quote}"),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn diag_on_a_quoted_name_holding_a_doubled_quote_still_spans_it() {
+        // A doubled quote is one character of the name but two bytes of source,
+        // so the old arithmetic drifted further with every one of them.
+        let sql = r#"SELECT 1 FROM "we""ird""#;
+        let d = diag_d(sql, SqlDialect::Postgres);
+        let found = d
+            .iter()
+            .find(|x| x.message.contains("not found"))
+            .expect("unknown table");
+        assert_eq!(&sql[found.range.0..found.range.1], r#""we""ird""#);
     }
 
     #[test]
@@ -6407,6 +6478,36 @@ mod tests {
         let sql = "SELECT * FROM employes";
         let d = db_error_diagnostic(sql, 0, sql.len(), "Table 'company.employes' doesn't exist");
         assert_eq!(&sql[d.range.0..d.range.1], "employes");
+    }
+
+    #[test]
+    fn db_error_locates_postgres_messages_too() {
+        // PostgreSQL double-quotes the object it is complaining about, and this
+        // knew only MySQL's single quotes — so *every* PG squiggle fell through
+        // to the leading-token fallback and landed on `SELECT`, in the feature
+        // whose whole job is putting the error where the mistake is. The three
+        // message shapes below are the ones the server really emits.
+        let sql = r#"SELECT id, nosuchcol FROM "Orders""#;
+        let d = db_error_diagnostic(sql, 0, sql.len(), r#"column "nosuchcol" does not exist"#);
+        assert_eq!(&sql[d.range.0..d.range.1], "nosuchcol");
+
+        let sql = r#"SELECT 1 FROM "Ordrs""#;
+        let d = db_error_diagnostic(sql, 0, sql.len(), r#"relation "Ordrs" does not exist"#);
+        assert_eq!(&sql[d.range.0..d.range.1], "Ordrs");
+
+        let sql = "SELECT 1 FRM t";
+        let d = db_error_diagnostic(sql, 0, sql.len(), r#"syntax error at or near "FRM""#);
+        assert_eq!(&sql[d.range.0..d.range.1], "FRM");
+    }
+
+    #[test]
+    fn db_error_still_prefers_a_findable_name_over_a_quoted_phrase() {
+        // Reading both quote styles must not make a generic phrase win. MySQL's
+        // `in 'field list'` is skipped as before, and a double-quoted phrase
+        // that isn't in the statement simply doesn't match.
+        let sql = "SELECT salery FROM employees";
+        let d = db_error_diagnostic(sql, 0, sql.len(), "Unknown column 'salery' in 'field list'");
+        assert_eq!(&sql[d.range.0..d.range.1], "salery");
     }
 
     #[test]
