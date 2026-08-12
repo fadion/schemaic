@@ -276,9 +276,14 @@ const MAX_ARENA: usize = OFFSET_MASK as usize;
 struct ColumnData {
     /// Per cell: `(tag << OFFSET_BITS) | end_offset`. The tag rides in the top 3
     /// bits so there's no separate tag byte; the offset (low 29 bits) reaches
-    /// [`MAX_ARENA`], unreachable within the 200k-row cap for any real cell.
+    /// [`MAX_ARENA`] — 512 MiB for the *whole column*, i.e. ~2.7 KB per row at
+    /// the 200k-row cap, which a text column can reach.
     ends: Vec<u32>,
     arena: String,
+    /// The arena hit [`MAX_ARENA`] and was truncated, so every cell from that
+    /// point on is blank. Reported, not silent — see
+    /// [`ColumnData::finish_cell`].
+    capped: bool,
 }
 
 impl ColumnData {
@@ -286,21 +291,38 @@ impl ColumnData {
         ColumnData {
             ends: Vec::with_capacity(rows),
             arena: String::new(),
+            capped: false,
         }
     }
 
     /// Finalize the cell whose text has just been appended to `arena`, recording
-    /// its tag + end offset as one packed word. If the arena ever exceeds the
-    /// 29-bit ceiling (a single 512 MiB column — unreachable within the row cap),
-    /// it's truncated at a char boundary so an offset can never collide with the
-    /// tag bits; graceful capping, never corruption.
+    /// its tag + end offset as one packed word.
+    ///
+    /// The 29-bit offset caps a column's arena at 512 MiB **across all its rows**
+    /// — not per cell, which is what the comment here used to imply while calling
+    /// it "unreachable within the row cap". At the 200,000-row default that is
+    /// only ~2.7 KB per row, which a `TEXT` or `JSON` column clears comfortably.
+    ///
+    /// Past the cap the arena is truncated at a char boundary, so an offset can
+    /// never collide with the tag bits — graceful capping, never corruption. But
+    /// every *later* cell then has `start == end == MAX_ARENA` and renders blank
+    /// while keeping its tag, so `capped` is set and carried out to
+    /// [`ResultSet::capped_columns`]: rows going blank partway down a result is
+    /// exactly the kind of thing a user must not have to guess at.
     fn finish_cell(&mut self, tag: CellTag) {
-        if self.arena.len() > MAX_ARENA {
-            let mut cut = MAX_ARENA;
+        self.finish_cell_within(tag, MAX_ARENA);
+    }
+
+    /// [`ColumnData::finish_cell`] with the ceiling passed in, so the capping
+    /// path can be tested without building a 512 MiB result.
+    fn finish_cell_within(&mut self, tag: CellTag, max_arena: usize) {
+        if self.arena.len() > max_arena {
+            let mut cut = max_arena;
             while !self.arena.is_char_boundary(cut) {
                 cut -= 1;
             }
             self.arena.truncate(cut);
+            self.capped = true;
         }
         let end = self.arena.len() as u32;
         self.ends.push((tag.to_bits() << OFFSET_BITS) | end);
@@ -383,6 +405,11 @@ pub struct ResultSet {
     pub elapsed_ms: u128,
     /// True if the fetch stopped at the row cap (more rows may exist).
     pub truncated: bool,
+    /// Indices of columns whose text arena hit its 512 MiB ceiling, so their
+    /// cells past that point are blank. Separate from `truncated`, which is
+    /// about *rows* and says nothing about this: a user whose cells go empty at
+    /// row 180,000 otherwise has no way to learn why.
+    pub capped_columns: Vec<usize>,
     /// For a statement that returns no result set (UPDATE/INSERT/DELETE/DDL),
     /// the number of rows the server reports affected. `None` for a row-
     /// returning result (a SELECT grid), so the UI can tell the two apart.
@@ -583,7 +610,15 @@ impl ResultBuilder {
     }
 
     pub fn finish(self) -> ResultSet {
+        let capped_columns = self
+            .cols
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.capped)
+            .map(|(i, _)| i)
+            .collect();
         ResultSet {
+            capped_columns,
             columns: self.columns,
             // One `Arc` per column, allocated once here at the end of the load —
             // see [`ResultSet`] for why the columns are shared individually.
@@ -1552,5 +1587,55 @@ mod tests {
         let w = GridWrite::default();
         assert!(w.is_empty());
         assert!(w.plan().is_empty());
+    }
+
+    // ── The column arena's ceiling is reported, not just applied ──────────
+
+    #[test]
+    fn a_column_under_its_ceiling_reports_nothing() {
+        let mut c = ColumnData::with_capacity(2);
+        c.arena.push_str("abc");
+        c.finish_cell_within(CellTag::Str, 64);
+        assert!(!c.capped);
+    }
+
+    #[test]
+    fn a_column_that_hits_its_ceiling_says_so_and_caps_at_a_char_boundary() {
+        // The real ceiling is 512 MiB *per column across all rows* — ~2.7 KB a
+        // row at the 200k cap, which a TEXT column clears — so this path is
+        // reachable and its consequence (every later cell blank) is invisible
+        // without the flag. Tested at a lowered ceiling because the honest
+        // version would need 600 MB of RAM.
+        let mut c = ColumnData::with_capacity(2);
+        c.arena.push_str("aaaaaaaa");
+        c.finish_cell_within(CellTag::Str, 4);
+        assert!(c.capped);
+        assert_eq!(c.arena.len(), 4);
+
+        // Multi-byte: the cut lands on a boundary, never mid-character.
+        let mut c = ColumnData::with_capacity(1);
+        c.arena.push_str("aé€"); // 1 + 2 + 3 bytes
+        c.finish_cell_within(CellTag::Str, 4);
+        assert!(c.capped);
+        assert_eq!(c.arena, "aé");
+    }
+
+    #[test]
+    fn every_later_cell_of_a_capped_column_is_empty() {
+        // Why the flag matters: the cells after the cap keep their tag and read
+        // as blank, so an `Int` column silently becomes a column of "".
+        let mut c = ColumnData::with_capacity(3);
+        c.arena.push_str("aaaa");
+        c.finish_cell_within(CellTag::Str, 3);
+        c.arena.push_str("bbbb");
+        c.finish_cell_within(CellTag::Str, 3);
+        assert!(c.capped);
+        assert_eq!(c.cell(1).map(|r| r.text().to_string()).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn an_ordinary_result_caps_nothing() {
+        let rs = ResultSet::from_rows(vec![col("text")], vec![vec![Value::Str("x".into())]]);
+        assert!(rs.capped_columns.is_empty());
     }
 }

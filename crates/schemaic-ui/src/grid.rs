@@ -1962,6 +1962,12 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     let key_map = Arc::new(column_key_map(&rs, gctx.source, gctx.db_nodes));
     let elapsed = rs.elapsed_ms;
     let truncated = rs.truncated;
+    // Named, not indexed: the toolbar has to say *which* column went blank.
+    let capped_columns: Vec<String> = rs
+        .capped_columns
+        .iter()
+        .filter_map(|&i| rs.columns.get(i).map(|c| c.name.clone()))
+        .collect();
     // Signals for the identity-colour rule at the table's top edge (below the
     // toolbar), captured before `gctx` fields move into the closures below.
     let (connections, active_conn) = (gctx.connections, gctx.active_conn);
@@ -2050,7 +2056,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     // Click a header to sort by that column (ASC → DESC → reset).
     let sort: RwSignal<SortState> = RwSignal::new(None);
 
-    let toolbar = grid_toolbar(gs, nrows, ncols, elapsed, truncated, sort);
+    let toolbar = grid_toolbar(gs, nrows, ncols, elapsed, truncated, capped_columns, sort);
 
     // Header + body rebuild together on a sort change OR a freeze toggle (both
     // repartition the columns between the frozen pane and the scrolling pane).
@@ -4208,6 +4214,7 @@ fn grid_toolbar(
     ncols: usize,
     elapsed_ms: u128,
     truncated: bool,
+    capped_columns: Vec<String>,
     sort: RwSignal<SortState>,
 ) -> impl IntoView {
     let cap = if truncated { " (capped)" } else { "" };
@@ -4218,6 +4225,20 @@ fn grid_toolbar(
         plural(ncols, "col", "cols"),
     ))
     .style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL));
+    // A column whose 512 MiB text arena filled up renders blank from that row
+    // on. Said out loud, because the alternative is the user discovering empty
+    // cells partway down a result with nothing to attribute them to — and unlike
+    // the row cap, this one loses data inside rows that are present.
+    let arena_note = if capped_columns.is_empty() {
+        empty().into_any()
+    } else {
+        text(format!(
+            "· {} too large to hold in full — later rows show blank",
+            capped_columns.join(", ")
+        ))
+        .style(|s| s.color(theme::error()).font_size(theme::FONT_LABEL))
+        .into_any()
+    };
     // Sorting a capped result reorders only the fetched subset — flag it.
     let caveat = dyn_container(
         move || truncated && sort.get().is_some(),
@@ -4527,6 +4548,7 @@ fn grid_toolbar(
 
     h_stack((
         stats,
+        arena_note,
         caveat,
         empty().style(|s| s.flex_grow(1.0_f32)),
         icons_cluster,
