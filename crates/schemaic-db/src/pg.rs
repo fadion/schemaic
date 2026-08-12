@@ -52,8 +52,8 @@ use schemaic_core::model::{
     ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value, WriteStep, one_row_verdict,
 };
 use schemaic_core::schema::{
-    CheckInfo, ColumnInfo, DbSchema, IndexColumn, TableInfo, TriggerAction, TriggerEvent,
-    TriggerInfo, TriggerLevel, TriggerTiming, ViewOptions,
+    CheckInfo, ColumnInfo, DbSchema, IndexColumn, RoutineInfo, TableInfo, TriggerAction,
+    TriggerEvent, TriggerInfo, TriggerLevel, TriggerTiming, ViewOptions, Volatility,
 };
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
@@ -1051,7 +1051,64 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
             }
         }
     }
+
     Ok(DbSchema { tables })
+}
+
+/// Every trigger function in `database`, read **lazily** — when the trigger or
+/// function editor opens, not on every schema fetch.
+///
+/// The same call `Db::view_algorithm` makes, for the same reason: a function's
+/// source is only needed for the one being bound or edited, and pulling every
+/// body into the schema refresh would cost far more than it answers. It also
+/// keeps `DbSchema` — which is cloned into an `Arc` and read on the completion
+/// path per keystroke — from carrying text nothing on that path looks at.
+///
+/// Narrowed to `RETURNS trigger`: routines are out of scope except as the thing
+/// a PostgreSQL trigger binds to.
+///
+/// `proconfig` is joined on `|` rather than `,` because a setting's *value* can
+/// contain a comma — `search_path=public, extensions` is one setting, and
+/// splitting it on the comma would emit two broken `SET` clauses.
+pub(crate) async fn trigger_functions(
+    db: &Db,
+    database: &str,
+) -> Result<Vec<RoutineInfo>, DbError> {
+    let client = connect_to(db, database).await?;
+    Ok(query_all(
+        &client,
+        &format!(
+            "SELECT n.nspname, p.proname, pg_get_function_arguments(p.oid), \
+                    pg_get_function_result(p.oid), l.lanname, p.prosrc, \
+                    p.provolatile, p.proisstrict::int, p.prosecdef::int, \
+                    COALESCE(array_to_string(p.proconfig, '|'), '') \
+             FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             JOIN pg_language l ON l.oid = p.prolang \
+             WHERE p.prorettype = 'trigger'::regtype AND {} \
+             ORDER BY n.nspname, p.proname",
+            user_schema_filter("n.nspname")
+        ),
+    )
+    .await?
+    .iter()
+    .map(|r| RoutineInfo {
+        schema: Some(cell(r, 0)),
+        name: cell(r, 1),
+        arguments: cell(r, 2),
+        returns: cell(r, 3),
+        language: cell(r, 4),
+        body: cell(r, 5),
+        volatility: Volatility::parse_code(&cell(r, 6)),
+        strict: cell(r, 7) == "1",
+        security_definer: cell(r, 8) == "1",
+        settings: cell(r, 9)
+            .split('|')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+    })
+    .collect())
 }
 
 /// Decode `pg_trigger.tgtype` into the three things it packs: when the trigger

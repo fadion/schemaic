@@ -875,6 +875,159 @@ impl TriggerInfo {
     }
 }
 
+// ── Routines (PostgreSQL functions) ─────────────────────────────────────────
+
+/// How often PostgreSQL may assume a function returns the same answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Volatility {
+    #[default]
+    Volatile,
+    Stable,
+    Immutable,
+}
+
+impl Volatility {
+    pub fn sql(self) -> &'static str {
+        match self {
+            Volatility::Volatile => "VOLATILE",
+            Volatility::Stable => "STABLE",
+            Volatility::Immutable => "IMMUTABLE",
+        }
+    }
+
+    /// From `pg_proc.provolatile`, which is a single char.
+    pub fn parse_code(c: &str) -> Volatility {
+        match c.trim() {
+            "i" => Volatility::Immutable,
+            "s" => Volatility::Stable,
+            _ => Volatility::Volatile,
+        }
+    }
+}
+
+/// A PostgreSQL function.
+///
+/// Modelled because a PostgreSQL trigger holds no body of its own — it is a
+/// binding to one of these — so triggers there are only half a feature without
+/// it. The fields past `body` exist for the reason [`ViewOptions`]'s security
+/// type does: **`CREATE OR REPLACE FUNCTION` replaces the whole routine**, so
+/// anything the statement doesn't restate reverts to the server's default.
+///
+/// `settings` is the sharpest of those. A `SECURITY DEFINER` function runs with
+/// its owner's rights, and the `SET search_path` pinned to it is what stops a
+/// caller from resolving an unqualified name inside the body to a table of their
+/// own. A replace that drops the `SET` leaves the function running as its owner
+/// with the caller's `search_path` — a privilege-escalation hole opened by an
+/// edit that said nothing about privileges.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RoutineInfo {
+    pub name: String,
+    /// PostgreSQL namespace. `None` means unqualified — see [`sql_qualifier`].
+    pub schema: Option<String>,
+    /// The argument list as `pg_get_function_arguments` renders it. Empty for a
+    /// trigger function, which receives its arguments through `TG_ARGV` instead.
+    pub arguments: String,
+    /// The return type as `pg_get_function_result` renders it — `trigger` for
+    /// the ones a trigger can bind to.
+    pub returns: String,
+    /// `plpgsql`, `sql`, `c`, …
+    pub language: String,
+    pub body: String,
+    pub volatility: Volatility,
+    /// `RETURNS NULL ON NULL INPUT`. A replace that omits it makes the function
+    /// start running on NULL arguments it used to short-circuit.
+    pub strict: bool,
+    pub security_definer: bool,
+    /// Per-function `SET` clauses, already rendered as `key=value`.
+    pub settings: Vec<String>,
+}
+
+impl RoutineInfo {
+    /// Whether a trigger can bind to this function.
+    pub fn is_trigger_function(&self) -> bool {
+        self.returns.trim().eq_ignore_ascii_case("trigger")
+            || self.returns.trim().eq_ignore_ascii_case("event_trigger")
+    }
+
+    /// The function's identity in SQL: `schema.name(argument types)`.
+    ///
+    /// PostgreSQL identifies a function by its **argument types**, not its name —
+    /// overloads share one name — so `DROP`/`ALTER`/`COMMENT ON` all need this
+    /// form and none of them accept the bare name.
+    pub fn signature_sql(&self, dialect: crate::intel::SqlDialect) -> String {
+        let q = |s: &str| ddl_ident_in(s, dialect);
+        let name = match sql_qualifier(self.schema.as_deref()) {
+            Some(s) => format!("{}.{}", q(s), q(&self.name)),
+            None => q(&self.name),
+        };
+        format!("{name}({})", self.arguments.trim())
+    }
+
+    /// `CREATE [OR REPLACE] FUNCTION`, with every option restated — the single
+    /// function emitter, on the same rule as [`crate::ddl::view_ddl`].
+    pub fn create_sql(&self, dialect: crate::intel::SqlDialect, replace: bool) -> String {
+        let tag = dollar_tag(&self.body);
+        let mut out = String::from("CREATE ");
+        if replace {
+            out.push_str("OR REPLACE ");
+        }
+        out.push_str(&format!("FUNCTION {}\n", self.signature_sql(dialect)));
+        out.push_str(&format!("RETURNS {}\n", self.returns.trim()));
+        out.push_str(&format!("LANGUAGE {}\n", self.language.trim()));
+        // VOLATILE is the default and says nothing, so it isn't restated — the
+        // same call `create_view_sql` makes about `ALGORITHM = UNDEFINED`.
+        if self.volatility != Volatility::Volatile {
+            out.push_str(self.volatility.sql());
+            out.push('\n');
+        }
+        if self.strict {
+            out.push_str("STRICT\n");
+        }
+        if self.security_definer {
+            out.push_str("SECURITY DEFINER\n");
+        }
+        for s in &self.settings {
+            out.push_str(&format!("SET {s}\n"));
+        }
+        out.push_str(&format!(
+            "AS {tag}\n{}\n{tag};",
+            self.body.trim_matches('\n')
+        ));
+        out
+    }
+}
+
+/// A dollar-quote delimiter that cannot appear inside `body`.
+///
+/// A function body is arbitrary user text and is quoted by wrapping, so the
+/// delimiter has to be one the body doesn't contain — otherwise the statement
+/// terminates in the middle of the body and the rest is parsed as SQL. `$$` is
+/// the common case; a body that already uses it (a nested function definition,
+/// or `$$` inside a string) walks up through tagged forms until one is free.
+///
+/// Deliberately not "escape the body": PostgreSQL has no escape inside a
+/// dollar-quoted string, which is the entire point of the construct.
+pub fn dollar_tag(body: &str) -> String {
+    if !body.contains("$$") {
+        return "$$".to_string();
+    }
+    for tag in ["$fn$", "$body$", "$function$"] {
+        if !body.contains(tag) {
+            return tag.to_string();
+        }
+    }
+    // Numbered fallback. A body can only contain finitely many tags, so this
+    // terminates; the loop is bounded anyway so a pathological body degrades to
+    // a wrong quote rather than a hang.
+    for i in 1..1000 {
+        let tag = format!("$fn{i}$");
+        if !body.contains(&tag) {
+            return tag;
+        }
+    }
+    "$schemaic$".to_string()
+}
+
 impl TableInfo {
     /// A `CREATE TABLE`/`CREATE VIEW` skeleton from the introspected schema. Not
     /// a round-trip of the server's DDL — no FK references, engine or charset —

@@ -30,9 +30,9 @@ use std::collections::{HashMap, HashSet};
 use crate::intel::SqlDialect;
 use crate::pairs;
 use crate::schema::{
-    CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo, TableInfo, TriggerAction, TriggerEvent,
-    TriggerInfo, TriggerLevel, TriggerTiming, ViewOptions, ddl_ident_in, ddl_string, definer_sql,
-    sql_qualifier,
+    CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo, RoutineInfo, TableInfo, TriggerAction,
+    TriggerEvent, TriggerInfo, TriggerLevel, TriggerTiming, ViewOptions, ddl_ident_in, ddl_string,
+    definer_sql, sql_qualifier,
 };
 use crate::sql;
 
@@ -753,6 +753,80 @@ impl TriggerDraft {
     }
 }
 
+// ── The desired state of a function ──────────────────────────────────────────
+
+/// The whole desired shape of one PostgreSQL function.
+///
+/// Carries a whole [`RoutineInfo`] for the reason [`ViewDraft`] carries
+/// [`ViewOptions`]: `CREATE OR REPLACE FUNCTION` replaces the entire routine, so
+/// anything the statement doesn't restate reverts to the server's default —
+/// including the `SET search_path` that keeps a `SECURITY DEFINER` function from
+/// being a privilege-escalation hole.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FunctionDraft {
+    /// The function's name on the server, or `None` for a new one. Identity, not
+    /// a name: editing `info.name` is a rename.
+    pub original: Option<String>,
+    pub info: RoutineInfo,
+}
+
+impl FunctionDraft {
+    pub fn from_info(f: &RoutineInfo) -> FunctionDraft {
+        FunctionDraft {
+            original: Some(f.name.clone()),
+            info: f.clone(),
+        }
+    }
+
+    /// A new trigger function, pre-shaped: `plpgsql`, `returns trigger`, and the
+    /// skeleton every one of them has to end with. A body that doesn't `RETURN`
+    /// is the single most common way a first trigger function fails at runtime
+    /// rather than at creation, so the starting point supplies it.
+    pub fn blank_trigger(name: impl Into<String>, schema: Option<String>) -> FunctionDraft {
+        FunctionDraft {
+            original: None,
+            info: RoutineInfo {
+                name: name.into(),
+                schema,
+                arguments: String::new(),
+                returns: "trigger".to_string(),
+                language: "plpgsql".to_string(),
+                body: "BEGIN\n    RETURN NEW;\nEND;".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Problems that would make the generated SQL nonsense. Whether the body
+    /// compiles is the server's judgement — PostgreSQL doesn't even check a
+    /// `plpgsql` body beyond syntax until it runs.
+    pub fn validate(&self) -> Vec<String> {
+        let f = &self.info;
+        let mut out = Vec::new();
+        if f.name.trim().is_empty() {
+            out.push("The function needs a name.".to_string());
+        }
+        if f.language.trim().is_empty() {
+            out.push("The function needs a language (plpgsql, sql).".to_string());
+        }
+        if f.returns.trim().is_empty() {
+            out.push("The function needs a return type.".to_string());
+        }
+        if f.body.trim().is_empty() {
+            out.push("The function needs a body.".to_string());
+        }
+        // Not a syntax error — it creates fine and then fails on every write.
+        if f.is_trigger_function() && !f.arguments.trim().is_empty() {
+            out.push(
+                "A trigger function takes no declared arguments — they arrive in \
+                 TG_ARGV."
+                    .to_string(),
+            );
+        }
+        out
+    }
+}
+
 // ── The difference ───────────────────────────────────────────────────────────
 
 /// One reviewable step between the table that's there and the table that's
@@ -858,6 +932,19 @@ pub enum Change {
     DropTrigger {
         name: String,
     },
+    /// Create a function that doesn't exist yet — plain `CREATE FUNCTION`, so a
+    /// signature already taken fails instead of silently replacing someone
+    /// else's routine.
+    CreateFunction(Box<FunctionDraft>),
+    /// Redefine an existing function in place, restating every option.
+    ReplaceFunction(Box<FunctionDraft>),
+    /// PostgreSQL renames a function in place, so unlike a trigger this is a
+    /// change of its own and the triggers bound to it keep working.
+    RenameFunction {
+        from: Box<RoutineInfo>,
+        to: String,
+    },
+    DropFunction(Box<RoutineInfo>),
 }
 
 /// What a view loses when it's dropped — the sentence behind both the plain
@@ -977,6 +1064,12 @@ impl Change {
                 }
             }
             Change::DropTrigger { name } => format!("Drop trigger {name}"),
+            Change::CreateFunction(d) => format!("Create function {}", d.info.name),
+            Change::ReplaceFunction(d) => format!("Redefine function {}", d.info.name),
+            Change::RenameFunction { from, to } => {
+                format!("Rename function {} to {to}", from.name)
+            }
+            Change::DropFunction(f) => format!("Drop function {}", f.name),
         }
     }
 
@@ -1051,6 +1144,20 @@ impl Change {
                  transactional (MySQL), a new definition the server rejects \
                  leaves the table with no trigger.",
                 draft.info.name
+            )],
+            // No data is lost and nothing is dropped, and it still has to be
+            // said: a function is shared, so every trigger bound to it starts
+            // doing something else the moment this runs — including triggers on
+            // tables this edit never mentioned.
+            Change::ReplaceFunction(d) => vec![format!(
+                "Redefines {}. Every trigger bound to it runs the new body from \
+                 now on, including any on other tables.",
+                d.info.name
+            )],
+            Change::DropFunction(f) => vec![format!(
+                "Drops function {}. PostgreSQL refuses while a trigger still \
+                 uses it, so any that do have to be dropped first.",
+                f.name
             )],
             _ => Vec::new(),
         }
@@ -1183,6 +1290,11 @@ impl ChangeSet {
     fn emit_mysql(&self) -> Vec<String> {
         let d = self.dialect;
         let mut out = self.view_statements();
+        // Functions before triggers: a trigger can't be created until the
+        // function it executes exists. Today a change set only ever holds one
+        // kind, so nothing depends on this yet — which is exactly why it's worth
+        // getting right now rather than discovering it later.
+        out.extend(self.function_statements());
         out.extend(self.trigger_statements());
         // Whole-table statements stand alone; they never share an ALTER.
         for c in &self.changes {
@@ -1326,6 +1438,11 @@ impl ChangeSet {
         let d = self.dialect;
         let q = |s: &str| ddl_ident_in(s, d);
         let mut out = self.view_statements();
+        // Functions before triggers: a trigger can't be created until the
+        // function it executes exists. Today a change set only ever holds one
+        // kind, so nothing depends on this yet — which is exactly why it's worth
+        // getting right now rather than discovering it later.
+        out.extend(self.function_statements());
         out.extend(self.trigger_statements());
         for c in &self.changes {
             match c {
@@ -1580,6 +1697,43 @@ impl ChangeSet {
                     out.push(draft.info.create_sql(d));
                 }
                 Change::DropTrigger { name } => out.push(drop(name)),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The function statements, in the order they must run.
+    ///
+    /// A rename goes **after** the redefinition, not before: `CREATE OR REPLACE`
+    /// has to address the signature the server already has, and only then can
+    /// `ALTER FUNCTION … RENAME` move it — the same ordering
+    /// [`ChangeSet::view_statements`] uses, and for the same reason.
+    fn function_statements(&self) -> Vec<String> {
+        let d = self.dialect;
+        let mut out = Vec::new();
+        for c in &self.changes {
+            match c {
+                Change::CreateFunction(draft) => out.push(draft.info.create_sql(d, false)),
+                Change::ReplaceFunction(draft) => {
+                    // Address the name the server knows; the rename runs after.
+                    let mut server = draft.info.clone();
+                    if let Some(orig) = &draft.original {
+                        server.name = orig.clone();
+                    }
+                    out.push(server.create_sql(d, true));
+                }
+                Change::RenameFunction { from, to } => out.push(format!(
+                    "ALTER FUNCTION {} RENAME TO {};",
+                    from.signature_sql(d),
+                    ddl_ident_in(to, d)
+                )),
+                // By signature, not by name: PostgreSQL identifies a function by
+                // its argument types, and a bare name is ambiguous the moment an
+                // overload exists.
+                Change::DropFunction(f) => {
+                    out.push(format!("DROP FUNCTION {};", f.signature_sql(d)))
+                }
                 _ => {}
             }
         }
@@ -2880,6 +3034,65 @@ pub fn drop_trigger(t: &TriggerInfo, dialect: SqlDialect) -> ChangeSet {
     }
 }
 
+/// Everything that has to happen to turn the function `current` into `draft`.
+///
+/// Same round-trip gate as [`diff`]: a function diffed against its own draft
+/// must produce nothing.
+///
+/// Unlike a trigger, a rename is its own change — PostgreSQL renames a function
+/// in place with `ALTER FUNCTION … RENAME TO`, and every trigger bound to it
+/// keeps working, so there is no reason to pay for a drop-and-create.
+pub fn diff_function(
+    current: &RoutineInfo,
+    draft: &FunctionDraft,
+    dialect: SqlDialect,
+) -> ChangeSet {
+    let mut changes: Vec<Change> = Vec::new();
+    let renamed = draft.info.name != current.name && !draft.info.name.trim().is_empty();
+    // Compare everything *except* the name, which the rename below owns.
+    let mut same_name = draft.info.clone();
+    same_name.name = current.name.clone();
+    if same_name != *current {
+        let mut d = draft.clone();
+        // The replace addresses the server's signature; the rename runs after.
+        d.info.name = current.name.clone();
+        d.original = Some(current.name.clone());
+        changes.push(Change::ReplaceFunction(Box::new(d)));
+    }
+    if renamed {
+        changes.push(Change::RenameFunction {
+            from: Box::new(current.clone()),
+            to: draft.info.name.clone(),
+        });
+    }
+    ChangeSet {
+        table: current.name.clone(),
+        schema: current.schema.clone(),
+        dialect,
+        changes,
+    }
+}
+
+/// The `CREATE FUNCTION` for a brand-new function.
+pub fn create_function(draft: &FunctionDraft, dialect: SqlDialect) -> ChangeSet {
+    ChangeSet {
+        table: draft.info.name.clone(),
+        schema: draft.info.schema.clone(),
+        dialect,
+        changes: vec![Change::CreateFunction(Box::new(draft.clone()))],
+    }
+}
+
+/// The `DROP FUNCTION` for one function.
+pub fn drop_function(f: &RoutineInfo, dialect: SqlDialect) -> ChangeSet {
+    ChangeSet {
+        table: f.name.clone(),
+        schema: f.schema.clone(),
+        dialect,
+        changes: vec![Change::DropFunction(Box::new(f.clone()))],
+    }
+}
+
 /// The `CREATE VIEW` for a brand-new view.
 pub fn create_view(draft: &ViewDraft, dialect: SqlDialect) -> ChangeSet {
     ChangeSet {
@@ -4004,6 +4217,152 @@ mod tests {
                 "checked_at IS NOT NULL"
             );
             assert_eq!(check_predicate("(checkout > 0)", MySql), "checkout > 0");
+        }
+
+        fn fnc() -> RoutineInfo {
+            RoutineInfo {
+                name: "audit".into(),
+                schema: Some("public".into()),
+                arguments: String::new(),
+                returns: "trigger".into(),
+                language: "plpgsql".into(),
+                body: "BEGIN RETURN NEW; END;".into(),
+                ..Default::default()
+            }
+        }
+
+        /// The gate: a draft taken straight off a function has nothing to say.
+        #[test]
+        fn an_untouched_function_is_not_a_change() {
+            let f = fnc();
+            let d = FunctionDraft::from_info(&f);
+            assert!(diff_function(&f, &d, Postgres).changes.is_empty());
+        }
+
+        /// PostgreSQL renames a function in place and the triggers bound to it
+        /// keep working — so unlike a trigger, this costs no re-creation.
+        #[test]
+        fn renaming_a_function_is_a_rename_not_a_recreate() {
+            let f = fnc();
+            let mut d = FunctionDraft::from_info(&f);
+            d.info.name = "audit2".into();
+            let cs = diff_function(&f, &d, Postgres);
+            assert_eq!(cs.changes.len(), 1);
+            assert_eq!(
+                cs.emit(),
+                vec!["ALTER FUNCTION \"audit\"() RENAME TO \"audit2\";"]
+            );
+        }
+
+        /// A rename *and* a body edit: the replace has to address the signature
+        /// the server still has, and the rename runs after it.
+        #[test]
+        fn a_rename_with_a_body_edit_replaces_under_the_old_name_first() {
+            let f = fnc();
+            let mut d = FunctionDraft::from_info(&f);
+            d.info.name = "audit2".into();
+            d.info.body = "BEGIN RETURN OLD; END;".into();
+            let sql = diff_function(&f, &d, Postgres).emit();
+            assert_eq!(sql.len(), 2);
+            assert!(
+                sql[0].contains("CREATE OR REPLACE FUNCTION \"audit\"()"),
+                "{sql:?}"
+            );
+            assert!(
+                sql[1].starts_with("ALTER FUNCTION \"audit\"() RENAME TO"),
+                "{sql:?}"
+            );
+        }
+
+        /// Everything a replace would otherwise reset has to be restated — the
+        /// `SET search_path` most of all, since dropping it from a SECURITY
+        /// DEFINER function is a privilege-escalation hole.
+        #[test]
+        fn create_function_restates_every_option() {
+            let mut f = fnc();
+            f.security_definer = true;
+            f.strict = true;
+            f.volatility = crate::schema::Volatility::Stable;
+            f.settings = vec!["search_path=public".into()];
+            let sql = f.create_sql(Postgres, true);
+            assert!(
+                sql.starts_with("CREATE OR REPLACE FUNCTION \"audit\"()"),
+                "{sql}"
+            );
+            assert!(sql.contains("RETURNS trigger"), "{sql}");
+            assert!(sql.contains("LANGUAGE plpgsql"), "{sql}");
+            assert!(sql.contains("STABLE"), "{sql}");
+            assert!(sql.contains("STRICT"), "{sql}");
+            assert!(sql.contains("SECURITY DEFINER"), "{sql}");
+            assert!(sql.contains("SET search_path=public"), "{sql}");
+        }
+
+        /// VOLATILE is the default and says nothing, so restating it would be
+        /// noise — the same call `create_view_sql` makes about UNDEFINED.
+        #[test]
+        fn the_default_volatility_is_not_restated() {
+            assert!(!fnc().create_sql(Postgres, false).contains("VOLATILE"));
+        }
+
+        /// A body containing the delimiter would terminate the statement in the
+        /// middle of itself, and PostgreSQL has no escape inside a dollar quote.
+        #[test]
+        fn the_dollar_tag_avoids_whatever_the_body_already_uses() {
+            use crate::schema::dollar_tag;
+            assert_eq!(dollar_tag("BEGIN END;"), "$$");
+            assert_eq!(dollar_tag("x := $$a$$;"), "$fn$");
+            assert_eq!(dollar_tag("$$ and $fn$"), "$body$");
+
+            let mut f = fnc();
+            f.body = "sql := $$SELECT 1$$;".into();
+            let sql = f.create_sql(Postgres, false);
+            assert!(sql.contains("AS $fn$"), "{sql}");
+            assert!(sql.trim_end().ends_with("$fn$;"), "{sql}");
+        }
+
+        /// By signature, not by name: an overload makes a bare name ambiguous.
+        #[test]
+        fn drop_function_names_the_signature() {
+            let mut f = fnc();
+            f.arguments = "a integer, b text".into();
+            assert_eq!(
+                drop_function(&f, Postgres).emit(),
+                vec!["DROP FUNCTION \"audit\"(a integer, b text);"]
+            );
+        }
+
+        /// Redefining a shared function changes what every trigger bound to it
+        /// does, including on tables this edit never mentioned.
+        #[test]
+        fn replacing_a_function_states_the_reach_of_the_change() {
+            let f = fnc();
+            let mut d = FunctionDraft::from_info(&f);
+            d.info.body = "BEGIN RETURN OLD; END;".into();
+            let risks = diff_function(&f, &d, Postgres).destructive();
+            assert_eq!(risks.len(), 1);
+            assert!(risks[0].contains("other tables"), "{risks:?}");
+        }
+
+        #[test]
+        fn a_blank_trigger_function_starts_valid_and_returns() {
+            let d = FunctionDraft::blank_trigger("f", None);
+            assert!(d.validate().is_empty());
+            // The most common first-run failure is a body that never returns.
+            assert!(d.info.body.contains("RETURN NEW"));
+            assert!(d.info.is_trigger_function());
+        }
+
+        #[test]
+        fn validate_catches_the_empty_draft_and_a_declared_argument() {
+            let d = FunctionDraft::default();
+            let msgs = d.validate().join(" | ");
+            assert!(msgs.contains("needs a name"), "{msgs}");
+            assert!(msgs.contains("needs a language"), "{msgs}");
+            assert!(msgs.contains("needs a body"), "{msgs}");
+
+            let mut d = FunctionDraft::blank_trigger("f", None);
+            d.info.arguments = "a integer".into();
+            assert!(d.validate().join(" | ").contains("TG_ARGV"));
         }
 
         fn my_trigger() -> TriggerInfo {
