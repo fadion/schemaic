@@ -944,7 +944,6 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
             "SELECT n.nspname, c.relname, t.tgname, t.tgtype::int, t.tgenabled, \
                     (t.tgconstraint <> 0)::int, t.tgfoid::regproc::text, \
                     pg_get_triggerdef(t.oid), \
-                    COALESCE(pg_get_expr(t.tgqual, t.tgrelid), ''), \
                     COALESCE((SELECT string_agg(a.attname, ',' ORDER BY x.ord) \
                               FROM unnest(string_to_array(NULLIF(t.tgattr::text, ''), ' ')) \
                                    WITH ORDINALITY AS x(attnum, ord) \
@@ -1011,18 +1010,21 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
                     table: t.name.clone(),
                     timing,
                     events,
-                    update_columns: cell(r, 9)
+                    update_columns: cell(r, 8)
                         .split(',')
                         .filter(|c| !c.is_empty())
                         .map(str::to_string)
                         .collect(),
                     level,
                     // Held bare; `create_sql` is the only thing that wraps it.
-                    condition: Some(schemaic_core::ddl::trigger_condition(
-                        &cell(r, 8),
-                        schemaic_core::intel::SqlDialect::Postgres,
-                    ))
-                    .filter(|w| !w.is_empty()),
+                    condition: pg_trigger_when(&cell(r, 7))
+                        .map(|w| {
+                            schemaic_core::ddl::trigger_condition(
+                                &w,
+                                schemaic_core::intel::SqlDialect::Postgres,
+                            )
+                        })
+                        .filter(|w| !w.is_empty()),
                     action: TriggerAction::Function {
                         name: cell(r, 6),
                         args: pg_trigger_args(&cell(r, 7)),
@@ -1150,6 +1152,54 @@ fn pg_trigger_type(tgtype: i32) -> (TriggerTiming, Vec<TriggerEvent>, TriggerLev
         }
     }
     (timing, events, level)
+}
+
+/// The `WHEN` guard of a trigger, read out of `pg_get_triggerdef`.
+///
+/// **Not `pg_get_expr(tgqual, tgrelid)`**, which is the obvious call and does
+/// not work: a trigger's guard may reference both `OLD` and `NEW`, and
+/// `pg_get_expr` renders expressions over a *single* relation — so it fails the
+/// whole query with `expression contains variables of more than one relation`,
+/// taking the entire schema fetch down with it. `pg_get_triggerdef` re-prints
+/// the same guard correctly, and this module already fetches it for the
+/// arguments.
+///
+/// Returned with the server's parens still on; [`schemaic_core::ddl::trigger_condition`]
+/// is what reduces it to the bare predicate the model stores.
+fn pg_trigger_when(def: &str) -> Option<String> {
+    // Search only the part before the call, so a literal argument containing
+    // the word can't be mistaken for the clause.
+    let exec = ["EXECUTE FUNCTION ", "EXECUTE PROCEDURE "]
+        .iter()
+        .find_map(|kw| def.rfind(kw))
+        .unwrap_or(def.len());
+    let head = &def[..exec];
+    let at = head.rfind(" WHEN (")? + " WHEN ".len();
+    let bytes = head.as_bytes();
+    let (mut depth, mut i, mut in_str) = (0usize, at, false);
+    while i < bytes.len() {
+        match bytes[i] {
+            // A doubled quote inside a literal is one quote, not a terminator.
+            b'\'' if in_str => {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 1;
+                } else {
+                    in_str = false;
+                }
+            }
+            b'\'' => in_str = true,
+            b'(' if !in_str => depth += 1,
+            b')' if !in_str => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(head[at..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// The literal arguments a trigger passes to its function, read out of
@@ -1971,6 +2021,61 @@ mod tests {
                 TriggerEvent::Truncate
             ]
         );
+    }
+
+    /// Verbatim `pg_get_triggerdef` output from PostgreSQL 16.14 — the guard has
+    /// the server's own double parens and a cast, and the call carries a literal
+    /// with an escaped quote.
+    const REAL_DEF: &str = "CREATE TRIGGER t_upd_cols BEFORE UPDATE OF name, total \
+         ON public.trig_demo FOR EACH ROW WHEN ((new.total > (0)::numeric)) \
+         EXECUTE FUNCTION schemaic_audit('audit', 'it''s')";
+
+    /// Regression: this used to be `pg_get_expr(tgqual, tgrelid)`, which fails
+    /// with "expression contains variables of more than one relation" the moment
+    /// a guard mentions both OLD and NEW — and took the whole schema fetch with
+    /// it, so every database showed "query failed".
+    #[test]
+    fn pg_trigger_when_reads_the_guard_out_of_the_definition() {
+        assert_eq!(
+            pg_trigger_when(REAL_DEF).as_deref(),
+            Some("((new.total > (0)::numeric))")
+        );
+        // Normalizing is `ddl::trigger_condition`'s job, and it peels to bare.
+        assert_eq!(
+            schemaic_core::ddl::trigger_condition(
+                &pg_trigger_when(REAL_DEF).unwrap(),
+                schemaic_core::intel::SqlDialect::Postgres,
+            ),
+            "new.total > (0)::numeric"
+        );
+    }
+
+    #[test]
+    fn pg_trigger_when_is_none_without_a_guard() {
+        let def = "CREATE TRIGGER t AFTER INSERT ON public.x FOR EACH ROW \
+                   EXECUTE FUNCTION f()";
+        assert!(pg_trigger_when(def).is_none());
+    }
+
+    /// The word may appear inside a literal argument; only the clause before the
+    /// call counts, and a paren inside a string mustn't close the group.
+    #[test]
+    fn pg_trigger_when_ignores_the_word_inside_an_argument() {
+        let def = "CREATE TRIGGER t AFTER INSERT ON public.x FOR EACH ROW \
+                   EXECUTE FUNCTION f(' WHEN (nope')";
+        assert!(pg_trigger_when(def).is_none());
+
+        let def = "CREATE TRIGGER t AFTER INSERT ON public.x FOR EACH ROW \
+                   WHEN ((new.note = 'a)b')) EXECUTE FUNCTION f()";
+        assert_eq!(
+            pg_trigger_when(def).as_deref(),
+            Some("((new.note = 'a)b'))")
+        );
+    }
+
+    #[test]
+    fn pg_trigger_args_survives_the_real_definition() {
+        assert_eq!(pg_trigger_args(REAL_DEF), vec!["audit", "it's"]);
     }
 
     #[test]
