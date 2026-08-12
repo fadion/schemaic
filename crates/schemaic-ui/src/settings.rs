@@ -91,16 +91,10 @@ pub(crate) fn term_settings_overlay(ui: Ui) -> impl IntoView {
     })
 }
 
-/// Font-size dropdown label (`settings_dropdown` needs a `fn(T) -> &'static str`,
-/// so the offered sizes are matched to literals here).
-fn term_font_label(n: u16) -> &'static str {
-    match n {
-        12 => "12",
-        14 => "14",
-        16 => "16",
-        18 => "18",
-        _ => "13",
-    }
+/// Font-size dropdown label — computed from the value, so it can't name a
+/// different size than the one in effect.
+fn term_font_label(n: u16) -> String {
+    n.to_string()
 }
 
 /// A shell picker as a dropdown (bound to the selected index over the dynamic
@@ -193,20 +187,35 @@ pub(crate) fn settings_toggle_row(
 // looks like an `edit_field` (dark surface, field border, chevron); the popup is
 // a floating menu styled via the dropdown's `ScrollClass` (bg_panel + border).
 // `active` is the source of truth; `label` renders each variant.
-pub(crate) fn settings_dropdown<T>(
+/// A settings dropdown.
+///
+/// `label` may return an owned `String`, so it can be *computed from the value*
+/// rather than looked up. Three of these label functions used to be `match`es
+/// with a `_` arm handing back the **default's** label, so any value outside the
+/// option list read as (say) "200,000" while the app used something else, and no
+/// popup row highlighted — the one modal whose job is to report settings
+/// accurately, asserting a setting that wasn't in effect. No such value is
+/// reachable today; the trap was the next ordinary edit to a list (adding a
+/// 24 px size, dropping the 1M row limit), which would have mislabelled the
+/// setting for every user who held the removed value.
+pub(crate) fn settings_dropdown<T, S>(
     active: RwSignal<T>,
     options: impl IntoIterator<Item = T> + Clone + 'static,
-    label: fn(T) -> &'static str,
+    label: fn(T) -> S,
 ) -> impl IntoView
 where
     T: Copy + PartialEq + 'static,
+    // `&'static str` for the enums, whose labels are total over their variants
+    // by construction; `String` for the numeric settings, which have to compute
+    // theirs.
+    S: Into<String> + 'static,
 {
     use floem::views::dropdown::Dropdown;
 
     // Closed box: selected label on the left, chevron on the right.
     let main = move |cur: T| {
         h_stack((
-            text(label(cur)).style(|s| s.color(theme::text()).font_size(theme::FONT_BODY)),
+            text(label(cur).into()).style(|s| s.color(theme::text()).font_size(theme::FONT_BODY)),
             empty().style(|s| s.flex_grow(1.0_f32)),
             icons::icon(icons::CHEVRON_DOWN, 16.0)
                 .style(|s| s.color(theme::text_dim()).flex_shrink(0.0_f32)),
@@ -221,7 +230,7 @@ where
     // rather than the list's selected state. `ListItemClass` below is neutralised
     // so this is the only styling.)
     let row = move |item: T| {
-        text(label(item))
+        text(label(item).into())
             .style(move |s| {
                 let s = s
                     .width_full()
@@ -531,26 +540,26 @@ fn shortcut_group(title: &'static str, rows: &[(&'static str, &'static str)]) ->
 const EDITOR_FONT_SIZES: [f32; 8] = [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 18.0, 20.0];
 const ROW_LIMITS: [usize; 5] = [1_000, 10_000, 100_000, 200_000, 1_000_000];
 
-fn editor_font_label(px: f32) -> &'static str {
-    match px as i32 {
-        11 => "11 px",
-        12 => "12 px",
-        13 => "13 px",
-        15 => "15 px",
-        16 => "16 px",
-        18 => "18 px",
-        20 => "20 px",
-        _ => "14 px",
-    }
+fn editor_font_label(px: f32) -> String {
+    format!("{} px", px as i32)
 }
-fn row_limit_label(n: usize) -> &'static str {
-    match n {
-        1_000 => "1,000",
-        10_000 => "10,000",
-        100_000 => "100,000",
-        1_000_000 => "1,000,000",
-        _ => "200,000",
+
+fn row_limit_label(n: usize) -> String {
+    thousands(n)
+}
+
+/// `1234567` → `"1,234,567"`. The row-limit dropdown's only formatting need, and
+/// the reason its label no longer has a list to fall off the end of.
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
     }
+    out
 }
 
 // A bold section header separating the functional groups.
@@ -769,4 +778,58 @@ pub(crate) fn help_overlay(ui: Ui) -> impl IntoView {
             s
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        EDITOR_FONT_SIZES, ROW_LIMITS, editor_font_label, row_limit_label, term_font_label,
+        thousands,
+    };
+    use crate::consts::TERM_FONT_SIZES;
+
+    /// The invariant the three dropdown labels used to rely on silently: that
+    /// every offered value has a label of its own.
+    ///
+    /// They were `match`es whose `_` arm returned the **default's** label, so a
+    /// value outside the list read as another value entirely and no popup row
+    /// highlighted — the settings modal asserting a setting that wasn't in
+    /// effect. No such value was reachable, and that was the whole risk: the
+    /// trap was the next ordinary edit to one of these lists.
+    #[test]
+    fn every_offered_option_labels_as_itself() {
+        for n in TERM_FONT_SIZES {
+            assert_eq!(term_font_label(n), n.to_string());
+        }
+        for px in EDITOR_FONT_SIZES {
+            assert_eq!(editor_font_label(px), format!("{} px", px as i32));
+        }
+        for n in ROW_LIMITS {
+            assert!(
+                row_limit_label(n).replace(',', "").parse::<usize>() == Ok(n),
+                "{n} labelled {}",
+                row_limit_label(n)
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_outside_the_list_labels_as_itself_too() {
+        // The failure that is now unrepresentable: an off-list value used to
+        // borrow the default's label. Hand-edited config, or a list this build
+        // no longer offers.
+        assert_eq!(term_font_label(21), "21");
+        assert_eq!(editor_font_label(17.0), "17 px");
+        assert_eq!(row_limit_label(50_000), "50,000");
+        assert_ne!(row_limit_label(50_000), row_limit_label(200_000));
+    }
+
+    #[test]
+    fn thousands_groups_from_the_right() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1_000), "1,000");
+        assert_eq!(thousands(12_345), "12,345");
+        assert_eq!(thousands(1_000_000), "1,000,000");
+    }
 }
