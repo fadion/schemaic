@@ -3339,6 +3339,32 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // transactional DDL, so a plan that fails halfway has genuinely half-applied
     // and the stale model is the *worse* half — it describes a column that was
     // just dropped.
+    // One `SHOW CREATE VIEW`, for the view the user just opened for editing.
+    // A fresh connection like every other read-only side channel, so it can't
+    // queue behind a tab's open transaction.
+    let view_algorithm: schemaic_ui::ViewAlgoFn = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(
+            move |req: schemaic_ui::ViewAlgoRequest, done: schemaic_ui::ViewAlgoDoneFn| {
+                let Ok(db) = db_for(req.conn_id) else {
+                    // Nothing to report: the editor keeps the algorithm it has.
+                    return;
+                };
+                let report = create_ext_action(cx, move |algo: Option<String>| (done)(algo));
+                handle.spawn(async move {
+                    // A failure here is not worth interrupting an edit for — it
+                    // leaves the emitter writing exactly what it writes today.
+                    let algo = db
+                        .view_algorithm(Some(&req.database), &req.view)
+                        .await
+                        .unwrap_or(None);
+                    report(algo);
+                });
+            },
+        )
+    };
+
     let run_ddl: schemaic_ui::DdlFn = {
         let handle = handle.clone();
         let db_for = db_for.clone();
@@ -4847,6 +4873,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 })
             },
             run_ddl,
+            view_algorithm,
         }),
         // Reset on every open (`import_view::open_import`), so one bundle serves
         // every table rather than a per-open scope that would need disposing.

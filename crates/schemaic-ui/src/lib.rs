@@ -258,14 +258,16 @@ pub enum DesignerTab {
     Columns,
     Indexes,
     ForeignKeys,
+    Checks,
 }
 
 impl DesignerTab {
-    pub const ALL: [DesignerTab; 4] = [
+    pub const ALL: [DesignerTab; 5] = [
         DesignerTab::Table,
         DesignerTab::Columns,
         DesignerTab::Indexes,
         DesignerTab::ForeignKeys,
+        DesignerTab::Checks,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -273,6 +275,7 @@ impl DesignerTab {
             DesignerTab::Columns => "Columns",
             DesignerTab::Indexes => "Indexes",
             DesignerTab::ForeignKeys => "Foreign keys",
+            DesignerTab::Checks => "Checks",
         }
     }
 }
@@ -325,6 +328,23 @@ pub enum DdlOutcome {
 pub type DdlDoneFn = Rc<dyn Fn(DdlOutcome)>;
 /// Apply a DDL plan off the UI thread, then re-introspect the database.
 pub type DdlFn = Rc<dyn Fn(DdlRunRequest, DdlDoneFn)>;
+
+/// Which view to read an `ALGORITHM` for.
+pub struct ViewAlgoRequest {
+    pub conn_id: u64,
+    pub database: String,
+    pub view: String,
+}
+/// Reports the algorithm on the UI thread. `None` covers both "the server said
+/// `UNDEFINED`" and "the query failed" — neither is worth interrupting an edit
+/// for, and both leave the emitter writing what it writes today.
+pub type ViewAlgoDoneFn = Rc<dyn Fn(Option<String>)>;
+/// Read one MySQL view's `ALGORITHM` off-thread.
+///
+/// Its own action rather than part of the schema fetch because it costs a
+/// `SHOW CREATE VIEW` **per view** — see [`schemaic_db::Db::view_algorithm`] —
+/// so it's paid once, for the view actually being edited.
+pub type ViewAlgoFn = Rc<dyn Fn(ViewAlgoRequest, ViewAlgoDoneFn)>;
 
 /// The schema-editing modals' state (Copy bundle, reset on open — as with
 /// [`ImportUi`], these outlive no view so they need no scope to dispose).
@@ -1346,6 +1366,8 @@ pub struct SchemaActions {
     pub import_cancel: Rc<dyn Fn()>,
     /// Apply an approved DDL plan, then re-introspect the database it changed.
     pub run_ddl: DdlFn,
+    /// Read a MySQL view's `ALGORITHM`, which no bulk query reports.
+    pub view_algorithm: ViewAlgoFn,
 }
 
 /// Result of a "Test" of the Manage-Connections draft (host + credentials),

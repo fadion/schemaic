@@ -30,7 +30,7 @@ use schemaic_core::model::{
     one_row_verdict,
 };
 use schemaic_core::schema::{
-    ColumnInfo, DbSchema, ForeignKeyInfo, IndexInfo, TableInfo, ViewOptions,
+    CheckInfo, ColumnInfo, DbSchema, ForeignKeyInfo, IndexInfo, TableInfo, ViewOptions,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -361,6 +361,41 @@ impl Db {
     /// 1295 — e.g. some `SHOW`/admin forms) can't be validated this way, so they're
     /// treated as `Ok` rather than surfacing a spurious error. A trailing `;` is
     /// trimmed (the protocol prepares a single statement).
+    /// A MySQL view's `ALGORITHM`, which lives nowhere a bulk query can reach it.
+    ///
+    /// MariaDB reports it in `information_schema.VIEWS` and the schema fetch
+    /// already carries it. **MySQL 8 has the column nowhere but `SHOW CREATE
+    /// VIEW`**, one statement per view — too many round-trips to fold into a
+    /// schema fetch, so this is called lazily, for the single view about to be
+    /// edited.
+    ///
+    /// It matters because `CREATE OR REPLACE VIEW` replaces the whole view: a
+    /// `MERGE` view redefined without the clause comes back `UNDEFINED`, letting
+    /// the server pick a materialization the author had ruled out. The same class
+    /// of silent loss as the `SQL SECURITY` bug, which is why it isn't left to
+    /// the default.
+    ///
+    /// `Ok(None)` means the server didn't state one (`UNDEFINED`), which is also
+    /// what PostgreSQL — with no such concept — returns without asking.
+    pub async fn view_algorithm(
+        &self,
+        database: Option<&str>,
+        view: &str,
+    ) -> Result<Option<String>, DbError> {
+        if self.engine == Engine::Postgres {
+            return Ok(None);
+        }
+        let mut conn = self.open(database, false).await?;
+        // `SHOW CREATE VIEW` returns (View, Create View, charset, collation).
+        let sql = format!("SHOW CREATE VIEW {}", ident(view));
+        let row: Option<(String, String, String, String)> = conn
+            .query_first(sql.as_str())
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        let _ = conn.disconnect().await;
+        Ok(row.and_then(|(_, create, ..)| view_algorithm_of(&create)))
+    }
+
     pub async fn prepare_check(&self, database: Option<&str>, sql: &str) -> Result<(), DbError> {
         if self.engine == Engine::Postgres {
             return pg::prepare_check(self, database, sql).await;
@@ -762,6 +797,49 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         .map(|(t, def, ..)| (t.clone(), def.clone()))
         .collect();
 
+    // CHECK constraints. The two servers put them in different places:
+    //
+    // * **MySQL 8.0.16+** — `CHECK_CONSTRAINTS` carries only the clause, with no
+    //   `TABLE_NAME`, so the table comes from a join onto `TABLE_CONSTRAINTS`,
+    //   which is also the only place `ENFORCED` lives.
+    // * **MariaDB 10.2+** — `CHECK_CONSTRAINTS` has `TABLE_NAME` itself, and
+    //   there is no `NOT ENFORCED` to report.
+    //
+    // Anything older has no check constraints *and* no `CHECK_CONSTRAINTS` table
+    // — MySQL 5.7 parsed the clause and threw it away. Naming a missing table
+    // fails the query, so *that* error degrades to "no checks" rather than
+    // taking the whole schema fetch down with it.
+    //
+    // Only that error. A blanket `unwrap_or_default` would turn a typo in the
+    // query above into every table quietly reporting no constraints, which is
+    // this feature's own bug wearing a disguise: the designer would then build a
+    // `CREATE TABLE` that drops checks the server really has.
+    let check_sql = if mariadb {
+        "SELECT CAST(TABLE_NAME AS CHAR) AS t, CAST(CONSTRAINT_NAME AS CHAR) AS cn, \
+                CAST(CHECK_CLAUSE AS CHAR) AS cc, 'YES' AS enforced \
+         FROM information_schema.CHECK_CONSTRAINTS \
+         WHERE CONSTRAINT_SCHEMA = ?"
+    } else {
+        "SELECT CAST(tc.TABLE_NAME AS CHAR) AS t, CAST(cc.CONSTRAINT_NAME AS CHAR) AS cn, \
+                CAST(cc.CHECK_CLAUSE AS CHAR) AS cc, CAST(tc.ENFORCED AS CHAR) AS enforced \
+         FROM information_schema.CHECK_CONSTRAINTS cc \
+         JOIN information_schema.TABLE_CONSTRAINTS tc \
+           ON tc.CONSTRAINT_SCHEMA = cc.CONSTRAINT_SCHEMA \
+          AND tc.CONSTRAINT_NAME = cc.CONSTRAINT_NAME \
+          AND tc.CONSTRAINT_TYPE = 'CHECK' \
+         WHERE cc.CONSTRAINT_SCHEMA = ?"
+    };
+    let check_rows: Vec<MyCheckRow> = match conn
+        .exec_map(check_sql, (database,), |r: MyCheckRow| r)
+        .await
+    {
+        Ok(rows) => rows,
+        // 1109 `ER_UNKNOWN_TABLE` / 1146 `ER_NO_SUCH_TABLE`: the server predates
+        // check constraints, so there are none to report.
+        Err(mysql_async::Error::Server(e)) if e.code == 1109 || e.code == 1146 => Vec::new(),
+        Err(e) => return Err(qerr(e)),
+    };
+
     let mut schema = assemble_schema(
         // MySQL: the database is the namespace, so tables carry none.
         None,
@@ -774,7 +852,107 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
     apply_table_options(&mut schema, &table_opt_rows);
     apply_view_options(&mut schema, &view_opt_rows);
     apply_fk_rules(&mut schema, &fk_rule_rows);
+    apply_check_constraints(&mut schema, &check_rows, mariadb);
     Ok(schema)
+}
+
+/// The `ALGORITHM` of a `SHOW CREATE VIEW` body, or `None` when it doesn't name
+/// one (which is what `UNDEFINED` means, and what the emitter leaves unwritten).
+///
+/// Pure, because the shape it reads is narrow and positional: the clause is
+/// always `CREATE ALGORITHM=… DEFINER=…`, before the definer and before any
+/// user-controlled text, so scanning to the first `ALGORITHM=` can't be led
+/// astray by a view *body* that happens to contain the word. Anchored to the
+/// leading `CREATE` for the same reason.
+fn view_algorithm_of(create_sql: &str) -> Option<String> {
+    let head = create_sql.trim_start();
+    let rest = head
+        .strip_prefix("CREATE")
+        .or_else(|| head.strip_prefix("create"))?;
+    // Only the clause immediately after `CREATE` — `DEFINER` follows it, and
+    // everything past that is the user's own SQL.
+    let rest = rest.trim_start();
+    let rest = rest
+        .get(..9)
+        .filter(|p| p.eq_ignore_ascii_case("ALGORITHM"))
+        .map(|_| &rest[9..])?;
+    let value = rest.trim_start().strip_prefix('=')?.trim_start();
+    let end = value
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(value.len());
+    let algo = value[..end].trim().to_ascii_uppercase();
+    // `UNDEFINED` is the default the emitter deliberately doesn't restate.
+    (!algo.is_empty() && algo != "UNDEFINED").then_some(algo)
+}
+
+/// One `information_schema.CHECK_CONSTRAINTS` row, already joined to its table:
+/// `(table, constraint name, check clause, enforced)`.
+type MyCheckRow = (String, String, String, String);
+
+/// One `CHECK_CLAUSE` as SQL that can actually be run.
+///
+/// The two servers disagree, and only one of them says so. **MySQL 8 returns the
+/// clause with an extra level of backslash escaping** — a predicate that reads
+/// `_latin1'new'` comes back as `_latin1\'new\'`, and `'C:\\temp'` as
+/// `'C:\\\\temp'` — so restating it verbatim in a `CREATE TABLE` is a syntax
+/// error, not a subtly different constraint. **MariaDB returns it already
+/// runnable**, byte for byte what `SHOW CREATE TABLE` prints, so unescaping there
+/// would eat the backslash out of `'it\'s'` and change what the predicate means.
+///
+/// The rule is one level of unescaping: a backslash escapes the character after
+/// it, which is emitted alone. Measured against `SHOW CREATE TABLE` on MySQL
+/// 8.4 — the same authority [`mysql_column`] uses for defaults, and the same
+/// class of bug, except this one fails loudly instead of writing something else.
+fn mysql_check_clause(clause: &str, mariadb: bool) -> String {
+    if mariadb || !clause.contains('\\') {
+        return clause.to_string();
+    }
+    let b = clause.as_bytes();
+    let mut out = String::with_capacity(clause.len());
+    let mut i = 0;
+    while i < b.len() {
+        // A trailing backslash escapes nothing — keep it rather than lose it.
+        if b[i] == b'\\' && i + 1 < b.len() {
+            i += 1;
+        }
+        // Copy one whole UTF-8 char: the escaped byte may begin a multi-byte one.
+        let start = i;
+        i += 1;
+        while i < b.len() && (b[i] & 0xC0) == 0x80 {
+            i += 1;
+        }
+        out.push_str(&clause[start..i]);
+    }
+    out
+}
+
+/// Fold MySQL/MariaDB's check constraints onto the assembled tables.
+///
+/// Kept out of [`assemble_schema`] for the reason [`apply_fk_rules`] is: it's a
+/// second query's worth of rows keyed by table, not part of the row shape the
+/// two engines share.
+fn apply_check_constraints(schema: &mut DbSchema, rows: &[MyCheckRow], mariadb: bool) {
+    for t in schema.tables.iter_mut() {
+        t.check_constraints = rows
+            .iter()
+            .filter(|(table, ..)| *table == t.name)
+            .map(|(_, name, clause, enforced)| CheckInfo {
+                name: name.clone(),
+                // `CHECK_CLAUSE` is the server's re-print of the predicate,
+                // parenthesised and — on MySQL 8 — escaped a second time; the
+                // model stores it bare and runnable. Unescaping has to come
+                // first: `check_predicate`'s paren scan reads string boundaries,
+                // and `\'new\'` isn't one until the escaping is gone.
+                expression: schemaic_core::ddl::check_predicate(
+                    &mysql_check_clause(clause, mariadb),
+                    schemaic_core::intel::SqlDialect::MySql,
+                ),
+                // MariaDB has no `NOT ENFORCED` and the query hardcodes `YES`
+                // there, so this reads as enforced on both.
+                enforced: !enforced.eq_ignore_ascii_case("NO"),
+            })
+            .collect();
+    }
 }
 
 /// One `information_schema.VIEWS` row: `(name, definition, check option, definer,
@@ -2511,6 +2689,97 @@ mod tests {
     fn mysql_quotes_a_raw_string_default() {
         let c = mysql_column(my_row("varchar(20)", Some("draft"), ""), false).column;
         assert_eq!(c.default.as_deref(), Some("'draft'"));
+    }
+
+    /// MySQL 8 returns `CHECK_CLAUSE` with one *extra* level of backslash
+    /// escaping, so restating it verbatim is a syntax error — measured against
+    /// `SHOW CREATE TABLE`, which is the runnable form.
+    #[test]
+    fn mysql8_check_clauses_are_unescaped_to_the_runnable_form() {
+        // Each pair is (what CHECK_CONSTRAINTS returns, what SHOW CREATE TABLE
+        // says) for the same constraint on MySQL 8.4.
+        let cases = [
+            (
+                r#"(`s` <> _latin1\'C:\\\\temp\')"#,
+                r#"(`s` <> _latin1'C:\\temp')"#,
+            ),
+            (
+                r#"(`s` <> _latin1\'it\\\'s\')"#,
+                r#"(`s` <> _latin1'it\'s')"#,
+            ),
+            (r#"(`s` <> _latin1\'a\\nb\')"#, r#"(`s` <> _latin1'a\nb')"#),
+            (
+                r#"(not((`s` like _latin1\'%a%\')))"#,
+                r#"(not((`s` like _latin1'%a%')))"#,
+            ),
+            (r#"(`qty` > 0)"#, r#"(`qty` > 0)"#),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(mysql_check_clause(raw, false), want, "for {raw}");
+        }
+    }
+
+    /// MariaDB reports the clause already runnable — its `CHECK_CLAUSE` and its
+    /// `SHOW CREATE TABLE` agree byte for byte. Unescaping it would eat the
+    /// backslash out of `'it\'s'` and change the predicate.
+    #[test]
+    fn mariadb_check_clauses_are_left_alone() {
+        let raw = r#"`s` <> 'it\'s'"#;
+        assert_eq!(mysql_check_clause(raw, true), raw);
+    }
+
+    /// A trailing lone backslash has nothing to escape; dropping it would lose a
+    /// character rather than an escape.
+    #[test]
+    fn a_dangling_backslash_survives() {
+        assert_eq!(mysql_check_clause(r"a\", false), r"a\");
+    }
+
+    /// The clause MySQL 8 puts nowhere else. It sits between `CREATE` and
+    /// `DEFINER`, so it's read positionally rather than searched for.
+    #[test]
+    fn a_views_algorithm_is_read_out_of_show_create_view() {
+        assert_eq!(
+            view_algorithm_of(
+                "CREATE ALGORITHM=MERGE DEFINER=`root`@`localhost` SQL SECURITY DEFINER \
+                 VIEW `v` AS select 1"
+            )
+            .as_deref(),
+            Some("MERGE")
+        );
+        assert_eq!(
+            view_algorithm_of("CREATE ALGORITHM = TEMPTABLE DEFINER=`r`@`h` VIEW `v` AS select 1")
+                .as_deref(),
+            Some("TEMPTABLE")
+        );
+    }
+
+    /// `UNDEFINED` is the server's default and the emitter leaves it unwritten,
+    /// so reading it back as a value would make every view look edited.
+    #[test]
+    fn an_undefined_or_absent_algorithm_is_none() {
+        assert_eq!(
+            view_algorithm_of("CREATE ALGORITHM=UNDEFINED DEFINER=`r`@`h` VIEW `v` AS select 1"),
+            None
+        );
+        assert_eq!(
+            view_algorithm_of("CREATE DEFINER=`r`@`h` SQL SECURITY DEFINER VIEW `v` AS select 1"),
+            None
+        );
+        assert_eq!(view_algorithm_of(""), None);
+    }
+
+    /// The body is the user's own SQL and may say anything. Only the clause in
+    /// its fixed position counts — a column called `algorithm=` in a `SELECT`
+    /// must not be mistaken for one.
+    #[test]
+    fn the_view_body_cannot_impersonate_the_clause() {
+        assert_eq!(
+            view_algorithm_of(
+                "CREATE DEFINER=`r`@`h` VIEW `v` AS select 'ALGORITHM=MERGE' as algorithm"
+            ),
+            None
+        );
     }
 
     /// MariaDB already hands back SQL text, so quoting again would store the

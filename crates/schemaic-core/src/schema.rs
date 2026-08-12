@@ -312,7 +312,17 @@ impl ColumnInfo {
             out.push_str(" NOT NULL");
         }
         if self.generated.is_none() {
-            if let Some(d) = &self.default {
+            // A server-assigned column carries its sequence *instead of* a
+            // default, the same rule the generated branch above follows. A PG
+            // `serial` reports as both — the catalogue renders its sequence
+            // binding as a `nextval(...)` default — and naming both is an error
+            // on either engine ("both default and identity specified" on
+            // PostgreSQL, an invalid default on MySQL). The identity is the half
+            // that stands alone: the default names a sequence that a fresh
+            // `CREATE TABLE` has not created.
+            if let Some(d) = &self.default
+                && !self.auto_increment
+            {
                 out.push_str(&format!(" DEFAULT {d}"));
             }
             if self.auto_increment {
@@ -439,6 +449,65 @@ pub struct TableInfo {
     /// MySQL table collation (which implies its charset). `None` on PostgreSQL.
     pub collation: Option<String>,
     pub comment: Option<String>,
+    /// `CHECK` constraints declared on this table. Table-level: unlike a column's
+    /// attributes these survive a `MODIFY COLUMN`, so an *edit* never dropped
+    /// one — but a `CREATE TABLE` built from a draft that doesn't carry them
+    /// loses every invariant the table was written to guarantee.
+    pub check_constraints: Vec<CheckInfo>,
+}
+
+/// One `CHECK` constraint: a name and the predicate it enforces.
+///
+/// The expression is the server's own rendering (`pg_get_constraintdef` /
+/// `CHECK_CLAUSE`), not the text the author typed — both engines re-print it
+/// from the parse tree, adding their own quoting and parentheses. That is the
+/// form to restate verbatim, and the reason [`crate::ddl::checks_equal`] exists:
+/// a user who retypes an equivalent predicate must not produce a phantom change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckInfo {
+    pub name: String,
+    /// The predicate, without the wrapping `CHECK (…)`.
+    pub expression: String,
+    /// MySQL's `NOT ENFORCED`: the server records the constraint and does not
+    /// apply it. Modelled — rather than assumed — for the same reason
+    /// [`ViewOptions`]'s security type is: a constraint restated without it
+    /// starts **rejecting writes** the table accepted a moment ago, and nothing
+    /// in the statement says so.
+    ///
+    /// MySQL-only, like [`ViewOptions::algorithm`]. PostgreSQL's nearest thing is
+    /// `NOT VALID`, which exempts only *existing* rows and so can't silently
+    /// change what a write does — re-adding such a constraint as valid fails
+    /// loudly against the rows that violate it, which is a report, not a trap.
+    pub enforced: bool,
+}
+
+impl Default for CheckInfo {
+    /// A constraint is enforced unless the server says otherwise — the opposite
+    /// default would quietly emit `NOT ENFORCED` on every check.
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            expression: String::new(),
+            enforced: true,
+        }
+    }
+}
+
+impl CheckInfo {
+    /// The `CONSTRAINT … CHECK (…)` clause, for a `CREATE TABLE` line or an
+    /// `ADD CONSTRAINT`. Both engines spell it the same; only `NOT ENFORCED` is
+    /// MySQL's alone.
+    pub fn clause_sql(&self, dialect: crate::intel::SqlDialect) -> String {
+        let mut out = format!(
+            "CONSTRAINT {} CHECK ({})",
+            ddl_ident_in(&self.name, dialect),
+            self.expression
+        );
+        if !self.enforced && dialect != crate::intel::SqlDialect::Postgres {
+            out.push_str(" NOT ENFORCED");
+        }
+        out
+    }
 }
 
 /// A view's options — everything about it that isn't the `SELECT`.
@@ -547,6 +616,11 @@ impl TableInfo {
             .collect();
         if !pk.is_empty() {
             lines.push(format!("  PRIMARY KEY ({})", pk.join(", ")));
+        }
+        // Table constraints, inline on both engines — unlike an index, which
+        // PostgreSQL can only create in a statement of its own.
+        for ck in &self.check_constraints {
+            lines.push(format!("  {}", ck.clause_sql(dialect)));
         }
         let non_pk = self.indexes.iter().filter(|ix| !ix.is_primary());
         if pg {
@@ -961,6 +1035,81 @@ mod tests {
         let sql = c.definition_sql(crate::intel::SqlDialect::MySql);
         assert_eq!(sql, "`total` int GENERATED ALWAYS AS (qty * price)");
         assert!(!sql.contains("DEFAULT"));
+    }
+
+    /// The same rule as a generated column, for the other server-assigned form:
+    /// PostgreSQL rejects a column that names both a default and an identity
+    /// ("both default and identity specified"), so a `serial` — which the
+    /// catalogue reports as a `nextval` default *and* as auto-increment — must
+    /// emit one of them. The identity is the half that stands on its own; the
+    /// default names a sequence a fresh `CREATE TABLE` has not created.
+    #[test]
+    fn a_server_assigned_column_emits_no_default_beside_its_identity() {
+        let c = ColumnInfo {
+            name: "id".into(),
+            type_name: "integer".into(),
+            primary_key: true,
+            auto_increment: true,
+            default: Some("nextval('t_id_seq'::regclass)".into()),
+            ..Default::default()
+        };
+        let pg = c.definition_sql(crate::intel::SqlDialect::Postgres);
+        assert_eq!(
+            pg,
+            "\"id\" integer NOT NULL GENERATED BY DEFAULT AS IDENTITY"
+        );
+        assert!(!pg.contains("DEFAULT nextval"));
+        // MySQL rejects the pairing too — `AUTO_INCREMENT` and `DEFAULT` on one
+        // column is an error there ("Invalid default value").
+        let my = c.definition_sql(crate::intel::SqlDialect::MySql);
+        assert_eq!(my, "`id` integer NOT NULL AUTO_INCREMENT");
+    }
+
+    /// A `CREATE TABLE` that drops the table's checks recreates something that
+    /// accepts data the original refused, and says nothing about it.
+    #[test]
+    fn create_table_restates_its_check_constraints() {
+        let t = TableInfo {
+            name: "orders".into(),
+            columns: vec![ColumnInfo {
+                name: "qty".into(),
+                type_name: "int".into(),
+                ..Default::default()
+            }],
+            check_constraints: vec![CheckInfo {
+                name: "qty_positive".into(),
+                expression: "`qty` > 0".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let sql = t.create_ddl(crate::intel::SqlDialect::MySql);
+        assert!(
+            sql.contains("CONSTRAINT `qty_positive` CHECK (`qty` > 0)"),
+            "{sql}"
+        );
+    }
+
+    /// `NOT ENFORCED` is the half that changes what a write does, so it has to
+    /// survive — and it is MySQL's alone, so PostgreSQL must not see it.
+    #[test]
+    fn an_unenforced_check_stays_unenforced_on_mysql_only() {
+        let c = CheckInfo {
+            name: "soft".into(),
+            expression: "qty > 0".into(),
+            enforced: false,
+        };
+        assert_eq!(
+            c.clause_sql(crate::intel::SqlDialect::MySql),
+            "CONSTRAINT `soft` CHECK (qty > 0) NOT ENFORCED"
+        );
+        assert_eq!(
+            c.clause_sql(crate::intel::SqlDialect::Postgres),
+            "CONSTRAINT \"soft\" CHECK (qty > 0)"
+        );
+        // The default is enforced — the opposite would emit the clause on every
+        // constraint the server never marked.
+        assert!(CheckInfo::default().enforced);
     }
 
     /// A prefix index recreated without its length fails outright on a TEXT

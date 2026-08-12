@@ -25,11 +25,11 @@ use floem::prelude::*;
 use floem::reactive::create_effect;
 
 use schemaic_core::ddl::{
-    self, ColumnDraft, ForeignKeyDraft, IndexDraft, TableDraft, key_list_text, parse_key_list,
-    parse_name_list,
+    self, CheckDraft, ColumnDraft, ForeignKeyDraft, IndexDraft, TableDraft, key_list_text,
+    parse_key_list, parse_name_list,
 };
 use schemaic_core::intel::SqlDialect;
-use schemaic_core::schema::{ColumnInfo, ForeignKeyInfo, IndexInfo};
+use schemaic_core::schema::{CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo};
 
 use crate::settings::{dropdown_box_style, settings_toggle_row};
 use crate::widgets::{
@@ -1258,6 +1258,127 @@ fn fk_form(ui: Ui, target: &DesignerTarget) -> AnyView {
     .into_any()
 }
 
+fn checks_list(ui: Ui) -> AnyView {
+    let d = ui.ddl;
+    let draft = d.draft.get_untracked();
+    let ui_rows = ui.clone();
+    let rows = v_stack_from_iter(draft.check_constraints.iter().enumerate().map(|(i, ck)| {
+        list_row(
+            ui_rows.clone(),
+            i,
+            ck.info.name.clone(),
+            // The predicate *is* the constraint — a list of names alone would
+            // say nothing about what any of them enforce.
+            ck.info.expression.clone(),
+            None,
+        )
+    }))
+    .style(|s| s.flex_col().width_full());
+
+    let add_ui = ui.clone();
+    let del_ui = ui.clone();
+    list_pane(
+        rows,
+        list_actions(
+            move || {
+                let ui = add_ui.clone();
+                ui.ddl.draft.update(|d| {
+                    let names: Vec<String> = d
+                        .check_constraints
+                        .iter()
+                        .map(|c| c.info.name.clone())
+                        .collect();
+                    d.check_constraints.push(CheckDraft::new(CheckInfo {
+                        name: unique_name(&names, &format!("{}_chk", d.name)),
+                        ..Default::default()
+                    }));
+                });
+                let n = ui.ddl.draft.with_untracked(|d| d.check_constraints.len());
+                ui.ddl.selected.set(n.saturating_sub(1));
+                ui.ddl.rev.update(|r| *r += 1);
+            },
+            move || {
+                let ui = del_ui.clone();
+                let i = ui.ddl.selected.get_untracked();
+                ui.ddl.draft.update(|d| {
+                    if i < d.check_constraints.len() {
+                        d.check_constraints.remove(i);
+                    }
+                });
+                clamp_selection(&ui, |d| d.check_constraints.len());
+            },
+            None,
+            None,
+        ),
+    )
+    .into_any()
+}
+
+fn check_form(ui: Ui, dialect: SqlDialect) -> AnyView {
+    let d = ui.ddl;
+    let i = d.selected.get_untracked();
+    let draft = d.draft.get_untracked();
+    let Some(ck) = draft.check_constraints.get(i).map(|c| c.info.clone()) else {
+        return centered_hint("No check selected.").into_any();
+    };
+
+    let name = form_setting(
+        "Name",
+        bound_field(
+            &ui,
+            ck.name.clone(),
+            FIELD_W,
+            "qty_positive",
+            move |d, v| {
+                if let Some(c) = d.check_constraints.get_mut(i) {
+                    c.info.name = v.trim().to_string();
+                }
+            },
+        ),
+    );
+    let expression = form_setting(
+        "Expression",
+        field_with_hint(
+            bound_field(
+                &ui,
+                ck.expression.clone(),
+                FIELD_W * 1.6,
+                "qty > 0",
+                move |d, v| {
+                    if let Some(c) = d.check_constraints.get_mut(i) {
+                        // Stored bare, as the introspected form is — the emitter
+                        // wraps it in `CHECK (…)` exactly once.
+                        c.info.expression = v.trim().to_string();
+                    }
+                },
+            ),
+            "The condition every row must satisfy. Written without CHECK (…).",
+        ),
+    );
+
+    // `NOT ENFORCED` is MySQL's alone; offering the switch on PostgreSQL would
+    // promise something the emitter deliberately doesn't write.
+    let enforced: AnyView = if dialect == SqlDialect::Postgres {
+        empty().into_any()
+    } else {
+        bound_toggle(
+            &ui,
+            "Enforced",
+            "Off records the constraint without applying it — existing and new rows are both accepted.",
+            ck.enforced,
+            move |d, v| {
+                if let Some(c) = d.check_constraints.get_mut(i) {
+                    c.info.enforced = v;
+                }
+            },
+        )
+    };
+
+    v_stack((name, expression, enforced))
+        .style(|s| s.flex_col().gap(FORM_GAP).width_full().padding_bottom(10.0))
+        .into_any()
+}
+
 // ── list helpers ─────────────────────────────────────────────────────────────
 
 fn centered_hint(msg: &'static str) -> impl IntoView {
@@ -1361,6 +1482,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                     DesignerTab::Columns => columns_list(list_ui.clone()),
                     DesignerTab::Indexes => indexes_list(list_ui.clone()),
                     DesignerTab::ForeignKeys => fks_list(list_ui.clone()),
+                    DesignerTab::Checks => checks_list(list_ui.clone()),
                 },
             )
             .style(move |s| {
@@ -1385,6 +1507,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                         DesignerTab::Columns => column_form(ui, &form_target),
                         DesignerTab::Indexes => index_form(ui, &form_target),
                         DesignerTab::ForeignKeys => fk_form(ui, &form_target),
+                        DesignerTab::Checks => check_form(ui, form_target.dialect),
                     }
                 },
             );

@@ -118,6 +118,21 @@ Zed-inspired, aiming to replace DataGrip.
     working around them, since any model-fidelity gap surfaces to the user as a phantom
     change. Also `key_list_text`/`parse_key_list` (the designer's `bio(20), age DESC`
     field) and `common_types`. Pure + unit-tested.
+    **CHECK constraints** are `CheckDraft`/`CheckInfo` → `Change::{AddCheck, DropCheck}`,
+    a drop-and-add on both engines (neither can alter one in place). Three rules are
+    written down because each was a bug waiting: the predicate is normalized **on the
+    way in** by `check_predicate` (PG's `pg_get_constraintdef` returns the whole clause,
+    MySQL's `CHECK_CLAUSE` a parenthesised predicate, a person types neither), so the
+    model holds it bare and the emitter wraps it exactly once; `checks_equal` compares
+    modulo wrapping parens and whitespace runs — via `peel_parens`, which goes through
+    `skip_noncode`, since `name <> ')'` has a close-paren in a string — but deliberately
+    *not* modulo tokenisation, so `qty>0` vs `qty > 0` costs a re-validating drop-and-add
+    rather than risking a kept edit; and a column rename is **not** rewritten into the
+    predicate, because PostgreSQL rewrites its own stored parse tree and MySQL refuses
+    the rename outright. `DropCheck` carries a risk sentence though it deletes no data —
+    the table stops guaranteeing something and nothing else says so. `enforced` is
+    MySQL's `NOT ENFORCED` only: PG's `NOT VALID` exempts existing rows and so can't
+    silently change what a write does.
     **Views** ride the same rails: `ViewDraft` (name + body + the `ViewOptions` it
     carries) → `diff_view` → `Change::{CreateView, ReplaceView, RenameView, DropView}`
     → the same preview. Two engine rules live here. MySQL's `CREATE OR REPLACE VIEW`
@@ -128,7 +143,12 @@ Zed-inspired, aiming to replace DataGrip.
     that renames/retypes/reorders one needs `DROP` + `CREATE`, which takes dependent
     views and grants with it: `pg_replaceable` (over `intel::select_output_names`)
     decides where it can, **uncertainty resolves to replace-and-let-the-server-refuse,
-    never to drop**, and `ViewDraft::force_recreate` is the user's override. Materialized
+    never to drop**, and `ViewDraft::force_recreate` is the user's override.
+    The MySQL `ALGORITHM` a replace would reset arrives *after* the editor opens
+    (`SchemaActions::view_algorithm` → `Db::view_algorithm`; see `schemaic-db`), and
+    `view_editor::fetch_algorithm` patches **both** sides of the diff with it — writing
+    only the draft would make every MySQL 8 view open already-changed against a `current`
+    that still said `None`. It leaves the draft alone if the user already picked one. Materialized
     views are drop-only (no `CREATE OR REPLACE` exists for one). Same round-trip gate,
     same rule about extending fixtures.
   - `erd.rs` — the **ER-diagram** model (the UI half is `ui/erd_view.rs`). `build_graph` turns an
@@ -312,7 +332,25 @@ Zed-inspired, aiming to replace DataGrip.
   MySQL additionally reads each table's engine/collation/comment, each FK's
   `REFERENTIAL_CONSTRAINTS` rules, and each view's `CHECK_OPTION`/`DEFINER`/`SECURITY_TYPE`
   (`mysql_view_options`; `ALGORITHM` too, but only on MariaDB — MySQL 8 has the column
-  nowhere but `SHOW CREATE VIEW`, so the query holds its shape with a `CAST(NULL AS CHAR)`);
+  nowhere but `SHOW CREATE VIEW`, so the query holds its shape with a `CAST(NULL AS CHAR)`
+  and `Db::view_algorithm` reads it **lazily, per view**, when the editor opens: one
+  `SHOW CREATE VIEW` each is too many round-trips for a schema fetch, and the value is only
+  needed for the view being redefined. `view_algorithm_of` is the pure reader — it takes the
+  clause *positionally*, between `CREATE` and `DEFINER`, since everything past that is the
+  user's own SQL and can say `ALGORITHM=` too);
+  CHECK constraints come from `CHECK_CONSTRAINTS`, which the two servers shape differently
+  (MariaDB has `TABLE_NAME`, MySQL 8 needs a `TABLE_CONSTRAINTS` join that is also the only
+  home of `ENFORCED`) — and only `ER_UNKNOWN_TABLE`/`ER_NO_SUCH_TABLE` degrades to "no checks",
+  for servers predating the feature, so a broken query surfaces instead of silently emptying
+  every table's constraints. **`mysql_check_clause` is the third of these
+  MySQL-vs-MariaDB text divergences** (with `mysql_column`'s defaults and the view
+  `ALGORITHM`), and the rule is again "normalize on the way in": MySQL 8 returns
+  `CHECK_CLAUSE` with one *extra* level of backslash escaping — `_latin1'new'` arrives
+  as `_latin1\'new\'` — where MariaDB returns it byte-for-byte runnable. Restating
+  MySQL's verbatim is a **syntax error**, and unescaping MariaDB's would eat the
+  backslash out of `'it\'s'`, so it is gated on the `mariadb` flag and measured against
+  `SHOW CREATE TABLE`. It also has to run *before* `ddl::check_predicate`, whose paren
+  scan reads string boundaries that `\'new\'` doesn't have;
   PG reads `confdeltype`/`confupdtype`, the `pg_constraint` name behind a PK/unique index,
   and its view bodies from **`pg_get_viewdef` over `pg_class`, not `information_schema.views`**
   (which hands back an empty definition to a non-owner and omits materialized views entirely)

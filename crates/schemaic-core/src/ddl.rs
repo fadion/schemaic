@@ -30,9 +30,10 @@ use std::collections::{HashMap, HashSet};
 use crate::intel::SqlDialect;
 use crate::pairs;
 use crate::schema::{
-    ColumnInfo, ForeignKeyInfo, IndexInfo, TableInfo, ViewOptions, ddl_ident_in, ddl_string,
-    definer_sql, sql_qualifier,
+    CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo, TableInfo, ViewOptions, ddl_ident_in,
+    ddl_string, definer_sql, sql_qualifier,
 };
+use crate::sql;
 
 // ── The desired state ────────────────────────────────────────────────────────
 
@@ -147,6 +148,30 @@ impl ForeignKeyDraft {
     }
 }
 
+/// A `CHECK` constraint as the designer holds it. Like a foreign key: named,
+/// droppable, and with no in-place alter on either engine — an edited predicate
+/// is a drop and an add.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CheckDraft {
+    pub original: Option<String>,
+    pub info: CheckInfo,
+}
+
+impl CheckDraft {
+    pub fn existing(info: CheckInfo) -> Self {
+        Self {
+            original: Some(info.name.clone()),
+            info,
+        }
+    }
+    pub fn new(info: CheckInfo) -> Self {
+        Self {
+            original: None,
+            info,
+        }
+    }
+}
+
 /// The whole desired shape of one table.
 ///
 /// The primary key lives here as an **ordered list** rather than as the
@@ -168,6 +193,10 @@ pub struct TableDraft {
     /// an entry here.
     pub indexes: Vec<IndexDraft>,
     pub foreign_keys: Vec<ForeignKeyDraft>,
+    /// `CHECK` constraints. Table-level, so unlike a column's attributes these
+    /// survive a `MODIFY COLUMN` — the gap they close is a `CREATE TABLE` built
+    /// from a draft, which used to lose them silently.
+    pub check_constraints: Vec<CheckDraft>,
     /// MySQL storage engine. Always `None` on PostgreSQL.
     pub engine: Option<String>,
     /// MySQL table collation. Always `None` on PostgreSQL.
@@ -203,6 +232,12 @@ impl TableDraft {
                 .iter()
                 .cloned()
                 .map(ForeignKeyDraft::existing)
+                .collect(),
+            check_constraints: t
+                .check_constraints
+                .iter()
+                .cloned()
+                .map(CheckDraft::existing)
                 .collect(),
             engine: t.engine.clone(),
             collation: t.collation.clone(),
@@ -647,6 +682,14 @@ pub enum Change {
     DropForeignKey {
         name: String,
     },
+    /// Add a `CHECK` constraint. Both engines validate it against the rows
+    /// already there, so this fails rather than half-applies.
+    AddCheck(Box<CheckInfo>),
+    /// Drop a `CHECK` constraint. Destructive in the sense the preview means it:
+    /// no data is lost, but an invariant the table guaranteed stops being one.
+    DropCheck {
+        name: String,
+    },
     /// MySQL table options / the table comment. Each field carries **only what
     /// changed**: `None` means "not part of this change", so the emitter restates
     /// nothing the user didn't edit. An empty `comment` clears it — that is a
@@ -741,6 +784,8 @@ impl Change {
                 fk.ref_columns.join(", ")
             ),
             Change::DropForeignKey { name } => format!("Drop foreign key {name}"),
+            Change::AddCheck(ck) => format!("Add check {} ({})", ck.name, ck.expression),
+            Change::DropCheck { name } => format!("Drop check {name}"),
             // Name the options this change actually carries — "change the
             // table's options" couldn't say which, and used to be shown for an
             // edit the statement didn't make.
@@ -820,6 +865,13 @@ impl Change {
                  replace a view whose columns changed name, type or order, so this \
                  is the only way to apply the edit.",
                 draft.name
+            )],
+            // No data is lost, which is exactly why it's worth a sentence: the
+            // table stops guaranteeing something it guaranteed a moment ago, and
+            // nothing about the statement or the grid afterwards shows it.
+            Change::DropCheck { name } => vec![format!(
+                "Drops check {name}. Rows the constraint refused are accepted from \
+                 now on, and existing data is not re-examined if it's added back."
             )],
             // Not destructive — the *opposite* — but it belongs in the same
             // block, because the block is where the preview says what the plan
@@ -980,6 +1032,16 @@ impl ChangeSet {
                 cl.push(format!("DROP FOREIGN KEY {}", self.q(name)));
             }
         }
+        // `DROP CONSTRAINT`, not MySQL 8's `DROP CHECK`: MariaDB only has the
+        // former, and MySQL has had it since 8.0.19 — so one spelling covers
+        // both current servers, where `DROP CHECK` covers only one. (A check
+        // constraint needs a server new enough to have them at all: MySQL
+        // 8.0.16, MariaDB 10.2.)
+        for c in &self.changes {
+            if let Change::DropCheck { name } = c {
+                cl.push(format!("DROP CONSTRAINT {}", self.q(name)));
+            }
+        }
         for c in &self.changes {
             if let Change::DropIndex { name, .. } = c {
                 cl.push(format!("DROP INDEX {}", self.q(name)));
@@ -1036,6 +1098,11 @@ impl ChangeSet {
         for c in &self.changes {
             if let Change::AddForeignKey(fk) = c {
                 cl.push(format!("ADD {}", fk_clause(fk, d)));
+            }
+        }
+        for c in &self.changes {
+            if let Change::AddCheck(ck) = c {
+                cl.push(format!("ADD {}", ck.clause_sql(d)));
             }
         }
         // 4. Table-level options.
@@ -1130,7 +1197,7 @@ impl ChangeSet {
         let mut cl: Vec<String> = Vec::new();
         for c in &self.changes {
             match c {
-                Change::DropForeignKey { name } => {
+                Change::DropForeignKey { name } | Change::DropCheck { name } => {
                     cl.push(format!("DROP CONSTRAINT {}", q(name)));
                 }
                 Change::DropIndex {
@@ -1173,6 +1240,11 @@ impl ChangeSet {
         for c in &self.changes {
             if let Change::AddForeignKey(fk) = c {
                 cl.push(format!("ADD {}", fk_clause(fk, d)));
+            }
+        }
+        for c in &self.changes {
+            if let Change::AddCheck(ck) = c {
+                cl.push(format!("ADD {}", ck.clause_sql(d)));
             }
         }
         for c in &self.changes {
@@ -1556,6 +1628,11 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
     }
     for fk in &d.foreign_keys {
         lines.push(format!("  {}", fk_clause(&fk.info, dialect)));
+    }
+    // Inline on both engines — a check is a table constraint, not an index, so
+    // PostgreSQL has nothing to split out here.
+    for ck in &d.check_constraints {
+        lines.push(format!("  {}", ck.info.clause_sql(dialect)));
     }
     let mut head = format!("CREATE TABLE {qname} (\n{}\n)", lines.join(",\n"));
     if !pg {
@@ -2001,6 +2078,108 @@ fn fks_equal(a: &ForeignKeyInfo, b: &ForeignKeyInfo) -> bool {
         }
 }
 
+/// Peel the parentheses that wrap a *whole* expression, leaving the predicate
+/// itself.
+///
+/// Only a pair that opens at the start and closes at the end: `(a) AND (b)`
+/// begins and ends with one, but they are not each other's match, and peeling
+/// blindly leaves `a) AND (b`. The scan goes through [`sql::skip_noncode`],
+/// because `name <> ')'` carries a close-paren inside a string literal and a raw
+/// byte scan reads it as the end of the group.
+fn peel_parens(s: &str, dialect: SqlDialect) -> &str {
+    let mut t = s.trim();
+    while t.len() >= 2 && t.starts_with('(') && t.ends_with(')') {
+        let b = t.as_bytes();
+        let (mut depth, mut i, mut wraps_all) = (0usize, 0usize, true);
+        while i < b.len() {
+            if let Some(j) = sql::skip_noncode(b, i, dialect) {
+                i = j;
+                continue;
+            }
+            match b[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 && i + 1 != b.len() {
+                        wraps_all = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if !wraps_all || depth != 0 {
+            break;
+        }
+        t = t[1..t.len() - 1].trim();
+    }
+    t
+}
+
+/// The bare predicate of a `CHECK` constraint, as the model stores it — given
+/// whatever the catalogue handed back.
+///
+/// Normalized **on the way in**, the way [`crate::schema::ColumnInfo::default`]'s
+/// text is, so everything downstream holds one shape and the emitter owns the
+/// wrapping. The two engines report three different things: PostgreSQL's
+/// `pg_get_constraintdef` returns the whole clause, `CHECK ((total >= 0))`;
+/// MySQL's `CHECK_CLAUSE` returns just the parenthesised predicate,
+/// `` (`qty` > 0) ``; and a person types `qty > 0`. Storing them verbatim and
+/// wrapping at emit produced `CHECK (((total >= 0)))` — valid, and read by the
+/// user in the preview.
+pub fn check_predicate(raw: &str, dialect: SqlDialect) -> String {
+    let t = raw.trim();
+    // `CHECK` only when it's the leading *word* — a predicate may legitimately
+    // start with a column called `checked_at`.
+    let t = t
+        .strip_prefix("CHECK")
+        .or_else(|| t.strip_prefix("check"))
+        .filter(|rest| rest.starts_with(['(', ' ', '\t', '\n']))
+        .unwrap_or(t);
+    peel_parens(t, dialect).to_string()
+}
+
+/// The comparison form: peeled, and with the whitespace runs the server re-prints
+/// with squashed to one space.
+///
+/// Deliberately *not* token-aware — `qty>0` and `qty > 0` do not compare equal
+/// here. Whitespace between tokens is all that's normalized, the same depth
+/// [`defaults_equal`] goes to. Getting it wrong in this direction costs a
+/// needless drop-and-add of an unchanged constraint, which re-validates and is
+/// safe; a tokenizer that got it wrong the other way would silently keep a
+/// predicate the user had edited.
+fn norm_check_expr(s: &str, dialect: SqlDialect) -> String {
+    peel_parens(s, dialect)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Is this `CHECK` constraint the same as that one, as far as the server is
+/// concerned?
+///
+/// A name difference counts: neither engine can alter a constraint in place, so a
+/// rename is a drop and an add either way.
+///
+/// Case is folded only when neither side carries a quote, the same rule
+/// [`defaults_equal`] follows — `qty > 0` and `QTY > 0` name the same column, but
+/// `status = 'a'` and `status = 'A'` are different predicates.
+pub fn checks_equal(a: &CheckInfo, b: &CheckInfo, dialect: SqlDialect) -> bool {
+    if a.name != b.name || a.enforced != b.enforced {
+        return false;
+    }
+    let (x, y) = (
+        norm_check_expr(&a.expression, dialect),
+        norm_check_expr(&b.expression, dialect),
+    );
+    if x.contains('\'') || y.contains('\'') {
+        x == y
+    } else {
+        x.eq_ignore_ascii_case(&y)
+    }
+}
+
 // ── The diff ─────────────────────────────────────────────────────────────────
 
 /// Everything that has to happen to turn `current` into `draft`.
@@ -2176,6 +2355,49 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, dialect: SqlDialect) -> Cha
     }
     for fk in added_fk {
         changes.push(Change::AddForeignKey(Box::new(fk)));
+    }
+
+    // CHECK constraints, on the same drop-and-recreate rule — neither engine can
+    // alter one in place.
+    //
+    // Deliberately *not* re-pointed through `renamed` the way a foreign key's
+    // column list is. A check's predicate is an expression, not a list of names,
+    // and each engine already answers the rename question itself: PostgreSQL
+    // stores the parse tree, so `RENAME COLUMN` rewrites every check that
+    // references it and the next introspection reads the new name; MySQL stores
+    // the text and *refuses* to rename a column a check depends on. So a rewrite
+    // here would be either redundant or a way to emit SQL the server rejects.
+    let ck_claimed: HashSet<&str> = draft
+        .check_constraints
+        .iter()
+        .filter_map(|c| c.original.as_deref())
+        .collect();
+    let mut dropped_ck: Vec<String> = Vec::new();
+    let mut added_ck: Vec<CheckInfo> = Vec::new();
+    for ck in &current.check_constraints {
+        if !ck_claimed.contains(ck.name.as_str()) {
+            dropped_ck.push(ck.name.clone());
+        }
+    }
+    for d in &draft.check_constraints {
+        let cur = d
+            .original
+            .as_deref()
+            .and_then(|n| current.check_constraints.iter().find(|c| c.name == n));
+        match cur {
+            Some(ck) if checks_equal(ck, &d.info, dialect) => {}
+            Some(ck) => {
+                dropped_ck.push(ck.name.clone());
+                added_ck.push(d.info.clone());
+            }
+            None => added_ck.push(d.info.clone()),
+        }
+    }
+    for name in dropped_ck {
+        changes.push(Change::DropCheck { name });
+    }
+    for ck in added_ck {
+        changes.push(Change::AddCheck(Box::new(ck)));
     }
 
     // Table-level options. On PostgreSQL only the comment exists, and the draft
@@ -3442,6 +3664,213 @@ mod tests {
     /// up to the user as a change they didn't make, on a table they only wanted
     /// to look at. Checking it here keeps the suite DB-free while still failing
     /// the moment either side drifts.
+    /// `CHECK` constraints: the invariant half of a table, and the one a
+    /// `CREATE TABLE` built from a draft used to drop without a word.
+    mod checks {
+        use super::*;
+
+        fn ck(name: &str, expr: &str) -> CheckInfo {
+            CheckInfo {
+                name: name.into(),
+                expression: expr.into(),
+                ..Default::default()
+            }
+        }
+
+        fn table_with(checks: Vec<CheckInfo>) -> TableInfo {
+            TableInfo {
+                name: "t".into(),
+                columns: vec![col("qty", "int")],
+                check_constraints: checks,
+                ..Default::default()
+            }
+        }
+
+        /// Three sources, one stored shape — so the emitter wraps exactly once
+        /// and the preview doesn't read `CHECK (((total >= 0)))`.
+        #[test]
+        fn the_stored_predicate_is_bare_whatever_the_catalogue_said() {
+            // PostgreSQL hands back the whole clause.
+            assert_eq!(
+                check_predicate("CHECK ((total >= (0)::numeric))", Postgres),
+                "total >= (0)::numeric"
+            );
+            // MySQL hands back the parenthesised predicate.
+            assert_eq!(check_predicate("(`qty` > 0)", MySql), "`qty` > 0");
+            // A person types the predicate.
+            assert_eq!(check_predicate("qty > 0", MySql), "qty > 0");
+            // Round-trips: what's stored, re-wrapped, is what the server said.
+            let ck = CheckInfo {
+                name: "c".into(),
+                expression: check_predicate("CHECK ((total >= 0))", Postgres),
+                ..Default::default()
+            };
+            assert_eq!(
+                ck.clause_sql(Postgres),
+                "CONSTRAINT \"c\" CHECK (total >= 0)"
+            );
+        }
+
+        /// `CHECK` is stripped only as a leading *word* — a predicate may open
+        /// with a column whose name merely starts with those five letters.
+        #[test]
+        fn a_column_named_like_the_keyword_survives() {
+            assert_eq!(
+                check_predicate("checked_at IS NOT NULL", MySql),
+                "checked_at IS NOT NULL"
+            );
+            assert_eq!(check_predicate("(checkout > 0)", MySql), "checkout > 0");
+        }
+
+        /// The gate: a draft taken straight off a table has nothing to say.
+        #[test]
+        fn an_untouched_check_is_not_a_change() {
+            let t = table_with(vec![ck("qty_pos", "(`qty` > 0)")]);
+            let d = TableDraft::from_table(&t);
+            assert!(diff(&t, &d, MySql).changes.is_empty());
+        }
+
+        /// The server re-prints a predicate from its parse tree, so the text that
+        /// comes back is never quite the text that went in. Comparing it raw
+        /// meant re-typing what the server itself would print counted as an edit.
+        #[test]
+        fn re_parenthesised_and_re_spaced_predicates_are_the_same_check() {
+            let a = ck("c", "((qty > 0))");
+            for same in ["(qty > 0)", "qty > 0", "  qty   >   0  "] {
+                assert!(
+                    checks_equal(&a, &ck("c", same), MySql),
+                    "{same:?} should match {:?}",
+                    a.expression
+                );
+            }
+            // The stated limit: whitespace *between* tokens is normalized, not
+            // tokenisation itself. This costs a re-validating drop-and-add, and
+            // is the safe side of the trade.
+            assert!(!checks_equal(&a, &ck("c", "qty>0"), MySql));
+            // Case folds for identifiers…
+            assert!(checks_equal(&a, &ck("c", "QTY > 0"), MySql));
+            // …but not inside a literal, where the two really differ.
+            let s = ck("c", "status = 'a'");
+            assert!(!checks_equal(&s, &ck("c", "status = 'A'"), MySql));
+        }
+
+        /// The paren peeler has to know where a group actually closes. `(a) AND
+        /// (b)` opens and ends with a paren that aren't each other's match, and a
+        /// literal can carry an unbalanced one of its own.
+        #[test]
+        fn only_parens_wrapping_the_whole_predicate_are_peeled() {
+            assert!(checks_equal(
+                &ck("c", "((a > 0) AND (b > 0))"),
+                &ck("c", "(a > 0) AND (b > 0)"),
+                MySql
+            ));
+            // Not equal: peeling blindly turns the first into `a > 0) AND (b > 0`
+            // and would match anything that normalises to the same wreck.
+            assert!(!checks_equal(
+                &ck("c", "(a > 0) AND (b > 0)"),
+                &ck("c", "a > 0) AND (b > 0"),
+                MySql
+            ));
+            // A close-paren inside a string is not the end of the group.
+            assert!(checks_equal(
+                &ck("c", "(name <> ')')"),
+                &ck("c", "name <> ')'"),
+                MySql
+            ));
+        }
+
+        /// A real edit is a drop and an add, in that order — neither engine can
+        /// alter a check in place.
+        #[test]
+        fn an_edited_predicate_drops_and_re_adds() {
+            let t = table_with(vec![ck("qty_pos", "qty > 0")]);
+            let mut d = TableDraft::from_table(&t);
+            d.check_constraints[0].info.expression = "qty > 10".into();
+            let cs = diff(&t, &d, MySql);
+            assert!(matches!(
+                cs.changes.as_slice(),
+                [Change::DropCheck { .. }, Change::AddCheck(_)]
+            ));
+            let sql = cs.emit().join("\n");
+            assert!(sql.contains("DROP CONSTRAINT `qty_pos`"), "{sql}");
+            assert!(
+                sql.contains("ADD CONSTRAINT `qty_pos` CHECK (qty > 10)"),
+                "{sql}"
+            );
+        }
+
+        /// Turning enforcement back on is a change of what the table *accepts*,
+        /// so it can't be waved through as cosmetic.
+        #[test]
+        fn enforcement_is_part_of_the_comparison() {
+            let t = table_with(vec![CheckInfo {
+                enforced: false,
+                ..ck("soft", "(qty > 0)")
+            }]);
+            let mut d = TableDraft::from_table(&t);
+            d.check_constraints[0].info.enforced = true;
+            assert_eq!(diff(&t, &d, MySql).changes.len(), 2);
+        }
+
+        /// Removing one is the case worth a sentence: nothing is deleted, but the
+        /// table stops guaranteeing something, and only the preview can say so.
+        #[test]
+        fn dropping_a_check_is_reported_as_a_loss_of_the_guarantee() {
+            let t = table_with(vec![ck("qty_pos", "(qty > 0)")]);
+            let mut d = TableDraft::from_table(&t);
+            d.check_constraints.clear();
+            let cs = diff(&t, &d, MySql);
+            assert!(matches!(cs.changes.as_slice(), [Change::DropCheck { .. }]));
+            let risks = cs.changes[0].risks();
+            assert_eq!(risks.len(), 1, "{risks:?}");
+            assert!(risks[0].contains("qty_pos"), "{risks:?}");
+            assert!(cs.changes[0].is_destructive());
+        }
+
+        /// PostgreSQL drops every constraint by name through one spelling, and
+        /// adds a check inline in the same `ALTER TABLE` as a foreign key —
+        /// unlike an index, which has to be a statement of its own.
+        #[test]
+        fn postgres_adds_and_drops_in_the_one_alter() {
+            let t = TableInfo {
+                name: "t".into(),
+                schema: Some("public".into()),
+                columns: vec![col("qty", "integer")],
+                check_constraints: vec![ck("old", "((qty > 0))")],
+                ..Default::default()
+            };
+            let mut d = TableDraft::from_table(&t);
+            d.check_constraints = vec![CheckDraft::new(ck("fresh", "qty > 5"))];
+            let sql = diff(&t, &d, Postgres).emit().join("\n");
+            assert_eq!(sql.matches("ALTER TABLE").count(), 1, "{sql}");
+            assert!(sql.contains("DROP CONSTRAINT \"old\""), "{sql}");
+            assert!(
+                sql.contains("ADD CONSTRAINT \"fresh\" CHECK (qty > 5)"),
+                "{sql}"
+            );
+            // `NOT ENFORCED` is MySQL's alone and would be a syntax error here.
+            assert!(!sql.contains("NOT ENFORCED"), "{sql}");
+        }
+
+        /// A renamed column is not re-pointed into the predicate on purpose:
+        /// PostgreSQL rewrites its own stored parse tree, and MySQL refuses the
+        /// rename outright. Either way the draft's text is left alone.
+        #[test]
+        fn a_column_rename_does_not_rewrite_the_predicate() {
+            let t = table_with(vec![ck("qty_pos", "(`qty` > 0)")]);
+            let mut d = TableDraft::from_table(&t);
+            d.columns[0].info.name = "quantity".into();
+            let cs = diff(&t, &d, MySql);
+            assert!(
+                !cs.changes
+                    .iter()
+                    .any(|c| matches!(c, Change::DropCheck { .. } | Change::AddCheck(_))),
+                "{:?}",
+                cs.changes
+            );
+        }
+    }
+
     mod roundtrip {
         use super::*;
 
@@ -3653,6 +4082,20 @@ mod tests {
                         ..Default::default()
                     },
                 ],
+                // Two checks, one of them `NOT ENFORCED` — the state a redefine
+                // would silently turn back on.
+                check_constraints: vec![
+                    CheckInfo {
+                        name: "articles_chk_1".into(),
+                        expression: "`body_len` >= 0".into(),
+                        ..Default::default()
+                    },
+                    CheckInfo {
+                        name: "slug_shape".into(),
+                        expression: "`slug` <> _utf8mb4''".into(),
+                        enforced: false,
+                    },
+                ],
                 ..Default::default()
             })
         }
@@ -3670,9 +4113,10 @@ mod tests {
             })
         }
 
-        /// `world.city` on PostgreSQL — a `serial` (a `nextval` default that also
-        /// reads as auto-increment), a `character varying`, a defaulted integer,
-        /// and a primary key that can only be dropped by its constraint name.
+        /// `world.city` on PostgreSQL — a `serial` (auto-increment, and *not*
+        /// also the `nextval` default the catalogue renders it as), a
+        /// `character varying`, a defaulted integer, and a primary key that can
+        /// only be dropped by its constraint name.
         fn pg_city() -> TableInfo {
             TableInfo {
                 name: "city".into(),
@@ -3754,6 +4198,13 @@ mod tests {
                         ..Default::default()
                     },
                 ],
+                // The bare predicate, as `check_predicate` stores it — the cast is
+                // PostgreSQL's own re-printing, the wrapping parens are not.
+                check_constraints: vec![CheckInfo {
+                    name: "invoice_total_nonneg".into(),
+                    expression: "total >= (0)::numeric".into(),
+                    ..Default::default()
+                }],
                 foreign_keys: vec![ForeignKeyInfo {
                     ref_schema: Some("sales".into()),
                     on_delete: Some("SET NULL".into()),
@@ -4062,6 +4513,24 @@ mod tests {
                     if let Some(a) = &fk.on_delete {
                         assert!(sql.contains(&format!("ON DELETE {a}")), "{}: {sql}", t.name);
                     }
+                }
+                // A recreated table that drops its checks accepts data the
+                // original refused — and the statement says nothing about it.
+                for ck in &t.check_constraints {
+                    assert!(
+                        sql.contains(&ck.name) && sql.contains(&ck.expression),
+                        "{}: check {} missing from\n{sql}",
+                        t.name,
+                        ck.name
+                    );
+                    // `NOT ENFORCED` is the half that changes what a write does.
+                    assert_eq!(
+                        sql.contains(&format!("CHECK ({}) NOT ENFORCED", ck.expression)),
+                        !ck.enforced,
+                        "{}: enforcement of {} did not survive\n{sql}",
+                        t.name,
+                        ck.name
+                    );
                 }
             }
         }
