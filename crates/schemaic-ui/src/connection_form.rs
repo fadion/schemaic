@@ -44,21 +44,15 @@ impl DbKind {
     }
 
     /// The default TCP port for this engine (offered when switching engines).
+    /// Shared with the port field's parse fallback, so the two can't disagree.
     fn default_port(self) -> u16 {
-        match self {
-            DbKind::MySql => 3306,
-            DbKind::Postgres => 5432,
-        }
+        schemaic_core::connection::default_port(self.label())
     }
 
     /// Map a persisted `db_type` label back to a picker value (anything not
     /// recognizably Postgres is MySQL — the historical default).
     fn from_db_type(s: &str) -> DbKind {
-        let t = s.trim();
-        if t.eq_ignore_ascii_case("postgresql")
-            || t.eq_ignore_ascii_case("postgres")
-            || t.eq_ignore_ascii_case("pg")
-        {
+        if schemaic_core::connection::is_postgres(s) {
             DbKind::Postgres
         } else {
             DbKind::MySql

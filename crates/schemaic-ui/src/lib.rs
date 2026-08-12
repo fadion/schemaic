@@ -848,12 +848,23 @@ impl DraftSignals {
 
     /// Build a `Connection` from the current form values (with the given id).
     pub fn to_connection(&self, id: u64) -> Connection {
+        let db_type = self.db_type.get_untracked();
         Connection {
             id,
             name: self.name.get_untracked(),
-            db_type: self.db_type.get_untracked(),
             host: self.host.get_untracked(),
-            port: self.port.get_untracked().trim().parse().unwrap_or(3306),
+            // A blank or unparseable port falls back to *this engine's* default.
+            // It used to be a bare 3306, so clearing a PostgreSQL connection's
+            // port and saving pointed it at the MySQL port — and redisplayed
+            // 3306, so the value shown was the wrong one rather than the blank
+            // the user left.
+            port: self
+                .port
+                .get_untracked()
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| schemaic_core::connection::default_port(&db_type)),
+            db_type,
             user: self.user.get_untracked(),
             password: self.password.get_untracked(),
             ssh: schemaic_core::connection::SshTunnel {
