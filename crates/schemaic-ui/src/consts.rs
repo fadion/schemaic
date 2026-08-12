@@ -153,6 +153,13 @@ pub(crate) const GUTTER_W: f64 = 52.0; // row-number gutter width (frozen)
 // the 10px sides so the value doesn't hug the edge/border. Header and cell share
 // it so numbers line up under their column name.
 pub(crate) const GRID_NUM_PAD_RIGHT: f64 = 14.0;
+/// Horizontal padding inside a grid cell / header (the numeric side swaps the
+/// right one for [`GRID_NUM_PAD_RIGHT`]).
+pub(crate) const GRID_PAD_H: f64 = 10.0;
+/// The divider drawn on a cell's right edge. Named because it is a *border*, so
+/// it comes out of the content box — anything computing how much room a cell has
+/// for its value has to subtract it (see `numeric_edit_pad_left`).
+pub(crate) const GRID_CELL_DIVIDER: f64 = 1.0;
 // Extra header width a key column needs over a plain one: its leading key icon
 // (14px) + gap (8px) beyond the normal side padding. Added to the width estimate
 // so a long type line (e.g. `INT UNSIGNED`) on a PK/FK column isn't clipped.
