@@ -857,6 +857,45 @@ mod tests {
         assert_eq!(ident_sql("a`b", Postgres), "\"a`b\"");
     }
 
+    /// Every identifier-quoting entry point in the workspace answers to
+    /// `ident_sql`. The *reading* side has had a single-lexer invariant since
+    /// round 1; the writing side had four implementations that had each
+    /// independently arrived at the same escaping — which is the drift hazard,
+    /// not the reassurance, and one of them (`ddl_string`, the literal half) had
+    /// already been found wrong.
+    ///
+    /// The `schemaic-db` pair is bound by a matching test in that crate, since
+    /// its functions are private to it.
+    #[test]
+    fn every_identifier_quoter_agrees_with_ident_sql() {
+        let nasty = [
+            "plain",
+            "MixedCase",
+            "with space",
+            "a`b",
+            "a\"b",
+            "both`and\"",
+            "sélect",
+            "",
+        ];
+        for name in nasty {
+            for d in [MySql, Postgres] {
+                assert_eq!(
+                    crate::schema::ddl_ident_in(name, d),
+                    ident_sql(name, d),
+                    "ddl_ident_in({name:?}, {d:?})"
+                );
+            }
+            // `filter`'s is `ident_sql` itself now; assert the re-export really
+            // is the same function rather than a lookalike that could be swapped
+            // back to a local copy.
+            assert_eq!(
+                crate::filter::quoted_ident_for_test(name, MySql),
+                ident_sql(name, MySql)
+            );
+        }
+    }
+
     #[test]
     fn sql_literal_handles_nonfinite_and_escapes() {
         assert_eq!(sql_literal(&Value::Float(f64::NAN), MySql), "NULL");

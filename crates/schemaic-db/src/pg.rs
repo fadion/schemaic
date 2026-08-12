@@ -1163,7 +1163,15 @@ fn pg_no_default(not_null: bool, has_default: bool, identity: &str) -> bool {
 
 /// Double-quote a Postgres identifier, doubling any embedded quote.
 fn pg_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+    // The one identifier-quoting rule, pinned to this module's only engine.
+    schemaic_core::export::ident_sql(name, schemaic_core::intel::SqlDialect::Postgres)
+}
+
+/// Reaches [`pg_ident`] from the crate-level test that binds every quoter to
+/// `core`'s.
+#[cfg(test)]
+pub(crate) fn pg_ident_for_test(name: &str) -> String {
+    pg_ident(name)
 }
 
 /// A table name for the **write path**, qualified with its namespace whenever one

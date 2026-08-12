@@ -2064,8 +2064,12 @@ fn build_refetch_sql(template: &RefetchTemplate) -> String {
 }
 
 /// Backtick-quote an identifier, doubling any embedded backtick.
+///
+/// The one identifier-quoting rule, pinned to this path's only engine — these
+/// statements are built for MySQL by construction (the PostgreSQL write path is
+/// `pg.rs`'s).
 fn ident(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
+    schemaic_core::export::ident_sql(name, schemaic_core::intel::SqlDialect::MySql)
 }
 
 /// Convert a typed cell value into a bound parameter for a `WHERE` comparison.
@@ -2801,6 +2805,35 @@ mod tests {
     fn explain_commands_strips_trailing_semicolon_and_space() {
         let (primary, _) = explain_commands("  SELECT 1 ;  ", false);
         assert_eq!(primary, "EXPLAIN SELECT 1");
+    }
+
+    /// This crate's two identifier quoters answer to `core`'s, so the SQL a
+    /// write path builds can't drift from the SQL the export and DDL paths
+    /// build. Each is engine-fixed by construction — `pg.rs` only ever emits
+    /// PostgreSQL, this module's statement builders only ever MySQL — which is
+    /// why they take no dialect and why the binding has to be asserted rather
+    /// than typed.
+    #[test]
+    fn the_write_paths_quote_identifiers_the_way_core_does() {
+        use schemaic_core::export::ident_sql;
+        use schemaic_core::intel::SqlDialect;
+        for name in [
+            "plain",
+            "MixedCase",
+            "with space",
+            "a`b",
+            "a\"b",
+            "both`and\"",
+            "sélect",
+            "",
+        ] {
+            assert_eq!(ident(name), ident_sql(name, SqlDialect::MySql), "{name:?}");
+            assert_eq!(
+                crate::pg::pg_ident_for_test(name),
+                ident_sql(name, SqlDialect::Postgres),
+                "{name:?}"
+            );
+        }
     }
 
     #[test]
