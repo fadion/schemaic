@@ -692,6 +692,12 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // into the Import entry below.
                         let editable_view = crate::view_editor::is_editable_view(info.as_ref());
                         let materialized = is_view && !editable_view;
+                        // Read here for the same reason `editable_view` is: the
+                        // Import entry below moves `info` into its closure.
+                        let triggers = info
+                            .as_ref()
+                            .map(|i| i.triggers.clone())
+                            .unwrap_or_default();
                         entries.push(
                             MenuEntry::action("Import", move || {
                                 if let Some(info) = info.clone() {
@@ -748,6 +754,41 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                     !has_columns
                                 }),
                             );
+                        }
+                        // Triggers: one submenu per table — a "Create trigger"
+                        // and an entry per trigger already on it. They hang off
+                        // the table because that is where they live on both
+                        // engines, and a constraint trigger is listed but not
+                        // editable, the same call a materialized view gets.
+                        {
+                            let ui = import_ui.clone();
+                            let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
+                            let mut items = vec![
+                                MenuEntry::action("Create trigger", {
+                                    let (ui, db, ns, tbl) =
+                                        (ui.clone(), db.clone(), ns.clone(), tbl.clone());
+                                    move || {
+                                        crate::trigger_editor::open_for_new(
+                                            &ui,
+                                            &db,
+                                            ns.as_deref(),
+                                            &tbl,
+                                        )
+                                    }
+                                })
+                                .disabled(read_only || is_view),
+                            ];
+                            for t in triggers {
+                                let (ui, db) = (ui.clone(), db.clone());
+                                let editable = crate::trigger_editor::is_editable_trigger(&t);
+                                items.push(
+                                    MenuEntry::action(t.name.clone(), move || {
+                                        crate::trigger_editor::open_for_trigger(&ui, &db, &t)
+                                    })
+                                    .disabled(!editable),
+                                );
+                            }
+                            entries.push(MenuEntry::sub("Triggers", items).disabled(!has_columns));
                         }
                         // Truncate and drop are the two that can't be taken back
                         // and sit next to harmless entries, so they ask first and
