@@ -543,6 +543,40 @@ impl Db {
         let _ = conn.disconnect().await;
         out
     }
+
+    /// `database`'s table **list** — name, namespace and view flag, and nothing
+    /// else. Every returned [`TableInfo`]'s columns, indexes and foreign keys are
+    /// **empty**, so this is not a substitute for [`Db::fetch_schema`]; it shares
+    /// the return type only so a name-listing caller needs no second formatter.
+    ///
+    /// It exists because `fetch_schema` was being used as a name list: the MCP
+    /// server's no-argument `list_schema` introspected **every** database on the
+    /// server in full — five catalogue queries each, every column of every table —
+    /// and then printed the names. That is the assistant's usual first tool call,
+    /// and the cost was unrelated to the answer.
+    pub async fn fetch_table_list(&self, database: &str) -> Result<DbSchema, DbError> {
+        if self.engine == Engine::Postgres {
+            return pg::fetch_table_list(self, database).await;
+        }
+        let mut conn = self.open(None, false).await?;
+        let out = conn
+            .exec_map(
+                "SELECT CAST(TABLE_NAME AS CHAR) AS t, CAST(TABLE_TYPE AS CHAR) AS ty \
+                 FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
+                (database,),
+                |(name, ty): (String, String)| TableInfo {
+                    name,
+                    is_view: ty.eq_ignore_ascii_case("VIEW"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|tables| DbSchema { tables })
+            .map_err(|e| DbError::Query(e.to_string()));
+        let _ = conn.disconnect().await;
+        out
+    }
 }
 
 async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbError> {

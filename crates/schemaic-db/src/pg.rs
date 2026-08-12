@@ -51,7 +51,7 @@ use schemaic_core::model::{
     Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder,
     ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value, WriteStep, one_row_verdict,
 };
-use schemaic_core::schema::{ColumnInfo, DbSchema, IndexColumn, ViewOptions};
+use schemaic_core::schema::{ColumnInfo, DbSchema, IndexColumn, TableInfo, ViewOptions};
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
@@ -613,6 +613,23 @@ fn schema_sort_key(name: &str) -> (u8, String) {
 /// name alone, so feeding it two schemas at once would silently merge same-named
 /// tables. Each resulting [`TableInfo`](schemaic_core::schema::TableInfo) carries
 /// its namespace, and the schemas are concatenated `public`-first.
+/// The PostgreSQL half of [`Db::fetch_table_list`]: the same table list the full
+/// fetch starts from, and none of the four catalogue queries after it.
+pub(crate) async fn fetch_table_list(db: &Db, database: &str) -> Result<DbSchema, DbError> {
+    let client = connect_to(db, database).await?;
+    let tables = query_all(&client, &table_list_sql())
+        .await?
+        .into_iter()
+        .map(|r| TableInfo {
+            schema: Some(cell(&r, 0)),
+            name: cell(&r, 1),
+            is_view: cell(&r, 2) == "VIEW",
+            ..Default::default()
+        })
+        .collect();
+    Ok(DbSchema { tables })
+}
+
 pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, DbError> {
     let client = connect_to(db, database).await?;
 

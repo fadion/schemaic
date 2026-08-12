@@ -268,7 +268,10 @@ async fn list_schema(db: &Db, database: Option<&str>) -> (String, bool) {
     };
     let mut dbs = Vec::with_capacity(names.len());
     for name in names {
-        let schema = db.fetch_schema(&name).await.map_err(|e| e.to_string());
+        // The *list*, not the schema: this prints table names, and introspecting
+        // every column of every table of every database to do that is the whole
+        // server's catalogue for an answer that doesn't use it.
+        let schema = db.fetch_table_list(&name).await.map_err(|e| e.to_string());
         dbs.push((name, schema));
     }
     (format_database_list(&dbs), false)
