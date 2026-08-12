@@ -273,6 +273,30 @@ mod status_tests {
     }
 }
 
+/// Is this saved `db_type` label PostgreSQL?
+///
+/// Anything not recognizably Postgres is MySQL — the historical default, which
+/// is what keeps connections saved before the field existed working. **The one
+/// answer**: `schemaic_db::Engine::from_db_type` and the connection form's
+/// engine picker both read it, so a new label can't mean Postgres to the driver
+/// and MySQL to the form.
+pub fn is_postgres(db_type: &str) -> bool {
+    let t = db_type.trim();
+    t.eq_ignore_ascii_case("postgresql")
+        || t.eq_ignore_ascii_case("postgres")
+        || t.eq_ignore_ascii_case("pg")
+}
+
+/// The default TCP port for a `db_type` label.
+///
+/// Used both when the engine picker changes and as the fallback for a port field
+/// that doesn't parse — the second of which used to be a bare `3306`, so clearing
+/// a PostgreSQL connection's port and saving pointed it silently at the MySQL
+/// port and redisplayed that as though the user had typed it.
+pub fn default_port(db_type: &str) -> u16 {
+    if is_postgres(db_type) { 5432 } else { 3306 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +383,21 @@ mod tests {
         assert_eq!(t.auth, SshAuth::Password);
         assert_eq!(t.key_path, "");
         assert_eq!(t.key_passphrase, "");
+    }
+
+    #[test]
+    fn postgres_is_recognised_by_any_of_its_labels() {
+        for label in ["PostgreSQL", "postgres", "PG", "  postgresql  "] {
+            assert!(is_postgres(label), "{label}");
+            assert_eq!(default_port(label), 5432, "{label}");
+        }
+    }
+
+    #[test]
+    fn anything_else_is_mysql_including_the_labels_that_predate_the_field() {
+        for label in ["MySQL", "MariaDB", "", "something new"] {
+            assert!(!is_postgres(label), "{label}");
+            assert_eq!(default_port(label), 3306, "{label}");
+        }
     }
 }

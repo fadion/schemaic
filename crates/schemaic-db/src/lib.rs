@@ -81,11 +81,7 @@ impl Engine {
     /// recognizably Postgres falls back to MySQL (the historical default), so old
     /// saved connections and the "MySQL"/"MariaDB" labels keep working.
     pub fn from_db_type(db_type: &str) -> Engine {
-        let t = db_type.trim();
-        if t.eq_ignore_ascii_case("postgresql")
-            || t.eq_ignore_ascii_case("postgres")
-            || t.eq_ignore_ascii_case("pg")
-        {
+        if schemaic_core::connection::is_postgres(db_type) {
             Engine::Postgres
         } else {
             Engine::MySql
