@@ -629,9 +629,11 @@ pub enum EditorThemeKind {
     CatppuccinLatte,
 }
 impl EditorThemeKind {
+    /// Dropdown order. The default comes first — see
+    /// `persist::default_editor_theme`, which this must agree with.
     pub const ALL: [EditorThemeKind; 3] = [
-        EditorThemeKind::OneDarkPro,
         EditorThemeKind::TokyoNight,
+        EditorThemeKind::OneDarkPro,
         EditorThemeKind::CatppuccinLatte,
     ];
     pub fn label(self) -> &'static str {
@@ -648,11 +650,15 @@ impl EditorThemeKind {
             EditorThemeKind::CatppuccinLatte => "catppuccin-latte",
         }
     }
+    /// An unknown key resolves to the **default**, which is what a config
+    /// written by a newer build (or hand-edited) degrades to — the same rule the
+    /// persisted enums' `…Raw` shims follow. Keep this arm and
+    /// `persist::default_editor_theme` in step.
     pub fn from_key(s: &str) -> EditorThemeKind {
         match s {
-            "tokyo-night" => EditorThemeKind::TokyoNight,
+            "one-dark-pro" => EditorThemeKind::OneDarkPro,
             "catppuccin-latte" => EditorThemeKind::CatppuccinLatte,
-            _ => EditorThemeKind::OneDarkPro,
+            _ => EditorThemeKind::TokyoNight,
         }
     }
     pub(crate) fn build(self) -> EditorTheme {
@@ -698,7 +704,10 @@ fn with_state<R>(f: impl FnOnce(&ThemeState) -> R) -> R {
             let scope = Scope::new();
             let state = ThemeState {
                 ui: scope.create_rw_signal(Rc::new(UiTheme::dark())),
-                editor: scope.create_rw_signal(Rc::new(EditorTheme::one_dark_pro())),
+                // The default, matching `persist::default_editor_theme` — this is
+                // what paints for the frame before `theme::init` seeds the saved
+                // choice.
+                editor: scope.create_rw_signal(Rc::new(EditorTheme::tokyo_night())),
                 ui_gen: scope.create_rw_signal(0u64),
                 editor_gen: scope.create_rw_signal(0u64),
                 editor_font: scope.create_rw_signal(14.0_f32),
@@ -878,6 +887,43 @@ mod tests {
         for kind in EditorThemeKind::ALL {
             let t = kind.build();
             assert!(t.fg.a > 0, "{} has a transparent foreground", kind.label());
+        }
+    }
+
+    /// The editor theme's default is stated in four places that must agree:
+    /// `persist::default_editor_theme` (what a fresh config gets), `ALL[0]` (what
+    /// the dropdown shows first), `from_key`'s fallback (what an unknown key
+    /// degrades to) and the runtime seed. Three of them are silent if they drift
+    /// — a mismatched `from_key` arm in particular would resolve a *newer*
+    /// build's theme key to something other than the documented default.
+    #[test]
+    fn the_editor_theme_default_agrees_everywhere() {
+        let default_key = schemaic_core::persist::UiState::default().editor_theme;
+        assert_eq!(default_key, "tokyo-night");
+        assert_eq!(EditorThemeKind::ALL[0].key(), default_key, "dropdown order");
+        assert_eq!(
+            EditorThemeKind::from_key("no-such-theme").key(),
+            default_key,
+            "an unknown key must resolve to the default"
+        );
+        assert_eq!(
+            EditorThemeKind::from_key(&default_key).key(),
+            default_key,
+            "the default key must round-trip"
+        );
+    }
+
+    #[test]
+    fn every_editor_theme_key_round_trips() {
+        // The keys are persisted, so a typo in one silently resets that user's
+        // choice to the default on the next load.
+        for kind in EditorThemeKind::ALL {
+            assert_eq!(
+                EditorThemeKind::from_key(kind.key()).key(),
+                kind.key(),
+                "{} does not round-trip",
+                kind.label()
+            );
         }
     }
 
