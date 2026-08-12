@@ -378,6 +378,23 @@ impl Db {
     ///
     /// `Ok(None)` means the server didn't state one (`UNDEFINED`), which is also
     /// what PostgreSQL — with no such concept — returns without asking.
+    /// Every trigger function in `database` — PostgreSQL only, and read lazily
+    /// when the trigger or function editor opens.
+    ///
+    /// Not part of `fetch_schema` on purpose, the same call [`Db::view_algorithm`]
+    /// makes: a function body is only needed for the one being bound or edited,
+    /// and every schema refresh would otherwise carry every body. Empty on MySQL,
+    /// whose triggers hold their own body and need no function at all.
+    pub async fn trigger_functions(
+        &self,
+        database: &str,
+    ) -> Result<Vec<schemaic_core::schema::RoutineInfo>, DbError> {
+        if self.engine != Engine::Postgres {
+            return Ok(Vec::new());
+        }
+        pg::trigger_functions(self, database).await
+    }
+
     pub async fn view_algorithm(
         &self,
         database: Option<&str>,
