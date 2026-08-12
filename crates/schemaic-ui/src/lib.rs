@@ -36,6 +36,7 @@ mod table_designer;
 mod tabs;
 pub mod theme;
 pub mod themes;
+mod trigger_editor;
 mod view_editor;
 mod widgets;
 
@@ -251,6 +252,58 @@ impl ViewTarget {
     }
 }
 
+/// What the trigger editor is editing. Doubles as its open flag.
+#[derive(Clone, Debug)]
+pub struct TriggerTarget {
+    pub conn_id: u64,
+    pub database: String,
+    pub dialect: SqlDialect,
+    /// The introspected trigger the draft started from — the left-hand side of
+    /// the diff. `None` means a new trigger, which emits `CREATE TRIGGER`.
+    pub current: Option<schemaic_core::schema::TriggerInfo>,
+    pub read_only: bool,
+}
+
+impl TriggerTarget {
+    /// The modal's title subject.
+    pub fn display(&self) -> String {
+        match &self.current {
+            Some(t) => t.name.clone(),
+            None => self.database.clone(),
+        }
+    }
+}
+
+/// What the function editor is editing. Doubles as its open flag.
+///
+/// Separate from [`TriggerTarget`] rather than a mode of it: a function has its
+/// own lifetime, outlives every trigger bound to it, and is reachable without
+/// going through a trigger at all.
+#[derive(Clone, Debug)]
+pub struct FunctionTarget {
+    pub conn_id: u64,
+    pub database: String,
+    pub dialect: SqlDialect,
+    pub current: Option<schemaic_core::schema::RoutineInfo>,
+    pub read_only: bool,
+}
+
+/// One lazy trigger-function fetch — see [`schemaic_db::Db::trigger_functions`].
+#[derive(Clone, Debug)]
+pub struct TriggerFnRequest {
+    pub conn_id: u64,
+    pub database: String,
+}
+
+/// Hands the fetched trigger functions back on the UI thread.
+pub type TriggerFnDoneFn = Rc<dyn Fn(Vec<schemaic_core::schema::RoutineInfo>)>;
+
+/// Fetches a database's trigger functions off the UI thread.
+///
+/// Lazy, not part of the schema fetch: a function body is only needed for the
+/// one being bound or edited — the same call [`ViewAlgoFn`] makes.
+pub type TriggerFnFn = Rc<dyn Fn(TriggerFnRequest, TriggerFnDoneFn)>;
+
 /// Which section of the designer is showing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DesignerTab {
@@ -371,9 +424,24 @@ pub struct DdlUi {
     /// The view being edited. Same rule as `draft`: one value, because the
     /// footer's change count is [`schemaic_core::ddl::diff_view`] of exactly it.
     pub view_draft: RwSignal<schemaic_core::ddl::ViewDraft>,
-    /// The body editor's auto-grow cap, in rows. A signal because that's what
-    /// [`FieldCfg::max_rows`] takes; nothing changes it.
+    /// The body editor's auto-grow cap, in rows — shared by whichever editor is
+    /// open, since only one ever is. A signal because that's what
+    /// [`FieldCfg::max_rows`] takes; nothing changes it mid-edit.
     pub view_rows: RwSignal<usize>,
+    /// The trigger editor's target; doubles as its open flag.
+    pub trigger: RwSignal<Option<TriggerTarget>>,
+    /// The trigger being edited. Same rule as `draft`: one value, because the
+    /// footer's change count is [`schemaic_core::ddl::diff_trigger`] of exactly
+    /// it.
+    pub trigger_draft: RwSignal<schemaic_core::ddl::TriggerDraft>,
+    /// The function editor's target; doubles as its open flag.
+    pub function: RwSignal<Option<FunctionTarget>>,
+    pub function_draft: RwSignal<schemaic_core::ddl::FunctionDraft>,
+    /// The database's trigger functions, fetched when a PostgreSQL trigger
+    /// editor opens — what its "Function" dropdown offers. Empty on MySQL, and
+    /// empty until the fetch lands, which is why the dropdown keeps whatever the
+    /// draft already names rather than resetting to the first entry.
+    pub functions: RwSignal<Vec<schemaic_core::schema::RoutineInfo>>,
     pub preview: RwSignal<Option<DdlPreview>>,
     /// The plan's SQL, bound to the preview's read-only field.
     pub sql: RwSignal<String>,
@@ -1368,6 +1436,7 @@ pub struct SchemaActions {
     pub run_ddl: DdlFn,
     /// Read a MySQL view's `ALGORITHM`, which no bulk query reports.
     pub view_algorithm: ViewAlgoFn,
+    pub trigger_functions: TriggerFnFn,
 }
 
 /// Result of a "Test" of the Manage-Connections draft (host + credentials),
@@ -1929,6 +1998,8 @@ pub fn workspace(ui: Ui) -> impl IntoView {
             let import_open = ui.import.target;
             let designer_open = ui.ddl.designer;
             let view_open = ui.ddl.view;
+            let trigger_open = ui.ddl.trigger;
+            let function_open = ui.ddl.function;
             let ddl_preview_open = ui.ddl.preview;
             stack((
                 error_modal_overlay(ui.clone()),
@@ -1937,6 +2008,20 @@ pub fn workspace(ui: Ui) -> impl IntoView {
                 import_view::import_overlay(ui.clone()),
                 table_designer::table_designer_overlay(ui.clone()),
                 view_editor::view_editor_overlay(ui.clone()),
+                // The trigger and function editors share one tuple element —
+                // this stack is at Floem's 16-arity `ViewTuple` limit, and only
+                // one of the pair is ever open.
+                stack((
+                    trigger_editor::trigger_editor_overlay(ui.clone()),
+                    trigger_editor::function_editor_overlay(ui.clone()),
+                ))
+                .style(move |s| {
+                    if trigger_open.get().is_some() || function_open.get().is_some() {
+                        s.absolute().inset(0.0)
+                    } else {
+                        s
+                    }
+                }),
                 ddl_preview::ddl_preview_overlay(ui.clone()),
             ))
             .style(move |s| {
@@ -1946,6 +2031,8 @@ pub fn workspace(ui: Ui) -> impl IntoView {
                     || import_open.get().is_some()
                     || designer_open.get().is_some()
                     || view_open.get().is_some()
+                    || trigger_open.get().is_some()
+                    || function_open.get().is_some()
                     || ddl_preview_open.get().is_some()
                 {
                     s.absolute().inset(0.0)

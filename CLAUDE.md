@@ -425,6 +425,23 @@ Zed-inspired, aiming to replace DataGrip.
     *carried* through a replace, and the PG "re-create instead of replacing" toggle is the
     override for the cases `ddl::pg_replaceable` can't read off the statement.
     `is_editable_view` is the entry point's gate — a materialized view is drop-only.
+  - `trigger_editor.rs` — the **trigger** modal *and* the **function** modal, over `core::ddl`'s
+    `TriggerDraft`/`FunctionDraft`. Reached from the schema context menu's per-table **Triggers**
+    submenu (Create trigger + an entry per existing one); same chrome, same
+    seed-local-signals-then-write-back rule and same `ddl_preview` ending as `view_editor`.
+    Two modals in one module because the second only exists to serve the first: a PG trigger has
+    no body, only a **function** to call, so the trigger form would be a dead end without a way to
+    write one. Three rules are written down because each was a bug waiting: **the form is
+    per-engine because the objects are** (MySQL owns a body and one event; PG calls a function,
+    takes several events and a `WHEN`), so it *hides* what an engine can't express rather than
+    offering it and failing at apply; **the function list is fetched lazily** (`Db::trigger_functions`
+    via `TriggerFnFn`, the same call `view_algorithm` makes) and arrives a round trip late, so the
+    picker keeps whatever the draft already names instead of selecting the first entry and silently
+    re-pointing the trigger; and **the trigger target is never cleared while the function modal is
+    up** — its overlay just renders nothing — so closing that one reveals the half-filled trigger
+    form intact, with no "return to trigger" flag to be a second source of truth. `is_editable_trigger`
+    is the entry point's gate: a constraint trigger's deferral settings aren't modelled, so it is
+    listed and droppable but not editable, the call a materialized view gets.
   - `ai_panel.rs` — AI Assistant panel (`ai_panel`/`message_bubble`/`render_segments`/`tool_chip`/
     `assistant_footer`).
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context

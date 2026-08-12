@@ -3365,6 +3365,30 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         )
     };
 
+    let trigger_functions: schemaic_ui::TriggerFnFn = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(
+            move |req: schemaic_ui::TriggerFnRequest, done: schemaic_ui::TriggerFnDoneFn| {
+                let Ok(db) = db_for(req.conn_id) else {
+                    // Nothing to report: the dropdown stays on whatever the
+                    // draft already names, which is the honest empty state.
+                    return;
+                };
+                let report = create_ext_action(cx, move |fns| (done)(fns));
+                handle.spawn(async move {
+                    // A failure here isn't worth interrupting an edit for — the
+                    // user can still type a function name by hand.
+                    let fns = db
+                        .trigger_functions(&req.database)
+                        .await
+                        .unwrap_or_default();
+                    report(fns);
+                });
+            },
+        )
+    };
+
     let run_ddl: schemaic_ui::DdlFn = {
         let handle = handle.clone();
         let db_for = db_for.clone();
@@ -4874,6 +4898,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             },
             run_ddl,
             view_algorithm,
+            trigger_functions,
         }),
         // Reset on every open (`import_view::open_import`), so one bundle serves
         // every table rather than a per-open scope that would need disposing.
@@ -4911,6 +4936,11 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             view: RwSignal::new(None),
             view_draft: RwSignal::new(schemaic_core::ddl::ViewDraft::default()),
             view_rows: RwSignal::new(14),
+            trigger: RwSignal::new(None),
+            trigger_draft: RwSignal::new(schemaic_core::ddl::TriggerDraft::default()),
+            function: RwSignal::new(None),
+            function_draft: RwSignal::new(schemaic_core::ddl::FunctionDraft::default()),
+            functions: RwSignal::new(Vec::new()),
             preview: RwSignal::new(None),
             sql: RwSignal::new(String::new()),
             sql_rows: RwSignal::new(16),
