@@ -4454,10 +4454,17 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     // created second so it wins the initial run → the field starts unfocused
     // (unless `autofocus` re-focuses it right after).
     {
+        // `focused` mirrored as plain, non-reactive state, for the deferred blur
+        // below to read. It can't use the signal: by the time it runs, the field's
+        // scope may already be disposed, and a `None` there can't be told apart
+        // from "focus came back" — the one thing it needs to know.
+        let focus_now = std::rc::Rc::new(std::cell::Cell::new(false));
+        let focus_now_f = focus_now.clone();
         let ed_focus = ed.clone();
         create_effect(move |_| {
             ed_focus.editor_view_focused.track();
             focused.set(true);
+            focus_now_f.set(true);
             // A read-only field can still be focused (to receive Enter/Escape),
             // but shows no blinking caret.
             if read_only {
@@ -4475,6 +4482,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         create_effect(move |prev: Option<()>| {
             ed_blur.editor_view_focus_lost.track();
             focused.set(false);
+            focus_now.set(false);
             ed_blur.cursor_info.hidden.set(true);
             ed_blur
                 .cursor_info
@@ -4486,7 +4494,22 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             if prev.is_some()
                 && let Some(cb) = &blur_cb
             {
-                (cb)();
+                // Deferred a tick, because a focus-lost does NOT mean the field
+                // was blurred. Floem clears `app_state.focus` on *every*
+                // pointer-down and re-requests it as a queued update message
+                // (window_handle.rs), so a click inside an already-focused field
+                // raises a real FocusLost→FocusGained pair. Firing `on_blur` on
+                // the Lost half committed and closed the field the user had only
+                // clicked into to move the caret — the tab rename, and the row
+                // panel's JSON leaf editor. One tick later the queued FocusGained
+                // has landed, so `focus_now` separates a click from a real blur.
+                let cb = cb.clone();
+                let focus_now = focus_now.clone();
+                floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+                    if !focus_now.get() {
+                        (cb)();
+                    }
+                });
             }
         });
     }
