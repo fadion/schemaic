@@ -4018,6 +4018,33 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         })
     };
 
+    // Leaving the tab a Ctrl+K generation belongs to cancels it.
+    //
+    // The editor pane is keyed on the active tab, so a switch disposes the pane
+    // and its `CmdK` — and nothing was left holding the generation. The `claude`
+    // child ran to completion (never aborted, so `kill_on_drop` never fired: the
+    // request was billed and answered in full), and the reply set this *global*
+    // signal to `Ready` while no pane had the popup open, so it rendered nowhere
+    // and was unreachable on return. The user saw the prompt simply vanish.
+    //
+    // Watching `active` rather than the pane's teardown, because floem has no
+    // scope-cleanup hook to hang this on — and it is the more honest signal
+    // anyway: the generation is bound to the tab it was started from, and
+    // `inline_ai` being one global signal means there is only ever one to cancel.
+    {
+        let inline_ai_cancel = inline_ai_cancel.clone();
+        create_effect(move |prev: Option<usize>| {
+            let id = active.get();
+            if let Some(prev) = prev
+                && prev != id
+                && matches!(inline_ai.get_untracked(), InlineAiState::Busy)
+            {
+                (inline_ai_cancel)();
+            }
+            id
+        });
+    }
+
     // AI-fill a single grid cell: bottom-sample the base table, build a prompt from
     // its DDL + sample + the row's other cells, run a one-shot `claude -p` call, and
     // report the parsed value back for the grid to stage (never auto-committed).
