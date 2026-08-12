@@ -26,6 +26,10 @@ mod monitor_view;
 mod overlays;
 mod plan_view;
 mod schema_tree;
+/// The tree-node key builders. Public because the persisted expanded-node set is
+/// the app's to edit (collapsing a database drops every `tbl:<db>:*` key), and
+/// the format belongs to exactly one module.
+pub use schema_tree::{column_key_named, table_key_named, table_key_prefix};
 mod settings;
 pub mod sql_highlight;
 mod table_designer;

@@ -75,17 +75,40 @@ fn schema_key(database: &str, schema: &str) -> String {
 }
 
 fn table_key(database: &str, t: &TableInfo) -> String {
-    format!(
-        "tbl:{database}:{}",
-        schemaic_core::schema::display_name(t.schema.as_deref(), &t.name)
+    table_key_named(
+        database,
+        &schemaic_core::schema::display_name(t.schema.as_deref(), &t.name),
     )
 }
 
+/// [`table_key`] for a caller that already has the displayed name — a
+/// `TableSource::display()`, or a database being collapsed wholesale.
+///
+/// Three sites used to format `tbl:{db}:{name}` inline, under a section headed
+/// "one place that builds every node's key". Each was correct, and each was a
+/// place the format could drift from the tests, which only ever exercised the
+/// builders.
+pub fn table_key_named(database: &str, table: &str) -> String {
+    format!("tbl:{database}:{table}")
+}
+
+/// The prefix every one of `database`'s table keys starts with — what
+/// "collapse this database" matches on.
+pub fn table_key_prefix(database: &str) -> String {
+    format!("tbl:{database}:")
+}
+
 fn column_key(database: &str, t: &TableInfo, column: &str) -> String {
-    format!(
-        "col:{database}:{}:{column}",
-        schemaic_core::schema::display_name(t.schema.as_deref(), &t.name)
+    column_key_named(
+        database,
+        &schemaic_core::schema::display_name(t.schema.as_deref(), &t.name),
+        column,
     )
+}
+
+/// [`column_key`] for a caller that already has the displayed table name.
+pub fn column_key_named(database: &str, table: &str, column: &str) -> String {
+    format!("col:{database}:{table}:{column}")
 }
 
 /// The namespaces to render as their own tree level, or empty when the tables
@@ -496,7 +519,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
             // Start from the active table whenever one is open and visible;
             // otherwise resume wherever the cursor last was.
             if let Some(src) = active_table.get_untracked() {
-                let k = format!("tbl:{}:{}", src.database, src.display());
+                let k = table_key_named(&src.database, &src.display());
                 let rows = visible_nav_rows(
                     db_nodes,
                     expanded,
@@ -1397,7 +1420,7 @@ fn column_row(
     let ctx_source = source.clone();
     let dbl_col = name.clone();
     let (database, table) = (source.database.clone(), source.display());
-    let nav_key = format!("col:{database}:{table}:{name}");
+    let nav_key = column_key_named(&database, &table, &name);
     // The glyph always reflects the column's *type* family — the key glyph is for
     // the key/index rows, not the columns they cover (so `id` is a numeric column,
     // and `PRIMARY(id)` is the key). Key membership only tints the row: a PK column
@@ -1922,6 +1945,27 @@ mod tests {
             column_key("shop", &tbl(None, "users"), "id"),
             "col:shop:users:id"
         );
+    }
+
+    #[test]
+    fn the_by_name_builders_agree_with_the_table_ones() {
+        // Three call sites formatted these keys inline — a focus handler with a
+        // `TableSource`, a column nav key, and the app's collapse-this-database
+        // prefix. Each was right, and each could drift, because the tests only
+        // ever ran the `TableInfo` builders. Now they share an implementation
+        // and this is what says so.
+        for t in [tbl(None, "users"), tbl(Some("sales"), "orders")] {
+            let display = schemaic_core::schema::display_name(t.schema.as_deref(), &t.name);
+            assert_eq!(table_key("shop", &t), table_key_named("shop", &display));
+            assert_eq!(
+                column_key("shop", &t, "id"),
+                column_key_named("shop", &display, "id")
+            );
+            // The collapse prefix must match the keys it is meant to drop.
+            assert!(table_key("shop", &t).starts_with(&table_key_prefix("shop")));
+        }
+        // …and must not match a database whose name merely starts the same way.
+        assert!(!table_key("shop", &tbl(None, "users")).starts_with(&table_key_prefix("sho")));
     }
 
     #[test]
