@@ -72,8 +72,11 @@ use crate::{
     ddl_preview, edit_field, theme,
 };
 
-const PANEL_W: f64 = 760.0;
-const PANEL_H: f64 = 640.0;
+/// Matches the table designer's, deliberately: this is the same list-plus-form
+/// layout over the same fixed-width list, so a different panel width squeezes
+/// the form pane and reads as the list being over-padded.
+const PANEL_W: f64 = 900.0;
+const PANEL_H: f64 = 620.0;
 const FIELD_W: f64 = 260.0;
 /// The body box's height before it scrolls.
 const BODY_ROWS: usize = 12;
@@ -508,6 +511,13 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize) -> AnyView {
                     mono: true,
                     multiline: true,
                     max_rows: Some(ui.ddl.view_rows),
+                    // Height from the *logical* line count, not the wrapped one.
+                    // Wrapped rows depend on the box's width, which isn't settled
+                    // on the first layout pass inside this flex row — so the box
+                    // opened at some tall guess and snapped down on first click.
+                    // Long SQL lines scrolling sideways is also what the editor
+                    // itself does by default.
+                    no_wrap: true,
                     ..Default::default()
                 },
                 |d, v| d.info.action = TriggerAction::Body(v.to_string()),
@@ -725,6 +735,10 @@ fn function_form(ui: Ui, target: &FunctionTarget) -> AnyView {
                 mono: true,
                 multiline: true,
                 max_rows: Some(ui.ddl.view_rows),
+                // As the trigger body above: logical lines, so the box hugs its
+                // content on the first frame instead of guessing from a width
+                // that hasn't settled.
+                no_wrap: true,
                 ..Default::default()
             },
             |d, v| d.info.body = v.to_string(),

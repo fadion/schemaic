@@ -766,10 +766,14 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             let n = triggers.len();
                             entries.push(
                                 MenuEntry::action(
+                                    // No ellipsis: every entry in this menu opens
+                                    // something, so it says nothing, and the count
+                                    // is the useful half. Bare when there are none
+                                    // — "(0)" reads as a broken count.
                                     if n == 0 {
-                                        "Triggers…".to_string()
+                                        "Triggers".to_string()
                                     } else {
-                                        format!("Triggers… ({n})")
+                                        format!("Triggers ({n})")
                                     },
                                     move || {
                                         crate::trigger_editor::open_for_table(
