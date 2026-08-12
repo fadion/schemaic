@@ -544,8 +544,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   executors call them: `GridWrite::plan` is the statement order and `one_row_verdict` is the
   per-statement verdict *and* its message — so neither can drift between MySQL and PostgreSQL, and
   a change to `affected != 1` fails a test rather than passing silently.
-- **Identifier scanning treats bytes `>= 0x80` as word bytes** so Unicode identifiers tokenize whole
-  (`is_word_byte`, `tokenize_range`, `syntax_errors`).
+- **Identifier scanning treats bytes `>= 0x80` as word bytes** so Unicode identifiers tokenize whole.
+  `sql::is_word_byte` (continues a word) and `sql::is_word_start` (begins one — `alphabetic`, since a
+  digit can't start a name) are the **only** definitions, next to `skip_noncode` because they answer
+  the other half of the same question: that one says where a token can't start, these say how far it
+  runs. Don't inline the predicate at a new scanner — there were four copies of each, no test
+  comparing them, and the rule had already been regressed and repaired once. `sql.rs` tests both over
+  all 256 byte values and asserts they differ on exactly the digits.
 - **Splitting `lib.rs` / `main.rs`:** grep the line range for interleaved unrelated `fn`s first; a
   helper still used by code that stays goes to `widgets.rs` (glob-imported), not the new leaf
   module; mark cross-called items `pub(crate)`; build + `cargo fmt` + smoke-launch each step.

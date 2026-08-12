@@ -101,6 +101,39 @@ fn scan_dollar(b: &[u8], i: usize) -> Option<usize> {
     Some(n) // unterminated → to end
 }
 
+/// Is this byte part of an identifier word?
+///
+/// **The one definition of architecture invariant 11** — *"identifier scanning
+/// treats bytes `>= 0x80` as word bytes so Unicode identifiers tokenize whole"*.
+/// It lives beside [`skip_noncode`] because it answers the other half of the same
+/// question: that one says where a token *can't* start, this one says how far a
+/// word runs.
+///
+/// It is one function rather than four because the invariant is stated in
+/// CLAUDE.md and was upheld by four private copies across two crates, each with
+/// its own comment restating the rule and no test comparing them — a fifth
+/// scanner written without the `>= 0x80` clause, or one of the four edited in
+/// isolation, would have reverted a documented invariant silently. The crate had
+/// already regressed and repaired it once before this was consolidated.
+///
+/// `>= 0x80` covers both UTF-8 lead *and* continuation bytes, so a name splits at
+/// no point inside a multi-byte character.
+pub fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+/// Can a word *start* here?
+///
+/// Deliberately not [`is_word_byte`]: a digit continues an identifier but can't
+/// begin one, or `1e5` and `2024_01` would scan as names. The `>= 0x80` half is
+/// the same invariant, and was hand-copied at four scanner sites — the reason
+/// this is a function is that the two rules differ by exactly one word
+/// (`alphanumeric` vs `alphabetic`), which is invisible when you are reading a
+/// copy rather than comparing two.
+pub fn is_word_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b >= 0x80
+}
+
 /// If `b[i..]` starts a string literal, quoted/backtick identifier, dollar-quoted
 /// string, or comment, return the index just past it; otherwise `None`. Boundary
 /// rules follow `dialect` (see the module docs): MySQL `\`-escapes every quote and
@@ -1442,5 +1475,54 @@ mod tests {
             v(&["", "   ", "-- just a note"], open_policy()),
             RunVerdict::Allow
         );
+    }
+
+    // ── The word-byte rule (architecture invariant 11) ────────────────────
+
+    #[test]
+    fn word_byte_rule_holds_over_every_byte_value() {
+        // Enumerated rather than sampled, because the invariant is about the
+        // whole byte range and the clause that gets dropped is always the same
+        // one: `>= 0x80`. Four copies of this predicate used to exist, none
+        // testing the others, and the crate has already regressed and repaired
+        // it once (the note in the completion layer says so).
+        for b in 0u8..=255 {
+            let expected = b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
+            assert_eq!(is_word_byte(b), expected, "byte {b:#04x}");
+        }
+    }
+
+    #[test]
+    fn a_digit_continues_a_word_but_cannot_start_one() {
+        // The one word of difference between the two predicates, pinned: without
+        // it `1e5` and `2024_01` scan as identifiers.
+        for b in b'0'..=b'9' {
+            assert!(is_word_byte(b), "{b:#04x}");
+            assert!(!is_word_start(b), "{b:#04x}");
+        }
+        // Everything else agrees, over the whole byte range.
+        for b in 0u8..=255 {
+            if !b.is_ascii_digit() {
+                assert_eq!(is_word_byte(b), is_word_start(b), "byte {b:#04x}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_unicode_identifier_is_one_word_not_several() {
+        // What the `>= 0x80` clause is *for*. Every byte of a multi-byte
+        // character — lead and continuation alike — must be a word byte, or the
+        // name splits at the first non-ASCII byte and the halves match nothing
+        // in the catalog.
+        for name in ["café", "日本語", "Ω", "naïve_column"] {
+            assert!(
+                name.as_bytes().iter().all(|&b| is_word_byte(b)),
+                "{name} split"
+            );
+        }
+        // …and the rule still stops at real boundaries.
+        for &b in b" .,()'`\"-;" {
+            assert!(!is_word_byte(b), "{:?} treated as a word byte", b as char);
+        }
     }
 }

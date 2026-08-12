@@ -967,11 +967,7 @@ pub fn is_sql_keyword(word: &str) -> bool {
 // guard on string/comment/backtick boundaries and yields absolute byte offsets,
 // which the AST (whose spans are still maturing) can't reliably provide.
 
-pub(crate) fn is_word_byte(b: u8) -> bool {
-    // `>= 0x80` = any UTF-8 lead/continuation byte, so Unicode identifiers count
-    // as one word instead of splitting at the first non-ASCII byte.
-    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
-}
+pub(crate) use crate::sql::{is_word_byte, is_word_start};
 
 /// Lightweight SQL token used by the context analysis (words + the punctuation
 /// that matters for it). Strings and comments are skipped by the tokenizer.
@@ -1098,7 +1094,7 @@ fn tokenize_range(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<T
             continue;
         }
         let c = b[i];
-        if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 {
+        if is_word_start(c) {
             let s = i;
             let mut j = i + 1;
             while j < hi && is_word_byte(b[j]) {
@@ -3795,7 +3791,7 @@ fn typo_checks(
             continue;
         }
         let c = b[i];
-        if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 {
+        if is_word_start(c) {
             let s = i;
             let mut j = i + 1;
             while j < hi && is_word_byte(b[j]) {
@@ -3838,7 +3834,7 @@ fn function_typo_checks(
             continue;
         }
         let c = b[i];
-        if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 {
+        if is_word_start(c) {
             let s = i;
             let mut j = i + 1;
             while j < hi && is_word_byte(b[j]) {

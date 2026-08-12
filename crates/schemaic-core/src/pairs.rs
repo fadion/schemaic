@@ -39,11 +39,8 @@ pub enum PairAction {
     Skip { caret: usize },
 }
 
-/// Word byte for adjacency guards — matches the crate convention that bytes
-/// `>= 0x80` are word bytes so Unicode identifiers count as whole words.
-fn is_word_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
-}
+/// Word byte for the adjacency guards — invariant 11's one definition.
+use crate::sql::is_word_byte;
 
 /// The role a typed character plays in the configured pair set, or `None` if it
 /// isn't a pair character in this dialect.
