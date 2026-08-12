@@ -91,6 +91,40 @@ pub fn inline_args(intent: &str, system: &str, model: &str) -> Vec<String> {
     ]
 }
 
+/// What the platform will accept as one spawned command line.
+///
+/// Windows' `CreateProcess` caps the **whole** command line at 32,767
+/// characters; the headroom is for the executable path and the quoting the
+/// runtime adds. Elsewhere the binding constraint is `MAX_ARG_STRLEN`, 128 KiB
+/// for any single argument — and the system prompt is a single argument.
+pub const fn arg_limit() -> usize {
+    if cfg!(windows) { 30_000 } else { 120 * 1024 }
+}
+
+/// Why this command line can't be spawned, or `None` if it can.
+///
+/// Called before the spawn because the failure it prevents is unrecognisable
+/// afterwards: the OS returns a generic error, and the app's handler says
+/// *"Ensure Claude Code is installed"* — the one cause that is definitely not
+/// the problem, sending the user to check an installation that is fine.
+///
+/// The message names the lever the user actually has. The system prompt carries
+/// the schema outline, and the AI schema scope is a setting.
+pub fn oversize_reason(args: &[String], limit: usize) -> Option<String> {
+    // Roughly what the OS sees: the arguments plus a separator each.
+    let total: usize = args.iter().map(|a| a.len() + 1).sum();
+    let longest = args.iter().map(String::len).max().unwrap_or(0);
+    if total <= limit && longest <= limit {
+        return None;
+    }
+    Some(format!(
+        "The context sent to Claude is too large for one command line \
+         ({total} characters; this platform allows about {limit}). Narrow \
+         Settings → AI → schema scope to the active database (or None), or \
+         shorten the query in the editor."
+    ))
+}
+
 /// Build a legible error message for a failed one-shot `claude` invocation.
 ///
 /// The CLI writes some fatal errors — notably `Failed to authenticate: OAuth
@@ -661,5 +695,32 @@ mod tests {
         };
         assert_eq!(name, "run_query");
         assert_eq!(sql.as_deref(), Some("SELECT 9"));
+    }
+
+    #[test]
+    fn an_ordinary_command_line_is_not_refused() {
+        let args = build_session_args("a system prompt", Some("haiku"), None, None, &[]);
+        assert_eq!(oversize_reason(&args, arg_limit()), None);
+    }
+
+    #[test]
+    fn an_oversize_prompt_is_refused_with_the_setting_that_fixes_it() {
+        // Not "Ensure Claude Code is installed", which is what the OS error
+        // becomes if this isn't caught, and which sends the user to check an
+        // installation that is fine.
+        let huge = "x".repeat(40_000);
+        let args = build_session_args(&huge, None, None, None, &[]);
+        let why = oversize_reason(&args, 30_000).expect("must refuse");
+        assert!(why.contains("schema scope"), "{why}");
+        assert!(!why.contains("installed"), "{why}");
+    }
+
+    #[test]
+    fn one_oversize_argument_is_refused_even_when_the_total_fits() {
+        // The system prompt is a *single* argument, and that is what Linux caps
+        // at `MAX_ARG_STRLEN` — a total-only check would pass and the spawn
+        // would still fail.
+        let args = vec!["-p".to_string(), "y".repeat(200)];
+        assert!(oversize_reason(&args, 150).is_some());
     }
 }
