@@ -5288,17 +5288,14 @@ fn data_cell(
                                 // Right-align the editor to match the right-aligned
                                 // numeric display, so entering edit mode doesn't jump
                                 // the value to the left. Floem's text_input has no
-                                // text-align, so pad the left by exactly the free space
-                                // — the buffer's *measured* width (re-runs as the buffer
+                                // text-align, so pad the left by the free space — the
+                                // buffer's *measured* width (re-runs as the buffer
                                 // changes, keeping it right-anchored while typing). A
                                 // value wider than the column clamps to `pad_left = 0`
                                 // (full width, left-aligned + clip) like the display.
                                 let w = gs.widths.with(|ws| ws.get(ci).copied().unwrap_or(CELL_W));
                                 let text_px = gs.edit_buf.with(|b| measure_text_px(b));
-                                // Cell content box = column width minus the cell's 10px
-                                // horizontal padding on each side.
-                                let pad_left = ((w - 20.0) - text_px).max(0.0);
-                                s.padding_left(pad_left)
+                                s.padding_left(numeric_edit_pad_left(w, text_px))
                             } else {
                                 s
                             }
@@ -5614,11 +5611,11 @@ fn data_cell(
             // Right-aligned numeric cells get extra right padding (matching the
             // header) so the value clears the edge/border; text cells stay at 10px.
             let s = if numeric {
-                s.padding_left(10.0)
+                s.padding_left(GRID_PAD_H)
                     .padding_right(GRID_NUM_PAD_RIGHT)
                     .justify_end()
             } else {
-                s.padding_horiz(10.0).justify_start()
+                s.padding_horiz(GRID_PAD_H).justify_start()
             };
             let formatted = gs
                 .formats
@@ -5665,13 +5662,37 @@ fn data_cell(
             // otherwise the usual right divider so a narrow table still shows where
             // the final column ends.
             if generating {
-                s.border(1.0).border_color(theme::key_foreign())
+                s.border(GRID_CELL_DIVIDER)
+                    .border_color(theme::key_foreign())
             } else {
-                s.border_right(1.0).border_color(theme::border())
+                s.border_right(GRID_CELL_DIVIDER)
+                    .border_color(theme::border())
             }
         })
         // Clip so a value wider than the column doesn't spill over neighbours.
         .clip()
+}
+
+/// Left padding that right-aligns `text_px` of text inside the in-place editor of
+/// a numeric cell `w` px wide — Floem 0.2 has no `text-align`, so the free space
+/// is padded rather than aligned (see the CLAUDE.md note).
+///
+/// **It must be computed from the cell's real content box**, which is the column
+/// width less the cell's own padding *and* its right divider — a border, so it
+/// comes out of the content too. This got it wrong by 5px (it assumed a plain
+/// 10px on both sides and no border), and 5px cost a whole character: floem sizes
+/// the input's inner text node to `content − padding_left`, clips the moment the
+/// text is a single pixel wider than that node, and clips on **glyph
+/// boundaries**. A 2-digit id showed one digit; a 1-digit id showed none at all.
+///
+/// `SLACK` keeps that cliff at arm's length. The measurement here and floem's own
+/// are the same layout of the same string, but the node width goes through an f32
+/// percentage resolution, and being a hair under is not a hair of clipping — it is
+/// a lost digit. Two pixels of slack is invisible against the value's right edge.
+fn numeric_edit_pad_left(w: f64, text_px: f64) -> f64 {
+    const SLACK: f64 = 2.0;
+    let content = w - GRID_PAD_H - GRID_NUM_PAD_RIGHT - GRID_CELL_DIVIDER;
+    (content - text_px - SLACK).max(0.0)
 }
 
 /// Compact row-count label: `1000 → 1k`, `1250 → 1.25k`, `1_000_000 → 1m`.
@@ -5871,6 +5892,50 @@ mod tests {
             is_null: RwSignal::new(false),
             flush: RwSignal::new(None),
         }
+    }
+
+    // ── The numeric cell's in-place editor (`numeric_edit_pad_left`) ──────
+
+    /// The width floem gives the input's inner text node: the cell's content box
+    /// less the padding we add. It clips the text — on a glyph boundary — the
+    /// moment the text is wider than this, so the padding must always leave room.
+    fn text_node_w(w: f64, pad_left: f64) -> f64 {
+        w - GRID_PAD_H - GRID_NUM_PAD_RIGHT - GRID_CELL_DIVIDER - pad_left
+    }
+
+    #[test]
+    fn a_numeric_edit_never_asks_for_more_width_than_the_cell_can_give() {
+        // The regression: the padding was computed against `w - 20` while the cell
+        // really offers `w - 10 - 14 - 1`, so the text node came out 5px short of
+        // the text every time. Clipping is glyph-quantised, so "99" showed "9" and
+        // "1" showed nothing at all.
+        for w in [MIN_COL_W, 60.0, 100.0, CELL_W, 420.0] {
+            for text_px in [0.0, 7.0, 14.0, 49.0, 120.0] {
+                let pad = numeric_edit_pad_left(w, text_px);
+                assert!(pad >= 0.0, "w={w} text={text_px}");
+                if pad > 0.0 {
+                    assert!(
+                        text_node_w(w, pad) >= text_px,
+                        "clipped: w={w} text={text_px} pad={pad}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_value_wider_than_its_column_is_left_aligned_and_clipped() {
+        // Same as the display: no room to right-align into, so start at the left
+        // edge and let floem clip to the caret.
+        assert_eq!(numeric_edit_pad_left(CELL_W, 400.0), 0.0);
+        assert_eq!(numeric_edit_pad_left(MIN_COL_W, 60.0), 0.0);
+    }
+
+    #[test]
+    fn a_short_value_is_pushed_right_to_meet_the_display_alignment() {
+        // 190 - 10 - 14 - 1 = 165 of content; a 14px value sits at the right edge
+        // (less the 2px of slack that keeps floem's clip off the boundary).
+        assert_eq!(numeric_edit_pad_left(CELL_W, 14.0), 149.0);
     }
 
     #[test]

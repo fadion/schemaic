@@ -719,8 +719,15 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
   fine — they never dispose.
 - **No `text-align` in Floem 0.2.** `text_input` paints at a fixed left origin, clips-to-cursor on
   overflow; `Style` only has `text_overflow`. To right-align an inline editor (numeric grid cells),
-  pad left by `col_w − measured_text_w` — measure with a throwaway `TextLayout` at `FONT_BODY` (same
-  global `FontSystem` → pixel-exact), recomputed reactively on the buffer (`grid::measure_text_px`).
+  pad left by the free space — measure with a throwaway `TextLayout` at `FONT_BODY` (same global
+  `FontSystem` → pixel-exact), recomputed reactively on the buffer (`grid::measure_text_px`).
+  **"Free space" is the cell's real content box** (`grid::numeric_edit_pad_left`, tested): the column
+  width less its padding *and* its 1px right divider, which is a border and so comes out of the
+  content too. Floem sizes the input's inner text node to `content − padding_left` and clips as soon
+  as the text is one pixel wider — **on a glyph boundary**, so a 5px error is a whole missing
+  character: a padding computed against `col_w − 20` showed one digit of a 2-digit id and *nothing*
+  for a 1-digit one. Leave a couple of px of slack; the node width goes through an f32 percentage
+  resolution, and landing a hair under the text width costs a digit, not a hair.
 - **SQL editor padding is a no-op; inset via a wrapper.** The editor is a scroll view — its own
   `padding_*` is ignored. Wrap it in a container carrying the border + padding (`editor_box`); the
   editor fills it flush. Top padding shifts the content origin, so `points_of_offset`-anchored
