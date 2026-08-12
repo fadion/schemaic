@@ -3935,6 +3935,10 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
     })
 }
 
+/// Box size of [`FieldCfg::trailing`]'s action — the icon's own 16px, so pinning
+/// the box doesn't move it horizontally.
+const TRAILING_SIZE: f64 = 16.0;
+
 /// A `fn`-pointer transparent background for [`FieldCfg::background`] (the
 /// Ctrl+K field, whose surface is owned by an animated outer container).
 pub(crate) fn bg_transparent() -> floem::peniko::Color {
@@ -4372,7 +4376,15 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     if multiline {
         let ed_rows = ed.clone();
         create_effect(move |_| {
-            ed_rows.viewport.track();
+            let vp = ed_rows.viewport.get();
+            // Not before the first layout. `EditorWidth` wrapping at a zero width
+            // puts every character on its own visual line, so measuring there
+            // reports one row per character and inflates the box — which then
+            // stays inflated until the next keystroke re-measures it. The width
+            // arriving is itself a viewport change, so this effect re-runs.
+            if vp.width() < 1.0 {
+                return;
+            }
             let n = ed_rows.last_vline().get() + 1;
             if rows.get_untracked() != n {
                 rows.set(n);
@@ -4450,11 +4462,22 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     // and its text can never scroll underneath the ×.
     let inner: AnyView = if let Some(trailing) = trailing {
         // Trailing action (e.g. the AI send/stop icon) in-flow beside the editor,
-        // right-aligned and vertically centred — same spot as the clearable ×. The
-        // negative right margin pulls it 4px closer to the box edge (14px gap).
+        // right-aligned — same spot as the clearable ×. The negative right margin
+        // pulls it 4px closer to the box edge (14px gap).
+        //
+        // Fixed size, pinned to the **bottom**: a multiline box grows with its
+        // text, and an action that merely centred in it wandered down the box as
+        // the message got taller (and stretched with it). `align_self` overrides
+        // the row's `items_center` for this one child; at a single row the box is
+        // one line tall, so bottom and centre are the same place and nothing about
+        // the common case changes.
         let side = container(trailing()).style(|s| {
             s.flex_shrink(0.0_f32)
+                .width(TRAILING_SIZE)
+                .height(TRAILING_SIZE)
                 .items_center()
+                .justify_center()
+                .align_self(Some(floem::taffy::style::AlignItems::FlexEnd))
                 .margin_left(6.0)
                 .margin_right(-4.0)
         });
