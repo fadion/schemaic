@@ -14,7 +14,6 @@
 
 # Private working notes — kept local, never published.
 TODO.md
-user-gui-verify.md
 
 # Codebase-review working notes (plan, ledger, fact sheet). The reusable review
 # skills live in .claude/skills/ and ARE checked in; only the per-round output
