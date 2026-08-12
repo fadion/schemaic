@@ -10,6 +10,7 @@
 pub mod shell;
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
@@ -114,6 +115,8 @@ pub struct Terminal {
     master: Mutex<Box<dyn MasterPty + Send>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     notify: Arc<dyn Fn() + Send + Sync>,
+    /// Set by the reader thread when the PTY reaches EOF — see [`Terminal::has_exited`].
+    exited: Arc<AtomicBool>,
 }
 
 impl Terminal {
@@ -174,12 +177,14 @@ impl Terminal {
         let term: SharedTerm = Arc::new(FairMutex::new(term));
 
         // Reader thread: pump PTY bytes → VTE parser → grid, then notify.
+        let exited = Arc::new(AtomicBool::new(false));
         {
             let term = term.clone();
             let notify = notify.clone();
+            let exited = exited.clone();
             std::thread::Builder::new()
                 .name("schemaic-term-reader".into())
-                .spawn(move || read_loop(reader, term, notify))
+                .spawn(move || read_loop(reader, term, notify, exited))
                 .ok();
         }
 
@@ -189,7 +194,19 @@ impl Terminal {
             master: Mutex::new(pair.master),
             child: Mutex::new(child),
             notify,
+            exited,
         })
+    }
+
+    /// Has the child process ended?
+    ///
+    /// The parent drops its copy of the PTY slave at spawn precisely so the
+    /// reader hits EOF when the child closes its end — that EOF *is* the exit
+    /// signal, and the reader thread's final `notify` is what wakes a caller to
+    /// ask. Nothing here reaps or waits: a caller wanting the status still goes
+    /// through `child`.
+    pub fn has_exited(&self) -> bool {
+        self.exited.load(Ordering::Acquire)
     }
 
     /// Feed raw bytes (already VT-encoded) to the shell's stdin.
@@ -379,6 +396,7 @@ fn read_loop(
     mut reader: Box<dyn Read + Send>,
     term: SharedTerm,
     notify: Arc<dyn Fn() + Send + Sync>,
+    exited: Arc<AtomicBool>,
 ) {
     let mut parser: Processor = Processor::new();
     let mut buf = [0u8; 8192];
@@ -396,6 +414,9 @@ fn read_loop(
             }
         }
     }
+    // Ordered before the wake-up, so whoever the final `notify` brings round
+    // reads `true` rather than racing the store.
+    exited.store(true, Ordering::Release);
     notify();
 }
 
