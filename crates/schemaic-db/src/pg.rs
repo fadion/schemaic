@@ -51,7 +51,7 @@ use schemaic_core::model::{
     Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder,
     ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value, WriteStep, one_row_verdict,
 };
-use schemaic_core::schema::{ColumnInfo, DbSchema, IndexColumn, TableInfo, ViewOptions};
+use schemaic_core::schema::{CheckInfo, ColumnInfo, DbSchema, IndexColumn, TableInfo, ViewOptions};
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
@@ -736,7 +736,14 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
                     pg_get_expr(ad.adbin, ad.adrelid), \
                     a.attidentity, a.attgenerated, \
                     col_description(c.oid, a.attnum), \
-                    co.collname \
+                    co.collname, \
+                    EXISTS (SELECT 1 FROM pg_depend d \
+                            JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S' \
+                            WHERE d.classid = 'pg_class'::regclass \
+                              AND d.refclassid = 'pg_class'::regclass \
+                              AND d.refobjid = a.attrelid \
+                              AND d.refobjsubid = a.attnum \
+                              AND d.deptype IN ('a', 'i')) AS owns_sequence \
              FROM pg_attribute a \
              JOIN pg_class c ON c.oid = a.attrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -754,30 +761,24 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
     .into_iter()
     .map(|r| {
         let (ns, t, c) = (cell(&r, 0), cell(&r, 1), cell(&r, 2));
-        let identity = !cell(&r, 6).is_empty();
-        let generated = !cell(&r, 7).is_empty();
-        let default = r.get(5).cloned().flatten();
+        // The three mutually-exclusive ways a column gets a value, resolved in
+        // one tested place — the catalogue reports them in overlapping fields.
+        let a = pg_assignment(
+            r.get(5).cloned().flatten(),
+            &cell(&r, 6),
+            &cell(&r, 7),
+            cell(&r, 10) == "t",
+        );
         let column = ColumnInfo {
             primary_key: pk_set.contains(&(ns.clone(), t.clone(), c.clone())),
             name: c,
             type_name: cell(&r, 3),
             // `attnotnull` arrives over the text protocol as `t`/`f`.
             nullable: cell(&r, 4) != "t",
-            // A generated column's `pg_get_expr` *is* its expression, and it
-            // must not also be emitted as a DEFAULT.
-            generated: generated.then(|| default.clone().unwrap_or_default()),
-            default: default.clone().filter(|_| !generated && !identity),
-            // Both an identity column and a `serial` (a default of
-            // `nextval(...)`) are server-assigned; the designer treats them the
-            // same way, so both land here.
-            auto_increment: identity
-                || default
-                    .as_deref()
-                    .is_some_and(|d| d.starts_with("nextval(")),
-            // …but they are *not* the same to a writer: `attidentity = 'a'`
-            // (`GENERATED ALWAYS`) rejects an explicit value, where `'d'`
-            // (`BY DEFAULT`) and `serial` accept one.
-            identity_always: cell(&r, 6) == "a",
+            generated: a.generated,
+            default: a.default,
+            auto_increment: a.auto_increment,
+            identity_always: a.identity_always,
             comment: r.get(8).cloned().flatten(),
             collation: r.get(9).cloned().flatten(),
             on_update: None,
@@ -903,9 +904,31 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
         tables.extend(schema.tables);
     }
 
-    // Post-fold enrichment: the two things `assemble_schema` can't carry because
+    // CHECK constraints. `pg_get_constraintdef` re-prints the predicate from its
+    // parse tree and returns the whole clause (`CHECK ((total >= 0))`), which
+    // `ddl::check_predicate` reduces to the bare predicate the model stores.
+    //
+    // `contype = 'c'` is only user checks: PostgreSQL 17 records a NOT NULL
+    // constraint here too, under `'n'`, and `conislocal` keeps an inherited
+    // constraint from being restated on the child that merely inherits it.
+    let check_all = query_all(
+        &client,
+        &format!(
+            "SELECT n.nspname, c.relname, con.conname, pg_get_constraintdef(con.oid) \
+             FROM pg_constraint con \
+             JOIN pg_class c ON c.oid = con.conrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE con.contype = 'c' AND con.conislocal AND {} \
+             ORDER BY n.nspname, c.relname, con.conname",
+            user_schema_filter("n.nspname")
+        ),
+    )
+    .await?;
+
+    // Post-fold enrichment: the things `assemble_schema` can't carry because
     // MySQL has no equivalent — an index's backing constraint, and each foreign
-    // key's referential actions.
+    // key's referential actions — plus the checks, which it has no field for on
+    // either engine's row shape.
     let idx_constraints: HashMap<(String, String, String), String> = idx_all
         .iter()
         .filter_map(|r| {
@@ -927,6 +950,20 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
         if t.is_view {
             t.view_options = view_options.get(&(ns.clone(), t.name.clone())).cloned();
         }
+        t.check_constraints = check_all
+            .iter()
+            .filter(|r| cell(r, 0) == ns && cell(r, 1) == t.name)
+            .map(|r| CheckInfo {
+                name: cell(r, 2),
+                expression: schemaic_core::ddl::check_predicate(
+                    &cell(r, 3),
+                    schemaic_core::intel::SqlDialect::Postgres,
+                ),
+                // PostgreSQL has no `NOT ENFORCED`; its `NOT VALID` exempts only
+                // the rows already there, which can't change what a write does.
+                enforced: true,
+            })
+            .collect();
         for ix in &mut t.indexes {
             ix.constraint = idx_constraints
                 .get(&(ns.clone(), t.name.clone(), ix.name.clone()))
@@ -970,6 +1007,57 @@ pub(crate) fn pg_view_options(relkind: &str, reloptions: &str) -> ViewOptions {
         }
     }
     out
+}
+
+/// How a column is assigned a value when the writer doesn't give one: the three
+/// model fields PostgreSQL spreads across four catalogue signals.
+pub(crate) struct Assignment {
+    pub default: Option<String>,
+    pub generated: Option<String>,
+    pub auto_increment: bool,
+    pub identity_always: bool,
+}
+
+/// Fold `pg_get_expr(adbin)` / `attidentity` / `attgenerated` / sequence
+/// ownership into [`Assignment`].
+///
+/// Pure because the three ways a column gets a value are mutually exclusive in
+/// the SQL that restates them, while the catalogue reports them in overlapping
+/// fields — and naming two at once doesn't fail here, it fails later, in DDL the
+/// user is about to run.
+///
+/// * A **generated** column's default expression *is* its expression.
+/// * A **`serial`** is a sequence binding rendered as a `nextval` default. It is
+///   auto-increment, and carrying the default as well emits both halves of a
+///   pairing PostgreSQL rejects.
+/// * An **identity** column has no default at all; `'a'` (`ALWAYS`) additionally
+///   refuses an explicit value, where `'d'` and `serial` accept one.
+///
+/// `owns_sequence` — not the `nextval(` text — is what makes the second case a
+/// `serial`. A hand-written `DEFAULT nextval('shared')` over a sequence the
+/// column doesn't own is an ordinary default, and rewriting it as an identity
+/// would quietly swap a shared counter for a private one.
+pub(crate) fn pg_assignment(
+    default: Option<String>,
+    identity: &str,
+    generated: &str,
+    owns_sequence: bool,
+) -> Assignment {
+    let is_generated = !generated.is_empty();
+    let is_identity = !identity.is_empty();
+    // A sequence the column owns, bound through a default, is a `serial`.
+    let is_serial = !is_identity
+        && !is_generated
+        && owns_sequence
+        && default
+            .as_deref()
+            .is_some_and(|d| d.starts_with("nextval("));
+    Assignment {
+        generated: is_generated.then(|| default.clone().unwrap_or_default()),
+        default: default.filter(|_| !is_generated && !is_identity && !is_serial),
+        auto_increment: is_identity || is_serial,
+        identity_always: identity == "a",
+    }
 }
 
 /// One `pg_constraint.confdeltype`/`confupdtype` code as the SQL it stands for.
@@ -1555,6 +1643,69 @@ pub(crate) async fn refetch_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four catalogue signals fold into three model fields, and only one
+    /// combination per row is legal — so each is pinned rather than trusted.
+    #[test]
+    fn a_plain_default_stays_a_default() {
+        let a = pg_assignment(Some("0".into()), "", "", false);
+        assert_eq!(a.default.as_deref(), Some("0"));
+        assert_eq!(a.generated, None);
+        assert!(!a.auto_increment);
+        assert!(!a.identity_always);
+    }
+
+    /// A `serial` is one fact reported twice: the catalogue renders its sequence
+    /// binding as a `nextval` default *and* the sequence is owned by the column.
+    /// Carrying both wrote `DEFAULT nextval(…) GENERATED BY DEFAULT AS IDENTITY`
+    /// into a generated `CREATE TABLE`, which PostgreSQL rejects outright.
+    #[test]
+    fn a_serial_is_auto_increment_and_not_also_a_default() {
+        let a = pg_assignment(Some("nextval('t_id_seq'::regclass)".into()), "", "", true);
+        assert_eq!(a.default, None);
+        assert!(a.auto_increment);
+        // `serial` accepts an explicit value — only `GENERATED ALWAYS` refuses.
+        assert!(!a.identity_always);
+    }
+
+    /// The case that makes ownership the test rather than the `nextval` text: a
+    /// hand-written `DEFAULT nextval('shared')` over a sequence the column does
+    /// *not* own is an ordinary default. Reading it as auto-increment would drop
+    /// the shared sequence and silently give the column a private one.
+    #[test]
+    fn a_nextval_over_an_unowned_sequence_is_an_ordinary_default() {
+        let a = pg_assignment(
+            Some("nextval('shared_seq'::regclass)".into()),
+            "",
+            "",
+            false,
+        );
+        assert_eq!(
+            a.default.as_deref(),
+            Some("nextval('shared_seq'::regclass)")
+        );
+        assert!(!a.auto_increment);
+    }
+
+    /// `GENERATED ALWAYS AS IDENTITY` is the one form that *rejects* an explicit
+    /// value, which is what `is_server_assigned` turns on.
+    #[test]
+    fn the_two_identity_forms_are_told_apart() {
+        let always = pg_assignment(None, "a", "", true);
+        assert!(always.auto_increment && always.identity_always);
+        let by_default = pg_assignment(None, "d", "", true);
+        assert!(by_default.auto_increment && !by_default.identity_always);
+    }
+
+    /// A generated column's `pg_get_expr` *is* its expression, not a default —
+    /// emitting both is a syntax error.
+    #[test]
+    fn a_generated_expression_is_not_a_default() {
+        let a = pg_assignment(Some("(qty * price)".into()), "", "s", false);
+        assert_eq!(a.generated.as_deref(), Some("(qty * price)"));
+        assert_eq!(a.default, None);
+        assert!(!a.auto_increment);
+    }
 
     /// `check_option` is lifted out (it's a DDL clause on both engines); the
     /// rest is restated verbatim inside the `WITH (…)` it came from.

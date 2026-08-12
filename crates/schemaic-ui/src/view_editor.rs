@@ -38,7 +38,10 @@ use crate::widgets::{
     FORM_GAP, footer_button, form_section, form_setting, form_setting_owned, modal_footer_split,
     modal_title_owned, panel_style,
 };
-use crate::{DdlPreview, FieldCfg, Ui, ViewTarget, ddl_preview, edit_field, theme};
+use crate::{
+    DdlPreview, FieldCfg, Ui, ViewAlgoDoneFn, ViewAlgoRequest, ViewTarget, ddl_preview, edit_field,
+    theme,
+};
 
 const PANEL_W: f64 = 760.0;
 const PANEL_H: f64 = 620.0;
@@ -75,6 +78,12 @@ pub(crate) fn open_for_view(ui: &Ui, database: &str, schema: Option<&str>, view:
         return;
     };
     let ctx = edit_ctx(ui);
+    let needs_algorithm = ctx.dialect != SqlDialect::Postgres
+        && info
+            .view_options
+            .as_ref()
+            .is_some_and(|o| o.algorithm.is_none());
+    let view_name = info.name.clone();
     open_editor(
         ui,
         ViewTarget {
@@ -86,6 +95,52 @@ pub(crate) fn open_for_view(ui: &Ui, database: &str, schema: Option<&str>, view:
             read_only: ctx.read_only,
         },
         draft,
+    );
+    if needs_algorithm {
+        fetch_algorithm(ui, ctx.conn_id, database.to_string(), view_name);
+    }
+}
+
+/// Fill in the `ALGORITHM` MySQL 8 keeps out of `information_schema`, once the
+/// editor is already open.
+///
+/// Both sides of the diff are patched, and that's the whole subtlety: writing it
+/// only into the draft would make every MySQL 8 view open *already changed*,
+/// since the introspected `current` it's compared against still said `None`.
+/// The draft is left alone if the user has already chosen an algorithm — the
+/// round-trip lands in milliseconds, but "unlikely" isn't a reason to overwrite
+/// what somebody typed.
+fn fetch_algorithm(ui: &Ui, conn_id: u64, database: String, view: String) {
+    let d = ui.ddl;
+    let generation = d.generation.get_untracked();
+    let done: ViewAlgoDoneFn = Rc::new(move |algo: Option<String>| {
+        // The modal can be closed, or reopened on another view, before this
+        // lands — same rule the apply callback follows.
+        if algo.is_none() || d.generation.get_untracked() != generation {
+            return;
+        }
+        d.view.update(|t| {
+            if let Some(o) = t
+                .as_mut()
+                .and_then(|t| t.current.as_mut())
+                .and_then(|c| c.view_options.as_mut())
+            {
+                o.algorithm = algo.clone();
+            }
+        });
+        d.view_draft.update(|dr| {
+            if dr.options.algorithm.is_none() {
+                dr.options.algorithm = algo.clone();
+            }
+        });
+    });
+    (ui.schema_actions.view_algorithm)(
+        ViewAlgoRequest {
+            conn_id,
+            database,
+            view,
+        },
+        done,
     );
 }
 
