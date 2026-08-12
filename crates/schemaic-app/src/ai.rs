@@ -744,7 +744,10 @@ pub(crate) fn active_tab_database(p: AiContextParams, fallback: Option<&str>) ->
 
 /// Pure core of [`active_tab_database`]: the tab's `(conn_id, database)` pair
 /// yields a database only when the connection matches; anything else falls back.
-fn scoped_database(
+///
+/// Also used by the terminal's DB-CLI button, which has the same question and
+/// the same way of getting it wrong.
+pub(crate) fn scoped_database(
     tab: Option<(u64, Option<String>)>,
     active_conn: u64,
     fallback: Option<&str>,
