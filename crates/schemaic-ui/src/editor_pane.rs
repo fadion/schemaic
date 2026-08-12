@@ -1687,6 +1687,27 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let ed_cursor = ed.clone(); // mirror caret offset out for the status bar
     let ed_goto = ed.clone(); // Ctrl+G go-to-line: move caret + centre
     let ed_jump = ed.clone(); // status-bar warning count: jump to first warning
+    let ed_mount = ed.clone(); // take focus once this pane is on screen
+
+    // Focus the editor as soon as the pane exists — typing after opening a tab
+    // should go into the query, not nowhere.
+    //
+    // One place covers every route because `center` rebuilds this pane whenever the
+    // active tab changes: opening a tab, switching to one, restoring the session,
+    // and each way the schema tree reaches a tab (double-click, Open, Open in new
+    // tab, Find Anywhere). None of those callers has to remember to ask, and a new
+    // one gets it for free.
+    //
+    // Deferred a tick, as `edit_field`'s autofocus is: the request has to land
+    // after the view is mounted, or it is set on a view not yet in the tree and
+    // dropped. The caret is wherever a fresh editor puts it — offset 0, i.e. line
+    // 1, col 1.
+    floem::action::exec_after(std::time::Duration::ZERO, move |_| {
+        // The tab can be closed inside the same tick that opened it.
+        if let Some(Some(vid)) = ed_mount.editor_view_id.try_get_untracked() {
+            vid.request_focus();
+        }
+    });
 
     // Mirror the caret's byte offset into the tab's `cursor_offset` signal so the
     // status bar can render Ln/Col. Tracks `ed.cursor`, so it fires on every caret
