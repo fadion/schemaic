@@ -40,7 +40,7 @@ use schemaic_core::model::{
 use schemaic_core::rowjson::{self, ColSpec};
 use schemaic_core::schema::{DbSchema, ForeignKeyInfo, SchemaState, TableInfo, TableSource};
 use schemaic_core::summary;
-use schemaic_core::text::plural;
+use schemaic_core::text::{hides_detail, plural};
 use schemaic_core::text_ops::contains_ignore_ascii_case;
 use schemaic_core::tx::{WRITE_WAIT_MS, WaitNote, write_wait_note};
 
@@ -401,7 +401,9 @@ struct GridState {
     /// own path, not the staged `dirty` batch).
     edit_row_open: RwSignal<bool>,
     edit_row_di: RwSignal<Option<usize>>,
-    edit_row_err: RwSignal<Option<String>>,
+    /// True while this panel's Save is in flight. Its *errors* have no signal of
+    /// their own — they share `commit_err`, the panel-level bar (see the status
+    /// line in `edit_row_panel`).
     edit_row_saving: RwSignal<bool>,
 }
 
@@ -524,7 +526,6 @@ impl GridState {
             seed_buf: RwSignal::new(String::new()),
             edit_row_open: RwSignal::new(false),
             edit_row_di: RwSignal::new(None),
-            edit_row_err: RwSignal::new(None),
             edit_row_saving: RwSignal::new(false),
         }
     }
@@ -1850,15 +1851,10 @@ pub(crate) fn grid_error_bar(
         // the top); the full text stays available in the View modal.
         let one_line = msg.split_whitespace().collect::<Vec<_>>().join(" ");
         let full = msg;
-        h_stack((
-            text(one_line).style(|s| {
-                s.color(theme::reject_text())
-                    .font_size(theme::FONT_BODY)
-                    .max_width_pct(80.0)
-                    .text_ellipsis()
-                    .margin_left(8.0)
-            }),
-            empty().style(|s| s.flex_grow(1.0_f32)),
+        // View only when the bar is hiding something — a server error with a
+        // DETAIL under it. On a short one-liner (a JSON parse error, a NOT-NULL
+        // rejection) it opens a modal repeating the same words.
+        let view: AnyView = if hides_detail(&full, BAR_ONE_LINE_CHARS) {
             text("View")
                 .on_click_stop(move |_| {
                     error_text.set(Some(full.clone()));
@@ -1868,7 +1864,21 @@ pub(crate) fn grid_error_bar(
                     s.color(theme::err_fix_btn())
                         .font_size(theme::FONT_BODY)
                         .margin_right(8.0)
-                }),
+                })
+                .into_any()
+        } else {
+            empty().into_any()
+        };
+        h_stack((
+            text(one_line).style(|s| {
+                s.color(theme::reject_text())
+                    .font_size(theme::FONT_BODY)
+                    .max_width_pct(80.0)
+                    .text_ellipsis()
+                    .margin_left(8.0)
+            }),
+            empty().style(|s| s.flex_grow(1.0_f32)),
+            view,
         ))
         .style(|s| {
             s.flex_row()
@@ -1892,6 +1902,13 @@ pub(crate) fn grid_error_bar(
         }
     })
 }
+
+/// Roughly how many characters of a message the error bar shows before it
+/// ellipsizes — the threshold for offering **View**. Approximate on purpose: the
+/// bar is as wide as the results panel, so the exact figure moves with the
+/// window, and the messages this decides between (a parse error against a
+/// multi-line server error) are nowhere near each other in length.
+const BAR_ONE_LINE_CHARS: usize = 90;
 
 /// The wait-note half of [`grid_error_bar`]: the sentence, and — when there is
 /// exactly one candidate — the button that ends it.
@@ -2480,8 +2497,12 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         find_pos.set(pos);
     });
 
-    // Max pixel height of the row-panel field list before it scrolls (≈half the
-    // results area), derived from the area height on the root `on_resize` below.
+    // Max pixel height of the **whole** row panel — header, fields and status —
+    // derived from the results-area height on the root `on_resize` below. It caps
+    // the panel rather than just its list because the list is only one of three
+    // children: capping the list let the chrome push the panel past the area, and
+    // the overflow is what clipped the last fields (their scroll viewport ran off
+    // the bottom, so scrolling could never bring them into view).
     let edit_row_max = RwSignal::new(320usize);
     // Wrap the grid so a 2px identity-colour rule can pin to its top edge (right
     // below the toolbar) without taking layout space — the "prominent colour"
@@ -2490,12 +2511,17 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         grid,
         crate::conn_edge_border(connections, active_conn, true),
     ))
-    .style(|s| {
+    .style(move |s| {
         s.flex_grow(1.0_f32)
             .flex_basis(0.0)
             .width_full()
             .flex_col()
-            .min_height(120.0)
+            // The row panel is allowed to squeeze the table: while it's open the
+            // user is editing a row, not reading the grid. Holding the floor here
+            // is what made the panel's share unsatisfiable — flexbox honours a
+            // min-height over a sibling's size, so the panel overflowed the area
+            // instead of the grid giving way.
+            .min_height(if gs.edit_row_open.get() { 0.0 } else { 120.0 })
             .min_width(0.0)
     });
     v_stack((
@@ -2506,8 +2532,11 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         edit_row_panel(gs, edit_row_max),
     ))
     .on_resize(move |r| {
-        // The row-panel field list caps at ~half the results area, then scrolls.
-        let cap = (r.height() * 0.5).max(160.0) as usize;
+        // The row panel may cover up to 70% of the results area, then its field
+        // list scrolls. Floored so a short window still shows a few fields, and
+        // ceilinged so the toolbar above it always has somewhere to sit.
+        let h = r.height();
+        let cap = (h * 0.70).max(140.0).min((h - 60.0).max(0.0)) as usize;
         if edit_row_max.get_untracked() != cap {
             edit_row_max.set(cap);
         }
@@ -2700,7 +2729,7 @@ fn row_colspecs(gs: GridState, di: usize) -> Vec<ColSpec> {
 /// `edit_row_open` (the caller owns opening).
 fn load_edit_row(gs: GridState, di: usize) {
     gs.edit_row_di.set(Some(di));
-    gs.edit_row_err.set(None);
+    gs.commit_err.set(None);
 }
 
 fn open_edit_row(gs: GridState, di: usize) {
@@ -2764,7 +2793,7 @@ fn commit_row_update(
     let changes = match rowjson::update_changes(cols, &state) {
         Ok(c) => c,
         Err(msg) => {
-            gs.edit_row_err.set(Some(msg));
+            gs.commit_err.set(Some(msg));
             return;
         }
     };
@@ -2787,7 +2816,7 @@ fn commit_row_update(
     let refetch = gs.build_row_refetch(di, &changes);
     gs.edit_row_saving.set(true);
     gs.commit_busy.set(true);
-    gs.edit_row_err.set(None);
+    gs.commit_err.set(None);
     arm_wait_note(gs);
     let done: Rc<dyn Fn(CommitDone)> = Rc::new(move |outcome| {
         gs.commit_busy.set(false);
@@ -2799,7 +2828,7 @@ fn commit_row_update(
                 gs.edit_row_open.set(false);
             }
             CommitDone::FullReran => gs.edit_row_open.set(false),
-            CommitDone::Failed(msg) => gs.edit_row_err.set(Some(msg)),
+            CommitDone::Failed(msg) => gs.commit_err.set(Some(msg)),
         }
     });
     (commit)(write, refetch, done);
@@ -3612,7 +3641,7 @@ fn json_row_view(
 /// Every committed edit re-serialises the tree back into the field buffer, so Save
 /// writes the updated JSON. Falls back to a raw-text field if the value isn't valid
 /// JSON.
-fn json_editor(f: FieldSig) -> AnyView {
+fn json_editor(f: FieldSig, sink: RwSignal<Option<String>>) -> AnyView {
     let Ok(root) = JsonNode::parse(&f.buf.get_untracked()) else {
         // The raw fallback is bound straight to `f.buf`, so there is nothing to
         // flush — and leaving a previous editor's flush installed would call into
@@ -3635,6 +3664,30 @@ fn json_editor(f: FieldSig) -> AnyView {
     let editing: RwSignal<Option<Vec<PathSeg>>> = RwSignal::new(None);
     let edit_buf = RwSignal::new(String::new());
     let err: RwSignal<Option<String>> = RwSignal::new(None);
+
+    // The message goes to the panel-level bar (`sink`), which is pinned to the
+    // bottom of the panel and can't be scrolled away from — this editor used to
+    // render it inline, which on a nested value put it several scrolls down from
+    // the Save that failed. The signal stays local because the *box* keeps a red
+    // outline: the bar says what went wrong, the outline says which field.
+    //
+    // `pushed` is what was last handed over, so clearing takes back only our own
+    // message — by then the bar may be showing a failed write instead.
+    let pushed: RwSignal<Option<String>> = RwSignal::new(None);
+    create_effect(move |_| {
+        let now = err.get();
+        match &now {
+            Some(msg) => sink.set(Some(msg.clone())),
+            None => {
+                if pushed.get_untracked().is_some()
+                    && sink.get_untracked() == pushed.get_untracked()
+                {
+                    sink.set(None);
+                }
+            }
+        }
+        pushed.set(now);
+    });
 
     // Commit the currently-edited leaf: parse the JSON scalar, write it into the
     // tree, re-serialise into the field buffer. Invalid JSON shows an inline error
@@ -3714,24 +3767,21 @@ fn json_editor(f: FieldSig) -> AnyView {
     )
     .style(|s| s.width_full());
 
-    let err_view = dyn_container(
-        move || err.get(),
-        move |e| match e {
-            Some(msg) => text(msg)
-                .style(|s| s.font_size(13.0).color(theme::conn_delete()))
-                .into_any(),
-            None => empty().into_any(),
-        },
-    );
-
-    v_stack((rows_view, err_view))
-        .style(|s| {
+    container(rows_view)
+        .style(move |s| {
+            // Red outline while this value's pending edit won't parse — the bar
+            // carries the words, this says where they came from. It outlives a
+            // dismissed bar on purpose: the field is still invalid.
+            let border = if err.get().is_some() {
+                theme::error()
+            } else {
+                theme::border()
+            };
             s.width_full()
                 .flex_col()
-                .gap(2.0)
                 .padding(6.0)
                 .border(1.0)
-                .border_color(theme::border())
+                .border_color(border)
                 .border_radius(6.0)
                 .background(theme::bg_editor())
         })
@@ -3741,9 +3791,9 @@ fn json_editor(f: FieldSig) -> AnyView {
 /// A JSON-typed editable field: the tree editor, wrapped (for a nullable column) in
 /// the same NULL toggle as scalar fields. Activating a NULL field seeds an empty
 /// object so the tree has something to edit.
-fn json_field(nullable: bool, f: FieldSig) -> AnyView {
+fn json_field(nullable: bool, f: FieldSig, sink: RwSignal<Option<String>>) -> AnyView {
     if !nullable {
-        return json_editor(f);
+        return json_editor(f, sink);
     }
     dyn_container(
         move || f.is_null.get(),
@@ -3768,7 +3818,7 @@ fn json_field(nullable: bool, f: FieldSig) -> AnyView {
                 .on_double_click_stop(move |_| enable())
                 .into_any()
             } else {
-                json_editor(f)
+                json_editor(f, sink)
             }
         },
     )
@@ -3806,7 +3856,7 @@ fn field_row(
     let editor = if !editable {
         readonly_value(f)
     } else if is_json {
-        json_field(nullable, f)
+        json_field(nullable, f, gs.commit_err)
     } else {
         scalar_editor(gs, nullable, autofocus, f)
     };
@@ -3962,30 +4012,40 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                     .padding_horiz(10.0)
             });
 
-            // The field list scrolls (app-standard auto-hiding bars) once it exceeds
-            // the pixel cap (~half the results area). The scroll spans the full panel
-            // width so its bar sits at the standard edge inset; the row content keeps
-            // its 10px horizontal padding *inside* the scroll.
+            // The field list scrolls (app-standard auto-hiding bars) once the panel
+            // hits its cap. The scroll spans the full panel width so its bar sits at
+            // the standard edge inset; the row content keeps its 10px horizontal
+            // padding *inside* the scroll.
+            //
+            // `min_height(0)` is what makes the cap work: a flex child defaults to a
+            // content-sized minimum, so a long field list refuses to shrink and the
+            // panel grows past its own max — which is exactly the clipping this is
+            // meant to prevent. With it, the list yields and scrolls instead.
             let fields = autohide(scroll(
                 v_stack_from_iter(rows).style(|s| s.width_full().flex_col().padding_horiz(10.0)),
             ))
-            .style(move |s| s.width_full().max_height(max_rows.get() as f64));
+            .style(|s| s.width_full().min_height(0.0));
 
-            // Status line: the validation/DB error, or — while the save is in
-            // flight — that it is. Save commits over the network and can queue
-            // behind another session's lock, so without this the ✓ looks dead.
-            // (What the wait is, once it's long enough to have a cause worth
-            // naming, is the panel-level bar's job — see `arm_wait_note`.)
+            // Status line: that a save is in flight. Save commits over the network
+            // and can queue behind another session's lock, so without this the ✓
+            // looks dead. (What the wait is, once it's long enough to have a cause
+            // worth naming, is the panel-level bar's job — see `arm_wait_note`.)
+            //
+            // Errors are NOT here. A failure used to render inline, underneath the
+            // field it came from — which on a JSON column meant inside a nested
+            // container, several scrolls down, so a save that didn't happen looked
+            // like a save that did nothing. They go to `commit_err` instead: the
+            // same red bar, pinned to the bottom of the panel, that a grid commit
+            // failure uses. It is the same class of message — this write didn't
+            // happen, here's why — and it can't be scrolled away from.
             let err_line = dyn_container(
-                move || (gs.edit_row_err.get(), gs.edit_row_saving.get()),
-                move |(e, saving)| match (e, saving) {
-                    (Some(msg), _) => text(msg)
-                        .style(|s| s.font_size(theme::FONT_LABEL).color(theme::conn_delete()))
-                        .into_any(),
-                    (None, true) => {
+                move || gs.edit_row_saving.get(),
+                move |saving| {
+                    if saving {
                         loading_dots("Saving", theme::text_dim, theme::FONT_LABEL).into_any()
+                    } else {
+                        empty().into_any()
                     }
-                    (None, false) => empty().into_any(),
                 },
             )
             .style(|s| s.width_full().padding_horiz(10.0));
@@ -3995,9 +4055,22 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
             // children (not here) so the field scroll can span full-width and pin its
             // bar to the edge. Escape closes it (handled at the results-area level).
             v_stack((head, fields, err_line))
-                .style(|s| {
+                // A click anywhere in the panel dismisses the error bar, the same
+                // way a click on the grid does (`dismiss_overlays` is on the cell /
+                // gutter / header surfaces, which the panel isn't one of). Passive:
+                // fields, chevrons and Save all still get the event.
+                .on_event_cont(EventListener::PointerDown, move |_| gs.dismiss_overlays())
+                // The cap sits here rather than on the wrapper below, because this
+                // is the element whose children have to give way: over the cap, the
+                // column shrinks its shrinkable child — the field list, which has
+                // `min_height(0)` and scrolls — while the fixed header keeps its
+                // size. Capping the wrapper instead would leave this stack at its
+                // content height and clip it.
+                .style(move |s| {
                     s.width_full()
                         .flex_col()
+                        .min_height(0.0)
+                        .max_height(max_rows.get() as f64)
                         .gap(8.0)
                         .padding_vert(8.0)
                         .border_top(1.0)
@@ -4007,7 +4080,7 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
                 .into_any()
         },
     )
-    .style(|s| s.width_full().flex_shrink(0.0_f32))
+    .style(|s| s.width_full().flex_shrink(0.0_f32).min_height(0.0))
 }
 
 /// Discard all staged changes — cell edits, pending new rows, and pending row

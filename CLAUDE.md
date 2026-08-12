@@ -861,7 +861,20 @@ for keyboard nav.
   the old viewer; the grid above shrinks) rendering the row as a **structured, per-field editor**, one
   row per column, over `core::rowjson`. Header = `Row {gutter#} · {table}` + a Save (✓) icon (shown
   only when the result has ≥1 editable column; otherwise it's a read-only row viewer) then Close (✕);
-  an inline red line shows the validation/DB error. A scalar field is an `edit_field` bound straight
+  a "Saving…" line shows while a save is in flight. Its **errors are not inline** — they go to
+  `commit_err`, the same bottom bar a grid commit failure uses, because an inline message rendered
+  under the field it came from was, on a JSON column, nested several scrolls down, so a save that
+  didn't happen looked like one that did nothing. The JSON tree's own parse errors go the same way,
+  and it keeps a **red outline** on the box meanwhile: the bar says what, the outline says *which
+  field* — which is also why that editor still owns the error signal it mirrors into the bar (and
+  takes back only its own message). The bar's **View** is offered per `text::hides_detail`, i.e.
+  only when one-lining actually hid something; a parse error repeated verbatim in a modal is a
+  button that does nothing. The panel is capped at **70% of the results area**
+  (`edit_row_max`, measured on resize) and that cap sits on the panel's own column, so the field
+  list is what shrinks and scrolls; the grid above drops its `min_height` floor while the panel is
+  open, since flexbox honours a min-height over a sibling's size and the two together overflowed the
+  area — which is what clipped the last fields out of reach of their own scrollbar.
+  A scalar field is an `edit_field` bound straight
   to its `FieldSig::buf` with an explicit NULL toggle; a `json`/`jsonb` column gets the
   `core::jsontree` tree editor instead (click-to-edit leaves, collapsible containers, raw-text
   fallback for invalid JSON).
@@ -880,7 +893,8 @@ for keyboard nav.
   the `UPDATE` keys on the *original* row, but the re-fetch has to look for the key it just wrote.
   Because this path is separate from the staged batch, its splice un-stages **only its own** changed
   columns (`model::drop_committed`) — a green cell edit elsewhere in the grid is still unwritten.
-  State on `GridState`: `edit_row_open` / `edit_row_di` / `edit_row_err` / `edit_row_saving`. Real
+  State on `GridState`: `edit_row_open` / `edit_row_di` / `edit_row_saving` (errors have no signal
+  of their own — see `commit_err` above). Real
   rows only (a pending new row is filled via inline cells); Esc closes it (after the find bar).
 - **Inline edit writes back to the DB.** Per-column *provenance*: `schemaic-db` runs on
   **`mysql_async`** (sqlx's MySQL driver discards `org_table`/`org_name`/key flags), so each `Column`
