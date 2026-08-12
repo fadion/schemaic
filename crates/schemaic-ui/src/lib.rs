@@ -984,6 +984,13 @@ pub struct TermUi {
     /// Available shells + selected default (for the settings modal).
     pub shells: RwSignal<Vec<schemaic_term::ShellProfile>>,
     pub shell_selected: RwSignal<usize>,
+    /// The engine label when the terminal is holding a **DB CLI** session
+    /// (`schemaic_core::connection::engine_label`), `None` for an ordinary
+    /// shell. Shown beside the panel title: the terminal is the one panel not
+    /// bound to the active connection, so after switching connections a `mysql>`
+    /// prompt is still talking to the server it was opened on, with nothing
+    /// otherwise saying so.
+    pub db_label: RwSignal<Option<String>>,
     /// Terminal appearance/behaviour settings (persisted to `terminal.json`).
     pub font_size: RwSignal<u16>,
     pub copy_on_select: RwSignal<bool>,
@@ -3647,6 +3654,7 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
     let restart = ui.term_actions.restart.clone();
     let scroll_bottom = ui.term_actions.scroll_bottom.clone();
     let open_cli = ui.tab_actions.open_db_cli.clone();
+    let db_label = ui.term.db_label;
     let font_size = ui.term.font_size;
     let copy_on_select = ui.term.copy_on_select;
     let cursor_style = ui.term.cursor_style;
@@ -3669,7 +3677,35 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
     );
     let icons_group = h_stack((db_cli_btn, restart_btn, gear))
         .style(|s| s.flex_row().items_start().flex_shrink(0.0_f32));
-    let title_row = h_stack((section_title("TERMINAL"), icons_group))
+    // The engine, but only while this is a DB CLI session — see `TermUi::db_label`.
+    // `section_title`'s own 12px right padding is the gap; the matching vertical
+    // padding lines the two up without depending on either font's line height.
+    // Grouped WITH the title rather than added to the row: `justify_between` over
+    // three children would strand it in the middle of the panel.
+    //
+    // Family + size are stated rather than inherited: this row sits directly above
+    // a monospace surface, and the badge is chrome, so it matches the title beside
+    // it. One step dimmer than that title (`text_faint` against its `text_muted`)
+    // and unbolded — it answers a question the user only asks after switching
+    // connections, and shouldn't compete with the panel's name the rest of the time.
+    let engine = dyn_container(
+        move || db_label.get(),
+        move |label| match label {
+            Some(l) => text(l)
+                .style(|s| {
+                    s.font_size(theme::FONT_TITLE)
+                        .font_family("IBM Plex Sans".to_string())
+                        .color(theme::text_faint())
+                        .padding_vert(8.0)
+                })
+                .into_any(),
+            None => empty().into_any(),
+        },
+    )
+    .style(|s| s.flex_shrink(0.0_f32));
+    let title_group = h_stack((section_title("TERMINAL"), engine))
+        .style(|s| s.flex_row().items_start().min_width(0.0));
+    let title_row = h_stack((title_group, icons_group))
         .style(|s| s.width_full().flex_row().items_start().justify_between());
 
     // Rebuilds on a snapshot change or a font-size change (the latter re-lays

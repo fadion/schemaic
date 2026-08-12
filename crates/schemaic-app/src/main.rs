@@ -4411,6 +4411,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             .map_err(|e| tracing::error!("terminal spawn failed: {e}"))
             .ok(),
     ));
+    // Which engine the terminal is a CLI for, or `None` for an ordinary shell —
+    // the panel title's badge. Every respawn sets it (this one starts a shell),
+    // since a session is only ever replaced, never layered.
+    let term_db_label: RwSignal<Option<String>> = RwSignal::new(None);
 
     // Re-snapshot on a notify tick, focus change, cursor-style change, or blink
     // phase. The cursor shows only while focused (and, if blinking, on-phase); a
@@ -4427,6 +4431,12 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             let bake_block = matches!(style, TermCursor::Block);
             if let Some(t) = terminal.borrow().as_ref() {
                 term_screen.set(t.snapshot(cursor_on, bake_block));
+                // The DB-CLI badge outlives the session it names unless something
+                // notices the client quit (`\q`, `exit`). The reader thread's
+                // EOF-notify is that something, and it lands on this same tick.
+                if t.has_exited() && term_db_label.get_untracked().is_some() {
+                    term_db_label.set(None);
+                }
             }
         });
     }
@@ -4551,6 +4561,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             match schemaic_term::Terminal::spawn(&cfg, cols, rows, term_notify.clone()) {
                 Ok(t) => {
                     *terminal.borrow_mut() = Some(t);
+                    term_db_label.set(None); // back to a plain shell
                     (term_notify)();
                 }
                 Err(e) => tracing::error!("terminal restart failed: {e}"),
@@ -4599,6 +4610,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                             schemaic_term::Terminal::spawn(&cfg, cols, rows, term_notify.clone())
                         {
                             *terminal.borrow_mut() = Some(t);
+                            // A message, not a session — nothing to badge.
+                            term_db_label.set(None);
                             (term_notify)();
                         }
                         return;
@@ -4607,7 +4620,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             } else {
                 conn
             };
-            let cfg = if schemaic_core::connection::is_postgres(&conn.db_type) {
+            let built = if schemaic_core::connection::is_postgres(&conn.db_type) {
                 // The button on the terminal's toolbar passes no database, and
                 // psql needs one. Fall back to the focused tab's — but only when
                 // that tab is on this connection, or we'd name a database from
@@ -4619,17 +4632,22 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 });
                 let scoped = scoped_database(tab, active_conn.get_untracked(), None);
                 let target = psql_database(db.as_deref(), scoped.as_deref());
-                psql_shell(&conn, &target)
-                    .unwrap_or_else(|| message_shell("No psql client found (PATH or WSL)."))
+                psql_shell(&conn, &target).ok_or("No psql client found (PATH or WSL).")
             } else {
-                mysql_shell(&conn, db.as_deref()).unwrap_or_else(|| {
-                    message_shell("No mysql/mariadb client found (PATH or WSL).")
-                })
+                mysql_shell(&conn, db.as_deref())
+                    .ok_or("No mysql/mariadb client found (PATH or WSL).")
             };
+            // Badge the panel only for a session that really is a client. The
+            // no-client arm spawns a message instead, which is nobody's engine.
+            let label = built
+                .is_ok()
+                .then(|| schemaic_core::connection::engine_label(&conn.db_type));
+            let cfg = built.unwrap_or_else(message_shell);
             let (cols, rows) = term_dims.get();
             match schemaic_term::Terminal::spawn(&cfg, cols, rows, term_notify.clone()) {
                 Ok(t) => {
                     *terminal.borrow_mut() = Some(t);
+                    term_db_label.set(label);
                     (term_notify)();
                 }
                 Err(e) => tracing::error!("db cli spawn failed: {e}"),
@@ -4650,6 +4668,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             {
                 Ok(t) => {
                     *terminal.borrow_mut() = Some(t);
+                    term_db_label.set(None); // a shell profile, not a client
                     term_shell_selected.set(idx);
                     // Persist the whole prefs file (shell + appearance).
                     (save_term_prefs)();
@@ -4931,6 +4950,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             settings_open: term_settings_open,
             shells: term_shells,
             shell_selected: term_shell_selected,
+            db_label: term_db_label,
             font_size: term_font_size,
             copy_on_select: term_copy_on_select,
             cursor_style: term_cursor_style,

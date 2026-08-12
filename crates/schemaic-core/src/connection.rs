@@ -287,6 +287,22 @@ pub fn is_postgres(db_type: &str) -> bool {
         || t.eq_ignore_ascii_case("pg")
 }
 
+/// How to name a connection's engine on screen.
+///
+/// Normalises the PostgreSQL aliases [`is_postgres`] accepts onto the one label
+/// (a hand-edited `"pg"` shouldn't reach the user), and otherwise shows the label
+/// as saved — `MariaDB` is worth saying when that's what it is. An empty one
+/// predates the field, and everything from that era was MySQL.
+pub fn engine_label(db_type: &str) -> String {
+    if is_postgres(db_type) {
+        return "PostgreSQL".to_string();
+    }
+    match db_type.trim() {
+        "" => "MySQL".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// The default TCP port for a `db_type` label.
 ///
 /// Used both when the engine picker changes and as the fallback for a port field
@@ -383,6 +399,24 @@ mod tests {
         assert_eq!(t.auth, SshAuth::Password);
         assert_eq!(t.key_path, "");
         assert_eq!(t.key_passphrase, "");
+    }
+
+    #[test]
+    fn every_postgres_alias_is_shown_under_one_name() {
+        for label in ["PostgreSQL", "postgres", "PG", "  postgresql  "] {
+            assert_eq!(engine_label(label), "PostgreSQL", "{label}");
+        }
+    }
+
+    #[test]
+    fn a_mysql_family_label_is_shown_as_saved() {
+        // MariaDB is a different client and a different server; saying so is
+        // more use than folding it into "MySQL".
+        assert_eq!(engine_label("MySQL"), "MySQL");
+        assert_eq!(engine_label("MariaDB"), "MariaDB");
+        // Written before the field existed.
+        assert_eq!(engine_label(""), "MySQL");
+        assert_eq!(engine_label("   "), "MySQL");
     }
 
     #[test]
