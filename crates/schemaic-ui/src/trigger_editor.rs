@@ -61,7 +61,7 @@ use schemaic_core::schema::{
 
 use crate::settings::settings_toggle_row;
 use crate::table_designer::{
-    edit_ctx, list_actions, list_pane, list_row, loaded_table, owned_dropdown,
+    edit_ctx, list_actions, list_pane, list_row_plain, loaded_table, owned_dropdown,
 };
 use crate::widgets::{
     FORM_GAP, footer_button, form_section, form_setting, form_setting_owned, modal_footer_split,
@@ -838,7 +838,7 @@ fn trigger_list(ui: Ui, pg: bool, table: String, schema: Option<String>) -> impl
                             .collect::<Vec<_>>()
                             .join("/")
                     );
-                    list_row(rows_ui.clone(), i, t.info.name.clone(), detail, None).into_any()
+                    list_row_plain(rows_ui.clone(), i, t.info.name.clone(), detail).into_any()
                 })
                 .collect();
             v_stack_from_iter(rows)
