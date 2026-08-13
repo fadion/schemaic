@@ -704,13 +704,10 @@ impl TriggerDraft {
         if t.events.is_empty() {
             out.push("A trigger needs at least one event to fire on.".to_string());
         }
-        if t.constraint {
-            out.push(
-                "Schemaic can't edit a constraint trigger — it doesn't model the \
-                 deferral settings one carries."
-                    .to_string(),
-            );
-        }
+        // A constraint trigger's *existence* is fine — see
+        // `TriggerSetDraft::validate`, which is where the refusal lives now,
+        // because it needs the server's copy to tell "this one is being
+        // changed" from "this one is merely present".
         if pg {
             match &t.action {
                 TriggerAction::Function { name, .. } if name.trim().is_empty() => {
@@ -805,9 +802,38 @@ impl TriggerSetDraft {
     /// Problems across the whole set, in plain language: each trigger's own,
     /// plus the one that only exists for a set — two triggers can't share a
     /// name, and a list-plus-form makes that easy to do by accident.
-    pub fn validate(&self, dialect: SqlDialect) -> Vec<String> {
+    /// `current` is the server's copy of the table's triggers — what
+    /// [`diff_triggers`] compares against. It is needed because one rule here is
+    /// about a *change*, not about a state: a constraint trigger may not be
+    /// edited (Schemaic doesn't model the deferral settings one carries), but it
+    /// may perfectly well sit on the table while its neighbours are.
+    ///
+    /// Folding every member's messages in unconditionally made **one** constraint
+    /// trigger lock the whole modal: the form renders `errs.first()` and gates
+    /// `ready` on the set being empty, so Preview SQL was permanently disabled
+    /// and the only way out was to select that trigger and drop it.
+    pub fn validate(&self, current: &[TriggerInfo], dialect: SqlDialect) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for t in &self.triggers {
+            // An untouched member says nothing: it is already on the server in
+            // exactly this shape, so nothing this plan does can be wrong about
+            // it. (`diff_triggers` uses the same comparison to decide it emits
+            // no statement.)
+            let unchanged = t
+                .original
+                .as_deref()
+                .and_then(|n| current.iter().find(|c| c.name == n))
+                .is_some_and(|cur| t.info == *cur);
+            if unchanged {
+                continue;
+            }
+            if t.info.constraint {
+                out.push(format!(
+                    "Schemaic can't edit the constraint trigger {} — it doesn't model \
+                     the deferral settings one carries.",
+                    t.info.name
+                ));
+            }
             out.extend(t.validate(dialect));
         }
         let mut seen: Vec<&str> = Vec::new();
@@ -6255,8 +6281,44 @@ mod tests {
             let (a, mut b) = (my_trigger(), my_trigger());
             b.name = "T_INS".into(); // both engines fold case here
             let t = table_with_triggers(vec![a, b]);
-            let msgs = TriggerSetDraft::from_table(&t).validate(MySql).join(" | ");
+            let msgs = TriggerSetDraft::from_table(&t)
+                .validate(&t.triggers, MySql)
+                .join(" | ");
             assert!(msgs.contains("both called"), "{msgs}");
+        }
+
+        /// One constraint trigger must not make every *other* trigger on the
+        /// table uneditable.
+        ///
+        /// `validate` folded every member's messages into the set's, and the
+        /// modal renders `errs.first()` and gates Preview SQL on the set being
+        /// empty — so a table carrying one constraint trigger could not have any
+        /// of its triggers edited, and the only way out was to select that one
+        /// and drop it. The rule is "you may not *change* this one", not "this
+        /// one exists".
+        #[test]
+        fn a_constraint_trigger_only_blocks_edits_to_itself() {
+            let mut ct = pg_trigger();
+            ct.name = "ct".into();
+            ct.constraint = true;
+            let t = table_with_triggers(vec![pg_trigger(), ct]);
+
+            // Untouched: the set is clean and the other trigger is editable.
+            let mut d = TriggerSetDraft::from_table(&t);
+            assert!(
+                d.validate(&t.triggers, Postgres).is_empty(),
+                "{:?}",
+                d.validate(&t.triggers, Postgres)
+            );
+
+            // Editing the *ordinary* one stays clean.
+            d.triggers[0].info.condition = Some("new.total > 5".into());
+            assert!(d.validate(&t.triggers, Postgres).is_empty());
+
+            // Editing the constraint trigger is what is refused, by name.
+            d.triggers[1].info.condition = Some("new.total > 5".into());
+            let msgs = d.validate(&t.triggers, Postgres).join(" | ");
+            assert!(msgs.contains("constraint trigger ct"), "{msgs}");
         }
 
         /// The gate: a draft taken straight off a trigger has nothing to say.
@@ -6363,9 +6425,15 @@ mod tests {
 
         #[test]
         fn validate_refuses_a_constraint_trigger_and_the_empty_draft() {
+            // The constraint-trigger refusal lives on the *set*, not on the
+            // member, because it is about a change rather than a state — see
+            // `a_constraint_trigger_only_blocks_edits_to_itself`.
             let mut p = pg_trigger();
             p.constraint = true;
-            let msgs = TriggerDraft::from_info(&p).validate(Postgres).join(" | ");
+            let t = table_with_triggers(vec![p]);
+            let mut d = TriggerSetDraft::from_table(&t);
+            d.triggers[0].info.condition = Some("new.total > 5".into());
+            let msgs = d.validate(&t.triggers, Postgres).join(" | ");
             assert!(msgs.contains("constraint trigger"), "{msgs}");
 
             let msgs = TriggerDraft::blank("", "", None)
