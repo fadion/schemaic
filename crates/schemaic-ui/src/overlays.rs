@@ -620,8 +620,11 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let (db, obj) = (database.clone(), item.clone());
                         let read_only = conn_read_only(&connections, active_conn);
                         let editable = crate::object_editor::is_editable_object(&obj);
+                        // Named, not a bare "Edit": one tree holds types, domains
+                        // and sequences, and the menu is the only thing that says
+                        // which of them the row under the cursor is.
                         entries.push(
-                            MenuEntry::action("Edit", move || {
+                            MenuEntry::action(format!("Edit {}", kind.label()), move || {
                                 crate::object_editor::open_for_object(&ui, &db, &obj);
                             })
                             .disabled(read_only || !editable),
@@ -853,26 +856,30 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
                             // Same entry, two editors: a view is a name and a
                             // SELECT, so it gets its own modal rather than the
-                            // designer's list-plus-form.
+                            // designer's list-plus-form. The label says which,
+                            // since the two rows look alike in the tree.
                             entries.push(
-                                MenuEntry::action("Edit", move || {
-                                    if is_view {
-                                        crate::view_editor::open_for_view(
-                                            &ui,
-                                            &db,
-                                            ns.as_deref(),
-                                            &tbl,
-                                        );
-                                    } else {
-                                        crate::table_designer::open_for_table(
-                                            &ui,
-                                            &db,
-                                            ns.as_deref(),
-                                            &tbl,
-                                            None,
-                                        );
-                                    }
-                                })
+                                MenuEntry::action(
+                                    if is_view { "Edit view" } else { "Edit table" },
+                                    move || {
+                                        if is_view {
+                                            crate::view_editor::open_for_view(
+                                                &ui,
+                                                &db,
+                                                ns.as_deref(),
+                                                &tbl,
+                                            );
+                                        } else {
+                                            crate::table_designer::open_for_table(
+                                                &ui,
+                                                &db,
+                                                ns.as_deref(),
+                                                &tbl,
+                                                None,
+                                            );
+                                        }
+                                    },
+                                )
                                 // An unloaded schema has nothing to edit from,
                                 // and a materialized view has no
                                 // `CREATE OR REPLACE` to edit it with.
@@ -1014,7 +1021,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     {
                         let ui = import_ui.clone();
                         let (src, col) = (source.clone(), column.clone());
-                        entries.push(MenuEntry::action("Edit", move || {
+                        entries.push(MenuEntry::action("Edit column", move || {
                             crate::table_designer::open_for_table(
                                 &ui,
                                 &src.database,

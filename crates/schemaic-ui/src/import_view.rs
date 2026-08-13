@@ -25,9 +25,9 @@ use schemaic_core::model::engine_is_transactional;
 use crate::consts::ROW_H;
 use crate::settings::{dropdown_box_style, settings_dropdown, settings_toggle_row};
 use crate::widgets::{
-    ExitAction, FORM_GAP, autohide, control_button, exit_action, focus_root, footer_button,
-    form_section, form_separator, form_setting, modal_footer, modal_title_owned, panel_style,
-    shift_hscroll,
+    ACTION_GAP, ActionKind, ExitAction, FORM_GAP, MODAL_PAD_H, action_button, autohide,
+    control_button, exit_action, focus_root, form_hint, form_section, form_separator, form_setting,
+    modal_footer, modal_footer_split, modal_title_owned, panel_style, shift_hscroll,
 };
 use crate::{
     FieldCfg, ImportProbeRequest, ImportRunRequest, ImportStep, ImportTargetInfo, ImportUi, Ui,
@@ -265,8 +265,7 @@ fn source_step(ui: Ui) -> impl IntoView {
             "Other values meaning NULL",
             v_stack((
                 edit_field(i.null_tokens, FieldCfg::default()).style(|s| s.width(FIELD_W)),
-                text("Comma-separated, e.g. NULL, \\N, NA.")
-                    .style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_faint())),
+                form_hint("Comma-separated, e.g. NULL, \\N, NA."),
             ))
             .style(|s| s.flex_col().gap(4.0)),
         ),
@@ -884,8 +883,11 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                 },
             );
 
-            // The footer mirrors Manage Connections: a bordered bar, quiet actions
-            // on the right, the affirmative one last and coloured.
+            // The footer wears the schema editors' filled actions: Cancel neutral,
+            // the affirmative one last and filled, which is the pair every other
+            // modal ends with. Back is the exception to the "actions on the right"
+            // rule — it moves *backwards* through the modal, so it sits at the far
+            // left rather than in the group deciding what happens next.
             let ui_back = ui.clone();
             let ui_next = ui.clone();
             let ui_run = ui.clone();
@@ -896,28 +898,28 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                 exit.clone(),
                 exit.clone(),
             );
-            let actions = match step {
+            let footer = match step {
                 ImportStep::Source => dyn_container(
                     move || (i.sample.get().is_some(), i.busy.get()),
                     move |(has_sample, busy)| {
                         let ui = ui_next.clone();
-                        h_stack((
-                            footer_button(
-                                "Cancel",
-                                theme::text_dim,
-                                theme::text,
-                                true,
-                                exit_at(&exit_src),
-                            ),
-                            footer_button(
-                                if busy { "Reading…" } else { "Next" },
-                                theme::conn_save,
-                                theme::conn_save_hover,
-                                has_sample && !busy,
-                                move || ui.import.step.set(ImportStep::Mapping),
-                            ),
-                        ))
-                        .style(|s| s.flex_row().items_center().gap(15.0))
+                        modal_footer(
+                            h_stack((
+                                action_button(
+                                    "Cancel",
+                                    ActionKind::Neutral,
+                                    true,
+                                    exit_at(&exit_src),
+                                ),
+                                action_button(
+                                    if busy { "Reading…" } else { "Next" },
+                                    ActionKind::Primary,
+                                    has_sample && !busy,
+                                    move || ui.import.step.set(ImportStep::Mapping),
+                                ),
+                            ))
+                            .style(|s| s.flex_row().items_center().gap(ACTION_GAP)),
+                        )
                         .into_any()
                     },
                 )
@@ -930,47 +932,45 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                         let ready = target
                             .map(|t| !import::insert_columns(&mapping, &t.table).is_empty())
                             .unwrap_or(false);
-                        h_stack((
-                            footer_button("Back", theme::text_dim, theme::text, !busy, move || {
+                        modal_footer_split(
+                            action_button("Back", ActionKind::Neutral, !busy, move || {
                                 back.import.step.set(ImportStep::Source)
                             }),
-                            // While a load is running this stops it (rolling the
-                            // transaction back) instead of closing — closing would
-                            // hide a write that's still going, which is the one
-                            // thing the user pressing Cancel doesn't want. That
-                            // rule now lives in `exit`, which Escape and the ✕
-                            // share; this button used to be the only one that had
-                            // it.
-                            footer_button(
-                                "Cancel",
-                                theme::text_dim,
-                                theme::text,
-                                true,
-                                exit_at(&exit_map),
-                            ),
-                            footer_button(
-                                if busy { "Importing…" } else { "Import" },
-                                theme::conn_save,
-                                theme::conn_save_hover,
-                                ready && !busy,
-                                move || run_import(ui.clone()),
-                            ),
-                        ))
-                        .style(|s| s.flex_row().items_center().gap(15.0))
+                            h_stack((
+                                // While a load is running this stops it (rolling
+                                // the transaction back) instead of closing —
+                                // closing would hide a write that's still going,
+                                // which is the one thing the user pressing Cancel
+                                // doesn't want. That rule now lives in `exit`,
+                                // which Escape and the ✕ share; this button used
+                                // to be the only one that had it.
+                                action_button(
+                                    "Cancel",
+                                    ActionKind::Neutral,
+                                    true,
+                                    exit_at(&exit_map),
+                                ),
+                                action_button(
+                                    if busy { "Importing…" } else { "Import" },
+                                    ActionKind::Primary,
+                                    ready && !busy,
+                                    move || run_import(ui.clone()),
+                                ),
+                            ))
+                            .style(|s| s.flex_row().items_center().gap(ACTION_GAP)),
+                        )
                         .into_any()
                     },
                 )
                 .into_any(),
-                ImportStep::Done => footer_button(
+                ImportStep::Done => modal_footer(action_button(
                     "Close",
-                    theme::conn_save,
-                    theme::conn_save_hover,
+                    ActionKind::Primary,
                     true,
                     exit_at(&exit_done),
-                )
+                ))
                 .into_any(),
             };
-            let footer = modal_footer(actions);
 
             let close_x: Rc<dyn Fn()> = exit_x.clone();
             let panel = v_stack((
@@ -983,7 +983,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                 autohide(scroll(v_stack((body, err)).style(|s| {
                     s.flex_col()
                         .width_full()
-                        .padding_horiz(20.0)
+                        .padding_horiz(MODAL_PAD_H)
                         .padding_vert(18.0)
                 })))
                 .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0)),

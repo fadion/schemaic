@@ -9,7 +9,7 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 
 use crate::consts::{CHAT_PAD_H, TERM_FONT_SIZES};
-use crate::widgets::{autohide, focus_root, modal_title, panel_style};
+use crate::widgets::{autohide, focus_root, form_hint, form_label_style, modal_title, panel_style};
 use crate::{AiEffort, AiModel, FieldCfg, SchemaScope, TermCursor, Ui, edit_field, icons, theme};
 
 // ===== moved from lib.rs (settings modals) =====
@@ -171,11 +171,8 @@ pub(crate) fn settings_toggle_row(
         // `flex_grow(1) + min_width(0)`: take the space left of the switch and be
         // allowed to shrink below the text's natural width, so a long hint wraps
         // instead of pushing the toggle past the panel edge.
-        v_stack((
-            text(title).style(|s| s.font_size(theme::FONT_BODY).color(theme::text())),
-            text(hint).style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_faint())),
-        ))
-        .style(|s| s.flex_col().gap(2.0).flex_grow(1.0_f32).min_width(0.0)),
+        v_stack((text(title).style(form_label_style), form_hint(hint)))
+            .style(|s| s.flex_col().gap(2.0).flex_grow(1.0_f32).min_width(0.0)),
         themed_toggle(sig),
     ))
     .style(|s| s.items_center().width_full().gap(10.0))
@@ -314,7 +311,7 @@ fn dropdown_item_style(s: floem::style::Style) -> floem::style::Style {
 
 // A small dim group heading inside the AI settings modal.
 fn settings_group_label(t: &'static str) -> impl IntoView {
-    text(t).style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_muted()))
+    text(t).style(form_label_style)
 }
 
 // A dark-theme switch. Track + handle colours are driven by on/off state; the

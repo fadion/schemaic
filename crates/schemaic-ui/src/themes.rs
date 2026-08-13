@@ -128,23 +128,49 @@ pub struct UiTheme {
     pub row_hover: Color,
     pub row_active: Color,
     pub row_selected: Color,
+    /// Pill tabs (the table designer's Table / Columns / …): the active pill's
+    /// fill and its label, and the hover fill of an inactive one. Their own roles
+    /// rather than the tree's `row_selected`/`row_hover`: a pill is a filled chip
+    /// carrying its own text colour, and retuning it shouldn't repaint the schema
+    /// tree's selection.
+    pub pill_active_bg: Color,
+    pub pill_active_text: Color,
+    pub pill_hover_bg: Color,
+    /// A modal footer's actions: a fill, its hover, and a label **tinted to
+    /// match**, one triple per variant. The label follows the fill rather than
+    /// staying one grey across all four, which is what buys the contrast back —
+    /// a blue label on a blue fill reads far better than a neutral one does.
+    pub btn_neutral: Color,
+    pub btn_neutral_hover: Color,
+    pub btn_neutral_text: Color,
+    pub btn_primary: Color,
+    pub btn_primary_hover: Color,
+    pub btn_primary_text: Color,
+    /// Recessed, for a side action that isn't part of the decision the footer is
+    /// asking for (Copy, Open in editor) — darker than the panel rather than
+    /// lighter, so it sits *under* the two that answer the question.
+    pub btn_quiet: Color,
+    pub btn_quiet_hover: Color,
+    pub btn_quiet_text: Color,
+    /// The affirmative action when the plan destroys something. A fill rather
+    /// than the red *text* the confirm dialog uses, since these buttons carry
+    /// their meaning in the fill.
+    pub btn_danger: Color,
+    pub btn_danger_hover: Color,
+    pub btn_danger_text: Color,
+    /// Manage Connections: the icon Test flashes in place of its label — pass and
+    /// fail. Roles of their own rather than the app's `status_ok`/`error`: they
+    /// are read on a `btn_neutral` fill, not on a panel, and they are the one
+    /// place a colour still carries meaning now that the button around them is
+    /// the same grey as Cancel.
+    pub conn_test_ok: Color,
+    pub conn_test_fail: Color,
     /// Manage Connections list: resting row text.
     pub conn_list_text: Color,
     /// Manage Connections list: hovered/selected row text.
     pub conn_list_sel_text: Color,
     /// Manage Connections list: selected row background (full-width).
     pub conn_list_sel_bg: Color,
-    /// Manage Connections: Delete button (icon+text), resting + hover.
-    pub conn_delete: Color,
-    pub conn_delete_hover: Color,
-    /// Manage Connections: Save button text, resting + hover.
-    pub conn_save: Color,
-    pub conn_save_hover: Color,
-    /// Manage Connections: Test button text, resting + hover.
-    pub conn_test: Color,
-    pub conn_test_hover: Color,
-    /// Manage Connections: Test result icon — success (failure reuses `conn_delete`).
-    pub conn_test_ok: Color,
     pub capsule_bg: Color,
     /// Schema db-visibility menu: a shown (enabled) row's text.
     pub db_toggle_on: Color,
@@ -297,16 +323,26 @@ impl UiTheme {
             row_hover: c("#171820"),
             row_active: c("#222432"),
             row_selected: c("#2B314D"),
+            pill_active_bg: c("#7C9CF0"),
+            pill_active_text: c("#14151A"),
+            pill_hover_bg: c("#2D2F39"),
+            btn_neutral: c("#393C4C"),
+            btn_neutral_hover: c("#454A5E"),
+            btn_neutral_text: c("#A5AAC9"),
+            btn_primary: c("#283863"),
+            btn_primary_hover: c("#31457B"),
+            btn_primary_text: c("#8EA7EA"),
+            btn_quiet: c("#14151A"),
+            btn_quiet_hover: c("#0C0D11"),
+            btn_quiet_text: c("#777A8C"),
+            btn_danger: c("#862C2C"),
+            btn_danger_hover: c("#9D3A3A"),
+            btn_danger_text: c("#E28F8F"),
+            conn_test_ok: c("#71C371"),
+            conn_test_fail: c("#E28F8F"),
             conn_list_text: c("#C6C8D6"),
             conn_list_sel_text: c("#FFFFFF"),
             conn_list_sel_bg: c("#222432"),
-            conn_delete: c("#9D3434"),
-            conn_delete_hover: c("#D46A6A"),
-            conn_save: c("#7694E3"),
-            conn_save_hover: c("#C1D1FB"),
-            conn_test: c("#C6C8D6"),
-            conn_test_hover: c("#FFFFFF"),
-            conn_test_ok: c("#71C371"),
             capsule_bg: c("#24283B"),
             db_toggle_on: c("#7694E3"),
             db_toggle_off: c("#474D73"),
@@ -420,16 +456,35 @@ impl UiTheme {
             row_hover: c("#ECEEF3"),
             row_active: c("#DEE3F5"),
             row_selected: c("#C9D4F7"),
+            // The active pill keeps the dark theme's fill: it's a filled accent
+            // chip that carries its own contrast, so it reads the same either way.
+            // Only the hover fill has to follow the surface it sits on.
+            pill_active_bg: c("#7C9CF0"),
+            pill_active_text: c("#14151A"),
+            pill_hover_bg: c("#E4E8F2"),
+            // Inverted, not recoloured: the light theme puts the tint in the fill
+            // and the depth in the label, so each variant reads the same way round
+            // (neutral grey, affirmative blue, destructive red) either way.
+            btn_neutral: c("#E2E5EC"),
+            btn_neutral_hover: c("#D3D7E1"),
+            btn_neutral_text: c("#454A5E"),
+            btn_primary: c("#DCE3F5"),
+            btn_primary_hover: c("#C9D4F7"),
+            btn_primary_text: c("#2F4A94"),
+            btn_quiet: c("#E7E9EF"),
+            btn_quiet_hover: c("#DADDE6"),
+            btn_quiet_text: c("#777A8C"),
+            btn_danger: c("#F6DCDE"),
+            btn_danger_hover: c("#EFC9CD"),
+            btn_danger_text: c("#8C2A2A"),
+            // Darker than the dark theme's, not lighter: these sit on a pale
+            // fill, and the mid-green that reads on #393C4C manages 2.7:1 on
+            // #E2E5EC — under the 3:1 an icon owes.
+            conn_test_ok: c("#2F7D49"),
+            conn_test_fail: c("#8C2A2A"),
             conn_list_text: c("#4A4E5E"),
             conn_list_sel_text: c("#1B1E2B"),
             conn_list_sel_bg: c("#DCE0EE"),
-            conn_delete: c("#B33A3A"),
-            conn_delete_hover: c("#D46A6A"),
-            conn_save: c("#4B6CC9"),
-            conn_save_hover: c("#7694E3"),
-            conn_test: c("#4A4E5E"),
-            conn_test_hover: c("#1B1E2B"),
-            conn_test_ok: c("#3E9E5E"),
             capsule_bg: c("#DCE0EE"),
             db_toggle_on: c("#4763C9"),
             db_toggle_off: c("#AAB0CC"),

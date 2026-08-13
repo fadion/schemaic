@@ -35,12 +35,12 @@ use schemaic_core::intel::SqlDialect;
 use crate::settings::settings_toggle_row;
 use crate::table_designer::{edit_ctx, loaded_table, owned_dropdown};
 use crate::widgets::{
-    FORM_GAP, focus_root, footer_button, form_section, form_setting, form_setting_owned,
-    modal_footer_split, modal_title_owned, panel_style,
+    ACTION_GAP, ActionKind, FORM_GAP, MODAL_PAD_H, action_button, focus_root, form_section,
+    form_setting, form_setting_owned, modal_footer_split, modal_title_owned, panel_style,
 };
 use crate::{
     DdlPreview, FieldCfg, Ui, ViewAlgoDoneFn, ViewAlgoRequest, ViewTarget, ddl_preview, edit_field,
-    theme,
+    object_location, theme,
 };
 
 const PANEL_W: f64 = 760.0;
@@ -241,20 +241,7 @@ fn form(ui: Ui, target: &ViewTarget) -> AnyView {
     let draft = d.get_untracked();
     let pg = target.dialect == SqlDialect::Postgres;
 
-    // Where the view lives — context, not a control.
-    let place = form_setting_owned(
-        if target.current.is_some() {
-            "In".to_string()
-        } else {
-            "Creating in".to_string()
-        },
-        text(match &target.schema {
-            Some(s) => format!("{}.{s}", target.database),
-            None => target.database.clone(),
-        })
-        .style(|s| s.color(theme::text_dim()).font_size(theme::FONT_BODY)),
-    );
-
+    // No "In {database}" row: the modal title names the place now.
     let name = form_setting(
         "Name",
         bound_field(
@@ -358,7 +345,6 @@ fn form(ui: Ui, target: &ViewTarget) -> AnyView {
 
     v_stack((
         form_section("View"),
-        place,
         name,
         form_section("Definition").style(|s| s.margin_top(4.0)),
         body,
@@ -418,13 +404,20 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
             };
             let ui = ui.clone();
             let title = match &target.current {
-                Some(_) => format!("Edit view {}", target.display()),
-                None => format!("Create view in {}", target.database),
+                Some(t) => format!(
+                    "Edit view {}.{}",
+                    object_location(&target.database, t.schema.as_deref()),
+                    t.name
+                ),
+                None => format!(
+                    "Create view in {}",
+                    object_location(&target.database, target.schema.as_deref())
+                ),
             };
 
             let body = crate::widgets::autohide(scroll(
                 form(ui.clone(), &target)
-                    .style(|s| s.width_full().padding_horiz(20.0).padding_vert(18.0)),
+                    .style(|s| s.width_full().padding_horiz(MODAL_PAD_H).padding_vert(18.0)),
             ))
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
 
@@ -470,19 +463,13 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
                     let cs = change_set(&target, &draft);
                     let ready = draft.validate().is_empty() && !cs.is_empty();
                     h_stack((
-                        footer_button("Cancel", theme::text_dim, theme::text, true, close),
-                        footer_button(
-                            "Preview SQL",
-                            theme::conn_save,
-                            theme::conn_save_hover,
-                            ready,
-                            move || {
-                                let cs = change_set(&target, &draft);
-                                ddl_preview::open_preview(&ui, preview_from(&target, &draft, &cs));
-                            },
-                        ),
+                        action_button("Cancel", ActionKind::Neutral, true, close),
+                        action_button("Preview SQL", ActionKind::Primary, ready, move || {
+                            let cs = change_set(&target, &draft);
+                            ddl_preview::open_preview(&ui, preview_from(&target, &draft, &cs));
+                        }),
                     ))
-                    .style(|s| s.flex_row().items_center().gap(15.0))
+                    .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
                     .into_any()
                 },
             );

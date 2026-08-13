@@ -108,7 +108,7 @@ fn modal_title_impl(title: impl Into<String>, close: Rc<dyn Fn()>, border: bool)
         s.width_full()
             .flex_row()
             .items_center()
-            .padding_horiz(14.0)
+            .padding_horiz(MODAL_PAD_H)
             .padding_vert(10.0)
             .border_bottom(if border { 1.0 } else { 0.0 })
             .border_color(theme::border())
@@ -124,6 +124,36 @@ fn modal_title_impl(title: impl Into<String>, close: Rc<dyn Fn()>, border: bool)
 /// Gap between form rows.
 pub(crate) const FORM_GAP: f64 = 18.0;
 
+/// The inset every part of a modal shares: the title, the designer's tab strip,
+/// the body, and the footer. One constant because the alignment is the point —
+/// the title sat at 14 and the bodies at 20, so a form's first label started six
+/// pixels right of the heading above it and of the buttons below it. A modal that
+/// insets its content by hand is the drift this exists to stop.
+pub(crate) const MODAL_PAD_H: f64 = 14.0;
+
+/// The caption above a control, and the explanatory line under one.
+///
+/// Two style fns rather than two widgets, because a caption isn't always a bare
+/// `text(…)` — some are computed, some live inside a `dyn_container`. Every form
+/// surface in the app goes through these: a text field, a dropdown, a switch, the
+/// colour picker. Settings was built in this style and the modals that came after
+/// each re-spelled it slightly differently (`text_dim` here, `text_faint` there,
+/// three font sizes), which is the drift these exist to end.
+pub(crate) fn form_label_style(s: floem::style::Style) -> floem::style::Style {
+    s.color(theme::text_muted()).font_size(theme::FONT_LABEL)
+}
+
+/// The hint under a control: the label's colour faded, a size down. See
+/// [`form_label_style`].
+pub(crate) fn form_hint_style(s: floem::style::Style) -> floem::style::Style {
+    s.color(theme::form_hint()).font_size(theme::FONT_HINT)
+}
+
+/// A form hint as a view — the common case, where the text is a literal.
+pub(crate) fn form_hint(hint: impl Into<String>) -> impl IntoView {
+    text(hint.into()).style(form_hint_style)
+}
+
 /// A labelled control: caption above, control below.
 pub(crate) fn form_setting(label: &'static str, control: impl IntoView + 'static) -> impl IntoView {
     form_setting_owned(label.to_string(), control)
@@ -131,15 +161,18 @@ pub(crate) fn form_setting(label: &'static str, control: impl IntoView + 'static
 
 /// [`form_setting`] for a caption that isn't known at compile time.
 pub(crate) fn form_setting_owned(label: String, control: impl IntoView + 'static) -> impl IntoView {
-    v_stack((
-        text(label).style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL)),
-        control,
-    ))
-    .style(|s| s.flex_col().gap(6.0).width_full())
+    v_stack((text(label).style(form_label_style), control))
+        .style(|s| s.flex_col().gap(6.0).width_full())
 }
 
 /// A small bold section heading.
 pub(crate) fn form_section(label: &'static str) -> impl IntoView {
+    form_section_owned(label.to_string())
+}
+
+/// [`form_section`] for a heading that isn't known at compile time — the DDL
+/// preview's "1 Change" / "3 Changes", where the count *is* the heading.
+pub(crate) fn form_section_owned(label: String) -> impl IntoView {
     text(label).style(|s| {
         s.font_size(theme::FONT_BODY)
             .font_bold()
@@ -169,38 +202,243 @@ pub(crate) fn control_button(
     label: impl Into<String>,
     on_click: impl Fn() + 'static,
 ) -> impl IntoView {
-    text(label.into())
-        .on_click_stop(move |_| on_click())
-        .style(|s| {
-            control_surface(s)
-                .font_size(theme::FONT_BODY)
-                .color(theme::text())
-                .padding_horiz(10.0)
-                .padding_vert(5.0)
-                .flex_shrink(0.0_f32)
-                .hover(|s| s.background(theme::control_hover()))
-        })
+    control_button_enabled(label, true, on_click)
 }
 
-/// A footer action, styled like Manage Connections' Test / Save: text only, a
-/// colour that carries the meaning, brightening on hover.
-pub(crate) fn footer_button(
+/// [`control_button`] that can be inert — for one whose subject may be missing
+/// (Edit, with nothing selected). Dimmed and unclickable rather than absent, on
+/// the same grounds a disabled [`action_button`] keeps its place: a control that
+/// comes and goes moves the row it sits in.
+pub(crate) fn control_button_enabled(
     label: impl Into<String>,
-    color: fn() -> floem::peniko::Color,
-    hover: fn() -> floem::peniko::Color,
     enabled: bool,
     on_click: impl Fn() + 'static,
 ) -> impl IntoView {
-    text_button(label, color, hover, enabled, (6.0, 4.0), on_click)
+    text(label.into())
+        .on_click_stop(move |_| {
+            if enabled {
+                on_click()
+            }
+        })
+        .style(move |s| {
+            let s = control_surface(s)
+                .font_size(theme::FONT_BODY)
+                .padding_horiz(10.0)
+                .padding_vert(5.0)
+                .flex_shrink(0.0_f32);
+            if enabled {
+                s.color(theme::text())
+                    .hover(|s| s.background(theme::control_hover()))
+            } else {
+                s.color(theme::text_faint())
+            }
+        })
 }
 
-/// [`footer_button`] at the roomier size the question dialogs use.
+/// How much weight a modal action carries.
 ///
-/// The transaction prompt and the confirm modal each carried a private copy of
-/// this — same colour-fn signature, same hover, same radius, differing only in
-/// padding, which is the reason they weren't already sharing one. The size is a
-/// parameter now rather than a third implementation, so a change to how a text
-/// button behaves reaches all of them.
+/// The variant is a **fill**, not a text colour: both labels are the same grey,
+/// so what separates "the thing this footer exists to do" from "never mind" is
+/// the background behind it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ActionKind {
+    /// Dismissive — Cancel, Back.
+    Neutral,
+    /// The affirmative one — Preview SQL, Apply, Save.
+    Primary,
+    /// A side action that isn't part of the decision the footer is asking about
+    /// — Copy, Open in editor. Recessed *below* the panel rather than raised
+    /// above it, which is what keeps it out of the Neutral/Primary pair.
+    Quiet,
+    /// [`ActionKind::Primary`] for a plan that destroys something: same place,
+    /// same weight, red. The preview's affirmative action has worn the colour of
+    /// what it does since before these buttons were filled, and it is the last
+    /// signal before an irreversible `ALTER`.
+    Danger,
+}
+
+/// The gap between a footer's actions.
+pub(crate) const ACTION_GAP: f64 = 10.0;
+
+/// Gap between an action's icon and its label.
+const ACTION_ICON_GAP: f64 = 7.0;
+
+/// An action's horizontal padding. Named because [`action_face`] has to add it
+/// back when it computes a width from a label.
+const ACTION_PAD_H: f64 = 10.0;
+/// Its vertical padding — the other half of [`action_height`].
+const ACTION_PAD_V: f64 = 8.0;
+
+/// The height every filled action holds, whatever its face: a label, a label
+/// with a glyph beside it, or a glyph standing in for the label.
+///
+/// Explicit, because those faces don't agree on a height — a 16px icon is taller
+/// than a 13px line box, so a button that flashed a confirmation *grew* while it
+/// showed it, and the footer's whole row of buttons shifted with it. Measured off
+/// the text rather than picked, so it stays right if `FONT_BODY` moves, and
+/// cached because the answer can't change within a run (the family is global and
+/// the size is a `const`). Thread-local: `TextLayout` goes through the global
+/// `FontSystem`, which is the UI thread's.
+fn action_height() -> f64 {
+    thread_local! {
+        static H: std::cell::OnceCell<f64> = const { std::cell::OnceCell::new() };
+    }
+    // A string with both an ascender and a descender, so the line box is the full
+    // one a label gets rather than the one an x-height-only string reports.
+    H.with(|h| *h.get_or_init(|| measure_text_h_at("Xg", theme::FONT_BODY) + 2.0 * ACTION_PAD_V))
+}
+
+/// A filled modal action. **Every** modal footer in the app is built from these
+/// now — the schema editors, the DDL preview, Import and Manage Connections — so
+/// keep it free of anything specific to one of them. The only actions that
+/// aren't filled are the question dialogs' ([`dialog_button`]), which have no
+/// footer bar to sit in.
+///
+/// Disabled keeps the fill and fades the label ([`theme::btn_text_disabled`]),
+/// rather than hiding or unfilling the button: which action is the affirmative
+/// one shouldn't move around as a form becomes valid.
+pub(crate) fn action_button(
+    label: impl Into<String>,
+    kind: ActionKind,
+    enabled: bool,
+    on_click: impl Fn() + 'static,
+) -> impl IntoView {
+    action_button_inner(label, None, kind, enabled, on_click)
+}
+
+/// [`action_button`] with a leading icon — the preview footer's Copy and Open in
+/// editor. The glyph inherits the button's colour, so it follows the disabled
+/// state without a second rule.
+pub(crate) fn action_button_icon(
+    label: impl Into<String>,
+    icon: &'static str,
+    kind: ActionKind,
+    enabled: bool,
+    on_click: impl Fn() + 'static,
+) -> impl IntoView {
+    action_button_inner(label, Some(icon), kind, enabled, on_click)
+}
+
+type ColorFn = fn() -> floem::peniko::Color;
+
+/// The (fill, hovered fill, label) triple an [`ActionKind`] paints with.
+fn action_colors(kind: ActionKind) -> (ColorFn, ColorFn, ColorFn) {
+    match kind {
+        ActionKind::Neutral => (
+            theme::btn_neutral,
+            theme::btn_neutral_hover,
+            theme::btn_neutral_text,
+        ),
+        ActionKind::Primary => (
+            theme::btn_primary,
+            theme::btn_primary_hover,
+            theme::btn_primary_text,
+        ),
+        ActionKind::Quiet => (
+            theme::btn_quiet,
+            theme::btn_quiet_hover,
+            theme::btn_quiet_text,
+        ),
+        ActionKind::Danger => (
+            theme::btn_danger,
+            theme::btn_danger_hover,
+            theme::btn_danger_text,
+        ),
+    }
+}
+
+/// The chrome every filled action wears, given its kind and whether it's live.
+fn action_style(s: floem::style::Style, kind: ActionKind, enabled: bool) -> floem::style::Style {
+    let (fill, fill_hover, label_color) = action_colors(kind);
+    let s = s
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .font_size(theme::FONT_BODY)
+        .padding_horiz(ACTION_PAD_H)
+        .padding_vert(ACTION_PAD_V)
+        .height(action_height())
+        .border_radius(5.0)
+        .flex_shrink(0.0_f32);
+    if enabled {
+        s.background(fill())
+            .color(label_color())
+            .hover(move |s| s.background(fill_hover()))
+    } else {
+        // The whole button fades, fill included — half-strength on both, so it
+        // recedes as one object instead of a dim label sitting in a chip as solid
+        // as the live one beside it. It still holds its place: which action is
+        // affirmative shouldn't move as a form becomes valid.
+        s.background(fill().multiply_alpha(0.5))
+            .color(label_color().multiply_alpha(0.5))
+    }
+}
+
+fn action_button_inner(
+    label: impl Into<String>,
+    icon: Option<&'static str>,
+    kind: ActionKind,
+    enabled: bool,
+    on_click: impl Fn() + 'static,
+) -> impl IntoView {
+    let glyph: AnyView = match icon {
+        Some(markup) => icons::icon(markup, 15.0)
+            .style(|s| s.flex_shrink(0.0_f32).margin_right(ACTION_ICON_GAP))
+            .into_any(),
+        None => empty().into_any(),
+    };
+    h_stack((glyph, text(label.into())))
+        .on_click_stop(move |_| {
+            if enabled {
+                on_click()
+            }
+        })
+        .style(move |s| action_style(s, kind, enabled))
+}
+
+/// An [`action_button`] whose face the caller supplies and can swap, held at the
+/// width its widest label needs.
+///
+/// For the two buttons that acknowledge themselves — Save flashing a check, Test
+/// flashing its result — where the confirmation replaces the label rather than
+/// sitting beside it. **Pinning the width is the whole point**: a button that
+/// resizes when you press it shoves its neighbours sideways and stops reading as
+/// the same button, which is why `width_for` is measured rather than left to the
+/// face inside. The face is centred, so an icon lands in the middle of the button
+/// the label just left; a face that needs to stay put across a change of its own
+/// (an animated `Test…`) states its own width and is centred as a block.
+pub(crate) fn action_face<V: IntoView + 'static, F: Fn() + 'static>(
+    width_for: &str,
+    kind: ActionKind,
+    enabled: bool,
+    face: V,
+    on_click: F,
+) -> impl IntoView + use<V, F> {
+    // +2px against sub-pixel rounding, the same guard `loading_dots` uses.
+    let w = measure_text_px_at(width_for, theme::FONT_BODY) + 2.0 * ACTION_PAD_H + 2.0;
+    container(face)
+        .on_click_stop(move |_| {
+            if enabled {
+                on_click()
+            }
+        })
+        .style(move |s| {
+            action_style(s, kind, enabled)
+                .width(w)
+                .justify_center()
+                .padding_horiz(0.0)
+        })
+}
+
+/// A text-only action: no fill, a colour that carries the meaning, brightening
+/// on hover. What the **question dialogs** use — the transaction prompt and the
+/// confirm modal, which each carried a private copy of it before (same
+/// colour-fn signature, same hover, same radius, differing only in padding,
+/// which is the reason they weren't already sharing one).
+///
+/// This is now the *only* text-button family left. Every modal with a footer bar
+/// wears the filled [`action_button`] instead; a `footer_button` at a smaller
+/// padding sat beside this one until the last of those footers moved over.
 pub(crate) fn dialog_button(
     label: impl Into<String>,
     color: fn() -> floem::peniko::Color,
@@ -262,7 +500,7 @@ pub(crate) fn modal_footer_split(
         s.width_full()
             .flex_row()
             .items_center()
-            .padding_horiz(14.0)
+            .padding_horiz(MODAL_PAD_H)
             .padding_vert(10.0)
             .border_top(1.0)
             .border_color(theme::border())
@@ -744,6 +982,16 @@ pub(crate) fn measure_mono_px_at(text: &str, size: f32) -> f64 {
 
 fn measure_text_px_weighted(text: &str, size: f32, bold: bool) -> f64 {
     measure_text_px_styled(text, size, bold, false)
+}
+
+/// [`measure_text_px_at`]'s other axis: the line box a label of this size
+/// occupies. What [`action_height`] is built on, so a button's height comes from
+/// the text it holds rather than from a number somebody picked.
+fn measure_text_h_at(text: &str, size: f32) -> f64 {
+    use floem::text::{Attrs, AttrsList, TextLayout};
+    let mut layout = TextLayout::new();
+    layout.set_text(text, AttrsList::new(Attrs::new().font_size(size)));
+    layout.size().height
 }
 
 fn measure_text_px_styled(text: &str, size: f32, bold: bool, mono: bool) -> f64 {

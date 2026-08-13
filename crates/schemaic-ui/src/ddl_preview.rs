@@ -17,8 +17,11 @@ use floem::AnyView;
 use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 
+use schemaic_core::text::plural;
+
 use crate::widgets::{
-    ExitAction, autohide, exit_action, focus_root, footer_button, form_section, modal_footer,
+    ACTION_GAP, ActionKind, ExitAction, MODAL_PAD_H, action_button, action_button_icon, autohide,
+    exit_action, focus_root, form_section, form_section_owned, modal_footer_split,
     modal_title_owned, panel_style,
 };
 use crate::{DdlOutcome, DdlPreview, DdlRunRequest, FieldCfg, Ui, edit_field, icons, theme};
@@ -238,14 +241,12 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
             } else {
                 let n = p.changes.len();
                 v_stack((
-                    form_section("Changes"),
+                    // The count *is* the heading — a bare "Changes" above the list
+                    // and a "2 changes" below it said the same thing twice, once
+                    // in each direction.
+                    form_section_owned(format!("{n} {}", plural(n, "Change", "Changes"))),
                     v_stack_from_iter(p.changes.iter().cloned().map(change_line))
                         .style(|s| s.flex_col().width_full()),
-                    text(format!("{n} change{}", if n == 1 { "" } else { "s" })).style(|s| {
-                        s.color(theme::text_faint())
-                            .font_size(theme::FONT_LABEL)
-                            .margin_top(2.0)
-                    }),
                     risk_block(p.destructive.clone()).style(|s| s.margin_top(14.0)),
                     form_section("SQL").style(|s| s.margin_top(18.0)),
                     // Read-only, but a real editor field: the script is meant to
@@ -286,53 +287,35 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                 },
             );
 
-            let actions = dyn_container(
+            // The script's own actions — neither of them answers the question the
+            // footer is asking, so they sit recessed at the far left rather than
+            // in the Back/Apply pair.
+            let ui_side = ui.clone();
+            let side = dyn_container(
                 move || (d.applying.get(), d.applied.get()),
                 move |(busy, applied)| {
-                    let ui = ui.clone();
-                    if applied {
-                        return footer_button(
-                            "Close",
-                            theme::conn_save,
-                            theme::conn_save_hover,
-                            true,
-                            exit,
-                        )
-                        .into_any();
-                    }
-                    let p = match d.preview.get_untracked() {
-                        Some(p) => p,
-                        None => return empty().into_any(),
+                    let Some(p) = d.preview.get_untracked().filter(|_| !applied) else {
+                        return empty().into_any();
                     };
                     let sql = p.statements.join("\n\n");
                     let open_sql = sql.clone();
-                    let open_query = ui.tab_actions.open_query.clone();
+                    let open_query = ui_side.tab_actions.open_query.clone();
                     h_stack((
-                        // "Back" only when there's somewhere to go back *to*. A
-                        // context-menu shortcut opens this modal with nothing
-                        // behind it, where Back would point at nowhere.
-                        footer_button(
-                            if d.designer.get_untracked().is_some()
-                                || d.view.get_untracked().is_some()
-                            {
-                                "Back"
-                            } else {
-                                "Cancel"
-                            },
-                            theme::text_dim,
-                            theme::text,
+                        action_button_icon(
+                            "Copy",
+                            icons::COPY,
+                            ActionKind::Quiet,
                             !busy,
-                            exit,
+                            move || {
+                                let _ = floem::Clipboard::set_contents(sql.clone());
+                            },
                         ),
-                        footer_button("Copy", theme::text_dim, theme::text, !busy, move || {
-                            let _ = floem::Clipboard::set_contents(sql.clone());
-                        }),
                         // The escape hatch: the generated script, in a tab, where
                         // it can be read, edited and run like anything else.
-                        footer_button(
+                        action_button_icon(
                             "Open in editor",
-                            theme::text_dim,
-                            theme::text,
+                            icons::FILE_PEN_LINE,
+                            ActionKind::Quiet,
                             !busy,
                             move || {
                                 (open_query)(open_sql.clone());
@@ -341,29 +324,56 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                                 d.view.set(None);
                             },
                         ),
-                        footer_button(
+                    ))
+                    .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
+                    .into_any()
+                },
+            );
+
+            let actions = dyn_container(
+                move || (d.applying.get(), d.applied.get()),
+                move |(busy, applied)| {
+                    let ui = ui.clone();
+                    if applied {
+                        return action_button("Close", ActionKind::Primary, true, exit).into_any();
+                    }
+                    let p = match d.preview.get_untracked() {
+                        Some(p) => p,
+                        None => return empty().into_any(),
+                    };
+                    h_stack((
+                        // "Back" only when there's somewhere to go back *to*. A
+                        // context-menu shortcut opens this modal with nothing
+                        // behind it, where Back would point at nowhere.
+                        action_button(
+                            if d.designer.get_untracked().is_some()
+                                || d.view.get_untracked().is_some()
+                            {
+                                "Back"
+                            } else {
+                                "Cancel"
+                            },
+                            ActionKind::Neutral,
+                            !busy,
+                            exit,
+                        ),
+                        action_button(
                             if busy { "Applying…" } else { "Apply" },
                             // A destructive plan's affirmative action wears the
-                            // colour of what it does — the *same* red pair as the
-                            // confirm modal's Yes, since it answers the same
-                            // question and the two should always retune together.
-                            // (It was `theme::error` for both resting and hover,
-                            // which is a red with no hover at all.)
+                            // colour of what it does. Same place and same weight
+                            // as an ordinary Apply — only the fill differs — since
+                            // this is the last thing between the user and an
+                            // irreversible statement.
                             if p.destructive.is_empty() {
-                                theme::conn_save
+                                ActionKind::Primary
                             } else {
-                                theme::confirm_yes
-                            },
-                            if p.destructive.is_empty() {
-                                theme::conn_save_hover
-                            } else {
-                                theme::confirm_yes_hover
+                                ActionKind::Danger
                             },
                             !busy && !p.read_only && !p.statements.is_empty(),
                             move || apply(ui.clone()),
                         ),
                     ))
-                    .style(|s| s.flex_row().items_center().gap(15.0))
+                    .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
                     .into_any()
                 },
             );
@@ -388,11 +398,12 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                 autohide(scroll(v_stack((body, err)).style(|s| {
                     s.flex_col()
                         .width_full()
-                        .padding_horiz(20.0)
+                        .padding_horiz(MODAL_PAD_H)
                         .padding_vert(18.0)
                 })))
                 .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0)),
-                modal_footer(
+                modal_footer_split(
+                    side,
                     h_stack((read_only_note, actions)).style(|s| s.flex_row().items_center()),
                 ),
             ))
