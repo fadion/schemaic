@@ -341,7 +341,11 @@ impl ObjectTarget {
     }
 }
 
-/// One lazy trigger-function fetch — see [`schemaic_db::Db::trigger_functions`].
+/// One lazy trigger-function fetch — see `schemaic_db::Db::trigger_functions`.
+///
+/// A plain code span, not an intra-doc link: this crate doesn't depend on
+/// `schemaic-db` (the app owns that side and hands the result across), so the
+/// path can't resolve from here.
 #[derive(Clone, Debug)]
 pub struct TriggerFnRequest {
     pub conn_id: u64,
@@ -448,7 +452,8 @@ pub type ViewAlgoDoneFn = Rc<dyn Fn(Option<String>)>;
 /// Read one MySQL view's `ALGORITHM` off-thread.
 ///
 /// Its own action rather than part of the schema fetch because it costs a
-/// `SHOW CREATE VIEW` **per view** — see [`schemaic_db::Db::view_algorithm`] —
+/// `SHOW CREATE VIEW` **per view** — see `schemaic_db::Db::view_algorithm`, a
+/// code span rather than a link for the reason [`TriggerFnRequest`] gives —
 /// so it's paid once, for the view actually being edited.
 pub type ViewAlgoFn = Rc<dyn Fn(ViewAlgoRequest, ViewAlgoDoneFn)>;
 

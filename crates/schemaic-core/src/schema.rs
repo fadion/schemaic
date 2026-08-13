@@ -1106,7 +1106,7 @@ pub struct DomainInfo {
     /// `numeric(10,2)`, `text[]`.
     pub base_type: String,
     pub collation: Option<String>,
-    /// Ready-to-emit SQL text, as [`ColumnInfo::default_value`] is.
+    /// Ready-to-emit SQL text, as [`ColumnInfo::default`] is.
     pub default_value: Option<String>,
     pub not_null: bool,
     pub checks: Vec<CheckInfo>,
