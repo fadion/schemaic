@@ -24,7 +24,8 @@ use schemaic_core::monitor::{ChangeKind, RowChange};
 use crate::settings::settings_dropdown;
 use crate::theme::{FONT_BODY, FONT_LABEL};
 use crate::widgets::{
-    at_content_bottom, autohide_state, loading_dots, panel_style, shift_hscroll, thin_scroll,
+    at_content_bottom, autohide_state, focus_root, loading_dots, panel_style, shift_hscroll,
+    thin_scroll,
 };
 
 /// The log's rows are shorter than a chat bubble, so it counts as "at the bottom"
@@ -265,9 +266,7 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                 });
 
             let close_bg = close.clone();
-            container(panel)
-                .keyboard_navigable()
-                .request_focus(|| {})
+            focus_root(container(panel))
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| (close)())
                 .on_click_stop(move |_| (close_bg)())
                 .style(|s| {

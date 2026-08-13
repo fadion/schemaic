@@ -33,8 +33,8 @@ use schemaic_core::schema::{CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo};
 
 use crate::settings::{dropdown_box_style, settings_toggle_row};
 use crate::widgets::{
-    FORM_GAP, MenuEntry, autohide, footer_button, form_section, form_setting, form_setting_owned,
-    modal_footer_split, modal_title_owned, panel_style,
+    FORM_GAP, MenuEntry, autohide, focus_root, footer_button, form_section, form_setting,
+    form_setting_owned, modal_footer_split, modal_title_owned, panel_style,
 };
 use crate::{
     DdlPreview, DesignerTab, DesignerTarget, FieldCfg, Ui, ddl_preview, edit_field, icons, theme,
@@ -1622,9 +1622,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
             .on_click_stop(|_| {})
             .style(|s| panel_style(s).width(PANEL_W).height(PANEL_H));
 
-            container(panel)
-                .keyboard_navigable()
-                .request_focus(|| {})
+            focus_root(container(panel))
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())
                 .style(|s| {
                     s.size_full()

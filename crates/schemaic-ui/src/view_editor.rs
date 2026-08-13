@@ -35,8 +35,8 @@ use schemaic_core::intel::SqlDialect;
 use crate::settings::settings_toggle_row;
 use crate::table_designer::{edit_ctx, loaded_table, owned_dropdown};
 use crate::widgets::{
-    FORM_GAP, footer_button, form_section, form_setting, form_setting_owned, modal_footer_split,
-    modal_title_owned, panel_style,
+    FORM_GAP, focus_root, footer_button, form_section, form_setting, form_setting_owned,
+    modal_footer_split, modal_title_owned, panel_style,
 };
 use crate::{
     DdlPreview, FieldCfg, Ui, ViewAlgoDoneFn, ViewAlgoRequest, ViewTarget, ddl_preview, edit_field,
@@ -496,9 +496,7 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
             .on_click_stop(|_| {})
             .style(|s| panel_style(s).width(PANEL_W).height(PANEL_H));
 
-            container(panel)
-                .keyboard_navigable()
-                .request_focus(|| {})
+            focus_root(container(panel))
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())
                 .style(|s| {
                     s.size_full()

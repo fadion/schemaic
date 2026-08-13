@@ -18,7 +18,7 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 
 use crate::widgets::{
-    ExitAction, autohide, exit_action, footer_button, form_section, modal_footer,
+    ExitAction, autohide, exit_action, focus_root, footer_button, form_section, modal_footer,
     modal_title_owned, panel_style,
 };
 use crate::{DdlOutcome, DdlPreview, DdlRunRequest, FieldCfg, Ui, edit_field, icons, theme};
@@ -399,9 +399,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
             .on_click_stop(|_| {})
             .style(|s| panel_style(s).width(PANEL_W).height(PANEL_H));
 
-            container(panel)
-                .keyboard_navigable()
-                .request_focus(|| {})
+            focus_root(container(panel))
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| exit())
                 .style(|s| {
                     s.size_full()

@@ -4359,10 +4359,28 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     let arrow_down = on_arrow_down.clone();
     let tab = on_tab.clone();
     let editor = text_editor_keys(text_sig.get_untracked(), move |editor_sig, kp, mods| {
-        if let Some(esc) = &escape
-            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Escape), _))
-        {
-            (esc)();
+        if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Escape), _)) {
+            match &escape {
+                Some(esc) => (esc)(),
+                // No handler of its own: Escape blurs the field. Floem hands a key
+                // event to the focused view and, when it consumes one, to nobody
+                // else — so a field that keeps Escape leaves an enclosing modal
+                // with no way to close from the keyboard. Focus goes back to the
+                // innermost overlay rather than merely away, because with focus on
+                // nothing the key reaches only the root view, not that overlay's
+                // own handler; the *next* Escape then closes it. The clear is
+                // unconditional so a field outside any overlay still blurs.
+                None => {
+                    if let Some(vid) =
+                        editor_sig.with_untracked(|e| e.editor_view_id.get_untracked())
+                    {
+                        vid.clear_focus();
+                    }
+                    if let Some(root) = widgets::innermost_focus_root() {
+                        root.request_focus();
+                    }
+                }
+            }
             return CommandExecuted::Yes;
         }
         // Tab accepts an external completion (the palette ghost) when opted in.

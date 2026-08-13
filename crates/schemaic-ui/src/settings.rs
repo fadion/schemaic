@@ -9,7 +9,7 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 
 use crate::consts::{CHAT_PAD_H, TERM_FONT_SIZES};
-use crate::widgets::{autohide, modal_title, panel_style};
+use crate::widgets::{autohide, focus_root, modal_title, panel_style};
 use crate::{AiEffort, AiModel, FieldCfg, SchemaScope, TermCursor, Ui, edit_field, icons, theme};
 
 // ===== moved from lib.rs (settings modals) =====
@@ -68,9 +68,7 @@ pub(crate) fn term_settings_overlay(ui: Ui) -> impl IntoView {
                 .style(|s| panel_style(s).background(theme::bg_panel()).width(420.0));
 
             let esc = close.clone();
-            container(panel)
-                .keyboard_navigable()
-                .request_focus(|| {})
+            focus_root(container(panel))
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
                 .on_click_stop(move |_| close())
                 .style(|s| {
@@ -473,9 +471,7 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
                 .style(|s| panel_style(s).background(theme::bg_panel()).width(460.0));
 
             let esc = close.clone();
-            container(panel)
-                .keyboard_navigable()
-                .request_focus(|| {})
+            focus_root(container(panel))
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
                 .on_click_stop(move |_| close())
                 .style(|s| {
@@ -657,9 +653,7 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
                 .style(|s| panel_style(s).background(theme::bg_panel()).width(420.0));
 
             let esc = close.clone();
-            container(panel)
-                .keyboard_navigable()
-                .request_focus(|| {})
+            focus_root(container(panel))
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
                 .on_click_stop(move |_| close())
                 .style(|s| {
@@ -757,9 +751,7 @@ pub(crate) fn help_overlay(ui: Ui) -> impl IntoView {
                 .style(|s| panel_style(s).background(theme::bg_panel()).width(420.0));
 
             let esc = close.clone();
-            container(panel)
-                .keyboard_navigable()
-                .request_focus(|| {})
+            focus_root(container(panel))
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
                 .on_click_stop(move |_| close())
                 .style(|s| {

@@ -2743,12 +2743,10 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         }
                     })
                 };
-                let panel = v_stack((
+                let panel = focus_root(v_stack((
                     row(0, "Run Current", run_current),
                     row(1, "Run Everything", run_everything),
-                ))
-                .keyboard_navigable()
-                .request_focus(|| {})
+                )))
                 .on_key_down(
                     Key::Named(NamedKey::ArrowDown),
                     |_| true,
