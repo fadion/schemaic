@@ -1045,7 +1045,11 @@ fn mysql_triggers(rows: &[MyTriggerRow]) -> Vec<TriggerInfo> {
             action: TriggerAction::Body(stmt.clone()),
             definer: Some(definer.clone()).filter(|d| !d.is_empty()),
             order: order_clause,
-            enabled: true,
+            // All three are PostgreSQL's alone: MySQL has no transition tables
+            // and no per-trigger firing mode.
+            old_table: None,
+            new_table: None,
+            enabled: schemaic_core::schema::TriggerEnabled::Origin,
             constraint: false,
         });
         prev = Some((table.clone(), timing.clone(), event.clone(), name.clone()));
@@ -3028,7 +3032,7 @@ mod tests {
         assert_eq!(t.action, TriggerAction::Body(s("SET NEW.x = 1")));
         assert_eq!(t.definer.as_deref(), Some("root@localhost"));
         assert!(t.schema.is_none()); // MySQL has no namespace level
-        assert!(t.enabled);
+        assert_eq!(t.enabled, schemaic_core::schema::TriggerEnabled::Origin);
     }
 
     #[test]
