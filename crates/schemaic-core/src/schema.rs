@@ -385,6 +385,29 @@ pub fn display_name(schema: Option<&str>, table: &str) -> String {
     }
 }
 
+/// The SQL form of the same thing: a quoted, namespace-qualified object name.
+///
+/// The counterpart to [`display_name`] — one is what a person reads, this is what
+/// a statement addresses — and the single builder for it, since every standalone
+/// object (table, view, type, domain, sequence, function) needs the identical
+/// "qualify unless it's `public`, then quote both halves" rule. It had been
+/// written out inline in three places before the object emitters would have made
+/// it six.
+pub fn qualified_ident(
+    name: &str,
+    schema: Option<&str>,
+    dialect: crate::intel::SqlDialect,
+) -> String {
+    match sql_qualifier(schema) {
+        Some(s) => format!(
+            "{}.{}",
+            ddl_ident_in(s, dialect),
+            ddl_ident_in(name, dialect)
+        ),
+        None => ddl_ident_in(name, dialect),
+    }
+}
+
 /// The table a query tab (and therefore its grid) was opened from — the identity
 /// that makes a result editable, shows key icons, and lets "open this table" reuse
 /// an existing tab. A tab running an arbitrary `SELECT` has none.
@@ -955,11 +978,7 @@ impl RoutineInfo {
     /// overloads share one name — so `DROP`/`ALTER`/`COMMENT ON` all need this
     /// form and none of them accept the bare name.
     pub fn signature_sql(&self, dialect: crate::intel::SqlDialect) -> String {
-        let q = |s: &str| ddl_ident_in(s, dialect);
-        let name = match sql_qualifier(self.schema.as_deref()) {
-            Some(s) => format!("{}.{}", q(s), q(&self.name)),
-            None => q(&self.name),
-        };
+        let name = qualified_ident(&self.name, self.schema.as_deref(), dialect);
         format!("{name}({})", self.arguments.trim())
     }
 
@@ -1026,6 +1045,271 @@ pub fn dollar_tag(body: &str) -> String {
         }
     }
     "$schemaic$".to_string()
+}
+
+// ── Standalone objects (PostgreSQL) ─────────────────────────────────────────
+
+/// A user-defined enum type — `CREATE TYPE mood AS ENUM ('sad', 'ok')`.
+///
+/// PostgreSQL-only as a *type*. MySQL spells `ENUM` as a column type, which is
+/// already carried by [`ColumnInfo::type_name`] and has no independent existence
+/// to model, so nothing here has a MySQL arm.
+///
+/// The values are stored in **sort order** (`pg_enum.enumsortorder`), not
+/// creation order, because that is the order comparisons and `ORDER BY` use —
+/// and it is what `ALTER TYPE … ADD VALUE … BEFORE/AFTER` manipulates. A list in
+/// any other order would show one thing and mean another.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnumInfo {
+    pub name: String,
+    /// PostgreSQL namespace. `None` means unqualified — see [`sql_qualifier`].
+    pub schema: Option<String>,
+    pub values: Vec<String>,
+    pub comment: Option<String>,
+}
+
+impl EnumInfo {
+    /// `CREATE TYPE … AS ENUM (…)`, plus a `COMMENT ON TYPE` when there is one.
+    pub fn create_sql(&self, dialect: crate::intel::SqlDialect) -> String {
+        let qname = qualified_ident(&self.name, self.schema.as_deref(), dialect);
+        let values = self
+            .values
+            .iter()
+            .map(|v| ddl_string(v, dialect))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut out = format!("CREATE TYPE {qname} AS ENUM ({values});");
+        if let Some(c) = &self.comment
+            && !c.is_empty()
+        {
+            out.push_str(&format!(
+                "\nCOMMENT ON TYPE {qname} IS {};",
+                ddl_string(c, dialect)
+            ));
+        }
+        out
+    }
+}
+
+/// A domain: a base type with a default and constraints attached, reusable as a
+/// column type.
+///
+/// The constraints are [`CheckInfo`]s — the same type a table's are — because
+/// they are the same thing: a named predicate the server re-prints from its own
+/// parse tree. Sharing it means [`crate::ddl::checks_equal`] governs both, so a
+/// retyped-but-equivalent predicate can't produce a phantom change here either.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DomainInfo {
+    pub name: String,
+    pub schema: Option<String>,
+    /// The underlying type as `format_type` renders it — `character varying(45)`,
+    /// `numeric(10,2)`, `text[]`.
+    pub base_type: String,
+    pub collation: Option<String>,
+    /// Ready-to-emit SQL text, as [`ColumnInfo::default_value`] is.
+    pub default_value: Option<String>,
+    pub not_null: bool,
+    pub checks: Vec<CheckInfo>,
+    pub comment: Option<String>,
+}
+
+impl DomainInfo {
+    /// `CREATE DOMAIN … AS …`, with every constraint inline, plus a
+    /// `COMMENT ON DOMAIN` when there is one.
+    pub fn create_sql(&self, dialect: crate::intel::SqlDialect) -> String {
+        let qname = qualified_ident(&self.name, self.schema.as_deref(), dialect);
+        let mut out = format!("CREATE DOMAIN {qname} AS {}", self.base_type.trim());
+        if let Some(c) = &self.collation
+            && !c.is_empty()
+        {
+            out.push_str(&format!("\n  COLLATE {}", ddl_ident_in(c, dialect)));
+        }
+        if let Some(d) = &self.default_value
+            && !d.is_empty()
+        {
+            out.push_str(&format!("\n  DEFAULT {d}"));
+        }
+        if self.not_null {
+            out.push_str("\n  NOT NULL");
+        }
+        for ck in &self.checks {
+            out.push_str(&format!("\n  {}", ck.clause_sql(dialect)));
+        }
+        out.push(';');
+        if let Some(c) = &self.comment
+            && !c.is_empty()
+        {
+            out.push_str(&format!(
+                "\nCOMMENT ON DOMAIN {qname} IS {};",
+                ddl_string(c, dialect)
+            ));
+        }
+        out
+    }
+}
+
+/// What a sequence is attached to, when it is attached to anything.
+///
+/// `internal` is the distinction that decides whether the sequence is the user's
+/// object at all. A `serial` column *owns* its sequence (`pg_depend` deptype
+/// `a`): the sequence is a real object, droppable and alterable on its own. An
+/// identity column's counter (deptype `i`) is **part of the column** — PostgreSQL
+/// refuses `DROP SEQUENCE` on it and tells you to drop the column instead — so
+/// Schemaic shows it and lets it be altered, and never offers the drop.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SequenceOwner {
+    pub table: String,
+    pub column: String,
+    pub internal: bool,
+}
+
+/// A sequence — the counter behind `serial`/identity columns, and an object in
+/// its own right.
+///
+/// The bounds are stored as the server reports them rather than as
+/// `Option<i64>`, because PostgreSQL has no "unset": `NO MAXVALUE` *is* the
+/// type's maximum, and a sequence read back always names concrete numbers. What
+/// varies is whether those numbers are the implicit ones — [`implicit_bounds`]
+/// answers that, and it is why [`SequenceInfo::create_sql`] can emit a clean
+/// three-line statement instead of restating six clauses that say nothing.
+///
+/// [`implicit_bounds`]: SequenceInfo::implicit_bounds
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequenceInfo {
+    pub name: String,
+    pub schema: Option<String>,
+    /// `smallint`, `integer` or `bigint`. Bounds are clamped to this type's range.
+    pub data_type: String,
+    pub start: i64,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cache: i64,
+    pub cycle: bool,
+    pub owned_by: Option<SequenceOwner>,
+    /// The counter's current position, or `None` when the sequence has never been
+    /// used (or the connected role can't read it). Display-only: it is a *live*
+    /// value, not part of the definition, so it takes no part in any diff.
+    pub last_value: Option<i64>,
+    pub comment: Option<String>,
+}
+
+impl Default for SequenceInfo {
+    /// PostgreSQL's own defaults for a bare `CREATE SEQUENCE`: an ascending
+    /// `bigint` from 1. Zeroes would be wrong in a way that emits a statement the
+    /// server rejects (`INCREMENT BY 0`).
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            schema: None,
+            data_type: "bigint".to_string(),
+            start: 1,
+            increment: 1,
+            min_value: 1,
+            max_value: i64::MAX,
+            cache: 1,
+            cycle: false,
+            owned_by: None,
+            last_value: None,
+            comment: None,
+        }
+    }
+}
+
+impl SequenceInfo {
+    /// The inclusive range of the sequence's storage type.
+    pub fn type_bounds(data_type: &str) -> (i64, i64) {
+        match data_type.trim().to_ascii_lowercase().as_str() {
+            "smallint" | "int2" => (i16::MIN as i64, i16::MAX as i64),
+            "integer" | "int" | "int4" => (i32::MIN as i64, i32::MAX as i64),
+            _ => (i64::MIN, i64::MAX),
+        }
+    }
+
+    /// The bounds PostgreSQL would apply if the statement named none, which
+    /// depend on the direction: an ascending sequence runs `1 ..= type_max`, a
+    /// descending one `type_min ..= -1`.
+    pub fn implicit_bounds(&self) -> (i64, i64) {
+        let (tmin, tmax) = Self::type_bounds(&self.data_type);
+        if self.increment < 0 {
+            (tmin, -1)
+        } else {
+            (1, tmax)
+        }
+    }
+
+    /// Where the counter starts when the statement doesn't say: the low end for
+    /// an ascending sequence, the high end for a descending one.
+    pub fn implicit_start(&self) -> i64 {
+        if self.increment < 0 {
+            self.max_value
+        } else {
+            self.min_value
+        }
+    }
+
+    /// The clauses that differ from what PostgreSQL would assume, in the order
+    /// `CREATE`/`ALTER SEQUENCE` takes them. Empty when the sequence is entirely
+    /// default — which is what lets an `ALTER` that changes nothing emit nothing.
+    fn clauses(&self) -> Vec<String> {
+        let (imin, imax) = self.implicit_bounds();
+        let mut out = Vec::new();
+        if !self.data_type.trim().eq_ignore_ascii_case("bigint") {
+            out.push(format!("AS {}", self.data_type.trim()));
+        }
+        if self.increment != 1 {
+            out.push(format!("INCREMENT BY {}", self.increment));
+        }
+        // `NO MINVALUE` and an explicit implicit bound mean the same thing to the
+        // server; saying nothing is the honest rendering of "the default".
+        if self.min_value != imin {
+            out.push(format!("MINVALUE {}", self.min_value));
+        }
+        if self.max_value != imax {
+            out.push(format!("MAXVALUE {}", self.max_value));
+        }
+        if self.start != self.implicit_start() {
+            out.push(format!("START WITH {}", self.start));
+        }
+        if self.cache != 1 {
+            out.push(format!("CACHE {}", self.cache));
+        }
+        if self.cycle {
+            out.push("CYCLE".to_string());
+        }
+        out
+    }
+
+    /// `CREATE SEQUENCE …`, naming only what isn't the server's default, plus the
+    /// `OWNED BY` and `COMMENT ON` that follow it.
+    ///
+    /// `OWNED BY` is restated because it is not cosmetic: it is what makes the
+    /// sequence get dropped with its column, and a copy of the DDL that omits it
+    /// recreates the sequence as an orphan that outlives the table.
+    pub fn create_sql(&self, dialect: crate::intel::SqlDialect) -> String {
+        let qname = qualified_ident(&self.name, self.schema.as_deref(), dialect);
+        let mut out = format!("CREATE SEQUENCE {qname}");
+        for c in self.clauses() {
+            out.push_str(&format!("\n  {c}"));
+        }
+        if let Some(o) = &self.owned_by {
+            out.push_str(&format!(
+                "\n  OWNED BY {}.{}",
+                qualified_ident(&o.table, self.schema.as_deref(), dialect),
+                ddl_ident_in(&o.column, dialect)
+            ));
+        }
+        out.push(';');
+        if let Some(c) = &self.comment
+            && !c.is_empty()
+        {
+            out.push_str(&format!(
+                "\nCOMMENT ON SEQUENCE {qname} IS {};",
+                ddl_string(c, dialect)
+            ));
+        }
+        out
+    }
 }
 
 impl TableInfo {
@@ -1246,15 +1530,96 @@ pub fn follow_target(
     })
 }
 
+/// Look one object up by `(namespace, name)` — the rule every `find_*` on
+/// [`DbSchema`] follows, written once.
+///
+/// An exact namespace match wins. When the caller has no namespace to offer —
+/// MySQL, or a tab restored from a session file written before multi-schema
+/// browsing — it falls back to the name alone, preferring `public` so the common
+/// case resolves the way it always did rather than to whichever same-named
+/// object happens to come first.
+fn find_by_ns<'a, T>(
+    items: &'a [T],
+    schema: Option<&str>,
+    name: &str,
+    key: impl Fn(&'a T) -> (Option<&'a str>, &'a str) + Copy,
+) -> Option<&'a T> {
+    if schema.is_some() {
+        return items
+            .iter()
+            .find(|i| key(i).1 == name && key(i).0 == schema);
+    }
+    let by_name = || items.iter().filter(|i| key(i).1 == name);
+    by_name()
+        .find(|i| key(i).0 == Some(PG_DEFAULT_SCHEMA))
+        .or_else(|| by_name().next())
+}
+
 /// The introspected schema of one database.
+///
+/// The three lists past `tables` are PostgreSQL's standalone objects and stay
+/// empty on MySQL. They live *here*, rather than being fetched lazily the way
+/// [`RoutineInfo`]s are, because they are browsable: the schema tree lists them
+/// beside the tables, and a column's type is one of them. A second, separately
+/// refreshed cache keyed the same way would be a second answer to "what is in
+/// this database", and the two would diverge on the first refresh that only
+/// updated one. A function body has no such reader — nothing renders it until an
+/// editor asks — which is why that one is lazy and these aren't.
 #[derive(Clone, Debug, Default)]
 pub struct DbSchema {
     pub tables: Vec<TableInfo>,
+    pub enums: Vec<EnumInfo>,
+    pub domains: Vec<DomainInfo>,
+    pub sequences: Vec<SequenceInfo>,
 }
 
 impl DbSchema {
     pub fn table_count(&self) -> usize {
         self.tables.len()
+    }
+
+    /// The enum type with this `(namespace, name)` identity, on the same
+    /// name-falls-back-to-`public` rule as [`DbSchema::find_table`].
+    pub fn find_enum(&self, schema: Option<&str>, name: &str) -> Option<&EnumInfo> {
+        find_by_ns(&self.enums, schema, name, |e| {
+            (e.schema.as_deref(), e.name.as_str())
+        })
+    }
+
+    pub fn find_domain(&self, schema: Option<&str>, name: &str) -> Option<&DomainInfo> {
+        find_by_ns(&self.domains, schema, name, |d| {
+            (d.schema.as_deref(), d.name.as_str())
+        })
+    }
+
+    pub fn find_sequence(&self, schema: Option<&str>, name: &str) -> Option<&SequenceInfo> {
+        find_by_ns(&self.sequences, schema, name, |s| {
+            (s.schema.as_deref(), s.name.as_str())
+        })
+    }
+
+    /// Every enum and domain in one namespace, as names a column's type could be.
+    ///
+    /// What the designer's type dropdown appends to [`crate::ddl::common_types`]:
+    /// a user-defined type is as usable in a column definition as `integer` is,
+    /// and a type list that omits the ones this database actually defines makes
+    /// the dropdown a worse answer than typing.
+    pub fn user_types_in(&self, schema: Option<&str>) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .enums
+            .iter()
+            .filter(|e| e.schema.as_deref() == schema)
+            .map(|e| e.name.clone())
+            .chain(
+                self.domains
+                    .iter()
+                    .filter(|d| d.schema.as_deref() == schema)
+                    .map(|d| d.name.clone()),
+            )
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// The introspected table with this `(namespace, name)` identity.
@@ -1265,16 +1630,9 @@ impl DbSchema {
     /// common case resolves the way it always did rather than to whichever
     /// same-named table happens to come first.
     pub fn find_table(&self, schema: Option<&str>, name: &str) -> Option<&TableInfo> {
-        if schema.is_some() {
-            return self
-                .tables
-                .iter()
-                .find(|t| t.name == name && t.schema.as_deref() == schema);
-        }
-        let by_name = || self.tables.iter().filter(|t| t.name == name);
-        by_name()
-            .find(|t| t.schema.as_deref() == Some(PG_DEFAULT_SCHEMA))
-            .or_else(|| by_name().next())
+        find_by_ns(&self.tables, schema, name, |t| {
+            (t.schema.as_deref(), t.name.as_str())
+        })
     }
 
     /// The table whose [`display_name`] is `name` — the inverse of the naming used
@@ -1322,10 +1680,16 @@ impl DbSchema {
     /// alphabetical). Empty on MySQL, where tables carry no namespace — which is
     /// how the schema tree decides whether to render a schema level at all.
     pub fn schemas(&self) -> Vec<String> {
+        // Every kind of object contributes, not just tables: a namespace holding
+        // only types or sequences is still a namespace, and leaving it out would
+        // make its contents unreachable in the tree.
         let mut out: Vec<String> = self
             .tables
             .iter()
             .filter_map(|t| t.schema.clone())
+            .chain(self.enums.iter().filter_map(|e| e.schema.clone()))
+            .chain(self.domains.iter().filter_map(|d| d.schema.clone()))
+            .chain(self.sequences.iter().filter_map(|s| s.schema.clone()))
             .collect();
         out.sort_by(|a, b| {
             let key = |s: &str| (s != PG_DEFAULT_SCHEMA, s.to_string());
@@ -2125,6 +2489,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         // Exact match wins, even though `sales` comes first in the list.
         assert_eq!(
@@ -2159,6 +2524,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         assert_eq!(
             s.find_table(None, "orders").map(|t| t.schema.as_deref()),
@@ -2171,6 +2537,7 @@ mod tests {
                 schema: Some("sales".into()),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert_eq!(
             only_sales
@@ -2195,6 +2562,7 @@ mod tests {
                 t("public", "staging"),
                 t("sales", "line_items"),
             ],
+            ..Default::default()
         };
         assert_eq!(s.schemas(), vec!["public", "analytics", "sales"]);
     }
@@ -2222,6 +2590,7 @@ mod tests {
                 base("sales", "orders"),
                 base("public", "elsewhere"),
             ],
+            ..Default::default()
         };
         let out = s.create_ddl_script(Some("sales"), Postgres);
         let table_at = out.find("CREATE TABLE").expect("table emitted");
@@ -2248,6 +2617,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         // Every table round-trips through its own display name.
         for t in &s.tables {
@@ -2279,6 +2649,7 @@ mod tests {
                 schema: Some("sales".into()),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert_eq!(s.create_ddl_script(Some("ghosts"), Postgres), "");
         assert_eq!(s.tables_in(Some("ghosts")).count(), 0);
@@ -2293,6 +2664,7 @@ mod tests {
                 name: "users".into(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         assert!(s.schemas().is_empty());
         assert!(DbSchema::default().schemas().is_empty());
@@ -2321,6 +2693,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         assert_eq!(s.table_count(), 2);
     }
@@ -2486,5 +2859,268 @@ mod tests {
         // A FK with no columns.
         let empty = fk(&[], None, "t", &[]);
         assert!(follow_target(&empty, &[], "db", SqlDialect::MySql).is_none());
+    }
+
+    // ── Standalone objects ──────────────────────────────────────────────────
+
+    use crate::intel::SqlDialect::Postgres;
+
+    #[test]
+    fn qualified_ident_drops_public_and_quotes_both_halves() {
+        assert_eq!(
+            qualified_ident("mood", Some("public"), Postgres),
+            "\"mood\""
+        );
+        assert_eq!(qualified_ident("mood", None, Postgres), "\"mood\"");
+        assert_eq!(
+            qualified_ident("mood", Some("sales"), Postgres),
+            "\"sales\".\"mood\""
+        );
+        // The quote character inside a name is doubled, not dropped.
+        assert_eq!(
+            qualified_ident("we\"ird", Some("od\"d"), Postgres),
+            "\"od\"\"d\".\"we\"\"ird\""
+        );
+    }
+
+    #[test]
+    fn enum_create_sql_quotes_values_as_literals() {
+        let e = EnumInfo {
+            name: "mood".into(),
+            schema: Some("public".into()),
+            values: vec!["sad".into(), "it's ok".into()],
+            comment: None,
+        };
+        assert_eq!(
+            e.create_sql(Postgres),
+            "CREATE TYPE \"mood\" AS ENUM ('sad', 'it''s ok');"
+        );
+    }
+
+    #[test]
+    fn enum_create_sql_appends_its_comment() {
+        let e = EnumInfo {
+            name: "mood".into(),
+            schema: Some("sales".into()),
+            values: vec!["ok".into()],
+            comment: Some("how it went".into()),
+        };
+        let sql = e.create_sql(Postgres);
+        assert!(
+            sql.starts_with("CREATE TYPE \"sales\".\"mood\" AS ENUM ('ok');"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("COMMENT ON TYPE \"sales\".\"mood\" IS 'how it went';"),
+            "{sql}"
+        );
+        // An empty comment is not a comment — emitting `IS ''` would *set* one.
+        let blank = EnumInfo {
+            comment: Some(String::new()),
+            ..e
+        };
+        assert!(!blank.create_sql(Postgres).contains("COMMENT"));
+    }
+
+    #[test]
+    fn domain_create_sql_carries_every_clause_in_order() {
+        let d = DomainInfo {
+            name: "email".into(),
+            schema: Some("public".into()),
+            base_type: "character varying(255)".into(),
+            collation: None,
+            default_value: Some("''::character varying".into()),
+            not_null: true,
+            checks: vec![CheckInfo {
+                name: "email_shaped".into(),
+                expression: "VALUE ~ '@'::text".into(),
+                enforced: true,
+            }],
+            comment: None,
+        };
+        let sql = d.create_sql(Postgres);
+        assert_eq!(
+            sql,
+            "CREATE DOMAIN \"email\" AS character varying(255)\n  \
+             DEFAULT ''::character varying\n  NOT NULL\n  \
+             CONSTRAINT \"email_shaped\" CHECK (VALUE ~ '@'::text);"
+        );
+    }
+
+    #[test]
+    fn a_bare_domain_is_just_the_type() {
+        let d = DomainInfo {
+            name: "positive".into(),
+            base_type: "integer".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            d.create_sql(Postgres),
+            "CREATE DOMAIN \"positive\" AS integer;"
+        );
+    }
+
+    #[test]
+    fn sequence_bounds_follow_the_storage_type_and_direction() {
+        let asc = SequenceInfo::default();
+        assert_eq!(asc.implicit_bounds(), (1, i64::MAX));
+        assert_eq!(asc.implicit_start(), 1);
+
+        let desc = SequenceInfo {
+            increment: -1,
+            min_value: i32::MIN as i64,
+            max_value: -1,
+            data_type: "integer".into(),
+            start: -1,
+            ..Default::default()
+        };
+        assert_eq!(desc.implicit_bounds(), (i32::MIN as i64, -1));
+        // A descending sequence starts at the *top* of its range.
+        assert_eq!(desc.implicit_start(), -1);
+
+        assert_eq!(
+            SequenceInfo::type_bounds("smallint"),
+            (i16::MIN as i64, i16::MAX as i64)
+        );
+        assert_eq!(
+            SequenceInfo::type_bounds("integer"),
+            (i32::MIN as i64, i32::MAX as i64)
+        );
+        // Anything unrecognised is bigint — the type PostgreSQL itself defaults to.
+        assert_eq!(SequenceInfo::type_bounds("nonsense"), (i64::MIN, i64::MAX));
+    }
+
+    #[test]
+    fn a_default_sequence_emits_no_clauses() {
+        // Every value equals what the server would assume, so restating them
+        // would be six lines saying nothing.
+        let s = SequenceInfo {
+            name: "counter".into(),
+            schema: Some("public".into()),
+            ..Default::default()
+        };
+        assert_eq!(s.create_sql(Postgres), "CREATE SEQUENCE \"counter\";");
+    }
+
+    #[test]
+    fn a_sequence_names_only_what_differs() {
+        let s = SequenceInfo {
+            name: "odds".into(),
+            schema: Some("public".into()),
+            data_type: "integer".into(),
+            increment: 2,
+            min_value: 1,
+            max_value: 99,
+            start: 3,
+            cache: 10,
+            cycle: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            s.create_sql(Postgres),
+            "CREATE SEQUENCE \"odds\"\n  AS integer\n  INCREMENT BY 2\n  \
+             MAXVALUE 99\n  START WITH 3\n  CACHE 10\n  CYCLE;"
+        );
+        // MINVALUE is absent because 1 *is* the implicit ascending minimum.
+        assert!(!s.create_sql(Postgres).contains("MINVALUE"));
+    }
+
+    #[test]
+    fn a_sequence_restates_its_owner() {
+        // Not cosmetic: without `OWNED BY` the recreated sequence outlives the
+        // column it belongs to instead of being dropped with it.
+        let s = SequenceInfo {
+            name: "orders_id_seq".into(),
+            schema: Some("sales".into()),
+            owned_by: Some(SequenceOwner {
+                table: "orders".into(),
+                column: "id".into(),
+                internal: false,
+            }),
+            ..Default::default()
+        };
+        assert!(
+            s.create_sql(Postgres)
+                .contains("OWNED BY \"sales\".\"orders\".\"id\""),
+            "{}",
+            s.create_sql(Postgres)
+        );
+    }
+
+    #[test]
+    fn last_value_is_display_only_and_never_reaches_the_ddl() {
+        let s = SequenceInfo {
+            name: "counter".into(),
+            last_value: Some(4171),
+            ..Default::default()
+        };
+        assert!(!s.create_sql(Postgres).contains("4171"));
+    }
+
+    fn objects() -> DbSchema {
+        DbSchema {
+            enums: vec![
+                EnumInfo {
+                    name: "mood".into(),
+                    schema: Some("public".into()),
+                    values: vec!["ok".into()],
+                    comment: None,
+                },
+                EnumInfo {
+                    name: "mood".into(),
+                    schema: Some("sales".into()),
+                    values: vec!["great".into()],
+                    comment: None,
+                },
+            ],
+            domains: vec![DomainInfo {
+                name: "email".into(),
+                schema: Some("sales".into()),
+                base_type: "text".into(),
+                ..Default::default()
+            }],
+            sequences: vec![SequenceInfo {
+                name: "counter".into(),
+                schema: Some("public".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn objects_look_up_by_namespace_on_the_same_rule_tables_do() {
+        let s = objects();
+        assert_eq!(
+            s.find_enum(Some("sales"), "mood").map(|e| e.values.clone()),
+            Some(vec!["great".to_string()])
+        );
+        // No namespace offered → `public` wins over whichever came first.
+        assert_eq!(
+            s.find_enum(None, "mood").map(|e| e.schema.clone()),
+            Some(Some("public".into()))
+        );
+        // A namespace we don't have is a miss, not a fallback.
+        assert!(s.find_enum(Some("archive"), "mood").is_none());
+        assert!(s.find_domain(Some("sales"), "email").is_some());
+        assert!(s.find_sequence(None, "counter").is_some());
+        assert!(s.find_sequence(None, "nope").is_none());
+    }
+
+    #[test]
+    fn user_types_are_the_enums_and_domains_of_one_namespace() {
+        let s = objects();
+        assert_eq!(s.user_types_in(Some("public")), vec!["mood"]);
+        // Sorted, and a domain counts as a type just as an enum does.
+        assert_eq!(s.user_types_in(Some("sales")), vec!["email", "mood"]);
+        assert!(s.user_types_in(Some("archive")).is_empty());
+    }
+
+    #[test]
+    fn a_namespace_holding_only_objects_is_still_a_namespace() {
+        // A table-less schema used to vanish from the tree, taking its types
+        // with it.
+        let s = objects();
+        assert_eq!(s.schemas(), vec!["public", "sales"]);
     }
 }

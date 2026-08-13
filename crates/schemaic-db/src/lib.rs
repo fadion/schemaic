@@ -625,7 +625,10 @@ impl Db {
                 },
             )
             .await
-            .map(|tables| DbSchema { tables })
+            .map(|tables| DbSchema {
+                tables,
+                ..Default::default()
+            })
             .map_err(|e| DbError::Query(e.to_string()));
         let _ = conn.disconnect().await;
         out
@@ -1409,7 +1412,10 @@ pub(crate) fn assemble_schema(
         }
     }
 
-    DbSchema { tables }
+    DbSchema {
+        tables,
+        ..Default::default()
+    }
 }
 
 /// Run the (unprepared, text-protocol) statement, stopping at the row cap, and

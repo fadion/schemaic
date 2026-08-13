@@ -5073,6 +5073,7 @@ mod tests {
                     tbl("employees", &["id", "name", "salary", "dept_id"]),
                     tbl("departments", &["id", "name"]),
                 ],
+                ..Default::default()
             },
             "company",
         )
@@ -5162,6 +5163,7 @@ mod tests {
                 tbl_in("public", "customers", &["id", "name"]),
                 tbl_in("sales", "orders", &["id", "total"]),
             ],
+            ..Default::default()
         };
         // Build over an owned schema; the catalog copies what it needs.
         Catalog::build(&[("warehouse", &schema)], Some("warehouse"))
@@ -5494,6 +5496,7 @@ mod tests {
         emp.columns[0].primary_key = true;
         let schema = DbSchema {
             tables: vec![emp, tbl("departments", &["id", "name"])],
+            ..Default::default()
         };
         let cat = Catalog::build(&[("company", &schema)], Some("company"));
         diagnostics(sql, &cat, SqlDialect::MySql)
@@ -6243,6 +6246,7 @@ mod tests {
         (
             DbSchema {
                 tables: vec![orders, customers, line_items],
+                ..Default::default()
             },
             "shop",
         )
@@ -6541,6 +6545,7 @@ mod tests {
         }];
         let schema = DbSchema {
             tables: vec![album, tbl("Artist", &["ArtistId", "Name"])],
+            ..Default::default()
         };
         let _ = dialect;
         Catalog::build(&[("chinook", &schema)], Some("chinook"))
@@ -6613,6 +6618,7 @@ mod tests {
         }];
         let schema = DbSchema {
             tables: vec![orders, tbl("customers", &["id", "name"])],
+            ..Default::default()
         };
         let cat = Catalog::build(&[("shop", &schema)], Some("shop"));
         for d in [SqlDialect::MySql, SqlDialect::Postgres] {
@@ -6766,6 +6772,7 @@ mod tests {
     fn catalog_cache_reuses_one_build_across_calls() {
         let schema = Arc::new(DbSchema {
             tables: vec![tbl("employees", &["id", "name"])],
+            ..Default::default()
         });
         let l = loaded(&[("company", &schema)]);
         let mut cache = CatalogCache::default();
@@ -6781,6 +6788,7 @@ mod tests {
     fn catalog_cache_rebuilds_when_a_schema_is_re_introspected() {
         let before = Arc::new(DbSchema {
             tables: vec![tbl("employees", &["id"])],
+            ..Default::default()
         });
         let mut cache = CatalogCache::default();
         let a = cache.get(&loaded(&[("company", &before)]), Some("company"));
@@ -6790,6 +6798,7 @@ mod tests {
         // the map key (the database name) is the same.
         let after = Arc::new(DbSchema {
             tables: vec![tbl("employees", &["id"]), tbl("departments", &["id"])],
+            ..Default::default()
         });
         let b = cache.get(&loaded(&[("company", &after)]), Some("company"));
         assert!(!Arc::ptr_eq(&a, &b));
@@ -6803,6 +6812,7 @@ mod tests {
     fn catalog_cache_rebuilds_when_the_same_arc_moves_database() {
         let schema = Arc::new(DbSchema {
             tables: vec![tbl("employees", &["id"])],
+            ..Default::default()
         });
         let mut cache = CatalogCache::default();
         let a = cache.get(&loaded(&[("company", &schema)]), Some("company"));
@@ -6815,9 +6825,11 @@ mod tests {
     fn catalog_cache_rebuilds_when_the_active_database_changes() {
         let a_schema = Arc::new(DbSchema {
             tables: vec![tbl("employees", &["id"])],
+            ..Default::default()
         });
         let b_schema = Arc::new(DbSchema {
             tables: vec![tbl("orders", &["id"])],
+            ..Default::default()
         });
         let l = loaded(&[("company", &a_schema), ("shop", &b_schema)]);
         let mut cache = CatalogCache::default();
@@ -6833,9 +6845,11 @@ mod tests {
     fn catalog_cache_rebuilds_when_a_database_is_loaded_or_dropped() {
         let a_schema = Arc::new(DbSchema {
             tables: vec![tbl("employees", &["id"])],
+            ..Default::default()
         });
         let b_schema = Arc::new(DbSchema {
             tables: vec![tbl("orders", &["id"])],
+            ..Default::default()
         });
         let mut cache = CatalogCache::default();
         let one = cache.get(&loaded(&[("company", &a_schema)]), None);

@@ -568,6 +568,7 @@ mod tests {
             "shop".to_string(),
             Ok(DbSchema {
                 tables: vec![tbl("orders", vec![c("id", "int", false, true)]), view],
+                ..Default::default()
             }),
         )];
         let out = format_database_list(&dbs);
@@ -599,6 +600,7 @@ mod tests {
         orders.foreign_keys = vec![fk(&["customer_id"], "customers", &["id"])];
         let schema = DbSchema {
             tables: vec![orders],
+            ..Default::default()
         };
         let out = format_database_schema("shop", &schema);
         assert!(out.contains("## shop"));
@@ -620,7 +622,13 @@ mod tests {
             ],
         );
         t.foreign_keys = vec![fk(&["order_id", "line_no"], "shipments", &["ord", "line"])];
-        let out = format_database_schema("shop", &DbSchema { tables: vec![t] });
+        let out = format_database_schema(
+            "shop",
+            &DbSchema {
+                tables: vec![t],
+                ..Default::default()
+            },
+        );
         assert!(out.contains("  FK: (order_id, line_no) -> shipments(ord, line)"));
     }
 
@@ -628,13 +636,19 @@ mod tests {
     fn database_schema_marks_a_view() {
         let mut view = tbl("v_active", vec![c("id", "int", true, false)]);
         view.is_view = true;
-        let out = format_database_schema("shop", &DbSchema { tables: vec![view] });
+        let out = format_database_schema(
+            "shop",
+            &DbSchema {
+                tables: vec![view],
+                ..Default::default()
+            },
+        );
         assert!(out.contains("### v_active (view)"));
     }
 
     #[test]
     fn database_schema_reports_an_empty_database() {
-        let out = format_database_schema("shop", &DbSchema { tables: vec![] });
+        let out = format_database_schema("shop", &DbSchema::default());
         assert!(out.contains("(no tables)"));
     }
 
@@ -676,6 +690,7 @@ mod tests {
                 in_schema(tbl("orders", vec![c("id", "int", false, true)]), "public"),
                 in_schema(tbl("orders", vec![c("id", "int", false, true)]), "sales"),
             ],
+            ..Default::default()
         };
         let out = format_database_schema("warehouse", &schema);
         assert!(out.contains("### public.orders"));
@@ -695,6 +710,7 @@ mod tests {
                 tbl("orders", vec![c("id", "int", false, true)]),
                 "public",
             )],
+            ..Default::default()
         };
         let out = format_database_schema("shop", &pg);
         assert!(out.contains("### orders"));
@@ -702,6 +718,7 @@ mod tests {
 
         let mysql = DbSchema {
             tables: vec![tbl("orders", vec![c("id", "int", false, true)])],
+            ..Default::default()
         };
         assert!(format_database_schema("shop", &mysql).contains("### orders"));
     }
@@ -724,6 +741,7 @@ mod tests {
                 child,
                 in_schema(tbl("orders", vec![c("id", "int", false, true)]), "public"),
             ],
+            ..Default::default()
         };
         let out = format_database_schema("warehouse", &schema);
         // A `public` FK target is spelled out too, or the edge reads as though it
@@ -755,6 +773,7 @@ mod tests {
                 in_schema(tbl("orders", vec![c("id", "int", false, true)]), "sales"),
                 tbl("payments", vec![c("id", "int", false, true)]),
             ],
+            ..Default::default()
         };
         let found = |n: &str| find_described(&schema, n).map(|t| t.schema.clone());
         // A multi-schema listing prints `public.orders`, so that name has to

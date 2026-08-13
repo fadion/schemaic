@@ -1689,7 +1689,10 @@ mod tests {
         NavDb {
             database: database.to_string(),
             name: database.to_string(),
-            schema: Some(std::sync::Arc::new(DbSchema { tables })),
+            schema: Some(std::sync::Arc::new(DbSchema {
+                tables,
+                ..Default::default()
+            })),
         }
     }
 
@@ -1869,6 +1872,7 @@ mod tests {
         // No namespaces at all → the flat list every MySQL user already has.
         let s = DbSchema {
             tables: vec![tbl(None, "users"), tbl(None, "orders")],
+            ..Default::default()
         };
         assert!(schema_groups(&s).is_empty());
     }
@@ -1904,6 +1908,7 @@ mod tests {
         // One namespace is no choice at all — grouping would just cost a click.
         let s = DbSchema {
             tables: vec![tbl(Some("public"), "album"), tbl(Some("public"), "artist")],
+            ..Default::default()
         };
         assert!(schema_groups(&s).is_empty());
     }
@@ -1916,6 +1921,7 @@ mod tests {
                 tbl(Some("public"), "staging"),
                 tbl(Some("analytics"), "daily"),
             ],
+            ..Default::default()
         };
         assert_eq!(schema_groups(&s), vec!["public", "analytics", "sales"]);
     }
@@ -1926,6 +1932,7 @@ mod tests {
         // to present, so no level — the table rows carry the qualifier themselves.
         let s = DbSchema {
             tables: vec![tbl(Some("sales"), "orders")],
+            ..Default::default()
         };
         assert!(schema_groups(&s).is_empty());
     }

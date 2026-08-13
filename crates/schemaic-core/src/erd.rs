@@ -1025,6 +1025,7 @@ mod tests {
                 table("products", vec![col("id", "int", true)], vec![]),
                 table("logs", vec![col("id", "int", true)], vec![]), // island
             ],
+            ..Default::default()
         }
     }
 
@@ -1096,6 +1097,7 @@ mod tests {
                 ),
                 table("products", vec![col("id", "int", true)], vec![]),
             ],
+            ..Default::default()
         }
     }
 
@@ -1203,6 +1205,7 @@ mod tests {
                     ..Default::default()
                 }],
             )],
+            ..Default::default()
         };
         // Also add the referenced customers-less setup: orders is the only table.
         let g = build_graph(&s, "shop", &DiagramSeed::Database);
@@ -1232,6 +1235,7 @@ mod tests {
                     vec![fk(&["user_id"], "users", &["id"])],
                 ),
             ],
+            ..Default::default()
         };
         let g = build_graph(&s, "app", &DiagramSeed::Database);
         assert_eq!(g.edges[0].cardinality, Cardinality::OneToOne);
@@ -2012,6 +2016,7 @@ mod multi_schema_tests {
                     vec![pg_fk(&["order_id"], "sales", "orders", &["id"])],
                 ),
             ],
+            ..Default::default()
         }
     }
 
@@ -2093,6 +2098,7 @@ mod multi_schema_tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let g = build_graph(&s, "shop", &DiagramSeed::Database);
         let mut ids: Vec<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
@@ -2119,6 +2125,7 @@ mod multi_schema_tests {
                 }],
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let g = build_graph(&s, "shop", &DiagramSeed::Database);
         assert!(
