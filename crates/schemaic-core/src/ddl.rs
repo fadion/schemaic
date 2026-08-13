@@ -3821,10 +3821,79 @@ pub fn trigger_condition(raw: &str, dialect: SqlDialect) -> String {
 /// safe; a tokenizer that got it wrong the other way would silently keep a
 /// predicate the user had edited.
 fn norm_check_expr(s: &str, dialect: SqlDialect) -> String {
-    peel_parens(s, dialect)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let t = peel_parens(s, dialect);
+    let b = t.as_bytes();
+    let mut out = String::with_capacity(t.len());
+    let mut i = 0usize;
+    let mut pending_space = false;
+    while i < b.len() {
+        // A string, quoted identifier or comment passes through **byte for
+        // byte**. Squashing inside one made `name <> 'a  b'` and
+        // `name <> 'a b'` compare equal, so an edit to a `LIKE`/regex pattern
+        // was silently discarded — the dangerous direction, and the one this
+        // function's own doc says it avoids.
+        if let Some(j) = sql::skip_noncode(b, i, dialect) {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.push_str(&t[i..j]);
+            i = j;
+            continue;
+        }
+        if b[i].is_ascii_whitespace() {
+            pending_space = true;
+            i += 1;
+            continue;
+        }
+        if pending_space && !out.is_empty() {
+            out.push(' ');
+        }
+        pending_space = false;
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Fold case only over the parts that aren't quoted.
+///
+/// `qty > 0` and `QTY > 0` name the same column, but `status = 'a'` and
+/// `status = 'A'` are different predicates — and on PostgreSQL so are `"Qty"`
+/// and `"qty"`, which is why the old "no `'` anywhere ⇒ fold the whole string"
+/// rule was wrong in both directions at once.
+fn check_exprs_equal(x: &str, y: &str, dialect: SqlDialect) -> bool {
+    let (xb, yb) = (x.as_bytes(), y.as_bytes());
+    let (mut i, mut j) = (0usize, 0usize);
+    loop {
+        if i >= xb.len() || j >= yb.len() {
+            // Both exhausted together, or one ran out first and they differ.
+            // `skip_noncode` indexes `b[i]` unguarded, so this has to come
+            // before either call.
+            return i >= xb.len() && j >= yb.len();
+        }
+        let xq = sql::skip_noncode(xb, i, dialect);
+        let yq = sql::skip_noncode(yb, j, dialect);
+        match (xq, yq) {
+            // Both at a quoted run: it has to match exactly.
+            (Some(xe), Some(ye)) => {
+                if x[i..xe] != y[j..ye] {
+                    return false;
+                }
+                i = xe;
+                j = ye;
+            }
+            (None, None) => {
+                if !xb[i].eq_ignore_ascii_case(&yb[j]) {
+                    return false;
+                }
+                i += 1;
+                j += 1;
+            }
+            // One side opened a quoted run where the other didn't.
+            _ => return false,
+        }
+    }
 }
 
 /// Is this `CHECK` constraint the same as that one, as far as the server is
@@ -3844,11 +3913,7 @@ pub fn checks_equal(a: &CheckInfo, b: &CheckInfo, dialect: SqlDialect) -> bool {
         norm_check_expr(&a.expression, dialect),
         norm_check_expr(&b.expression, dialect),
     );
-    if x.contains('\'') || y.contains('\'') {
-        x == y
-    } else {
-        x.eq_ignore_ascii_case(&y)
-    }
+    check_exprs_equal(&x, &y, dialect)
 }
 
 // ── The diff ─────────────────────────────────────────────────────────────────
@@ -5892,6 +5957,52 @@ mod tests {
                 ck.clause_sql(Postgres),
                 "CONSTRAINT \"c\" CHECK (total >= 0)"
             );
+        }
+
+        /// Normalization must stop at a string boundary.
+        ///
+        /// `norm_check_expr` squashed whitespace runs across the *whole*
+        /// predicate, so `name <> 'a  b'` and `name <> 'a b'` compared equal and
+        /// an edit to a `LIKE` or regex pattern was **silently discarded** —
+        /// the dangerous direction, and the one this function's own doc claims
+        /// to avoid. Case folding had the mirror flaw: it applied to the whole
+        /// string whenever neither side contained a `'`, which folds
+        /// PostgreSQL's case-*sensitive* `"Qty"` into `"qty"`.
+        #[test]
+        fn a_checks_string_literals_are_compared_byte_for_byte() {
+            let ck = |e: &str| CheckInfo {
+                name: "c".into(),
+                expression: e.into(),
+                ..Default::default()
+            };
+            // The reported case: only the spacing *inside* the literal differs.
+            assert!(!checks_equal(
+                &ck("name <> 'a  b'"),
+                &ck("name <> 'a b'"),
+                MySql
+            ));
+            // Different letter case inside a literal is a different predicate.
+            assert!(!checks_equal(
+                &ck("status = 'a'"),
+                &ck("status = 'A'"),
+                MySql
+            ));
+            // A quoted identifier is case-sensitive on PostgreSQL.
+            assert!(!checks_equal(
+                &ck("\"Qty\" > 0"),
+                &ck("\"qty\" > 0"),
+                Postgres
+            ));
+
+            // …while everything outside a literal still normalizes: spacing
+            // between tokens, and the case of bare identifiers and keywords.
+            assert!(checks_equal(&ck("qty   >  0"), &ck("qty > 0"), MySql));
+            assert!(checks_equal(&ck("QTY > 0"), &ck("qty > 0"), MySql));
+            assert!(checks_equal(
+                &ck("name <> 'a  b'  AND qty > 0"),
+                &ck("name <> 'a  b' and qty > 0"),
+                MySql
+            ));
         }
 
         /// MariaDB destroys a column's CHECK when the column is altered, and
