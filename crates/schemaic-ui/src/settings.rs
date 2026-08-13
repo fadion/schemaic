@@ -171,8 +171,13 @@ pub(crate) fn settings_toggle_row(
         // `flex_grow(1) + min_width(0)`: take the space left of the switch and be
         // allowed to shrink below the text's natural width, so a long hint wraps
         // instead of pushing the toggle past the panel edge.
-        v_stack((text(title).style(form_label_style), form_hint(hint)))
-            .style(|s| s.flex_col().gap(2.0).flex_grow(1.0_f32).min_width(0.0)),
+        // The switch's primary label, so `theme::text()` rather than a caption's
+        // colour: it is the thing being toggled, not a caption above it.
+        v_stack((
+            text(title).style(|s| s.color(theme::text()).font_size(theme::FONT_LABEL)),
+            form_hint(hint),
+        ))
+        .style(|s| s.flex_col().gap(2.0).flex_grow(1.0_f32).min_width(0.0)),
         themed_toggle(sig),
     ))
     .style(|s| s.items_center().width_full().gap(10.0))

@@ -201,23 +201,6 @@ macro_rules! pair {
     };
 }
 
-/// Like [`pair`], for a *foreground* painted at reduced alpha — a form hint.
-/// Composited over its surface before measuring: [`contrast_ratio`] ignores
-/// alpha, so reading the raw colour would flatter a hint by exactly the amount
-/// the fade takes away.
-macro_rules! faded {
-    ($fg:ident($alpha:expr) on $bg:ident, $role:ident, $site:expr) => {
-        Pairing {
-            fg: concat!(stringify!($fg), "@", stringify!($alpha)),
-            bg: stringify!($bg),
-            role: Legibility::$role,
-            site: $site,
-            fg_of: |t| over(t.$fg.multiply_alpha($alpha), t.$bg),
-            bg_of: |t| t.$bg,
-        }
-    };
-}
-
 /// Like [`faded`], for a control that fades *whole* — a disabled action, where
 /// the label and the fill are both at half strength. Neither half is opaque, so
 /// both have to be composited against the surface behind them before the pair
@@ -309,16 +292,21 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     pair!(text on tab_active, Body, "tab strip: the active tab's label"),
     // ── Side panels, modals and popup menus (`bg_panel`).
     pair!(text on bg_panel, Body, "schema tree, modals, menu rows"),
-    pair!(text_dim on bg_panel, Body, "panel + form labels"),
-    pair!(text_muted on bg_panel, Icon, "section titles, form labels, metadata"),
-    faded!(text_muted(0.6) on bg_panel, Recessive, "form modals: a control's hint line"),
-    pair!(text_faint on bg_panel, Recessive, "count capsules, empty-state hints"),
+    pair!(text_dim on bg_panel, Body, "panel labels + every form caption"),
+    pair!(text_muted on bg_panel, Icon, "section titles, secondary metadata"),
+    pair!(text_faint on bg_panel, Recessive, "form hints, count capsules, empty states"),
     pair!(search_hint on bg_panel, Recessive, "schema tree: the search box hint"),
     pair!(error on bg_panel, Body, "modal + panel error lines"),
     pair!(accent on bg_panel, Body, "selected/active affordances in a panel"),
     pair!(match_highlight on bg_panel, Body, "Find Anywhere: the matched substring"),
     pair!(plan_warn on bg_panel, Body, "import modal: a pre-flight warning"),
     pair!(change_count on bg_panel, Body, "table designer: the N changes count"),
+    // The in-form button surface — `theme::control_bg()` is `erd_canvas` under
+    // another name. Two roles paint on it and neither had a row, so a palette
+    // edit could have moved either silently, which is the one thing this table
+    // exists to stop.
+    pair!(text on erd_canvas, Body, "in-form buttons: Choose file…, Add value"),
+    pair!(text_faint on erd_canvas, Recessive, "an in-form button with nothing to act on"),
     // [B16-L2-01] read these two as a fill under white text and set them aside
     // as "therefore fine". They aren't a fill: `footer_button` takes a colour
     // fn, so this is red *text* on the modal panel.
@@ -452,116 +440,135 @@ pub const EDITOR_PAIRINGS: &[Pairing<EditorTheme>] = &[
 ///
 /// Read it as the inventory of what a contrast pass would have to fix. It is
 /// deliberately not a list of colours to leave alone.
-pub const UI_SHORTFALL: &[Shortfall] = &[
-    ("dark", "status_text", "bg_deepest", 3.7),
-    ("dark", "text_muted", "bg_deepest", 2.7),
-    ("dark", "placeholder", "bg_deepest", 1.5),
-    ("dark", "text_muted", "bg_chrome", 2.6),
-    ("dark", "tab_text", "bg_chrome", 3.7),
-    ("dark", "tab_close", "bg_chrome", 1.4),
-    ("dark", "text_dim", "bg_panel", 4.4),
-    ("dark", "text_muted", "bg_panel", 2.5),
-    // The hint line: `text_muted` at 60% composites to 1.7:1 here, and to 1.79:1
-    // under the Light theme. Both are under the "still perceptible" floor — this
-    // is a deliberate design choice about how far a hint recedes, recorded so it
-    // can't drift further without somebody choosing that too.
-    ("dark", "text_muted@0.6", "bg_panel", 1.7),
-    // Modal footer actions. Tinting each label to its own fill put both *resting*
-    // states over AA — they aren't listed here at all — so what's left is the
-    // hovers, where lightening the fill under an unchanged label costs contrast,
-    // and the destructive red, whose fill can only go so light before it stops
-    // reading as a warning.
-    ("dark", "btn_neutral_text", "btn_neutral_hover", 3.8),
-    ("dark", "btn_primary_text", "btn_primary_hover", 3.9),
-    // The recessed pair is the one whose *hover* clears 4.5 (it darkens), which is
-    // why only its resting state is listed.
-    ("dark", "btn_quiet_text", "btn_quiet", 4.2),
-    ("dark", "btn_danger_text", "btn_danger", 3.5),
-    ("dark", "btn_danger_text", "btn_danger_hover", 2.7),
-    ("dark", "search_hint", "bg_panel", 1.4),
-    ("dark", "db_icon", "bg_panel", 1.6),
-    ("dark", "table_icon", "bg_panel", 2.7),
-    ("dark", "text_muted", "capsule_bg", 2.1),
-    ("dark", "text_dim", "row_selected", 3.3),
-    ("dark", "placeholder", "bg_editor", 1.3),
-    ("dark", "cmdk_placeholder", "bg_editor", 1.4),
-    ("dark", "text_dim", "bg_header_row", 4.1),
-    ("dark", "text_dim", "grid_col_sel", 3.5),
-    ("dark", "text_muted", "completion_active", 1.7),
-    ("dark", "text_muted", "erd_node_bg", 2.3),
-    ("dark", "text_dim", "erd_node_bg", 4.0),
-    ("dark", "text", "grid_edit_staged", 2.1),
-    (
-        "dark",
-        "text_faint",
-        "grid_edit_staged@0.15 over bg_results",
-        1.9,
-    ),
-    ("dark", "reject_text", "reject_bg", 2.3),
-    ("dark", "toggle_handle_off", "toggle_off", 1.8),
-    ("light", "status_text", "bg_deepest", 3.6),
-    ("light", "chip_active", "bg_deepest", 3.8),
-    ("light", "text_muted", "bg_deepest", 2.4),
-    ("light", "placeholder", "bg_deepest", 1.4),
-    ("light", "text_muted", "bg_chrome", 2.7),
-    ("light", "text_faint", "bg_chrome", 1.9),
-    ("light", "error", "bg_chrome", 4.1),
-    ("light", "accent", "bg_chrome", 4.3),
-    ("light", "tab_text", "bg_chrome", 2.7),
-    ("light", "tab_close", "bg_chrome", 1.4),
-    ("light", "text_muted", "bg_panel", 2.8),
-    ("light", "text_muted@0.6", "bg_panel", 1.7),
-    ("light", "btn_quiet_text", "btn_quiet", 3.5),
-    ("light", "btn_quiet_text", "btn_quiet_hover", 3.1),
-    ("light", "search_hint", "bg_panel", 1.6),
-    ("light", "error", "bg_panel", 4.3),
-    ("light", "plan_warn", "bg_panel", 3.2),
-    ("light", "key_primary", "bg_panel", 2.2),
-    ("light", "favorite_star", "bg_panel", 2.6),
-    ("light", "view_icon", "bg_panel", 2.6),
-    ("light", "db_toggle_off", "bg_panel", 1.9),
-    ("light", "text_muted", "capsule_bg", 2.4),
-    ("light", "text_dim", "row_selected", 4.1),
-    ("light", "key_primary", "row_selected", 1.7),
-    ("light", "placeholder", "bg_editor", 1.7),
-    ("light", "cmdk_placeholder", "bg_editor", 1.7),
-    ("light", "text_faint", "bg_header_row", 1.8),
-    ("light", "chip_active", "bg_header_row", 4.2),
-    ("light", "text_muted", "completion_active", 2.5),
-    ("light", "plan_warn", "plan_warn_bg", 3.0),
-    ("light", "key_primary", "erd_node_bg", 2.5),
-    ("light", "text_muted", "erd_node_bg", 3.2),
-    ("light", "text", "grid_edit_staged", 3.8),
-    (
-        "light",
-        "text_faint",
-        "grid_edit_staged@0.15 over bg_results",
-        1.9,
-    ),
-    ("light", "reject_text", "reject_bg", 4.0),
-    ("light", "err_fix_btn", "reject_bg", 3.3),
-    ("light", "diff_add_marker", "diff_add_bg", 3.6),
-    ("light", "diff_del_marker", "diff_del_bg", 4.0),
-    ("light", "toggle_handle_off", "toggle_off", 1.5),
-];
+pub const UI_SHORTFALL: &[Shortfall] = {
+    use Legibility::{Body, Icon, Recessive};
+    &[
+        ("dark", "status_text", "bg_deepest", Body, 3.7),
+        ("dark", "text_muted", "bg_deepest", Icon, 2.7),
+        ("dark", "placeholder", "bg_deepest", Recessive, 1.5),
+        ("dark", "text_muted", "bg_chrome", Icon, 2.6),
+        ("dark", "tab_text", "bg_chrome", Body, 3.7),
+        ("dark", "tab_close", "bg_chrome", Recessive, 1.4),
+        ("dark", "text_dim", "bg_panel", Body, 4.4),
+        ("dark", "text_muted", "bg_panel", Icon, 2.5),
+        // Modal footer actions. Tinting each label to its own fill put both *resting*
+        // states over AA — they aren't listed here at all — so what's left is the
+        // hovers, where lightening the fill under an unchanged label costs contrast,
+        // and the destructive red, whose fill can only go so light before it stops
+        // reading as a warning.
+        ("dark", "btn_neutral_text", "btn_neutral_hover", Body, 3.8),
+        ("dark", "btn_primary_text", "btn_primary_hover", Body, 3.9),
+        // The recessed pair is the one whose *hover* clears 4.5 (it darkens), which is
+        // why only its resting state is listed.
+        ("dark", "btn_quiet_text", "btn_quiet", Body, 4.2),
+        ("dark", "btn_danger_text", "btn_danger", Body, 3.5),
+        ("dark", "btn_danger_text", "btn_danger_hover", Body, 2.7),
+        ("dark", "search_hint", "bg_panel", Recessive, 1.4),
+        ("dark", "db_icon", "bg_panel", Icon, 1.6),
+        ("dark", "table_icon", "bg_panel", Icon, 2.7),
+        ("dark", "text_muted", "capsule_bg", Icon, 2.1),
+        ("dark", "text_dim", "row_selected", Body, 3.3),
+        ("dark", "placeholder", "bg_editor", Recessive, 1.3),
+        ("dark", "cmdk_placeholder", "bg_editor", Recessive, 1.4),
+        ("dark", "text_dim", "bg_header_row", Body, 4.1),
+        ("dark", "text_dim", "grid_col_sel", Body, 3.5),
+        ("dark", "text_muted", "completion_active", Icon, 1.7),
+        ("dark", "text_muted", "erd_node_bg", Body, 2.3),
+        ("dark", "text_dim", "erd_node_bg", Body, 4.0),
+        ("dark", "text", "grid_edit_staged", Body, 2.1),
+        (
+            "dark",
+            "text_faint",
+            "grid_edit_staged@0.15 over bg_results",
+            Recessive,
+            1.9,
+        ),
+        ("dark", "reject_text", "reject_bg", Body, 2.3),
+        ("dark", "toggle_handle_off", "toggle_off", Icon, 1.8),
+        ("light", "status_text", "bg_deepest", Body, 3.6),
+        ("light", "chip_active", "bg_deepest", Body, 3.8),
+        ("light", "text_muted", "bg_deepest", Icon, 2.4),
+        ("light", "placeholder", "bg_deepest", Recessive, 1.4),
+        ("light", "text_muted", "bg_chrome", Icon, 2.7),
+        ("light", "text_faint", "bg_chrome", Recessive, 1.9),
+        ("light", "error", "bg_chrome", Body, 4.1),
+        ("light", "accent", "bg_chrome", Body, 4.3),
+        ("light", "tab_text", "bg_chrome", Body, 2.7),
+        ("light", "tab_close", "bg_chrome", Recessive, 1.4),
+        ("light", "text_muted", "bg_panel", Icon, 2.8),
+        ("light", "btn_quiet_text", "btn_quiet", Body, 3.5),
+        ("light", "btn_quiet_text", "btn_quiet_hover", Body, 3.1),
+        ("light", "search_hint", "bg_panel", Recessive, 1.6),
+        ("light", "error", "bg_panel", Body, 4.3),
+        ("light", "plan_warn", "bg_panel", Body, 3.2),
+        ("light", "key_primary", "bg_panel", Icon, 2.2),
+        ("light", "favorite_star", "bg_panel", Icon, 2.6),
+        ("light", "view_icon", "bg_panel", Icon, 2.6),
+        ("light", "db_toggle_off", "bg_panel", Recessive, 1.9),
+        ("light", "text_muted", "capsule_bg", Icon, 2.4),
+        ("light", "text_dim", "row_selected", Body, 4.1),
+        ("light", "key_primary", "row_selected", Icon, 1.7),
+        ("light", "placeholder", "bg_editor", Recessive, 1.7),
+        ("light", "cmdk_placeholder", "bg_editor", Recessive, 1.7),
+        ("light", "text_faint", "bg_header_row", Recessive, 1.8),
+        ("light", "chip_active", "bg_header_row", Body, 4.2),
+        ("light", "text_muted", "completion_active", Icon, 2.5),
+        ("light", "plan_warn", "plan_warn_bg", Body, 3.0),
+        ("light", "key_primary", "erd_node_bg", Body, 2.5),
+        ("light", "text_muted", "erd_node_bg", Body, 3.2),
+        ("light", "text", "grid_edit_staged", Body, 3.8),
+        (
+            "light",
+            "text_faint",
+            "grid_edit_staged@0.15 over bg_results",
+            Recessive,
+            1.9,
+        ),
+        ("light", "reject_text", "reject_bg", Body, 4.0),
+        ("light", "err_fix_btn", "reject_bg", Body, 3.3),
+        ("light", "diff_add_marker", "diff_add_bg", Body, 3.6),
+        ("light", "diff_del_marker", "diff_del_bg", Body, 4.0),
+        ("light", "toggle_handle_off", "toggle_off", Icon, 1.5),
+    ]
+};
 
 /// Same, for the editor surface. All three are Schemaic's own choices on the
 /// upstream palettes' backgrounds — `cursor` is Latte's rosewater, which is
 /// faithful to that theme and a poor caret.
-pub const EDITOR_SHORTFALL: &[Shortfall] = &[
-    ("one-dark-pro", "underline", "bg", 2.7),
-    ("catppuccin-latte", "cursor", "bg", 2.3),
-    ("catppuccin-latte", "underline", "bg", 2.3),
-];
+pub const EDITOR_SHORTFALL: &[Shortfall] = {
+    use Legibility::Icon;
+    &[
+        ("one-dark-pro", "underline", "bg", Icon, 2.7),
+        ("catppuccin-latte", "cursor", "bg", Icon, 2.3),
+        ("catppuccin-latte", "underline", "bg", Icon, 2.3),
+    ]
+};
 
-/// One baselined pairing: `(theme key, foreground, background, ratio it holds)`.
-pub type Shortfall = (&'static str, &'static str, &'static str, f64);
+/// One baselined pairing:
+/// `(theme key, foreground, background, the role it was excused at, ratio)`.
+///
+/// **The role is part of the key**, not decoration. Without it the gate matched
+/// on `(fg, bg)` alone, so *reusing* a listed colour in a more demanding place
+/// was invisible: `text_muted on bg_panel` was baselined as an **Icon** pairing
+/// at 2.5, and when every form caption in the app was routed through that same
+/// colour the audit went on passing — body text at 2.55:1, held to an icon's
+/// floor by a row that meant something else. A new colour would have been held
+/// to AA; a reused one was not. Now a role change is a key change, so the
+/// pairing has to meet its new floor or somebody has to write the exemption down
+/// on purpose.
+pub type Shortfall = (&'static str, &'static str, &'static str, Legibility, f64);
 
-/// The ratio a pairing is baselined at in `list`, if it is.
-pub fn baselined(list: &[Shortfall], theme: &str, fg: &str, bg: &str) -> Option<f64> {
+/// The ratio a pairing is baselined at in `list`, if it is — at *that role*.
+pub fn baselined(
+    list: &[Shortfall],
+    theme: &str,
+    fg: &str,
+    bg: &str,
+    role: Legibility,
+) -> Option<f64> {
     list.iter()
-        .find(|(t, f, b, _)| *t == theme && *f == fg && *b == bg)
-        .map(|(_, _, _, r)| *r)
+        .find(|(t, f, b, ro, _)| *t == theme && *f == fg && *b == bg && *ro == role)
+        .map(|(.., r)| *r)
 }
 
 #[cfg(test)]
@@ -624,7 +631,7 @@ mod tests {
     ) {
         for p in pairings {
             let r = p.ratio(theme);
-            match baselined(shortfall, key, p.fg, p.bg) {
+            match baselined(shortfall, key, p.fg, p.bg, p.role) {
                 None => {
                     if r < p.role.floor() {
                         bad.push(format!(
@@ -722,56 +729,80 @@ mod tests {
         assert!(bad.is_empty() && stale.is_empty(), "{bad:?} {stale:?}");
 
         // Baselined above what it manages: it got worse.
-        let (bad, stale) = run(&[("dark", "text", "bg_deepest", 20.0)]);
+        let (bad, stale) = run(&[("dark", "text", "bg_deepest", Legibility::Body, 20.0)]);
         assert_eq!(bad.len(), 1, "{bad:?}");
         assert!(bad[0].contains("got worse"), "{}", bad[0]);
         assert!(stale.is_empty());
 
         // Baselined but now passing: the entry has to go.
-        let (bad, stale) = run(&[("dark", "text", "bg_deepest", 2.0)]);
+        let (bad, stale) = run(&[("dark", "text", "bg_deepest", Legibility::Body, 2.0)]);
         assert!(bad.is_empty(), "{bad:?}");
         assert_eq!(stale.len(), 1, "{stale:?}");
         assert!(stale[0].contains("drop it"), "{}", stale[0]);
 
         // A baseline for a *different* theme doesn't exempt this one.
         const FAILING: &[Pairing<UiTheme>] = &[pair!(placeholder on bg_editor, Body, "probe")];
-        let (mut bad, mut stale) = (Vec::new(), Vec::new());
-        check(
-            FAILING,
-            &[("light", "placeholder", "bg_editor", 1.0)],
-            "dark",
-            "Dark",
-            &dark,
-            &mut bad,
-            &mut stale,
-        );
+        let fails = |shortfall: &[Shortfall]| {
+            let (mut bad, mut stale) = (Vec::new(), Vec::new());
+            check(
+                FAILING, shortfall, "dark", "Dark", &dark, &mut bad, &mut stale,
+            );
+            (bad, stale)
+        };
+        let (bad, stale) = fails(&[("light", "placeholder", "bg_editor", Legibility::Body, 1.0)]);
         assert_eq!(bad.len(), 1, "{bad:?}");
         assert!(bad[0].contains("needs 4.5:1"), "{}", bad[0]);
         assert!(stale.is_empty());
+
+        // Nor does a baseline recorded at a *different role*. This is the hole
+        // the role in the key closes: `text_muted on bg_panel` was excused as an
+        // Icon pairing, and routing every form caption through it made body text
+        // inherit that excuse without a line of the table changing.
+        let (bad, _) = fails(&[(
+            "dark",
+            "placeholder",
+            "bg_editor",
+            Legibility::Recessive,
+            1.0,
+        )]);
+        assert_eq!(bad.len(), 1, "{bad:?}");
+        assert!(bad[0].contains("needs 4.5:1"), "{}", bad[0]);
+        // At the role it actually is, the same entry exempts it.
+        let (bad, _) = fails(&[("dark", "placeholder", "bg_editor", Legibility::Body, 1.0)]);
+        assert!(bad.is_empty(), "{bad:?}");
     }
 
     /// A baseline entry that names a pairing (or a theme) nobody has is worse
     /// than no entry: it silently exempts nothing while looking like it does.
     #[test]
     fn every_baseline_entry_names_a_real_pairing() {
-        for (theme, fg, bg, _) in UI_SHORTFALL {
+        // The **role** has to match too, which is what makes it part of the key:
+        // move a pairing to a harder role and its old exemption stops applying,
+        // so the pairing must either meet the new floor or be baselined again
+        // deliberately. Body text inherited an icon's excuse exactly once, and
+        // this is the assertion that would have caught it.
+        for (theme, fg, bg, role, _) in UI_SHORTFALL {
             assert!(
                 UiThemeKind::ALL.iter().any(|k| k.key() == *theme),
                 "no UI theme {theme:?}"
             );
             assert!(
-                UI_PAIRINGS.iter().any(|p| p.fg == *fg && p.bg == *bg),
-                "no pairing {fg} on {bg}"
+                UI_PAIRINGS
+                    .iter()
+                    .any(|p| p.fg == *fg && p.bg == *bg && p.role == *role),
+                "no pairing {fg} on {bg} at {role:?}"
             );
         }
-        for (theme, fg, bg, _) in EDITOR_SHORTFALL {
+        for (theme, fg, bg, role, _) in EDITOR_SHORTFALL {
             assert!(
                 EditorThemeKind::ALL.iter().any(|k| k.key() == *theme),
                 "no editor theme {theme:?}"
             );
             assert!(
-                EDITOR_PAIRINGS.iter().any(|p| p.fg == *fg && p.bg == *bg),
-                "no pairing {fg} on {bg}"
+                EDITOR_PAIRINGS
+                    .iter()
+                    .any(|p| p.fg == *fg && p.bg == *bg && p.role == *role),
+                "no pairing {fg} on {bg} at {role:?}"
             );
         }
     }
@@ -815,7 +846,7 @@ mod tests {
                 let t = kind.build();
                 for p in rows.iter() {
                     assert!(
-                        baselined(UI_SHORTFALL, kind.key(), p.fg, p.bg).is_none(),
+                        baselined(UI_SHORTFALL, kind.key(), p.fg, p.bg, p.role).is_none(),
                         "{name} on {} is baselined in {}",
                         p.bg,
                         kind.label()

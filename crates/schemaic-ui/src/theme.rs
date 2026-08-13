@@ -176,13 +176,6 @@ pub fn text_muted() -> Color {
 pub fn placeholder() -> Color {
     ui().placeholder
 }
-/// The explanatory line under a form control — `text_muted` faded, so a hint
-/// reads as subordinate to the label above it without becoming a second grey in
-/// the palette. Derived rather than a theme field: the two can't drift apart, and
-/// a new theme gets it for free.
-pub fn form_hint() -> Color {
-    ui().text_muted.multiply_alpha(0.6)
-}
 
 // Status-bar panel toggles: idle (panel closed) vs active (panel open).
 pub fn chip_idle() -> Color {
