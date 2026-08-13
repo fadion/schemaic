@@ -168,6 +168,71 @@ pub fn skip_noncode(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
     }
 }
 
+/// The index of the `)` that closes the `(` at `start`, or `None` when it is
+/// never closed (or `start` isn't an open paren at all).
+///
+/// Nesting counts; a paren inside a string, quoted identifier or comment does
+/// not, because every step goes through [`skip_noncode`] — `name <> ')'` carries
+/// a close-paren in a literal, and a raw byte scan reads it as the end of the
+/// group.
+///
+/// This is the shared form of a scan that had grown three copies: `ddl`'s
+/// `peel_parens` (correct — it went through this lexer), and `pg`'s
+/// `pg_trigger_when`/`pg_trigger_args` (hand-rolled, aware of `'` only, so a
+/// `"it's"` identifier latched the scanner into a string that never ended).
+/// Returning the index rather than the slice is what lets a caller keep the
+/// offsets it needs into its own buffer.
+pub fn balanced_paren_span(b: &[u8], start: usize, dialect: SqlDialect) -> Option<usize> {
+    if b.get(start) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            i = j;
+            continue;
+        }
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The index of the first occurrence of `needle` at a *code* position — outside
+/// every string, quoted identifier and comment.
+///
+/// The plain `str::find`/`rfind` this replaces cannot tell the keyword it is
+/// looking for from the same bytes inside a literal argument, which is how
+/// `EXECUTE FUNCTION audit_fn('EXECUTE FUNCTION x(', 'b')` came apart.
+pub fn find_code(hay: &str, needle: &str, dialect: SqlDialect) -> Option<usize> {
+    let b = hay.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            i = j;
+            continue;
+        }
+        // Byte comparison, not `hay[i..].starts_with` — `i` walks bytes and a
+        // multi-byte character elsewhere in the input would make that slice
+        // panic on a char boundary.
+        if b[i..].starts_with(needle.as_bytes()) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Byte offsets bounding each top-level statement: `[0, after-`;`, …, len]`.
 /// `;` inside strings / identifiers / comments does not split.
 pub fn statement_bounds(sql: &str, dialect: SqlDialect) -> Vec<usize> {
@@ -1524,5 +1589,61 @@ mod tests {
         for &b in b" .,()'`\"-;" {
             assert!(!is_word_byte(b), "{:?} treated as a word byte", b as char);
         }
+    }
+
+    #[test]
+    fn balanced_paren_span_matches_the_outer_pair() {
+        let s = "((a > 0) AND (b < 1)) trailing";
+        assert_eq!(
+            balanced_paren_span(s.as_bytes(), 0, SqlDialect::Postgres),
+            Some(20)
+        );
+        assert_eq!(&s[..=20], "((a > 0) AND (b < 1))");
+    }
+
+    #[test]
+    fn balanced_paren_span_ignores_parens_inside_literals() {
+        // The reason this goes through `skip_noncode` rather than counting
+        // bytes: both of these carry a close-paren that is data, not structure.
+        for (s, dialect) in [
+            ("(name <> ')')", SqlDialect::Postgres),
+            ("(name <> ')')", SqlDialect::MySql),
+        ] {
+            let end = balanced_paren_span(s.as_bytes(), 0, dialect);
+            assert_eq!(end, Some(s.len() - 1), "{s}");
+        }
+        // A quoted identifier holding a quote is the case the hand-rolled
+        // scanner latched on: after `"it's"` it believed it was inside a string
+        // for the rest of the input.
+        let s = r#"(new."it's" > 0)"#;
+        assert_eq!(
+            balanced_paren_span(s.as_bytes(), 0, SqlDialect::Postgres),
+            Some(s.len() - 1)
+        );
+    }
+
+    #[test]
+    fn balanced_paren_span_rejects_a_non_paren_start_and_an_unclosed_group() {
+        assert_eq!(balanced_paren_span(b"a > 0", 0, SqlDialect::Postgres), None);
+        assert_eq!(
+            balanced_paren_span(b"(a > 0", 0, SqlDialect::Postgres),
+            None
+        );
+        assert_eq!(balanced_paren_span(b"", 0, SqlDialect::Postgres), None);
+    }
+
+    #[test]
+    fn find_code_skips_a_match_inside_a_literal() {
+        let s = "EXECUTE FUNCTION f('EXECUTE FUNCTION x(', 'b')";
+        // The real keyword is at 0; the one in the argument must not be found.
+        assert_eq!(
+            find_code(s, "EXECUTE FUNCTION ", SqlDialect::Postgres),
+            Some(0)
+        );
+        let s = "CREATE TRIGGER t ... f('EXECUTE FUNCTION x(')";
+        assert_eq!(
+            find_code(s, "EXECUTE FUNCTION ", SqlDialect::Postgres),
+            None
+        );
     }
 }
