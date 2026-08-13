@@ -650,23 +650,78 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize) -> AnyView {
 /// already names** if that isn't in the list yet — the list arrives a round trip
 /// after the modal, and re-pointing a trigger the user had already aimed would
 /// be a silent edit.
+/// What the picker *shows* for a function: always namespace-qualified, so two
+/// same-named functions in two schemas are two distinguishable rows rather than
+/// two identical ones.
+fn fn_display(f: &RoutineInfo) -> String {
+    match f.schema.as_deref() {
+        Some(s) => format!("{s}.{}", f.name),
+        None => f.name.clone(),
+    }
+}
+
+/// What the picker *stores*: emittable SQL, quoted and qualified by the same
+/// rules everything else in the codebase uses.
+///
+/// The pair is `intel::JoinTarget`'s shape — a bare name to show, `table_sql` to
+/// insert — and it exists for the same reason. Storing the bare `proname` bound
+/// a trigger on `s22.t` to `public.audit_fn`, permanently and by OID, while
+/// every surface still said `audit_fn`; a name needing quotes (`s22."My Fn"`)
+/// was emitted raw and was a syntax error.
+fn fn_sql(f: &RoutineInfo) -> String {
+    schemaic_core::schema::qualified_ident(&f.name, f.schema.as_deref(), SqlDialect::Postgres)
+}
+
+/// Does this stored SQL name this function?
+///
+/// Compared on **identity, not spelling**. The two producers quote differently
+/// and both are right: PostgreSQL's `tgfoid::regproc::text` quotes only what a
+/// bare name would get wrong (`s22.audit_fn`, `s22."My Fn"`), while
+/// `qualified_ident` quotes unconditionally (`"s22"."audit_fn"`). Comparing the
+/// strings would leave Edit disabled for every introspected trigger — the very
+/// fault this change is fixing — so the quotes are dropped first, which leaves
+/// exactly [`fn_display`]'s form on both sides.
+///
+/// A name containing a literal `"` falls out of this and shows the stored SQL
+/// verbatim instead. That is the honest degradation: it names the right
+/// function, it just can't be matched to a row.
+fn fn_names(f: &RoutineInfo, sql: &str) -> bool {
+    sql.replace('"', "") == fn_display(f)
+}
+
 fn pg_action(ui: &Ui, i: usize, draft: &TriggerDraft, target: &TriggerTarget) -> AnyView {
     let d = ui.ddl.trigger_draft;
     let fns = ui.ddl.functions;
-    let current = match &draft.info.action {
+    // `TriggerAction::Function::name` is **emittable SQL** on both producers:
+    // introspection's `tgfoid::regproc::text` already comes back correctly
+    // quoted and conditionally qualified, and the picker now writes the same
+    // shape. Displaying it means mapping back through the list.
+    let stored = match &draft.info.action {
         TriggerAction::Function { name, .. } => name.clone(),
         TriggerAction::Body(_) => String::new(),
     };
+    let display_of = move |sql: &str, list: &[RoutineInfo]| -> String {
+        list.iter()
+            .find(|f| fn_names(f, sql))
+            .map(fn_display)
+            // Not in the list — the fetch hasn't landed, or it isn't a trigger
+            // function any more. Showing the stored SQL verbatim is honest;
+            // inventing a display name would hide which function is bound.
+            .unwrap_or_else(|| sql.to_string())
+    };
+    let current = display_of(&stored, &fns.get_untracked());
 
     // The selection lives in a signal, not in the rebuilt closure: `owned_dropdown`
     // needs a `Copy` getter, and a captured `String` isn't one. It also keeps the
     // control's own state independent of the list arriving.
+    // `sel` holds the **display** form; the draft holds the SQL one.
     let sel = floem::reactive::create_rw_signal(current);
     create_effect(move |_| {
-        let named = d.with(|s| match s.triggers.get(i).map(|t| &t.info.action) {
+        let sql = d.with(|s| match s.triggers.get(i).map(|t| &t.info.action) {
             Some(TriggerAction::Function { name, .. }) => name.clone(),
             _ => String::new(),
         });
+        let named = display_of(&sql, &fns.get());
         if sel.get_untracked() != named {
             sel.set(named);
         }
@@ -674,7 +729,7 @@ fn pg_action(ui: &Ui, i: usize, draft: &TriggerDraft, target: &TriggerTarget) ->
     let picker = dyn_container(
         move || (fns.get(), sel.get()),
         move |(list, named)| {
-            let mut options: Vec<String> = list.iter().map(|f| f.name.clone()).collect();
+            let mut options: Vec<String> = list.iter().map(fn_display).collect();
             // Whatever the draft names stays selectable even before the fetch
             // lands, or on a server where it isn't a trigger function any more.
             if !named.is_empty() && !options.contains(&named) {
@@ -685,6 +740,15 @@ fn pg_action(ui: &Ui, i: usize, draft: &TriggerDraft, target: &TriggerTarget) ->
                 options,
                 FIELD_W,
                 move |v: String| {
+                    // Display back to SQL. An entry not in the list is the
+                    // fallback row above — it *is* the stored SQL, so it goes
+                    // back unchanged rather than being re-quoted.
+                    let sql = fns.with_untracked(|l| {
+                        l.iter()
+                            .find(|f| fn_display(f) == v)
+                            .map(fn_sql)
+                            .unwrap_or_else(|| v.clone())
+                    });
                     d.update(|s| {
                         let Some(dr) = s.triggers.get_mut(i) else {
                             return;
@@ -693,7 +757,7 @@ fn pg_action(ui: &Ui, i: usize, draft: &TriggerDraft, target: &TriggerTarget) ->
                             TriggerAction::Function { args, .. } => args.clone(),
                             TriggerAction::Body(_) => Vec::new(),
                         };
-                        dr.info.action = TriggerAction::Function { name: v, args };
+                        dr.info.action = TriggerAction::Function { name: sql, args };
                     });
                 },
             )
@@ -722,7 +786,11 @@ fn pg_action(ui: &Ui, i: usize, draft: &TriggerDraft, target: &TriggerTarget) ->
     let edit_btn = dyn_container(
         move || (sel.get(), fns.get()),
         move |(named, list)| {
-            let found = list.iter().find(|f| f.name == named).cloned();
+            // Compared against the same built display string the picker shows.
+            // This used to compare the bare `proname` against introspection's
+            // *pre-quoted qualified* name, so it never matched and Edit was
+            // permanently disabled for exactly the functions that needed it.
+            let found = list.iter().find(|f| fn_display(f) == named).cloned();
             let ui = edit_ui.clone();
             let db = edit_db.clone();
             control_button_enabled("Edit", found.is_some(), move || {
@@ -1277,4 +1345,63 @@ pub(crate) fn function_editor_overlay(ui: Ui) -> impl IntoView {
             s
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn routine(schema: &str, name: &str) -> RoutineInfo {
+        RoutineInfo {
+            schema: Some(schema.into()),
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    /// The picker shows a qualified name and stores emittable SQL.
+    ///
+    /// Storing the bare `proname` bound a trigger on `s22.t` to
+    /// `public.audit_fn` — permanently, by OID, with every surface still saying
+    /// `audit_fn` — and made two same-named functions two identical rows.
+    #[test]
+    fn a_function_is_shown_qualified_and_stored_as_sql() {
+        let s22 = routine("s22", "audit_fn");
+        let public = routine("public", "audit_fn");
+        // Two distinguishable rows, not two identical ones.
+        assert_eq!(fn_display(&s22), "s22.audit_fn");
+        assert_eq!(fn_display(&public), "public.audit_fn");
+        assert_ne!(fn_display(&s22), fn_display(&public));
+
+        // What is emitted. `public` is dropped on the way out, which is the
+        // codebase's rule for every generated identifier.
+        assert_eq!(fn_sql(&s22), "\"s22\".\"audit_fn\"");
+        assert_eq!(fn_sql(&public), "\"audit_fn\"");
+        // A name a bare identifier would get wrong is quoted, where the old
+        // path emitted it raw and PostgreSQL answered `syntax error at or near
+        // "Fn"`.
+        assert_eq!(fn_sql(&routine("s22", "My Fn")), "\"s22\".\"My Fn\"");
+    }
+
+    /// Matching is on identity, not spelling — the two producers quote
+    /// differently and both are correct.
+    ///
+    /// `tgfoid::regproc::text` quotes only what a bare name would get wrong;
+    /// `qualified_ident` quotes unconditionally. Comparing strings left Edit
+    /// permanently disabled for exactly the introspected triggers that needed
+    /// it.
+    #[test]
+    fn a_stored_name_matches_its_function_in_either_quoting() {
+        let s22 = routine("s22", "audit_fn");
+        // PostgreSQL's own rendering…
+        assert!(fn_names(&s22, "s22.audit_fn"));
+        // …and the emitter's.
+        assert!(fn_names(&s22, "\"s22\".\"audit_fn\""));
+        // A different schema's same-named function is not a match.
+        assert!(!fn_names(&routine("public", "audit_fn"), "s22.audit_fn"));
+
+        let quoted = routine("s22", "My Fn");
+        assert!(fn_names(&quoted, "s22.\"My Fn\""));
+        assert!(fn_names(&quoted, "\"s22\".\"My Fn\""));
+    }
 }
