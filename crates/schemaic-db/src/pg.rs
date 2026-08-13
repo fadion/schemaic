@@ -52,8 +52,9 @@ use schemaic_core::model::{
     ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value, WriteStep, one_row_verdict,
 };
 use schemaic_core::schema::{
-    CheckInfo, ColumnInfo, DbSchema, IndexColumn, RoutineInfo, TableInfo, TriggerAction,
-    TriggerEvent, TriggerInfo, TriggerLevel, TriggerTiming, ViewOptions, Volatility,
+    CheckInfo, ColumnInfo, DbSchema, DomainInfo, EnumInfo, IndexColumn, RoutineInfo, SequenceInfo,
+    SequenceOwner, TableInfo, TriggerAction, TriggerEvent, TriggerInfo, TriggerLevel,
+    TriggerTiming, ViewOptions, Volatility,
 };
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
@@ -1057,10 +1058,228 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
         }
     }
 
+    // The standalone objects. They hang off the database, not off any table, so
+    // they're gathered after the per-table fold rather than inside it.
+    let (enums, domains) = pg_types(&client).await?;
     Ok(DbSchema {
         tables,
-        ..Default::default()
+        enums,
+        domains,
+        sequences: pg_sequences(&client).await?,
     })
+}
+
+/// The enum types and domains of every user namespace, plus each one's labels
+/// and constraints.
+///
+/// Enums and domains come out of **one** `pg_type` scan because that is where
+/// both live (`typtype` `e` and `d`); splitting them would be two round trips
+/// over the same rows. The labels and the domain constraints then need one query
+/// each, and the labels can't be string-aggregated into the first: an enum label
+/// is arbitrary text up to 63 bytes and may contain a comma, a newline, or
+/// nothing at all, so **any** separator is a value some database already uses.
+/// One row per label is the only rendering that can't be misread.
+///
+/// A domain's collation is reported only when it differs from its base type's.
+/// PostgreSQL fills `typcollation` in for every collatable domain whether or not
+/// the statement said `COLLATE`, so restating it unconditionally would put a
+/// `COLLATE "en_US.utf8"` on every `text` domain and make each one open with a
+/// phantom change against the round-trip gate.
+async fn pg_types(client: &Client) -> Result<(Vec<EnumInfo>, Vec<DomainInfo>), DbError> {
+    let filter = user_schema_filter("n.nspname");
+    let type_rows = query_all_optional(
+        client,
+        &format!(
+            "SELECT n.nspname, t.typname, t.typtype::text, \
+                    CASE WHEN t.typtype = 'd' \
+                         THEN format_type(t.typbasetype, t.typtypmod) ELSE '' END, \
+                    COALESCE(pg_get_expr(t.typdefaultbin, 0), t.typdefault, ''), \
+                    t.typnotnull::int, COALESCE(co.collname, ''), \
+                    COALESCE(obj_description(t.oid, 'pg_type'), ''), \
+                    (t.typdefaultbin IS NOT NULL OR t.typdefault IS NOT NULL)::int \
+             FROM pg_type t \
+             JOIN pg_namespace n ON n.oid = t.typnamespace \
+             LEFT JOIN pg_type bt ON bt.oid = t.typbasetype \
+             LEFT JOIN pg_collation co ON co.oid = t.typcollation \
+                                      AND t.typcollation <> bt.typcollation \
+             WHERE t.typtype IN ('e', 'd') AND {filter} \
+             ORDER BY n.nspname, t.typname"
+        ),
+    )
+    .await?;
+    if type_rows.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let label_rows = query_all_optional(
+        client,
+        &format!(
+            "SELECT n.nspname, t.typname, e.enumlabel \
+             FROM pg_enum e \
+             JOIN pg_type t ON t.oid = e.enumtypid \
+             JOIN pg_namespace n ON n.oid = t.typnamespace \
+             WHERE {filter} \
+             ORDER BY n.nspname, t.typname, e.enumsortorder"
+        ),
+    )
+    .await?;
+    let constraint_rows = query_all_optional(
+        client,
+        &format!(
+            "SELECT n.nspname, t.typname, c.conname, pg_get_constraintdef(c.oid) \
+             FROM pg_constraint c \
+             JOIN pg_type t ON t.oid = c.contypid \
+             JOIN pg_namespace n ON n.oid = t.typnamespace \
+             WHERE c.contype = 'c' AND {filter} \
+             ORDER BY n.nspname, t.typname, c.conname"
+        ),
+    )
+    .await?;
+
+    Ok(pg_fold_types(&type_rows, &label_rows, &constraint_rows))
+}
+
+/// Fold the three `pg_type` row sets into the model — the pure half of
+/// [`pg_types`], separated so the decisions in it can be tested without a server.
+///
+/// Two of those decisions are only visible in an edge case a live database
+/// happily produces. A domain's default may be the **empty string**, so "has a
+/// default" is a flag of its own rather than a non-empty test on the text — read
+/// the other way, `DEFAULT ''` would come back as no default and every replay
+/// would silently drop it. And an enum's labels are matched by `(namespace,
+/// name)` rather than positionally, because the label query is ordered by sort
+/// order within a type and a type with **no** labels contributes no rows at all.
+fn pg_fold_types(
+    type_rows: &[Vec<Option<String>>],
+    label_rows: &[Vec<Option<String>>],
+    constraint_rows: &[Vec<Option<String>>],
+) -> (Vec<EnumInfo>, Vec<DomainInfo>) {
+    let (mut enums, mut domains) = (Vec::new(), Vec::new());
+    for r in type_rows {
+        let (ns, name) = (cell(r, 0), cell(r, 1));
+        let of = |rows: &[Vec<Option<String>>]| -> Vec<Vec<Option<String>>> {
+            rows.iter()
+                .filter(|x| cell(x, 0) == ns && cell(x, 1) == name)
+                .cloned()
+                .collect()
+        };
+        let comment = Some(cell(r, 7)).filter(|c| !c.is_empty());
+        if cell(r, 2) == "e" {
+            enums.push(EnumInfo {
+                schema: Some(ns.clone()),
+                name: name.clone(),
+                values: of(label_rows).iter().map(|l| cell(l, 2)).collect(),
+                comment,
+            });
+        } else {
+            domains.push(DomainInfo {
+                schema: Some(ns.clone()),
+                name: name.clone(),
+                base_type: cell(r, 3),
+                collation: Some(cell(r, 6)).filter(|c| !c.is_empty()),
+                default_value: (cell(r, 8) == "1").then(|| cell(r, 4)),
+                not_null: cell(r, 5) == "1",
+                checks: of(constraint_rows)
+                    .iter()
+                    .map(|c| CheckInfo {
+                        name: cell(c, 2),
+                        // The same normalization a table's checks get: the server
+                        // hands back the whole `CHECK (…)` clause and the model
+                        // holds the predicate bare.
+                        expression: schemaic_core::ddl::check_predicate(
+                            &cell(c, 3),
+                            schemaic_core::intel::SqlDialect::Postgres,
+                        ),
+                        // PostgreSQL has no `NOT ENFORCED`.
+                        enforced: true,
+                    })
+                    .collect(),
+                comment,
+            });
+        }
+    }
+    (enums, domains)
+}
+
+/// Every sequence in every user namespace, with what owns it.
+///
+/// The definition comes from the `pg_sequence` **catalogue** rather than the
+/// `pg_sequences` view, and `last_value` from the view: the catalogue is
+/// readable whatever the role's privileges on the sequence itself, while the
+/// counter's position is exactly the part that needs `SELECT`/`USAGE`. Read
+/// together, a role that may see the schema but not the data gets a complete
+/// definition and a blank position, instead of the sequence vanishing.
+///
+/// `deptype` is what separates the two kinds: `a` is a `serial` column's
+/// sequence — an object in its own right that merely gets dropped with its
+/// column — and `i` is an identity column's counter, which *is* part of the
+/// column and which PostgreSQL refuses to drop separately.
+async fn pg_sequences(client: &Client) -> Result<Vec<SequenceInfo>, DbError> {
+    let rows = query_all_optional(
+        client,
+        &format!(
+            "SELECT n.nspname, c.relname, format_type(s.seqtypid, NULL), \
+                    s.seqstart::text, s.seqincrement::text, s.seqmin::text, \
+                    s.seqmax::text, s.seqcache::text, s.seqcycle::int, \
+                    COALESCE(ps.last_value::text, ''), \
+                    COALESCE(dt.relname, ''), COALESCE(da.attname, ''), \
+                    COALESCE(d.deptype, ''), \
+                    COALESCE(obj_description(c.oid, 'pg_class'), '') \
+             FROM pg_sequence s \
+             JOIN pg_class c ON c.oid = s.seqrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             LEFT JOIN pg_sequences ps \
+                    ON ps.schemaname = n.nspname AND ps.sequencename = c.relname \
+             LEFT JOIN pg_depend d \
+                    ON d.classid = 'pg_class'::regclass AND d.objid = c.oid \
+                   AND d.refclassid = 'pg_class'::regclass \
+                   AND d.deptype IN ('a', 'i') \
+             LEFT JOIN pg_class dt ON dt.oid = d.refobjid \
+             LEFT JOIN pg_attribute da \
+                    ON da.attrelid = d.refobjid AND da.attnum = d.refobjsubid \
+             WHERE {} \
+             ORDER BY n.nspname, c.relname",
+            user_schema_filter("n.nspname")
+        ),
+    )
+    .await?;
+    Ok(rows.iter().map(|r| pg_sequence_row(r)).collect())
+}
+
+/// One `pg_sequence` row as a [`SequenceInfo`] — the pure half of
+/// [`pg_sequences`].
+///
+/// The bounds come back as **text** and are parsed here rather than read as
+/// integers, because `seqmax` on a `bigint` sequence is `i64::MAX` and the text
+/// protocol is the only path that carries it without a decoder. Each falls back
+/// to PostgreSQL's own default rather than to zero: a sequence claiming
+/// `INCREMENT BY 0` is a statement the server rejects, so a parse failure that
+/// degraded to `Default` would turn a display glitch into un-runnable DDL.
+fn pg_sequence_row(r: &[Option<String>]) -> SequenceInfo {
+    let num = |i: usize, fallback: i64| cell(r, i).parse::<i64>().unwrap_or(fallback);
+    let owner_table = cell(r, 10);
+    SequenceInfo {
+        schema: Some(cell(r, 0)),
+        name: cell(r, 1),
+        data_type: cell(r, 2),
+        start: num(3, 1),
+        increment: num(4, 1),
+        min_value: num(5, 1),
+        max_value: num(6, i64::MAX),
+        cache: num(7, 1),
+        cycle: cell(r, 8) == "1",
+        // Blank means "never used, or this role may not look" — both of which are
+        // "no position to show", and neither of which is a position of 0.
+        last_value: cell(r, 9).parse::<i64>().ok(),
+        owned_by: (!owner_table.is_empty()).then(|| SequenceOwner {
+            table: owner_table,
+            column: cell(r, 11),
+            // `i` is an identity column's counter — part of the column, and
+            // undroppable on its own. `a` is a `serial`'s, which is a real object.
+            internal: cell(r, 12) == "i",
+        }),
+        comment: Some(cell(r, 13)).filter(|c| !c.is_empty()),
+    }
 }
 
 /// Every trigger function in `database`, read **lazily** — when the trigger or
@@ -1353,6 +1572,50 @@ fn fk_action(code: &str) -> Option<String> {
 
 /// Run a read-only SELECT and return every row as a `Vec<Option<String>>` (one
 /// entry per column, `None` = SQL NULL) over the text protocol.
+/// [`query_all`], but a server that has never heard of the catalogue being asked
+/// about answers "nothing" instead of failing the whole schema load.
+///
+/// The same judgement `mysql_checks` makes, and the same two-sided rule: only
+/// `undefined_table`/`undefined_column`/`undefined_function` degrade — the
+/// SQLSTATEs that mean *this server predates the feature* — and every other error
+/// still surfaces. A blanket `unwrap_or_default` would turn a typo, a permission
+/// problem or a dropped connection into a database that silently appears to have
+/// no types, which is indistinguishable from the truth and therefore worse than
+/// an error.
+///
+/// It is worth the care here specifically: these queries run inside
+/// [`fetch_schema`], so a failure takes **the whole database's** schema with it —
+/// the exact shape of the `pg_get_expr` trigger bug.
+async fn query_all_optional(
+    client: &Client,
+    sql: &str,
+) -> Result<Vec<Vec<Option<String>>>, DbError> {
+    use tokio_postgres::error::SqlState;
+    match client.simple_query(sql).await {
+        Ok(msgs) => Ok(msgs
+            .into_iter()
+            .filter_map(|m| match m {
+                SimpleQueryMessage::Row(r) => {
+                    let n = r.columns().len();
+                    Some((0..n).map(|i| r.get(i).map(|s| s.to_string())).collect())
+                }
+                _ => None,
+            })
+            .collect()),
+        Err(e)
+            if matches!(
+                e.code(),
+                Some(&SqlState::UNDEFINED_TABLE)
+                    | Some(&SqlState::UNDEFINED_COLUMN)
+                    | Some(&SqlState::UNDEFINED_FUNCTION)
+            ) =>
+        {
+            Ok(Vec::new())
+        }
+        Err(e) => Err(DbError::Query(e.to_string())),
+    }
+}
+
 async fn query_all(client: &Client, sql: &str) -> Result<Vec<Vec<Option<String>>>, DbError> {
     let msgs = client
         .simple_query(sql)
@@ -2499,5 +2762,182 @@ mod index_key_tests {
             sql.contains("NOT o.opcdefault"),
             "a non-default operator class is still unreadable per column"
         );
+    }
+
+    // ── Standalone objects ──────────────────────────────────────────────────
+
+    /// A catalogue row from a list of column texts, `None` for a NULL.
+    fn row(cells: &[&str]) -> Vec<Option<String>> {
+        cells.iter().map(|c| Some((*c).to_string())).collect()
+    }
+
+    #[test]
+    fn an_enum_takes_its_labels_in_query_order() {
+        let types = vec![row(&[
+            "public",
+            "mood",
+            "e",
+            "",
+            "",
+            "0",
+            "",
+            "how it went",
+            "0",
+        ])];
+        let labels = vec![
+            row(&["public", "mood", "sad"]),
+            row(&["public", "mood", "ok"]),
+            // Another type's labels must not leak in.
+            row(&["public", "other", "nope"]),
+            row(&["sales", "mood", "great"]),
+        ];
+        let (enums, domains) = pg_fold_types(&types, &labels, &[]);
+        assert!(domains.is_empty());
+        assert_eq!(enums.len(), 1);
+        assert_eq!(enums[0].values, vec!["sad", "ok"]);
+        assert_eq!(enums[0].comment.as_deref(), Some("how it went"));
+    }
+
+    /// A label may be the empty string, a comma, or a newline — which is why the
+    /// labels arrive one per row instead of string-aggregated. Any separator at
+    /// all would be a value some database already stores.
+    #[test]
+    fn enum_labels_survive_being_commas_newlines_and_empty() {
+        let types = vec![row(&["public", "weird", "e", "", "", "0", "", "", "0"])];
+        let labels = vec![
+            row(&["public", "weird", "a,b"]),
+            row(&["public", "weird", "line1\nline2"]),
+            row(&["public", "weird", ""]),
+        ];
+        let (enums, _) = pg_fold_types(&types, &labels, &[]);
+        assert_eq!(enums[0].values, vec!["a,b", "line1\nline2", ""]);
+    }
+
+    #[test]
+    fn an_enum_with_no_labels_is_still_an_enum() {
+        // `CREATE TYPE t AS ENUM ()` is legal and contributes no label rows.
+        let types = vec![row(&["public", "empty", "e", "", "", "0", "", "", "0"])];
+        let (enums, _) = pg_fold_types(&types, &[], &[]);
+        assert_eq!(enums.len(), 1);
+        assert!(enums[0].values.is_empty());
+    }
+
+    /// The whole reason `has default` is its own column: `DEFAULT ''` is a real
+    /// default, and reading it off the text would drop it on every replay.
+    #[test]
+    fn a_domain_defaulting_to_the_empty_string_still_has_a_default() {
+        let blank = vec![row(&[
+            "public", "blankdef", "d", "text", "", "0", "", "", "1",
+        ])];
+        let (_, domains) = pg_fold_types(&blank, &[], &[]);
+        assert_eq!(domains[0].default_value.as_deref(), Some(""));
+
+        let none = vec![row(&["public", "plain", "d", "text", "", "0", "", "", "0"])];
+        let (_, domains) = pg_fold_types(&none, &[], &[]);
+        assert_eq!(domains[0].default_value, None);
+    }
+
+    #[test]
+    fn a_domains_constraints_are_normalized_like_a_tables() {
+        let types = vec![row(&[
+            "public", "positive", "d", "integer", "", "1", "en_US", "", "0",
+        ])];
+        let checks = vec![
+            row(&[
+                "public",
+                "positive",
+                "positive_check",
+                "CHECK ((VALUE > 0))",
+            ]),
+            row(&["public", "elsewhere", "other", "CHECK (false)"]),
+        ];
+        let (_, domains) = pg_fold_types(&types, &[], &checks);
+        assert_eq!(domains.len(), 1);
+        assert!(domains[0].not_null);
+        assert_eq!(domains[0].collation.as_deref(), Some("en_US"));
+        assert_eq!(domains[0].checks.len(), 1);
+        // Held bare: `check_predicate` peels the server's wrapping `CHECK (…)`.
+        assert_eq!(domains[0].checks[0].expression, "VALUE > 0");
+        assert!(domains[0].checks[0].enforced);
+    }
+
+    fn seq_row(extra: &[&str]) -> Vec<Option<String>> {
+        let mut base = vec![
+            "public",
+            "counter",
+            "bigint",
+            "1",
+            "1",
+            "1",
+            "9223372036854775807",
+            "1",
+            "0",
+        ];
+        base.extend_from_slice(extra);
+        row(&base)
+    }
+
+    #[test]
+    fn a_sequence_reads_its_bounds_out_of_text() {
+        // `seqmax` on a bigint sequence *is* `i64::MAX`; going through text is
+        // what carries it intact.
+        let s = pg_sequence_row(&seq_row(&["", "", "", "", ""]));
+        assert_eq!(s.max_value, i64::MAX);
+        assert_eq!(s.min_value, 1);
+        assert_eq!(s.increment, 1);
+        assert!(!s.cycle);
+        assert_eq!(s.last_value, None);
+        assert_eq!(s.owned_by, None);
+        assert_eq!(s.comment, None);
+    }
+
+    #[test]
+    fn an_unparseable_bound_falls_back_to_postgres_own_default() {
+        // Never to zero: `INCREMENT BY 0` is a statement the server rejects, so a
+        // display glitch would become un-runnable DDL.
+        let mut r = seq_row(&["", "", "", "", ""]);
+        r[4] = Some("not-a-number".into());
+        assert_eq!(pg_sequence_row(&r).increment, 1);
+    }
+
+    #[test]
+    fn a_sequences_owner_separates_identity_from_serial() {
+        // `a`: a serial's sequence — a real object of its own.
+        let serial = pg_sequence_row(&seq_row(&["", "orders", "id", "a", ""]));
+        let o = serial.owned_by.expect("owned");
+        assert_eq!((o.table.as_str(), o.column.as_str()), ("orders", "id"));
+        assert!(!o.internal);
+
+        // `i`: an identity column's counter — part of the column, undroppable.
+        let identity = pg_sequence_row(&seq_row(&["", "orders", "id", "i", ""]));
+        assert!(identity.owned_by.expect("owned").internal);
+
+        // No dependency row at all → a free-standing sequence.
+        assert!(
+            pg_sequence_row(&seq_row(&["", "", "", "", ""]))
+                .owned_by
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_blank_last_value_is_no_position_rather_than_zero() {
+        // Blank means never used, or this role may not look — neither is 0.
+        assert_eq!(
+            pg_sequence_row(&seq_row(&["", "", "", "", ""])).last_value,
+            None
+        );
+        assert_eq!(
+            pg_sequence_row(&seq_row(&["41", "", "", "", ""])).last_value,
+            Some(41)
+        );
+    }
+
+    #[test]
+    fn the_object_queries_use_the_shared_namespace_filter() {
+        // Same rule as every other introspection query, so a namespace can't be
+        // browsable for tables and invisible for its types.
+        let f = user_schema_filter("n.nspname");
+        assert!(f.contains("'pg_catalog', 'information_schema'"));
     }
 }
