@@ -4371,6 +4371,61 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         b.build()
     };
 
+    // A multiline field that doesn't wrap can overflow sideways, so it needs the
+    // two affordances every other scroll surface here has: Shift+wheel, and a bar
+    // that fades out when nothing is scrolling.
+    //
+    // Both have to reach the editor's *internal* scroll, which this code doesn't
+    // own — `shift_hscroll`/`autohide` wrap a `Scroll` and there is none to wrap.
+    // So the wheel listener goes straight onto that view (the parent of
+    // `editor_view_id`, the same handle `editor_pane` uses), and the bar is faded
+    // through its `Handle` colour rather than `hide_bars`, since alpha is the one
+    // lever reachable from a style class (§ Floem: no `opacity` property).
+    let (bar_shown, bar_poke) = widgets::autohide_state();
+    if multiline {
+        let ed_wheel = ed.clone();
+        if let Some(scroll_id) = ed.editor_view_id.get_untracked().and_then(|c| c.parent()) {
+            let poke = bar_poke.clone();
+            scroll_id.add_event_listener(
+                EventListener::PointerWheel,
+                Box::new(move |e| {
+                    let Event::PointerWheel(pe) = e else {
+                        return EventPropagation::Continue;
+                    };
+                    // Any wheel over the field is scroll activity worth showing
+                    // the bar for, shifted or not.
+                    (poke)();
+                    if !pe.modifiers.shift() {
+                        return EventPropagation::Continue;
+                    }
+                    // Windows delivers shift+wheel as a vertical delta; map it to
+                    // x. Floem's scroll runs registered listeners before its own
+                    // wheel handling, so `Stop` suppresses the vertical scroll.
+                    let dx = if pe.delta.x != 0.0 {
+                        pe.delta.x
+                    } else {
+                        pe.delta.y
+                    };
+                    if dx != 0.0 {
+                        ed_wheel.scroll_delta.set(floem::kurbo::Vec2::new(dx, 0.0));
+                    }
+                    EventPropagation::Stop
+                }),
+            );
+        }
+        // Caret movement scrolls too, and that never goes through the wheel.
+        let ed_vp = ed.clone();
+        let poke = bar_poke.clone();
+        create_effect(move |prev: Option<()>| {
+            ed_vp.viewport.track();
+            // Not on the first run — that's establishing tracking, and a bar
+            // flashing on every field that mounts would be worse than none.
+            if prev.is_some() {
+                (poke)();
+            }
+        });
+    }
+
     // doc → signal: mirror the editor text into `text_sig` and recompute the
     // grown height. Single-line fields strip any pasted newlines.
     let ed_upd = ed.clone();
@@ -4414,10 +4469,19 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                 .background(floem::peniko::Color::TRANSPARENT)
                 .class(Handle, move |s| {
                     if multiline {
-                        // The chat box shows a thin bar past the row cap.
+                        // The chat box shows a thin bar past the row cap. Faded
+                        // out while idle rather than hidden: alpha is what a
+                        // style class can reach, and it transitions.
                         s.set(Thickness, Px(6.0))
                             .set(Rounded, true)
-                            .background(theme::scrollbar())
+                            .background(theme::scrollbar().multiply_alpha(if bar_shown.get() {
+                                1.0
+                            } else {
+                                0.0
+                            }))
+                            .transition_background(floem::style::Transition::ease_in_out(
+                                std::time::Duration::from_millis(200),
+                            ))
                     } else {
                         // Single-line scrolls to the caret with NO scrollbar at
                         // all (0 thickness → nothing to show, even on hover).
