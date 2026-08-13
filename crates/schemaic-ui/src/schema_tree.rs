@@ -2421,6 +2421,7 @@ mod tests {
                     schema: Some(ns.into()),
                     ..Default::default()
                 }],
+                ..Default::default()
             })),
         }
     }

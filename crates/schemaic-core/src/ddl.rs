@@ -31,8 +31,8 @@ use crate::intel::SqlDialect;
 use crate::pairs;
 use crate::schema::{
     CheckInfo, ColumnInfo, DomainInfo, EnumInfo, ForeignKeyInfo, IndexInfo, RoutineInfo,
-    SequenceInfo, TableInfo, TriggerAction, TriggerEvent, TriggerInfo, TriggerLevel, TriggerTiming,
-    ViewOptions, ddl_ident_in, ddl_string, definer_sql, sql_qualifier,
+    SequenceInfo, ServerFlavour, TableInfo, TriggerAction, TriggerEvent, TriggerInfo, TriggerLevel,
+    TriggerTiming, ViewOptions, ddl_ident_in, ddl_string, definer_sql, sql_qualifier,
 };
 use crate::sql;
 
@@ -2077,6 +2077,34 @@ fn type_change_risk(from: &str, to: &str, subject: &str) -> Option<String> {
     ))
 }
 
+/// Where a plan is going: the dialect it must be spelled in, and — within the
+/// MySQL family — *which* server, because the two diverge at the emitter.
+///
+/// A separate type rather than a second parameter everywhere so the ~40 call
+/// sites that only ever had a dialect keep compiling: `diff(&t, &d, MySql)`
+/// still works through [`From<SqlDialect>`], and means "MySQL family, flavour
+/// not stated". Only the callers that actually know say so.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Target {
+    pub dialect: SqlDialect,
+    pub flavour: ServerFlavour,
+}
+
+impl From<SqlDialect> for Target {
+    fn from(dialect: SqlDialect) -> Self {
+        Target {
+            dialect,
+            flavour: ServerFlavour::Unknown,
+        }
+    }
+}
+
+impl Target {
+    pub fn new(dialect: SqlDialect, flavour: ServerFlavour) -> Self {
+        Target { dialect, flavour }
+    }
+}
+
 /// A set of changes against one table, ready to review and emit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangeSet {
@@ -2085,6 +2113,10 @@ pub struct ChangeSet {
     pub table: String,
     pub schema: Option<String>,
     pub dialect: SqlDialect,
+    /// The server flavour, when the caller knew it. Only the MySQL emitter's
+    /// `ALTER TABLE` path reads it — see [`ChangeSet::alter_table`] — so every
+    /// other constructor leaves it `Unknown`.
+    pub flavour: ServerFlavour,
     pub changes: Vec<Change>,
 }
 
@@ -2100,7 +2132,42 @@ impl ChangeSet {
     /// Every destructive consequence in this set, in change order — a change can
     /// contribute more than one.
     pub fn destructive(&self) -> Vec<String> {
-        self.changes.iter().flat_map(Change::risks).collect()
+        let mut out: Vec<String> = self.changes.iter().flat_map(Change::risks).collect();
+        out.extend(self.mariadb_risks());
+        out
+    }
+
+    /// Risks that belong to the **server**, not to any one change — so they
+    /// can't come from `Change::risks`, which has no flavour to ask.
+    ///
+    /// Only one today, and it is the most destructive thing this emitter can do
+    /// silently: on MariaDB, `ALTER TABLE … MODIFY COLUMN` **drops the CHECK
+    /// constraint defined on that column**, without mentioning it. Measured on
+    /// 10.11.14 — a column declared `qty INT CHECK (qty > 0)`, widened to
+    /// `BIGINT`, comes back with no constraints at all and accepts `-5` on the
+    /// next insert. MySQL 8.4 keeps it, so the same plan has opposite outcomes
+    /// on the two servers Schemaic calls one dialect.
+    ///
+    /// Only *column-level* checks are affected; a table-level `CONSTRAINT … CHECK`
+    /// survives untouched (also measured). Schemaic can't yet tell which a given
+    /// constraint is — that needs MariaDB's `CHECK_CONSTRAINTS.LEVEL` on the
+    /// model — so the sentence names the column and says "any", rather than
+    /// claiming a certainty it doesn't have.
+    fn mariadb_risks(&self) -> Vec<String> {
+        if !self.flavour.is_mariadb() {
+            return Vec::new();
+        }
+        self.changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::AlterColumn { to, .. } => Some(format!(
+                    "MariaDB drops any CHECK constraint defined on column {} when the \
+                     column is altered, without saying so. Re-add it after applying.",
+                    to.name
+                )),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The statements, in the order they must run. Ready to hand to the preview
@@ -3791,7 +3858,8 @@ pub fn checks_equal(a: &CheckInfo, b: &CheckInfo, dialect: SqlDialect) -> bool {
 /// Diffing a table against [`TableDraft::from_table`] of itself must produce
 /// nothing — that's the round-trip gate, and it's what catches a model-fidelity
 /// gap before a user ever sees a phantom change.
-pub fn diff(current: &TableInfo, draft: &TableDraft, dialect: SqlDialect) -> ChangeSet {
+pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) -> ChangeSet {
+    let Target { dialect, flavour } = target.into();
     let mut changes: Vec<Change> = Vec::new();
 
     // Which server-side columns the draft still claims, and under what name.
@@ -4047,6 +4115,7 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, dialect: SqlDialect) -> Cha
         table: current.name.clone(),
         schema: current.schema.clone(),
         dialect,
+        flavour,
         changes,
     }
 }
@@ -4196,6 +4265,7 @@ pub fn diff_view(current: &TableInfo, draft: &ViewDraft, dialect: SqlDialect) ->
         table: current.name.clone(),
         schema: current.schema.clone(),
         dialect,
+        flavour: ServerFlavour::Unknown,
         changes,
     }
 }
@@ -4221,6 +4291,7 @@ pub fn diff_trigger(current: &TriggerInfo, draft: &TriggerDraft, dialect: SqlDia
         table: current.table.clone(),
         schema: current.schema.clone(),
         dialect,
+        flavour: ServerFlavour::Unknown,
         changes,
     }
 }
@@ -4273,6 +4344,7 @@ pub fn diff_triggers(
         table: draft.table.clone(),
         schema: draft.schema.clone(),
         dialect,
+        flavour: ServerFlavour::Unknown,
         changes,
     }
 }
@@ -4283,6 +4355,7 @@ pub fn create_trigger(draft: &TriggerDraft, dialect: SqlDialect) -> ChangeSet {
         table: draft.info.table.clone(),
         schema: draft.info.schema.clone(),
         dialect,
+        flavour: ServerFlavour::Unknown,
         changes: vec![Change::CreateTrigger(Box::new(draft.clone()))],
     }
 }
@@ -4293,6 +4366,7 @@ pub fn drop_trigger(t: &TriggerInfo, dialect: SqlDialect) -> ChangeSet {
         table: t.table.clone(),
         schema: t.schema.clone(),
         dialect,
+        flavour: ServerFlavour::Unknown,
         changes: vec![Change::DropTrigger {
             name: t.name.clone(),
         }],
@@ -4334,6 +4408,7 @@ pub fn diff_function(
         table: current.name.clone(),
         schema: current.schema.clone(),
         dialect,
+        flavour: ServerFlavour::Unknown,
         changes,
     }
 }
@@ -4344,6 +4419,7 @@ pub fn create_function(draft: &FunctionDraft, dialect: SqlDialect) -> ChangeSet 
         table: draft.info.name.clone(),
         schema: draft.info.schema.clone(),
         dialect,
+        flavour: ServerFlavour::Unknown,
         changes: vec![Change::CreateFunction(Box::new(draft.clone()))],
     }
 }
@@ -4354,6 +4430,7 @@ pub fn drop_function(f: &RoutineInfo, dialect: SqlDialect) -> ChangeSet {
         table: f.name.clone(),
         schema: f.schema.clone(),
         dialect,
+        flavour: ServerFlavour::Unknown,
         changes: vec![Change::DropFunction(Box::new(f.clone()))],
     }
 }
@@ -4364,6 +4441,7 @@ pub fn create_view(draft: &ViewDraft, dialect: SqlDialect) -> ChangeSet {
         table: draft.name.clone(),
         schema: draft.schema.clone(),
         dialect,
+        flavour: ServerFlavour::Unknown,
         changes: vec![Change::CreateView(Box::new(draft.clone()))],
     }
 }
@@ -4374,6 +4452,7 @@ pub fn create(draft: &TableDraft, dialect: SqlDialect) -> ChangeSet {
         table: draft.name.clone(),
         schema: draft.schema.clone(),
         dialect,
+        flavour: ServerFlavour::Unknown,
         changes: vec![Change::CreateTable(Box::new(draft.clone()))],
     }
 }
@@ -4435,6 +4514,7 @@ pub fn diff_enum(
         table: current.name.clone(),
         schema: current.schema.clone(),
         dialect,
+        flavour: ServerFlavour::Unknown,
         changes,
     }
 }
@@ -4614,6 +4694,7 @@ pub fn diff_domain(
         table: current.name.clone(),
         schema: current.schema.clone(),
         dialect,
+        flavour: ServerFlavour::Unknown,
         changes,
     }
 }
@@ -4660,6 +4741,7 @@ pub fn diff_sequence(
         table: current.name.clone(),
         schema: current.schema.clone(),
         dialect,
+        flavour: ServerFlavour::Unknown,
         changes,
     }
 }
@@ -4711,6 +4793,7 @@ fn object_set(name: &str, schema: Option<&str>, dialect: SqlDialect, change: Cha
         table: name.to_string(),
         schema: schema.map(str::to_string),
         dialect,
+        flavour: ServerFlavour::Unknown,
         changes: vec![change],
     }
 }
@@ -4722,6 +4805,7 @@ pub fn single(table: &str, schema: Option<&str>, dialect: SqlDialect, change: Ch
         table: table.to_string(),
         schema: schema.map(str::to_string),
         dialect,
+        flavour: ServerFlavour::Unknown,
         changes: vec![change],
     }
 }
@@ -5808,6 +5892,49 @@ mod tests {
                 ck.clause_sql(Postgres),
                 "CONSTRAINT \"c\" CHECK (total >= 0)"
             );
+        }
+
+        /// MariaDB destroys a column's CHECK when the column is altered, and
+        /// said nothing about it.
+        ///
+        /// Measured on MariaDB 10.11.14: a column declared
+        /// `qty INT CHECK (qty > 0)`, widened to `BIGINT`, comes back with **no
+        /// constraints at all** and accepts `-5` on the next insert — a row the
+        /// table refused a moment earlier. MySQL 8.4 keeps the constraint, so
+        /// the same plan has opposite outcomes on the two servers Schemaic
+        /// calls one dialect. Only *column-level* checks are affected; a
+        /// table-level `CONSTRAINT … CHECK` survives (also measured).
+        ///
+        /// The flavour is not a `SqlDialect` arm — the two agree on everything
+        /// `sql`/`intel`/`filter` care about — so it rides on the plan.
+        #[test]
+        fn a_mariadb_column_alter_says_it_will_drop_the_columns_check() {
+            let mut before = TableInfo {
+                name: "t".into(),
+                ..Default::default()
+            };
+            before.columns.push(ColumnInfo {
+                name: "qty".into(),
+                type_name: "int".into(),
+                ..Default::default()
+            });
+            let mut draft = TableDraft::from_table(&before);
+            draft.columns[0].info.type_name = "bigint".into();
+
+            let risks = diff(&before, &draft, Target::new(MySql, ServerFlavour::MariaDb))
+                .destructive()
+                .join(" ");
+            assert!(risks.contains("MariaDB drops any CHECK"), "{risks}");
+            assert!(risks.contains("column qty"), "{risks}");
+
+            // Real MySQL keeps the constraint, so the sentence would be a lie.
+            let risks = diff(&before, &draft, Target::new(MySql, ServerFlavour::MySql))
+                .destructive()
+                .join(" ");
+            assert!(!risks.contains("MariaDB"), "{risks}");
+            // And an unstated flavour must not guess either way.
+            let risks = diff(&before, &draft, MySql).destructive().join(" ");
+            assert!(!risks.contains("MariaDB"), "{risks}");
         }
 
         /// A PostgreSQL clause trailer belongs to the *constraint*, not to the

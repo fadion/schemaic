@@ -506,6 +506,7 @@ mod tests {
         d.designer.set(Some(crate::DesignerTarget {
             conn_id: 1,
             database: "db".into(),
+            flavour: Default::default(),
             schema: None,
             dialect: SqlDialect::MySql,
             current: None,
