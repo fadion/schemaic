@@ -25,8 +25,8 @@ use schemaic_core::plan::{PlanWarningKind, QueryPlan};
 use crate::settings::themed_toggle;
 use crate::theme::{FONT_BODY, FONT_LABEL};
 use crate::widgets::{
-    autohide, loading_dots, measure_text_px_at, measure_text_px_bold_at, modal_title_borderless,
-    panel_style, shift_hscroll,
+    autohide, focus_root, loading_dots, measure_text_px_at, measure_text_px_bold_at,
+    modal_title_borderless, panel_style, shift_hscroll,
 };
 use crate::{PlanState, RightPanel, Ui, icons, theme};
 
@@ -149,9 +149,7 @@ pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
             .style(|s| panel_style(s).background(theme::bg_panel()).width(760.0));
 
             let esc = close.clone();
-            container(panel)
-                .keyboard_navigable()
-                .request_focus(|| {})
+            focus_root(container(panel))
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
                 .on_click_stop(move |_| close())
                 .style(|s| {

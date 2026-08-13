@@ -25,8 +25,9 @@ use schemaic_core::model::engine_is_transactional;
 use crate::consts::ROW_H;
 use crate::settings::{dropdown_box_style, settings_dropdown, settings_toggle_row};
 use crate::widgets::{
-    ExitAction, FORM_GAP, autohide, control_button, exit_action, footer_button, form_section,
-    form_separator, form_setting, modal_footer, modal_title_owned, panel_style, shift_hscroll,
+    ExitAction, FORM_GAP, autohide, control_button, exit_action, focus_root, footer_button,
+    form_section, form_separator, form_setting, modal_footer, modal_title_owned, panel_style,
+    shift_hscroll,
 };
 use crate::{
     FieldCfg, ImportProbeRequest, ImportRunRequest, ImportStep, ImportTargetInfo, ImportUi, Ui,
@@ -996,9 +997,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                 })
             });
 
-            container(panel)
-                .keyboard_navigable()
-                .request_focus(|| {})
+            focus_root(container(panel))
                 .on_key_down(
                     Key::Named(NamedKey::Escape),
                     |_| true,

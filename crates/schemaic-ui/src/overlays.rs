@@ -20,8 +20,8 @@ use schemaic_core::schema::{SchemaState, TableSource};
 
 use crate::consts::{CHAT_PAD_H, CHAT_PAD_V, DB_MENU_W};
 use crate::widgets::{
-    CURSOR_MENU_GAP, MenuEntry, autohide, cursor_menu_pos, dialog_button, measure_text_px_at,
-    menu_item_style, menu_panel, menu_panel_height, panel_style, window_size,
+    CURSOR_MENU_GAP, MenuEntry, autohide, cursor_menu_pos, dialog_button, focus_root,
+    measure_text_px_at, menu_item_style, menu_panel, menu_panel_height, panel_style, window_size,
 };
 use crate::{
     ConnNode, CtxKind, CtxMenu, PopupAnchor, RightPanel, TxChoice, Ui, icons, right_panel_allowed,
@@ -186,9 +186,7 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
             });
 
             // Transparent full-window layer: click outside the panel or Escape closes.
-            container(panel)
-                .keyboard_navigable()
-                .request_focus(|| {})
+            focus_root(container(panel))
                 .on_key_down(
                     Key::Named(NamedKey::Escape),
                     |_| true,
@@ -268,9 +266,7 @@ pub(crate) fn active_db_menu_overlay(ui: Ui) -> impl IntoView {
                     .font_size(theme::FONT_TITLE)
             });
 
-            container(panel)
-                .keyboard_navigable()
-                .request_focus(|| {})
+            focus_root(container(panel))
                 .on_key_down(
                     Key::Named(NamedKey::Escape),
                     |_| true,
@@ -340,9 +336,7 @@ pub(crate) fn db_visibility_overlay(ui: Ui) -> impl IntoView {
             // on the gear from switching menus). Dismissal is via the root-level
             // pointer-down handler; the panel absorbs its own pointer-downs so it
             // isn't closed while flipping items.
-            v_stack((list,))
-                .keyboard_navigable()
-                .request_focus(|| {})
+            focus_root(v_stack((list,)))
                 .on_key_down(
                     Key::Named(NamedKey::Escape),
                     |_| true,
@@ -404,9 +398,7 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
                 .style(menu_item_style)
                 .style(|s| s.padding_vert(8.0));
 
-            v_stack((refresh_item, collapse_item))
-                .keyboard_navigable()
-                .request_focus(|| {})
+            focus_root(v_stack((refresh_item, collapse_item)))
                 .on_key_down(
                     Key::Named(NamedKey::Escape),
                     |_| true,
@@ -2676,14 +2668,12 @@ pub(crate) fn tx_prompt_overlay(ui: Ui) -> impl IntoView {
                     .border_color(theme::modal_border())
             });
 
-            container(panel)
-                // Take focus so the editor and the global shortcuts behind the
-                // backdrop stop receiving keys — Ctrl+W closing another tab while
-                // this one is asking about a transaction would be a mess. Escape
-                // is swallowed rather than handled: unlike every other modal here,
-                // there's no safe "never mind" for uncommitted writes.
-                .keyboard_navigable()
-                .request_focus(|| {})
+            // Take focus so the editor and the global shortcuts behind the
+            // backdrop stop receiving keys — Ctrl+W closing another tab while
+            // this one is asking about a transaction would be a mess. Escape
+            // is swallowed rather than handled: unlike every other modal here,
+            // there's no safe "never mind" for uncommitted writes.
+            focus_root(container(panel))
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| {})
                 .style(|s| {
                     s.size_full()
@@ -2787,12 +2777,10 @@ pub(crate) fn confirm_overlay(ui: Ui) -> impl IntoView {
                     .border_color(theme::modal_border())
             });
 
-            container(panel)
-                // Focus so the shortcuts behind the backdrop stop firing while
-                // the question is up (Ctrl+W closing a tab mid-confirm would be
-                // a mess), and so Escape lands here.
-                .keyboard_navigable()
-                .request_focus(|| {})
+            // Focus so the shortcuts behind the backdrop stop firing while
+            // the question is up (Ctrl+W closing a tab mid-confirm would be
+            // a mess), and so Escape lands here.
+            focus_root(container(panel))
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, {
                     let a = answer.clone();
                     move |_| (a)(false)
@@ -2877,9 +2865,7 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
                 open.set(false);
                 text_override.set(None);
             };
-            container(panel)
-                .keyboard_navigable()
-                .request_focus(|| {})
+            focus_root(container(panel))
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())
                 .on_click_stop(move |_| close())
                 .style(|s| {

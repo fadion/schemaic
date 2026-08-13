@@ -20,6 +20,54 @@ use floem::views::scroll::ScrollCustomStyle;
 use crate::consts::*;
 use crate::{icons, theme};
 
+// ── Focus roots ─────────────────────────────────────────────────────────────
+//
+// Floem delivers a key event *directly* to the focused view and, when that view
+// consumes it, to nobody else — a focused view's ancestors never see it, since
+// the dispatch is `directed`. Floem's editor consumes every `KeyDown`, so while
+// a text field has focus an enclosing modal's `on_key_down(Escape)` can't fire:
+// the field swallows Escape and the modal has no way to close from the keyboard.
+//
+// So Escape in a field (one that hasn't claimed the key itself) hands focus back
+// to the innermost mounted overlay, and the *next* Escape reaches that overlay's
+// own handler — which is the two-step the user sees: blur, then close.
+//
+// A thread-local `Vec`, not a signal: this is UI-thread-only bookkeeping nothing
+// renders from, and a signal would turn every open/close into a notification. A
+// `Vec` rather than one slot because overlays nest (the DDL preview opens over
+// the designer), and `retain` rather than `pop` because they don't always unmount
+// innermost-first.
+thread_local! {
+    static FOCUS_ROOTS: std::cell::RefCell<Vec<floem::ViewId>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Mark `view` as the overlay that owns the keyboard while it is mounted: it
+/// takes focus on build (so its own key handlers fire straight away) and becomes
+/// what Escape in a text field inside it returns focus to. Replaces the
+/// `.keyboard_navigable().request_focus(|| {})` pair every modal used to spell
+/// out — go through this instead, or the modal's Escape stops working the moment
+/// a field is focused.
+///
+/// A field is *not* a focus root: the grid's inline cell editor takes focus the
+/// same way and deliberately stays off this list. Don't chain your own
+/// `.on_cleanup` onto the result either — floem keeps a single cleanup slot per
+/// view, so a second one silently replaces the unregister.
+pub(crate) fn focus_root<V: IntoView + 'static>(view: V) -> V::V {
+    let view = view.into_view();
+    let id = view.id();
+    FOCUS_ROOTS.with_borrow_mut(|s| s.push(id));
+    view.keyboard_navigable()
+        .request_focus(|| {})
+        .on_cleanup(move || FOCUS_ROOTS.with_borrow_mut(|s| s.retain(|x| *x != id)))
+}
+
+/// The innermost mounted [`focus_root`], or `None` when no overlay is open (a
+/// field in the main workspace then simply drops focus on Escape).
+pub(crate) fn innermost_focus_root() -> Option<floem::ViewId> {
+    FOCUS_ROOTS.with_borrow(|s| s.last().copied())
+}
+
 // ===== moved from lib.rs (widgets cluster) =====
 // A title bar for a modal panel, with a close (×) button.
 pub(crate) fn modal_title(title: &'static str, close: Rc<dyn Fn()>) -> impl IntoView {
@@ -655,10 +703,11 @@ pub(crate) fn menu_panel(
     width: f64,
 ) -> impl IntoView {
     let esc = close.clone();
-    menu_stack(entries, close, width)
-        .keyboard_navigable()
-        .request_focus(|| {})
-        .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| (esc)())
+    focus_root(menu_stack(entries, close, width)).on_key_down(
+        Key::Named(NamedKey::Escape),
+        |_| true,
+        move |_| (esc)(),
+    )
 }
 
 /// Measure a string's rendered width (px) at `FONT_BODY`, through the same global

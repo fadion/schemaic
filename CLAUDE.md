@@ -437,6 +437,11 @@ Zed-inspired, aiming to replace DataGrip.
   - `widgets.rs` — reusable widgets: `menu_panel`/`MenuEntry`, `modal_title`/`panel_style`/
     `menu_item_style`, `window_size`, `autohide`/`shift_hscroll`/`wheel_hscroll` scroll wrappers,
     `section_title`/`centered_msg`/`toggle_icon`, `measure_text_px`, `jump_to_bottom_button`.
+    Also `focus_root` — the **one** way an overlay claims the keyboard (see the Floem gotcha on
+    directed key dispatch): it takes focus on build *and* registers the view so Escape in a
+    text field inside it hands focus back rather than dead-ending. Never spell out
+    `.keyboard_navigable().request_focus(|| {})` again; that pair is what left every modal
+    unclosable from the keyboard while a field was focused.
     Also the **shared modal form chrome** every modal wears — `form_setting`/`form_section`/
     `form_separator`/`FORM_GAP`/`control_button`/`footer_button`/`modal_footer`. Manage
     Connections set that shape and Import followed it; a new modal builds on these rather
@@ -929,6 +934,15 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
   `on_event(KeyDown)` never sees it. `edit_field` routes Escape to `on_escape` and focus-loss to
   `on_blur` (guarded to skip the mount run) — use it for discard-on-Escape / commit-on-blur (inline
   rename, find/replace).
+- **A key event goes to the focused view and, if consumed, to *nobody* else.** The dispatch is
+  `directed` — no bubbling to ancestors, and with focus on nothing only the root view's own
+  listeners run. Floem's editor consumes every `KeyDown`, so a focused `edit_field` used to swallow
+  Escape and leave the enclosing modal unclosable from the keyboard. The fix is a two-step the user
+  can see: Escape in a field with no `on_escape` of its own blurs it and hands focus back to the
+  innermost mounted `widgets::focus_root`, and the *next* Escape reaches that overlay's handler.
+  So an overlay that wants keys goes through `focus_root` (which is also what registers it) —
+  `.keyboard_navigable().request_focus(|| {})` on its own leaves it deaf as soon as a field is
+  focused. A field is *not* a focus root (the grid's inline cell editor deliberately isn't one).
 - **`text_editor_keys` inserts a typed char *unconditionally* — your handler's `CommandExecuted`
   return is ignored for plain character keys.** Floem's `editor_content` KeyDown listener discards the
   handler's result and then, if `mods` (minus SHIFT/ALTGR) is empty, calls `receive_char(c)` for any

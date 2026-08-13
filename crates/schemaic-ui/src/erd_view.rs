@@ -54,8 +54,8 @@ use schemaic_core::schema::{DbSchema, SchemaState, classify_column_type};
 
 use crate::schema_tree::column_type_icon;
 use crate::widgets::{
-    centered_msg, measure_text_px_at, measure_text_px_bold_at, modal_title_borderless, panel_style,
-    window_size,
+    centered_msg, focus_root, measure_text_px_at, measure_text_px_bold_at, modal_title_borderless,
+    panel_style, window_size,
 };
 use crate::{ConnNode, Ui, icons, theme};
 
@@ -1383,9 +1383,7 @@ fn modal_frame(
     });
 
     let esc = close.clone();
-    container(panel)
-        .keyboard_navigable()
-        .request_focus(|| {})
+    focus_root(container(panel))
         .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
         .on_click_stop(move |_| close())
         .style(|s| {

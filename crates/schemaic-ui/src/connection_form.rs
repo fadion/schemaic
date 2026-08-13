@@ -19,7 +19,8 @@ use schemaic_core::connection::SshAuth;
 use crate::consts::MASK_CH;
 use crate::settings::{settings_dropdown, settings_toggle_row};
 use crate::widgets::{
-    autohide, loading_dots, measure_text_px_at, menu_item_style, modal_title, panel_style,
+    autohide, focus_root, loading_dots, measure_text_px_at, menu_item_style, modal_title,
+    panel_style,
 };
 use crate::{DraftSignals, FieldCfg, Ui, edit_field, icons, theme};
 
@@ -410,9 +411,7 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                 .style(|s| panel_style(s).width(720.0).height(500.0));
 
             // Dark backdrop, centered panel, click-away or Escape closes.
-            container(panel)
-                .keyboard_navigable()
-                .request_focus(|| {})
+            focus_root(container(panel))
                 .on_key_down(
                     Key::Named(NamedKey::Escape),
                     |_| true,
