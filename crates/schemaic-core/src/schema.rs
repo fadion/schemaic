@@ -704,13 +704,28 @@ pub enum TriggerOrder {
 /// `String` both sides pretend to understand.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TriggerAction {
-    /// MySQL/MariaDB: the statement body as `information_schema.TRIGGERS`
-    /// reports it — one statement or a `BEGIN … END` block, no trailing `;`.
+    /// MySQL/MariaDB: the statement body — one statement or a `BEGIN … END`
+    /// block, no trailing `;`.
+    ///
+    /// **As `SHOW CREATE TRIGGER` reports it, not `information_schema`.** See
+    /// [`TriggerSource`]: on MySQL 8 that column resolves the body's escapes,
+    /// and a recreate from it writes a different trigger or destroys the one it
+    /// replaces.
     Body(String),
     /// PostgreSQL: the function to call. A PG trigger holds no body of its own,
     /// so the function is a separate object with its own lifetime — dropping the
     /// trigger leaves it behind, and dropping it out from under the trigger
     /// breaks every write to the table.
+    ///
+    /// **`name` is emittable SQL** — already quoted, and qualified when it isn't
+    /// in `public` — never a bare identifier. Both producers must write that
+    /// shape: introspection's `tgfoid::regproc::text` does so natively, and the
+    /// editor's picker builds it with [`qualified_ident`]. This is written down
+    /// because the field once meant *both* things depending on who wrote it,
+    /// which is how a trigger came to be bound to `public`'s copy of a function
+    /// the user had picked from another schema — and how two review passes
+    /// reached opposite conclusions about which side was wrong. Do not route
+    /// this through a quoter on the way out; it is already quoted.
     Function { name: String, args: Vec<String> },
 }
 
