@@ -630,7 +630,10 @@ pub(crate) async fn fetch_table_list(db: &Db, database: &str) -> Result<DbSchema
             ..Default::default()
         })
         .collect();
-    Ok(DbSchema { tables })
+    Ok(DbSchema {
+        tables,
+        ..Default::default()
+    })
 }
 
 pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, DbError> {
@@ -1054,7 +1057,10 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
         }
     }
 
-    Ok(DbSchema { tables })
+    Ok(DbSchema {
+        tables,
+        ..Default::default()
+    })
 }
 
 /// Every trigger function in `database`, read **lazily** — when the trigger or

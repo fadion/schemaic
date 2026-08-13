@@ -226,6 +226,21 @@ Zed-inspired, aiming to replace DataGrip.
     above; its **view** branch delegates to `ddl::view_ddl` so Copy DDL, the MCP table-info tool
     and the apply path all emit through one view emitter (it used to have its own, which restated
     none of the options).
+    **The standalone PostgreSQL objects** — `EnumInfo`/`DomainInfo`/`SequenceInfo` — sit here
+    beside the tables and, unlike `RoutineInfo`, **on `DbSchema` itself** rather than being
+    fetched lazily: the tree lists them and a column's type *is* one of them, so a separately
+    refreshed second cache would be a second answer to "what is in this database" and the two
+    would diverge on the first refresh that only updated one. An enum's `values` are in
+    `enumsortorder`, not creation order, because that is the order comparisons use and the
+    order `ADD VALUE … BEFORE/AFTER` manipulates. A domain's constraints are `CheckInfo`s —
+    the same type a table's are, so `ddl::checks_equal` governs both. `SequenceOwner::internal`
+    separates an identity column's counter (droppable only with the column) from a `serial`'s
+    (an object in its own right), and `SequenceInfo::implicit_bounds`/`implicit_start` are why
+    `create_sql` emits a clean statement instead of restating six clauses that say nothing;
+    `last_value` is live state and deliberately takes no part in any diff. `qualified_ident` is
+    the one "qualify unless `public`, then quote both halves" builder every one of these (and
+    `RoutineInfo::signature_sql`) addresses its object through, and `find_by_ns` the one
+    namespace-lookup rule behind every `DbSchema::find_*`.
   - `secrets.rs` — keeps connection secrets (DB/SSH passwords + SSH key passphrase) out of the
     plaintext `connections.json`: the `SecretStore` seam + pure transforms `hydrate_file` (load →
     fill empty fields from the store, flag legacy plaintext for migration), `sanitize_file` (save →

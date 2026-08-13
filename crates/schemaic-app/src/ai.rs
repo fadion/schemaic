@@ -1237,7 +1237,10 @@ mod tests {
     }
 
     fn schema(tables: Vec<TableInfo>) -> std::sync::Arc<DbSchema> {
-        std::sync::Arc::new(DbSchema { tables })
+        std::sync::Arc::new(DbSchema {
+            tables,
+            ..Default::default()
+        })
     }
 
     /// Build the system-prompt context the way `turn_context` would, but from
