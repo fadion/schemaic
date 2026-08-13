@@ -151,6 +151,31 @@ Zed-inspired, aiming to replace DataGrip.
     that still said `None`. It leaves the draft alone if the user already picked one. Materialized
     views are drop-only (no `CREATE OR REPLACE` exists for one). Same round-trip gate,
     same rule about extending fixtures.
+    **PostgreSQL's standalone objects** — enums, domains, sequences — are `EnumDraft`/
+    `DomainDraft`/`SequenceDraft` → `diff_enum`/`diff_domain`/`diff_sequence` → the same
+    preview, with `ObjectKind` folding the three identical-but-for-a-keyword changes
+    (`RenameObject`/`DropObject`/`SetObjectComment`) into one arm each. The shape is dictated
+    by what PostgreSQL *can't* do. `enum_value_plan` is the heart of it: appending, inserting
+    and renaming a value are `ALTER TYPE`, but there is no `DROP VALUE` and no way to move
+    one, so the moment a value is **removed or reordered** the whole edit collapses into a
+    single `Change::RecreateEnum` — `recreate_type_sql`'s park-create-recast-drop dance, which
+    casts each dependent column through `text` (`text[]` for an array, since `mood[]` has no
+    direct cast to the rebuilt one) and restates the default it had to drop first. A domain's
+    base type is the same story (`ALTER DOMAIN` has no action for it); everything else about
+    one alters in place. `type_dependents` reads the columns that dance has to touch off the
+    introspected schema, and is deliberately a **lower bound** — a view or function built on
+    the type can't be enumerated from `DbSchema` at all — which is why `recreate_risk` names
+    the columns *and* says the server may still refuse. Two disclosures exist because the
+    model can't distinguish the intent: a value list can't tell a rename from a
+    delete-plus-add, so the plan takes the reading that keeps the data and
+    `RenameEnumValue::risks` says every row will be relabelled; and `AddEnumValue` warns that
+    PostgreSQL can never take a value back. A sequence's `restart` is on the **draft, not the
+    model** — it's an action, not a state, so folding it in would make every re-opened editor
+    dirty against a sequence nothing had changed — and `sequence_edits`/
+    `sequence_alter_clauses` are kept in step so the sentence the user reads and the statement
+    that runs come from one comparison. All PostgreSQL-only; `object_statements` is still
+    called from both emitters so a MySQL connection handed such a set emits SQL the server can
+    reject rather than dropping it on the floor.
   - `erd.rs` — the **ER-diagram** model (the UI half is `ui/erd_view.rs`). `build_graph` turns an
     introspected `DbSchema` into a `DiagramGraph` — nodes = tables, edges = FKs — seeded either by
     `DiagramSeed::Database` (whole database, hiding FK-less "island" tables) or `::Table` (one

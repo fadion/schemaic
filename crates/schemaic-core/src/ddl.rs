@@ -30,9 +30,9 @@ use std::collections::{HashMap, HashSet};
 use crate::intel::SqlDialect;
 use crate::pairs;
 use crate::schema::{
-    CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo, RoutineInfo, TableInfo, TriggerAction,
-    TriggerEvent, TriggerInfo, TriggerLevel, TriggerTiming, ViewOptions, ddl_ident_in, ddl_string,
-    definer_sql, sql_qualifier,
+    CheckInfo, ColumnInfo, DomainInfo, EnumInfo, ForeignKeyInfo, IndexInfo, RoutineInfo,
+    SequenceInfo, TableInfo, TriggerAction, TriggerEvent, TriggerInfo, TriggerLevel, TriggerTiming,
+    ViewOptions, ddl_ident_in, ddl_string, definer_sql, sql_qualifier,
 };
 use crate::sql;
 
@@ -888,6 +888,292 @@ impl FunctionDraft {
     }
 }
 
+// ── The desired state of a standalone object ─────────────────────────────────
+
+/// Which of PostgreSQL's standalone objects a shared change is about.
+///
+/// The three of them spell rename, drop and comment identically apart from one
+/// keyword, so those get one [`Change`] arm each with this to say which — rather
+/// than nine arms differing by a string. Everything that genuinely diverges
+/// (adding an enum value, altering a domain's constraints, restarting a
+/// sequence) keeps its own arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectKind {
+    Enum,
+    Domain,
+    Sequence,
+}
+
+impl ObjectKind {
+    /// What the object is called in a sentence a person reads.
+    pub fn label(self) -> &'static str {
+        match self {
+            ObjectKind::Enum => "type",
+            ObjectKind::Domain => "domain",
+            ObjectKind::Sequence => "sequence",
+        }
+    }
+
+    /// The keyword that addresses it in `ALTER`/`DROP`/`COMMENT ON`.
+    ///
+    /// A domain **is** a type, and `ALTER TYPE` will rename one — but `ALTER
+    /// DOMAIN` is the documented spelling, is what `COMMENT ON DOMAIN` requires
+    /// (`COMMENT ON TYPE` on a domain is an error), and keeps the emitted script
+    /// readable as the thing it edits. One keyword per kind, everywhere.
+    pub fn sql_keyword(self) -> &'static str {
+        match self {
+            ObjectKind::Enum => "TYPE",
+            ObjectKind::Domain => "DOMAIN",
+            ObjectKind::Sequence => "SEQUENCE",
+        }
+    }
+}
+
+/// One column that would have to be re-cast if the type under it were rebuilt.
+///
+/// PostgreSQL can't remove or reorder an enum's values, and can't change a
+/// domain's base type, so those edits are a rename-create-recast-drop dance
+/// rather than an `ALTER`. This is what the dance has to touch — read off the
+/// introspected schema by [`type_dependents`] so the preview can *name* every
+/// affected column instead of describing the risk in the abstract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeDependent {
+    pub schema: Option<String>,
+    pub table: String,
+    pub column: String,
+    /// The declared type — the bare name, or its `mood[]` array form, which needs
+    /// a different cast.
+    pub type_name: String,
+    /// Restated after the re-cast. A column default is stored against the *old*
+    /// type and has to come off before the column can be retyped, so a dance that
+    /// didn't put it back would silently drop it.
+    pub default_value: Option<String>,
+}
+
+impl TypeDependent {
+    /// Whether the column holds an array of the type rather than the type.
+    pub fn is_array(&self) -> bool {
+        self.type_name.trim_end().ends_with("[]")
+    }
+}
+
+/// Every column in `schema` declared as the type `name` (or an array of it).
+///
+/// Name-matched against the introspected `type_name`, which is what
+/// `format_type` reports — so `mood` and `mood[]` both count and a
+/// same-named type in another namespace doesn't. It is deliberately a *lower*
+/// bound: a view, function or composite built on the type can't be enumerated
+/// from `DbSchema` at all, which is why the recreate's risk sentence says the
+/// server may still refuse rather than promising the list is complete.
+pub fn type_dependents(
+    db: &crate::schema::DbSchema,
+    schema: Option<&str>,
+    name: &str,
+) -> Vec<TypeDependent> {
+    let mut out = Vec::new();
+    for t in &db.tables {
+        // A view has no storage, so nothing in it is re-cast — and its *body* is
+        // the dependency that makes the drop fail, which this can't fix anyway.
+        if t.is_view || t.schema.as_deref() != schema {
+            continue;
+        }
+        for c in &t.columns {
+            let bare = c.type_name.trim().trim_end_matches("[]").trim();
+            // The qualifier is dropped before comparing: `format_type` writes
+            // `sales.mood` for a type off the search_path and a bare `mood` for
+            // one on it, and both are the same type.
+            let bare = bare.rsplit('.').next().unwrap_or(bare);
+            if bare.eq_ignore_ascii_case(name) {
+                out.push(TypeDependent {
+                    schema: t.schema.clone(),
+                    table: t.name.clone(),
+                    column: c.name.clone(),
+                    type_name: c.type_name.clone(),
+                    default_value: c.default.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The whole desired shape of one enum type.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnumDraft {
+    /// The type's name on the server, or `None` for a new one. Identity, not a
+    /// name: editing `info.name` is a rename.
+    pub original: Option<String>,
+    pub info: EnumInfo,
+}
+
+impl EnumDraft {
+    pub fn from_info(e: &EnumInfo) -> EnumDraft {
+        EnumDraft {
+            original: Some(e.name.clone()),
+            info: e.clone(),
+        }
+    }
+
+    pub fn blank(name: impl Into<String>, schema: Option<String>) -> EnumDraft {
+        EnumDraft {
+            original: None,
+            info: EnumInfo {
+                name: name.into(),
+                schema,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Problems that would make the generated SQL nonsense.
+    pub fn validate(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.info.name.trim().is_empty() {
+            out.push("The type needs a name.".to_string());
+        }
+        // An empty enum is legal (`CREATE TYPE t AS ENUM ()`) and useless, so it
+        // is allowed rather than rejected — but a *duplicate* label is an error
+        // the server raises, and catching it here beats a failed apply.
+        let mut seen: Vec<&str> = Vec::new();
+        for v in &self.info.values {
+            if seen.contains(&v.as_str()) {
+                out.push(format!("The value {v:?} is listed more than once."));
+            }
+            seen.push(v);
+        }
+        out
+    }
+}
+
+/// The whole desired shape of one domain.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DomainDraft {
+    pub original: Option<String>,
+    pub info: DomainInfo,
+}
+
+impl DomainDraft {
+    pub fn from_info(d: &DomainInfo) -> DomainDraft {
+        DomainDraft {
+            original: Some(d.name.clone()),
+            info: d.clone(),
+        }
+    }
+
+    pub fn blank(name: impl Into<String>, schema: Option<String>) -> DomainDraft {
+        DomainDraft {
+            original: None,
+            info: DomainInfo {
+                name: name.into(),
+                schema,
+                base_type: "text".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    pub fn validate(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.info.name.trim().is_empty() {
+            out.push("The domain needs a name.".to_string());
+        }
+        if self.info.base_type.trim().is_empty() {
+            out.push("A domain needs a type to be based on.".to_string());
+        }
+        for ck in &self.info.checks {
+            if ck.name.trim().is_empty() {
+                out.push("Every constraint needs a name.".to_string());
+            }
+            if ck.expression.trim().is_empty() {
+                out.push(format!("Constraint {} has no predicate.", ck.name));
+            }
+        }
+        out
+    }
+}
+
+/// The whole desired shape of one sequence.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SequenceDraft {
+    pub original: Option<String>,
+    pub info: SequenceInfo,
+    /// `RESTART WITH n`, when the user asked for one.
+    ///
+    /// Not part of `info`: restarting is an **action**, not a state. It doesn't
+    /// show up in a re-introspection, so folding it into the model would make
+    /// every re-opened editor diff dirty against a sequence nothing had changed.
+    pub restart: Option<i64>,
+}
+
+impl SequenceDraft {
+    pub fn from_info(s: &SequenceInfo) -> SequenceDraft {
+        SequenceDraft {
+            original: Some(s.name.clone()),
+            info: s.clone(),
+            restart: None,
+        }
+    }
+
+    pub fn blank(name: impl Into<String>, schema: Option<String>) -> SequenceDraft {
+        SequenceDraft {
+            original: None,
+            info: SequenceInfo {
+                name: name.into(),
+                schema,
+                ..Default::default()
+            },
+            restart: None,
+        }
+    }
+
+    /// Problems the server would raise, caught before the apply.
+    ///
+    /// These are checked here rather than left to PostgreSQL because each has a
+    /// clear plain-language answer, and because the alternative is a rejected
+    /// statement in the middle of a plan.
+    pub fn validate(&self) -> Vec<String> {
+        let s = &self.info;
+        let mut out = Vec::new();
+        if s.name.trim().is_empty() {
+            out.push("The sequence needs a name.".to_string());
+        }
+        if s.increment == 0 {
+            out.push("A sequence can't increment by 0.".to_string());
+        }
+        if s.min_value > s.max_value {
+            out.push(format!(
+                "The minimum ({}) is above the maximum ({}).",
+                s.min_value, s.max_value
+            ));
+        }
+        if s.start < s.min_value || s.start > s.max_value {
+            out.push(format!(
+                "The start value ({}) is outside {}..{}.",
+                s.start, s.min_value, s.max_value
+            ));
+        }
+        if s.cache < 1 {
+            out.push("The cache has to be at least 1.".to_string());
+        }
+        let (tmin, tmax) = SequenceInfo::type_bounds(&s.data_type);
+        if s.min_value < tmin || s.max_value > tmax {
+            out.push(format!(
+                "{}..{} doesn't fit in {}.",
+                s.min_value, s.max_value, s.data_type
+            ));
+        }
+        if let Some(r) = self.restart
+            && (r < s.min_value || r > s.max_value)
+        {
+            out.push(format!(
+                "Restarting at {r} is outside {}..{}.",
+                s.min_value, s.max_value
+            ));
+        }
+        out
+    }
+}
+
 // ── The difference ───────────────────────────────────────────────────────────
 
 /// One reviewable step between the table that's there and the table that's
@@ -1006,6 +1292,85 @@ pub enum Change {
         to: String,
     },
     DropFunction(Box<RoutineInfo>),
+    /// Create an enum type that doesn't exist yet.
+    CreateEnum(Box<EnumInfo>),
+    /// `ALTER TYPE … ADD VALUE`. One change per value, so the preview lists each
+    /// one and its position rather than a count.
+    ///
+    /// `after`/`before` is how a value lands anywhere but the end. Exactly one is
+    /// set: the anchor is the value the new one goes next to, which for a run of
+    /// insertions is the previous *new* value, so they arrive in draft order.
+    AddEnumValue {
+        value: String,
+        after: Option<String>,
+        before: Option<String>,
+    },
+    /// `ALTER TYPE … RENAME VALUE … TO …`. Rewrites the label everywhere at once;
+    /// no row is touched, because rows store the value's identity, not its text.
+    RenameEnumValue {
+        from: String,
+        to: String,
+    },
+    /// Rebuild an enum from scratch, re-casting every column that uses it.
+    ///
+    /// The escape hatch for the two edits PostgreSQL has no `ALTER` for —
+    /// **removing a value and reordering them**. It is a rename-create-recast-drop
+    /// dance, and it is offered rather than refused because the alternative is an
+    /// editor that can only ever append. The whole plan runs in one transaction on
+    /// PostgreSQL, so it either lands or leaves nothing behind.
+    RecreateEnum {
+        info: Box<EnumInfo>,
+        dependents: Vec<TypeDependent>,
+    },
+    CreateDomain(Box<DomainInfo>),
+    /// `ALTER DOMAIN … SET/DROP DEFAULT`.
+    SetDomainDefault {
+        to: Option<String>,
+    },
+    /// `ALTER DOMAIN … SET/DROP NOT NULL`. Setting it is checked against every
+    /// column of the domain's type, so it fails rather than half-applies.
+    SetDomainNotNull {
+        to: bool,
+    },
+    AddDomainCheck(Box<CheckInfo>),
+    DropDomainCheck {
+        name: String,
+    },
+    /// Rebuild a domain from scratch — the only way to change its base type,
+    /// which `ALTER DOMAIN` has no action for.
+    RecreateDomain {
+        info: Box<DomainInfo>,
+        dependents: Vec<TypeDependent>,
+    },
+    CreateSequence(Box<SequenceInfo>),
+    /// `ALTER SEQUENCE`, restating **only** the clauses that changed — the same
+    /// rule `TableOptions` follows, and for the same reason: a restated clause the
+    /// user didn't edit is a change nobody reviewed.
+    AlterSequence {
+        from: Box<SequenceInfo>,
+        to: Box<SequenceInfo>,
+    },
+    /// `ALTER SEQUENCE … RESTART WITH`. Its own change because it is an action
+    /// rather than a state — see [`SequenceDraft::restart`].
+    RestartSequence {
+        to: i64,
+    },
+    /// `ALTER … RENAME TO` for any of the three standalone objects.
+    RenameObject {
+        kind: ObjectKind,
+        to: String,
+    },
+    /// `DROP TYPE`/`DOMAIN`/`SEQUENCE`. Never `CASCADE`: cascading here drops the
+    /// *columns* built on the type, which is a far larger act than the one the
+    /// user asked for. Let the server refuse and name what still depends on it.
+    DropObject {
+        kind: ObjectKind,
+    },
+    /// `COMMENT ON …`. `None` clears it.
+    SetObjectComment {
+        kind: ObjectKind,
+        comment: Option<String>,
+    },
 }
 
 /// What a view loses when it's dropped — the sentence behind both the plain
@@ -1131,6 +1496,63 @@ impl Change {
                 format!("Rename function {} to {to}", from.name)
             }
             Change::DropFunction(f) => format!("Drop function {}", f.name),
+            Change::CreateEnum(e) => format!(
+                "Create type {} with {} value{}",
+                e.name,
+                e.values.len(),
+                plural(e.values.len())
+            ),
+            Change::AddEnumValue {
+                value,
+                after,
+                before,
+            } => match (after, before) {
+                (Some(a), _) => format!("Add value {value} after {a}"),
+                (_, Some(b)) => format!("Add value {value} before {b}"),
+                _ => format!("Add value {value}"),
+            },
+            Change::RenameEnumValue { from, to } => format!("Rename value {from} to {to}"),
+            Change::RecreateEnum { info, dependents } => format!(
+                "Re-create type {} ({} value{}, re-casting {} column{})",
+                info.name,
+                info.values.len(),
+                plural(info.values.len()),
+                dependents.len(),
+                plural(dependents.len())
+            ),
+            Change::CreateDomain(d) => format!("Create domain {} as {}", d.name, d.base_type),
+            Change::SetDomainDefault { to } => match to {
+                Some(d) => format!("Set the domain's default to {d}"),
+                None => "Drop the domain's default".to_string(),
+            },
+            Change::SetDomainNotNull { to } => {
+                format!(
+                    "Make the domain {}",
+                    if *to { "NOT NULL" } else { "nullable" }
+                )
+            }
+            Change::AddDomainCheck(ck) => format!("Add check {} ({})", ck.name, ck.expression),
+            Change::DropDomainCheck { name } => format!("Drop check {name}"),
+            Change::RecreateDomain { info, dependents } => format!(
+                "Re-create domain {} as {} (re-casting {} column{})",
+                info.name,
+                info.base_type,
+                dependents.len(),
+                plural(dependents.len())
+            ),
+            Change::CreateSequence(s) => format!("Create sequence {}", s.name),
+            // Name what changed, as `TableOptions` does — "alter the sequence"
+            // couldn't say which of six clauses the statement carries.
+            Change::AlterSequence { from, to } => {
+                format!("Set the sequence's {}", sequence_edits(from, to).join(", "))
+            }
+            Change::RestartSequence { to } => format!("Restart the sequence at {to}"),
+            Change::RenameObject { kind, to } => format!("Rename the {} to {to}", kind.label()),
+            Change::DropObject { kind } => format!("Drop the {}", kind.label()),
+            Change::SetObjectComment { kind, comment } => match comment {
+                Some(_) => format!("Set the {}'s comment", kind.label()),
+                None => format!("Clear the {}'s comment", kind.label()),
+            },
         }
     }
 
@@ -1220,6 +1642,61 @@ impl Change {
                  uses it, so any that do have to be dropped first.",
                 f.name
             )],
+            // Nothing is destroyed and it still has to be said, because it is the
+            // one edit here that **can't be undone in place**: PostgreSQL has no
+            // way to remove an enum value, so taking this one back means
+            // re-creating the type and re-casting every column that uses it.
+            Change::AddEnumValue { value, .. } => vec![format!(
+                "Adding {value} can't be undone in place — PostgreSQL can't remove \
+                 an enum value, so taking it back means re-creating the type. The \
+                 value also can't be used until this plan is applied."
+            )],
+            // No row is rewritten and every row means something new, which is
+            // exactly why it has to be said. A value list can't tell "I renamed
+            // this one" from "I deleted it and typed another", so the plan takes
+            // the reading that keeps the data — and this sentence is what makes
+            // that reading visible before it runs.
+            Change::RenameEnumValue { from, to } => vec![format!(
+                "Every row holding {from} reads {to} from now on. If you meant to \
+                 remove {from} rather than rename it, delete it and apply that on \
+                 its own."
+            )],
+            Change::RecreateEnum { info, dependents } => {
+                vec![recreate_risk(&info.name, "type", dependents)]
+            }
+            Change::RecreateDomain { info, dependents } => {
+                vec![recreate_risk(&info.name, "domain", dependents)]
+            }
+            // The same shape as `DropCheck` on a table: no data goes, but the
+            // guarantee does, and every column of this type loses it at once.
+            Change::DropDomainCheck { name } => vec![format!(
+                "Drops check {name}. Every column of this domain stops being \
+                 checked, and existing data is not re-examined if it's added back."
+            )],
+            Change::SetDomainNotNull { to: false } => vec![
+                "Every column of this domain starts accepting NULL, including ones \
+                 in tables this edit never mentioned."
+                    .to_string(),
+            ],
+            Change::SetDomainNotNull { to: true } => vec![
+                "The statement fails if any column of this domain already holds NULL.".to_string(),
+            ],
+            Change::DropObject { kind } => vec![match kind {
+                ObjectKind::Sequence => "Drops the sequence and the position it had \
+                     reached. A column defaulting to `nextval` on it stops working."
+                    .to_string(),
+                k => format!(
+                    "Drops the {}. PostgreSQL refuses while a column still uses it, \
+                     so those columns have to change type first.",
+                    k.label()
+                ),
+            }],
+            // Every row keeps its value, and the counter forgets where it was: the
+            // next `nextval` can hand back a key that already exists.
+            Change::RestartSequence { to } => vec![format!(
+                "Restarts the counter at {to}. Values already handed out are not \
+                 changed, so a key it reaches again collides."
+            )],
             _ => Vec::new(),
         }
     }
@@ -1228,6 +1705,97 @@ impl Change {
     pub fn is_destructive(&self) -> bool {
         !self.risks().is_empty()
     }
+}
+
+/// The sentence behind a rename-create-recast-drop rebuild.
+///
+/// It names the columns rather than counting them, because "3 columns" doesn't
+/// tell anyone whether the one they care about is in the list. It is capped, for
+/// the same reason: a type used by forty columns produces a paragraph nobody
+/// reads, and past a handful the *count* is the useful part again.
+///
+/// It also says the list may be short. A view, function or composite type built
+/// on this one can't be enumerated from the introspected schema at all, so the
+/// honest claim is "these columns, and the server may still refuse" — never
+/// "these columns, and that's all of them".
+fn recreate_risk(name: &str, kind: &str, dependents: &[TypeDependent]) -> String {
+    const NAMED: usize = 6;
+    let mut out = format!(
+        "Re-creating {kind} {name} drops and rebuilds it. Every column below is \
+         re-cast through text; a value the new definition doesn't accept fails the \
+         whole plan, and nothing is applied"
+    );
+    if dependents.is_empty() {
+        out.push_str(
+            ". Nothing uses it today, but a view or function built on it \
+                      can't be listed here and would make the server refuse.",
+        );
+        return out;
+    }
+    let named: Vec<String> = dependents
+        .iter()
+        .take(NAMED)
+        .map(|d| {
+            format!(
+                "{}.{}",
+                crate::schema::display_name(d.schema.as_deref(), &d.table),
+                d.column
+            )
+        })
+        .collect();
+    out.push_str(&format!(": {}", named.join(", ")));
+    if dependents.len() > NAMED {
+        out.push_str(&format!(" and {} more", dependents.len() - NAMED));
+    }
+    out.push_str(
+        ". A view or function built on it can't be listed here and would make the \
+         server refuse.",
+    );
+    out
+}
+
+/// Which of a sequence's clauses differ, named for the preview.
+///
+/// Shared by the summary and the emitter, so the line the user reads and the
+/// statement that runs are built from the same comparison — the `TableOptions`
+/// rule, which exists because the two once disagreed.
+fn sequence_edits(from: &SequenceInfo, to: &SequenceInfo) -> Vec<String> {
+    let mut out = Vec::new();
+    if !from.data_type.eq_ignore_ascii_case(&to.data_type) {
+        out.push(format!("type to {}", to.data_type));
+    }
+    if from.increment != to.increment {
+        out.push(format!("increment to {}", to.increment));
+    }
+    if from.min_value != to.min_value {
+        out.push(format!("minimum to {}", to.min_value));
+    }
+    if from.max_value != to.max_value {
+        out.push(format!("maximum to {}", to.max_value));
+    }
+    if from.start != to.start {
+        out.push(format!("start to {}", to.start));
+    }
+    if from.cache != to.cache {
+        out.push(format!("cache to {}", to.cache));
+    }
+    if from.cycle != to.cycle {
+        out.push(
+            if to.cycle {
+                "cycling on"
+            } else {
+                "cycling off"
+            }
+            .to_string(),
+        );
+    }
+    if from.owned_by != to.owned_by {
+        out.push(match &to.owned_by {
+            Some(o) => format!("owner to {}.{}", o.table, o.column),
+            None => "owner to none".to_string(),
+        });
+    }
+    out
 }
 
 /// Everything an in-place column change puts at risk. Narrowing is the one that
@@ -1357,6 +1925,11 @@ impl ChangeSet {
         // getting right now rather than discovering it later.
         out.extend(self.function_statements());
         out.extend(self.trigger_statements());
+        // The standalone objects are PostgreSQL's, so this contributes nothing on
+        // a MySQL connection. It is still called from *both* emitters rather than
+        // one, so that such a change set arriving here emits SQL the server can
+        // reject instead of being silently dropped on the floor.
+        out.extend(self.object_statements());
         // Whole-table statements stand alone; they never share an ALTER.
         for c in &self.changes {
             match c {
@@ -1505,6 +2078,7 @@ impl ChangeSet {
         // getting right now rather than discovering it later.
         out.extend(self.function_statements());
         out.extend(self.trigger_statements());
+        out.extend(self.object_statements());
         for c in &self.changes {
             match c {
                 Change::CreateTable(draft) => out.extend(create_table_sql(draft, d)),
@@ -1800,6 +2374,243 @@ impl ChangeSet {
         }
         out
     }
+
+    /// The statements for a standalone object — an enum, a domain or a sequence.
+    ///
+    /// One builder for all three, on the same grounds as
+    /// [`ChangeSet::view_statements`]: none of these can ever be a clause of an
+    /// `ALTER TABLE`, so there is no coalescing to do and no engine split to make
+    /// — every one of them is PostgreSQL-only, which is why nothing here consults
+    /// the dialect beyond quoting.
+    ///
+    /// Order is dependency-first and then rename-last, the same shape the rest of
+    /// the emitter uses: create before altering, alter under the name the server
+    /// currently knows, and rename only once everything above has run.
+    fn object_statements(&self) -> Vec<String> {
+        let d = self.dialect;
+        let qname = self.qname();
+        let mut out = Vec::new();
+        for c in &self.changes {
+            match c {
+                Change::CreateEnum(e) => out.push(e.create_sql(d)),
+                Change::CreateDomain(dom) => out.push(dom.create_sql(d)),
+                Change::CreateSequence(s) => out.push(s.create_sql(d)),
+                Change::AddEnumValue {
+                    value,
+                    after,
+                    before,
+                } => {
+                    let anchor = match (after, before) {
+                        (Some(a), _) => format!(" AFTER {}", ddl_string(a, d)),
+                        (_, Some(b)) => format!(" BEFORE {}", ddl_string(b, d)),
+                        _ => String::new(),
+                    };
+                    out.push(format!(
+                        "ALTER TYPE {qname} ADD VALUE {}{anchor};",
+                        ddl_string(value, d)
+                    ));
+                }
+                Change::RenameEnumValue { from, to } => out.push(format!(
+                    "ALTER TYPE {qname} RENAME VALUE {} TO {};",
+                    ddl_string(from, d),
+                    ddl_string(to, d)
+                )),
+                Change::RecreateEnum { info, dependents } => {
+                    out.extend(recreate_type_sql(
+                        ObjectKind::Enum,
+                        &qname,
+                        &self.table,
+                        self.schema.as_deref(),
+                        &info.create_sql(d),
+                        dependents,
+                        d,
+                    ));
+                }
+                Change::RecreateDomain { info, dependents } => {
+                    out.extend(recreate_type_sql(
+                        ObjectKind::Domain,
+                        &qname,
+                        &self.table,
+                        self.schema.as_deref(),
+                        &info.create_sql(d),
+                        dependents,
+                        d,
+                    ));
+                }
+                Change::SetDomainDefault { to } => out.push(match to {
+                    Some(v) => format!("ALTER DOMAIN {qname} SET DEFAULT {v};"),
+                    None => format!("ALTER DOMAIN {qname} DROP DEFAULT;"),
+                }),
+                Change::SetDomainNotNull { to } => out.push(format!(
+                    "ALTER DOMAIN {qname} {} NOT NULL;",
+                    if *to { "SET" } else { "DROP" }
+                )),
+                // Drops before adds, so a constraint can be redefined under the
+                // name it already has within one plan.
+                Change::DropDomainCheck { name } => out.push(format!(
+                    "ALTER DOMAIN {qname} DROP CONSTRAINT {};",
+                    ddl_ident_in(name, d)
+                )),
+                Change::AlterSequence { from, to } => {
+                    let clauses = sequence_alter_clauses(from, to, d);
+                    if !clauses.is_empty() {
+                        out.push(format!(
+                            "ALTER SEQUENCE {qname}\n  {};",
+                            clauses.join("\n  ")
+                        ));
+                    }
+                }
+                Change::RestartSequence { to } => {
+                    out.push(format!("ALTER SEQUENCE {qname} RESTART WITH {to};"))
+                }
+                _ => {}
+            }
+        }
+        for c in &self.changes {
+            if let Change::AddDomainCheck(ck) = c {
+                out.push(format!("ALTER DOMAIN {qname} ADD {};", ck.clause_sql(d)));
+            }
+        }
+        // The comment addresses the object under the name the server still knows,
+        // so it goes before the rename — as the view and function renames do.
+        for c in &self.changes {
+            if let Change::SetObjectComment { kind, comment } = c {
+                out.push(format!(
+                    "COMMENT ON {} {qname} IS {};",
+                    kind.sql_keyword(),
+                    match comment {
+                        Some(t) => ddl_string(t, d),
+                        None => "NULL".to_string(),
+                    }
+                ));
+            }
+        }
+        for c in &self.changes {
+            match c {
+                Change::RenameObject { kind, to } => out.push(format!(
+                    "ALTER {} {qname} RENAME TO {};",
+                    kind.sql_keyword(),
+                    ddl_ident_in(to, d)
+                )),
+                Change::DropObject { kind } => {
+                    out.push(format!("DROP {} {qname};", kind.sql_keyword()))
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// The rename-create-recast-drop dance behind [`Change::RecreateEnum`] and
+/// [`Change::RecreateDomain`].
+///
+/// The old type is **renamed out of the way** rather than dropped first, so the
+/// columns keep a valid type at every step and the new one can take the original
+/// name immediately. Each dependent column then loses its default (a default is
+/// stored against the old type and blocks the retype), is cast through **text**
+/// — the one representation both an old and a new enum share — and has its
+/// default restated. The old type goes last, when nothing points at it.
+///
+/// An array column casts through `text[]`: `mood[]` has no direct cast to the
+/// rebuilt `mood[]`, but the element cast makes the array cast legal.
+///
+/// On PostgreSQL the whole plan is one transaction, so a value the new definition
+/// rejects fails the cast and leaves the database exactly as it was.
+fn recreate_type_sql(
+    kind: ObjectKind,
+    qname: &str,
+    name: &str,
+    schema: Option<&str>,
+    create: &str,
+    dependents: &[TypeDependent],
+    d: SqlDialect,
+) -> Vec<String> {
+    // A name the user's own schema can't already hold, so the shuffle can't
+    // collide with a real object.
+    let parked = format!("{name}_schemaic_old");
+    let qparked = qualified(&parked, schema, d);
+    // A domain *is* a type and PostgreSQL will accept `ALTER TYPE`/`DROP TYPE`
+    // on one, but the matching keyword is what the rest of the emitter uses and
+    // what makes the script readable as the thing it edits.
+    let kw = kind.sql_keyword();
+    let mut out = vec![format!(
+        "ALTER {kw} {qname} RENAME TO {};",
+        ddl_ident_in(&parked, d)
+    )];
+    out.push(create.to_string());
+    for dep in dependents {
+        let table = qualified(&dep.table, dep.schema.as_deref(), d);
+        let col = ddl_ident_in(&dep.column, d);
+        if dep.default_value.is_some() {
+            out.push(format!(
+                "ALTER TABLE {table} ALTER COLUMN {col} DROP DEFAULT;"
+            ));
+        }
+        let (target, via) = if dep.is_array() {
+            (format!("{qname}[]"), "text[]")
+        } else {
+            (qname.to_string(), "text")
+        };
+        out.push(format!(
+            "ALTER TABLE {table} ALTER COLUMN {col} TYPE {target} \
+             USING {col}::{via}::{target};"
+        ));
+        if let Some(def) = &dep.default_value {
+            out.push(format!(
+                "ALTER TABLE {table} ALTER COLUMN {col} SET DEFAULT {def};"
+            ));
+        }
+    }
+    out.push(format!("DROP {kw} {qparked};"));
+    out
+}
+
+/// The `ALTER SEQUENCE` clauses for the fields that changed — and only those.
+///
+/// Restating an unchanged clause would be a change nobody reviewed, which is the
+/// same rule `TableOptions` follows. The clause list is kept in step with
+/// [`sequence_edits`], which is what the preview's sentence is built from.
+fn sequence_alter_clauses(from: &SequenceInfo, to: &SequenceInfo, d: SqlDialect) -> Vec<String> {
+    let mut out = Vec::new();
+    if !from.data_type.eq_ignore_ascii_case(&to.data_type) {
+        out.push(format!("AS {}", to.data_type.trim()));
+    }
+    if from.increment != to.increment {
+        out.push(format!("INCREMENT BY {}", to.increment));
+    }
+    // Bounds go out as explicit numbers rather than `NO MINVALUE`: the model holds
+    // concrete values either way, and naming them says what the sequence will
+    // actually enforce.
+    if from.min_value != to.min_value {
+        out.push(format!("MINVALUE {}", to.min_value));
+    }
+    if from.max_value != to.max_value {
+        out.push(format!("MAXVALUE {}", to.max_value));
+    }
+    // `START WITH` alone changes only what a later `RESTART` would return to — it
+    // does not move the counter. That's `RestartSequence`'s job, and keeping them
+    // separate is why editing the start value doesn't silently rewind a live key.
+    if from.start != to.start {
+        out.push(format!("START WITH {}", to.start));
+    }
+    if from.cache != to.cache {
+        out.push(format!("CACHE {}", to.cache));
+    }
+    if from.cycle != to.cycle {
+        out.push(if to.cycle { "CYCLE" } else { "NO CYCLE" }.to_string());
+    }
+    if from.owned_by != to.owned_by {
+        out.push(match &to.owned_by {
+            Some(o) => format!(
+                "OWNED BY {}.{}",
+                qualified(&o.table, to.schema.as_deref(), d),
+                ddl_ident_in(&o.column, d)
+            ),
+            None => "OWNED BY NONE".to_string(),
+        });
+    }
+    out
 }
 
 /// The `CREATE VIEW` for an introspected view — the **display and copy** path's
@@ -3223,6 +4034,324 @@ pub fn create(draft: &TableDraft, dialect: SqlDialect) -> ChangeSet {
         schema: draft.schema.clone(),
         dialect,
         changes: vec![Change::CreateTable(Box::new(draft.clone()))],
+    }
+}
+
+// ── Standalone objects ───────────────────────────────────────────────────────
+
+/// Everything that has to happen to turn the enum `current` into `draft`.
+///
+/// The shape of this diff is dictated by what PostgreSQL can and can't do.
+/// Appending or inserting a value is `ADD VALUE`, and renaming one is `RENAME
+/// VALUE` — both in place, both cheap. **Removing or reordering is neither**:
+/// there is no `DROP VALUE` and no way to move one, so the moment the draft
+/// implies either, the whole edit collapses into a single
+/// [`Change::RecreateEnum`] rather than a mixture. A plan that added a value and
+/// then rebuilt the type around it would do the first half twice.
+///
+/// Same round-trip gate as [`diff`]: an enum diffed against its own draft must
+/// produce nothing.
+pub fn diff_enum(
+    current: &EnumInfo,
+    draft: &EnumDraft,
+    dependents: &[TypeDependent],
+    dialect: SqlDialect,
+) -> ChangeSet {
+    let mut changes = Vec::new();
+    let new = &draft.info;
+    match enum_value_plan(&current.values, &new.values) {
+        Some(steps) => changes.extend(steps),
+        // Removed or reordered: no `ALTER` reaches it, so rebuild.
+        None => changes.push(Change::RecreateEnum {
+            info: Box::new(EnumInfo {
+                // The rebuild creates the type under the name the server knows;
+                // any rename is the separate change below, so the two don't have
+                // to agree about which name the recast columns point at.
+                name: current.name.clone(),
+                schema: current.schema.clone(),
+                values: new.values.clone(),
+                comment: new.comment.clone(),
+            }),
+            dependents: dependents.to_vec(),
+        }),
+    }
+    // A rebuild restates the comment itself, so setting it again would be a
+    // second statement saying the same thing.
+    let rebuilt = matches!(changes.first(), Some(Change::RecreateEnum { .. }));
+    if !rebuilt && current.comment != new.comment {
+        changes.push(Change::SetObjectComment {
+            kind: ObjectKind::Enum,
+            comment: new.comment.clone(),
+        });
+    }
+    if new.name != current.name && !new.name.trim().is_empty() {
+        changes.push(Change::RenameObject {
+            kind: ObjectKind::Enum,
+            to: new.name.clone(),
+        });
+    }
+    ChangeSet {
+        table: current.name.clone(),
+        schema: current.schema.clone(),
+        dialect,
+        changes,
+    }
+}
+
+/// How to get from the value list `current` to `want` using only `ADD VALUE` and
+/// `RENAME VALUE`, or `None` when no sequence of those can do it.
+///
+/// `None` is the answer whenever a value is **removed or reordered**, because
+/// PostgreSQL offers neither operation — the caller's cue to rebuild the type.
+///
+/// A rename is recognised positionally: with the surviving values lined up in
+/// order, a slot whose text changed is the same value under a new label, and one
+/// PostgreSQL rewrites without touching a row. Each insertion anchors on the
+/// value **before it in the draft**, which by the time the statement runs already
+/// exists — so a run of new values inserted together arrives in the order the
+/// list shows, rather than all landing on the same anchor in reverse.
+fn enum_value_plan(current: &[String], want: &[String]) -> Option<Vec<Change>> {
+    // Every original value has to survive somewhere, in its original order. The
+    // ones that don't move are matched by position among the *kept* values, so a
+    // rename is a slot that changed text rather than a drop plus an add.
+    if want.len() < current.len() {
+        return None;
+    }
+    // Which draft slots stand for the values already on the server: the first
+    // `current.len()` slots that aren't brand-new insertions. Rather than guess,
+    // walk the draft and greedily match each original value by name; whatever is
+    // left over in order is a rename candidate.
+    let mut kept: Vec<Option<usize>> = Vec::with_capacity(current.len());
+    let mut next = 0usize;
+    for c in current {
+        // Look for this exact value at or after the cursor — anything before it
+        // would mean the order changed.
+        match want[next..].iter().position(|w| w == c) {
+            Some(off) => {
+                kept.push(Some(next + off));
+                next += off + 1;
+            }
+            None => kept.push(None),
+        }
+    }
+    // An unmatched original is either a rename or a removal. It is a rename only
+    // if a draft slot is free at the position the value held relative to its
+    // matched neighbours; anything else is a removal, and rebuilds.
+    let mut renames = Vec::new();
+    let mut taken: Vec<usize> = kept.iter().flatten().copied().collect();
+    for (i, slot) in kept.iter().enumerate() {
+        if slot.is_some() {
+            continue;
+        }
+        let lower = kept[..i].iter().flatten().max().map(|x| x + 1).unwrap_or(0);
+        let upper = kept[i + 1..]
+            .iter()
+            .flatten()
+            .min()
+            .copied()
+            .unwrap_or(want.len());
+        // No free slot where this value sat ⇒ it was removed, not renamed, and
+        // no `ALTER` can express that.
+        let s = (lower..upper).find(|s| !taken.contains(s))?;
+        taken.push(s);
+        renames.push(Change::RenameEnumValue {
+            from: current[i].clone(),
+            to: want[s].clone(),
+        });
+    }
+    // Everything the draft holds that no original claimed is an insertion.
+    let mut out = renames;
+    for (s, v) in want.iter().enumerate() {
+        if taken.contains(&s) {
+            continue;
+        }
+        out.push(Change::AddEnumValue {
+            value: v.clone(),
+            // Anchor on the value before it, which by then exists — an insertion
+            // at the head has none, so it anchors ahead instead.
+            after: (s > 0).then(|| want[s - 1].clone()),
+            before: (s == 0).then(|| want.get(1).cloned()).flatten(),
+        });
+        taken.push(s);
+    }
+    Some(out)
+}
+
+/// Everything that has to happen to turn the domain `current` into `draft`.
+///
+/// A domain's default, nullability and constraints are all alterable in place.
+/// Its **base type is not** — `ALTER DOMAIN` has no action for it — so changing
+/// that collapses the whole edit into a [`Change::RecreateDomain`], on the same
+/// grounds as the enum's rebuild.
+pub fn diff_domain(
+    current: &DomainInfo,
+    draft: &DomainDraft,
+    dependents: &[TypeDependent],
+    dialect: SqlDialect,
+) -> ChangeSet {
+    let new = &draft.info;
+    let mut changes = Vec::new();
+    // `types_equal` so `varchar(45)` and `character varying(45)` are the same
+    // domain, which is what keeps an editor from opening already-changed.
+    let retyped = !types_equal(&current.base_type, &new.base_type, dialect)
+        || current.collation != new.collation;
+    if retyped {
+        changes.push(Change::RecreateDomain {
+            info: Box::new(DomainInfo {
+                name: current.name.clone(),
+                schema: current.schema.clone(),
+                ..new.clone()
+            }),
+            dependents: dependents.to_vec(),
+        });
+    } else {
+        if !defaults_equal(
+            current.default_value.as_deref(),
+            new.default_value.as_deref(),
+        ) {
+            changes.push(Change::SetDomainDefault {
+                to: new.default_value.clone(),
+            });
+        }
+        if current.not_null != new.not_null {
+            changes.push(Change::SetDomainNotNull { to: new.not_null });
+        }
+        // Drops first, so a constraint can be redefined under the name it has.
+        for ck in &current.checks {
+            if !new
+                .checks
+                .iter()
+                .any(|n| n.name == ck.name && checks_equal(ck, n, dialect))
+            {
+                changes.push(Change::DropDomainCheck {
+                    name: ck.name.clone(),
+                });
+            }
+        }
+        for ck in &new.checks {
+            if !current
+                .checks
+                .iter()
+                .any(|c| c.name == ck.name && checks_equal(c, ck, dialect))
+            {
+                changes.push(Change::AddDomainCheck(Box::new(ck.clone())));
+            }
+        }
+    }
+    if !retyped && current.comment != new.comment {
+        changes.push(Change::SetObjectComment {
+            kind: ObjectKind::Domain,
+            comment: new.comment.clone(),
+        });
+    }
+    if new.name != current.name && !new.name.trim().is_empty() {
+        changes.push(Change::RenameObject {
+            kind: ObjectKind::Domain,
+            to: new.name.clone(),
+        });
+    }
+    ChangeSet {
+        table: current.name.clone(),
+        schema: current.schema.clone(),
+        dialect,
+        changes,
+    }
+}
+
+/// Everything that has to happen to turn the sequence `current` into `draft`.
+///
+/// Every field of a sequence is alterable in place, so this never rebuilds. The
+/// restart is deliberately its own change and not part of the `ALTER`: moving the
+/// counter and changing the definition are different acts with different
+/// consequences, and the preview has to be able to say so separately.
+pub fn diff_sequence(
+    current: &SequenceInfo,
+    draft: &SequenceDraft,
+    dialect: SqlDialect,
+) -> ChangeSet {
+    let new = &draft.info;
+    let mut changes = Vec::new();
+    if !sequence_edits(current, new).is_empty() {
+        changes.push(Change::AlterSequence {
+            from: Box::new(current.clone()),
+            to: Box::new(SequenceInfo {
+                name: current.name.clone(),
+                schema: current.schema.clone(),
+                ..new.clone()
+            }),
+        });
+    }
+    if let Some(r) = draft.restart {
+        changes.push(Change::RestartSequence { to: r });
+    }
+    if current.comment != new.comment {
+        changes.push(Change::SetObjectComment {
+            kind: ObjectKind::Sequence,
+            comment: new.comment.clone(),
+        });
+    }
+    if new.name != current.name && !new.name.trim().is_empty() {
+        changes.push(Change::RenameObject {
+            kind: ObjectKind::Sequence,
+            to: new.name.clone(),
+        });
+    }
+    ChangeSet {
+        table: current.name.clone(),
+        schema: current.schema.clone(),
+        dialect,
+        changes,
+    }
+}
+
+/// The `CREATE TYPE` for a brand-new enum.
+pub fn create_enum(draft: &EnumDraft, dialect: SqlDialect) -> ChangeSet {
+    object_set(
+        &draft.info.name,
+        draft.info.schema.as_deref(),
+        dialect,
+        Change::CreateEnum(Box::new(draft.info.clone())),
+    )
+}
+
+/// The `CREATE DOMAIN` for a brand-new domain.
+pub fn create_domain(draft: &DomainDraft, dialect: SqlDialect) -> ChangeSet {
+    object_set(
+        &draft.info.name,
+        draft.info.schema.as_deref(),
+        dialect,
+        Change::CreateDomain(Box::new(draft.info.clone())),
+    )
+}
+
+/// The `CREATE SEQUENCE` for a brand-new sequence.
+pub fn create_sequence(draft: &SequenceDraft, dialect: SqlDialect) -> ChangeSet {
+    object_set(
+        &draft.info.name,
+        draft.info.schema.as_deref(),
+        dialect,
+        Change::CreateSequence(Box::new(draft.info.clone())),
+    )
+}
+
+/// The `DROP` for one standalone object — the context menu's shortcut.
+pub fn drop_object(
+    kind: ObjectKind,
+    name: &str,
+    schema: Option<&str>,
+    dialect: SqlDialect,
+) -> ChangeSet {
+    object_set(name, schema, dialect, Change::DropObject { kind })
+}
+
+/// A one-change set against a standalone object. [`single`]'s counterpart, kept
+/// apart only because the field is called `table` and these aren't one.
+fn object_set(name: &str, schema: Option<&str>, dialect: SqlDialect, change: Change) -> ChangeSet {
+    ChangeSet {
+        table: name.to_string(),
+        schema: schema.map(str::to_string),
+        dialect,
+        changes: vec![change],
     }
 }
 
@@ -6295,5 +7424,580 @@ mod lossy_index_tests {
             c,
             Change::DropIndex { name, .. } if name == "idx_person"
         )));
+    }
+}
+
+/// The three standalone PostgreSQL objects: enums, domains and sequences.
+///
+/// Their own module because what they're testing is a different thing from the
+/// table differ above — the same reason `lossy_index_tests` is separate.
+#[cfg(test)]
+mod object_tests {
+    use super::*;
+    use crate::intel::SqlDialect::Postgres;
+
+    // ── Enums ───────────────────────────────────────────────────────────────
+
+    fn mood() -> EnumInfo {
+        EnumInfo {
+            name: "mood".into(),
+            schema: Some("public".into()),
+            values: vec!["sad".into(), "ok".into(), "happy".into()],
+            comment: Some("how it went".into()),
+        }
+    }
+
+    fn enum_cs(current: &EnumInfo, mutate: impl FnOnce(&mut EnumDraft)) -> ChangeSet {
+        let mut d = EnumDraft::from_info(current);
+        mutate(&mut d);
+        diff_enum(current, &d, &[], Postgres)
+    }
+
+    #[test]
+    fn an_enum_diffed_against_itself_has_no_changes() {
+        let e = mood();
+        let cs = diff_enum(&e, &EnumDraft::from_info(&e), &[], Postgres);
+        assert!(cs.is_empty(), "phantom changes: {:?}", cs.changes);
+        assert!(cs.emit().is_empty());
+    }
+
+    #[test]
+    fn appending_a_value_anchors_on_the_one_before_it() {
+        let cs = enum_cs(&mood(), |d| d.info.values.push("elated".into()));
+        assert_eq!(cs.len(), 1);
+        assert_eq!(
+            cs.emit(),
+            vec!["ALTER TYPE \"mood\" ADD VALUE 'elated' AFTER 'happy';"]
+        );
+    }
+
+    #[test]
+    fn inserting_a_value_in_the_middle_anchors_on_its_predecessor() {
+        let cs = enum_cs(&mood(), |d| d.info.values.insert(1, "meh".into()));
+        assert_eq!(
+            cs.emit(),
+            vec!["ALTER TYPE \"mood\" ADD VALUE 'meh' AFTER 'sad';"]
+        );
+    }
+
+    #[test]
+    fn inserting_at_the_head_anchors_ahead_instead() {
+        // There is no predecessor to anchor on, so the only correct clause names
+        // what now follows it.
+        let cs = enum_cs(&mood(), |d| d.info.values.insert(0, "awful".into()));
+        assert_eq!(
+            cs.emit(),
+            vec!["ALTER TYPE \"mood\" ADD VALUE 'awful' BEFORE 'sad';"]
+        );
+    }
+
+    /// A run of insertions must arrive in list order. Anchoring each on an
+    /// *existing* value instead of on its predecessor would land them all at the
+    /// same spot, in reverse.
+    #[test]
+    fn consecutive_insertions_chain_onto_each_other() {
+        let cs = enum_cs(&mood(), |d| {
+            d.info.values.insert(1, "a".into());
+            d.info.values.insert(2, "b".into());
+        });
+        assert_eq!(
+            cs.emit(),
+            vec![
+                "ALTER TYPE \"mood\" ADD VALUE 'a' AFTER 'sad';",
+                "ALTER TYPE \"mood\" ADD VALUE 'b' AFTER 'a';",
+            ]
+        );
+    }
+
+    #[test]
+    fn renaming_a_value_is_an_alter_not_a_rebuild() {
+        // No row is touched: a row stores the value's identity, not its label.
+        let cs = enum_cs(&mood(), |d| d.info.values[1] = "fine".into());
+        assert_eq!(
+            cs.emit(),
+            vec!["ALTER TYPE \"mood\" RENAME VALUE 'ok' TO 'fine';"]
+        );
+    }
+
+    /// A value list can't distinguish "I renamed this" from "I deleted it and
+    /// typed another", so the plan takes the reading that keeps the data — and
+    /// says so, because the two mean very different things about existing rows.
+    #[test]
+    fn a_rename_discloses_that_it_relabels_every_row() {
+        let cs = enum_cs(&mood(), |d| d.info.values[1] = "fine".into());
+        let risk = cs.destructive().join(" ");
+        assert!(risk.contains("Every row holding ok reads fine"), "{risk}");
+        assert!(
+            risk.contains("delete it and apply that on its own"),
+            "{risk}"
+        );
+    }
+
+    /// Renames are emitted first, so an insertion may anchor on a value's **new**
+    /// label — which is the only name that exists by the time the `ADD` runs.
+    #[test]
+    fn an_insertion_can_anchor_on_a_value_renamed_in_the_same_plan() {
+        let cs = enum_cs(&mood(), |d| {
+            d.info.values[1] = "fine".into();
+            d.info.values.insert(2, "good".into());
+        });
+        assert_eq!(
+            cs.emit(),
+            vec![
+                "ALTER TYPE \"mood\" RENAME VALUE 'ok' TO 'fine';",
+                "ALTER TYPE \"mood\" ADD VALUE 'good' AFTER 'fine';",
+            ]
+        );
+    }
+
+    /// A swap keeps every value and still can't be done in place — there is no
+    /// way to move one — so it rebuilds rather than being read as two renames.
+    #[test]
+    fn swapping_two_values_rebuilds() {
+        let cs = enum_cs(&mood(), |d| d.info.values.swap(0, 2));
+        assert!(
+            matches!(cs.changes[0], Change::RecreateEnum { .. }),
+            "{:?}",
+            cs.changes
+        );
+    }
+
+    #[test]
+    fn removing_a_value_rebuilds_because_postgres_cannot_drop_one() {
+        let cs = enum_cs(&mood(), |d| {
+            d.info.values.retain(|v| v != "ok");
+        });
+        assert_eq!(cs.len(), 1, "one rebuild, not a mixture: {:?}", cs.changes);
+        assert!(matches!(cs.changes[0], Change::RecreateEnum { .. }));
+    }
+
+    #[test]
+    fn reordering_values_rebuilds_too() {
+        // The order *is* the comparison order, so it can't be left alone — and
+        // PostgreSQL has no way to move a value.
+        let cs = enum_cs(&mood(), |d| d.info.values.reverse());
+        assert!(matches!(cs.changes[0], Change::RecreateEnum { .. }));
+    }
+
+    /// The rebuild is the dangerous one, so its script is pinned whole.
+    #[test]
+    fn a_rebuild_parks_the_old_type_and_recasts_every_column() {
+        let cur = mood();
+        let mut d = EnumDraft::from_info(&cur);
+        d.info.values = vec!["ok".into(), "happy".into()];
+        let deps = vec![
+            TypeDependent {
+                schema: Some("public".into()),
+                table: "people".into(),
+                column: "m".into(),
+                type_name: "mood".into(),
+                default_value: Some("'ok'::mood".into()),
+            },
+            TypeDependent {
+                schema: Some("public".into()),
+                table: "people".into(),
+                column: "tags".into(),
+                type_name: "mood[]".into(),
+                default_value: None,
+            },
+        ];
+        assert_eq!(
+            diff_enum(&cur, &d, &deps, Postgres).emit(),
+            vec![
+                "ALTER TYPE \"mood\" RENAME TO \"mood_schemaic_old\";",
+                "CREATE TYPE \"mood\" AS ENUM ('ok', 'happy');\n\
+                 COMMENT ON TYPE \"mood\" IS 'how it went';",
+                "ALTER TABLE \"people\" ALTER COLUMN \"m\" DROP DEFAULT;",
+                "ALTER TABLE \"people\" ALTER COLUMN \"m\" TYPE \"mood\" \
+                 USING \"m\"::text::\"mood\";",
+                "ALTER TABLE \"people\" ALTER COLUMN \"m\" SET DEFAULT 'ok'::mood;",
+                // An array casts through `text[]`; there is no direct cast.
+                "ALTER TABLE \"people\" ALTER COLUMN \"tags\" TYPE \"mood\"[] \
+                 USING \"tags\"::text[]::\"mood\"[];",
+                "DROP TYPE \"mood_schemaic_old\";",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rebuild_names_the_columns_it_recasts() {
+        let cur = mood();
+        let mut d = EnumDraft::from_info(&cur);
+        d.info.values.remove(0);
+        let deps = vec![TypeDependent {
+            schema: Some("sales".into()),
+            table: "people".into(),
+            column: "m".into(),
+            type_name: "mood".into(),
+            default_value: None,
+        }];
+        let risk = diff_enum(&cur, &d, &deps, Postgres).destructive().join(" ");
+        assert!(risk.contains("sales.people.m"), "{risk}");
+        // And admits the list can't be complete.
+        assert!(risk.contains("view or function"), "{risk}");
+    }
+
+    /// Adding a value destroys nothing and is still disclosed: it is the one edit
+    /// here PostgreSQL offers no way to undo.
+    #[test]
+    fn adding_a_value_warns_that_it_cannot_be_taken_back() {
+        let cs = enum_cs(&mood(), |d| d.info.values.push("elated".into()));
+        let risk = cs.destructive().join(" ");
+        assert!(risk.contains("can't remove an enum value"), "{risk}");
+        assert!(risk.contains("until this plan is applied"), "{risk}");
+    }
+
+    #[test]
+    fn renaming_the_type_runs_after_everything_addressing_it() {
+        let cs = enum_cs(&mood(), |d| {
+            d.info.values.push("elated".into());
+            d.info.name = "feeling".into();
+        });
+        let sql = cs.emit();
+        assert_eq!(sql.len(), 2);
+        assert!(
+            sql[0].starts_with("ALTER TYPE \"mood\" ADD VALUE"),
+            "{sql:?}"
+        );
+        assert_eq!(sql[1], "ALTER TYPE \"mood\" RENAME TO \"feeling\";");
+    }
+
+    #[test]
+    fn a_rebuild_does_not_also_restate_the_comment() {
+        // `CREATE TYPE` carries it, so a second `COMMENT ON` would be one
+        // statement saying what the one above it already said.
+        let cs = enum_cs(&mood(), |d| {
+            d.info.values.remove(0);
+            d.info.comment = Some("different".into());
+        });
+        assert_eq!(cs.len(), 1);
+        assert!(cs.emit().iter().any(|s| s.contains("IS 'different'")));
+    }
+
+    #[test]
+    fn clearing_a_comment_emits_null_rather_than_an_empty_string() {
+        let cs = enum_cs(&mood(), |d| d.info.comment = None);
+        assert_eq!(cs.emit(), vec!["COMMENT ON TYPE \"mood\" IS NULL;"]);
+    }
+
+    #[test]
+    fn a_duplicate_enum_value_is_caught_before_the_apply() {
+        let mut d = EnumDraft::from_info(&mood());
+        d.info.values.push("ok".into());
+        assert!(d.validate().iter().any(|m| m.contains("more than once")));
+        // An empty enum is legal, if useless, so it isn't rejected.
+        let mut empty = EnumDraft::blank("t", Some("public".into()));
+        assert!(empty.validate().is_empty());
+        empty.info.name = String::new();
+        assert!(!empty.validate().is_empty());
+    }
+
+    #[test]
+    fn a_new_enum_creates_rather_than_alters() {
+        let d = EnumDraft {
+            original: None,
+            info: EnumInfo {
+                name: "mood".into(),
+                schema: Some("sales".into()),
+                values: vec!["ok".into()],
+                comment: None,
+            },
+        };
+        assert_eq!(
+            create_enum(&d, Postgres).emit(),
+            vec!["CREATE TYPE \"sales\".\"mood\" AS ENUM ('ok');"]
+        );
+    }
+
+    // ── Standalone objects: domains ─────────────────────────────────────────
+
+    fn email() -> DomainInfo {
+        DomainInfo {
+            name: "email".into(),
+            schema: Some("public".into()),
+            base_type: "character varying(255)".into(),
+            collation: None,
+            default_value: Some("''::character varying".into()),
+            not_null: true,
+            checks: vec![CheckInfo {
+                name: "email_shaped".into(),
+                expression: "(VALUE)::text ~ '@'::text".into(),
+                enforced: true,
+            }],
+            comment: Some("an address".into()),
+        }
+    }
+
+    fn domain_cs(current: &DomainInfo, mutate: impl FnOnce(&mut DomainDraft)) -> ChangeSet {
+        let mut d = DomainDraft::from_info(current);
+        mutate(&mut d);
+        diff_domain(current, &d, &[], Postgres)
+    }
+
+    #[test]
+    fn a_domain_diffed_against_itself_has_no_changes() {
+        let d = email();
+        let cs = diff_domain(&d, &DomainDraft::from_info(&d), &[], Postgres);
+        assert!(cs.is_empty(), "phantom changes: {:?}", cs.changes);
+    }
+
+    /// The same normalization a column's type gets, for the same reason: the
+    /// server says `character varying(255)` and a person types `varchar(255)`.
+    #[test]
+    fn an_equivalent_base_type_is_not_a_rebuild() {
+        let cs = domain_cs(&email(), |d| d.info.base_type = "varchar(255)".into());
+        assert!(cs.is_empty(), "{:?}", cs.changes);
+    }
+
+    #[test]
+    fn changing_the_base_type_rebuilds_because_alter_domain_cannot() {
+        let cs = domain_cs(&email(), |d| d.info.base_type = "text".into());
+        assert_eq!(cs.len(), 1);
+        assert!(matches!(cs.changes[0], Change::RecreateDomain { .. }));
+        assert!(cs.emit()[0].starts_with("ALTER DOMAIN \"email\" RENAME TO"));
+        assert!(cs.emit().last().unwrap().starts_with("DROP DOMAIN"));
+    }
+
+    #[test]
+    fn a_domains_default_nullability_and_checks_alter_in_place() {
+        let cs = domain_cs(&email(), |d| {
+            d.info.default_value = None;
+            d.info.not_null = false;
+            d.info.checks = vec![CheckInfo {
+                name: "email_shaped".into(),
+                expression: "(VALUE)::text ~ '@example'::text".into(),
+                enforced: true,
+            }];
+        });
+        assert_eq!(
+            cs.emit(),
+            vec![
+                "ALTER DOMAIN \"email\" DROP DEFAULT;",
+                "ALTER DOMAIN \"email\" DROP NOT NULL;",
+                // Drop before add, so the name can be reused within one plan.
+                "ALTER DOMAIN \"email\" DROP CONSTRAINT \"email_shaped\";",
+                "ALTER DOMAIN \"email\" ADD CONSTRAINT \"email_shaped\" \
+                 CHECK ((VALUE)::text ~ '@example'::text);",
+            ]
+        );
+    }
+
+    /// Both directions are disclosed: dropping it changes what every column of
+    /// the domain accepts, and setting it can fail against rows already there.
+    #[test]
+    fn both_nullability_directions_are_disclosed() {
+        let off = domain_cs(&email(), |d| d.info.not_null = false)
+            .destructive()
+            .join(" ");
+        assert!(off.contains("starts accepting NULL"), "{off}");
+        let mut nullable = email();
+        nullable.not_null = false;
+        let on = diff_domain(&nullable, &DomainDraft::from_info(&email()), &[], Postgres)
+            .destructive()
+            .join(" ");
+        assert!(on.contains("fails if any column"), "{on}");
+    }
+
+    #[test]
+    fn a_retyped_predicate_that_means_the_same_is_not_a_change() {
+        // `checks_equal` governs a domain's constraints exactly as it does a
+        // table's — modulo wrapping parens and whitespace.
+        let cs = domain_cs(&email(), |d| {
+            d.info.checks[0].expression = "((VALUE)::text  ~  '@'::text)".into();
+        });
+        assert!(cs.is_empty(), "{:?}", cs.changes);
+    }
+
+    // ── Standalone objects: sequences ───────────────────────────────────────
+
+    fn counter() -> SequenceInfo {
+        SequenceInfo {
+            name: "counter".into(),
+            schema: Some("public".into()),
+            last_value: Some(41),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_sequence_diffed_against_itself_has_no_changes() {
+        let s = counter();
+        let cs = diff_sequence(&s, &SequenceDraft::from_info(&s), Postgres);
+        assert!(cs.is_empty(), "phantom changes: {:?}", cs.changes);
+    }
+
+    #[test]
+    fn a_sequence_alter_restates_only_what_changed() {
+        let s = counter();
+        let mut d = SequenceDraft::from_info(&s);
+        d.info.increment = 5;
+        d.info.cycle = true;
+        assert_eq!(
+            diff_sequence(&s, &d, Postgres).emit(),
+            vec!["ALTER SEQUENCE \"counter\"\n  INCREMENT BY 5\n  CYCLE;"]
+        );
+    }
+
+    /// Moving the counter is a different act from changing where a later restart
+    /// would return to, so the two are separate changes with separate sentences.
+    #[test]
+    fn restarting_is_its_own_change_and_not_part_of_the_alter() {
+        let s = counter();
+        let mut d = SequenceDraft::from_info(&s);
+        d.info.start = 100;
+        d.restart = Some(500);
+        let cs = diff_sequence(&s, &d, Postgres);
+        assert_eq!(
+            cs.emit(),
+            vec![
+                "ALTER SEQUENCE \"counter\"\n  START WITH 100;",
+                "ALTER SEQUENCE \"counter\" RESTART WITH 500;",
+            ]
+        );
+        assert!(cs.destructive().iter().any(|r| r.contains("collides")));
+    }
+
+    /// A restart doesn't survive a re-introspection, so keeping it in the model
+    /// would make every re-opened editor dirty against a sequence nothing changed.
+    #[test]
+    fn a_restart_is_not_part_of_the_sequence_model() {
+        let s = counter();
+        let d = SequenceDraft::from_info(&s);
+        assert_eq!(d.restart, None);
+        assert!(diff_sequence(&s, &d, Postgres).is_empty());
+    }
+
+    #[test]
+    fn detaching_a_sequence_from_its_column_says_owned_by_none() {
+        let mut s = counter();
+        s.owned_by = Some(crate::schema::SequenceOwner {
+            table: "orders".into(),
+            column: "id".into(),
+            internal: false,
+        });
+        let mut d = SequenceDraft::from_info(&s);
+        d.info.owned_by = None;
+        assert_eq!(
+            diff_sequence(&s, &d, Postgres).emit(),
+            vec!["ALTER SEQUENCE \"counter\"\n  OWNED BY NONE;"]
+        );
+    }
+
+    #[test]
+    fn a_nonsensical_sequence_is_caught_before_the_apply() {
+        let mut d = SequenceDraft::from_info(&counter());
+        d.info.increment = 0;
+        assert!(d.validate().iter().any(|m| m.contains("increment by 0")));
+
+        let mut d = SequenceDraft::from_info(&counter());
+        d.info.start = 900;
+        d.info.max_value = 100;
+        let msgs = d.validate().join(" ");
+        assert!(msgs.contains("outside"), "{msgs}");
+
+        // Bounds have to fit the storage type, or the server refuses.
+        let mut d = SequenceDraft::from_info(&counter());
+        d.info.data_type = "smallint".into();
+        assert!(d.validate().iter().any(|m| m.contains("doesn't fit")));
+
+        // And a restart outside the range is caught with the rest.
+        let mut d = SequenceDraft::from_info(&counter());
+        d.restart = Some(-5);
+        assert!(d.validate().iter().any(|m| m.contains("Restarting at -5")));
+    }
+
+    // ── Shared: rename, drop, comment ───────────────────────────────────────
+
+    #[test]
+    fn each_kind_is_dropped_with_its_own_keyword() {
+        for (kind, kw) in [
+            (ObjectKind::Enum, "TYPE"),
+            (ObjectKind::Domain, "DOMAIN"),
+            (ObjectKind::Sequence, "SEQUENCE"),
+        ] {
+            assert_eq!(
+                drop_object(kind, "x", Some("sales"), Postgres).emit(),
+                vec![format!("DROP {kw} \"sales\".\"x\";")]
+            );
+        }
+    }
+
+    /// Never `CASCADE`: cascading drops the *columns* built on the type, which is
+    /// a far larger act than the one asked for.
+    #[test]
+    fn dropping_an_object_never_cascades() {
+        let cs = drop_object(ObjectKind::Enum, "mood", None, Postgres);
+        assert!(!cs.emit()[0].contains("CASCADE"));
+        assert!(cs.destructive()[0].contains("refuses while a column still uses it"));
+    }
+
+    #[test]
+    fn dropping_a_sequence_says_what_stops_working() {
+        let cs = drop_object(ObjectKind::Sequence, "counter", None, Postgres);
+        assert!(cs.destructive()[0].contains("nextval"));
+    }
+
+    // ── Which columns a rebuild has to touch ────────────────────────────────
+
+    fn schema_using_mood() -> crate::schema::DbSchema {
+        let colt = |name: &str, ty: &str| ColumnInfo {
+            name: name.into(),
+            type_name: ty.into(),
+            ..Default::default()
+        };
+        crate::schema::DbSchema {
+            tables: vec![
+                TableInfo {
+                    name: "people".into(),
+                    schema: Some("public".into()),
+                    columns: vec![
+                        colt("m", "mood"),
+                        colt("tags", "mood[]"),
+                        colt("qualified", "public.mood"),
+                        colt("other", "text"),
+                    ],
+                    ..Default::default()
+                },
+                // Another namespace's same-named type is a different type.
+                TableInfo {
+                    name: "elsewhere".into(),
+                    schema: Some("sales".into()),
+                    columns: vec![colt("m", "mood")],
+                    ..Default::default()
+                },
+                // A view has no storage to re-cast.
+                TableInfo {
+                    name: "v".into(),
+                    schema: Some("public".into()),
+                    is_view: true,
+                    columns: vec![colt("m", "mood")],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn dependents_cover_arrays_and_qualified_names_but_not_other_namespaces() {
+        let deps = type_dependents(&schema_using_mood(), Some("public"), "mood");
+        let names: Vec<&str> = deps.iter().map(|d| d.column.as_str()).collect();
+        assert_eq!(names, vec!["m", "tags", "qualified"]);
+        assert!(deps[1].is_array());
+        assert!(!deps[0].is_array());
+        // The other namespace's `mood` is a different type entirely.
+        assert_eq!(
+            type_dependents(&schema_using_mood(), Some("sales"), "mood").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_type_nothing_uses_still_warns_about_what_cannot_be_listed() {
+        let cur = mood();
+        let mut d = EnumDraft::from_info(&cur);
+        d.info.values.remove(0);
+        let risk = diff_enum(&cur, &d, &[], Postgres).destructive().join(" ");
+        assert!(risk.contains("Nothing uses it today"), "{risk}");
     }
 }
