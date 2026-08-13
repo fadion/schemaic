@@ -2457,21 +2457,37 @@ impl ChangeSet {
                 ),
             }
         };
-        let mut out = Vec::new();
+        // **All the drops, then all the creates** — not each replace's pair
+        // together.
+        //
+        // Adjacent pairs collide the moment two triggers swap names (`a`→`b`,
+        // `b`→`a`): statement 2 creates `b` while the original `b` is still
+        // there, fails `ERROR 1359 (Trigger already exists)`, and on MySQL
+        // statement 1 has **already committed** — trigger `a` is simply gone,
+        // since MySQL DDL has no transaction to roll back. PostgreSQL rolls the
+        // whole plan back, so the two engines disagreed about what a failed
+        // apply leaves behind. `TriggerSetDraft::validate` can't catch it: it
+        // compares only final names, and the final names are unique.
+        //
+        // This is the order `diff_triggers` already documents for standalone
+        // drops, and the one `GridWrite::plan` uses in `core::model`.
+        let mut drops = Vec::new();
+        let mut creates = Vec::new();
         for c in &self.changes {
             match c {
-                Change::CreateTrigger(draft) => out.push(draft.info.create_sql(d)),
+                Change::CreateTrigger(draft) => creates.push(draft.info.create_sql(d)),
                 Change::ReplaceTrigger { draft } => {
                     // The drop addresses the name the server knows; the create
                     // builds the draft's, which is how a rename comes for free.
-                    out.push(drop(draft.original.as_deref().unwrap_or(&draft.info.name)));
-                    out.push(draft.info.create_sql(d));
+                    drops.push(drop(draft.original.as_deref().unwrap_or(&draft.info.name)));
+                    creates.push(draft.info.create_sql(d));
                 }
-                Change::DropTrigger { name } => out.push(drop(name)),
+                Change::DropTrigger { name } => drops.push(drop(name)),
                 _ => {}
             }
         }
-        out
+        drops.extend(creates);
+        drops
     }
 
     /// The function statements, in the order they must run.
@@ -5789,6 +5805,37 @@ mod tests {
             }]);
             let d = TriggerSetDraft::from_table(&t);
             assert!(diff_triggers(&t.triggers, &d, MySql).changes.is_empty());
+        }
+
+        /// Swapping two triggers' names must not destroy one of them.
+        ///
+        /// `TriggerSetDraft::validate` compares only *final* names, and after an
+        /// `a`→`b`, `b`→`a` swap those are unique — so the plan is accepted.
+        /// Emitted as adjacent `DROP`+`CREATE` pairs it then failed `ERROR 1359`
+        /// on statement 2, with statement 1 already committed on MySQL: trigger
+        /// `a` gone, and no transaction to roll back.
+        #[test]
+        fn swapping_two_trigger_names_drops_both_before_creating_either() {
+            let a = my_trigger();
+            let mut b = my_trigger();
+            b.name = "t_two".into();
+            let t = table_with_triggers(vec![a, b]);
+            let mut d = TriggerSetDraft::from_table(&t);
+            d.triggers[0].info.name = "t_two".into();
+            d.triggers[1].info.name = "t_ins".into();
+            let sql = diff_triggers(&t.triggers, &d, MySql).emit();
+            let first_create = sql
+                .iter()
+                .position(|s| s.contains("CREATE"))
+                .expect("a create");
+            let last_drop = sql
+                .iter()
+                .rposition(|s| s.starts_with("DROP TRIGGER"))
+                .expect("a drop");
+            assert!(
+                last_drop < first_create,
+                "every drop must precede every create: {sql:?}"
+            );
         }
 
         /// The round-trip gate for the state PG 16.14 reports and the emitter

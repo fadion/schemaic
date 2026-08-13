@@ -1011,6 +1011,14 @@ type MyTriggerRow = (String, String, String, String, String, String, u64);
 /// A server too old to report the column sends `0` for every row. `0` means "no
 /// ordering information", not "first", so those get no clause at all rather than
 /// a fabricated chain.
+///
+/// **The group's leader gets a `PRECEDES`, not nothing.** `FOLLOWS <previous>`
+/// covers positions 2 and up, but position 1 has no predecessor to name — and a
+/// `CREATE TRIGGER` with no ordering clause makes MySQL append the trigger
+/// *last*, so replacing the leader reversed the whole group. Measured on MySQL
+/// 8.4.11. A positive anchor is the only clause that can express "first", so the
+/// leader of a group of two or more names its successor instead. A group of one
+/// still gets nothing: there is no order to preserve.
 fn mysql_triggers(rows: &[MyTriggerRow]) -> Vec<TriggerInfo> {
     // Group key then position, so the previous row in iteration order *is* the
     // trigger this one follows. Name last, to keep it deterministic when a stale
@@ -1020,12 +1028,19 @@ fn mysql_triggers(rows: &[MyTriggerRow]) -> Vec<TriggerInfo> {
     let mut out: Vec<TriggerInfo> = Vec::with_capacity(sorted.len());
     // (table, timing, event, the name of the last trigger emitted in that group)
     let mut prev: Option<(String, String, String, String)> = None;
-    for (table, name, timing, event, stmt, definer, order) in sorted {
+    for (i, (table, name, timing, event, stmt, definer, order)) in sorted.iter().enumerate() {
         let same_group = prev
             .as_ref()
             .is_some_and(|(t, ti, e, _)| t == table && ti == timing && e == event);
         let order_clause = match (&prev, same_group, *order > 1) {
             (Some((.., last)), true, true) => Some(TriggerOrder::Follows(last.clone())),
+            // The leader of a group of two or more. `*order == 1` excludes the
+            // `0` "no information" case, and the successor's name is already in
+            // hand — it is the next row, which is in the same group by the sort.
+            _ if *order == 1 => sorted
+                .get(i + 1)
+                .filter(|(t, _, ti, e, ..)| t == table && ti == timing && e == event)
+                .map(|(_, next, ..)| TriggerOrder::Precedes(next.clone())),
             _ => None,
         };
         out.push(TriggerInfo {
@@ -2993,8 +3008,11 @@ mod tests {
         ];
         let out = mysql_triggers(&rows);
         let by = |n: &str| out.iter().find(|t| t.name == n).unwrap().order.clone();
-        // Position 1 starts the chain; each later one follows its predecessor.
-        assert_eq!(by("first"), None);
+        // Position 1 anchors the chain from the front. This used to assert
+        // `None` — which is the defect, not the contract: a `CREATE TRIGGER`
+        // with no ordering clause is appended *last* by MySQL, so recreating
+        // the leader reversed the group.
+        assert_eq!(by("first"), Some(TriggerOrder::Precedes(s("second"))));
         assert_eq!(by("second"), Some(TriggerOrder::Follows(s("first"))));
         assert_eq!(by("third"), Some(TriggerOrder::Follows(s("second"))));
     }
@@ -3010,6 +3028,38 @@ mod tests {
             tr("lines", "d", "BEFORE", "INSERT", 1),
         ];
         assert!(mysql_triggers(&rows).iter().all(|t| t.order.is_none()));
+    }
+
+    /// The **leading** trigger of a group needs an anchor too.
+    ///
+    /// It recorded none, because `ACTION_ORDER > 1` was the whole condition. So
+    /// replacing it emitted a `CREATE TRIGGER` with no ordering clause, MySQL
+    /// appended it **last**, and the group's firing order silently reversed —
+    /// every later write computing from a chain that now runs backwards, with
+    /// no error and nothing in the preview. Measured on MySQL 8.4.11: a group
+    /// `[a, b]` came back `[b, a]` after replacing `a`, and `PRECEDES b`
+    /// restored it.
+    ///
+    /// A group of one needs nothing: there is no order to lose.
+    #[test]
+    fn mysql_triggers_anchor_the_leading_trigger_of_a_group() {
+        let rows = [
+            tr("orders", "a", "BEFORE", "INSERT", 1),
+            tr("orders", "b", "BEFORE", "INSERT", 2),
+            tr("orders", "c", "BEFORE", "INSERT", 3),
+        ];
+        let out = mysql_triggers(&rows);
+        assert_eq!(
+            out[0].order,
+            Some(TriggerOrder::Precedes(s("b"))),
+            "the leader must name its successor"
+        );
+        assert_eq!(out[1].order, Some(TriggerOrder::Follows(s("a"))));
+        assert_eq!(out[2].order, Some(TriggerOrder::Follows(s("b"))));
+
+        // A lone trigger in its group has no order to preserve.
+        let out = mysql_triggers(&[tr("orders", "only", "BEFORE", "INSERT", 1)]);
+        assert!(out[0].order.is_none());
     }
 
     #[test]
