@@ -691,9 +691,10 @@ impl TriggerDraft {
     /// engines, because the model deliberately holds both shapes: introspection
     /// must never have to lie about what a server reported, so the refusal lives
     /// here instead.
-    pub fn validate(&self, dialect: SqlDialect) -> Vec<String> {
+    pub fn validate(&self, dialect: SqlDialect, host: TriggerHost) -> Vec<String> {
         let t = &self.info;
         let pg = dialect == SqlDialect::Postgres;
+        let view = host == TriggerHost::View;
         let mut out = Vec::new();
         if t.name.trim().is_empty() {
             out.push("The trigger needs a name.".to_string());
@@ -726,6 +727,26 @@ impl TriggerDraft {
             }
             if t.timing == TriggerTiming::InsteadOf && t.level != TriggerLevel::Row {
                 out.push("An INSTEAD OF trigger has to be FOR EACH ROW.".to_string());
+            }
+            // What the timing may be depends on what it fires on, and the two
+            // rules are exact opposites — measured on 16.14, verbatim:
+            // `"t" is a table … Tables cannot have INSTEAD OF triggers` and
+            // `"v" is a view … Views cannot have row-level BEFORE or AFTER
+            // triggers`. A statement-level `BEFORE`/`AFTER` on a view is fine,
+            // so this is narrower than "a view only takes INSTEAD OF".
+            if t.timing == TriggerTiming::InsteadOf && !view {
+                out.push(
+                    "Only a view can have an INSTEAD OF trigger — a table takes \
+                     BEFORE or AFTER."
+                        .to_string(),
+                );
+            }
+            if view && t.timing != TriggerTiming::InsteadOf && t.level == TriggerLevel::Row {
+                out.push(
+                    "A view's BEFORE or AFTER trigger has to be FOR EACH STATEMENT \
+                     — use INSTEAD OF to act on rows."
+                        .to_string(),
+                );
             }
         } else {
             if t.events.len() > 1 {
@@ -762,6 +783,33 @@ impl TriggerDraft {
             }
         }
         out
+    }
+}
+
+/// What a trigger fires on — the half of the rules that isn't the dialect.
+///
+/// PostgreSQL's timing rules are exact opposites on the two, so a validator that
+/// only knows the dialect has to guess, and guessed wrong in both directions:
+/// the modal offered `INSTEAD OF` on tables, where the server always refuses it,
+/// while a view's triggers were unreachable. `Table` is the default because it
+/// is what a trigger fires on unless something says otherwise.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TriggerHost {
+    #[default]
+    Table,
+    View,
+}
+
+impl TriggerHost {
+    /// The host a `TableInfo` is. `is_view` covers a materialized view too, but
+    /// PostgreSQL takes no trigger on one at all, so the distinction never
+    /// reaches here.
+    pub fn of(is_view: bool) -> TriggerHost {
+        if is_view {
+            TriggerHost::View
+        } else {
+            TriggerHost::Table
+        }
     }
 }
 
@@ -812,7 +860,12 @@ impl TriggerSetDraft {
     /// trigger lock the whole modal: the form renders `errs.first()` and gates
     /// `ready` on the set being empty, so Preview SQL was permanently disabled
     /// and the only way out was to select that trigger and drop it.
-    pub fn validate(&self, current: &[TriggerInfo], dialect: SqlDialect) -> Vec<String> {
+    pub fn validate(
+        &self,
+        current: &[TriggerInfo],
+        dialect: SqlDialect,
+        host: TriggerHost,
+    ) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for t in &self.triggers {
             // An untouched member says nothing: it is already on the server in
@@ -834,7 +887,7 @@ impl TriggerSetDraft {
                     t.info.name
                 ));
             }
-            out.extend(t.validate(dialect));
+            out.extend(t.validate(dialect, host));
         }
         let mut seen: Vec<&str> = Vec::new();
         for t in &self.triggers {
@@ -6983,7 +7036,7 @@ mod tests {
             b.name = "T_INS".into(); // both engines fold case here
             let t = table_with_triggers(vec![a, b]);
             let msgs = TriggerSetDraft::from_table(&t)
-                .validate(&t.triggers, MySql)
+                .validate(&t.triggers, MySql, TriggerHost::Table)
                 .join(" | ");
             assert!(msgs.contains("both called"), "{msgs}");
         }
@@ -7007,18 +7060,24 @@ mod tests {
             // Untouched: the set is clean and the other trigger is editable.
             let mut d = TriggerSetDraft::from_table(&t);
             assert!(
-                d.validate(&t.triggers, Postgres).is_empty(),
+                d.validate(&t.triggers, Postgres, TriggerHost::Table)
+                    .is_empty(),
                 "{:?}",
-                d.validate(&t.triggers, Postgres)
+                d.validate(&t.triggers, Postgres, TriggerHost::Table)
             );
 
             // Editing the *ordinary* one stays clean.
             d.triggers[0].info.condition = Some("new.total > 5".into());
-            assert!(d.validate(&t.triggers, Postgres).is_empty());
+            assert!(
+                d.validate(&t.triggers, Postgres, TriggerHost::Table)
+                    .is_empty()
+            );
 
             // Editing the constraint trigger is what is refused, by name.
             d.triggers[1].info.condition = Some("new.total > 5".into());
-            let msgs = d.validate(&t.triggers, Postgres).join(" | ");
+            let msgs = d
+                .validate(&t.triggers, Postgres, TriggerHost::Table)
+                .join(" | ");
             assert!(msgs.contains("constraint trigger ct"), "{msgs}");
         }
 
@@ -7099,13 +7158,17 @@ mod tests {
             let mut t = my_trigger();
             t.events = vec![TriggerEvent::Insert, TriggerEvent::Update];
             t.condition = Some("NEW.x > 0".into());
-            let msgs = TriggerDraft::from_info(&t).validate(MySql).join(" | ");
+            let msgs = TriggerDraft::from_info(&t)
+                .validate(MySql, TriggerHost::Table)
+                .join(" | ");
             assert!(msgs.contains("one event"), "{msgs}");
             assert!(msgs.contains("no WHEN"), "{msgs}");
 
             let mut p = pg_trigger();
             p.action = TriggerAction::Body("SET x = 1".into());
-            let msgs = TriggerDraft::from_info(&p).validate(Postgres).join(" | ");
+            let msgs = TriggerDraft::from_info(&p)
+                .validate(Postgres, TriggerHost::Table)
+                .join(" | ");
             assert!(msgs.contains("runs a function"), "{msgs}");
         }
 
@@ -7114,14 +7177,61 @@ mod tests {
             let mut p = pg_trigger();
             p.events = vec![TriggerEvent::Truncate];
             p.level = TriggerLevel::Row;
-            let msgs = TriggerDraft::from_info(&p).validate(Postgres).join(" | ");
+            let msgs = TriggerDraft::from_info(&p)
+                .validate(Postgres, TriggerHost::Table)
+                .join(" | ");
             assert!(msgs.contains("FOR EACH STATEMENT"), "{msgs}");
 
             let mut p = pg_trigger();
             p.timing = TriggerTiming::InsteadOf;
             p.level = TriggerLevel::Statement;
-            let msgs = TriggerDraft::from_info(&p).validate(Postgres).join(" | ");
+            let msgs = TriggerDraft::from_info(&p)
+                .validate(Postgres, TriggerHost::View)
+                .join(" | ");
             assert!(msgs.contains("FOR EACH ROW"), "{msgs}");
+        }
+
+        /// The timing rules are exact opposites on a table and a view, and the
+        /// modal had them inverted — `INSTEAD OF` offered only where the server
+        /// always refuses it, while a view's triggers were unreachable. Both
+        /// messages measured verbatim on PG 16.14.
+        #[test]
+        fn validate_knows_which_timings_a_table_and_a_view_can_take() {
+            // `"t" is a table … Tables cannot have INSTEAD OF triggers.`
+            let mut p = pg_trigger();
+            p.timing = TriggerTiming::InsteadOf;
+            p.level = TriggerLevel::Row;
+            let msgs = TriggerDraft::from_info(&p)
+                .validate(Postgres, TriggerHost::Table)
+                .join(" | ");
+            assert!(msgs.contains("Only a view"), "{msgs}");
+            assert!(
+                TriggerDraft::from_info(&p)
+                    .validate(Postgres, TriggerHost::View)
+                    .is_empty()
+            );
+
+            // `"v" is a view … Views cannot have row-level BEFORE or AFTER
+            // triggers.` — but statement-level is legal there, which is why the
+            // rule can't be "a view only takes INSTEAD OF".
+            let mut p = pg_trigger();
+            p.timing = TriggerTiming::Before;
+            p.level = TriggerLevel::Row;
+            let msgs = TriggerDraft::from_info(&p)
+                .validate(Postgres, TriggerHost::View)
+                .join(" | ");
+            assert!(msgs.contains("FOR EACH STATEMENT"), "{msgs}");
+            assert!(
+                TriggerDraft::from_info(&p)
+                    .validate(Postgres, TriggerHost::Table)
+                    .is_empty()
+            );
+            p.level = TriggerLevel::Statement;
+            assert!(
+                TriggerDraft::from_info(&p)
+                    .validate(Postgres, TriggerHost::View)
+                    .is_empty()
+            );
         }
 
         #[test]
@@ -7134,11 +7244,13 @@ mod tests {
             let t = table_with_triggers(vec![p]);
             let mut d = TriggerSetDraft::from_table(&t);
             d.triggers[0].info.condition = Some("new.total > 5".into());
-            let msgs = d.validate(&t.triggers, Postgres).join(" | ");
+            let msgs = d
+                .validate(&t.triggers, Postgres, TriggerHost::Table)
+                .join(" | ");
             assert!(msgs.contains("constraint trigger"), "{msgs}");
 
             let msgs = TriggerDraft::blank("", "", None)
-                .validate(MySql)
+                .validate(MySql, TriggerHost::Table)
                 .join(" | ");
             assert!(msgs.contains("needs a name"), "{msgs}");
             assert!(msgs.contains("needs a table"), "{msgs}");

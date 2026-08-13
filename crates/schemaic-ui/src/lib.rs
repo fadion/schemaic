@@ -290,6 +290,11 @@ pub struct TriggerTarget {
     pub schema: Option<String>,
     pub table: String,
     pub dialect: SqlDialect,
+    /// Whether the target is a **view**. PostgreSQL's timing rules are exact
+    /// opposites on a table and a view (`INSTEAD OF` only on the latter,
+    /// row-level `BEFORE`/`AFTER` only on the former), so the form can't offer
+    /// the right options without knowing.
+    pub is_view: bool,
     /// The introspected triggers the draft started from — the left-hand side of
     /// the diff.
     pub current: Vec<schemaic_core::schema::TriggerInfo>,
@@ -300,6 +305,11 @@ impl TriggerTarget {
     /// The modal's title subject: the table whose triggers these are.
     pub fn display(&self) -> String {
         schemaic_core::schema::display_name(self.schema.as_deref(), &self.table)
+    }
+
+    /// What the model needs to judge a timing against.
+    pub fn host(&self) -> schemaic_core::ddl::TriggerHost {
+        schemaic_core::ddl::TriggerHost::of(self.is_view)
     }
 }
 

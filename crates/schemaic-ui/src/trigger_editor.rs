@@ -231,6 +231,7 @@ pub(crate) fn open_for_table(ui: &Ui, database: &str, schema: Option<&str>, tabl
             schema: info.schema.clone(),
             table: info.name.clone(),
             dialect: ctx.dialect,
+            is_view: info.is_view,
             current: info.triggers.clone(),
             read_only: ctx.read_only,
         },
@@ -245,10 +246,17 @@ fn blank_trigger(
     table: &str,
     schema: Option<String>,
     pg: bool,
+    is_view: bool,
 ) -> TriggerDraft {
     let taken: Vec<String> = existing.iter().map(|t| t.info.name.clone()).collect();
     let mut draft = TriggerDraft::blank(unique_name(&taken, "new_trigger"), table, schema);
     draft.info.events = vec![TriggerEvent::Insert];
+    // A view's row-level trigger can only be `INSTEAD OF`, so opening on
+    // `BEFORE` there would be the same "opens on a validation error" the rest of
+    // this function exists to avoid.
+    if pg && is_view {
+        draft.info.timing = TriggerTiming::InsteadOf;
+    }
     draft.info.action = if pg {
         TriggerAction::Function {
             name: String::new(),
@@ -467,11 +475,15 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize) -> AnyView {
         .style(move |s| s.width(FIELD_W)),
     );
 
-    // INSTEAD OF is PostgreSQL's alone, so the option only exists there.
-    let timings: Vec<String> = if pg {
-        vec!["BEFORE".into(), "AFTER".into(), "INSTEAD OF".into()]
-    } else {
-        vec!["BEFORE".into(), "AFTER".into()]
+    // `INSTEAD OF` is PostgreSQL's alone **and a view's alone**: on a table the
+    // server answers `Tables cannot have INSTEAD OF triggers`, so offering it
+    // there is the "hide what it can't express" rule broken in the direction
+    // that fails at Apply. `BEFORE`/`AFTER` stay on the list for a view — those
+    // are legal there statement-level, which `TriggerDraft::validate` is the
+    // authority on.
+    let timings: Vec<String> = match (pg, target.is_view) {
+        (true, true) => vec!["BEFORE".into(), "AFTER".into(), "INSTEAD OF".into()],
+        _ => vec!["BEFORE".into(), "AFTER".into()],
     };
     let timing = form_setting(
         "Timing",
@@ -987,7 +999,13 @@ fn change_set(target: &TriggerTarget, draft: &TriggerSetDraft) -> ddl::ChangeSet
 ///
 /// Re-renders on every draft change — unlike the form, which must not — so a
 /// rename shows in the list as you type it. Same split as the designer's.
-fn trigger_list(ui: Ui, pg: bool, table: String, schema: Option<String>) -> impl IntoView {
+fn trigger_list(
+    ui: Ui,
+    pg: bool,
+    is_view: bool,
+    table: String,
+    schema: Option<String>,
+) -> impl IntoView {
     let d = ui.ddl.trigger_draft;
     let selected = ui.ddl.selected;
     let rev = ui.ddl.rev;
@@ -1028,7 +1046,7 @@ fn trigger_list(ui: Ui, pg: bool, table: String, schema: Option<String>) -> impl
 
     let add = move || {
         d.update(|s| {
-            let fresh = blank_trigger(&s.triggers, &table, schema.clone(), pg);
+            let fresh = blank_trigger(&s.triggers, &table, schema.clone(), pg, is_view);
             s.triggers.push(fresh);
         });
         // Select what was just added, and bump `rev`: `selected` may be
@@ -1140,6 +1158,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                 trigger_list(
                     ui.clone(),
                     target.dialect == SqlDialect::Postgres,
+                    target.is_view,
                     target.table.clone(),
                     target.schema.clone(),
                 ),
@@ -1163,7 +1182,11 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
             let status = dyn_container(
                 move || d.trigger_draft.get(),
                 move |draft| {
-                    let errs = draft.validate(&status_target.current, status_target.dialect);
+                    let errs = draft.validate(
+                        &status_target.current,
+                        status_target.dialect,
+                        status_target.host(),
+                    );
                     if let Some(first) = errs.first() {
                         return text(first.clone())
                             .style(|s| {
@@ -1198,7 +1221,9 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                     let ui = preview_ui.clone();
                     let target = preview_target.clone();
                     let cs = change_set(&target, &draft);
-                    let ready = draft.validate(&target.current, target.dialect).is_empty()
+                    let ready = draft
+                        .validate(&target.current, target.dialect, target.host())
+                        .is_empty()
                         && !cs.is_empty();
                     h_stack((
                         action_button("Cancel", ActionKind::Neutral, true, close),
