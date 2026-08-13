@@ -1046,6 +1046,10 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
                 // predicate came out of.
                 validated: schemaic_core::ddl::check_clause_flags(&cell(r, 3)).0,
                 inherited: schemaic_core::ddl::check_clause_flags(&cell(r, 3)).1,
+                // MariaDB's alone: PostgreSQL folds a column-level `CHECK` into
+                // a table constraint at `CREATE` time, and `pg_constraint` has
+                // no other kind.
+                column_level: false,
             })
             .collect();
         t.triggers = trigger_all
@@ -1254,6 +1258,9 @@ fn pg_fold_types(
                         // statement the domain emitted a syntax error.
                         validated: schemaic_core::ddl::check_clause_flags(&cell(c, 3)).0,
                         inherited: schemaic_core::ddl::check_clause_flags(&cell(c, 3)).1,
+                        // A domain's constraints are never column-level; that is
+                        // MariaDB's, and a domain has no columns.
+                        column_level: false,
                     })
                     .collect(),
                 comment,

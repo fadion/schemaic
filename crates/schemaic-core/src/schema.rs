@@ -477,10 +477,12 @@ pub struct TableInfo {
     /// MySQL table collation (which implies its charset). `None` on PostgreSQL.
     pub collation: Option<String>,
     pub comment: Option<String>,
-    /// `CHECK` constraints declared on this table. Table-level: unlike a column's
-    /// attributes these survive a `MODIFY COLUMN`, so an *edit* never dropped
-    /// one — but a `CREATE TABLE` built from a draft that doesn't carry them
-    /// loses every invariant the table was written to guarantee.
+    /// `CHECK` constraints declared on this table.
+    ///
+    /// Table-level on PostgreSQL and MySQL, and on MariaDB either that or
+    /// **column-level** ([`CheckInfo::column_level`]) — which is the one that
+    /// does *not* survive a `MODIFY COLUMN`, and so is the reason the flag
+    /// exists at all.
     pub check_constraints: Vec<CheckInfo>,
     /// Triggers declared on this table. Table-owned on both engines, so they
     /// hang here rather than off [`DbSchema`] — a trigger has no independent
@@ -523,6 +525,23 @@ pub struct CheckInfo {
     /// **PostgreSQL**: `false` when the constraint was added `NO INHERIT`, so
     /// child tables don't get it. Restated for the same reason.
     pub inherited: bool,
+    /// **MariaDB**: the constraint was written *inside* its column's definition
+    /// (`information_schema.CHECK_CONSTRAINTS.LEVEL = 'Column'`), which is what
+    /// the ordinary `q INT CHECK (q > 0)` syntax produces.
+    ///
+    /// Modelled because such a constraint is **part of the column**, exactly as
+    /// its default or collation is: `ALTER TABLE … MODIFY COLUMN` replaces the
+    /// whole definition, so a `MODIFY`/`CHANGE` that doesn't restate the check
+    /// destroys it — silently, on the next introspection, with rows the table
+    /// refused a moment ago accepted from then on. Measured on 10.11.14; MySQL 8
+    /// rewrites the same syntax into a table constraint at `CREATE` time and so
+    /// never has one.
+    ///
+    /// MariaDB gives it no name of its own — the syntax refuses a `CONSTRAINT`
+    /// label at column level (1064) — so it is always named after its column and
+    /// is renamed with it. `DROP CONSTRAINT` cannot find one (1091); the only way
+    /// to change or remove it is to restate the column without it.
+    pub column_level: bool,
 }
 
 impl Default for CheckInfo {
@@ -537,6 +556,10 @@ impl Default for CheckInfo {
             // `NO INHERIT` on every check nobody asked to weaken.
             validated: true,
             inherited: true,
+            // A check the model didn't read off MariaDB is a table constraint:
+            // that is what every other producer makes, and what the emitter
+            // writes.
+            column_level: false,
         }
     }
 }
@@ -564,6 +587,18 @@ impl CheckInfo {
             out.push_str(" NOT ENFORCED");
         }
         out
+    }
+
+    /// The same constraint written *inside* a column definition, as MariaDB
+    /// accepts it there: bare `CHECK (…)`, with no name.
+    ///
+    /// See [`CheckInfo::column_level`] for why this spelling exists at all —
+    /// MariaDB refuses a `CONSTRAINT` label at column level, and a `MODIFY`
+    /// that omits the clause deletes the constraint. `NOT ENFORCED` is not
+    /// emitted here: MariaDB, the only server with column-level checks, has no
+    /// such clause.
+    pub fn inline_sql(&self) -> String {
+        format!("CHECK ({})", self.expression)
     }
 }
 

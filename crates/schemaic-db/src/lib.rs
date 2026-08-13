@@ -878,14 +878,22 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
     // query above into every table quietly reporting no constraints, which is
     // this feature's own bug wearing a disguise: the designer would then build a
     // `CREATE TABLE` that drops checks the server really has.
+    //
+    // `LEVEL` is MariaDB's alone and is not cosmetic: a `Column` check is part
+    // of the column definition `MODIFY COLUMN` replaces, so the emitter has to
+    // restate it or the server deletes it (see `CheckInfo::column_level`). MySQL
+    // has no such thing — it rewrites the same syntax into a table constraint at
+    // `CREATE` time — so that branch reports `Table` for every row.
     let check_sql = if mariadb {
         "SELECT CAST(TABLE_NAME AS CHAR) AS t, CAST(CONSTRAINT_NAME AS CHAR) AS cn, \
-                CAST(CHECK_CLAUSE AS CHAR) AS cc, 'YES' AS enforced \
+                CAST(CHECK_CLAUSE AS CHAR) AS cc, 'YES' AS enforced, \
+                CAST(LEVEL AS CHAR) AS lvl \
          FROM information_schema.CHECK_CONSTRAINTS \
          WHERE CONSTRAINT_SCHEMA = ?"
     } else {
         "SELECT CAST(tc.TABLE_NAME AS CHAR) AS t, CAST(cc.CONSTRAINT_NAME AS CHAR) AS cn, \
-                CAST(cc.CHECK_CLAUSE AS CHAR) AS cc, CAST(tc.ENFORCED AS CHAR) AS enforced \
+                CAST(cc.CHECK_CLAUSE AS CHAR) AS cc, CAST(tc.ENFORCED AS CHAR) AS enforced, \
+                'Table' AS lvl \
          FROM information_schema.CHECK_CONSTRAINTS cc \
          JOIN information_schema.TABLE_CONSTRAINTS tc \
            ON tc.CONSTRAINT_SCHEMA = cc.CONSTRAINT_SCHEMA \
@@ -893,6 +901,14 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
           AND tc.CONSTRAINT_TYPE = 'CHECK' \
          WHERE cc.CONSTRAINT_SCHEMA = ?"
     };
+    // MariaDB grew `LEVEL` in 10.5; 10.2-10.4 have the table without it. Losing
+    // that column must not cost the whole database its check constraints, so a
+    // missing-column error retries without it — those servers then behave as
+    // Schemaic did before the column was read at all.
+    let check_fallback = "SELECT CAST(TABLE_NAME AS CHAR) AS t, CAST(CONSTRAINT_NAME AS CHAR) AS cn, \
+                CAST(CHECK_CLAUSE AS CHAR) AS cc, 'YES' AS enforced, 'Table' AS lvl \
+         FROM information_schema.CHECK_CONSTRAINTS \
+         WHERE CONSTRAINT_SCHEMA = ?";
     let check_rows: Vec<MyCheckRow> = match conn
         .exec_map(check_sql, (database,), |r: MyCheckRow| r)
         .await
@@ -901,6 +917,11 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         // 1109 `ER_UNKNOWN_TABLE` / 1146 `ER_NO_SUCH_TABLE`: the server predates
         // check constraints, so there are none to report.
         Err(mysql_async::Error::Server(e)) if e.code == 1109 || e.code == 1146 => Vec::new(),
+        // 1054 `ER_BAD_FIELD_ERROR`: a MariaDB too old for `LEVEL`.
+        Err(mysql_async::Error::Server(e)) if e.code == 1054 && mariadb => conn
+            .exec_map(check_fallback, (database,), |r: MyCheckRow| r)
+            .await
+            .map_err(qerr)?,
         Err(e) => return Err(qerr(e)),
     };
 
@@ -1046,8 +1067,11 @@ fn trigger_body_of(create_sql: &str) -> Option<String> {
 }
 
 /// One `information_schema.CHECK_CONSTRAINTS` row, already joined to its table:
-/// `(table, constraint name, check clause, enforced)`.
-type MyCheckRow = (String, String, String, String);
+/// `(table, constraint name, check clause, enforced, level)`.
+///
+/// `level` is MariaDB's `Column`/`Table`; the MySQL query reports `Table` for
+/// every row, which is what that server actually stores.
+type MyCheckRow = (String, String, String, String, String);
 
 /// One `CHECK_CLAUSE` as SQL that can actually be run.
 ///
@@ -1117,7 +1141,7 @@ fn apply_check_constraints(schema: &mut DbSchema, rows: &[MyCheckRow], mariadb: 
         t.check_constraints = rows
             .iter()
             .filter(|(table, ..)| *table == t.name)
-            .map(|(_, name, clause, enforced)| CheckInfo {
+            .map(|(_, name, clause, enforced, level)| CheckInfo {
                 name: name.clone(),
                 // `CHECK_CLAUSE` is the server's re-print of the predicate,
                 // parenthesised and — on MySQL 8 — escaped a second time; the
@@ -1131,6 +1155,10 @@ fn apply_check_constraints(schema: &mut DbSchema, rows: &[MyCheckRow], mariadb: 
                 // MariaDB has no `NOT ENFORCED` and the query hardcodes `YES`
                 // there, so this reads as enforced on both.
                 enforced: !enforced.eq_ignore_ascii_case("NO"),
+                // MariaDB's `LEVEL`. Only `Column` matters — it says the
+                // constraint lives inside the column definition, so a `MODIFY`
+                // that doesn't restate it deletes it.
+                column_level: level.eq_ignore_ascii_case("Column"),
                 // `NOT VALID` / `NO INHERIT` are PostgreSQL's; neither engine
                 // here can report one, and the emitter writes neither.
                 ..Default::default()
