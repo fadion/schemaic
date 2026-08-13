@@ -99,9 +99,11 @@ CI's passes a tree CI will reject, which is the one thing a pre-release gate exi
 1. `git status --short` empty. Reviewing a dirty tree reviews something that isn't shipping.
 2. `cargo fmt --all --check` → exit 0.
 3. `cargo clippy --workspace --all-targets -- -D warnings` → clean.
-4. `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` → clean. Easy to forget because
-   it is the one gate no local habit runs; a doc link pointing at a renamed item has failed a
-   release push on exactly this.
+4. `$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --workspace --no-deps` → clean. Easy to forget
+   because it is the one gate no local habit runs; a doc link pointing at a renamed item has failed
+   a release push on exactly this. **PowerShell**, not a POSIX env-var prefix — `RUSTDOCFLAGS="…"
+   cargo doc` is a *parse error* on this machine, and a parse error's exit code is indistinguishable
+   at a glance from a rustdoc warning while the correct reaction to each is the opposite.
 5. `cargo deny check` → advisories / bans / licenses / sources ok. It also appears in Pass 0's
    census, but a policy failure is a stop, not a fact.
 6. `cargo test --workspace` → green, no `#[ignore]`.

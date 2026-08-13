@@ -159,11 +159,20 @@ Zed-inspired, aiming to replace DataGrip.
     and renaming a value are `ALTER TYPE`, but there is no `DROP VALUE` and no way to move
     one, so the moment a value is **removed or reordered** the whole edit collapses into a
     single `Change::RecreateEnum` — `recreate_type_sql`'s park-create-recast-drop dance, which
-    casts each dependent column through `text` (`text[]` for an array, since `mood[]` has no
-    direct cast to the rebuilt one) and restates the default it had to drop first. A domain's
+    casts each dependent column through `text` — **and for an enum only, on to the rebuilt
+    type**, because `text` has no assignment cast to one. A *domain* stops at `::text`
+    deliberately: the second, explicit cast is what silently truncates (`varchar(64)` →
+    `varchar(16)` destroyed 48 characters per row and committed), where the assignment cast
+    PostgreSQL then applies refuses instead. `RecreateDomain` therefore carries the base type
+    it had *before* the edit, so `risks()` can run the same `column_risks` narrowing analysis a
+    column's type change gets — it was the one narrowing path in the emitter that disclosed
+    nothing. It also restates the default it had to drop first. A domain's
     base type is the same story (`ALTER DOMAIN` has no action for it); everything else about
     one alters in place. `type_dependents` reads the columns that dance has to touch off the
-    introspected schema, and is deliberately a **lower bound** — a view or function built on
+    introspected schema, matched on the **type's** identity and scanned across *every*
+    namespace (a qualified declaration must match both halves; an unqualified one is the
+    default namespace's type wherever the table lives, which is what `format_type` means by
+    printing it bare). It is deliberately a **lower bound** — a view or function built on
     the type can't be enumerated from `DbSchema` at all — which is why `recreate_risk` names
     the columns *and* says the server may still refuse. Two disclosures exist because the
     model can't distinguish the intent: a value list can't tell a rename from a
@@ -176,6 +185,21 @@ Zed-inspired, aiming to replace DataGrip.
     that runs come from one comparison. All PostgreSQL-only; `object_statements` is still
     called from both emitters so a MySQL connection handed such a set emits SQL the server can
     reject rather than dropping it on the floor.
+    **Triggers and PostgreSQL trigger functions** ride the same rails again:
+    `TriggerSetDraft`/`TriggerDraft` → `diff_triggers` and `FunctionDraft` → `diff_function`
+    → `Change::{CreateTrigger, ReplaceTrigger, DropTrigger, CreateFunction, ReplaceFunction,
+    RenameFunction, DropFunction}` → the same preview. Neither engine can *alter* a trigger,
+    so **every** edit is a drop-and-create and `ReplaceTrigger` is that pair — which is why
+    `trigger_statements` emits **all the drops, then all the creates** rather than each pair
+    together: adjacent pairs collide the moment two triggers swap names, and on MySQL
+    statement 1 has already committed when statement 2 fails, so the first trigger is simply
+    gone. Same rule, same reason as `GridWrite::plan` in `core::model`.
+    `session_wrapped_create` is the MySQL half of that emitter: `CREATE TRIGGER` has no clause
+    for the `sql_mode`/`character_set_client`/`collation_connection` a trigger was written
+    under, yet all three are part of what it does, so the values are set on the session around
+    the statement and restored after (`run_ddl` runs a MySQL plan in order on one connection,
+    which is what makes that safe). Nothing is emitted when nothing is known — `None` means
+    "not fetched", and inventing a session state is a change nobody asked for.
   - `erd.rs` — the **ER-diagram** model (the UI half is `ui/erd_view.rs`). `build_graph` turns an
     introspected `DbSchema` into a `DiagramGraph` — nodes = tables, edges = FKs — seeded either by
     `DiagramSeed::Database` (whole database, hiding FK-less "island" tables) or `::Table` (one
@@ -251,6 +275,23 @@ Zed-inspired, aiming to replace DataGrip.
     above; its **view** branch delegates to `ddl::view_ddl` so Copy DDL, the MCP table-info tool
     and the apply path all emit through one view emitter (it used to have its own, which restated
     none of the options).
+    **`TriggerInfo`/`TriggerAction`/`TriggerEvent`/`TriggerEnabled`/`TriggerSource` +
+    `RoutineInfo`** are the trigger and PG-trigger-function half, and carry three rules the
+    same "restate everything or it silently resets" logic as `ViewOptions`.
+    `TriggerAction::Function::name` is **emittable SQL** on both producers — already quoted,
+    qualified when it isn't in `public` — never a bare identifier; it once meant both
+    depending on who wrote it, which bound triggers to `public`'s copy of a function picked
+    from another schema. `TriggerEvent`'s **declaration order is load-bearing**: the derived
+    `Ord` is what the UI sorts into and must be `pg_trigger.tgtype`'s bit order (`INSERT`,
+    `DELETE`, `UPDATE`, `TRUNCATE`), not DML order, or an introspected trigger re-sorts into a
+    phantom drop-and-recreate. `TriggerEnabled` is `tgenabled`'s **four** states, because
+    `ENABLE ALWAYS`/`ENABLE REPLICA` folded into a bool get recreated as plain `O` and change
+    what fires during replication apply; `old_table`/`new_table` are `REFERENCING OLD/NEW
+    TABLE`, whose loss breaks *every write to the table* rather than failing the plan.
+    `TriggerSource` is the MySQL body + session state, fetched lazily — see `schemaic-db`.
+    `CheckInfo::validated`/`inherited` are PostgreSQL's `NOT VALID` / `NO INHERIT`, carried and
+    restated: they are part of the clause, and `pg_get_constraintdef` prints them *after* the
+    parens, which is why `ddl::check_predicate` must strip them before peeling.
     **The standalone PostgreSQL objects** — `EnumInfo`/`DomainInfo`/`SequenceInfo` — sit here
     beside the tables and, unlike `RoutineInfo`, **on `DbSchema` itself** rather than being
     fetched lazily: the tree lists them and a column's type *is* one of them, so a separately
@@ -419,7 +460,24 @@ Zed-inspired, aiming to replace DataGrip.
   atomicity**: PostgreSQL runs the whole plan in one transaction (transactional DDL), MySQL runs
   it sequentially and reports which statement failed *and how many already stuck*
   (`DdlError::applied`) — every MySQL DDL statement commits implicitly, so a transaction there
-  would be theatre. SSH tunnels return a `TunnelHandle` (drop → port freed) with
+  would be theatre.
+  **`Db::trigger_source` is the fourth MySQL-vs-MariaDB text divergence** (with `mysql_column`'s
+  defaults, the view `ALGORITHM` and `mysql_check_clause`) and the only one that is not an
+  optimisation: `information_schema.TRIGGERS.ACTION_STATEMENT` on MySQL 8 returns the body with
+  its escapes **already resolved** (`'C:\temp'` → `C:`,0x09,`emp`; `'it''s'` → `'it's'`), and the
+  damage is *not* recoverable by re-escaping — so a recreate writes a different trigger, or fails
+  1064 after the `DROP` has committed and destroys it. `SHOW CREATE TRIGGER` is the only faithful
+  source and carries `sql_mode`/`character_set_client`/`collation_connection` in the same row;
+  `trigger_body_of` is the pure positional reader beside `view_algorithm_of` (anchored on the
+  first `FOR EACH ROW` at a *code* position, since a table can be named `` `x FOR EACH ROW y` ``).
+  Read **lazily, per trigger**, when the editor opens. MariaDB returns everything verbatim.
+  `mysql_triggers` also gives a group's *leading* trigger a `PRECEDES` anchor: MySQL appends a
+  no-clause `CREATE TRIGGER` **last**, so replacing the leader silently reversed the firing order.
+  On the PG side, `pg_triggers` filters `tgparentid = 0` (a partition's cloned trigger is
+  `tgisinternal = false` and can only be dropped through its parent), and `UPDATE OF` columns +
+  a function's `proconfig` arrive **one row each** rather than string-aggregated — same rule the
+  enum labels follow, and for the same reason.
+  SSH tunnels return a `TunnelHandle` (drop → port freed) with
   keepalives + TOFU host-key verification (`ssh_known_hosts.json`).
   `import_rows` is the bulk-load path (both engines): one transaction of batched multi-row
   `INSERT`s pulled from a `RowSource` iterator, each batch required to affect exactly as many rows
@@ -463,7 +521,7 @@ Zed-inspired, aiming to replace DataGrip.
     for query runs) instead of closing — the transaction rolls back, so a cancelled import writes
     nothing.
   - `table_designer.rs` + `ddl_preview.rs` — **schema editing**, over `core::ddl`. The
-    designer is a list-plus-form per section (Table / Columns / Indexes / Foreign keys) over
+    designer is a list-plus-form per section (Table / Columns / Indexes / Foreign keys / Checks) over
     one `DdlUi::draft`; the footer's change count *is* `ddl::diff` of that draft, the same
     call the preview emits from, so the two can't disagree. The list re-renders on every
     draft change but the **form must not** — it seeds local signals from the draft and writes
@@ -572,7 +630,7 @@ Zed-inspired, aiming to replace DataGrip.
     floor (so a new colour, surface or theme is held to AA), a listed one may never get worse, and
     a listed one that now passes must be deleted — the baseline can only shrink. Adding a theme
     needs no work here; painting a role on a new surface means adding its row.
-  - `lib.rs` (~5k lines, still the crate's largest) — the `Ui` struct + bundles, shared model/state
+  - `lib.rs` (~5.6k lines; `grid.rs` at ~6.3k is the crate's largest) — the `Ui` struct + bundles, shared model/state
     types, `workspace`/`body`/`center`/`header`/`footer`, resize handles, `edit_field`/`FieldCfg`,
     terminal panel. The shared types living in the crate root is what stalls further splitting: the
     root depends on the leaves (`mod`) and the leaves depend on the root (types), so a view builder
@@ -797,8 +855,12 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
   `chore: release vX.Y.Z`.
 - **Releases are tag-driven.** Bump → commit → `git tag vX.Y.Z && git push origin vX.Y.Z` (keep tag
   and `Cargo.toml` in sync). The tag triggers `release.yml` (Linux + Windows binaries → GitHub
-  Release); `ci.yml` runs fmt + clippy (`-D warnings`) + `cargo deny` + build/test on push/PR. Keep
-  the tree green before tagging.
+  Release); `ci.yml` runs fmt + clippy (`-D warnings`) + **rustdoc (`RUSTDOCFLAGS=-D warnings cargo
+  doc --workspace --no-deps`)** + `cargo deny` + build/test on push/PR. Keep the tree green before
+  tagging. The rustdoc gate is the one no local habit runs, and a doc link pointing at a renamed
+  item has failed a push on exactly it — in PowerShell that check is
+  `$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --workspace --no-deps`, since the POSIX env-var
+  prefix is a parse error there.
 
 ## UI conventions
 
