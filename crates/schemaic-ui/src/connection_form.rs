@@ -19,10 +19,19 @@ use schemaic_core::connection::SshAuth;
 use crate::consts::MASK_CH;
 use crate::settings::{settings_dropdown, settings_toggle_row};
 use crate::widgets::{
-    autohide, focus_root, loading_dots, measure_text_px_at, menu_item_style, modal_title,
-    panel_style,
+    ACTION_GAP, ActionKind, action_button_icon, action_face, autohide, focus_root, form_hint,
+    form_label_style, loading_dots, menu_item_style, modal_title, panel_style,
 };
 use crate::{DraftSignals, FieldCfg, Ui, edit_field, icons, theme};
+
+/// How long Save's check stands in for its label. Long enough to be read on a
+/// glance away from the button, short enough that it can't still be showing when
+/// the next edit is made and would then be confirming the wrong write.
+const SAVE_FLASH: std::time::Duration = std::time::Duration::from_millis(2000);
+/// The same for Test's result icon, held longer: a failure is worth going back
+/// and looking at, and unlike Save there is nothing else on screen that says how
+/// it went.
+const TEST_FLASH: std::time::Duration = std::time::Duration::from_millis(4000);
 
 /// The engine choice in the connection form's **Type** picker. Backs a
 /// [`settings_dropdown`]; the selection is persisted into `Connection::db_type`
@@ -69,7 +78,7 @@ const CONN_FIELD_W: f64 = 200.0;
 // One labelled text field for the connection form.
 fn field(lbl: &'static str, sig: RwSignal<String>) -> impl IntoView {
     v_stack((
-        text(lbl).style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL)),
+        text(lbl).style(form_label_style),
         edit_field(sig, FieldCfg::default()).style(|s| s.width_full()),
     ))
     .style(|s| s.flex_col().gap(6.0).width_full())
@@ -85,7 +94,7 @@ fn host_port_row(
 ) -> impl IntoView {
     let host_field = field(host_lbl, host).style(|s| s.flex_grow(1.0_f32).min_width(0.0));
     let port_field = v_stack((
-        text(port_lbl).style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL)),
+        text(port_lbl).style(form_label_style),
         edit_field(port, FieldCfg::default()).style(|s| s.width(96.0)),
     ))
     .style(|s| s.flex_col().gap(6.0).flex_shrink(0.0_f32));
@@ -126,7 +135,7 @@ fn key_pair_fields(draft: DraftSignals) -> impl IntoView {
         });
 
     let key_row = v_stack((
-        text("Private key").style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL)),
+        text("Private key").style(form_label_style),
         h_stack((
             edit_field(draft.ssh_key_path, FieldCfg::default())
                 .style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
@@ -186,7 +195,7 @@ fn color_picker(color: RwSignal<Option<String>>) -> impl IntoView {
     });
 
     v_stack((
-        text("Colour").style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL)),
+        text("Colour").style(form_label_style),
         h_stack_from_iter(swatches).style(|s| s.flex_row().items_center().gap(8.0)),
     ))
     .style(|s| s.flex_col().gap(6.0).width_full())
@@ -280,7 +289,7 @@ fn masked_field(lbl: &'static str, sig: RwSignal<String>) -> impl IntoView {
     });
 
     v_stack((
-        text(lbl).style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL)),
+        text(lbl).style(form_label_style),
         edit_field(
             disp,
             FieldCfg {
@@ -304,10 +313,39 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
     let delete_conn = ui.conn_actions.delete_conn.clone();
     let test_conn = ui.conn_actions.test_conn.clone();
     let conn_test = ui.conn.conn_test;
-    // Transient "saved" confirmation for the Save button (checkmark for ~1.2s).
-    // Created here (once, in the stable workspace scope), not inside the open/close
-    // `dyn_container`, so the deferred reset never fires on a disposed signal.
+    // Transient confirmations standing in for the two safe actions' labels: a
+    // check on Save, the result icon on Test. Created here (once, in the stable
+    // workspace scope), not inside the open/close `dyn_container`, so a deferred
+    // reset never fires on a disposed signal.
     let save_flash = RwSignal::new(false);
+    let test_flash = RwSignal::new(false);
+    // Test's flash is driven by the *result arriving*, not by the click — the
+    // click only starts the round trip, and how long that takes is the server's
+    // business. `test_gen` is what keeps an earlier result's timer from cutting a
+    // later one short, the same guard `autohide_state` uses; `try_get_untracked`
+    // because the window can close while a timer is out.
+    let test_gen: RwSignal<u64> = RwSignal::new(0);
+    floem::reactive::create_effect(move |_| {
+        match conn_test.get() {
+            crate::TestState::Ok | crate::TestState::Fail => {
+                let g = test_gen.get_untracked().wrapping_add(1);
+                test_gen.set(g);
+                test_flash.set(true);
+                floem::action::exec_after(TEST_FLASH, move |_| {
+                    if test_gen.try_get_untracked() == Some(g) {
+                        test_flash.set(false);
+                    }
+                });
+            }
+            // Editing any field resets the state, which withdraws the result the
+            // icon was reporting.
+            _ => {
+                if test_flash.get_untracked() {
+                    test_flash.set(false);
+                }
+            }
+        }
+    });
 
     dyn_container(
         move || open.get(),
@@ -400,6 +438,7 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                 test_conn.clone(),
                 conn_test,
                 save_flash,
+                test_flash,
             );
 
             let body = h_stack((left, right))
@@ -444,6 +483,7 @@ fn conn_form(
     test_conn: Rc<dyn Fn()>,
     conn_test: RwSignal<crate::TestState>,
     save_flash: RwSignal<bool>,
+    test_flash: RwSignal<bool>,
 ) -> impl IntoView {
     // Editing any connection parameter invalidates a prior Test result, so reset
     // the indicator whenever host/port/user/password or the SSH fields change.
@@ -479,8 +519,7 @@ fn conn_form(
             }
             // Authentication method picker (150px), matching the settings dropdowns.
             let auth_field = v_stack((
-                text("Authentication")
-                    .style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL)),
+                text("Authentication").style(form_label_style),
                 settings_dropdown(draft.ssh_auth, SshAuth::ALL, SshAuth::label)
                     .style(|s| s.width(150.0)),
             ))
@@ -495,15 +534,11 @@ fn conn_form(
                         .style(|s| s.width(CONN_FIELD_W))
                         .into_any(),
                     SshAuth::KeyPair => key_pair_fields(draft).into_any(),
-                    SshAuth::Agent => text(
+                    SshAuth::Agent => form_hint(
                         "Signing is delegated to your running SSH agent (OpenSSH \
                          agent / Pageant on Windows). No key is stored by Schemaic.",
                     )
-                    .style(|s| {
-                        s.color(theme::text_faint())
-                            .font_size(theme::FONT_LABEL)
-                            .width_full()
-                    })
+                    .style(|s| s.width_full())
                     .into_any(),
                 },
             )
@@ -517,14 +552,17 @@ fn conn_form(
             ))
             // `width_full` so the inner fields fill the pane (the `dyn_container`
             // below must also fill, or these collapse to shrink-wrapped width).
-            // Tinted, padded container groups the tunnel fields — the toggle above
-            // stays outside it.
+            // A bordered, padded container groups the tunnel fields — the toggle
+            // above stays outside it. Outlined rather than tinted, matching the
+            // designer's list pane: a fill reads as a *state* (a selected row, a
+            // header) everywhere else in the app, and this is only a grouping.
             .style(|s| {
                 s.flex_col()
                     .gap(20.0)
                     .width_full()
                     .padding(10.0)
-                    .background(theme::bg_header_row())
+                    .border(1.0)
+                    .border_color(theme::border())
                     .border_radius(6.0)
             })
             .into_any()
@@ -568,7 +606,7 @@ fn conn_form(
         k
     });
     let type_field = v_stack((
-        text("Type").style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL)),
+        text("Type").style(form_label_style),
         // 150px wide (not full width), matching the settings dropdowns' look.
         container(settings_dropdown(engine, DbKind::ALL, DbKind::label)).style(|s| s.width(150.0)),
     ))
@@ -576,7 +614,7 @@ fn conn_form(
 
     // Environment picker → the top-bar badge. Defaults to None (no badge).
     let env_field = v_stack((
-        text("Environment").style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL)),
+        text("Environment").style(form_label_style),
         container(settings_dropdown(
             draft.environment,
             Environment::ALL,
@@ -604,146 +642,94 @@ fn conn_form(
     ))
     .style(|s| s.flex_col().gap(20.0).width_full().padding(14.0));
 
-    // Delete / Save are plain clickable text (no `button()` — its default theme
-    // restyles the font size on focus/active, which caused the size to jump on
-    // click). Explicit `font_size` keeps them stable; colour is set on the row so
-    // the trash svg's `currentColor` and the label share the hover tint.
+    // The three footer actions are the filled buttons every other modal ends
+    // with: Save is the affirmative one, Test its own `Verify` hue (it does real
+    // work but changes nothing), Delete red like the preview's Apply on a
+    // destructive plan. Delete keeps its trash glyph through the shared
+    // icon+label form, so its spacing is the preview footer's Copy and Open in
+    // editor rather than a third answer to the same question.
     let del = delete_conn.clone();
     let delete_btn = dyn_container(
         move || draft.id.get(),
         move |id| match id {
             Some(cid) => {
                 let del = del.clone();
-                h_stack((
-                    icons::icon(icons::TRASH_2, 16.0),
-                    text("Delete").style(|s| s.font_size(theme::FONT_BODY)),
-                ))
-                .on_click_stop(move |_| (del)(cid))
-                .style(|s| {
-                    s.flex_row()
-                        .items_center()
-                        .gap(8.0)
-                        .padding_horiz(6.0)
-                        .padding_vert(4.0)
-                        .border_radius(6.0)
-                        .color(theme::conn_delete())
-                        .hover(|s| s.color(theme::conn_delete_hover()))
-                })
+                action_button_icon(
+                    "Delete",
+                    icons::TRASH_2,
+                    ActionKind::Danger,
+                    true,
+                    move || (del)(cid),
+                )
                 .into_any()
             }
             None => empty().into_any(),
         },
     );
 
-    // Test button: a fixed 16px icon slot (so the result icon never shifts the
-    // "Test" label) + the label. The slot is empty until a result lands; the
-    // icons carry their own fixed colours, so they don't follow the label hover.
+    // Test: `Neutral`, the same grey as every modal's Cancel — it commits
+    // nothing, and a fill of its own said otherwise. Its label is replaced, in
+    // place, by the result icon, which keeps its green or red: with the button no
+    // longer carrying a colour, the glyph is the only thing that says how it went.
+    // The width is pinned to `Test...` so none of the three faces — label,
+    // animated dots, icon — moves the button.
     let test = test_conn.clone();
-    let test_btn = h_stack((
-        container(dyn_container(
-            move || conn_test.get(),
-            move |st| match st {
-                crate::TestState::Ok => icons::icon(icons::CIRCLE_CHECK, 16.0)
+    let test_btn = action_face(
+        "Test...",
+        ActionKind::Neutral,
+        true,
+        dyn_container(
+            move || (conn_test.get(), test_flash.get()),
+            move |(st, flashing)| match st {
+                crate::TestState::Testing => {
+                    loading_dots("Test", theme::btn_neutral_text, theme::FONT_BODY).into_any()
+                }
+                crate::TestState::Ok if flashing => icons::icon(icons::CIRCLE_CHECK, 16.0)
                     .style(|s| s.color(theme::conn_test_ok()))
                     .into_any(),
-                crate::TestState::Fail => icons::icon(icons::CIRCLE_X, 16.0)
-                    .style(|s| s.color(theme::conn_delete()))
+                crate::TestState::Fail if flashing => icons::icon(icons::CIRCLE_X, 16.0)
+                    .style(|s| s.color(theme::conn_test_fail()))
                     .into_any(),
-                _ => empty().into_any(),
+                // Centred, like every other face here. It deliberately does *not*
+                // claim `loading_dots`' reserved `Test...` box: doing so pinned
+                // the word to the left of a button sized for three dots it isn't
+                // showing, which is a permanently off-centre label bought to
+                // avoid a one-off shift as the test starts.
+                _ => text("Test")
+                    .style(move |s| s.font_size(theme::FONT_BODY))
+                    .into_any(),
             },
-        ))
-        .style(|s| {
-            s.width(16.0)
-                .height(16.0)
-                .flex_shrink(0.0_f32)
-                .items_center()
-                .justify_center()
-        }),
-        // While testing, the label animates "Test." → ".." → "..." (shared
-        // `loading_dots`). The idle/result label reserves the same `Test...` width
-        // (left-anchored) so entering/leaving the testing state — and the dots
-        // cycling within it — never shift the text.
-        {
-            let reserved = measure_text_px_at("Test...", theme::FONT_BODY) + 2.0;
-            dyn_container(
-                move || conn_test.get() == crate::TestState::Testing,
-                move |testing| {
-                    if testing {
-                        loading_dots("Test", theme::conn_test, theme::FONT_BODY).into_any()
-                    } else {
-                        text("Test")
-                            .style(move |s| s.font_size(theme::FONT_BODY).min_width(reserved))
-                            .into_any()
-                    }
-                },
-            )
-        },
-    ))
-    .on_click_stop(move |_| (test)())
-    .style(|s| {
-        s.flex_row()
-            .items_center()
-            .gap(8.0)
-            .padding_horiz(6.0)
-            .padding_vert(4.0)
-            .border_radius(6.0)
-            .color(theme::conn_test())
-            .hover(|s| s.color(theme::conn_test_hover()))
-    });
+        ),
+        move || (test)(),
+    );
 
-    // Save button: on click it saves, then flashes a `✓ Saved` confirmation for
-    // ~1.2s (the write is otherwise silent). The click handler sits on the stable
-    // outer container so it works in either state; the label swaps via
-    // `dyn_container` (like the Test button's icon slot).
+    // Save: the write is otherwise silent, so the button flashes a check in place
+    // of its label. Same pinned width, so the confirmation can't nudge Test.
     let save = save_conn.clone();
-    // Fixed width sized for the widest state ("✓ Saved": 15px icon + 6px gap +
-    // text), with the content right-aligned, so swapping in the confirm icon never
-    // widens the button and shifts the Test button sitting to its left.
-    let saved_w = 15.0 + 6.0 + measure_text_px_at("Saved", theme::FONT_BODY) + 2.0;
-    let save_btn = container(dyn_container(
-        move || save_flash.get(),
-        move |flashed| {
-            if flashed {
-                h_stack((
-                    icons::icon(icons::CIRCLE_CHECK, 15.0)
-                        .style(|s| s.color(theme::conn_test_ok())),
-                    text("Saved")
-                        .style(move |s| s.font_size(theme::FONT_BODY).color(theme::conn_test_ok())),
-                ))
-                .style(|s| s.flex_row().items_center().gap(6.0))
-                .into_any()
-            } else {
-                text("Save")
-                    .style(move |s| {
-                        s.font_size(theme::FONT_BODY)
-                            .color(theme::conn_save())
-                            .hover(|s| s.color(theme::conn_save_hover()))
-                    })
-                    .into_any()
-            }
+    let save_btn = action_face(
+        "Save",
+        ActionKind::Primary,
+        true,
+        dyn_container(
+            move || save_flash.get(),
+            move |flashed| {
+                if flashed {
+                    icons::icon(icons::CHECK, 16.0).into_any()
+                } else {
+                    text("Save")
+                        .style(move |s| s.font_size(theme::FONT_BODY))
+                        .into_any()
+                }
+            },
+        ),
+        move || {
+            (save)();
+            save_flash.set(true);
+            floem::action::exec_after(SAVE_FLASH, move |_| save_flash.set(false));
         },
-    ))
-    .on_click_stop(move |_| {
-        (save)();
-        save_flash.set(true);
-        floem::action::exec_after(std::time::Duration::from_millis(1200), move |_| {
-            save_flash.set(false);
-        });
-    })
-    .style(move |s| {
-        s.width(saved_w)
-            .flex_row()
-            .items_center()
-            .justify_end()
-            .padding_horiz(6.0)
-            .padding_vert(4.0)
-            .border_radius(6.0)
-            // Nudge the whole button 10px in from the right edge.
-            .margin_right(10.0)
-    });
-    // Test sits 15px to the left of Save.
+    );
     let right_actions =
-        h_stack((test_btn, save_btn)).style(|s| s.flex_row().items_center().gap(15.0));
+        h_stack((test_btn, save_btn)).style(|s| s.flex_row().items_center().gap(ACTION_GAP));
     let buttons = h_stack((
         delete_btn,
         empty().style(|s| s.flex_grow(1.0_f32)),

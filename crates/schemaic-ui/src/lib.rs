@@ -224,6 +224,22 @@ impl DesignerTarget {
     }
 }
 
+/// Where an object lives, for a schema-editor's modal title: `database` on
+/// MySQL, `database.schema` wherever there is a namespace level.
+///
+/// Every one of these modals used to carry an "In {database}.{schema}" row above
+/// its first field, saying something the title was the natural place for. This is
+/// that row's rule, moved into the title — deliberately **not**
+/// `schema::display_name`, which drops `public` because it is the search-path
+/// default. That's right for a tab title or a tree row, which name an *object*;
+/// this names a **place**, and the row it replaces spelled `public` out.
+pub fn object_location(database: &str, schema: Option<&str>) -> String {
+    match schema {
+        Some(s) => format!("{database}.{s}"),
+        None => database.to_string(),
+    }
+}
+
 /// What the view editor is editing.
 ///
 /// Captured when the modal opens, exactly like [`DesignerTarget`] — but a much

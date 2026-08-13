@@ -61,15 +61,16 @@ use schemaic_core::schema::{
 
 use crate::settings::settings_toggle_row;
 use crate::table_designer::{
-    edit_ctx, list_actions, list_pane, list_row_plain, loaded_table, owned_dropdown,
+    edit_ctx, empty_hint, list_actions, list_pane, list_row_plain, loaded_table, owned_dropdown,
 };
 use crate::widgets::{
-    FORM_GAP, focus_root, footer_button, form_section, form_setting, form_setting_owned,
+    ACTION_GAP, ActionKind, FORM_GAP, MODAL_PAD_H, action_button, control_button,
+    control_button_enabled, focus_root, form_section, form_setting, form_setting_owned,
     modal_footer_split, modal_title_owned, panel_style,
 };
 use crate::{
     DdlPreview, FieldCfg, FunctionTarget, TriggerFnDoneFn, TriggerFnRequest, TriggerTarget, Ui,
-    ddl_preview, edit_field, theme,
+    ddl_preview, edit_field, object_location, theme,
 };
 
 /// Matches the table designer's, deliberately: this is the same list-plus-form
@@ -326,7 +327,10 @@ fn bound_fn_field(
 fn form(ui: Ui, target: &TriggerTarget, i: usize) -> AnyView {
     let d = ui.ddl.trigger_draft;
     let Some(draft) = d.with_untracked(|s| s.triggers.get(i).cloned()) else {
-        return empty().into_any();
+        // Same empty state the designer's tabs show, in the same place: this pane
+        // is otherwise a blank half of the modal with no indication that the list
+        // beside it is what fills it.
+        return empty_hint("No trigger selected.").into_any();
     };
     let pg = target.dialect == SqlDialect::Postgres;
 
@@ -605,15 +609,14 @@ fn pg_action(ui: &Ui, i: usize, draft: &TriggerDraft, target: &TriggerTarget) ->
     let new_ui = ui.clone();
     let database = target.database.clone();
     let schema = draft.info.schema.clone();
-    let new_btn = footer_button(
-        "New function…",
-        theme::text_dim,
-        theme::text,
-        true,
-        move || {
-            open_for_new_function(&new_ui, &database, schema.as_deref());
-        },
-    );
+    // `control_button`, not the footer's: these sit *in* the form beside the
+    // picker, where the app's bordered in-form button is what "Choose file…",
+    // "Add value" and "Add constraint" already wear. They were the last two
+    // callers of the text-only footer button, in the one place it wasn't a
+    // footer.
+    let new_btn = control_button("New function", move || {
+        open_for_new_function(&new_ui, &database, schema.as_deref());
+    });
 
     // Editing an existing function lives here rather than in the schema tree
     // because this is where the list exists: it is fetched lazily when this
@@ -627,17 +630,11 @@ fn pg_action(ui: &Ui, i: usize, draft: &TriggerDraft, target: &TriggerTarget) ->
             let found = list.iter().find(|f| f.name == named).cloned();
             let ui = edit_ui.clone();
             let db = edit_db.clone();
-            footer_button(
-                "Edit…",
-                theme::text_dim,
-                theme::text,
-                found.is_some(),
-                move || {
-                    if let Some(f) = &found {
-                        open_for_function(&ui, &db, f);
-                    }
-                },
-            )
+            control_button_enabled("Edit", found.is_some(), move || {
+                if let Some(f) = &found {
+                    open_for_function(&ui, &db, f);
+                }
+            })
             .into_any()
         },
     );
@@ -682,19 +679,11 @@ fn pg_action(ui: &Ui, i: usize, draft: &TriggerDraft, target: &TriggerTarget) ->
 
 // ── the function form ────────────────────────────────────────────────────────
 
-fn function_form(ui: Ui, target: &FunctionTarget) -> AnyView {
+fn function_form(ui: Ui, _target: &FunctionTarget) -> AnyView {
     let d = ui.ddl.function_draft;
     let draft = d.get_untracked();
 
-    let place = form_setting_owned(
-        "In".to_string(),
-        text(match &draft.info.schema {
-            Some(s) => format!("{}.{s}", target.database),
-            None => target.database.clone(),
-        })
-        .style(|s| s.color(theme::text_dim()).font_size(theme::FONT_BODY)),
-    );
-
+    // No "In {database}" row: the modal title names the place now.
     let name = form_setting(
         "Name",
         bound_fn_field(
@@ -789,7 +778,6 @@ fn function_form(ui: Ui, target: &FunctionTarget) -> AnyView {
 
     v_stack((
         form_section("Function"),
-        place,
         name,
         language,
         form_section("Body").style(|s| s.margin_top(4.0)),
@@ -941,7 +929,11 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                 return empty().into_any();
             };
             let ui = ui.clone();
-            let title = format!("Triggers on {}", target.display());
+            let title = format!(
+                "Triggers on {}.{}",
+                object_location(&target.database, target.schema.as_deref()),
+                target.table
+            );
 
             // The form is keyed on `(selected, rev)` and NOT on the draft: a
             // draft-keyed form is torn down mid-keystroke. `rev` is in the key
@@ -977,7 +969,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                     .width_full()
                     .flex_grow(1.0_f32)
                     .min_height(0.0)
-                    .padding_horiz(20.0)
+                    .padding_horiz(MODAL_PAD_H)
                     .padding_vert(18.0)
                     .gap(0.0)
             });
@@ -1023,19 +1015,13 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                     let cs = change_set(&target, &draft);
                     let ready = draft.validate(target.dialect).is_empty() && !cs.is_empty();
                     h_stack((
-                        footer_button("Cancel", theme::text_dim, theme::text, true, close),
-                        footer_button(
-                            "Preview SQL",
-                            theme::conn_save,
-                            theme::conn_save_hover,
-                            ready,
-                            move || {
-                                let cs = change_set(&target, &draft);
-                                ddl_preview::open_preview(&ui, preview_from(&target, &cs));
-                            },
-                        ),
+                        action_button("Cancel", ActionKind::Neutral, true, close),
+                        action_button("Preview SQL", ActionKind::Primary, ready, move || {
+                            let cs = change_set(&target, &draft);
+                            ddl_preview::open_preview(&ui, preview_from(&target, &cs));
+                        }),
                     ))
-                    .style(|s| s.flex_row().items_center().gap(15.0))
+                    .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
                     .into_any()
                 },
             );
@@ -1089,13 +1075,20 @@ pub(crate) fn function_editor_overlay(ui: Ui) -> impl IntoView {
             };
             let ui = ui.clone();
             let title = match &target.current {
-                Some(f) => format!("Edit function {}", f.name),
+                Some(f) => format!(
+                    "Edit function {}.{}",
+                    object_location(&target.database, f.schema.as_deref()),
+                    f.name
+                ),
+                // A new function has no namespace chosen yet — the form's own
+                // Schema field is where that lands — so the title names the
+                // database and stops there.
                 None => format!("Create function in {}", target.database),
             };
 
             let body = crate::widgets::autohide(scroll(
                 function_form(ui.clone(), &target)
-                    .style(|s| s.width_full().padding_horiz(20.0).padding_vert(18.0)),
+                    .style(|s| s.width_full().padding_horiz(MODAL_PAD_H).padding_vert(18.0)),
             ))
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
 
@@ -1141,28 +1134,22 @@ pub(crate) fn function_editor_overlay(ui: Ui) -> impl IntoView {
                     let ready = draft.validate().is_empty() && !cs.is_empty();
                     let subject = draft.info.name.clone();
                     h_stack((
-                        footer_button("Cancel", theme::text_dim, theme::text, true, close),
-                        footer_button(
-                            "Preview SQL",
-                            theme::conn_save,
-                            theme::conn_save_hover,
-                            ready,
-                            move || {
-                                let cs = fn_change_set(&target, &draft);
-                                ddl_preview::open_preview(
-                                    &ui,
-                                    ddl_preview::preview_of(
-                                        target.conn_id,
-                                        &target.database,
-                                        subject.clone(),
-                                        &cs,
-                                        target.read_only,
-                                    ),
-                                );
-                            },
-                        ),
+                        action_button("Cancel", ActionKind::Neutral, true, close),
+                        action_button("Preview SQL", ActionKind::Primary, ready, move || {
+                            let cs = fn_change_set(&target, &draft);
+                            ddl_preview::open_preview(
+                                &ui,
+                                ddl_preview::preview_of(
+                                    target.conn_id,
+                                    &target.database,
+                                    subject.clone(),
+                                    &cs,
+                                    target.read_only,
+                                ),
+                            );
+                        }),
                     ))
-                    .style(|s| s.flex_row().items_center().gap(15.0))
+                    .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
                     .into_any()
                 },
             );

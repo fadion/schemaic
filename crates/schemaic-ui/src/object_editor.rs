@@ -35,12 +35,14 @@ use floem::reactive::create_effect;
 use schemaic_core::ddl::{self, DomainDraft, EnumDraft, ObjectDraft, ObjectKind, SequenceDraft};
 use schemaic_core::schema::{CheckInfo, ObjectItem, SchemaState};
 
-use crate::table_designer::{edit_ctx, owned_dropdown};
+use crate::table_designer::{edit_ctx, owned_dropdown, suggest_chevron};
 use crate::widgets::{
-    FORM_GAP, focus_root, footer_button, form_section, form_setting, form_setting_owned,
-    modal_footer_split, modal_title_owned, panel_style,
+    ACTION_GAP, ActionKind, FORM_GAP, MODAL_PAD_H, action_button, focus_root, form_section,
+    form_setting, form_setting_owned, modal_footer_split, modal_title_owned, panel_style,
 };
-use crate::{DdlPreview, FieldCfg, ObjectTarget, Ui, ddl_preview, edit_field, icons, theme};
+use crate::{
+    DdlPreview, FieldCfg, ObjectTarget, Ui, ddl_preview, edit_field, icons, object_location, theme,
+};
 
 const PANEL_W: f64 = 700.0;
 const PANEL_H: f64 = 620.0;
@@ -49,6 +51,10 @@ const FIELD_W: f64 = 260.0;
 /// Narrower, for the numbers a sequence is made of — a 20-character box for a
 /// value that is nearly always one or two digits reads as a text field.
 const NUM_W: f64 = 130.0;
+/// The gap between two of those, side by side. Wider than [`FORM_GAP`] because
+/// it separates two *questions* rather than two rows of one: Increment and Start
+/// sitting a form's gap apart read as one control with two boxes.
+const NUM_GAP: f64 = 50.0;
 
 // ── opening ──────────────────────────────────────────────────────────────────
 
@@ -235,18 +241,36 @@ fn bound_toggle(
     crate::settings::settings_toggle_row(title, hint, sig).into_any()
 }
 
+/// The glyph size the list rows' icon buttons paint at.
+const ROW_ICON: f64 = 14.0;
+/// The padding around it — the other half of [`row_slot`]'s footprint.
+const ROW_ICON_PAD: f64 = 4.0;
+
+/// One icon-button-shaped slot in a list row.
+fn row_slot(inner: impl IntoView + 'static) -> impl IntoView {
+    container(inner).style(|s| s.padding(ROW_ICON_PAD).flex_shrink(0.0_f32))
+}
+
 /// The small icon button the list rows use.
-fn row_button(glyph: &'static str, tip: &'static str, act: impl Fn() + 'static) -> impl IntoView {
-    container(icons::icon(glyph, 14.0))
+fn row_button(glyph: &'static str, tip: &'static str, act: impl Fn() + 'static) -> AnyView {
+    row_slot(icons::icon(glyph, ROW_ICON as f32))
         .on_click_stop(move |_| act())
-        .style(|s| {
-            s.padding(4.0)
-                .border_radius(4.0)
-                .flex_shrink(0.0_f32)
-                .color(theme::text_dim())
-                .hover(|s| s.background(theme::row_hover()).color(theme::text()))
-        })
+        // Colour-only hover, like every other icon button in the app.
+        .style(|s| s.color(theme::text_dim()).hover(|s| s.color(theme::text())))
         .tooltip(move || text(tip).style(crate::widgets::tooltip_style))
+        .into_any()
+}
+
+/// [`row_button`]'s footprint with nothing in it — what a move button becomes on
+/// the row it can't move: the first row's ↑, the last row's ↓.
+///
+/// An empty slot rather than `hide()`, which is `display: none` and takes the
+/// space with it: the ↓ and the bin would slide left into where the ↑ and ↓ sit
+/// on every other row, so the three icons would stand in a different place on the
+/// first row, the last row, and the ones between. A one-value list, where *both*
+/// arrows are dead, is the case that made it obvious.
+fn row_gap() -> AnyView {
+    row_slot(empty().style(|s| s.size(ROW_ICON, ROW_ICON))).into_any()
 }
 
 // ── the enum form ────────────────────────────────────────────────────────────
@@ -300,18 +324,23 @@ fn enum_values(ui: &Ui) -> AnyView {
                     });
                     rev.update(|r| *r += 1);
                 };
+                // The arrow a row can't act on isn't offered: the first value is
+                // already first and the last is already last, so an arrow there
+                // is a control whose only outcome is nothing happening.
+                let up = if i > 0 {
+                    row_button(icons::CHEVRON_UP, "Move up", move || swap(i, i - 1))
+                } else {
+                    row_gap()
+                };
+                let down = if i + 1 < n {
+                    row_button(icons::CHEVRON_DOWN, "Move down", move || swap(i, i + 1))
+                } else {
+                    row_gap()
+                };
                 h_stack((
                     field,
-                    row_button(icons::CHEVRON_UP, "Move up", move || {
-                        if i > 0 {
-                            swap(i, i - 1);
-                        }
-                    }),
-                    row_button(icons::CHEVRON_DOWN, "Move down", move || {
-                        if i + 1 < n {
-                            swap(i, i + 1);
-                        }
-                    }),
+                    up,
+                    down,
                     row_button(icons::TRASH_2, "Remove", move || {
                         draft.update(|d| {
                             if let ObjectDraft::Enum(e) = d
@@ -527,6 +556,12 @@ fn domain_form(ui: &Ui, d: &DomainDraft, dialect: schemaic_core::intel::SqlDiale
         });
         form_setting(
             "Type",
+            // The same control the designer's column type wears: a free-text box
+            // with a chevron offering the usual types. It was a `Dropdown` parked
+            // beside the field, which said the same thing in a second shape — and
+            // a domain can be built on a type no fixed list holds (another
+            // domain, an array, an extension's), so the box is the answer and the
+            // menu is only a shortcut into it.
             h_stack((
                 edit_field(
                     sig,
@@ -536,25 +571,16 @@ fn domain_form(ui: &Ui, d: &DomainDraft, dialect: schemaic_core::intel::SqlDiale
                     },
                 )
                 .style(move |s| s.width(FIELD_W)),
-                // The dropdown is a *picker*, not a display: it fills the field
-                // beside it and shows nothing itself, because the field is where
-                // the answer lives and a domain can be built on a type no fixed
-                // list holds (another domain, an array, an extension's).
-                owned_dropdown(
-                    String::new,
+                suggest_chevron(
+                    ui,
+                    sig,
                     ddl::common_types(dialect)
                         .iter()
                         .map(|t| t.to_string())
                         .collect(),
-                    150.0,
-                    move |v: String| {
-                        if !v.is_empty() {
-                            sig.set(v);
-                        }
-                    },
                 ),
             ))
-            .style(|s| s.flex_row().items_center().gap(8.0)),
+            .style(|s| s.flex_row().items_center().gap(2.0)),
         )
     };
     let default = form_setting(
@@ -667,42 +693,51 @@ fn sequence_form(ui: &Ui, d: &SequenceDraft) -> AnyView {
             ),
         )
     };
+    // Each number gets exactly its field's width, so the row's `gap` is the gap
+    // that lands on screen. `form_setting` is `width_full`, which in a flex row
+    // means "an equal share" — so the three columns spread across the panel and
+    // the spacing between a 130 px box and the next label came out at whatever
+    // the leftovers divided into, twice what it was asked to be and different on
+    // the two-field row from the three-field one.
+    let num_col = |label: &'static str, field: AnyView| {
+        form_setting(label, field).style(|s| s.width(NUM_W).flex_shrink(0.0_f32))
+    };
     let numbers = h_stack((
-        form_setting(
+        num_col(
             "Increment",
             num_field(ui, "Increment", d.info.increment.to_string(), |s, t| {
                 t.parse().map(|n| s.info.increment = n).map_err(|_| ())
             }),
         ),
-        form_setting(
+        num_col(
             "Start",
             num_field(ui, "Start", d.info.start.to_string(), |s, t| {
                 t.parse().map(|n| s.info.start = n).map_err(|_| ())
             }),
         ),
-        form_setting(
+        num_col(
             "Cache",
             num_field(ui, "Cache", d.info.cache.to_string(), |s, t| {
                 t.parse().map(|n| s.info.cache = n).map_err(|_| ())
             }),
         ),
     ))
-    .style(|s| s.flex_row().gap(14.0).width_full());
+    .style(|s| s.flex_row().gap(NUM_GAP).width_full());
     let bounds = h_stack((
-        form_setting(
+        num_col(
             "Minimum",
             num_field(ui, "Minimum", d.info.min_value.to_string(), |s, t| {
                 t.parse().map(|n| s.info.min_value = n).map_err(|_| ())
             }),
         ),
-        form_setting(
+        num_col(
             "Maximum",
             num_field(ui, "Maximum", d.info.max_value.to_string(), |s, t| {
                 t.parse().map(|n| s.info.max_value = n).map_err(|_| ())
             }),
         ),
     ))
-    .style(|s| s.flex_row().gap(14.0).width_full());
+    .style(|s| s.flex_row().gap(NUM_GAP).width_full());
     let cycle = bound_toggle(
         ui,
         "Cycle",
@@ -833,25 +868,13 @@ fn sequence_form(ui: &Ui, d: &SequenceDraft) -> AnyView {
 
 fn form(ui: &Ui, target: &ObjectTarget) -> AnyView {
     let draft = ui.ddl.object_draft.get_untracked();
-    // Where the object lives — context, not a control.
-    let place = form_setting_owned(
-        if target.current.is_some() {
-            "In".to_string()
-        } else {
-            "Creating in".to_string()
-        },
-        text(match &target.schema {
-            Some(s) => format!("{}.{s}", target.database),
-            None => target.database.clone(),
-        })
-        .style(|s| s.color(theme::text_dim()).font_size(theme::FONT_BODY)),
-    );
+    // No "In {database}" row: the modal title names the place now.
     let body = match &draft {
         ObjectDraft::Enum(d) => enum_form(ui, d),
         ObjectDraft::Domain(d) => domain_form(ui, d, target.dialect),
         ObjectDraft::Sequence(d) => sequence_form(ui, d),
     };
-    v_stack((place, body))
+    v_stack((body,))
         .style(|s| s.flex_col().gap(FORM_GAP).width_full())
         .into_any()
 }
@@ -896,13 +919,15 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
             };
             let ui = ui.clone();
             let kind = d.object_draft.with_untracked(|dr| dr.kind());
+            let location = object_location(&target.database, target.schema.as_deref());
             let title = match &target.current {
-                Some(_) => format!("Edit {} {}", kind.label(), target.display()),
-                None => format!("Create {} in {}", kind.label(), target.database),
+                Some(c) => format!("Edit {} {location}.{}", kind.label(), c.name()),
+                None => format!("Create {} in {location}", kind.label()),
             };
 
             let body = crate::widgets::autohide(scroll(
-                form(&ui, &target).style(|s| s.width_full().padding_horiz(20.0).padding_vert(18.0)),
+                form(&ui, &target)
+                    .style(|s| s.width_full().padding_horiz(MODAL_PAD_H).padding_vert(18.0)),
             ))
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
 
@@ -949,19 +974,13 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
                     let cs = change_set(&target, &draft);
                     let ready = errs.is_empty() && draft.validate().is_empty() && !cs.is_empty();
                     h_stack((
-                        footer_button("Cancel", theme::text_dim, theme::text, true, close),
-                        footer_button(
-                            "Preview SQL",
-                            theme::conn_save,
-                            theme::conn_save_hover,
-                            ready,
-                            move || {
-                                let cs = change_set(&target, &draft);
-                                ddl_preview::open_preview(&ui, preview_from(&target, &draft, &cs));
-                            },
-                        ),
+                        action_button("Cancel", ActionKind::Neutral, true, close),
+                        action_button("Preview SQL", ActionKind::Primary, ready, move || {
+                            let cs = change_set(&target, &draft);
+                            ddl_preview::open_preview(&ui, preview_from(&target, &draft, &cs));
+                        }),
                     ))
-                    .style(|s| s.flex_row().items_center().gap(15.0))
+                    .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
                     .into_any()
                 },
             );

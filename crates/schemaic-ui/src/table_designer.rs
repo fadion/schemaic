@@ -33,15 +33,16 @@ use schemaic_core::schema::{CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo};
 
 use crate::settings::{dropdown_box_style, settings_toggle_row};
 use crate::widgets::{
-    FORM_GAP, MenuEntry, autohide, focus_root, footer_button, form_section, form_setting,
-    form_setting_owned, modal_footer_split, modal_title_owned, panel_style,
+    ACTION_GAP, ActionKind, FORM_GAP, MODAL_PAD_H, MenuEntry, action_button, autohide, focus_root,
+    form_hint, form_setting, modal_footer_split, modal_title_owned, panel_style,
 };
 use crate::{
-    DdlPreview, DesignerTab, DesignerTarget, FieldCfg, Ui, ddl_preview, edit_field, icons, theme,
+    DdlPreview, DesignerTab, DesignerTarget, FieldCfg, Ui, ddl_preview, edit_field, icons,
+    object_location, theme,
 };
 
 const PANEL_W: f64 = 900.0;
-const PANEL_H: f64 = 620.0;
+const PANEL_H: f64 = 550.0;
 /// The item list's width, shared by all three sections so switching between them
 /// doesn't shift the form. Wide enough that a long name and a long type
 /// (`timestamp without time zone`) can both be read — the detail pane has the
@@ -270,13 +271,14 @@ fn tab_strip(ui: Ui) -> impl IntoView {
                 let s = s
                     .font_size(theme::FONT_BODY)
                     .padding_horiz(12.0)
-                    .padding_vert(6.0)
+                    .padding_vert(7.0)
                     .border_radius(6.0);
                 if d.tab.get() == t {
-                    s.background(theme::row_selected()).color(theme::text())
+                    s.background(theme::pill_active_bg())
+                        .color(theme::pill_active_text())
                 } else {
                     s.color(theme::text_dim())
-                        .hover(|s| s.background(theme::row_hover()).color(theme::text()))
+                        .hover(|s| s.background(theme::pill_hover_bg()).color(theme::text()))
                 }
             })
     }))
@@ -285,7 +287,7 @@ fn tab_strip(ui: Ui) -> impl IntoView {
             .items_center()
             .gap(4.0)
             .width_full()
-            .padding_horiz(14.0)
+            .padding_horiz(MODAL_PAD_H)
             .padding_vert(8.0)
             .border_bottom(1.0)
             .border_color(theme::border())
@@ -360,8 +362,47 @@ fn field_view(sig: RwSignal<String>, width: f64, placeholder: &'static str, mono
     .into_any()
 }
 
-/// [`bound_field`] plus a chevron that opens a menu of suggestions writing into
-/// it. The field stays free text — the menu is a shortcut, not a picker.
+/// The chevron that sits beside a free-text field and offers a menu of
+/// suggestions, each writing itself into that field.
+///
+/// A **shortcut, not a picker** — which is why it isn't a [`owned_dropdown`]. A
+/// type box has to stay free text, because the answer worth typing is often one
+/// no fixed list holds (a length, a domain built on another domain, an array, an
+/// extension's type), and a `Dropdown` parked beside a field reads as a second
+/// control asking a second question. Shared so the two type fields in the app —
+/// the designer's column type and the object editor's domain base type — are one
+/// control rather than two that merely offer the same list.
+// `use<>`: the view captures only the two `Copy` overlay signals, not the `&Ui`
+// it read them off, so it can outlive the borrow and be returned from a form
+// builder that took `ui` by reference.
+pub(crate) fn suggest_chevron(
+    ui: &Ui,
+    sig: RwSignal<String>,
+    options: Vec<String>,
+) -> impl IntoView + use<> {
+    let popup = ui.overlay.popup_menu;
+    let anchor = ui.overlay.popup_anchor;
+    container(icons::icon(icons::CHEVRON_DOWN, 16.0))
+        .on_click_stop(move |_| {
+            anchor.set(None);
+            popup.set(Some(
+                options
+                    .iter()
+                    .map(|o| {
+                        let o = o.clone();
+                        MenuEntry::action(o.clone(), move || sig.set(o.clone()))
+                    })
+                    .collect(),
+            ));
+        })
+        .style(|s| {
+            s.padding(6.0)
+                .color(theme::text_dim())
+                .hover(|s| s.color(theme::text()))
+        })
+}
+
+/// [`bound_field`] plus a [`suggest_chevron`] writing into it.
 fn bound_field_with_menu(
     ui: &Ui,
     initial: String,
@@ -371,29 +412,10 @@ fn bound_field_with_menu(
     options: Vec<String>,
     apply: impl Fn(&mut TableDraft, &str) + 'static,
 ) -> AnyView {
-    let popup = ui.overlay.popup_menu;
-    let anchor = ui.overlay.popup_anchor;
     let sig = bound_signal(ui, initial, apply);
     h_stack((
         field_view(sig, width, placeholder, mono),
-        container(icons::icon(icons::CHEVRON_DOWN, 16.0))
-            .on_click_stop(move |_| {
-                anchor.set(None);
-                popup.set(Some(
-                    options
-                        .iter()
-                        .map(|o| {
-                            let o = o.clone();
-                            MenuEntry::action(o.clone(), move || sig.set(o.clone()))
-                        })
-                        .collect(),
-                ));
-            })
-            .style(|s| {
-                s.padding(6.0)
-                    .color(theme::text_dim())
-                    .hover(|s| s.color(theme::text()))
-            }),
+        suggest_chevron(ui, sig, options),
     ))
     .style(|s| s.flex_row().items_center().gap(2.0))
     .into_any()
@@ -477,11 +499,13 @@ pub(crate) fn list_actions(
     let btn = |glyph: &'static str, tip: &'static str, act: Rc<dyn Fn()>| {
         container(icons::icon(glyph, 15.0))
             .on_click_stop(move |_| (act)())
+            // Colour is the whole affordance, as it is for every icon button in
+            // the app (`toolbar_icon`, the modal ✕, the grid's toolbar). The
+            // padding stays — it's the hitbox — but nothing paints behind it.
             .style(|s| {
                 s.padding(5.0)
-                    .border_radius(5.0)
                     .color(theme::text_dim())
-                    .hover(|s| s.background(theme::row_hover()).color(theme::text()))
+                    .hover(|s| s.color(theme::text()))
             })
             .tooltip(move || text(tip).style(crate::widgets::tooltip_style))
     };
@@ -619,6 +643,14 @@ pub(crate) fn list_pane(
 ///
 /// The left inset is the gap to the list — so on the Table section, which has no
 /// list, the form starts flush with the body padding like every other modal's.
+///
+/// **`width_full` on the scroll is one link of the chain that makes the form fill
+/// the pane** — the others are the `container` here, the `dyn_container` the
+/// caller passes in, and the form's own column. A percentage width resolves only
+/// against a definite one, so a single link left at its content size collapses
+/// every link below it back to content, and the switches end up wherever the
+/// longest hint happens to end. Every other scrolled modal body in the app
+/// (Settings, the object editor, Import) states a width here for the same reason.
 fn detail_pane(tab: RwSignal<DesignerTab>, body: impl IntoView + 'static) -> impl IntoView {
     autohide(scroll(container(body).style(move |s| {
         s.width_full()
@@ -627,13 +659,22 @@ fn detail_pane(tab: RwSignal<DesignerTab>, body: impl IntoView + 'static) -> imp
             } else {
                 18.0
             })
-            .padding_right(4.0)
+            // Clear of the scrollbar, which floats over the content at the pane's
+            // edge rather than insetting it. Now that the form really is as wide
+            // as the pane, a toggle's switch is the rightmost thing in it and was
+            // sitting under the bar.
+            .padding_right(10.0)
     })))
-    .style(|s| s.flex_grow(1.0_f32).min_width(0.0).height_full())
+    .style(|s| {
+        s.width_full()
+            .flex_grow(1.0_f32)
+            .min_width(0.0)
+            .height_full()
+    })
 }
 
 fn hint(t: &'static str) -> impl IntoView {
-    text(t).style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_faint()))
+    form_hint(t)
 }
 
 /// A field with a hint under it.
@@ -671,7 +712,7 @@ fn table_section(ui: Ui, target: &DesignerTarget) -> AnyView {
             bound_field_with_menu(
                 &ui,
                 draft.engine.clone().unwrap_or_default(),
-                180.0,
+                FIELD_W,
                 "InnoDB",
                 // A storage-engine name isn't SQL text the way a type is.
                 false,
@@ -695,22 +736,11 @@ fn table_section(ui: Ui, target: &DesignerTarget) -> AnyView {
         if mysql { s } else { s.hide() }
     });
 
-    // Where the table lives — context, not a control: neither engine moves a
-    // table between databases from here.
-    let place = form_setting_owned(
-        if target.current.is_some() {
-            "In".to_string()
-        } else {
-            "Creating in".to_string()
-        },
-        text(match &target.schema {
-            Some(s) => format!("{}.{s}", target.database),
-            None => target.database.clone(),
-        })
-        .style(|s| s.color(theme::text_dim()).font_size(theme::FONT_BODY)),
-    );
-
-    v_stack((form_section("Table"), place, name, comment, mysql_only))
+    // No section heading and no "In {database}" row: the tab strip above already
+    // says which section this is, and the modal title carries where the table
+    // lives — neither engine moves one between databases from here, so that row
+    // was a caption repeating the title.
+    v_stack((name, comment, mysql_only))
         .style(|s| s.flex_col().gap(FORM_GAP).width_full())
         .into_any()
 }
@@ -778,7 +808,7 @@ fn column_form(ui: Ui, target: &DesignerTarget) -> AnyView {
     let i = d.selected.get_untracked();
     let draft = d.draft.get_untracked();
     let Some(c) = draft.columns.get(i).map(|c| c.info.clone()) else {
-        return centered_hint("No column selected.").into_any();
+        return empty_hint("No column selected.").into_any();
     };
     let pg = target.dialect == SqlDialect::Postgres;
     let in_pk = draft.is_in_primary_key(i);
@@ -998,8 +1028,7 @@ fn index_form(ui: Ui, target: &DesignerTarget) -> AnyView {
     let i = d.selected.get_untracked();
     let draft = d.draft.get_untracked();
     let Some(ix) = draft.indexes.get(i).map(|x| x.info.clone()) else {
-        return centered_hint("No index selected. The primary key lives on the columns.")
-            .into_any();
+        return empty_hint("No index selected. The primary key lives on the columns.").into_any();
     };
     let pg = target.dialect == SqlDialect::Postgres;
     let key_hint: &'static str = if pg {
@@ -1158,7 +1187,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget) -> AnyView {
     let i = d.selected.get_untracked();
     let draft = d.draft.get_untracked();
     let Some(fk) = draft.foreign_keys.get(i).map(|f| f.info.clone()) else {
-        return centered_hint("No foreign key selected.").into_any();
+        return empty_hint("No foreign key selected.").into_any();
     };
     let draft_sig = d.draft;
     let actions: Vec<String> = ddl::FK_ACTIONS.iter().map(|a| action_label(*a)).collect();
@@ -1345,7 +1374,7 @@ fn check_form(ui: Ui, dialect: SqlDialect) -> AnyView {
     let i = d.selected.get_untracked();
     let draft = d.draft.get_untracked();
     let Some(ck) = draft.check_constraints.get(i).map(|c| c.info.clone()) else {
-        return centered_hint("No check selected.").into_any();
+        return empty_hint("No check selected.").into_any();
     };
 
     let name = form_setting(
@@ -1407,9 +1436,20 @@ fn check_form(ui: Ui, dialect: SqlDialect) -> AnyView {
 
 // ── list helpers ─────────────────────────────────────────────────────────────
 
-fn centered_hint(msg: &'static str) -> impl IntoView {
-    container(text(msg).style(|s| s.color(theme::text_faint()).font_size(theme::FONT_BODY)))
-        .style(|s| s.size_full().items_center().justify_center().padding(20.0))
+/// What a list-plus-form pane shows while nothing is selected.
+///
+/// Top-left, **not** centred: it stands exactly where the form's first label
+/// would, so selecting an item doesn't make the pane's content jump from the
+/// middle of the empty space up to the top. The inset comes from the detail pane
+/// itself, the same one every form in this modal gets — nothing here adds its own.
+///
+/// Shared with the trigger editor, which lays its two panes out the same way.
+pub(crate) fn empty_hint(msg: &'static str) -> impl IntoView {
+    text(msg).style(|s| {
+        s.color(theme::text_faint())
+            .font_size(theme::FONT_BODY)
+            .width_full()
+    })
 }
 
 /// A name that isn't taken yet: `column`, then `column_2`, `column_3`…
@@ -1492,8 +1532,15 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
             };
             let ui = ui.clone();
             let title = match &target.current {
-                Some(_) => format!("Design {}", target.display()),
-                None => format!("Create table in {}", target.database),
+                Some(t) => format!(
+                    "Edit {}.{}",
+                    object_location(&target.database, t.schema.as_deref()),
+                    t.name
+                ),
+                None => format!(
+                    "Create table in {}",
+                    object_location(&target.database, target.schema.as_deref())
+                ),
             };
 
             // The list re-renders on every draft change (it shows names and
@@ -1536,14 +1583,23 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                         DesignerTab::Checks => check_form(ui, form_target.dialect),
                     }
                 },
-            );
+            )
+            // Without this the whole detail column is content-sized. A
+            // `dyn_container` carries no style of its own, so it sizes to its
+            // child; the form inside asks for `width_full`, which then resolves
+            // against *the widest line of text in the form* rather than the pane
+            // — so the switches sat wherever the longest hint happened to end,
+            // and moved between sections as the wording changed. It has to be
+            // stated on every link of the chain (scroll → container → this →
+            // form) or the percentage has nothing definite to resolve against.
+            .style(|s| s.width_full());
 
             let body = h_stack((list, detail_pane(d.tab, form))).style(|s| {
                 s.flex_row()
                     .width_full()
                     .flex_grow(1.0_f32)
                     .min_height(0.0)
-                    .padding_horiz(20.0)
+                    .padding_horiz(MODAL_PAD_H)
                     .padding_vert(18.0)
                     .gap(0.0)
             });
@@ -1593,19 +1649,13 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                     let cs = change_set(&target, &draft);
                     let ready = draft.validate().is_empty() && !cs.is_empty();
                     h_stack((
-                        footer_button("Cancel", theme::text_dim, theme::text, true, close),
-                        footer_button(
-                            "Preview SQL",
-                            theme::conn_save,
-                            theme::conn_save_hover,
-                            ready,
-                            move || {
-                                let cs = change_set(&target, &draft);
-                                ddl_preview::open_preview(&ui, preview_from(&target, &draft, &cs));
-                            },
-                        ),
+                        action_button("Cancel", ActionKind::Neutral, true, close),
+                        action_button("Preview SQL", ActionKind::Primary, ready, move || {
+                            let cs = change_set(&target, &draft);
+                            ddl_preview::open_preview(&ui, preview_from(&target, &draft, &cs));
+                        }),
                     ))
-                    .style(|s| s.flex_row().items_center().gap(15.0))
+                    .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
                     .into_any()
                 },
             );

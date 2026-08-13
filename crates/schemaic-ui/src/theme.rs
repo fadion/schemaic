@@ -176,6 +176,13 @@ pub fn text_muted() -> Color {
 pub fn placeholder() -> Color {
     ui().placeholder
 }
+/// The explanatory line under a form control — `text_muted` faded, so a hint
+/// reads as subordinate to the label above it without becoming a second grey in
+/// the palette. Derived rather than a theme field: the two can't drift apart, and
+/// a new theme gets it for free.
+pub fn form_hint() -> Color {
+    ui().text_muted.multiply_alpha(0.6)
+}
 
 // Status-bar panel toggles: idle (panel closed) vs active (panel open).
 pub fn chip_idle() -> Color {
@@ -262,6 +269,63 @@ pub fn row_active() -> Color {
 pub fn row_selected() -> Color {
     ui().row_selected
 }
+// Pill tabs (the table designer's section tabs): the active pill's fill and
+// label, and the hover fill of an inactive one.
+pub fn pill_active_bg() -> Color {
+    ui().pill_active_bg
+}
+pub fn pill_active_text() -> Color {
+    ui().pill_active_text
+}
+pub fn pill_hover_bg() -> Color {
+    ui().pill_hover_bg
+}
+// A modal footer's actions: a fill, its hover and a matching label, per variant.
+// A disabled action keeps its fill and halves its label (see `action_button`), so
+// the button holds its place rather than vanishing.
+pub fn btn_neutral() -> Color {
+    ui().btn_neutral
+}
+pub fn btn_neutral_hover() -> Color {
+    ui().btn_neutral_hover
+}
+pub fn btn_neutral_text() -> Color {
+    ui().btn_neutral_text
+}
+pub fn btn_primary() -> Color {
+    ui().btn_primary
+}
+pub fn btn_primary_hover() -> Color {
+    ui().btn_primary_hover
+}
+pub fn btn_primary_text() -> Color {
+    ui().btn_primary_text
+}
+pub fn btn_quiet() -> Color {
+    ui().btn_quiet
+}
+pub fn btn_quiet_hover() -> Color {
+    ui().btn_quiet_hover
+}
+pub fn btn_quiet_text() -> Color {
+    ui().btn_quiet_text
+}
+pub fn btn_danger() -> Color {
+    ui().btn_danger
+}
+pub fn btn_danger_hover() -> Color {
+    ui().btn_danger_hover
+}
+pub fn btn_danger_text() -> Color {
+    ui().btn_danger_text
+}
+// Manage Connections: the pass/fail icon Test flashes in place of its label.
+pub fn conn_test_ok() -> Color {
+    ui().conn_test_ok
+}
+pub fn conn_test_fail() -> Color {
+    ui().conn_test_fail
+}
 // Manage Connections list rows: resting text, hovered/selected text, selected bg.
 pub fn conn_list_text() -> Color {
     ui().conn_list_text
@@ -272,31 +336,11 @@ pub fn conn_list_sel_text() -> Color {
 pub fn conn_list_sel_bg() -> Color {
     ui().conn_list_sel_bg
 }
-// Manage Connections: Delete button (icon+text), resting + hover.
-pub fn conn_delete() -> Color {
-    ui().conn_delete
-}
-pub fn conn_delete_hover() -> Color {
-    ui().conn_delete_hover
-}
-// Manage Connections: Save button text, resting + hover.
-pub fn conn_save() -> Color {
-    ui().conn_save
-}
-pub fn conn_save_hover() -> Color {
-    ui().conn_save_hover
-}
-// Manage Connections: Test button text, resting + hover.
-pub fn conn_test() -> Color {
-    ui().conn_test
-}
-pub fn conn_test_hover() -> Color {
-    ui().conn_test_hover
-}
-// Manage Connections: Test result icon — success (failure reuses `conn_delete`).
-pub fn conn_test_ok() -> Color {
-    ui().conn_test_ok
-}
+// Manage Connections' three footer actions used to carry seven colours of their
+// own — coloured *text*, plus a green tick and a red cross for the test result.
+// They wear the shared `btn_*` fills now, like every other modal's footer, so
+// those roles are gone rather than left tuneable: a colour nothing paints is one
+// a later retune spends time on for no effect.
 
 // Count-capsule fill ("N cols" / "N keys" under a table).
 pub fn capsule_bg() -> Color {
@@ -577,4 +621,6 @@ pub const AI_W: f64 = 350.0;
 pub const FONT_TITLE: f32 = 14.0;
 pub const FONT_BODY: f32 = 13.0;
 pub const FONT_LABEL: f32 = 13.0;
+/// A form hint — one step under the label it explains.
+pub const FONT_HINT: f32 = 12.0;
 pub const FONT_STATUS: f32 = 12.0;

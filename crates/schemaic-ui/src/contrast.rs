@@ -201,6 +201,51 @@ macro_rules! pair {
     };
 }
 
+/// Like [`pair`], for a *foreground* painted at reduced alpha — a form hint.
+/// Composited over its surface before measuring: [`contrast_ratio`] ignores
+/// alpha, so reading the raw colour would flatter a hint by exactly the amount
+/// the fade takes away.
+macro_rules! faded {
+    ($fg:ident($alpha:expr) on $bg:ident, $role:ident, $site:expr) => {
+        Pairing {
+            fg: concat!(stringify!($fg), "@", stringify!($alpha)),
+            bg: stringify!($bg),
+            role: Legibility::$role,
+            site: $site,
+            fg_of: |t| over(t.$fg.multiply_alpha($alpha), t.$bg),
+            bg_of: |t| t.$bg,
+        }
+    };
+}
+
+/// Like [`faded`], for a control that fades *whole* — a disabled action, where
+/// the label and the fill are both at half strength. Neither half is opaque, so
+/// both have to be composited against the surface behind them before the pair
+/// can be measured at all.
+macro_rules! disabled {
+    ($fg:ident($fa:expr) on $fill:ident($ba:expr) over $bg:ident, $role:ident, $site:expr) => {
+        Pairing {
+            fg: concat!(stringify!($fg), "@", stringify!($fa)),
+            bg: concat!(
+                stringify!($fill),
+                "@",
+                stringify!($ba),
+                " over ",
+                stringify!($bg)
+            ),
+            role: Legibility::$role,
+            site: $site,
+            fg_of: |t| {
+                over(
+                    t.$fg.multiply_alpha($fa),
+                    over(t.$fill.multiply_alpha($ba), t.$bg),
+                )
+            },
+            bg_of: |t| over(t.$fill.multiply_alpha($ba), t.$bg),
+        }
+    };
+}
+
 /// Like [`pair`], for a foreground on a translucent wash over a surface — the
 /// results grid paints most of its cell states that way, and what the eye reads
 /// is the composite, not the wash.
@@ -265,7 +310,8 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     // ── Side panels, modals and popup menus (`bg_panel`).
     pair!(text on bg_panel, Body, "schema tree, modals, menu rows"),
     pair!(text_dim on bg_panel, Body, "panel + form labels"),
-    pair!(text_muted on bg_panel, Icon, "section titles, secondary metadata"),
+    pair!(text_muted on bg_panel, Icon, "section titles, form labels, metadata"),
+    faded!(text_muted(0.6) on bg_panel, Recessive, "form modals: a control's hint line"),
     pair!(text_faint on bg_panel, Recessive, "count capsules, empty-state hints"),
     pair!(search_hint on bg_panel, Recessive, "schema tree: the search box hint"),
     pair!(error on bg_panel, Body, "modal + panel error lines"),
@@ -288,13 +334,9 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     pair!(view_icon on bg_panel, Icon, "schema tree: the view glyph"),
     pair!(db_toggle_on on bg_panel, Body, "database visibility menu: a shown row"),
     pair!(db_toggle_off on bg_panel, Recessive, "database visibility menu: a hidden row"),
-    pair!(conn_delete on bg_panel, Body, "Manage Connections: Delete"),
-    pair!(conn_delete_hover on bg_panel, Body, "Manage Connections: hovering Delete"),
-    pair!(conn_save on bg_panel, Body, "Manage Connections: Save"),
-    pair!(conn_save_hover on bg_panel, Body, "Manage Connections: hovering Save"),
-    pair!(conn_test on bg_panel, Body, "Manage Connections: Test"),
-    pair!(conn_test_hover on bg_panel, Body, "Manage Connections: hovering Test"),
-    pair!(conn_test_ok on bg_panel, Icon, "Manage Connections: the test-passed tick"),
+    // Manage Connections' footer actions used to be coloured text on the panel;
+    // they are filled buttons now, so those seven pairings are the `btn_*` rows
+    // above rather than seven of their own.
     pair!(conn_ok on bg_panel, Icon, "connection menu: the reachable dot"),
     pair!(text_muted on capsule_bg, Icon, "schema tree: the N cols / N keys capsule"),
     // ── Rows: hover, active and the keyboard-nav cursor.
@@ -303,6 +345,27 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     pair!(text on row_selected, Body, "schema tree: the keyboard-nav cursor row"),
     pair!(text_dim on row_selected, Body, "designer list: a selected row's detail"),
     pair!(key_primary on row_selected, Icon, "schema tree: a key glyph under the cursor"),
+    pair!(pill_active_text on pill_active_bg, Body, "designer tabs: the active pill"),
+    // Modal footer actions. Each variant's own label on its own fill, resting and
+    // hovered, since a hover is a state a label is read in, not a decoration.
+    pair!(btn_neutral_text on btn_neutral, Body, "modal footer: Cancel / Back"),
+    pair!(btn_neutral_text on btn_neutral_hover, Body, "modal footer: hovering it"),
+    pair!(btn_primary_text on btn_primary, Body, "modal footer: Preview SQL / Apply"),
+    pair!(btn_primary_text on btn_primary_hover, Body, "modal footer: hovering it"),
+    pair!(btn_quiet_text on btn_quiet, Body, "preview footer: Copy / Open in editor"),
+    pair!(btn_quiet_text on btn_quiet_hover, Body, "preview footer: hovering one"),
+    pair!(btn_danger_text on btn_danger, Body, "preview footer: Apply, on a destructive plan"),
+    pair!(btn_danger_text on btn_danger_hover, Body, "preview footer: hovering it"),
+    // Test's result icon, on the neutral fill it flashes inside. Both hover
+    // states listed too: the pointer is on the button that was just pressed.
+    pair!(conn_test_ok on btn_neutral, Icon, "Manage Connections: the test-passed tick"),
+    pair!(conn_test_ok on btn_neutral_hover, Icon, "Manage Connections: hovering it"),
+    pair!(conn_test_fail on btn_neutral, Icon, "Manage Connections: the test-failed cross"),
+    pair!(conn_test_fail on btn_neutral_hover, Icon, "Manage Connections: hovering it"),
+    // Preview SQL before there is anything to preview — the one action that sits
+    // disabled for more than a moment, so it's the disabled state worth tracking.
+    disabled!(btn_primary_text(0.5) on btn_primary(0.5) over bg_panel, Recessive, "modal footer: an action not yet available"),
+    pair!(text on pill_hover_bg, Body, "designer tabs: a hovered pill"),
     pair!(text on dropdown_hover, Body, "settings dropdown: a hovered option"),
     pair!(text on dropdown_active, Body, "settings dropdown: the chosen option"),
     pair!(conn_list_sel_text on conn_list_sel_bg, Body, "Manage Connections: the selected row"),
@@ -398,10 +461,26 @@ pub const UI_SHORTFALL: &[Shortfall] = &[
     ("dark", "tab_close", "bg_chrome", 1.4),
     ("dark", "text_dim", "bg_panel", 4.4),
     ("dark", "text_muted", "bg_panel", 2.5),
+    // The hint line: `text_muted` at 60% composites to 1.7:1 here, and to 1.79:1
+    // under the Light theme. Both are under the "still perceptible" floor — this
+    // is a deliberate design choice about how far a hint recedes, recorded so it
+    // can't drift further without somebody choosing that too.
+    ("dark", "text_muted@0.6", "bg_panel", 1.7),
+    // Modal footer actions. Tinting each label to its own fill put both *resting*
+    // states over AA — they aren't listed here at all — so what's left is the
+    // hovers, where lightening the fill under an unchanged label costs contrast,
+    // and the destructive red, whose fill can only go so light before it stops
+    // reading as a warning.
+    ("dark", "btn_neutral_text", "btn_neutral_hover", 3.8),
+    ("dark", "btn_primary_text", "btn_primary_hover", 3.9),
+    // The recessed pair is the one whose *hover* clears 4.5 (it darkens), which is
+    // why only its resting state is listed.
+    ("dark", "btn_quiet_text", "btn_quiet", 4.2),
+    ("dark", "btn_danger_text", "btn_danger", 3.5),
+    ("dark", "btn_danger_text", "btn_danger_hover", 2.7),
     ("dark", "search_hint", "bg_panel", 1.4),
     ("dark", "db_icon", "bg_panel", 1.6),
     ("dark", "table_icon", "bg_panel", 2.7),
-    ("dark", "conn_delete", "bg_panel", 2.4),
     ("dark", "text_muted", "capsule_bg", 2.1),
     ("dark", "text_dim", "row_selected", 3.3),
     ("dark", "placeholder", "bg_editor", 1.3),
@@ -431,6 +510,9 @@ pub const UI_SHORTFALL: &[Shortfall] = &[
     ("light", "tab_text", "bg_chrome", 2.7),
     ("light", "tab_close", "bg_chrome", 1.4),
     ("light", "text_muted", "bg_panel", 2.8),
+    ("light", "text_muted@0.6", "bg_panel", 1.7),
+    ("light", "btn_quiet_text", "btn_quiet", 3.5),
+    ("light", "btn_quiet_text", "btn_quiet_hover", 3.1),
     ("light", "search_hint", "bg_panel", 1.6),
     ("light", "error", "bg_panel", 4.3),
     ("light", "plan_warn", "bg_panel", 3.2),
@@ -438,9 +520,6 @@ pub const UI_SHORTFALL: &[Shortfall] = &[
     ("light", "favorite_star", "bg_panel", 2.6),
     ("light", "view_icon", "bg_panel", 2.6),
     ("light", "db_toggle_off", "bg_panel", 1.9),
-    ("light", "conn_delete_hover", "bg_panel", 3.0),
-    ("light", "conn_save", "bg_panel", 4.3),
-    ("light", "conn_save_hover", "bg_panel", 2.6),
     ("light", "text_muted", "capsule_bg", 2.4),
     ("light", "text_dim", "row_selected", 4.1),
     ("light", "key_primary", "row_selected", 1.7),
