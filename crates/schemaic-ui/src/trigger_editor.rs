@@ -845,7 +845,13 @@ fn trigger_list(ui: Ui, pg: bool, table: String, schema: Option<String>) -> impl
                 .style(|s| s.flex_col().width_full())
                 .into_any()
         },
-    );
+    )
+    // The `dyn_container` needs it too, not just the stack inside it: without a
+    // width of its own it shrinks to content, and the inner `width_full` then
+    // resolves against *that* — so the rows sat inset from the list's edges.
+    // The designer has no such wrapper (its whole section rebuilds instead), so
+    // this is the one place it can go wrong.
+    .style(|s| s.width_full());
 
     let add = move || {
         d.update(|s| {
