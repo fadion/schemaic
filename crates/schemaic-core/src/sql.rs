@@ -233,20 +233,90 @@ pub fn find_code(hay: &str, needle: &str, dialect: SqlDialect) -> Option<usize> 
     None
 }
 
+/// A `DELIMITER <token>` directive starting at `i`: the offset just past its
+/// line, and the token it sets.
+///
+/// **A client directive, not SQL** — the server has never heard of it — and
+/// MySQL's alone. It exists because a compound body (`BEGIN … END`) holds its own
+/// semicolons, so `mysqldump` and every hand-written trigger script switch the
+/// terminator around them; a splitter that doesn't know the word cuts such a
+/// script into fragments that are each a syntax error. It is recognised only at
+/// the start of a statement, so `SELECT delimiter FROM t` is untouched.
+fn delimiter_directive(sql: &str, i: usize, dialect: SqlDialect) -> Option<(usize, String)> {
+    if dialect == SqlDialect::Postgres {
+        return None;
+    }
+    let b = sql.as_bytes();
+    const KW: &[u8] = b"DELIMITER";
+    if b.len() - i < KW.len() + 1
+        || !b[i..i + KW.len()]
+            .iter()
+            .zip(KW)
+            .all(|(x, y)| x.eq_ignore_ascii_case(y))
+        || !b[i + KW.len()].is_ascii_whitespace()
+    {
+        return None;
+    }
+    let mut j = i + KW.len();
+    while j < b.len() && b[j] != b'\n' && b[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    let start = j;
+    while j < b.len() && !b[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if start == j {
+        return None;
+    }
+    let token = sql[start..j].to_string();
+    // The rest of the line belongs to the directive, whatever it is.
+    let end = sql[j..]
+        .find('\n')
+        .map(|k| j + k + 1)
+        .unwrap_or_else(|| sql.len());
+    Some((end, token))
+}
+
+/// Is `sql[lo..hi]` a `DELIMITER` directive rather than a statement?
+///
+/// Exposed so the callers that *execute* ranges can drop it: the server would
+/// answer a syntax error, since it is the client that owns the word.
+pub fn is_delimiter_directive(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> bool {
+    delimiter_directive(sql, lo, dialect).is_some_and(|(end, _)| end >= hi)
+}
+
 /// Byte offsets bounding each top-level statement: `[0, after-`;`, …, len]`.
-/// `;` inside strings / identifiers / comments does not split.
+/// `;` inside strings / identifiers / comments does not split, and on MySQL a
+/// `DELIMITER` directive changes what does — see [`delimiter_directive`].
 pub fn statement_bounds(sql: &str, dialect: SqlDialect) -> Vec<usize> {
     let b = sql.as_bytes();
     let n = b.len();
     let mut bounds = vec![0usize];
+    let mut delim: Vec<u8> = vec![b';'];
     let mut i = 0;
+    // Where the current segment begins, for recognising a directive only at the
+    // start of one.
+    let mut seg = 0usize;
     while i < n {
         if let Some(j) = skip_noncode(b, i, dialect) {
             i = j;
             continue;
         }
-        if b[i] == b';' {
-            bounds.push(i + 1);
+        // Only at the start of a segment — `SELECT delimiter FROM t` is data.
+        if (seg..i).all(|k| b[k].is_ascii_whitespace())
+            && let Some((end, token)) = delimiter_directive(sql, i, dialect)
+        {
+            bounds.push(end);
+            delim = token.into_bytes();
+            i = end;
+            seg = end;
+            continue;
+        }
+        if b[i..].starts_with(&delim) {
+            bounds.push(i + delim.len());
+            i += delim.len();
+            seg = i;
+            continue;
         }
         i += 1;
     }
@@ -308,7 +378,12 @@ pub fn statement_ranges(sql: &str, dialect: SqlDialect) -> Vec<(usize, usize)> {
     statement_bounds(sql, dialect)
         .windows(2)
         .map(|w| trim_range(sql, w[0], w[1]))
-        .filter(|&(lo, hi)| lo < hi && segment_has_code(sql, lo, hi, dialect))
+        .filter(|&(lo, hi)| {
+            lo < hi
+                && segment_has_code(sql, lo, hi, dialect)
+                // The directive is the client's, not the server's.
+                && !is_delimiter_directive(sql, lo, hi, dialect)
+        })
         .collect()
 }
 
@@ -825,6 +900,48 @@ mod tests {
     }
     fn leading_keyword(s: &str) -> Option<String> {
         super::leading_keyword(s, SqlDialect::MySql)
+    }
+
+    /// A MySQL compound trigger body holds its own semicolons, so a script
+    /// carrying one is only splittable with `DELIMITER` — the form `mysqldump`
+    /// writes, and the form the DDL preview now hands to "Open in editor".
+    #[test]
+    fn a_delimiter_directive_moves_the_statement_terminator() {
+        let s = "DELIMITER $$\n\nCREATE TRIGGER t BEFORE INSERT ON o FOR EACH ROW\nBEGIN\n  \
+                 SET NEW.a = 1;\n  SET NEW.b = 2;\nEND$$\n\nDELIMITER ;";
+        let r = statement_ranges(s);
+        assert_eq!(
+            r.len(),
+            1,
+            "{:?}",
+            r.iter().map(|&(a, b)| &s[a..b]).collect::<Vec<_>>()
+        );
+        assert!(s[r[0].0..r[0].1].starts_with("CREATE TRIGGER"));
+        assert!(s[r[0].0..r[0].1].ends_with("END$$"));
+    }
+
+    /// Without it, the same body is cut into fragments — which is the bug, and
+    /// is also why the directive can't just be ignored.
+    #[test]
+    fn the_same_body_without_a_delimiter_is_still_split_on_semicolons() {
+        let s = "CREATE TRIGGER t BEFORE INSERT ON o FOR EACH ROW\nBEGIN\n  SET NEW.a = 1;\n  \
+                 SET NEW.b = 2;\nEND;";
+        assert_eq!(statement_ranges(s).len(), 3);
+    }
+
+    #[test]
+    fn delimiter_is_only_a_directive_at_the_start_of_a_statement() {
+        // A column called `delimiter`, and the word inside a statement, are data.
+        let s = "SELECT delimiter FROM t; SELECT 2;";
+        assert_eq!(statement_ranges(s).len(), 2);
+        // PostgreSQL has no such directive at all, so the line is just the head
+        // of the one statement that follows it.
+        let pg = "DELIMITER $$\nSELECT 1;";
+        assert_eq!(super::statement_ranges(pg, SqlDialect::Postgres).len(), 1);
+        // Restoring `;` puts the ordinary terminator back.
+        let s = "DELIMITER $$\nSELECT 1$$\nDELIMITER ;\nSELECT 2;\nSELECT 3;";
+        let r = statement_ranges(s);
+        assert_eq!(r.len(), 3, "{:?}", r);
     }
     fn has_top_level_where(s: &str) -> bool {
         super::has_top_level_where(s, SqlDialect::MySql)

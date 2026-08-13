@@ -2251,6 +2251,40 @@ impl ChangeSet {
         self.emit().join("\n\n")
     }
 
+    /// The same script, but runnable by a **client** that splits on `;`.
+    ///
+    /// `run_ddl` hands each statement to the wire whole, so it never needs this;
+    /// "Open in editor" drops the text into a query tab, where Schemaic's own
+    /// splitter cuts on every top-level `;` — and a MySQL trigger's `BEGIN … END`
+    /// body is full of them. Run Everything then ran `CREATE TRIGGER … SET NEW.a
+    /// = 1;` as one statement and the rest as fragments: the application handing
+    /// the user a script it cannot run itself, which is exactly what the escape
+    /// hatch exists to avoid.
+    ///
+    /// So a statement carrying an internal `;` is wrapped in `DELIMITER $$` …
+    /// `DELIMITER ;`, the form `mysqldump` writes and `sql::statement_bounds`
+    /// now reads. Nothing is wrapped when nothing needs it, and PostgreSQL never
+    /// does — a function body there is dollar-quoted, which `skip_noncode`
+    /// already sees through.
+    pub fn editor_script(&self) -> String {
+        let stmts = self.emit();
+        if self.dialect == SqlDialect::Postgres
+            || !stmts.iter().any(|s| needs_delimiter(s, self.dialect))
+        {
+            return stmts.join("\n\n");
+        }
+        let mut out = String::from("DELIMITER $$\n\n");
+        out.push_str(
+            &stmts
+                .iter()
+                .map(|s| format!("{}$$", s.trim_end().trim_end_matches(';')))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        );
+        out.push_str("\n\nDELIMITER ;");
+        out
+    }
+
     fn q(&self, name: &str) -> String {
         ddl_ident_in(name, self.dialect)
     }
@@ -3963,6 +3997,18 @@ fn norm_check_expr(s: &str, dialect: SqlDialect) -> String {
         i += 1;
     }
     out
+}
+
+/// Does this statement carry a `;` anywhere but at its very end?
+///
+/// The test for "a client splitting on `;` would cut this in half" — see
+/// [`ChangeSet::editor_script`]. Through [`sql::statement_bounds`], so a `;`
+/// inside a string or a comment doesn't count.
+fn needs_delimiter(stmt: &str, dialect: SqlDialect) -> bool {
+    let end = stmt.trim_end().len();
+    sql::statement_bounds(stmt, dialect)
+        .iter()
+        .any(|&b| b > 0 && b < end)
 }
 
 /// Rewrite every reference to column `from` in a CHECK predicate as `to`,
@@ -6823,6 +6869,36 @@ mod tests {
                 triggers: ts,
                 ..Default::default()
             }
+        }
+
+        /// The escape hatch has to hand over something the app itself can run.
+        /// A MySQL compound body holds its own semicolons, and the query tab
+        /// splits on every top-level one — so the script it gets is wrapped in
+        /// `DELIMITER $$`, and the two renderings must stay statement-for-
+        /// statement equal.
+        #[test]
+        fn a_compound_mysql_body_is_handed_over_as_one_statement() {
+            let mut t = my_trigger();
+            t.action = TriggerAction::Body("BEGIN\n  SET NEW.a = 1;\n  SET NEW.b = 2;\nEND".into());
+            let cs = create_trigger(&TriggerDraft::from_info(&t), MySql);
+
+            // On the wire it is one statement and `DELIMITER` never appears.
+            assert_eq!(cs.emit().len(), 1);
+            assert!(!cs.emit()[0].contains("DELIMITER"));
+
+            // In a query tab it survives the splitter as one statement.
+            let script = cs.editor_script();
+            assert!(script.starts_with("DELIMITER $$"), "{script}");
+            let ranges = sql::statement_ranges(&script, MySql);
+            assert_eq!(ranges.len(), 1, "{script}");
+            assert!(script[ranges[0].0..ranges[0].1].starts_with("CREATE TRIGGER"));
+
+            // A statement with no internal `;` is handed over untouched.
+            let plain = create_trigger(&TriggerDraft::from_info(&my_trigger()), MySql);
+            assert_eq!(plain.editor_script(), plain.script());
+            // …and PostgreSQL never wraps: its bodies are dollar-quoted.
+            let pg = create_trigger(&TriggerDraft::from_info(&pg_trigger()), Postgres);
+            assert_eq!(pg.editor_script(), pg.script());
         }
 
         /// The gate, for the whole set: a draft off a table says nothing.

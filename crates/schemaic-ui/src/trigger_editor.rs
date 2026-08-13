@@ -419,6 +419,91 @@ fn bound_fn_field(
     edit_field(sig, cfg).into_any()
 }
 
+/// A list of free-text values as **rows**, not one comma-joined box.
+///
+/// The separator-in-the-data rule, which both layers below this one already
+/// follow: `pg_trigger_args` parses `tgargs` quote-aware, and `pg.rs` joins
+/// `proconfig` on `|` *specifically* so `SET search_path = public, pg_temp`
+/// stays one setting. Joining either on `", "` and splitting on `,` undid both
+/// — a one-argument `audit_fn('col_a,col_b')` re-applied as three arguments,
+/// cleanly, changing what the function did on every write; and a two-element
+/// `search_path` became two broken `SET` clauses that failed at Apply with a
+/// message naming neither the field nor the cause.
+///
+/// Rows are what `object_editor`'s enum values already use, for the same reason.
+/// `read`/`write` take the whole list so one helper can serve two different
+/// draft signals; only add and remove bump `rev`, so typing never tears down the
+/// field being typed into.
+fn value_rows(
+    ui: &Ui,
+    placeholder: &'static str,
+    add_label: &'static str,
+    mono: bool,
+    read: impl Fn() -> Vec<String> + Clone + 'static,
+    write: impl Fn(Vec<String>) + Clone + 'static,
+) -> AnyView {
+    let rev = ui.ddl.rev;
+    dyn_container(
+        // Structural only, as in the object editor.
+        move || rev.get(),
+        move |_| {
+            let (read, write) = (read.clone(), write.clone());
+            let (read_a, write_a) = (read.clone(), write.clone());
+            let rows = v_stack_from_iter(read().into_iter().enumerate().map(move |(i, v)| {
+                let sig = floem::reactive::create_rw_signal(v);
+                let (read_i, write_i) = (read.clone(), write.clone());
+                create_effect(move |prev: Option<String>| {
+                    let t = sig.get();
+                    if prev.is_some_and(|p| p != t) {
+                        let mut all = read_i();
+                        if let Some(slot) = all.get_mut(i) {
+                            slot.clone_from(&t);
+                        }
+                        write_i(all);
+                    }
+                    t
+                });
+                let (read_d, write_d) = (read.clone(), write.clone());
+                h_stack((
+                    edit_field(
+                        sig,
+                        FieldCfg {
+                            placeholder,
+                            mono,
+                            ..Default::default()
+                        },
+                    )
+                    .style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
+                    crate::widgets::row_button(crate::icons::TRASH_2, "Remove", move || {
+                        let mut all = read_d();
+                        if i < all.len() {
+                            all.remove(i);
+                        }
+                        write_d(all);
+                        rev.update(|r| *r += 1);
+                    }),
+                ))
+                .style(|s| s.flex_row().items_center().gap(2.0).width_full())
+            }))
+            .style(|s| s.flex_col().gap(6.0).width_full());
+            let add = control_button(add_label, move || {
+                let mut all = read_a();
+                all.push(String::new());
+                write_a(all);
+                rev.update(|r| *r += 1);
+            });
+            v_stack((
+                rows,
+                container(add).style(|s| s.width_full().margin_top(2.0)),
+            ))
+            .style(|s| s.flex_col().gap(6.0).width_full())
+            .into_any()
+        },
+    )
+    .style(|s| s.width_full())
+    .into_any()
+}
+
 // ── the trigger form ─────────────────────────────────────────────────────────
 
 /// The detail form for the trigger at `i`.
@@ -843,28 +928,27 @@ fn pg_action(ui: &Ui, i: usize, draft: &TriggerDraft, target: &TriggerTarget) ->
         ),
         form_setting(
             "Arguments",
-            bound_field(
+            value_rows(
                 ui,
-                i,
-                match &draft.info.action {
-                    TriggerAction::Function { args, .. } => args.join(", "),
-                    TriggerAction::Body(_) => String::new(),
+                "col_a",
+                "Add argument",
+                false,
+                move || {
+                    d.with(|s| match s.triggers.get(i).map(|t| &t.info.action) {
+                        Some(TriggerAction::Function { args, .. }) => args.clone(),
+                        _ => Vec::new(),
+                    })
                 },
-                FieldCfg {
-                    placeholder: "audit, orders",
-                    ..Default::default()
-                },
-                |d, v| {
-                    let args: Vec<String> = v
-                        .split(',')
-                        .map(|a| a.trim().to_string())
-                        .filter(|a| !a.is_empty())
-                        .collect();
-                    let name = match &d.info.action {
-                        TriggerAction::Function { name, .. } => name.clone(),
-                        TriggerAction::Body(_) => String::new(),
-                    };
-                    d.info.action = TriggerAction::Function { name, args };
+                move |args| {
+                    d.update(|s| {
+                        if let Some(t) = s.triggers.get_mut(i) {
+                            let name = match &t.info.action {
+                                TriggerAction::Function { name, .. } => name.clone(),
+                                TriggerAction::Body(_) => String::new(),
+                            };
+                            t.info.action = TriggerAction::Function { name, args };
+                        }
+                    });
                 },
             )
             .style(move |s| s.width(FIELD_W * 1.6)),
@@ -876,7 +960,7 @@ fn pg_action(ui: &Ui, i: usize, draft: &TriggerDraft, target: &TriggerTarget) ->
 
 // ── the function form ────────────────────────────────────────────────────────
 
-fn function_form(ui: Ui, _target: &FunctionTarget) -> AnyView {
+fn function_form(ui: Ui) -> AnyView {
     let d = ui.ddl.function_draft;
     let draft = d.get_untracked();
 
@@ -954,21 +1038,13 @@ fn function_form(ui: Ui, _target: &FunctionTarget) -> AnyView {
 
     let settings = form_setting(
         "Settings",
-        bound_fn_field(
+        value_rows(
             &ui,
-            draft.info.settings.join(", "),
-            FieldCfg {
-                placeholder: "search_path=public",
-                mono: true,
-                ..Default::default()
-            },
-            |d, v| {
-                d.info.settings = v
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            },
+            "search_path=public, pg_temp",
+            "Add setting",
+            true,
+            move || d.with(|s| s.info.settings.clone()),
+            move |v| d.update(|s| s.info.settings = v),
         )
         .style(move |s| s.width(FIELD_W * 1.6)),
     );
@@ -1291,14 +1367,25 @@ pub(crate) fn function_editor_overlay(ui: Ui) -> impl IntoView {
                     object_location(&target.database, f.schema.as_deref()),
                     f.name
                 ),
-                // A new function has no namespace chosen yet — the form's own
-                // Schema field is where that lands — so the title names the
-                // database and stops there.
-                None => format!("Create function in {}", target.database),
+                // A new function's namespace isn't chosen — it is *inherited*
+                // from the table whose trigger is being written, silently, in
+                // `open_for_new_function`. The form has no Schema field to say
+                // so (and shouldn't: a function in another namespace couldn't
+                // be the one this trigger calls), so the title is where it is
+                // disclosed.
+                None => format!(
+                    "Create function in {}",
+                    object_location(
+                        &target.database,
+                        d.function_draft
+                            .with_untracked(|f| f.info.schema.clone())
+                            .as_deref(),
+                    )
+                ),
             };
 
             let body = crate::widgets::autohide(scroll(
-                function_form(ui.clone(), &target)
+                function_form(ui.clone())
                     .style(|s| s.width_full().padding_horiz(MODAL_PAD_H).padding_vert(18.0)),
             ))
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
@@ -1405,6 +1492,52 @@ mod tests {
             name: name.into(),
             ..Default::default()
         }
+    }
+
+    /// The entry-point gates, which decide whether a tree row's **Edit** opens
+    /// anything. Both read correctly and neither had a test — and
+    /// `is_editable_view`'s nested `is_some_and` is exactly the shape that gates
+    /// the opposite way when it is wrong.
+    #[test]
+    fn the_edit_gates_refuse_what_the_editors_cannot_express() {
+        use schemaic_core::schema::{TableInfo, TriggerInfo, ViewOptions};
+
+        // A constraint trigger's deferral settings aren't modelled, so
+        // re-creating it would drop them. Everything else is editable.
+        let ct = TriggerInfo {
+            name: "ct".into(),
+            constraint: true,
+            ..Default::default()
+        };
+        assert!(!is_editable_trigger(&ct));
+        assert!(is_editable_trigger(&TriggerInfo {
+            constraint: false,
+            ..ct
+        }));
+
+        // A materialized view is drop-only: there is no `CREATE OR REPLACE` for
+        // one. A plain view is editable; a *table* is not a view at all; and
+        // "no table loaded" must not read as editable.
+        let view = |materialized: bool| TableInfo {
+            name: "v".into(),
+            is_view: true,
+            view_options: Some(ViewOptions {
+                materialized,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(crate::view_editor::is_editable_view(Some(&view(false))));
+        assert!(!crate::view_editor::is_editable_view(Some(&view(true))));
+        // A view with no options at all is still a view.
+        assert!(crate::view_editor::is_editable_view(Some(&TableInfo {
+            is_view: true,
+            ..Default::default()
+        })));
+        assert!(!crate::view_editor::is_editable_view(Some(
+            &TableInfo::default()
+        )));
+        assert!(!crate::view_editor::is_editable_view(None));
     }
 
     /// Both "new object" buttons walk the suffixes now.

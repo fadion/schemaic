@@ -420,6 +420,10 @@ pub struct DdlPreview {
     /// before the Apply button, in the error colour.
     pub destructive: Vec<String>,
     pub statements: Vec<String>,
+    /// The same plan as one script a **client** can run — see
+    /// [`schemaic_core::ddl::ChangeSet::editor_script`]. What "Copy" and "Open in
+    /// editor" hand over; `statements` is what goes on the wire.
+    pub script: String,
     pub read_only: bool,
 }
 
