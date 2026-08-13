@@ -507,6 +507,22 @@ Zed-inspired, aiming to replace DataGrip.
     form intact, with no "return to trigger" flag to be a second source of truth. `is_editable_trigger`
     is the entry point's gate: a constraint trigger's deferral settings aren't modelled, so it is
     listed and droppable but not editable, the call a materialized view gets.
+  - `object_editor.rs` — the **enum / domain / sequence** modal, over `core::ddl`'s
+    `ObjectDraft`. Reached from a tree object's **Edit** and from a database or schema node's
+    **Create type / domain / sequence** (PostgreSQL only — on MySQL those entries don't
+    exist, the same "hide what an engine can't express" call `trigger_editor`'s form makes).
+    One modal for three objects because the chrome, the footer, the change count and the
+    ending at `ddl_preview` are identical and only the middle section differs. Same
+    seed-local-signals-then-write-back rule as the other editors, and three more written down:
+    the list rows are keyed on `object_rev`, a **structural** counter, so typing into a row
+    doesn't tear it down and removing one doesn't leave its neighbour showing the old text;
+    an enum's values are **rows, not a newline-separated box**, because a label may contain a
+    newline and splitting one would rebuild the type around the split (data loss on apply,
+    not a failure); and a sequence's numbers go through `object_errors` beside the draft,
+    since the draft holds `i64` and a half-typed `-` has nowhere to live in it — writing
+    nothing back on a failed parse would silently swallow what somebody typed.
+    `is_editable_object` is the entry point's gate: an identity column's counter is listed
+    and alterable but not editable-as-an-object, the call a materialized view gets.
   - `ai_panel.rs` — AI Assistant panel (`ai_panel`/`message_bubble`/`render_segments`/`tool_chip`/
     `assistant_footer`).
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context
