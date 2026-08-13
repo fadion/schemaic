@@ -760,6 +760,21 @@ pub struct TriggerInfo {
     /// triggers on that event — and order is the entire point when two of them
     /// write the same row.
     pub order: Option<TriggerOrder>,
+    /// **MySQL/MariaDB**: the session state the trigger was *created* under,
+    /// which is part of what it does and is not restated by `CREATE TRIGGER`.
+    ///
+    /// A trigger written under `sql_mode = ''` and recreated under a strict mode
+    /// starts failing every parent `INSERT`; reversed, it stops raising and
+    /// silently truncates. `character_set_client` and `collation_connection`
+    /// decide how string literals *in the body* compare. None of the three is
+    /// readable from `information_schema.TRIGGERS`, so they arrive with the body
+    /// from `SHOW CREATE TRIGGER` — see [`TriggerSource`].
+    ///
+    /// `None` means "not known", which is what an unfetched trigger and every
+    /// PostgreSQL one both are, and nothing is emitted for it.
+    pub sql_mode: Option<String>,
+    pub charset_client: Option<String>,
+    pub collation_connection: Option<String>,
     /// **PostgreSQL**: `REFERENCING OLD TABLE AS …` / `NEW TABLE AS …` — the
     /// transition relations a statement-level trigger's function reads.
     ///
@@ -779,6 +794,46 @@ pub struct TriggerInfo {
     /// deferral options one carries, so these are shown and droppable but not
     /// editable — the same call [`ViewOptions::materialized`] gets.
     pub constraint: bool,
+}
+
+/// What one `SHOW CREATE TRIGGER` round trip yields for a MySQL trigger: the
+/// body **as written**, and the session state it was written under.
+///
+/// It exists because `information_schema.TRIGGERS.ACTION_STATEMENT` cannot be
+/// used to recreate a trigger on MySQL 8. That column returns the body with its
+/// escapes **already resolved**, and the damage is not recoverable by
+/// re-escaping — measured on 8.4.11, a body holding `'C:\temp'` comes back
+/// carrying a literal tab (`…27433A09656D7027`), which is indistinguishable
+/// from a trigger that really was written with one; a body holding `'it''s'`
+/// comes back as `'it's'`, which is a 1064 syntax error on restate, *after* the
+/// `DROP` has committed and taken the only copy with it. MariaDB returns both
+/// verbatim.
+///
+/// The same statement is also the only place the three session values live, so
+/// one round trip answers both. Fetched **lazily**, when the editor opens — the
+/// call [`ViewOptions::algorithm`] already makes, and for the same reason.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TriggerSource {
+    /// Everything after `FOR EACH ROW` and any ordering clause.
+    pub body: String,
+    pub sql_mode: Option<String>,
+    pub charset_client: Option<String>,
+    pub collation_connection: Option<String>,
+}
+
+impl TriggerSource {
+    /// Copy this onto a [`TriggerInfo`] — the body **and** the session state.
+    ///
+    /// One method because both sides of the diff have to be patched with it
+    /// (`current` and the draft), exactly as `view_editor::fetch_algorithm`
+    /// does: patching only the draft would make every MySQL trigger open
+    /// already-changed against a `current` that still held the corrupt body.
+    pub fn apply_to(&self, t: &mut TriggerInfo) {
+        t.action = TriggerAction::Body(self.body.clone());
+        t.sql_mode = self.sql_mode.clone();
+        t.charset_client = self.charset_client.clone();
+        t.collation_connection = self.collation_connection.clone();
+    }
 }
 
 /// Which sessions a PostgreSQL trigger fires in — `pg_trigger.tgenabled`.
@@ -847,6 +902,9 @@ impl Default for TriggerInfo {
             action: TriggerAction::default(),
             definer: None,
             order: None,
+            sql_mode: None,
+            charset_client: None,
+            collation_connection: None,
             old_table: None,
             new_table: None,
             enabled: TriggerEnabled::default(),

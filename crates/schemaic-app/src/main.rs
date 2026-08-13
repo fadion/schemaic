@@ -3365,6 +3365,31 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         )
     };
 
+    let trigger_source: schemaic_ui::TriggerSrcFn = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(
+            move |req: schemaic_ui::TriggerSrcRequest, done: schemaic_ui::TriggerSrcDoneFn| {
+                let Ok(db) = db_for(req.conn_id) else {
+                    // Nothing to report: the editor keeps the body it has.
+                    return;
+                };
+                let name = req.trigger.clone();
+                let report = create_ext_action(cx, move |src| (done)(name.clone(), src));
+                handle.spawn(async move {
+                    // A failed read leaves the editor on `information_schema`'s
+                    // body — which is the state every build before this shipped,
+                    // and better than refusing to open the editor at all.
+                    let src = db
+                        .trigger_source(Some(&req.database), &req.trigger)
+                        .await
+                        .unwrap_or(None);
+                    report(src);
+                });
+            },
+        )
+    };
+
     let trigger_functions: schemaic_ui::TriggerFnFn = {
         let handle = handle.clone();
         let db_for = db_for.clone();
@@ -4899,6 +4924,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             run_ddl,
             view_algorithm,
             trigger_functions,
+            trigger_source,
         }),
         // Reset on every open (`import_view::open_import`), so one bundle serves
         // every table rather than a per-open scope that would need disposing.

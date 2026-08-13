@@ -24,6 +24,7 @@ use mysql_async::consts::{ColumnFlags, ColumnType};
 use mysql_async::prelude::Queryable;
 use mysql_async::{Column as MyColumn, Conn, Row, Value as MyValue};
 use mysql_async::{OptsBuilder, Params};
+use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
     Column, ColumnFlags as CoreColFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
     ResultBuilder, ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value, WriteStep,
@@ -31,8 +32,9 @@ use schemaic_core::model::{
 };
 use schemaic_core::schema::{
     CheckInfo, ColumnInfo, DbSchema, ForeignKeyInfo, IndexInfo, TableInfo, TriggerAction,
-    TriggerEvent, TriggerInfo, TriggerOrder, TriggerTiming, ViewOptions,
+    TriggerEvent, TriggerInfo, TriggerOrder, TriggerSource, TriggerTiming, ViewOptions,
 };
+use schemaic_core::sql;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, thiserror::Error)]
@@ -393,6 +395,47 @@ impl Db {
             return Ok(Vec::new());
         }
         pg::trigger_functions(self, database).await
+    }
+
+    /// A MySQL trigger's body **as written**, plus the session state it was
+    /// written under — read lazily, when the trigger editor opens.
+    ///
+    /// The same shape [`Db::view_algorithm`] uses, and not part of
+    /// `fetch_schema` for the same reason: one `SHOW CREATE TRIGGER` per trigger
+    /// is far too many round trips for a schema refresh, and the answer is only
+    /// needed for the trigger actually being edited.
+    ///
+    /// **This is not an optimisation — it is the only correct source.** See
+    /// [`TriggerSource`] for what `information_schema` does to the body instead.
+    /// `Ok(None)` on PostgreSQL (whose triggers have no body) and on MariaDB,
+    /// which returns a faithful `ACTION_STATEMENT` already and needs no second
+    /// round trip.
+    pub async fn trigger_source(
+        &self,
+        database: Option<&str>,
+        trigger: &str,
+    ) -> Result<Option<TriggerSource>, DbError> {
+        if self.engine == Engine::Postgres {
+            return Ok(None);
+        }
+        let mut conn = self.open(database, false).await?;
+        // (Trigger, sql_mode, SQL Original Statement, character_set_client,
+        //  collation_connection, Database Collation, Created)
+        let sql = format!("SHOW CREATE TRIGGER {}", ident(trigger));
+        let row: Option<MyShowCreateTriggerRow> = conn
+            .query_first(sql.as_str())
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        let _ = conn.disconnect().await;
+        let some = |s: String| Some(s).filter(|s| !s.is_empty());
+        Ok(row.and_then(|(_, mode, create, cs, coll, ..)| {
+            trigger_body_of(&create).map(|body| TriggerSource {
+                body,
+                sql_mode: some(mode),
+                charset_client: some(cs),
+                collation_connection: some(coll),
+            })
+        }))
     }
 
     pub async fn view_algorithm(
@@ -925,6 +968,75 @@ fn view_algorithm_of(create_sql: &str) -> Option<String> {
     (!algo.is_empty() && algo != "UNDEFINED").then_some(algo)
 }
 
+/// One `SHOW CREATE TRIGGER` row: `(Trigger, sql_mode, SQL Original Statement,
+/// character_set_client, collation_connection, Database Collation, Created)`.
+///
+/// `Created` is nullable — MySQL only started recording it in 5.7.2, and a
+/// trigger made before an upgrade still has none.
+type MyShowCreateTriggerRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+);
+
+/// The **body** of a `SHOW CREATE TRIGGER` statement — everything after
+/// `FOR EACH ROW` and any `FOLLOWS`/`PRECEDES` clause.
+///
+/// Positional, like [`view_algorithm_of`], but it cannot be a plain `find`: the
+/// text before the body is server-generated, yet it contains *identifiers*, and
+/// a table or trigger named `` `x FOR EACH ROW y` `` is legal. So the scan goes
+/// through [`sql::skip_noncode`] on the MySQL dialect, which steps over a
+/// backtick-quoted name whole. Everything after the anchor is the user's own
+/// SQL and is returned untouched — including any `FOR EACH ROW` inside it,
+/// which is why the **first** anchor is the right one.
+///
+/// The ordering clause is dropped rather than kept: `TriggerInfo::order` is
+/// reconstructed from `information_schema.ACTION_ORDER` and the emitter writes
+/// it back, so carrying it in the body too would emit it twice.
+fn trigger_body_of(create_sql: &str) -> Option<String> {
+    const ANCHOR: &str = "FOR EACH ROW";
+    let b = create_sql.as_bytes();
+    let mut i = 0usize;
+    let after = loop {
+        if i >= b.len() {
+            return None;
+        }
+        if let Some(j) = sql::skip_noncode(b, i, SqlDialect::MySql) {
+            i = j;
+            continue;
+        }
+        if b[i..].len() >= ANCHOR.len()
+            && b[i..i + ANCHOR.len()].eq_ignore_ascii_case(ANCHOR.as_bytes())
+        {
+            break i + ANCHOR.len();
+        }
+        i += 1;
+    };
+    let rest = create_sql.get(after..)?.trim_start();
+    // An ordering clause, if the server printed one: the keyword, then one
+    // identifier (which may be backtick-quoted and hold anything).
+    for kw in ["FOLLOWS", "PRECEDES"] {
+        if rest.len() >= kw.len() && rest.as_bytes()[..kw.len()].eq_ignore_ascii_case(kw.as_bytes())
+        {
+            let after_kw = rest[kw.len()..].trim_start();
+            let nb = after_kw.as_bytes();
+            let end = match sql::skip_noncode(nb, 0, SqlDialect::MySql) {
+                Some(j) => j,
+                None => nb
+                    .iter()
+                    .position(|&c| !sql::is_word_byte(c))
+                    .unwrap_or(nb.len()),
+            };
+            return Some(after_kw[end..].trim().to_string());
+        }
+    }
+    Some(rest.trim().to_string())
+}
+
 /// One `information_schema.CHECK_CONSTRAINTS` row, already joined to its table:
 /// `(table, constraint name, check clause, enforced)`.
 type MyCheckRow = (String, String, String, String);
@@ -1060,6 +1172,12 @@ fn mysql_triggers(rows: &[MyTriggerRow]) -> Vec<TriggerInfo> {
             action: TriggerAction::Body(stmt.clone()),
             definer: Some(definer.clone()).filter(|d| !d.is_empty()),
             order: order_clause,
+            // `information_schema` reports none of the three, and on MySQL 8 the
+            // body it *does* report is already unescaped. Both come from
+            // `Db::trigger_source`, lazily, when the editor opens.
+            sql_mode: None,
+            charset_client: None,
+            collation_connection: None,
             // All three are PostgreSQL's alone: MySQL has no transition tables
             // and no per-trigger firing mode.
             old_table: None,
@@ -2995,6 +3113,65 @@ mod tests {
             s("root@localhost"),
             order,
         )
+    }
+
+    /// Verbatim `SHOW CREATE TRIGGER` output from MySQL 8.4.11 — the two bodies
+    /// `information_schema.ACTION_STATEMENT` corrupts.
+    ///
+    /// Through that column they come back as `SET NEW.a = 'C:<TAB>emp'` (the
+    /// `\t` already resolved, hex `…27433A09656D7027`) and `SET NEW.b = 'it's'`
+    /// (a 1064 on restate). Here they are exactly as written.
+    #[test]
+    fn trigger_body_survives_the_escapes_information_schema_resolves() {
+        let bs = "CREATE DEFINER=`schemaic`@`%` TRIGGER `wp5_bs` BEFORE INSERT ON `wp5` \
+                  FOR EACH ROW SET NEW.a = 'C:\\temp'";
+        assert_eq!(
+            trigger_body_of(bs).as_deref(),
+            Some("SET NEW.a = 'C:\\temp'")
+        );
+        let q = "CREATE DEFINER=`schemaic`@`%` TRIGGER `wp5_q` BEFORE UPDATE ON `wp5` \
+                 FOR EACH ROW SET NEW.b = 'it''s'";
+        assert_eq!(trigger_body_of(q).as_deref(), Some("SET NEW.b = 'it''s'"));
+    }
+
+    /// The anchor is found at a *code* position, so an identifier holding the
+    /// words can't be mistaken for it — a table really can be named this.
+    #[test]
+    fn trigger_body_anchor_ignores_the_words_inside_an_identifier() {
+        let sql = "CREATE DEFINER=`root`@`%` TRIGGER `t` BEFORE INSERT ON \
+                   `a FOR EACH ROW b` FOR EACH ROW SET NEW.x = 1";
+        assert_eq!(trigger_body_of(sql).as_deref(), Some("SET NEW.x = 1"));
+        // …and a body that mentions them is returned whole.
+        let sql = "CREATE TRIGGER `t` BEFORE INSERT ON `t2` FOR EACH ROW \
+                   SET NEW.note = 'FOR EACH ROW'";
+        assert_eq!(
+            trigger_body_of(sql).as_deref(),
+            Some("SET NEW.note = 'FOR EACH ROW'")
+        );
+    }
+
+    /// The ordering clause belongs to `TriggerInfo::order`, which the emitter
+    /// writes back — carrying it in the body too would emit it twice.
+    #[test]
+    fn trigger_body_drops_the_ordering_clause() {
+        for sql in [
+            "CREATE TRIGGER `b` BEFORE INSERT ON `t` FOR EACH ROW FOLLOWS `a` SET NEW.x = 1",
+            "CREATE TRIGGER `b` BEFORE INSERT ON `t` FOR EACH ROW PRECEDES `a` SET NEW.x = 1",
+            // A quoted name holding the next keyword must be stepped over whole.
+            "CREATE TRIGGER `b` BEFORE INSERT ON `t` FOR EACH ROW FOLLOWS `a SET x` SET NEW.x = 1",
+        ] {
+            assert_eq!(
+                trigger_body_of(sql).as_deref(),
+                Some("SET NEW.x = 1"),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_body_is_none_without_an_anchor() {
+        assert!(trigger_body_of("CREATE TRIGGER `t` BEFORE INSERT ON `t2`").is_none());
+        assert!(trigger_body_of("").is_none());
     }
 
     /// The ordering is the point: MySQL reports positions, and only a

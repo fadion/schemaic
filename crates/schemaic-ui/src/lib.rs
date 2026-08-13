@@ -457,6 +457,28 @@ pub type ViewAlgoDoneFn = Rc<dyn Fn(Option<String>)>;
 /// so it's paid once, for the view actually being edited.
 pub type ViewAlgoFn = Rc<dyn Fn(ViewAlgoRequest, ViewAlgoDoneFn)>;
 
+/// Which trigger to read the real body and session state for.
+pub struct TriggerSrcRequest {
+    pub conn_id: u64,
+    pub database: String,
+    /// The trigger's name **on the server** — the identity a `SHOW CREATE`
+    /// addresses, not whatever the draft has been renamed to.
+    pub trigger: String,
+}
+/// Reports one trigger's source on the UI thread, keyed by the name asked for
+/// so the caller can match it back to the row it belongs to. `None` means the
+/// server had nothing to say (PostgreSQL, MariaDB, or a failed read).
+pub type TriggerSrcDoneFn = Rc<dyn Fn(String, Option<schemaic_core::schema::TriggerSource>)>;
+/// Read one MySQL trigger's body **as written** off-thread.
+///
+/// Its own action for the same reason [`ViewAlgoFn`] is — it costs a
+/// `SHOW CREATE TRIGGER` per trigger — but unlike that one it is not an
+/// optimisation: on MySQL 8 `information_schema` hands back a body whose
+/// escapes are already resolved, so this is the *only* source that can
+/// recreate a trigger without changing or destroying it. See
+/// `schemaic_core::schema::TriggerSource`.
+pub type TriggerSrcFn = Rc<dyn Fn(TriggerSrcRequest, TriggerSrcDoneFn)>;
+
 /// The schema-editing modals' state (Copy bundle, reset on open — as with
 /// [`ImportUi`], these outlive no view so they need no scope to dispose).
 ///
@@ -1537,6 +1559,9 @@ pub struct SchemaActions {
     /// Read a MySQL view's `ALGORITHM`, which no bulk query reports.
     pub view_algorithm: ViewAlgoFn,
     pub trigger_functions: TriggerFnFn,
+    /// Read a MySQL trigger's body as written, which `information_schema`
+    /// cannot report faithfully.
+    pub trigger_source: TriggerSrcFn,
 }
 
 /// Result of a "Test" of the Manage-Connections draft (host + credentials),

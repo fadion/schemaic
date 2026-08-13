@@ -1073,9 +1073,13 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
                         name: cell(r, 6),
                         args: pg_trigger_args(&cell(r, 7)),
                     },
-                    // MySQL's alone.
+                    // MySQL's alone — a PostgreSQL trigger has no body of its
+                    // own, so no session state was captured with one.
                     definer: None,
                     order: None,
+                    sql_mode: None,
+                    charset_client: None,
+                    collation_connection: None,
                     old_table: Some(cell(r, 8)).filter(|s| !s.is_empty()),
                     new_table: Some(cell(r, 9)).filter(|s| !s.is_empty()),
                     // All four of `tgenabled`'s states: `A`/`R` used to fold
