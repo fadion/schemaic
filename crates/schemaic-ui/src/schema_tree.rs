@@ -202,6 +202,55 @@ fn namespace_has_object_match(schema: &DbSchema, ns: &str, filt: &str) -> bool {
         })
 }
 
+/// Does this database's row survive the filter?
+///
+/// **Shared by the render and `nav_rows`**, which is the whole point: the two
+/// had drifted in both directions at once — the render dropped a database whose
+/// only match was a type's name, so the object the user searched for was
+/// unreachable, while `nav_rows` kept it, so the arrow keys walked rows that
+/// weren't on screen. The `TableScope` doc comment records the previous instance
+/// of exactly this divergence.
+///
+/// A database whose schema is still loading survives: nothing is known about its
+/// contents yet, and hiding it would be a guess.
+fn db_survives(schema: Option<&DbSchema>, db_name: &str, filt: &str) -> bool {
+    if filt.is_empty() || db_name.to_lowercase().contains(filt) {
+        return true;
+    }
+    match schema {
+        Some(s) => s.tables.iter().any(|t| t.matches_search(filt)) || has_object_match(s, filt),
+        None => true,
+    }
+}
+
+/// Does this namespace's row survive the filter? Same rule one level down, and
+/// shared for the same reason.
+fn namespace_survives(schema: &DbSchema, ns: &str, db_hit: bool, filt: &str) -> bool {
+    if filt.is_empty() || db_hit || ns.to_lowercase().contains(filt) {
+        return true;
+    }
+    schema
+        .tables
+        .iter()
+        .any(|t| t.schema.as_deref() == Some(ns) && t.matches_search(filt))
+        || namespace_has_object_match(schema, ns, filt)
+}
+
+/// Which of a folder's objects the filter leaves. Empty means the folder itself
+/// renders nothing — a header with a count, no children and a chevron that can
+/// never open was the converse half of the same divergence.
+fn objects_shown<'a>(
+    items: &'a [ObjectItem],
+    parent_hit: bool,
+    ns_hit: bool,
+    filt: &str,
+) -> Vec<&'a ObjectItem> {
+    items
+        .iter()
+        .filter(|o| filt.is_empty() || parent_hit || ns_hit || object_matches(o, filt))
+        .collect()
+}
+
 /// The namespaces to render as their own tree level, or empty when the tables
 /// should be listed flat directly under the database.
 ///
@@ -342,16 +391,8 @@ fn nav_rows(
         // DB whose schema is still loading is kept (we can't know its tables yet).
         let db_hit = filtering && n.name.to_lowercase().contains(&filt);
         let schema = n.schema.as_ref();
-        if filtering && !db_hit {
-            let has_match = match schema {
-                Some(s) => {
-                    s.tables.iter().any(|t| t.matches_search(&filt)) || has_object_match(s, &filt)
-                }
-                None => true,
-            };
-            if !has_match {
-                continue;
-            }
+        if !db_survives(schema.map(|s| s.as_ref()), &n.name, &filt) {
+            continue;
         }
         let db_key = db_key(&n.database);
         let db_open = exp.contains(&db_key) || filtering;
@@ -419,10 +460,7 @@ fn nav_rows(
                     .name()
                     .is_some_and(|s| s.to_lowercase().contains(&filt));
             for (kind, items) in object_groups(schema, scope) {
-                let shown: Vec<&ObjectItem> = items
-                    .iter()
-                    .filter(|o| !filtering || db_hit || ns_hit || object_matches(o, &filt))
-                    .collect();
+                let shown = objects_shown(&items, db_hit, ns_hit, &filt);
                 if shown.is_empty() {
                     continue;
                 }
@@ -455,16 +493,7 @@ fn nav_rows(
             continue;
         }
         for ns in &groups {
-            let ns_hit = filtering && ns.to_lowercase().contains(&filt);
-            if filtering
-                && !db_hit
-                && !ns_hit
-                && !schema
-                    .tables
-                    .iter()
-                    .any(|t| t.schema.as_deref() == Some(ns.as_str()) && t.matches_search(&filt))
-                && !namespace_has_object_match(schema, ns, &filt)
-            {
+            if !namespace_survives(schema, ns, db_hit, &filt) {
                 continue; // no match in this namespace → the group is hidden
             }
             let key = schema_key(&n.database, ns);
@@ -572,6 +601,10 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     let nav_toggle = on_toggle.clone();
     let nav_open_table = open_table.clone();
     let nav_open_table_col = open_table_col.clone();
+    // Enter on an object leaf opens its editor, which needs the whole `Ui`; the
+    // row builders need it for the matching double-click.
+    let nav_ui = ui.clone();
+    let tree_ui = ui.clone();
 
     // Not `width_full`: the tree sizes to its widest row so the horizontal
     // scrollbar appears when a deep/long row overflows the panel. Hidden
@@ -586,17 +619,12 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                 // `with`, not `get` — this runs per database, and `get` would clone
                 // the whole hidden set each time.
                 .filter(|c| !hidden_dbs.with(|h| h.contains(&c.database)))
-                // While filtering, drop a database with no match: neither its own
-                // name nor any of its tables/columns matches. A database whose schema
-                // is still loading is kept (we can't know its tables yet).
-                .filter(|c| {
-                    if filt.is_empty() || c.name.to_lowercase().contains(&filt) {
-                        return true;
-                    }
-                    match c.schema.get() {
-                        SchemaState::Loaded(s) => s.tables.iter().any(|t| t.matches_search(&filt)),
-                        _ => true,
-                    }
+                // While filtering, drop a database with no match — through the
+                // same predicate `nav_rows` uses, so the keyboard walks exactly
+                // what is on screen.
+                .filter(|c| match c.schema.get() {
+                    SchemaState::Loaded(s) => db_survives(Some(&s), &c.name, &filt),
+                    _ => db_survives(None, &c.name, &filt),
                 })
                 .collect::<Vec<_>>();
             // Favorited databases sort to the top (oldest favorite first); re-runs
@@ -618,6 +646,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
             db_node(
                 c,
                 SchemaTreeCtx {
+                    ui: tree_ui.clone(),
                     expanded,
                     filter,
                     on_toggle: on_toggle.clone(),
@@ -701,6 +730,34 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                                         c.name.clone(),
                                     );
                                     break 'find;
+                                }
+                            }
+                        }
+                        // The standalone objects, whose leaves `nav_rows` makes
+                        // navigable *because* Enter opens their editor. Without
+                        // this arm the cursor could park on a row with no
+                        // keyboard action — the dead end the key rows are kept
+                        // out of `nav_rows` to avoid. The key is rebuilt exactly
+                        // as `push_objects` builds it, scopes included.
+                        let names = schema_groups(&schema);
+                        let scopes: Vec<TableScope> = if names.is_empty() {
+                            vec![TableScope::Flat]
+                        } else {
+                            names.iter().map(|n| TableScope::Namespace(n)).collect()
+                        };
+                        for scope in scopes {
+                            for (kind, items) in object_groups(&schema, scope) {
+                                for o in &items {
+                                    if object_key(&node.database, scope, kind, o.name()) == sel {
+                                        if crate::object_editor::is_editable_object(o) {
+                                            crate::object_editor::open_for_object(
+                                                &nav_ui,
+                                                &node.database,
+                                                o,
+                                            );
+                                        }
+                                        break 'find;
+                                    }
                                 }
                             }
                         }
@@ -896,6 +953,9 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
 /// clone (signals are `Copy`, the two callbacks are `Rc`).
 #[derive(Clone)]
 struct SchemaTreeCtx {
+    /// The whole `Ui`, for the row actions that open a modal rather than a tab —
+    /// an object leaf's editor, which Enter and double-click both reach.
+    ui: Ui,
     expanded: RwSignal<HashSet<String>>,
     filter: RwSignal<String>,
     on_toggle: Rc<dyn Fn(String)>,
@@ -922,6 +982,7 @@ struct SchemaTreeCtx {
 }
 
 fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
+    let node_ui = ctx.ui.clone();
     let SchemaTreeCtx {
         expanded,
         filter,
@@ -1079,6 +1140,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                 SchemaState::Loaded(schema) => {
                     let db = database.clone();
                     let child_ctx = |indent: f64| SchemaTreeCtx {
+                        ui: node_ui.clone(),
                         expanded,
                         filter,
                         on_toggle: toggle_tables.clone(),
@@ -1101,15 +1163,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                     if !groups.is_empty() {
                         let visible: Vec<String> = groups
                             .into_iter()
-                            .filter(|ns| {
-                                !filtering
-                                    || db_hit
-                                    || ns.to_lowercase().contains(&filt)
-                                    || schema.tables.iter().any(|t| {
-                                        t.schema.as_deref() == Some(ns.as_str())
-                                            && t.matches_search(&filt)
-                                    })
-                            })
+                            .filter(|ns| namespace_survives(&schema, ns, db_hit, &filt))
                             .collect();
                         if visible.is_empty() {
                             return empty().into_any();
@@ -1134,10 +1188,12 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                         .cloned()
                         .collect();
                     let objects = object_group_nodes(
+                        node_ui.clone(),
                         db.clone(),
                         None,
                         schema.clone(),
                         db_hit,
+                        filt.clone(),
                         child_ctx(0.0),
                     );
                     if tables.is_empty() {
@@ -1185,6 +1241,7 @@ fn schema_node(
     db_hit: bool,
     ctx: SchemaTreeCtx,
 ) -> impl IntoView {
+    let node_ui = ctx.ui.clone();
     let SchemaTreeCtx {
         expanded,
         filter,
@@ -1290,10 +1347,12 @@ fn schema_node(
             let db = database.clone();
             let ctx = ctx.clone();
             let objects = object_group_nodes(
+                node_ui.clone(),
                 db.clone(),
                 Some(ns_children.clone()),
                 schema.clone(),
                 db_hit || ns_hit,
+                filt.clone(),
                 ctx.clone(),
             );
             if tables.is_empty() {
@@ -1327,19 +1386,32 @@ fn schema_node(
 /// tables. Empty when the database has none — which is every MySQL connection,
 /// so nothing about that tree changes.
 fn object_group_nodes(
+    ui: Ui,
     database: String,
     scope_ns: Option<String>,
     schema: std::sync::Arc<DbSchema>,
     parent_hit: bool,
+    filt: String,
     ctx: SchemaTreeCtx,
 ) -> impl IntoView {
     let scope = || match &scope_ns {
         Some(ns) => TableScope::Namespace(ns.as_str()),
         None => TableScope::Flat,
     };
-    let groups = object_groups(&schema, scope());
+    let ns_hit = !filt.is_empty()
+        && scope_ns
+            .as_deref()
+            .is_some_and(|s| s.to_lowercase().contains(&filt));
+    // A folder with nothing to show renders nothing at all — header included.
+    // `nav_rows` skips it, so leaving the header on screen made a row with a
+    // count that the keyboard could not reach and that expanded to nothing.
+    let groups: Vec<_> = object_groups(&schema, scope())
+        .into_iter()
+        .filter(|(_, items)| !objects_shown(items, parent_hit, ns_hit, &filt).is_empty())
+        .collect();
     v_stack_from_iter(groups.into_iter().map(move |(kind, items)| {
         object_group_node(
+            ui.clone(),
             database.clone(),
             scope_ns.clone(),
             kind,
@@ -1353,6 +1425,7 @@ fn object_group_nodes(
 
 /// One folder: a header row over the objects of that kind.
 fn object_group_node(
+    ui: Ui,
     database: String,
     scope_ns: Option<String>,
     kind: ObjectKind,
@@ -1428,9 +1501,8 @@ fn object_group_node(
                 return empty().into_any();
             }
             let term = (!filt.is_empty()).then(|| filt.clone());
-            let shown: Vec<ObjectItem> = items
-                .iter()
-                .filter(|o| !filtering || parent_hit || ns_hit || object_matches(o, &filt))
+            let shown: Vec<ObjectItem> = objects_shown(&items, parent_hit, ns_hit, &filt)
+                .into_iter()
                 .cloned()
                 .collect();
             if shown.is_empty() {
@@ -1438,8 +1510,10 @@ fn object_group_node(
             }
             let db = database.clone();
             let ns = scope_ns.clone();
+            let ui = ui.clone();
             v_stack_from_iter(shown.into_iter().map(move |o| {
                 object_row(
+                    ui.clone(),
                     db.clone(),
                     ns.clone(),
                     o,
@@ -1462,6 +1536,7 @@ fn object_group_node(
 /// domain's base type, a sequence's owner.
 #[allow(clippy::too_many_arguments)]
 fn object_row(
+    ui: Ui,
     database: String,
     scope_ns: Option<String>,
     o: ObjectItem,
@@ -1509,6 +1584,16 @@ fn object_row(
         }),
     ))
     .style(|s| s.items_center())
+    // Double-click opens the editor, the way a table row does — and the same
+    // action Enter takes, which is what makes these leaves worth navigating to.
+    .on_double_click_stop({
+        let (ui, db, obj) = (ui.clone(), database.clone(), o.clone());
+        move |_| {
+            if crate::object_editor::is_editable_object(&obj) {
+                crate::object_editor::open_for_object(&ui, &db, &obj);
+            }
+        }
+    })
     .on_secondary_click_stop({
         let (db, obj) = (database.clone(), o.clone());
         let display = schemaic_core::schema::display_name(obj.schema(), obj.name());
@@ -1587,10 +1672,14 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
     let key_count = table.indexes.len();
     let ddl = table.create_ddl(dialect);
     // Views get a distinct glyph + tint; base tables keep the green table icon.
-    let (glyph, glyph_color) = if table.is_view {
-        (icons::TABLE_CELLS_MERGE, theme::view_icon())
+    // The colour is the **function**, not its value: this node is rebuilt only
+    // when the expansion, schema or filter changes, none of which a theme switch
+    // touches, so a `Color` resolved here would keep the old theme's tint until
+    // something else forced a rebuild.
+    let (glyph, glyph_color): (&'static str, fn() -> Color) = if table.is_view {
+        (icons::TABLE_CELLS_MERGE, theme::view_icon)
     } else {
-        (icons::TABLE, theme::table_icon())
+        (icons::TABLE, theme::table_icon)
     };
 
     let dbl_source = source.clone();
@@ -1604,7 +1693,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
     let header = h_stack((
         chevron(expanded, key.clone(), on_toggle),
         icons::icon(glyph, SCHEMA_ICON as f32).style(move |s| {
-            s.color(glyph_color)
+            s.color(glyph_color())
                 .margin_left(CHEVRON_GAP)
                 .margin_right(ICON_GAP)
                 .flex_shrink(0.0_f32)
@@ -2501,6 +2590,62 @@ mod tests {
             !keys.iter().any(|k| k.starts_with("objgrp:shop::domain")),
             "{keys:?}"
         );
+    }
+
+    /// The render and `nav_rows` now decide through **one** predicate each, so
+    /// the two can't drift again. The tests above exercise `nav_rows`; these
+    /// pin the shared functions themselves, which is the half that was missing
+    /// — a `nav_rows`-only test passes while the render hides the row.
+    #[test]
+    fn the_shared_filter_predicates_keep_a_level_its_object_matches() {
+        let s = objects_db("shop", vec![tbl(Some("public"), "orders")], "public")
+            .schema
+            .expect("loaded");
+        // No table matches `mood`, but the enum does — so the database survives.
+        assert!(db_survives(Some(&s), "shop", "mood"));
+        assert!(namespace_survives(&s, "public", false, "mood"));
+        // Nothing matches at all: both levels go.
+        assert!(!db_survives(Some(&s), "shop", "zzz"));
+        assert!(!namespace_survives(&s, "public", false, "zzz"));
+        // A database whose schema hasn't loaded can't be judged, so it stays.
+        assert!(db_survives(None, "shop", "zzz"));
+        // The level's own name still wins, and so does an empty filter.
+        assert!(db_survives(Some(&s), "shop", "sho"));
+        assert!(db_survives(Some(&s), "shop", ""));
+        assert!(namespace_survives(&s, "public", true, "zzz"));
+
+        // The converse: a folder with nothing to show renders nothing, so a
+        // header with a count and no reachable children can't happen.
+        let enums = s.objects_all(ObjectKind::Enum);
+        assert!(objects_shown(&enums, false, false, "zzz").is_empty());
+        assert_eq!(objects_shown(&enums, false, false, "mood").len(), 1);
+        // A match on the level above shows the whole folder.
+        assert_eq!(objects_shown(&enums, true, false, "zzz").len(), enums.len());
+        assert_eq!(objects_shown(&enums, false, true, "zzz").len(), enums.len());
+    }
+
+    /// Enter rebuilds an object leaf's key from the schema, exactly as
+    /// `push_objects` builds it — the two are compared as strings, so they have
+    /// to agree byte for byte or the handler silently does nothing.
+    #[test]
+    fn an_object_leafs_nav_key_is_the_one_the_enter_handler_rebuilds() {
+        let s = objects_db("shop", vec![], "public").schema.expect("loaded");
+        for (k, items) in object_groups(&s, TableScope::Flat) {
+            let group = object_group_key("shop", TableScope::Flat, k);
+            let rows = walk(
+                &[objects_db("shop", vec![], "public")],
+                &["db:shop", &group],
+                &[],
+                "",
+            );
+            for o in &items {
+                let from_render = object_key("shop", TableScope::Flat, k, o.name());
+                assert!(
+                    rows.iter().any(|(key, _)| key == &from_render),
+                    "{from_render} is not a nav row"
+                );
+            }
+        }
     }
 
     #[test]

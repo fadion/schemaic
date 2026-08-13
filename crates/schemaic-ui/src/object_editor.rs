@@ -33,7 +33,7 @@ use floem::prelude::*;
 use floem::reactive::create_effect;
 
 use schemaic_core::ddl::{self, DomainDraft, EnumDraft, ObjectDraft, ObjectKind, SequenceDraft};
-use schemaic_core::schema::{CheckInfo, ObjectItem, SchemaState};
+use schemaic_core::schema::{CheckInfo, ObjectItem, SchemaState, SequenceInfo, SequenceOwner};
 
 use crate::table_designer::{edit_ctx, owned_dropdown, suggest_chevron};
 use crate::widgets::{
@@ -663,7 +663,26 @@ fn domain_form(ui: &Ui, d: &DomainDraft, dialect: schemaic_core::intel::SqlDiale
 
 // ── the sequence form ────────────────────────────────────────────────────────
 
-fn sequence_form(ui: &Ui, d: &SequenceDraft) -> AnyView {
+/// What "Detach from its column" writes to the draft, in **both** directions.
+///
+/// The `false` direction is the one that was missing: the toggle applied only
+/// on `true`, so unticking it left `OWNED BY NONE` in the plan with the control
+/// reading *off*. There is nowhere else to recover the owner from — the editor
+/// offers no owner picker — so the original comes from `ObjectTarget::current`
+/// rather than from the draft it is about to overwrite.
+pub(crate) fn detach_apply(orig: Option<&SequenceOwner>, detached: bool) -> Option<SequenceOwner> {
+    if detached { None } else { orig.cloned() }
+}
+
+/// The sequence a target holds, for reading state the draft may have cleared.
+fn target_sequence(target: &ObjectTarget) -> Option<&SequenceInfo> {
+    match target.current.as_ref() {
+        Some(ObjectItem::Sequence(s)) => Some(s),
+        _ => None,
+    }
+}
+
+fn sequence_form(ui: &Ui, d: &SequenceDraft, orig_owner: Option<SequenceOwner>) -> AnyView {
     let draft = ui.ddl.object_draft;
     let name = form_setting(
         "Name",
@@ -819,7 +838,12 @@ fn sequence_form(ui: &Ui, d: &SequenceDraft) -> AnyView {
     // control: re-pointing a sequence at a different column needs a table and a
     // column picker for something almost nobody does, and `OWNED BY` is what
     // makes the sequence get dropped with its column.
-    let owner: AnyView = match d.info.owned_by.clone() {
+    //
+    // Rendered from the **server's** owner, not the draft's: the draft is what
+    // the toggle clears, so reading it here made the row and the toggle vanish
+    // the moment the form rebuilt — leaving a pending `OWNED BY NONE` in the
+    // change count with nothing on screen that named it or could undo it.
+    let owner: AnyView = match orig_owner.clone() {
         Some(o) => v_stack((
             form_setting_owned(
                 "Owned by".to_string(),
@@ -830,12 +854,10 @@ fn sequence_form(ui: &Ui, d: &SequenceDraft) -> AnyView {
                 ui,
                 "Detach from its column",
                 "The sequence stops being dropped with the column, and outlives it.",
-                false,
-                |d, v| {
-                    if let ObjectDraft::Sequence(s) = d
-                        && v
-                    {
-                        s.info.owned_by = None;
+                d.info.owned_by.is_none(),
+                move |d, v| {
+                    if let ObjectDraft::Sequence(s) = d {
+                        s.info.owned_by = detach_apply(orig_owner.as_ref(), v);
                     }
                 },
             ),
@@ -887,7 +909,11 @@ fn form(ui: &Ui, target: &ObjectTarget) -> AnyView {
     let body = match &draft {
         ObjectDraft::Enum(d) => enum_form(ui, d),
         ObjectDraft::Domain(d) => domain_form(ui, d, target.dialect),
-        ObjectDraft::Sequence(d) => sequence_form(ui, d),
+        ObjectDraft::Sequence(d) => sequence_form(
+            ui,
+            d,
+            target_sequence(target).and_then(|s| s.owned_by.clone()),
+        ),
     };
     v_stack((body,))
         .style(|s| s.flex_col().gap(FORM_GAP).width_full())
@@ -1056,5 +1082,26 @@ mod tests {
         // Everything else is editable.
         assert!(is_editable_object(&ObjectItem::Enum(Default::default())));
         assert!(is_editable_object(&ObjectItem::Domain(Default::default())));
+    }
+
+    /// Detaching has to be undoable, and there is nowhere else to recover the
+    /// owner from: the toggle used to apply only on `true`, so changing your
+    /// mind left `OWNED BY NONE` in the plan with the control reading *off*.
+    #[test]
+    fn detaching_a_sequence_round_trips_through_the_toggle() {
+        let orig = SequenceOwner {
+            table: "orders".into(),
+            column: "id".into(),
+            internal: false,
+        };
+        assert_eq!(detach_apply(Some(&orig), true), None);
+        assert_eq!(detach_apply(Some(&orig), false), Some(orig.clone()));
+        // Some(o) → None → Some(o): the second call has to restore what the
+        // first cleared, which is why it reads the *target*, not the draft.
+        let after = detach_apply(Some(&orig), true);
+        assert_eq!(detach_apply(Some(&orig), after.is_none()), None);
+        assert_eq!(detach_apply(Some(&orig), false), Some(orig));
+        // A sequence that never had an owner has nothing to restore.
+        assert_eq!(detach_apply(None, false), None);
     }
 }

@@ -595,11 +595,20 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     ddl,
                 } => {
                     let kind = item.kind();
+                    // `database.schema.name`, the shape the table entry uses and
+                    // for the same reason. `menu.name` is the *display* name,
+                    // whose job is to drop `public` — so for the common case it
+                    // was byte-identical to "Name" above and resolved through
+                    // whatever `search_path` happened to be.
+                    let qualified = format!(
+                        "{database}.{}",
+                        schemaic_core::schema::display_name(item.schema(), item.name())
+                    );
                     entries.push(MenuEntry::sub(
                         "Copy",
                         vec![
                             MenuEntry::action("Name", copy(item.name().to_string())),
-                            MenuEntry::action("Qualified name", copy(menu.name.clone())),
+                            MenuEntry::action("Qualified name", copy(qualified)),
                         ],
                     ));
                     {
