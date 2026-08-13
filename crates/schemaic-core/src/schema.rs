@@ -630,12 +630,23 @@ impl TriggerTiming {
 }
 
 /// What a trigger fires on.
+///
+/// **The declaration order is load-bearing**: the derived `Ord` is the order the
+/// UI sorts a trigger's events into, and it must be the order PostgreSQL prints
+/// them in — which is `pg_trigger.tgtype`'s bit order, `INSERT`(4),
+/// `DELETE`(8), `UPDATE`(16), `TRUNCATE`(32), *not* the DML order a person would
+/// write down. When this read `Insert, Update, Delete`, an introspected
+/// `AFTER DELETE OR UPDATE` trigger came back as `[Delete, Update]`, one tick of
+/// any checkbox renormalised it to `[Update, Delete]`, and `diff_triggers`'
+/// element-wise compare reported a change on a trigger nothing had touched — so
+/// Apply emitted a `DROP` + `CREATE` of its own accord. `db::pg_trigger_type`
+/// pins the two together from the side that can see both.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TriggerEvent {
     #[default]
     Insert,
-    Update,
     Delete,
+    Update,
     /// **PostgreSQL only**, and only `FOR EACH STATEMENT`.
     Truncate,
 }
@@ -654,8 +665,8 @@ impl TriggerEvent {
         let s = s.trim();
         [
             TriggerEvent::Insert,
-            TriggerEvent::Update,
             TriggerEvent::Delete,
+            TriggerEvent::Update,
             TriggerEvent::Truncate,
         ]
         .into_iter()

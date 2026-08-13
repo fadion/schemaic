@@ -5733,6 +5733,34 @@ mod tests {
             assert!(diff_triggers(&t.triggers, &d, MySql).changes.is_empty());
         }
 
+        /// The other half of the gate: the UI sorts a trigger's events whenever
+        /// a checkbox is ticked, so a *sorted* copy of an introspected trigger
+        /// must still diff to nothing.
+        ///
+        /// It did not. PostgreSQL prints `AFTER DELETE OR UPDATE` in `tgtype`
+        /// bit order, so introspection produced `[Delete, Update]`, while
+        /// `TriggerEvent`'s derived `Ord` followed a declaration order of
+        /// `Insert, Update, Delete` and re-sorted it to `[Update, Delete]`.
+        /// Ticking any event on and straight back off left the designer
+        /// reporting one change and offering to drop and recreate a trigger
+        /// nothing had touched — and that phantom recreate is how a trigger's
+        /// unmodelled state gets destroyed with the user having asked for
+        /// nothing at all.
+        #[test]
+        fn sorting_an_introspected_triggers_events_is_not_a_change() {
+            let mut pg = pg_trigger();
+            pg.events = vec![TriggerEvent::Delete, TriggerEvent::Update];
+            let t = table_with_triggers(vec![pg]);
+            let mut d = TriggerSetDraft::from_table(&t);
+            // Exactly what `ui::trigger_editor` does on every event toggle.
+            d.triggers[0].info.events.sort();
+            assert!(
+                diff_triggers(&t.triggers, &d, Postgres).changes.is_empty(),
+                "phantom change: {:?}",
+                diff_triggers(&t.triggers, &d, Postgres).emit()
+            );
+        }
+
         #[test]
         fn removing_a_trigger_from_the_set_drops_it() {
             let t = table_with_triggers(vec![my_trigger()]);

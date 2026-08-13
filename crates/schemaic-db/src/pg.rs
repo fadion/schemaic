@@ -2301,6 +2301,26 @@ mod tests {
         );
     }
 
+    /// The two canonical orderings must be **the same** ordering.
+    ///
+    /// This module builds its vec in `tgtype` bit order; `TriggerEvent`'s derived
+    /// `Ord` follows its declaration order in `schemaic-core`. When those
+    /// disagreed, `ui::trigger_editor`'s `events.sort()` renormalised an
+    /// introspected `[Delete, Update]` to `[Update, Delete]`, `diff_triggers`'
+    /// element-wise compare saw a change, and one tick of any checkbox — on and
+    /// straight back off — made the designer offer to drop and recreate a
+    /// trigger nothing had touched.
+    #[test]
+    fn the_introspected_event_order_is_already_sorted() {
+        // `tgtype = 25` is `AFTER DELETE OR UPDATE FOR EACH ROW`, confirmed live.
+        for tgtype in [25, 1 | 4 | 8 | 16 | 32, 1 | 4 | 16, 1 | 8, 32] {
+            let (_, events, _) = pg_trigger_type(tgtype);
+            let mut sorted = events.clone();
+            sorted.sort();
+            assert_eq!(events, sorted, "tgtype = {tgtype}");
+        }
+    }
+
     /// Verbatim `pg_get_triggerdef` output from PostgreSQL 16.14 — the guard has
     /// the server's own double parens and a cast, and the call carries a literal
     /// with an escaped quote.
