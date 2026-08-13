@@ -957,33 +957,57 @@ impl TypeDependent {
     }
 }
 
-/// Every column in `schema` declared as the type `name` (or an array of it).
+/// Every column **anywhere in the database** declared as the type
+/// `schema.name` (or an array of it).
 ///
-/// Name-matched against the introspected `type_name`, which is what
-/// `format_type` reports — so `mood` and `mood[]` both count and a
-/// same-named type in another namespace doesn't. It is deliberately a *lower*
-/// bound: a view, function or composite built on the type can't be enumerated
-/// from `DbSchema` at all, which is why the recreate's risk sentence says the
-/// server may still refuse rather than promising the list is complete.
+/// Matched on the *type's* identity, which is not the same question as the
+/// table's namespace and used to be conflated with it. `format_type` writes
+/// `sales.mood` for a type off the `search_path` and a bare `mood` for one on
+/// it, so: a **qualified** name must match both halves, and an **unqualified**
+/// one matches only the default namespace, because that is the only place an
+/// unqualified `format_type` result can have come from.
+///
+/// Scanning tables in every namespace is deliberate — a column declared with
+/// this type can live anywhere, and skipping the ones that didn't share its
+/// namespace meant the rebuild's final `DROP TYPE` failed on a dependent the
+/// list never mentioned.
+///
+/// It remains a *lower* bound: a view, function or composite built on the type
+/// can't be enumerated from `DbSchema` at all, which is why the recreate's risk
+/// sentence says the server may still refuse rather than promising the list is
+/// complete.
 pub fn type_dependents(
     db: &crate::schema::DbSchema,
     schema: Option<&str>,
     name: &str,
 ) -> Vec<TypeDependent> {
+    let target_ns = schema.unwrap_or(crate::schema::PG_DEFAULT_SCHEMA);
     let mut out = Vec::new();
     for t in &db.tables {
         // A view has no storage, so nothing in it is re-cast — and its *body* is
         // the dependency that makes the drop fail, which this can't fix anyway.
-        if t.is_view || t.schema.as_deref() != schema {
+        // (A materialized view has storage but no `ALTER COLUMN … TYPE`, so it
+        // can't be re-cast either; PostgreSQL refusing the `DROP TYPE` is the
+        // documented lower bound.)
+        if t.is_view {
             continue;
         }
         for c in &t.columns {
-            let bare = c.type_name.trim().trim_end_matches("[]").trim();
-            // The qualifier is dropped before comparing: `format_type` writes
-            // `sales.mood` for a type off the search_path and a bare `mood` for
-            // one on it, and both are the same type.
-            let bare = bare.rsplit('.').next().unwrap_or(bare);
-            if bare.eq_ignore_ascii_case(name) {
+            let declared = c.type_name.trim().trim_end_matches("[]").trim();
+            let matches = match declared.rsplit_once('.') {
+                // Qualified: both halves, or it is a different type that merely
+                // shares a name.
+                Some((ns, bare)) => {
+                    ns.eq_ignore_ascii_case(target_ns) && bare.eq_ignore_ascii_case(name)
+                }
+                // Unqualified ⇒ resolved through the `search_path`, so it is the
+                // default namespace's type and nothing else.
+                None => {
+                    declared.eq_ignore_ascii_case(name)
+                        && target_ns.eq_ignore_ascii_case(crate::schema::PG_DEFAULT_SCHEMA)
+                }
+            };
+            if matches {
                 out.push(TypeDependent {
                     schema: t.schema.clone(),
                     table: t.name.clone(),
@@ -8313,11 +8337,16 @@ mod object_tests {
                     ],
                     ..Default::default()
                 },
-                // Another namespace's same-named type is a different type.
+                // Another namespace's same-named type is a different type — and
+                // saying so takes the **qualifier**, not the table's namespace.
+                // This column used to be declared a bare `mood`, which
+                // `format_type` only writes for a type on the `search_path`,
+                // i.e. `public.mood`: the fixture asserted the table's namespace
+                // decided the type's identity, which is exactly the defect.
                 TableInfo {
                     name: "elsewhere".into(),
                     schema: Some("sales".into()),
-                    columns: vec![colt("m", "mood")],
+                    columns: vec![colt("m", "sales.mood")],
                     ..Default::default()
                 },
                 // A view has no storage to re-cast.
@@ -8345,6 +8374,65 @@ mod object_tests {
             type_dependents(&schema_using_mood(), Some("sales"), "mood").len(),
             1
         );
+    }
+
+    /// The dependent is decided by the **type's** identity, not the table's.
+    ///
+    /// `type_dependents` filtered on `t.schema != schema` and then stripped the
+    /// qualifier before comparing names, so it answered a question nobody
+    /// asked — "which columns of tables in this namespace are declared with
+    /// something *called* this". Two opposite faults, and the function's own
+    /// doc claimed neither happened:
+    ///
+    /// - a `public.orders.state` column declared `sales.status` was re-cast to
+    ///   `public.status`, silently retyping a column the user never edited;
+    /// - a `sales.audit.state` column declared `public.status` was **skipped**,
+    ///   so the final `DROP TYPE` failed and the rebuild became impossible with
+    ///   no way to see why.
+    #[test]
+    fn dependents_are_matched_on_the_types_identity_not_the_tables_namespace() {
+        let colt = |name: &str, ty: &str| ColumnInfo {
+            name: name.into(),
+            type_name: ty.into(),
+            ..Default::default()
+        };
+        let db = crate::schema::DbSchema {
+            tables: vec![
+                TableInfo {
+                    name: "orders".into(),
+                    schema: Some("public".into()),
+                    // Another namespace's type, in a table in *this* one.
+                    columns: vec![colt("state", "sales.status"), colt("ok", "status")],
+                    ..Default::default()
+                },
+                TableInfo {
+                    name: "audit".into(),
+                    schema: Some("sales".into()),
+                    // *This* namespace's type, in a table somewhere else.
+                    columns: vec![colt("state", "public.status")],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let deps = type_dependents(&db, Some("public"), "status");
+        let got: Vec<(&str, &str)> = deps
+            .iter()
+            .map(|d| (d.table.as_str(), d.column.as_str()))
+            .collect();
+        // `public.orders.ok` (unqualified ⇒ on the search_path ⇒ public) and
+        // `sales.audit.state` (explicitly public). Not `orders.state`, which is
+        // `sales.status`.
+        assert_eq!(got, vec![("orders", "ok"), ("audit", "state")], "{got:?}");
+
+        // And the mirror: `sales.status`'s one dependent lives in `public`.
+        let deps = type_dependents(&db, Some("sales"), "status");
+        let got: Vec<(&str, &str)> = deps
+            .iter()
+            .map(|d| (d.table.as_str(), d.column.as_str()))
+            .collect();
+        assert_eq!(got, vec![("orders", "state")], "{got:?}");
     }
 
     #[test]
