@@ -1397,7 +1397,11 @@ fn object_group_node(
     .style({
         let hl = key.clone();
         move |s| {
-            let s = tree_row(s, ROW_PAD + indent).gap(6.0);
+            // Exactly `table_node`'s indent, because a folder sits at the same
+            // level a table does: under the database when the tree is flat, and
+            // one step under the namespace row when it isn't. `ROW_PAD + indent`
+            // put it *level with* the namespace it belongs to.
+            let s = tree_row(s, ROW_PAD + LEVEL_INDENT + indent).gap(6.0);
             if is_nav_selected(nav, &hl) {
                 s.background(theme::row_selected())
             } else {
