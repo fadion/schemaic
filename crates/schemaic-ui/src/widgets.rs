@@ -155,14 +155,24 @@ pub(crate) const MODAL_PAD_H: f64 = 14.0;
 /// colour picker. Settings was built in this style and the modals that came after
 /// each re-spelled it slightly differently (`text_dim` here, `text_faint` there,
 /// three font sizes), which is the drift these exist to end.
+///
+/// **`text_dim`, not `text_muted`.** A caption is body text a user is expected to
+/// read, and this one fn paints every one in the app; `text_muted` is 2.55:1 on
+/// `bg_panel` in the dark theme and 2.8:1 in the light one, against a `Body`
+/// floor of 4.5. `text_dim` is 4.45:1, which is what these captions were before
+/// they were collected here — the collecting was right, the colour it landed on
+/// was not.
 pub(crate) fn form_label_style(s: floem::style::Style) -> floem::style::Style {
-    s.color(theme::text_muted()).font_size(theme::FONT_LABEL)
+    s.color(theme::text_dim()).font_size(theme::FONT_LABEL)
 }
 
-/// The hint under a control: the label's colour faded, a size down. See
-/// [`form_label_style`].
+/// The hint under a control: recessive, a size down. See [`form_label_style`].
+///
+/// `text_faint`, not `text_muted` at 60% — the latter composites to 1.70:1,
+/// under even the `Recessive` floor of 2.0, which no other foreground in
+/// `UI_PAIRINGS` misses.
 pub(crate) fn form_hint_style(s: floem::style::Style) -> floem::style::Style {
-    s.color(theme::form_hint()).font_size(theme::FONT_HINT)
+    s.color(theme::text_faint()).font_size(theme::FONT_HINT)
 }
 
 /// A form hint as a view — the common case, where the text is a literal.

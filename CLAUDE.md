@@ -649,7 +649,10 @@ Zed-inspired, aiming to replace DataGrip.
     views, which is how three sites shipped at 1.02:1 in *both* themes. Chrome that is below AA
     today is listed in `UI_SHORTFALL` with the ratio it manages: an unlisted pairing must meet its
     floor (so a new colour, surface or theme is held to AA), a listed one may never get worse, and
-    a listed one that now passes must be deleted — the baseline can only shrink. Adding a theme
+    a listed one that now passes must be deleted — the baseline can only shrink. **A baseline entry
+    is keyed on `(theme, fg, bg, role)`, the role included**: keyed on the colours alone, *reusing*
+    a listed colour in a harder role was invisible to the gate, which is how every form caption in
+    the app came to be painted at 2.55:1 under a row baselined for icons. Adding a theme
     needs no work here; painting a role on a new surface means adding its row.
   - `lib.rs` (~5.6k lines; `grid.rs` at ~6.3k is the crate's largest) — the `Ui` struct + bundles, shared model/state
     types, `workspace`/`body`/`center`/`header`/`footer`, resize handles, `edit_field`/`FieldCfg`,
