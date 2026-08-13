@@ -103,18 +103,40 @@ debug = true
 # debuggability. `package."*"` also matches our crates when they're built as
 # dependencies of `schemaic-app`, so each is pinned back to 0 explicitly.
 # One-time cost: a full -O3 rebuild of all dependencies (a few minutes, once).
+#
+# Dev-build **disk**, the other axis, is a measurement (2026-08-13): a 177 GB
+# working directory, 166 GB of it `target/debug`, and debug info was most of it —
+# 38 GB of `.rlib` + 18 GB of `.pdb` under `deps/`, plus a 102 GB `incremental/`
+# cache whose `.o` files carry the same information a second time. So debug info
+# is cut on both sides: **off entirely for dependencies** (a backtrace through
+# wgpu/cosmic-text is a wall of frames you read the top of) and
+# **`line-tables-only` for our own crates** — a panic still names the file and
+# line, which is what a backtrace is read for here, without the type/variable
+# tables that dominate the object files. `line-tables-only` is restated per crate
+# because `package."*"` also matches our crates when they're built as
+# dependencies of `schemaic-app`, the same reason `opt-level` is.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 opt-level = 3
+debug = false
 
 [profile.dev.package.schemaic-core]
 opt-level = 0
+debug = "line-tables-only"
 [profile.dev.package.schemaic-db]
 opt-level = 0
+debug = "line-tables-only"
 [profile.dev.package.schemaic-ai]
 opt-level = 0
+debug = "line-tables-only"
 [profile.dev.package.schemaic-term]
 opt-level = 0
+debug = "line-tables-only"
 [profile.dev.package.schemaic-ui]
 opt-level = 0
+debug = "line-tables-only"
 [profile.dev.package.schemaic-app]
 opt-level = 0
+debug = "line-tables-only"
