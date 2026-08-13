@@ -1102,6 +1102,9 @@ fn apply_check_constraints(schema: &mut DbSchema, rows: &[MyCheckRow], mariadb: 
                 // MariaDB has no `NOT ENFORCED` and the query hardcodes `YES`
                 // there, so this reads as enforced on both.
                 enforced: !enforced.eq_ignore_ascii_case("NO"),
+                // `NOT VALID` / `NO INHERIT` are PostgreSQL's; neither engine
+                // here can report one, and the emitter writes neither.
+                ..Default::default()
             })
             .collect();
     }

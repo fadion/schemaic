@@ -3612,7 +3612,57 @@ pub fn check_predicate(raw: &str, dialect: SqlDialect) -> String {
         .or_else(|| t.strip_prefix("check"))
         .filter(|rest| rest.starts_with(['(', ' ', '\t', '\n']))
         .unwrap_or(t);
-    peel_parens(t, dialect).to_string()
+    peel_parens(check_trailers(t).0, dialect).to_string()
+}
+
+/// Split PostgreSQL's clause trailers off the end of a `pg_get_constraintdef`
+/// body: `(predicate, validated, inherited)`.
+///
+/// `pg_get_constraintdef` returns the **whole clause** — `CHECK ((qty > 0))
+/// NOT VALID`, or `CHECK ((…)) NO INHERIT NOT VALID` — and `peel_parens` gates
+/// on the text ending in `)`, which a trailer makes false. So the trailer was
+/// stored *inside* `expression` and the emitter wrapped the lot:
+/// `CHECK (((qty > 0)) NOT VALID)`, which every path that emits a check turned
+/// into `ERROR: syntax error at or near "NOT"` — Copy DDL, `CREATE TABLE`, the
+/// preview's script, and domain checks, which share this parser.
+///
+/// Order follows the server's own printing, so both are stripped in one pass
+/// regardless of which are present.
+fn check_trailers(s: &str) -> (&str, bool, bool) {
+    let mut t = s.trim_end();
+    let mut validated = true;
+    let mut inherited = true;
+    // Right to left, since that is the order they were appended in.
+    for (kw, flag) in [
+        ("NOT VALID", &mut validated),
+        ("NO INHERIT", &mut inherited),
+    ] {
+        let end = t.len().saturating_sub(kw.len());
+        if t.len() > kw.len() && t[end..].eq_ignore_ascii_case(kw) {
+            // Only when it really is a trailing *clause*, not the tail of the
+            // predicate's own last token.
+            let before = t[..end].trim_end();
+            if before.len() < t[..end].len() {
+                *flag = false;
+                t = before;
+            }
+        }
+    }
+    (t, validated, inherited)
+}
+
+/// The `NOT VALID` / `NO INHERIT` flags of a `pg_get_constraintdef` body, for
+/// the introspection side to record beside the predicate that
+/// [`check_predicate`] extracts from the same text.
+pub fn check_clause_flags(raw: &str) -> (bool, bool) {
+    let t = raw.trim();
+    let t = t
+        .strip_prefix("CHECK")
+        .or_else(|| t.strip_prefix("check"))
+        .filter(|rest| rest.starts_with(['(', ' ', '\t', '\n']))
+        .unwrap_or(t);
+    let (_, validated, inherited) = check_trailers(t);
+    (validated, inherited)
 }
 
 /// The bare `WHEN` guard of a trigger, as the model stores it — the same
@@ -5684,6 +5734,76 @@ mod tests {
             );
         }
 
+        /// A PostgreSQL clause trailer belongs to the *constraint*, not to the
+        /// predicate — and putting it in the predicate made every statement
+        /// Schemaic emitted for that table a syntax error.
+        ///
+        /// `pg_get_constraintdef` returns `CHECK ((qty > 0)) NOT VALID`;
+        /// `peel_parens` gates on the text ending in `)`, which the trailer
+        /// makes false, so the whole thing was stored as the expression and
+        /// `clause_sql` wrapped it: `CHECK (((qty > 0)) NOT VALID)` →
+        /// `ERROR: syntax error at or near "NOT"`. Copy DDL, `CREATE TABLE`,
+        /// the preview's script and every domain check share the path. All four
+        /// inputs below are verbatim PG 16.14 output.
+        #[test]
+        fn a_postgres_clause_trailer_is_not_part_of_the_predicate() {
+            assert_eq!(
+                check_predicate("CHECK ((qty > 0)) NOT VALID", Postgres),
+                "qty > 0"
+            );
+            assert_eq!(
+                check_predicate("CHECK ((qty < 100)) NO INHERIT", Postgres),
+                "qty < 100"
+            );
+            // Both, in the order the server prints them — and a close-paren
+            // inside a literal, which is why the peel goes through the lexer.
+            assert_eq!(
+                check_predicate("CHECK ((name <> ')'::text)) NO INHERIT NOT VALID", Postgres),
+                "name <> ')'::text"
+            );
+            assert_eq!(check_predicate("CHECK ((qty <> 5))", Postgres), "qty <> 5");
+        }
+
+        /// The trailers are *carried*, not dropped: restating the constraint
+        /// without them changes what the table promises, and would turn a
+        /// working Copy DDL script into one that fails on data the server
+        /// itself accepts.
+        #[test]
+        fn a_carried_trailer_round_trips_through_the_emitter() {
+            for (raw, tail) in [
+                ("CHECK ((qty > 0)) NOT VALID", " NOT VALID"),
+                ("CHECK ((qty > 0)) NO INHERIT", " NO INHERIT"),
+                (
+                    "CHECK ((qty > 0)) NO INHERIT NOT VALID",
+                    " NO INHERIT NOT VALID",
+                ),
+                ("CHECK ((qty > 0))", ""),
+            ] {
+                let (validated, inherited) = check_clause_flags(raw);
+                let ck = CheckInfo {
+                    name: "c".into(),
+                    expression: check_predicate(raw, Postgres),
+                    validated,
+                    inherited,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    ck.clause_sql(Postgres),
+                    format!("CONSTRAINT \"c\" CHECK (qty > 0){tail}"),
+                    "{raw}"
+                );
+            }
+            // MySQL has neither clause and must never grow one.
+            let ck = CheckInfo {
+                name: "c".into(),
+                expression: "qty > 0".into(),
+                validated: false,
+                inherited: false,
+                enforced: true,
+            };
+            assert_eq!(ck.clause_sql(MySql), "CONSTRAINT `c` CHECK (qty > 0)");
+        }
+
         /// `CHECK` is stripped only as a leading *word* — a predicate may open
         /// with a column whose name merely starts with those five letters.
         #[test]
@@ -6607,6 +6727,7 @@ mod tests {
                         name: "slug_shape".into(),
                         expression: "`slug` <> _utf8mb4''".into(),
                         enforced: false,
+                        ..Default::default()
                     },
                 ],
                 ..Default::default()
@@ -8085,7 +8206,7 @@ mod object_tests {
             checks: vec![CheckInfo {
                 name: "email_shaped".into(),
                 expression: "(VALUE)::text ~ '@'::text".into(),
-                enforced: true,
+                ..Default::default()
             }],
             comment: Some("an address".into()),
         }
@@ -8243,7 +8364,7 @@ mod object_tests {
             d.info.checks = vec![CheckInfo {
                 name: "email_shaped".into(),
                 expression: "(VALUE)::text ~ '@example'::text".into(),
-                enforced: true,
+                ..Default::default()
             }];
         });
         assert_eq!(

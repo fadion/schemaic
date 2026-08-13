@@ -1041,6 +1041,11 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
                 // PostgreSQL has no `NOT ENFORCED`; its `NOT VALID` exempts only
                 // the rows already there, which can't change what a write does.
                 enforced: true,
+                // …but it is still part of the clause, and restating it wrong
+                // changes what the table promises. Read from the same text the
+                // predicate came out of.
+                validated: schemaic_core::ddl::check_clause_flags(&cell(r, 3)).0,
+                inherited: schemaic_core::ddl::check_clause_flags(&cell(r, 3)).1,
             })
             .collect();
         t.triggers = trigger_all
@@ -1240,6 +1245,11 @@ fn pg_fold_types(
                         ),
                         // PostgreSQL has no `NOT ENFORCED`.
                         enforced: true,
+                        // A domain's checks share the table path's parser, and
+                        // so shared its bug: a `NOT VALID` one made every
+                        // statement the domain emitted a syntax error.
+                        validated: schemaic_core::ddl::check_clause_flags(&cell(c, 3)).0,
+                        inherited: schemaic_core::ddl::check_clause_flags(&cell(c, 3)).1,
                     })
                     .collect(),
                 comment,

@@ -506,6 +506,18 @@ pub struct CheckInfo {
     /// change what a write does — re-adding such a constraint as valid fails
     /// loudly against the rows that violate it, which is a report, not a trap.
     pub enforced: bool,
+    /// **PostgreSQL**: `false` when the constraint was added `NOT VALID`, so the
+    /// rows already in the table were never checked against it.
+    ///
+    /// Carried and restated rather than dropped. Dropping it is *safe* — the
+    /// re-add fails loudly against violating rows rather than silently letting
+    /// them through — but it is still a change to what the table promises, made
+    /// by an edit that asked for something else, and it would turn a working
+    /// Copy DDL script into one that fails on data the server itself accepts.
+    pub validated: bool,
+    /// **PostgreSQL**: `false` when the constraint was added `NO INHERIT`, so
+    /// child tables don't get it. Restated for the same reason.
+    pub inherited: bool,
 }
 
 impl Default for CheckInfo {
@@ -516,6 +528,10 @@ impl Default for CheckInfo {
             name: String::new(),
             expression: String::new(),
             enforced: true,
+            // Same rule: the opposite defaults would emit `NOT VALID` /
+            // `NO INHERIT` on every check nobody asked to weaken.
+            validated: true,
+            inherited: true,
         }
     }
 }
@@ -530,7 +546,16 @@ impl CheckInfo {
             ddl_ident_in(&self.name, dialect),
             self.expression
         );
-        if !self.enforced && dialect != crate::intel::SqlDialect::Postgres {
+        if dialect == crate::intel::SqlDialect::Postgres {
+            // PostgreSQL's own order, as `pg_get_constraintdef` prints it:
+            // `CHECK (…) NO INHERIT NOT VALID`.
+            if !self.inherited {
+                out.push_str(" NO INHERIT");
+            }
+            if !self.validated {
+                out.push_str(" NOT VALID");
+            }
+        } else if !self.enforced {
             out.push_str(" NOT ENFORCED");
         }
         out
@@ -2443,6 +2468,7 @@ mod tests {
             name: "soft".into(),
             expression: "qty > 0".into(),
             enforced: false,
+            ..Default::default()
         };
         assert_eq!(
             c.clause_sql(crate::intel::SqlDialect::MySql),
@@ -3268,7 +3294,7 @@ mod tests {
             checks: vec![CheckInfo {
                 name: "email_shaped".into(),
                 expression: "VALUE ~ '@'::text".into(),
-                enforced: true,
+                ..Default::default()
             }],
             comment: None,
         };
