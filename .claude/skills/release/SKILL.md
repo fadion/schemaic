@@ -23,8 +23,11 @@ git status --short
 The tree must be clean. Uncommitted work means the user has something in flight:
 stop and ask rather than sweeping it into the release.
 
-Then confirm the tree is green locally, because CI checks exactly these three and
-an unformatted tree is historically the most common CI failure:
+Then confirm the tree is green locally. Run **all five** — this list mirrors
+`.github/workflows/ci.yml`, so check it against that file rather than against
+memory, and add anything CI has grown since. A local bar narrower than CI's is
+worse than no local check: it reports the ground as clear and the push fails
+anyway.
 
 ```bash
 cargo fmt --all --check
@@ -35,12 +38,26 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ```bash
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+```
+
+```bash
+cargo deny check
+```
+
+```bash
 cargo test --workspace
 ```
 
+An unformatted tree is historically the most common CI failure, and rustdoc the
+most commonly *forgotten* check — nothing in day-to-day work runs it, so a doc
+link left pointing at a renamed item sits green locally and fails the release
+push. It has already cost one.
+
 If `fmt --check` fails, run `cargo fmt --all`, commit the result as its own
-`style:` or `chore:` commit, and carry on. Failing clippy or tests is a stop —
-that's real breakage, not a formatting nit.
+`style:` or `chore:` commit, and carry on. A broken doc link is the same shape:
+fix it, commit it as `docs:`, carry on. Failing clippy, `deny` or tests is a stop
+— that's real breakage, not a formatting nit.
 
 Also read the current version so you can sanity-check the requested one:
 
@@ -50,6 +67,15 @@ grep -n '^version' Cargo.toml
 
 The new version must be greater than the current one, and the tag must not
 already exist (`git tag --list vX.Y.Z`). If either is off, stop and ask.
+
+Finally, check whether the range being shipped has been reviewed. If
+`review/release-<last-tag>/findings.md` doesn't exist — or exists but its
+header records a head SHA older than the current one — mention it once and
+offer the `release-review` skill, which reviews `<last-tag>..HEAD`
+autonomously and writes its findings there. It's an offer, not a gate: the
+user may well have reviewed another way, and a green tree is what the two
+gates below actually protect. Don't run it uninvited, and never run it after
+the tag — its whole value is arriving before one.
 
 ## Phase 1 — push the work, wait for CI
 
