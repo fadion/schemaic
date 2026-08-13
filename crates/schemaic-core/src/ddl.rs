@@ -3428,27 +3428,10 @@ fn fks_equal(a: &ForeignKeyInfo, b: &ForeignKeyInfo) -> bool {
 fn peel_parens(s: &str, dialect: SqlDialect) -> &str {
     let mut t = s.trim();
     while t.len() >= 2 && t.starts_with('(') && t.ends_with(')') {
-        let b = t.as_bytes();
-        let (mut depth, mut i, mut wraps_all) = (0usize, 0usize, true);
-        while i < b.len() {
-            if let Some(j) = sql::skip_noncode(b, i, dialect) {
-                i = j;
-                continue;
-            }
-            match b[i] {
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 && i + 1 != b.len() {
-                        wraps_all = false;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        if !wraps_all || depth != 0 {
+        // The pair only wraps the whole expression when the opener's *match* is
+        // the final byte. `(a) AND (b)` starts and ends with one and peeling
+        // blindly would leave `a) AND (b`.
+        if sql::balanced_paren_span(t.as_bytes(), 0, dialect) != Some(t.len() - 1) {
             break;
         }
         t = t[1..t.len() - 1].trim();

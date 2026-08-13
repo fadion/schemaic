@@ -47,6 +47,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
+use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
     Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder,
     ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value, WriteStep, one_row_verdict,
@@ -56,11 +57,17 @@ use schemaic_core::schema::{
     SequenceOwner, TableInfo, TriggerAction, TriggerEvent, TriggerInfo, TriggerLevel,
     TriggerTiming, ViewOptions, Volatility,
 };
+use schemaic_core::sql;
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
 
 use crate::{Db, DbError, FkColRow, TxScope, assemble_schema, parse_typed};
+
+/// This module's dialect, once. Every boundary scan here is PostgreSQL's — the
+/// engine the file exists for — and spelling it out at each call site is what
+/// makes a scan easy to write without one.
+const PG: SqlDialect = SqlDialect::Postgres;
 
 /// Open a fresh connection to a specific PostgreSQL database. Unlike MySQL,
 /// PostgreSQL requires connecting to a concrete database to run any statement.
@@ -1393,38 +1400,22 @@ fn pg_trigger_type(tgtype: i32) -> (TriggerTiming, Vec<TriggerEvent>, TriggerLev
 /// is what reduces it to the bare predicate the model stores.
 fn pg_trigger_when(def: &str) -> Option<String> {
     // Search only the part before the call, so a literal argument containing
-    // the word can't be mistaken for the clause.
+    // the word can't be mistaken for the clause — and take the keyword itself at
+    // a *code* position, or an argument holding `EXECUTE FUNCTION ` cuts the
+    // head in the wrong place.
     let exec = ["EXECUTE FUNCTION ", "EXECUTE PROCEDURE "]
         .iter()
-        .find_map(|kw| def.rfind(kw))
+        .find_map(|kw| sql::find_code(def, kw, PG))
         .unwrap_or(def.len());
     let head = &def[..exec];
-    let at = head.rfind(" WHEN (")? + " WHEN ".len();
-    let bytes = head.as_bytes();
-    let (mut depth, mut i, mut in_str) = (0usize, at, false);
-    while i < bytes.len() {
-        match bytes[i] {
-            // A doubled quote inside a literal is one quote, not a terminator.
-            b'\'' if in_str => {
-                if bytes.get(i + 1) == Some(&b'\'') {
-                    i += 1;
-                } else {
-                    in_str = false;
-                }
-            }
-            b'\'' => in_str = true,
-            b'(' if !in_str => depth += 1,
-            b')' if !in_str => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(head[at..=i].to_string());
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
+    // The **first** `WHEN` at a code position, not the last: a guard may carry
+    // its own `CASE WHEN`, and anchoring at the end recorded that inner
+    // condition as the whole clause.
+    let at = sql::find_code(head, " WHEN ", PG)? + " WHEN ".len();
+    let b = head.as_bytes();
+    let open = at + b[at..].iter().position(|c| !c.is_ascii_whitespace())?;
+    let end = sql::balanced_paren_span(b, open, PG)?;
+    Some(head[open..=end].to_string())
 }
 
 /// The literal arguments a trigger passes to its function, read out of
@@ -1442,39 +1433,57 @@ fn pg_trigger_when(def: &str) -> Option<String> {
 /// edit.
 fn pg_trigger_args(def: &str) -> Vec<String> {
     // `EXECUTE PROCEDURE` is the pre-11 spelling; servers still accept it and
-    // older ones still print it.
-    let tail = ["EXECUTE FUNCTION ", "EXECUTE PROCEDURE "]
+    // older ones still print it. Located at a code position: `rfind` landed
+    // *inside* an argument that contains the same text and read the list from
+    // the wrong offset.
+    let Some(tail) = ["EXECUTE FUNCTION ", "EXECUTE PROCEDURE "]
         .iter()
-        .find_map(|kw| def.rfind(kw).map(|i| &def[i + kw.len()..]));
-    let Some(tail) = tail else {
+        .find_map(|kw| sql::find_code(def, kw, PG).map(|i| &def[i + kw.len()..]))
+    else {
         return Vec::new();
     };
-    let Some(open) = tail.find('(') else {
-        return Vec::new();
-    };
-    let inner = &tail[open + 1..];
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut in_str = false;
-    let mut chars = inner.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' if in_str => {
-                // A doubled quote is one literal quote, not the end of the value.
-                if chars.peek() == Some(&'\'') {
-                    chars.next();
-                    cur.push('\'');
-                } else {
-                    in_str = false;
-                    out.push(std::mem::take(&mut cur));
-                }
-            }
-            '\'' => in_str = true,
-            // The close-paren that ends the call — only outside a literal.
-            ')' if !in_str => break,
-            _ if in_str => cur.push(c),
-            _ => {}
+    let b = tail.as_bytes();
+    // The `(` that opens the call — a quoted function name may carry one.
+    let mut i = 0usize;
+    let open = loop {
+        if i >= b.len() {
+            return Vec::new();
         }
+        if let Some(j) = sql::skip_noncode(b, i, PG) {
+            i = j;
+            continue;
+        }
+        if b[i] == b'(' {
+            break i;
+        }
+        i += 1;
+    };
+    // Each literal is one token to the shared lexer, so a `)` or a keyword
+    // inside one is data and never structure.
+    let mut out: Vec<String> = Vec::new();
+    let mut i = open + 1;
+    while i < b.len() {
+        if b[i] == b'\'' {
+            let end = sql::skip_noncode(b, i, PG).unwrap_or(b.len());
+            // `end` is one past the closing quote — unless the literal was never
+            // terminated, in which case the scan ran to the end of the input.
+            let close = if b.get(end - 1) == Some(&b'\'') {
+                end - 1
+            } else {
+                end
+            };
+            out.push(tail[i + 1..close].replace("''", "'"));
+            i = end;
+            continue;
+        }
+        if let Some(j) = sql::skip_noncode(b, i, PG) {
+            i = j;
+            continue;
+        }
+        if b[i] == b')' {
+            break;
+        }
+        i += 1;
     }
     out
 }
@@ -2340,6 +2349,51 @@ mod tests {
             pg_trigger_when(def).as_deref(),
             Some("((new.note = 'a)b'))")
         );
+    }
+
+    /// Regression: the anchor was `rfind(" WHEN (")`, so a guard containing its
+    /// own `CASE WHEN` recorded the **inner** condition — the recreated trigger
+    /// then fires on a different set of rows, silently.
+    #[test]
+    fn pg_trigger_when_takes_the_outer_clause_not_an_inner_case_when() {
+        // Copied verbatim from PG 16.14's `pg_get_triggerdef` — it pretty-prints
+        // a `CASE` across lines under a *single* outer paren, so the anchor has
+        // to survive both the newlines and the inner `WHEN (`.
+        let def = "CREATE TRIGGER t_case AFTER UPDATE ON wp2.t FOR EACH ROW WHEN (\n\
+                   \x20       CASE\n\
+                   \x20           WHEN (new.a > 0) THEN true\n\
+                   \x20           ELSE false\n\
+                   \x20       END) EXECUTE FUNCTION audit_fn()";
+        let got = pg_trigger_when(def).expect("guard");
+        assert!(got.starts_with("(\n"), "{got}");
+        assert!(got.ends_with("END)"), "{got}");
+        assert!(got.contains("WHEN (new.a > 0) THEN true"), "{got}");
+        // The whole expression, not the inner condition the old `rfind` picked.
+        assert_ne!(got, "(new.a > 0)");
+    }
+
+    /// Regression: the hand-rolled scan knew only `'`, so a quoted *identifier*
+    /// holding an apostrophe latched it into a string that never ended and the
+    /// guard came back as absent — the recreated trigger then fires
+    /// unconditionally.
+    #[test]
+    fn pg_trigger_when_survives_an_apostrophe_in_a_quoted_identifier() {
+        let def = "CREATE TRIGGER t AFTER UPDATE ON public.x FOR EACH ROW \
+                   WHEN ((new.\"it's\" > 0)) EXECUTE FUNCTION f()";
+        assert_eq!(
+            pg_trigger_when(def).as_deref(),
+            Some("((new.\"it's\" > 0))")
+        );
+    }
+
+    /// Regression: `rfind("EXECUTE FUNCTION ")` landed **inside** the literal
+    /// argument that contains the same text, so the argument list was read from
+    /// the wrong offset and came back as a single `", "`.
+    #[test]
+    fn pg_trigger_args_are_not_located_by_a_keyword_inside_an_argument() {
+        let def = "CREATE TRIGGER t AFTER INSERT ON public.x FOR EACH ROW \
+                   EXECUTE FUNCTION audit_fn('EXECUTE FUNCTION x(', 'b')";
+        assert_eq!(pg_trigger_args(def), vec!["EXECUTE FUNCTION x(", "b"]);
     }
 
     #[test]
