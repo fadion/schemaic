@@ -1157,12 +1157,14 @@ async fn pg_types(client: &Client) -> Result<(Vec<EnumInfo>, Vec<DomainInfo>), D
                     COALESCE(pg_get_expr(t.typdefaultbin, 0), t.typdefault, ''), \
                     t.typnotnull::int, COALESCE(co.collname, ''), \
                     COALESCE(obj_description(t.oid, 'pg_type'), ''), \
-                    (t.typdefaultbin IS NOT NULL OR t.typdefault IS NOT NULL)::int \
+                    (t.typdefaultbin IS NOT NULL OR t.typdefault IS NOT NULL)::int, \
+                    COALESCE(cn.nspname, '') \
              FROM pg_type t \
              JOIN pg_namespace n ON n.oid = t.typnamespace \
              LEFT JOIN pg_type bt ON bt.oid = t.typbasetype \
              LEFT JOIN pg_collation co ON co.oid = t.typcollation \
                                       AND t.typcollation <> bt.typcollation \
+             LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace \
              WHERE t.typtype IN ('e', 'd') AND {filter} \
              ORDER BY n.nspname, t.typname"
         ),
@@ -1238,6 +1240,11 @@ fn pg_fold_types(
                 name: name.clone(),
                 base_type: cell(r, 3),
                 collation: Some(cell(r, 6)).filter(|c| !c.is_empty()),
+                // The namespace the collation is in. `pg_catalog` is dropped:
+                // it is searched first and can't be shadowed, so a built-in
+                // needs no qualifier and qualifying it would rewrite the DDL of
+                // every domain that already round-trips.
+                collation_schema: Some(cell(r, 9)).filter(|s| !s.is_empty() && s != "pg_catalog"),
                 default_value: (cell(r, 8) == "1").then(|| cell(r, 4)),
                 not_null: cell(r, 5) == "1",
                 checks: of(constraint_rows)

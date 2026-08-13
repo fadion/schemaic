@@ -1331,7 +1331,23 @@ pub struct DomainInfo {
     /// The underlying type as `format_type` renders it — `character varying(45)`,
     /// `numeric(10,2)`, `text[]`.
     pub base_type: String,
+    /// The collation the domain was declared with, bare — reported only when it
+    /// differs from the base type's, so an ordinary `text` domain carries none.
     pub collation: Option<String>,
+    /// The namespace [`DomainInfo::collation`] lives in, when it needs one.
+    ///
+    /// Carried because a collation is an object like any other and the clause
+    /// resolves through `search_path`: emitting a bare `COLLATE "mycoll"` for a
+    /// collation in another schema either fails (`collation "mycoll" for
+    /// encoding "UTF8" does not exist`) or — worse, and measured on 16.14 —
+    /// silently binds a *different*, same-named collation that is on the path,
+    /// so the recreated domain sorts and compares under another locale and every
+    /// index over it is rebuilt with a different ordering.
+    ///
+    /// `None` for a built-in (`pg_catalog` is searched first and can't be
+    /// shadowed) and, following [`qualified_ident`]'s rule, `Some("public")`
+    /// still emits bare.
+    pub collation_schema: Option<String>,
     /// Ready-to-emit SQL text, as [`ColumnInfo::default`] is.
     pub default_value: Option<String>,
     pub not_null: bool,
@@ -1348,7 +1364,10 @@ impl DomainInfo {
         if let Some(c) = &self.collation
             && !c.is_empty()
         {
-            out.push_str(&format!("\n  COLLATE {}", ddl_ident_in(c, dialect)));
+            out.push_str(&format!(
+                "\n  COLLATE {}",
+                qualified_ident(c, self.collation_schema.as_deref(), dialect)
+            ));
         }
         if let Some(d) = &self.default_value
             && !d.is_empty()
@@ -2085,12 +2104,22 @@ impl DbSchema {
             .filter(move |t| t.schema.as_deref() == schema)
     }
 
-    /// A `CREATE` script for every table in one namespace, blank-line separated.
+    /// A `CREATE` script for everything in one namespace, blank-line separated.
     ///
-    /// **Base tables first, then views** — a view's body references the tables it
-    /// selects from, so the script only replays cleanly in that order. Foreign
-    /// keys aren't emitted by [`TableInfo::create_ddl`] at all, so ordering
-    /// *between* base tables doesn't affect validity.
+    /// **In dependency order**: the standalone types first, then base tables,
+    /// then views, then the sequences that stand on their own. A view's body
+    /// references the tables it selects from, and a column's type may *be* one
+    /// of the namespace's enums or domains — `format_type` prints that
+    /// qualified, so the script names it — which is the ordering that matters
+    /// most: an omitted foreign key leaves a script that still runs, an omitted
+    /// type leaves one that fails on its first `CREATE TABLE`. Foreign keys
+    /// aren't emitted by [`TableInfo::create_ddl`] at all, so ordering *between*
+    /// base tables doesn't affect validity.
+    ///
+    /// A sequence created by a `serial` or an identity column is skipped
+    /// ([`ObjectItem::is_internal`], plus the `serial`'s own owner): the
+    /// column's definition creates it, and restating it makes the script fail
+    /// on a name that already exists.
     ///
     /// Empty when the namespace holds nothing.
     pub fn create_ddl_script(
@@ -2098,12 +2127,36 @@ impl DbSchema {
         schema: Option<&str>,
         dialect: crate::intel::SqlDialect,
     ) -> String {
+        use crate::ddl::ObjectKind;
         let (views, tables): (Vec<&TableInfo>, Vec<&TableInfo>) =
             self.tables_in(schema).partition(|t| t.is_view);
-        tables
+        let types: Vec<String> = [ObjectKind::Enum, ObjectKind::Domain]
             .into_iter()
-            .chain(views)
-            .map(|t| t.create_ddl(dialect))
+            .flat_map(|k| self.objects_in(schema, k))
+            .map(|o| o.create_sql(dialect))
+            .collect();
+        // A sequence a table in this script already owns is created by that
+        // table's column, whether or not the catalogue calls the link internal.
+        let owned_here: std::collections::HashSet<&str> =
+            tables.iter().map(|t| t.name.as_str()).collect();
+        let seqs: Vec<String> = self
+            .objects_in(schema, ObjectKind::Sequence)
+            .into_iter()
+            .filter(|o| !o.is_internal())
+            .filter(|o| match o {
+                ObjectItem::Sequence(s) => s
+                    .owned_by
+                    .as_ref()
+                    .is_none_or(|w| !owned_here.contains(w.table.as_str())),
+                _ => true,
+            })
+            .map(|o| o.create_sql(dialect))
+            .collect();
+        types
+            .into_iter()
+            .chain(tables.into_iter().map(|t| t.create_ddl(dialect)))
+            .chain(views.into_iter().map(|t| t.create_ddl(dialect)))
+            .chain(seqs)
             .collect::<Vec<_>>()
             .join("\n\n")
     }
@@ -3126,6 +3179,82 @@ mod tests {
         assert!(s.find_by_display("other_db.orders").is_none());
     }
 
+    /// A column's type may be one of the namespace's own enums or domains —
+    /// `format_type` prints those qualified, so the script names them — and a
+    /// script that creates the table first fails on its very first statement
+    /// (`ERROR: type "s31a.weird" does not exist`, measured on 16.14).
+    #[test]
+    fn create_ddl_script_emits_types_before_the_tables_that_use_them() {
+        use crate::intel::SqlDialect::Postgres;
+        let s = DbSchema {
+            tables: vec![TableInfo {
+                name: "usest".into(),
+                schema: Some("s31a".into()),
+                columns: vec![col("m", "s31a.weird", true, false)],
+                ..Default::default()
+            }],
+            enums: vec![EnumInfo {
+                name: "weird".into(),
+                schema: Some("s31a".into()),
+                values: vec!["a,b".into()],
+                comment: None,
+            }],
+            domains: vec![DomainInfo {
+                name: "d_nn".into(),
+                schema: Some("s31a".into()),
+                base_type: "integer".into(),
+                not_null: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let out = s.create_ddl_script(Some("s31a"), Postgres);
+        let ty = out.find("CREATE TYPE").expect("enum emitted");
+        let dom = out.find("CREATE DOMAIN").expect("domain emitted");
+        let tbl = out.find("CREATE TABLE").expect("table emitted");
+        assert!(ty < tbl && dom < tbl, "{out}");
+    }
+
+    /// A `serial`'s counter is created by the column, so restating it would make
+    /// the script fail on a name that already exists. A standalone sequence is
+    /// the user's own object and belongs in the script.
+    #[test]
+    fn create_ddl_script_skips_a_sequence_its_own_table_creates() {
+        use crate::intel::SqlDialect::Postgres;
+        let seq = |name: &str, owner: Option<SequenceOwner>| SequenceInfo {
+            name: name.into(),
+            schema: Some("s31a".into()),
+            owned_by: owner,
+            ..Default::default()
+        };
+        let s = DbSchema {
+            tables: vec![TableInfo {
+                name: "usest".into(),
+                schema: Some("s31a".into()),
+                columns: vec![col("id", "integer", false, true)],
+                ..Default::default()
+            }],
+            sequences: vec![
+                seq(
+                    "usest_id_seq",
+                    Some(SequenceOwner {
+                        table: "usest".into(),
+                        column: "id".into(),
+                        internal: false,
+                    }),
+                ),
+                seq("ticket_no", None),
+            ],
+            ..Default::default()
+        };
+        let out = s.create_ddl_script(Some("s31a"), Postgres);
+        assert!(!out.contains("usest_id_seq"), "{out}");
+        assert!(
+            out.contains("CREATE SEQUENCE \"s31a\".\"ticket_no\""),
+            "{out}"
+        );
+    }
+
     #[test]
     fn create_ddl_script_is_empty_for_an_unknown_namespace() {
         use crate::intel::SqlDialect::Postgres;
@@ -3415,6 +3544,7 @@ mod tests {
             schema: Some("public".into()),
             base_type: "character varying(255)".into(),
             collation: None,
+            collation_schema: None,
             default_value: Some("''::character varying".into()),
             not_null: true,
             checks: vec![CheckInfo {

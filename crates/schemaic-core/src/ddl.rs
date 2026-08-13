@@ -1252,6 +1252,23 @@ impl SequenceDraft {
                 s.min_value, s.max_value
             ));
         }
+        // Where the counter *is* now. PostgreSQL checks the new bounds against
+        // it — `ERROR: RESTART value (500) cannot be greater than MAXVALUE
+        // (100)`, and the symmetric MINVALUE message, both measured on 16.14 —
+        // and skips the check only when the same statement restarts the
+        // sequence, which is why supplying a restart clears this. Without it the
+        // user reaches Apply and gets the server's wording for an edit the
+        // editor had already called valid.
+        if self.restart.is_none()
+            && let Some(last) = s.last_value
+            && (last < s.min_value || last > s.max_value)
+        {
+            out.push(format!(
+                "The sequence is at {last}, outside the new {}..{}. Give it a \
+                 restart value inside the range.",
+                s.min_value, s.max_value
+            ));
+        }
         out
     }
 }
@@ -2705,6 +2722,30 @@ impl ChangeSet {
         let d = self.dialect;
         let qname = self.qname();
         let mut out = Vec::new();
+        // A restart rides in the same `ALTER SEQUENCE` as the bound edits when
+        // the plan has both. PostgreSQL cross-checks new bounds against the
+        // sequence's **current** value unless the statement also restarts it —
+        // measured on 16.14: `ALTER SEQUENCE s MAXVALUE 100` on a sequence
+        // sitting at 500 is `ERROR: RESTART value (500) cannot be greater than
+        // MAXVALUE (100)`, while the same clause with `RESTART WITH 50` after it
+        // succeeds. Split across two statements, the narrowing-plus-restart pair
+        // — the *only* form of that edit the server can accept — could never be
+        // applied. The two stay separate `Change`s so the preview still says
+        // both things; only the statement is shared.
+        let folded_restart: Option<i64> = self
+            .changes
+            .iter()
+            .any(|c| {
+                matches!(c, Change::AlterSequence { from, to }
+                if !sequence_alter_clauses(from, to, d).is_empty())
+            })
+            .then(|| {
+                self.changes.iter().find_map(|c| match c {
+                    Change::RestartSequence { to } => Some(*to),
+                    _ => None,
+                })
+            })
+            .flatten();
         for c in &self.changes {
             match c {
                 Change::CreateEnum(e) => out.push(e.create_sql(d)),
@@ -2769,15 +2810,19 @@ impl ChangeSet {
                     ddl_ident_in(name, d)
                 )),
                 Change::AlterSequence { from, to } => {
-                    let clauses = sequence_alter_clauses(from, to, d);
+                    let mut clauses = sequence_alter_clauses(from, to, d);
                     if !clauses.is_empty() {
+                        if let Some(r) = folded_restart {
+                            clauses.push(format!("RESTART WITH {r}"));
+                        }
                         out.push(format!(
                             "ALTER SEQUENCE {qname}\n  {};",
                             clauses.join("\n  ")
                         ));
                     }
                 }
-                Change::RestartSequence { to } => {
+                // Only when it hasn't already ridden along above.
+                Change::RestartSequence { to } if folded_restart.is_none() => {
                     out.push(format!("ALTER SEQUENCE {qname} RESTART WITH {to};"))
                 }
                 _ => {}
@@ -9030,6 +9075,7 @@ mod object_tests {
             schema: Some("public".into()),
             base_type: "character varying(255)".into(),
             collation: None,
+            collation_schema: None,
             default_value: Some("''::character varying".into()),
             not_null: true,
             checks: vec![CheckInfo {
@@ -9051,6 +9097,38 @@ mod object_tests {
     fn a_domain_diffed_against_itself_has_no_changes() {
         let d = email();
         let cs = diff_domain(&d, &DomainDraft::from_info(&d), &[], Postgres);
+        assert!(cs.is_empty(), "phantom changes: {:?}", cs.changes);
+    }
+
+    /// A collation is an object like any other, and the `COLLATE` clause
+    /// resolves through `search_path`. Emitted bare, a collation in another
+    /// namespace either doesn't exist (`ERROR: collation "mycoll" for encoding
+    /// "UTF8" does not exist`) or — measured on 16.14 — binds a *different*,
+    /// same-named one that is on the path, so the rebuilt domain compares under
+    /// another locale and every index over it is rebuilt with another ordering.
+    #[test]
+    fn a_domains_collation_is_emitted_with_its_namespace() {
+        let mut d = email();
+        d.base_type = "text".into();
+        d.collation = Some("mycoll".into());
+        d.collation_schema = Some("s31b".into());
+        assert!(
+            d.create_sql(Postgres)
+                .contains("COLLATE \"s31b\".\"mycoll\""),
+            "{}",
+            d.create_sql(Postgres)
+        );
+        // A built-in carries no namespace — `pg_catalog` is searched first and
+        // can't be shadowed — and `public` follows `qualified_ident`'s rule.
+        d.collation = Some("C".into());
+        d.collation_schema = None;
+        assert!(d.create_sql(Postgres).contains("COLLATE \"C\""), "{d:?}");
+        // …and it round-trips, so no designer opens on a phantom change.
+        let cs = diff_domain(&d, &DomainDraft::from_info(&d), &[], Postgres);
+        assert!(cs.is_empty(), "phantom changes: {:?}", cs.changes);
+        let mut ns = d.clone();
+        ns.collation_schema = Some("s31b".into());
+        let cs = diff_domain(&ns, &DomainDraft::from_info(&ns), &[], Postgres);
         assert!(cs.is_empty(), "phantom changes: {:?}", cs.changes);
     }
 
@@ -9266,22 +9344,69 @@ mod object_tests {
     }
 
     /// Moving the counter is a different act from changing where a later restart
-    /// would return to, so the two are separate changes with separate sentences.
+    /// would return to, so the two stay separate **changes** with separate
+    /// sentences — but they share the statement, because PostgreSQL cross-checks
+    /// new bounds against the sequence's current value in any `ALTER SEQUENCE`
+    /// that doesn't also restart it.
     #[test]
-    fn restarting_is_its_own_change_and_not_part_of_the_alter() {
+    fn restarting_is_its_own_change_but_rides_in_the_same_statement() {
         let s = counter();
         let mut d = SequenceDraft::from_info(&s);
         d.info.start = 100;
         d.restart = Some(500);
         let cs = diff_sequence(&s, &d, Postgres);
+        assert_eq!(cs.len(), 2, "{:?}", cs.changes);
         assert_eq!(
             cs.emit(),
-            vec![
-                "ALTER SEQUENCE \"counter\"\n  START WITH 100;",
-                "ALTER SEQUENCE \"counter\" RESTART WITH 500;",
-            ]
+            vec!["ALTER SEQUENCE \"counter\"\n  START WITH 100\n  RESTART WITH 500;"]
         );
         assert!(cs.destructive().iter().any(|r| r.contains("collides")));
+    }
+
+    /// A restart on its own is still a statement of its own — there is no
+    /// `ALTER SEQUENCE` for it to ride in.
+    #[test]
+    fn a_lone_restart_is_its_own_statement() {
+        let s = counter();
+        let mut d = SequenceDraft::from_info(&s);
+        d.restart = Some(500);
+        assert_eq!(
+            diff_sequence(&s, &d, Postgres).emit(),
+            vec!["ALTER SEQUENCE \"counter\" RESTART WITH 500;"]
+        );
+    }
+
+    /// The edit the split made impossible: narrowing the range below where the
+    /// counter sits is legal only when the same statement restarts it.
+    /// Measured on 16.14 — `ALTER SEQUENCE s MAXVALUE 100` on a sequence at 500
+    /// is `ERROR: RESTART value (500) cannot be greater than MAXVALUE (100)`.
+    #[test]
+    fn narrowing_below_the_counter_is_emitted_with_its_restart() {
+        let mut s = counter();
+        s.last_value = Some(500);
+        let mut d = SequenceDraft::from_info(&s);
+        d.info.max_value = 100;
+        d.restart = Some(50);
+        assert!(d.validate().is_empty(), "{:?}", d.validate());
+        let sql = diff_sequence(&s, &d, Postgres).emit().join("\n");
+        assert_eq!(sql.matches("ALTER SEQUENCE").count(), 1, "{sql}");
+        assert!(sql.contains("MAXVALUE 100"), "{sql}");
+        assert!(sql.contains("RESTART WITH 50"), "{sql}");
+    }
+
+    /// …and without the restart it is the editor that says so, not the server
+    /// halfway through a plan.
+    #[test]
+    fn narrowing_below_the_counter_without_a_restart_is_rejected_up_front() {
+        let mut s = counter();
+        s.last_value = Some(500);
+        let mut d = SequenceDraft::from_info(&s);
+        d.info.max_value = 100;
+        let msgs = d.validate().join(" ");
+        assert!(msgs.contains("at 500"), "{msgs}");
+        // The same edit with a restart is fine, so the message must not fire.
+        d.restart = Some(50);
+        assert!(d.validate().is_empty(), "{:?}", d.validate());
     }
 
     /// A restart doesn't survive a re-introspection, so keeping it in the model
