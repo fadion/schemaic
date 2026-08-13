@@ -551,6 +551,81 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         );
                     }
                 }
+                // One of PostgreSQL's standalone objects. Deliberately the same
+                // shape as the table menu — copy, DDL, refresh, then the writing
+                // group — so a type isn't a second-class node with its own idiom.
+                CtxKind::Object {
+                    database,
+                    item,
+                    ddl,
+                } => {
+                    let kind = item.kind();
+                    entries.push(MenuEntry::sub(
+                        "Copy",
+                        vec![
+                            MenuEntry::action("Name", copy(item.name().to_string())),
+                            MenuEntry::action("Qualified name", copy(menu.name.clone())),
+                        ],
+                    ));
+                    {
+                        let oq = open_query.clone();
+                        entries.push(MenuEntry::action("Generate DDL", move || {
+                            let _ = floem::Clipboard::set_contents(ddl.clone());
+                            (oq)(ddl.clone());
+                        }));
+                    }
+                    {
+                        let rf = refresh_db.clone();
+                        let db = database.clone();
+                        entries.push(MenuEntry::action("Refresh", move || (rf)(db.clone())));
+                    }
+                    entries.push(MenuEntry::Separator);
+                    {
+                        let ui = import_ui.clone();
+                        let confirm = ui.overlay.confirm;
+                        let (db, obj) = (database.clone(), item.clone());
+                        let label = menu.name.clone();
+                        let read_only = conn_read_only(&connections, active_conn);
+                        // An identity column's counter is part of the column:
+                        // PostgreSQL refuses `DROP SEQUENCE` on one and says to
+                        // drop the column instead. Offering it would be an entry
+                        // that can only ever fail.
+                        let internal = obj.is_internal();
+                        entries.push(
+                            MenuEntry::action_colored("Drop", theme::error, move || {
+                                let (ui, db, obj) = (ui.clone(), db.clone(), obj.clone());
+                                let label = label.clone();
+                                confirm.set(Some(crate::Confirm {
+                                    title: format!("Drop {}", kind.label()),
+                                    message: format!("Drop {label}? This can't be undone."),
+                                    resolve: Rc::new(move |yes| {
+                                        if !yes {
+                                            return;
+                                        }
+                                        let ctx = crate::table_designer::edit_ctx(&ui);
+                                        let cs = schemaic_core::ddl::drop_object(
+                                            kind,
+                                            obj.name(),
+                                            obj.schema(),
+                                            ctx.dialect,
+                                        );
+                                        crate::ddl_preview::open_preview(
+                                            &ui,
+                                            crate::ddl_preview::preview_of(
+                                                ctx.conn_id,
+                                                &db,
+                                                label.clone(),
+                                                &cs,
+                                                ctx.read_only,
+                                            ),
+                                        );
+                                    }),
+                                }));
+                            })
+                            .disabled(read_only || internal),
+                        );
+                    }
+                }
                 CtxKind::Schema { database, ddl } => {
                     entries.push(MenuEntry::action("Copy name", copy(menu.name.clone())));
                     // The whole namespace as one CREATE script — the schema-level

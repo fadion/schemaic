@@ -1013,6 +1013,16 @@ pub enum CtxKind {
         source: TableSource,
         column: String,
     },
+    /// One of PostgreSQL's standalone objects — an enum type, a domain or a
+    /// sequence. Carries the whole object rather than its name, because the menu
+    /// needs it: its `CREATE` for Copy DDL, and its current state to seed the
+    /// editor without a second lookup that could disagree with the row.
+    Object {
+        database: String,
+        item: Box<schemaic_core::schema::ObjectItem>,
+        /// Its `CREATE`, built when the menu is staged.
+        ddl: String,
+    },
     /// An index or foreign-key row under a table.
     Key {
         source: TableSource,

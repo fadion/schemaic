@@ -19,11 +19,12 @@ use floem::prelude::*;
 use floem::reactive::{Memo, create_effect};
 
 use schemaic_core::db_color::DbColorRule;
+use schemaic_core::ddl::ObjectKind;
 use schemaic_core::favorite::FavoriteRule;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::schema::{
-    ColumnInfo, ColumnTypeClass, DbSchema, IndexInfo, SchemaState, TableInfo, TableSource,
-    classify_column_type,
+    ColumnInfo, ColumnTypeClass, DbSchema, IndexInfo, ObjectItem, SchemaState, TableInfo,
+    TableSource, classify_column_type,
 };
 use schemaic_core::text::plural;
 
@@ -109,6 +110,96 @@ fn column_key(database: &str, t: &TableInfo, column: &str) -> String {
 /// [`column_key`] for a caller that already has the displayed table name.
 pub fn column_key_named(database: &str, table: &str, column: &str) -> String {
     format!("col:{database}:{table}:{column}")
+}
+
+/// The `Types`/`Domains`/`Sequences` folder under a database or namespace.
+///
+/// Scoped by the *tree* level rather than by the objects' own namespace, for the
+/// same reason [`TableScope`] exists: flat means "this database has no schema
+/// level", and its one folder covers every namespace's objects.
+fn object_group_key(database: &str, scope: TableScope, kind: ObjectKind) -> String {
+    format!(
+        "objgrp:{database}:{}:{}",
+        scope.name().unwrap_or_default(),
+        kind.label()
+    )
+}
+
+fn object_key(database: &str, scope: TableScope, kind: ObjectKind, name: &str) -> String {
+    format!(
+        "obj:{database}:{}:{}:{name}",
+        scope.name().unwrap_or_default(),
+        kind.label()
+    )
+}
+
+/// The object folders one tree level shows, in a fixed order, skipping the empty
+/// ones — an empty folder is a click that leads nowhere.
+///
+/// Fixed order rather than "biggest first" so the tree doesn't rearrange itself
+/// when a type is added.
+fn object_groups(schema: &DbSchema, scope: TableScope) -> Vec<(ObjectKind, Vec<ObjectItem>)> {
+    [ObjectKind::Enum, ObjectKind::Domain, ObjectKind::Sequence]
+        .into_iter()
+        .filter_map(|k| {
+            let items = match scope {
+                TableScope::Flat => schema.objects_all(k),
+                TableScope::Namespace(ns) => schema.objects_in(Some(ns), k),
+            };
+            (!items.is_empty()).then_some((k, items))
+        })
+        .collect()
+}
+
+/// The folder's label. Plural, because it names a group.
+fn object_group_label(kind: ObjectKind) -> &'static str {
+    match kind {
+        ObjectKind::Enum => "Types",
+        ObjectKind::Domain => "Domains",
+        ObjectKind::Sequence => "Sequences",
+    }
+}
+
+fn object_icon(kind: ObjectKind) -> &'static str {
+    match kind {
+        ObjectKind::Enum => icons::TAG,
+        ObjectKind::Domain => icons::SCAN_SQUARE,
+        ObjectKind::Sequence => icons::FILE_DIGIT,
+    }
+}
+
+/// Does an object match the tree's filter box? By name only: its *detail* is a
+/// summary the row happens to show, and matching on it would surface a sequence
+/// because some unrelated table's name appeared in its owner.
+fn object_matches(o: &ObjectItem, filt: &str) -> bool {
+    o.name().to_lowercase().contains(filt)
+}
+
+/// Does anything in this database match by object name?
+///
+/// The database and namespace filters both need this, because a search for a
+/// type would otherwise hide the very database that defines it — the level above
+/// is dropped before the folder holding the match is ever reached.
+fn has_object_match(schema: &DbSchema, filt: &str) -> bool {
+    [ObjectKind::Enum, ObjectKind::Domain, ObjectKind::Sequence]
+        .into_iter()
+        .any(|k| {
+            schema
+                .objects_all(k)
+                .iter()
+                .any(|o| object_matches(o, filt))
+        })
+}
+
+fn namespace_has_object_match(schema: &DbSchema, ns: &str, filt: &str) -> bool {
+    [ObjectKind::Enum, ObjectKind::Domain, ObjectKind::Sequence]
+        .into_iter()
+        .any(|k| {
+            schema
+                .objects_in(Some(ns), k)
+                .iter()
+                .any(|o| object_matches(o, filt))
+        })
 }
 
 /// The namespaces to render as their own tree level, or empty when the tables
@@ -253,7 +344,9 @@ fn nav_rows(
         let schema = n.schema.as_ref();
         if filtering && !db_hit {
             let has_match = match schema {
-                Some(s) => s.tables.iter().any(|t| t.matches_search(&filt)),
+                Some(s) => {
+                    s.tables.iter().any(|t| t.matches_search(&filt)) || has_object_match(s, &filt)
+                }
                 None => true,
             };
             if !has_match {
@@ -317,8 +410,48 @@ fn nav_rows(
                 // are the only leaf that acts on Enter/double-click).
             }
         };
+        // The standalone-object folders, which sit after a level's tables. Unlike
+        // key rows these *are* navigable: a leaf opens its editor, so selecting
+        // one goes somewhere.
+        let push_objects = |rows: &mut Vec<NavRow>, parent: &String, scope: TableScope| {
+            let ns_hit = filtering
+                && scope
+                    .name()
+                    .is_some_and(|s| s.to_lowercase().contains(&filt));
+            for (kind, items) in object_groups(schema, scope) {
+                let shown: Vec<&ObjectItem> = items
+                    .iter()
+                    .filter(|o| !filtering || db_hit || ns_hit || object_matches(o, &filt))
+                    .collect();
+                if shown.is_empty() {
+                    continue;
+                }
+                let gk = object_group_key(&n.database, scope, kind);
+                // A filter that matched inside this folder opens it, the same way
+                // a column match force-reveals its table.
+                let open = exp.contains(&gk) || (filtering && !db_hit && !ns_hit);
+                rows.push(NavRow {
+                    key: gk.clone(),
+                    parent: Some(parent.clone()),
+                    expandable: true,
+                    expanded: open,
+                });
+                if !open {
+                    continue;
+                }
+                for o in shown {
+                    rows.push(NavRow {
+                        key: object_key(&n.database, scope, kind, o.name()),
+                        parent: Some(gk.clone()),
+                        expandable: false,
+                        expanded: false,
+                    });
+                }
+            }
+        };
         if groups.is_empty() {
             push_tables(&mut rows, &db_key, TableScope::Flat);
+            push_objects(&mut rows, &db_key, TableScope::Flat);
             continue;
         }
         for ns in &groups {
@@ -330,6 +463,7 @@ fn nav_rows(
                     .tables
                     .iter()
                     .any(|t| t.schema.as_deref() == Some(ns.as_str()) && t.matches_search(&filt))
+                && !namespace_has_object_match(schema, ns, &filt)
             {
                 continue; // no match in this namespace → the group is hidden
             }
@@ -343,6 +477,7 @@ fn nav_rows(
             });
             if open {
                 push_tables(&mut rows, &key, TableScope::Namespace(ns));
+                push_objects(&mut rows, &key, TableScope::Namespace(ns));
             }
         }
     }
@@ -998,20 +1133,36 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
                         .filter(|t| !filtering || db_hit || t.matches_search(&filt))
                         .cloned()
                         .collect();
+                    let objects = object_group_nodes(
+                        db.clone(),
+                        None,
+                        schema.clone(),
+                        db_hit,
+                        child_ctx(0.0),
+                    );
                     if tables.is_empty() {
                         // Hide the node's body entirely while filtering with no
-                        // match; otherwise show the empty-schema hint.
+                        // match; otherwise show the empty-schema hint — but a
+                        // database can hold types and no tables, and saying "No
+                        // tables" above a list of them would be a flat lie.
+                        let none = object_groups(&schema, TableScope::Flat).is_empty();
                         return if filtering {
-                            empty().into_any()
-                        } else {
+                            objects.into_any()
+                        } else if none {
                             info_row("No tables", theme::text_muted).into_any()
+                        } else {
+                            objects.into_any()
                         };
                     }
-                    v_stack_from_iter(
-                        tables
-                            .into_iter()
-                            .map(move |t| table_node(db.clone(), t, child_ctx(0.0))),
-                    )
+                    v_stack((
+                        v_stack_from_iter(
+                            tables
+                                .into_iter()
+                                .map(move |t| table_node(db.clone(), t, child_ctx(0.0))),
+                        )
+                        .style(|s| s.flex_col()),
+                        objects,
+                    ))
                     .style(|s| s.flex_col())
                     .into_any()
                 }
@@ -1136,26 +1287,258 @@ fn schema_node(
                 .filter(|t| !filtering || db_hit || ns_hit || t.matches_search(&filt))
                 .cloned()
                 .collect();
-            if tables.is_empty() {
-                return if filtering {
-                    empty().into_any()
-                } else {
-                    info_row("No tables", theme::text_muted).into_any()
-                };
-            }
             let db = database.clone();
             let ctx = ctx.clone();
-            v_stack_from_iter(
-                tables
-                    .into_iter()
-                    .map(move |t| table_node(db.clone(), t, ctx.clone())),
-            )
+            let objects = object_group_nodes(
+                db.clone(),
+                Some(ns_children.clone()),
+                schema.clone(),
+                db_hit || ns_hit,
+                ctx.clone(),
+            );
+            if tables.is_empty() {
+                let none = object_groups(&schema, TableScope::Namespace(&ns_children)).is_empty();
+                return if filtering {
+                    objects.into_any()
+                } else if none {
+                    info_row("No tables", theme::text_muted).into_any()
+                } else {
+                    objects.into_any()
+                };
+            }
+            v_stack((
+                v_stack_from_iter(
+                    tables
+                        .into_iter()
+                        .map(move |t| table_node(db.clone(), t, ctx.clone())),
+                )
+                .style(|s| s.flex_col()),
+                objects,
+            ))
             .style(|s| s.flex_col())
             .into_any()
         },
     );
 
     v_stack((header, children)).style(|s| s.flex_col())
+}
+
+/// The `Types`/`Domains`/`Sequences` folders for one tree level, after its
+/// tables. Empty when the database has none — which is every MySQL connection,
+/// so nothing about that tree changes.
+fn object_group_nodes(
+    database: String,
+    scope_ns: Option<String>,
+    schema: std::sync::Arc<DbSchema>,
+    parent_hit: bool,
+    ctx: SchemaTreeCtx,
+) -> impl IntoView {
+    let scope = || match &scope_ns {
+        Some(ns) => TableScope::Namespace(ns.as_str()),
+        None => TableScope::Flat,
+    };
+    let groups = object_groups(&schema, scope());
+    v_stack_from_iter(groups.into_iter().map(move |(kind, items)| {
+        object_group_node(
+            database.clone(),
+            scope_ns.clone(),
+            kind,
+            items,
+            parent_hit,
+            ctx.clone(),
+        )
+    }))
+    .style(|s| s.flex_col())
+}
+
+/// One folder: a header row over the objects of that kind.
+fn object_group_node(
+    database: String,
+    scope_ns: Option<String>,
+    kind: ObjectKind,
+    items: Vec<ObjectItem>,
+    parent_hit: bool,
+    ctx: SchemaTreeCtx,
+) -> impl IntoView {
+    let SchemaTreeCtx {
+        expanded,
+        filter,
+        on_toggle,
+        nav,
+        context_menu,
+        dialect,
+        indent,
+        ..
+    } = ctx;
+    let scope = match &scope_ns {
+        Some(ns) => TableScope::Namespace(ns.as_str()),
+        None => TableScope::Flat,
+    };
+    let key = object_group_key(&database, scope, kind);
+    let count = items.len();
+
+    let toggle_row = on_toggle.clone();
+    let key_row = key.clone();
+    let header = h_stack((
+        chevron(expanded, key.clone(), on_toggle),
+        // Muted like a namespace row: a folder is structural, not something you
+        // open.
+        icons::icon(icons::FOLDER, SCHEMA_ICON as f32).style(move |s| {
+            s.color(theme::text_muted())
+                .margin_left(CHEVRON_GAP)
+                .margin_right(ICON_GAP)
+                .flex_shrink(0.0_f32)
+        }),
+        text(object_group_label(kind))
+            .style(|s| s.font_size(theme::FONT_BODY).color(theme::text())),
+        capsule(count.to_string()),
+    ))
+    .on_double_click_stop(move |_| (toggle_row)(key_row.clone()))
+    .style({
+        let hl = key.clone();
+        move |s| {
+            let s = tree_row(s, ROW_PAD + indent).gap(6.0);
+            if is_nav_selected(nav, &hl) {
+                s.background(theme::row_selected())
+            } else {
+                s
+            }
+        }
+    });
+    let header = with_nav_scroll(header.into_any(), nav, key.clone());
+
+    let key_children = key.clone();
+    let ns_hit_base = scope_ns.clone();
+    let children = dyn_container(
+        move || (expanded.with(|e| e.contains(&key_children)), filter.get()),
+        move |(open, filt)| {
+            let filt = filt.trim().to_lowercase();
+            let filtering = !filt.is_empty();
+            let ns_hit = filtering
+                && ns_hit_base
+                    .as_deref()
+                    .is_some_and(|s| s.to_lowercase().contains(&filt));
+            // A filter that matched inside this folder opens it, the same way a
+            // column match force-reveals its table. `nav_rows` mirrors this.
+            if !open && !(filtering && !parent_hit && !ns_hit) {
+                return empty().into_any();
+            }
+            let term = (!filt.is_empty()).then(|| filt.clone());
+            let shown: Vec<ObjectItem> = items
+                .iter()
+                .filter(|o| !filtering || parent_hit || ns_hit || object_matches(o, &filt))
+                .cloned()
+                .collect();
+            if shown.is_empty() {
+                return empty().into_any();
+            }
+            let db = database.clone();
+            let ns = scope_ns.clone();
+            v_stack_from_iter(shown.into_iter().map(move |o| {
+                object_row(
+                    db.clone(),
+                    ns.clone(),
+                    o,
+                    context_menu,
+                    dialect,
+                    term.clone(),
+                    nav,
+                    indent,
+                )
+            }))
+            .style(|s| s.flex_col())
+            .into_any()
+        },
+    );
+
+    v_stack((header, children)).style(|s| s.flex_col())
+}
+
+/// One object (leaf): its icon, name, and a dim summary — an enum's values, a
+/// domain's base type, a sequence's owner.
+#[allow(clippy::too_many_arguments)]
+fn object_row(
+    database: String,
+    scope_ns: Option<String>,
+    o: ObjectItem,
+    context_menu: RwSignal<Option<CtxMenu>>,
+    dialect: SqlDialect,
+    term: Option<String>,
+    nav: Nav,
+    indent: f64,
+) -> impl IntoView {
+    let scope = match &scope_ns {
+        Some(ns) => TableScope::Namespace(ns.as_str()),
+        None => TableScope::Flat,
+    };
+    let kind = o.kind();
+    let nav_key = object_key(&database, scope, kind, o.name());
+    let name = o.name().to_string();
+    let detail = o.detail();
+    // An identity column's counter isn't an object anyone can act on alone, so
+    // it reads quieter — the same signal a lossy index gets.
+    let dim = o.is_internal();
+    let row = h_stack((
+        icons::icon(object_icon(kind), SCHEMA_ICON as f32).style(move |s| {
+            s.color(theme::text_muted().multiply_alpha(if dim { 0.4 } else { 0.7 }))
+                .margin_right(ICON_GAP)
+                .flex_shrink(0.0_f32)
+        }),
+        highlight_text(
+            name.clone(),
+            term,
+            theme::FONT_BODY,
+            move || {
+                if dim {
+                    theme::text_muted()
+                } else {
+                    theme::text()
+                }
+            },
+            false,
+            1.0,
+        ),
+        text(detail).style(|s| {
+            s.color(theme::text_muted())
+                .font_size(theme::FONT_LABEL)
+                .margin_left(12.0)
+        }),
+    ))
+    .style(|s| s.items_center())
+    .on_secondary_click_stop({
+        let (db, obj) = (database.clone(), o.clone());
+        let display = schemaic_core::schema::display_name(obj.schema(), obj.name());
+        move |_| {
+            let ai_prompt = format!(
+                "In the `{db}` database, explain the `{display}` {} — what it is for \
+                 and where it is used.",
+                kind.label()
+            );
+            context_menu.set(Some(CtxMenu {
+                kind: CtxKind::Object {
+                    database: db.clone(),
+                    item: Box::new(obj.clone()),
+                    // Built here rather than per render: it is only ever needed
+                    // once the menu opens, as a namespace's script is.
+                    ddl: obj.create_sql(dialect),
+                },
+                name: display.clone(),
+                ai_prompt,
+            }));
+        }
+    })
+    .style({
+        let hl = nav_key.clone();
+        move |s| {
+            let s = tree_row(s, COL_PAD + indent);
+            if is_nav_selected(nav, &hl) {
+                s.background(theme::row_selected())
+            } else {
+                s
+            }
+        }
+    });
+    with_nav_scroll(row.into_any(), nav, nav_key)
 }
 
 // A table node: a header row (double-click opens & runs `SELECT *`) over its
@@ -2005,5 +2388,214 @@ mod tests {
         assert_eq!(s.table, "orders");
         // MySQL rows carry none, so they compare equal to a restored source.
         assert_eq!(table_source("shop", &tbl(None, "users")).schema, None);
+    }
+
+    // ── Standalone objects in the tree ──────────────────────────────────────
+
+    use schemaic_core::schema::{DomainInfo, EnumInfo, SequenceInfo};
+
+    fn objects_db(database: &str, tables: Vec<TableInfo>, ns: &str) -> NavDb {
+        NavDb {
+            database: database.to_string(),
+            name: database.to_string(),
+            schema: Some(std::sync::Arc::new(DbSchema {
+                tables,
+                enums: vec![EnumInfo {
+                    name: "mood".into(),
+                    schema: Some(ns.into()),
+                    values: vec!["ok".into()],
+                    comment: None,
+                }],
+                domains: vec![DomainInfo {
+                    name: "email".into(),
+                    schema: Some(ns.into()),
+                    base_type: "text".into(),
+                    ..Default::default()
+                }],
+                sequences: vec![SequenceInfo {
+                    name: "counter".into(),
+                    schema: Some(ns.into()),
+                    ..Default::default()
+                }],
+            })),
+        }
+    }
+
+    #[test]
+    fn object_folders_come_after_the_tables_of_their_level() {
+        let dbs = vec![objects_db(
+            "shop",
+            vec![tbl(Some("public"), "orders")],
+            "public",
+        )];
+        let keys: Vec<String> = walk(&dbs, &["db:shop"], &[], "")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "db:shop",
+                "tbl:shop:orders",
+                "objgrp:shop::type",
+                "objgrp:shop::domain",
+                "objgrp:shop::sequence",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_expanded_folder_lists_its_objects() {
+        let dbs = vec![objects_db("shop", vec![], "public")];
+        let rows = walk(&dbs, &["db:shop", "objgrp:shop::type"], &[], "");
+        assert!(
+            rows.contains(&(
+                "obj:shop::type:mood".to_string(),
+                "objgrp:shop::type".to_string()
+            )),
+            "{rows:?}"
+        );
+        // The other folders stay closed, so their objects aren't in the walk.
+        assert!(!rows.iter().any(|(k, _)| k.starts_with("obj:shop::domain")));
+    }
+
+    #[test]
+    fn empty_folders_are_not_rendered_at_all() {
+        // A folder that leads nowhere is a click that leads nowhere.
+        let dbs = vec![db("shop", vec![tbl(None, "orders")])];
+        let keys: Vec<String> = walk(&dbs, &["db:shop"], &[], "")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, vec!["db:shop", "tbl:shop:orders"]);
+    }
+
+    /// A search for a type must not be hidden by the level above it: the
+    /// database and the namespace are both dropped before the folder holding the
+    /// match is ever reached.
+    #[test]
+    fn filtering_by_an_object_name_keeps_every_level_above_it() {
+        let dbs = vec![objects_db(
+            "shop",
+            vec![tbl(Some("public"), "orders")],
+            "public",
+        )];
+        let keys: Vec<String> = walk(&dbs, &[], &[], "mood")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        // The database survives, its folder force-opens, and the match is in it.
+        assert!(keys.contains(&"db:shop".to_string()), "{keys:?}");
+        assert!(
+            keys.contains(&"obj:shop::type:mood".to_string()),
+            "{keys:?}"
+        );
+        // The unrelated table and the other folders are filtered away.
+        assert!(!keys.contains(&"tbl:shop:orders".to_string()), "{keys:?}");
+        assert!(
+            !keys.iter().any(|k| k.starts_with("objgrp:shop::domain")),
+            "{keys:?}"
+        );
+    }
+
+    #[test]
+    fn a_namespace_survives_a_filter_that_only_its_objects_match() {
+        let dbs = vec![objects_db(
+            "warehouse",
+            vec![tbl(Some("public"), "staging"), tbl(Some("sales"), "orders")],
+            "sales",
+        )];
+        let keys: Vec<String> = walk(&dbs, &[], &[], "counter")
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(
+            keys.contains(&"sch:warehouse:sales".to_string()),
+            "{keys:?}"
+        );
+        assert!(
+            keys.contains(&"obj:warehouse:sales:sequence:counter".to_string()),
+            "{keys:?}"
+        );
+        // `public` holds nothing matching, so its group is gone.
+        assert!(
+            !keys.contains(&"sch:warehouse:public".to_string()),
+            "{keys:?}"
+        );
+    }
+
+    /// Flat means "this database has no schema level", not "these objects have no
+    /// namespace" — the same distinction that once made keyboard navigation reach
+    /// no table at all on a `public`-only PostgreSQL database.
+    #[test]
+    fn a_flat_database_shows_objects_whatever_namespace_they_carry() {
+        let dbs = vec![objects_db("chinook", vec![], "public")];
+        let rows = walk(&dbs, &["db:chinook", "objgrp:chinook::sequence"], &[], "");
+        assert!(
+            rows.iter()
+                .any(|(k, _)| k == "obj:chinook::sequence:counter"),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn an_enums_detail_lists_its_values_and_says_when_there_are_more() {
+        let e = |vals: &[&str]| {
+            ObjectItem::Enum(EnumInfo {
+                name: "mood".into(),
+                schema: None,
+                values: vals.iter().map(|v| v.to_string()).collect(),
+                comment: None,
+            })
+        };
+        assert_eq!(e(&["sad", "ok"]).detail(), "sad, ok");
+        // Clipped, because a tree row is one line and past a few values the
+        // useful fact is that there are more.
+        assert_eq!(
+            e(&["a", "b", "c", "d", "e", "f"]).detail(),
+            "a, b, c, d, +2"
+        );
+    }
+
+    #[test]
+    fn a_sequence_shows_its_owner_and_an_identity_one_is_undroppable() {
+        let owned = |internal: bool| {
+            ObjectItem::Sequence(SequenceInfo {
+                name: "orders_id_seq".into(),
+                owned_by: Some(schemaic_core::schema::SequenceOwner {
+                    table: "orders".into(),
+                    column: "id".into(),
+                    internal,
+                }),
+                ..Default::default()
+            })
+        };
+        assert_eq!(owned(false).detail(), "orders.id");
+        assert!(!owned(false).is_internal());
+        // An identity column's counter is part of the column: PostgreSQL refuses
+        // to drop it separately, so the menu must not offer to.
+        assert!(owned(true).is_internal());
+        // A free-standing sequence falls back to its storage type.
+        assert_eq!(
+            ObjectItem::Sequence(SequenceInfo::default()).detail(),
+            "bigint"
+        );
+    }
+
+    #[test]
+    fn objects_match_the_filter_by_name_only() {
+        // Not by detail: a sequence would surface because some unrelated table's
+        // name appeared in its owner.
+        let s = ObjectItem::Sequence(SequenceInfo {
+            name: "counter".into(),
+            owned_by: Some(schemaic_core::schema::SequenceOwner {
+                table: "orders".into(),
+                column: "id".into(),
+                internal: false,
+            }),
+            ..Default::default()
+        });
+        assert!(object_matches(&s, "count"));
+        assert!(!object_matches(&s, "orders"));
     }
 }
