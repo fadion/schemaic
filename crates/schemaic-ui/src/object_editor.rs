@@ -500,9 +500,22 @@ fn domain_checks(ui: &Ui) -> AnyView {
             let add = crate::widgets::control_button("Add constraint", move || {
                 draft.update(|d| {
                     if let ObjectDraft::Domain(dom) = d {
-                        let n = dom.info.checks.len() + 1;
+                        // The next free suffix, not `len + 1`: removing a
+                        // constraint and adding another re-proposed a name
+                        // still in the list, and PostgreSQL always rejects
+                        // that plan (`constraint "email_check2" for domain
+                        // "email" already exists`).
+                        let stem = format!("{}_check", dom.info.name);
+                        let n = (1..)
+                            .find(|i| {
+                                !dom.info
+                                    .checks
+                                    .iter()
+                                    .any(|c| c.name == format!("{stem}{i}"))
+                            })
+                            .unwrap_or(1);
                         dom.info.checks.push(CheckInfo {
-                            name: format!("{}_check{n}", dom.info.name),
+                            name: format!("{stem}{n}"),
                             expression: "VALUE IS NOT NULL".to_string(),
                             ..Default::default()
                         });

@@ -2559,6 +2559,13 @@ mod tests {
             e(&["a", "b", "c", "d", "e", "f"]).detail(),
             "a, b, c, d, +2"
         );
+        // A label is arbitrary text and may hold a newline or a tab — the same
+        // fact `pg_types` reads its labels one row at a time for. This row has a
+        // fixed height, so whitespace runs collapse before the join.
+        assert_eq!(e(&["a\nb", "c\t\td"]).detail(), "a b, c d");
+        // Surrounding whitespace is *data* in a label: keeping one space is what
+        // stops `"ok "` and `"ok"` rendering identically.
+        assert_eq!(e(&["  ok  "]).detail(), " ok ");
     }
 
     #[test]

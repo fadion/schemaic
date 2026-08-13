@@ -368,9 +368,14 @@ pub const PG_DEFAULT_SCHEMA: &str = "public";
 /// (The *write* path doesn't use this — `commit_writes`/`refetch_rows` qualify
 /// unconditionally, since that SQL is invisible and must not depend on
 /// `search_path` at all.)
+/// **Case-sensitively** `public`, and only that. PostgreSQL identifiers are
+/// case-sensitive once quoted, so a schema literally named `"PUBLIC"` is a
+/// different schema from `public` — and folding it away made every statement
+/// generated for its objects address `public`'s same-named object instead,
+/// including `recreate_type_sql`'s drop-and-rebuild. Reproduced live.
 pub fn sql_qualifier(schema: Option<&str>) -> Option<&str> {
     match schema {
-        Some(s) if !s.eq_ignore_ascii_case(PG_DEFAULT_SCHEMA) => Some(s),
+        Some(s) if s != PG_DEFAULT_SCHEMA => Some(s),
         _ => None,
     }
 }
@@ -1545,11 +1550,45 @@ impl ObjectItem {
     /// tree row is one line, and past a few values the useful information is
     /// that there are more. A sequence shows what owns it, which is the fact that
     /// decides whether it is an object anyone should touch.
+    /// Collapse every whitespace run to a single space, so arbitrary text fits
+    /// a one-line row. Leading and trailing whitespace is *kept* as a single
+    /// space, because in an enum label it is data and dropping it would show
+    /// two different labels identically.
+    fn one_line(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut in_ws = false;
+        for c in s.chars() {
+            if c.is_whitespace() {
+                in_ws = true;
+                continue;
+            }
+            if in_ws {
+                out.push(' ');
+                in_ws = false;
+            }
+            out.push(c);
+        }
+        if in_ws {
+            out.push(' ');
+        }
+        out
+    }
+
     pub fn detail(&self) -> String {
         const VALUES: usize = 4;
         match self {
             ObjectItem::Enum(e) => {
-                let head: Vec<&str> = e.values.iter().take(VALUES).map(String::as_str).collect();
+                // Whitespace runs collapse to one space **before** joining: an
+                // enum label is arbitrary text and may hold a newline or tab —
+                // the same fact `pg_types` reads its labels one row at a time
+                // for — while this string goes into a tree row of fixed height,
+                // which a raw newline overflows.
+                let head: Vec<String> = e
+                    .values
+                    .iter()
+                    .take(VALUES)
+                    .map(|v| Self::one_line(v))
+                    .collect();
                 let mut out = head.join(", ");
                 if e.values.len() > VALUES {
                     out.push_str(&format!(", +{}", e.values.len() - VALUES));
@@ -2744,7 +2783,13 @@ mod tests {
         // `public` is on the stock search_path → statements stay bare, exactly as
         // they were before multi-schema browsing existed.
         assert_eq!(sql_qualifier(Some("public")), None);
-        assert_eq!(sql_qualifier(Some("PUBLIC")), None); // fold case
+        // …but a schema literally *named* `PUBLIC` is a different schema, and
+        // `nspname` is what it is really called. This asserted `None` — folding
+        // case here made every statement generated for its objects address
+        // `public`'s same-named object instead, `recreate_type_sql`'s
+        // drop-and-rebuild included. Reproduced on PG 16.14.
+        assert_eq!(sql_qualifier(Some("PUBLIC")), Some("PUBLIC"));
+        assert_eq!(display_name(Some("PUBLIC"), "orders"), "PUBLIC.orders");
         // Anything else must be qualified or it resolves somewhere else.
         assert_eq!(sql_qualifier(Some("sales")), Some("sales"));
         // A schema literally named "" is not `public`, so it still qualifies
