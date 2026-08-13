@@ -512,7 +512,16 @@ Zed-inspired, aiming to replace DataGrip.
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context
     menu, generic grid popup, Find-Anywhere, error modal.
   - `schema_tree.rs` — SCHEMA sidebar (`schema_panel` + db/table/column/key row builders + keyboard
-    nav). `completion.rs` — SQL autocomplete: the ranking + popup layer
+    nav). PostgreSQL's standalone objects hang off the same levels the tables do, in
+    `Types`/`Domains`/`Sequences` folders after them (`object_groups`/`object_group_node`/
+    `object_row`, over `schema::ObjectItem`); an empty folder isn't rendered, and none of them
+    exist on MySQL, so that tree is untouched. They are scoped by `TableScope` for the reason
+    it exists — *flat* means the database has no schema level, not that its objects have no
+    namespace. Two filter rules follow from the level above being evaluated first: a database
+    and a namespace both survive a search that only one of their **objects** matches, or the
+    match would be hidden by the row that contains it. `nav_rows` carries the folders and their
+    leaves like everything else — it is the function that must stay bug-for-bug identical to
+    the render. `completion.rs` — SQL autocomplete: the ranking + popup layer
     (`recompute_completions`/`accept_completion`/`completion_popup` + `SchemaIndex`/`fuzzy_score`)
     over `schemaic_core::intel`'s scope/context engine.
   - `tabs.rs` — query-tab strip. `grid.rs` — the whole results grid (`GridState`/`GridCtx`;

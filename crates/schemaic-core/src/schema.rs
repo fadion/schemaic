@@ -1312,6 +1312,92 @@ impl SequenceInfo {
     }
 }
 
+/// One standalone object, whichever kind it is.
+///
+/// The tree renders a mixed list of these and the editor holds exactly one, so
+/// both need a single type that can answer "what are you, what are you called,
+/// and what does your `CREATE` look like" without a three-way match at every
+/// site. The kind tag itself lives in [`crate::ddl::ObjectKind`], next to the
+/// changes that are shared across the three.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObjectItem {
+    Enum(EnumInfo),
+    Domain(DomainInfo),
+    Sequence(SequenceInfo),
+}
+
+impl ObjectItem {
+    pub fn kind(&self) -> crate::ddl::ObjectKind {
+        match self {
+            ObjectItem::Enum(_) => crate::ddl::ObjectKind::Enum,
+            ObjectItem::Domain(_) => crate::ddl::ObjectKind::Domain,
+            ObjectItem::Sequence(_) => crate::ddl::ObjectKind::Sequence,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            ObjectItem::Enum(e) => &e.name,
+            ObjectItem::Domain(d) => &d.name,
+            ObjectItem::Sequence(s) => &s.name,
+        }
+    }
+
+    pub fn schema(&self) -> Option<&str> {
+        match self {
+            ObjectItem::Enum(e) => e.schema.as_deref(),
+            ObjectItem::Domain(d) => d.schema.as_deref(),
+            ObjectItem::Sequence(s) => s.schema.as_deref(),
+        }
+    }
+
+    /// The one-line summary shown beside the name — what the object *is*, in the
+    /// space a column row gives its type.
+    ///
+    /// An enum shows its values, because that list is the entire content of the
+    /// type and a name alone says nothing. It is clipped rather than wrapped: a
+    /// tree row is one line, and past a few values the useful information is
+    /// that there are more. A sequence shows what owns it, which is the fact that
+    /// decides whether it is an object anyone should touch.
+    pub fn detail(&self) -> String {
+        const VALUES: usize = 4;
+        match self {
+            ObjectItem::Enum(e) => {
+                let head: Vec<&str> = e.values.iter().take(VALUES).map(String::as_str).collect();
+                let mut out = head.join(", ");
+                if e.values.len() > VALUES {
+                    out.push_str(&format!(", +{}", e.values.len() - VALUES));
+                }
+                out
+            }
+            ObjectItem::Domain(d) => d.base_type.clone(),
+            ObjectItem::Sequence(s) => match &s.owned_by {
+                Some(o) => format!("{}.{}", o.table, o.column),
+                None => s.data_type.clone(),
+            },
+        }
+    }
+
+    /// Whether this object exists only as part of a column, and so can be
+    /// inspected and altered but never dropped on its own — an identity column's
+    /// counter, and nothing else today. The same call `is_editable_view` makes
+    /// for a materialized view.
+    pub fn is_internal(&self) -> bool {
+        match self {
+            ObjectItem::Sequence(s) => s.owned_by.as_ref().is_some_and(|o| o.internal),
+            _ => false,
+        }
+    }
+
+    pub fn create_sql(&self, dialect: crate::intel::SqlDialect) -> String {
+        match self {
+            ObjectItem::Enum(e) => e.create_sql(dialect),
+            ObjectItem::Domain(d) => d.create_sql(dialect),
+            ObjectItem::Sequence(s) => s.create_sql(dialect),
+        }
+    }
+}
+
 impl TableInfo {
     /// A `CREATE TABLE`/`CREATE VIEW` skeleton from the introspected schema. Not
     /// a round-trip of the server's DDL — no FK references, engine or charset —
@@ -1596,6 +1682,46 @@ impl DbSchema {
         find_by_ns(&self.sequences, schema, name, |s| {
             (s.schema.as_deref(), s.name.as_str())
         })
+    }
+
+    /// Every standalone object in one namespace, of one kind, in introspection
+    /// order — what a schema-tree group renders.
+    ///
+    /// `schema` is matched exactly, so a `None` selects the objects that carry no
+    /// namespace (i.e. none, on PostgreSQL). The tree's *flat* case passes
+    /// [`DbSchema::objects_all`] instead, since flat means "this database has no
+    /// schema level", not "these objects have no namespace" — the distinction
+    /// that once made keyboard navigation reach no table at all.
+    pub fn objects_in(
+        &self,
+        schema: Option<&str>,
+        kind: crate::ddl::ObjectKind,
+    ) -> Vec<ObjectItem> {
+        self.objects_all(kind)
+            .into_iter()
+            .filter(|o| o.schema() == schema)
+            .collect()
+    }
+
+    /// Every standalone object of one kind, whatever namespace it is in.
+    pub fn objects_all(&self, kind: crate::ddl::ObjectKind) -> Vec<ObjectItem> {
+        match kind {
+            crate::ddl::ObjectKind::Enum => {
+                self.enums.iter().cloned().map(ObjectItem::Enum).collect()
+            }
+            crate::ddl::ObjectKind::Domain => self
+                .domains
+                .iter()
+                .cloned()
+                .map(ObjectItem::Domain)
+                .collect(),
+            crate::ddl::ObjectKind::Sequence => self
+                .sequences
+                .iter()
+                .cloned()
+                .map(ObjectItem::Sequence)
+                .collect(),
+        }
     }
 
     /// Every enum and domain in one namespace, as names a column's type could be.
