@@ -39,6 +39,7 @@ use crate::table_designer::{edit_ctx, owned_dropdown, suggest_chevron};
 use crate::widgets::{
     ACTION_GAP, ActionKind, FORM_GAP, MODAL_PAD_H, action_button, focus_root, form_section,
     form_setting, form_setting_owned, modal_footer_split, modal_title_owned, panel_style,
+    row_button, row_gap,
 };
 use crate::{
     DdlPreview, FieldCfg, ObjectTarget, Ui, ddl_preview, edit_field, icons, object_location, theme,
@@ -241,38 +242,6 @@ fn bound_toggle(
         v
     });
     crate::settings::settings_toggle_row(title, hint, sig).into_any()
-}
-
-/// The glyph size the list rows' icon buttons paint at.
-const ROW_ICON: f64 = 14.0;
-/// The padding around it — the other half of [`row_slot`]'s footprint.
-const ROW_ICON_PAD: f64 = 4.0;
-
-/// One icon-button-shaped slot in a list row.
-fn row_slot(inner: impl IntoView + 'static) -> impl IntoView {
-    container(inner).style(|s| s.padding(ROW_ICON_PAD).flex_shrink(0.0_f32))
-}
-
-/// The small icon button the list rows use.
-fn row_button(glyph: &'static str, tip: &'static str, act: impl Fn() + 'static) -> AnyView {
-    row_slot(icons::icon(glyph, ROW_ICON as f32))
-        .on_click_stop(move |_| act())
-        // Colour-only hover, like every other icon button in the app.
-        .style(|s| s.color(theme::text_dim()).hover(|s| s.color(theme::text())))
-        .tooltip(move || text(tip).style(crate::widgets::tooltip_style))
-        .into_any()
-}
-
-/// [`row_button`]'s footprint with nothing in it — what a move button becomes on
-/// the row it can't move: the first row's ↑, the last row's ↓.
-///
-/// An empty slot rather than `hide()`, which is `display: none` and takes the
-/// space with it: the ↓ and the bin would slide left into where the ↑ and ↓ sit
-/// on every other row, so the three icons would stand in a different place on the
-/// first row, the last row, and the ones between. A one-value list, where *both*
-/// arrows are dead, is the case that made it obvious.
-fn row_gap() -> AnyView {
-    row_slot(empty().style(|s| s.size(ROW_ICON, ROW_ICON))).into_any()
 }
 
 // ── the enum form ────────────────────────────────────────────────────────────

@@ -57,7 +57,10 @@ pub(crate) fn close_editors(d: crate::DdlUi) {
 /// Open the preview on a change set. `from_designer` decides where Cancel goes.
 pub(crate) fn open_preview(ui: &Ui, preview: DdlPreview) {
     let d = ui.ddl;
-    d.sql.set(preview.statements.join("\n\n"));
+    // The script, so what the box shows is what Copy and "Open in editor" hand
+    // over. Apply still sends `statements` on the wire, where `DELIMITER` — a
+    // client directive the server has never heard of — must not appear.
+    d.sql.set(preview.script.clone());
     d.sql_rows.set(SQL_ROWS);
     d.error.set(None);
     d.applied.set(false);
@@ -82,6 +85,7 @@ pub(crate) fn preview_of(
         changes: cs.changes.iter().map(|c| c.summary()).collect(),
         destructive: cs.destructive(),
         statements: cs.emit(),
+        script: cs.editor_script(),
         read_only,
     }
 }
@@ -318,7 +322,9 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                     let Some(p) = d.preview.get_untracked().filter(|_| !applied) else {
                         return empty().into_any();
                     };
-                    let sql = p.statements.join("\n\n");
+                    // The *script*, not the wire statements: both of these hand
+                    // the plan to something that splits on `;`.
+                    let sql = p.script.clone();
                     let open_sql = sql.clone();
                     let open_query = ui_side.tab_actions.open_query.clone();
                     h_stack((
