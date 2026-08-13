@@ -1119,6 +1119,10 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
         enums,
         domains,
         sequences: pg_sequences(&client).await?,
+        // A MySQL-family flavour is meaningless here, and `Unknown` is what
+        // makes the emitter withhold MariaDB-specific behaviour rather than
+        // assume it.
+        flavour: schemaic_core::schema::ServerFlavour::Unknown,
     })
 }
 

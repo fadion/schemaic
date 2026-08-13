@@ -199,6 +199,10 @@ pub type ImportFn = Rc<dyn Fn(ImportRunRequest, ImportDoneFn)>;
 pub struct DesignerTarget {
     pub conn_id: u64,
     pub database: String,
+    /// Which MySQL-family server this database is on, so per-flavour controls
+    /// can hide what the server can't express rather than offering it and
+    /// failing at apply — the rule `trigger_editor`'s per-engine form follows.
+    pub flavour: schemaic_core::schema::ServerFlavour,
     /// The namespace a *new* table goes into (`None` on MySQL). For an existing
     /// table the draft carries it.
     pub schema: Option<String>,

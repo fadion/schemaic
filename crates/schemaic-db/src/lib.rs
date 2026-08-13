@@ -936,6 +936,14 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
     apply_fk_rules(&mut schema, &fk_rule_rows);
     apply_check_constraints(&mut schema, &check_rows, mariadb);
     apply_triggers(&mut schema, mysql_triggers(&trigger_rows));
+    // The flavour was computed at the top of this function and then thrown
+    // away, so the emitter — which is where MySQL and MariaDB actually diverge
+    // — had no way to ask. It rides on the schema now.
+    schema.flavour = if mariadb {
+        schemaic_core::schema::ServerFlavour::MariaDb
+    } else {
+        schemaic_core::schema::ServerFlavour::MySql
+    };
     Ok(schema)
 }
 

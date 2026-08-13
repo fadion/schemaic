@@ -1882,6 +1882,52 @@ pub struct DbSchema {
     pub enums: Vec<EnumInfo>,
     pub domains: Vec<DomainInfo>,
     pub sequences: Vec<SequenceInfo>,
+    /// Which MySQL-family server this came from, when it came from one.
+    ///
+    /// `SqlDialect` deliberately has no MariaDB arm — the two speak one dialect
+    /// as far as parsing, quoting and completion are concerned, and giving them
+    /// separate arms would fork every `match` in `sql`/`intel`/`filter` for a
+    /// difference none of them care about. But they **diverge at the emitter**,
+    /// and each divergence is a data-loss bug rather than a syntax preference:
+    /// MariaDB has no `NOT ENFORCED`, and its `MODIFY COLUMN` silently destroys
+    /// the column's own `CHECK`.
+    ///
+    /// So the flavour rides on the introspected schema instead, where
+    /// `collect_schema` already computes it from `SELECT VERSION()` and used to
+    /// throw it away. `Unknown` is the honest default for PostgreSQL, for a
+    /// hand-built schema, and for a server that hasn't been asked — and the
+    /// emitter treats it as "don't assume MariaDB", so a missing answer costs a
+    /// feature rather than a table's constraints.
+    pub flavour: ServerFlavour,
+}
+
+/// Which MySQL-family server a schema was introspected from. See
+/// [`DbSchema::flavour`] for why this is not a [`crate::intel::SqlDialect`] arm.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ServerFlavour {
+    /// PostgreSQL, a hand-built schema, or a MySQL-family server not yet asked.
+    #[default]
+    Unknown,
+    MySql,
+    MariaDb,
+}
+
+impl ServerFlavour {
+    /// Read `SELECT VERSION()`. MariaDB puts its name in the string; MySQL does
+    /// not, which is the same test `schemaic-db` has always used.
+    pub fn parse_version(v: &str) -> Self {
+        if v.to_ascii_lowercase().contains("mariadb") {
+            ServerFlavour::MariaDb
+        } else {
+            ServerFlavour::MySql
+        }
+    }
+
+    /// Is this **known** to be MariaDB? Unknown answers `false`, so a feature is
+    /// withheld rather than a destructive assumption made.
+    pub fn is_mariadb(self) -> bool {
+        self == ServerFlavour::MariaDb
+    }
 }
 
 impl DbSchema {

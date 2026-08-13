@@ -29,7 +29,7 @@ use schemaic_core::ddl::{
     parse_key_list, parse_name_list,
 };
 use schemaic_core::intel::SqlDialect;
-use schemaic_core::schema::{CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo};
+use schemaic_core::schema::{CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo, ServerFlavour};
 
 use crate::settings::{dropdown_box_style, settings_toggle_row};
 use crate::widgets::{
@@ -105,6 +105,26 @@ pub(crate) fn edit_ctx(ui: &Ui) -> EditCtx {
 
 /// The introspected table behind a schema-tree node, when its database's schema
 /// has loaded. `None` ⇒ nothing to design, and the menu entry is disabled.
+/// Which MySQL-family server `database` was introspected from, when its schema
+/// has loaded.
+///
+/// Read off the schema rather than the connection because that is where
+/// `SELECT VERSION()` was actually asked — see [`ServerFlavour`]. `Unknown`
+/// until the schema loads, which is the honest answer and the one that makes a
+/// per-flavour control hide rather than guess.
+pub(crate) fn db_flavour(ui: &Ui, database: &str) -> ServerFlavour {
+    ui.schema.db_nodes.with_untracked(|nodes| {
+        nodes
+            .iter()
+            .find(|n| n.database == database)
+            .and_then(|n| match n.schema.get_untracked() {
+                schemaic_core::schema::SchemaState::Loaded(db) => Some(db.flavour),
+                _ => None,
+            })
+            .unwrap_or_default()
+    })
+}
+
 pub(crate) fn loaded_table(
     ui: &Ui,
     database: &str,
@@ -187,6 +207,7 @@ pub(crate) fn open_for_table(
         DesignerTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
+            flavour: db_flavour(ui, database),
             schema: info.schema.clone(),
             dialect: ctx.dialect,
             current: Some(info),
@@ -221,7 +242,11 @@ pub(crate) fn preview_draft_edit(
     let ctx = edit_ctx(ui);
     let mut draft = TableDraft::from_table(&info);
     edit(&mut draft);
-    let cs = ddl::diff(&info, &draft, ctx.dialect);
+    let cs = ddl::diff(
+        &info,
+        &draft,
+        ddl::Target::new(ctx.dialect, db_flavour(ui, database)),
+    );
     if cs.is_empty() {
         return;
     }
@@ -245,6 +270,7 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>) {
         DesignerTarget {
             conn_id: ctx.conn_id,
             database: database.to_string(),
+            flavour: db_flavour(ui, database),
             schema: schema.map(str::to_string),
             dialect: ctx.dialect,
             current: None,
@@ -1371,7 +1397,7 @@ fn checks_list(ui: Ui) -> AnyView {
     .into_any()
 }
 
-fn check_form(ui: Ui, dialect: SqlDialect) -> AnyView {
+fn check_form(ui: Ui, dialect: SqlDialect, target_flavour: ServerFlavour) -> AnyView {
     let d = ui.ddl;
     let i = d.selected.get_untracked();
     let draft = d.draft.get_untracked();
@@ -1413,9 +1439,18 @@ fn check_form(ui: Ui, dialect: SqlDialect) -> AnyView {
         ),
     );
 
-    // `NOT ENFORCED` is MySQL's alone; offering the switch on PostgreSQL would
-    // promise something the emitter deliberately doesn't write.
-    let enforced: AnyView = if dialect == SqlDialect::Postgres {
+    // `NOT ENFORCED` is **MySQL's** alone — not the MySQL *dialect's*.
+    // PostgreSQL has no such clause, and neither does MariaDB: unticking this
+    // there emitted `ERROR 1064 … near 'NOT ENFORCED'`, measured live. The
+    // introspection side was already right (the MariaDB query hardcodes `YES`),
+    // so only this control could create one, and only to fail.
+    //
+    // `Unknown` hides it too: the form withholds a feature rather than offering
+    // one the server may reject, which is the call the trigger editor's
+    // per-engine form already makes.
+    let enforced: AnyView = if dialect == SqlDialect::Postgres
+        || target_flavour != ServerFlavour::MySql
+    {
         empty().into_any()
     } else {
         bound_toggle(
@@ -1507,7 +1542,9 @@ fn swap_selected(ui: &Ui, delta: isize) {
 /// emits from, so the footer's count can never disagree with the SQL.
 fn change_set(target: &DesignerTarget, draft: &TableDraft) -> ddl::ChangeSet {
     match &target.current {
-        Some(cur) => ddl::diff(cur, draft, target.dialect),
+        // The flavour goes with it: the emitter's MariaDB-specific risk can
+        // only be stated by a plan that knows which server it is for.
+        Some(cur) => ddl::diff(cur, draft, ddl::Target::new(target.dialect, target.flavour)),
         None => ddl::create(draft, target.dialect),
     }
 }
@@ -1582,7 +1619,9 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                         DesignerTab::Columns => column_form(ui, &form_target),
                         DesignerTab::Indexes => index_form(ui, &form_target),
                         DesignerTab::ForeignKeys => fk_form(ui, &form_target),
-                        DesignerTab::Checks => check_form(ui, form_target.dialect),
+                        DesignerTab::Checks => {
+                            check_form(ui, form_target.dialect, form_target.flavour)
+                        }
                     }
                 },
             )
