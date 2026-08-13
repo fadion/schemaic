@@ -1437,6 +1437,11 @@ pub enum Change {
     /// which `ALTER DOMAIN` has no action for.
     RecreateDomain {
         info: Box<DomainInfo>,
+        /// The base type it had **before** the edit. Carried so `risks` can run
+        /// the same narrowing analysis a column's type change gets: this is a
+        /// retype of every value of every column of the domain, and it was the
+        /// one such path in the emitter that disclosed nothing.
+        from_type: String,
         dependents: Vec<TypeDependent>,
     },
     CreateSequence(Box<SequenceInfo>),
@@ -1630,8 +1635,12 @@ impl Change {
             }
             Change::AddDomainCheck(ck) => format!("Add check {} ({})", ck.name, ck.expression),
             Change::DropDomainCheck { name } => format!("Drop check {name}"),
-            Change::RecreateDomain { info, dependents } => format!(
-                "Re-create domain {} as {} (re-casting {} column{})",
+            Change::RecreateDomain {
+                info,
+                from_type,
+                dependents,
+            } => format!(
+                "Re-create domain {} as {} (was {from_type}; re-casting {} column{})",
                 info.name,
                 info.base_type,
                 dependents.len(),
@@ -1761,8 +1770,30 @@ impl Change {
             Change::RecreateEnum { info, dependents } => {
                 vec![recreate_risk(&info.name, "type", dependents)]
             }
-            Change::RecreateDomain { info, dependents } => {
-                vec![recreate_risk(&info.name, "domain", dependents)]
+            Change::RecreateDomain {
+                info,
+                from_type,
+                dependents,
+            } => {
+                // The narrowing verdict goes **first**: `recreate_risk`'s
+                // sentence ends "nothing is applied", which is the opposite of
+                // what a truncating re-cast does, and a reader who stops after
+                // the first sentence must not stop on that one.
+                //
+                // Normalized first, and with `Postgres` spelled in rather than
+                // threaded through `risks()`: a domain exists on no other
+                // engine, and without it the server's `character varying(255)`
+                // and a typed `varchar(16)` read as two different type families
+                // — which reports "rewrites every value" instead of naming the
+                // truncation.
+                let mut out = Vec::new();
+                out.extend(type_change_risk(
+                    &normalize_type(from_type, SqlDialect::Postgres),
+                    &normalize_type(&info.base_type, SqlDialect::Postgres),
+                    &format!("domain {}", info.name),
+                ));
+                out.push(recreate_risk(&info.name, "domain", dependents));
+                out
             }
             // The same shape as `DropCheck` on a table: no data goes, but the
             // guarantee does, and every column of this type loses it at once.
@@ -1910,16 +1941,28 @@ fn alter_risks(from: &ColumnInfo, to: &ColumnInfo) -> Vec<String> {
             to.name
         ));
     }
+    out.extend(type_change_risk(&from.type_name, &to.type_name, &to.name));
+    out
+}
+
+/// What changing a declared type from `from` to `to` costs the values already
+/// stored — phrased about `subject`, which is a column name here and a domain's
+/// name when [`Change::RecreateDomain`] asks.
+///
+/// Split out of [`alter_risks`] because a domain's base type is the same
+/// question asked of a different object, and `RecreateDomain` was the one
+/// narrowing path in the emitter that answered it with nothing at all.
+fn type_change_risk(from: &str, to: &str, subject: &str) -> Option<String> {
     let (fb, fa) = {
-        let p = split_type(&from.type_name);
+        let p = split_type(from);
         (p.base, p.params)
     };
     let (tb, ta) = {
-        let p = split_type(&to.type_name);
+        let p = split_type(to);
         (p.base, p.params)
     };
-    if fb.is_empty() || tb.is_empty() || from.type_name == to.type_name {
-        return out;
+    if fb.is_empty() || tb.is_empty() || from == to {
+        return None;
     }
     if fb == tb {
         // Same family: compare the parameters **pairwise**, because the two carry
@@ -1938,22 +1981,18 @@ fn alter_risks(from: &ColumnInfo, to: &ColumnInfo) -> Vec<String> {
         if narrowed(1) {
             lost.push("rounds every value in the column");
         }
-        if !lost.is_empty() {
-            out.push(format!(
-                "Narrowing {} from {} to {} {}.",
-                to.name,
-                from.type_name,
-                to.type_name,
-                lost.join(" and ")
-            ));
+        if lost.is_empty() {
+            return None;
         }
-        return out;
+        return Some(format!(
+            "Narrowing {subject} from {from} to {to} {}.",
+            lost.join(" and ")
+        ));
     }
-    out.push(format!(
-        "Changing {} from {} to {} rewrites every value; it can fail or lose precision.",
-        to.name, from.type_name, to.type_name
-    ));
-    out
+    Some(format!(
+        "Changing {subject} from {from} to {to} rewrites every value; \
+         it can fail or lose precision."
+    ))
 }
 
 /// A set of changes against one table, ready to review and emit.
@@ -2523,7 +2562,9 @@ impl ChangeSet {
                         d,
                     ));
                 }
-                Change::RecreateDomain { info, dependents } => {
+                Change::RecreateDomain {
+                    info, dependents, ..
+                } => {
                     out.extend(recreate_type_sql(
                         ObjectKind::Domain,
                         &qname,
@@ -2649,9 +2690,25 @@ fn recreate_type_sql(
         } else {
             (qname.to_string(), "text")
         };
+        // **The second cast is the difference between refusing and destroying.**
+        //
+        // `USING col::text::varchar(16)` is an *explicit* cast, which truncates
+        // and rounds; stopping at `::text` leaves PostgreSQL to apply the
+        // *assignment* cast, which refuses ("value too long for type character
+        // varying(16)"). Measured both ways on PG 16.14 against a 64-character
+        // value: the explicit form committed a 16-character one.
+        //
+        // An enum cannot do without it — `USING m::text` alone is rejected with
+        // "result of USING clause ... cannot be cast automatically to type
+        // mood", because text has no assignment cast to an enum. So the two
+        // kinds diverge here, and only the kind that *can* lose data silently
+        // gives the cast up.
+        let recast = match kind {
+            ObjectKind::Domain => format!("{col}::{via}"),
+            _ => format!("{col}::{via}::{target}"),
+        };
         out.push(format!(
-            "ALTER TABLE {table} ALTER COLUMN {col} TYPE {target} \
-             USING {col}::{via}::{target};"
+            "ALTER TABLE {table} ALTER COLUMN {col} TYPE {target} USING {recast};"
         ));
         if let Some(def) = &dep.default_value {
             out.push(format!(
@@ -4282,6 +4339,7 @@ pub fn diff_domain(
                 schema: current.schema.clone(),
                 ..new.clone()
             }),
+            from_type: current.base_type.clone(),
             dependents: dependents.to_vec(),
         });
     } else {
@@ -7892,6 +7950,120 @@ mod object_tests {
         assert!(matches!(cs.changes[0], Change::RecreateDomain { .. }));
         assert!(cs.emit()[0].starts_with("ALTER DOMAIN \"email\" RENAME TO"));
         assert!(cs.emit().last().unwrap().starts_with("DROP DOMAIN"));
+    }
+
+    /// Narrowing a domain's base type **destroys data and commits**, and the
+    /// only sentence the preview showed promised the opposite: `recreate_risk`
+    /// says a value the new definition doesn't accept "fails the whole plan,
+    /// and nothing is applied".
+    ///
+    /// It doesn't. `recreate_type_sql` re-cast every dependent column with
+    /// `USING col::text::domain`, and an **explicit** cast to `varchar(n)` /
+    /// `numeric(p,s)` truncates and rounds where the assignment cast a bare
+    /// `ALTER COLUMN … TYPE` uses *refuses*. Measured on PG 16.14: 64 → 16
+    /// characters destroyed and committed; `numeric(10,4)` 1.2345 → 1.23.
+    ///
+    /// `column_risks`' narrowing analysis is the existing, tested answer to
+    /// exactly this question — `RecreateDomain` was the one narrowing path that
+    /// skipped it.
+    #[test]
+    fn narrowing_a_domains_base_type_says_what_it_costs() {
+        let dep = TypeDependent {
+            schema: Some("public".into()),
+            table: "people".into(),
+            column: "addr".into(),
+            type_name: "email".into(),
+            default_value: None,
+        };
+        let mut d = DomainDraft::from_info(&email());
+        d.info.base_type = "varchar(16)".into();
+        let cs = diff_domain(&email(), &d, std::slice::from_ref(&dep), Postgres);
+        let risks = cs.destructive().join(" ");
+        assert!(risks.contains("truncates"), "{risks}");
+
+        // The scale half — the direction that loses data without the statement
+        // complaining at all.
+        let mut num = email();
+        num.base_type = "numeric(10,4)".into();
+        let mut d = DomainDraft::from_info(&num);
+        d.info.base_type = "numeric(10,2)".into();
+        let cs = diff_domain(&num, &d, std::slice::from_ref(&dep), Postgres);
+        let risks = cs.destructive().join(" ");
+        assert!(risks.contains("rounds"), "{risks}");
+
+        // Widening costs nothing and must not manufacture a warning.
+        let mut d = DomainDraft::from_info(&email());
+        d.info.base_type = "varchar(512)".into();
+        let cs = diff_domain(&email(), &d, std::slice::from_ref(&dep), Postgres);
+        let risks = cs.destructive().join(" ");
+        assert!(!risks.contains("truncates"), "{risks}");
+    }
+
+    /// The other half: stop the truncation happening at all.
+    ///
+    /// A domain rebuild re-casts through `text` and then **explicitly** to the
+    /// new domain, which is what silently truncates. Dropping that second cast
+    /// leaves an assignment cast, which PostgreSQL refuses — verified live: the
+    /// bare form and `USING a::text` both error `value too long for type
+    /// character varying(16)` where `USING a::text::d16` committed a 16-char
+    /// value over a 64-char one.
+    ///
+    /// An **enum** rebuild still needs both casts — `USING m::text` alone is
+    /// rejected with "cannot be cast automatically to type mood" — so the two
+    /// object kinds diverge here on purpose.
+    #[test]
+    fn a_domain_rebuild_recasts_without_the_truncating_explicit_cast() {
+        let dep = TypeDependent {
+            schema: Some("public".into()),
+            table: "people".into(),
+            column: "addr".into(),
+            type_name: "email".into(),
+            default_value: None,
+        };
+        let mut d = DomainDraft::from_info(&email());
+        d.info.base_type = "varchar(16)".into();
+        let sql = diff_domain(&email(), &d, std::slice::from_ref(&dep), Postgres)
+            .emit()
+            .join("\n");
+        assert!(
+            sql.contains("USING \"addr\"::text;"),
+            "domain recast should stop at text: {sql}"
+        );
+        assert!(
+            !sql.contains("::text::"),
+            "the second, explicit cast is what truncates: {sql}"
+        );
+    }
+
+    /// The counterpart to the domain rule, pinned because it looks like the
+    /// same code and must not be "simplified" to match.
+    ///
+    /// An enum rebuild keeps **both** casts. PostgreSQL 16.14 rejects
+    /// `USING m::text` on its own — "result of USING clause for column m cannot
+    /// be cast automatically to type mood" — because there is no assignment
+    /// cast from text to an enum. A domain gives the second cast up precisely
+    /// because it *does* have one, and that cast truncates.
+    #[test]
+    fn an_enum_rebuild_keeps_the_explicit_cast_a_domain_gives_up() {
+        let mut e = mood();
+        e.values = vec!["ok".into(), "bad".into()];
+        let mut d = EnumDraft::from_info(&e);
+        // Removing a value is what collapses an enum edit into a full rebuild.
+        d.info.values = vec!["ok".into()];
+        let dep = TypeDependent {
+            schema: Some("public".into()),
+            table: "t".into(),
+            column: "m".into(),
+            type_name: "mood".into(),
+            default_value: None,
+        };
+        let sql = diff_enum(&e, &d, std::slice::from_ref(&dep), Postgres)
+            .emit()
+            .join("\n");
+        assert!(
+            sql.contains("USING \"m\"::text::\"mood\";"),
+            "an enum needs the explicit cast: {sql}"
+        );
     }
 
     #[test]
