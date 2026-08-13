@@ -1639,13 +1639,13 @@ impl TableInfo {
     /// statement and drop all of them.
     pub fn create_ddl(&self, dialect: crate::intel::SqlDialect) -> String {
         let pg = dialect == crate::intel::SqlDialect::Postgres;
-        let q = |s: &str| -> String {
-            if pg {
-                format!("\"{}\"", s.replace('"', "\"\""))
-            } else {
-                ddl_ident(s)
-            }
-        };
+        // Delegated, not inlined. This was a fifth copy of the identifier
+        // quoter — byte-identical to `ddl_ident_in`, so it produced no wrong
+        // output, but the range that added the check loop below put the
+        // divergence *inside one function body*: the checks emit through
+        // `ddl_ident_in` while the columns three lines up used this closure.
+        // **Invariant:** one identifier quoter.
+        let q = |s: &str| ddl_ident_in(s, dialect);
         // The table's own name, schema-qualified when it isn't in `public`.
         let qname = match sql_qualifier(self.schema.as_deref()) {
             Some(s) => format!("{}.{}", q(s), q(&self.name)),

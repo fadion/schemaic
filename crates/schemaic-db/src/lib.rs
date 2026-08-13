@@ -1071,8 +1071,29 @@ fn mysql_check_clause(clause: &str, mariadb: bool) -> String {
     let mut out = String::with_capacity(clause.len());
     let mut i = 0;
     while i < b.len() {
-        // A trailing backslash escapes nothing — keep it rather than lose it.
         if b[i] == b'\\' && i + 1 < b.len() {
+            // **Decode the escape, don't just drop the backslash.** MySQL's
+            // escapes are not all "the next byte literally": `\n` is a newline,
+            // not the letter `n`. Dropping the backslash turned a column named
+            // with an embedded newline into a different, non-existent
+            // identifier — measured live on MySQL 8.4.11, `` `nl\ncol` ``
+            // came back as `` `nlncol` ``.
+            let decoded = match b[i + 1] {
+                b'n' => Some('\n'),
+                b'r' => Some('\r'),
+                b't' => Some('\t'),
+                b'0' => Some('\0'),
+                b'b' => Some('\u{8}'),
+                b'Z' => Some('\u{1a}'),
+                // Everything else — `\'`, `\"`, `\\`, `\%`, `\_` — really is
+                // the next character standing for itself.
+                _ => None,
+            };
+            if let Some(c) = decoded {
+                out.push(c);
+                i += 2;
+                continue;
+            }
             i += 1;
         }
         // Copy one whole UTF-8 char: the escaped byte may begin a multi-byte one.
@@ -2974,6 +2995,13 @@ mod tests {
                 r#"(not((`s` like _latin1'%a%')))"#,
             ),
             (r#"(`qty` > 0)"#, r#"(`qty` > 0)"#),
+            // A **control character in an identifier**, which is where dropping
+            // the backslash instead of decoding the escape went wrong: this
+            // names a column whose name contains a newline, and the old code
+            // produced `nlncol` — a different, non-existent column. Measured on
+            // MySQL 8.4.11 (`CHECK_CLAUSE` hex `…606E6C5C6E636F6C60…`, i.e. the
+            // two bytes `\` `n`, against a real 0x0A in `SHOW CREATE TABLE`).
+            ("(`nl\\ncol` > 0)", "(`nl\ncol` > 0)"),
         ];
         for (raw, want) in cases {
             assert_eq!(mysql_check_clause(raw, false), want, "for {raw}");
