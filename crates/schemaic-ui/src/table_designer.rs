@@ -518,13 +518,36 @@ pub(crate) fn list_row(
     // tint follows a live theme switch.
     icon: Option<crate::widgets::MenuIcon>,
 ) -> impl IntoView {
+    list_row_inner(ui, idx, label, detail, icon, true)
+}
+
+/// [`list_row`] for a list where **nothing** carries an icon.
+///
+/// The icon slot is reserved even when a row has none, so a keyed and an unkeyed
+/// column line up. A list where no row can ever have one — triggers — would just
+/// be indented by a gutter that never fills, so it doesn't reserve it.
+pub(crate) fn list_row_plain(ui: Ui, idx: usize, label: String, detail: String) -> impl IntoView {
+    list_row_inner(ui, idx, label, detail, None, false)
+}
+
+fn list_row_inner(
+    ui: Ui,
+    idx: usize,
+    label: String,
+    detail: String,
+    icon: Option<crate::widgets::MenuIcon>,
+    reserve_icon: bool,
+) -> impl IntoView {
     let selected = ui.ddl.selected;
     let mark: AnyView = match icon {
         Some((glyph, color)) => icons::icon(glyph, 13.0)
             .style(move |s| s.color(color()).flex_shrink(0.0_f32))
             .into_any(),
-        None => empty()
+        None if reserve_icon => empty()
             .style(|s| s.width(13.0).flex_shrink(0.0_f32))
+            .into_any(),
+        None => empty()
+            .style(|s| s.width(0.0).flex_shrink(0.0_f32))
             .into_any(),
     };
     h_stack((
