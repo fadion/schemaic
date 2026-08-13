@@ -504,7 +504,7 @@ fn domain_checks(ui: &Ui) -> AnyView {
                         dom.info.checks.push(CheckInfo {
                             name: format!("{}_check{n}", dom.info.name),
                             expression: "VALUE IS NOT NULL".to_string(),
-                            enforced: true,
+                            ..Default::default()
                         });
                     }
                 });
