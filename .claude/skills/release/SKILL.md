@@ -37,8 +37,8 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-```bash
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+```powershell
+$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --workspace --no-deps
 ```
 
 ```bash
