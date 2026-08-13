@@ -1029,6 +1029,16 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
   So an overlay that wants keys goes through `focus_root` (which is also what registers it) —
   `.keyboard_navigable().request_focus(|| {})` on its own leaves it deaf as soon as a field is
   focused. A field is *not* a focus root (the grid's inline cell editor deliberately isn't one).
+  **The same two-step covers an overlay over an overlay, and it is the `on_cleanup` half that
+  makes it work.** Floem clears `app_state.focus` when a focused view is removed and does it
+  *silently* — `if self.focus == Some(id) { self.focus = None }`, no `focus_changed`, so no
+  `FocusGained` lands anywhere — so a popup menu opened over a modal took the keyboard and gave it
+  back to nobody: Escape closed the menu and then the modal answered nothing, while its close
+  button and Cancel still worked. `focus_root`'s cleanup therefore hands focus to the new innermost
+  root. That the first Escape closes the *menu* and the second the modal is the intended
+  behaviour — one keypress dismissing two layers is the bug, not the fix. Don't chain your own
+  `.on_cleanup` onto a `focus_root`: floem keeps one cleanup slot per view, so a second silently
+  replaces both the unregister and the hand-back.
 - **`text_editor_keys` inserts a typed char *unconditionally* — your handler's `CommandExecuted`
   return is ignored for plain character keys.** Floem's `editor_content` KeyDown listener discards the
   handler's result and then, if `mods` (minus SHIFT/ALTGR) is empty, calls `receive_char(c)` for any
