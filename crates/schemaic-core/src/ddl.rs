@@ -2497,14 +2497,17 @@ impl ChangeSet {
         // drops, and the one `GridWrite::plan` uses in `core::model`.
         let mut drops = Vec::new();
         let mut creates = Vec::new();
+        let mut push_create = |t: &TriggerInfo| {
+            creates.extend(session_wrapped_create(t, d));
+        };
         for c in &self.changes {
             match c {
-                Change::CreateTrigger(draft) => creates.push(draft.info.create_sql(d)),
+                Change::CreateTrigger(draft) => push_create(&draft.info),
                 Change::ReplaceTrigger { draft } => {
                     // The drop addresses the name the server knows; the create
                     // builds the draft's, which is how a rename comes for free.
                     drops.push(drop(draft.original.as_deref().unwrap_or(&draft.info.name)));
-                    creates.push(draft.info.create_sql(d));
+                    push_create(&draft.info);
                 }
                 Change::DropTrigger { name } => drops.push(drop(name)),
                 _ => {}
@@ -3512,6 +3515,59 @@ fn fks_equal(a: &ForeignKeyInfo, b: &ForeignKeyInfo) -> bool {
             (Some(x), Some(y)) => x == y,
             _ => true,
         }
+}
+
+/// A trigger's `CREATE`, wrapped in the session state it was created under.
+///
+/// `CREATE TRIGGER` has **no clause** for `sql_mode`, `character_set_client` or
+/// `collation_connection`, yet all three are part of what the trigger does: one
+/// written under `sql_mode = ''` and recreated under a strict mode starts
+/// failing every parent `INSERT`, and reversed it stops raising and silently
+/// truncates. So the values are set on the session around the statement and
+/// restored after — the shape `mysqldump` uses, and safe here because
+/// `Db::run_ddl` runs a MySQL plan's statements in order on **one** connection.
+///
+/// Emitting nothing when nothing is known is deliberate: `None` means "not
+/// fetched" (or PostgreSQL), and inventing a session state would be a change
+/// nobody asked for. Restoring from a user variable rather than a literal keeps
+/// the connection as it was found, whatever it was.
+fn session_wrapped_create(t: &TriggerInfo, d: SqlDialect) -> Vec<String> {
+    let create = t.create_sql(d);
+    if d == SqlDialect::Postgres {
+        return vec![create];
+    }
+    let settings: Vec<(&str, &str)> = [
+        ("sql_mode", t.sql_mode.as_deref()),
+        ("character_set_client", t.charset_client.as_deref()),
+        ("collation_connection", t.collation_connection.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.map(|v| (k, v)))
+    .collect();
+    if settings.is_empty() {
+        return vec![create];
+    }
+    let save = settings
+        .iter()
+        .map(|(k, _)| format!("@schemaic_{k} = @@SESSION.{k}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let set = settings
+        .iter()
+        .map(|(k, v)| format!("SESSION {k} = {}", ddl_string(v, d)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let restore = settings
+        .iter()
+        .map(|(k, _)| format!("SESSION {k} = @schemaic_{k}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    vec![
+        format!("SET {save};"),
+        format!("SET {set};"),
+        create,
+        format!("SET {restore};"),
+    ]
 }
 
 /// Peel the parentheses that wrap a *whole* expression, leaving the predicate
@@ -5829,6 +5885,48 @@ mod tests {
             }]);
             let d = TriggerSetDraft::from_table(&t);
             assert!(diff_triggers(&t.triggers, &d, MySql).changes.is_empty());
+        }
+
+        /// A MySQL trigger carries the session state it was created under, and
+        /// `CREATE TRIGGER` has no clause for any of it.
+        ///
+        /// Recreated under whatever the applying session happens to have, a
+        /// trigger written under `sql_mode = ''` starts failing every parent
+        /// `INSERT` — or, reversed, stops raising and silently truncates.
+        /// Nothing in the preview named it, because the three values were never
+        /// read at all.
+        #[test]
+        fn a_mysql_trigger_is_recreated_under_the_session_state_it_was_written_in() {
+            let mut t = my_trigger();
+            t.sql_mode = Some("NO_ENGINE_SUBSTITUTION".into());
+            t.charset_client = Some("latin1".into());
+            t.collation_connection = Some("latin1_swedish_ci".into());
+            let table = table_with_triggers(vec![t.clone()]);
+            let mut d = TriggerSetDraft::from_table(&table);
+            d.triggers[0].info.action = TriggerAction::Body("SET NEW.x = 2".into());
+            let sql = diff_triggers(&table.triggers, &d, MySql).emit();
+
+            let create = sql
+                .iter()
+                .position(|s| s.contains("CREATE"))
+                .expect("a create");
+            // Saved before, set before, restored after — in that order.
+            assert!(sql[create - 2].starts_with("SET @schemaic_sql_mode = @@SESSION.sql_mode"));
+            assert!(
+                sql[create - 1].contains("SESSION sql_mode = 'NO_ENGINE_SUBSTITUTION'"),
+                "{:?}",
+                sql[create - 1]
+            );
+            assert!(sql[create - 1].contains("SESSION character_set_client = 'latin1'"));
+            assert!(sql[create + 1].contains("SESSION sql_mode = @schemaic_sql_mode"));
+
+            // Nothing known ⇒ nothing emitted: `None` means "not fetched", and
+            // inventing a session state is a change nobody asked for.
+            let plain = table_with_triggers(vec![my_trigger()]);
+            let mut d = TriggerSetDraft::from_table(&plain);
+            d.triggers[0].info.action = TriggerAction::Body("SET NEW.x = 2".into());
+            let sql = diff_triggers(&plain.triggers, &d, MySql).emit();
+            assert!(!sql.iter().any(|s| s.contains("@@SESSION")), "{sql:?}");
         }
 
         /// Swapping two triggers' names must not destroy one of them.

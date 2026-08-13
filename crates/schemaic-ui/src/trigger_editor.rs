@@ -69,8 +69,8 @@ use crate::widgets::{
     modal_footer_split, modal_title_owned, panel_style,
 };
 use crate::{
-    DdlPreview, FieldCfg, FunctionTarget, TriggerFnDoneFn, TriggerFnRequest, TriggerTarget, Ui,
-    ddl_preview, edit_field, object_location, theme,
+    DdlPreview, FieldCfg, FunctionTarget, TriggerFnDoneFn, TriggerFnRequest, TriggerSrcDoneFn,
+    TriggerSrcRequest, TriggerTarget, Ui, ddl_preview, edit_field, object_location, theme,
 };
 
 /// Matches the table designer's, deliberately: this is the same list-plus-form
@@ -107,6 +107,89 @@ fn open_editor(ui: &Ui, target: TriggerTarget, draft: TriggerSetDraft) {
     d.trigger.set(Some(target));
     if pg {
         fetch_functions(ui);
+    } else {
+        fetch_sources(ui);
+    }
+}
+
+/// Replace every MySQL trigger's body with the one the server actually holds.
+///
+/// **Not an enhancement — a correction.** `information_schema.ACTION_STATEMENT`
+/// is what the editor opened with, and on MySQL 8 that body has had its escapes
+/// resolved: a trigger written `'C:\temp'` reads back with a literal tab, and
+/// one written `'it''s'` reads back as `'it's'`, which is a 1064 on restate —
+/// after the `DROP` has committed and taken the only copy with it. So each
+/// trigger's real source is fetched when the editor opens, before anything can
+/// be applied.
+///
+/// **Both sides of the diff are patched**, the rule
+/// [`crate::view_editor`]'s `fetch_algorithm` established: writing only the
+/// draft would make every MySQL trigger open *already changed* against a
+/// `current` that still held the corrupt body, and writing only `current` would
+/// leave the draft emitting it. A draft the user has already edited is left
+/// alone — the round trip lands in milliseconds, but "unlikely" is not a reason
+/// to overwrite what somebody typed.
+fn fetch_sources(ui: &Ui) {
+    let d = ui.ddl;
+    let Some((conn_id, database, names)) = d.trigger.with_untracked(|t| {
+        t.as_ref().map(|t| {
+            (
+                t.conn_id,
+                t.database.clone(),
+                t.current.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+            )
+        })
+    }) else {
+        return;
+    };
+    let session = d.session.get_untracked();
+    for name in names {
+        let done: TriggerSrcDoneFn = Rc::new(move |name: String, src| {
+            let Some(src) = src else {
+                return;
+            };
+            if d.session.get_untracked() != session {
+                return;
+            }
+            // The body the editor opened with — the corrupt one — is what says
+            // whether the user has since edited this row, so it is read before
+            // `current` is corrected.
+            let opened_with = d.trigger.with_untracked(|t| {
+                t.as_ref()
+                    .and_then(|t| t.current.iter().find(|c| c.name == name))
+                    .map(|c| c.action.clone())
+            });
+            // `current` — the left-hand side of every diff.
+            d.trigger.update(|t| {
+                if let Some(cur) = t
+                    .as_mut()
+                    .and_then(|t| t.current.iter_mut().find(|c| c.name == name))
+                {
+                    src.apply_to(cur);
+                }
+            });
+            // …and the draft, unless the user has already edited this row: the
+            // round trip lands in milliseconds, but that is not a reason to
+            // overwrite what somebody typed.
+            d.trigger_draft.update(|dr| {
+                if let Some(row) = dr
+                    .triggers
+                    .iter_mut()
+                    .find(|r| r.original.as_deref() == Some(name.as_str()))
+                    .filter(|r| opened_with.as_ref() == Some(&r.info.action))
+                {
+                    src.apply_to(&mut row.info);
+                }
+            });
+        });
+        (ui.schema_actions.trigger_source)(
+            TriggerSrcRequest {
+                conn_id,
+                database: database.clone(),
+                trigger: name,
+            },
+            done,
+        );
     }
 }
 
