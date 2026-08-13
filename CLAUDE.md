@@ -127,12 +127,33 @@ Zed-inspired, aiming to replace DataGrip.
     modulo wrapping parens and whitespace runs — via `peel_parens`, which goes through
     `skip_noncode`, since `name <> ')'` has a close-paren in a string — but deliberately
     *not* modulo tokenisation, so `qty>0` vs `qty > 0` costs a re-validating drop-and-add
-    rather than risking a kept edit; and a column rename is **not** rewritten into the
-    predicate, because PostgreSQL rewrites its own stored parse tree and MySQL refuses
-    the rename outright. `DropCheck` carries a risk sentence though it deletes no data —
-    the table stops guaranteeing something and nothing else says so. `enforced` is
-    MySQL's `NOT ENFORCED` only: PG's `NOT VALID` exempts existing rows and so can't
-    silently change what a write does.
+    rather than risking a kept edit; and a column rename is rewritten into the
+    predicate **only where the server won't do it itself** — PostgreSQL rewrites its own
+    stored parse tree and MariaDB rewrites a table-level check's text, while MySQL 8
+    *refuses the rename outright* (`ERROR 3959`) unless the constraint comes off first,
+    so there and only there `diff` adds a `DropCheck`+`AddCheck` pair with the predicate
+    re-pointed through `repoint_check_column` (a **token walk** over `skip_noncode`, so
+    `qty` never matches inside `qty_total`, inside `'qty'`, or in a comment).
+    `DropCheck` carries a risk sentence though it deletes no data — the table stops
+    guaranteeing something and nothing else says so — but `ChangeSet::destructive`
+    suppresses it when the same name is re-added in the same plan, since every check
+    *edit* is a drop-and-add and "rows the constraint refused are accepted from now on"
+    is simply false about one. `enforced` is MySQL's `NOT ENFORCED` only: PG's
+    `NOT VALID` exempts existing rows and so can't silently change what a write does.
+    **`CheckInfo::column_level` is MariaDB's `CHECK_CONSTRAINTS.LEVEL`**, and it is the
+    one place a check is not a table-level object: `q INT CHECK (q > 0)` makes a
+    constraint that is *part of the column*, so `MODIFY`/`CHANGE COLUMN` deletes it
+    unless the clause restates it (measured on 10.11.14 — the constraint is simply gone
+    and the next `-5` is accepted). It has no name of its own — the syntax refuses a
+    `CONSTRAINT` label at column level, MariaDB names it after its column and renames it
+    with the column — and `DROP CONSTRAINT` cannot address one at all (`ERROR 1091`).
+    So the emitter goes through the column both ways: `Change::AlterColumn::inline_check`
+    restates an unchanged one (re-pointed when the column is renamed, or the `CHANGE` is
+    `ERROR 1054`), and a check the draft **dropped or edited** has its impossible
+    `DropCheck` swapped for a `MODIFY COLUMN` without the clause. MySQL 8 has none of
+    this — it folds the same syntax into a table constraint at `CREATE` time — so all of
+    it is gated on `ServerFlavour::MariaDb`, and a MariaDB older than 10.5 (no `LEVEL`
+    column) degrades to the pre-flag behaviour rather than losing its checks.
     **Views** ride the same rails: `ViewDraft` (name + body + the `ViewOptions` it
     carries) → `diff_view` → `Change::{CreateView, ReplaceView, RenameView, DropView}`
     → the same preview. Two engine rules live here. MySQL's `CREATE OR REPLACE VIEW`

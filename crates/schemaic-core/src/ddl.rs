@@ -194,9 +194,9 @@ pub struct TableDraft {
     /// an entry here.
     pub indexes: Vec<IndexDraft>,
     pub foreign_keys: Vec<ForeignKeyDraft>,
-    /// `CHECK` constraints. Table-level, so unlike a column's attributes these
-    /// survive a `MODIFY COLUMN` — the gap they close is a `CREATE TABLE` built
-    /// from a draft, which used to lose them silently.
+    /// `CHECK` constraints, table-level and — on MariaDB — column-level alike:
+    /// the designer lists both, and [`CheckInfo::column_level`] is what tells
+    /// the emitter which statement can express a given one.
     pub check_constraints: Vec<CheckDraft>,
     /// MySQL storage engine. Always `None` on PostgreSQL.
     pub engine: Option<String>,
@@ -1382,6 +1382,15 @@ pub enum Change {
         from: Box<ColumnInfo>,
         to: Box<ColumnInfo>,
         position: Option<Position>,
+        /// A **MariaDB column-level** CHECK that has to be restated inside this
+        /// clause or the server deletes it — see [`CheckInfo::column_level`].
+        ///
+        /// It rides on the change rather than being a change of its own because
+        /// nothing about the constraint is changing: it is part of the column
+        /// definition `MODIFY`/`CHANGE` replaces, in the same way the column's
+        /// default is, and the preview would otherwise list an edit the user
+        /// never made. The predicate is already re-pointed for a rename.
+        inline_check: Option<Box<CheckInfo>>,
     },
     /// The primary key changed. Either side may be empty (adding a key to a
     /// table that had none, or dropping one). `drop_constraint` is the name
@@ -1579,7 +1588,9 @@ impl Change {
                 format!("Add column {} {}", column.name, column.type_name)
             }
             Change::DropColumn { name, .. } => format!("Drop column {name}"),
-            Change::AlterColumn { from, to, position } => {
+            Change::AlterColumn {
+                from, to, position, ..
+            } => {
                 if from.name != to.name {
                     format!("Rename column {} to {}", from.name, to.name)
                 } else if from.as_ref() == to.as_ref() && position.is_some() {
@@ -2132,41 +2143,26 @@ impl ChangeSet {
     /// Every destructive consequence in this set, in change order — a change can
     /// contribute more than one.
     pub fn destructive(&self) -> Vec<String> {
-        let mut out: Vec<String> = self.changes.iter().flat_map(Change::risks).collect();
-        out.extend(self.mariadb_risks());
-        out
-    }
-
-    /// Risks that belong to the **server**, not to any one change — so they
-    /// can't come from `Change::risks`, which has no flavour to ask.
-    ///
-    /// Only one today, and it is the most destructive thing this emitter can do
-    /// silently: on MariaDB, `ALTER TABLE … MODIFY COLUMN` **drops the CHECK
-    /// constraint defined on that column**, without mentioning it. Measured on
-    /// 10.11.14 — a column declared `qty INT CHECK (qty > 0)`, widened to
-    /// `BIGINT`, comes back with no constraints at all and accepts `-5` on the
-    /// next insert. MySQL 8.4 keeps it, so the same plan has opposite outcomes
-    /// on the two servers Schemaic calls one dialect.
-    ///
-    /// Only *column-level* checks are affected; a table-level `CONSTRAINT … CHECK`
-    /// survives untouched (also measured). Schemaic can't yet tell which a given
-    /// constraint is — that needs MariaDB's `CHECK_CONSTRAINTS.LEVEL` on the
-    /// model — so the sentence names the column and says "any", rather than
-    /// claiming a certainty it doesn't have.
-    fn mariadb_risks(&self) -> Vec<String> {
-        if !self.flavour.is_mariadb() {
-            return Vec::new();
-        }
-        self.changes
+        // A check that comes off and goes back on in the same plan is not a
+        // dropped check, and saying "rows the constraint refused are accepted
+        // from now on" about one is simply false. Neither engine can alter a
+        // check in place, so *every* edit — and the compensating pair a MySQL
+        // column rename needs — is a drop and an add; the `AddCheck` summary is
+        // what states the new predicate.
+        let re_added: HashSet<&str> = self
+            .changes
             .iter()
             .filter_map(|c| match c {
-                Change::AlterColumn { to, .. } => Some(format!(
-                    "MariaDB drops any CHECK constraint defined on column {} when the \
-                     column is altered, without saying so. Re-add it after applying.",
-                    to.name
-                )),
+                Change::AddCheck(ck) => Some(ck.name.as_str()),
                 _ => None,
             })
+            .collect();
+        self.changes
+            .iter()
+            .filter(
+                |c| !matches!(c, Change::DropCheck { name } if re_added.contains(name.as_str())),
+            )
+            .flat_map(Change::risks)
             .collect()
     }
 
@@ -2263,9 +2259,24 @@ impl ChangeSet {
             }
         }
         for c in &self.changes {
-            if let Change::AlterColumn { from, to, position } = c {
+            if let Change::AlterColumn {
+                from,
+                to,
+                position,
+                inline_check,
+            } = c
+            {
                 let pos = position.as_ref().map(|p| p.sql(d)).unwrap_or_default();
-                let def = to.definition_sql(d);
+                let mut def = to.definition_sql(d);
+                // A MariaDB column-level CHECK is part of the definition being
+                // replaced, so it has to be restated here or the server deletes
+                // it. It can't be re-added as a constraint afterwards instead:
+                // `DROP CONSTRAINT`/`ADD CONSTRAINT` can't address one (1091 on
+                // the drop), and the name is the column's, not the user's.
+                if let Some(ck) = inline_check {
+                    def.push(' ');
+                    def.push_str(&ck.inline_sql());
+                }
                 // CHANGE restates the old name as well; MODIFY doesn't take one.
                 // Either way the definition is restated in full — MySQL replaces
                 // the column, so anything left out is destroyed.
@@ -3856,6 +3867,83 @@ fn norm_check_expr(s: &str, dialect: SqlDialect) -> String {
     out
 }
 
+/// Rewrite every reference to column `from` in a CHECK predicate as `to`,
+/// returning `None` when the predicate never names it.
+///
+/// A **token walk**, not a substring replace: `qty` must not match inside
+/// `qty_total`, inside the literal `'qty'`, or inside a comment — getting that
+/// wrong re-points a constraint the user never touched, or corrupts a pattern.
+/// The walk is [`sql::skip_noncode`]'s, so string, comment and quoted-identifier
+/// boundaries are the ones the rest of the app agrees on. A quoted identifier is
+/// a *non-code* run to that scanner, so it is matched here explicitly — it is
+/// the form both servers print (`` `qty` `` / `"qty"`).
+///
+/// Case follows the engine: MySQL/MariaDB column names are case-insensitive,
+/// PostgreSQL's are exactly as written once quoted — the same split
+/// [`check_exprs_equal`] makes.
+///
+/// The replacement is always emitted quoted. This text goes into a statement
+/// Schemaic runs, and the new name is whatever the user typed in the designer.
+fn repoint_check_column(expr: &str, from: &str, to: &str, dialect: SqlDialect) -> Option<String> {
+    let pg = dialect == SqlDialect::Postgres;
+    let quote = if pg { b'"' } else { b'`' };
+    let same = |s: &str| {
+        if pg {
+            s == from
+        } else {
+            s.eq_ignore_ascii_case(from)
+        }
+    };
+    let b = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len());
+    let mut hit = false;
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(j) = sql::skip_noncode(b, i, dialect) {
+            // Only a *quoted identifier* is a name; a string or comment that
+            // reads like one isn't.
+            let run = &expr[i..j];
+            let q = quote as char;
+            // A doubled quote inside the run is one literal quote.
+            let inner = (b[i] == quote && j - i >= 2 && b[j - 1] == quote)
+                .then(|| run[1..run.len() - 1].replace(&format!("{q}{q}"), &q.to_string()));
+            match inner {
+                Some(name) if same(&name) => {
+                    out.push_str(&ddl_ident_in(to, dialect));
+                    hit = true;
+                }
+                _ => out.push_str(run),
+            }
+            i = j;
+            continue;
+        }
+        if sql::is_word_start(b[i]) {
+            let start = i;
+            while i < b.len() && sql::is_word_byte(b[i]) {
+                i += 1;
+            }
+            let word = &expr[start..i];
+            // A word immediately followed by `(` is a function call, not a
+            // column — `qty(…)` names no column even in a table with a `qty`.
+            let is_call = expr[i..].trim_start().starts_with('(');
+            if same(word) && !is_call {
+                out.push_str(&ddl_ident_in(to, dialect));
+                hit = true;
+            } else {
+                out.push_str(word);
+            }
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < b.len() && (b[i] & 0xC0) == 0x80 {
+            i += 1;
+        }
+        out.push_str(&expr[start..i]);
+    }
+    hit.then_some(out)
+}
+
 /// Fold case only over the parts that aren't quoted.
 ///
 /// `qty > 0` and `QTY > 0` name the same column, but `status = 'a'` and
@@ -3964,6 +4052,8 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
                         from: Box::new((*cur).clone()),
                         to: Box::new(c.info.clone()),
                         position: None,
+                        // Filled in below, once the check diff is known.
+                        inline_check: None,
                     });
                 }
             }
@@ -4137,6 +4227,161 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
         changes.push(Change::AddCheck(Box::new(ck)));
     }
 
+    // What a column clause does to the checks standing on that column — and the
+    // two servers Schemaic calls one dialect do opposite things, so this is the
+    // one place in the emitter driven by `flavour` rather than `dialect`.
+    // PostgreSQL needs neither arm: it rewrites its own stored parse tree.
+    //
+    // A constraint the draft already changed is left alone in both arms. The
+    // user's edit is the authority there, and touching it twice would either
+    // duplicate the statement or overwrite what they typed.
+    if dialect != SqlDialect::Postgres {
+        let touched: HashSet<String> = changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::DropCheck { name } => Some(name.clone()),
+                Change::AddCheck(ck) => Some(ck.name.clone()),
+                _ => None,
+            })
+            .collect();
+        if flavour.is_mariadb() {
+            // **MariaDB.** A column-level check is part of the column
+            // definition, so `MODIFY`/`CHANGE COLUMN` deletes it unless the
+            // clause restates it — measured on 10.11.14, including a bare
+            // rename. It has no name of its own (MariaDB names it after the
+            // column and renames it along with the column), so a rename
+            // re-points the predicate too: `CHANGE COLUMN q qty bigint
+            // CHECK (q > 0)` is `ERROR 1054 Unknown column 'q'`.
+            for c in changes.iter_mut() {
+                let Change::AlterColumn {
+                    from,
+                    to,
+                    inline_check,
+                    ..
+                } = c
+                else {
+                    continue;
+                };
+                let Some(ck) = current.check_constraints.iter().find(|ck| {
+                    ck.column_level
+                        && ck.name.eq_ignore_ascii_case(&from.name)
+                        && !touched.contains(&ck.name)
+                }) else {
+                    continue;
+                };
+                let mut ck = ck.clone();
+                if from.name != to.name {
+                    ck.name = to.name.clone();
+                    if let Some(e) =
+                        repoint_check_column(&ck.expression, &from.name, &to.name, dialect)
+                    {
+                        ck.expression = e;
+                    }
+                }
+                *inline_check = Some(Box::new(ck));
+            }
+            // The other direction: a column-level check the draft **removed or
+            // edited** can't come off with `DROP CONSTRAINT` either — MariaDB
+            // can't address one by name (`ERROR 1091 … check that it exists`).
+            // The only way to take it off is to restate the column without the
+            // clause, so the plan swaps that drop for a column clause. An edit
+            // then lands as an ordinary `ADD CONSTRAINT`, i.e. as a table-level
+            // constraint, which is the only kind `ALTER TABLE` can add.
+            let dropped_inline: Vec<String> = changes
+                .iter()
+                .filter_map(|c| match c {
+                    Change::DropCheck { name } => current
+                        .check_constraints
+                        .iter()
+                        .find(|ck| ck.column_level && ck.name == *name)
+                        .map(|ck| ck.name.clone()),
+                    _ => None,
+                })
+                .collect();
+            changes.retain(
+                |c| !matches!(c, Change::DropCheck { name } if dropped_inline.contains(name)),
+            );
+            for name in &dropped_inline {
+                // MariaDB names a column-level check after its column, and the
+                // syntax gives no way to name it anything else.
+                let Some(cur) = current
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(name))
+                else {
+                    continue;
+                };
+                // A column on its way out takes its check with it.
+                if changes
+                    .iter()
+                    .any(|c| matches!(c, Change::DropColumn { name, .. } if *name == cur.name))
+                {
+                    continue;
+                }
+                if changes
+                    .iter()
+                    .any(|c| matches!(c, Change::AlterColumn { from, .. } if from.name == cur.name))
+                {
+                    continue;
+                }
+                let to = draft
+                    .columns
+                    .iter()
+                    .find(|c| c.original.as_deref() == Some(cur.name.as_str()))
+                    .map(|c| c.info.clone())
+                    .unwrap_or_else(|| cur.clone());
+                changes.push(Change::AlterColumn {
+                    from: Box::new(cur.clone()),
+                    to: Box::new(to),
+                    position: None,
+                    inline_check: None,
+                });
+            }
+        } else {
+            // **MySQL 8.** It refuses to rename a column any check names at all
+            // — `ERROR 3959 … hence column cannot be dropped or renamed` — so
+            // the rename only goes through if the constraint comes off first and
+            // back on after, which the emitter already orders that way. Measured
+            // live: the drop, the `CHANGE COLUMN` and the add run in one
+            // `ALTER TABLE`.
+            let renames: Vec<(String, String)> = changes
+                .iter()
+                .filter_map(|c| match c {
+                    Change::AlterColumn { from, to, .. } if from.name != to.name => {
+                        Some((from.name.clone(), to.name.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let mut pairs: Vec<CheckInfo> = Vec::new();
+            for ck in &current.check_constraints {
+                if touched.contains(&ck.name) {
+                    continue;
+                }
+                let mut expr = ck.expression.clone();
+                let mut hit = false;
+                for (from, to) in &renames {
+                    if let Some(e) = repoint_check_column(&expr, from, to, dialect) {
+                        expr = e;
+                        hit = true;
+                    }
+                }
+                if hit {
+                    pairs.push(CheckInfo {
+                        expression: expr,
+                        ..ck.clone()
+                    });
+                }
+            }
+            for ck in pairs {
+                changes.push(Change::DropCheck {
+                    name: ck.name.clone(),
+                });
+                changes.push(Change::AddCheck(Box::new(ck)));
+            }
+        }
+    }
+
     // Table-level options. On PostgreSQL only the comment exists, and the draft
     // carries `None` for the other two on both sides, so nothing is emitted.
     //
@@ -4257,6 +4502,10 @@ fn apply_positions(
                 from: Box::new(info.clone()),
                 to: Box::new(info),
                 position: Some(pos),
+                // A move is a `MODIFY COLUMN` too, so it destroys a MariaDB
+                // column-level check exactly as a retype does. `diff` fills this
+                // in for every `AlterColumn` it ends up with, this one included.
+                inline_check: None,
             });
         }
     }
@@ -6005,8 +6254,8 @@ mod tests {
             ));
         }
 
-        /// MariaDB destroys a column's CHECK when the column is altered, and
-        /// said nothing about it.
+        /// MariaDB destroys a column's CHECK when the column is altered, so the
+        /// clause has to restate it.
         ///
         /// Measured on MariaDB 10.11.14: a column declared
         /// `qty INT CHECK (qty > 0)`, widened to `BIGINT`, comes back with **no
@@ -6018,34 +6267,202 @@ mod tests {
         ///
         /// The flavour is not a `SqlDialect` arm — the two agree on everything
         /// `sql`/`intel`/`filter` care about — so it rides on the plan.
-        #[test]
-        fn a_mariadb_column_alter_says_it_will_drop_the_columns_check() {
-            let mut before = TableInfo {
+        ///
+        /// It can't be compensated with `DROP CONSTRAINT` + `ADD CONSTRAINT`
+        /// the way MySQL's rename is: MariaDB can't address a column-level
+        /// check by name at all (`ERROR 1091 … check that it exists`), and the
+        /// syntax refuses to give one a name in the first place. Restating the
+        /// clause inside the `MODIFY` is the only form that works, and it was
+        /// measured to keep the constraint at `LEVEL = 'Column'`.
+        fn checked_column_table() -> TableInfo {
+            TableInfo {
                 name: "t".into(),
+                columns: vec![ColumnInfo {
+                    name: "qty".into(),
+                    type_name: "int".into(),
+                    nullable: true,
+                    ..Default::default()
+                }],
+                check_constraints: vec![CheckInfo {
+                    // MariaDB names a column-level check after its column.
+                    name: "qty".into(),
+                    expression: "`qty` > 0".into(),
+                    column_level: true,
+                    ..Default::default()
+                }],
                 ..Default::default()
-            };
-            before.columns.push(ColumnInfo {
-                name: "qty".into(),
-                type_name: "int".into(),
-                ..Default::default()
-            });
+            }
+        }
+
+        #[test]
+        fn a_mariadb_column_alter_restates_the_columns_own_check() {
+            let before = checked_column_table();
             let mut draft = TableDraft::from_table(&before);
             draft.columns[0].info.type_name = "bigint".into();
 
-            let risks = diff(&before, &draft, Target::new(MySql, ServerFlavour::MariaDb))
-                .destructive()
-                .join(" ");
-            assert!(risks.contains("MariaDB drops any CHECK"), "{risks}");
-            assert!(risks.contains("column qty"), "{risks}");
+            let sql = diff(&before, &draft, Target::new(MySql, ServerFlavour::MariaDb))
+                .emit()
+                .join("\n");
+            assert!(
+                sql.contains("MODIFY COLUMN `qty` bigint CHECK (`qty` > 0)"),
+                "{sql}"
+            );
+            // The constraint is not *changed*, so it is not a change: it rides
+            // on the column clause rather than appearing as an edit nobody made.
+            let cs = diff(&before, &draft, Target::new(MySql, ServerFlavour::MariaDb));
+            assert_eq!(cs.len(), 1, "{:?}", cs.changes);
 
-            // Real MySQL keeps the constraint, so the sentence would be a lie.
-            let risks = diff(&before, &draft, Target::new(MySql, ServerFlavour::MySql))
-                .destructive()
-                .join(" ");
-            assert!(!risks.contains("MariaDB"), "{risks}");
-            // And an unstated flavour must not guess either way.
-            let risks = diff(&before, &draft, MySql).destructive().join(" ");
-            assert!(!risks.contains("MariaDB"), "{risks}");
+            // Real MySQL keeps the constraint through a `MODIFY`, so restating
+            // it there would create a second one.
+            let sql = diff(&before, &draft, Target::new(MySql, ServerFlavour::MySql))
+                .emit()
+                .join("\n");
+            assert!(!sql.contains("CHECK"), "{sql}");
+        }
+
+        /// The round-trip gate, for the new field: a table carrying a
+        /// column-level check must diff to nothing against its own draft, or
+        /// every MariaDB designer would open on a phantom change.
+        #[test]
+        fn a_column_level_check_round_trips_to_no_changes() {
+            let before = checked_column_table();
+            let draft = TableDraft::from_table(&before);
+            for flavour in [ServerFlavour::MariaDb, ServerFlavour::MySql] {
+                let cs = diff(&before, &draft, Target::new(MySql, flavour));
+                assert!(cs.is_empty(), "{flavour:?}: {:?}", cs.changes);
+            }
+        }
+
+        #[test]
+        fn re_pointing_matches_names_the_way_the_engine_does() {
+            // MySQL/MariaDB: case-insensitive, and both spellings re-point.
+            assert_eq!(
+                repoint_check_column("QTY > 0", "qty", "quantity", MySql).as_deref(),
+                Some("`quantity` > 0")
+            );
+            // PostgreSQL: a quoted name is exactly what was written.
+            assert_eq!(
+                repoint_check_column("\"Qty\" > 0", "qty", "quantity", Postgres),
+                None
+            );
+            assert_eq!(
+                repoint_check_column("\"Qty\" > 0", "Qty", "Quantity", Postgres).as_deref(),
+                Some("\"Quantity\" > 0")
+            );
+            // A doubled quote inside a name is one quote, not a boundary.
+            assert_eq!(
+                repoint_check_column("`a``b` > 0", "a`b", "c", MySql).as_deref(),
+                Some("`c` > 0")
+            );
+            // Nothing to re-point is `None`, not an unchanged copy — that is
+            // what tells the caller no constraint is involved.
+            assert_eq!(repoint_check_column("a > 0", "qty", "q", MySql), None);
+        }
+
+        /// A bare `CHANGE COLUMN` destroys it too, and the restated predicate
+        /// has to name the *new* column — `CHANGE COLUMN q qty bigint
+        /// CHECK (q > 0)` is `ERROR 1054 Unknown column 'q'`. MariaDB renames
+        /// the constraint with the column, so the plan does the same.
+        #[test]
+        fn a_mariadb_rename_re_points_the_restated_check() {
+            let before = checked_column_table();
+            let mut draft = TableDraft::from_table(&before);
+            draft.columns[0].info.name = "quantity".into();
+
+            let cs = diff(&before, &draft, Target::new(MySql, ServerFlavour::MariaDb));
+            let sql = cs.emit().join("\n");
+            assert!(
+                sql.contains("CHANGE COLUMN `qty` `quantity` int CHECK (`quantity` > 0)"),
+                "{sql}"
+            );
+            // And no drop-and-add pair: MariaDB would refuse the drop.
+            assert!(
+                !sql.contains("DROP CONSTRAINT") && !sql.contains("ADD CONSTRAINT"),
+                "{sql}"
+            );
+        }
+
+        /// A move is a `MODIFY COLUMN` as much as a retype is, so it loses the
+        /// check the same way.
+        #[test]
+        fn a_mariadb_column_move_restates_the_check_too() {
+            let mut before = checked_column_table();
+            // `qty` last on the server, first in the draft — so it is the one
+            // column the plan moves.
+            before.columns.insert(
+                0,
+                ColumnInfo {
+                    name: "a".into(),
+                    type_name: "int".into(),
+                    nullable: true,
+                    ..Default::default()
+                },
+            );
+            let mut draft = TableDraft::from_table(&before);
+            draft.columns.swap(0, 1);
+
+            let sql = diff(&before, &draft, Target::new(MySql, ServerFlavour::MariaDb))
+                .emit()
+                .join("\n");
+            assert!(sql.contains("CHECK (`qty` > 0)"), "{sql}");
+        }
+
+        /// The user's own edit stays the authority: a check the draft changed is
+        /// applied as the drop-and-add the designer asked for, not restated
+        /// inline from the version on the server.
+        #[test]
+        fn an_edited_column_check_is_not_also_restated_inline() {
+            let before = checked_column_table();
+            let mut draft = TableDraft::from_table(&before);
+            draft.columns[0].info.type_name = "bigint".into();
+            draft.check_constraints[0].info.expression = "`qty` > 10".into();
+
+            let sql = diff(&before, &draft, Target::new(MySql, ServerFlavour::MariaDb))
+                .emit()
+                .join("\n");
+            assert!(!sql.contains("MODIFY COLUMN `qty` bigint CHECK"), "{sql}");
+            assert_eq!(sql.matches("CHECK (`qty` > 10)").count(), 1, "{sql}");
+            // And the old one comes off by restating the column, not by a
+            // `DROP CONSTRAINT` MariaDB answers with 1091.
+            assert!(!sql.contains("DROP CONSTRAINT"), "{sql}");
+        }
+
+        /// Deleting one is the same shape with nothing added back — and it is
+        /// the case that had no working statement at all before: the designer
+        /// listed a constraint whose removal the server refused.
+        #[test]
+        fn a_deleted_column_check_comes_off_by_restating_the_column() {
+            let before = checked_column_table();
+            let mut draft = TableDraft::from_table(&before);
+            draft.check_constraints.clear();
+
+            let cs = diff(&before, &draft, Target::new(MySql, ServerFlavour::MariaDb));
+            let sql = cs.emit().join("\n");
+            assert!(!sql.contains("DROP CONSTRAINT"), "{sql}");
+            assert!(sql.contains("MODIFY COLUMN `qty` int"), "{sql}");
+            assert!(!sql.contains("CHECK"), "{sql}");
+
+            // MySQL 8 has no column-level checks, so nothing changes there.
+            let sql = diff(&before, &draft, Target::new(MySql, ServerFlavour::MySql))
+                .emit()
+                .join("\n");
+            assert!(sql.contains("DROP CONSTRAINT `qty`"), "{sql}");
+        }
+
+        /// A column on its way out takes its check with it — the plan must not
+        /// grow a clause restating a column it is dropping.
+        #[test]
+        fn dropping_the_column_does_not_resurrect_it_to_drop_its_check() {
+            let before = checked_column_table();
+            let mut draft = TableDraft::from_table(&before);
+            draft.columns.clear();
+            draft.check_constraints.clear();
+
+            let sql = diff(&before, &draft, Target::new(MySql, ServerFlavour::MariaDb))
+                .emit()
+                .join("\n");
+            assert!(sql.contains("DROP COLUMN `qty`"), "{sql}");
+            assert!(!sql.contains("MODIFY COLUMN"), "{sql}");
         }
 
         /// A PostgreSQL clause trailer belongs to the *constraint*, not to the
@@ -6114,6 +6531,7 @@ mod tests {
                 validated: false,
                 inherited: false,
                 enforced: true,
+                column_level: false,
             };
             assert_eq!(ck.clause_sql(MySql), "CONSTRAINT `c` CHECK (qty > 0)");
         }
@@ -6841,19 +7259,71 @@ mod tests {
             assert!(!sql.contains("NOT ENFORCED"), "{sql}");
         }
 
-        /// A renamed column is not re-pointed into the predicate on purpose:
-        /// PostgreSQL rewrites its own stored parse tree, and MySQL refuses the
-        /// rename outright. Either way the draft's text is left alone.
+        /// **MySQL 8 refuses to rename a column any check names** — `ERROR 3959
+        /// … hence column cannot be dropped or renamed` — so the constraint has
+        /// to come off before the rename and go back on after, re-pointed.
+        /// Measured live: the three clauses run in one `ALTER TABLE`.
         #[test]
-        fn a_column_rename_does_not_rewrite_the_predicate() {
+        fn a_mysql_rename_drops_and_re_adds_the_checks_that_name_the_column() {
             let t = table_with(vec![ck("qty_pos", "(`qty` > 0)")]);
+            let mut d = TableDraft::from_table(&t);
+            d.columns[0].info.name = "quantity".into();
+            let cs = diff(&t, &d, MySql);
+            let sql = cs.emit().join("\n");
+            assert!(sql.contains("DROP CONSTRAINT `qty_pos`"), "{sql}");
+            assert!(
+                sql.contains("ADD CONSTRAINT `qty_pos` CHECK ((`quantity` > 0))"),
+                "{sql}"
+            );
+            // Dropped and immediately re-added is not a lost guarantee, and
+            // saying it is would be the preview's only sentence about this plan.
+            assert!(
+                !cs.destructive().iter().any(|r| r.contains("qty_pos")),
+                "{:?}",
+                cs.destructive()
+            );
+        }
+
+        /// Both the servers that *rewrite the predicate themselves* are left
+        /// alone: PostgreSQL rewrites its stored parse tree, MariaDB rewrites a
+        /// table-level check's text. An unnecessary drop-and-add on PostgreSQL
+        /// costs a full validating scan.
+        #[test]
+        fn a_rename_is_not_re_pointed_where_the_server_does_it() {
+            let t = table_with(vec![ck("qty_pos", "(`qty` > 0)")]);
+            let mut d = TableDraft::from_table(&t);
+            d.columns[0].info.name = "quantity".into();
+            for target in [
+                Target::from(Postgres),
+                Target::new(MySql, ServerFlavour::MariaDb),
+            ] {
+                let cs = diff(&t, &d, target);
+                assert!(
+                    !cs.changes
+                        .iter()
+                        .any(|c| matches!(c, Change::DropCheck { .. } | Change::AddCheck(_))),
+                    "{:?}",
+                    cs.changes
+                );
+            }
+        }
+
+        /// The walk is over tokens, not bytes: a rename must not reach into a
+        /// longer name, a string literal, or a function call that happens to
+        /// share the name.
+        #[test]
+        fn re_pointing_a_rename_does_not_reach_into_look_alikes() {
+            let t = table_with(vec![ck(
+                "c",
+                "`qty_total` > 0 AND note <> 'qty' AND qty(1) > 0",
+            )]);
             let mut d = TableDraft::from_table(&t);
             d.columns[0].info.name = "quantity".into();
             let cs = diff(&t, &d, MySql);
             assert!(
                 !cs.changes
                     .iter()
-                    .any(|c| matches!(c, Change::DropCheck { .. } | Change::AddCheck(_))),
+                    .any(|c| matches!(c, Change::DropCheck { .. })),
                 "{:?}",
                 cs.changes
             );
@@ -8005,6 +8475,7 @@ mod tests {
             from: Box::new(col("c", from)),
             to: Box::new(col("c", to)),
             position: None,
+            inline_check: None,
         }
         .risks()
     }
@@ -8027,6 +8498,7 @@ mod tests {
             from: Box::new(from),
             to: Box::new(to),
             position: None,
+            inline_check: None,
         }
         .risks();
         assert_eq!(got.len(), 2, "{got:?}");
@@ -8046,6 +8518,7 @@ mod tests {
             from: Box::new(col("c", "varchar(255)")),
             to: Box::new(to),
             position: None,
+            inline_check: None,
         }
         .risks();
         assert_eq!(got.len(), 1, "{got:?}");
