@@ -23,6 +23,7 @@ pub mod icons;
 mod import_view;
 mod markdown;
 mod monitor_view;
+mod object_editor;
 mod overlays;
 mod plan_view;
 mod schema_tree;
@@ -295,6 +296,34 @@ pub struct FunctionTarget {
     pub read_only: bool,
 }
 
+/// What the object editor is editing — an enum type, a domain or a sequence.
+/// Doubles as its open flag.
+///
+/// `dependents` is read off the schema **when the editor opens**, not when the
+/// plan is built: they are the columns a rebuild would have to re-cast, and they
+/// are found by the type's *current* name — which the draft may be in the middle
+/// of changing.
+#[derive(Clone, Debug)]
+pub struct ObjectTarget {
+    pub conn_id: u64,
+    pub database: String,
+    pub schema: Option<String>,
+    pub dialect: SqlDialect,
+    pub current: Option<schemaic_core::schema::ObjectItem>,
+    pub dependents: Vec<schemaic_core::ddl::TypeDependent>,
+    pub read_only: bool,
+}
+
+impl ObjectTarget {
+    /// The object's display name, for the modal title and the preview subject.
+    pub fn display(&self) -> String {
+        schemaic_core::schema::display_name(
+            self.schema.as_deref(),
+            self.current.as_ref().map(|c| c.name()).unwrap_or_default(),
+        )
+    }
+}
+
 /// One lazy trigger-function fetch — see [`schemaic_db::Db::trigger_functions`].
 #[derive(Clone, Debug)]
 pub struct TriggerFnRequest {
@@ -446,6 +475,22 @@ pub struct DdlUi {
     /// The function editor's target; doubles as its open flag.
     pub function: RwSignal<Option<FunctionTarget>>,
     pub function_draft: RwSignal<schemaic_core::ddl::FunctionDraft>,
+    /// The object editor's target; doubles as its open flag.
+    pub object: RwSignal<Option<ObjectTarget>>,
+    /// The enum / domain / sequence being edited. Same rule as `draft`: one
+    /// value, because the footer's change count is
+    /// [`schemaic_core::ddl::ObjectDraft::change_set`] of exactly it.
+    pub object_draft: RwSignal<schemaic_core::ddl::ObjectDraft>,
+    /// Fields whose text isn't a number yet — a sequence's bounds are typed, and
+    /// the draft holds `i64`, so a half-typed `-` has nowhere to live in it.
+    /// Kept beside the draft rather than in it: they are a property of the *form*,
+    /// and a draft carrying them couldn't be diffed.
+    pub object_errors: RwSignal<Vec<String>>,
+    /// Bumped on every structural edit to a list inside the object editor (an
+    /// enum value added or moved, a domain constraint removed). The rows are
+    /// keyed on it for the reason the designer's form is: removing row *n*
+    /// leaves the index alone while the item at it is now a different one.
+    pub object_rev: RwSignal<u64>,
     /// The database's trigger functions, fetched when a PostgreSQL trigger
     /// editor opens — what its "Function" dropdown offers. Empty on MySQL, and
     /// empty until the fetch lands, which is why the dropdown keeps whatever the
@@ -2019,6 +2064,7 @@ pub fn workspace(ui: Ui) -> impl IntoView {
             let view_open = ui.ddl.view;
             let trigger_open = ui.ddl.trigger;
             let function_open = ui.ddl.function;
+            let object_open = ui.ddl.object;
             let ddl_preview_open = ui.ddl.preview;
             stack((
                 error_modal_overlay(ui.clone()),
@@ -2041,6 +2087,7 @@ pub fn workspace(ui: Ui) -> impl IntoView {
                         s
                     }
                 }),
+                object_editor::object_editor_overlay(ui.clone()),
                 ddl_preview::ddl_preview_overlay(ui.clone()),
             ))
             .style(move |s| {
@@ -2052,6 +2099,7 @@ pub fn workspace(ui: Ui) -> impl IntoView {
                     || view_open.get().is_some()
                     || trigger_open.get().is_some()
                     || function_open.get().is_some()
+                    || object_open.get().is_some()
                     || ddl_preview_open.get().is_some()
                 {
                     s.absolute().inset(0.0)

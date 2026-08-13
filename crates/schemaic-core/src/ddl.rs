@@ -1174,6 +1174,103 @@ impl SequenceDraft {
     }
 }
 
+/// Whichever standalone object the editor is editing.
+///
+/// The counterpart to [`crate::schema::ObjectItem`] on the draft side: one modal
+/// holds one of these, so its chrome, footer and preview path don't have to
+/// three-way match. The forms below it differ per kind, because the objects do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObjectDraft {
+    Enum(EnumDraft),
+    Domain(DomainDraft),
+    Sequence(SequenceDraft),
+}
+
+impl Default for ObjectDraft {
+    fn default() -> Self {
+        ObjectDraft::Enum(EnumDraft::default())
+    }
+}
+
+impl ObjectDraft {
+    /// The draft that describes an introspected object exactly — the editor's
+    /// starting point, and the input to the round-trip gate.
+    pub fn from_item(o: &crate::schema::ObjectItem) -> ObjectDraft {
+        match o {
+            crate::schema::ObjectItem::Enum(e) => ObjectDraft::Enum(EnumDraft::from_info(e)),
+            crate::schema::ObjectItem::Domain(d) => ObjectDraft::Domain(DomainDraft::from_info(d)),
+            crate::schema::ObjectItem::Sequence(s) => {
+                ObjectDraft::Sequence(SequenceDraft::from_info(s))
+            }
+        }
+    }
+
+    pub fn blank(kind: ObjectKind, name: impl Into<String>, schema: Option<String>) -> ObjectDraft {
+        match kind {
+            ObjectKind::Enum => ObjectDraft::Enum(EnumDraft::blank(name, schema)),
+            ObjectKind::Domain => ObjectDraft::Domain(DomainDraft::blank(name, schema)),
+            ObjectKind::Sequence => ObjectDraft::Sequence(SequenceDraft::blank(name, schema)),
+        }
+    }
+
+    pub fn kind(&self) -> ObjectKind {
+        match self {
+            ObjectDraft::Enum(_) => ObjectKind::Enum,
+            ObjectDraft::Domain(_) => ObjectKind::Domain,
+            ObjectDraft::Sequence(_) => ObjectKind::Sequence,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            ObjectDraft::Enum(d) => &d.info.name,
+            ObjectDraft::Domain(d) => &d.info.name,
+            ObjectDraft::Sequence(d) => &d.info.name,
+        }
+    }
+
+    pub fn validate(&self) -> Vec<String> {
+        match self {
+            ObjectDraft::Enum(d) => d.validate(),
+            ObjectDraft::Domain(d) => d.validate(),
+            ObjectDraft::Sequence(d) => d.validate(),
+        }
+    }
+
+    /// Everything that has to happen to turn `current` into this draft, or the
+    /// `CREATE` when there is no `current`.
+    ///
+    /// The **one** call the editor's change count and its preview both go
+    /// through, so the number in the footer can't disagree with the SQL — the
+    /// rule every other editor here follows.
+    ///
+    /// A kind mismatch between `current` and the draft can't happen (the editor
+    /// builds the draft from the object it opened on) and resolves to the
+    /// `CREATE`, which is the reading that never destroys anything.
+    pub fn change_set(
+        &self,
+        current: Option<&crate::schema::ObjectItem>,
+        dependents: &[TypeDependent],
+        dialect: SqlDialect,
+    ) -> ChangeSet {
+        use crate::schema::ObjectItem;
+        match (current, self) {
+            (Some(ObjectItem::Enum(c)), ObjectDraft::Enum(d)) => {
+                diff_enum(c, d, dependents, dialect)
+            }
+            (Some(ObjectItem::Domain(c)), ObjectDraft::Domain(d)) => {
+                diff_domain(c, d, dependents, dialect)
+            }
+            (Some(ObjectItem::Sequence(c)), ObjectDraft::Sequence(d)) => {
+                diff_sequence(c, d, dialect)
+            }
+            (_, ObjectDraft::Enum(d)) => create_enum(d, dialect),
+            (_, ObjectDraft::Domain(d)) => create_domain(d, dialect),
+            (_, ObjectDraft::Sequence(d)) => create_sequence(d, dialect),
+        }
+    }
+}
+
 // ── The difference ───────────────────────────────────────────────────────────
 
 /// One reviewable step between the table that's there and the table that's

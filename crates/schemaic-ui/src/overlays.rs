@@ -47,6 +47,42 @@ fn conn_read_only(connections: &RwSignal<Vec<Connection>>, active_conn: RwSignal
     })
 }
 
+/// The `Create type` / `Create domain` / `Create sequence` entries a database or
+/// namespace node offers.
+///
+/// **Empty on MySQL**, which has none of these — the same call
+/// `trigger_editor`'s form makes about what an engine can't express: hide it,
+/// rather than offer it and fail at apply. That is also why these are hidden
+/// where every other schema-editing entry is merely *dimmed* on a read-only
+/// connection: a missing entry reads as "not supported", a dimmed one as "not
+/// here", and here both readings are true of a different engine.
+fn create_object_entries(
+    ui: &Ui,
+    database: &str,
+    schema: Option<&str>,
+    read_only: bool,
+) -> Vec<MenuEntry> {
+    use schemaic_core::ddl::ObjectKind;
+    if crate::table_designer::edit_ctx(ui).dialect != schemaic_core::intel::SqlDialect::Postgres {
+        return Vec::new();
+    }
+    [
+        (ObjectKind::Enum, "Create type"),
+        (ObjectKind::Domain, "Create domain"),
+        (ObjectKind::Sequence, "Create sequence"),
+    ]
+    .into_iter()
+    .map(|(kind, label)| {
+        let ui = ui.clone();
+        let (db, ns) = (database.to_string(), schema.map(str::to_string));
+        MenuEntry::action(label, move || {
+            crate::object_editor::open_for_new(&ui, &db, ns.as_deref(), kind);
+        })
+        .disabled(read_only)
+    })
+    .collect()
+}
+
 // ===== moved from lib.rs (overlays) =====
 pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
     let open = ui.conn.conn_menu_open;
@@ -531,6 +567,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let dbn = menu.name.clone();
                         let view_ui = ui.clone();
                         let view_ns = ns.clone();
+                        let obj_ns = ns.clone();
                         let view_db = menu.name.clone();
                         let read_only = conn_read_only(&connections, active_conn);
                         entries.push(
@@ -549,6 +586,12 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             })
                             .disabled(read_only),
                         );
+                        entries.extend(create_object_entries(
+                            &import_ui,
+                            &menu.name,
+                            obj_ns.as_deref(),
+                            read_only,
+                        ));
                     }
                 }
                 // One of PostgreSQL's standalone objects. Deliberately the same
@@ -580,6 +623,18 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         entries.push(MenuEntry::action("Refresh", move || (rf)(db.clone())));
                     }
                     entries.push(MenuEntry::Separator);
+                    {
+                        let ui = import_ui.clone();
+                        let (db, obj) = (database.clone(), item.clone());
+                        let read_only = conn_read_only(&connections, active_conn);
+                        let editable = crate::object_editor::is_editable_object(&obj);
+                        entries.push(
+                            MenuEntry::action("Edit", move || {
+                                crate::object_editor::open_for_object(&ui, &db, &obj);
+                            })
+                            .disabled(read_only || !editable),
+                        );
+                    }
                     {
                         let ui = import_ui.clone();
                         let confirm = ui.overlay.confirm;
@@ -661,6 +716,12 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             })
                             .disabled(read_only),
                         );
+                        entries.extend(create_object_entries(
+                            &import_ui,
+                            &database,
+                            Some(&menu.name),
+                            read_only,
+                        ));
                     }
                     // A namespace is introspected as part of its database, so
                     // refreshing targets the database.
