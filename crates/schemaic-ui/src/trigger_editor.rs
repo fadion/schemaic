@@ -417,7 +417,14 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize) -> AnyView {
                             dr.info.events.push(ev);
                         }
                         // Keep PostgreSQL's print order, which is what the
-                        // emitter round-trips against.
+                        // emitter round-trips against. That holds because
+                        // `TriggerEvent`'s declaration order *is* `tgtype`'s bit
+                        // order — see the type's own doc, and the test in
+                        // `schemaic-db` that pins the two together. It did not
+                        // hold when this comment was first written, and saying
+                        // so is what let a phantom drop-and-recreate through
+                        // review; the ordering is not obvious enough to assert
+                        // without naming where it is enforced.
                         dr.info.events.sort();
                     });
                 }
