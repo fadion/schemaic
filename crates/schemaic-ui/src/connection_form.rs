@@ -705,6 +705,8 @@ fn conn_form(
 
     // Save: the write is otherwise silent, so the button flashes a check in place
     // of its label. Same pinned width, so the confirmation can't nudge Test.
+    // `save_gen` is Save's counterpart to `test_gen`, for the identical reason.
+    let save_gen: RwSignal<u64> = RwSignal::new(0);
     let save = save_conn.clone();
     let save_btn = action_face(
         "Save",
@@ -724,8 +726,20 @@ fn conn_form(
         ),
         move || {
             (save)();
+            // The same generation guard the Test flash beside this one already
+            // has, and for the same reason: unguarded, a second Save inside
+            // `SAVE_FLASH` has its confirmation cleared early by the *first*
+            // click's timer, so the tick vanishes while the save it reports is
+            // the one that just happened. Widening `SAVE_FLASH` to 2000 ms
+            // widened that window rather than closing it.
+            let g = save_gen.get_untracked().wrapping_add(1);
+            save_gen.set(g);
             save_flash.set(true);
-            floem::action::exec_after(SAVE_FLASH, move |_| save_flash.set(false));
+            floem::action::exec_after(SAVE_FLASH, move |_| {
+                if save_gen.try_get_untracked() == Some(g) {
+                    save_flash.set(false);
+                }
+            });
         },
     );
     let right_actions =

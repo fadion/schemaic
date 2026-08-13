@@ -148,7 +148,16 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                     on_submit: Some(commit_enter),
                     on_escape: Some(Rc::new(move || tab.editing.set(false))),
                     on_blur: Some(Rc::new(move || {
-                        if tab.editing.get_untracked() {
+                        // `try_get_untracked`, not `get_untracked`: the blur is
+                        // armed as a `Duration::ZERO` timer, nothing cancels it,
+                        // and `get_untracked` is `try_get_untracked().unwrap()`.
+                        // If the tab's scope is ever disposed between the arm
+                        // and the fire, a late callback must degrade to a no-op
+                        // rather than panic the app. Hardening: no input was
+                        // found that reaches it — floem runs `handle_timer` at
+                        // the top of every event-loop callback, so the timer
+                        // fires before the click that would dispose anything.
+                        if tab.editing.try_get_untracked() == Some(true) {
                             (commit_blur)();
                         }
                     })),

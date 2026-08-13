@@ -4952,6 +4952,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             error: RwSignal::new(None),
             applied: RwSignal::new(false),
             generation: RwSignal::new(0),
+            session: RwSignal::new(0),
         },
         conn: ConnUi {
             connections,

@@ -90,6 +90,9 @@ const NEW_BODY: &str = "BEGIN\n    \nEND";
 fn open_editor(ui: &Ui, target: TriggerTarget, draft: TriggerSetDraft) {
     let d = ui.ddl;
     let pg = target.dialect == SqlDialect::Postgres;
+    // A new editing session: any lazy fetch still in flight for the last one is
+    // now for the wrong target and must not land.
+    d.session.update(|g| *g += 1);
     d.trigger_draft.set(draft);
     d.view_rows.set(BODY_ROWS);
     d.selected.set(0);
@@ -109,8 +112,10 @@ fn open_editor(ui: &Ui, target: TriggerTarget, draft: TriggerSetDraft) {
 
 /// Load the database's trigger functions once the editor is already open.
 ///
-/// Guarded on `generation` like every other off-thread callback here: the modal
-/// can be closed, or reopened on another trigger, before this lands.
+/// Guarded on `session` — a *DDL editor session*, not `generation`, which counts
+/// preview opens. See [`crate::DdlUi::session`]: with the old guard an in-flight
+/// fetch from one database landed on a modal since reopened on another, and
+/// opening the preview mid-fetch threw the result away for good.
 fn fetch_functions(ui: &Ui) {
     let d = ui.ddl;
     let Some((conn_id, database)) = d
@@ -119,9 +124,9 @@ fn fetch_functions(ui: &Ui) {
     else {
         return;
     };
-    let generation = d.generation.get_untracked();
+    let session = d.session.get_untracked();
     let done: TriggerFnDoneFn = Rc::new(move |fns: Vec<RoutineInfo>| {
-        if d.generation.get_untracked() != generation {
+        if d.session.get_untracked() != session {
             return;
         }
         d.functions.set(fns);

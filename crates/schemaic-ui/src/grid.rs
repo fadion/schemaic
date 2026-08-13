@@ -3698,10 +3698,21 @@ fn json_editor(f: FieldSig, sink: RwSignal<Option<String>>) -> AnyView {
     // the field buffer — and `update_changes` compares text, so merely *browsing* a
     // JSON value by clicking two leaves would have put the column in the `UPDATE`.
     let commit_current: Rc<dyn Fn()> = Rc::new(move || {
-        let Some(path) = editing.get_untracked() else {
+        // `try_get_untracked`, not `get_untracked`: this is wired as an
+        // `on_blur`, which `edit_field` arms as a `Duration::ZERO` timer that
+        // nothing cancels, and `get_untracked` is `try_get_untracked().unwrap()`.
+        // Reading through the fallible form means a callback that fires after
+        // the panel's scope is disposed is a no-op instead of a panic.
+        // Hardening, not a repro: floem runs `handle_timer` at the top of every
+        // event-loop callback, so the timer lands before the click that would
+        // dispose anything.
+        let Some(Some(path)) = editing.try_get_untracked() else {
             return;
         };
-        match JsonNode::parse(&edit_buf.get_untracked()) {
+        let Some(buf) = edit_buf.try_get_untracked() else {
+            return;
+        };
+        match JsonNode::parse(&buf) {
             Ok(node) => {
                 if tree.with_untracked(|t| t.get(&path) != Some(&node)) {
                     tree.update(|t| {
