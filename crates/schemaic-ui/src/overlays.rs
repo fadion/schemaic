@@ -819,6 +819,8 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let ns = schema.clone();
                         let is_view = info.as_ref().is_some_and(|i| i.is_view);
                         let has_columns = info.as_ref().is_some_and(|i| !i.columns.is_empty());
+                        let is_pg = crate::table_designer::edit_ctx(&ui).dialect
+                            == schemaic_core::intel::SqlDialect::Postgres;
                         // A view Schemaic can edit — read before `info` is moved
                         // into the Import entry below.
                         let editable_view = crate::view_editor::is_editable_view(info.as_ref());
@@ -919,9 +921,14 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                         )
                                     },
                                 )
-                                // An unloaded schema has no trigger list to show,
-                                // and a view can't carry one on either engine.
-                                .disabled(!has_columns || is_view),
+                                // An unloaded schema has no trigger list to show.
+                                // A view carries triggers on PostgreSQL — that
+                                // is where `INSTEAD OF` lives, and `pg_triggers`
+                                // already introspects them — so only MySQL's
+                                // views are excluded, plus a materialized one
+                                // (`relation "mv" cannot have triggers`, the
+                                // same call `is_editable_view` makes).
+                                .disabled(!has_columns || (is_view && (!is_pg || materialized))),
                             );
                         }
                         // Truncate and drop are the two that can't be taken back

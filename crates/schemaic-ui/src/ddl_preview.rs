@@ -527,6 +527,7 @@ mod tests {
             schema: None,
             table: "t".into(),
             dialect: SqlDialect::MySql,
+            is_view: false,
             current: Vec::new(),
             read_only: false,
         }));
