@@ -466,6 +466,21 @@ impl TableDraft {
                 }
             }
         }
+        // Checks were the one section with no arm here, though every sibling
+        // guards its equivalent — so a blank one reached the server as
+        // `ADD CONSTRAINT `t_chk` CHECK ()`, two clicks from the designer.
+        let mut check_names: HashSet<String> = HashSet::new();
+        for ck in &self.check_constraints {
+            let name = ck.info.name.trim();
+            if name.is_empty() {
+                out.push("Every check constraint needs a name.".to_string());
+            } else if !check_names.insert(name.to_ascii_lowercase()) {
+                out.push(format!("Two check constraints are both called {name}."));
+            }
+            if ck.info.expression.trim().is_empty() {
+                out.push(format!("Check {name} has no predicate."));
+            }
+        }
         out
     }
 }
@@ -1063,6 +1078,13 @@ impl EnumDraft {
             if seen.contains(&v.as_str()) {
                 out.push(format!("The value {v:?} is listed more than once."));
             }
+            // An **empty** label is legal SQL and almost certainly a blank row
+            // left behind. It matters more than the usual blank-field slip:
+            // PostgreSQL has no `DROP VALUE`, so the only way to take it back is
+            // the full park-create-recast-drop rebuild.
+            if v.is_empty() {
+                out.push("A value can't be empty — PostgreSQL can never remove it.".to_string());
+            }
             seen.push(v);
         }
         out
@@ -1104,6 +1126,7 @@ impl DomainDraft {
         if self.info.base_type.trim().is_empty() {
             out.push("A domain needs a type to be based on.".to_string());
         }
+        let mut seen: Vec<&str> = Vec::new();
         for ck in &self.info.checks {
             if ck.name.trim().is_empty() {
                 out.push("Every constraint needs a name.".to_string());
@@ -1111,6 +1134,15 @@ impl DomainDraft {
             if ck.expression.trim().is_empty() {
                 out.push(format!("Constraint {} has no predicate.", ck.name));
             }
+            // A duplicate name is a plan PostgreSQL always rejects
+            // (`constraint "email_check2" for domain "email" already exists`),
+            // and it is reachable in two clicks: the editor proposes
+            // `{domain}_check{len+1}`, so removing one and adding another
+            // re-proposes a name still in the list.
+            if seen.contains(&ck.name.as_str()) {
+                out.push(format!("Constraint {} is named twice.", ck.name));
+            }
+            seen.push(&ck.name);
         }
         out
     }
@@ -4443,6 +4475,11 @@ fn enum_value_plan(current: &[String], want: &[String]) -> Option<Vec<Change>> {
         });
     }
     // Everything the draft holds that no original claimed is an insertion.
+    //
+    // The slots that already exist on the server — kept values and rename
+    // targets — before any of these statements run. A head insertion has to
+    // anchor on one of *these*, not on whatever happens to sit next to it.
+    let surviving = taken.clone();
     let mut out = renames;
     for (s, v) in want.iter().enumerate() {
         if taken.contains(&s) {
@@ -4450,10 +4487,23 @@ fn enum_value_plan(current: &[String], want: &[String]) -> Option<Vec<Change>> {
         }
         out.push(Change::AddEnumValue {
             value: v.clone(),
-            // Anchor on the value before it, which by then exists — an insertion
-            // at the head has none, so it anchors ahead instead.
+            // Anchor on the value before it, which by then exists: it is either
+            // original or was added by an earlier statement in this same loop,
+            // which walks the slots in order.
             after: (s > 0).then(|| want[s - 1].clone()),
-            before: (s == 0).then(|| want.get(1).cloned()).flatten(),
+            // The head has no predecessor, so it anchors ahead — on the first
+            // slot that survives from the server. Taking `want[1]` instead
+            // named a label that doesn't exist yet whenever slot 1 was itself
+            // new, and PostgreSQL rejected the whole plan.
+            before: (s == 0)
+                .then(|| {
+                    surviving
+                        .iter()
+                        .filter(|&&x| x > s)
+                        .min()
+                        .map(|&x| want[x].clone())
+                })
+                .flatten(),
         });
         taken.push(s);
     }
@@ -8592,6 +8642,105 @@ mod object_tests {
         assert_eq!(
             type_dependents(&schema_using_mood(), Some("sales"), "mood").len(),
             1
+        );
+    }
+
+    /// Three draft validators had the same omission: a section with no arm,
+    /// where every sibling guarded its equivalent.
+    ///
+    /// Each reaches the server as a statement it always rejects, and the enum
+    /// one is worse than a failed apply — PostgreSQL has no `DROP VALUE`, so an
+    /// empty label can only be taken back by a full type rebuild.
+    #[test]
+    fn the_draft_validators_catch_what_the_server_would_reject() {
+        // A blank check on a table: two clicks in the designer, emitted as
+        // `ADD CONSTRAINT `t_chk` CHECK ()`.
+        let mut t = TableDraft::blank("t", None);
+        t.columns.push(ColumnDraft::new(ColumnInfo {
+            name: "id".into(),
+            type_name: "int".into(),
+            ..Default::default()
+        }));
+        t.check_constraints.push(CheckDraft::new(CheckInfo {
+            name: "t_chk".into(),
+            expression: "  ".into(),
+            ..Default::default()
+        }));
+        let msgs = t.validate().join(" | ");
+        assert!(msgs.contains("no predicate"), "{msgs}");
+
+        // Two checks sharing a name — the shape the domain editor's suffix
+        // used to propose after a remove-then-add.
+        let mut t2 = TableDraft::blank("t", None);
+        t2.columns.push(ColumnDraft::new(ColumnInfo {
+            name: "id".into(),
+            type_name: "int".into(),
+            ..Default::default()
+        }));
+        for _ in 0..2 {
+            t2.check_constraints.push(CheckDraft::new(CheckInfo {
+                name: "dup".into(),
+                expression: "id > 0".into(),
+                ..Default::default()
+            }));
+        }
+        assert!(t2.validate().join(" | ").contains("both called dup"));
+
+        // An empty enum label.
+        let mut e = EnumDraft::from_info(&mood());
+        e.info.values.push(String::new());
+        assert!(
+            e.validate().join(" | ").contains("can never remove it"),
+            "{:?}",
+            e.validate()
+        );
+
+        // A domain naming two constraints the same.
+        let mut d = DomainDraft::from_info(&email());
+        d.info.checks = vec![
+            CheckInfo {
+                name: "email_check1".into(),
+                expression: "VALUE IS NOT NULL".into(),
+                ..Default::default()
+            },
+            CheckInfo {
+                name: "email_check1".into(),
+                expression: "VALUE <> ''".into(),
+                ..Default::default()
+            },
+        ];
+        assert!(d.validate().join(" | ").contains("named twice"));
+    }
+
+    /// Two values added at the head must not anchor on each other.
+    ///
+    /// The head insertion has no predecessor, so it anchors `BEFORE` the *next*
+    /// slot — which was taken as `want[1]` unconditionally. When slot 1 is
+    /// itself a new value, that names a label PostgreSQL doesn't have yet:
+    /// `ERROR: "bad" is not an existing enum label`, and since the plan runs in
+    /// one transaction the whole edit rolls back. Two values could not be added
+    /// at the head of an enum at all.
+    #[test]
+    fn two_values_added_at_the_head_anchor_on_one_that_exists() {
+        let cur = EnumInfo {
+            name: "mood".into(),
+            schema: Some("public".into()),
+            values: vec!["dire".into(), "ok".into()],
+            comment: None,
+        };
+        let mut d = EnumDraft::from_info(&cur);
+        d.info.values = vec!["awful".into(), "bad".into(), "dire".into(), "ok".into()];
+        let sql = diff_enum(&cur, &d, &[], Postgres).emit().join("\n");
+
+        // Whatever each `ADD VALUE` anchors on has to exist when it runs: either
+        // an original value, or one an earlier statement in this plan added.
+        assert!(
+            sql.contains("ADD VALUE 'awful' BEFORE 'dire'"),
+            "head insertion must anchor on a surviving value: {sql}"
+        );
+        assert!(
+            sql.contains("ADD VALUE 'bad' AFTER 'awful'"),
+            "the second may anchor on the first, which now exists: {sql}"
         );
     }
 
