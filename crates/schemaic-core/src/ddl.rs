@@ -2114,7 +2114,7 @@ pub struct ChangeSet {
     pub schema: Option<String>,
     pub dialect: SqlDialect,
     /// The server flavour, when the caller knew it. Only the MySQL emitter's
-    /// `ALTER TABLE` path reads it — see [`ChangeSet::alter_table`] — so every
+    /// `ALTER TABLE` path reads it — see [`ChangeSet::destructive`] — so every
     /// other constructor leaves it `Unknown`.
     pub flavour: ServerFlavour,
     pub changes: Vec<Change>,
