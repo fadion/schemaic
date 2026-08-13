@@ -247,13 +247,7 @@ fn blank_trigger(
     pg: bool,
 ) -> TriggerDraft {
     let taken: Vec<String> = existing.iter().map(|t| t.info.name.clone()).collect();
-    let mut name = "new_trigger".to_string();
-    let mut n = 2;
-    while taken.iter().any(|t| t.eq_ignore_ascii_case(&name)) {
-        name = format!("new_trigger_{n}");
-        n += 1;
-    }
-    let mut draft = TriggerDraft::blank(name, table, schema);
+    let mut draft = TriggerDraft::blank(unique_name(&taken, "new_trigger"), table, schema);
     draft.info.events = vec![TriggerEvent::Insert];
     draft.info.action = if pg {
         TriggerAction::Function {
@@ -313,6 +307,14 @@ pub(crate) fn open_for_function(ui: &Ui, database: &str, f: &RoutineInfo) {
 /// signal already answers.
 pub(crate) fn open_for_new_function(ui: &Ui, database: &str, schema: Option<&str>) {
     let ctx = edit_ctx(ui);
+    // Against the functions already fetched for this database, so a second
+    // "New function…" doesn't propose a name the first one took.
+    let taken: Vec<String> = ui.ddl.functions.with_untracked(|l| {
+        l.iter()
+            .filter(|f| f.schema.as_deref() == schema)
+            .map(|f| f.name.clone())
+            .collect()
+    });
     open_function(
         ui,
         FunctionTarget {
@@ -322,7 +324,10 @@ pub(crate) fn open_for_new_function(ui: &Ui, database: &str, schema: Option<&str
             current: None,
             read_only: ctx.read_only,
         },
-        FunctionDraft::blank_trigger("new_trigger_fn", schema.map(str::to_string)),
+        FunctionDraft::blank_trigger(
+            unique_name(&taken, "new_trigger_fn"),
+            schema.map(str::to_string),
+        ),
     );
 }
 
@@ -650,6 +655,23 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize) -> AnyView {
 /// already names** if that isn't in the list yet — the list arrives a round trip
 /// after the modal, and re-pointing a trigger the user had already aimed would
 /// be a silent edit.
+/// `stem`, or `stem_2`, `stem_3`, … — the first that nothing in `taken` already
+/// uses, compared case-insensitively because both engines fold a name here.
+///
+/// Shared because the two "new object" buttons a screen apart disagreed: the
+/// trigger side walked the suffixes, while "New function…" always proposed
+/// `new_trigger_fn`, and `create_function` emits `CREATE FUNCTION` without
+/// `OR REPLACE` — so a second one failed at apply.
+fn unique_name(taken: &[String], stem: &str) -> String {
+    let mut name = stem.to_string();
+    let mut n = 2;
+    while taken.iter().any(|t| t.eq_ignore_ascii_case(&name)) {
+        name = format!("{stem}_{n}");
+        n += 1;
+    }
+    name
+}
+
 /// What the picker *shows* for a function: always namespace-qualified, so two
 /// same-named functions in two schemas are two distinguishable rows rather than
 /// two identical ones.
@@ -1141,7 +1163,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
             let status = dyn_container(
                 move || d.trigger_draft.get(),
                 move |draft| {
-                    let errs = draft.validate(status_target.dialect);
+                    let errs = draft.validate(&status_target.current, status_target.dialect);
                     if let Some(first) = errs.first() {
                         return text(first.clone())
                             .style(|s| {
@@ -1176,7 +1198,8 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                     let ui = preview_ui.clone();
                     let target = preview_target.clone();
                     let cs = change_set(&target, &draft);
-                    let ready = draft.validate(target.dialect).is_empty() && !cs.is_empty();
+                    let ready = draft.validate(&target.current, target.dialect).is_empty()
+                        && !cs.is_empty();
                     h_stack((
                         action_button("Cancel", ActionKind::Neutral, true, close),
                         action_button("Preview SQL", ActionKind::Primary, ready, move || {
@@ -1357,6 +1380,36 @@ mod tests {
             name: name.into(),
             ..Default::default()
         }
+    }
+
+    /// Both "new object" buttons walk the suffixes now.
+    ///
+    /// The trigger side always did; "New function…" always proposed
+    /// `new_trigger_fn`, so a second one collided. The fix is the dedupe, **not**
+    /// `OR REPLACE` on the create path: this button means "make a new function",
+    /// and `CREATE OR REPLACE` there would silently overwrite an existing one —
+    /// possibly one another trigger is bound to. A name collision failing at the
+    /// server is the correct outcome; proposing a colliding name is not.
+    #[test]
+    fn a_proposed_name_steps_past_the_ones_already_taken() {
+        let taken = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(unique_name(&taken(&[]), "new_trigger_fn"), "new_trigger_fn");
+        assert_eq!(
+            unique_name(&taken(&["new_trigger_fn"]), "new_trigger_fn"),
+            "new_trigger_fn_2"
+        );
+        assert_eq!(
+            unique_name(
+                &taken(&["new_trigger_fn", "new_trigger_fn_2"]),
+                "new_trigger_fn"
+            ),
+            "new_trigger_fn_3"
+        );
+        // Both engines fold case for these names, so the walk must too.
+        assert_eq!(
+            unique_name(&taken(&["NEW_TRIGGER"]), "new_trigger"),
+            "new_trigger_2"
+        );
     }
 
     /// The picker shows a qualified name and stores emittable SQL.
