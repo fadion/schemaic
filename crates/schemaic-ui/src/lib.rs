@@ -75,6 +75,7 @@ use floem::text::FamilyOwned;
 use floem::unit::Px;
 use floem::views::editor::command::CommandExecuted;
 use floem::views::editor::core::editor::EditType;
+use floem::views::editor::core::mode::Mode;
 use floem::views::editor::core::selection::Selection;
 use floem::views::editor::keypress::default_key_handler;
 use floem::views::editor::keypress::key::KeyInput;
@@ -4814,37 +4815,45 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     };
 
     // A click anywhere in the BOX focuses the field. The editor is the only child
-    // that takes focus and it doesn't reach under the box's horizontal padding or
-    // the trailing gutter, so those were dead: a text cursor, and nothing on click.
-    // The schema search is where that got noticed because `clearable` makes the
-    // gutter widest — 10px padding + a 22px button slot, ~32px of dead right edge.
+    // that takes focus and it spans only the content box, so everything around it
+    // — the 1px border, the 10px horizontal padding, the `pad_v` vertical padding,
+    // and the trailing gutter — was dead: a text cursor, and nothing on click.
+    // That is most of the box: a default single-line field is 34px tall with a
+    // 20px editor in it, so the top and bottom fifths of *every* field in the app
+    // missed, and `clearable` makes the right edge widest at ~32px (10px padding +
+    // a 22px button slot).
     //
-    // Gated on the editor's own span rather than on propagation: floem's editor
+    // Gated on the editor's own rect rather than on propagation: floem's editor
     // handles `PointerDown` with `on_event_cont`, so it does NOT consume the event
     // and this listener runs for in-text clicks too. Without the gate, clicking
-    // mid-text would focus correctly and then have the caret yanked to the end.
+    // mid-text would focus correctly and then have the caret yanked elsewhere.
     let ed_click = ed.clone();
     stack((inner, placeholder))
         .on_event_cont(EventListener::PointerDown, move |e| {
             let Event::PointerDown(pe) = e else { return };
-            // The editor sits at the content origin (1px border + the box padding) and
-            // is as wide as its own viewport; the rest of the row is the gutter.
-            let left = 1.0 + CHAT_PAD_H;
-            let width = ed_click.viewport.get_untracked().width();
-            if pe.pos.x >= left && pe.pos.x <= left + width {
+            // The editor sits at the content origin (1px border + the box padding)
+            // and is exactly as large as its own viewport; the rest is chrome.
+            let (left, top) = (1.0 + CHAT_PAD_H, 1.0 + pad_v);
+            let vp = ed_click.viewport.get_untracked();
+            if pe.pos.x >= left
+                && pe.pos.x <= left + vp.width()
+                && pe.pos.y >= top
+                && pe.pos.y <= top + vp.height()
+            {
                 return; // on the text — the editor already placed the caret
             }
             let Some(Some(vid)) = ed_click.editor_view_id.try_get_untracked() else {
                 return;
             };
             vid.request_focus();
-            // Caret to the side of the text the click was on. (Both the same while
-            // the field is empty, which is when the dead zone is widest.)
-            let off = if pe.pos.x < left {
-                0
-            } else {
-                ed_click.doc().text().to_string().len()
-            };
+            // Caret at the nearest text position to the click, in *content* coords
+            // so a scrolled (multiline) field maps correctly. `offset_of_point`
+            // clamps a point outside the text to the nearest line and its nearest
+            // column, which is exactly what a click in the surrounding chrome
+            // wants: the padding above the first line lands on it, the gutter past
+            // the end of a line lands at its end.
+            let p = Point::new(pe.pos.x - left + vp.x0, pe.pos.y - top + vp.y0);
+            let (off, _) = ed_click.offset_of_point(Mode::Insert, p);
             ed_click.cursor.update(|c| c.set_offset(off, false, false));
         })
         .style(move |s| {
