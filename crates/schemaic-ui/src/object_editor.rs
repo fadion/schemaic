@@ -60,6 +60,8 @@ const NUM_GAP: f64 = 50.0;
 
 fn open_editor(ui: &Ui, target: ObjectTarget, draft: ObjectDraft) {
     let d = ui.ddl;
+    // A new editing session — see `DdlUi::session`.
+    d.session.update(|g| *g += 1);
     d.object_draft.set(draft);
     d.object_errors.set(Vec::new());
     d.object_rev.update(|r| *r += 1);

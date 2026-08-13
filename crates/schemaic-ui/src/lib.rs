@@ -528,9 +528,23 @@ pub struct DdlUi {
     pub error: RwSignal<Option<String>>,
     /// Set once the plan has been applied — the modal then only offers Close.
     pub applied: RwSignal<bool>,
-    /// Bumped on every open. An apply is off-thread and can outlive the modal
-    /// that asked for it, so its callback checks this before writing.
+    /// Bumped on every **preview** open. An apply is off-thread and can outlive
+    /// the modal that asked for it, so its callback checks this before writing.
     pub generation: RwSignal<u64>,
+    /// Bumped when a DDL **editor session** starts — a designer, view, trigger
+    /// or object editor opening on a new target.
+    ///
+    /// Separate from `generation` because the two answer different questions and
+    /// one counter could not answer both. The lazy per-object fetches
+    /// (`trigger_editor::fetch_functions`, `view_editor::fetch_algorithm`)
+    /// guarded on `generation`, which is bumped only by `ddl_preview`'s
+    /// `open_preview` — so an in-flight fetch from `db1.orders` landed with the
+    /// generation unchanged and overwrote the list for a modal now open on
+    /// `db2.invoices`, while opening the *preview* mid-fetch discarded the
+    /// result permanently and left the dropdown empty for good. Opening a
+    /// nested function editor deliberately does **not** bump this: it runs
+    /// inside the trigger session that asked for the list.
+    pub session: RwSignal<u64>,
 }
 
 /// Reports an export's outcome back on the UI thread (`Err` carries a

@@ -32,6 +32,28 @@ const PANEL_H: f64 = 560.0;
 /// with a handful of clauses is visible whole.
 const SQL_ROWS: usize = 16;
 
+/// Close **every** editor behind the preview.
+///
+/// One function because there are five of them and the two sites that had to
+/// clear them cleared two. After a successful Apply, pressing Close remounted
+/// the trigger, function or object editor from the untouched pre-apply draft,
+/// with the same change count — and Preview → Apply then re-ran a plan the
+/// server had already applied (a second `CREATE TRIGGER`, a rename whose source
+/// is gone). On the "Open in editor" path it was worse: the script landed in a
+/// query tab and the modal immediately painted over the tab the user had just
+/// been sent to.
+///
+/// A sixth editor added later is a one-line change here rather than a bug in two
+/// places, which is what [`ddl_preview::tests::close_editors_clears_every_editor`]
+/// is guarding.
+pub(crate) fn close_editors(d: crate::DdlUi) {
+    d.designer.set(None);
+    d.view.set(None);
+    d.trigger.set(None);
+    d.function.set(None);
+    d.object.set(None);
+}
+
 /// Open the preview on a change set. `from_designer` decides where Cancel goes.
 pub(crate) fn open_preview(ui: &Ui, preview: DdlPreview) {
     let d = ui.ddl;
@@ -174,8 +196,7 @@ fn apply(ui: Ui) {
                     d.applied.set(true);
                     // The draft behind this is now the server's state, so
                     // whichever editor opened it has nothing left to show.
-                    d.designer.set(None);
-                    d.view.set(None);
+                    close_editors(d);
                 }
                 DdlOutcome::Failed(e) => d.error.set(Some(e)),
                 // The user answered "Cancel" to a question the apply raised, so
@@ -320,8 +341,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             move || {
                                 (open_query)(open_sql.clone());
                                 d.preview.set(None);
-                                d.designer.set(None);
-                                d.view.set(None);
+                                close_editors(d);
                             },
                         ),
                     ))
@@ -429,4 +449,111 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
             s
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use floem::reactive::Scope;
+    use schemaic_core::intel::SqlDialect;
+
+    /// Every editor signal, so the test fails to compile rather than silently
+    /// pass if a sixth one is added.
+    fn ddl_ui(scope: Scope) -> crate::DdlUi {
+        crate::DdlUi {
+            designer: scope.create_rw_signal(None),
+            draft: scope.create_rw_signal(Default::default()),
+            tab: scope.create_rw_signal(crate::DesignerTab::Table),
+            selected: scope.create_rw_signal(0),
+            rev: scope.create_rw_signal(0),
+            view: scope.create_rw_signal(None),
+            view_draft: scope.create_rw_signal(Default::default()),
+            view_rows: scope.create_rw_signal(14),
+            trigger: scope.create_rw_signal(None),
+            trigger_draft: scope.create_rw_signal(Default::default()),
+            function: scope.create_rw_signal(None),
+            function_draft: scope.create_rw_signal(Default::default()),
+            functions: scope.create_rw_signal(Vec::new()),
+            object: scope.create_rw_signal(None),
+            object_draft: scope.create_rw_signal(Default::default()),
+            object_errors: scope.create_rw_signal(Vec::new()),
+            object_rev: scope.create_rw_signal(0),
+            preview: scope.create_rw_signal(None),
+            sql: scope.create_rw_signal(String::new()),
+            sql_rows: scope.create_rw_signal(16),
+            applying: scope.create_rw_signal(false),
+            error: scope.create_rw_signal(None),
+            applied: scope.create_rw_signal(false),
+            generation: scope.create_rw_signal(0),
+            session: scope.create_rw_signal(0),
+        }
+    }
+
+    /// After a successful Apply — and after "Open in editor" — **no** editor may
+    /// still be holding its pre-apply draft.
+    ///
+    /// Both sites used to clear `designer` and `view` only, though this range
+    /// added three more overlays. Pressing Close then remounted the trigger,
+    /// function or object editor with the same change count, and Preview →
+    /// Apply re-ran a plan the server had already applied.
+    #[test]
+    fn close_editors_clears_every_editor() {
+        let scope = Scope::new();
+        let d = ddl_ui(scope);
+
+        // Only the signals matter here, not what is in them — but they carry no
+        // `Default`, so each is seeded with the smallest real target.
+        d.designer.set(Some(crate::DesignerTarget {
+            conn_id: 1,
+            database: "db".into(),
+            schema: None,
+            dialect: SqlDialect::MySql,
+            current: None,
+            tables: Vec::new(),
+            read_only: false,
+        }));
+        d.view.set(Some(crate::ViewTarget {
+            conn_id: 1,
+            database: "db".into(),
+            schema: None,
+            dialect: SqlDialect::MySql,
+            current: None,
+            read_only: false,
+        }));
+        d.trigger.set(Some(crate::TriggerTarget {
+            conn_id: 1,
+            database: "db".into(),
+            schema: None,
+            table: "t".into(),
+            dialect: SqlDialect::MySql,
+            current: Vec::new(),
+            read_only: false,
+        }));
+        d.function.set(Some(crate::FunctionTarget {
+            conn_id: 1,
+            database: "db".into(),
+            dialect: SqlDialect::Postgres,
+            current: None,
+            read_only: false,
+        }));
+        d.object.set(Some(crate::ObjectTarget {
+            conn_id: 1,
+            database: "db".into(),
+            schema: None,
+            dialect: SqlDialect::Postgres,
+            current: None,
+            dependents: Vec::new(),
+            read_only: false,
+        }));
+
+        close_editors(d);
+
+        assert!(d.designer.get_untracked().is_none(), "designer");
+        assert!(d.view.get_untracked().is_none(), "view");
+        assert!(d.trigger.get_untracked().is_none(), "trigger");
+        assert!(d.function.get_untracked().is_none(), "function");
+        assert!(d.object.get_untracked().is_none(), "object");
+
+        scope.dispose();
+    }
 }

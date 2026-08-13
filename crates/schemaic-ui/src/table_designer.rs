@@ -59,6 +59,8 @@ const FIELD_W: f64 = 260.0;
 /// a blank one for a new table).
 pub(crate) fn open_designer(ui: &Ui, target: DesignerTarget) {
     let d = ui.ddl;
+    // A new editing session — see `DdlUi::session`.
+    d.session.update(|g| *g += 1);
     let draft = match &target.current {
         Some(t) => TableDraft::from_table(t),
         None => TableDraft::blank("new_table", target.schema.clone()),

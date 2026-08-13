@@ -58,6 +58,8 @@ const NEW_BODY: &str = "SELECT * FROM ";
 
 fn open_editor(ui: &Ui, target: ViewTarget, draft: ViewDraft) {
     let d = ui.ddl;
+    // A new editing session — see `DdlUi::session`.
+    d.session.update(|g| *g += 1);
     d.view_draft.set(draft);
     d.view_rows.set(BODY_ROWS);
     d.error.set(None);
@@ -112,11 +114,13 @@ pub(crate) fn open_for_view(ui: &Ui, database: &str, schema: Option<&str>, view:
 /// what somebody typed.
 fn fetch_algorithm(ui: &Ui, conn_id: u64, database: String, view: String) {
     let d = ui.ddl;
-    let generation = d.generation.get_untracked();
+    let session = d.session.get_untracked();
     let done: ViewAlgoDoneFn = Rc::new(move |algo: Option<String>| {
         // The modal can be closed, or reopened on another view, before this
-        // lands — same rule the apply callback follows.
-        if algo.is_none() || d.generation.get_untracked() != generation {
+        // lands. Guarded on `session` — a DDL editor session — not on
+        // `generation`, which counts preview opens and so both missed a genuine
+        // reopen and discarded a fetch whenever the preview went up first.
+        if algo.is_none() || d.session.get_untracked() != session {
             return;
         }
         d.view.update(|t| {
