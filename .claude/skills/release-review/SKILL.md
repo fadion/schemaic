@@ -39,6 +39,14 @@ One directory per run, under the already-gitignored `review/`:
 already exists from a run at a **different** head SHA, rename it to
 `review/release-<base-tag>-<old-head-sha>/` and start clean; same head SHA means resume (below).
 
+**The base need not be a tag.** The `commit` skill defers a multi-commit feature's review to the
+commit that finishes it and then points here with `<first-sha>^..HEAD`, so a mid-cycle run is a
+normal use, not a misuse — the base is simply a SHA and the directory is named after it. Such a run
+reviews a feature, not a release: it says nothing about whether the tag should go out, and the
+pre-release run over the full `<last-tag>..HEAD` still happens and still reads every slice. Being
+reviewed mid-cycle is never a reason to narrow that one, for the same reason a prior commit-time
+record isn't.
+
 The periodic review's `review/findings.md` is a different, longer-lived ledger. Never write to it.
 Do **read** its `## Rejected` section if it exists — re-raising something a previous round already
 settled wastes the writer session's time.
@@ -116,6 +124,30 @@ Two environment facts that have already cost a pass: on Windows, stop a running 
 before building; and the agent's `%APPDATA%` view is MSIX-redirected, so an app instance the agent
 launches shares no connections, tabs or history with the user's. Any pass that drives the GUI states
 which instance it exercised.
+
+### Prior commit-time reviews
+
+The `commit` skill writes `review/commits/<sha>.md` whenever a commit was reviewed as it landed.
+Collect the ones whose SHA is in the range — a file outside it belongs to an earlier cycle and is
+ignored, not deleted:
+
+```bash
+git log --format=%h <base>..HEAD
+```
+
+They are **leads, not findings.** Each entry names a `file:line` as of *its own* commit, which a
+later commit in the same range may have rewritten, fixed, or deleted — so an entry enters through
+reference §3's verification gate exactly like anything a pass discovers, and is re-anchored against
+`HEAD` before it can reach the ledger. An unverified import would hold a tag on a bug fixed four
+commits later.
+
+Their real value is directional: Phase 1 notes on each slice's plan row which prior entries land in
+it, and each subagent brief carries its slice's entries as prior art — "this was flagged here, check
+whether it survived" is a cheaper start than a cold read. A `clean` record is context only, and
+never a reason to narrow a slice.
+
+Phase 5 states what became of them: confirmed, superseded, or dropped as already fixed. An imported
+lead nobody accounted for is the failure this line catches.
 
 ## Phase 1 — cut the diff into slices
 
@@ -380,3 +412,6 @@ Close by naming the two follow-ups the review deliberately doesn't do: a writer 
 - **Every finding states its `Origin`.** Without it the ledger can't answer whether the tag should
   go out, which is the only question this review exists for.
 - **Don't touch `review/findings.md`** — that's the periodic review's ledger. Read-only.
+- **A prior commit-time entry is a lead, not a finding.** It enters through the verification gate
+  like anything else, re-anchored against `HEAD`. `review/commits/` is read-only here — the `commit`
+  skill writes it and `release` archives it at the tag.
