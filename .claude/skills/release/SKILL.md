@@ -142,6 +142,21 @@ git push origin main
 git push origin vX.Y.Z
 ```
 
+The tag closes the cycle, so this is where the commit-time review records are
+retired. If `review/commits/` exists, **rename it, don't delete it** — the
+directory is gitignored, so a wrong delete is unrecoverable, and this matches
+what `release-review` does with a stale run directory:
+
+```bash
+mv review/commits review/commits-vX.Y.Z
+```
+
+The tag is the trigger rather than the review finishing: a finished review can
+sit for days while its fixes land, and that is exactly the window where the
+per-commit record is still being read. Nothing later in this flow reads the
+directory, so if the rename fails, say so and carry on — it is bookkeeping, not
+a gate.
+
 ## Phase 3 — wait for the Release workflow
 
 The tag push triggers **Release** (`release.yml`), which builds Linux and Windows
