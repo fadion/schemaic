@@ -4450,7 +4450,7 @@ pub fn single(table: &str, schema: Option<&str>, dialect: SqlDialect, change: Ch
 mod tests {
     use super::*;
     use crate::intel::SqlDialect::{MySql, Postgres};
-    use crate::schema::IndexColumn;
+    use crate::schema::{IndexColumn, TriggerEnabled};
 
     fn col(name: &str, ty: &str) -> ColumnInfo {
         ColumnInfo {
@@ -5731,6 +5731,34 @@ mod tests {
             }]);
             let d = TriggerSetDraft::from_table(&t);
             assert!(diff_triggers(&t.triggers, &d, MySql).changes.is_empty());
+        }
+
+        /// The round-trip gate for the state PG 16.14 reports and the emitter
+        /// has to restate: transition tables and a non-default `tgenabled`.
+        ///
+        /// Both were unmodelled, so a trigger carrying either came back
+        /// *stripped* — and because the clause is dropped silently, the failure
+        /// lands on the next write to the table, not in the preview.
+        #[test]
+        fn a_transition_table_trigger_round_trips_and_restates_its_clauses() {
+            let mut pg = pg_trigger();
+            pg.level = TriggerLevel::Statement;
+            pg.old_table = Some("o".into());
+            pg.new_table = Some("n".into());
+            pg.enabled = TriggerEnabled::Always;
+            let t = table_with_triggers(vec![pg.clone()]);
+            let d = TriggerSetDraft::from_table(&t);
+            assert!(
+                diff_triggers(&t.triggers, &d, Postgres).changes.is_empty(),
+                "phantom change on an untouched trigger"
+            );
+            // And a real recreate carries both clauses through.
+            let sql = pg.create_sql(Postgres);
+            assert!(
+                sql.contains("REFERENCING OLD TABLE AS \"o\" NEW TABLE AS \"n\""),
+                "{sql}"
+            );
+            assert!(sql.contains("ENABLE ALWAYS TRIGGER"), "{sql}");
         }
 
         /// The other half of the gate: the UI sorts a trigger's events whenever

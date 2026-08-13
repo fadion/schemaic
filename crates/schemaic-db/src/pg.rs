@@ -54,8 +54,8 @@ use schemaic_core::model::{
 };
 use schemaic_core::schema::{
     CheckInfo, ColumnInfo, DbSchema, DomainInfo, EnumInfo, IndexColumn, RoutineInfo, SequenceInfo,
-    SequenceOwner, TableInfo, TriggerAction, TriggerEvent, TriggerInfo, TriggerLevel,
-    TriggerTiming, ViewOptions, Volatility,
+    SequenceOwner, TableInfo, TriggerAction, TriggerEnabled, TriggerEvent, TriggerInfo,
+    TriggerLevel, TriggerTiming, ViewOptions, Volatility,
 };
 use schemaic_core::sql;
 use tokio_postgres::types::Type;
@@ -945,30 +945,64 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
     // — taking the constraint with them. It keeps user-written `CREATE
     // CONSTRAINT TRIGGER`s, which are visible objects and `tgconstraint <> 0`.
     //
-    // `tgattr` is an `int2vector` whose text form is space-separated attnums;
-    // going through `string_to_array` avoids depending on an int2vector→array
-    // cast, and `NULLIF` makes the empty case yield no rows rather than one
-    // empty element.
+    // `tgparentid <> 0` is a trigger *cloned onto a partition* by a trigger on
+    // the parent. It is `tgisinternal = false`, so the filter above keeps it:
+    // a 100-partition table listed the same trigger 101 times, and every drop
+    // or edit of a clone failed ("trigger pt on table p1 ... requires it"),
+    // because a clone can only be dropped through its parent.
     let trigger_all = query_all(
         &client,
         &format!(
             "SELECT n.nspname, c.relname, t.tgname, t.tgtype::int, t.tgenabled, \
                     (t.tgconstraint <> 0)::int, t.tgfoid::regproc::text, \
                     pg_get_triggerdef(t.oid), \
-                    COALESCE((SELECT string_agg(a.attname, ',' ORDER BY x.ord) \
-                              FROM unnest(string_to_array(NULLIF(t.tgattr::text, ''), ' ')) \
-                                   WITH ORDINALITY AS x(attnum, ord) \
-                              JOIN pg_attribute a ON a.attrelid = t.tgrelid \
-                                                 AND a.attnum = x.attnum::smallint), '') \
+                    COALESCE(t.tgoldtable, ''), COALESCE(t.tgnewtable, '') \
              FROM pg_trigger t \
              JOIN pg_class c ON c.oid = t.tgrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE NOT t.tgisinternal AND {} \
+             WHERE NOT t.tgisinternal AND t.tgparentid = 0 AND {} \
              ORDER BY n.nspname, c.relname, t.tgname",
             user_schema_filter("n.nspname")
         ),
     )
     .await?;
+
+    // `UPDATE OF a, b` — **one row per column**, not a `string_agg`.
+    //
+    // The aggregate that was here joined on `','` and was split back on `','`,
+    // so an `UPDATE OF "a,b"` trigger read back as two columns that don't
+    // exist. Same rule the enum labels beside it already follow: every
+    // separator is a value some database already stores, so the fold belongs in
+    // Rust.
+    //
+    // `tgattr` is an `int2vector` whose text form is space-separated attnums;
+    // going through `string_to_array` avoids depending on an int2vector→array
+    // cast, and `NULLIF` makes the empty case yield no rows rather than one
+    // empty element.
+    let trigger_cols_all = query_all(
+        &client,
+        &format!(
+            "SELECT n.nspname, c.relname, t.tgname, a.attname \
+             FROM pg_trigger t \
+             JOIN pg_class c ON c.oid = t.tgrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             CROSS JOIN LATERAL unnest(string_to_array(NULLIF(t.tgattr::text, ''), ' ')) \
+                  WITH ORDINALITY AS x(attnum, ord) \
+             JOIN pg_attribute a ON a.attrelid = t.tgrelid \
+                                AND a.attnum = x.attnum::smallint \
+             WHERE NOT t.tgisinternal AND t.tgparentid = 0 AND {} \
+             ORDER BY n.nspname, c.relname, t.tgname, x.ord",
+            user_schema_filter("n.nspname")
+        ),
+    )
+    .await?;
+    let mut trigger_cols: HashMap<(String, String, String), Vec<String>> = HashMap::new();
+    for r in &trigger_cols_all {
+        trigger_cols
+            .entry((cell(r, 0), cell(r, 1), cell(r, 2)))
+            .or_default()
+            .push(cell(r, 3));
+    }
 
     // Post-fold enrichment: the things `assemble_schema` can't carry because
     // MySQL has no equivalent — an index's backing constraint, and each foreign
@@ -1021,11 +1055,10 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
                     table: t.name.clone(),
                     timing,
                     events,
-                    update_columns: cell(r, 8)
-                        .split(',')
-                        .filter(|c| !c.is_empty())
-                        .map(str::to_string)
-                        .collect(),
+                    update_columns: trigger_cols
+                        .get(&(ns.clone(), t.name.clone(), cell(r, 2)))
+                        .cloned()
+                        .unwrap_or_default(),
                     level,
                     // Held bare; `create_sql` is the only thing that wraps it.
                     condition: pg_trigger_when(&cell(r, 7))
@@ -1043,8 +1076,12 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
                     // MySQL's alone.
                     definer: None,
                     order: None,
-                    // `tgenabled` is O/A/R (fires) or D (doesn't).
-                    enabled: cell(r, 4) != "D",
+                    old_table: Some(cell(r, 8)).filter(|s| !s.is_empty()),
+                    new_table: Some(cell(r, 9)).filter(|s| !s.is_empty()),
+                    // All four of `tgenabled`'s states: `A`/`R` used to fold
+                    // into "enabled" and be recreated as `O`, which changes
+                    // what fires during replication apply.
+                    enabled: TriggerEnabled::parse(&cell(r, 4)),
                     constraint: cell(r, 5) == "1",
                 }
             })
@@ -1301,21 +1338,44 @@ fn pg_sequence_row(r: &[Option<String>]) -> SequenceInfo {
 /// Narrowed to `RETURNS trigger`: routines are out of scope except as the thing
 /// a PostgreSQL trigger binds to.
 ///
-/// `proconfig` is joined on `|` rather than `,` because a setting's *value* can
-/// contain a comma — `search_path=public, extensions` is one setting, and
-/// splitting it on the comma would emit two broken `SET` clauses.
+/// `proconfig` comes back **one row per setting**, keyed on the function's oid.
+///
+/// It was `array_to_string(proconfig, '|')` split back on `'|'`, chosen because
+/// a value can contain a comma — but a value can contain a `|` just as easily,
+/// and `SET search_path = "my|schema"` then emitted two broken `SET` clauses on
+/// a `SECURITY DEFINER` function, which is the privilege-escalation shape
+/// [`RoutineInfo::settings`] exists to preserve. Every separator is a value some
+/// database already stores; the fold belongs in Rust, as the enum labels beside
+/// it already do.
 pub(crate) async fn trigger_functions(
     db: &Db,
     database: &str,
 ) -> Result<Vec<RoutineInfo>, DbError> {
     let client = connect_to(db, database).await?;
+    let settings_all = query_all(
+        &client,
+        &format!(
+            "SELECT p.oid::text, s.setting \
+             FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             CROSS JOIN LATERAL unnest(p.proconfig) WITH ORDINALITY AS s(setting, ord) \
+             WHERE p.prorettype = 'trigger'::regtype AND {} \
+             ORDER BY p.oid, s.ord",
+            user_schema_filter("n.nspname")
+        ),
+    )
+    .await?;
+    let mut settings: HashMap<String, Vec<String>> = HashMap::new();
+    for r in &settings_all {
+        settings.entry(cell(r, 0)).or_default().push(cell(r, 1));
+    }
     Ok(query_all(
         &client,
         &format!(
             "SELECT n.nspname, p.proname, pg_get_function_arguments(p.oid), \
                     pg_get_function_result(p.oid), l.lanname, p.prosrc, \
                     p.provolatile, p.proisstrict::int, p.prosecdef::int, \
-                    COALESCE(array_to_string(p.proconfig, '|'), '') \
+                    p.oid::text \
              FROM pg_proc p \
              JOIN pg_namespace n ON n.oid = p.pronamespace \
              JOIN pg_language l ON l.oid = p.prolang \
@@ -1336,11 +1396,7 @@ pub(crate) async fn trigger_functions(
         volatility: Volatility::parse_code(&cell(r, 6)),
         strict: cell(r, 7) == "1",
         security_definer: cell(r, 8) == "1",
-        settings: cell(r, 9)
-            .split('|')
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect(),
+        settings: settings.get(&cell(r, 9)).cloned().unwrap_or_default(),
     })
     .collect())
 }

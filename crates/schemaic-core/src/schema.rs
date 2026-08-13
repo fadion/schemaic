@@ -760,19 +760,80 @@ pub struct TriggerInfo {
     /// triggers on that event — and order is the entire point when two of them
     /// write the same row.
     pub order: Option<TriggerOrder>,
-    /// **PostgreSQL**: the trigger is disabled and does not fire. Recreating a
-    /// disabled trigger as enabled starts firing it against writes it was
-    /// deliberately kept out of, so [`TriggerInfo::create_sql`] restates it.
-    pub enabled: bool,
+    /// **PostgreSQL**: `REFERENCING OLD TABLE AS …` / `NEW TABLE AS …` — the
+    /// transition relations a statement-level trigger's function reads.
+    ///
+    /// Modelled for the same reason [`ViewOptions::definer`] is, only louder:
+    /// `CREATE TRIGGER` without the clause succeeds, and *then* every write to
+    /// the table fails with `relation "o" does not exist`, because the function
+    /// body still references a table that no longer exists for it. The failure
+    /// surfaces on a write, not in the preview.
+    pub old_table: Option<String>,
+    pub new_table: Option<String>,
+    /// **PostgreSQL**: which sessions the trigger fires in — `tgenabled`'s four
+    /// states, not two. Recreating any of them as the default starts (or stops)
+    /// firing it against writes it was deliberately configured for, so
+    /// [`TriggerInfo::create_sql`] restates it.
+    pub enabled: TriggerEnabled,
     /// **PostgreSQL**: a `CREATE CONSTRAINT TRIGGER`. Schemaic doesn't model the
     /// deferral options one carries, so these are shown and droppable but not
     /// editable — the same call [`ViewOptions::materialized`] gets.
     pub constraint: bool,
 }
 
+/// Which sessions a PostgreSQL trigger fires in — `pg_trigger.tgenabled`.
+///
+/// Four states, and only the first two are interchangeable with a bool. `A` and
+/// `R` exist for logical replication: an `ALWAYS` trigger fires even while the
+/// replication apply worker is writing, a `REPLICA` one fires *only* then. Both
+/// used to fold into `true` and be recreated as [`TriggerEnabled::Origin`],
+/// which changes what fires during replication with nothing to say so.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TriggerEnabled {
+    /// `O` — fires in ordinary sessions. What `CREATE TRIGGER` produces.
+    #[default]
+    Origin,
+    /// `D` — disabled; does not fire at all.
+    Disabled,
+    /// `A` — fires in ordinary sessions *and* during replication apply.
+    Always,
+    /// `R` — fires **only** during replication apply.
+    Replica,
+}
+
+impl TriggerEnabled {
+    /// Read `pg_trigger.tgenabled`. An unknown letter is [`Self::Origin`], the
+    /// same "a server that grows a state surfaces as the ordinary one rather
+    /// than as disabled" call [`TriggerTiming::parse`] makes.
+    pub fn parse(s: &str) -> Self {
+        match s.trim() {
+            "D" => TriggerEnabled::Disabled,
+            "A" => TriggerEnabled::Always,
+            "R" => TriggerEnabled::Replica,
+            _ => TriggerEnabled::Origin,
+        }
+    }
+
+    /// The `ALTER TABLE … <clause> TRIGGER n` a recreate must follow the
+    /// `CREATE` with, or `None` when the create already produced this state.
+    pub fn alter_clause(self) -> Option<&'static str> {
+        match self {
+            TriggerEnabled::Origin => None,
+            TriggerEnabled::Disabled => Some("DISABLE TRIGGER"),
+            TriggerEnabled::Always => Some("ENABLE ALWAYS TRIGGER"),
+            TriggerEnabled::Replica => Some("ENABLE REPLICA TRIGGER"),
+        }
+    }
+
+    /// Does it fire in an ordinary session? What the UI's list shows.
+    pub fn fires_normally(self) -> bool {
+        matches!(self, TriggerEnabled::Origin | TriggerEnabled::Always)
+    }
+}
+
 impl Default for TriggerInfo {
-    /// A trigger fires unless the server says otherwise; defaulting `enabled` to
-    /// `false` would emit a `DISABLE TRIGGER` after every create.
+    /// A trigger fires unless the server says otherwise; defaulting to
+    /// `Disabled` would emit a `DISABLE TRIGGER` after every create.
     fn default() -> Self {
         Self {
             name: String::new(),
@@ -786,7 +847,9 @@ impl Default for TriggerInfo {
             action: TriggerAction::default(),
             definer: None,
             order: None,
-            enabled: true,
+            old_table: None,
+            new_table: None,
+            enabled: TriggerEnabled::default(),
             constraint: false,
         }
     }
@@ -865,13 +928,27 @@ impl TriggerInfo {
             out.push_str("CONSTRAINT ");
         }
         out.push_str(&format!(
-            "TRIGGER {} {} {} ON {}\n{}",
+            "TRIGGER {} {} {} ON {}",
             q(&self.name),
             self.timing.sql(),
             events,
             qtable,
-            self.level.sql(),
         ));
+        // `REFERENCING` sits between the table and the level, per PostgreSQL's
+        // grammar — and a trigger that had one and is recreated without it
+        // leaves every write to the table failing.
+        let transitions = [
+            ("OLD TABLE AS", &self.old_table),
+            ("NEW TABLE AS", &self.new_table),
+        ]
+        .into_iter()
+        .filter_map(|(kw, name)| name.as_deref().map(|n| format!("{kw} {}", q(n))))
+        .collect::<Vec<_>>();
+        if !transitions.is_empty() {
+            out.push_str(&format!("\nREFERENCING {}", transitions.join(" ")));
+        }
+        out.push('\n');
+        out.push_str(self.level.sql());
         if let Some(w) = self
             .condition
             .as_deref()
@@ -899,9 +976,9 @@ impl TriggerInfo {
             }
         };
         out.push_str(&format!("\nEXECUTE FUNCTION {call};"));
-        if !self.enabled {
+        if let Some(clause) = self.enabled.alter_clause() {
             out.push_str(&format!(
-                "\nALTER TABLE {qtable} DISABLE TRIGGER {};",
+                "\nALTER TABLE {qtable} {clause} {};",
                 q(&self.name)
             ));
         }
@@ -1940,7 +2017,8 @@ mod trigger_tests {
     #[test]
     fn default_trigger_is_enabled() {
         // The opposite default would append a DISABLE TRIGGER to every create.
-        assert!(TriggerInfo::default().enabled);
+        assert_eq!(TriggerInfo::default().enabled, TriggerEnabled::Origin);
+        assert!(TriggerInfo::default().enabled.fires_normally());
     }
 
     #[test]
@@ -2000,7 +2078,7 @@ mod trigger_tests {
     #[test]
     fn pg_disabled_trigger_restates_the_disable() {
         let mut t = pg_trigger();
-        t.enabled = false;
+        t.enabled = TriggerEnabled::Disabled;
         let sql = t.create_sql(SqlDialect::Postgres);
         // CREATE TRIGGER always makes an enabled one, so stopping at the create
         // would silently switch it back on.
@@ -2008,6 +2086,52 @@ mod trigger_tests {
             sql.contains("ALTER TABLE \"orders\" DISABLE TRIGGER \"audit_upd\";"),
             "{sql}"
         );
+    }
+
+    /// `tgenabled` has four states, not two. Folding `A`/`R` into "enabled"
+    /// recreates them as plain `O`, and a trigger the DBA set to fire on a
+    /// replica *stops firing during replication apply* — silently, on a plan
+    /// the user asked for something else entirely.
+    #[test]
+    fn pg_always_and_replica_triggers_restate_their_firing_mode() {
+        for (state, clause) in [
+            (TriggerEnabled::Always, "ENABLE ALWAYS TRIGGER"),
+            (TriggerEnabled::Replica, "ENABLE REPLICA TRIGGER"),
+            (TriggerEnabled::Disabled, "DISABLE TRIGGER"),
+        ] {
+            let mut t = pg_trigger();
+            t.enabled = state;
+            let sql = t.create_sql(SqlDialect::Postgres);
+            assert!(
+                sql.contains(&format!("ALTER TABLE \"orders\" {clause} \"audit_upd\";")),
+                "{state:?}: {sql}"
+            );
+        }
+        // The ordinary state says nothing — `CREATE TRIGGER` already made one.
+        let sql = pg_trigger().create_sql(SqlDialect::Postgres);
+        assert!(!sql.contains("ALTER TABLE"), "{sql}");
+    }
+
+    /// Regression: `REFERENCING OLD/NEW TABLE` was not modelled, so recreating
+    /// such a trigger succeeded and dropped the clause — after which **every
+    /// write to the table fails** with `relation "o" does not exist`, because
+    /// the function body still references the transition table.
+    #[test]
+    fn pg_transition_tables_survive_a_recreate() {
+        let mut t = pg_trigger();
+        t.level = TriggerLevel::Statement;
+        t.old_table = Some("o".into());
+        t.new_table = Some("n".into());
+        let sql = t.create_sql(SqlDialect::Postgres);
+        assert!(
+            sql.contains("REFERENCING OLD TABLE AS \"o\" NEW TABLE AS \"n\""),
+            "{sql}"
+        );
+        // PostgreSQL wants the clause between `ON table` and `FOR EACH`.
+        let refs = sql.find("REFERENCING").expect("clause");
+        let each = sql.find("FOR EACH").expect("level");
+        assert!(refs < each, "{sql}");
+        assert!(sql.find("ON \"orders\"").expect("table") < refs, "{sql}");
     }
 
     #[test]
