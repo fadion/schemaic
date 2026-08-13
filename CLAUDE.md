@@ -366,6 +366,22 @@ Zed-inspired, aiming to replace DataGrip.
   backslash out of `'it\'s'`, so it is gated on the `mariadb` flag and measured against
   `SHOW CREATE TABLE`. It also has to run *before* `ddl::check_predicate`, whose paren
   scan reads string boundaries that `\'new\'` doesn't have;
+  **The standalone PG objects** come from `pg_types` (enums *and* domains in one `pg_type`
+  scan — both live there, `typtype` `e`/`d`) and `pg_sequences`, each folded by a pure,
+  tested half (`pg_fold_types`/`pg_sequence_row`). Four decisions are written down because
+  each is a bug the live pass would otherwise have shipped: an enum's labels arrive **one
+  row each** rather than string-aggregated, since a label is arbitrary text and every
+  separator is a value some database already stores (`'a,b'`, an embedded newline, `''`);
+  a domain's "has a default" is its own column, because `DEFAULT ''` read off the text
+  would come back as *no* default and get dropped on every replay; a domain's collation is
+  reported only when it differs from its base type's, or every `text` domain would open
+  with a phantom `COLLATE`; and a sequence's definition is read from the `pg_sequence`
+  **catalogue** while only `last_value` comes from the `pg_sequences` **view**, so a role
+  that may see the schema but not the data gets a full definition and a blank position
+  rather than a vanished sequence. These run inside `fetch_schema`, where one failure takes
+  the whole database's schema with it, so they go through `query_all_optional` — which
+  degrades on `undefined_table`/`column`/`function` only, the same two-sided rule
+  `mysql_checks` follows.
   PG reads `confdeltype`/`confupdtype`, the `pg_constraint` name behind a PK/unique index,
   and its view bodies from **`pg_get_viewdef` over `pg_class`, not `information_schema.views`**
   (which hands back an empty definition to a non-owner and omits materialized views entirely)
