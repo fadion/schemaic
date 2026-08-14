@@ -1065,8 +1065,25 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
   to the focused view and, unhandled, only to the window root — and a modal opens with focus on its
   own `focus_root`, which is also where Escape hands it back. Without a Tab handler there the ring
   could only be joined by clicking a control first, so Tab did nothing at all on a freshly-opened
-  modal. The root isn't a ring member, so `step_from` reads it as "focus was nowhere" and starts at
-  the first control (the last, for Shift+Tab).
+  modal. The root isn't a ring member, so `step_from` falls back to the ring's **remembered cursor**
+  (`FocusRing::remember`, set by every Escape blur and every step) and, on a ring that has been
+  nowhere yet, starts at the first control (the last, for Shift+Tab). The memory is not a nicety: a
+  `tab_indents` field can only be left by Escape, so re-entering at position 0 made every control
+  after it unreachable by forward Tab.
+  **The window root is the backstop** (`lib.rs`'s root KeyDown, beside the Escape branch). A plain
+  Tab reaches it only when nothing in the overlay consumed the key — focus is on a dropdown's popup
+  list, or on *nothing*, which is what floem leaves behind whenever a focused view is removed or an
+  unfocusable row is clicked — and floem's own fallback then walks the whole window tree. So the
+  root steps `widgets::innermost_focus_ring()` instead, which is why `FOCUS_ROOTS` carries
+  `(ViewId, Option<FocusRing>)` rather than a bare id.
+  **Every cleanup that can run while focused hands the keyboard back** — `focus_root`,
+  `in_focus_ring` and `edit_field` all do, because floem clears `app_state.focus` *silently* on
+  removal (no `focus_changed`, so no `FocusGained` lands anywhere) and the modal around the
+  departing control is then deaf to Escape and Tab alike. One click on the designer's list `+` was
+  enough. "Was I focused?" is mirrored into an `Rc<Cell<bool>>`, never read back from a signal that
+  may already be disposed. Note floem keeps **one** cleanup slot per view, so a control needing its
+  own teardown passes it to `widgets::in_focus_ring_with` rather than chaining a second
+  `.on_cleanup`, which would silently replace the unregister *and* the hand-back.
 - **A `.hide()`n control is still in the Tab order** — `hide()` is `display: none`, so the view is
   still in the tree and still registered in the ring, and Tab moves focus onto something nobody can
   see. Every engine-conditional block that was built-and-hidden is therefore now **built
@@ -1089,7 +1106,9 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
   focus it stands for.
 - **In a field holding *code*, Tab is typing.** `FieldCfg::tab_indents` suppresses only the ring's
   step-away, so Tab still *arrives* at the field and floem's own `InsertTab` then runs; Escape is
-  the way out, blurring to the `focus_root` whose Tab re-enters the ring. Set on the trigger body,
+  the way out, blurring to the `focus_root` whose Tab re-enters the ring **after this field** (the
+  blur calls `FocusRing::remember`, which is what makes a mid-ring placement legal). Set on the
+  trigger body,
   the PG function body and the view editor's `SELECT`. Deliberately not on prose (the AI settings'
   custom instructions) or on the DDL preview's read-only script box, where there is no indent to
   type and Tab moving on is simply better.
@@ -1101,6 +1120,14 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
   and finds nothing. `widgets::set_open_popup`/`dismiss_open_popup` is that slot (thread-local: only
   one popup can be up), consulted from `workspace`'s root KeyDown fallback. Escape then peels one
   layer per press — root closes the popup, `in_focus_ring` blurs the control, the modal closes.
+  **The slot is tagged with a `PopupToken`, and a control may only clear its own entry.** Floem
+  queues B's open during dispatch and A's close at the end of the *same* event, so opening a second
+  dropdown over an open one ran `set(B)` and then A's clear — and an untagged clear emptied the slot
+  under B, after which Escape did nothing at all. The build-time run of each dropdown's effect (with
+  `open == false`) was a second way in, so merely constructing one wiped it. `clear_open_popup` is
+  also what the dropdown's `in_focus_ring_with` teardown calls: a control disposed with its popup
+  still up (click the backdrop) otherwise left a closure over a dead scope in the slot, and the next
+  Escape *anywhere in the app* was swallowed by it.
 - **Floem's `Dropdown` toggles on `KeyUp`, which reopens it after a keyboard accept.** Enter is
   *pressed* in the popup (accepting, which closes it) and *released* over the box focus has just
   returned to, so the release opened it again — no delay fixes that, the release is tens of ms

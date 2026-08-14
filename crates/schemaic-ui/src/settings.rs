@@ -540,18 +540,41 @@ where
     use floem::reactive::create_effect;
 
     let open = RwSignal::new(false);
-    let id = dd.id();
+    // Where the keyboard goes once the popup is gone: the ring entry *now* at
+    // this tabindex, resolved when the focus request fires rather than the id
+    // captured here. An accept can rebuild the box it came from — the PG trigger
+    // editor's Function picker sits in a container keyed on the very signal its
+    // own accept writes — and floem's focus request has no existence check, so a
+    // captured id parked the keyboard on a removed view and killed the modal.
+    let refocus = {
+        let ring = ring.clone();
+        move || {
+            let ring = ring.clone();
+            floem::action::exec_after(std::time::Duration::ZERO, move |_| ring.focus_at(tabindex));
+        }
+    };
     // While the popup is up it holds the keyboard, so Escape reaches neither this
     // box nor the enclosing modal — only the window root. Publish the way to
-    // close so the root can, and withdraw it the moment the popup goes.
-    create_effect(move |_| {
-        if open.get() {
-            crate::widgets::set_open_popup(Some(Rc::new(move || {
-                open.set(false);
-                floem::action::exec_after(std::time::Duration::ZERO, move |_| id.request_focus());
-            })));
-        } else {
-            crate::widgets::set_open_popup(None);
+    // close so the root can, and withdraw it the moment the popup goes. The slot
+    // is shared app-wide, so the entry is tagged: this dropdown must not clear
+    // another's, which is what the build-time run of this effect (`open` false,
+    // possibly while some other popup is up) would otherwise do.
+    let token = crate::widgets::popup_token();
+    create_effect({
+        let refocus = refocus.clone();
+        move |_| {
+            if open.get() {
+                let refocus = refocus.clone();
+                crate::widgets::set_open_popup(
+                    token,
+                    Rc::new(move || {
+                        open.set(false);
+                        refocus();
+                    }),
+                );
+            } else {
+                crate::widgets::clear_open_popup(token);
+            }
         }
     });
     let dd = dd
@@ -571,9 +594,17 @@ where
             on_accept(item);
             // Deferred: the popup is removed during this same update pass, and a
             // focus request into it would be undone by the removal.
-            floem::action::exec_after(std::time::Duration::ZERO, move |_| id.request_focus());
+            refocus();
         });
-    crate::widgets::in_focus_ring(dd, ring, tabindex).on_event(EventListener::KeyDown, move |e| {
+    // The extra cleanup goes *through* the ring helper: floem keeps one cleanup
+    // slot per view, so chaining a second one here would replace the ring's.
+    // Without it, a dropdown disposed with its popup still up (click the
+    // backdrop) left the global slot holding a closure over a dead scope, and
+    // the next Escape anywhere in the app was swallowed by it.
+    crate::widgets::in_focus_ring_with(dd, ring, tabindex, move || {
+        crate::widgets::clear_open_popup(token)
+    })
+    .on_event(EventListener::KeyDown, move |e| {
         let Event::KeyDown(ke) = e else {
             return EventPropagation::Continue;
         };
