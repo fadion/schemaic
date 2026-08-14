@@ -6,6 +6,7 @@
 //! here lets the leaf view modules depend on them without an ordering deadlock.
 
 use std::rc::Rc;
+use std::time::Instant;
 
 use floem::AnyView;
 use floem::event::{Event, EventListener, EventPropagation};
@@ -1094,6 +1095,108 @@ pub(crate) fn at_content_bottom(content_h: f64, viewport_bottom: f64, slack: f64
     content_h - viewport_bottom <= slack
 }
 
+/// Backstop expiry on an unconsumed gesture: a wheel against the end of the
+/// content moves nothing, so it raises no `on_scroll` to spend its stamp, and a
+/// stamp left lying around would be spent by whatever scrolled next.
+const SCROLL_GESTURE_MS: u64 = 500;
+
+/// Answers whether the scroll that just happened was the user's. **Consuming** —
+/// call it exactly once per `on_scroll`.
+pub(crate) type ScrollGestureByUser = Rc<dyn Fn() -> bool>;
+
+/// Attaches the pointer listeners a tail-following scroll needs, and returns it
+/// with the `by_user` predicate to hand [`follow_after_scroll`].
+///
+/// One gesture explains exactly **one** scroll, which is why reading the flag
+/// clears it. A time window alone is not enough and was itself a bug: the
+/// relayout that a streamed chunk triggers lands within milliseconds of the
+/// wheel that preceded it, so the clamp it causes was attributed to the reader,
+/// recorded the clamped position as the one they had chosen, and then held them
+/// at the top for the rest of the answer. The expiry above is only a backstop for
+/// a gesture that never scrolled anything.
+///
+/// A scrollbar drag needs the `held` flag: floem scrolls it from pointer *moves*,
+/// and moves must not count while nothing is pressed, or merely resting the
+/// cursor over the conversation would make every relayout look deliberate.
+pub(crate) fn with_scroll_gesture(s: Scroll) -> (Scroll, ScrollGestureByUser) {
+    // Plain cells, not signals: these are read from `on_scroll` on the very view
+    // whose scrolling writes them, and they outlive nothing.
+    let pending: Rc<std::cell::Cell<Option<Instant>>> = Rc::new(std::cell::Cell::new(None));
+    let held: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+    let s = s
+        // Registered listeners run in the scroll's `event_after_children`, ahead
+        // of its own scrolling, so the stamp is in place before the `on_scroll`
+        // it causes. `_cont` so the scroll still handles the event itself.
+        .on_event_cont(EventListener::PointerWheel, {
+            let p = pending.clone();
+            move |_| p.set(Some(Instant::now()))
+        })
+        .on_event_cont(EventListener::PointerDown, {
+            let (p, h) = (pending.clone(), held.clone());
+            move |_| {
+                h.set(true);
+                p.set(Some(Instant::now()));
+            }
+        })
+        .on_event_cont(EventListener::PointerUp, {
+            let h = held.clone();
+            move |_| h.set(false)
+        })
+        .on_event_cont(EventListener::PointerMove, {
+            let (p, h) = (pending.clone(), held.clone());
+            move |_| {
+                if h.get() {
+                    p.set(Some(Instant::now()));
+                }
+            }
+        });
+    let by_user: ScrollGestureByUser = Rc::new(move || {
+        matches!(pending.replace(None),
+            Some(t) if t.elapsed() < std::time::Duration::from_millis(SCROLL_GESTURE_MS))
+    });
+    (s, by_user)
+}
+
+/// Whether a tail-following view should still be following after its viewport
+/// moved. `by_user` says whether a wheel, drag or pointer-down caused the move.
+///
+/// The position alone cannot answer this, and every version that tried released
+/// the follow permanently mid-stream. The reason is that a tail-following list
+/// rebuilds its content as it grows, and a rebuilt child is measured *before*
+/// its text re-wraps to the pinned panel width — wider means fewer lines, so the
+/// content momentarily collapses to roughly half its height. While it is short,
+/// floem clamps the offset to `y0 = 0` (content shorter than the viewport) and
+/// reports that from `on_scroll`. Geometrically it is indistinguishable from the
+/// reader jumping to the top: the viewport is nowhere near the bottom, and the
+/// top edge moved up. Both readings released the follow, after which `scroll_to`
+/// returns `None` for good — the content grows under a viewport that never moves
+/// again, and floem's clamp early-returns without repainting, so even the
+/// scrollbar sits stale until a manual scroll snaps it to the top.
+///
+/// What the geometry can't say, the input can: the *reader* leaving the bottom
+/// is always a gesture, and a relayout never is. So a move that no gesture
+/// explains leaves the decision alone, which is what makes the collapse
+/// survivable — the next chunk re-pins to the bottom as if nothing happened.
+///
+/// Reaching the bottom re-arms, and it is tested first so the clamp that lands
+/// there during a collapse (or on a cleared conversation) recovers the follow
+/// rather than needing the user to ask for it back.
+pub(crate) fn follow_after_scroll(
+    following: bool,
+    by_user: bool,
+    viewport_bottom: f64,
+    content_h: f64,
+    slack: f64,
+) -> bool {
+    if at_content_bottom(content_h, viewport_bottom, slack) {
+        true
+    } else if by_user {
+        false
+    } else {
+        following
+    }
+}
+
 /// Auto-hide: bars stay hidden until content is scrolled; each scroll shows them
 /// and (re)arms a timer that hides them SCROLL_HIDE_MS after scrolling stops. The
 /// generation guard ensures only the latest scroll's timer fires.
@@ -1918,5 +2021,51 @@ mod follow_tests {
     fn content_shorter_than_the_viewport_is_at_the_bottom() {
         assert!(at_content_bottom(100.0, 400.0, 30.0));
         assert!(at_content_bottom(0.0, 0.0, 30.0));
+    }
+
+    /// The regression this function exists for, with the numbers off the real
+    /// log: a rebuild collapsed the content, floem clamped the offset to the top,
+    /// and `on_scroll` reported a viewport nowhere near the bottom of a 732px
+    /// document. No gesture caused it, so the follow must survive it.
+    #[test]
+    fn a_relayout_that_yanks_the_viewport_to_the_top_keeps_following() {
+        assert!(follow_after_scroll(true, false, 673.0, 732.8, 30.0));
+    }
+
+    /// Mid-stream the measured height also runs ahead of the offset the last
+    /// snap reached. Also not a reader.
+    #[test]
+    fn content_growing_under_a_parked_viewport_keeps_following() {
+        assert!(follow_after_scroll(true, false, 1000.0, 1200.0, 30.0));
+    }
+
+    /// The one thing that does release it: the reader scrolling away.
+    #[test]
+    fn a_user_scroll_away_from_the_bottom_releases_the_follow() {
+        assert!(!follow_after_scroll(true, true, 800.0, 1200.0, 30.0));
+    }
+
+    /// A gesture that leaves the viewport at the bottom isn't leaving — a wheel
+    /// nudge against the end of the content must not stop the follow.
+    #[test]
+    fn a_gesture_that_stays_at_the_bottom_keeps_following() {
+        assert!(follow_after_scroll(true, true, 1000.0, 1000.0, 30.0));
+    }
+
+    /// Reaching the bottom re-arms, whether the user scrolled back down to it or
+    /// a clamp landed there during a collapse.
+    #[test]
+    fn reaching_the_bottom_re_arms() {
+        // Scrolled back down to the end.
+        assert!(follow_after_scroll(false, true, 1000.0, 1000.0, 30.0));
+        // Content collapsed below the viewport height: trivially at the bottom.
+        assert!(follow_after_scroll(false, false, 673.0, 512.4, 30.0));
+    }
+
+    /// A released follow stays released while the content keeps growing — only
+    /// the bottom (or the jump button) brings it back.
+    #[test]
+    fn a_released_follow_is_not_re_armed_by_growth_alone() {
+        assert!(!follow_after_scroll(false, false, 800.0, 2000.0, 30.0));
     }
 }
