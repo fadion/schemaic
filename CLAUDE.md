@@ -1134,16 +1134,24 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
   growing list → `ACTION_TAB` for the footer, and that chain is asserted at **compile time** in
   `widgets.rs` (`const _: () = { … }`). It has already caught one regression: adding
   `ROW_TAB_STRIDE` cut the footer's headroom tenfold the day it landed.
-  The focus signal is an **outline** and it is painted in `.focus`, *not* `.focus_visible` —
-  floem gates `FocusVisible` on `app_state.keyboard_navigation`, which only its own
-  `view_tab_navigation` ever sets, so a `focus_visible` rule on a ring member never fires at all.
+  A **button's** focus signal is an outline, painted in `.focus`, *not* `.focus_visible` — floem
+  gates `FocusVisible` on `app_state.keyboard_navigation`, which only its own `view_tab_navigation`
+  ever sets, so a `focus_visible` rule on a ring member usually never fires at all. A **group**
+  (below) deliberately shows nothing.
 - **A group of like things is *one* Tab stop, and arrows move within it.** Manage Connections'
   colour swatches (`connection_form::color_picker`) and connection list, the designer's section
   strip, and the designer/trigger item list (`table_designer::list_pane`) each take a single ring
   slot: Tab reaches the group, Left/Right or Up/Down move inside it, Tab leaves. `widgets::nav_group`
   is the shared one (the swatches and `list_pane` predate it and carry their own scrolling and
   chrome). Eight swatches or twenty columns as individual stops would
-  make crossing a pane the user is only passing through cost twenty keypresses. Two details each
+  make crossing a pane the user is only passing through cost twenty keypresses.
+  **A `nav_group` paints no focus indication**, unlike a button: it wraps a whole bar or pane, so
+  an outline around it reads as a stray border — and it doesn't need one, because what the arrows
+  move is already highlighted, so the first press announces the focus by moving the thing you were
+  looking at. Floem's own 3px magenta ring is still suppressed (`focus_visible → outline(0)`),
+  since `keyboard_navigation` latches globally once floem's traversal has run anywhere.
+  `list_pane` makes the opposite call and recolours the border it already has — it has one to
+  recolour, which costs no layout; that is the test, not a house style. Two details each
   had a reason: the **ring wraps and these clamp** — wrapping is what stops Tab escaping the modal,
   while a selection that jumps from the last column to the first is only a surprise (the swatches
   *do* wrap, being a short fixed ring where the ends are visibly adjacent) — and the group's focus
