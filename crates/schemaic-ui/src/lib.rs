@@ -4488,6 +4488,41 @@ fn common_suffix_len(a: &str, b: &str, floor: usize) -> usize {
     i
 }
 
+/// What Tab does in an [`edit_field`] — see [`tab_action`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TabAction {
+    /// Run [`FieldCfg::on_tab`] (the command palette's ghost completion).
+    Callback,
+    /// Move to the next control in [`FieldCfg::focus`]'s ring.
+    StepRing,
+    /// Leave the key to floem, whose editor maps it to `InsertTab`.
+    Insert,
+}
+
+/// [`edit_field`]'s three-way Tab precedence, as one decision rather than three
+/// sequential `if`s.
+///
+/// `on_tab` first, because it is an explicit override for this specific key;
+/// then [`FieldCfg::tab_indents`], which is the field saying Tab is typing here;
+/// then the ring. A field with none of them lets floem insert a tab, which is
+/// also what a `tab_indents` field does — the difference between those two is
+/// only reachable through the ring, so the enum keeps them distinct rather than
+/// collapsing to a bool.
+///
+/// **Shift+Tab never runs `on_tab`.** Accepting a completion is a forward
+/// motion, and its one caller (the palette) has no ring, so a shifted Tab there
+/// falls through to `Insert` — which is what the code did before this was
+/// written down, and what the doc on `on_tab` says.
+pub(crate) fn tab_action(on_tab: bool, tab_indents: bool, in_ring: bool, shift: bool) -> TabAction {
+    if on_tab && !shift {
+        TabAction::Callback
+    } else if in_ring && !tab_indents {
+        TabAction::StepRing
+    } else {
+        TabAction::Insert
+    }
+}
+
 /// The one text-input component used across the app (except the specialised
 /// Ctrl+K overlay and the `*`-masked password fields): Floem's editor engine —
 /// the same one that powers the SQL editor — configured as a plain field inside
@@ -4637,28 +4672,30 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             }
             return CommandExecuted::Yes;
         }
-        // Tab accepts an external completion (the palette ghost) when opted in.
-        if let Some(cb) = &tab
-            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _))
-            && !mods.shift()
-        {
-            (cb)();
-            return CommandExecuted::Yes;
-        }
-        // Otherwise Tab leaves the field for the next control in the modal's
-        // ring. It has to be answered here: floem's editor consumes every key,
-        // so neither an outer listener nor floem's own traversal can see it.
-        //
-        // Unless the field holds code, where Tab is typing: falling through
-        // leaves it to floem, whose editor maps Tab to `InsertTab`. See
-        // [`FieldCfg::tab_indents`].
-        if let Some((ring, _)) = &key_focus
-            && !tab_indents
-            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _))
-            && let Some(me) = editor_sig.with_untracked(|e| e.editor_view_id.get_untracked())
-        {
-            ring.step_from(me, mods.shift());
-            return CommandExecuted::Yes;
+        if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _)) {
+            match tab_action(
+                tab.is_some(),
+                tab_indents,
+                key_focus.is_some(),
+                mods.shift(),
+            ) {
+                TabAction::Callback => {
+                    if let Some(cb) = &tab {
+                        (cb)();
+                    }
+                    return CommandExecuted::Yes;
+                }
+                TabAction::StepRing => {
+                    if let Some((ring, _)) = &key_focus
+                        && let Some(me) =
+                            editor_sig.with_untracked(|e| e.editor_view_id.get_untracked())
+                    {
+                        ring.step_from(me, mods.shift());
+                        return CommandExecuted::Yes;
+                    }
+                }
+                TabAction::Insert => {}
+            }
         }
         // Arrow Up/Down drive an external list (command-palette nav) instead of
         // the caret, when the caller opted in.
@@ -5877,4 +5914,50 @@ pub(crate) fn search_box(
         },
     )
     .style(|s| s.width_full())
+}
+
+#[cfg(test)]
+mod field_key_tests {
+    use super::{TabAction, tab_action};
+
+    /// The documented order: an explicit `on_tab` beats everything.
+    #[test]
+    fn an_explicit_tab_handler_wins() {
+        assert_eq!(
+            tab_action(true, false, true, false),
+            TabAction::Callback,
+            "even with a ring"
+        );
+        assert_eq!(tab_action(true, true, true, false), TabAction::Callback);
+    }
+
+    /// Accepting a completion is a forward motion, so a shifted Tab isn't one.
+    /// The palette (the only `on_tab` caller) has no ring, so it falls through
+    /// to floem.
+    #[test]
+    fn shift_tab_never_accepts_a_completion() {
+        assert_eq!(tab_action(true, false, false, true), TabAction::Insert);
+        assert_eq!(tab_action(true, false, true, true), TabAction::StepRing);
+    }
+
+    #[test]
+    fn a_ringed_field_steps_in_both_directions() {
+        assert_eq!(tab_action(false, false, true, false), TabAction::StepRing);
+        assert_eq!(tab_action(false, false, true, true), TabAction::StepRing);
+    }
+
+    /// A field holding code types the indent — Escape is the way out, and the
+    /// ring re-enters after it (`FocusRing::remember`). Shift+Tab is suppressed
+    /// too, deliberately: half a step-away would be stranger than none.
+    #[test]
+    fn a_code_field_types_the_indent_instead_of_leaving() {
+        assert_eq!(tab_action(false, true, true, false), TabAction::Insert);
+        assert_eq!(tab_action(false, true, true, true), TabAction::Insert);
+    }
+
+    #[test]
+    fn a_plain_field_outside_any_ring_inserts() {
+        assert_eq!(tab_action(false, false, false, false), TabAction::Insert);
+        assert_eq!(tab_action(false, true, false, false), TabAction::Insert);
+    }
 }
