@@ -253,6 +253,19 @@ pub(crate) enum NavAxis {
 /// a *selection* clamps at its ends (jumping from the last item to the first is
 /// only a surprise) while the Tab ring wraps, since wrapping is what stops Tab
 /// leaving the modal. See [`list_step`] and [`ring_step`].
+///
+/// **A group shows no focus indication of its own**, unlike a
+/// [button](in_ring_button). It is a container spanning a whole bar or pane, so
+/// an outline around it reads as a stray border rather than as focus — and it
+/// doesn't need one: what the arrows move is *already* highlighted, so the first
+/// press says the group has the keyboard by moving the thing you were looking
+/// at. A button has no such state and must say so itself.
+///
+/// Floem's default ring is still suppressed rather than left alone: it is a 3px
+/// magenta outline belonging to no palette here, and while `FocusVisible` can't
+/// fire from [`FocusRing`]'s own focus requests (see [`button_focus_ring`]),
+/// floem latches `keyboard_navigation` globally once its *own* traversal has run
+/// anywhere in the window.
 pub(crate) fn nav_group<V: IntoView + 'static>(
     body: V,
     ring: FocusRing,
@@ -260,7 +273,9 @@ pub(crate) fn nav_group<V: IntoView + 'static>(
     axis: NavAxis,
     step: impl Fn(isize) + 'static,
 ) -> AnyView {
-    let group = body.into_view().style(button_focus_ring);
+    let group = body
+        .into_view()
+        .style(|s| s.focus_visible(|s| s.outline(0.0)));
     in_focus_ring(group, ring, tabindex)
         .on_event(EventListener::KeyDown, move |e| {
             let Event::KeyDown(ke) = e else {
