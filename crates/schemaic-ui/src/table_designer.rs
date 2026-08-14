@@ -728,13 +728,7 @@ pub(crate) fn list_pane(
     tabindex: u32,
 ) -> impl IntoView {
     let step = move |delta: isize| {
-        let n = len();
-        if n == 0 {
-            return;
-        }
-        let cur = selected.get_untracked();
-        let next = (cur as isize + delta).clamp(0, n as isize - 1) as usize;
-        if next != cur {
+        if let Some(next) = crate::widgets::list_step(len(), selected.get_untracked(), delta) {
             selected.set(next);
         }
     };
@@ -1720,13 +1714,21 @@ pub(crate) fn empty_hint(msg: &'static str) -> impl IntoView {
 }
 
 /// A name that isn't taken yet: `column`, then `column_2`, `column_3`…
+///
+/// **Case-insensitively taken**, which is the same fold
+/// [`TableDraft::validate`](schemaic_core::ddl::TableDraft::validate) applies
+/// when it reports "Two columns are both called …". The two rules have to agree:
+/// an exact match let `+` generate `Name` beside an existing `name`, and the
+/// footer then blanked the change count and disabled Preview SQL over a row the
+/// generator had just created.
 fn unique_name(taken: &[String], base: &str) -> String {
-    if !taken.iter().any(|t| t == base) {
+    let free = |c: &str| !taken.iter().any(|t| t.eq_ignore_ascii_case(c));
+    if free(base) {
         return base.to_string();
     }
     (2..)
         .map(|n| format!("{base}_{n}"))
-        .find(|c| !taken.iter().any(|t| t == c))
+        .find(|c| free(c))
         .unwrap_or_else(|| base.to_string())
 }
 
@@ -1753,16 +1755,26 @@ fn clamp_selection(ui: &Ui, len: impl Fn(&TableDraft) -> usize) {
     ui.ddl.rev.update(|r| *r += 1);
 }
 
+/// Where "move the item at `i` by `delta`" lands, or `None` when it can't.
+///
+/// **Both** indices are checked, not only the destination: `i` comes from
+/// `ui.ddl.selected`, which every writer today keeps inside the column list, but
+/// nothing states that invariant and an out-of-range one would panic inside
+/// `Vec::swap` rather than declining to move.
+fn swap_target(len: usize, i: usize, delta: isize) -> Option<usize> {
+    let j = i.checked_add_signed(delta)?;
+    (i < len && j < len).then_some(j)
+}
+
 /// Move the selected item one place, taking the selection with it.
 fn swap_selected(ui: &Ui, delta: isize) {
     let i = ui.ddl.selected.get_untracked();
-    let j = i as isize + delta;
-    let len = ui.ddl.draft.with_untracked(|d| d.columns.len()) as isize;
-    if j < 0 || j >= len {
+    let len = ui.ddl.draft.with_untracked(|d| d.columns.len());
+    let Some(j) = swap_target(len, i, delta) else {
         return;
-    }
-    ui.ddl.draft.update(|d| d.columns.swap(i, j as usize));
-    ui.ddl.selected.set(j as usize);
+    };
+    ui.ddl.draft.update(|d| d.columns.swap(i, j));
+    ui.ddl.selected.set(j);
     ui.ddl.rev.update(|r| *r += 1);
 }
 
@@ -1994,4 +2006,67 @@ fn preview_from(target: &DesignerTarget, draft: &TableDraft, cs: &ddl::ChangeSet
         cs,
         target.read_only,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{swap_target, unique_name};
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn an_untaken_name_is_used_as_is() {
+        assert_eq!(unique_name(&names(&["id"]), "column"), "column");
+        assert_eq!(unique_name(&[], "column"), "column");
+    }
+
+    #[test]
+    fn a_taken_name_counts_up_from_two() {
+        assert_eq!(unique_name(&names(&["column"]), "column"), "column_2");
+        assert_eq!(
+            unique_name(&names(&["column", "column_2"]), "column"),
+            "column_3"
+        );
+        // The gap is filled rather than skipped past.
+        assert_eq!(
+            unique_name(&names(&["column", "column_3"]), "column"),
+            "column_2"
+        );
+    }
+
+    /// The generator and `TableDraft::validate` have to fold case the same way,
+    /// or `+` creates a row the validator immediately refuses — blanking the
+    /// change count and disabling Preview SQL over its own output.
+    #[test]
+    fn taken_is_case_insensitive_like_the_validator() {
+        assert_eq!(unique_name(&names(&["Column"]), "column"), "column_2");
+        assert_eq!(unique_name(&names(&["COLUMN_2"]), "column"), "column");
+        assert_eq!(
+            unique_name(&names(&["column", "Column_2"]), "column"),
+            "column_3"
+        );
+    }
+
+    #[test]
+    fn a_column_moves_one_place_in_either_direction() {
+        assert_eq!(swap_target(3, 1, 1), Some(2));
+        assert_eq!(swap_target(3, 1, -1), Some(0));
+    }
+
+    #[test]
+    fn the_ends_of_the_list_have_nowhere_to_move_to() {
+        assert_eq!(swap_target(3, 2, 1), None);
+        assert_eq!(swap_target(3, 0, -1), None);
+        assert_eq!(swap_target(0, 0, 1), None);
+    }
+
+    /// The selection index is checked too, not just the destination: a stale one
+    /// would panic inside `Vec::swap` instead of declining to move.
+    #[test]
+    fn a_selection_past_the_end_declines_rather_than_panicking() {
+        assert_eq!(swap_target(3, 7, -1), None);
+        assert_eq!(swap_target(3, 7, 1), None);
+    }
 }
