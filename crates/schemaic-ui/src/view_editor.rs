@@ -316,7 +316,7 @@ fn form(ui: Ui, target: &ViewTarget, ring: FocusRing) -> AnyView {
     // `hide()`n control is still in the modal's Tab order, so Tab would land on
     // something nobody can see.
     let mysql_only: AnyView = if pg {
-        empty().into_any()
+        crate::widgets::nothing()
     } else {
         let security = form_setting(
             "SQL security",
@@ -348,7 +348,7 @@ fn form(ui: Ui, target: &ViewTarget, ring: FocusRing) -> AnyView {
     // PostgreSQL's escape hatch. Off by default — a drop is never the quiet
     // answer — and the preview spells out what taking it costs.
     let recreate: AnyView = if !pg {
-        empty().into_any()
+        crate::widgets::nothing()
     } else {
         let sig = floem::reactive::create_rw_signal(draft.force_recreate);
         create_effect(move |prev: Option<bool>| {

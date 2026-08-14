@@ -118,6 +118,20 @@ pub(crate) fn ring_step(len: usize, cur: Option<usize>, backwards: bool) -> Opti
     })
 }
 
+/// A branch that wasn't built, as a view — for the else-arm of an
+/// engine-conditional block inside a gapped stack.
+///
+/// `display: none`, not a bare `empty()`. This is the one place `hide()` is
+/// still right: taffy excludes a `display:none` child from **gap** accounting
+/// but counts a zero-sized one, so a plain `empty()` arm leaves a whole
+/// [`FORM_GAP`] of dead space where the block would have been. The distinction
+/// the range drew still holds — a *control* must never be built-and-hidden,
+/// because a hidden view is still in the Tab ring — and nothing is hidden here:
+/// there is nothing inside to reach.
+pub(crate) fn nothing() -> floem::AnyView {
+    empty().style(|s| s.hide()).into_any()
+}
+
 /// Where a **growing** block of Tab stops starts — a list of enum values, of
 /// domain checks, of trigger arguments, of function settings — one stop per row
 /// from here upwards.

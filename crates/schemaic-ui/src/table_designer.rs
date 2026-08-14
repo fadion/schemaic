@@ -889,7 +889,7 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         .style(|s| s.flex_col().gap(FORM_GAP).width_full())
         .into_any()
     } else {
-        empty().into_any()
+        crate::widgets::nothing()
     };
 
     // No section heading and no "In {database}" row: the tab strip above already
@@ -1121,7 +1121,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     // `ON UPDATE CURRENT_TIMESTAMP` is MySQL's alone. Built only there rather
     // than built and hidden: a `hide()`n field is still in the Tab order.
     let on_update: AnyView = if pg {
-        empty().into_any()
+        crate::widgets::nothing()
     } else {
         form_setting(
             "On update",
@@ -1278,7 +1278,7 @@ fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         .style(|s| s.flex_col().gap(FORM_GAP).width_full())
         .into_any()
     } else {
-        empty().into_any()
+        crate::widgets::nothing()
     };
 
     v_stack((
@@ -1673,7 +1673,7 @@ fn check_form(
     let enforced: AnyView = if dialect == SqlDialect::Postgres
         || target_flavour != ServerFlavour::MySql
     {
-        empty().into_any()
+        crate::widgets::nothing()
     } else {
         bound_toggle(
             &ui,
