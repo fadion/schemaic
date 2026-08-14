@@ -370,6 +370,12 @@ Zed-inspired, aiming to replace DataGrip.
     - `transcript.rs` — the rendered shape of one AI turn (`ChatMessage`/`Seg::{Text,Tool}`/
       `TurnStats`), kept here rather than in `schemaic-ai` so the UI crate needn't depend on the
       CLI-integration crate. `ChatMessage::prose` is what copy *and* conversation replay use.
+      Also the message box's **prompt recall** (Ctrl+Up/Down): `user_prompts` (the user's own
+      questions, newest first, blanks dropped and a repeat kept only at its newest spot) +
+      `recall_step`, which is a **cycle** — `None → newest → … → oldest → None` — rather than a
+      list that stops at its ends, because the empty box is the only way back out of a recall and
+      both keys have to reach it. A cursor past the end of a conversation that has since changed
+      reads as `None`, so a stale walk restarts instead of landing somewhere arbitrary.
     - `chat.rs` — per-connection conversations persisted to `chats.json`. `ChatFile::of` replaces
       every tool `result` with `RESULT_OMITTED` before it reaches disk — a `run_query` result is up
       to 200 rows of real table data, and writing it verbatim exported user data to a plaintext

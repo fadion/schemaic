@@ -4293,6 +4293,27 @@ pub(crate) struct FieldCfg {
     /// set, the key is consumed here instead of moving the editor caret.
     pub on_arrow_up: Option<Rc<dyn Fn()>>,
     pub on_arrow_down: Option<Rc<dyn Fn()>>,
+    /// Ctrl+Arrow Up / Down (the AI panel's prompt-history recall). Separate
+    /// hooks from [`FieldCfg::on_arrow_up`] because they answer a different
+    /// question: the plain arrows drive a list *beside* the field, these rewrite
+    /// the field itself. When set, the key is consumed here.
+    pub on_ctrl_arrow_up: Option<Rc<dyn Fn()>>,
+    pub on_ctrl_arrow_down: Option<Rc<dyn Fn()>>,
+    /// "This text was put here, not typed" — the field renders its whole buffer
+    /// in [`FieldCfg::placeholder_color`] while set, and the next key that isn't
+    /// a recall key (`on_ctrl_arrow_*`) or a bare modifier commits it: the flag
+    /// clears and the caret jumps to the end.
+    ///
+    /// Escape is the exception — it *discards* rather than commits, emptying the
+    /// field and keeping focus, so changing your mind about a recalled entry
+    /// costs one key rather than a selection and a delete.
+    ///
+    /// The commit is synchronous, inside the key handler, because floem inserts
+    /// a plain character *after* the handler returns (§ Floem: `text_editor_keys`
+    /// inserts unconditionally) — deferring the caret move by even a tick would
+    /// land that character wherever the caret happened to be sitting and only
+    /// then jump to the end.
+    pub uncommitted: Option<RwSignal<bool>>,
     /// Tab (e.g. accept the command-palette ghost completion). When set, the key
     /// is consumed here instead of inserting a tab / moving focus.
     pub on_tab: Option<Rc<dyn Fn()>>,
@@ -4330,11 +4351,42 @@ impl Default for FieldCfg {
             on_blur: None,
             on_arrow_up: None,
             on_arrow_down: None,
+            on_ctrl_arrow_up: None,
+            on_ctrl_arrow_down: None,
+            uncommitted: None,
             on_tab: None,
             caret_end: None,
             trailing: None,
         }
     }
+}
+
+/// True for a key that only modifies other keys, so pressing it alone means the
+/// user hasn't typed anything yet.
+///
+/// [`FieldCfg::uncommitted`] needs it: the recall keys are Ctrl+Arrow, and the
+/// Ctrl arrives as its own key-down first — treated as input, it would commit
+/// the recalled text before the arrow that was meant to replace it.
+fn is_modifier_key(k: &Key) -> bool {
+    matches!(
+        k,
+        Key::Named(
+            NamedKey::Alt
+                | NamedKey::AltGraph
+                | NamedKey::CapsLock
+                | NamedKey::Control
+                | NamedKey::Fn
+                | NamedKey::FnLock
+                | NamedKey::Meta
+                | NamedKey::NumLock
+                | NamedKey::ScrollLock
+                | NamedKey::Shift
+                | NamedKey::Symbol
+                | NamedKey::SymbolLock
+                | NamedKey::Super
+                | NamedKey::Hyper
+        )
+    )
 }
 
 /// Length (bytes, rounded down to a char boundary) of the common prefix of two
@@ -4400,6 +4452,9 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         on_blur,
         on_arrow_up,
         on_arrow_down,
+        on_ctrl_arrow_up,
+        on_ctrl_arrow_down,
+        uncommitted,
         on_tab,
         caret_end,
         trailing,
@@ -4435,8 +4490,51 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     let escape = on_escape.clone();
     let arrow_up = on_arrow_up.clone();
     let arrow_down = on_arrow_down.clone();
+    let ctrl_up = on_ctrl_arrow_up.clone();
+    let ctrl_down = on_ctrl_arrow_down.clone();
     let tab = on_tab.clone();
     let editor = text_editor_keys(text_sig.get_untracked(), move |editor_sig, kp, mods| {
+        // Ctrl+Arrow recall, before the plain-arrow hooks: the modifier is what
+        // tells the two apart, and the plain-arrow branch below doesn't look at
+        // it.
+        if mods.control()
+            && let Some(cb) = match &kp.key {
+                KeyInput::Keyboard(Key::Named(NamedKey::ArrowUp), _) => ctrl_up.as_ref(),
+                KeyInput::Keyboard(Key::Named(NamedKey::ArrowDown), _) => ctrl_down.as_ref(),
+                _ => None,
+            }
+        {
+            (cb)();
+            return CommandExecuted::Yes;
+        }
+        // Escape *discards* recalled text instead of committing it: the recall
+        // put it there, so the way back out is the empty box it started from,
+        // with the caret still in it. Consuming the key keeps focus — the field
+        // has answered this Escape, and the next one blurs as usual, which is
+        // the same one-layer-per-press step the modals take.
+        if let Some(flag) = uncommitted
+            && flag.get_untracked()
+            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Escape), _))
+        {
+            flag.set(false);
+            text_sig.set(String::new());
+            return CommandExecuted::Yes;
+        }
+        // Anything else — but not a bare modifier, or holding Ctrl down for the
+        // recall keys above would itself commit — turns recalled text into the
+        // user's own. Caret to the end first: floem applies a plain character
+        // after this handler returns, so it lands after the text rather than
+        // inside it.
+        if let Some(flag) = uncommitted
+            && flag.get_untracked()
+            && !matches!(&kp.key, KeyInput::Keyboard(k, _) if is_modifier_key(k))
+        {
+            flag.set(false);
+            editor_sig.with_untracked(|e| {
+                let len = e.doc().text().to_string().len();
+                e.cursor.update(|c| c.set_offset(len, false, false));
+            });
+        }
         if matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Escape), _)) {
             match &escape {
                 Some(esc) => (esc)(),
@@ -4620,7 +4718,14 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             let s = s
                 .height_full()
                 .min_width(0.0)
-                .color(text_color())
+                // Recalled-but-not-yet-owned text reads as the placeholder it
+                // stands in for. Read inside the reactive style, so committing
+                // repaints it without rebuilding the field.
+                .color(if uncommitted.is_some_and(|u| u.get()) {
+                    placeholder_color()
+                } else {
+                    text_color()
+                })
                 .background(floem::peniko::Color::TRANSPARENT)
                 .class(Handle, move |s| {
                     if multiline {

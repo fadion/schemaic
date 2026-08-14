@@ -75,6 +75,59 @@ impl ChatMessage {
     }
 }
 
+/// Which way a prompt-history recall step moves through the user's own
+/// questions: [`RecallDir::Older`] is Ctrl+Up, [`RecallDir::Newer`] Ctrl+Down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecallDir {
+    Older,
+    Newer,
+}
+
+/// The user's own questions from a conversation, **newest first** — what the AI
+/// panel's Ctrl+Up/Down recall walks.
+///
+/// Blank questions are dropped (there is nothing to recall) and a repeated one
+/// is kept only at its newest position: asking the same thing twice shouldn't
+/// cost two presses to step past.
+pub fn user_prompts(msgs: &[ChatMessage]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in msgs.iter().rev() {
+        if m.role != Role::User {
+            continue;
+        }
+        let t = m.text.trim();
+        if t.is_empty() || out.iter().any(|p| p == t) {
+            continue;
+        }
+        out.push(t.to_string());
+    }
+    out
+}
+
+/// Step the recall cursor over `len` prompts (index 0 = newest), where `None` is
+/// the empty box the recall started from.
+///
+/// It is a **cycle** — `None → newest → … → oldest → None` going up, and the
+/// mirror image going down — rather than a list that stops at its ends, because
+/// the empty box is the only way back out of a recall and both keys have to
+/// reach it. `cur` past the end of a conversation that has since changed is read
+/// as `None` rather than clamped, so a stale cursor restarts the walk instead of
+/// landing somewhere arbitrary.
+pub fn recall_step(len: usize, cur: Option<usize>, dir: RecallDir) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let cur = cur.filter(|i| *i < len);
+    match (dir, cur) {
+        (RecallDir::Older, None) => Some(0),
+        (RecallDir::Older, Some(i)) if i + 1 < len => Some(i + 1),
+        (RecallDir::Older, Some(_)) => None,
+        (RecallDir::Newer, None) => Some(len - 1),
+        (RecallDir::Newer, Some(0)) => None,
+        (RecallDir::Newer, Some(i)) => Some(i - 1),
+    }
+}
+
 /// One piece of a rendered assistant turn, in emission order.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Seg {
@@ -271,6 +324,85 @@ mod tests {
         );
         // No stats at all → empty string.
         assert_eq!(TurnStats::default().summary(), "");
+    }
+
+    fn assistant(text: &str) -> ChatMessage {
+        ChatMessage {
+            role: Role::Assistant,
+            text: String::new(),
+            segs: vec![Seg::Text(text.to_string())],
+            stats: None,
+            pending: false,
+        }
+    }
+
+    #[test]
+    fn user_prompts_are_newest_first_and_skip_the_assistant() {
+        let msgs = vec![
+            ChatMessage::user("first".into()),
+            assistant("reply"),
+            ChatMessage::user("second".into()),
+            assistant("reply"),
+        ];
+        assert_eq!(user_prompts(&msgs), vec!["second", "first"]);
+    }
+
+    #[test]
+    fn user_prompts_drop_blanks_and_keep_a_repeat_only_at_its_newest_spot() {
+        let msgs = vec![
+            ChatMessage::user("a".into()),
+            ChatMessage::user("   ".into()),
+            ChatMessage::user("b".into()),
+            ChatMessage::user(" a ".into()),
+        ];
+        // "a" was asked twice; it survives once, at the newest position.
+        assert_eq!(user_prompts(&msgs), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn user_prompts_of_an_empty_conversation_is_empty() {
+        assert!(user_prompts(&[]).is_empty());
+        assert!(user_prompts(&[assistant("hi")]).is_empty());
+    }
+
+    #[test]
+    fn recall_up_walks_to_the_oldest_then_back_to_the_empty_box() {
+        use RecallDir::Older;
+        assert_eq!(recall_step(3, None, Older), Some(0));
+        assert_eq!(recall_step(3, Some(0), Older), Some(1));
+        assert_eq!(recall_step(3, Some(1), Older), Some(2));
+        assert_eq!(recall_step(3, Some(2), Older), None);
+    }
+
+    #[test]
+    fn recall_down_walks_to_the_newest_then_back_to_the_empty_box() {
+        use RecallDir::Newer;
+        assert_eq!(recall_step(3, None, Newer), Some(2));
+        assert_eq!(recall_step(3, Some(2), Newer), Some(1));
+        assert_eq!(recall_step(3, Some(1), Newer), Some(0));
+        assert_eq!(recall_step(3, Some(0), Newer), None);
+    }
+
+    #[test]
+    fn recall_with_no_history_stays_on_the_empty_box() {
+        assert_eq!(recall_step(0, None, RecallDir::Older), None);
+        assert_eq!(recall_step(0, None, RecallDir::Newer), None);
+        assert_eq!(recall_step(0, Some(2), RecallDir::Older), None);
+    }
+
+    #[test]
+    fn recall_of_one_prompt_toggles_with_the_empty_box() {
+        assert_eq!(recall_step(1, None, RecallDir::Older), Some(0));
+        assert_eq!(recall_step(1, Some(0), RecallDir::Older), None);
+        assert_eq!(recall_step(1, None, RecallDir::Newer), Some(0));
+        assert_eq!(recall_step(1, Some(0), RecallDir::Newer), None);
+    }
+
+    #[test]
+    fn a_stale_cursor_past_the_end_restarts_the_walk() {
+        // The conversation shrank under the cursor (a new chat, a restore).
+        assert_eq!(recall_step(2, Some(7), RecallDir::Older), Some(0));
+        assert_eq!(recall_step(2, Some(7), RecallDir::Newer), Some(1));
     }
 
     #[test]
