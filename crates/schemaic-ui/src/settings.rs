@@ -9,7 +9,10 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 
 use crate::consts::{CHAT_PAD_H, TERM_FONT_SIZES};
-use crate::widgets::{autohide, focus_root, form_hint, form_label_style, modal_title, panel_style};
+use crate::widgets::{
+    autohide, focus_root, focus_root_with_ring, form_hint, form_label_style, modal_title,
+    panel_style,
+};
 use crate::{AiEffort, AiModel, FieldCfg, SchemaScope, TermCursor, Ui, edit_field, icons, theme};
 
 // ===== moved from lib.rs (settings modals) =====
@@ -34,25 +37,47 @@ pub(crate) fn term_settings_overlay(ui: Ui) -> impl IntoView {
             }
             let close: Rc<dyn Fn()> = Rc::new(move || open.set(false));
 
-            let shell_dd = shell_dropdown(shells, selected, apply.clone());
-            let font_dd = settings_dropdown(font_size, TERM_FONT_SIZES, term_font_label);
-            let cursor_dd = settings_dropdown(cursor_style, TermCursor::ALL, TermCursor::label);
+            // The modal's Tab order. Indices are spaced by 10 so a control can be
+            // inserted between two without renumbering — see `FocusRing`.
+            let ring = crate::widgets::FocusRing::new();
+
+            let shell_dd = shell_dropdown(shells, selected, apply.clone(), ring.clone(), 10);
+            let font_dd = focusable_dropdown(
+                font_size,
+                TERM_FONT_SIZES,
+                term_font_label,
+                ring.clone(),
+                20,
+            );
+            let cursor_dd = focusable_dropdown(
+                cursor_style,
+                TermCursor::ALL,
+                TermCursor::label,
+                ring.clone(),
+                30,
+            );
 
             let group = |s: floem::style::Style| s.flex_col().gap(6.0);
             let shell_section = v_stack((settings_group_label("Shell"), shell_dd)).style(group);
             let font_section = v_stack((settings_group_label("Font size"), font_dd)).style(group);
             let cursor_section =
                 v_stack((settings_group_label("Cursor style"), cursor_dd)).style(group);
-            let copy_row = settings_toggle_row(
+            let copy_row = focusable_toggle_row(
                 "Copy on selection",
                 "Copy selected text to the clipboard the moment a selection ends.",
                 copy_on_select,
+                ring.clone(),
+                40,
             );
-            let blink_row = settings_toggle_row(
+            let blink_row = focusable_toggle_row(
                 "Blink cursor",
                 "Blink the cursor while the terminal is focused.",
                 cursor_blink,
+                ring.clone(),
+                50,
             );
+            // Kept for the root, which answers Tab by entering the ring.
+            let root_ring = ring;
 
             let body = v_stack((
                 shell_section,
@@ -68,7 +93,7 @@ pub(crate) fn term_settings_overlay(ui: Ui) -> impl IntoView {
                 .style(|s| panel_style(s).background(theme::bg_panel()).width(420.0));
 
             let esc = close.clone();
-            focus_root(container(panel))
+            focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
                 .on_click_stop(move |_| close())
                 .style(|s| {
@@ -101,6 +126,8 @@ fn shell_dropdown(
     shells: RwSignal<Vec<schemaic_term::ShellProfile>>,
     selected: RwSignal<usize>,
     apply: Rc<dyn Fn(usize)>,
+    ring: crate::widgets::FocusRing,
+    tabindex: u32,
 ) -> impl IntoView {
     use floem::views::dropdown::Dropdown;
 
@@ -155,23 +182,17 @@ fn shell_dropdown(
     };
 
     let opts: Vec<usize> = (0..shells.get_untracked().len()).collect();
-    Dropdown::custom(move || selected.get(), main, opts, row)
-        .on_accept(move |i| (apply)(i))
-        .style(dropdown_box_style)
+    let dd = Dropdown::custom(move || selected.get(), main, opts, row).style(dropdown_box_style);
+    in_ring_dropdown(dd, ring, tabindex, move |i| (apply)(i))
 }
 
-/// A self-describing toggle row: title + hint on the left, switch on the right.
-/// Shared by the AI and Terminal settings panes.
-pub(crate) fn settings_toggle_row(
-    title: &'static str,
-    hint: &'static str,
-    sig: RwSignal<bool>,
-) -> impl IntoView {
-    toggle_row_layout(title, hint, themed_toggle(sig).into_any())
-}
-
-/// [`settings_toggle_row`] whose switch joins a modal's Tab order and can be
-/// flipped with Space or Enter.
+/// A self-describing toggle row — title + hint on the left, switch on the right
+/// — whose switch is in a modal's Tab order and can be flipped with Space or
+/// Enter.
+///
+/// There is no un-focusable variant: every toggle in the app lives in a modal
+/// that has a ring, and a second one would only be a way to leave a control out
+/// of it by accident.
 pub(crate) fn focusable_toggle_row(
     title: &'static str,
     hint: &'static str,
@@ -475,12 +496,40 @@ where
     T: Copy + PartialEq + 'static,
     S: Into<String> + 'static,
 {
+    in_ring_dropdown(
+        settings_dropdown(active, options, label),
+        ring,
+        tabindex,
+        move |item| active.set(item),
+    )
+}
+
+/// Put an already-built [`Dropdown`](floem::views::dropdown::Dropdown) in a
+/// modal's Tab order, taking its open state over.
+///
+/// The behaviour and every reason for it are documented on
+/// [`focusable_dropdown`]; this is the half that doesn't care what the options
+/// are, so the app's *other* picker — [`crate::table_designer::owned_dropdown`],
+/// which exists because a table name isn't `Copy` — joins the ring through the
+/// same code rather than a second copy of four floem work-arounds.
+///
+/// `on_accept` is passed in rather than left on the dropdown because floem keeps
+/// a **single** accept slot: whatever the builder set is replaced here, so the
+/// caller's action has to arrive with the ring.
+pub(crate) fn in_ring_dropdown<T>(
+    dd: floem::views::dropdown::Dropdown<T>,
+    ring: crate::widgets::FocusRing,
+    tabindex: u32,
+    on_accept: impl Fn(T) + 'static,
+) -> impl IntoView
+where
+    T: Clone + 'static,
+{
     use floem::event::{Event, EventListener, EventPropagation};
     use floem::keyboard::{Key, NamedKey};
     use floem::reactive::create_effect;
 
     let open = RwSignal::new(false);
-    let dd = settings_dropdown(active, options, label);
     let id = dd.id();
     // While the popup is up it holds the keyboard, so Escape reaches neither this
     // box nor the enclosing modal — only the window root. Publish the way to
@@ -506,10 +555,10 @@ where
             }
         })
         .disable_default_event(|| (EventListener::KeyUp, true))
-        // `on_accept` is a single slot, so this replaces the one
-        // `settings_dropdown` set and has to repeat its `active.set`.
+        // `on_accept` is a single slot, so this replaces the one the builder set
+        // and has to carry the caller's action itself.
         .on_accept(move |item| {
-            active.set(item);
+            on_accept(item);
             // Deferred: the popup is removed during this same update pass, and a
             // focus request into it would be undone by the removal.
             floem::action::exec_after(std::time::Duration::ZERO, move |_| id.request_focus());
@@ -560,11 +609,15 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
                 })
             };
 
+            // The modal's Tab order; indices spaced by 10 — see `FocusRing`.
+            let ring = crate::widgets::FocusRing::new();
+
             let path_field = edit_field(
                 cli_path,
                 FieldCfg {
                     placeholder: "Leave empty to auto-detect",
                     clearable: true,
+                    focus: Some((ring.clone(), 10)),
                     ..Default::default()
                 },
             )
@@ -596,15 +649,24 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
                 },
             );
 
-            let model_dd = settings_dropdown(model, AiModel::ALL, AiModel::label);
-            let effort_dd = settings_dropdown(effort, AiEffort::ALL, AiEffort::label);
-            let scope_dd = settings_dropdown(scope, SchemaScope::ALL, SchemaScope::label);
+            let model_dd =
+                focusable_dropdown(model, AiModel::ALL, AiModel::label, ring.clone(), 20);
+            let effort_dd =
+                focusable_dropdown(effort, AiEffort::ALL, AiEffort::label, ring.clone(), 30);
+            let scope_dd = focusable_dropdown(
+                scope,
+                SchemaScope::ALL,
+                SchemaScope::label,
+                ring.clone(),
+                50,
+            );
 
             let instr_field = edit_field(
                 instructions,
                 FieldCfg {
                     placeholder: "Dialect, conventions, house rules…",
                     multiline: true,
+                    focus: Some((ring.clone(), 40)),
                     ..Default::default()
                 },
             )
@@ -626,11 +688,15 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
             let scope_section =
                 v_stack((settings_group_label("Schema context"), scope_dd)).style(group);
             // Self-describing toggle row (label + hint on the left, switch right).
-            let queries_section = settings_toggle_row(
+            let queries_section = focusable_toggle_row(
                 "Let the assistant run queries",
                 "Read-only queries (SELECT/SHOW/…) to inspect your data.",
                 run_queries,
+                ring.clone(),
+                60,
             );
+            // Kept for the root, which answers Tab by entering the ring.
+            let root_ring = ring;
 
             let body = v_stack((
                 cli_section,
@@ -647,7 +713,7 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
                 .style(|s| panel_style(s).background(theme::bg_panel()).width(460.0));
 
             let esc = close.clone();
-            focus_root(container(panel))
+            focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
                 .on_click_stop(move |_| close())
                 .style(|s| {
@@ -764,37 +830,54 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
 
             let ctrl = |s: floem::style::Style| s.flex_col().gap(6.0);
 
+            // The modal's Tab order: one group per section, spaced by 10 within
+            // it and by 100 between them — see `FocusRing`.
+            let ring = crate::widgets::FocusRing::new();
+
             // General group.
-            let restore_row = settings_toggle_row(
+            let restore_row = focusable_toggle_row(
                 "Restore tabs on startup",
                 "Reopen the query tabs from your last session when the app starts.",
                 restore_tabs,
+                ring.clone(),
+                10,
             );
             let general_group = v_stack((settings_section_header("General"), restore_row))
                 .style(|s| s.flex_col().gap(16.0));
 
             // Editor group. (Tab width, spaces-vs-tabs, and word wrap live in the
             // status bar.)
-            let font_dd = settings_dropdown(editor_font, EDITOR_FONT_SIZES, editor_font_label);
+            let font_dd = focusable_dropdown(
+                editor_font,
+                EDITOR_FONT_SIZES,
+                editor_font_label,
+                ring.clone(),
+                100,
+            );
             let font_section = v_stack((settings_group_label("Font size"), font_dd)).style(ctrl);
             let editor_group = v_stack((settings_section_header("Editor"), font_section))
                 .style(|s| s.flex_col().gap(16.0));
 
             // Query group.
-            let row_dd = settings_dropdown(row_limit, ROW_LIMITS, row_limit_label);
+            let row_dd =
+                focusable_dropdown(row_limit, ROW_LIMITS, row_limit_label, ring.clone(), 200);
             let row_section =
                 v_stack((settings_group_label("Default row limit"), row_dd)).style(ctrl);
-            let confirm_row = settings_toggle_row(
+            let confirm_row = focusable_toggle_row(
                 "Confirm before running writes",
                 "Ask before executing any statement that modifies data or schema.",
                 confirm_writes,
+                ring.clone(),
+                210,
             );
-            let validate_row = settings_toggle_row(
+            let validate_row = focusable_toggle_row(
                 "Live database validation",
                 "Check the statement under the cursor against the database as you type \
                  (a non-executing PREPARE) to surface exact errors. Adds a DB round-trip \
                  on each pause.",
                 live_validate,
+                ring.clone(),
+                220,
             );
             let query_group = v_stack((
                 settings_section_header("Query"),
@@ -805,13 +888,22 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
             .style(|s| s.flex_col().gap(16.0));
 
             // Theme group.
-            let ui_dd =
-                settings_dropdown(ui_theme, theme::UiThemeKind::ALL, theme::UiThemeKind::label);
-            let editor_dd = settings_dropdown(
+            let ui_dd = focusable_dropdown(
+                ui_theme,
+                theme::UiThemeKind::ALL,
+                theme::UiThemeKind::label,
+                ring.clone(),
+                300,
+            );
+            let editor_dd = focusable_dropdown(
                 editor_theme,
                 theme::EditorThemeKind::ALL,
                 theme::EditorThemeKind::label,
+                ring.clone(),
+                310,
             );
+            // Kept for the root, which answers Tab by entering the ring.
+            let root_ring = ring;
             let ui_section = v_stack((settings_group_label("Interface theme"), ui_dd)).style(ctrl);
             let editor_section =
                 v_stack((settings_group_label("Editor theme"), editor_dd)).style(ctrl);
@@ -829,7 +921,7 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
                 .style(|s| panel_style(s).background(theme::bg_panel()).width(420.0));
 
             let esc = close.clone();
-            focus_root(container(panel))
+            focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
                 .on_click_stop(move |_| close())
                 .style(|s| {
