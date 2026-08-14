@@ -79,7 +79,7 @@ mod tests {
         "toggle panel",
         "go to line",
         "history",
-        "ai",
+        "ask ai",
         "terminal",
         "ui theme",
         "editor theme",
@@ -172,10 +172,32 @@ mod tests {
     #[test]
     fn space_after_sigil_is_allowed() {
         assert_eq!(
-            parse("> ai how do i join", ARGS),
+            parse("> ask ai how do i join", ARGS),
             Parsed::Command {
-                name: "ai".into(),
+                name: "ask ai".into(),
                 arg: "how do i join".into()
+            }
+        );
+    }
+
+    /// Tab completes the command's *label*, so what lands in the box is
+    /// title-cased ("Ask AI", "Editor Theme") and must resolve to the same
+    /// command as the lower-case name — including the argument's own case, which
+    /// is a prompt or a shell command and must survive verbatim.
+    #[test]
+    fn a_completed_label_resolves_to_its_command() {
+        assert_eq!(
+            parse(">Ask AI Why is this JOIN slow?", ARGS),
+            Parsed::Command {
+                name: "ask ai".into(),
+                arg: "Why is this JOIN slow?".into()
+            }
+        );
+        assert_eq!(
+            parse(">Editor Theme One Dark Pro", ARGS),
+            Parsed::Command {
+                name: "editor theme".into(),
+                arg: "One Dark Pro".into()
             }
         );
     }

@@ -1507,6 +1507,11 @@ enum CmdArg {
 
 /// A command-palette entry. `name` is the canonical lowercase keyword the pure
 /// parser matches (see `schemaic_core::palette`); `label`/`hint` are display.
+///
+/// **`name` must be `label` lowercased**, because `name` is not an internal id —
+/// Tab completion types it into the box the user is looking at. "Ask AI" that
+/// completed to `>ai` read as the palette having chosen a different command;
+/// [`assert_names_match_labels`] holds every entry to it.
 struct Command {
     name: &'static str,
     label: &'static str,
@@ -1517,6 +1522,34 @@ struct Command {
 impl Command {
     fn takes_arg(&self) -> bool {
         !matches!(self.arg, CmdArg::Instant(_))
+    }
+}
+
+/// Enforce [`Command`]'s name/label rule over a built registry.
+///
+/// A `debug_assert` rather than a unit test because the registry can only be
+/// built from a live [`Ui`]: it fires the first time the palette opens on a dev
+/// build, which is where a new command is written. Also checks the invariant
+/// `schemaic_core::palette::parse` documents but cannot verify from inside — no
+/// argument-command name may be a word-prefix of another, or the longer one
+/// becomes unreachable.
+fn assert_names_match_labels(cmds: &[Command]) {
+    for c in cmds {
+        debug_assert_eq!(
+            c.name,
+            c.label.to_lowercase(),
+            "palette command name must be its label lowercased — Tab types it in front of the user"
+        );
+    }
+    for a in cmds.iter().filter(|c| c.takes_arg()) {
+        for b in cmds.iter().filter(|c| c.takes_arg()) {
+            debug_assert!(
+                std::ptr::eq(a, b) || !b.name.starts_with(&format!("{} ", a.name)),
+                "argument-command `{}` is a word-prefix of `{}`, which the parser can never reach",
+                a.name,
+                b.name
+            );
+        }
     }
 }
 
@@ -1802,7 +1835,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             arg: instant(hist_clear.clone(), &close),
         },
         Command {
-            name: "ai",
+            name: "ask ai",
             label: "Ask AI",
             hint: "<prompt>",
             arg: CmdArg::Text({
@@ -2119,18 +2152,25 @@ fn build_items(
                     f.is_empty() || c.label.to_lowercase().contains(&f) || c.name.contains(&f)
                 })
                 .map(|c| {
-                    // Tab/ghost target: the command name, plus a trailing space for
-                    // argument-commands so the caret lands ready for the argument.
+                    // Tab/ghost target: the **label**, as shown on the row, plus a
+                    // trailing space for argument-commands so the caret lands ready
+                    // for the argument. Completing `c.name` instead put a string in
+                    // the box that the row never showed. The parser lowercases
+                    // before matching, so the typed label resolves to `c.name`
+                    // regardless of case, and `ghost_suffix` already compares
+                    // case-insensitively against an original-cased target.
                     let complete = if c.takes_arg() {
-                        format!(">{} ", c.name)
+                        format!(">{} ", c.label)
                     } else {
-                        format!(">{}", c.name)
+                        format!(">{}", c.label)
                     };
                     let activate: Rc<dyn Fn()> = match &c.arg {
                         CmdArg::Instant(run) => run.clone(),
                         // Argument-command: transition into argument entry (same as
                         // accepting the completion) and move the caret to the end.
                         _ => {
+                            // Reuses `complete`, so Enter types exactly what Tab
+                            // would; the two can't drift apart.
                             let s = complete.clone();
                             Rc::new(move || {
                                 query.set(s.clone());
@@ -2178,11 +2218,18 @@ fn build_items(
                             let run = run.clone();
                             let v2 = v.clone();
                             PaletteItem {
-                                primary: l,
+                                primary: l.clone(),
                                 secondary: String::new(),
                                 activate: Rc::new(move || (run)(v2.clone())),
-                                // Tab fills the argument with this option's value.
-                                complete: Some(format!(">{} {}", c.name, v)),
+                                // Tab fills the argument with the option as *shown*,
+                                // not the value behind it — that value is a config
+                                // key or a row id, so Switch Connection completed a
+                                // connection's name to a bare number and Editor
+                                // Theme turned "One Dark Pro" into "one-dark-pro".
+                                // Running still goes through this row's own
+                                // `activate`, which holds the value, so nothing
+                                // depends on the typed text round-tripping.
+                                complete: Some(format!(">{} {}", c.label, l)),
                                 match_term: Some(a.clone()),
                                 icon: None,
                                 right_icon: None,
@@ -2293,6 +2340,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
             // The command registry (rebuilt per open) + the names of its
             // argument-taking commands, which the pure parser needs.
             let commands = Rc::new(palette_commands(&ui_reg, close.clone()));
+            assert_names_match_labels(&commands);
             let arg_names: Vec<&'static str> = commands
                 .iter()
                 .filter(|c| c.takes_arg())
