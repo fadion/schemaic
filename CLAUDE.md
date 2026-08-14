@@ -555,7 +555,14 @@ Zed-inspired, aiming to replace DataGrip.
     `core::import`. Two steps (Source → Mapping) in one panel driven by the `ImportUi` bundle;
     `SchemaActions::import_probe`/`import_run` do the file + DB work off the UI thread. A probe or
     an import can outlive the modal, so both callbacks check `ImportUi::generation` (bumped on
-    every open) before writing. The effect that re-probes on a settings change tracks only settings
+    every open) before writing — and a probe checks `probe_seq` (bumped per *request*) too, via
+    `import::probe_verdict`: several probes of one file are routinely in flight, they report in
+    completion order, and only the newest may write. **Discarded whole, `busy` included** — that
+    flag staying set is what keeps Next and Import disabled until the newest answer lands, which
+    is in turn why `run_import` may send a fresh `read_config` beside the *stored* mapping.
+    A schema change goes through `import::target_survives`: closing needs positive evidence the
+    table is gone, since `load_schema` empties `db_nodes` before it fetches, and a running load is
+    *cancelled* rather than abandoned. The effect that re-probes on a settings change tracks only settings
     that change how the file *parses* — the NULL rules apply at coercion time, so tracking them
     would re-read the file per keystroke and stamp over a hand-edited mapping. While a load runs,
     the footer's Cancel fires `SchemaActions::import_cancel` (the app owns the token, as it does

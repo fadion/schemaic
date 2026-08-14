@@ -232,6 +232,71 @@ impl Mapping {
     }
 }
 
+/// What a probe's answer is worth by the time it lands.
+///
+/// A probe reads the file off the UI thread, so several can be in flight at
+/// once — typing `\t` into the Delimiter box is three edits and therefore three
+/// probes — and they report in *completion* order, not the order they were
+/// asked. Only the newest may write, because everything a probe sets is a
+/// statement about the settings the controls now show: the sample, the file
+/// size, and above all `auto_map`, which matches by **name** with a header and
+/// strictly by **position** without one. A loser landing last left the mapping
+/// built from a config the user could no longer see, and the load then ran with
+/// the live config against that stale mapping — for a header `name,email` over
+/// `(id, email, name)` that writes every name into `email`, committed.
+///
+/// Two counters because they answer two questions: `open` is bumped per opening
+/// of the modal (the answer is about a different *table*), `seq` per request
+/// (the answer is about different *settings*).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProbeVerdict {
+    /// Fold this answer into the modal — and, since it is the newest, clear the
+    /// busy flag with it.
+    Apply,
+    /// Drop it whole. Not even the busy flag: a request still in flight is still
+    /// a reason the modal must not let the user move on.
+    Discard,
+}
+
+/// Whether a probe that has just finished may write. See [`ProbeVerdict`].
+pub fn probe_verdict(mine: (u64, u64), current: (u64, u64)) -> ProbeVerdict {
+    if mine == current {
+        ProbeVerdict::Apply
+    } else {
+        ProbeVerdict::Discard
+    }
+}
+
+/// What a schema refresh means for a modal editing `target`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TargetVerdict {
+    /// Leave the modal alone.
+    Keep,
+    /// The table really is gone; close.
+    Close,
+    /// The table is gone *and* a load is running — cancel it (rolling the
+    /// transaction back) rather than closing over a bulk write whose outcome
+    /// would then have no reader.
+    Cancel,
+}
+
+/// Whether a modal open on a table survives a schema change.
+///
+/// Closing needs **positive evidence** that the table is gone, which is the
+/// whole content of this function: the schema list is *emptied* before a refetch
+/// begins, so "I looked and it wasn't there" was true of every refresh and of
+/// every connection switch, and a hand-built twelve-column mapping was discarded
+/// by a background reload the user didn't ask for.
+pub fn target_survives(nodes_empty: bool, found: bool, busy: bool) -> TargetVerdict {
+    if nodes_empty || found {
+        TargetVerdict::Keep
+    } else if busy {
+        TargetVerdict::Cancel
+    } else {
+        TargetVerdict::Close
+    }
+}
+
 /// Propose a mapping from the file's columns onto the table's.
 ///
 /// With a header, match on name, case-insensitively and ignoring surrounding
@@ -1303,6 +1368,56 @@ pub fn build_insert(
 mod tests {
     use super::*;
     use crate::schema::ColumnInfo;
+
+    #[test]
+    fn only_the_newest_probe_may_write() {
+        assert_eq!(probe_verdict((1, 3), (1, 3)), ProbeVerdict::Apply);
+    }
+
+    /// Typing `\t` into the Delimiter box is three edits and so three probes,
+    /// reporting in completion order. An older one landing last rebuilt the
+    /// mapping — name-matched or positional depending on a `has_header` the
+    /// controls no longer showed — and the load then ran the live config against
+    /// it.
+    #[test]
+    fn an_overtaken_probe_is_discarded_whole() {
+        assert_eq!(probe_verdict((1, 2), (1, 3)), ProbeVerdict::Discard);
+    }
+
+    /// The other counter: the modal was closed and reopened on a different
+    /// table while this one was reading.
+    #[test]
+    fn a_probe_from_a_previous_opening_is_discarded() {
+        assert_eq!(probe_verdict((1, 3), (2, 3)), ProbeVerdict::Discard);
+    }
+
+    /// The schema list is *emptied* before a refetch begins, so "I looked and it
+    /// wasn't there" is true of every refresh — and used to discard the file and
+    /// a hand-built mapping over a reload nobody asked for.
+    #[test]
+    fn an_unloaded_schema_is_not_evidence_the_table_is_gone() {
+        assert_eq!(target_survives(true, false, false), TargetVerdict::Keep);
+        assert_eq!(target_survives(true, false, true), TargetVerdict::Keep);
+    }
+
+    #[test]
+    fn a_table_still_listed_keeps_the_modal_open() {
+        assert_eq!(target_survives(false, true, false), TargetVerdict::Keep);
+        assert_eq!(target_survives(false, true, true), TargetVerdict::Keep);
+    }
+
+    #[test]
+    fn a_table_really_gone_closes_the_modal() {
+        assert_eq!(target_survives(false, false, false), TargetVerdict::Close);
+    }
+
+    /// Closing over a running load abandons a bulk write with nobody left to
+    /// read its outcome — on a non-transactional engine the user then cannot
+    /// tell whether rows landed, and a re-run duplicates whatever did.
+    #[test]
+    fn a_running_load_is_cancelled_rather_than_abandoned() {
+        assert_eq!(target_survives(false, false, true), TargetVerdict::Cancel);
+    }
 
     fn tbl(cols: &[(&str, &str, bool)]) -> TableInfo {
         TableInfo {

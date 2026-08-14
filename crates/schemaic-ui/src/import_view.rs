@@ -133,13 +133,18 @@ fn probe(ui: Ui, sniff: bool) {
     i.busy.set(true);
     i.error.set(None);
     let target = i.target.get_untracked();
-    let opened = i.generation.get_untracked();
+    // Which question this answer belongs to: which *opening* of the modal, and
+    // which *request* within it. Several probes of one file are routinely in
+    // flight — see `import::probe_verdict`.
+    i.probe_seq.update(|n| *n += 1);
+    let mine = (i.generation.get_untracked(), i.probe_seq.get_untracked());
     (ui.schema_actions.import_probe)(
         ImportProbeRequest { path, format, cfg },
         Rc::new(move |res| {
-            // The modal was reopened while this was reading — this answer is to a
-            // question about a different table.
-            if i.generation.get_untracked() != opened {
+            let current = (i.generation.get_untracked(), i.probe_seq.get_untracked());
+            // Discarded whole, `busy` included: a request still in flight is
+            // still a reason the modal must not enable Next.
+            if import::probe_verdict(mine, current) == import::ProbeVerdict::Discard {
                 return;
             }
             i.busy.set(false);
@@ -758,6 +763,14 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
 }
 
 /// Run the check-then-load, and fold the outcome back into the modal.
+///
+/// It sends a **fresh** `read_config` beside the **stored** mapping, which is
+/// only sound because the two can no longer describe different settings: every
+/// probe but the newest is discarded whole (`import::probe_verdict`), `busy`
+/// stays set until that newest one lands, and Import is disabled while `busy`.
+/// So the mapping on screen was built from the config on screen. Loosen any one
+/// of those three and this becomes the mismatch that writes a file's `name`
+/// column into `email`.
 fn run_import(ui: Ui) {
     let i = ui.import;
     let (Some(target), Some(path)) = (i.target.get_untracked(), i.path.get_untracked()) else {
@@ -859,16 +872,22 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
         });
     }
 
-    // A refreshed schema shouldn't leave the modal editing a table that's gone.
+    // A refreshed schema shouldn't leave the modal editing a table that's gone —
+    // but closing needs *positive* evidence, which is what
+    // `import::target_survives` is for. `load_schema` empties `db_nodes` before
+    // it fetches, so "not in the list" was true of every refresh and of every
+    // connection switch: the per-node `Loading` arm below never ran, because
+    // there was no node left to be loading.
     {
         let db_nodes = ui.schema.db_nodes;
+        let stop = ui.schema_actions.clone();
         create_effect(move |_| {
             db_nodes.track();
             if let Some(t) = i.target.get_untracked()
                 && i.step.get_untracked() != ImportStep::Done
             {
-                let still_there = db_nodes.with_untracked(|nodes| {
-                    nodes.iter().any(|n| {
+                let (empty, found) = db_nodes.with_untracked(|nodes| {
+                    let found = nodes.iter().any(|n| {
                         n.database == t.database
                             && match n.schema.get_untracked() {
                                 schemaic_core::schema::SchemaState::Loaded(db) => db
@@ -879,10 +898,16 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                                 // modal alone rather than closing it under the user.
                                 _ => true,
                             }
-                    })
+                    });
+                    (nodes.is_empty(), found)
                 });
-                if !still_there {
-                    i.target.set(None);
+                match import::target_survives(empty, found, i.busy.get_untracked()) {
+                    import::TargetVerdict::Keep => {}
+                    import::TargetVerdict::Close => i.target.set(None),
+                    // A load is running: cancelling rolls its transaction back,
+                    // where closing would abandon a bulk write whose outcome has
+                    // nowhere left to report.
+                    import::TargetVerdict::Cancel => (stop.import_cancel)(),
                 }
             }
         });

@@ -909,6 +909,12 @@ pub struct ImportUi {
     /// otherwise closing a running import and opening the modal on another table
     /// lets the first one report its result into the second one's state.
     pub generation: RwSignal<u64>,
+    /// Bumped on every *probe*, which [`generation`](Self::generation) is too
+    /// coarse to separate: several probes of the same file are routinely in
+    /// flight at once (typing `\t` into Delimiter is three edits) and they
+    /// report in completion order, so the pair is what tells the newest from an
+    /// overtaken one. See [`schemaic_core::import::probe_verdict`].
+    pub probe_seq: RwSignal<u64>,
 }
 
 /// A yes/no question asked before something destructive runs.

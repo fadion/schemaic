@@ -4950,6 +4950,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             busy: RwSignal::new(false),
             applying: RwSignal::new(false),
             generation: RwSignal::new(0),
+            probe_seq: RwSignal::new(0),
         },
         // Same rule as `import` above: reset on open, so one bundle serves every
         // table rather than a per-open scope that would need disposing.
