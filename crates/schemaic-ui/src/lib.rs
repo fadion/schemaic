@@ -2267,14 +2267,15 @@ pub fn workspace(ui: Ui) -> impl IntoView {
             // walks the **whole window tree**, so from either state Tab left the
             // modal for the workspace behind it — the one thing the ring exists to
             // prevent. Step the innermost overlay's ring instead.
-            if matches!(ke.key.logical_key, Key::Named(NamedKey::Tab)) && !m.control() {
-                if let (Some(root), Some(ring)) = (
+            if matches!(ke.key.logical_key, Key::Named(NamedKey::Tab))
+                && !m.control()
+                && let (Some(root), Some(ring)) = (
                     widgets::innermost_focus_root(),
                     widgets::innermost_focus_ring(),
-                ) {
-                    ring.step_from(root, m.shift());
-                    return EventPropagation::Stop;
-                }
+                )
+            {
+                ring.step_from(root, m.shift());
+                return EventPropagation::Stop;
             }
             if m.control() {
                 // Global nav (Ctrl+P/T/W/Tab/1-9) — also wired inside the editor,

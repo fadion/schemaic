@@ -443,10 +443,10 @@ pub(crate) fn in_focus_ring_with<V: IntoView + 'static>(
             // around it answers neither Escape nor Tab. One click on the
             // designer's list `+` did it — the click focuses the pane, and the
             // draft it edits is half the container's key.
-            if at_cleanup.get() {
-                if let Some(root) = innermost_focus_root() {
-                    root.request_focus();
-                }
+            if at_cleanup.get()
+                && let Some(root) = innermost_focus_root()
+            {
+                root.request_focus();
             }
         })
 }
