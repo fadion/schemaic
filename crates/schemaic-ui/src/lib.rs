@@ -1637,6 +1637,10 @@ pub struct ConnActions {
     pub switch_conn: Rc<dyn Fn(u64)>,
     pub select_conn: Rc<dyn Fn(u64)>,
     pub new_conn: Rc<dyn Fn()>,
+    /// Copy a saved connection by id — server, credentials and guard-rails
+    /// carried, new identity — persist it, and select the copy for editing.
+    /// Offered from the connection list's right-click menu.
+    pub duplicate_conn: Rc<dyn Fn(u64)>,
     pub save_conn: Rc<dyn Fn()>,
     /// Flip a connection's read-only flag by id and persist (status-bar shortcut
     /// for the Manage-Connections toggle).
