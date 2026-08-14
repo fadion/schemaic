@@ -425,7 +425,7 @@ fn field_view(
 /// The chevron that sits beside a free-text field and offers a menu of
 /// suggestions, each writing itself into that field.
 ///
-/// A **shortcut, not a picker** — which is why it isn't a [`owned_dropdown`]. A
+/// A **shortcut, not a picker** — which is why it isn't a [`focusable_owned_dropdown`]. A
 /// type box has to stay free text, because the answer worth typing is often one
 /// no fixed list holds (a length, a domain built on another domain, an array, an
 /// extension's type), and a `Dropdown` parked beside a field reads as a second

@@ -118,6 +118,20 @@ pub(crate) fn ring_step(len: usize, cur: Option<usize>, backwards: bool) -> Opti
     })
 }
 
+/// Where a **growing** block of Tab stops starts — a list of enum values, of
+/// domain checks, of trigger arguments, of function settings — one stop per row
+/// from here upwards.
+///
+/// Far above every fixed control on purpose. A block claiming `base + i` with a
+/// dozen indices of headroom is safe only while it is the last thing in its
+/// form: add one control after it and the 11th row collides, after which the two
+/// order by registration (`register` inserts *after* an equal tabindex), so Tab
+/// visits them in an order that depends on which happened to be built first. The
+/// rule belongs beside [`FocusRing`] rather than in each editor, because the
+/// hazard is the ring's, and a per-file constant is a per-file decision to get
+/// right again.
+pub(crate) const VALUE_TAB: u32 = 1000;
+
 /// Step a *selection* of `len` items from `cur` by `delta`, **clamping** at both
 /// ends. `None` when there is nowhere to go — an empty list, or a step that
 /// would land where it started.
