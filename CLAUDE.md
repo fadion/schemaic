@@ -278,7 +278,10 @@ Zed-inspired, aiming to replace DataGrip.
     through a `…Raw` shim with `#[serde(other)]`, so a value written by a newer build degrades to a
     default instead of failing all of `connections.json`. There is deliberately no
     `mysql://user:pass@host` builder, and the password fields here aren't what's on disk — see
-    `secrets.rs`.
+    `secrets.rs`. `targets_same_server` is the "is this still the same server" test the schema
+    tree's reload gates on (see `schema.rs`'s `SchemaState::begin_refresh`) — everything that
+    decides which server the next query reaches and nothing else, so a rename or a colour can't
+    blank the tree and a repointed host can't leave another server's databases on it.
   - `schema.rs` — the introspected model. `ColumnInfo` carries the **full** column definition
     (type *with* parameters, default as ready-to-emit SQL text, auto-increment/identity, generated
     expression, `ON UPDATE`, comment, collation) because MySQL's `MODIFY COLUMN` replaces a column
@@ -328,6 +331,28 @@ Zed-inspired, aiming to replace DataGrip.
     the one "qualify unless `public`, then quote both halves" builder every one of these (and
     `RoutineInfo::signature_sql`) addresses its object through, and `find_by_ns` the one
     namespace-lookup rule behind every `DbSchema::find_*`.
+    **`SchemaState::begin_refresh` is why a refresh doesn't blank the tree.** Re-introspection
+    is whole-database on both engines and always will be — the cost is ~10 catalogue
+    round-trips, not the rows, so scoping it to one table would optimise the term that doesn't
+    dominate (measured: 48 ms for 600 tables / 12.6k columns on MySQL, 134 ms on PG, locally).
+    Dropping to `Loading` for that window replaced every table and column row with one
+    "Loading" row, after *every* DDL apply as well as every manual Refresh. So a database that
+    has something on screen keeps it, and the method returns **`Option`**: a floem signal never
+    dedups, so writing an equal `Loaded` back would dispose and rebuild the very subtree the
+    refresh is meant to leave alone. Not writing is the only way to keep it. Nothing marks the
+    row as busy meanwhile, deliberately: at these durations an indicator is a glyph flickering
+    for a frame or two, which reads as a rendering fault rather than as progress.
+    **There are two refresh paths and both go through it**, via the app's one
+    `start_fetch` (`FetchSchemaFn`): the per-database one
+    (`refresh_db`) and the connection-wide one (`load_schema`, the SCHEMA header's Refresh),
+    which additionally **reuses the `ConnNode` of every database that is still there** — same
+    `schema` signal, so the rows survive, and same node id, so the `dyn_stack` doesn't rebuild
+    a surviving database at all. Reuse means the node `Scope` is kept rather than replaced, so
+    it is gated on `Connection::targets_same_server` (id + engine + host/port/user + the SSH
+    hop; *not* the password, name, colour or `read_only`): a **switch** must still clear and
+    dispose, or the tree shows one server's databases while another's load — and a saved
+    connection repointed at a new host keeps its id, which is the case an id comparison alone
+    gets wrong.
   - `secrets.rs` — keeps connection secrets (DB/SSH passwords + SSH key passphrase) out of the
     plaintext `connections.json`: the `SecretStore` seam + pure transforms `hydrate_file` (load →
     fill empty fields from the store, flag legacy plaintext for migration), `sanitize_file` (save →

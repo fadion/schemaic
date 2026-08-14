@@ -256,6 +256,33 @@ impl Connection {
     pub fn endpoint(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
+
+    /// Do these two point at the same server — everything that decides *which*
+    /// server the next query reaches, and nothing else?
+    ///
+    /// The schema tree asks this to decide whether a reload may keep the
+    /// databases it is already showing (see `SchemaState::begin_refresh`) or has
+    /// to clear them. Same server → the rows stay up while they refresh. A
+    /// different one → they are another server's and must go, even though the
+    /// saved connection kept its id, which is the case an id comparison alone
+    /// gets wrong: editing a connection's host is an edit *in place*.
+    ///
+    /// The password is deliberately not part of it. A corrected password reaches
+    /// the same databases; treating it as a different server would blank the
+    /// tree for a change that moves nothing. Nor is anything presentational
+    /// (name, colour, environment) or a guard-rail (`read_only`) — those don't
+    /// change what the server holds.
+    pub fn targets_same_server(&self, other: &Connection) -> bool {
+        self.id == other.id
+            && self.db_type == other.db_type
+            && self.host == other.host
+            && self.port == other.port
+            && self.user == other.user
+            && self.ssh.enabled == other.ssh.enabled
+            && self.ssh.host == other.ssh.host
+            && self.ssh.port == other.ssh.port
+            && self.ssh.user == other.ssh.user
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +361,63 @@ mod tests {
             environment: Environment::None,
         };
         assert_eq!(c.endpoint(), "db.example.com:3307");
+    }
+
+    fn conn() -> Connection {
+        Connection {
+            id: 1,
+            name: "prod".to_string(),
+            db_type: "MySQL".to_string(),
+            host: "db.example.com".to_string(),
+            port: 3307,
+            user: "root".to_string(),
+            password: "secret".to_string(),
+            ssh: SshTunnel::default(),
+            color: None,
+            prominent_color: false,
+            read_only: false,
+            environment: Environment::None,
+        }
+    }
+
+    #[test]
+    fn a_connection_targets_the_same_server_as_itself() {
+        assert!(conn().targets_same_server(&conn()));
+    }
+
+    /// Presentation and guard-rails don't change what the server holds, so a
+    /// rename (or a colour, or flipping read-only) must not count as a different
+    /// target — the schema tree would throw away everything it has loaded.
+    #[test]
+    fn presentation_changes_are_the_same_server() {
+        let mut edited = conn();
+        edited.name = "production (eu)".into();
+        edited.color = Some("#ff0000".into());
+        edited.prominent_color = true;
+        edited.read_only = true;
+        edited.environment = Environment::Production;
+        assert!(conn().targets_same_server(&edited));
+    }
+
+    /// Everything that decides which server the next query reaches. Each is
+    /// checked on its own so a field dropped from the comparison fails here
+    /// rather than silently showing one server's databases for another's.
+    #[test]
+    fn anything_that_moves_the_target_is_a_different_server() {
+        fn moved(edit: impl Fn(&mut Connection)) -> bool {
+            let mut edited = conn();
+            edit(&mut edited);
+            !conn().targets_same_server(&edited)
+        }
+        assert!(moved(|c| c.id = 2), "id");
+        assert!(moved(|c| c.db_type = "PostgreSQL".into()), "engine");
+        assert!(moved(|c| c.host = "other.example.com".into()), "host");
+        assert!(moved(|c| c.port = 3306), "port");
+        assert!(moved(|c| c.user = "reader".into()), "user");
+        assert!(moved(|c| c.ssh.enabled = true), "ssh toggle");
+        assert!(moved(|c| c.ssh.host = "bastion".into()), "ssh host");
+        assert!(moved(|c| c.ssh.port = 2222), "ssh port");
+        assert!(moved(|c| c.ssh.user = "deploy".into()), "ssh user");
     }
 
     #[test]

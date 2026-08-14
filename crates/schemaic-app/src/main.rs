@@ -94,6 +94,10 @@ type EndTxFn = Rc<dyn Fn(usize, bool, Option<Rc<dyn Fn()>>)>;
 /// (a tab isn't closed, a mode isn't switched). It is `Some` for the one caller
 /// that has already told a modal work is under way and has to take that back.
 type GuardTxFn = Rc<dyn Fn(usize, Rc<dyn Fn()>, Option<Rc<dyn Fn()>>)>;
+/// Start one database's introspection against a `Db` — the single path the
+/// initial load, the connection-wide Refresh and the per-database Refresh all
+/// take, so what the tree shows while a fetch is out is decided once.
+type FetchSchemaFn = Rc<dyn Fn(&ConnNode, Db)>;
 use schemaic_core::filter::{Order, table_query};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::persist::{self, ConnectionsFile, UiState};
@@ -805,10 +809,18 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let tunnels: Rc<RefCell<HashMap<u64, schemaic_db::ssh::TunnelHandle>>> =
         Rc::new(RefCell::new(HashMap::new()));
     // The child scope the current `db_nodes` (and their `schema` signals) were
-    // built in. Each `load_schema` swaps in a fresh scope and disposes the old
-    // one, so a session's connection switches / refreshes don't accrete orphaned
-    // schema signals (review C14).
+    // built in. A `load_schema` that switches connection swaps in a fresh scope
+    // and disposes the old one, so a session's connection switches don't accrete
+    // orphaned schema signals (review C14). A *reload of the same connection*
+    // keeps the scope, because it keeps the nodes — see `nodes_conn`.
     let nodes_scope: Rc<RefCell<Option<Scope>>> = Rc::new(RefCell::new(None));
+    // The connection the installed `db_nodes` belong to. `active_conn` can't
+    // answer this: it is set when the user picks a connection, which is *before*
+    // that connection's databases have been listed, so during a switch it names
+    // the connection whose nodes are not on screen yet. The whole `Connection`,
+    // not its id, so `targets_same_server` can see an edit in place — a saved
+    // connection repointed at another host keeps its id.
+    let nodes_conn: Rc<RefCell<Option<Connection>>> = Rc::new(RefCell::new(None));
 
     // Resolve a saved connection id to a `Db` handle (the app's connection
     // identity — no credential URL). For an SSH connection this needs the tunnel
@@ -3153,19 +3165,64 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // stamp against the live one before touching anything shared. See
     // `load_landing`.
     let schema_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+
+    // Start one database's introspection, keeping whatever that database already
+    // shows while it runs (`SchemaState::begin_refresh`).
+    //
+    // The initial load, the connection-wide Refresh and the per-database Refresh
+    // all come through here on purpose: they differ only in *which* `Db` and how
+    // the node was obtained, and when they each decided for themselves what the
+    // tree shows meanwhile, two of the three blanked it.
+    let start_fetch: FetchSchemaFn = {
+        let handle = handle.clone();
+        Rc::new(move |node: &ConnNode, db: Db| {
+            let sig = node.schema;
+            let database = node.database.clone();
+            if let Some(st) = sig.get_untracked().begin_refresh() {
+                sig.set(st);
+            }
+            // `try_update`, not `set`: switching connections disposes the node
+            // scope this signal lives in, and a fetch already in flight then
+            // lands on a freed one.
+            let send_schema = create_ext_action(cx, move |st: SchemaState| {
+                let _ = sig.try_update(|v| *v = st);
+            });
+            handle.spawn(async move {
+                let st = match db.fetch_schema(&database).await {
+                    Ok(s) => SchemaState::Loaded(Arc::new(s)),
+                    Err(e) => SchemaState::Failed(e.to_string()),
+                };
+                send_schema(st);
+            });
+        })
+    };
+
     let load_schema: Rc<dyn Fn(Connection)> = {
         let handle = handle.clone();
         let tunnels = tunnels.clone();
         let nodes_scope = nodes_scope.clone();
+        let nodes_conn = nodes_conn.clone();
         let schema_gen = schema_gen.clone();
+        let start_fetch = start_fetch.clone();
         Rc::new(move |conn: Connection| {
-            db_nodes.set(Vec::new());
+            // Reloading the connection already on screen (the SCHEMA header's
+            // Refresh) keeps its databases visible while the list is re-fetched;
+            // only a *switch* clears, where the rows would otherwise be another
+            // server's for as long as the connect takes.
+            let reload = nodes_conn
+                .borrow()
+                .as_ref()
+                .is_some_and(|c| c.targets_same_server(&conn));
+            if !reload {
+                db_nodes.set(Vec::new());
+            }
             let stamp = (conn.id, schema_gen.get() + 1);
             schema_gen.set(stamp.1);
             let gen_cb = schema_gen.clone();
             let nodes_scope_cb = nodes_scope.clone();
+            let nodes_conn_cb = nodes_conn.clone();
+            let start_fetch_cb = start_fetch.clone();
             let cached_port = tunnels.borrow().get(&conn.id).map(|h| h.port());
-            let handle_inner = handle.clone();
             let tunnels_cache = tunnels.clone();
             // `conn` (original) → the send callback; `conn_task` → the async task.
             let conn_send = conn.clone();
@@ -3187,20 +3244,46 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         if landing != LoadLanding::Install {
                             return;
                         }
-                        // Build these nodes in a fresh child scope; dispose the
-                        // previous set's scope (deferred, so the schema tree —
-                        // keyed on node id — rebuilds off the new nodes before the
-                        // old signals are freed) so schema signals don't leak
-                        // across connection switches / refreshes (C14).
-                        let node_cx = cx.create_child();
-                        let mut nodes = Vec::with_capacity(names.len());
-                        for (i, name) in names.iter().enumerate() {
-                            nodes.push(ConnNode::new(node_cx, i + 1, name, name));
-                        }
+                        // A reload of the connection already on screen reuses the
+                        // node of every database that is still there — its
+                        // `schema` signal comes through untouched, so the rows
+                        // stay up while the re-introspection runs, and its id
+                        // comes through with it, so the tree (keyed on node id)
+                        // doesn't rebuild a surviving database at all. Only a
+                        // database that has *appeared* gets a new node.
+                        //
+                        // Which means the scope has to survive too. On a
+                        // connection switch nothing is reused, so that path
+                        // still builds in a fresh child scope and disposes the
+                        // old one (deferred, so the tree rebuilds off the new
+                        // nodes before the old signals are freed) — schema
+                        // signals must not accrete across switches (C14).
+                        let existing = if reload {
+                            db_nodes.get_untracked()
+                        } else {
+                            Vec::new()
+                        };
+                        let kept_scope = nodes_scope_cb.borrow().filter(|_| reload);
+                        let node_cx = kept_scope.unwrap_or_else(|| cx.create_child());
+                        let mut next_id = existing.iter().map(|n| n.id).max().unwrap_or(0) + 1;
+                        let nodes: Vec<ConnNode> = names
+                            .iter()
+                            .map(|name| match existing.iter().find(|n| &n.database == name) {
+                                Some(kept) => kept.clone(),
+                                None => {
+                                    let node = ConnNode::new(node_cx, next_id, name, name);
+                                    next_id += 1;
+                                    node
+                                }
+                            })
+                            .collect();
                         db_nodes.set(nodes.clone());
-                        if let Some(old) = nodes_scope_cb.borrow_mut().replace(node_cx) {
+                        if kept_scope.is_none()
+                            && let Some(old) = nodes_scope_cb.borrow_mut().replace(node_cx)
+                        {
                             exec_after(Duration::ZERO, move |_| old.dispose());
                         }
+                        *nodes_conn_cb.borrow_mut() = Some(conn_send.clone());
                         // Bind any tab of THIS connection that doesn't yet have a
                         // database (e.g. the initial tab) to the first database.
                         if let Some(first) = names.first() {
@@ -3216,19 +3299,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         }
                         // One `Db` for this connection, cloned per-database fetch.
                         let db = Db::connect(&conn_send, tunnel_port);
-                        for node in nodes {
-                            let sig = node.schema;
-                            let dbname = node.database.clone();
-                            let db = db.clone();
-                            let send_schema =
-                                create_ext_action(cx, move |st: SchemaState| sig.set(st));
-                            handle_inner.spawn(async move {
-                                let st = match db.fetch_schema(&dbname).await {
-                                    Ok(s) => SchemaState::Loaded(Arc::new(s)),
-                                    Err(e) => SchemaState::Failed(e.to_string()),
-                                };
-                                send_schema(st);
-                            });
+                        for node in &nodes {
+                            (start_fetch_cb)(node, db.clone());
                         }
                     }
                     Err(e) => {
@@ -3279,34 +3351,19 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // Finds the matching node and re-fetches just its tables — no full tree
     // rebuild, so the rest of the panel and its expansion state stay put.
     let refresh_db: Rc<dyn Fn(String)> = {
-        let handle = handle.clone();
         let db_for = db_for.clone();
         Rc::new(move |database: String| {
-            let sig = db_nodes.with_untracked(|nodes| {
-                nodes
-                    .iter()
-                    .find(|n| n.database == database)
-                    .map(|n| n.schema)
-            });
-            let Some(sig) = sig else { return };
+            let node = db_nodes
+                .with_untracked(|nodes| nodes.iter().find(|n| n.database == database).cloned());
+            let Some(node) = node else { return };
             // The tree shows the active connection's databases, so refresh runs
             // against the active connection's `Db`.
-            let db = match db_for(active_conn.get_untracked()) {
-                Ok(db) => db,
-                Err(e) => {
-                    sig.set(SchemaState::Failed(e));
-                    return;
-                }
-            };
-            sig.set(SchemaState::Loading);
-            let send_schema = create_ext_action(cx, move |st: SchemaState| sig.set(st));
-            handle.spawn(async move {
-                let st = match db.fetch_schema(&database).await {
-                    Ok(s) => SchemaState::Loaded(Arc::new(s)),
-                    Err(e) => SchemaState::Failed(e.to_string()),
-                };
-                send_schema(st);
-            });
+            match db_for(active_conn.get_untracked()) {
+                // Keeps the rows on screen while the fetch is out; see
+                // `start_fetch`.
+                Ok(db) => (start_fetch)(&node, db),
+                Err(e) => node.schema.set(SchemaState::Failed(e)),
+            }
         })
     };
 
