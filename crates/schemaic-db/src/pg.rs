@@ -319,7 +319,7 @@ pub(crate) async fn explain(
 /// The PostgreSQL half of [`Db::run_ddl`]: one transaction around the whole
 /// plan. `ALTER TABLE`, `CREATE INDEX` and `COMMENT ON` are all transactional
 /// here, so a failure anywhere leaves the table exactly as it was — which is why
-/// [`DdlError::applied`] is always 0 on this path.
+/// [`crate::DdlError::applied`] is always 0 on this path.
 pub(crate) async fn run_ddl(
     db: &Db,
     database: &str,
@@ -622,7 +622,7 @@ fn schema_sort_key(name: &str) -> (u8, String) {
 /// **partitioned by namespace** and handed to the shared, engine-agnostic
 /// [`assemble_schema`] one schema at a time — that function keys its rows by table
 /// name alone, so feeding it two schemas at once would silently merge same-named
-/// tables. Each resulting [`TableInfo`](schemaic_core::schema::TableInfo) carries
+/// tables. Each resulting [`TableInfo`] carries
 /// its namespace, and the schemas are concatenated `public`-first.
 /// The PostgreSQL half of [`Db::fetch_table_list`]: the same table list the full
 /// fetch starts from, and none of the four catalogue queries after it.

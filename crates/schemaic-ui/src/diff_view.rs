@@ -51,7 +51,7 @@ fn diff_line(line: String, dialect: SqlDialect) -> impl IntoView {
     h_stack_from_iter(segs).style(|s| s.flex_row().items_center().flex_shrink(0.0_f32))
 }
 
-/// Renders the hunked diff rows (see [`build_diff_rows`]): each line carries its
+/// Renders the hunked diff rows (see [`schemaic_core::diff::build_diff_rows`]): each line carries its
 /// document line number, a +/- (or blank) marker, and syntax-highlighted text
 /// over a tinted background; gaps render as a faint "⋯ N unchanged lines" row.
 pub(crate) fn diff_view(rows: Vec<DiffRow>, dialect: SqlDialect) -> impl IntoView {

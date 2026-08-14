@@ -907,7 +907,7 @@ fn action_height() -> f64 {
 /// aren't filled are the question dialogs' ([`dialog_button`]), which have no
 /// footer bar to sit in.
 ///
-/// Disabled keeps the fill and fades the label ([`theme::btn_text_disabled`]),
+/// Disabled keeps the fill and fades the label (its `ActionKind` label colour at half alpha),
 /// rather than hiding or unfilling the button: which action is the affirmative
 /// one shouldn't move around as a form becomes valid.
 pub(crate) fn action_button(

@@ -201,7 +201,7 @@ macro_rules! pair {
     };
 }
 
-/// Like [`faded`], for a control that fades *whole* — a disabled action, where
+/// Like `pair!`, for a control that fades *whole* — a disabled action, where
 /// the label and the fill are both at half strength. Neither half is opaque, so
 /// both have to be composited against the surface behind them before the pair
 /// can be measured at all.

@@ -1,7 +1,7 @@
 //! The table designer: edit a table's shape, see what that means, hand it to the
 //! preview.
 //!
-//! One `TableDraft` is the whole state ([`DdlUi::draft`]). Every control writes
+//! One `TableDraft` is the whole state ([`crate::DdlUi::draft`]). Every control writes
 //! into it and nothing else, so the change count in the footer is literally
 //! [`ddl::diff`] of the draft against the introspected table — the same function
 //! that generates the SQL. There's no second model of "what the user changed"

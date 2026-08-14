@@ -37,8 +37,14 @@ jobs:
       # deleted item shipped silently. `[workspace.lints.rustdoc]` allows links
       # from a public item to a private one (real references in an unpublished
       # workspace); what this catches is a link that resolves to nothing.
+      #
+      # `--document-private-items` is load-bearing, not thoroughness for its own
+      # sake: `schemaic-ui` is `pub(crate)` almost end to end, so without it this
+      # gate saw *none* of the crate that carries most of the app's prose. It sat
+      # green over eleven dead links, two of them written by the commit that
+      # renamed their target.
       - name: Rustdoc (warnings = errors)
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: -D warnings
       - name: License / advisory policy

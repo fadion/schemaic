@@ -32,7 +32,7 @@ use crate::{icons, theme};
 const MD_LINE_HEIGHT: f32 = 1.4;
 
 /// Body font size for markdown prose — list items, paragraphs, table cells.
-/// Headings scale from [`heading_size`] instead.
+/// Headings scale from `heading_size` instead.
 const MD_FONT_SIZE: f32 = 14.0;
 
 /// Inline run style flags — emphasis nests, so these compose (bold *and* italic,

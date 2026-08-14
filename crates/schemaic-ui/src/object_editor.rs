@@ -3,7 +3,7 @@
 //!
 //! One modal for three objects, on the same grounds `trigger_editor` holds two:
 //! the chrome, the footer, the change count and the ending at
-//! [`ddl_preview`](crate::ddl_preview) are identical, and only the middle section
+//! [`ddl_preview`] are identical, and only the middle section
 //! differs — because the objects do. Nothing here is a designer tab, for the
 //! reason written into `trigger_editor`: what belongs there is what can be a
 //! *clause* of `ALTER TABLE`, and none of these can.
