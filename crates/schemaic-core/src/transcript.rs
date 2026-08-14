@@ -19,7 +19,12 @@ pub enum Role {
 }
 
 /// One message in the AI panel conversation.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// `PartialEq` is load-bearing rather than incidental: the panel renders one view
+/// per message and gates each on a memo of *its* message, so a streamed chunk
+/// re-renders only the bubble it lands in. A memo notifies on inequality, so this
+/// is what stops every earlier bubble rebuilding on every chunk.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     /// The user's text (user messages only).
@@ -129,7 +134,7 @@ pub fn recall_step(len: usize, cur: Option<usize>, dir: RecallDir) -> Option<usi
 }
 
 /// One piece of a rendered assistant turn, in emission order.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Seg {
     /// Assistant prose (light markdown).
     Text(String),
@@ -138,7 +143,7 @@ pub enum Seg {
 }
 
 /// A single tool invocation and (once it returns) its result.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     /// Fully-qualified tool name, e.g. `mcp__schemaic__run_query`.
     pub name: String,
@@ -158,7 +163,7 @@ impl ToolCall {
 }
 
 /// Timing/usage summary for a finished turn (from the CLI's `result` event).
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TurnStats {
     pub duration_ms: Option<u64>,
     pub input_tokens: Option<u64>,

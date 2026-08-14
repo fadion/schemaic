@@ -99,18 +99,24 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     // track the panel as it's resized. Seeded to the default until first layout.
     let panel_w = RwSignal::new(theme::AI_W);
 
-    // Whole list rebuilds on any change (few messages; also lets the pending
-    // bubble flip to its answer in place without stale-view issues).
+    // One view per message: a streamed chunk re-renders only the bubble it lands
+    // in. The list used to rebuild whole on every chunk, re-parsing and
+    // re-laying out every earlier message's markdown — quadratic over a
+    // conversation, and it made the content momentarily *collapse* each time,
+    // because a freshly built `rich_text` measures unwrapped on its first layout
+    // pass and only wraps on the second. Floem clamps the scroll offset against
+    // that short height, which is what dragged the reader around mid-answer.
     //
-    // Also keyed on the UI-theme generation. `render_markdown` bakes its body
-    // colour into a text `Attrs` list rather than a style closure, so it is the
-    // one place a live theme switch cannot reach by re-reading — without the
-    // rebuild, every message already on screen keeps the old theme's text colour
-    // against the new background and the panel goes two-toned.
+    // Two pieces make it per-message, and both are needed. `dyn_stack` keyed by
+    // index keeps a bubble's view alive across changes to its neighbours — but
+    // every read of `messages` tracks the *whole* vector, so a naive child would
+    // still rebuild on every chunk. The per-message memo is the filter: it
+    // re-runs on each change and notifies only when *this* message differs.
+    let msg_count = floem::reactive::create_memo(move |_| messages.with(|m| m.len()));
     let convo = dyn_container(
-        move || (messages.get(), theme::ui_generation()),
-        move |(msgs, _)| {
-            if msgs.is_empty() {
+        move || msg_count.get() == 0,
+        move |is_empty| {
+            if is_empty {
                 ai_seen().set(0); // new/cleared conversation → next messages pop in
                 // Left-aligned placeholder: 10px below the title, 15px from the
                 // left, 14px. Flips to "Claude not connected." when Claude isn't
@@ -135,28 +141,64 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                 )
                 .into_any();
             }
+            let actions = code_actions.clone();
+            let regen = regenerate.clone();
             // Width pinned to the scroll viewport (`panel_w`, measured below) so a
             // scroll's unbounded child width doesn't stop the text wrapping, while
             // still tracking the panel as it's resized. 10px between messages; the
             // first label sits 10px below the title; bubbles carry their own margins.
-            let actions = code_actions.clone();
-            let regen = regenerate.clone();
-            let last = msgs.len().saturating_sub(1);
-            // Bubbles newly appended since the last (re)build get the entrance pop.
-            let prev_seen = ai_seen().get_untracked();
-            let total = msgs.len();
-            let list = v_stack_from_iter(msgs.into_iter().enumerate().map(move |(i, m)| {
-                message_bubble(
-                    m,
-                    actions.clone(),
-                    elapsed_ms,
-                    i == last,
-                    regen.clone(),
-                    i >= prev_seen,
-                )
-            }));
-            ai_seen().set(total);
-            list.style(move |s| {
+            dyn_stack(
+                move || 0..msg_count.get(),
+                |i| *i,
+                move |i| {
+                    let actions = actions.clone();
+                    let regen = regen.clone();
+                    // Newly appended bubbles get the entrance pop; ones that were
+                    // already on screen don't.
+                    //
+                    // Consumed on the first *build*, not held for the item: the
+                    // streaming bubble rebuilds on every chunk, and the pop starts
+                    // from 94% scale, so a flag that stayed true replayed the
+                    // animation per chunk and the bubble visibly pulsed. What the
+                    // list rebuild used to get from `ai_seen` advancing underneath
+                    // it, each item now owns.
+                    let pop = Rc::new(std::cell::Cell::new(i >= ai_seen().get_untracked()));
+                    if ai_seen().get_untracked() < i + 1 {
+                        ai_seen().set(i + 1);
+                    }
+                    // `is_last` rides in the memo rather than being captured: it
+                    // drives the regenerate affordance, and appending a message
+                    // flips it on the previously-last bubble, which is a change to
+                    // that bubble even though its message didn't move.
+                    let msg = floem::reactive::create_memo(move |_| {
+                        messages.with(|m| (m.get(i).cloned(), i + 1 == m.len()))
+                    });
+                    // Also keyed on the UI-theme generation. `render_markdown` bakes
+                    // its body colour into a text `Attrs` list rather than a style
+                    // closure, so it is the one place a live theme switch cannot
+                    // reach by re-reading — without the rebuild, every message on
+                    // screen keeps the old theme's text colour against the new
+                    // background and the panel goes two-toned.
+                    dyn_container(
+                        move || (msg.get(), theme::ui_generation()),
+                        move |((m, is_last), _)| match m {
+                            Some(m) => message_bubble(
+                                m,
+                                actions.clone(),
+                                elapsed_ms,
+                                is_last,
+                                regen.clone(),
+                                pop.replace(false),
+                            )
+                            .into_any(),
+                            // The vector shrank under the stack; the next diff
+                            // drops this item.
+                            None => empty().into_any(),
+                        },
+                    )
+                },
+            )
+            .style(move |s| {
                 s.flex_col()
                     .width(panel_w.get())
                     .gap(10.0)
@@ -551,10 +593,12 @@ fn message_bubble(
     };
 
     // Entrance pop (slide in from the bubble's side + a slight scale), only on a
-    // message's first appearance (`animate`) — the conversation rebuilds on every
-    // streaming token, so re-popping each time would jitter. User bubbles come
-    // from the right, Claude's from the left. `shown` flips a frame after mount so
-    // the declared transitions interpolate from the offset/scaled start to rest.
+    // message's first appearance (`animate`) — the streaming bubble rebuilds on
+    // every chunk, so re-popping each time makes it pulse. The caller is what
+    // guarantees that: it hands `true` to the first build of a bubble and `false`
+    // to every rebuild. User bubbles come from the right, Claude's from the left.
+    // `shown` flips a frame after mount so the declared transitions interpolate
+    // from the offset/scaled start to rest.
     let shown = RwSignal::new(!animate);
     if animate {
         floem::action::exec_after(Duration::ZERO, move |_| {
