@@ -21,11 +21,11 @@ use floem::reactive::create_effect;
 
 use schemaic_core::monitor::{ChangeKind, RowChange};
 
-use crate::settings::settings_dropdown;
+use crate::settings::focusable_dropdown;
 use crate::theme::{FONT_BODY, FONT_LABEL};
 use crate::widgets::{
-    autohide_state, focus_root, follow_after_scroll, loading_dots, panel_style, shift_hscroll,
-    thin_scroll, with_scroll_gesture,
+    autohide_state, follow_after_scroll, loading_dots, panel_style, shift_hscroll, thin_scroll,
+    with_scroll_gesture,
 };
 
 /// The log's rows are shorter than a chat bubble, so it counts as "at the bottom"
@@ -76,6 +76,10 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                 title.set(None);
                 cols.set(Vec::new());
             });
+            // One control, but it still gets a ring: without one the root has no
+            // Tab handler, so Tab falls through to floem's whole-window traversal
+            // and walks out of the modal into the workspace behind it.
+            let ring = crate::widgets::FocusRing::new();
 
             // Scroll bookkeeping: `bump` triggers a scroll-to-bottom, `view_rect` +
             // `content_h` decide whether we're at the bottom, `hscroll` mirrors the
@@ -160,10 +164,12 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                 },
             )
             .style(|s| s.flex_grow(1.0_f32).min_width(0.0));
-            let interval_dd = container(settings_dropdown(
+            let interval_dd = container(focusable_dropdown(
                 interval,
                 [1u64, 2, 5, 10],
                 interval_label,
+                ring.clone(),
+                10,
             ))
             .style(|s| s.width(84.0).flex_shrink(0.0_f32));
             let status = h_stack((status_text, interval_dd)).style(|s| {
@@ -270,7 +276,7 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                 });
 
             let close_bg = close.clone();
-            focus_root(container(panel))
+            crate::widgets::focus_root_with_ring(container(panel), ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| (close)())
                 .on_click_stop(move |_| (close_bg)())
                 .style(|s| {

@@ -36,7 +36,7 @@ const SAVE_FLASH: std::time::Duration = std::time::Duration::from_millis(2000);
 const TEST_FLASH: std::time::Duration = std::time::Duration::from_millis(4000);
 
 /// The engine choice in the connection form's **Type** picker. Backs a
-/// [`settings_dropdown`]; the selection is persisted into `Connection::db_type`
+/// [`crate::settings::focusable_dropdown`]; the selection is persisted into `Connection::db_type`
 /// (as the label string) and drives the DB layer's engine + the editor's SQL
 /// dialect via `schemaic_db::Engine::from_db_type` / `SqlDialect::from_db_type`.
 #[derive(Clone, Copy, PartialEq, Eq)]

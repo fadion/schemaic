@@ -531,8 +531,22 @@ Zed-inspired, aiming to replace DataGrip.
     `form_separator`/`FORM_GAP`/`control_button`/`footer_button`/`modal_footer`. Manage
     Connections set that shape and Import followed it; a new modal builds on these rather
     than copying them a third time.
+    And the **keyboard-navigation cluster**, which is the subject of the Tab gotchas below:
+    `FocusRing` (a modal's Tab order — `register`/`unregister`/`step_from`/`remember`/`focus_at`,
+    plus the `ring_step` wrap rule and its deliberate opposite `list_step`, which clamps),
+    `focus_root_with_ring`/`innermost_focus_ring` (how the modal root and the *window* root enter
+    it), `in_focus_ring`/`in_focus_ring_with` (how a non-field control joins, the second for one
+    with teardown of its own — floem keeps a single cleanup slot), `VALUE_TAB` (where a growing
+    block of stops starts), and the `PopupToken`-tagged `set_open_popup`/`clear_open_popup`/
+    `dismiss_open_popup` slot. A field joins through `FieldCfg::focus` instead, since nothing
+    outside floem's editor can see a key it has.
   - `markdown.rs` — AI-chat `render_markdown`/`CodeActions`/`code_block` (pulldown-cmark).
-  - `settings.rs` — the three settings modals + shared controls.
+  - `settings.rs` — the three settings modals **and the four shared controls every modal's form is
+    built from**: `focusable_toggle`/`focusable_toggle_row` (the switch — Space is ours, Enter is
+    floem's), `focusable_dropdown` and the picker-agnostic `in_ring_dropdown` under it (which owns
+    the four floem work-arounds a keyboard-operable dropdown needs). `themed_toggle` and
+    `settings_dropdown` are the un-ringed builders beneath, and are **private** on purpose: a
+    control nobody can Tab to is one left out of the modal's keyboard order by accident.
   - `connection_form.rs` — Manage Connections modal + password-mask (+ tests).
   - `diff_view.rs` — Ctrl+K diff preview. `history_panel.rs` — Query History right-column panel.
   - `plan_view.rs` — Query Plan modal (`EXPLAIN`/`EXPLAIN ANALYZE` table + warnings + "Ask AI"),
@@ -555,6 +569,9 @@ Zed-inspired, aiming to replace DataGrip.
     back through effects, so a draft-keyed form would tear down the field being typed into
     (it's keyed on `(tab, selected, rev)`, where `rev` is bumped on structural edits because
     removing the selected row leaves `selected` unchanged over a different item).
+    It also owns two things the other editors reuse: `list_pane` — the list-plus-action-bar that
+    is **one** Tab stop with Up/Down inside it (over `widgets::list_step`) — and
+    `focusable_owned_dropdown`, the picker for a value that isn't `Copy`.
     **Every path ends at `ddl_preview`** — designer, Create table, and the context-menu
     shortcuts — so there's one place that shows the SQL, one that names what's destroyed, and
     one "Open in editor" escape hatch. Never run generated DDL without it. Entry points:

@@ -190,28 +190,16 @@ fn shell_dropdown(
 /// — whose switch is in a modal's Tab order and can be flipped with Space (or
 /// Enter, which floem's own switch answers; see [`focusable_toggle`]).
 ///
-/// There is no un-focusable variant: every toggle in the app lives in a modal
-/// that has a ring, and a second one would only be a way to leave a control out
-/// of it by accident.
+/// There is no un-focusable variant, and [`themed_toggle`] is private so there
+/// can't be: a switch nobody can Tab to is a control left out of the modal's
+/// keyboard order by accident, and the two modals that had one — Query plan and
+/// Live monitor — now carry rings of their own.
 pub(crate) fn focusable_toggle_row(
     title: &'static str,
     hint: &'static str,
     sig: RwSignal<bool>,
     ring: crate::widgets::FocusRing,
     tabindex: u32,
-) -> impl IntoView {
-    toggle_row_layout(
-        title,
-        hint,
-        focusable_toggle(sig, ring, tabindex).into_any(),
-    )
-}
-
-/// The shared row: title + hint on the left, the switch on the right.
-fn toggle_row_layout(
-    title: &'static str,
-    hint: &'static str,
-    switch: floem::AnyView,
 ) -> impl IntoView {
     h_stack((
         // `flex_grow(1) + min_width(0)`: take the space left of the switch and be
@@ -224,7 +212,7 @@ fn toggle_row_layout(
             form_hint(hint),
         ))
         .style(|s| s.flex_col().gap(2.0).flex_grow(1.0_f32).min_width(0.0)),
-        switch,
+        focusable_toggle(sig, ring, tabindex),
     ))
     .style(|s| s.items_center().width_full().gap(10.0))
 }
@@ -244,7 +232,7 @@ fn toggle_row_layout(
 /// reachable today; the trap was the next ordinary edit to a list (adding a
 /// 24 px size, dropping the 1M row limit), which would have mislabelled the
 /// setting for every user who held the removed value.
-pub(crate) fn settings_dropdown<T, S>(
+fn settings_dropdown<T, S>(
     active: RwSignal<T>,
     options: impl IntoIterator<Item = T> + Clone + 'static,
     label: fn(T) -> S,
@@ -382,7 +370,7 @@ fn settings_group_label(t: &'static str) -> impl IntoView {
 // A dark-theme switch. Track + handle colours are driven by on/off state; the
 // track brightens on hover, and the press (active) state is neutralised to match
 // hover so there's no distracting flash on click.
-pub(crate) fn themed_toggle(sig: RwSignal<bool>) -> impl IntoView {
+fn themed_toggle(sig: RwSignal<bool>) -> impl IntoView {
     use floem::peniko::Brush;
     use floem::style::Foreground;
     use floem::unit::PxPct;
@@ -470,11 +458,13 @@ pub(crate) fn focusable_toggle(
 
 /// A [`settings_dropdown`] in a modal's Tab order.
 ///
-/// Nothing is added beyond the ring, because floem's `Dropdown` already answers
-/// the keyboard: Enter and Space open and close it from `event_before_children`
-/// (which runs ahead of any listener attached here), and the popup list is
+/// Floem's `Dropdown` answers half the keyboard on its own — the popup list is
 /// keyboard-navigable in its own right, so Up/Down walk the options and Enter
-/// accepts.
+/// accepts — but **its own open/close is taken over here**, and the rest of this
+/// comment is why. Do not "simplify" by deleting the KeyDown handler and
+/// `disable_default_event` below on the strength of floem having an Enter/Space
+/// arm: that arm fires on *KeyUp*, and restoring it restores the bug this exists
+/// to fix.
 ///
 /// Choosing an option hands focus **back to the box**. Floem's dropdown removes
 /// its popup without giving the keyboard to anything, and floem clears the focus
@@ -519,7 +509,7 @@ where
 ///
 /// The behaviour and every reason for it are documented on
 /// [`focusable_dropdown`]; this is the half that doesn't care what the options
-/// are, so the app's *other* picker — [`crate::table_designer::owned_dropdown`],
+/// are, so the app's *other* picker — [`crate::table_designer::focusable_owned_dropdown`],
 /// which exists because a table name isn't `Copy` — joins the ring through the
 /// same code rather than a second copy of four floem work-arounds.
 ///

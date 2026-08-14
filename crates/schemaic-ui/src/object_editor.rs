@@ -54,8 +54,9 @@ const FIELD_W: f64 = 260.0;
 const NUM_W: f64 = 130.0;
 /// Where a repeating row's Tab stops start: an enum's values and a domain's
 /// checks are lists that grow, so they claim a block of their own above every
-/// fixed control in the form.
-const VALUE_TAB: u32 = 1000;
+/// fixed control in the form. Shared with the trigger editor's two growing
+/// lists — see [`crate::widgets::VALUE_TAB`] for why it is one constant.
+use crate::widgets::VALUE_TAB;
 /// The gap between two of those, side by side. Wider than [`FORM_GAP`] because
 /// it separates two *questions* rather than two rows of one: Increment and Start
 /// sitting a form's gap apart read as one control with two boxes.

@@ -443,7 +443,10 @@ fn bound_fn_field(
 /// `ring`/`tabindex` place the rows in the modal's Tab order, one stop each from
 /// `tabindex` upwards — so a list that grows keeps its own contiguous block and
 /// the add/remove buttons (pointer-only, like every other button here) stay out
-/// of it.
+/// of it. Both callers pass [`crate::widgets::VALUE_TAB`], which is where such a
+/// block belongs: the bases these used to carry (70 here, 50 in the function
+/// form) cleared the fixed controls by ten indices and were safe only because
+/// each block happened to be last in its form.
 #[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
 fn value_rows(
     ui: &Ui,
@@ -877,7 +880,7 @@ fn pg_action(
     };
     let current = display_of(&stored, &fns.get_untracked());
 
-    // The selection lives in a signal, not in the rebuilt closure: `owned_dropdown`
+    // The selection lives in a signal, not in the rebuilt closure: `focusable_owned_dropdown`
     // needs a `Copy` getter, and a captured `String` isn't one. It also keeps the
     // control's own state independent of the list arriving.
     // `sel` holds the **display** form; the draft holds the SQL one.
@@ -984,7 +987,7 @@ fn pg_action(
                 "Add argument",
                 false,
                 ring,
-                70,
+                crate::widgets::VALUE_TAB,
                 move || {
                     d.with(|s| match s.triggers.get(i).map(|t| &t.info.action) {
                         Some(TriggerAction::Function { args, .. }) => args.clone(),
@@ -1104,7 +1107,7 @@ fn function_form(ui: Ui, ring: FocusRing) -> AnyView {
             "Add setting",
             true,
             ring,
-            50,
+            crate::widgets::VALUE_TAB,
             move || d.with(|s| s.info.settings.clone()),
             move |v| d.update(|s| s.info.settings = v),
         )

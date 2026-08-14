@@ -22,11 +22,11 @@ use floem::reactive::create_effect;
 
 use schemaic_core::plan::{PlanWarningKind, QueryPlan};
 
-use crate::settings::themed_toggle;
+use crate::settings::focusable_toggle;
 use crate::theme::{FONT_BODY, FONT_LABEL};
 use crate::widgets::{
-    autohide, focus_root, loading_dots, measure_text_px_at, measure_text_px_bold_at,
-    modal_title_borderless, panel_style, shift_hscroll,
+    autohide, loading_dots, measure_text_px_at, measure_text_px_bold_at, modal_title_borderless,
+    panel_style, shift_hscroll,
 };
 use crate::{PlanState, RightPanel, Ui, icons, theme};
 
@@ -61,6 +61,10 @@ pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
                 plan_open.set(false);
                 plan_state.set(PlanState::Idle);
             });
+            // One control, but it still gets a ring: without one the root has no
+            // Tab handler, so Tab falls through to floem's whole-window traversal
+            // and walks out of the modal into the workspace behind it.
+            let ring = crate::widgets::FocusRing::new();
 
             // Drive the EXPLAIN: fires once on open, and again whenever the Analyze
             // toggle flips. `plan_sql` is read untracked (it only changes together
@@ -87,7 +91,7 @@ pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
                     .into_any()
             } else {
                 h_stack((
-                    themed_toggle(plan_analyze),
+                    focusable_toggle(plan_analyze, ring.clone(), 10),
                     v_stack((
                         text("Analyze").style(|s| s.font_size(FONT_BODY).color(theme::text())),
                         text("Executes the statement to measure real timings")
@@ -149,7 +153,7 @@ pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
             .style(|s| panel_style(s).background(theme::bg_panel()).width(760.0));
 
             let esc = close.clone();
-            focus_root(container(panel))
+            crate::widgets::focus_root_with_ring(container(panel), ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
                 .on_click_stop(move |_| close())
                 .style(|s| {
