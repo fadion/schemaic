@@ -25,9 +25,10 @@ use schemaic_core::model::engine_is_transactional;
 use crate::consts::ROW_H;
 use crate::settings::{dropdown_box_style, focusable_dropdown, focusable_toggle_row};
 use crate::widgets::{
-    ACTION_GAP, ActionKind, ExitAction, FORM_GAP, FocusRing, MODAL_PAD_H, action_button, autohide,
-    control_button, exit_action, focus_root_with_ring, form_hint, form_section, form_separator,
-    form_setting, modal_footer, modal_footer_split, modal_title_owned, panel_style, shift_hscroll,
+    ACTION_GAP, ACTION_TAB, ActionKind, ExitAction, FORM_GAP, FocusRing, MODAL_PAD_H,
+    action_button, autohide, control_button, exit_action, focus_root_with_ring, form_hint,
+    form_section, form_separator, form_setting, modal_footer, modal_footer_split,
+    modal_title_owned, panel_style, shift_hscroll,
 };
 use crate::{
     FieldCfg, ImportProbeRequest, ImportRunRequest, ImportStep, ImportTargetInfo, ImportUi, Ui,
@@ -214,7 +215,10 @@ fn small_field(
 fn source_step(ui: Ui, ring: FocusRing) -> impl IntoView {
     let i = ui.import;
     let ui_pick = ui.clone();
-    let pick = control_button("Choose file…", move || {
+    // The first stop in the step, ahead of the Format picker at 10: without it a
+    // keyboard user could reach every reading setting and never pick a file,
+    // which is the one thing this step is for.
+    let pick = control_button("Choose file…", ring.clone(), 5, move || {
         let ui = ui_pick.clone();
         floem::action::open_file(
             floem::file::FileDialogOptions::new().title("Import into table"),
@@ -943,8 +947,8 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
             let ring = FocusRing::new();
             let root_ring = ring.clone();
             let body = match step {
-                ImportStep::Source => source_step(ui.clone(), ring).into_any(),
-                ImportStep::Mapping => mapping_step(ui.clone(), ring).into_any(),
+                ImportStep::Source => source_step(ui.clone(), ring.clone()).into_any(),
+                ImportStep::Mapping => mapping_step(ui.clone(), ring.clone()).into_any(),
                 ImportStep::Done => text(format!(
                     "Imported {} row{} into {title}.",
                     i.imported.get_untracked(),
@@ -990,23 +994,31 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                 exit.clone(),
                 exit.clone(),
             );
+            let ring_src = ring.clone();
+            let ring_map = ring.clone();
+            let ring_done = ring.clone();
             let footer = match step {
                 ImportStep::Source => dyn_container(
                     move || (i.sample.get().is_some(), i.busy.get()),
                     move |(has_sample, busy)| {
                         let ui = ui_next.clone();
+                        let ring = ring_src.clone();
                         modal_footer(
                             h_stack((
                                 action_button(
                                     "Cancel",
                                     ActionKind::Neutral,
                                     true,
+                                    ring.clone(),
+                                    ACTION_TAB,
                                     exit_at(&exit_src),
                                 ),
                                 action_button(
                                     if busy { "Reading…" } else { "Next" },
                                     ActionKind::Primary,
                                     has_sample && !busy,
+                                    ring,
+                                    ACTION_TAB + 10,
                                     move || ui.import.step.set(ImportStep::Mapping),
                                 ),
                             ))
@@ -1021,13 +1033,19 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                     move |(busy, mapping, target)| {
                         let ui = ui_run.clone();
                         let back = ui_back.clone();
+                        let ring = ring_map.clone();
                         let ready = target
                             .map(|t| !import::insert_columns(&mapping, &t.table).is_empty())
                             .unwrap_or(false);
                         modal_footer_split(
-                            action_button("Back", ActionKind::Neutral, !busy, move || {
-                                back.import.step.set(ImportStep::Source)
-                            }),
+                            action_button(
+                                "Back",
+                                ActionKind::Neutral,
+                                !busy,
+                                ring.clone(),
+                                ACTION_TAB,
+                                move || back.import.step.set(ImportStep::Source),
+                            ),
                             h_stack((
                                 // While a load is running this stops it (rolling
                                 // the transaction back) instead of closing —
@@ -1040,12 +1058,16 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                                     "Cancel",
                                     ActionKind::Neutral,
                                     true,
+                                    ring.clone(),
+                                    ACTION_TAB + 10,
                                     exit_at(&exit_map),
                                 ),
                                 action_button(
                                     if busy { "Importing…" } else { "Import" },
                                     ActionKind::Primary,
                                     ready && !busy,
+                                    ring,
+                                    ACTION_TAB + 20,
                                     move || run_import(ui.clone()),
                                 ),
                             ))
@@ -1059,6 +1081,8 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                     "Close",
                     ActionKind::Primary,
                     true,
+                    ring_done,
+                    ACTION_TAB,
                     exit_at(&exit_done),
                 ))
                 .into_any(),

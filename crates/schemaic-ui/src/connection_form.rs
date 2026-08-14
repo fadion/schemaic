@@ -20,9 +20,9 @@ use schemaic_core::connection::SshAuth;
 use crate::consts::MASK_CH;
 use crate::settings::{focusable_dropdown, focusable_toggle_row};
 use crate::widgets::{
-    ACTION_GAP, ActionKind, FocusRing, action_button_icon, action_face, autohide,
-    focus_root_with_ring, form_hint, form_label_style, loading_dots, menu_item_style, modal_title,
-    panel_style,
+    ACTION_GAP, ACTION_TAB, ActionKind, FocusRing, NAV_TAB, NavAxis, action_button_icon,
+    action_face, autohide, control_button, focus_root_with_ring, form_hint, form_label_style,
+    in_ring_button, loading_dots, menu_item_style, modal_title, nav_group, panel_style,
 };
 use crate::{DraftSignals, FieldCfg, Ui, edit_field, icons, theme};
 
@@ -138,31 +138,21 @@ fn key_pair_fields(draft: DraftSignals, ring: FocusRing, tabindex: u32) -> impl 
     use floem::file_action::open_file;
 
     let key_sig = draft.ssh_key_path;
-    let browse = text("Browse…")
-        .on_click_stop(move |_| {
-            open_file(
-                FileDialogOptions::new().title("Select private key"),
-                move |file| {
-                    if let Some(info) = file
-                        && let Some(path) = info.path.first()
-                    {
-                        key_sig.set(path.to_string_lossy().to_string());
-                    }
-                },
-            )
-        })
-        .style(|s| {
-            s.flex_shrink(0.0_f32)
-                .font_size(theme::FONT_BODY)
-                .padding_horiz(10.0)
-                .padding_vert(6.0)
-                .border_radius(6.0)
-                .background(theme::bg_editor())
-                .border(1.0)
-                .border_color(theme::field_border())
-                .color(theme::text())
-                .hover(|s| s.border_color(theme::field_border_active()))
-        });
+    // Its own stop, right after the path it fills in — the field is editable by
+    // hand, but a keyboard user who wants the picker shouldn't have to reach for
+    // the mouse to open it.
+    let browse = control_button("Browse…", ring.clone(), tabindex + 2, move || {
+        open_file(
+            FileDialogOptions::new().title("Select private key"),
+            move |file| {
+                if let Some(info) = file
+                    && let Some(path) = info.path.first()
+                {
+                    key_sig.set(path.to_string_lossy().to_string());
+                }
+            },
+        )
+    });
 
     let key_row = v_stack((
         text("Private key").style(form_label_style),
@@ -500,6 +490,12 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
             if !is_open {
                 return empty().into_any();
             }
+            // The Tab order belongs to the modal, not the form: Escape is
+            // answered here at the root, and the connection list on the left is
+            // part of it — it is this modal's primary control, so leaving it out
+            // would mean a keyboard user could edit a connection but never
+            // choose which one.
+            let ring = FocusRing::new();
             let select = select_conn.clone();
             let list = dyn_stack(
                 move || connections.get(),
@@ -553,22 +549,55 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
             // between rows.
             .style(|s| s.flex_col().width_full().gap(5.0));
 
-            let new_c = new_conn.clone();
-            let add = container(
-                h_stack((
-                    icons::icon(icons::CIRCLE_PLUS, 16.0),
-                    text("New connection").style(|s| s.font_size(theme::FONT_BODY)),
-                ))
-                .style(|s| s.flex_row().items_center().gap(8.0).color(theme::accent())),
-            )
-            .on_click_stop(move |_| (new_c)())
-            .style(|s| menu_item_style(s).justify_center());
-
-            let left = v_stack((
+            // One Tab stop for the whole list, Up/Down inside it — the rule the
+            // colour swatches and the designer's item list already follow. Twenty
+            // connections as twenty stops would make Tab-ing *past* the pane to
+            // the form, which is the common case, cost twenty presses.
+            //
+            // The step clamps rather than wraps: this is a selection, and landing
+            // back on the first connection after the last is only a surprise. The
+            // Tab ring around it wraps, which is what stops Tab leaving the modal.
+            let arrow_select = select_conn.clone();
+            let list = nav_group(
                 autohide(scroll(list)).style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0)),
-                add,
-            ))
-            .style(|s| {
+                ring.clone(),
+                NAV_TAB,
+                NavAxis::Vertical,
+                move |delta| {
+                    let ids: Vec<u64> =
+                        connections.with_untracked(|cs| cs.iter().map(|c| c.id).collect());
+                    let cur = draft
+                        .id
+                        .get_untracked()
+                        .and_then(|id| ids.iter().position(|x| *x == id))
+                        .unwrap_or(0);
+                    if let Some(next) = crate::widgets::list_step(ids.len(), cur, delta) {
+                        (arrow_select)(ids[next]);
+                    }
+                },
+            );
+
+            let new_c = new_conn.clone();
+            let add = in_ring_button(
+                container(
+                    h_stack((
+                        icons::icon(icons::CIRCLE_PLUS, 16.0),
+                        text("New connection").style(|s| s.font_size(theme::FONT_BODY)),
+                    ))
+                    .style(|s| s.flex_row().items_center().gap(8.0).color(theme::accent())),
+                )
+                .on_click_stop({
+                    let new_c = new_c.clone();
+                    move |_| (new_c)()
+                })
+                .style(|s| crate::widgets::button_focus_ring(menu_item_style(s).justify_center())),
+                ring.clone(),
+                NAV_TAB + 1,
+                true,
+                move || (new_c)(),
+            );
+
+            let left = v_stack((list, add)).style(|s| {
                 s.width(210.0)
                     .flex_shrink(0.0_f32)
                     .height_full()
@@ -578,10 +607,6 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                     .padding_vert(6.0)
             });
 
-            // The Tab order belongs to the modal, not the form: Escape is
-            // answered here at the root, and it has to be able to ask the ring
-            // whether a control has a popup open before closing anything.
-            let ring = FocusRing::new();
             let right = conn_form(
                 draft,
                 save_conn.clone(),
@@ -856,6 +881,7 @@ fn conn_form(
     // icon+label form, so its spacing is the preview footer's Copy and Open in
     // editor rather than a third answer to the same question.
     let del = delete_conn.clone();
+    let ring_del = ring.clone();
     let delete_btn = dyn_container(
         move || draft.id.get(),
         move |id| match id {
@@ -866,9 +892,10 @@ fn conn_form(
                     icons::TRASH_2,
                     ActionKind::Danger,
                     true,
+                    ring_del.clone(),
+                    ACTION_TAB,
                     move || (del)(cid),
                 )
-                .into_any()
             }
             None => empty().into_any(),
         },
@@ -885,6 +912,8 @@ fn conn_form(
         "Test...",
         ActionKind::Neutral,
         true,
+        ring.clone(),
+        ACTION_TAB + 10,
         dyn_container(
             move || (conn_test.get(), test_flash.get()),
             move |(st, flashing)| match st {
@@ -919,6 +948,8 @@ fn conn_form(
         "Save",
         ActionKind::Primary,
         true,
+        ring.clone(),
+        ACTION_TAB + 20,
         dyn_container(
             move || save_flash.get(),
             move |flashed| {

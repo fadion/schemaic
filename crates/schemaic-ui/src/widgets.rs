@@ -132,6 +132,174 @@ pub(crate) fn nothing() -> floem::AnyView {
     empty().style(|s| s.hide()).into_any()
 }
 
+/// Where a modal's **navigation pane** sits — below every form control, because
+/// it is what you use to choose *what* the form is editing: Manage Connections'
+/// connection list, the designer's section strip. See [`nav_group`].
+pub(crate) const NAV_TAB: u32 = 1;
+
+/// Where a modal's **footer actions** start — Save, Cancel, Apply, Preview SQL,
+/// Import, Back, Copy, Open in editor — one stop each, left to right.
+///
+/// Far above [`VALUE_TAB`] because the footer is the last thing in every modal
+/// and a growing list must not be able to overtake it: a form that ends in a
+/// hundred-thousand-row list is not a real case, but "the buttons come last" is
+/// a rule, and a rule that holds only for short lists isn't one.
+///
+/// The gap is this wide because a row costs [`ROW_TAB_STRIDE`], not one index —
+/// a test pins the arithmetic, and caught exactly this when the stride was
+/// introduced and quietly cut the headroom tenfold.
+pub(crate) const ACTION_TAB: u32 = 1_000_000;
+
+/// The Tab stops one repeating row claims: its field(s) at the base, then its
+/// buttons a little above them, so row *i* occupies
+/// `VALUE_TAB + i * ROW_TAB_STRIDE ..= + ROW_TAB_STRIDE - 1` and can grow a
+/// second field or a fourth button without renumbering its neighbours.
+pub(crate) const ROW_TAB_STRIDE: u32 = 10;
+
+/// Where a row's ↑ / ↓ / ✕ sit within its [`ROW_TAB_STRIDE`] block — after its
+/// fields, which take the low half.
+pub(crate) const ROW_BUTTON_TAB: u32 = 5;
+
+// The Tab order every modal in the app is laid out in, asserted at **compile
+// time** rather than in a test, because it is arithmetic over constants and a
+// violation should stop the build rather than wait for `cargo test`:
+//
+//   nav pane → its items → the form → a growing list of rows → the footer
+//
+// The last step is the one that needs guarding, because a growing block is
+// unbounded upward and the footer must stay last. It has already been caught
+// once: `ROW_TAB_STRIDE` made every row cost ten indices instead of one, which
+// silently cut the headroom below `ACTION_TAB` tenfold on the day it landed.
+const _: () = {
+    assert!(NAV_TAB < crate::table_designer::LIST_TAB);
+    assert!(
+        crate::table_designer::LIST_TAB < 10,
+        "before the first field"
+    );
+    assert!(
+        110 < VALUE_TAB,
+        "past the highest fixed control (a sequence's)"
+    );
+    // A row costs a whole stride, so the headroom is in rows, not indices.
+    assert!(VALUE_TAB + 90_000 * ROW_TAB_STRIDE < ACTION_TAB);
+    // A row's buttons sit above its own fields (a domain check has two) and
+    // below the next row's, so Tab walks a value, then what you can do to it.
+    assert!(1 < ROW_BUTTON_TAB);
+    assert!(ROW_BUTTON_TAB + 2 < ROW_TAB_STRIDE);
+};
+
+/// A button in a modal's Tab order: focusable, reached by Tab, and pressed with
+/// **Space or Enter**.
+///
+/// Both keys, unlike [`crate::settings::focusable_toggle`], which has to leave
+/// Enter to floem's `ToggleButton`. Nothing here answers either key already, so
+/// there is no second handler to double up with.
+///
+/// A **disabled** button is not a stop at all — it isn't registered and isn't
+/// focusable, so Tab walks past it the way it walks past a label. It keeps its
+/// place on screen (see [`action_button`]), which is a layout decision; being
+/// skipped by the keyboard is the same answer the pointer already gives, since
+/// its click handler is inert too.
+///
+/// There is deliberately **no default-Enter**: Enter in a field does not fire a
+/// modal's affirmative action. The DDL preview's Apply is an irreversible
+/// `ALTER`, and a key that means "newline" in one control and "apply the plan"
+/// in another is the shape of defect this ring's own review was full of. Reach
+/// the button and press it.
+pub(crate) fn in_ring_button<V: IntoView + 'static>(
+    view: V,
+    ring: FocusRing,
+    tabindex: u32,
+    enabled: bool,
+    on_press: impl Fn() + 'static,
+) -> AnyView {
+    if !enabled {
+        return view.into_any();
+    }
+    in_focus_ring(view, ring, tabindex)
+        .on_event(EventListener::KeyDown, move |e| {
+            let Event::KeyDown(ke) = e else {
+                return EventPropagation::Continue;
+            };
+            if matches!(
+                ke.key.logical_key,
+                Key::Named(NamedKey::Space) | Key::Named(NamedKey::Enter)
+            ) {
+                on_press();
+                return EventPropagation::Stop;
+            }
+            EventPropagation::Continue
+        })
+        .into_any()
+}
+
+/// Which arrows move inside a [`nav_group`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NavAxis {
+    /// A column of rows — Up/Down. The connection list.
+    Vertical,
+    /// A row of items — Left/Right. The designer's section strip.
+    Horizontal,
+}
+
+/// A navigation pane that is **one** Tab stop, with the arrows moving inside it.
+///
+/// The rule the colour swatches and the designer's item list already follow: a
+/// group of like things costs one stop, not N. A connection list of twenty as
+/// twenty stops would make Tab-ing *past* it to the form cost twenty presses,
+/// which is the common case — you are usually going somewhere else.
+///
+/// `step` takes ±1 and is the caller's, because clamping is not universal:
+/// a *selection* clamps at its ends (jumping from the last item to the first is
+/// only a surprise) while the Tab ring wraps, since wrapping is what stops Tab
+/// leaving the modal. See [`list_step`] and [`ring_step`].
+pub(crate) fn nav_group<V: IntoView + 'static>(
+    body: V,
+    ring: FocusRing,
+    tabindex: u32,
+    axis: NavAxis,
+    step: impl Fn(isize) + 'static,
+) -> AnyView {
+    let group = body.into_view().style(button_focus_ring);
+    in_focus_ring(group, ring, tabindex)
+        .on_event(EventListener::KeyDown, move |e| {
+            let Event::KeyDown(ke) = e else {
+                return EventPropagation::Continue;
+            };
+            let (back, fwd) = match axis {
+                NavAxis::Vertical => (NamedKey::ArrowUp, NamedKey::ArrowDown),
+                NavAxis::Horizontal => (NamedKey::ArrowLeft, NamedKey::ArrowRight),
+            };
+            match &ke.key.logical_key {
+                Key::Named(k) if *k == back => {
+                    step(-1);
+                    EventPropagation::Stop
+                }
+                Key::Named(k) if *k == fwd => {
+                    step(1);
+                    EventPropagation::Stop
+                }
+                _ => EventPropagation::Continue,
+            }
+        })
+        .into_any()
+}
+
+/// The focus signal every ringed button wears: an **outline**, painted outside
+/// the box, so gaining the keyboard costs no layout — the rule a swatch and a
+/// list pane already follow, and the reason neither takes a border.
+///
+/// Painted in `.focus`, **not** `.focus_visible`, and that is not a style
+/// choice. Floem gates `FocusVisible` on `app_state.keyboard_navigation`, which
+/// only its *own* `view_tab_navigation` ever sets — every path that reaches
+/// `UpdateMessage::Focus`, which is all [`FocusRing`] has, leaves the flag
+/// `false`. So a `focus_visible` rule on a ring member never fires at all.
+pub(crate) fn button_focus_ring(s: floem::style::Style) -> floem::style::Style {
+    s.focus(|s| s.outline(2.0).outline_color(theme::field_border_active()))
+        // Floem's own is a 3px magenta ring belonging to no palette here.
+        .focus_visible(|s| s.outline(2.0).outline_color(theme::field_border_active()))
+}
+
 /// Where a **growing** block of Tab stops starts — a list of enum values, of
 /// domain checks, of trigger arguments, of function settings — one stop per row
 /// from here upwards.
@@ -600,17 +768,25 @@ pub(crate) fn row_slot(inner: impl IntoView + 'static) -> impl IntoView {
 
 /// The small icon button an editable list's rows use — the enum values, a
 /// domain's checks, a trigger's arguments, a function's settings.
+///
+/// `tabindex` sits in its row's [`ROW_TAB_STRIDE`] block, above the row's own
+/// fields — so Tab walks a row's value, then what you can do to it, then the
+/// next row.
 pub(crate) fn row_button(
     glyph: &'static str,
     tip: &'static str,
+    ring: FocusRing,
+    tabindex: u32,
     act: impl Fn() + 'static,
 ) -> AnyView {
-    row_slot(crate::icons::icon(glyph, ROW_ICON as f32))
+    let act = Rc::new(act);
+    let pressed = act.clone();
+    let button = row_slot(crate::icons::icon(glyph, ROW_ICON as f32))
         .on_click_stop(move |_| act())
         // Colour-only hover, like every other icon button in the app.
-        .style(|s| s.color(theme::text_dim()).hover(|s| s.color(theme::text())))
-        .tooltip(move || text(tip).style(tooltip_style))
-        .into_any()
+        .style(|s| button_focus_ring(s.color(theme::text_dim()).hover(|s| s.color(theme::text()))))
+        .tooltip(move || text(tip).style(tooltip_style));
+    in_ring_button(button, ring, tabindex, true, move || pressed())
 }
 
 /// [`row_button`]'s footprint with nothing in it — what a move button becomes on
@@ -630,9 +806,11 @@ pub(crate) fn row_gap() -> AnyView {
 /// button.
 pub(crate) fn control_button(
     label: impl Into<String>,
+    ring: FocusRing,
+    tabindex: u32,
     on_click: impl Fn() + 'static,
-) -> impl IntoView {
-    control_button_enabled(label, true, on_click)
+) -> AnyView {
+    control_button_enabled(label, true, ring, tabindex, on_click)
 }
 
 /// [`control_button`] that can be inert — for one whose subject may be missing
@@ -642,16 +820,20 @@ pub(crate) fn control_button(
 pub(crate) fn control_button_enabled(
     label: impl Into<String>,
     enabled: bool,
+    ring: FocusRing,
+    tabindex: u32,
     on_click: impl Fn() + 'static,
-) -> impl IntoView {
-    text(label.into())
+) -> AnyView {
+    let on_click = Rc::new(on_click);
+    let pressed = on_click.clone();
+    let button = text(label.into())
         .on_click_stop(move |_| {
             if enabled {
                 on_click()
             }
         })
         .style(move |s| {
-            let s = control_surface(s)
+            let s = button_focus_ring(control_surface(s))
                 .font_size(theme::FONT_BODY)
                 .padding_horiz(10.0)
                 .padding_vert(5.0)
@@ -662,7 +844,8 @@ pub(crate) fn control_button_enabled(
             } else {
                 s.color(theme::text_faint())
             }
-        })
+        });
+    in_ring_button(button, ring, tabindex, enabled, move || pressed())
 }
 
 /// How much weight a modal action carries.
@@ -731,9 +914,11 @@ pub(crate) fn action_button(
     label: impl Into<String>,
     kind: ActionKind,
     enabled: bool,
+    ring: FocusRing,
+    tabindex: u32,
     on_click: impl Fn() + 'static,
-) -> impl IntoView {
-    action_button_inner(label, None, kind, enabled, on_click)
+) -> AnyView {
+    action_button_inner(label, None, kind, enabled, ring, tabindex, on_click)
 }
 
 /// [`action_button`] with a leading icon — the preview footer's Copy and Open in
@@ -744,9 +929,11 @@ pub(crate) fn action_button_icon(
     icon: &'static str,
     kind: ActionKind,
     enabled: bool,
+    ring: FocusRing,
+    tabindex: u32,
     on_click: impl Fn() + 'static,
-) -> impl IntoView {
-    action_button_inner(label, Some(icon), kind, enabled, on_click)
+) -> AnyView {
+    action_button_inner(label, Some(icon), kind, enabled, ring, tabindex, on_click)
 }
 
 type ColorFn = fn() -> floem::peniko::Color;
@@ -804,26 +991,32 @@ fn action_style(s: floem::style::Style, kind: ActionKind, enabled: bool) -> floe
     }
 }
 
+#[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
 fn action_button_inner(
     label: impl Into<String>,
     icon: Option<&'static str>,
     kind: ActionKind,
     enabled: bool,
+    ring: FocusRing,
+    tabindex: u32,
     on_click: impl Fn() + 'static,
-) -> impl IntoView {
+) -> AnyView {
     let glyph: AnyView = match icon {
         Some(markup) => icons::icon(markup, 15.0)
             .style(|s| s.flex_shrink(0.0_f32).margin_right(ACTION_ICON_GAP))
             .into_any(),
         None => empty().into_any(),
     };
-    h_stack((glyph, text(label.into())))
+    let on_click = Rc::new(on_click);
+    let pressed = on_click.clone();
+    let button = h_stack((glyph, text(label.into())))
         .on_click_stop(move |_| {
             if enabled {
                 on_click()
             }
         })
-        .style(move |s| action_style(s, kind, enabled))
+        .style(move |s| button_focus_ring(action_style(s, kind, enabled)));
+    in_ring_button(button, ring, tabindex, enabled, move || pressed())
 }
 
 /// An [`action_button`] whose face the caller supplies and can swap, held at the
@@ -841,23 +1034,28 @@ pub(crate) fn action_face<V: IntoView + 'static, F: Fn() + 'static>(
     width_for: &str,
     kind: ActionKind,
     enabled: bool,
+    ring: FocusRing,
+    tabindex: u32,
     face: V,
     on_click: F,
-) -> impl IntoView + use<V, F> {
+) -> AnyView {
     // +2px against sub-pixel rounding, the same guard `loading_dots` uses.
     let w = measure_text_px_at(width_for, theme::FONT_BODY) + 2.0 * ACTION_PAD_H + 2.0;
-    container(face)
+    let on_click = Rc::new(on_click);
+    let pressed = on_click.clone();
+    let button = container(face)
         .on_click_stop(move |_| {
             if enabled {
                 on_click()
             }
         })
         .style(move |s| {
-            action_style(s, kind, enabled)
+            button_focus_ring(action_style(s, kind, enabled))
                 .width(w)
                 .justify_center()
                 .padding_horiz(0.0)
-        })
+        });
+    in_ring_button(button, ring, tabindex, enabled, move || pressed())
 }
 
 /// A text-only action: no fill, a colour that carries the meaning, brightening
@@ -2507,6 +2705,21 @@ mod ring_tests {
         ring.remember(ids[1]);
         ring.unregister(ids[1]);
         assert_eq!(ring.target(floem::ViewId::new(), false), Some(ids[0]));
+    }
+
+    /// **A disabled button is not a Tab stop.** It keeps its place on screen —
+    /// which action is the affirmative one shouldn't move as a form becomes
+    /// valid — but the keyboard walks past it, the same answer the pointer
+    /// already gives, since its click handler is inert too. Landing on Preview
+    /// SQL and pressing Space to nothing is worse than not landing there.
+    #[test]
+    fn a_disabled_button_is_not_a_tab_stop() {
+        let ring = FocusRing::new();
+        let live = in_ring_button(empty(), ring.clone(), ACTION_TAB, true, || {});
+        let dead = in_ring_button(empty(), ring.clone(), ACTION_TAB + 10, false, || {});
+        assert_eq!(ring.ids(), vec![live.id()], "only the live one registered");
+        assert_ne!(dead.id(), live.id());
+        assert_eq!(ring.at(ACTION_TAB + 10), None);
     }
 
     /// What a dropdown refocuses through after its popup closes: the accept can

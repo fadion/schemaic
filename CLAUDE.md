@@ -1121,10 +1121,28 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
   whole `FORM_GAP` of dead space where the block would have been. The rule is about *controls*: an
   arm with nothing inside it has nothing to be Tab-reachable. Where the conditional is a
   `dyn_container`, the hide goes on the **container** — that is the flex child, not its inner view.
+- **Buttons are in the ring too, and Space or Enter presses them — but there is no default Enter.**
+  Every button a modal has goes through `widgets::in_ring_button` (which the six builders —
+  `action_button`/`action_button_icon`/`action_face`/`control_button`/`control_button_enabled`/
+  `row_button` — call for you; the ring parameter is *required*, so a modal button that isn't
+  reachable won't compile). Enter in a *field* fires nothing: the DDL preview's Apply is an
+  irreversible `ALTER`, and a key meaning "newline" in one control and "apply the plan" in another
+  is the shape of defect the ring's own review was full of. **A disabled button is not a stop** —
+  it keeps its place on screen (which action is affirmative shouldn't move as a form becomes valid)
+  but the keyboard walks past it, since its click handler is inert anyway.
+  Order is `NAV_TAB` → `LIST_TAB` → the form (10, 20, …) → `VALUE_TAB` + `i * ROW_TAB_STRIDE` for a
+  growing list → `ACTION_TAB` for the footer, and that chain is asserted at **compile time** in
+  `widgets.rs` (`const _: () = { … }`). It has already caught one regression: adding
+  `ROW_TAB_STRIDE` cut the footer's headroom tenfold the day it landed.
+  The focus signal is an **outline** and it is painted in `.focus`, *not* `.focus_visible` —
+  floem gates `FocusVisible` on `app_state.keyboard_navigation`, which only its own
+  `view_tab_navigation` ever sets, so a `focus_visible` rule on a ring member never fires at all.
 - **A group of like things is *one* Tab stop, and arrows move within it.** Manage Connections'
-  colour swatches (`connection_form::color_picker`) and the designer/trigger item list
-  (`table_designer::list_pane`) each take a single ring slot: Tab reaches the group, Left/Right or
-  Up/Down move inside it, Tab leaves. Eight swatches or twenty columns as individual stops would
+  colour swatches (`connection_form::color_picker`) and connection list, the designer's section
+  strip, and the designer/trigger item list (`table_designer::list_pane`) each take a single ring
+  slot: Tab reaches the group, Left/Right or Up/Down move inside it, Tab leaves. `widgets::nav_group`
+  is the shared one (the swatches and `list_pane` predate it and carry their own scrolling and
+  chrome). Eight swatches or twenty columns as individual stops would
   make crossing a pane the user is only passing through cost twenty keypresses. Two details each
   had a reason: the **ring wraps and these clamp** — wrapping is what stops Tab escaping the modal,
   while a selection that jumps from the last column to the first is only a surprise (the swatches

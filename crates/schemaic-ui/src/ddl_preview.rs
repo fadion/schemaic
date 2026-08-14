@@ -20,9 +20,9 @@ use floem::prelude::*;
 use schemaic_core::text::plural;
 
 use crate::widgets::{
-    ACTION_GAP, ActionKind, ExitAction, FocusRing, MODAL_PAD_H, action_button, action_button_icon,
-    autohide, exit_action, focus_root_with_ring, form_section, form_section_owned,
-    modal_footer_split, modal_title_owned, panel_style,
+    ACTION_GAP, ACTION_TAB, ActionKind, ExitAction, FocusRing, MODAL_PAD_H, action_button,
+    action_button_icon, autohide, exit_action, focus_root_with_ring, form_section,
+    form_section_owned, modal_footer_split, modal_title_owned, panel_style,
 };
 use crate::{DdlOutcome, DdlPreview, DdlRunRequest, FieldCfg, Ui, edit_field, icons, theme};
 
@@ -243,10 +243,13 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                 return empty().into_any();
             };
 
-            // One Tab stop: the script box. It is read-only, but it is the thing
-            // this modal exists to be *read*, and Tab is how a keyboard reaches it
-            // to scroll and select. The footer stays pointer-only, so nothing else
-            // joins.
+            // The script box, then the footer. The box is read-only, but it is
+            // the thing this modal exists to be *read*, and Tab is how a keyboard
+            // reaches it to scroll and select; the footer follows it at
+            // `ACTION_TAB`. Apply is deliberately reachable only by Tab-ing to it
+            // — there is no default Enter anywhere in these modals, and this is
+            // the button that most earns that: the plan behind it is an
+            // irreversible `ALTER`.
             let ring = FocusRing::new();
             let root_ring = ring.clone();
 
@@ -295,7 +298,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             mono: true,
                             font_size: theme::FONT_BODY,
                             max_rows: Some(d.sql_rows),
-                            focus: Some((ring, 10)),
+                            focus: Some((ring.clone(), 10)),
                             ..Default::default()
                         },
                     )
@@ -324,9 +327,11 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
             // footer is asking, so they sit recessed at the far left rather than
             // in the Back/Apply pair.
             let ui_side = ui.clone();
+            let ring_side = ring.clone();
             let side = dyn_container(
                 move || (d.applying.get(), d.applied.get()),
                 move |(busy, applied)| {
+                    let ring = ring_side.clone();
                     let Some(p) = d.preview.get_untracked().filter(|_| !applied) else {
                         return empty().into_any();
                     };
@@ -341,6 +346,8 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             icons::COPY,
                             ActionKind::Quiet,
                             !busy,
+                            ring.clone(),
+                            ACTION_TAB,
                             move || {
                                 let _ = floem::Clipboard::set_contents(sql.clone());
                             },
@@ -352,6 +359,8 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             icons::FILE_PEN_LINE,
                             ActionKind::Quiet,
                             !busy,
+                            ring.clone(),
+                            ACTION_TAB + 10,
                             move || {
                                 (open_query)(open_sql.clone());
                                 d.preview.set(None);
@@ -364,12 +373,21 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                 },
             );
 
+            let ring_actions = ring.clone();
             let actions = dyn_container(
                 move || (d.applying.get(), d.applied.get()),
                 move |(busy, applied)| {
                     let ui = ui.clone();
+                    let ring = ring_actions.clone();
                     if applied {
-                        return action_button("Close", ActionKind::Primary, true, exit).into_any();
+                        return action_button(
+                            "Close",
+                            ActionKind::Primary,
+                            true,
+                            ring,
+                            ACTION_TAB + 20,
+                            exit,
+                        );
                     }
                     let p = match d.preview.get_untracked() {
                         Some(p) => p,
@@ -389,6 +407,8 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             },
                             ActionKind::Neutral,
                             !busy,
+                            ring.clone(),
+                            ACTION_TAB + 20,
                             exit,
                         ),
                         action_button(
@@ -404,6 +424,8 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                                 ActionKind::Danger
                             },
                             !busy && !p.read_only && !p.statements.is_empty(),
+                            ring,
+                            ACTION_TAB + 30,
                             move || apply(ui.clone()),
                         ),
                     ))

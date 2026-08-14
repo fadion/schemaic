@@ -37,9 +37,9 @@ use schemaic_core::schema::{CheckInfo, ObjectItem, SchemaState, SequenceInfo, Se
 
 use crate::table_designer::{edit_ctx, focusable_owned_dropdown, suggest_chevron};
 use crate::widgets::{
-    ACTION_GAP, ActionKind, FORM_GAP, FocusRing, MODAL_PAD_H, action_button, focus_root_with_ring,
-    form_section, form_setting, form_setting_owned, modal_footer_split, modal_title_owned,
-    panel_style, row_button, row_gap,
+    ACTION_GAP, ACTION_TAB, ActionKind, FORM_GAP, FocusRing, MODAL_PAD_H, action_button,
+    focus_root_with_ring, form_section, form_setting, form_setting_owned, modal_footer_split,
+    modal_title_owned, panel_style, row_button, row_gap,
 };
 use crate::{
     DdlPreview, FieldCfg, ObjectTarget, Ui, ddl_preview, edit_field, icons, object_location, theme,
@@ -56,7 +56,7 @@ const NUM_W: f64 = 130.0;
 /// checks are lists that grow, so they claim a block of their own above every
 /// fixed control in the form. Shared with the trigger editor's two growing
 /// lists — see [`crate::widgets::VALUE_TAB`] for why it is one constant.
-use crate::widgets::VALUE_TAB;
+use crate::widgets::{ROW_BUTTON_TAB, ROW_TAB_STRIDE, VALUE_TAB};
 /// The gap between two of those, side by side. Wider than [`FORM_GAP`] because
 /// it separates two *questions* rather than two rows of one: Increment and Start
 /// sitting a form's gap apart read as one control with two boxes.
@@ -281,13 +281,20 @@ fn enum_values(ui: &Ui, ring: FocusRing) -> AnyView {
             let n = values.len();
             let ui = ui.clone();
             let ring = ring.clone();
+            let add_ring = ring.clone();
             let rows = v_stack_from_iter(values.into_iter().enumerate().map(move |(i, v)| {
+                // Row `i` owns a whole `ROW_TAB_STRIDE` block: its value at the
+                // base, its buttons above. So Tab walks a value, then what you
+                // can do to it, then the next value — and a row that grows a
+                // second field or a fourth button renumbers nothing.
+                let base = VALUE_TAB + i as u32 * ROW_TAB_STRIDE;
+                let btn = base + ROW_BUTTON_TAB;
                 let field = bound_field(
                     &ui,
                     v,
                     FieldCfg {
                         placeholder: "value",
-                        focus: Some((ring.clone(), VALUE_TAB + i as u32)),
+                        focus: Some((ring.clone(), base)),
                         ..Default::default()
                     },
                     move |d, t| {
@@ -314,12 +321,20 @@ fn enum_values(ui: &Ui, ring: FocusRing) -> AnyView {
                 // already first and the last is already last, so an arrow there
                 // is a control whose only outcome is nothing happening.
                 let up = if i > 0 {
-                    row_button(icons::CHEVRON_UP, "Move up", move || swap(i, i - 1))
+                    row_button(icons::CHEVRON_UP, "Move up", ring.clone(), btn, move || {
+                        swap(i, i - 1)
+                    })
                 } else {
                     row_gap()
                 };
                 let down = if i + 1 < n {
-                    row_button(icons::CHEVRON_DOWN, "Move down", move || swap(i, i + 1))
+                    row_button(
+                        icons::CHEVRON_DOWN,
+                        "Move down",
+                        ring.clone(),
+                        btn + 1,
+                        move || swap(i, i + 1),
+                    )
                 } else {
                     row_gap()
                 };
@@ -327,7 +342,7 @@ fn enum_values(ui: &Ui, ring: FocusRing) -> AnyView {
                     field,
                     up,
                     down,
-                    row_button(icons::TRASH_2, "Remove", move || {
+                    row_button(icons::TRASH_2, "Remove", ring.clone(), btn + 2, move || {
                         draft.update(|d| {
                             if let ObjectDraft::Enum(e) = d
                                 && i < e.info.values.len()
@@ -342,14 +357,21 @@ fn enum_values(ui: &Ui, ring: FocusRing) -> AnyView {
             }))
             .style(|s| s.flex_col().gap(6.0).width_full());
 
-            let add = crate::widgets::control_button("Add value", move || {
-                draft.update(|d| {
-                    if let ObjectDraft::Enum(e) = d {
-                        e.info.values.push(String::new());
-                    }
-                });
-                rev.update(|r| *r += 1);
-            });
+            // Last in the block, above every row — it is what you reach after
+            // walking them.
+            let add = crate::widgets::control_button(
+                "Add value",
+                add_ring,
+                VALUE_TAB + n as u32 * ROW_TAB_STRIDE,
+                move || {
+                    draft.update(|d| {
+                        if let ObjectDraft::Enum(e) = d {
+                            e.info.values.push(String::new());
+                        }
+                    });
+                    rev.update(|r| *r += 1);
+                },
+            );
             v_stack((
                 rows,
                 container(add).style(|s| s.width_full().margin_top(2.0)),
@@ -419,8 +441,8 @@ fn enum_form(ui: &Ui, d: &EnumDraft, ring: FocusRing) -> AnyView {
 ///
 /// Unordered, so there are no move buttons — unlike an enum's values, where the
 /// order is the type's meaning.
-/// Each row takes two Tab stops — its name then its predicate — from `VALUE_TAB`
-/// upwards.
+/// Each row owns a `ROW_TAB_STRIDE` block from `VALUE_TAB` upwards: its name,
+/// its predicate, then its remove button.
 fn domain_checks(ui: &Ui, ring: FocusRing) -> AnyView {
     let draft = ui.ddl.object_draft;
     let rev = ui.ddl.object_rev;
@@ -434,13 +456,16 @@ fn domain_checks(ui: &Ui, ring: FocusRing) -> AnyView {
             });
             let ui = ui.clone();
             let ring = ring.clone();
+            let add_ring = ring.clone();
+            let n = checks.len();
             let rows = v_stack_from_iter(checks.into_iter().enumerate().map(move |(i, ck)| {
+                let base = VALUE_TAB + i as u32 * ROW_TAB_STRIDE;
                 let name = bound_field(
                     &ui,
                     ck.name.clone(),
                     FieldCfg {
                         placeholder: "constraint_name",
-                        focus: Some((ring.clone(), VALUE_TAB + i as u32 * 2)),
+                        focus: Some((ring.clone(), base)),
                         ..Default::default()
                     },
                     move |d, t| {
@@ -458,7 +483,7 @@ fn domain_checks(ui: &Ui, ring: FocusRing) -> AnyView {
                     FieldCfg {
                         placeholder: "VALUE > 0",
                         mono: true,
-                        focus: Some((ring.clone(), VALUE_TAB + i as u32 * 2 + 1)),
+                        focus: Some((ring.clone(), base + 1)),
                         ..Default::default()
                     },
                     move |d, t| {
@@ -473,47 +498,58 @@ fn domain_checks(ui: &Ui, ring: FocusRing) -> AnyView {
                 h_stack((
                     name,
                     expr,
-                    row_button(icons::TRASH_2, "Remove", move || {
-                        draft.update(|d| {
-                            if let ObjectDraft::Domain(dom) = d
-                                && i < dom.info.checks.len()
-                            {
-                                dom.info.checks.remove(i);
-                            }
-                        });
-                        rev.update(|r| *r += 1);
-                    }),
+                    row_button(
+                        icons::TRASH_2,
+                        "Remove",
+                        ring.clone(),
+                        base + ROW_BUTTON_TAB,
+                        move || {
+                            draft.update(|d| {
+                                if let ObjectDraft::Domain(dom) = d
+                                    && i < dom.info.checks.len()
+                                {
+                                    dom.info.checks.remove(i);
+                                }
+                            });
+                            rev.update(|r| *r += 1);
+                        },
+                    ),
                 ))
                 .style(|s| s.flex_row().items_center().gap(6.0).width_full())
             }))
             .style(|s| s.flex_col().gap(6.0).width_full());
 
-            let add = crate::widgets::control_button("Add constraint", move || {
-                draft.update(|d| {
-                    if let ObjectDraft::Domain(dom) = d {
-                        // The next free suffix, not `len + 1`: removing a
-                        // constraint and adding another re-proposed a name
-                        // still in the list, and PostgreSQL always rejects
-                        // that plan (`constraint "email_check2" for domain
-                        // "email" already exists`).
-                        let stem = format!("{}_check", dom.info.name);
-                        let n = (1..)
-                            .find(|i| {
-                                !dom.info
-                                    .checks
-                                    .iter()
-                                    .any(|c| c.name == format!("{stem}{i}"))
-                            })
-                            .unwrap_or(1);
-                        dom.info.checks.push(CheckInfo {
-                            name: format!("{stem}{n}"),
-                            expression: "VALUE IS NOT NULL".to_string(),
-                            ..Default::default()
-                        });
-                    }
-                });
-                rev.update(|r| *r += 1);
-            });
+            let add = crate::widgets::control_button(
+                "Add constraint",
+                add_ring,
+                VALUE_TAB + n as u32 * ROW_TAB_STRIDE,
+                move || {
+                    draft.update(|d| {
+                        if let ObjectDraft::Domain(dom) = d {
+                            // The next free suffix, not `len + 1`: removing a
+                            // constraint and adding another re-proposed a name
+                            // still in the list, and PostgreSQL always rejects
+                            // that plan (`constraint "email_check2" for domain
+                            // "email" already exists`).
+                            let stem = format!("{}_check", dom.info.name);
+                            let n = (1..)
+                                .find(|i| {
+                                    !dom.info
+                                        .checks
+                                        .iter()
+                                        .any(|c| c.name == format!("{stem}{i}"))
+                                })
+                                .unwrap_or(1);
+                            dom.info.checks.push(CheckInfo {
+                                name: format!("{stem}{n}"),
+                                expression: "VALUE IS NOT NULL".to_string(),
+                                ..Default::default()
+                            });
+                        }
+                    });
+                    rev.update(|r| *r += 1);
+                },
+            );
             v_stack((
                 rows,
                 container(add).style(|s| s.width_full().margin_top(2.0)),
@@ -1015,7 +1051,7 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
             let root_ring = ring.clone();
 
             let body = crate::widgets::autohide(scroll(
-                form(&ui, &target, ring)
+                form(&ui, &target, ring.clone())
                     .style(|s| s.width_full().padding_horiz(MODAL_PAD_H).padding_vert(18.0)),
             ))
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
@@ -1055,19 +1091,35 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
 
             let preview_ui = ui.clone();
             let preview_target = target.clone();
+            let ring_actions = ring.clone();
             let actions = dyn_container(
                 move || (d.object_draft.get(), d.object_errors.get()),
                 move |(draft, errs)| {
                     let ui = preview_ui.clone();
                     let target = preview_target.clone();
+                    let ring = ring_actions.clone();
                     let cs = change_set(&target, &draft);
                     let ready = errs.is_empty() && draft.validate().is_empty() && !cs.is_empty();
                     h_stack((
-                        action_button("Cancel", ActionKind::Neutral, true, close),
-                        action_button("Preview SQL", ActionKind::Primary, ready, move || {
-                            let cs = change_set(&target, &draft);
-                            ddl_preview::open_preview(&ui, preview_from(&target, &draft, &cs));
-                        }),
+                        action_button(
+                            "Cancel",
+                            ActionKind::Neutral,
+                            true,
+                            ring.clone(),
+                            ACTION_TAB,
+                            close,
+                        ),
+                        action_button(
+                            "Preview SQL",
+                            ActionKind::Primary,
+                            ready,
+                            ring,
+                            ACTION_TAB + 10,
+                            move || {
+                                let cs = change_set(&target, &draft);
+                                ddl_preview::open_preview(&ui, preview_from(&target, &draft, &cs));
+                            },
+                        ),
                     ))
                     .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
                     .into_any()

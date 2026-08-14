@@ -35,9 +35,9 @@ use schemaic_core::intel::SqlDialect;
 use crate::settings::focusable_toggle_row;
 use crate::table_designer::{edit_ctx, focusable_owned_dropdown, loaded_table};
 use crate::widgets::{
-    ACTION_GAP, ActionKind, FORM_GAP, FocusRing, MODAL_PAD_H, action_button, focus_root_with_ring,
-    form_section, form_setting, form_setting_owned, modal_footer_split, modal_title_owned,
-    panel_style,
+    ACTION_GAP, ACTION_TAB, ActionKind, FORM_GAP, FocusRing, MODAL_PAD_H, action_button,
+    focus_root_with_ring, form_section, form_setting, form_setting_owned, modal_footer_split,
+    modal_title_owned, panel_style,
 };
 use crate::{
     DdlPreview, FieldCfg, Ui, ViewAlgoDoneFn, ViewAlgoRequest, ViewTarget, ddl_preview, edit_field,
@@ -448,7 +448,7 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
             let root_ring = ring.clone();
 
             let body = crate::widgets::autohide(scroll(
-                form(ui.clone(), &target, ring)
+                form(ui.clone(), &target, ring.clone())
                     .style(|s| s.width_full().padding_horiz(MODAL_PAD_H).padding_vert(18.0)),
             ))
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
@@ -487,19 +487,35 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
 
             let preview_ui = ui.clone();
             let preview_target = target.clone();
+            let ring_actions = ring.clone();
             let actions = dyn_container(
                 move || d.view_draft.get(),
                 move |draft| {
                     let ui = preview_ui.clone();
                     let target = preview_target.clone();
+                    let ring = ring_actions.clone();
                     let cs = change_set(&target, &draft);
                     let ready = draft.validate().is_empty() && !cs.is_empty();
                     h_stack((
-                        action_button("Cancel", ActionKind::Neutral, true, close),
-                        action_button("Preview SQL", ActionKind::Primary, ready, move || {
-                            let cs = change_set(&target, &draft);
-                            ddl_preview::open_preview(&ui, preview_from(&target, &draft, &cs));
-                        }),
+                        action_button(
+                            "Cancel",
+                            ActionKind::Neutral,
+                            true,
+                            ring.clone(),
+                            ACTION_TAB,
+                            close,
+                        ),
+                        action_button(
+                            "Preview SQL",
+                            ActionKind::Primary,
+                            ready,
+                            ring,
+                            ACTION_TAB + 10,
+                            move || {
+                                let cs = change_set(&target, &draft);
+                                ddl_preview::open_preview(&ui, preview_from(&target, &draft, &cs));
+                            },
+                        ),
                     ))
                     .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
                     .into_any()
