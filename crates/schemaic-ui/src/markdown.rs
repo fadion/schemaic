@@ -20,6 +20,21 @@ use floem::views::{RichText, rich_text};
 use crate::{icons, theme};
 
 // ===== moved from lib.rs (markdown cluster) =====
+/// Line height of every text run the markdown renderer emits, as a multiple of
+/// the font size.
+///
+/// Shared rather than repeated because cosmic-text centres a glyph in its line
+/// box — `centering_offset = (line_height - glyph_height) / 2` — so two views
+/// top-aligned beside each other only line up while their line heights agree.
+/// A list marker is exactly that: a plain label next to a `rich_text`, and at
+/// the default (the font's own metrics, ~1.2) it floated a couple of pixels
+/// above the item it belongs to.
+const MD_LINE_HEIGHT: f32 = 1.4;
+
+/// Body font size for markdown prose — list items, paragraphs, table cells.
+/// Headings scale from [`heading_size`] instead.
+const MD_FONT_SIZE: f32 = 14.0;
+
 /// Inline run style flags — emphasis nests, so these compose (bold *and* italic,
 /// code inside a link, …). Built from the CommonMark event stream.
 #[derive(Clone, Copy, Default)]
@@ -53,7 +68,7 @@ fn inline_text(
         .font_size(font_size)
         .color(base)
         .weight(base_weight)
-        .line_height(LineHeightValue::Normal(1.4));
+        .line_height(LineHeightValue::Normal(MD_LINE_HEIGHT));
     let mut list = AttrsList::new(base_attrs);
     let mut pos = 0usize;
     for (t, st) in &runs {
@@ -65,7 +80,7 @@ fn inline_text(
                     .family(&mono)
                     .font_size(font_size - 1.0)
                     .color(theme::text())
-                    .line_height(LineHeightValue::Normal(1.4)),
+                    .line_height(LineHeightValue::Normal(MD_LINE_HEIGHT)),
             );
         } else if st.bold || st.italic || st.strike || st.link || bold_all {
             let color = if st.link {
@@ -85,7 +100,7 @@ fn inline_text(
                 .font_size(font_size)
                 .color(color)
                 .weight(weight)
-                .line_height(LineHeightValue::Normal(1.4));
+                .line_height(LineHeightValue::Normal(MD_LINE_HEIGHT));
             if st.italic {
                 a = a.style(FontStyle::Italic);
             }
@@ -119,14 +134,19 @@ fn md_item(
     quote: usize,
 ) -> AnyView {
     h_stack((
+        // Same size *and* line height as the content beside it — the marker is a
+        // plain label rather than a `rich_text`, so nothing else makes the two
+        // line boxes agree, and only equal boxes put the two glyphs on one
+        // baseline under `items_start` (see [`MD_LINE_HEIGHT`]).
         text(marker).style(|s| {
             s.flex_shrink(0.0_f32)
                 .min_width(16.0)
                 .color(theme::text_dim())
-                .font_size(14.0)
+                .font_size(MD_FONT_SIZE)
+                .line_height(MD_LINE_HEIGHT)
                 .margin_right(4.0)
         }),
-        inline_text(runs, base, false, 14.0).style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
+        inline_text(runs, base, false, MD_FONT_SIZE).style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
     ))
     .style(move |s| {
         md_quote_wrap(
@@ -154,7 +174,7 @@ fn md_table(
             let cell_views: Vec<AnyView> = cells
                 .into_iter()
                 .map(|runs| {
-                    inline_text(runs, base, is_head, 14.0)
+                    inline_text(runs, base, is_head, MD_FONT_SIZE)
                         .style(|s| {
                             s.flex_grow(1.0_f32)
                                 .flex_basis(0.0)
@@ -299,9 +319,10 @@ pub(crate) fn render_markdown(src: &str, actions: CodeActions) -> impl IntoView 
                     // Inside a list item, the item's text flushes on End(Item) (or
                     // before a nested list); a top-level paragraph flushes here.
                     if item_stack.is_empty() && !runs.is_empty() {
-                        let block = inline_text(std::mem::take(&mut runs), base, false, 14.0)
-                            .style(move |s| md_quote_wrap(s.width_full(), quote))
-                            .into_any();
+                        let block =
+                            inline_text(std::mem::take(&mut runs), base, false, MD_FONT_SIZE)
+                                .style(move |s| md_quote_wrap(s.width_full(), quote))
+                                .into_any();
                         out.push(block);
                     }
                 }
