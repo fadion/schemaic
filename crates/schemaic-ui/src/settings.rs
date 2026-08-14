@@ -187,8 +187,8 @@ fn shell_dropdown(
 }
 
 /// A self-describing toggle row — title + hint on the left, switch on the right
-/// — whose switch is in a modal's Tab order and can be flipped with Space or
-/// Enter.
+/// — whose switch is in a modal's Tab order and can be flipped with Space (or
+/// Enter, which floem's own switch answers; see [`focusable_toggle`]).
 ///
 /// There is no un-focusable variant: every toggle in the app lives in a modal
 /// that has a ring, and a second one would only be a way to leave a control out
@@ -429,7 +429,19 @@ pub(crate) fn themed_toggle(sig: RwSignal<bool>) -> impl IntoView {
 }
 
 /// A [`themed_toggle`] in a modal's Tab order, operable from the keyboard:
-/// Space or Enter flips it.
+/// **Space** flips it.
+///
+/// Space and not Enter, because floem answers Enter itself and the two do not
+/// compose. `ToggleButton::event_before_children` calls `ontoggle(!state)` on
+/// Enter and returns `Continue`, and the listener block then runs *every*
+/// registered KeyDown listener, OR-folding without short-circuiting — so a
+/// handler here that also inverted the signal flipped it twice and netted zero.
+/// The switch is now flipped exactly once per press either way: by floem on
+/// Enter, by this listener on Space, which `ToggleButton` ignores.
+///
+/// `disable_default_event` is not the answer to that overlap: the same gate
+/// covers the whole listener block, so taking floem's Enter arm out would take
+/// [`crate::widgets::in_focus_ring`]'s Tab/Escape handler with it.
 ///
 /// Safe to add a second KeyDown listener on top of the ring's — floem keeps a
 /// `Vec` of listeners per event type, so both run. (`on_cleanup` is the one with
@@ -446,10 +458,8 @@ pub(crate) fn focusable_toggle(
                 return floem::event::EventPropagation::Continue;
             };
             use floem::keyboard::{Key, NamedKey};
-            if matches!(
-                ke.key.logical_key,
-                Key::Named(NamedKey::Space) | Key::Named(NamedKey::Enter)
-            ) {
+            // Space only — Enter is floem's, and claiming it here flips twice.
+            if ke.key.logical_key == Key::Named(NamedKey::Space) {
                 sig.update(|v| *v = !*v);
                 return floem::event::EventPropagation::Stop;
             }

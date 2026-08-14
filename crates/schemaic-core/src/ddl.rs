@@ -353,16 +353,43 @@ impl TableDraft {
             .is_some_and(|c| self.primary_key.contains(&c.key_name))
     }
 
-    /// Add the column at `idx` to the primary key (appended in click order) or
-    /// take it out. The counterpart to [`TableDraft::is_in_primary_key`], and for
-    /// the same reason: a by-name `retain` mid-rename removes the *other*
-    /// column's membership.
+    /// Add the column at `idx` to the primary key or take it out. The
+    /// counterpart to [`TableDraft::is_in_primary_key`], and for the same reason:
+    /// a by-name `retain` mid-rename removes the *other* column's membership.
+    ///
+    /// A member is inserted at **its own column ordinal**, not appended, so that
+    /// taking a column out and putting it straight back is a no-op on a key that
+    /// is in column order. Appending was not: any path that wrote the toggle
+    /// twice — and the app had one, an Enter on the focused switch that flipped
+    /// it off and on within a single keypress — moved a *composite* key's column
+    /// to the end, and a key that looks unchanged on screen emits `DROP PRIMARY
+    /// KEY` + `ADD PRIMARY KEY (…reordered…)`, i.e. a clustered-index rebuild.
+    /// The residual is deliberate and visible: a key the server reports out of
+    /// column order (`PRIMARY KEY (b, a)`) is *normalized* by an off-then-on
+    /// pair rather than restored, which takes two deliberate clicks and shows in
+    /// the change count.
     pub fn set_in_primary_key(&mut self, idx: usize, member: bool) {
         let Some(name) = self.columns.get(idx).map(|c| c.key_name.clone()) else {
             return;
         };
         match member {
-            true if !self.primary_key.contains(&name) => self.primary_key.push(name),
+            true if !self.primary_key.contains(&name) => {
+                // The first member whose column sits after this one; a member
+                // naming no column at all (mid-rename) counts as after, so a
+                // half-typed name never pushes a real column out of order.
+                let at = self
+                    .primary_key
+                    .iter()
+                    .position(|p| {
+                        !self
+                            .columns
+                            .iter()
+                            .position(|c| c.key_name == *p)
+                            .is_some_and(|o| o < idx)
+                    })
+                    .unwrap_or(self.primary_key.len());
+                self.primary_key.insert(at, name);
+            }
             true => {}
             false => self.primary_key.retain(|p| *p != name),
         }
@@ -5973,6 +6000,37 @@ mod tests {
         assert_eq!(d.primary_key, vec!["a"]);
         d.set_in_primary_key(1, true);
         assert_eq!(d.primary_key, vec!["a", "ab"]);
+    }
+
+    #[test]
+    fn taking_a_composite_key_column_out_and_back_leaves_the_key_alone() {
+        // A double-write of the toggle — the app had one, an Enter on the
+        // focused switch flipping it off and on inside a single keypress — used
+        // to move the column to the *end* of the key: a keypress whose visible
+        // result is nothing emitted `DROP PRIMARY KEY` + a reordered `ADD`.
+        let mut d = TableDraft::from_table(&ab_table());
+        d.columns[1].info.nullable = false;
+        d.primary_key = vec!["a".into(), "b".into()];
+        d.set_in_primary_key(0, false);
+        d.set_in_primary_key(0, true);
+        assert_eq!(d.primary_key, vec!["a", "b"]);
+        // Same for the middle of a three-column key.
+        d.primary_key = vec!["a".into(), "b".into()];
+        d.set_in_primary_key(1, false);
+        d.set_in_primary_key(1, true);
+        assert_eq!(d.primary_key, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_new_key_member_lands_at_its_column_ordinal() {
+        let mut d = TableDraft::from_table(&ab_table());
+        d.primary_key = vec!["b".into()];
+        d.set_in_primary_key(0, true);
+        assert_eq!(d.primary_key, vec!["a", "b"], "a is column 0, so it leads");
+        d.primary_key.clear();
+        d.set_in_primary_key(1, true);
+        d.set_in_primary_key(0, true);
+        assert_eq!(d.primary_key, vec!["a", "b"], "click order doesn't decide");
     }
 
     #[test]
