@@ -3652,6 +3652,47 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         draft.color.set(Some(pick_connection_color(&used_colors)));
     });
 
+    // Duplicate a saved connection: same server, new identity, selected in the
+    // form so the one thing the copy is missing — what makes it different — is
+    // where the cursor already is.
+    //
+    // Persisted at once, unlike New, which leaves an unsaved draft. The copy's
+    // whole value is the credentials it carries, and those only reach the
+    // keyring through a save; a duplicate that evaporates when the user clicks
+    // another row would have saved them nothing.
+    let duplicate_conn: Rc<dyn Fn(u64)> = {
+        let select_conn = select_conn.clone();
+        Rc::new(move |id: u64| {
+            let Some(src) =
+                connections.with_untracked(|cs| cs.iter().find(|c| c.id == id).cloned())
+            else {
+                return;
+            };
+            let (names, used_colors, next_id) = connections.with_untracked(|cs| {
+                (
+                    cs.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                    cs.iter()
+                        .filter_map(|c| c.color.clone())
+                        .collect::<Vec<_>>(),
+                    // Same rule `save_conn` uses for a new connection's id.
+                    cs.iter().map(|c| c.id).max().unwrap_or(0) + 1,
+                )
+            });
+            // A fresh colour, not the original's: the dot is what tells two
+            // connections apart in the switcher and on their tabs, and a copy
+            // of a connection is precisely the case where the *names* are
+            // nearly identical too.
+            let copy = src.duplicate(
+                next_id,
+                unique_name(&format!("{} (copy)", src.name), &names),
+                Some(pick_connection_color(&used_colors)),
+            );
+            connections.update(|cs| cs.push(copy));
+            persist_conns(Some(active_conn.get_untracked()));
+            (select_conn)(next_id);
+        })
+    };
+
     // Test the draft's host + credentials without saving: open a throwaway
     // connection (and, for SSH, a throwaway tunnel that drops at task end — never
     // cached, since the draft may differ from any saved connection) and ping it.
@@ -5051,6 +5092,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             switch_conn,
             select_conn,
             new_conn,
+            duplicate_conn,
             save_conn,
             toggle_read_only,
             delete_conn,

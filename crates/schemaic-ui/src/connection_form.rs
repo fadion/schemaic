@@ -20,7 +20,7 @@ use schemaic_core::connection::SshAuth;
 use crate::consts::MASK_CH;
 use crate::settings::{focusable_dropdown, focusable_toggle_row};
 use crate::widgets::{
-    ACTION_GAP, ACTION_TAB, ActionKind, FocusRing, NAV_TAB, NavAxis, action_button_icon,
+    ACTION_GAP, ACTION_TAB, ActionKind, FocusRing, MenuEntry, NAV_TAB, NavAxis, action_button_icon,
     action_face, autohide, control_button, focus_root_with_ring, form_hint, form_label_style,
     in_ring_button, loading_dots, menu_item_style, modal_title, nav_group, panel_style,
 };
@@ -34,6 +34,10 @@ const SAVE_FLASH: std::time::Duration = std::time::Duration::from_millis(2000);
 /// and looking at, and unlike Save there is nothing else on screen that says how
 /// it went.
 const TEST_FLASH: std::time::Duration = std::time::Duration::from_millis(4000);
+/// Width of the connection list's right-click menu. Narrower than the shared
+/// 170px default because both its labels are one short word; the editor's
+/// right-click menu makes the same call at 120.
+const CONN_MENU_W: f64 = 130.0;
 
 /// The engine choice in the connection form's **Type** picker. Backs a
 /// [`crate::settings::focusable_dropdown`]; the selection is persisted into `Connection::db_type`
@@ -447,8 +451,15 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
     let select_conn = ui.conn_actions.select_conn.clone();
     let new_conn = ui.conn_actions.new_conn.clone();
     let save_conn = ui.conn_actions.save_conn.clone();
+    let duplicate_conn = ui.conn_actions.duplicate_conn.clone();
     let delete_conn = ui.conn_actions.delete_conn.clone();
     let test_conn = ui.conn_actions.test_conn.clone();
+    // The list's right-click menu goes through the app-wide popup channel, like
+    // every other menu — it is rendered at the workspace root, which is the only
+    // surface painted above this modal's panel.
+    let popup_menu = ui.overlay.popup_menu;
+    let popup_anchor = ui.overlay.popup_anchor;
+    let popup_width = ui.overlay.popup_width;
     let conn_test = ui.conn.conn_test;
     // Transient confirmations standing in for the two safe actions' labels: a
     // check on Save, the result icon on Test. Created here (once, in the stable
@@ -497,12 +508,17 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
             // choose which one.
             let ring = FocusRing::new();
             let select = select_conn.clone();
+            let row_dup = duplicate_conn.clone();
+            let row_del = delete_conn.clone();
             let list = dyn_stack(
                 move || connections.get(),
                 |c: &Connection| c.id,
                 move |c| {
                     let id = c.id;
                     let select = select.clone();
+                    let menu_select = select.clone();
+                    let dup = row_dup.clone();
+                    let del = row_del.clone();
                     // `[colour dot] [name]`, reflecting this connection's *stored*
                     // name/colour. Reads `connections` (not the draft) so the row
                     // refreshes only when Save writes the edit back — never live while
@@ -529,6 +545,30 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                     );
                     container(label)
                         .on_click_stop(move |_| (select)(id))
+                        // Right-click opens the row's own menu — and selects the
+                        // row first, so the form is showing the connection the
+                        // menu is about to act on. Delete has no confirmation
+                        // step, so "which one is this about" has to be answered
+                        // before it is clicked, not after. Selecting discards an
+                        // unsaved draft, but a left-click on the same row
+                        // already does that, so the gesture costs nothing new.
+                        .on_secondary_click_stop(move |_| {
+                            (menu_select)(id);
+                            let (dup, del) = (dup.clone(), del.clone());
+                            popup_anchor.set(None);
+                            popup_width.set(CONN_MENU_W);
+                            popup_menu.set(Some(vec![
+                                MenuEntry::action("Duplicate", move || (dup)(id)),
+                                // Red, like every other destructive menu entry
+                                // in the app (the schema tree's Drop). It asks
+                                // nothing first, matching the form's own Delete
+                                // button — one action, one answer, wherever it
+                                // is reached from.
+                                MenuEntry::action_colored("Delete", theme::error, move || {
+                                    (del)(id)
+                                }),
+                            ]));
+                        })
                         // Full-width row: resting `conn_list_text`, hover text
                         // brightens (no bg), selected = bright text on a full-width
                         // `conn_list_sel_bg`.

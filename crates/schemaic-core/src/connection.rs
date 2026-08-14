@@ -257,6 +257,31 @@ impl Connection {
         format!("{}:{}", self.host, self.port)
     }
 
+    /// A copy of this connection ready to be saved as a new one: everything
+    /// that says **how to reach the server** is carried, and only what
+    /// identifies the connection *to the user* — its id, name and colour — is
+    /// replaced by what the caller supplies.
+    ///
+    /// The credentials are the point. They live in the OS keyring (see
+    /// [`crate::secrets`]), so the alternative to this is retyping a password
+    /// and a whole SSH block to reach a second database on the same host. The
+    /// guard-rails come across for the opposite reason: a copy of a read-only
+    /// production connection that opened writable would be a worse trap than
+    /// having no duplicate at all.
+    ///
+    /// Written as a struct update rather than a field-by-field build, so a
+    /// field added to [`Connection`] later is carried **by construction** — the
+    /// failure mode here is a new credential silently not being copied, which
+    /// no compiler error would catch in the explicit form.
+    pub fn duplicate(&self, id: u64, name: String, color: Option<String>) -> Connection {
+        Connection {
+            id,
+            name,
+            color,
+            ..self.clone()
+        }
+    }
+
     /// Do these two point at the same server — everything that decides *which*
     /// server the next query reaches, and nothing else?
     ///
@@ -378,6 +403,63 @@ mod tests {
             read_only: false,
             environment: Environment::None,
         }
+    }
+
+    /// A connection with every secret-bearing field filled — what a duplicate
+    /// exists to avoid retyping.
+    fn tunnelled() -> Connection {
+        Connection {
+            ssh: SshTunnel {
+                enabled: true,
+                host: "bastion.example.com".to_string(),
+                port: 2222,
+                user: "deploy".to_string(),
+                password: "ssh-secret".to_string(),
+                auth: SshAuth::KeyPair,
+                key_path: "C:/keys/id_ed25519".to_string(),
+                key_passphrase: "key-secret".to_string(),
+            },
+            ..conn()
+        }
+    }
+
+    /// The whole point: the credentials come across. They live in the keyring,
+    /// so a copy made by hand means retyping every one of them.
+    #[test]
+    fn a_duplicate_carries_the_credentials_and_the_whole_ssh_block() {
+        let copy = tunnelled().duplicate(7, "copy".to_string(), None);
+        assert_eq!(copy.host, "db.example.com");
+        assert_eq!(copy.port, 3307);
+        assert_eq!(copy.user, "root");
+        assert_eq!(copy.password, "secret");
+        assert_eq!(copy.db_type, "MySQL");
+        assert_eq!(copy.ssh, tunnelled().ssh);
+    }
+
+    /// …and only what identifies it *to the user* is replaced.
+    #[test]
+    fn a_duplicate_takes_the_new_identity_it_is_given() {
+        let copy = conn().duplicate(7, "prod (copy)".to_string(), Some("#ff0000".into()));
+        assert_eq!(copy.id, 7);
+        assert_eq!(copy.name, "prod (copy)");
+        assert_eq!(copy.color.as_deref(), Some("#ff0000"));
+    }
+
+    /// A guard-rail is not decoration: a copy of a read-only production
+    /// connection that opened writable, or badged as something else, would be a
+    /// worse trap than having no duplicate at all.
+    #[test]
+    fn a_duplicate_keeps_the_guard_rails() {
+        let src = Connection {
+            read_only: true,
+            prominent_color: true,
+            environment: Environment::Production,
+            ..conn()
+        };
+        let copy = src.duplicate(7, "copy".to_string(), None);
+        assert!(copy.read_only);
+        assert!(copy.prominent_color);
+        assert_eq!(copy.environment, Environment::Production);
     }
 
     #[test]

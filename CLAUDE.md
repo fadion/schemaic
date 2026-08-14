@@ -278,7 +278,10 @@ Zed-inspired, aiming to replace DataGrip.
     through a `…Raw` shim with `#[serde(other)]`, so a value written by a newer build degrades to a
     default instead of failing all of `connections.json`. There is deliberately no
     `mysql://user:pass@host` builder, and the password fields here aren't what's on disk — see
-    `secrets.rs`. `targets_same_server` is the "is this still the same server" test the schema
+    `secrets.rs`. `duplicate` is the copy the connection list's right-click menu makes — a
+    **struct update**, so a field added to `Connection` later is carried by construction; the
+    failure mode is a credential silently not copied, which the field-by-field form would not
+    fail to compile over. `targets_same_server` is the "is this still the same server" test the schema
     tree's reload gates on (see `schema.rs`'s `SchemaState::begin_refresh`) — everything that
     decides which server the next query reaches and nothing else, so a rename or a colour can't
     blank the tree and a repointed host can't leave another server's databases on it.
