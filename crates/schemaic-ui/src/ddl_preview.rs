@@ -20,9 +20,9 @@ use floem::prelude::*;
 use schemaic_core::text::plural;
 
 use crate::widgets::{
-    ACTION_GAP, ActionKind, ExitAction, MODAL_PAD_H, action_button, action_button_icon, autohide,
-    exit_action, focus_root, form_section, form_section_owned, modal_footer_split,
-    modal_title_owned, panel_style,
+    ACTION_GAP, ActionKind, ExitAction, FocusRing, MODAL_PAD_H, action_button, action_button_icon,
+    autohide, exit_action, focus_root_with_ring, form_section, form_section_owned,
+    modal_footer_split, modal_title_owned, panel_style,
 };
 use crate::{DdlOutcome, DdlPreview, DdlRunRequest, FieldCfg, Ui, edit_field, icons, theme};
 
@@ -243,6 +243,13 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                 return empty().into_any();
             };
 
+            // One Tab stop: the script box. It is read-only, but it is the thing
+            // this modal exists to be *read*, and Tab is how a keyboard reaches it
+            // to scroll and select. The footer stays pointer-only, so nothing else
+            // joins.
+            let ring = FocusRing::new();
+            let root_ring = ring.clone();
+
             let body: AnyView = if applied {
                 container(
                     v_stack((
@@ -288,6 +295,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             mono: true,
                             font_size: theme::FONT_BODY,
                             max_rows: Some(d.sql_rows),
+                            focus: Some((ring, 10)),
                             ..Default::default()
                         },
                     )
@@ -436,7 +444,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
             .on_click_stop(|_| {})
             .style(|s| panel_style(s).width(PANEL_W).height(PANEL_H));
 
-            focus_root(container(panel))
+            focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| exit())
                 .style(|s| {
                     s.size_full()

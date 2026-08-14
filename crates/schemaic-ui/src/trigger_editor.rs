@@ -59,13 +59,14 @@ use schemaic_core::schema::{
     RoutineInfo, TriggerAction, TriggerEvent, TriggerInfo, TriggerLevel, TriggerTiming,
 };
 
-use crate::settings::settings_toggle_row;
+use crate::settings::focusable_toggle_row;
 use crate::table_designer::{
-    edit_ctx, empty_hint, list_actions, list_pane, list_row_plain, loaded_table, owned_dropdown,
+    LIST_TAB, edit_ctx, empty_hint, focusable_owned_dropdown, list_actions, list_pane,
+    list_row_plain, loaded_table,
 };
 use crate::widgets::{
-    ACTION_GAP, ActionKind, FORM_GAP, MODAL_PAD_H, action_button, control_button,
-    control_button_enabled, focus_root, form_section, form_setting, form_setting_owned,
+    ACTION_GAP, ActionKind, FORM_GAP, FocusRing, MODAL_PAD_H, action_button, control_button,
+    control_button_enabled, focus_root_with_ring, form_section, form_setting, form_setting_owned,
     modal_footer_split, modal_title_owned, panel_style,
 };
 use crate::{
@@ -378,14 +379,18 @@ fn bound_choice(
     i: usize,
     initial: String,
     options: Vec<String>,
+    ring: FocusRing,
+    tabindex: u32,
     apply: impl Fn(&mut TriggerDraft, &str) + 'static,
 ) -> AnyView {
     let draft = ui.ddl.trigger_draft;
     let sig = floem::reactive::create_rw_signal(initial);
-    owned_dropdown(
+    focusable_owned_dropdown(
         move || sig.get(),
         options,
         FIELD_W,
+        ring,
+        tabindex,
         move |v: String| {
             if sig.get_untracked() != v {
                 sig.set(v.clone());
@@ -434,11 +439,19 @@ fn bound_fn_field(
 /// `read`/`write` take the whole list so one helper can serve two different
 /// draft signals; only add and remove bump `rev`, so typing never tears down the
 /// field being typed into.
+///
+/// `ring`/`tabindex` place the rows in the modal's Tab order, one stop each from
+/// `tabindex` upwards — so a list that grows keeps its own contiguous block and
+/// the add/remove buttons (pointer-only, like every other button here) stay out
+/// of it.
+#[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
 fn value_rows(
     ui: &Ui,
     placeholder: &'static str,
     add_label: &'static str,
     mono: bool,
+    ring: FocusRing,
+    tabindex: u32,
     read: impl Fn() -> Vec<String> + Clone + 'static,
     write: impl Fn(Vec<String>) + Clone + 'static,
 ) -> AnyView {
@@ -449,6 +462,7 @@ fn value_rows(
         move |_| {
             let (read, write) = (read.clone(), write.clone());
             let (read_a, write_a) = (read.clone(), write.clone());
+            let ring = ring.clone();
             let rows = v_stack_from_iter(read().into_iter().enumerate().map(move |(i, v)| {
                 let sig = floem::reactive::create_rw_signal(v);
                 let (read_i, write_i) = (read.clone(), write.clone());
@@ -470,6 +484,7 @@ fn value_rows(
                         FieldCfg {
                             placeholder,
                             mono,
+                            focus: Some((ring.clone(), tabindex + i as u32)),
                             ..Default::default()
                         },
                     )
@@ -510,7 +525,7 @@ fn value_rows(
 ///
 /// Built once per `(selected, rev)` — never keyed on the draft — for the reason
 /// the designer's form isn't: a draft-keyed form is torn down mid-keystroke.
-fn form(ui: Ui, target: &TriggerTarget, i: usize) -> AnyView {
+fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
     let d = ui.ddl.trigger_draft;
     let Some(draft) = d.with_untracked(|s| s.triggers.get(i).cloned()) else {
         // Same empty state the designer's tabs show, in the same place: this pane
@@ -553,6 +568,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize) -> AnyView {
             draft.info.name.clone(),
             FieldCfg {
                 placeholder: "trigger_name",
+                focus: Some((ring.clone(), 10)),
                 ..Default::default()
             },
             |d, v| d.info.name = v.trim().to_string(),
@@ -577,6 +593,8 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize) -> AnyView {
             i,
             draft.info.timing.sql().to_string(),
             timings,
+            ring.clone(),
+            20,
             |d, v| {
                 d.info.timing = TriggerTiming::parse(v).unwrap_or_default();
             },
@@ -588,12 +606,15 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize) -> AnyView {
     // one control that lies about what the server accepts.
     let events: AnyView = if pg {
         let mut rows: Vec<AnyView> = Vec::new();
-        for ev in [
+        for (n, ev) in [
             TriggerEvent::Insert,
             TriggerEvent::Update,
             TriggerEvent::Delete,
             TriggerEvent::Truncate,
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let on = floem::reactive::create_rw_signal(draft.info.events.contains(&ev));
             create_effect(move |prev: Option<bool>| {
                 let v = on.get();
@@ -621,13 +642,15 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize) -> AnyView {
                 v
             });
             rows.push(
-                settings_toggle_row(
+                focusable_toggle_row(
                     ev.sql(),
                     match ev {
                         TriggerEvent::Truncate => "Statement-level only.",
                         _ => "",
                     },
                     on,
+                    ring.clone(),
+                    30 + n as u32,
                 )
                 .into_any(),
             );
@@ -648,6 +671,8 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize) -> AnyView {
                     .map(|e| e.sql().to_string())
                     .unwrap_or_else(|| "INSERT".into()),
                 vec!["INSERT".into(), "UPDATE".into(), "DELETE".into()],
+                ring.clone(),
+                30,
                 |d, v| {
                     d.info.events = TriggerEvent::parse(v).into_iter().collect();
                 },
@@ -656,47 +681,60 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize) -> AnyView {
         .into_any()
     };
 
-    // FOR EACH ROW is the only level MySQL has, so the control is PostgreSQL's.
-    let level = form_setting(
-        "Fires",
-        bound_choice(
-            &ui,
-            i,
-            draft.info.level.sql().to_string(),
-            vec!["FOR EACH ROW".into(), "FOR EACH STATEMENT".into()],
-            |d, v| {
-                d.info.level = if v.contains("STATEMENT") {
-                    TriggerLevel::Statement
-                } else {
-                    TriggerLevel::Row
-                };
-            },
-        ),
-    )
-    .style(move |s| if pg { s } else { s.hide() });
-
-    let when = form_setting(
-        "When",
-        bound_field(
-            &ui,
-            i,
-            draft.info.condition.clone().unwrap_or_default(),
-            FieldCfg {
-                placeholder: "new.total > 0",
-                mono: true,
-                ..Default::default()
-            },
-            |d, v| {
-                d.info.condition = Some(v.trim().to_string()).filter(|c| !c.is_empty());
-            },
+    // FOR EACH ROW is the only level MySQL has, so the control is PostgreSQL's —
+    // and it is built only there rather than built and hidden, since a `hide()`n
+    // control is still in the modal's Tab order.
+    let level: AnyView = if !pg {
+        empty().into_any()
+    } else {
+        form_setting(
+            "Fires",
+            bound_choice(
+                &ui,
+                i,
+                draft.info.level.sql().to_string(),
+                vec!["FOR EACH ROW".into(), "FOR EACH STATEMENT".into()],
+                ring.clone(),
+                40,
+                |d, v| {
+                    d.info.level = if v.contains("STATEMENT") {
+                        TriggerLevel::Statement
+                    } else {
+                        TriggerLevel::Row
+                    };
+                },
+            ),
         )
-        .style(move |s| s.width(FIELD_W * 1.6)),
-    )
-    .style(move |s| if pg { s } else { s.hide() });
+        .into_any()
+    };
+
+    let when: AnyView = if !pg {
+        empty().into_any()
+    } else {
+        form_setting(
+            "When",
+            bound_field(
+                &ui,
+                i,
+                draft.info.condition.clone().unwrap_or_default(),
+                FieldCfg {
+                    placeholder: "new.total > 0",
+                    mono: true,
+                    focus: Some((ring.clone(), 50)),
+                    ..Default::default()
+                },
+                |d, v| {
+                    d.info.condition = Some(v.trim().to_string()).filter(|c| !c.is_empty());
+                },
+            )
+            .style(move |s| s.width(FIELD_W * 1.6)),
+        )
+        .into_any()
+    };
 
     // The action: a body on MySQL, a function to call on PostgreSQL.
     let action: AnyView = if pg {
-        pg_action(&ui, i, &draft, target).into_any()
+        pg_action(&ui, i, &draft, target, ring.clone()).into_any()
     } else {
         form_setting(
             "Body",
@@ -719,6 +757,9 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize) -> AnyView {
                     // Long SQL lines scrolling sideways is also what the editor
                     // itself does by default.
                     no_wrap: true,
+                    focus: Some((ring, 60)),
+                    // It's a trigger body: Tab indents. Escape leaves.
+                    tab_indents: true,
                     ..Default::default()
                 },
                 |d, v| d.info.action = TriggerAction::Body(v.to_string()),
@@ -808,7 +849,13 @@ fn fn_names(f: &RoutineInfo, sql: &str) -> bool {
     sql.replace('"', "") == fn_display(f)
 }
 
-fn pg_action(ui: &Ui, i: usize, draft: &TriggerDraft, target: &TriggerTarget) -> AnyView {
+fn pg_action(
+    ui: &Ui,
+    i: usize,
+    draft: &TriggerDraft,
+    target: &TriggerTarget,
+    ring: FocusRing,
+) -> AnyView {
     let d = ui.ddl.trigger_draft;
     let fns = ui.ddl.functions;
     // `TriggerAction::Function::name` is **emittable SQL** on both producers:
@@ -845,6 +892,7 @@ fn pg_action(ui: &Ui, i: usize, draft: &TriggerDraft, target: &TriggerTarget) ->
             sel.set(named);
         }
     });
+    let picker_ring = ring.clone();
     let picker = dyn_container(
         move || (fns.get(), sel.get()),
         move |(list, named)| {
@@ -854,10 +902,12 @@ fn pg_action(ui: &Ui, i: usize, draft: &TriggerDraft, target: &TriggerTarget) ->
             if !named.is_empty() && !options.contains(&named) {
                 options.insert(0, named);
             }
-            owned_dropdown(
+            focusable_owned_dropdown(
                 move || sel.get(),
                 options,
                 FIELD_W,
+                picker_ring.clone(),
+                60,
                 move |v: String| {
                     // Display back to SQL. An entry not in the list is the
                     // fallback row above — it *is* the stored SQL, so it goes
@@ -933,6 +983,8 @@ fn pg_action(ui: &Ui, i: usize, draft: &TriggerDraft, target: &TriggerTarget) ->
                 "col_a",
                 "Add argument",
                 false,
+                ring,
+                70,
                 move || {
                     d.with(|s| match s.triggers.get(i).map(|t| &t.info.action) {
                         Some(TriggerAction::Function { args, .. }) => args.clone(),
@@ -960,7 +1012,7 @@ fn pg_action(ui: &Ui, i: usize, draft: &TriggerDraft, target: &TriggerTarget) ->
 
 // ── the function form ────────────────────────────────────────────────────────
 
-fn function_form(ui: Ui) -> AnyView {
+fn function_form(ui: Ui, ring: FocusRing) -> AnyView {
     let d = ui.ddl.function_draft;
     let draft = d.get_untracked();
 
@@ -972,6 +1024,7 @@ fn function_form(ui: Ui) -> AnyView {
             draft.info.name.clone(),
             FieldCfg {
                 placeholder: "audit_fn",
+                focus: Some((ring.clone(), 10)),
                 ..Default::default()
             },
             |d, v| d.info.name = v.trim().to_string(),
@@ -981,10 +1034,12 @@ fn function_form(ui: Ui) -> AnyView {
 
     let language = form_setting("Language", {
         let sig = floem::reactive::create_rw_signal(draft.info.language.clone());
-        owned_dropdown(
+        focusable_owned_dropdown(
             move || sig.get(),
             vec!["plpgsql".into(), "sql".into()],
             FIELD_W,
+            ring.clone(),
+            20,
             move |v: String| {
                 if sig.get_untracked() != v {
                     sig.set(v.clone());
@@ -1009,6 +1064,9 @@ fn function_form(ui: Ui) -> AnyView {
                 // content on the first frame instead of guessing from a width
                 // that hasn't settled.
                 no_wrap: true,
+                focus: Some((ring.clone(), 30)),
+                // It's a function body: Tab indents. Escape leaves.
+                tab_indents: true,
                 ..Default::default()
             },
             |d, v| d.info.body = v.to_string(),
@@ -1028,11 +1086,13 @@ fn function_form(ui: Ui) -> AnyView {
             }
             v
         });
-        settings_toggle_row(
+        focusable_toggle_row(
             "Security definer",
             "Runs with the owner's rights instead of the caller's. Pin a search_path \
              below when you use this.",
             sig,
+            ring.clone(),
+            40,
         )
     };
 
@@ -1043,6 +1103,8 @@ fn function_form(ui: Ui) -> AnyView {
             "search_path=public, pg_temp",
             "Add setting",
             true,
+            ring,
+            50,
             move || d.with(|s| s.info.settings.clone()),
             move |v| d.update(|s| s.info.settings = v),
         )
@@ -1081,6 +1143,7 @@ fn trigger_list(
     is_view: bool,
     table: String,
     schema: Option<String>,
+    ring: FocusRing,
 ) -> impl IntoView {
     let d = ui.ddl.trigger_draft;
     let selected = ui.ddl.selected;
@@ -1146,7 +1209,15 @@ fn trigger_list(
     // execution order — MySQL's ordering is the `FOLLOWS` clause and
     // PostgreSQL fires alphabetically. Offering ↑/↓ here would imply a control
     // over firing order that moving a row does not have.
-    list_pane(rows, list_actions(add, remove, None, None))
+    // One Tab stop for the list, ahead of the form it feeds; Up/Down walk it.
+    list_pane(
+        rows,
+        list_actions(add, remove, None, None),
+        selected,
+        move || d.with_untracked(|s| s.triggers.len()),
+        ring,
+        LIST_TAB,
+    )
 }
 
 fn fn_change_set(target: &FunctionTarget, draft: &FunctionDraft) -> ddl::ChangeSet {
@@ -1218,13 +1289,21 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
             // draft-keyed form is torn down mid-keystroke. `rev` is in the key
             // because removing the selected row leaves `selected` unchanged
             // while the item at that index is now a different trigger.
+            // One ring for the modal, not one per form: the form rebuilds on
+            // every selection change and `in_focus_ring` unregisters on unmount,
+            // so its controls simply re-register here. The list is in it as a
+            // single stop, where Up/Down move the selection.
+            let ring = FocusRing::new();
+            let root_ring = ring.clone();
+
             let form_ui = ui.clone();
             let form_target = target.clone();
+            let form_ring = ring.clone();
             let (selected, rev) = (ui.ddl.selected, ui.ddl.rev);
             let detail = dyn_container(
                 move || (selected.get(), rev.get()),
                 move |(i, _)| {
-                    form(form_ui.clone(), &form_target, i)
+                    form(form_ui.clone(), &form_target, i, form_ring.clone())
                         .style(|s| s.width_full())
                         .into_any()
                 },
@@ -1237,6 +1316,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                     target.is_view,
                     target.table.clone(),
                     target.schema.clone(),
+                    ring,
                 ),
                 crate::widgets::autohide(scroll(
                     container(detail)
@@ -1322,7 +1402,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
             .on_click_stop(|_| {})
             .style(|s| panel_style(s).width(PANEL_W).height(PANEL_H));
 
-            focus_root(container(panel))
+            focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())
                 .style(|s| {
                     s.size_full()
@@ -1384,8 +1464,12 @@ pub(crate) fn function_editor_overlay(ui: Ui) -> impl IntoView {
                 ),
             };
 
+            // The form is built once per open, so one ring covers it.
+            let ring = FocusRing::new();
+            let root_ring = ring.clone();
+
             let body = crate::widgets::autohide(scroll(
-                function_form(ui.clone())
+                function_form(ui.clone(), ring)
                     .style(|s| s.width_full().padding_horiz(MODAL_PAD_H).padding_vert(18.0)),
             ))
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
@@ -1461,7 +1545,7 @@ pub(crate) fn function_editor_overlay(ui: Ui) -> impl IntoView {
             .on_click_stop(|_| {})
             .style(|s| panel_style(s).width(PANEL_W).height(PANEL_H));
 
-            focus_root(container(panel))
+            focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())
                 .style(|s| {
                     s.size_full()

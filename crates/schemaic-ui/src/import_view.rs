@@ -23,11 +23,11 @@ use schemaic_core::import::{
 use schemaic_core::model::engine_is_transactional;
 
 use crate::consts::ROW_H;
-use crate::settings::{dropdown_box_style, settings_dropdown, settings_toggle_row};
+use crate::settings::{dropdown_box_style, focusable_dropdown, focusable_toggle_row};
 use crate::widgets::{
-    ACTION_GAP, ActionKind, ExitAction, FORM_GAP, MODAL_PAD_H, action_button, autohide,
-    control_button, exit_action, focus_root, form_hint, form_section, form_separator, form_setting,
-    modal_footer, modal_footer_split, modal_title_owned, panel_style, shift_hscroll,
+    ACTION_GAP, ActionKind, ExitAction, FORM_GAP, FocusRing, MODAL_PAD_H, action_button, autohide,
+    control_button, exit_action, focus_root_with_ring, form_hint, form_section, form_separator,
+    form_setting, modal_footer, modal_footer_split, modal_title_owned, panel_style, shift_hscroll,
 };
 use crate::{
     FieldCfg, ImportProbeRequest, ImportRunRequest, ImportStep, ImportTargetInfo, ImportUi, Ui,
@@ -189,12 +189,24 @@ fn probe(ui: Ui, sniff: bool) {
     );
 }
 
-fn small_field(value: RwSignal<String>, width: f64) -> impl IntoView {
-    edit_field(value, FieldCfg::default()).style(move |s| s.width(width))
+fn small_field(
+    value: RwSignal<String>,
+    width: f64,
+    ring: FocusRing,
+    tabindex: u32,
+) -> impl IntoView {
+    edit_field(
+        value,
+        FieldCfg {
+            focus: Some((ring, tabindex)),
+            ..Default::default()
+        },
+    )
+    .style(move |s| s.width(width))
 }
 
 /// Step 1 — the file and how to read it.
-fn source_step(ui: Ui) -> impl IntoView {
+fn source_step(ui: Ui, ring: FocusRing) -> impl IntoView {
     let i = ui.import;
     let ui_pick = ui.clone();
     let pick = control_button("Choose file…", move || {
@@ -243,41 +255,67 @@ fn source_step(ui: Ui) -> impl IntoView {
     );
 
     // CSV-only settings — a JSON file has no delimiter, and its nulls are its own.
-    let csv_settings = v_stack((
-        form_section("Reading"),
-        form_setting("Delimiter", small_field(i.delimiter, 96.0)),
-        settings_toggle_row(
-            "First row is a header",
-            "Use the first row as column names instead of data.",
-            i.has_header,
-        ),
-        settings_toggle_row(
-            "Trim whitespace",
-            "Strip spaces around every value — including inside quotes.",
-            i.trim,
-        ),
-        settings_toggle_row(
-            "Empty field is NULL",
-            "An empty field means NULL rather than an empty string.",
-            i.empty_is_null,
-        ),
-        form_setting(
-            "Other values meaning NULL",
+    //
+    // Built only for CSV rather than built-and-hidden: a `hide()`n view is still
+    // in the tree, so its controls would still be in the modal's Tab order and
+    // Tab would move focus onto something nobody can see. Nothing is lost by
+    // rebuilding — every control here binds straight to an `ImportUi` signal.
+    let ring_csv = ring.clone();
+    let csv_settings = dyn_container(
+        move || i.format.get() == ImportFormat::Csv,
+        move |is_csv| {
+            if !is_csv {
+                return empty().into_any();
+            }
+            let ring = ring_csv.clone();
             v_stack((
-                edit_field(i.null_tokens, FieldCfg::default()).style(|s| s.width(FIELD_W)),
-                form_hint("Comma-separated, e.g. NULL, \\N, NA."),
+                form_section("Reading"),
+                form_setting(
+                    "Delimiter",
+                    small_field(i.delimiter, 96.0, ring.clone(), 20),
+                ),
+                focusable_toggle_row(
+                    "First row is a header",
+                    "Use the first row as column names instead of data.",
+                    i.has_header,
+                    ring.clone(),
+                    30,
+                ),
+                focusable_toggle_row(
+                    "Trim whitespace",
+                    "Strip spaces around every value — including inside quotes.",
+                    i.trim,
+                    ring.clone(),
+                    40,
+                ),
+                focusable_toggle_row(
+                    "Empty field is NULL",
+                    "An empty field means NULL rather than an empty string.",
+                    i.empty_is_null,
+                    ring.clone(),
+                    50,
+                ),
+                form_setting(
+                    "Other values meaning NULL",
+                    v_stack((
+                        edit_field(
+                            i.null_tokens,
+                            FieldCfg {
+                                focus: Some((ring, 60)),
+                                ..Default::default()
+                            },
+                        )
+                        .style(|s| s.width(FIELD_W)),
+                        form_hint("Comma-separated, e.g. NULL, \\N, NA."),
+                    ))
+                    .style(|s| s.flex_col().gap(4.0)),
+                ),
             ))
-            .style(|s| s.flex_col().gap(4.0)),
-        ),
-    ))
-    .style(move |s| {
-        let s = s.flex_col().gap(FORM_GAP).width_full();
-        if i.format.get() == ImportFormat::Csv {
-            s
-        } else {
-            s.hide()
-        }
-    });
+            .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+            .into_any()
+        },
+    )
+    .style(|s| s.width_full());
 
     v_stack((
         form_section("Source"),
@@ -288,10 +326,12 @@ fn source_step(ui: Ui) -> impl IntoView {
         ),
         form_setting(
             "Format",
-            container(settings_dropdown(
+            container(focusable_dropdown(
                 i.format,
                 ImportFormat::ALL,
                 ImportFormat::label,
+                ring,
+                10,
             ))
             .style(|s| s.width(150.0)),
         ),
@@ -318,7 +358,7 @@ fn target_label(target: &Target, table: &schemaic_core::schema::TableInfo) -> St
 /// The dropdown reads and writes `mapping` directly instead of holding its own
 /// signal — one source of truth, so re-proposing the mapping after a settings
 /// change is a single `set` and every row follows it.
-fn mapping_row(ui: Ui, fi: usize, file_col: String) -> impl IntoView {
+fn mapping_row(ui: Ui, fi: usize, file_col: String, ring: FocusRing) -> impl IntoView {
     use floem::views::dropdown::Dropdown;
 
     let i = ui.import;
@@ -390,7 +430,15 @@ fn mapping_row(ui: Ui, fi: usize, file_col: String) -> impl IntoView {
     };
 
     let picker = Dropdown::custom(current, main, options, row)
-        .on_accept(move |chosen: Target| {
+        .style(|s| dropdown_box_style(s).width(300.0).flex_shrink(0.0_f32));
+    // One Tab stop per file column, in the order they appear. The row index is
+    // the index, spaced so the step's own controls (if any are ever added above)
+    // can sit in front of them.
+    let picker = crate::settings::in_ring_dropdown(
+        picker,
+        ring,
+        100 + fi as u32 * 10,
+        move |chosen: Target| {
             i.mapping.update(|m| {
                 // One target per column: claiming a column frees it from whoever
                 // had it, so two file columns can't both write to the same place.
@@ -405,8 +453,8 @@ fn mapping_row(ui: Ui, fi: usize, file_col: String) -> impl IntoView {
                     *slot = chosen;
                 }
             });
-        })
-        .style(|s| dropdown_box_style(s).width(300.0).flex_shrink(0.0_f32));
+        },
+    );
 
     h_stack((
         name,
@@ -590,7 +638,7 @@ fn issue_list(ui: Ui) -> impl IntoView {
 }
 
 /// Step 2 — mapping, preview, and whatever the last check said.
-fn mapping_step(ui: Ui) -> impl IntoView {
+fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
     let i = ui.import;
     let ui_rows = ui.clone();
     let rows = dyn_container(
@@ -602,10 +650,11 @@ fn mapping_step(ui: Ui) -> impl IntoView {
         },
         move |cols| {
             let ui = ui_rows.clone();
+            let ring = ring.clone();
             v_stack_from_iter(
                 cols.into_iter()
                     .enumerate()
-                    .map(move |(fi, c)| mapping_row(ui.clone(), fi, c)),
+                    .map(move |(fi, c)| mapping_row(ui.clone(), fi, c, ring.clone())),
             )
             .style(|s| s.flex_col())
             .into_any()
@@ -850,9 +899,14 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                 .target
                 .with_untracked(|t| t.as_ref().map(|t| t.display()).unwrap_or_default());
 
+            // The Tab order belongs to the modal, and this rebuilds per step —
+            // so each step gets its own ring, holding exactly the controls that
+            // are on screen.
+            let ring = FocusRing::new();
+            let root_ring = ring.clone();
             let body = match step {
-                ImportStep::Source => source_step(ui.clone()).into_any(),
-                ImportStep::Mapping => mapping_step(ui.clone()).into_any(),
+                ImportStep::Source => source_step(ui.clone(), ring).into_any(),
+                ImportStep::Mapping => mapping_step(ui.clone(), ring).into_any(),
                 ImportStep::Done => text(format!(
                     "Imported {} row{} into {title}.",
                     i.imported.get_untracked(),
@@ -997,7 +1051,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                 })
             });
 
-            focus_root(container(panel))
+            focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(
                     Key::Named(NamedKey::Escape),
                     |_| true,

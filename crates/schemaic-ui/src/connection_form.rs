@@ -8,6 +8,7 @@
 
 use std::rc::Rc;
 
+use floem::event::{Event, EventListener, EventPropagation};
 use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::create_effect;
@@ -19,8 +20,9 @@ use schemaic_core::connection::SshAuth;
 use crate::consts::MASK_CH;
 use crate::settings::{focusable_dropdown, focusable_toggle_row};
 use crate::widgets::{
-    ACTION_GAP, ActionKind, FocusRing, action_button_icon, action_face, autohide, focus_root,
-    form_hint, form_label_style, loading_dots, menu_item_style, modal_title, panel_style,
+    ACTION_GAP, ActionKind, FocusRing, action_button_icon, action_face, autohide,
+    focus_root_with_ring, form_hint, form_label_style, loading_dots, menu_item_style, modal_title,
+    panel_style,
 };
 use crate::{DraftSignals, FieldCfg, Ui, edit_field, icons, theme};
 
@@ -207,12 +209,22 @@ fn conn_color_dot(color: Option<String>) -> impl IntoView {
 /// A row of colour swatches that sets the draft's identity colour. Every
 /// connection has a colour (new ones are auto-assigned), so there's no "none"
 /// option; the selected swatch gets a 2px border in `text()`.
-fn color_picker(color: RwSignal<Option<String>>) -> impl IntoView {
-    let swatches = crate::CONN_COLOR_PRESETS.iter().map(move |(_, hex, _)| {
+fn color_picker(color: RwSignal<Option<String>>, ring: FocusRing, tabindex: u32) -> impl IntoView {
+    let presets = crate::CONN_COLOR_PRESETS;
+    // The keyboard's position in the row, and *only* the keyboard's: cleared on
+    // blur, so the halo it paints never outlives the focus it stands for. It is
+    // separate from `color` because a row that has focus but no colour yet still
+    // has to say where the first arrow will land.
+    let cursor = RwSignal::new(None::<usize>);
+
+    let swatches = presets.iter().enumerate().map(move |(i, (_, hex, _))| {
         let hex = (*hex).to_string();
         let hx = hex.clone();
         empty()
-            .on_click_stop(move |_| color.set(Some(hex.clone())))
+            .on_click_stop(move |_| {
+                cursor.set(Some(i));
+                color.set(Some(hex.clone()));
+            })
             .style(move |s| {
                 let fill = theme::parse_hex(&hx).unwrap_or(floem::peniko::Color::TRANSPARENT);
                 let s = s
@@ -220,8 +232,18 @@ fn color_picker(color: RwSignal<Option<String>>) -> impl IntoView {
                     .flex_shrink(0.0_f32)
                     .border_radius(9.0)
                     .background(fill);
-                if color.get().as_deref() == Some(hx.as_str()) {
+                let s = if color.get().as_deref() == Some(hx.as_str()) {
                     s.border(2.0).border_color(floem::peniko::Color::WHITE)
+                } else {
+                    s
+                };
+                // `outline`, not a border: an 18px circle that grew by 2px when
+                // the keyboard arrived would nudge every swatch after it along
+                // the row. An outline is painted outside the box and costs no
+                // layout — the same reason the dropdowns suppress floem's with
+                // `outline(0)` rather than restyling it.
+                if cursor.get() == Some(i) {
+                    s.outline(2.0).outline_color(theme::field_border_active())
                 } else {
                     s
                 }
@@ -229,9 +251,77 @@ fn color_picker(color: RwSignal<Option<String>>) -> impl IntoView {
             .into_any()
     });
 
+    // Where the cursor starts when the row is Tab-ed into: on the colour in
+    // effect, or at the head of the row when there isn't one yet.
+    let cursor_start = move || {
+        color
+            .get_untracked()
+            .and_then(|c| presets.iter().position(|(_, hex, _)| *hex == c))
+            .unwrap_or(0)
+    };
+    // One step along the row, selecting as it goes — a radio group, not a list
+    // you then have to confirm. `ring_step` because the wrap-at-both-ends rule
+    // is the same one the modal's Tab order follows.
+    let step = move |backwards: bool| {
+        let next = crate::widgets::ring_step(presets.len(), cursor.get_untracked(), backwards)
+            .unwrap_or(0);
+        cursor.set(Some(next));
+        color.set(Some(presets[next].1.to_string()));
+    };
+
+    let row = h_stack_from_iter(swatches).style(|s| {
+        s.flex_row()
+            .items_center()
+            .gap(8.0)
+            .flex_shrink(0.0_f32)
+            // Floem's own focus ring is a magenta outline belonging to no
+            // palette here; the cursor halo above is this row's focus signal.
+            .focus_visible(|s| s.outline(0.0))
+    });
+    let row = crate::widgets::in_focus_ring(row, ring, tabindex)
+        .on_event(EventListener::FocusGained, move |_| {
+            if cursor.get_untracked().is_none() {
+                cursor.set(Some(cursor_start()));
+            }
+            EventPropagation::Continue
+        })
+        .on_event(EventListener::FocusLost, move |_| {
+            cursor.set(None);
+            EventPropagation::Continue
+        })
+        .on_event(EventListener::KeyDown, move |e| {
+            let Event::KeyDown(ke) = e else {
+                return EventPropagation::Continue;
+            };
+            match ke.key.logical_key {
+                Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::ArrowDown) => {
+                    step(false);
+                    EventPropagation::Stop
+                }
+                Key::Named(NamedKey::ArrowLeft) | Key::Named(NamedKey::ArrowUp) => {
+                    step(true);
+                    EventPropagation::Stop
+                }
+                // Space/Enter take the swatch the cursor is already on. It is
+                // normally selected already — the arrows select as they move —
+                // but not on the row's very first focus, where the cursor sits
+                // on a colour nobody has chosen yet.
+                Key::Named(NamedKey::Space) | Key::Named(NamedKey::Enter) => {
+                    let at = cursor.get_untracked().unwrap_or_else(cursor_start);
+                    cursor.set(Some(at));
+                    color.set(Some(presets[at].1.to_string()));
+                    EventPropagation::Stop
+                }
+                _ => EventPropagation::Continue,
+            }
+        });
+
     v_stack((
         text("Colour").style(form_label_style),
-        h_stack_from_iter(swatches).style(|s| s.flex_row().items_center().gap(8.0)),
+        // The row shrink-wraps inside a full-width line, so the focus halo hugs
+        // the swatches instead of stretching across the form.
+        h_stack((row, empty().style(|s| s.flex_grow(1.0_f32))))
+            .style(|s| s.flex_row().width_full()),
     ))
     .style(|s| s.flex_col().gap(6.0).width_full())
 }
@@ -486,6 +576,7 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                 test_flash,
                 ring.clone(),
             );
+            let root_ring = ring;
 
             let body = h_stack((left, right))
                 .style(|s| s.width_full().flex_grow(1.0_f32).flex_row().min_height(0.0));
@@ -502,7 +593,10 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
             // keyboard, so neither its own box nor this modal sees the key), then
             // `in_focus_ring` blurs whatever control was focused, and only then
             // does this run.
-            focus_root(container(panel))
+            //
+            // The root also answers Tab, by entering the ring — it is where focus
+            // sits when the modal opens and where Escape hands it back.
+            focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(
                     Key::Named(NamedKey::Escape),
                     |_| true,
@@ -717,11 +811,11 @@ fn conn_form(
     .style(|s| s.flex_col().gap(6.0).width_full());
 
     // Name + Colour sit closer together (20px) than the rest of the form (25px).
-    // The colour swatches stay out of the ring for now — they are a row of
-    // buttons, not a field, and want their own left/right handling.
+    // The swatch row is one Tab stop, between Name and the toggles below it —
+    // a radio group, so Left/Right walk it once the keyboard is there.
     let name_color = v_stack((
         field("Name", draft.name, ring.clone(), 10),
-        color_picker(draft.color),
+        color_picker(draft.color, ring.clone(), 15),
     ))
     .style(|s| s.flex_col().gap(20.0).width_full());
 

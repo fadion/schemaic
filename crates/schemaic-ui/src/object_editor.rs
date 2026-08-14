@@ -35,11 +35,11 @@ use floem::reactive::create_effect;
 use schemaic_core::ddl::{self, DomainDraft, EnumDraft, ObjectDraft, ObjectKind, SequenceDraft};
 use schemaic_core::schema::{CheckInfo, ObjectItem, SchemaState, SequenceInfo, SequenceOwner};
 
-use crate::table_designer::{edit_ctx, owned_dropdown, suggest_chevron};
+use crate::table_designer::{edit_ctx, focusable_owned_dropdown, suggest_chevron};
 use crate::widgets::{
-    ACTION_GAP, ActionKind, FORM_GAP, MODAL_PAD_H, action_button, focus_root, form_section,
-    form_setting, form_setting_owned, modal_footer_split, modal_title_owned, panel_style,
-    row_button, row_gap,
+    ACTION_GAP, ActionKind, FORM_GAP, FocusRing, MODAL_PAD_H, action_button, focus_root_with_ring,
+    form_section, form_setting, form_setting_owned, modal_footer_split, modal_title_owned,
+    panel_style, row_button, row_gap,
 };
 use crate::{
     DdlPreview, FieldCfg, ObjectTarget, Ui, ddl_preview, edit_field, icons, object_location, theme,
@@ -52,6 +52,10 @@ const FIELD_W: f64 = 260.0;
 /// Narrower, for the numbers a sequence is made of — a 20-character box for a
 /// value that is nearly always one or two digits reads as a text field.
 const NUM_W: f64 = 130.0;
+/// Where a repeating row's Tab stops start: an enum's values and a domain's
+/// checks are lists that grow, so they claim a block of their own above every
+/// fixed control in the form.
+const VALUE_TAB: u32 = 1000;
 /// The gap between two of those, side by side. Wider than [`FORM_GAP`] because
 /// it separates two *questions* rather than two rows of one: Increment and Start
 /// sitting a form's gap apart read as one control with two boxes.
@@ -188,6 +192,8 @@ fn num_field(
     ui: &Ui,
     label: &'static str,
     initial: String,
+    ring: FocusRing,
+    tabindex: u32,
     apply: impl Fn(&mut SequenceDraft, &str) -> Result<(), ()> + 'static,
 ) -> AnyView {
     let draft = ui.ddl.object_draft;
@@ -217,6 +223,7 @@ fn num_field(
         sig,
         FieldCfg {
             placeholder: "",
+            focus: Some((ring, tabindex)),
             ..Default::default()
         },
     )
@@ -230,6 +237,8 @@ fn bound_toggle(
     title: &'static str,
     hint: &'static str,
     initial: bool,
+    ring: FocusRing,
+    tabindex: u32,
     apply: impl Fn(&mut ObjectDraft, bool) + 'static,
 ) -> AnyView {
     let draft = ui.ddl.object_draft;
@@ -241,7 +250,7 @@ fn bound_toggle(
         }
         v
     });
-    crate::settings::settings_toggle_row(title, hint, sig).into_any()
+    crate::settings::focusable_toggle_row(title, hint, sig, ring, tabindex).into_any()
 }
 
 // ── the enum form ────────────────────────────────────────────────────────────
@@ -252,7 +261,10 @@ fn bound_toggle(
 /// newline. Order is editable because it is the type's comparison order — and
 /// because reordering is one of the two edits that force a rebuild, so being
 /// able to do it at all is the difference between an editor and an append box.
-fn enum_values(ui: &Ui) -> AnyView {
+/// `ring` places each row's field in the modal's Tab order, one stop per value
+/// from `VALUE_TAB` upwards; the move/remove buttons stay pointer-only, like
+/// every other button here.
+fn enum_values(ui: &Ui, ring: FocusRing) -> AnyView {
     let draft = ui.ddl.object_draft;
     let rev = ui.ddl.object_rev;
     let ui = ui.clone();
@@ -267,12 +279,14 @@ fn enum_values(ui: &Ui) -> AnyView {
             });
             let n = values.len();
             let ui = ui.clone();
+            let ring = ring.clone();
             let rows = v_stack_from_iter(values.into_iter().enumerate().map(move |(i, v)| {
                 let field = bound_field(
                     &ui,
                     v,
                     FieldCfg {
                         placeholder: "value",
+                        focus: Some((ring.clone(), VALUE_TAB + i as u32)),
                         ..Default::default()
                     },
                     move |d, t| {
@@ -347,7 +361,7 @@ fn enum_values(ui: &Ui) -> AnyView {
     .into_any()
 }
 
-fn enum_form(ui: &Ui, d: &EnumDraft) -> AnyView {
+fn enum_form(ui: &Ui, d: &EnumDraft, ring: FocusRing) -> AnyView {
     let name = form_setting(
         "Name",
         bound_field(
@@ -355,6 +369,7 @@ fn enum_form(ui: &Ui, d: &EnumDraft) -> AnyView {
             d.info.name.clone(),
             FieldCfg {
                 placeholder: "type_name",
+                focus: Some((ring.clone(), 10)),
                 ..Default::default()
             },
             |d, v| {
@@ -372,6 +387,7 @@ fn enum_form(ui: &Ui, d: &EnumDraft) -> AnyView {
             d.info.comment.clone().unwrap_or_default(),
             FieldCfg {
                 placeholder: "—",
+                focus: Some((ring.clone(), 20)),
                 ..Default::default()
             },
             |d, v| {
@@ -389,7 +405,7 @@ fn enum_form(ui: &Ui, d: &EnumDraft) -> AnyView {
         form_section("Values").style(|s| s.margin_top(4.0)),
         form_setting_owned(
             "In comparison order — this is the order ORDER BY uses".to_string(),
-            enum_values(ui),
+            enum_values(ui, ring),
         ),
     ))
     .style(|s| s.flex_col().gap(FORM_GAP).width_full())
@@ -402,7 +418,9 @@ fn enum_form(ui: &Ui, d: &EnumDraft) -> AnyView {
 ///
 /// Unordered, so there are no move buttons — unlike an enum's values, where the
 /// order is the type's meaning.
-fn domain_checks(ui: &Ui) -> AnyView {
+/// Each row takes two Tab stops — its name then its predicate — from `VALUE_TAB`
+/// upwards.
+fn domain_checks(ui: &Ui, ring: FocusRing) -> AnyView {
     let draft = ui.ddl.object_draft;
     let rev = ui.ddl.object_rev;
     let ui = ui.clone();
@@ -414,12 +432,14 @@ fn domain_checks(ui: &Ui) -> AnyView {
                 _ => Vec::new(),
             });
             let ui = ui.clone();
+            let ring = ring.clone();
             let rows = v_stack_from_iter(checks.into_iter().enumerate().map(move |(i, ck)| {
                 let name = bound_field(
                     &ui,
                     ck.name.clone(),
                     FieldCfg {
                         placeholder: "constraint_name",
+                        focus: Some((ring.clone(), VALUE_TAB + i as u32 * 2)),
                         ..Default::default()
                     },
                     move |d, t| {
@@ -437,6 +457,7 @@ fn domain_checks(ui: &Ui) -> AnyView {
                     FieldCfg {
                         placeholder: "VALUE > 0",
                         mono: true,
+                        focus: Some((ring.clone(), VALUE_TAB + i as u32 * 2 + 1)),
                         ..Default::default()
                     },
                     move |d, t| {
@@ -504,7 +525,12 @@ fn domain_checks(ui: &Ui) -> AnyView {
     .into_any()
 }
 
-fn domain_form(ui: &Ui, d: &DomainDraft, dialect: schemaic_core::intel::SqlDialect) -> AnyView {
+fn domain_form(
+    ui: &Ui,
+    d: &DomainDraft,
+    dialect: schemaic_core::intel::SqlDialect,
+    ring: FocusRing,
+) -> AnyView {
     let draft = ui.ddl.object_draft;
     let name = form_setting(
         "Name",
@@ -513,6 +539,7 @@ fn domain_form(ui: &Ui, d: &DomainDraft, dialect: schemaic_core::intel::SqlDiale
             d.info.name.clone(),
             FieldCfg {
                 placeholder: "domain_name",
+                focus: Some((ring.clone(), 10)),
                 ..Default::default()
             },
             |d, v| {
@@ -551,6 +578,7 @@ fn domain_form(ui: &Ui, d: &DomainDraft, dialect: schemaic_core::intel::SqlDiale
                     sig,
                     FieldCfg {
                         placeholder: "text",
+                        focus: Some((ring.clone(), 20)),
                         ..Default::default()
                     },
                 )
@@ -575,6 +603,7 @@ fn domain_form(ui: &Ui, d: &DomainDraft, dialect: schemaic_core::intel::SqlDiale
             FieldCfg {
                 placeholder: "—",
                 mono: true,
+                focus: Some((ring.clone(), 30)),
                 ..Default::default()
             },
             |d, v| {
@@ -593,6 +622,8 @@ fn domain_form(ui: &Ui, d: &DomainDraft, dialect: schemaic_core::intel::SqlDiale
         "NOT NULL",
         "Every column of this domain rejects NULL. Turning it on fails if one already holds one.",
         d.info.not_null,
+        ring.clone(),
+        40,
         |d, v| {
             if let ObjectDraft::Domain(dom) = d {
                 dom.info.not_null = v;
@@ -606,6 +637,7 @@ fn domain_form(ui: &Ui, d: &DomainDraft, dialect: schemaic_core::intel::SqlDiale
             d.info.comment.clone().unwrap_or_default(),
             FieldCfg {
                 placeholder: "—",
+                focus: Some((ring.clone(), 50)),
                 ..Default::default()
             },
             |d, v| {
@@ -624,7 +656,7 @@ fn domain_form(ui: &Ui, d: &DomainDraft, dialect: schemaic_core::intel::SqlDiale
         not_null,
         comment,
         form_section("Constraints").style(|s| s.margin_top(4.0)),
-        domain_checks(ui),
+        domain_checks(ui, ring),
     ))
     .style(|s| s.flex_col().gap(FORM_GAP).width_full())
     .into_any()
@@ -651,7 +683,12 @@ fn target_sequence(target: &ObjectTarget) -> Option<&SequenceInfo> {
     }
 }
 
-fn sequence_form(ui: &Ui, d: &SequenceDraft, orig_owner: Option<SequenceOwner>) -> AnyView {
+fn sequence_form(
+    ui: &Ui,
+    d: &SequenceDraft,
+    orig_owner: Option<SequenceOwner>,
+    ring: FocusRing,
+) -> AnyView {
     let draft = ui.ddl.object_draft;
     let name = form_setting(
         "Name",
@@ -660,6 +697,7 @@ fn sequence_form(ui: &Ui, d: &SequenceDraft, orig_owner: Option<SequenceOwner>) 
             d.info.name.clone(),
             FieldCfg {
                 placeholder: "sequence_name",
+                focus: Some((ring.clone(), 10)),
                 ..Default::default()
             },
             |d, v| {
@@ -676,13 +714,15 @@ fn sequence_form(ui: &Ui, d: &SequenceDraft, orig_owner: Option<SequenceOwner>) 
         let sig = floem::reactive::create_rw_signal(d.info.data_type.clone());
         form_setting(
             "Stores",
-            owned_dropdown(
+            focusable_owned_dropdown(
                 move || sig.get(),
                 ["smallint", "integer", "bigint"]
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
                 FIELD_W,
+                ring.clone(),
+                20,
                 move |v: String| {
                     if sig.get_untracked() != v {
                         sig.set(v.clone());
@@ -708,36 +748,61 @@ fn sequence_form(ui: &Ui, d: &SequenceDraft, orig_owner: Option<SequenceOwner>) 
     let numbers = h_stack((
         num_col(
             "Increment",
-            num_field(ui, "Increment", d.info.increment.to_string(), |s, t| {
-                t.parse().map(|n| s.info.increment = n).map_err(|_| ())
-            }),
+            num_field(
+                ui,
+                "Increment",
+                d.info.increment.to_string(),
+                ring.clone(),
+                30,
+                |s, t| t.parse().map(|n| s.info.increment = n).map_err(|_| ()),
+            ),
         ),
         num_col(
             "Start",
-            num_field(ui, "Start", d.info.start.to_string(), |s, t| {
-                t.parse().map(|n| s.info.start = n).map_err(|_| ())
-            }),
+            num_field(
+                ui,
+                "Start",
+                d.info.start.to_string(),
+                ring.clone(),
+                40,
+                |s, t| t.parse().map(|n| s.info.start = n).map_err(|_| ()),
+            ),
         ),
         num_col(
             "Cache",
-            num_field(ui, "Cache", d.info.cache.to_string(), |s, t| {
-                t.parse().map(|n| s.info.cache = n).map_err(|_| ())
-            }),
+            num_field(
+                ui,
+                "Cache",
+                d.info.cache.to_string(),
+                ring.clone(),
+                50,
+                |s, t| t.parse().map(|n| s.info.cache = n).map_err(|_| ()),
+            ),
         ),
     ))
     .style(|s| s.flex_row().gap(NUM_GAP).width_full());
     let bounds = h_stack((
         num_col(
             "Minimum",
-            num_field(ui, "Minimum", d.info.min_value.to_string(), |s, t| {
-                t.parse().map(|n| s.info.min_value = n).map_err(|_| ())
-            }),
+            num_field(
+                ui,
+                "Minimum",
+                d.info.min_value.to_string(),
+                ring.clone(),
+                60,
+                |s, t| t.parse().map(|n| s.info.min_value = n).map_err(|_| ()),
+            ),
         ),
         num_col(
             "Maximum",
-            num_field(ui, "Maximum", d.info.max_value.to_string(), |s, t| {
-                t.parse().map(|n| s.info.max_value = n).map_err(|_| ())
-            }),
+            num_field(
+                ui,
+                "Maximum",
+                d.info.max_value.to_string(),
+                ring.clone(),
+                70,
+                |s, t| t.parse().map(|n| s.info.max_value = n).map_err(|_| ()),
+            ),
         ),
     ))
     .style(|s| s.flex_row().gap(NUM_GAP).width_full());
@@ -746,6 +811,8 @@ fn sequence_form(ui: &Ui, d: &SequenceDraft, orig_owner: Option<SequenceOwner>) 
         "Cycle",
         "Wrap around to the other end of the range instead of failing when the sequence runs out.",
         d.info.cycle,
+        ring.clone(),
+        80,
         |d, v| {
             if let ObjectDraft::Sequence(s) = d {
                 s.info.cycle = v;
@@ -796,6 +863,7 @@ fn sequence_form(ui: &Ui, d: &SequenceDraft, orig_owner: Option<SequenceOwner>) 
                 sig,
                 FieldCfg {
                     placeholder: "leave empty to keep the position",
+                    focus: Some((ring.clone(), 100)),
                     ..Default::default()
                 },
             )
@@ -824,6 +892,8 @@ fn sequence_form(ui: &Ui, d: &SequenceDraft, orig_owner: Option<SequenceOwner>) 
                 "Detach from its column",
                 "The sequence stops being dropped with the column, and outlives it.",
                 d.info.owned_by.is_none(),
+                ring.clone(),
+                110,
                 move |d, v| {
                     if let ObjectDraft::Sequence(s) = d {
                         s.info.owned_by = detach_apply(orig_owner.as_ref(), v);
@@ -843,6 +913,7 @@ fn sequence_form(ui: &Ui, d: &SequenceDraft, orig_owner: Option<SequenceOwner>) 
             d.info.comment.clone().unwrap_or_default(),
             FieldCfg {
                 placeholder: "—",
+                focus: Some((ring, 90)),
                 ..Default::default()
             },
             |d, v| {
@@ -872,16 +943,17 @@ fn sequence_form(ui: &Ui, d: &SequenceDraft, orig_owner: Option<SequenceOwner>) 
 
 // ── the modal ────────────────────────────────────────────────────────────────
 
-fn form(ui: &Ui, target: &ObjectTarget) -> AnyView {
+fn form(ui: &Ui, target: &ObjectTarget, ring: FocusRing) -> AnyView {
     let draft = ui.ddl.object_draft.get_untracked();
     // No "In {database}" row: the modal title names the place now.
     let body = match &draft {
-        ObjectDraft::Enum(d) => enum_form(ui, d),
-        ObjectDraft::Domain(d) => domain_form(ui, d, target.dialect),
+        ObjectDraft::Enum(d) => enum_form(ui, d, ring),
+        ObjectDraft::Domain(d) => domain_form(ui, d, target.dialect, ring),
         ObjectDraft::Sequence(d) => sequence_form(
             ui,
             d,
             target_sequence(target).and_then(|s| s.owned_by.clone()),
+            ring,
         ),
     };
     v_stack((body,))
@@ -935,8 +1007,14 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
                 None => format!("Create {} in {location}", kind.label()),
             };
 
+            // One ring for the modal: the value/constraint rows rebuild on
+            // `object_rev` and re-register themselves, so the root — built once,
+            // out here — keeps a stable handle on the current set.
+            let ring = FocusRing::new();
+            let root_ring = ring.clone();
+
             let body = crate::widgets::autohide(scroll(
-                form(&ui, &target)
+                form(&ui, &target, ring)
                     .style(|s| s.width_full().padding_horiz(MODAL_PAD_H).padding_vert(18.0)),
             ))
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
@@ -1004,7 +1082,7 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
             .on_click_stop(|_| {})
             .style(|s| panel_style(s).width(PANEL_W).height(PANEL_H));
 
-            focus_root(container(panel))
+            focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())
                 .style(|s| {
                     s.size_full()

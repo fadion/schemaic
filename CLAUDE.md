@@ -1056,7 +1056,43 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
   outside can see a key there. It registers the **inner** editor view — the id that actually takes
   focus — and withdraws it on unmount. Order is an explicit `tabindex`, spaced, **not** registration
   order: a section built later (the SSH block, once its toggle is on) would otherwise register after
-  the fields below it on screen.
+  the fields below it on screen. A dropdown joins through `settings::in_ring_dropdown`, which is the
+  whole four-work-around apparatus below in one place; `focusable_dropdown` (settings' `Copy`
+  picker) and `table_designer::focusable_owned_dropdown` (the designer/editors', since a table name
+  isn't `Copy`) are both thin wrappers over it, and neither has an un-focusable sibling left —
+  a second one would only be a way to leave a control out of the ring by accident.
+  **The modal's root is what *enters* the ring**, via `widgets::focus_root_with_ring`. A key goes
+  to the focused view and, unhandled, only to the window root — and a modal opens with focus on its
+  own `focus_root`, which is also where Escape hands it back. Without a Tab handler there the ring
+  could only be joined by clicking a control first, so Tab did nothing at all on a freshly-opened
+  modal. The root isn't a ring member, so `step_from` reads it as "focus was nowhere" and starts at
+  the first control (the last, for Shift+Tab).
+- **A `.hide()`n control is still in the Tab order** — `hide()` is `display: none`, so the view is
+  still in the tree and still registered in the ring, and Tab moves focus onto something nobody can
+  see. Every engine-conditional block that was built-and-hidden is therefore now **built
+  conditionally**: import's CSV settings, the designer's MySQL-only engine/collation and `ON UPDATE`
+  and PostgreSQL-only index method/predicate, the view editor's MySQL options and PG recreate
+  toggle, the trigger form's `Fires`/`When`. Nothing is lost by rebuilding — each of those binds
+  straight to a draft or a persisted signal — and a control an engine can't express shouldn't be
+  reachable at all, which is the same call `trigger_editor`'s per-engine form already made.
+- **A group of like things is *one* Tab stop, and arrows move within it.** Manage Connections'
+  colour swatches (`connection_form::color_picker`) and the designer/trigger item list
+  (`table_designer::list_pane`) each take a single ring slot: Tab reaches the group, Left/Right or
+  Up/Down move inside it, Tab leaves. Eight swatches or twenty columns as individual stops would
+  make crossing a pane the user is only passing through cost twenty keypresses. Two details each
+  had a reason: the **ring wraps and these clamp** — wrapping is what stops Tab escaping the modal,
+  while a selection that jumps from the last column to the first is only a surprise (the swatches
+  *do* wrap, being a short fixed ring where the ends are visibly adjacent) — and the group's focus
+  indication must cost **no layout**, so the list recolours the border it already has and a swatch
+  takes an `outline` (painted outside the box) rather than a border that would nudge the row along.
+  The swatch cursor is a signal of its own, cleared on `FocusLost`, so the halo never outlives the
+  focus it stands for.
+- **In a field holding *code*, Tab is typing.** `FieldCfg::tab_indents` suppresses only the ring's
+  step-away, so Tab still *arrives* at the field and floem's own `InsertTab` then runs; Escape is
+  the way out, blurring to the `focus_root` whose Tab re-enters the ring. Set on the trigger body,
+  the PG function body and the view editor's `SELECT`. Deliberately not on prose (the AI settings'
+  custom instructions) or on the DDL preview's read-only script box, where there is no indent to
+  type and Tab moving on is simply better.
 - **A popup that takes the keyboard can only be closed from the *window root*.** The corollary of
   the directed dispatch above, and it is not obvious: a modal's Escape handler runs because its
   `focus_root` is the *focused view*, not because it is an ancestor — there is no bubbling in

@@ -31,10 +31,11 @@ use schemaic_core::ddl::{
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::schema::{CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo, ServerFlavour};
 
-use crate::settings::{dropdown_box_style, settings_toggle_row};
+use crate::settings::{dropdown_box_style, focusable_toggle_row};
 use crate::widgets::{
-    ACTION_GAP, ActionKind, FORM_GAP, MODAL_PAD_H, MenuEntry, action_button, autohide, focus_root,
-    form_hint, form_setting, modal_footer_split, modal_title_owned, panel_style,
+    ACTION_GAP, ActionKind, FORM_GAP, FocusRing, MODAL_PAD_H, MenuEntry, action_button, autohide,
+    focus_root_with_ring, form_hint, form_setting, modal_footer_split, modal_title_owned,
+    panel_style,
 };
 use crate::{
     DdlPreview, DesignerTab, DesignerTarget, FieldCfg, Ui, ddl_preview, edit_field, icons,
@@ -52,6 +53,11 @@ const LIST_W: f64 = 320.0;
 const ROW_H: f64 = 30.0;
 /// Text-field width in the detail form, matching the connection form's fields.
 const FIELD_W: f64 = 260.0;
+/// The item list's place in the Tab order: ahead of the form it feeds, because
+/// it sits to the left of it and choosing *what* to edit comes before editing it.
+/// Shared by all four sections — only one list is mounted at a time — and by the
+/// trigger editor, which wears the same list-plus-form layout.
+pub(crate) const LIST_TAB: u32 = 5;
 
 // ── opening ──────────────────────────────────────────────────────────────────
 
@@ -336,9 +342,18 @@ fn bound_field(
     initial: String,
     width: f64,
     placeholder: &'static str,
+    ring: FocusRing,
+    tabindex: u32,
     apply: impl Fn(&mut TableDraft, &str) + 'static,
 ) -> AnyView {
-    field_view(bound_signal(ui, initial, apply), width, placeholder, false)
+    field_view(
+        bound_signal(ui, initial, apply),
+        width,
+        placeholder,
+        false,
+        ring,
+        tabindex,
+    )
 }
 
 /// [`bound_field`] for a field whose content is **SQL**, not prose — a type, a
@@ -351,9 +366,18 @@ fn sql_field(
     initial: String,
     width: f64,
     placeholder: &'static str,
+    ring: FocusRing,
+    tabindex: u32,
     apply: impl Fn(&mut TableDraft, &str) + 'static,
 ) -> AnyView {
-    field_view(bound_signal(ui, initial, apply), width, placeholder, true)
+    field_view(
+        bound_signal(ui, initial, apply),
+        width,
+        placeholder,
+        true,
+        ring,
+        tabindex,
+    )
 }
 
 /// The signal behind a bound field: seeded once, on build; the effect writes
@@ -377,12 +401,20 @@ fn bound_signal(
     sig
 }
 
-fn field_view(sig: RwSignal<String>, width: f64, placeholder: &'static str, mono: bool) -> AnyView {
+fn field_view(
+    sig: RwSignal<String>,
+    width: f64,
+    placeholder: &'static str,
+    mono: bool,
+    ring: FocusRing,
+    tabindex: u32,
+) -> AnyView {
     edit_field(
         sig,
         FieldCfg {
             placeholder,
             mono,
+            focus: Some((ring, tabindex)),
             ..Default::default()
         },
     )
@@ -431,6 +463,7 @@ pub(crate) fn suggest_chevron(
 }
 
 /// [`bound_field`] plus a [`suggest_chevron`] writing into it.
+#[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
 fn bound_field_with_menu(
     ui: &Ui,
     initial: String,
@@ -438,11 +471,13 @@ fn bound_field_with_menu(
     placeholder: &'static str,
     mono: bool,
     options: Vec<String>,
+    ring: FocusRing,
+    tabindex: u32,
     apply: impl Fn(&mut TableDraft, &str) + 'static,
 ) -> AnyView {
     let sig = bound_signal(ui, initial, apply);
     h_stack((
-        field_view(sig, width, placeholder, mono),
+        field_view(sig, width, placeholder, mono, ring, tabindex),
         suggest_chevron(ui, sig, options),
     ))
     .style(|s| s.flex_row().items_center().gap(2.0))
@@ -450,13 +485,36 @@ fn bound_field_with_menu(
 }
 
 /// A `<select>`-style dropdown over owned values (the settings one needs `Copy`,
-/// and a table name isn't). Same chrome, so it reads as the same control.
-pub(crate) fn owned_dropdown(
+/// and a table name isn't), in a modal's Tab order. Same chrome as the settings
+/// picker, so it reads as the same control.
+///
+/// The keyboard handling — and the four floem behaviours it works around — is
+/// [`crate::settings::in_ring_dropdown`]'s, shared with that picker so the two
+/// can't drift. There is deliberately no un-focusable variant: every one of
+/// these is in a modal that has a ring.
+pub(crate) fn focusable_owned_dropdown(
     current: impl Fn() -> String + Copy + 'static,
     options: Vec<String>,
     width: f64,
+    ring: crate::widgets::FocusRing,
+    tabindex: u32,
     on_pick: impl Fn(String) + 'static,
 ) -> impl IntoView {
+    crate::settings::in_ring_dropdown(
+        owned_dropdown_box(current, options, width),
+        ring,
+        tabindex,
+        on_pick,
+    )
+}
+
+/// The dropdown itself, without an accept action — the shared half, since
+/// `on_accept` is a single slot and the ring has to own it.
+fn owned_dropdown_box(
+    current: impl Fn() -> String + Copy + 'static,
+    options: Vec<String>,
+    width: f64,
+) -> floem::views::dropdown::Dropdown<String> {
     use floem::views::dropdown::Dropdown;
     let main = move |cur: String| {
         h_stack((
@@ -492,9 +550,7 @@ pub(crate) fn owned_dropdown(
             })
             .into_any()
     };
-    Dropdown::custom(current, main, options, row)
-        .on_accept(move |v: String| on_pick(v))
-        .style(move |s| dropdown_box_style(s).width(width))
+    Dropdown::custom(current, main, options, row).style(move |s| dropdown_box_style(s).width(width))
 }
 
 /// A toggle row bound to the draft, same shape as the settings modals'.
@@ -503,6 +559,8 @@ fn bound_toggle(
     title: &'static str,
     hint: &'static str,
     initial: bool,
+    ring: FocusRing,
+    tabindex: u32,
     apply: impl Fn(&mut TableDraft, bool) + 'static,
 ) -> AnyView {
     let draft = ui.ddl.draft;
@@ -514,7 +572,7 @@ fn bound_toggle(
         }
         v
     });
-    settings_toggle_row(title, hint, sig).into_any()
+    focusable_toggle_row(title, hint, sig, ring, tabindex).into_any()
 }
 
 /// The +/−/↑/↓ bar under an item list.
@@ -647,12 +705,47 @@ fn list_row_inner(
 }
 
 /// The list + its action bar, boxed like the import preview's table.
+///
+/// **One Tab stop for the whole list, then Up/Down inside it.** A list is not N
+/// controls — it is one control that answers "which item is the form editing?",
+/// so giving every row its own stop would make Tab take as many presses as the
+/// table has columns to cross a pane the user was only passing through.
+///
+/// Up/Down **clamp** rather than wrap, unlike the Tab ring above: wrapping there
+/// is what stops Tab escaping the modal, while a selection that jumps from the
+/// last column to the first is just a surprise. `+`/`−` stay on the action bar —
+/// buttons are pointer-only here, as everywhere else in these modals.
+///
+/// The selected row is kept on screen with `ensure_visible`, which scrolls only
+/// when the row isn't already showing: rows are a fixed [`ROW_H`] tall, so the
+/// rect is arithmetic rather than a measured view.
 pub(crate) fn list_pane(
     rows: impl IntoView + 'static,
     actions: impl IntoView + 'static,
+    selected: RwSignal<usize>,
+    len: impl Fn() -> usize + 'static,
+    ring: FocusRing,
+    tabindex: u32,
 ) -> impl IntoView {
-    v_stack((
-        autohide(scroll(rows)).style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0)),
+    let step = move |delta: isize| {
+        let n = len();
+        if n == 0 {
+            return;
+        }
+        let cur = selected.get_untracked();
+        let next = (cur as isize + delta).clamp(0, n as isize - 1) as usize;
+        if next != cur {
+            selected.set(next);
+        }
+    };
+
+    let pane = v_stack((
+        autohide(scroll(rows))
+            .ensure_visible(move || {
+                let top = selected.get() as f64 * ROW_H;
+                floem::kurbo::Rect::new(0.0, top, 1.0, top + ROW_H)
+            })
+            .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0)),
         actions,
     ))
     .style(|s| {
@@ -663,7 +756,32 @@ pub(crate) fn list_pane(
             .border(1.0)
             .border_color(theme::border())
             .border_radius(6.0)
-    })
+            // The box already has a border, so focus only recolours it — nothing
+            // moves. Floem's own focus ring is suppressed for the same reason the
+            // dropdowns suppress theirs.
+            .focus(|s| s.border_color(theme::field_border_active()))
+            .focus_visible(|s| s.outline(0.0))
+    });
+
+    crate::widgets::in_focus_ring(pane, ring, tabindex).on_event(
+        floem::event::EventListener::KeyDown,
+        move |e| {
+            let floem::event::Event::KeyDown(ke) = e else {
+                return floem::event::EventPropagation::Continue;
+            };
+            match ke.key.logical_key {
+                Key::Named(NamedKey::ArrowDown) => {
+                    step(1);
+                    floem::event::EventPropagation::Stop
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    step(-1);
+                    floem::event::EventPropagation::Stop
+                }
+                _ => floem::event::EventPropagation::Continue,
+            }
+        },
+    )
 }
 
 /// The detail form beside a list: scrolls on its own, so a long column form
@@ -712,15 +830,21 @@ fn field_with_hint(field: impl IntoView + 'static, h: &'static str) -> impl Into
 
 // ── the Table section ────────────────────────────────────────────────────────
 
-fn table_section(ui: Ui, target: &DesignerTarget) -> AnyView {
+fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     let d = ui.ddl.draft;
     let mysql = target.dialect != SqlDialect::Postgres;
     let draft = d.get_untracked();
     let name = form_setting(
         "Name",
-        bound_field(&ui, draft.name.clone(), FIELD_W, "table_name", |d, v| {
-            d.name = v.trim().to_string()
-        }),
+        bound_field(
+            &ui,
+            draft.name.clone(),
+            FIELD_W,
+            "table_name",
+            ring.clone(),
+            10,
+            |d, v| d.name = v.trim().to_string(),
+        ),
     );
     let comment = form_setting(
         "Comment",
@@ -729,40 +853,50 @@ fn table_section(ui: Ui, target: &DesignerTarget) -> AnyView {
             draft.comment.clone().unwrap_or_default(),
             FIELD_W * 1.6,
             "What this table is for",
+            ring.clone(),
+            20,
             |d, v| d.comment = Some(v.to_string()).filter(|s| !s.is_empty()),
         ),
     );
     // Engine and collation exist on MySQL only; PostgreSQL has neither, so the
-    // controls aren't shown rather than shown and ignored.
-    let mysql_only = v_stack((
-        form_setting(
-            "Engine",
-            bound_field_with_menu(
-                &ui,
-                draft.engine.clone().unwrap_or_default(),
-                FIELD_W,
-                "InnoDB",
-                // A storage-engine name isn't SQL text the way a type is.
-                false,
-                ddl::MYSQL_ENGINES.iter().map(|e| e.to_string()).collect(),
-                |d, v| d.engine = Some(v.trim().to_string()).filter(|s| !s.is_empty()),
+    // controls aren't built rather than built and ignored. Built, not hidden: a
+    // `hide()`n view is still in the tree, so its fields would still be in the
+    // modal's Tab order and Tab would land on something nobody can see.
+    let mysql_only: AnyView = if mysql {
+        v_stack((
+            form_setting(
+                "Engine",
+                bound_field_with_menu(
+                    &ui,
+                    draft.engine.clone().unwrap_or_default(),
+                    FIELD_W,
+                    "InnoDB",
+                    // A storage-engine name isn't SQL text the way a type is.
+                    false,
+                    ddl::MYSQL_ENGINES.iter().map(|e| e.to_string()).collect(),
+                    ring.clone(),
+                    30,
+                    |d, v| d.engine = Some(v.trim().to_string()).filter(|s| !s.is_empty()),
+                ),
             ),
-        ),
-        form_setting(
-            "Collation",
-            bound_field(
-                &ui,
-                draft.collation.clone().unwrap_or_default(),
-                FIELD_W,
-                "utf8mb4_general_ci",
-                |d, v| d.collation = Some(v.trim().to_string()).filter(|s| !s.is_empty()),
+            form_setting(
+                "Collation",
+                bound_field(
+                    &ui,
+                    draft.collation.clone().unwrap_or_default(),
+                    FIELD_W,
+                    "utf8mb4_general_ci",
+                    ring,
+                    40,
+                    |d, v| d.collation = Some(v.trim().to_string()).filter(|s| !s.is_empty()),
+                ),
             ),
-        ),
-    ))
-    .style(move |s| {
-        let s = s.flex_col().gap(FORM_GAP).width_full();
-        if mysql { s } else { s.hide() }
-    });
+        ))
+        .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+        .into_any()
+    } else {
+        empty().into_any()
+    };
 
     // No section heading and no "In {database}" row: the tab strip above already
     // says which section this is, and the modal title carries where the table
@@ -775,7 +909,7 @@ fn table_section(ui: Ui, target: &DesignerTarget) -> AnyView {
 
 // ── the Columns section ──────────────────────────────────────────────────────
 
-fn columns_list(ui: Ui) -> AnyView {
+fn columns_list(ui: Ui, ring: FocusRing) -> AnyView {
     let d = ui.ddl;
     let draft = d.draft.get_untracked();
     let ui_rows = ui.clone();
@@ -827,11 +961,15 @@ fn columns_list(ui: Ui) -> AnyView {
             mysql.then(|| Rc::new(move || swap_selected(&up_ui, -1)) as Rc<dyn Fn()>),
             mysql.then(|| Rc::new(move || swap_selected(&down_ui, 1)) as Rc<dyn Fn()>),
         ),
+        d.selected,
+        move || d.draft.with_untracked(|dr| dr.columns.len()),
+        ring,
+        LIST_TAB,
     )
     .into_any()
 }
 
-fn column_form(ui: Ui, target: &DesignerTarget) -> AnyView {
+fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     let d = ui.ddl;
     let i = d.selected.get_untracked();
     let draft = d.draft.get_untracked();
@@ -843,9 +981,15 @@ fn column_form(ui: Ui, target: &DesignerTarget) -> AnyView {
 
     let name = form_setting(
         "Name",
-        bound_field(&ui, c.name.clone(), FIELD_W, "column_name", move |d, v| {
-            d.rename_column(i, v.trim())
-        }),
+        bound_field(
+            &ui,
+            c.name.clone(),
+            FIELD_W,
+            "column_name",
+            ring.clone(),
+            10,
+            move |d, v| d.rename_column(i, v.trim()),
+        ),
     );
     let ty = form_setting(
         "Type",
@@ -860,6 +1004,8 @@ fn column_form(ui: Ui, target: &DesignerTarget) -> AnyView {
                     .iter()
                     .map(|t| t.to_string())
                     .collect(),
+                ring.clone(),
+                20,
                 move |d, v| {
                     if let Some(col) = d.columns.get_mut(i) {
                         col.info.type_name = v.trim().to_string();
@@ -874,6 +1020,8 @@ fn column_form(ui: Ui, target: &DesignerTarget) -> AnyView {
         "Nullable",
         "Allow NULL in this column.",
         c.nullable,
+        ring.clone(),
+        30,
         move |d, v| {
             if let Some(col) = d.columns.get_mut(i) {
                 col.info.nullable = v;
@@ -885,6 +1033,8 @@ fn column_form(ui: Ui, target: &DesignerTarget) -> AnyView {
         "Primary key",
         "Part of the table's primary key, appended in the order you add columns.",
         in_pk,
+        ring.clone(),
+        40,
         move |d, v| d.set_in_primary_key(i, v),
     );
     let auto = bound_toggle(
@@ -896,6 +1046,8 @@ fn column_form(ui: Ui, target: &DesignerTarget) -> AnyView {
             "The server assigns the value (AUTO_INCREMENT)."
         },
         c.auto_increment,
+        ring.clone(),
+        50,
         move |d, v| {
             if let Some(col) = d.columns.get_mut(i) {
                 col.info.auto_increment = v;
@@ -910,6 +1062,8 @@ fn column_form(ui: Ui, target: &DesignerTarget) -> AnyView {
                 c.default.clone().unwrap_or_default(),
                 FIELD_W,
                 "",
+                ring.clone(),
+                60,
                 move |d, v| {
                     if let Some(col) = d.columns.get_mut(i) {
                         col.info.default = ddl::norm_default(Some(v));
@@ -927,6 +1081,8 @@ fn column_form(ui: Ui, target: &DesignerTarget) -> AnyView {
                 c.generated.clone().unwrap_or_default(),
                 FIELD_W,
                 "",
+                ring.clone(),
+                70,
                 move |d, v| {
                     if let Some(col) = d.columns.get_mut(i) {
                         col.info.generated = Some(v.trim().to_string()).filter(|s| !s.is_empty());
@@ -943,6 +1099,8 @@ fn column_form(ui: Ui, target: &DesignerTarget) -> AnyView {
             c.comment.clone().unwrap_or_default(),
             FIELD_W,
             "",
+            ring.clone(),
+            100,
             move |d, v| {
                 if let Some(col) = d.columns.get_mut(i) {
                     col.info.comment = Some(v.to_string()).filter(|s| !s.is_empty());
@@ -957,6 +1115,8 @@ fn column_form(ui: Ui, target: &DesignerTarget) -> AnyView {
             c.collation.clone().unwrap_or_default(),
             FIELD_W,
             "",
+            ring.clone(),
+            80,
             move |d, v| {
                 if let Some(col) = d.columns.get_mut(i) {
                     col.info.collation = Some(v.trim().to_string()).filter(|s| !s.is_empty());
@@ -964,22 +1124,29 @@ fn column_form(ui: Ui, target: &DesignerTarget) -> AnyView {
             },
         ),
     );
-    // `ON UPDATE CURRENT_TIMESTAMP` is MySQL's alone.
-    let on_update = form_setting(
-        "On update",
-        bound_field(
-            &ui,
-            c.on_update.clone().unwrap_or_default(),
-            FIELD_W,
-            "CURRENT_TIMESTAMP",
-            move |d, v| {
-                if let Some(col) = d.columns.get_mut(i) {
-                    col.info.on_update = Some(v.trim().to_string()).filter(|s| !s.is_empty());
-                }
-            },
-        ),
-    )
-    .style(move |s| if pg { s.hide() } else { s });
+    // `ON UPDATE CURRENT_TIMESTAMP` is MySQL's alone. Built only there rather
+    // than built and hidden: a `hide()`n field is still in the Tab order.
+    let on_update: AnyView = if pg {
+        empty().into_any()
+    } else {
+        form_setting(
+            "On update",
+            bound_field(
+                &ui,
+                c.on_update.clone().unwrap_or_default(),
+                FIELD_W,
+                "CURRENT_TIMESTAMP",
+                ring,
+                90,
+                move |d, v| {
+                    if let Some(col) = d.columns.get_mut(i) {
+                        col.info.on_update = Some(v.trim().to_string()).filter(|s| !s.is_empty());
+                    }
+                },
+            ),
+        )
+        .into_any()
+    };
 
     v_stack((
         name, ty, nullable, primary, auto, default, generated, collation, on_update, comment,
@@ -990,7 +1157,7 @@ fn column_form(ui: Ui, target: &DesignerTarget) -> AnyView {
 
 // ── the Indexes section ──────────────────────────────────────────────────────
 
-fn indexes_list(ui: Ui) -> AnyView {
+fn indexes_list(ui: Ui, ring: FocusRing) -> AnyView {
     let d = ui.ddl;
     let draft = d.draft.get_untracked();
     let ui_rows = ui.clone();
@@ -1047,11 +1214,15 @@ fn indexes_list(ui: Ui) -> AnyView {
             None,
             None,
         ),
+        d.selected,
+        move || d.draft.with_untracked(|dr| dr.indexes.len()),
+        ring,
+        LIST_TAB,
     )
     .into_any()
 }
 
-fn index_form(ui: Ui, target: &DesignerTarget) -> AnyView {
+fn index_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     let d = ui.ddl;
     let i = d.selected.get_untracked();
     let draft = d.draft.get_untracked();
@@ -1065,55 +1236,73 @@ fn index_form(ui: Ui, target: &DesignerTarget) -> AnyView {
         "Comma-separated, in key order. bio(20) is a prefix length; add DESC to sort down."
     };
 
-    let pg_only = v_stack((
-        form_setting(
-            "Method",
-            field_with_hint(
-                bound_field(
-                    &ui,
-                    ix.method.clone().unwrap_or_default(),
-                    180.0,
-                    "btree",
-                    move |d, v| {
-                        if let Some(x) = d.indexes.get_mut(i) {
-                            x.info.method = Some(v.trim().to_string()).filter(|s| !s.is_empty());
-                        }
-                    },
+    // PostgreSQL-only, and built only there: a `hide()`n field is still in the
+    // modal's Tab order.
+    let pg_only: AnyView = if pg {
+        v_stack((
+            form_setting(
+                "Method",
+                field_with_hint(
+                    bound_field(
+                        &ui,
+                        ix.method.clone().unwrap_or_default(),
+                        180.0,
+                        "btree",
+                        ring.clone(),
+                        40,
+                        move |d, v| {
+                            if let Some(x) = d.indexes.get_mut(i) {
+                                x.info.method =
+                                    Some(v.trim().to_string()).filter(|s| !s.is_empty());
+                            }
+                        },
+                    ),
+                    "Leave empty for the default (btree).",
                 ),
-                "Leave empty for the default (btree).",
             ),
-        ),
-        form_setting(
-            "Only rows where",
-            field_with_hint(
-                bound_field(
-                    &ui,
-                    ix.predicate.clone().unwrap_or_default(),
-                    FIELD_W * 1.4,
-                    "",
-                    move |d, v| {
-                        if let Some(x) = d.indexes.get_mut(i) {
-                            x.info.predicate = Some(v.trim().to_string()).filter(|s| !s.is_empty());
-                        }
-                    },
+            form_setting(
+                "Only rows where",
+                field_with_hint(
+                    bound_field(
+                        &ui,
+                        ix.predicate.clone().unwrap_or_default(),
+                        FIELD_W * 1.4,
+                        "",
+                        ring.clone(),
+                        50,
+                        move |d, v| {
+                            if let Some(x) = d.indexes.get_mut(i) {
+                                x.info.predicate =
+                                    Some(v.trim().to_string()).filter(|s| !s.is_empty());
+                            }
+                        },
+                    ),
+                    "A partial index's condition, without the WHERE.",
                 ),
-                "A partial index's condition, without the WHERE.",
             ),
-        ),
-    ))
-    .style(move |s| {
-        let s = s.flex_col().gap(FORM_GAP).width_full();
-        if pg { s } else { s.hide() }
-    });
+        ))
+        .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+        .into_any()
+    } else {
+        empty().into_any()
+    };
 
     v_stack((
         form_setting(
             "Name",
-            bound_field(&ui, ix.name.clone(), FIELD_W, "index_name", move |d, v| {
-                if let Some(x) = d.indexes.get_mut(i) {
-                    x.info.name = v.trim().to_string();
-                }
-            }),
+            bound_field(
+                &ui,
+                ix.name.clone(),
+                FIELD_W,
+                "index_name",
+                ring.clone(),
+                10,
+                move |d, v| {
+                    if let Some(x) = d.indexes.get_mut(i) {
+                        x.info.name = v.trim().to_string();
+                    }
+                },
+            ),
         ),
         form_setting(
             "Columns",
@@ -1123,6 +1312,8 @@ fn index_form(ui: Ui, target: &DesignerTarget) -> AnyView {
                     key_list_text(&ix.columns),
                     FIELD_W * 1.4,
                     "id, name",
+                    ring.clone(),
+                    20,
                     move |d, v| {
                         if let Some(x) = d.indexes.get_mut(i) {
                             x.info.columns = parse_key_list(v);
@@ -1137,6 +1328,8 @@ fn index_form(ui: Ui, target: &DesignerTarget) -> AnyView {
             "Unique",
             "Refuse duplicate values across these columns.",
             ix.unique,
+            ring,
+            30,
             move |d, v| {
                 if let Some(x) = d.indexes.get_mut(i) {
                     x.info.unique = v;
@@ -1151,7 +1344,7 @@ fn index_form(ui: Ui, target: &DesignerTarget) -> AnyView {
 
 // ── the Foreign keys section ─────────────────────────────────────────────────
 
-fn fks_list(ui: Ui) -> AnyView {
+fn fks_list(ui: Ui, ring: FocusRing) -> AnyView {
     let d = ui.ddl;
     let draft = d.draft.get_untracked();
     let ui_rows = ui.clone();
@@ -1200,6 +1393,10 @@ fn fks_list(ui: Ui) -> AnyView {
             None,
             None,
         ),
+        d.selected,
+        move || d.draft.with_untracked(|dr| dr.foreign_keys.len()),
+        ring,
+        LIST_TAB,
     )
     .into_any()
 }
@@ -1210,7 +1407,7 @@ fn action_label(a: Option<&str>) -> String {
     a.unwrap_or("NO ACTION").to_string()
 }
 
-fn fk_form(ui: Ui, target: &DesignerTarget) -> AnyView {
+fn fk_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     let d = ui.ddl;
     let i = d.selected.get_untracked();
     let draft = d.draft.get_untracked();
@@ -1225,7 +1422,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget) -> AnyView {
     let tables = target.tables.clone();
     let ref_table = form_setting(
         "References table",
-        owned_dropdown(
+        focusable_owned_dropdown(
             move || {
                 draft_sig.with(|d| {
                     d.foreign_keys
@@ -1236,6 +1433,8 @@ fn fk_form(ui: Ui, target: &DesignerTarget) -> AnyView {
             },
             tables,
             FIELD_W,
+            ring.clone(),
+            30,
             move |v| {
                 draft_sig.update(|d| {
                     if let Some(f) = d.foreign_keys.get_mut(i) {
@@ -1248,7 +1447,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget) -> AnyView {
 
     let on_delete = form_setting(
         "On delete",
-        owned_dropdown(
+        focusable_owned_dropdown(
             move || {
                 draft_sig.with(|d| {
                     action_label(
@@ -1260,6 +1459,8 @@ fn fk_form(ui: Ui, target: &DesignerTarget) -> AnyView {
             },
             actions.clone(),
             180.0,
+            ring.clone(),
+            50,
             move |v| {
                 draft_sig.update(|d| {
                     if let Some(f) = d.foreign_keys.get_mut(i) {
@@ -1271,7 +1472,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget) -> AnyView {
     );
     let on_update = form_setting(
         "On update",
-        owned_dropdown(
+        focusable_owned_dropdown(
             move || {
                 draft_sig.with(|d| {
                     action_label(
@@ -1283,6 +1484,8 @@ fn fk_form(ui: Ui, target: &DesignerTarget) -> AnyView {
             },
             actions,
             180.0,
+            ring.clone(),
+            60,
             move |v| {
                 draft_sig.update(|d| {
                     if let Some(f) = d.foreign_keys.get_mut(i) {
@@ -1296,11 +1499,19 @@ fn fk_form(ui: Ui, target: &DesignerTarget) -> AnyView {
     v_stack((
         form_setting(
             "Name",
-            bound_field(&ui, fk.name.clone(), FIELD_W, "fk_name", move |d, v| {
-                if let Some(f) = d.foreign_keys.get_mut(i) {
-                    f.info.name = v.trim().to_string();
-                }
-            }),
+            bound_field(
+                &ui,
+                fk.name.clone(),
+                FIELD_W,
+                "fk_name",
+                ring.clone(),
+                10,
+                move |d, v| {
+                    if let Some(f) = d.foreign_keys.get_mut(i) {
+                        f.info.name = v.trim().to_string();
+                    }
+                },
+            ),
         ),
         form_setting(
             "Columns",
@@ -1310,6 +1521,8 @@ fn fk_form(ui: Ui, target: &DesignerTarget) -> AnyView {
                     fk.columns.join(", "),
                     FIELD_W * 1.2,
                     "customer_id",
+                    ring.clone(),
+                    20,
                     move |d, v| {
                         if let Some(f) = d.foreign_keys.get_mut(i) {
                             f.info.columns = parse_name_list(v);
@@ -1327,6 +1540,8 @@ fn fk_form(ui: Ui, target: &DesignerTarget) -> AnyView {
                 fk.ref_columns.join(", "),
                 FIELD_W * 1.2,
                 "id",
+                ring,
+                40,
                 move |d, v| {
                     if let Some(f) = d.foreign_keys.get_mut(i) {
                         f.info.ref_columns = parse_name_list(v);
@@ -1341,7 +1556,7 @@ fn fk_form(ui: Ui, target: &DesignerTarget) -> AnyView {
     .into_any()
 }
 
-fn checks_list(ui: Ui) -> AnyView {
+fn checks_list(ui: Ui, ring: FocusRing) -> AnyView {
     let d = ui.ddl;
     let draft = d.draft.get_untracked();
     let ui_rows = ui.clone();
@@ -1393,11 +1608,20 @@ fn checks_list(ui: Ui) -> AnyView {
             None,
             None,
         ),
+        d.selected,
+        move || d.draft.with_untracked(|dr| dr.check_constraints.len()),
+        ring,
+        LIST_TAB,
     )
     .into_any()
 }
 
-fn check_form(ui: Ui, dialect: SqlDialect, target_flavour: ServerFlavour) -> AnyView {
+fn check_form(
+    ui: Ui,
+    dialect: SqlDialect,
+    target_flavour: ServerFlavour,
+    ring: FocusRing,
+) -> AnyView {
     let d = ui.ddl;
     let i = d.selected.get_untracked();
     let draft = d.draft.get_untracked();
@@ -1412,6 +1636,8 @@ fn check_form(ui: Ui, dialect: SqlDialect, target_flavour: ServerFlavour) -> Any
             ck.name.clone(),
             FIELD_W,
             "qty_positive",
+            ring.clone(),
+            10,
             move |d, v| {
                 if let Some(c) = d.check_constraints.get_mut(i) {
                     c.info.name = v.trim().to_string();
@@ -1427,6 +1653,8 @@ fn check_form(ui: Ui, dialect: SqlDialect, target_flavour: ServerFlavour) -> Any
                 ck.expression.clone(),
                 FIELD_W * 1.6,
                 "qty > 0",
+                ring.clone(),
+                20,
                 move |d, v| {
                     if let Some(c) = d.check_constraints.get_mut(i) {
                         // Stored bare, as the introspected form is — the emitter
@@ -1458,6 +1686,8 @@ fn check_form(ui: Ui, dialect: SqlDialect, target_flavour: ServerFlavour) -> Any
             "Enforced",
             "Off records the constraint without applying it — existing and new rows are both accepted.",
             ck.enforced,
+            ring,
+            30,
             move |d, v| {
                 if let Some(c) = d.check_constraints.get_mut(i) {
                     c.info.enforced = v;
@@ -1586,15 +1816,30 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
             // types); the form does NOT, or typing into a field would rebuild
             // the field mid-keystroke. That's why the two are separate
             // containers with different keys.
+            // One ring for the modal, not one per form: the form rebuilds on
+            // every tab/selection change, and `in_focus_ring` unregisters on
+            // unmount, so the rebuilt controls simply re-register here. A ring
+            // created inside the form would be a different one each time and the
+            // root — built once, out here — could never reach the current one.
+            //
+            // The list pane is in it too, as a *single* stop at `LIST_TAB`:
+            // Up/Down move the selection once the keyboard is there.
+            let ring = FocusRing::new();
+            let root_ring = ring.clone();
+
             let list_ui = ui.clone();
+            let list_ring = ring.clone();
             let list = dyn_container(
                 move || (d.tab.get(), d.draft.get()),
-                move |(tab, _)| match tab {
-                    DesignerTab::Table => empty().into_any(),
-                    DesignerTab::Columns => columns_list(list_ui.clone()),
-                    DesignerTab::Indexes => indexes_list(list_ui.clone()),
-                    DesignerTab::ForeignKeys => fks_list(list_ui.clone()),
-                    DesignerTab::Checks => checks_list(list_ui.clone()),
+                move |(tab, _)| {
+                    let (ui, ring) = (list_ui.clone(), list_ring.clone());
+                    match tab {
+                        DesignerTab::Table => empty().into_any(),
+                        DesignerTab::Columns => columns_list(ui, ring),
+                        DesignerTab::Indexes => indexes_list(ui, ring),
+                        DesignerTab::ForeignKeys => fks_list(ui, ring),
+                        DesignerTab::Checks => checks_list(ui, ring),
+                    }
                 },
             )
             .style(move |s| {
@@ -1614,13 +1859,14 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                 move || (d.tab.get(), d.selected.get(), d.rev.get()),
                 move |(tab, ..)| {
                     let ui = form_ui.clone();
+                    let ring = ring.clone();
                     match tab {
-                        DesignerTab::Table => table_section(ui, &form_target),
-                        DesignerTab::Columns => column_form(ui, &form_target),
-                        DesignerTab::Indexes => index_form(ui, &form_target),
-                        DesignerTab::ForeignKeys => fk_form(ui, &form_target),
+                        DesignerTab::Table => table_section(ui, &form_target, ring),
+                        DesignerTab::Columns => column_form(ui, &form_target, ring),
+                        DesignerTab::Indexes => index_form(ui, &form_target, ring),
+                        DesignerTab::ForeignKeys => fk_form(ui, &form_target, ring),
                         DesignerTab::Checks => {
-                            check_form(ui, form_target.dialect, form_target.flavour)
+                            check_form(ui, form_target.dialect, form_target.flavour, ring)
                         }
                     }
                 },
@@ -1713,7 +1959,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
             .on_click_stop(|_| {})
             .style(|s| panel_style(s).width(PANEL_W).height(PANEL_H));
 
-            focus_root(container(panel))
+            focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())
                 .style(|s| {
                     s.size_full()

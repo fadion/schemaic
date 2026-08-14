@@ -188,6 +188,33 @@ impl FocusRing {
     }
 }
 
+/// A [`focus_root`] that also answers Tab by **entering** `ring`.
+///
+/// Without this the ring can only be joined by clicking a control first: a modal
+/// opens with focus on its root, floem delivers a key to the focused view (and,
+/// failing that, only to the window root's own listeners), and the root has no
+/// Tab handler of its own — so Tab did nothing at all until something inside was
+/// clicked. The same dead end follows every Escape, which hands focus back here
+/// on purpose.
+///
+/// The root is not itself a ring member, so [`FocusRing::step_from`] treats it as
+/// "focus was nowhere" and starts at the first control — or the last, for
+/// Shift+Tab.
+pub(crate) fn focus_root_with_ring<V: IntoView + 'static>(view: V, ring: FocusRing) -> V::V {
+    let view = focus_root(view);
+    let id = view.id();
+    view.on_event(EventListener::KeyDown, move |e| {
+        let Event::KeyDown(ke) = e else {
+            return EventPropagation::Continue;
+        };
+        if ke.key.logical_key == Key::Named(NamedKey::Tab) {
+            ring.step_from(id, ke.modifiers.shift());
+            return EventPropagation::Stop;
+        }
+        EventPropagation::Continue
+    })
+}
+
 /// Put `view` in `ring` at `tabindex`: focusable, Tab / Shift+Tab move on, and
 /// Escape blurs.
 ///

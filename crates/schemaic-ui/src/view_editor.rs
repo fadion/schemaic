@@ -32,11 +32,12 @@ use floem::reactive::create_effect;
 use schemaic_core::ddl::{self, ViewDraft};
 use schemaic_core::intel::SqlDialect;
 
-use crate::settings::settings_toggle_row;
-use crate::table_designer::{edit_ctx, loaded_table, owned_dropdown};
+use crate::settings::focusable_toggle_row;
+use crate::table_designer::{edit_ctx, focusable_owned_dropdown, loaded_table};
 use crate::widgets::{
-    ACTION_GAP, ActionKind, FORM_GAP, MODAL_PAD_H, action_button, focus_root, form_section,
-    form_setting, form_setting_owned, modal_footer_split, modal_title_owned, panel_style,
+    ACTION_GAP, ActionKind, FORM_GAP, FocusRing, MODAL_PAD_H, action_button, focus_root_with_ring,
+    form_section, form_setting, form_setting_owned, modal_footer_split, modal_title_owned,
+    panel_style,
 };
 use crate::{
     DdlPreview, FieldCfg, Ui, ViewAlgoDoneFn, ViewAlgoRequest, ViewTarget, ddl_preview, edit_field,
@@ -222,14 +223,18 @@ fn bound_choice(
     ui: &Ui,
     initial: String,
     options: Vec<String>,
+    ring: FocusRing,
+    tabindex: u32,
     apply: impl Fn(&mut ViewDraft, &str) + 'static,
 ) -> AnyView {
     let draft = ui.ddl.view_draft;
     let sig = floem::reactive::create_rw_signal(initial);
-    owned_dropdown(
+    focusable_owned_dropdown(
         move || sig.get(),
         options,
         FIELD_W,
+        ring,
+        tabindex,
         move |v: String| {
             if sig.get_untracked() != v {
                 sig.set(v.clone());
@@ -240,7 +245,7 @@ fn bound_choice(
     .into_any()
 }
 
-fn form(ui: Ui, target: &ViewTarget) -> AnyView {
+fn form(ui: Ui, target: &ViewTarget, ring: FocusRing) -> AnyView {
     let d = ui.ddl.view_draft;
     let draft = d.get_untracked();
     let pg = target.dialect == SqlDialect::Postgres;
@@ -253,6 +258,7 @@ fn form(ui: Ui, target: &ViewTarget) -> AnyView {
             draft.name.clone(),
             FieldCfg {
                 placeholder: "view_name",
+                focus: Some((ring.clone(), 10)),
                 ..Default::default()
             },
             |d, v| d.name = v.trim().to_string(),
@@ -277,6 +283,9 @@ fn form(ui: Ui, target: &ViewTarget) -> AnyView {
                 font_size: theme::FONT_BODY,
                 max_rows: Some(ui.ddl.view_rows),
                 placeholder: "SELECT …",
+                focus: Some((ring.clone(), 20)),
+                // It's SQL: Tab indents. Escape leaves.
+                tab_indents: true,
                 ..Default::default()
             },
             |d, v| d.select = v.to_string(),
@@ -297,38 +306,50 @@ fn form(ui: Ui, target: &ViewTarget) -> AnyView {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            ring.clone(),
+            30,
             |d, v| d.options.check_option = Some(v.to_string()).filter(|s| !s.is_empty()),
         ),
     );
 
-    let security = form_setting(
-        "SQL security",
-        bound_choice(
-            &ui,
-            draft.options.security.clone().unwrap_or_default(),
-            ["", "DEFINER", "INVOKER"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            |d, v| d.options.security = Some(v.to_string()).filter(|s| !s.is_empty()),
-        ),
-    );
-    // The definer is displayed, never edited: setting one you aren't is a
-    // privileged operation, and the reason it's here at all is that the emitted
-    // statement restates it.
-    let definer = form_setting_owned(
-        "Definer".to_string(),
-        text(draft.options.definer.clone().unwrap_or_else(|| "—".into()))
-            .style(|s| s.color(theme::text_dim()).font_size(theme::FONT_BODY)),
-    );
-    let mysql_only = v_stack((security, definer)).style(move |s| {
-        let s = s.flex_col().gap(FORM_GAP).width_full();
-        if pg { s.hide() } else { s }
-    });
+    // MySQL's alone, and built only there rather than built and hidden: a
+    // `hide()`n control is still in the modal's Tab order, so Tab would land on
+    // something nobody can see.
+    let mysql_only: AnyView = if pg {
+        empty().into_any()
+    } else {
+        let security = form_setting(
+            "SQL security",
+            bound_choice(
+                &ui,
+                draft.options.security.clone().unwrap_or_default(),
+                ["", "DEFINER", "INVOKER"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                ring.clone(),
+                40,
+                |d, v| d.options.security = Some(v.to_string()).filter(|s| !s.is_empty()),
+            ),
+        );
+        // The definer is displayed, never edited: setting one you aren't is a
+        // privileged operation, and the reason it's here at all is that the
+        // emitted statement restates it.
+        let definer = form_setting_owned(
+            "Definer".to_string(),
+            text(draft.options.definer.clone().unwrap_or_else(|| "—".into()))
+                .style(|s| s.color(theme::text_dim()).font_size(theme::FONT_BODY)),
+        );
+        v_stack((security, definer))
+            .style(|s| s.flex_col().gap(FORM_GAP).width_full())
+            .into_any()
+    };
 
     // PostgreSQL's escape hatch. Off by default — a drop is never the quiet
     // answer — and the preview spells out what taking it costs.
-    let recreate = {
+    let recreate: AnyView = if !pg {
+        empty().into_any()
+    } else {
         let sig = floem::reactive::create_rw_signal(draft.force_recreate);
         create_effect(move |prev: Option<bool>| {
             let v = sig.get();
@@ -337,14 +358,16 @@ fn form(ui: Ui, target: &ViewTarget) -> AnyView {
             }
             v
         });
-        settings_toggle_row(
+        focusable_toggle_row(
             "Re-create instead of replacing",
             "PostgreSQL can only add columns to an existing view. Renaming, retyping or \
              reordering one needs a DROP and a CREATE, which takes dependent views and \
              grants with it.",
             sig,
+            ring,
+            50,
         )
-        .style(move |s| if pg { s } else { s.hide() })
+        .into_any()
     };
 
     v_stack((
@@ -419,8 +442,13 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
                 ),
             };
 
+            // The form is built once per open, so one ring covers it; the root
+            // keeps a clone to answer Tab by entering it.
+            let ring = FocusRing::new();
+            let root_ring = ring.clone();
+
             let body = crate::widgets::autohide(scroll(
-                form(ui.clone(), &target)
+                form(ui.clone(), &target, ring)
                     .style(|s| s.width_full().padding_horiz(MODAL_PAD_H).padding_vert(18.0)),
             ))
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
@@ -487,7 +515,7 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
             .on_click_stop(|_| {})
             .style(|s| panel_style(s).width(PANEL_W).height(PANEL_H));
 
-            focus_root(container(panel))
+            focus_root_with_ring(container(panel), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())
                 .style(|s| {
                     s.size_full()

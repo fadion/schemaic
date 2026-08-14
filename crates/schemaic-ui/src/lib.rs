@@ -4336,6 +4336,20 @@ pub(crate) struct FieldCfg {
     /// key while a field has focus. [`FieldCfg::on_tab`] wins if both are set,
     /// since that one is an explicit override for a specific key.
     pub focus: Option<(widgets::FocusRing, u32)>,
+    /// **Tab types an indent here instead of leaving.** For a field holding
+    /// *code* — a trigger body, a function body, a view's `SELECT` — where
+    /// indenting is ordinary typing and losing it to focus movement would be a
+    /// worse trade than the extra key it costs to get out.
+    ///
+    /// The field still joins the ring, so Tab can still *arrive*; only the step
+    /// away is suppressed, and floem's own `InsertTab` then runs. Escape is the
+    /// way out, as it is from any field — it blurs to the enclosing
+    /// [`widgets::focus_root`], whose Tab re-enters the ring.
+    ///
+    /// Not for prose (the AI settings' custom instructions) and not for a
+    /// read-only script box (the DDL preview's), where there is no indent to
+    /// type and Tab moving on is simply the better behaviour.
+    pub tab_indents: bool,
     /// A "move caret to end" pulse: when this signal changes, the field refocuses
     /// and drops the caret at the end of the text. Used after a programmatic
     /// completion (the palette's command → argument transition) so typing
@@ -4375,6 +4389,7 @@ impl Default for FieldCfg {
             uncommitted: None,
             on_tab: None,
             focus: None,
+            tab_indents: false,
             caret_end: None,
             trailing: None,
         }
@@ -4477,6 +4492,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         uncommitted,
         on_tab,
         focus,
+        tab_indents,
         caret_end,
         trailing,
     } = cfg;
@@ -4592,7 +4608,12 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         // Otherwise Tab leaves the field for the next control in the modal's
         // ring. It has to be answered here: floem's editor consumes every key,
         // so neither an outer listener nor floem's own traversal can see it.
+        //
+        // Unless the field holds code, where Tab is typing: falling through
+        // leaves it to floem, whose editor maps Tab to `InsertTab`. See
+        // [`FieldCfg::tab_indents`].
         if let Some((ring, _)) = &key_focus
+            && !tab_indents
             && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _))
             && let Some(me) = editor_sig.with_untracked(|e| e.editor_view_id.get_untracked())
         {
