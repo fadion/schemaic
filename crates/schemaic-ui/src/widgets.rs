@@ -118,6 +118,24 @@ pub(crate) fn ring_step(len: usize, cur: Option<usize>, backwards: bool) -> Opti
     })
 }
 
+/// Step a *selection* of `len` items from `cur` by `delta`, **clamping** at both
+/// ends. `None` when there is nowhere to go — an empty list, or a step that
+/// would land where it started.
+///
+/// The deliberate counterpart to [`ring_step`]: the Tab ring wraps because
+/// wrapping is what stops Tab escaping the modal, while a selection that jumps
+/// from the last column to the first is only a surprise. Written as its own
+/// function so the divergence is stated once and pinned by a test — and because
+/// the clamp is where an empty list bites: `clamp(0, -1)` panics in debug, which
+/// any table without CHECK constraints could reach.
+pub(crate) fn list_step(len: usize, cur: usize, delta: isize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let next = (cur as isize + delta).clamp(0, len as isize - 1) as usize;
+    (next != cur).then_some(next)
+}
+
 /// The Tab order over one modal's controls.
 ///
 /// Schemaic has to own this rather than use floem's. Floem *does* have
@@ -2344,6 +2362,39 @@ mod ring_tests {
     fn a_single_control_keeps_focus_on_itself() {
         assert_eq!(ring_step(1, Some(0), false), Some(0));
         assert_eq!(ring_step(1, Some(0), true), Some(0));
+    }
+
+    // ── Selection inside a list (`list_pane`) ───────────────────────────────
+
+    #[test]
+    fn a_selection_walks_one_item_at_a_time() {
+        assert_eq!(list_step(3, 0, 1), Some(1));
+        assert_eq!(list_step(3, 2, -1), Some(1));
+    }
+
+    /// The documented divergence from [`ring_step`]: the Tab ring wraps so Tab
+    /// can't leave the modal; a *selection* clamps, because jumping from the
+    /// last column to the first is only a surprise.
+    #[test]
+    fn a_selection_clamps_at_both_ends_where_the_tab_ring_wraps() {
+        assert_eq!(list_step(3, 2, 1), None, "clamped, not wrapped");
+        assert_eq!(list_step(3, 0, -1), None);
+        assert_eq!(ring_step(3, Some(2), false), Some(0), "the ring wraps");
+        assert_eq!(ring_step(3, Some(0), true), Some(2));
+    }
+
+    /// A table with no CHECK constraints reaches this, and the clamp is where it
+    /// would bite: `clamp(0, -1)` panics in debug.
+    #[test]
+    fn an_empty_list_has_nowhere_to_step() {
+        assert_eq!(list_step(0, 0, 1), None);
+        assert_eq!(list_step(0, 0, -1), None);
+    }
+
+    #[test]
+    fn a_single_item_list_never_moves() {
+        assert_eq!(list_step(1, 0, 1), None);
+        assert_eq!(list_step(1, 0, -1), None);
     }
 
     // ── The ring itself ─────────────────────────────────────────────────────

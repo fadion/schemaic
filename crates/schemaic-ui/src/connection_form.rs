@@ -206,6 +206,26 @@ fn conn_color_dot(color: Option<String>) -> impl IntoView {
     })
 }
 
+/// Where the keyboard cursor lands when the swatch row is Tab-ed into: on the
+/// preset the connection's colour already names, or **nowhere** when it names
+/// none of them.
+///
+/// Nowhere, not the first swatch. A colour outside the preset table is
+/// reachable — a hand-edited `connections.json`, or a preset retuned in a later
+/// build — and answering "Red" put the halo on a swatch the selection border was
+/// not on, which the next Space *wrote*: a connection silently repainted by two
+/// keys that look like navigation. A `None` cursor paints no halo, and the first
+/// arrow enters the row at its head as it does for a colourless connection.
+///
+/// The match is case-insensitive on purpose: `#e05252` and `#E05252` are the
+/// same colour to every renderer here, so they must be the same swatch.
+pub(crate) fn preset_cursor(presets: &[crate::ColorPreset], color: Option<&str>) -> Option<usize> {
+    let c = color?.trim();
+    presets
+        .iter()
+        .position(|(_, hex, _)| hex.eq_ignore_ascii_case(c))
+}
+
 /// A row of colour swatches that sets the draft's identity colour. Every
 /// connection has a colour (new ones are auto-assigned), so there's no "none"
 /// option; the selected swatch gets a 2px border in `text()`.
@@ -251,14 +271,7 @@ fn color_picker(color: RwSignal<Option<String>>, ring: FocusRing, tabindex: u32)
             .into_any()
     });
 
-    // Where the cursor starts when the row is Tab-ed into: on the colour in
-    // effect, or at the head of the row when there isn't one yet.
-    let cursor_start = move || {
-        color
-            .get_untracked()
-            .and_then(|c| presets.iter().position(|(_, hex, _)| *hex == c))
-            .unwrap_or(0)
-    };
+    let cursor_start = move || preset_cursor(presets, color.get_untracked().as_deref());
     // One step along the row, selecting as it goes — a radio group, not a list
     // you then have to confirm. `ring_step` because the wrap-at-both-ends rule
     // is the same one the modal's Tab order follows.
@@ -281,7 +294,7 @@ fn color_picker(color: RwSignal<Option<String>>, ring: FocusRing, tabindex: u32)
     let row = crate::widgets::in_focus_ring(row, ring, tabindex)
         .on_event(EventListener::FocusGained, move |_| {
             if cursor.get_untracked().is_none() {
-                cursor.set(Some(cursor_start()));
+                cursor.set(cursor_start());
             }
             EventPropagation::Continue
         })
@@ -305,11 +318,14 @@ fn color_picker(color: RwSignal<Option<String>>, ring: FocusRing, tabindex: u32)
                 // Space/Enter take the swatch the cursor is already on. It is
                 // normally selected already — the arrows select as they move —
                 // but not on the row's very first focus, where the cursor sits
-                // on a colour nobody has chosen yet.
+                // on a colour nobody has chosen yet. With the cursor on nothing
+                // (a colour outside the presets) there is no swatch to take, so
+                // the key does nothing rather than picking one.
                 Key::Named(NamedKey::Space) | Key::Named(NamedKey::Enter) => {
-                    let at = cursor.get_untracked().unwrap_or_else(cursor_start);
-                    cursor.set(Some(at));
-                    color.set(Some(presets[at].1.to_string()));
+                    if let Some(at) = cursor.get_untracked().or_else(cursor_start) {
+                        cursor.set(Some(at));
+                        color.set(Some(presets[at].1.to_string()));
+                    }
                     EventPropagation::Stop
                 }
                 _ => EventPropagation::Continue,
@@ -959,7 +975,37 @@ fn conn_form(
 
 #[cfg(test)]
 mod tests {
-    use super::{mask_of_len, reconstruct_real};
+    use super::{mask_of_len, preset_cursor, reconstruct_real};
+
+    #[test]
+    fn the_swatch_cursor_starts_on_the_colour_in_effect() {
+        let presets = crate::CONN_COLOR_PRESETS;
+        let first = presets[0].1;
+        let last = presets[presets.len() - 1].1;
+        assert_eq!(preset_cursor(presets, Some(first)), Some(0));
+        assert_eq!(preset_cursor(presets, Some(last)), Some(presets.len() - 1));
+    }
+
+    /// Both spellings are the same colour to every renderer here, so they have
+    /// to be the same swatch.
+    #[test]
+    fn the_swatch_cursor_reads_hex_case_insensitively() {
+        let presets = crate::CONN_COLOR_PRESETS;
+        let upper = presets[1].1.to_ascii_uppercase();
+        assert_eq!(preset_cursor(presets, Some(&upper)), Some(1));
+    }
+
+    /// The defect this replaced: an unrecognised colour answered "the first
+    /// swatch", so the halo sat where the selection border did not — and the
+    /// next Space wrote it, repainting the connection with two keys that look
+    /// like navigation.
+    #[test]
+    fn a_colour_outside_the_presets_puts_the_cursor_nowhere() {
+        let presets = crate::CONN_COLOR_PRESETS;
+        assert_eq!(preset_cursor(presets, Some("#123456")), None);
+        assert_eq!(preset_cursor(presets, Some("")), None);
+        assert_eq!(preset_cursor(presets, None), None);
+    }
 
     #[test]
     fn mask_lengths() {
