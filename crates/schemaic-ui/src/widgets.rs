@@ -39,7 +39,7 @@ use crate::{icons, theme};
 // the designer), and `retain` rather than `pop` because they don't always unmount
 // innermost-first.
 thread_local! {
-    static FOCUS_ROOTS: std::cell::RefCell<Vec<floem::ViewId>> =
+    static FOCUS_ROOTS: std::cell::RefCell<Vec<(floem::ViewId, Option<FocusRing>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -55,13 +55,17 @@ thread_local! {
 /// `.on_cleanup` onto the result either — floem keeps a single cleanup slot per
 /// view, so a second one silently replaces the unregister.
 pub(crate) fn focus_root<V: IntoView + 'static>(view: V) -> V::V {
+    focus_root_inner(view, None)
+}
+
+fn focus_root_inner<V: IntoView + 'static>(view: V, ring: Option<FocusRing>) -> V::V {
     let view = view.into_view();
     let id = view.id();
-    FOCUS_ROOTS.with_borrow_mut(|s| s.push(id));
+    FOCUS_ROOTS.with_borrow_mut(|s| s.push((id, ring)));
     view.keyboard_navigable()
         .request_focus(|| {})
         .on_cleanup(move || {
-            FOCUS_ROOTS.with_borrow_mut(|s| s.retain(|x| *x != id));
+            FOCUS_ROOTS.with_borrow_mut(|s| s.retain(|(x, _)| *x != id));
             // **Hand the keyboard back.** Floem clears `app_state.focus` when a
             // focused view is removed and does it *silently* — no
             // `focus_changed`, so no `FocusGained` lands anywhere — and a key
@@ -82,7 +86,17 @@ pub(crate) fn focus_root<V: IntoView + 'static>(view: V) -> V::V {
 /// The innermost mounted [`focus_root`], or `None` when no overlay is open (a
 /// field in the main workspace then simply drops focus on Escape).
 pub(crate) fn innermost_focus_root() -> Option<floem::ViewId> {
-    FOCUS_ROOTS.with_borrow(|s| s.last().copied())
+    FOCUS_ROOTS.with_borrow(|s| s.last().map(|(id, _)| *id))
+}
+
+/// The innermost mounted overlay's [`FocusRing`], for the window root's Tab
+/// backstop: with focus on a dropdown's popup list — or on nothing at all, which
+/// is what a click on an unfocusable list row leaves behind — the key reaches
+/// neither a ring member nor the modal's own root, and floem's fallback walks
+/// the *whole window tree*, so Tab escaped the modal into the workspace behind
+/// it. The root can step this ring instead.
+pub(crate) fn innermost_focus_ring() -> Option<FocusRing> {
+    FOCUS_ROOTS.with_borrow(|s| s.last().and_then(|(_, r)| r.clone()))
 }
 
 // ── Tab order ───────────────────────────────────────────────────────────────
@@ -120,17 +134,41 @@ pub(crate) fn ring_step(len: usize, cur: Option<usize>, backwards: bool) -> Opti
 #[derive(Clone, Default)]
 pub(crate) struct FocusRing {
     entries: Rc<std::cell::RefCell<Vec<(u32, floem::ViewId)>>>,
+    /// Where the walk resumes when the key arrives somewhere that isn't a ring
+    /// member — the modal's own root after an Escape, or the window root when
+    /// focus is on a popup list or nowhere.
+    ///
+    /// Without it every such re-entry restarted at position 0, which made a
+    /// `tab_indents` field (where Tab types an indent and Escape is the way out)
+    /// a **trap**: every control after it in the ring was unreachable by forward
+    /// Tab, because leaving the field always landed back at the top.
+    last: Rc<std::cell::Cell<Option<floem::ViewId>>>,
 }
 
 /// Closes a control's open popup and returns the keyboard to it.
 pub(crate) type PopupDismiss = Rc<dyn Fn()>;
 
+/// Who owns the [`OPEN_POPUP`] slot. Handed out by [`popup_token`] and compared
+/// on the way out, so a control can only ever clear *its own* entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct PopupToken(u64);
+
 thread_local! {
-    static OPEN_POPUP: std::cell::RefCell<Option<PopupDismiss>> =
+    static OPEN_POPUP: std::cell::RefCell<Option<(PopupToken, PopupDismiss)>> =
         const { std::cell::RefCell::new(None) };
+    static NEXT_POPUP_TOKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Publish how to close the popup just opened, or `None` once it closes.
+/// A fresh owner token, one per control that can put a popup up.
+pub(crate) fn popup_token() -> PopupToken {
+    NEXT_POPUP_TOKEN.with(|n| {
+        let t = n.get();
+        n.set(t + 1);
+        PopupToken(t)
+    })
+}
+
+/// Publish how to close the popup `token`'s control just opened.
 ///
 /// Global rather than per-modal because only one such popup can be up at a time,
 /// and — the deciding reason — Escape can only be answered from the *window
@@ -138,8 +176,26 @@ thread_local! {
 /// owns it nor the enclosing modal is the focused view; floem delivers a key to
 /// the focused view and then only to listeners on the root, so the modal's own
 /// Escape handler never runs while a popup is up.
-pub(crate) fn set_open_popup(dismiss: Option<PopupDismiss>) {
-    OPEN_POPUP.with_borrow_mut(|p| *p = dismiss);
+///
+/// One slot, but it carries **whose** popup it is: a control that publishes and
+/// a control that withdraws are not the same control often enough to matter.
+/// Floem queues B's open during dispatch and A's close at the end of the same
+/// event, so clicking a second dropdown while the first is up ran
+/// `set(Some(closeB))` and then A's clear — and an untagged clear emptied the
+/// slot under B, after which Escape did nothing at all. The build-time run of
+/// each dropdown's effect (with `open == false`) was a second way in.
+pub(crate) fn set_open_popup(token: PopupToken, dismiss: PopupDismiss) {
+    OPEN_POPUP.with_borrow_mut(|p| *p = Some((token, dismiss)));
+}
+
+/// Withdraw `token`'s entry, if the slot is still its. A no-op otherwise — see
+/// [`set_open_popup`] for why that matters.
+pub(crate) fn clear_open_popup(token: PopupToken) {
+    OPEN_POPUP.with_borrow_mut(|p| {
+        if p.as_ref().is_some_and(|(t, _)| *t == token) {
+            *p = None;
+        }
+    });
 }
 
 /// Escape's **first** step: close an open popup and give the keyboard back to
@@ -151,7 +207,7 @@ pub(crate) fn set_open_popup(dismiss: Option<PopupDismiss>) {
 pub(crate) fn dismiss_open_popup() -> bool {
     let dismiss = OPEN_POPUP.with_borrow_mut(|p| p.take());
     match dismiss {
-        Some(f) => {
+        Some((_, f)) => {
             f();
             true
         }
@@ -177,14 +233,60 @@ impl FocusRing {
         self.entries.borrow_mut().retain(|(_, x)| *x != id);
     }
 
-    /// Move focus one step from `from`. A view that isn't in the ring (focus sat
-    /// somewhere unregistered) starts the walk from the top.
-    pub(crate) fn step_from(&self, from: floem::ViewId, backwards: bool) {
+    /// Remember `id` as where the walk should resume — what a control calls on
+    /// its way out when it hands focus back to the modal root, so the root's own
+    /// Tab continues from it instead of restarting at the top.
+    pub(crate) fn remember(&self, id: floem::ViewId) {
+        self.last.set(Some(id));
+    }
+
+    /// Where one step from `from` lands: the [remembered](Self::remember)
+    /// position stands in when `from` isn't a ring member — which is every
+    /// re-entry from a modal root, a popup list, or nowhere. Neither known:
+    /// start at the near end.
+    pub(crate) fn target(&self, from: floem::ViewId, backwards: bool) -> Option<floem::ViewId> {
         let e = self.entries.borrow();
-        let cur = e.iter().position(|(_, x)| *x == from);
-        if let Some(next) = ring_step(e.len(), cur, backwards) {
-            e[next].1.request_focus();
+        let find = |id: floem::ViewId| e.iter().position(|(_, x)| *x == id);
+        let cur = find(from).or_else(|| self.last.get().and_then(find));
+        ring_step(e.len(), cur, backwards).map(|n| e[n].1)
+    }
+
+    /// Move focus one step from `from`, per [`FocusRing::target`].
+    pub(crate) fn step_from(&self, from: floem::ViewId, backwards: bool) {
+        if let Some(id) = self.target(from, backwards) {
+            self.last.set(Some(id));
+            id.request_focus();
         }
+    }
+
+    /// Whatever now sits at `tabindex`.
+    pub(crate) fn at(&self, tabindex: u32) -> Option<floem::ViewId> {
+        self.entries
+            .borrow()
+            .iter()
+            .find(|(t, _)| *t == tabindex)
+            .map(|(_, id)| *id)
+    }
+
+    /// Focus whatever now sits at `tabindex`.
+    ///
+    /// Deliberately by tabindex rather than by the `ViewId` a caller captured at
+    /// build time: a control that refocuses itself *after* the update pass its
+    /// own action started — a dropdown returning the keyboard once its popup is
+    /// gone — may have been rebuilt by that very action, and floem's focus
+    /// request has no existence check, so the captured id parked the keyboard on
+    /// a removed view and left the modal dead. The tabindex is what survives the
+    /// rebuild; the replacement re-registers under it.
+    pub(crate) fn focus_at(&self, tabindex: u32) {
+        if let Some(id) = self.at(tabindex) {
+            self.last.set(Some(id));
+            id.request_focus();
+        }
+    }
+
+    #[cfg(test)]
+    fn ids(&self) -> Vec<floem::ViewId> {
+        self.entries.borrow().iter().map(|(_, id)| *id).collect()
     }
 }
 
@@ -197,11 +299,15 @@ impl FocusRing {
 /// clicked. The same dead end follows every Escape, which hands focus back here
 /// on purpose.
 ///
-/// The root is not itself a ring member, so [`FocusRing::step_from`] treats it as
-/// "focus was nowhere" and starts at the first control — or the last, for
-/// Shift+Tab.
+/// The root is not itself a ring member, so [`FocusRing::step_from`] resumes
+/// from wherever the ring last was — and, on a freshly-opened modal that has
+/// been nowhere yet, starts at the first control (the last, for Shift+Tab).
+///
+/// The ring is also published for the *window* root, which is where a key lands
+/// when focus is on a dropdown's popup list or on nothing — see
+/// [`innermost_focus_ring`].
 pub(crate) fn focus_root_with_ring<V: IntoView + 'static>(view: V, ring: FocusRing) -> V::V {
-    let view = focus_root(view);
+    let view = focus_root_inner(view, Some(ring.clone()));
     let id = view.id();
     view.on_event(EventListener::KeyDown, move |e| {
         let Event::KeyDown(ke) = e else {
@@ -234,12 +340,33 @@ pub(crate) fn in_focus_ring<V: IntoView + 'static>(
     ring: FocusRing,
     tabindex: u32,
 ) -> impl IntoView {
+    in_focus_ring_with(view, ring, tabindex, || {})
+}
+
+/// [`in_focus_ring`] for a control that needs teardown of its own.
+///
+/// Floem keeps a **single** cleanup slot per view, so chaining a second
+/// `.on_cleanup` onto the result would silently replace the ring's unregister
+/// *and* the focus hand-back below. Pass the extra work here instead.
+pub(crate) fn in_focus_ring_with<V: IntoView + 'static>(
+    view: V,
+    ring: FocusRing,
+    tabindex: u32,
+    on_dispose: impl Fn() + 'static,
+) -> impl IntoView {
     let view = view.into_view();
     let id = view.id();
     ring.register(tabindex, id);
     let step_ring = ring.clone();
     let cleanup_ring = ring;
+    // "Was I focused?" mirrored into a plain `Cell`, not read back from floem at
+    // cleanup time: by then the view is being removed and `app_state.focus` has
+    // already been cleared.
+    let focused = Rc::new(std::cell::Cell::new(false));
+    let (gained, lost, at_cleanup) = (focused.clone(), focused.clone(), focused);
     view.keyboard_navigable()
+        .on_event_cont(EventListener::FocusGained, move |_| gained.set(true))
+        .on_event_cont(EventListener::FocusLost, move |_| lost.set(false))
         .on_event(EventListener::KeyDown, move |e| {
             let Event::KeyDown(ke) = e else {
                 return EventPropagation::Continue;
@@ -249,6 +376,9 @@ pub(crate) fn in_focus_ring<V: IntoView + 'static>(
                 return EventPropagation::Stop;
             }
             if ke.key.logical_key == Key::Named(NamedKey::Escape) {
+                // Remember where the walk was before handing the keyboard back,
+                // so the root's Tab resumes here rather than at the top.
+                step_ring.remember(id);
                 id.clear_focus();
                 if let Some(root) = innermost_focus_root() {
                     root.request_focus();
@@ -257,7 +387,22 @@ pub(crate) fn in_focus_ring<V: IntoView + 'static>(
             }
             EventPropagation::Continue
         })
-        .on_cleanup(move || cleanup_ring.unregister(id))
+        .on_cleanup(move || {
+            cleanup_ring.unregister(id);
+            on_dispose();
+            // **Hand the keyboard back**, the same step `focus_root`'s cleanup
+            // takes and for the same reason: floem clears `app_state.focus`
+            // *silently* when the focused view is removed, so a control that
+            // unmounts while focused leaves the keyboard nowhere and the modal
+            // around it answers neither Escape nor Tab. One click on the
+            // designer's list `+` did it — the click focuses the pane, and the
+            // draft it edits is half the container's key.
+            if at_cleanup.get() {
+                if let Some(root) = innermost_focus_root() {
+                    root.request_focus();
+                }
+            }
+        })
 }
 
 // ===== moved from lib.rs (widgets cluster) =====
@@ -2199,6 +2344,165 @@ mod ring_tests {
     fn a_single_control_keeps_focus_on_itself() {
         assert_eq!(ring_step(1, Some(0), false), Some(0));
         assert_eq!(ring_step(1, Some(0), true), Some(0));
+    }
+
+    // ── The ring itself ─────────────────────────────────────────────────────
+    //
+    // `ViewId::new()` is public and `request_focus` only queues an update
+    // message, so the whole ordering rule tests without an app — which is worth
+    // having, because every way of getting it wrong is silent: flip
+    // `partition_point`'s `<=` to `<` and controls sharing a tabindex reverse;
+    // drop `register`'s `retain` and `edit_field`'s re-registering effect
+    // duplicates its field, so Tab visits the same box twice.
+
+    fn ring_of(spec: &[u32]) -> (FocusRing, Vec<floem::ViewId>) {
+        let ring = FocusRing::new();
+        let ids: Vec<_> = spec
+            .iter()
+            .map(|t| {
+                let id = floem::ViewId::new();
+                ring.register(*t, id);
+                id
+            })
+            .collect();
+        (ring, ids)
+    }
+
+    #[test]
+    fn the_ring_orders_by_tabindex_not_registration() {
+        // The SSH block registers only once its toggle is on, i.e. after the
+        // fields below it on screen.
+        let (ring, ids) = ring_of(&[30, 10, 20]);
+        assert_eq!(ring.ids(), vec![ids[1], ids[2], ids[0]]);
+    }
+
+    #[test]
+    fn re_registering_a_view_moves_it_rather_than_duplicating_it() {
+        let (ring, ids) = ring_of(&[10, 20]);
+        ring.register(30, ids[0]);
+        assert_eq!(ring.ids(), vec![ids[1], ids[0]]);
+    }
+
+    /// A `dyn_container` swap builds the newcomer *before* removing the outgoing
+    /// view, so the two share a tabindex for one update pass. The survivor has
+    /// to keep the slot in both directions.
+    #[test]
+    fn a_tie_is_broken_in_favour_of_the_survivor() {
+        let (ring, ids) = ring_of(&[10, 20, 30]);
+        let incoming = floem::ViewId::new();
+        ring.register(20, incoming);
+        assert_eq!(ring.ids(), vec![ids[0], ids[1], incoming, ids[2]]);
+        ring.unregister(ids[1]);
+        assert_eq!(ring.ids(), vec![ids[0], incoming, ids[2]]);
+    }
+
+    #[test]
+    fn a_tab_from_a_member_steps_to_its_neighbour_and_wraps() {
+        let (ring, ids) = ring_of(&[10, 20, 30]);
+        assert_eq!(ring.target(ids[0], false), Some(ids[1]));
+        assert_eq!(ring.target(ids[2], false), Some(ids[0]));
+        assert_eq!(ring.target(ids[0], true), Some(ids[2]));
+    }
+
+    /// The reason `remember` exists: leaving a `tab_indents` field (where Tab
+    /// types an indent and Escape is the only way out) hands focus to the modal
+    /// root, and re-entering at position 0 made every control after the field
+    /// unreachable by forward Tab.
+    #[test]
+    fn re_entering_from_outside_resumes_where_the_ring_last_was() {
+        let (ring, ids) = ring_of(&[10, 20, 30]);
+        let root = floem::ViewId::new();
+        assert_eq!(
+            ring.target(root, false),
+            Some(ids[0]),
+            "nowhere yet: the top"
+        );
+        ring.remember(ids[1]);
+        assert_eq!(ring.target(root, false), Some(ids[2]));
+        assert_eq!(ring.target(root, true), Some(ids[0]));
+    }
+
+    #[test]
+    fn a_remembered_view_that_has_since_unmounted_starts_the_walk_over() {
+        let (ring, ids) = ring_of(&[10, 20, 30]);
+        ring.remember(ids[1]);
+        ring.unregister(ids[1]);
+        assert_eq!(ring.target(floem::ViewId::new(), false), Some(ids[0]));
+    }
+
+    /// What a dropdown refocuses through after its popup closes: the accept can
+    /// have rebuilt the box, so the id captured at build time is gone and only
+    /// the tabindex still names the control.
+    #[test]
+    fn a_tabindex_resolves_to_whatever_currently_holds_it() {
+        let (ring, ids) = ring_of(&[10, 20]);
+        assert_eq!(ring.at(20), Some(ids[1]));
+        let rebuilt = floem::ViewId::new();
+        ring.register(20, rebuilt);
+        ring.unregister(ids[1]);
+        assert_eq!(ring.at(20), Some(rebuilt));
+        assert_eq!(ring.at(99), None);
+    }
+}
+
+#[cfg(test)]
+mod popup_slot_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn counting() -> (PopupDismiss, Rc<Cell<u32>>) {
+        let n = Rc::new(Cell::new(0));
+        let seen = n.clone();
+        (Rc::new(move || n.set(n.get() + 1)), seen)
+    }
+
+    #[test]
+    fn escape_closes_the_published_popup_once() {
+        let token = popup_token();
+        let (dismiss, seen) = counting();
+        set_open_popup(token, dismiss);
+        assert!(dismiss_open_popup());
+        assert_eq!(seen.get(), 1);
+        assert!(!dismiss_open_popup(), "the slot is empty again");
+        assert_eq!(seen.get(), 1);
+    }
+
+    #[test]
+    fn nothing_open_means_escape_falls_through_to_the_modal() {
+        assert!(!dismiss_open_popup());
+    }
+
+    /// The bug the token exists for. Floem queues B's open during dispatch and
+    /// A's close at the end of the same event, so clicking a second dropdown
+    /// while the first is up runs `set(B)` and *then* A's clear — and an
+    /// untagged clear emptied the slot under B, after which Escape did nothing.
+    /// The build-time run of every dropdown's effect (with `open == false`) was
+    /// a second way in, so merely constructing one wiped the slot.
+    #[test]
+    fn a_control_can_only_clear_its_own_entry() {
+        let (a, b) = (popup_token(), popup_token());
+        let (dismiss_b, seen_b) = counting();
+        set_open_popup(b, dismiss_b);
+        clear_open_popup(a);
+        assert!(dismiss_open_popup(), "B's popup is still closeable");
+        assert_eq!(seen_b.get(), 1);
+    }
+
+    #[test]
+    fn clearing_your_own_entry_empties_the_slot() {
+        let token = popup_token();
+        let (dismiss, seen) = counting();
+        set_open_popup(token, dismiss);
+        clear_open_popup(token);
+        assert!(!dismiss_open_popup());
+        assert_eq!(seen.get(), 0);
+    }
+
+    /// Two tokens are never equal, which is what makes the check above mean
+    /// anything.
+    #[test]
+    fn every_control_gets_a_token_of_its_own() {
+        assert_ne!(popup_token(), popup_token());
     }
 }
 

@@ -2253,6 +2253,23 @@ pub fn workspace(ui: Ui) -> impl IntoView {
             {
                 return EventPropagation::Stop;
             }
+            // The Tab trap's backstop, and the mirror of the Escape branch above:
+            // a plain Tab only gets this far when nothing in the overlay consumed
+            // it, which means focus is on a dropdown's popup list or on nothing at
+            // all (floem clears it silently when a focused view is removed, and a
+            // click on an unfocusable row leaves it cleared). Floem's own fallback
+            // walks the **whole window tree**, so from either state Tab left the
+            // modal for the workspace behind it — the one thing the ring exists to
+            // prevent. Step the innermost overlay's ring instead.
+            if matches!(ke.key.logical_key, Key::Named(NamedKey::Tab)) && !m.control() {
+                if let (Some(root), Some(ring)) = (
+                    widgets::innermost_focus_root(),
+                    widgets::innermost_focus_ring(),
+                ) {
+                    ring.step_from(root, m.shift());
+                    return EventPropagation::Stop;
+                }
+            }
             if m.control() {
                 // Global nav (Ctrl+P/T/W/Tab/1-9) — also wired inside the editor,
                 // which stops KeyDown; here it catches every other focus (grid,
@@ -4344,7 +4361,15 @@ pub(crate) struct FieldCfg {
     /// The field still joins the ring, so Tab can still *arrive*; only the step
     /// away is suppressed, and floem's own `InsertTab` then runs. Escape is the
     /// way out, as it is from any field — it blurs to the enclosing
-    /// [`widgets::focus_root`], whose Tab re-enters the ring.
+    /// [`widgets::focus_root`], whose Tab re-enters the ring **at the control
+    /// after this one**, because the blur tells the ring where it was
+    /// ([`widgets::FocusRing::remember`]).
+    ///
+    /// That last clause is the whole of why such a field can sit anywhere in a
+    /// ring. Re-entry used to restart at position 0, which made any placement
+    /// but the last one a trap: Tab typed an indent, Escape went to the root,
+    /// and the root's Tab came back to the top — so every control below the
+    /// field was unreachable by forward Tab.
     ///
     /// Not for prose (the AI settings' custom instructions) and not for a
     /// read-only script box (the DDL preview's), where there is no indent to
@@ -4588,6 +4613,15 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                     if let Some(vid) =
                         editor_sig.with_untracked(|e| e.editor_view_id.get_untracked())
                     {
+                        // Tell the ring where the walk was before handing the
+                        // keyboard back, so the root's Tab resumes *after* this
+                        // field. Without it re-entry always restarted at position
+                        // 0, which made a `tab_indents` field — where Escape is
+                        // the only way out — a trap: every control below it in
+                        // the ring was unreachable by forward Tab.
+                        if let Some((ring, _)) = &key_focus {
+                            ring.remember(vid);
+                        }
                         vid.clear_focus();
                     }
                     if let Some(root) = widgets::innermost_focus_root() {
@@ -4942,15 +4976,18 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         });
     }
 
+    // `focused` mirrored as plain, non-reactive state, for the deferred blur
+    // below to read — and for the cleanup, which has to know whether this field
+    // held the keyboard as it went. Neither can use the signal: by the time they
+    // run, the field's scope may already be disposed, and a `None` there can't
+    // be told apart from "focus came back" — the one thing they need to know.
+    let focus_now = std::rc::Rc::new(std::cell::Cell::new(false));
+
     // Caret focus-gating + border focus tracking. The focus-lost effect is
     // created second so it wins the initial run → the field starts unfocused
     // (unless `autofocus` re-focuses it right after).
     {
-        // `focused` mirrored as plain, non-reactive state, for the deferred blur
-        // below to read. It can't use the signal: by the time it runs, the field's
-        // scope may already be disposed, and a `None` there can't be told apart
-        // from "focus came back" — the one thing it needs to know.
-        let focus_now = std::rc::Rc::new(std::cell::Cell::new(false));
+        let focus_now = focus_now.clone();
         let focus_now_f = focus_now.clone();
         let ed_focus = ed.clone();
         create_effect(move |_| {
@@ -5110,6 +5147,16 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         .on_cleanup(move || {
             if let (Some(ring), Some(vid)) = (ring_cleanup.as_ref(), registered.get()) {
                 ring.unregister(vid);
+            }
+            // Hand the keyboard back if this field held it — floem clears the
+            // focus of a removed view *silently*, so a field that unmounts while
+            // focused (a branch folding away under the control that changed it)
+            // otherwise leaves the modal around it answering neither Escape nor
+            // Tab. Same step `focus_root`'s and `in_focus_ring`'s cleanups take.
+            if focus_now.get()
+                && let Some(root) = widgets::innermost_focus_root()
+            {
+                root.request_focus();
             }
         })
         .on_event_cont(EventListener::PointerDown, move |e| {
