@@ -2242,6 +2242,17 @@ pub fn workspace(ui: Ui) -> impl IntoView {
     .on_event(EventListener::KeyDown, move |e| {
         if let Event::KeyDown(ke) = e {
             let m = ke.modifiers;
+            // Escape closing a control's popup has to be answered here, and only
+            // here: the popup takes the keyboard itself, so neither the control
+            // that owns it nor the modal around it is the focused view, and floem
+            // delivers a key to the focused view and then only to the root's
+            // listeners. Nothing open → falls through, and the modal's own
+            // Escape handles the layer below (see `widgets::dismiss_open_popup`).
+            if matches!(ke.key.logical_key, Key::Named(NamedKey::Escape))
+                && widgets::dismiss_open_popup()
+            {
+                return EventPropagation::Stop;
+            }
             if m.control() {
                 // Global nav (Ctrl+P/T/W/Tab/1-9) — also wired inside the editor,
                 // which stops KeyDown; here it catches every other focus (grid,
@@ -4317,6 +4328,14 @@ pub(crate) struct FieldCfg {
     /// Tab (e.g. accept the command-palette ghost completion). When set, the key
     /// is consumed here instead of inserting a tab / moving focus.
     pub on_tab: Option<Rc<dyn Fn()>>,
+    /// Place the field in a modal's Tab order at this index.
+    ///
+    /// The ring has to reach *inside* the editor's key handler: floem registers
+    /// the editor's KeyDown listener with `on_event_stop`, so no listener bolted
+    /// on from outside — and not floem's own Tab traversal either — ever sees a
+    /// key while a field has focus. [`FieldCfg::on_tab`] wins if both are set,
+    /// since that one is an explicit override for a specific key.
+    pub focus: Option<(widgets::FocusRing, u32)>,
     /// A "move caret to end" pulse: when this signal changes, the field refocuses
     /// and drops the caret at the end of the text. Used after a programmatic
     /// completion (the palette's command → argument transition) so typing
@@ -4355,6 +4374,7 @@ impl Default for FieldCfg {
             on_ctrl_arrow_down: None,
             uncommitted: None,
             on_tab: None,
+            focus: None,
             caret_end: None,
             trailing: None,
         }
@@ -4456,6 +4476,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
         on_ctrl_arrow_down,
         uncommitted,
         on_tab,
+        focus,
         caret_end,
         trailing,
     } = cfg;
@@ -4493,6 +4514,7 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     let ctrl_up = on_ctrl_arrow_up.clone();
     let ctrl_down = on_ctrl_arrow_down.clone();
     let tab = on_tab.clone();
+    let key_focus = focus.clone();
     let editor = text_editor_keys(text_sig.get_untracked(), move |editor_sig, kp, mods| {
         // Ctrl+Arrow recall, before the plain-arrow hooks: the modifier is what
         // tells the two apart, and the plain-arrow branch below doesn't look at
@@ -4565,6 +4587,16 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             && !mods.shift()
         {
             (cb)();
+            return CommandExecuted::Yes;
+        }
+        // Otherwise Tab leaves the field for the next control in the modal's
+        // ring. It has to be answered here: floem's editor consumes every key,
+        // so neither an outer listener nor floem's own traversal can see it.
+        if let Some((ring, _)) = &key_focus
+            && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _))
+            && let Some(me) = editor_sig.with_untracked(|e| e.editor_view_id.get_untracked())
+        {
+            ring.step_from(me, mods.shift());
             return CommandExecuted::Yes;
         }
         // Arrow Up/Down drive an external list (command-palette nav) instead of
@@ -4774,6 +4806,25 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                 // sit after the text, not before it. (Empty fields: end == 0.)
                 let len = ed_af.doc().text().to_string().len();
                 ed_af.cursor.update(|c| c.set_offset(len, false, false));
+            }
+        });
+    }
+
+    // Join the modal's Tab order. The ring holds the *inner* editor view, not
+    // this one: that is what `request_focus` has to target (autofocus above
+    // takes the same id) and what the key handler reports as "me". It only
+    // exists once the editor is built, so register from an effect on the signal
+    // that publishes it rather than at build time, and remember what was
+    // registered so cleanup can withdraw it without reading a disposed signal.
+    let registered: Rc<std::cell::Cell<Option<floem::ViewId>>> =
+        Rc::new(std::cell::Cell::new(None));
+    if let Some((ring, tabindex)) = focus.clone() {
+        let ed_reg = ed.clone();
+        let reg = registered.clone();
+        create_effect(move |_| {
+            if let Some(vid) = ed_reg.editor_view_id.get() {
+                ring.register(tabindex, vid);
+                reg.set(Some(vid));
             }
         });
     }
@@ -5029,7 +5080,17 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     // and this listener runs for in-text clicks too. Without the gate, clicking
     // mid-text would focus correctly and then have the caret yanked elsewhere.
     let ed_click = ed.clone();
+    // Leave the Tab order when the field unmounts (the SSH block folding away),
+    // or the ring would hand focus to a view that no longer exists. Reads the id
+    // recorded at registration rather than the editor's signal, which by cleanup
+    // time may already be disposed.
+    let ring_cleanup = focus.map(|(ring, _)| ring);
     stack((inner, placeholder))
+        .on_cleanup(move || {
+            if let (Some(ring), Some(vid)) = (ring_cleanup.as_ref(), registered.get()) {
+                ring.unregister(vid);
+            }
+        })
         .on_event_cont(EventListener::PointerDown, move |e| {
             let Event::PointerDown(pe) = e else { return };
             // The editor sits at the content origin (1px border + the box padding)

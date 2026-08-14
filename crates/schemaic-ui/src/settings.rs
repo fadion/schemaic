@@ -167,6 +167,31 @@ pub(crate) fn settings_toggle_row(
     hint: &'static str,
     sig: RwSignal<bool>,
 ) -> impl IntoView {
+    toggle_row_layout(title, hint, themed_toggle(sig).into_any())
+}
+
+/// [`settings_toggle_row`] whose switch joins a modal's Tab order and can be
+/// flipped with Space or Enter.
+pub(crate) fn focusable_toggle_row(
+    title: &'static str,
+    hint: &'static str,
+    sig: RwSignal<bool>,
+    ring: crate::widgets::FocusRing,
+    tabindex: u32,
+) -> impl IntoView {
+    toggle_row_layout(
+        title,
+        hint,
+        focusable_toggle(sig, ring, tabindex).into_any(),
+    )
+}
+
+/// The shared row: title + hint on the left, the switch on the right.
+fn toggle_row_layout(
+    title: &'static str,
+    hint: &'static str,
+    switch: floem::AnyView,
+) -> impl IntoView {
     h_stack((
         // `flex_grow(1) + min_width(0)`: take the space left of the switch and be
         // allowed to shrink below the text's natural width, so a long hint wraps
@@ -178,7 +203,7 @@ pub(crate) fn settings_toggle_row(
             form_hint(hint),
         ))
         .style(|s| s.flex_col().gap(2.0).flex_grow(1.0_f32).min_width(0.0)),
-        themed_toggle(sig),
+        switch,
     ))
     .style(|s| s.items_center().width_full().gap(10.0))
 }
@@ -202,7 +227,7 @@ pub(crate) fn settings_dropdown<T, S>(
     active: RwSignal<T>,
     options: impl IntoIterator<Item = T> + Clone + 'static,
     label: fn(T) -> S,
-) -> impl IntoView
+) -> floem::views::dropdown::Dropdown<T>
 where
     T: Copy + PartialEq + 'static,
     // `&'static str` for the enums, whose labels are total over their variants
@@ -268,6 +293,11 @@ pub(crate) fn dropdown_box_style(s: floem::style::Style) -> floem::style::Style 
         .border_color(theme::field_border())
         .border_radius(6.0)
         .hover(|s| s.border_color(theme::field_border_active()))
+        // Keyboard focus wears the same lit border as hover — the affordance the
+        // box already has — instead of floem's default focus outline, which is a
+        // magenta ring belonging to no palette here.
+        .focus(|s| s.border_color(theme::field_border_active()))
+        .focus_visible(|s| s.outline(0.0))
         // The floating popup (the dropdown's inner scroll) — a menu surface that
         // clears the global scrollbar styling automatically.
         .class(ScrollClass, move |s| {
@@ -297,8 +327,17 @@ pub(crate) fn dropdown_box_style(s: floem::style::Style) -> floem::style::Style 
 }
 
 // Neutralise Floem's built-in list-item chrome (side margin, padding, border,
-// default hover/selected tint) so the row content is the only thing that styles
-// the option — see `settings_dropdown`'s `row`.
+// default hover tint) so the row content is the only thing that styles the
+// option — see `settings_dropdown`'s `row`.
+//
+// **Except the selected state**, which is the keyboard's cursor through the
+// list: floem's list moves `selection` on Up/Down, and blanking it (as the rest
+// of this function does to floem's chrome) left arrowing through an open
+// dropdown with nothing to look at — you could count keypresses and press
+// Enter, but not see what you were about to choose. It paints the hover
+// background on purpose: the pointer and the keyboard are the same act of
+// pointing at a row, and the *resting* highlight for the value already in
+// effect is a separate, dimmer colour applied by the row builder.
 fn dropdown_item_style(s: floem::style::Style) -> floem::style::Style {
     let transparent = floem::peniko::Color::TRANSPARENT;
     s.margin(0.0)
@@ -309,8 +348,8 @@ fn dropdown_item_style(s: floem::style::Style) -> floem::style::Style {
         .background(transparent)
         .hover(|s| s.background(transparent))
         .selected(move |s| {
-            s.background(transparent)
-                .hover(|s| s.background(transparent))
+            s.background(theme::dropdown_hover())
+                .hover(|s| s.background(theme::dropdown_hover()))
         })
 }
 
@@ -345,7 +384,11 @@ pub(crate) fn themed_toggle(sig: RwSignal<bool>) -> impl IntoView {
             };
             s.width(36.0)
                 .height(18.0)
-                .border(0.0)
+                // A transparent border at rest, so gaining focus changes only its
+                // colour: giving the switch a border *on focus* would grow it by
+                // 2px and nudge the row it sits in.
+                .border(1.0)
+                .border_color(floem::peniko::Color::TRANSPARENT)
                 .border_radius(9.0)
                 .flex_shrink(0.0_f32)
                 .set(ToggleButtonInset, PxPct::Pct(12.0))
@@ -354,8 +397,139 @@ pub(crate) fn themed_toggle(sig: RwSignal<bool>) -> impl IntoView {
                 .background(bg)
                 .hover(move |s| s.background(bg_hover))
                 .active(move |s| s.background(bg_hover))
-                .focus(move |s| s.hover(move |s| s.background(bg_hover)))
+                // Keyboard focus: the field's lit border, since a switch reached
+                // by Tab had nothing to say it was the thing Space would flip.
+                .focus(move |s| {
+                    s.border_color(theme::field_border_active())
+                        .hover(move |s| s.background(bg_hover))
+                })
+                .focus_visible(|s| s.outline(0.0))
         })
+}
+
+/// A [`themed_toggle`] in a modal's Tab order, operable from the keyboard:
+/// Space or Enter flips it.
+///
+/// Safe to add a second KeyDown listener on top of the ring's — floem keeps a
+/// `Vec` of listeners per event type, so both run. (`on_cleanup` is the one with
+/// a single slot.)
+pub(crate) fn focusable_toggle(
+    sig: RwSignal<bool>,
+    ring: crate::widgets::FocusRing,
+    tabindex: u32,
+) -> impl IntoView {
+    crate::widgets::in_focus_ring(themed_toggle(sig), ring, tabindex).on_event(
+        floem::event::EventListener::KeyDown,
+        move |e| {
+            let floem::event::Event::KeyDown(ke) = e else {
+                return floem::event::EventPropagation::Continue;
+            };
+            use floem::keyboard::{Key, NamedKey};
+            if matches!(
+                ke.key.logical_key,
+                Key::Named(NamedKey::Space) | Key::Named(NamedKey::Enter)
+            ) {
+                sig.update(|v| *v = !*v);
+                return floem::event::EventPropagation::Stop;
+            }
+            floem::event::EventPropagation::Continue
+        },
+    )
+}
+
+/// A [`settings_dropdown`] in a modal's Tab order.
+///
+/// Nothing is added beyond the ring, because floem's `Dropdown` already answers
+/// the keyboard: Enter and Space open and close it from `event_before_children`
+/// (which runs ahead of any listener attached here), and the popup list is
+/// keyboard-navigable in its own right, so Up/Down walk the options and Enter
+/// accepts.
+///
+/// Choosing an option hands focus **back to the box**. Floem's dropdown removes
+/// its popup without giving the keyboard to anything, and floem clears the focus
+/// of a removed view silently — no `FocusGained` lands anywhere — so picking a
+/// value with Enter dropped focus out of the modal entirely and the next Tab
+/// resumed from wherever the app happened to put it.
+///
+/// Hung off `on_accept` rather than `on_open(false)`, which fires on *every*
+/// close: closing by clicking another control would then yank focus back off the
+/// thing just clicked. The trade is that dismissing the popup without choosing
+/// still leaves focus adrift.
+///
+/// **Opening moves to KeyDown**, which is why the open state is driven from a
+/// signal here rather than left to floem. Floem toggles the dropdown on *KeyUp*,
+/// and the Enter that accepts an option is pressed in the popup and released
+/// over the box we have just refocused — so the release reopened the menu every
+/// time. `disable_default_event` takes that toggle out and `show_list` puts the
+/// state under our control; `on_open` mirrors floem's own opens and closes back
+/// into the signal, so a pointer click can't leave the two disagreeing. Arrow
+/// keys open it too, the reflex a `<select>` trains.
+pub(crate) fn focusable_dropdown<T, S>(
+    active: RwSignal<T>,
+    options: impl IntoIterator<Item = T> + Clone + 'static,
+    label: fn(T) -> S,
+    ring: crate::widgets::FocusRing,
+    tabindex: u32,
+) -> impl IntoView
+where
+    T: Copy + PartialEq + 'static,
+    S: Into<String> + 'static,
+{
+    use floem::event::{Event, EventListener, EventPropagation};
+    use floem::keyboard::{Key, NamedKey};
+    use floem::reactive::create_effect;
+
+    let open = RwSignal::new(false);
+    let dd = settings_dropdown(active, options, label);
+    let id = dd.id();
+    // While the popup is up it holds the keyboard, so Escape reaches neither this
+    // box nor the enclosing modal — only the window root. Publish the way to
+    // close so the root can, and withdraw it the moment the popup goes.
+    create_effect(move |_| {
+        if open.get() {
+            crate::widgets::set_open_popup(Some(Rc::new(move || {
+                open.set(false);
+                floem::action::exec_after(std::time::Duration::ZERO, move |_| id.request_focus());
+            })));
+        } else {
+            crate::widgets::set_open_popup(None);
+        }
+    });
+    let dd = dd
+        .show_list(move || open.get())
+        // Mirror floem's own state changes (a pointer click, a click-away close)
+        // back into the signal. A redundant `OpenState` is a no-op inside the
+        // dropdown, so this can't loop.
+        .on_open(move |b| {
+            if open.get_untracked() != b {
+                open.set(b);
+            }
+        })
+        .disable_default_event(|| (EventListener::KeyUp, true))
+        // `on_accept` is a single slot, so this replaces the one
+        // `settings_dropdown` set and has to repeat its `active.set`.
+        .on_accept(move |item| {
+            active.set(item);
+            // Deferred: the popup is removed during this same update pass, and a
+            // focus request into it would be undone by the removal.
+            floem::action::exec_after(std::time::Duration::ZERO, move |_| id.request_focus());
+        });
+    crate::widgets::in_focus_ring(dd, ring, tabindex).on_event(EventListener::KeyDown, move |e| {
+        let Event::KeyDown(ke) = e else {
+            return EventPropagation::Continue;
+        };
+        if matches!(
+            ke.key.logical_key,
+            Key::Named(NamedKey::Enter)
+                | Key::Named(NamedKey::Space)
+                | Key::Named(NamedKey::ArrowDown)
+                | Key::Named(NamedKey::ArrowUp)
+        ) {
+            open.set(true);
+            return EventPropagation::Stop;
+        }
+        EventPropagation::Continue
+    })
 }
 
 // AI Assistant settings: CLI path override + model + effort. Changes commit when
