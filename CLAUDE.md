@@ -1045,6 +1045,38 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
   behaviour — one keypress dismissing two layers is the bug, not the fix. Don't chain your own
   `.on_cleanup` onto a `focus_root`: floem keeps one cleanup slot per view, so a second silently
   replaces both the unregister and the hand-back.
+- **Tab navigation is ours, not floem's, and a modal's Tab order is a `widgets::FocusRing`.**
+  Floem has `view_tab_navigation`, and it is unusable here on three counts: it is `pub(crate)`; it
+  walks the *whole window tree*, so Tab would leave the modal for the workspace behind it; and it
+  only runs when **nothing consumed the key**, while floem's editor registers KeyDown with
+  `on_event_stop` and so swallows every key — a focused field being exactly the case Tab must work
+  from. So a control joins the ring: `widgets::in_focus_ring` for anything but a text field (it adds
+  `keyboard_navigable`, Tab/Shift+Tab, and the Escape blur), and `FieldCfg::focus` for a field,
+  which carries the ring *inside* the editor's own key handler because nothing bolted on from
+  outside can see a key there. It registers the **inner** editor view — the id that actually takes
+  focus — and withdraws it on unmount. Order is an explicit `tabindex`, spaced, **not** registration
+  order: a section built later (the SSH block, once its toggle is on) would otherwise register after
+  the fields below it on screen.
+- **A popup that takes the keyboard can only be closed from the *window root*.** The corollary of
+  the directed dispatch above, and it is not obvious: a modal's Escape handler runs because its
+  `focus_root` is the *focused view*, not because it is an ancestor — there is no bubbling in
+  between. So while a dropdown's popup is up, the box that owns it, its ring, and the modal around
+  it are all bypassed, and floem's list returns `Continue` for Escape, so the key reaches the root
+  and finds nothing. `widgets::set_open_popup`/`dismiss_open_popup` is that slot (thread-local: only
+  one popup can be up), consulted from `workspace`'s root KeyDown fallback. Escape then peels one
+  layer per press — root closes the popup, `in_focus_ring` blurs the control, the modal closes.
+- **Floem's `Dropdown` toggles on `KeyUp`, which reopens it after a keyboard accept.** Enter is
+  *pressed* in the popup (accepting, which closes it) and *released* over the box focus has just
+  returned to, so the release opened it again — no delay fixes that, the release is tens of ms
+  later. `settings::focusable_dropdown` therefore takes the open state over: `disable_default_event`
+  drops floem's KeyUp toggle (its only use), `show_list` drives the state from a signal, `on_open`
+  mirrors floem's own opens/closes back into it so a pointer click can't leave the two disagreeing,
+  and opening moves to KeyDown (Enter/Space/Up/Down). Also: `on_accept` is a **single slot**, so
+  overriding it means repeating whatever the previous one did.
+- **A list item's `selected` style is the keyboard's cursor — don't neutralise it.** The dropdown
+  popup blanked floem's selected tint (the resting highlight for the value in effect is applied by
+  the row builder instead), which left arrowing through an open dropdown with nothing to look at:
+  you could count keypresses and press Enter, but not see what you were about to choose.
 - **`text_editor_keys` inserts a typed char *unconditionally* — your handler's `CommandExecuted`
   return is ignored for plain character keys.** Floem's `editor_content` KeyDown listener discards the
   handler's result and then, if `mods` (minus SHIFT/ALTGR) is empty, calls `receive_char(c)` for any

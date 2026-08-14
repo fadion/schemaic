@@ -17,10 +17,10 @@ use schemaic_core::connection::Environment;
 use schemaic_core::connection::SshAuth;
 
 use crate::consts::MASK_CH;
-use crate::settings::{settings_dropdown, settings_toggle_row};
+use crate::settings::{focusable_dropdown, focusable_toggle_row};
 use crate::widgets::{
-    ACTION_GAP, ActionKind, action_button_icon, action_face, autohide, focus_root, form_hint,
-    form_label_style, loading_dots, menu_item_style, modal_title, panel_style,
+    ACTION_GAP, ActionKind, FocusRing, action_button_icon, action_face, autohide, focus_root,
+    form_hint, form_label_style, loading_dots, menu_item_style, modal_title, panel_style,
 };
 use crate::{DraftSignals, FieldCfg, Ui, edit_field, icons, theme};
 
@@ -76,10 +76,27 @@ const CONN_FIELD_W: f64 = 200.0;
 
 // ===== moved from lib.rs (connection form + password masking) =====
 // One labelled text field for the connection form.
-fn field(lbl: &'static str, sig: RwSignal<String>) -> impl IntoView {
+/// One labelled text field, placed in the modal's Tab order at `tabindex`.
+///
+/// Indices are explicit and spaced rather than implied by build order, because
+/// the SSH block is built only when its toggle is on and would otherwise
+/// register after the fields that follow it on screen.
+fn field(
+    lbl: &'static str,
+    sig: RwSignal<String>,
+    ring: FocusRing,
+    tabindex: u32,
+) -> impl IntoView {
     v_stack((
         text(lbl).style(form_label_style),
-        edit_field(sig, FieldCfg::default()).style(|s| s.width_full()),
+        edit_field(
+            sig,
+            FieldCfg {
+                focus: Some((ring.clone(), tabindex)),
+                ..Default::default()
+            },
+        )
+        .style(|s| s.width_full()),
     ))
     .style(|s| s.flex_col().gap(6.0).width_full())
 }
@@ -91,11 +108,22 @@ fn host_port_row(
     host: RwSignal<String>,
     port_lbl: &'static str,
     port: RwSignal<String>,
+    ring: FocusRing,
+    tabindex: u32,
 ) -> impl IntoView {
-    let host_field = field(host_lbl, host).style(|s| s.flex_grow(1.0_f32).min_width(0.0));
+    let host_field = field(host_lbl, host, ring.clone(), tabindex)
+        .style(|s| s.flex_grow(1.0_f32).min_width(0.0));
     let port_field = v_stack((
         text(port_lbl).style(form_label_style),
-        edit_field(port, FieldCfg::default()).style(|s| s.width(96.0)),
+        edit_field(
+            port,
+            FieldCfg {
+                // Port follows Host on the same row, so it takes the next slot.
+                focus: Some((ring.clone(), tabindex + 1)),
+                ..Default::default()
+            },
+        )
+        .style(|s| s.width(96.0)),
     ))
     .style(|s| s.flex_col().gap(6.0).flex_shrink(0.0_f32));
     h_stack((host_field, port_field)).style(|s| s.flex_row().items_start().gap(25.0).width_full())
@@ -103,7 +131,7 @@ fn host_port_row(
 
 // Key-pair credentials: a private-key path (with a native "Browse…" picker) and
 // an optional passphrase. Shown when the SSH auth method is "Key pair".
-fn key_pair_fields(draft: DraftSignals) -> impl IntoView {
+fn key_pair_fields(draft: DraftSignals, ring: FocusRing, tabindex: u32) -> impl IntoView {
     use floem::file::FileDialogOptions;
     use floem::file_action::open_file;
 
@@ -137,8 +165,14 @@ fn key_pair_fields(draft: DraftSignals) -> impl IntoView {
     let key_row = v_stack((
         text("Private key").style(form_label_style),
         h_stack((
-            edit_field(draft.ssh_key_path, FieldCfg::default())
-                .style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
+            edit_field(
+                draft.ssh_key_path,
+                FieldCfg {
+                    focus: Some((ring.clone(), tabindex)),
+                    ..Default::default()
+                },
+            )
+            .style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
             browse,
         ))
         .style(|s| s.flex_row().items_center().gap(8.0).width_full()),
@@ -147,7 +181,8 @@ fn key_pair_fields(draft: DraftSignals) -> impl IntoView {
 
     v_stack((
         key_row,
-        masked_field("Passphrase", draft.ssh_key_passphrase).style(|s| s.width(CONN_FIELD_W)),
+        masked_field("Passphrase", draft.ssh_key_passphrase, ring, tabindex + 1)
+            .style(|s| s.width(CONN_FIELD_W)),
     ))
     .style(|s| s.flex_col().gap(20.0).width_full())
 }
@@ -246,7 +281,12 @@ fn reconstruct_real(prev_real: &str, prev_disp: &str, cur_disp: &str) -> String 
 // changes to `sig` (loading a saved connection) re-mask the buffer to match.
 // `disp` and `real` always share a char count, which is what makes the diff in
 // `reconstruct_real` map masked-buffer edits back to the right real positions.
-fn masked_field(lbl: &'static str, sig: RwSignal<String>) -> impl IntoView {
+fn masked_field(
+    lbl: &'static str,
+    sig: RwSignal<String>,
+    ring: FocusRing,
+    tabindex: u32,
+) -> impl IntoView {
     let real = sig;
     let disp = RwSignal::new(mask_of_len(real.get_untracked().chars().count()));
     // Untracked mirrors of the last state each effect committed, so an effect
@@ -294,6 +334,7 @@ fn masked_field(lbl: &'static str, sig: RwSignal<String>) -> impl IntoView {
             disp,
             FieldCfg {
                 background: theme::bg_deepest,
+                focus: Some((ring.clone(), tabindex)),
                 ..Default::default()
             },
         )
@@ -431,6 +472,10 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                     .padding_vert(6.0)
             });
 
+            // The Tab order belongs to the modal, not the form: Escape is
+            // answered here at the root, and it has to be able to ask the ring
+            // whether a control has a popup open before closing anything.
+            let ring = FocusRing::new();
             let right = conn_form(
                 draft,
                 save_conn.clone(),
@@ -439,6 +484,7 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                 conn_test,
                 save_flash,
                 test_flash,
+                ring.clone(),
             );
 
             let body = h_stack((left, right))
@@ -450,6 +496,12 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                 .style(|s| panel_style(s).width(720.0).height(500.0));
 
             // Dark backdrop, centered panel, click-away or Escape closes.
+            //
+            // Escape peels one layer at a time and this is the last of them: an
+            // open dropdown popup is closed at the *window root* (it holds the
+            // keyboard, so neither its own box nor this modal sees the key), then
+            // `in_focus_ring` blurs whatever control was focused, and only then
+            // does this run.
             focus_root(container(panel))
                 .on_key_down(
                     Key::Named(NamedKey::Escape),
@@ -476,6 +528,7 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
     })
 }
 
+#[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
 fn conn_form(
     draft: DraftSignals,
     save_conn: Rc<dyn Fn()>,
@@ -484,6 +537,11 @@ fn conn_form(
     conn_test: RwSignal<crate::TestState>,
     save_flash: RwSignal<bool>,
     test_flash: RwSignal<bool>,
+    // Owned by the modal (Escape consults it there). Indices below are spaced by
+    // 10 so a field can be inserted between two without renumbering, and the SSH
+    // block — built only once its toggle is on — claims the 100s so it lands
+    // between the toggle that reveals it and the fields below.
+    ring: FocusRing,
 ) -> impl IntoView {
     // Editing any connection parameter invalidates a prior Test result, so reset
     // the indicator whenever host/port/user/password or the SSH fields change.
@@ -506,34 +564,47 @@ fn conn_form(
     // SSH tunnel fields, shown only when enabled. The toggle is the themed switch
     // (like the other toggles); the fields lay out exactly like the normal ones.
     let ssh_enabled = draft.ssh_enabled;
-    let ssh_toggle = settings_toggle_row(
+    let ssh_toggle = focusable_toggle_row(
         "SSH tunnel",
         "Reach the server through an SSH tunnel.",
         draft.ssh_enabled,
+        ring.clone(),
+        90,
     );
+    let ring_ssh = ring.clone();
     let ssh_fields = dyn_container(
         move || ssh_enabled.get(),
         move |on| {
             if !on {
                 return empty().into_any();
             }
+            let ring = ring_ssh.clone();
             // Authentication method picker (150px), matching the settings dropdowns.
             let auth_field = v_stack((
                 text("Authentication").style(form_label_style),
-                settings_dropdown(draft.ssh_auth, SshAuth::ALL, SshAuth::label)
-                    .style(|s| s.width(150.0)),
+                focusable_dropdown(
+                    draft.ssh_auth,
+                    SshAuth::ALL,
+                    SshAuth::label,
+                    ring.clone(),
+                    130,
+                )
+                .style(|s| s.width(150.0)),
             ))
             .style(|s| s.flex_col().gap(6.0));
 
             // Method-specific credentials, swapped on the chosen auth.
             let ssh_auth = draft.ssh_auth;
+            let ring_creds = ring.clone();
             let auth_creds = dyn_container(
                 move || ssh_auth.get(),
                 move |auth| match auth {
-                    SshAuth::Password => masked_field("SSH password", draft.ssh_password)
-                        .style(|s| s.width(CONN_FIELD_W))
-                        .into_any(),
-                    SshAuth::KeyPair => key_pair_fields(draft).into_any(),
+                    SshAuth::Password => {
+                        masked_field("SSH password", draft.ssh_password, ring_creds.clone(), 140)
+                            .style(|s| s.width(CONN_FIELD_W))
+                            .into_any()
+                    }
+                    SshAuth::KeyPair => key_pair_fields(draft, ring_creds.clone(), 140).into_any(),
                     SshAuth::Agent => form_hint(
                         "Signing is delegated to your running SSH agent (OpenSSH \
                          agent / Pageant on Windows). No key is stored by Schemaic.",
@@ -545,8 +616,16 @@ fn conn_form(
             .style(|s| s.width_full());
 
             v_stack((
-                host_port_row("SSH host", draft.ssh_host, "SSH port", draft.ssh_port),
-                field("SSH user", draft.ssh_user).style(|s| s.width(CONN_FIELD_W)),
+                host_port_row(
+                    "SSH host",
+                    draft.ssh_host,
+                    "SSH port",
+                    draft.ssh_port,
+                    ring.clone(),
+                    100,
+                ),
+                field("SSH user", draft.ssh_user, ring.clone(), 120)
+                    .style(|s| s.width(CONN_FIELD_W)),
                 auth_field,
                 auth_creds,
             ))
@@ -573,16 +652,20 @@ fn conn_form(
     // "Prominent color in editor" — when on, the identity colour frames the
     // query+results editor (a guard-rail for e.g. production connections). Uses
     // the same themed switch as the AI/terminal settings toggles.
-    let prominent_toggle = settings_toggle_row(
+    let prominent_toggle = focusable_toggle_row(
         "Prominent color in editor",
         "Frame the query editor in this connection's colour.",
         draft.prominent_color,
+        ring.clone(),
+        20,
     );
     // Read-only guard-rail: disables cell edits and blocks write/DDL queries.
-    let read_only_toggle = settings_toggle_row(
+    let read_only_toggle = focusable_toggle_row(
         "Read-only",
         "Disable cell edits and block write/DDL queries on this connection.",
         draft.read_only,
+        ring.clone(),
+        30,
     );
 
     // Type: engine picker (MySQL / PostgreSQL). The selection drives `draft.db_type`;
@@ -608,25 +691,39 @@ fn conn_form(
     let type_field = v_stack((
         text("Type").style(form_label_style),
         // 150px wide (not full width), matching the settings dropdowns' look.
-        container(settings_dropdown(engine, DbKind::ALL, DbKind::label)).style(|s| s.width(150.0)),
+        container(focusable_dropdown(
+            engine,
+            DbKind::ALL,
+            DbKind::label,
+            ring.clone(),
+            50,
+        ))
+        .style(|s| s.width(150.0)),
     ))
     .style(|s| s.flex_col().gap(6.0).width_full());
 
     // Environment picker → the top-bar badge. Defaults to None (no badge).
     let env_field = v_stack((
         text("Environment").style(form_label_style),
-        container(settings_dropdown(
+        container(focusable_dropdown(
             draft.environment,
             Environment::ALL,
             Environment::label,
+            ring.clone(),
+            40,
         ))
         .style(|s| s.width(150.0)),
     ))
     .style(|s| s.flex_col().gap(6.0).width_full());
 
     // Name + Colour sit closer together (20px) than the rest of the form (25px).
-    let name_color = v_stack((field("Name", draft.name), color_picker(draft.color)))
-        .style(|s| s.flex_col().gap(20.0).width_full());
+    // The colour swatches stay out of the ring for now — they are a row of
+    // buttons, not a field, and want their own left/right handling.
+    let name_color = v_stack((
+        field("Name", draft.name, ring.clone(), 10),
+        color_picker(draft.color),
+    ))
+    .style(|s| s.flex_col().gap(20.0).width_full());
 
     let fields = v_stack((
         name_color,
@@ -634,9 +731,9 @@ fn conn_form(
         read_only_toggle,
         env_field,
         type_field,
-        host_port_row("Host", draft.host, "Port", draft.port),
-        field("User", draft.user).style(|s| s.width(CONN_FIELD_W)),
-        masked_field("Password", draft.password).style(|s| s.width(CONN_FIELD_W)),
+        host_port_row("Host", draft.host, "Port", draft.port, ring.clone(), 60),
+        field("User", draft.user, ring.clone(), 70).style(|s| s.width(CONN_FIELD_W)),
+        masked_field("Password", draft.password, ring.clone(), 80).style(|s| s.width(CONN_FIELD_W)),
         ssh_toggle,
         ssh_fields,
     ))

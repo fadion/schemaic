@@ -85,6 +85,154 @@ pub(crate) fn innermost_focus_root() -> Option<floem::ViewId> {
     FOCUS_ROOTS.with_borrow(|s| s.last().copied())
 }
 
+// ── Tab order ───────────────────────────────────────────────────────────────
+
+/// Step a ring of `len` controls from `cur`, wrapping at both ends.
+///
+/// Wrapping rather than stopping is what makes the ring a *trap*: a modal's Tab
+/// order must not walk out into the workspace behind it, and floem's own
+/// traversal does exactly that — it iterates the whole window tree.
+pub(crate) fn ring_step(len: usize, cur: Option<usize>, backwards: bool) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match (cur, backwards) {
+        (None, false) => 0,
+        (None, true) => len - 1,
+        (Some(i), false) => (i + 1) % len,
+        (Some(i), true) => (i + len - 1) % len,
+    })
+}
+
+/// The Tab order over one modal's controls.
+///
+/// Schemaic has to own this rather than use floem's. Floem *does* have
+/// `view_tab_navigation`, but it is `pub(crate)`, it walks the entire window
+/// tree (so Tab would leave the modal), and — decisively — it only runs when
+/// **nothing consumed the key**, while floem's text editor registers its
+/// KeyDown listener with `on_event_stop` and so swallows every key including
+/// Tab. A field with focus is exactly the case Tab has to work from.
+///
+/// Order is an explicit `tabindex`, not registration order, because a control
+/// that appears later — the SSH block builds only once its toggle is on —
+/// registers whenever it is switched on and would otherwise land at the end,
+/// after the fields below it. Gaps are cheap; leave room between sections.
+#[derive(Clone, Default)]
+pub(crate) struct FocusRing {
+    entries: Rc<std::cell::RefCell<Vec<(u32, floem::ViewId)>>>,
+}
+
+/// Closes a control's open popup and returns the keyboard to it.
+pub(crate) type PopupDismiss = Rc<dyn Fn()>;
+
+thread_local! {
+    static OPEN_POPUP: std::cell::RefCell<Option<PopupDismiss>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Publish how to close the popup just opened, or `None` once it closes.
+///
+/// Global rather than per-modal because only one such popup can be up at a time,
+/// and — the deciding reason — Escape can only be answered from the *window
+/// root*. A dropdown's popup takes the keyboard itself, so neither the box that
+/// owns it nor the enclosing modal is the focused view; floem delivers a key to
+/// the focused view and then only to listeners on the root, so the modal's own
+/// Escape handler never runs while a popup is up.
+pub(crate) fn set_open_popup(dismiss: Option<PopupDismiss>) {
+    OPEN_POPUP.with_borrow_mut(|p| *p = dismiss);
+}
+
+/// Escape's **first** step: close an open popup and give the keyboard back to
+/// the control that owns it. `true` when it did something, which is the root's
+/// cue to stop there.
+///
+/// Escape peels one layer per press: this closes a popup, [`in_focus_ring`] then
+/// blurs the control, and only then does the modal answer.
+pub(crate) fn dismiss_open_popup() -> bool {
+    let dismiss = OPEN_POPUP.with_borrow_mut(|p| p.take());
+    match dismiss {
+        Some(f) => {
+            f();
+            true
+        }
+        None => false,
+    }
+}
+
+impl FocusRing {
+    pub(crate) fn new() -> FocusRing {
+        FocusRing::default()
+    }
+
+    /// Add a control at `tabindex`, keeping the ring ordered. Re-registering the
+    /// same view moves it rather than duplicating it.
+    pub(crate) fn register(&self, tabindex: u32, id: floem::ViewId) {
+        let mut e = self.entries.borrow_mut();
+        e.retain(|(_, x)| *x != id);
+        let at = e.partition_point(|(t, _)| *t <= tabindex);
+        e.insert(at, (tabindex, id));
+    }
+
+    pub(crate) fn unregister(&self, id: floem::ViewId) {
+        self.entries.borrow_mut().retain(|(_, x)| *x != id);
+    }
+
+    /// Move focus one step from `from`. A view that isn't in the ring (focus sat
+    /// somewhere unregistered) starts the walk from the top.
+    pub(crate) fn step_from(&self, from: floem::ViewId, backwards: bool) {
+        let e = self.entries.borrow();
+        let cur = e.iter().position(|(_, x)| *x == from);
+        if let Some(next) = ring_step(e.len(), cur, backwards) {
+            e[next].1.request_focus();
+        }
+    }
+}
+
+/// Put `view` in `ring` at `tabindex`: focusable, Tab / Shift+Tab move on, and
+/// Escape blurs.
+///
+/// Escape hands focus back to the innermost [`focus_root`] rather than merely
+/// dropping it, so the *next* Escape reaches the modal and closes it — the same
+/// two-step, one-layer-per-press contract `edit_field` follows, and the reason a
+/// control reached by Tab doesn't trap the keyboard.
+///
+/// Only those keys are consumed — everything else falls through, so a control
+/// keeps whatever keyboard behaviour it has of its own.
+///
+/// Not for a text field: floem's editor never lets a key reach a listener like
+/// this one, so [`crate::FieldCfg::focus`] carries the ring into the editor's
+/// own key handler instead.
+pub(crate) fn in_focus_ring<V: IntoView + 'static>(
+    view: V,
+    ring: FocusRing,
+    tabindex: u32,
+) -> impl IntoView {
+    let view = view.into_view();
+    let id = view.id();
+    ring.register(tabindex, id);
+    let step_ring = ring.clone();
+    let cleanup_ring = ring;
+    view.keyboard_navigable()
+        .on_event(EventListener::KeyDown, move |e| {
+            let Event::KeyDown(ke) = e else {
+                return EventPropagation::Continue;
+            };
+            if ke.key.logical_key == Key::Named(NamedKey::Tab) {
+                step_ring.step_from(id, ke.modifiers.shift());
+                return EventPropagation::Stop;
+            }
+            if ke.key.logical_key == Key::Named(NamedKey::Escape) {
+                id.clear_focus();
+                if let Some(root) = innermost_focus_root() {
+                    root.request_focus();
+                }
+                return EventPropagation::Stop;
+            }
+            EventPropagation::Continue
+        })
+        .on_cleanup(move || cleanup_ring.unregister(id))
+}
+
 // ===== moved from lib.rs (widgets cluster) =====
 // A title bar for a modal panel, with a close (×) button.
 pub(crate) fn modal_title(title: &'static str, close: Rc<dyn Fn()>) -> impl IntoView {
@@ -1984,6 +2132,46 @@ mod menu_placement_tests {
             menu_panel_height(std::slice::from_ref(&sub)),
             menu_panel_height(&[MenuEntry::action("Copy", || {})])
         );
+    }
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use super::*;
+
+    #[test]
+    fn tab_walks_forward_and_wraps_at_the_end() {
+        assert_eq!(ring_step(3, Some(0), false), Some(1));
+        assert_eq!(ring_step(3, Some(1), false), Some(2));
+        // Wraps rather than escaping the modal.
+        assert_eq!(ring_step(3, Some(2), false), Some(0));
+    }
+
+    #[test]
+    fn shift_tab_walks_backward_and_wraps_at_the_start() {
+        assert_eq!(ring_step(3, Some(2), true), Some(1));
+        assert_eq!(ring_step(3, Some(1), true), Some(0));
+        assert_eq!(ring_step(3, Some(0), true), Some(2));
+    }
+
+    /// Focus sat on something unregistered (a click on the modal's chrome), so
+    /// the walk starts at whichever end the key implies rather than nowhere.
+    #[test]
+    fn a_tab_from_outside_the_ring_enters_at_the_near_end() {
+        assert_eq!(ring_step(3, None, false), Some(0));
+        assert_eq!(ring_step(3, None, true), Some(2));
+    }
+
+    #[test]
+    fn an_empty_ring_has_nowhere_to_go() {
+        assert_eq!(ring_step(0, None, false), None);
+        assert_eq!(ring_step(0, Some(0), true), None);
+    }
+
+    #[test]
+    fn a_single_control_keeps_focus_on_itself() {
+        assert_eq!(ring_step(1, Some(0), false), Some(0));
+        assert_eq!(ring_step(1, Some(0), true), Some(0));
     }
 }
 
