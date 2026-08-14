@@ -24,8 +24,8 @@ use schemaic_core::monitor::{ChangeKind, RowChange};
 use crate::settings::settings_dropdown;
 use crate::theme::{FONT_BODY, FONT_LABEL};
 use crate::widgets::{
-    at_content_bottom, autohide_state, focus_root, loading_dots, panel_style, shift_hscroll,
-    thin_scroll,
+    autohide_state, focus_root, follow_after_scroll, loading_dots, panel_style, shift_hscroll,
+    thin_scroll, with_scroll_gesture,
 };
 
 /// The log's rows are shorter than a chat bubble, so it counts as "at the bottom"
@@ -216,37 +216,41 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                             .padding_vert(8.0)
                             .gap(2.0)
                     });
-                    let list_scroll =
-                        shift_hscroll(list.on_resize(move |r| content_h.set(r.height())))
-                            .scroll_style(move |cs| thin_scroll(cs).hide_bars(!shown.get()))
-                            .on_scroll(move |vp| {
-                                view_rect.set(vp);
-                                hscroll.set(vp.x0);
-                                // At the bottom? (within 24px). Only notify on a real
-                                // flip — `set` never dedups, and a redundant notify
-                                // would re-snap while the user scrolls near the bottom.
-                                let at_bottom = at_content_bottom(
-                                    content_h.get_untracked(),
-                                    vp.y1,
-                                    MONITOR_FOLLOW_SLACK,
-                                );
-                                if follow.get_untracked() != at_bottom {
-                                    follow.set(at_bottom);
-                                }
-                                poke();
-                            })
-                            // Follow the bottom on `bump` — but only while `follow`;
-                            // `None` when scrolled up leaves the view put (and clears
-                            // any sticky target). Preserves the horizontal offset.
-                            .scroll_to(move || {
-                                bump.get();
-                                if follow.get() {
-                                    Some(Point::new(view_rect.get_untracked().x0, 1.0e9))
-                                } else {
-                                    None
-                                }
-                            })
-                            .style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0));
+                    let (list_scroll, by_user) = with_scroll_gesture(shift_hscroll(
+                        list.on_resize(move |r| content_h.set(r.height())),
+                    ));
+                    let list_scroll = list_scroll
+                        .scroll_style(move |cs| thin_scroll(cs).hide_bars(!shown.get()))
+                        .on_scroll(move |vp| {
+                            view_rect.set(vp);
+                            hscroll.set(vp.x0);
+                            // Released only by the reader: a poll appending rows moves
+                            // the bottom without anyone asking for it.
+                            // Only notify on a real flip: `set` never dedups, and a
+                            // redundant notify would re-snap while the user scrolls
+                            // near the bottom.
+                            let keep = follow_after_scroll(
+                                follow.get_untracked(),
+                                (by_user)(),
+                                vp.y1,
+                                content_h.get_untracked(),
+                                MONITOR_FOLLOW_SLACK,
+                            );
+                            if follow.get_untracked() != keep {
+                                follow.set(keep);
+                            }
+                            poke();
+                        })
+                        // Follow the bottom on `bump` — but only while `follow`;
+                        // `None` when scrolled up leaves the view put (and clears
+                        // any sticky target). Preserves the horizontal offset.
+                        .scroll_to(move || {
+                            bump.get();
+                            follow
+                                .get()
+                                .then(|| Point::new(view_rect.get_untracked().x0, 1.0e9))
+                        })
+                        .style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0));
                     v_stack((table_header, list_scroll))
                         .style(|s| s.flex_col().flex_grow(1.0_f32).width_full().min_height(0.0))
                         .into_any()

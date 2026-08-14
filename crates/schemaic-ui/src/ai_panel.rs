@@ -21,8 +21,8 @@ use schemaic_core::transcript::{RecallDir, Seg, ToolCall, TurnStats, recall_step
 use crate::consts::{CHAT_PAD_H, FOLLOW_SLACK};
 use crate::markdown::{CodeActions, render_markdown};
 use crate::widgets::{
-    at_content_bottom, autohide_state, jump_to_bottom_button, section_title, thin_scroll,
-    toolbar_icon, verb_spinner,
+    at_content_bottom, autohide_state, follow_after_scroll, jump_to_bottom_button, section_title,
+    thin_scroll, toolbar_icon, verb_spinner, with_scroll_gesture,
 };
 use crate::{ChatMessage, FieldCfg, Role, Ui, edit_field, icons, theme};
 
@@ -113,6 +113,33 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     // still rebuild on every chunk. The per-message memo is the filter: it
     // re-runs on each change and notifies only when *this* message differs.
     let msg_count = floem::reactive::create_memo(move |_| messages.with(|m| m.len()));
+
+    // Floor under the list's height, and the thing that finally stops a streamed
+    // answer dragging the scroll around.
+    //
+    // The collapse above is unavoidable from here: floem's `RichText` reports its
+    // *unwrapped* size from `layout` and only learns its wrap width in
+    // `compute_layout`, which then requests a second pass — so a rebuilt bubble is
+    // one line tall for one pass, every chunk. The scroll clamps its offset
+    // against that short height, and a clamp cannot be undone after the fact
+    // without fighting the next one, which is exactly what re-pinning the reader
+    // turned into.
+    //
+    // A message only ever grows while it streams (a chunk appends; the spinner is
+    // replaced by something taller), so the dips are measurement, never content.
+    // Holding the highest height seen makes them invisible to the scroll: the list
+    // renders a few pixels of slack for one frame instead of collapsing, and the
+    // clamp never fires. Reset when the message count changes, so a shorter
+    // conversation — a restore, a connection switch — doesn't inherit a floor from
+    // the last one.
+    let floor = RwSignal::new(0.0_f64);
+    create_effect(move |_| {
+        msg_count.get();
+        if floor.get_untracked() != 0.0 {
+            floor.set(0.0);
+        }
+    });
+
     let convo = dyn_container(
         move || msg_count.get() == 0,
         move |is_empty| {
@@ -201,6 +228,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
             .style(move |s| {
                 s.flex_col()
                     .width(panel_w.get())
+                    .min_height(floor.get())
                     .gap(10.0)
                     .padding_top(10.0)
                     .padding_bottom(10.0)
@@ -247,21 +275,38 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     // `on_scroll` can BOTH track the viewport and poke the bar-hide timer — a
     // single `on_scroll` callback would otherwise clobber the other.
     let (scroll_shown, scroll_poke) = autohide_state();
-    let scrolled = scroll(convo.on_resize(move |r| content_h.set(r.height())))
+    // Was the move the reader's, or a relayout's? `content_h` is written a layout
+    // pass ahead of the offset the last snap reached, so mid-stream the two
+    // disagree through nobody's doing — see `follow_after_scroll`.
+    let (scrolled, by_user) = with_scroll_gesture(scroll(convo.on_resize(move |r| {
+        let h = r.height();
+        content_h.set(h);
+        if h > floor.get_untracked() {
+            floor.set(h);
+        }
+    })));
+    let scrolled = scrolled
         .scroll_style(move |cs| thin_scroll(cs).hide_bars(!scroll_shown.get()))
         .on_scroll(move |vp| {
             view_rect.set(vp);
             // Only notify on a real flip: `set` never dedups, and a redundant
             // notify would re-snap while the user scrolls near the bottom.
-            let at_bottom = at_content_bottom(content_h.get_untracked(), vp.y1, FOLLOW_SLACK);
-            if follow.get_untracked() != at_bottom {
-                follow.set(at_bottom);
+            let keep = follow_after_scroll(
+                follow.get_untracked(),
+                (by_user)(),
+                vp.y1,
+                content_h.get_untracked(),
+                FOLLOW_SLACK,
+            );
+            if follow.get_untracked() != keep {
+                follow.set(keep);
             }
             scroll_poke();
         })
         // `None` while scrolled up — that is what *releases* the follow. A
         // `scroll_to` target is sticky, so leaving `bump` un-read wouldn't be
-        // enough: the last target stays applied.
+        // enough: the last target stays applied. Nothing re-pins the reader,
+        // because with the height floor above nothing moves them.
         .scroll_to(move || {
             bump.get();
             follow.get().then(|| Point::new(0.0, 1.0e9))
