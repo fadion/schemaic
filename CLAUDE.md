@@ -1097,6 +1097,14 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
   behaviour — one keypress dismissing two layers is the bug, not the fix. Don't chain your own
   `.on_cleanup` onto a `focus_root`: floem keeps one cleanup slot per view, so a second silently
   replaces both the unregister and the hand-back.
+- **A view that takes focus *on mount* must first check that no overlay owns the keyboard**
+  (`widgets::innermost_focus_root().is_some()` → don't). The query pane focuses its editor when it
+  is built, which is right for every route it was written for — each is a tab the user just asked
+  to look at — but the pane is also rebuilt whenever the *active tab* changes, and that can happen
+  behind an open modal: deleting a connection from Manage Connections takes its tabs with it, so
+  the editor stole the keyboard out from under the modal, which then had to be clicked again
+  before it answered Escape. The registry is the honest test — a list of the modals that are open
+  would rot on the next one added.
 - **Tab navigation is ours, not floem's, and a modal's Tab order is a `widgets::FocusRing`.**
   Floem has `view_tab_navigation`, and it is unusable here on three counts: it is `pub(crate)`; it
   walks the *whole window tree*, so Tab would leave the modal for the workspace behind it; and it

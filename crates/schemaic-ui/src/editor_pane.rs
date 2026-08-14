@@ -1704,9 +1704,21 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // 1, col 1.
     floem::action::exec_after(std::time::Duration::ZERO, move |_| {
         // The tab can be closed inside the same tick that opened it.
-        if let Some(Some(vid)) = ed_mount.editor_view_id.try_get_untracked() {
-            vid.request_focus();
+        let Some(Some(vid)) = ed_mount.editor_view_id.try_get_untracked() else {
+            return;
+        };
+        // …and the pane can be rebuilt *behind* an open overlay, which owns the
+        // keyboard for as long as it is mounted. Deleting a connection from
+        // Manage Connections is the case: it takes that connection's tabs with
+        // it, so the active tab changes and this pane is rebuilt — and the
+        // editor then took focus out from under the modal the user was still
+        // working in, which had to be clicked again before it answered anything.
+        // Every route this autofocus is *for* is a tab the user just asked to
+        // look at, and none of them leaves an overlay up.
+        if crate::widgets::innermost_focus_root().is_some() {
+            return;
         }
+        vid.request_focus();
     });
 
     // Mirror the caret's byte offset into the tab's `cursor_offset` signal so the
