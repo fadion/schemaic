@@ -688,7 +688,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
     // and it is built only there rather than built and hidden, since a `hide()`n
     // control is still in the modal's Tab order.
     let level: AnyView = if !pg {
-        empty().into_any()
+        crate::widgets::nothing()
     } else {
         form_setting(
             "Fires",
@@ -712,7 +712,7 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
     };
 
     let when: AnyView = if !pg {
-        empty().into_any()
+        crate::widgets::nothing()
     } else {
         form_setting(
             "When",

@@ -320,7 +320,20 @@ fn source_step(ui: Ui, ring: FocusRing) -> impl IntoView {
             .into_any()
         },
     )
-    .style(|s| s.width_full());
+    // The *container* is the flex child, so hiding its inner view wouldn't be
+    // enough: taffy counts a zero-sized child for the parent's gap and skips a
+    // `display:none` one, so on JSON this whole node steps aside rather than
+    // leaving a `FORM_GAP` of dead space under the Format row. Nothing is
+    // hidden-but-reachable — the branch builds no controls at all (see
+    // `widgets::nothing`).
+    .style(move |s| {
+        let s = s.width_full();
+        if i.format.get() == ImportFormat::Csv {
+            s
+        } else {
+            s.hide()
+        }
+    });
 
     v_stack((
         form_section("Source"),

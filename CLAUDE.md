@@ -1116,6 +1116,11 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
   toggle, the trigger form's `Fires`/`When`. Nothing is lost by rebuilding — each of those binds
   straight to a draft or a persisted signal — and a control an engine can't express shouldn't be
   reachable at all, which is the same call `trigger_editor`'s per-engine form already made.
+  **The else-arm is still `display:none`, via `widgets::nothing()`** — taffy skips a `display:none`
+  child when it distributes `gap` but counts a zero-sized one, so a bare `empty()` arm leaves a
+  whole `FORM_GAP` of dead space where the block would have been. The rule is about *controls*: an
+  arm with nothing inside it has nothing to be Tab-reachable. Where the conditional is a
+  `dyn_container`, the hide goes on the **container** — that is the flex child, not its inner view.
 - **A group of like things is *one* Tab stop, and arrows move within it.** Manage Connections'
   colour swatches (`connection_form::color_picker`) and the designer/trigger item list
   (`table_designer::list_pane`) each take a single ring slot: Tab reaches the group, Left/Right or
