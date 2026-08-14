@@ -646,7 +646,7 @@ impl GridState {
     /// explicit "set this value" action, so the result is always visible (green) —
     /// otherwise, when the model returns a value equal to the current one (common
     /// when editing an already-coherent row), nothing would appear to happen.
-    /// Manual inline edits use [`stage`], which clears when typed back to original.
+    /// Manual inline edits use [`GridState::stage`], which clears when typed back to original.
     fn stage_set(&self, di: usize, ci: usize, val: Option<String>) {
         self.dirty.update(|d| {
             d.insert((di, ci), val);
@@ -870,7 +870,7 @@ impl GridState {
             .collect()
     }
 
-    /// Like [`build_edits`], but for one data row `di` from an explicit change set
+    /// Like [`GridState::build_edits`], but for one data row `di` from an explicit change set
     /// (result-column index → new value, `None` = SQL NULL) rather than the staged
     /// `dirty` map — used by the whole-row JSON editor, which commits immediately.
     /// A join row edits >1 base table, so this may return several `RowEdit`s; the

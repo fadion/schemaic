@@ -44,7 +44,7 @@ const SQL_ROWS: usize = 16;
 /// been sent to.
 ///
 /// A sixth editor added later is a one-line change here rather than a bug in two
-/// places, which is what [`ddl_preview::tests::close_editors_clears_every_editor`]
+/// places, which is what `tests::close_editors_clears_every_editor`
 /// is guarding.
 pub(crate) fn close_editors(d: crate::DdlUi) {
     d.designer.set(None);

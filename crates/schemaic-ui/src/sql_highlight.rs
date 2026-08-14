@@ -239,7 +239,7 @@ pub fn highlight_spans(line: &str, dialect: SqlDialect) -> Vec<(usize, usize, Co
 /// their theme color.
 ///
 /// `start_in_block` = this line begins inside a `/* … */` block comment opened on
-/// an earlier line (see [`starts_in_block_comment`]): its leading text up to the
+/// an earlier line (see [`block_comment_lines`]): its leading text up to the
 /// closing `*/` (or the whole line, if it doesn't close here) is coloured as a
 /// comment before normal lexing resumes. (A string spanning lines is still handled
 /// per-line — the rarer case the TODO didn't call for.)

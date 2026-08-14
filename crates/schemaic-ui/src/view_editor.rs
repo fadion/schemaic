@@ -6,7 +6,7 @@
 //! beside one text box. What it is instead is the same modal chrome every other
 //! one wears (`form_section`/`form_setting`/`modal_footer_split`), a real
 //! multi-line field for the body, and the same ending: one
-//! [`ViewDraft`](schemaic_core::ddl::ViewDraft) that the footer's change count and
+//! [`ViewDraft`] that the footer's change count and
 //! the preview's SQL are both computed from, so the two can't disagree.
 //!
 //! Two things here are load-bearing rather than cosmetic:
@@ -159,7 +159,7 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>) {
 /// the caret, so the common case (write a `SELECT`, keep it) doesn't mean
 /// retyping it into a form.
 ///
-/// The namespace comes from [`table_designer::default_schema`], the same answer
+/// The namespace comes from [`crate::table_designer::default_schema`], the same answer
 /// the tree's own Create view gives on a database node.
 pub(crate) fn open_from_query(ui: &Ui, database: &str, select: &str) {
     let schema = crate::table_designer::default_schema(ui, database);
