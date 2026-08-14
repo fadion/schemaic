@@ -65,9 +65,9 @@ use crate::table_designer::{
     list_row_plain, loaded_table,
 };
 use crate::widgets::{
-    ACTION_GAP, ActionKind, FORM_GAP, FocusRing, MODAL_PAD_H, action_button, control_button,
-    control_button_enabled, focus_root_with_ring, form_section, form_setting, form_setting_owned,
-    modal_footer_split, modal_title_owned, panel_style,
+    ACTION_GAP, ACTION_TAB, ActionKind, FORM_GAP, FocusRing, MODAL_PAD_H, action_button,
+    control_button, control_button_enabled, focus_root_with_ring, form_section, form_setting,
+    form_setting_owned, modal_footer_split, modal_title_owned, panel_style,
 };
 use crate::{
     DdlPreview, FieldCfg, FunctionTarget, TriggerFnDoneFn, TriggerFnRequest, TriggerSrcDoneFn,
@@ -466,7 +466,12 @@ fn value_rows(
             let (read, write) = (read.clone(), write.clone());
             let (read_a, write_a) = (read.clone(), write.clone());
             let ring = ring.clone();
+            let add_ring = ring.clone();
+            let n = read().len();
             let rows = v_stack_from_iter(read().into_iter().enumerate().map(move |(i, v)| {
+                // Row `i` owns a `ROW_TAB_STRIDE` block: its value, then its
+                // remove button — see `widgets::ROW_TAB_STRIDE`.
+                let base = tabindex + i as u32 * crate::widgets::ROW_TAB_STRIDE;
                 let sig = floem::reactive::create_rw_signal(v);
                 let (read_i, write_i) = (read.clone(), write.clone());
                 create_effect(move |prev: Option<String>| {
@@ -487,29 +492,42 @@ fn value_rows(
                         FieldCfg {
                             placeholder,
                             mono,
-                            focus: Some((ring.clone(), tabindex + i as u32)),
+                            focus: Some((ring.clone(), base)),
                             ..Default::default()
                         },
                     )
                     .style(|s| s.flex_grow(1.0_f32).min_width(0.0)),
-                    crate::widgets::row_button(crate::icons::TRASH_2, "Remove", move || {
-                        let mut all = read_d();
-                        if i < all.len() {
-                            all.remove(i);
-                        }
-                        write_d(all);
-                        rev.update(|r| *r += 1);
-                    }),
+                    crate::widgets::row_button(
+                        crate::icons::TRASH_2,
+                        "Remove",
+                        ring.clone(),
+                        base + crate::widgets::ROW_BUTTON_TAB,
+                        move || {
+                            let mut all = read_d();
+                            if i < all.len() {
+                                all.remove(i);
+                            }
+                            write_d(all);
+                            rev.update(|r| *r += 1);
+                        },
+                    ),
                 ))
                 .style(|s| s.flex_row().items_center().gap(2.0).width_full())
             }))
             .style(|s| s.flex_col().gap(6.0).width_full());
-            let add = control_button(add_label, move || {
-                let mut all = read_a();
-                all.push(String::new());
-                write_a(all);
-                rev.update(|r| *r += 1);
-            });
+            // Last in the block, above every row — what you reach after walking
+            // them.
+            let add = control_button(
+                add_label,
+                add_ring,
+                tabindex + n as u32 * crate::widgets::ROW_TAB_STRIDE,
+                move || {
+                    let mut all = read_a();
+                    all.push(String::new());
+                    write_a(all);
+                    rev.update(|r| *r += 1);
+                },
+            );
             v_stack((
                 rows,
                 container(add).style(|s| s.width_full().margin_top(2.0)),
@@ -945,7 +963,9 @@ fn pg_action(
     // "Add value" and "Add constraint" already wear. They were the last two
     // callers of the text-only footer button, in the one place it wasn't a
     // footer.
-    let new_btn = control_button("New function", move || {
+    // 61 and 62: right after the picker at 60 they sit beside, and below the
+    // arguments block at `VALUE_TAB`.
+    let new_btn = control_button("New function", ring.clone(), 61, move || {
         open_for_new_function(&new_ui, &database, schema.as_deref());
     });
 
@@ -955,9 +975,11 @@ fn pg_action(
     // nothing to offer.
     let edit_ui = ui.clone();
     let edit_db = target.database.clone();
+    let edit_ring = ring.clone();
     let edit_btn = dyn_container(
         move || (sel.get(), fns.get()),
         move |(named, list)| {
+            let ring = edit_ring.clone();
             // Compared against the same built display string the picker shows.
             // This used to compare the bare `proname` against introspection's
             // *pre-quoted qualified* name, so it never matched and Edit was
@@ -965,12 +987,11 @@ fn pg_action(
             let found = list.iter().find(|f| fn_display(f) == named).cloned();
             let ui = edit_ui.clone();
             let db = edit_db.clone();
-            control_button_enabled("Edit", found.is_some(), move || {
+            control_button_enabled("Edit", found.is_some(), ring, 62, move || {
                 if let Some(f) = &found {
                     open_for_function(&ui, &db, f);
                 }
             })
-            .into_any()
         },
     );
 
@@ -1215,7 +1236,7 @@ fn trigger_list(
     // One Tab stop for the list, ahead of the form it feeds; Up/Down walk it.
     list_pane(
         rows,
-        list_actions(add, remove, None, None),
+        list_actions(add, remove, None, None, ring.clone()),
         selected,
         move || d.with_untracked(|s| s.triggers.len()),
         ring,
@@ -1319,7 +1340,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
                     target.is_view,
                     target.table.clone(),
                     target.schema.clone(),
-                    ring,
+                    ring.clone(),
                 ),
                 crate::widgets::autohide(scroll(
                     container(detail)
@@ -1374,22 +1395,38 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
 
             let preview_ui = ui.clone();
             let preview_target = target.clone();
+            let ring_actions = ring.clone();
             let actions = dyn_container(
                 move || d.trigger_draft.get(),
                 move |draft| {
                     let ui = preview_ui.clone();
                     let target = preview_target.clone();
+                    let ring = ring_actions.clone();
                     let cs = change_set(&target, &draft);
                     let ready = draft
                         .validate(&target.current, target.dialect, target.host())
                         .is_empty()
                         && !cs.is_empty();
                     h_stack((
-                        action_button("Cancel", ActionKind::Neutral, true, close),
-                        action_button("Preview SQL", ActionKind::Primary, ready, move || {
-                            let cs = change_set(&target, &draft);
-                            ddl_preview::open_preview(&ui, preview_from(&target, &cs));
-                        }),
+                        action_button(
+                            "Cancel",
+                            ActionKind::Neutral,
+                            true,
+                            ring.clone(),
+                            ACTION_TAB,
+                            close,
+                        ),
+                        action_button(
+                            "Preview SQL",
+                            ActionKind::Primary,
+                            ready,
+                            ring,
+                            ACTION_TAB + 10,
+                            move || {
+                                let cs = change_set(&target, &draft);
+                                ddl_preview::open_preview(&ui, preview_from(&target, &cs));
+                            },
+                        ),
                     ))
                     .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
                     .into_any()
@@ -1472,7 +1509,7 @@ pub(crate) fn function_editor_overlay(ui: Ui) -> impl IntoView {
             let root_ring = ring.clone();
 
             let body = crate::widgets::autohide(scroll(
-                function_form(ui.clone(), ring)
+                function_form(ui.clone(), ring.clone())
                     .style(|s| s.width_full().padding_horiz(MODAL_PAD_H).padding_vert(18.0)),
             ))
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
@@ -1510,29 +1547,45 @@ pub(crate) fn function_editor_overlay(ui: Ui) -> impl IntoView {
 
             let preview_ui = ui.clone();
             let preview_target = target.clone();
+            let ring_actions = ring.clone();
             let actions = dyn_container(
                 move || d.function_draft.get(),
                 move |draft| {
                     let ui = preview_ui.clone();
                     let target = preview_target.clone();
+                    let ring = ring_actions.clone();
                     let cs = fn_change_set(&target, &draft);
                     let ready = draft.validate().is_empty() && !cs.is_empty();
                     let subject = draft.info.name.clone();
                     h_stack((
-                        action_button("Cancel", ActionKind::Neutral, true, close),
-                        action_button("Preview SQL", ActionKind::Primary, ready, move || {
-                            let cs = fn_change_set(&target, &draft);
-                            ddl_preview::open_preview(
-                                &ui,
-                                ddl_preview::preview_of(
-                                    target.conn_id,
-                                    &target.database,
-                                    subject.clone(),
-                                    &cs,
-                                    target.read_only,
-                                ),
-                            );
-                        }),
+                        action_button(
+                            "Cancel",
+                            ActionKind::Neutral,
+                            true,
+                            ring.clone(),
+                            ACTION_TAB,
+                            close,
+                        ),
+                        action_button(
+                            "Preview SQL",
+                            ActionKind::Primary,
+                            ready,
+                            ring,
+                            ACTION_TAB + 10,
+                            move || {
+                                let cs = fn_change_set(&target, &draft);
+                                ddl_preview::open_preview(
+                                    &ui,
+                                    ddl_preview::preview_of(
+                                        target.conn_id,
+                                        &target.database,
+                                        subject.clone(),
+                                        &cs,
+                                        target.read_only,
+                                    ),
+                                );
+                            },
+                        ),
                     ))
                     .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
                     .into_any()

@@ -33,8 +33,8 @@ use schemaic_core::schema::{CheckInfo, ColumnInfo, ForeignKeyInfo, IndexInfo, Se
 
 use crate::settings::{dropdown_box_style, focusable_toggle_row};
 use crate::widgets::{
-    ACTION_GAP, ActionKind, FORM_GAP, FocusRing, MODAL_PAD_H, MenuEntry, action_button, autohide,
-    focus_root_with_ring, form_hint, form_setting, modal_footer_split, modal_title_owned,
+    ACTION_GAP, ACTION_TAB, ActionKind, FORM_GAP, FocusRing, MODAL_PAD_H, MenuEntry, action_button,
+    autohide, focus_root_with_ring, form_hint, form_setting, modal_footer_split, modal_title_owned,
     panel_style,
 };
 use crate::{
@@ -290,9 +290,16 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>) {
 
 /// The section switcher — one row of quiet buttons, the active one carrying the
 /// selected-row background the schema tree and dropdowns use.
-fn tab_strip(ui: Ui) -> impl IntoView {
+///
+/// **One Tab stop for the strip, Left/Right between sections** — the same rule
+/// the item list beside it follows. Five separate stops would make Tab-ing into
+/// the form, which is where you are going, cost five presses; and leaving the
+/// strip out entirely (what it did until now) meant a keyboard user could only
+/// ever edit the section the designer happened to open on, since `open_designer`
+/// always lands on Table.
+fn tab_strip(ui: Ui, ring: FocusRing) -> impl IntoView {
     let d = ui.ddl;
-    h_stack_from_iter(DesignerTab::ALL.into_iter().map(move |t| {
+    let strip = h_stack_from_iter(DesignerTab::ALL.into_iter().map(move |t| {
         text(t.label())
             .on_click_stop(move |_| {
                 if d.tab.get_untracked() != t {
@@ -325,7 +332,27 @@ fn tab_strip(ui: Ui) -> impl IntoView {
             .padding_vert(8.0)
             .border_bottom(1.0)
             .border_color(theme::border())
-    })
+    });
+    // Clamped, not wrapping: this is a selection, and the ring around it is what
+    // wraps. Switching section resets the item selection exactly as a click does
+    // — the two paths must not disagree about what "a new section" means.
+    crate::widgets::nav_group(
+        strip,
+        ring,
+        crate::widgets::NAV_TAB,
+        crate::widgets::NavAxis::Horizontal,
+        move |delta| {
+            let cur = DesignerTab::ALL
+                .iter()
+                .position(|t| *t == d.tab.get_untracked())
+                .unwrap_or(0);
+            if let Some(next) = crate::widgets::list_step(DesignerTab::ALL.len(), cur, delta) {
+                d.tab.set(DesignerTab::ALL[next]);
+                d.selected.set(0);
+                d.rev.update(|r| *r += 1);
+            }
+        },
+    )
 }
 
 /// A text field bound to one place in the draft.
@@ -576,35 +603,48 @@ fn bound_toggle(
 }
 
 /// The +/−/↑/↓ bar under an item list.
+///
+/// Four stops from `LIST_TAB + 1`, immediately after the list they act on and
+/// still ahead of the form at 10. Four rather than one, unlike the list itself:
+/// these are four different verbs, not four of the same thing, so there is
+/// nothing for an arrow key to mean between them.
 pub(crate) fn list_actions(
     add: impl Fn() + 'static,
     remove: impl Fn() + 'static,
     move_up: Option<Rc<dyn Fn()>>,
     move_down: Option<Rc<dyn Fn()>>,
+    ring: FocusRing,
 ) -> impl IntoView {
-    let btn = |glyph: &'static str, tip: &'static str, act: Rc<dyn Fn()>| {
-        container(icons::icon(glyph, 15.0))
-            .on_click_stop(move |_| (act)())
-            // Colour is the whole affordance, as it is for every icon button in
-            // the app (`toolbar_icon`, the modal ✕, the grid's toolbar). The
-            // padding stays — it's the hitbox — but nothing paints behind it.
-            .style(|s| {
-                s.padding(5.0)
-                    .color(theme::text_dim())
-                    .hover(|s| s.color(theme::text()))
-            })
-            .tooltip(move || text(tip).style(crate::widgets::tooltip_style))
+    let btn = move |glyph: &'static str, tip: &'static str, slot: u32, act: Rc<dyn Fn()>| {
+        let pressed = act.clone();
+        crate::widgets::in_ring_button(
+            container(icons::icon(glyph, 15.0)).on_click_stop(move |_| (act)()),
+            ring.clone(),
+            LIST_TAB + 1 + slot,
+            true,
+            move || (pressed)(),
+        )
+        // Colour is the whole affordance, as it is for every icon button in
+        // the app (`toolbar_icon`, the modal ✕, the grid's toolbar). The
+        // padding stays — it's the hitbox — but nothing paints behind it.
+        .style(|s| {
+            crate::widgets::button_focus_ring(s)
+                .padding(5.0)
+                .color(theme::text_dim())
+                .hover(|s| s.color(theme::text()))
+        })
+        .tooltip(move || text(tip).style(crate::widgets::tooltip_style))
     };
     let arrows: Vec<AnyView> = match (move_up, move_down) {
         (Some(u), Some(d)) => vec![
-            btn(icons::CHEVRON_UP, "Move up", u).into_any(),
-            btn(icons::CHEVRON_DOWN, "Move down", d).into_any(),
+            btn(icons::CHEVRON_UP, "Move up", 2, u).into_any(),
+            btn(icons::CHEVRON_DOWN, "Move down", 3, d).into_any(),
         ],
         _ => Vec::new(),
     };
     h_stack((
-        btn(icons::PLUS, "Add", Rc::new(add)),
-        btn(icons::TRASH_2, "Remove", Rc::new(remove)),
+        btn(icons::PLUS, "Add", 0, Rc::new(add)),
+        btn(icons::TRASH_2, "Remove", 1, Rc::new(remove)),
         h_stack_from_iter(arrows).style(|s| s.flex_row().gap(2.0)),
     ))
     .style(|s| {
@@ -713,8 +753,9 @@ fn list_row_inner(
 ///
 /// Up/Down **clamp** rather than wrap, unlike the Tab ring above: wrapping there
 /// is what stops Tab escaping the modal, while a selection that jumps from the
-/// last column to the first is just a surprise. `+`/`−` stay on the action bar —
-/// buttons are pointer-only here, as everywhere else in these modals.
+/// last column to the first is just a surprise. `+`/`−`/`↑`/`↓` stay on the
+/// action bar and take four stops of their own after this one — four different
+/// verbs, so unlike the list there is nothing for an arrow to mean between them.
 ///
 /// The selected row is kept on screen with `ensure_visible`, which scrolls only
 /// when the row isn't already showing: rows are a fixed [`ROW_H`] tall, so the
@@ -954,6 +995,7 @@ fn columns_list(ui: Ui, ring: FocusRing) -> AnyView {
             // promise an edit no statement can carry out.
             mysql.then(|| Rc::new(move || swap_selected(&up_ui, -1)) as Rc<dyn Fn()>),
             mysql.then(|| Rc::new(move || swap_selected(&down_ui, 1)) as Rc<dyn Fn()>),
+            ring.clone(),
         ),
         d.selected,
         move || d.draft.with_untracked(|dr| dr.columns.len()),
@@ -1207,6 +1249,7 @@ fn indexes_list(ui: Ui, ring: FocusRing) -> AnyView {
             },
             None,
             None,
+            ring.clone(),
         ),
         d.selected,
         move || d.draft.with_untracked(|dr| dr.indexes.len()),
@@ -1386,6 +1429,7 @@ fn fks_list(ui: Ui, ring: FocusRing) -> AnyView {
             },
             None,
             None,
+            ring.clone(),
         ),
         d.selected,
         move || d.draft.with_untracked(|dr| dr.foreign_keys.len()),
@@ -1601,6 +1645,7 @@ fn checks_list(ui: Ui, ring: FocusRing) -> AnyView {
             },
             None,
             None,
+            ring.clone(),
         ),
         d.selected,
         move || d.draft.with_untracked(|dr| dr.check_constraints.len()),
@@ -1864,6 +1909,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
 
             let form_ui = ui.clone();
             let form_target = target.clone();
+            let form_ring = ring.clone();
             let form = dyn_container(
                 // `rev` is what makes a *structural* edit rebuild the form: after
                 // removing item 2, index 2 is a different item but `selected` is
@@ -1871,7 +1917,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                 move || (d.tab.get(), d.selected.get(), d.rev.get()),
                 move |(tab, ..)| {
                     let ui = form_ui.clone();
-                    let ring = ring.clone();
+                    let ring = form_ring.clone();
                     match tab {
                         DesignerTab::Table => table_section(ui, &form_target, ring),
                         DesignerTab::Columns => column_form(ui, &form_target, ring),
@@ -1940,19 +1986,35 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
 
             let preview_ui = ui.clone();
             let preview_target = target.clone();
+            let ring_actions = ring.clone();
             let actions = dyn_container(
                 move || d.draft.get(),
                 move |draft| {
                     let ui = preview_ui.clone();
                     let target = preview_target.clone();
+                    let ring = ring_actions.clone();
                     let cs = change_set(&target, &draft);
                     let ready = draft.validate().is_empty() && !cs.is_empty();
                     h_stack((
-                        action_button("Cancel", ActionKind::Neutral, true, close),
-                        action_button("Preview SQL", ActionKind::Primary, ready, move || {
-                            let cs = change_set(&target, &draft);
-                            ddl_preview::open_preview(&ui, preview_from(&target, &draft, &cs));
-                        }),
+                        action_button(
+                            "Cancel",
+                            ActionKind::Neutral,
+                            true,
+                            ring.clone(),
+                            ACTION_TAB,
+                            close,
+                        ),
+                        action_button(
+                            "Preview SQL",
+                            ActionKind::Primary,
+                            ready,
+                            ring,
+                            ACTION_TAB + 10,
+                            move || {
+                                let cs = change_set(&target, &draft);
+                                ddl_preview::open_preview(&ui, preview_from(&target, &draft, &cs));
+                            },
+                        ),
                     ))
                     .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
                     .into_any()
@@ -1962,7 +2024,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
             let close_x: Rc<dyn Fn()> = Rc::new(close);
             let panel = v_stack((
                 modal_title_owned(title, close_x),
-                tab_strip(ui.clone()),
+                tab_strip(ui.clone(), ring.clone()),
                 body,
                 // The count sits at the far left, the actions at the far right —
                 // it's what those actions are *about*, not a label on them.
