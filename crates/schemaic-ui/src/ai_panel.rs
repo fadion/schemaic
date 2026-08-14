@@ -16,7 +16,7 @@ use floem::reactive::{Scope, create_effect};
 use floem::style::{CursorStyle, ScaleX, ScaleY, Transition, TranslateX};
 use floem::unit::PxPct;
 
-use schemaic_core::transcript::{Seg, ToolCall, TurnStats};
+use schemaic_core::transcript::{RecallDir, Seg, ToolCall, TurnStats, recall_step, user_prompts};
 
 use crate::consts::{CHAT_PAD_H, FOLLOW_SLACK};
 use crate::markdown::{CodeActions, render_markdown};
@@ -270,7 +270,9 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     let input_row = dyn_container(
         move || input_state.get(),
         move |(claude_ok, db_down)| match (claude_ok, db_down) {
-            (true, false) => ai_input_row(input, busy, send.clone(), cancel.clone()).into_any(),
+            (true, false) => {
+                ai_input_row(input, messages, busy, send.clone(), cancel.clone()).into_any()
+            }
             (_, true) => ai_input_disabled("Not connected to the database").into_any(),
             (false, _) => ai_input_disabled("Message…").into_any(),
         },
@@ -312,13 +314,66 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
 
 // The AI message box: a full-width multiline field with an inline send/stop icon
 // (play sends, square cancels while busy, dim play when empty). Enter submits.
+//
+// Ctrl+Up/Down recalls the user's own earlier questions from this conversation
+// (`transcript::user_prompts` / `recall_step`). A recalled question is *shown*,
+// not typed: it renders in the placeholder colour until the user touches it, and
+// stepping again replaces it. It is nonetheless the field's real value, so
+// sending one — Enter or the icon — sends exactly what is on screen.
 fn ai_input_row(
     input: RwSignal<String>,
+    messages: RwSignal<Vec<ChatMessage>>,
     busy: RwSignal<bool>,
     send: Rc<dyn Fn(String)>,
     cancel: Rc<dyn Fn()>,
 ) -> impl IntoView {
     let send_key = send.clone();
+    // Where the recall sits: `None` is the empty box it started from.
+    let recall = RwSignal::new(None::<usize>);
+    let uncommitted = RwSignal::new(false);
+    let caret_end = RwSignal::new(0u64);
+    // An emptied box (sending clears it; so does deleting the text) ends the
+    // recall, so the next Ctrl+Up starts from the newest question again rather
+    // than resuming wherever the last walk stopped. Guarded sets: `set` never
+    // dedups, and this runs on every keystroke.
+    create_effect(move |_| {
+        if input.with(|t| t.is_empty()) {
+            if recall.get_untracked().is_some() {
+                recall.set(None);
+            }
+            if uncommitted.get_untracked() {
+                uncommitted.set(false);
+            }
+        }
+    });
+    let step = move |dir: RecallDir| {
+        // Only an empty box, or one still holding a recalled question, may be
+        // rewritten — never text the user typed.
+        if !uncommitted.get_untracked() {
+            if !input.with_untracked(|t| t.is_empty()) {
+                return;
+            }
+            recall.set(None);
+        }
+        let prompts = messages.with_untracked(|m| user_prompts(m));
+        let next = recall_step(prompts.len(), recall.get_untracked(), dir);
+        recall.set(next);
+        match next {
+            Some(i) => {
+                input.set(prompts[i].clone());
+                uncommitted.set(true);
+            }
+            None => {
+                // Order matters only for the redundant-notify guard: clearing
+                // `input` runs the effect above, which already resets the flag.
+                input.set(String::new());
+                if uncommitted.get_untracked() {
+                    uncommitted.set(false);
+                }
+            }
+        }
+        caret_end.update(|n| *n = n.wrapping_add(1));
+    };
     let icon: Rc<dyn Fn() -> AnyView> = {
         let send = send.clone();
         let cancel = cancel.clone();
@@ -380,6 +435,10 @@ fn ai_input_row(
                     (send_key)(text);
                 }
             })),
+            on_ctrl_arrow_up: Some(Rc::new(move || step(RecallDir::Older))),
+            on_ctrl_arrow_down: Some(Rc::new(move || step(RecallDir::Newer))),
+            uncommitted: Some(uncommitted),
+            caret_end: Some(caret_end),
             trailing: Some(icon),
             ..Default::default()
         },
