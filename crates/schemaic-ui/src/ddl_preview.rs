@@ -46,10 +46,25 @@ const SQL_ROWS: usize = 16;
 /// A sixth editor added later is a one-line change here rather than a bug in two
 /// places, which is what `tests::close_editors_clears_every_editor`
 /// is guarding.
+///
+/// **One exception: a function plan doesn't close the trigger editor it was
+/// opened from.** The function modal exists to serve the trigger one — a
+/// PostgreSQL trigger has no body, only a function to call — so `open_function`
+/// deliberately leaves the trigger target set and the trigger overlay renders
+/// nothing while the function modal is up. Clearing both meant the documented
+/// middle step (fill in a trigger, press **New function**, Apply) silently
+/// destroyed the half-written trigger, and "Open in editor" did the same without
+/// applying anything at all.
+///
+/// The function editor being open *is* the signal that the plan came from it: it
+/// renders over the trigger modal, so nothing else can reach Preview while it is.
 pub(crate) fn close_editors(d: crate::DdlUi) {
+    let from_function = d.function.get_untracked().is_some();
     d.designer.set(None);
     d.view.set(None);
-    d.trigger.set(None);
+    if !from_function {
+        d.trigger.set(None);
+    }
     d.function.set(None);
     d.object.set(None);
 }
@@ -571,13 +586,6 @@ mod tests {
             current: Vec::new(),
             read_only: false,
         }));
-        d.function.set(Some(crate::FunctionTarget {
-            conn_id: 1,
-            database: "db".into(),
-            dialect: SqlDialect::Postgres,
-            current: None,
-            read_only: false,
-        }));
         d.object.set(Some(crate::ObjectTarget {
             conn_id: 1,
             database: "db".into(),
@@ -593,9 +601,48 @@ mod tests {
         assert!(d.designer.get_untracked().is_none(), "designer");
         assert!(d.view.get_untracked().is_none(), "view");
         assert!(d.trigger.get_untracked().is_none(), "trigger");
-        assert!(d.function.get_untracked().is_none(), "function");
         assert!(d.object.get_untracked().is_none(), "object");
 
+        scope.dispose();
+    }
+
+    /// **The one editor a close must leave standing.** A PostgreSQL trigger has
+    /// no body, only a function to call, so the function modal is opened *from*
+    /// a half-filled trigger form and `open_function` deliberately leaves the
+    /// trigger target set. Clearing both destroyed that form on Apply — and on
+    /// "Open in editor", which applies nothing at all.
+    #[test]
+    fn a_function_plan_leaves_the_trigger_editor_behind_it_standing() {
+        let scope = Scope::new();
+        let d = ddl_ui(scope);
+        d.trigger.set(Some(crate::TriggerTarget {
+            conn_id: 1,
+            database: "db".into(),
+            schema: None,
+            table: "t".into(),
+            dialect: SqlDialect::Postgres,
+            is_view: false,
+            current: Vec::new(),
+            read_only: false,
+        }));
+        d.function.set(Some(crate::FunctionTarget {
+            conn_id: 1,
+            database: "db".into(),
+            dialect: SqlDialect::Postgres,
+            current: None,
+            read_only: false,
+        }));
+
+        close_editors(d);
+
+        assert!(
+            d.function.get_untracked().is_none(),
+            "the editor the plan came from still closes"
+        );
+        assert!(
+            d.trigger.get_untracked().is_some(),
+            "the trigger form it was opened from is what the function is for"
+        );
         scope.dispose();
     }
 }

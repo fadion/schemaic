@@ -703,13 +703,32 @@ fn strip_bom(s: &str) -> &str {
     s.strip_prefix('\u{feff}').unwrap_or(s)
 }
 
+/// How many bytes the **preview** may read, whatever the file's shape.
+///
+/// A record-count limit is not a byte limit. `reader_for` sets no field- or
+/// record-size bound, so a single stray `"` in a 1.5 GB CSV makes the whole
+/// remainder one unterminated field: the sample "of 200 records" reads to EOF,
+/// materialising the file as a `String` and again as a `StringRecord` — from a
+/// file the user only meant to *look at*, on a modal that (until the `reading`
+/// flag was split out) could not be dismissed while it happened.
+///
+/// The JSON side was already bounded, so the bound had been thought about for
+/// one format and not the other. Generous enough that no real preview is
+/// affected: 200 records of anything a person would import fits many times over.
+pub const SAMPLE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Read the first `limit` records for the preview, in whichever format.
+///
+/// Bounded at [`SAMPLE_MAX_BYTES`] — see there for the unterminated-quote case
+/// that makes a record count no bound at all. A truncated read can only make the
+/// preview *shorter*; the load itself is a separate pass over the whole file.
 pub fn read_sample<R: std::io::Read>(
     r: R,
     format: ImportFormat,
     cfg: &ReadConfig,
     limit: usize,
 ) -> Result<Sample, ImportError> {
+    let r = r.take(SAMPLE_MAX_BYTES);
     match format {
         ImportFormat::Csv => read_csv_sample(r, cfg, limit),
         ImportFormat::Json => read_json_sample(r, limit),
@@ -2251,6 +2270,44 @@ mod tests {
         assert!(s.more);
         assert_eq!(s.rows[0][0].as_deref(), Some("0"));
         assert_eq!(s.rows[2][0].as_deref(), Some("2"));
+    }
+
+    /// **A record count is not a byte bound.** `reader_for` sets no field- or
+    /// record-size limit, so one stray `"` makes the whole remainder of a file a
+    /// single unterminated field, and a sample "of 200 records" reads to EOF —
+    /// materialising the file as a `String` and again as a `StringRecord`, from
+    /// a file the user only meant to look at.
+    ///
+    /// The reader here **panics** past the cap, so a read that isn't bounded
+    /// fails loudly rather than merely taking a while.
+    #[test]
+    fn an_unterminated_quote_cannot_read_past_the_sample_bound() {
+        struct Fused<'a> {
+            data: &'a [u8],
+            pos: usize,
+            cap: usize,
+        }
+        impl std::io::Read for Fused<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                assert!(self.pos <= self.cap, "read past the bound at {}", self.pos);
+                let n = (self.data.len() - self.pos).min(buf.len());
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+        // A header, then a record that opens a quote and never closes it — the
+        // rest of the "file" is one field as far as the CSV reader is concerned.
+        let mut csv = String::from("id,name\n1,\"");
+        csv.push_str(&"x".repeat(SAMPLE_MAX_BYTES as usize * 2));
+        let r = Fused {
+            data: csv.as_bytes(),
+            pos: 0,
+            // A little slack for the reader's own buffering past the `take`.
+            cap: SAMPLE_MAX_BYTES as usize + 64 * 1024,
+        };
+        // It may fail or return a short sample; what it must not do is read on.
+        let _ = read_sample(r, ImportFormat::Csv, &cfg(true), 200);
     }
 
     /// The rewrite is byte-for-byte in place, so it has to survive a record

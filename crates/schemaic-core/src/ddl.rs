@@ -6014,11 +6014,32 @@ mod tests {
         d.set_in_primary_key(0, false);
         d.set_in_primary_key(0, true);
         assert_eq!(d.primary_key, vec!["a", "b"]);
-        // Same for the middle of a three-column key.
+        // The **last** column of a two-column key: the re-add appends, so this
+        // one passes whether the scan finds the insertion point or falls back to
+        // `push`. It is here as the control, not as the interesting case.
         d.primary_key = vec!["a".into(), "b".into()];
         d.set_in_primary_key(1, false);
         d.set_in_primary_key(1, true);
         assert_eq!(d.primary_key, vec!["a", "b"]);
+
+        // **The middle of a three-column key**, which is what the comment here
+        // used to claim while running on a two-column fixture — so index 1 was
+        // the last column and the insertion scan's interior branch was never
+        // exercised at all. A regression to `push` passed both assertions above.
+        let mut t = ab_table();
+        t.columns.push(col("c", "int"));
+        t.indexes[0] = IndexInfo::plain("PRIMARY", vec!["a", "b", "c"], true);
+        let mut d = TableDraft::from_table(&t);
+        d.columns[1].info.nullable = false;
+        assert_eq!(d.primary_key, vec!["a", "b", "c"]);
+        d.set_in_primary_key(1, false);
+        assert_eq!(d.primary_key, vec!["a", "c"]);
+        d.set_in_primary_key(1, true);
+        assert_eq!(
+            d.primary_key,
+            vec!["a", "b", "c"],
+            "b goes back between a and c, not on the end"
+        );
     }
 
     #[test]

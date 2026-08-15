@@ -942,7 +942,11 @@ fn sequence_form(
         ))
         .style(|s| s.flex_col().gap(FORM_GAP).width_full())
         .into_any(),
-        None => empty().into_any(),
+        // `nothing()`, not `empty()`: taffy counts a zero-sized child when it
+        // distributes `gap` and skips a `display:none` one, so a bare `empty()`
+        // here left 18px of dead space below Position on every sequence that
+        // isn't owned by a column — the common case.
+        None => crate::widgets::nothing(),
     };
 
     let comment = form_setting(
