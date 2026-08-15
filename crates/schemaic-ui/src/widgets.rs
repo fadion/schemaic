@@ -1881,6 +1881,16 @@ pub(crate) type ScrollGestureByUser = Rc<dyn Fn() -> bool>;
 /// A scrollbar drag needs the `held` flag: floem scrolls it from pointer *moves*,
 /// and moves must not count while nothing is pressed, or merely resting the
 /// cursor over the conversation would make every relayout look deliberate.
+///
+/// **`held` is cleared by leaving as well as by releasing**, and it has to be.
+/// The Scroll never requests active, so a `PointerUp` outside it is delivered
+/// somewhere else entirely: press inside the conversation, drag out of the panel,
+/// release, and the flag **latched on for the life of the view**. Every later
+/// pointer move then stamped a gesture — precisely what the flag exists to
+/// prevent — so the follow was released mid-answer by nothing but a cursor
+/// passing over. `PointerLeave` closes it because leaving with the button down
+/// is the only way to reach an unseen release: floem delivers `PointerUp` to
+/// whatever is under the cursor, so a release back inside still lands here.
 pub(crate) fn with_scroll_gesture(s: Scroll) -> (Scroll, ScrollGestureByUser) {
     // Plain cells, not signals: these are read from `on_scroll` on the very view
     // whose scrolling writes them, and they outlive nothing.
@@ -1902,6 +1912,13 @@ pub(crate) fn with_scroll_gesture(s: Scroll) -> (Scroll, ScrollGestureByUser) {
             }
         })
         .on_event_cont(EventListener::PointerUp, {
+            let h = held.clone();
+            move |_| h.set(false)
+        })
+        // The release we would otherwise never see: no pointer capture, so a
+        // drag that ends outside this view delivers its `PointerUp` elsewhere and
+        // the flag latches on forever.
+        .on_event_cont(EventListener::PointerLeave, {
             let h = held.clone();
             move |_| h.set(false)
         })
@@ -1957,6 +1974,31 @@ pub(crate) fn follow_after_scroll(
         false
     } else {
         following
+    }
+}
+
+/// The height floor a tail-following list holds under itself, given the height
+/// just measured.
+///
+/// The sibling decision to [`follow_after_scroll`], and it exists for the same
+/// reason: a rebuilt `RichText` reports its **unwrapped** height for one layout
+/// pass, so a streaming list momentarily collapses and floem's clamp drags the
+/// reader with it. Holding the tallest height seen makes the dip invisible — the
+/// list renders a few pixels of slack for one frame instead of collapsing.
+///
+/// `invalidated` is the other half, and it was missing. "A message only ever
+/// grows" is true of *streaming* and false of a **re-layout**: dragging the panel
+/// wider re-wraps every bubble shorter, and a floor that only ever rises left
+/// ~300px of blank under the last message — which then measured as content, lit
+/// the jump-to-bottom button, and snapped the next follow to the bottom of the
+/// blank. It is false of a conversation *switch* too. So whatever legitimately
+/// changes the true height (the message count, the wrap width, which
+/// conversation) releases the floor, and only within one of those is it held.
+pub(crate) fn next_floor(prev: f64, measured: f64, invalidated: bool) -> f64 {
+    if invalidated {
+        measured
+    } else {
+        prev.max(measured)
     }
 }
 
@@ -3235,5 +3277,30 @@ mod follow_tests {
     #[test]
     fn a_released_follow_is_not_re_armed_by_growth_alone() {
         assert!(!follow_after_scroll(false, false, 800.0, 2000.0, 30.0));
+    }
+
+    /// The floor's whole job: a rebuilt `RichText` measures unwrapped for one
+    /// pass, so the list momentarily halves. Holding the tallest height seen is
+    /// what makes floem's clamp never fire.
+    #[test]
+    fn a_measurement_dip_does_not_lower_the_floor() {
+        assert_eq!(next_floor(1200.0, 600.0, false), 1200.0);
+        assert_eq!(
+            next_floor(1200.0, 1400.0, false),
+            1400.0,
+            "growth raises it"
+        );
+    }
+
+    /// And the half that was missing. "A message only ever grows" is true of
+    /// streaming and false of a **re-layout**: dragging the panel wider re-wraps
+    /// every bubble shorter, and a floor that only ever rose left ~300px of
+    /// blank under the last message — measured as content, lighting the
+    /// jump-to-bottom button, and snapping the next follow to the bottom of it.
+    #[test]
+    fn a_relayout_releases_the_floor_to_the_height_it_just_measured() {
+        assert_eq!(next_floor(1200.0, 900.0, true), 900.0);
+        // Not a maximum in this arm: the point is that it may go *down*.
+        assert_eq!(next_floor(1200.0, 1400.0, true), 1400.0);
     }
 }

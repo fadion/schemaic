@@ -6050,4 +6050,54 @@ mod field_key_tests {
         assert_eq!(tab_action(false, false, false, false), TabAction::Insert);
         assert_eq!(tab_action(false, true, false, false), TabAction::Insert);
     }
+
+    /// `is_modifier_key` decides whether a keypress **commits** recalled text.
+    /// The recall keys are Ctrl+Arrow and the Ctrl arrives as its own key-down
+    /// first, so a missing arm would commit the recalled question before the
+    /// arrow meant to replace it — with the suite green, since it is a `matches!`
+    /// over fourteen variants under no exhaustiveness pressure.
+    #[test]
+    fn every_modifier_is_recognised_as_typing_nothing() {
+        use super::is_modifier_key;
+        use floem::keyboard::{Key, NamedKey};
+        for k in [
+            NamedKey::Alt,
+            NamedKey::AltGraph,
+            NamedKey::CapsLock,
+            NamedKey::Control,
+            NamedKey::Fn,
+            NamedKey::FnLock,
+            NamedKey::Meta,
+            NamedKey::NumLock,
+            NamedKey::ScrollLock,
+            NamedKey::Shift,
+            NamedKey::Symbol,
+            NamedKey::SymbolLock,
+            NamedKey::Super,
+            NamedKey::Hyper,
+        ] {
+            assert!(is_modifier_key(&Key::Named(k)), "{k:?}");
+        }
+    }
+
+    /// The other half: a key that really does type something must not be taken
+    /// for a modifier, or the recalled text would never commit at all.
+    #[test]
+    fn a_key_that_types_is_not_a_modifier() {
+        use super::is_modifier_key;
+        use floem::keyboard::{Key, NamedKey};
+        assert!(!is_modifier_key(&Key::Character("a".into())));
+        assert!(!is_modifier_key(&Key::Character(" ".into())));
+        for k in [
+            NamedKey::Enter,
+            NamedKey::Backspace,
+            NamedKey::Delete,
+            NamedKey::Space,
+            NamedKey::ArrowUp,
+            NamedKey::Escape,
+            NamedKey::Tab,
+        ] {
+            assert!(!is_modifier_key(&Key::Named(k)), "{k:?}");
+        }
+    }
 }
