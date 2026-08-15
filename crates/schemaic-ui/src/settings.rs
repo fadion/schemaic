@@ -1033,6 +1033,9 @@ pub(crate) fn help_overlay(ui: Ui) -> impl IntoView {
                     "Results grid",
                     &[
                         ("Ctrl+F", "Find in results"),
+                        // Ctrl+G in the grid has no affordance anywhere else —
+                        // same as its editor twin, this modal is all there is.
+                        ("Ctrl+G", "Go to row"),
                         ("Ctrl+C", "Copy"),
                         ("Ctrl+A", "Select all"),
                         ("Enter", "Edit cell / open value"),

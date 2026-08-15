@@ -576,7 +576,13 @@ Zed-inspired, aiming to replace DataGrip.
   `ui.schema.db_nodes`, the tabs signal is `ui.tabs_ui.tabs`. Modules:
   - `consts.rs` — layout/dimension constants + `MONO_FAMILY` (glob-imported). Any SQL/code
     surface reads that one name — the diff view, and `FieldCfg::mono` (the DDL preview's
-    script box, the view editor's definition).
+    script box, the view editor's definition). `FIELD_INPUT_H` is the same idea for the
+    **compact single-line field** every transient bar wears (the editor's find/replace/goto, the
+    grid's find/goto, the row panel's inputs): `FieldCfg::height` is an `Option`, and leaving it
+    off is not a neutral default but a *different* control — `None` derives the box from content
+    at `line_h + CHAT_PAD_V * 2 + 3`, which is 34px against this 26. The grid's find bar shipped
+    without it and stood 8px taller than the identical editor bar beside it, so a bar that means
+    to be compact says so with this constant and never with a literal.
   - `widgets.rs` — reusable widgets: `menu_panel`/`MenuEntry`, `modal_title`/`panel_style`/
     `menu_item_style`, `window_size`, `autohide`/`shift_hscroll`/`wheel_hscroll` scroll wrappers,
     `section_title`/`centered_msg`/`toggle_icon`, `measure_text_px`, `jump_to_bottom_button`.
@@ -1430,6 +1436,30 @@ for keyboard nav.
   `commit_grid` → a `GridWrite { updates, inserts }` → the app's `commit_edits`. On success the app
   re-runs the query; on failure the error shows in the toolbar and green edits stay. No global "Edit"
   toggle. A read-only cell's double-click opens the value viewer.
+- **Find (Ctrl+F) and Go to row (Ctrl+G)** are two popups sharing one anchor at the panel's
+  top-right, and both are **split in the same way**: the bar renders at the RESULTS-*panel* level
+  (`grid_find_bar`/`grid_goto_bar`, mounted in `results_section`) so it can sit at the panel's edge,
+  while the work happens in `grid_view`, which is the only place that has the row data. Find is
+  incremental on `find_query`; goto fires on a `goto_step` **nonce** the popup bumps on Enter,
+  because a jump belongs to submit rather than to every keystroke. `grid_view` keeps at most one of
+  the two open, as the editor does with its own pair. Go to row resolves through the pure
+  `model::goto_row_index` — 1-based, in **display** coordinates (the gutter numbers what is on
+  screen, so "row N" means the Nth row *as sorted*, and the total includes pending unsaved rows),
+  **clamping** to the nearest end when the number is outside the grid: past the last row goes to the
+  last, `0` goes to the first, and a number too wide for a `usize` clamps with every other overshoot
+  rather than falling through to the not-a-number path. A row of 9s is how people ask for the bottom
+  of a long result, and a silent no-op there can't be told apart from a broken feature, while
+  overshooting is cheap to recover from — the gutter number and the row highlight say where you
+  landed. `None` is left for the only two cases that can mean no row: an empty grid, and input that
+  isn't a number. It then selects the whole row with the gutter click's own gesture (anchor column 0,
+  active last column) and scrolls at **column 0**, so a jump doesn't also fling the viewport to the
+  far right.
+  **Closing either bar hands the keyboard back** (`focus_id.request_focus()`, on a true→false edge
+  of the open flag). This is not optional and it is not the bar's job: Escape only flips the flag,
+  floem then disposes the field's view and clears `app_state.focus` **silently**, and the grid was
+  left focused on nothing — the next Ctrl+F reached nobody until the user clicked a cell. The bar
+  can't do it either, being built a level up where `focus_id` doesn't exist, which is why the rule
+  lives on the flag in `grid_view`. A new panel-level bar over the grid inherits this obligation.
 - **Row actions: new / clone / delete.** Gated on a single writable table (`EditModel::insert_target()`;
   hidden for joins / read-only), committed in the shared `GridWrite` transaction (`commit_writes` runs
   **deletes → updates → inserts**, each exactly 1 row).

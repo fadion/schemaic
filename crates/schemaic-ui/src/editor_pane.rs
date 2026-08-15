@@ -3342,7 +3342,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         autofocus: true,
                         font_size: 13.0,
                         border_radius: 6.0,
-                        height: Some(26.0),
+                        height: Some(FIELD_INPUT_H),
                         on_submit: Some(on_submit),
                         on_escape: Some(Rc::new(move || (esc)())),
                         on_arrow_up: Some(on_up),
@@ -3409,7 +3409,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         placeholder: "Replace",
                         font_size: 13.0,
                         border_radius: 6.0,
-                        height: Some(26.0),
+                        height: Some(FIELD_INPUT_H),
                         on_submit: Some(ro),
                         on_escape: Some(esc2),
                         ..Default::default()
@@ -3478,13 +3478,16 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                         autofocus: true,
                         font_size: 13.0,
                         border_radius: 6.0,
-                        height: Some(26.0),
+                        height: Some(FIELD_INPUT_H),
                         on_submit: Some(submit.clone()),
                         on_escape: Some(Rc::new(move || (esc)())),
                         ..Default::default()
                     },
                 )
-                .style(|s| s.width(52.0));
+                // Wide enough for a six-figure line number and the caret. 52px
+                // fit four digits, so a line number in a generated script — the
+                // case the popup exists for — scrolled inside its own field.
+                .style(|s| s.width(78.0));
                 // Close ✕ — same glyph size, styling, and row gap as the
                 // find/replace bar's × (`icon_btn` there is a local closure).
                 let close_x = close.clone();
