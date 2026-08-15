@@ -65,12 +65,14 @@ production data, or any data you care about.
   one, and with the password passed by environment rather than on the command
   line.
 - **AI assistant** — a `claude` CLI session wired into the app rather than bolted
-  beside it: rewrite the statement under the caret and accept or reject the diff
-  (Ctrl+K), explain or optimize it from the right-click menu, ask about an
-  `EXPLAIN` plan without retyping it, summarize a column or a single value, or
-  generate realistic rows for a table from the shape of the data already in it. A
-  built-in MCP server lets it read your schema and query the database, so answers
-  are about your data rather than a generic guess.
+  beside it: **AI Fix** on a failed query, which hands it the error and the query
+  and offers you the corrected SQL as a diff; rewrite the statement
+  under the caret and accept or reject that diff yourself (Ctrl+K); explain or
+  optimize it from the right-click menu; ask about an `EXPLAIN` plan without
+  retyping it; summarize a column or a single value; or generate realistic rows
+  for a table from the shape of the data already in it. A built-in MCP server
+  lets it read your schema and query the database, so answers are about your data
+  rather than a generic guess.
 - **Themeable** — dark / light UI themes and multiple editor color schemes.
 
 ## Build & run

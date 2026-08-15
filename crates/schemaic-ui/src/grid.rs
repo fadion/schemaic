@@ -2249,7 +2249,16 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     // Click a header to sort by that column (ASC → DESC → reset).
     let sort: RwSignal<SortState> = RwSignal::new(None);
 
-    let toolbar = grid_toolbar(gs, nrows, ncols, elapsed, truncated, capped_columns, sort);
+    let toolbar = grid_toolbar(
+        gs,
+        nrows,
+        ncols,
+        elapsed,
+        truncated,
+        capped_columns,
+        sort,
+        rs.database.clone(),
+    );
 
     // Header + body rebuild together on a sort change OR a freeze toggle (both
     // repartition the columns between the frozen pane and the scrolling pane).
@@ -4590,6 +4599,7 @@ fn filter_bar(gs: GridState) -> impl IntoView {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn grid_toolbar(
     gs: GridState,
     nrows: usize,
@@ -4598,10 +4608,17 @@ fn grid_toolbar(
     truncated: bool,
     capped_columns: Vec<String>,
     sort: RwSignal<SortState>,
+    database: Option<String>,
 ) -> impl IntoView {
     let cap = if truncated { " (capped)" } else { "" };
+    // The database leads the line, because it is the fact that says what the rest
+    // of the line is *about*. Taken from the result rather than the tab: the tab's
+    // selection moves on, and a result that outlived it must not claim the new one
+    // (`ResultSet::database`). A connection with no default database says nothing
+    // rather than inventing a name.
+    let scope = database.map(|d| format!("{d} · ")).unwrap_or_default();
     let stats = text(format!(
-        "{} {}{cap} · {ncols} {} · {elapsed_ms} ms",
+        "{scope}{} {}{cap} · {ncols} {} · {elapsed_ms} ms",
         human_count(nrows),
         plural(nrows, "row", "rows"),
         plural(ncols, "col", "cols"),

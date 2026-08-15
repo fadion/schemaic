@@ -414,6 +414,24 @@ pub struct ResultSet {
     /// the number of rows the server reports affected. `None` for a row-
     /// returning result (a SELECT grid), so the UI can tell the two apart.
     pub affected: Option<u64>,
+    /// The database this statement **ran against** — what the grid's stats line
+    /// reports, so a result says where it came from.
+    ///
+    /// It lives on the result, not on the tab, and that is the whole point. A
+    /// tab's database selection moves: the moment someone changes it, the grid
+    /// still shows rows fetched under the old one, so a label read from the tab
+    /// would be wrong in exactly the situation it exists to catch. Stored here it
+    /// is a snapshot by construction, and it survives a commit splice for free
+    /// (which mutates the columns in place and leaves this alone).
+    ///
+    /// `None` when the connection had no default database, and on a result no
+    /// query produced — a test fixture, or the temporary set a re-fetch splices
+    /// from.
+    ///
+    /// It names the **scope**, not the origin of every row: a statement is free
+    /// to qualify another database (`SELECT … FROM world.country` while scoped to
+    /// `sakila`), and this still reports the scope the connection ran under.
+    pub database: Option<String>,
 }
 
 impl ResultSet {
@@ -627,6 +645,8 @@ impl ResultBuilder {
             elapsed_ms: self.elapsed_ms,
             truncated: self.truncated,
             affected: None,
+            // Stamped by the loader that knows the scope — see the field's doc.
+            database: None,
         }
     }
 }
@@ -1684,6 +1704,30 @@ mod tests {
     fn an_ordinary_result_caps_nothing() {
         let rs = ResultSet::from_rows(vec![col("text")], vec![vec![Value::Str("x".into())]]);
         assert!(rs.capped_columns.is_empty());
+    }
+
+    /// A pure-UPDATE commit splices in place instead of re-running, and the
+    /// spliced result must still say where it came from — otherwise the label
+    /// disappears the first time you edit a cell, which is the one moment you are
+    /// definitely writing to whatever it names.
+    #[test]
+    fn a_commit_splice_keeps_the_result_database() {
+        let mut rs = ResultSet::from_rows(
+            vec![col("INT"), col("VARCHAR")],
+            vec![vec![Value::Int(1), Value::Str("a".into())]],
+        );
+        rs.database = Some("world".into());
+        rs.splice_rows(&[(0, vec![Value::Int(1), Value::Str("b".into())])]);
+        assert_eq!(rs.database.as_deref(), Some("world"));
+        assert_eq!(rs.cell(0, 1).map(|c| c.display()), Some("b"));
+    }
+
+    /// A result nothing scoped — a fixture, or the temporary set a re-fetch
+    /// splices from — says nothing rather than guessing.
+    #[test]
+    fn a_result_no_query_produced_names_no_database() {
+        let rs = ResultSet::from_rows(vec![col("INT")], vec![vec![Value::Int(1)]]);
+        assert_eq!(rs.database, None);
     }
 
     #[test]
