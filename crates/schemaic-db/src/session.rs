@@ -73,6 +73,16 @@ pub struct Session {
     /// we're trying to kill.
     db: Db,
     database: Option<String>,
+    /// The database statements on this connection are *currently* scoped to —
+    /// the pinned one until a `USE` moves it.
+    ///
+    /// Separate from [`database`](Self::database), which is what the connection
+    /// was opened with and what PostgreSQL's path still addresses. Only the
+    /// **label** follows a `USE`: on MySQL the server really does change scope
+    /// mid-session, and stamping the immutable pinned name meant a result that
+    /// ran in `sakila` reported `world`. Written only while `inner` is held, so
+    /// it can't race a statement.
+    scope: std::sync::Mutex<Option<String>>,
     inner: Mutex<Backend>,
     /// Whether a transaction is currently open on this connection.
     ///
@@ -116,6 +126,7 @@ impl Session {
         Ok(Arc::new(Session {
             db: db.clone(),
             database: database.map(|s| s.to_string()),
+            scope: std::sync::Mutex::new(database.map(|s| s.to_string())),
             inner: Mutex::new(backend),
             in_tx: AtomicBool::new(false),
         }))
@@ -303,11 +314,27 @@ impl Session {
                 }
             }
         };
-        // Same stamp `Db::fetch_query` applies, from this session's own pinned
-        // database — which is the one the statement ran under, and need not be
-        // the tab's current selection. See `ResultSet::database`.
+        // Same stamp `Db::fetch_query` applies, from this session's own scope —
+        // which is the one the statement ran under, and need not be the tab's
+        // current selection. See `ResultSet::database`.
+        //
+        // The scope **follows a `USE`**, and the stamp is applied after it, so a
+        // `USE` labels its own result with the database it moved to. Stamping
+        // the immutable pinned name meant every statement after one reported the
+        // database it was no longer running in. `sql::use_target` is
+        // conservative: a `USE` it can't read plainly drops the label rather than
+        // carrying a name that is now certainly wrong.
+        if result.is_ok() {
+            let dialect = self.db.engine().dialect();
+            if schemaic_core::sql::leading_keyword(sql, dialect).as_deref() == Some("USE")
+                && let Ok(mut scope) = self.scope.lock()
+            {
+                *scope = schemaic_core::sql::use_target(sql, dialect);
+            }
+        }
+        let scope = self.scope.lock().ok().and_then(|s| s.clone());
         let result = result.map(|mut rs| {
-            rs.database = self.database.clone();
+            rs.database = scope;
             rs
         });
         // MySQL DDL commits the open transaction out from under us, so the flag

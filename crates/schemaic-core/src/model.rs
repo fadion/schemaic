@@ -903,31 +903,68 @@ pub fn drop_committed(staged: &mut StagedEdits, committed: &HashSet<(usize, usiz
 ///
 /// Display index, not data row: the grid numbers its gutter by display position,
 /// so "row 40" means the fortieth row *as sorted on screen*, which is the only
-/// reading that matches what the user is looking at. `total` therefore includes
-/// any pending unsaved rows, since those are numbered too.
+/// reading that matches what the user is looking at. `total` is therefore the
+/// count of **numbered** rows: a pending unsaved row's gutter reads `*`, not a
+/// number, so counting them in made "row 101" land on a row showing no number,
+/// and made the clamp stop one short of the last one that does.
 ///
-/// Digit-group separators are accepted (`148,203`, `148 203`, `148_203`): the
-/// grid's own status line writes counts with separators, so a number read off the
-/// screen and typed back in has to work. Nothing else is stripped — a stray
-/// letter is still a miss rather than being quietly filtered into a number the
-/// user never asked for.
+/// The forms it accepts are exactly the forms the grid **prints**, so a number
+/// read off the screen and typed back in works:
+///
+/// - plain digits, `148203`;
+/// - the compact counts of the stats line — `200k`, `1.25k`, `3m`, `1b` — which
+///   is the whole reason this isn't a `parse::<usize>()`. `200k` is what the
+///   grid says a big result holds, and typing it back returned `None`: nothing
+///   moved and nothing was said, which is indistinguishable from a broken
+///   feature. A decimal point means something only against one of those
+///   suffixes; a bare `1.25` is not a row number;
+/// - digit-group separators (`148,203`, `148 203`, `148_203`), which the app
+///   itself never writes — the stats line is compact, the gutter and the find
+///   readout unformatted — but which come in from anywhere a count is copied.
+///
+/// Nothing else is stripped: a stray letter is still a miss rather than being
+/// quietly filtered into a number the user never asked for.
 pub fn goto_row_index(input: &str, total: usize) -> Option<usize> {
     if total == 0 {
         return None;
     }
-    let mut digits = String::with_capacity(input.len());
+    let mut s = String::with_capacity(input.len());
     for c in input.trim().chars() {
         match c {
             ',' | '_' | ' ' | '\u{202f}' | '\u{a0}' => continue,
-            _ => digits.push(c),
+            _ => s.push(c.to_ascii_lowercase()),
         }
     }
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    let (digits, mult): (&str, u128) = match s.as_bytes().last() {
+        Some(b'k') => (&s[..s.len() - 1], 1_000),
+        Some(b'm') => (&s[..s.len() - 1], 1_000_000),
+        Some(b'b') => (&s[..s.len() - 1], 1_000_000_000),
+        _ => (&s[..], 1),
+    };
+    let (int_part, frac_part) = match digits.split_once('.') {
+        // Only a suffix gives a fraction a meaning: `1.25k` is 1250 rows, a bare
+        // `1.25` is not a row number at all.
+        Some(_) if mult == 1 => return None,
+        Some((i, f)) => (i, f),
+        None => (digits, ""),
+    };
+    if (int_part.is_empty() && frac_part.is_empty())
+        || !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
+    // Fixed-point rather than an `f64`, so `1.25k` is exactly 1250 and a long
+    // fraction truncates rather than rounding to a row the user didn't name.
+    let scale = 10u128.checked_pow(frac_part.len() as u32)?;
     // All digits but too wide for the machine is still just "past the end" — it
     // must clamp with every other overshoot, not fall through to the miss above.
-    let n = digits.parse::<usize>().unwrap_or(usize::MAX);
+    let int = int_part.parse::<u128>().unwrap_or(u128::MAX);
+    let frac = frac_part.parse::<u128>().unwrap_or(0);
+    let n = int
+        .saturating_mul(mult)
+        .saturating_add(frac.saturating_mul(mult) / scale);
+    let n = usize::try_from(n).unwrap_or(usize::MAX);
     Some(n.clamp(1, total) - 1)
 }
 
@@ -1774,8 +1811,37 @@ mod tests {
         assert_eq!(goto_row_index("\t7\n", 100), Some(6));
     }
 
-    /// A count read off the screen carries separators, and typing it back in has
-    /// to work — the grid's own status line writes them.
+    /// **The form the grid actually prints.** The stats line says `200k rows`,
+    /// and typing that back returned `None`: nothing moved and nothing was said,
+    /// which is indistinguishable from a feature that doesn't work.
+    #[test]
+    fn goto_row_accepts_the_compact_counts_the_grid_prints() {
+        assert_eq!(goto_row_index("200k", 200_000), Some(199_999));
+        assert_eq!(goto_row_index("1.25k", 200_000), Some(1_249));
+        assert_eq!(goto_row_index("3m", 5_000_000), Some(2_999_999));
+        assert_eq!(goto_row_index("1b", 100), Some(99), "past the end clamps");
+        // Case and spacing come off a copy-paste as often as not.
+        assert_eq!(goto_row_index(" 200K ", 200_000), Some(199_999));
+    }
+
+    /// A fraction means something only against a suffix — `1.25k` is 1250 rows,
+    /// a bare `1.25` is not a row number — and it is fixed-point, so a long one
+    /// truncates rather than rounding to a row nobody named.
+    #[test]
+    fn goto_row_reads_a_fraction_only_against_a_suffix() {
+        assert_eq!(goto_row_index("1.25", 200_000), None);
+        assert_eq!(goto_row_index("1.2345k", 200_000), Some(1_233));
+        assert_eq!(
+            goto_row_index("k", 200_000),
+            None,
+            "a suffix with no number"
+        );
+        assert_eq!(goto_row_index("1.k", 200_000), Some(999));
+    }
+
+    /// Separators are accepted for anything pasted in from elsewhere — the app
+    /// itself never writes one (the stats line is compact, the gutter and the
+    /// find readout unformatted).
     #[test]
     fn goto_row_accepts_digit_group_separators() {
         assert_eq!(goto_row_index("148,203", 200_000), Some(148_202));

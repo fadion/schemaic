@@ -429,6 +429,81 @@ fn leading_keyword_span(sql: &str, dialect: SqlDialect) -> Option<(usize, usize)
     None
 }
 
+/// The database a `USE db` statement switches to, or `None` for anything else.
+///
+/// MySQL only — PostgreSQL has no `USE`, and a `USE` there is a syntax error the
+/// server refuses, so nothing to track.
+///
+/// Why this exists: `run_batch` computes the scope **once** before the loop and
+/// stamps it on every result, on a method whose own doc advertises that a `USE`
+/// carries across statements. So Run Everything on `USE sakila; SELECT * FROM
+/// actor;` from a tab scoped to `world` ran statement 2 in `sakila` and labelled
+/// its result `world` — the stats line lying in exactly the case the label
+/// exists to catch. `Session::fetch_query` has the same shape against an
+/// immutable pinned name.
+///
+/// Deliberately conservative. It reads the **one** identifier after the keyword
+/// and refuses anything else, so `USE` with a variable, an expression, or
+/// trailing junk answers `None` — and the caller drops the label rather than
+/// printing a name it isn't sure of. A missing label says nothing; a wrong one
+/// is a new class of wrong, which is the whole defect being fixed.
+///
+/// The identifier goes through [`skip_noncode`], so a backtick-quoted name is
+/// lifted out whole and unquoted (`` USE `my db` `` → `my db`), and a comment
+/// between the keyword and the name is skipped.
+pub fn use_target(sql: &str, dialect: SqlDialect) -> Option<String> {
+    if dialect != SqlDialect::MySql || leading_keyword(sql, dialect)? != "USE" {
+        return None;
+    }
+    let b = sql.as_bytes();
+    let n = b.len();
+    let mut i = leading_keyword_end(sql, dialect)?;
+    loop {
+        while i < n && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        // `skip_comment` indexes `b[i]` unguarded, so the end of input has to be
+        // checked here.
+        match (i < n).then(|| skip_comment(b, i, dialect)).flatten() {
+            Some(j) => i = j,
+            None => break,
+        }
+    }
+    let (name, mut i) = if i < n && b[i] == b'`' {
+        // `` `a``b` `` — a doubled backtick is one literal backtick.
+        let end = skip_noncode(b, i, dialect)?;
+        (sql[i + 1..end - 1].replace("``", "`"), end)
+    } else if i < n && (b[i].is_ascii_alphabetic() || b[i] == b'_' || b[i] >= 0x80) {
+        let s = i;
+        let mut j = i + 1;
+        while j < n && is_word_byte(b[j]) {
+            j += 1;
+        }
+        (sql[s..j].to_string(), j)
+    } else {
+        return None;
+    };
+    // Nothing may follow but whitespace, a comment, and a terminating `;`.
+    loop {
+        while i < n && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        // `skip_comment` indexes `b[i]` unguarded, so the end of input has to be
+        // checked here.
+        match (i < n).then(|| skip_comment(b, i, dialect)).flatten() {
+            Some(j) => i = j,
+            None => break,
+        }
+    }
+    if i < n && b[i] == b';' {
+        i += 1;
+        while i < n && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+    }
+    (i == n && !name.is_empty()).then_some(name)
+}
+
 /// Does `sql` contain a `WHERE` keyword at paren depth 0 (not inside a
 /// subquery, string, identifier, or comment)?
 pub fn has_top_level_where(sql: &str, dialect: SqlDialect) -> bool {
@@ -1762,5 +1837,57 @@ mod tests {
             find_code(s, "EXECUTE FUNCTION ", SqlDialect::Postgres),
             None
         );
+    }
+
+    fn used(sql: &str) -> Option<String> {
+        use_target(sql, SqlDialect::MySql)
+    }
+
+    #[test]
+    fn a_use_statement_names_the_database_it_switches_to() {
+        assert_eq!(used("USE sakila"), Some("sakila".into()));
+        assert_eq!(used("use sakila;"), Some("sakila".into()));
+        assert_eq!(used("  USE   sakila  ;  "), Some("sakila".into()));
+        assert_eq!(used("USE my_db2"), Some("my_db2".into()));
+    }
+
+    /// Through `skip_noncode`, so the name comes back **unquoted** — the label is
+    /// prose, not SQL — and a doubled backtick is one literal backtick.
+    #[test]
+    fn a_backticked_database_name_is_lifted_out_whole() {
+        assert_eq!(used("USE `my db`"), Some("my db".into()));
+        assert_eq!(used("USE `a``b`;"), Some("a`b".into()));
+    }
+
+    #[test]
+    fn a_comment_between_the_keyword_and_the_name_is_skipped() {
+        assert_eq!(used("USE /* x */ sakila"), Some("sakila".into()));
+        assert_eq!(used("/* lead */ USE sakila -- tail"), Some("sakila".into()));
+    }
+
+    /// **Anything it can't read plainly is `None`**, and the caller then drops
+    /// the label rather than printing a name it isn't sure of. A missing label
+    /// says nothing; a wrong one is the defect this function exists to fix.
+    #[test]
+    fn anything_but_a_plain_use_is_refused() {
+        for s in [
+            "SELECT 1",
+            "USE",
+            "USE ;",
+            "USE sakila world",
+            "USE @db",
+            "USE 'sakila'",
+            "USEsakila",
+            "",
+        ] {
+            assert_eq!(used(s), None, "{s:?}");
+        }
+    }
+
+    /// PostgreSQL has no `USE` — the server refuses it, so there is nothing to
+    /// track and no label to change.
+    #[test]
+    fn postgres_has_no_use_statement() {
+        assert_eq!(use_target("USE sakila", SqlDialect::Postgres), None);
     }
 }

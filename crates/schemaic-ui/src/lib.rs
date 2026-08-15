@@ -3602,6 +3602,33 @@ fn results_section(
     let (commit_err, error_open, error_text) = (gctx.commit_err, gctx.error_open, gctx.error_text);
     let (commit_wait, rollback_tx) = (gctx.commit_wait, gctx.rollback_tx.clone());
     let view_err = gctx.view_err;
+    // **The panel-level bars must not outlive the grid they describe.** All three
+    // are mounted here, outside `body`, while their only writer lives inside
+    // `grid_view`, which exists only under `Phase::Loaded` — so running a
+    // statement that failed left the panel showing "Query failed." with the
+    // previous result's total still pinned to its edge, indefinitely, and left
+    // the Go-to-row popup floating there looking live while Enter bumped a nonce
+    // with nobody listening and no close path but Escape.
+    //
+    // One effect on the result state closes both, and it is the state itself
+    // that is tracked rather than the grid's disposal: a `dyn_container` child's
+    // cleanup is not somewhere a sibling's signals can be reached.
+    {
+        let (results, result_tabs) = (results, result_tabs);
+        create_effect(move |_| {
+            let loaded = if result_tabs.with(|v| v.is_empty()) {
+                matches!(results.get(), QueryState::Loaded(_))
+            } else {
+                // Run Everything: at least one statement still has a grid.
+                result_tabs.with(|v| v.iter().any(|p| matches!(p.state, QueryState::Loaded(_))))
+            };
+            if !loaded {
+                sel_summary.set(None);
+                goto_open.set(false);
+                find_open.set(false);
+            }
+        });
+    }
     // Live Monitor: watch the tab's source table. Captured before `gctx` moves.
     let open_monitor = gctx.open_monitor.clone();
     let (monitor_source, monitor_conn) = (gctx.source, gctx.conn_id);
