@@ -48,7 +48,8 @@ use consts::*;
 use editor_pane::{QueryPaneParams, editor_placeholder, query_pane};
 use erd_view::erd_overlay;
 use grid::{
-    GridCtx, grid_error_bar, grid_find_bar, grid_goto_bar, loaded_view, results_view, running_view,
+    GridCtx, grid_error_bar, grid_find_bar, grid_goto_bar, grid_selection_bar, loaded_view,
+    results_view, running_view,
 };
 use history_panel::history_panel;
 use monitor_view::monitor_overlay;
@@ -3458,6 +3459,8 @@ fn center(ui: Ui) -> impl IntoView {
                     goto_open: RwSignal::new(false),
                     goto_query: RwSignal::new(String::new()),
                     goto_step: RwSignal::new(0u64),
+                    // Selection aggregates, written by the mounted grid.
+                    sel_summary: RwSignal::new(None),
                     // Commit-status bar (bottom) — its own per-tab-render signals;
                     // "View" opens the shared workspace error modal with its text.
                     commit_err: RwSignal::new(None),
@@ -3566,6 +3569,7 @@ fn results_section(
     let (find_open, find_query, find_step) = (gctx.find_open, gctx.find_query, gctx.find_step);
     let (find_total, find_pos, find_more) = (gctx.find_total, gctx.find_pos, gctx.find_more);
     let (goto_open, goto_query, goto_step) = (gctx.goto_open, gctx.goto_query, gctx.goto_step);
+    let sel_summary = gctx.sel_summary;
     let (commit_err, error_open, error_text) = (gctx.commit_err, gctx.error_open, gctx.error_text);
     let (commit_wait, rollback_tx) = (gctx.commit_wait, gctx.rollback_tx.clone());
     let view_err = gctx.view_err;
@@ -3647,6 +3651,14 @@ fn results_section(
             error_open,
             error_text,
         ),
+        // Last, so it paints over the panel — and it lifts itself above the error
+        // bar when that one is up, by the same predicate `grid_error_bar` decides
+        // its own visibility with.
+        grid_selection_bar(sel_summary, move || {
+            commit_err.with(Option::is_some)
+                || view_err.with(Option::is_some)
+                || commit_wait.with(Option::is_some)
+        }),
     ))
     .style(|s| {
         s.width_full()

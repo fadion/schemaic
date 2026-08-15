@@ -23,6 +23,20 @@ Zed-inspired, aiming to replace DataGrip.
     `one_row_verdict` (the 1-row safety net's verdict *and* its message),
     `Rollback`/`engine_is_transactional` (what a rollback actually achieved — see the invariant
     below), and `drop_committed` (which staged edits a commit un-stages).
+  - `aggregate.rs` — what a multi-cell grid selection adds up to (`aggregate` → `Aggregates` +
+    `summary`). The arithmetic is **fixed-point, not `f64`**, and that is the whole reason the
+    module has substance: `Column::is_numeric` counts `DECIMAL`/`NUMERIC`, while `Value` leaves
+    those cells as `Str` precisely so the wire's digits are never rounded — and a money column is
+    exactly what anyone wants a `Sum` for. Summing through a float would reintroduce, in the one
+    number the user reads, the error the storage model exists to avoid (`45.599999999999994` under
+    a column of tidy prices). So values parse into `Fixed` (an `i128` of units at a scale), sum and
+    compare at the widest scale present, and format back keeping the column's own decimals; only
+    the average divides, and it carries extra places to say so. Overflow degrades to *no* aggregate
+    rather than wrapping — a silently wrong total is worse than an absent one. NULLs are counted
+    but excluded (the average divides by what it actually had), a numeric cell that doesn't parse
+    is present-but-skipped rather than treated as zero, and a non-numeric column gets counts only:
+    there is nothing to sum in a name, and a lexicographic min/max reads as a bug more often than
+    it answers anything.
   - `sql.rs` — one `skip_noncode` tokenizer → statement splitting, unsafe-statement guard, AI
     read-only gate, `edit_distance`. The *single* SQL boundary lexer; `intel` (scope/context/
     diagnostics)/`sql_highlight`/`sqlfmt` all build on it so string/`#`/`--`/`/* */`/backtick
@@ -1465,6 +1479,25 @@ for keyboard nav.
   `commit_grid` → a `GridWrite { updates, inserts }` → the app's `commit_edits`. On success the app
   re-runs the query; on failure the error shows in the toolbar and green edits stay. No global "Edit"
   toggle. A read-only cell's double-click opens the value viewer.
+- **Range selection is back, and it feeds the aggregates bar.** The state (`active`/`anchor`), the
+  rect (`bounds`), the paint and `copy_selection` were always multi-cell aware; only the *input*
+  had been gated off ("the grid has no multi-cell actions"). Shift+click, Shift+arrow and
+  drag-select are live again — drag needs no pointer capture, just `gs.selecting` set on a cell's
+  `PointerDown`, extended by each cell's `PointerEnter`, and cleared by the **body's** `PointerUp`
+  (the release routinely lands outside the cell, past the last row, or outside the grid) **and by
+  the double-click handler**, since floem's `DoubleClick` swallows the second `PointerUp` and the
+  flag would otherwise stay armed with no button down. `Del` now drives the whole range to *one*
+  state rather than flipping each row: on a mixed selection a per-row toggle both marks and
+  unmarks, which reads as the key doing nothing.
+  **Which column the arithmetic is about is the *anchor's*** — the one the selection started on, so
+  dragging from `price` across to `name` still reports `price`. It reads `gs.anchor` rather than
+  `bounds()`, which is a normalised rect and has forgotten which corner you began at. A selection
+  covering *every* column is a row selection (gutter click, Ctrl+A, the Ctrl+G jump) whose anchor
+  column is column 0 — usually an id, whose sum means nothing — so those get counts only; a
+  single-column result is exempt, since there covering every column is covering the one you meant.
+  `grid_selection_bar` renders at panel level (like the find bar, so it can sit at the panel's
+  edge) while `grid_view` computes it, and it lifts itself above `grid_error_bar` when that one is
+  up: they coincide exactly when a bulk delete fails, which is when both have something to say.
 - **A result says which database it came from, and the answer lives on the result.** The grid's
   stats line leads with `ResultSet::database` (`world · 100 rows · 15 cols · 1 ms`), stamped by the
   loader that knows the scope — `Db::fetch_query`, `Session::fetch_query` (its *pinned* database,

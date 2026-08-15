@@ -6,6 +6,7 @@
 //! connection + schema models in [`connection`]/[`schema`]; and config
 //! persistence in [`persist`].
 
+pub mod aggregate;
 pub mod chat;
 pub mod connection;
 pub mod db_color;

@@ -294,6 +294,12 @@ struct GridState {
     /// Data-row indices marked for deletion (the toolbar count + a red row tint);
     /// they `DELETE` on commit. Cleared on commit / discard.
     del_rows: RwSignal<HashSet<usize>>,
+    /// True between a cell's pointer-down and the release that ends it — the
+    /// drag-select gate. Each cell's `PointerEnter` extends the range while it is
+    /// set, so no pointer capture is needed. Cleared by the body's `PointerUp`
+    /// **and** by a double-click, since floem's `DoubleClick` swallows the second
+    /// `PointerUp` and the flag would otherwise stay armed with no button down.
+    selecting: RwSignal<bool>,
     /// Which columns are editable + each base table's WHERE key (from the
     /// result's per-column provenance). Computed once per result set.
     edit_model: RwSignal<Arc<EditModel>>,
@@ -490,6 +496,7 @@ impl GridState {
             dirty: RwSignal::new(HashMap::new()),
             new_rows: RwSignal::new(Vec::new()),
             del_rows: RwSignal::new(HashSet::new()),
+            selecting: RwSignal::new(false),
             edit_model: RwSignal::new(Arc::new(EditModel::default())),
             commit_busy: RwSignal::new(false),
             commit_seq: RwSignal::new(0),
@@ -1807,6 +1814,15 @@ pub(crate) struct GridCtx {
     pub(crate) goto_open: RwSignal<bool>,
     pub(crate) goto_query: RwSignal<String>,
     pub(crate) goto_step: RwSignal<u64>,
+    /// The selection-aggregates line, written by `grid_view` (which has the cells)
+    /// and rendered by the panel-level bar (which can sit at the panel's bottom
+    /// edge) — the same split as the find bar, for the same reason. `None` when
+    /// nothing multi-cell is selected, which is when the bar is hidden.
+    ///
+    /// One signal is enough because only one result grid is mounted at a time:
+    /// `results_multi` is a tab strip keyed on `active_result`, not several grids
+    /// side by side.
+    pub(crate) sel_summary: RwSignal<Option<String>>,
     /// Last commit error (grid write-back), shown in a bottom error bar at the
     /// panel level (like the find bar at the top). Cleared by the next edit/commit.
     pub(crate) commit_err: RwSignal<Option<String>>,
@@ -2071,6 +2087,58 @@ pub(crate) fn grid_find_bar(
         },
     )
     .style(|s| s.absolute().inset_top(5.0).inset_right(5.0))
+}
+
+/// The selection-aggregates bar: what the current multi-cell selection adds up
+/// to, pinned to the bottom edge of the RESULTS panel.
+///
+/// Rendered at panel level, like the find bar, so it can sit at the panel's edge
+/// rather than scrolling with the rows — and computed in `grid_view`, which has
+/// the cells. It is hidden entirely when nothing multi-cell is selected, so it
+/// costs no room in the ordinary case.
+///
+/// `error_shown` lifts it clear of [`grid_error_bar`], the panel's other
+/// bottom-anchored overlay. They coincide exactly when a bulk delete fails, so
+/// "it's transient" is not an answer — that is the moment both have something to
+/// say.
+pub(crate) fn grid_selection_bar(
+    sel_summary: RwSignal<Option<String>>,
+    error_shown: impl Fn() -> bool + 'static + Copy,
+) -> impl IntoView {
+    dyn_container(
+        move || sel_summary.get(),
+        move |summary| match summary {
+            None => empty().into_any(),
+            Some(text_line) => text(text_line)
+                .style(|s| {
+                    // `bg_deepest`, the footer's surface — darker than the panel
+                    // it floats over, which is what makes the readout legible
+                    // against the grid behind it. Already a gated pairing with
+                    // `text_dim` (the completion popup's doc line), so this
+                    // introduces no combination the contrast test hasn't judged.
+                    s.color(theme::text_dim())
+                        .font_size(theme::FONT_LABEL)
+                        .padding_horiz(10.0)
+                        .padding_vert(4.0)
+                        .background(theme::bg_deepest())
+                        .border(1.0)
+                        .border_color(theme::border())
+                        .border_radius(6.0)
+                })
+                .into_any(),
+        },
+    )
+    .style(move |s| {
+        if sel_summary.with(Option::is_some) {
+            // Clears `grid_error_bar`'s 35px + its own 5px inset when that one is
+            // up; sits at the edge otherwise.
+            s.absolute()
+                .inset_right(8.0)
+                .inset_bottom(if error_shown() { 45.0 } else { 8.0 })
+        } else {
+            s
+        }
+    })
 }
 
 /// The grid's **go to row** popup (Ctrl+G) — the editor's go-to-line popup, for
@@ -2481,6 +2549,12 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             })
             .scroll_style(move |s| thin_scroll(s).hide_bars(!grid_shown.get()))
             .keyboard_navigable()
+            // Ends a drag-select. On the body rather than the cells because the
+            // release routinely lands outside the cell the drag began in — and
+            // past the last row, or outside the grid entirely.
+            .on_event_cont(EventListener::PointerUp, move |_| {
+                gs.selecting.set(false);
+            })
             .on_event(EventListener::KeyDown, move |e| {
                 grid_key(gs, nrows, ncols, e)
             })
@@ -2594,6 +2668,62 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         gs.goto_open.set(false);
         gs.goto_query.set(String::new());
         step
+    });
+    // Selection aggregates. Rendered by the panel-level bar; computed here,
+    // because this is where the cells are.
+    //
+    // **Which column the arithmetic is about**: the one the selection *started*
+    // on — the anchor's column — so dragging from `price` across to `name` still
+    // reports `price`. Reading the anchor rather than `bounds()` is the point:
+    // bounds is a normalised rect and has forgotten which corner you began at.
+    //
+    // A selection covering *every* column is a row selection (the gutter click,
+    // Ctrl+A, the Ctrl+G jump), and its anchor column is column 0 — usually an
+    // id, whose sum means nothing. Those get the counts only. A single-column
+    // result is exempt from that rule: there, covering every column is just
+    // covering the one you meant.
+    let sel_summary = gctx.sel_summary;
+    create_effect(move |_| {
+        let Some((r0, c0, r1, c1)) = gs.bounds() else {
+            sel_summary.set(None);
+            return;
+        };
+        if r0 == r1 && c0 == c1 {
+            sel_summary.set(None); // a lone cell aggregates to itself
+            return;
+        }
+        let Some((_, anchor_col)) = gs.anchor.get_untracked() else {
+            sel_summary.set(None);
+            return;
+        };
+        let rs = gs.rs.get_untracked();
+        let Some(column) = rs.columns.get(anchor_col) else {
+            sel_summary.set(None);
+            return;
+        };
+        let whole_row = ncols > 1 && c1 - c0 + 1 == ncols;
+        let order = gs.order.get_untracked();
+        // Pending unsaved rows have no stored cells; they are counted by the row
+        // span but contribute nothing to read.
+        let cells = (r0..=r1)
+            .filter_map(|d| order.get(d).copied())
+            .filter_map(|di| rs.cell(di, anchor_col));
+        let agg = if whole_row {
+            // Count the span without reading a column nobody chose.
+            schemaic_core::aggregate::Aggregates {
+                rows: r1 - r0 + 1,
+                non_null: r1 - r0 + 1,
+                numeric: None,
+            }
+        } else {
+            schemaic_core::aggregate::aggregate(column, cells)
+        };
+        let label = if whole_row {
+            agg.summary()
+        } else {
+            format!("{} · {}", column.name, agg.summary())
+        };
+        sel_summary.set(Some(label));
     });
     // Only one of the two bars is up at a time — they share an anchor, so both
     // open would paint one over the other. The editor's pair does this too.
@@ -4403,9 +4533,10 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
         return EventPropagation::Continue;
     }
     let m = ke.modifiers;
-    // Shift+Arrow no longer extends a multi-cell selection — keyboard nav always
-    // moves the single active cell. (Mouse drag-select + copy still work.)
-    let shift = false;
+    // Shift+Arrow extends the range from the anchor, the keyboard half of
+    // shift-click and drag-select. `set_active` keeps the anchor put and moves
+    // only the active end.
+    let shift = m.shift();
     let ctrl = m.control() || m.meta();
     let active_opt = gs.active.get_untracked();
     let (r, c) = active_opt.unwrap_or((0, 0));
@@ -4482,13 +4613,29 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
             gs.goto_open.set(true); // its input autofocuses on mount
         }
         Key::Named(NamedKey::Delete)
-            // Toggle the active real row's "marked for deletion" state (single
-            // writable table only). No selection, or a pending row → no-op.
+            // Toggle "marked for deletion" over every real row the selection
+            // covers (single writable table only). No selection → no-op.
+            //
+            // The whole range is driven to *one* state rather than each row
+            // flipping its own: on a mixed selection a per-row toggle both marks
+            // and unmarks, which reads as the key doing nothing. Any unmarked row
+            // in range means "mark them all"; only an already-fully-marked range
+            // unmarks. A pending row has nothing to delete and is skipped.
             if active_opt.is_some() && gs.edit_model.get_untracked().insert_target().is_some() => {
-                if let Some(&di) = gs.order.get_untracked().get(r) {
-                    gs.toggle_delete(di);
-                } else {
+                let Some((r0, _, r1, _)) = gs.bounds_untracked() else {
                     return EventPropagation::Continue;
+                };
+                let order = gs.order.get_untracked();
+                let rows: Vec<usize> = (r0..=r1).filter_map(|d| order.get(d).copied()).collect();
+                if rows.is_empty() {
+                    return EventPropagation::Continue;
+                }
+                let all_marked = gs.del_rows.with_untracked(|d| rows.iter().all(|di| d.contains(di)));
+                for di in rows {
+                    let marked = gs.del_rows.with_untracked(|d| d.contains(&di));
+                    if marked == all_marked {
+                        gs.toggle_delete(di);
+                    }
                 }
             }
         _ => return EventPropagation::Continue,
@@ -5584,9 +5731,13 @@ fn data_cell(
                         follow_relation(gs, data_idx, spec);
                         return EventPropagation::Stop;
                     }
-                    // Single-cell selection only — no drag-select / shift-extend
-                    // (the grid has no multi-cell actions).
-                    set_active(gs, i, ci, false);
+                    // Shift extends the range from the existing anchor; a plain
+                    // click starts a new one and arms drag-select, which the
+                    // cells' `PointerEnter` continues until the button is
+                    // released (the release is caught at the body level, since
+                    // the pointer may well be outside this cell by then).
+                    set_active(gs, i, ci, pe.modifiers.shift());
+                    gs.selecting.set(true);
                     if let Some(fid) = gs.focus_id.get_untracked() {
                         fid.request_focus();
                     }
@@ -5595,7 +5746,20 @@ fn data_cell(
             }
             EventPropagation::Continue
         })
+        // Drag-select: while the button is down, entering a cell moves the active
+        // end and leaves the anchor where the drag started. No pointer capture —
+        // the flag is enough, and the body's `PointerUp` ends it wherever the
+        // pointer happens to be.
+        .on_event_cont(EventListener::PointerEnter, move |_| {
+            if gs.selecting.get_untracked() {
+                set_active(gs, i, ci, true);
+            }
+        })
         .on_double_click_stop(move |_| {
+            // `DoubleClick` consumes the second `PointerUp`, so the drag flag has
+            // to be cleared here too or it stays armed with no button held and the
+            // next hover drags a selection out of nowhere.
+            gs.selecting.set(false);
             // Double-click edits an editable cell; on a read-only cell it does
             // nothing (viewing is via the right-click menu's View item).
             if gs.edit_model.get_untracked().editable(ci) {
