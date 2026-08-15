@@ -1279,6 +1279,10 @@ enum ResultIcon {
     Table,
     View,
     Column(schemaic_core::schema::ColumnTypeClass, ColKeyRole),
+    /// A PostgreSQL standalone object — enum / domain / sequence. Same glyph and
+    /// same muted tint the schema tree gives its row, so the thing you found in
+    /// one surface is recognisable in the other.
+    Object(schemaic_core::ddl::ObjectKind),
 }
 
 #[derive(Clone, Copy)]
@@ -1294,12 +1298,15 @@ impl ResultIcon {
             ResultIcon::Table => icons::TABLE,
             ResultIcon::View => icons::TABLE_CELLS_MERGE,
             ResultIcon::Column(class, _) => crate::schema_tree::column_type_icon(class),
+            ResultIcon::Object(kind) => crate::schema_tree::object_icon(kind),
         }
     }
     fn color(self) -> floem::peniko::Color {
         match self {
             ResultIcon::Table => theme::table_icon(),
             ResultIcon::View => theme::view_icon(),
+            // The tree's object rows, which are muted at the same alpha.
+            ResultIcon::Object(_) => theme::text_muted().multiply_alpha(0.7),
             ResultIcon::Column(_, role) => {
                 let base = match role {
                     ColKeyRole::Primary => theme::key_primary(),
@@ -1338,6 +1345,98 @@ fn column_result_icon(
         schemaic_core::schema::classify_column_type(&c.type_name),
         role,
     )
+}
+
+/// May this object be a Find-Anywhere result at all?
+///
+/// The **one** gate, asked by both producers — a fresh search ([`schema_hits`])
+/// and a remembered one ([`lookup_object`]) — because a palette row's whole
+/// activation is `open_for_object`, and that is guarded by `is_editable_object`
+/// at every schema-tree call site. Asking the editor's own predicate rather than
+/// re-spelling it as `!is_internal()` is what keeps the two from drifting if
+/// another kind of object ever becomes non-editable.
+///
+/// It has to be asked on the history path too, not just on the search that
+/// created the entry: a `serial`'s sequence is an ordinary object and a fine
+/// result, but migrating its column to an identity column makes that same
+/// sequence internal, and the remembered row would otherwise open an editor whose
+/// only irreversible action the server refuses.
+fn is_palette_target(o: &schemaic_core::schema::ObjectItem) -> bool {
+    crate::object_editor::is_editable_object(o)
+}
+
+/// Resolve a remembered object (a search-history entry) against the live schema.
+/// `None` if the database isn't loaded, the object is gone, or it is no longer
+/// something the palette may offer — a history row that resolves to nothing is
+/// dropped rather than shown, since its whole activation is "open the editor on
+/// *this* object".
+fn lookup_object(
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    database: &str,
+    schema: Option<&str>,
+    kind: schemaic_core::ddl::ObjectKind,
+    name: &str,
+) -> Option<schemaic_core::schema::ObjectItem> {
+    db_nodes.with_untracked(|nodes| {
+        let node = nodes.iter().find(|n| n.database == database)?;
+        let SchemaState::Loaded(s) = node.schema.get_untracked() else {
+            return None;
+        };
+        s.find_object(schema, kind, name).filter(is_palette_target)
+    })
+}
+
+/// Build one object result row: records the activation to search history, then
+/// opens the object editor — the same action the schema tree's row takes on Enter
+/// or a double-click.
+#[allow(clippy::too_many_arguments)]
+fn object_result_item(
+    database: String,
+    item: schemaic_core::schema::ObjectItem,
+    history: bool,
+    match_term: Option<String>,
+    active_conn: RwSignal<u64>,
+    search_history: RwSignal<Vec<schemaic_core::search_history::SearchEntry>>,
+    open_object: Rc<dyn Fn(String, schemaic_core::schema::ObjectItem)>,
+    close: Rc<dyn Fn()>,
+) -> PaletteItem {
+    let kind = item.kind();
+    // Qualified outside `public`, exactly as a table hit is, so two same-named
+    // types in two namespaces are distinguishable in the list.
+    let primary = schemaic_core::schema::display_name(item.schema(), item.name());
+    // The kind rides in the secondary line because a type and a table may share a
+    // name — without it the two rows would read identically.
+    let secondary = format!("{database} · {}", kind.label());
+    let name = item.name().to_string();
+    let schema = item.schema().map(str::to_string);
+    // Tab-completion inserts the bare name — the qualifier isn't what you're
+    // typing to search for, the same call the table rows make.
+    let complete = name.clone();
+    PaletteItem {
+        primary,
+        secondary,
+        activate: Rc::new(move || {
+            search_history.update(|v| {
+                schemaic_core::search_history::push(
+                    v,
+                    schemaic_core::search_history::SearchEntry {
+                        conn_id: active_conn.get_untracked(),
+                        database: database.clone(),
+                        schema: schema.clone(),
+                        table: name.clone(),
+                        column: None,
+                        object: Some(schemaic_core::search_history::ObjectTag::of(kind)),
+                    },
+                );
+            });
+            (open_object)(database.clone(), item.clone());
+            (close)();
+        }),
+        complete: Some(complete),
+        match_term,
+        icon: Some(ResultIcon::Object(kind)),
+        right_icon: history.then_some(icons::ROTATE_CCW_CLOCK),
+    }
 }
 
 /// Re-derive a history entry's icon from the live schema (its type/key info isn't
@@ -1404,6 +1503,7 @@ fn search_result_item(
                         schema: source.schema.clone(),
                         table: source.table.clone(),
                         column: column.clone(),
+                        object: None,
                     },
                 );
             });
@@ -2058,6 +2158,7 @@ fn build_items(
     search_history: RwSignal<Vec<schemaic_core::search_history::SearchEntry>>,
     open_table: &Rc<dyn Fn(TableSource)>,
     open_table_col: &Rc<dyn Fn(TableSource, String)>,
+    open_object: &Rc<dyn Fn(String, schemaic_core::schema::ObjectItem)>,
     close: &Rc<dyn Fn()>,
     query: RwSignal<String>,
     caret_end: RwSignal<u64>,
@@ -2077,30 +2178,53 @@ fn build_items(
                     .with_untracked(|v| schemaic_core::search_history::recent(v, conn));
                 return recent
                     .into_iter()
-                    .map(|e| {
+                    .filter_map(|e| {
+                        // An object entry resolves against the live schema; one
+                        // whose type has since been dropped (or whose kind this
+                        // build doesn't know) is dropped from the list rather
+                        // than offered as a row that opens nothing.
+                        if let Some(tag) = e.object {
+                            let item = lookup_object(
+                                db_nodes,
+                                &e.database,
+                                e.schema.as_deref(),
+                                tag.kind()?,
+                                &e.table,
+                            )?;
+                            return Some(object_result_item(
+                                e.database,
+                                item,
+                                true, // history row → trailing clock marker
+                                None, // nothing to highlight (empty query)
+                                active_conn,
+                                search_history,
+                                open_object.clone(),
+                                close.clone(),
+                            ));
+                        }
                         let source = TableSource::new(e.database, e.schema, e.table);
                         let left = lookup_result_icon(db_nodes, &source, e.column.as_deref());
-                        search_result_item(
+                        Some(search_result_item(
                             source,
                             e.column,
                             left,
-                            true, // history row → trailing clock marker
-                            None, // nothing to highlight (empty query)
+                            true,
+                            None,
                             active_conn,
                             search_history,
                             open_table.clone(),
                             open_table_col.clone(),
                             close.clone(),
-                        )
+                        ))
                     })
                     .collect();
             }
             find_matches(db_nodes, hidden, &q, 80)
                 .into_iter()
-                .map(|hit| {
-                    search_result_item(
-                        hit.source,
-                        hit.column,
+                .map(|hit| match hit.target {
+                    FindTarget::Table { source, column } => search_result_item(
+                        source,
+                        column,
                         Some(hit.icon),
                         false,
                         Some(q.clone()),
@@ -2109,7 +2233,17 @@ fn build_items(
                         open_table.clone(),
                         open_table_col.clone(),
                         close.clone(),
-                    )
+                    ),
+                    FindTarget::Object { database, item } => object_result_item(
+                        database,
+                        item,
+                        false,
+                        Some(q.clone()),
+                        active_conn,
+                        search_history,
+                        open_object.clone(),
+                        close.clone(),
+                    ),
                 })
                 .collect()
         }
@@ -2291,6 +2425,16 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
     let active_conn = ui.conn.active_conn;
     let search_history = ui.overlay.search_history;
     let ui_reg = ui.clone(); // for building the command registry per open
+    // Activating a type / domain / sequence opens the object editor — the same
+    // action its schema-tree row takes. Built here rather than on an actions
+    // bundle because the editor lives in this crate; the palette needs no help
+    // from the app to reach it.
+    let open_object: Rc<dyn Fn(String, schemaic_core::schema::ObjectItem)> = {
+        let ui = ui.clone();
+        Rc::new(move |database, item| {
+            crate::object_editor::open_for_object(&ui, &database, &item);
+        })
+    };
 
     dyn_container(
         move || open.get(),
@@ -2330,6 +2474,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                 let commands = commands.clone();
                 let open_table = open_table.clone();
                 let open_table_col = open_table_col.clone();
+                let open_object = open_object.clone();
                 let close = close.clone();
                 create_effect(move |prev: Option<String>| {
                     let raw = query.get();
@@ -2353,6 +2498,7 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                         search_history,
                         &open_table,
                         &open_table_col,
+                        &open_object,
                         &close,
                         query,
                         caret_end,
@@ -2929,13 +3075,34 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
     })
 }
 
-/// One Find-Anywhere hit: a table (`column: None`) or a specific column within a
-/// table (`column: Some`). Clicking either opens the table.
+/// What one Find-Anywhere hit points at.
+#[derive(Clone)]
+enum FindTarget {
+    /// A table (`column: None`) or a specific column within one. Activating
+    /// either opens the table.
+    Table {
+        source: TableSource,
+        column: Option<String>,
+    },
+    /// A PostgreSQL standalone object — enum / domain / sequence. Activating it
+    /// opens the object editor, which is exactly what Enter on its schema-tree
+    /// row does; the palette is a second way to reach a row, not a second set of
+    /// verbs.
+    ///
+    /// The `ObjectItem` is captured here rather than re-resolved on activation,
+    /// for the same reason the tree's own row captures it: the result list is
+    /// rebuilt whenever any database's schema signal changes, so a captured item
+    /// is no more stale than the row you would have clicked.
+    Object {
+        database: String,
+        item: schemaic_core::schema::ObjectItem,
+    },
+}
+
+/// One Find-Anywhere hit: what it points at, plus the schema-style icon for it.
 #[derive(Clone)]
 struct FindHit {
-    source: TableSource,
-    column: Option<String>,
-    /// The schema-style icon for this hit (table/view or column-by-type+key).
+    target: FindTarget,
     icon: ResultIcon,
 }
 
@@ -2951,40 +3118,368 @@ fn find_matches(
         if hidden.contains(&node.database) {
             continue;
         }
-        if let SchemaState::Loaded(schema) = node.schema.get_untracked() {
-            for t in &schema.tables {
-                // A table-name match lists the table itself; then each matching
-                // column is listed as its own `table.column` hit.
-                let source =
-                    TableSource::new(node.database.clone(), t.schema.clone(), t.name.clone());
-                if q.is_empty() || t.name.to_lowercase().contains(q) {
-                    out.push(FindHit {
-                        source: source.clone(),
-                        column: None,
-                        icon: table_result_icon(t),
-                    });
-                    if out.len() >= limit {
-                        return out;
-                    }
+        if let SchemaState::Loaded(schema) = node.schema.get_untracked()
+            && schema_hits(&node.database, &schema, q, limit, &mut out)
+        {
+            return out;
+        }
+    }
+    out
+}
+
+/// One database's hits, appended to `out`. Returns whether `limit` was reached —
+/// the caller stops there.
+///
+/// Split out from [`find_matches`] because that one reads signals and this one is
+/// plain data: it is what the tests drive to prove the palette matches the same
+/// things the schema tree's filter keeps.
+fn schema_hits(
+    database: &str,
+    schema: &schemaic_core::schema::DbSchema,
+    q: &str,
+    limit: usize,
+    out: &mut Vec<FindHit>,
+) -> bool {
+    let src = |t: &schemaic_core::schema::TableInfo| {
+        TableSource::new(database.to_string(), t.schema.clone(), t.name.clone())
+    };
+    // Pass 1 — table and view *names*.
+    for t in &schema.tables {
+        if !(q.is_empty() || t.name.to_lowercase().contains(q)) {
+            continue;
+        }
+        out.push(FindHit {
+            target: FindTarget::Table {
+                source: src(t),
+                column: None,
+            },
+            icon: table_result_icon(t),
+        });
+        if out.len() >= limit {
+            return true;
+        }
+    }
+    // Pass 2 — the PostgreSQL standalone objects the tree lists in its Types /
+    // Domains / Sequences folders. Matched through the *same*
+    // `ObjectItem::matches_search` the tree's filter uses, which is the whole
+    // point: this arm did not exist, so Ctrl+P for a type you were looking at in
+    // the sidebar found nothing.
+    //
+    // **Before the columns, deliberately.** Columns are the category that floods:
+    // one `user_id` foreign key repeated across a hundred tables is a hundred
+    // hits, and with the objects appended last they were pushed past `limit`
+    // entirely — reproducing the same "a type can't be found" symptom under a new
+    // cause. Names are few, so this costs the tail of a broad column search and
+    // buys the objects a place. (A database with `limit` *table-name* matches can
+    // still starve them, but a name match is rare where a column match is not.)
+    //
+    // A non-editable object is skipped — an identity column's counter, whose only
+    // activation would be an editor that refuses to open. The tree can list it
+    // because a tree row is context: it sits under the table that owns it and says
+    // so. A palette row is a destination, and one that goes nowhere is worse than
+    // an absent one. Nothing is lost: such a sequence is named after its own
+    // table, which the palette does find.
+    //
+    // `objects_matching` rather than `objects_all` because this runs on **every
+    // keystroke**, over every loaded database: the whole-list form cloned every
+    // object in the database — an enum's entire value list included — to answer a
+    // substring test.
+    for kind in [
+        schemaic_core::ddl::ObjectKind::Enum,
+        schemaic_core::ddl::ObjectKind::Domain,
+        schemaic_core::ddl::ObjectKind::Sequence,
+    ] {
+        let items = if q.is_empty() {
+            schema.objects_all(kind)
+        } else {
+            schema.objects_matching(kind, q)
+        };
+        for o in items {
+            if !is_palette_target(&o) {
+                continue;
+            }
+            out.push(FindHit {
+                target: FindTarget::Object {
+                    database: database.to_string(),
+                    item: o,
+                },
+                icon: ResultIcon::Object(kind),
+            });
+            if out.len() >= limit {
+                return true;
+            }
+        }
+    }
+    // Pass 3 — columns, each as its own `table.column` hit, still grouped under
+    // the table they belong to.
+    if !q.is_empty() {
+        for t in &schema.tables {
+            for c in &t.columns {
+                if !c.name.to_lowercase().contains(q) {
+                    continue;
                 }
-                if !q.is_empty() {
-                    for c in &t.columns {
-                        if c.name.to_lowercase().contains(q) {
-                            out.push(FindHit {
-                                source: source.clone(),
-                                column: Some(c.name.clone()),
-                                icon: column_result_icon(t, c),
-                            });
-                            if out.len() >= limit {
-                                return out;
-                            }
-                        }
-                    }
+                out.push(FindHit {
+                    target: FindTarget::Table {
+                        source: src(t),
+                        column: Some(c.name.clone()),
+                    },
+                    icon: column_result_icon(t, c),
+                });
+                if out.len() >= limit {
+                    return true;
                 }
             }
         }
     }
-    out
+    false
+}
+
+#[cfg(test)]
+mod find_tests {
+    use super::{FindHit, FindTarget, schema_hits};
+    use schemaic_core::ddl::ObjectKind;
+    use schemaic_core::schema::{
+        DbSchema, DomainInfo, EnumInfo, SequenceInfo, SequenceOwner, TableInfo,
+    };
+
+    fn fixture() -> DbSchema {
+        DbSchema {
+            tables: vec![TableInfo {
+                name: "orders".into(),
+                schema: Some("public".into()),
+                columns: vec![schemaic_core::schema::ColumnInfo {
+                    name: "order_ref".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            enums: vec![
+                EnumInfo {
+                    name: "order_status".into(),
+                    schema: Some("public".into()),
+                    values: vec!["shipped".into()],
+                    comment: None,
+                },
+                EnumInfo {
+                    name: "mood".into(),
+                    schema: Some("sales".into()),
+                    values: vec![],
+                    comment: None,
+                },
+            ],
+            domains: vec![DomainInfo {
+                name: "order_email".into(),
+                schema: Some("public".into()),
+                base_type: "text".into(),
+                ..Default::default()
+            }],
+            sequences: vec![
+                SequenceInfo {
+                    name: "order_counter".into(),
+                    schema: Some("public".into()),
+                    ..Default::default()
+                },
+                // An identity column's counter: listed by the tree, never a
+                // palette destination.
+                SequenceInfo {
+                    name: "orders_id_seq".into(),
+                    schema: Some("public".into()),
+                    owned_by: Some(SequenceOwner {
+                        table: "orders".into(),
+                        column: "id".into(),
+                        internal: true,
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn hits(q: &str) -> Vec<FindHit> {
+        let mut out = Vec::new();
+        schema_hits("shop", &fixture(), q, 80, &mut out);
+        out
+    }
+
+    fn object_names(q: &str) -> Vec<String> {
+        hits(q)
+            .into_iter()
+            .filter_map(|h| match h.target {
+                FindTarget::Object { item, .. } => Some(item.name().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every row in order, tagged by category — what the ordering tests read.
+    fn labels_of(hits: Vec<FindHit>) -> Vec<String> {
+        hits.into_iter()
+            .map(|h| match h.target {
+                FindTarget::Table {
+                    source,
+                    column: None,
+                } => format!("table:{}", source.table),
+                FindTarget::Table {
+                    column: Some(c), ..
+                } => format!("column:{c}"),
+                FindTarget::Object { item, .. } => format!("object:{}", item.name()),
+            })
+            .collect()
+    }
+
+    /// The bug: the palette walked only `schema.tables`, so on a PostgreSQL
+    /// connection none of the three object kinds could be found at all.
+    #[test]
+    fn every_standalone_object_kind_is_findable() {
+        assert_eq!(object_names("order_status"), vec!["order_status"]);
+        assert_eq!(object_names("order_email"), vec!["order_email"]);
+        assert_eq!(object_names("order_counter"), vec!["order_counter"]);
+    }
+
+    /// One term reaching a table, all three object kinds and a column, in the
+    /// order the palette commits to: **names, then objects, then columns.**
+    #[test]
+    fn a_database_lists_table_names_then_objects_then_columns() {
+        assert_eq!(
+            labels_of(hits("order")),
+            vec![
+                "table:orders",
+                // enums, then domains, then sequences — the tree's folder order
+                "object:order_status",
+                "object:order_email",
+                "object:order_counter",
+                "column:order_ref",
+            ]
+        );
+    }
+
+    /// Why objects come before columns. Columns are the category that floods —
+    /// one `user_id` foreign key across every table is one hit per table — and
+    /// with objects appended last they were pushed past the result cap entirely,
+    /// so `user_role` could not be found however precisely you typed it. That is
+    /// the same "Ctrl+P for a type finds nothing" symptom this feature exists to
+    /// fix, arriving by a different route.
+    #[test]
+    fn an_object_survives_a_flood_of_column_matches() {
+        let flooded = DbSchema {
+            tables: (0..20)
+                .map(|i| TableInfo {
+                    name: format!("t{i}"),
+                    schema: Some("public".into()),
+                    columns: vec![schemaic_core::schema::ColumnInfo {
+                        name: "user_id".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })
+                .collect(),
+            enums: vec![EnumInfo {
+                name: "user_role".into(),
+                schema: Some("public".into()),
+                values: vec![],
+                comment: None,
+            }],
+            ..Default::default()
+        };
+        // A cap far below the number of matching columns: the enum must still be
+        // in the results, and ahead of them.
+        let mut out = Vec::new();
+        schema_hits("shop", &flooded, "user", 5, &mut out);
+        let labels = labels_of(out);
+        assert_eq!(
+            labels.first().map(String::as_str),
+            Some("object:user_role"),
+            "the object must not be crowded out, got {labels:?}"
+        );
+        assert_eq!(labels.len(), 5, "the cap is still honoured");
+    }
+
+    #[test]
+    fn an_identity_columns_counter_is_never_a_result() {
+        // It matches by name, and is still withheld: its activation would be an
+        // editor that refuses to open.
+        assert!(!object_names("orders_id_seq").contains(&"orders_id_seq".to_string()));
+        assert!(!object_names("seq").contains(&"orders_id_seq".to_string()));
+    }
+
+    /// `is_palette_target` is asked on the **history** path as well as the search
+    /// path, and this is why: a `serial`'s sequence is an ordinary object and a
+    /// legitimate result, so it can be recorded in search history — but migrating
+    /// its column to an identity column makes that same sequence internal. The
+    /// remembered row must then stop being offered, or Enter opens an editor on a
+    /// counter the server won't let anyone alter.
+    #[test]
+    fn a_sequence_that_becomes_internal_stops_being_a_palette_target() {
+        let seq = |internal: bool| {
+            schemaic_core::schema::ObjectItem::Sequence(SequenceInfo {
+                name: "orders_id_seq".into(),
+                schema: Some("public".into()),
+                owned_by: Some(SequenceOwner {
+                    table: "orders".into(),
+                    column: "id".into(),
+                    internal,
+                }),
+                ..Default::default()
+            })
+        };
+        assert!(super::is_palette_target(&seq(false)), "a serial's sequence");
+        assert!(
+            !super::is_palette_target(&seq(true)),
+            "the same sequence once the column is an identity column"
+        );
+    }
+
+    /// The gate is the object editor's own predicate, not a second spelling of
+    /// it — so a kind that becomes non-editable later drops out of the palette
+    /// without anyone remembering to update it.
+    #[test]
+    fn the_palette_gate_is_the_editors_own_predicate() {
+        for o in fixture().objects_all(ObjectKind::Sequence) {
+            assert_eq!(
+                super::is_palette_target(&o),
+                crate::object_editor::is_editable_object(&o),
+                "{}",
+                o.name()
+            );
+        }
+    }
+
+    #[test]
+    fn an_object_search_is_case_insensitive_and_matches_a_substring() {
+        assert_eq!(object_names("status"), vec!["order_status"]);
+        // The caller lower-cases the query; the name may be any case.
+        assert_eq!(object_names("mood"), vec!["mood"]);
+    }
+
+    #[test]
+    fn a_term_matching_nothing_finds_no_object() {
+        assert!(object_names("zzz").is_empty());
+    }
+
+    /// The invariant this whole change exists to establish: the palette lists
+    /// exactly the objects the schema tree's filter keeps — the two surfaces read
+    /// the same data through the same `ObjectItem::matches_search`.
+    ///
+    /// The **one** deliberate divergence is the internal sequence above: a tree
+    /// row is context, a palette row is a destination.
+    #[test]
+    fn the_palette_finds_what_the_schema_tree_filter_keeps() {
+        let schema = fixture();
+        for q in ["order", "status", "o", "mood", "seq", "zzz", "email"] {
+            let mut tree: Vec<String> = Vec::new();
+            for kind in [ObjectKind::Enum, ObjectKind::Domain, ObjectKind::Sequence] {
+                let all = schema.objects_all(kind);
+                tree.extend(
+                    crate::schema_tree::objects_shown(&all, false, false, q)
+                        .into_iter()
+                        .filter(|o| super::is_palette_target(o))
+                        .map(|o| o.name().to_string()),
+                );
+            }
+            assert_eq!(object_names(q), tree, "the two surfaces disagree on {q:?}");
+        }
+    }
 }
 
 #[cfg(test)]

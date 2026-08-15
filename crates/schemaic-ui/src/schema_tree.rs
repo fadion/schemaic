@@ -160,19 +160,14 @@ fn object_group_label(kind: ObjectKind) -> &'static str {
     }
 }
 
-fn object_icon(kind: ObjectKind) -> &'static str {
+/// The glyph for a standalone object's kind — shared with the Find-Anywhere
+/// palette, so a type looks the same wherever it is listed.
+pub(crate) fn object_icon(kind: ObjectKind) -> &'static str {
     match kind {
         ObjectKind::Enum => icons::TAG,
         ObjectKind::Domain => icons::SCAN_SQUARE,
         ObjectKind::Sequence => icons::FILE_DIGIT,
     }
-}
-
-/// Does an object match the tree's filter box? By name only: its *detail* is a
-/// summary the row happens to show, and matching on it would surface a sequence
-/// because some unrelated table's name appeared in its owner.
-fn object_matches(o: &ObjectItem, filt: &str) -> bool {
-    o.name().to_lowercase().contains(filt)
 }
 
 /// Does anything in this database match by object name?
@@ -183,12 +178,7 @@ fn object_matches(o: &ObjectItem, filt: &str) -> bool {
 fn has_object_match(schema: &DbSchema, filt: &str) -> bool {
     [ObjectKind::Enum, ObjectKind::Domain, ObjectKind::Sequence]
         .into_iter()
-        .any(|k| {
-            schema
-                .objects_all(k)
-                .iter()
-                .any(|o| object_matches(o, filt))
-        })
+        .any(|k| schema.objects_all(k).iter().any(|o| o.matches_search(filt)))
 }
 
 fn namespace_has_object_match(schema: &DbSchema, ns: &str, filt: &str) -> bool {
@@ -198,7 +188,7 @@ fn namespace_has_object_match(schema: &DbSchema, ns: &str, filt: &str) -> bool {
             schema
                 .objects_in(Some(ns), k)
                 .iter()
-                .any(|o| object_matches(o, filt))
+                .any(|o| o.matches_search(filt))
         })
 }
 
@@ -239,7 +229,7 @@ fn namespace_survives(schema: &DbSchema, ns: &str, db_hit: bool, filt: &str) -> 
 /// Which of a folder's objects the filter leaves. Empty means the folder itself
 /// renders nothing — a header with a count, no children and a chevron that can
 /// never open was the converse half of the same divergence.
-fn objects_shown<'a>(
+pub(crate) fn objects_shown<'a>(
     items: &'a [ObjectItem],
     parent_hit: bool,
     ns_hit: bool,
@@ -247,7 +237,7 @@ fn objects_shown<'a>(
 ) -> Vec<&'a ObjectItem> {
     items
         .iter()
-        .filter(|o| filt.is_empty() || parent_hit || ns_hit || object_matches(o, filt))
+        .filter(|o| filt.is_empty() || parent_hit || ns_hit || o.matches_search(filt))
         .collect()
 }
 
@@ -2737,22 +2727,5 @@ mod tests {
             ObjectItem::Sequence(SequenceInfo::default()).detail(),
             "bigint"
         );
-    }
-
-    #[test]
-    fn objects_match_the_filter_by_name_only() {
-        // Not by detail: a sequence would surface because some unrelated table's
-        // name appeared in its owner.
-        let s = ObjectItem::Sequence(SequenceInfo {
-            name: "counter".into(),
-            owned_by: Some(schemaic_core::schema::SequenceOwner {
-                table: "orders".into(),
-                column: "id".into(),
-                internal: false,
-            }),
-            ..Default::default()
-        });
-        assert!(object_matches(&s, "count"));
-        assert!(!object_matches(&s, "orders"));
     }
 }

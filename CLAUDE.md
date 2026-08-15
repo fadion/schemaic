@@ -447,7 +447,19 @@ Zed-inspired, aiming to replace DataGrip.
     tested (they share `history.rs`'s shape; a new one belongs here, not in the UI):
     - `search_history.rs` — recent Find-Anywhere targets (`MAX_PER_CONN`, newest-first, deduped).
       `push` records only an *activated* result, not every keystroke, and the PG namespace is part
-      of the dedup identity so same-named tables in two schemas don't collapse into one.
+      of the dedup identity so same-named tables in two schemas don't collapse into one. So is
+      `ObjectTag`, which is what makes an entry a PostgreSQL enum/domain/sequence rather than a
+      table (its name rides in `table`, so every file written before objects were searchable still
+      loads): a type and a table may share a name in one namespace and are different places to go
+      back to. The tag is a **persisted** enum of its own rather than `ddl::ObjectKind` so a kind
+      written by a newer build degrades instead of failing the file and losing every connection's
+      history, the rule `SshAuth`/`Environment` follow; it resolves to no live kind, so the row is
+      dropped from the recents list exactly as an entry for a since-renamed table is. `Unknown`
+      **keeps the text it didn't recognise** and a hand-written `Serialize` writes it back
+      verbatim — the obvious `#[serde(other)]` unit variant degrades the *file* but silently
+      destroys the *value*, and since the app rewrites the whole of `search_history.json` on every
+      change, merely running an older build once would rewrite a newer one's `"collation"` as the
+      literal `"unknown"`.
     - `favorite.rs` — the `(conn_id, database)` star list. `toggle` appends newest-**last** on
       purpose: `rank` (0 = that connection's oldest) is what the schema tree sorts by, so order in
       the `Vec` *is* the sort key.
@@ -871,6 +883,41 @@ Re-introducing the anti-patterns these guard against is a regression:
   each having independently arrived at the same escaping, which is the drift hazard rather than the
   reassurance: the literal half of the same split (`schema::ddl_string` missing MySQL's backslash
   escaping while `export::sql_literal` had it) shipped as a High.
+- **Both schema-search surfaces match through one predicate.** The schema tree's filter box and the
+  Find-Anywhere palette answer the same question over the same `DbSchema`, so they go through
+  `schema::TableInfo::matches_search` (name or any column) and `schema::ObjectItem::matches_search`
+  (name only — a `detail()` match would surface a sequence because some unrelated table's name
+  appeared in its owner). They were two predicates and the palette's simply **had no object arm**,
+  so on a PostgreSQL connection Ctrl+P for a type you were looking at in the sidebar returned
+  nothing. `overlays::schema_hits` is the palette's half split out as plain data for exactly this
+  reason, and `overlays::find_tests` asserts the two surfaces return the same objects for a set of
+  terms. **One deliberate divergence, and it is the only one allowed without a test change:** an
+  *internal* object (an identity column's counter) is listed by the tree and withheld by the
+  palette — a tree row is context, sitting under the table that owns it, while a palette row is a
+  destination, and this one's activation is an editor that refuses to open. That withholding is
+  `overlays::is_palette_target`, which **delegates to `object_editor::is_editable_object`** rather
+  than re-spelling it, and **both** producers ask it — the live search *and* `lookup_object` on the
+  search-history path. A `serial`'s sequence is an ordinary object and a legitimate result, so it
+  can be remembered; migrating its column to an identity column makes that same sequence internal,
+  and only the second gate stops the remembered row from opening an editor the server would refuse.
+  Every path to `open_for_object` is gated (the tree's two, and this one) — don't add an ungated one.
+- **A Find-Anywhere database is searched in three passes: table/view *names*, then objects, then
+  columns** (`overlays::schema_hits`), and the object pass sits in the middle **deliberately**.
+  Columns are the category that floods — one `user_id` foreign key across a hundred tables is a
+  hundred hits — so with the objects appended last they were pushed past the 80-result cap
+  entirely, and a type could not be found however precisely you typed its name. That is the same
+  symptom the object arm was added to fix, arriving by a different route, which is why
+  `an_object_survives_a_flood_of_column_matches` pins it with a deliberately small cap. Names are
+  few, so the ordering costs only the tail of a broad column search. Two residual limits, both
+  pre-existing and both accepted: a database with `limit` *table-name* matches can still starve its
+  objects (a name match is rare where a column match is not), and the cap is **global across
+  databases**, so a wide first database still contributes everything and later ones nothing.
+- **The Find-Anywhere query is not debounced.** Unlike the schema tree's filter box
+  (`debounced(filter_input, SEARCH_DEBOUNCE_MS)`), the palette's effect re-runs on every keystroke,
+  over every loaded database. So anything it calls per-database is on a per-character path: that is
+  why the object arm goes through `DbSchema::objects_matching` (clones only the hits) rather than
+  `objects_all` (clones the database's every enum, domain and sequence, an enum's whole value list
+  included, to answer a substring test). Same rule as `SignalGet::with` over `get`.
 - **Identifier scanning treats bytes `>= 0x80` as word bytes** so Unicode identifiers tokenize whole.
   `sql::is_word_byte` (continues a word) and `sql::is_word_start` (begins one — `alphabetic`, since a
   digit can't start a name) are the **only** definitions, next to `skip_noncode` because they answer

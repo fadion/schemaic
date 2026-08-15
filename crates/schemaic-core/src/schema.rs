@@ -1557,6 +1557,22 @@ impl SequenceInfo {
     }
 }
 
+/// Does a standalone object's **name** match a schema-search term?
+/// `needle_lower` must already be lower-cased; an empty needle matches nothing,
+/// since every caller answers "no filter" separately.
+///
+/// The rule lives here as a free function, not only as
+/// [`ObjectItem::matches_search`], so a caller can ask it of a *borrowed*
+/// `EnumInfo`/`DomainInfo`/`SequenceInfo` without building an owned `ObjectItem`
+/// first — see [`DbSchema::objects_matching`], which is on a per-keystroke path
+/// and so must not clone the objects it rejects.
+pub fn object_name_matches(name: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return false;
+    }
+    name.to_lowercase().contains(needle_lower)
+}
+
 /// One standalone object, whichever kind it is.
 ///
 /// The tree renders a mixed list of these and the editor holds exactly one, so
@@ -1655,6 +1671,24 @@ impl ObjectItem {
                 None => s.data_type.clone(),
             },
         }
+    }
+
+    /// Does this object match a schema-search term? **By name only**, and
+    /// `needle_lower` must already be lower-cased — the counterpart of
+    /// [`TableInfo::matches_search`], and an empty needle matches nothing for the
+    /// same reason (every caller answers "no filter" separately).
+    ///
+    /// Name-only because [`ObjectItem::detail`] is a summary the row happens to
+    /// show: matching it would surface a sequence because some unrelated table's
+    /// name appeared in its owner, and an enum because one of its values spelled
+    /// the term.
+    ///
+    /// This is the **one** predicate behind both search surfaces — the schema
+    /// tree's filter box and the Find-Anywhere palette. They were two, and the
+    /// palette's simply had no object arm at all, so on a PostgreSQL connection
+    /// Ctrl+P for a type you were looking at in the sidebar returned nothing.
+    pub fn matches_search(&self, needle_lower: &str) -> bool {
+        object_name_matches(self.name(), needle_lower)
     }
 
     /// Whether this object exists only as part of a column, and so can be
@@ -2026,6 +2060,79 @@ impl DbSchema {
             .into_iter()
             .filter(|o| o.schema() == schema)
             .collect()
+    }
+
+    /// One standalone object by namespace, kind and name — the kind-agnostic
+    /// counterpart of [`DbSchema::find_enum`] and friends, on the same
+    /// `find_by_ns` namespace rule tables use.
+    ///
+    /// Owned rather than borrowed, matching [`DbSchema::objects_all`]: the
+    /// callers are the ones that resolve a *remembered* target (a Find-Anywhere
+    /// hit, a search-history entry) against whatever the schema now holds, and
+    /// they hand the result straight to an editor that wants it by value.
+    pub fn find_object(
+        &self,
+        schema: Option<&str>,
+        kind: crate::ddl::ObjectKind,
+        name: &str,
+    ) -> Option<ObjectItem> {
+        match kind {
+            crate::ddl::ObjectKind::Enum => {
+                self.find_enum(schema, name).cloned().map(ObjectItem::Enum)
+            }
+            crate::ddl::ObjectKind::Domain => self
+                .find_domain(schema, name)
+                .cloned()
+                .map(ObjectItem::Domain),
+            crate::ddl::ObjectKind::Sequence => self
+                .find_sequence(schema, name)
+                .cloned()
+                .map(ObjectItem::Sequence),
+        }
+    }
+
+    /// The objects of one kind whose **name** matches, in any namespace —
+    /// [`object_name_matches`] applied to the borrowed catalogue, so an object
+    /// that doesn't match is never cloned.
+    ///
+    /// This exists rather than `objects_all(kind).retain(…)` because the caller
+    /// is the Find-Anywhere palette, whose query signal is **not** debounced: it
+    /// re-runs on every keystroke, over every loaded database, three times. Going
+    /// through `objects_all` there cloned every `EnumInfo`/`DomainInfo`/
+    /// `SequenceInfo` in the database — names, comments, an enum's whole value
+    /// list — to answer a substring test, thousands of allocations per character
+    /// on the UI thread. Same rule as `SignalGet::with` over `get`.
+    ///
+    /// An empty needle matches **nothing**, following `object_name_matches`; a
+    /// caller that means "no filter" wants [`DbSchema::objects_all`].
+    pub fn objects_matching(
+        &self,
+        kind: crate::ddl::ObjectKind,
+        needle_lower: &str,
+    ) -> Vec<ObjectItem> {
+        match kind {
+            crate::ddl::ObjectKind::Enum => self
+                .enums
+                .iter()
+                .filter(|e| object_name_matches(&e.name, needle_lower))
+                .cloned()
+                .map(ObjectItem::Enum)
+                .collect(),
+            crate::ddl::ObjectKind::Domain => self
+                .domains
+                .iter()
+                .filter(|d| object_name_matches(&d.name, needle_lower))
+                .cloned()
+                .map(ObjectItem::Domain)
+                .collect(),
+            crate::ddl::ObjectKind::Sequence => self
+                .sequences
+                .iter()
+                .filter(|s| object_name_matches(&s.name, needle_lower))
+                .cloned()
+                .map(ObjectItem::Sequence)
+                .collect(),
+        }
     }
 
     /// Every standalone object of one kind, whatever namespace it is in.
@@ -3812,5 +3919,153 @@ mod tests {
         // with it.
         let s = objects();
         assert_eq!(s.schemas(), vec!["public", "sales"]);
+    }
+
+    #[test]
+    fn an_object_matches_a_search_by_name_case_insensitively() {
+        let s = objects();
+        let mood = s
+            .find_object(Some("public"), crate::ddl::ObjectKind::Enum, "mood")
+            .unwrap();
+        assert!(mood.matches_search("moo"));
+        assert!(mood.matches_search("mood"));
+        assert!(mood.matches_search("oo"), "substring, not prefix");
+        assert!(!mood.matches_search("xyz"));
+    }
+
+    /// The caller lower-cases the needle; an upper-case name still matches.
+    #[test]
+    fn object_search_folds_the_name_it_is_matching() {
+        let e = ObjectItem::Enum(EnumInfo {
+            name: "OrderStatus".into(),
+            schema: Some("public".into()),
+            values: vec![],
+            comment: None,
+        });
+        assert!(e.matches_search("orderstatus"));
+        assert!(e.matches_search("status"));
+    }
+
+    /// An empty needle matches nothing, the same call [`TableInfo::matches_search`]
+    /// makes — "no filter" is a separate question every caller answers first.
+    #[test]
+    fn an_empty_search_matches_no_object() {
+        let s = objects();
+        let mood = s
+            .find_object(Some("public"), crate::ddl::ObjectKind::Enum, "mood")
+            .unwrap();
+        assert!(!mood.matches_search(""));
+    }
+
+    /// Matching the *detail* would surface a sequence because some unrelated
+    /// table's name appears in its owner, and an enum because a value happens to
+    /// spell the term. The name is the only thing anyone searches an object by.
+    #[test]
+    fn object_search_ignores_the_detail_line() {
+        let e = ObjectItem::Enum(EnumInfo {
+            name: "mood".into(),
+            schema: None,
+            values: vec!["shipped".into()],
+            comment: None,
+        });
+        assert!(
+            !e.matches_search("shipped"),
+            "an enum value is not its name"
+        );
+        let seq = ObjectItem::Sequence(SequenceInfo {
+            name: "counter".into(),
+            schema: None,
+            owned_by: Some(SequenceOwner {
+                table: "invoices".into(),
+                column: "id".into(),
+                internal: false,
+            }),
+            ..Default::default()
+        });
+        assert!(
+            !seq.matches_search("invoices"),
+            "the owning table is not the sequence's name"
+        );
+    }
+
+    /// `objects_matching` must agree with `objects_all` + the predicate — it is
+    /// an optimisation, and the only thing it may change is what it allocates.
+    #[test]
+    fn objects_matching_agrees_with_filtering_the_whole_list() {
+        use crate::ddl::ObjectKind;
+        let s = objects();
+        for q in ["mood", "moo", "email", "counter", "o", "zzz"] {
+            for kind in [ObjectKind::Enum, ObjectKind::Domain, ObjectKind::Sequence] {
+                let expected: Vec<ObjectItem> = s
+                    .objects_all(kind)
+                    .into_iter()
+                    .filter(|o| o.matches_search(q))
+                    .collect();
+                assert_eq!(s.objects_matching(kind, q), expected, "{kind:?} on {q:?}");
+            }
+        }
+    }
+
+    /// It keeps every namespace's copy, as `objects_all` does — the palette
+    /// qualifies them on the row rather than collapsing them.
+    #[test]
+    fn objects_matching_keeps_a_name_that_exists_in_two_namespaces() {
+        let s = objects();
+        let hits = s.objects_matching(crate::ddl::ObjectKind::Enum, "mood");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits.iter().map(|o| o.schema()).collect::<Vec<_>>(),
+            vec![Some("public"), Some("sales")]
+        );
+    }
+
+    /// An empty needle means "nothing", not "everything" — a caller wanting the
+    /// whole list has `objects_all`. Getting this backwards would put every type
+    /// in the database into the palette the moment the query box was cleared.
+    #[test]
+    fn objects_matching_returns_nothing_for_an_empty_needle() {
+        let s = objects();
+        for kind in [
+            crate::ddl::ObjectKind::Enum,
+            crate::ddl::ObjectKind::Domain,
+            crate::ddl::ObjectKind::Sequence,
+        ] {
+            assert!(s.objects_matching(kind, "").is_empty(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn find_object_resolves_every_kind_on_the_namespace_rule_tables_use() {
+        use crate::ddl::ObjectKind;
+        let s = objects();
+        // Same name in two namespaces resolves independently.
+        assert_eq!(
+            s.find_object(Some("sales"), ObjectKind::Enum, "mood")
+                .map(|o| o.detail()),
+            Some("great".to_string())
+        );
+        // No namespace offered → `public` wins, as `find_enum` does.
+        assert_eq!(
+            s.find_object(None, ObjectKind::Enum, "mood")
+                .and_then(|o| o.schema().map(str::to_string)),
+            Some("public".into())
+        );
+        assert!(
+            s.find_object(Some("sales"), ObjectKind::Domain, "email")
+                .is_some()
+        );
+        assert!(
+            s.find_object(None, ObjectKind::Sequence, "counter")
+                .is_some()
+        );
+        // The kind is part of the identity: a domain is not an enum.
+        assert!(
+            s.find_object(Some("sales"), ObjectKind::Enum, "email")
+                .is_none()
+        );
+        assert!(
+            s.find_object(Some("archive"), ObjectKind::Enum, "mood")
+                .is_none()
+        );
     }
 }
