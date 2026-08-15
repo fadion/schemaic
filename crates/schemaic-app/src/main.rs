@@ -80,7 +80,16 @@ struct ClosedTab {
 /// Record one executed query into history: `(conn_id, database, sql, tab_name)`,
 /// returning the **run id** it was recorded under — what
 /// [`FinishHistoryFn`] later reports that run's outcome against.
-type RecordHistoryFn = Rc<dyn Fn(u64, Option<String>, String, Option<String>) -> u64>;
+/// Record a run's statements and hand back one run id each, in order.
+///
+/// A **slice**, and one file write for the lot. It took a single statement and
+/// wrote the whole of `history.json` each time — clone the cross-connection
+/// vector, serialize it, temp file, read-back, `.bak`, rename — so Run Everything
+/// on a hundred-statement migration did that a hundred times in one UI-thread
+/// handler, ~500 fs operations and O(N × min(N, MAX_PER_CONN)) entry
+/// serializations, before the batch was even spawned. `finish_history` was given
+/// this shape by an earlier fix; only the launch half was left.
+type RecordHistoryFn = Rc<dyn Fn(u64, Option<String>, &[String], Option<String>) -> Vec<u64>>;
 
 /// Resolve the pinned session a tab's statements must run on: `Ok(None)` in
 /// Auto-commit (fresh connection per op, as everywhere else), `Err` when the tab
@@ -105,7 +114,10 @@ type FetchSchemaFn = Rc<dyn Fn(&ConnNode, Db)>;
 ///
 /// A **slice**, not one run, because Run Everything lands a whole batch at once
 /// and each recorded run costs a full rewrite of `history.json`.
-type FinishHistoryFn = Rc<dyn Fn(&[(u64, schemaic_core::history::RunResult)])>;
+/// Fill in how runs went, and delete the entries of runs that never happened.
+///
+/// One call for the whole slice, and one file write for both halves.
+type FinishHistoryFn = Rc<dyn Fn(&[(u64, schemaic_core::history::RunResult)], &[u64])>;
 use schemaic_core::filter::{Order, table_query};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::persist::{self, ConnectionsFile, UiState};
@@ -640,6 +652,26 @@ fn fetch_landing(started: u64, current: u64) -> bool {
     started == current
 }
 
+/// Where the session's run-id counter starts: past **every** id on disk, across
+/// all connections. Each `record_history` then hands out `seed + 1`, `+ 2`, …
+///
+/// Three properties, and the whole of the argument that a landing run reports
+/// against the entry it launched:
+///
+/// - **Global, not per-connection.** Ids are matched by `finish` without a
+///   connection filter, so a per-connection seed would let two connections issue
+///   the same id and let one run's outcome land on the other's entry.
+/// - **Only ever counting up.** Re-deriving `max + 1` per push would reuse an id
+///   the moment the per-connection cap evicted the entry holding the maximum —
+///   while the run holding it was still in flight.
+/// - **Never zero.** Entries written before run ids exist carry `0`, so the
+///   first id handed out must not be one, or a landing run would claim a legacy
+///   entry. `max().unwrap_or(0)` on an empty history seeds 0 and the first
+///   allocation is 1.
+fn run_id_seed(entries: &[schemaic_core::history::HistoryEntry]) -> u64 {
+    entries.iter().map(|e| e.run_id).max().unwrap_or(0)
+}
+
 /// The default connection created on first launch (matches the local WSL
 /// MariaDB used in development).
 fn seed_connection() -> Connection {
@@ -663,32 +695,20 @@ fn seed_connection() -> Connection {
 /// no verdict — still running, or cancelled, where the honest answer is the
 /// nothing the entry already says.
 ///
-/// The row count is the result's own: rows **returned** for a `SELECT`, rows
-/// **affected** for a write (`ResultSet::affected`, which is `None` for exactly
-/// the row-returning case). A failure has neither.
-///
-/// A fetch that stopped at the row cap carries `rows_capped`, because its count
-/// *is* the cap: the entry would otherwise claim that a 5-million-row table
-/// returned exactly 200,000, and the grid that said "truncated" is long gone by
-/// the time anyone reads the history. `affected` is the server's own number and
-/// is never capped.
-///
 /// Shared by both run paths so a single run and a statement inside Run
-/// Everything can't come to answer this differently.
+/// Everything can't come to answer this differently. A thin match over
+/// `QueryState`; what each arm *records* is `RunResult::loaded`/`failed`, in
+/// core and under test.
 fn run_result(state: &QueryState, duration_ms: u64) -> Option<schemaic_core::history::RunResult> {
+    use schemaic_core::history::RunResult;
     match state {
-        QueryState::Loaded(rs) => Some(schemaic_core::history::RunResult {
+        QueryState::Loaded(rs) => Some(RunResult::loaded(
             duration_ms,
-            rows: Some(rs.affected.unwrap_or_else(|| rs.row_count() as u64)),
-            rows_capped: rs.affected.is_none() && rs.truncated,
-            ok: true,
-        }),
-        QueryState::Failed(_) => Some(schemaic_core::history::RunResult {
-            duration_ms,
-            rows: None,
-            rows_capped: false,
-            ok: false,
-        }),
+            rs.affected,
+            rs.row_count() as u64,
+            rs.truncated,
+        )),
+        QueryState::Failed(_) => Some(RunResult::failed(duration_ms)),
         QueryState::Idle | QueryState::Running | QueryState::Cancelled => None,
     }
 }
@@ -1122,17 +1142,19 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // disk, and only ever counting up, so an id can't be reused while the run
     // holding it is still in flight (which re-deriving `max + 1` per push would
     // allow, once the per-connection cap evicted the entry holding the maximum).
-    let run_ids: Rc<Cell<u64>> =
-        Rc::new(Cell::new(history_entries.with_untracked(|v| {
-            v.iter().map(|e| e.run_id).max().unwrap_or(0)
-        })));
+    let run_ids: Rc<Cell<u64>> = Rc::new(Cell::new(
+        history_entries.with_untracked(|v| run_id_seed(v)),
+    ));
 
     // Record an executed query into the history (newest-first, capped) and persist
     // it. Called from every run path (single Run, Run Current, Run Everything).
     let record_history: RecordHistoryFn = {
         let run_ids = run_ids.clone();
         Rc::new(
-            move |conn_id: u64, database: Option<String>, sql: String, tab_name: Option<String>| {
+            move |conn_id: u64,
+                  database: Option<String>,
+                  stmts: &[String],
+                  tab_name: Option<String>| {
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
@@ -1147,34 +1169,44 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                             .map(|c| SqlDialect::from_db_type(&c.db_type))
                     })
                     .unwrap_or_default();
-                let run_id = run_ids.get() + 1;
-                run_ids.set(run_id);
+                let mut ids = Vec::with_capacity(stmts.len());
+                let mut wrote = false;
                 history_entries.update(|v| {
-                    schemaic_core::history::push(
-                        v,
-                        schemaic_core::history::HistoryEntry {
-                            conn_id,
-                            database,
-                            sql,
-                            ts,
-                            run_id,
-                            tab_name,
-                            // Filled in by `finish_history` when the run lands.
-                            duration_ms: None,
-                            rows: None,
-                            rows_capped: false,
-                            outcome: schemaic_core::history::Outcome::Unknown,
-                        },
-                        dialect,
-                    );
+                    for sql in stmts {
+                        let run_id = run_ids.get() + 1;
+                        run_ids.set(run_id);
+                        ids.push(run_id);
+                        wrote |= schemaic_core::history::push(
+                            v,
+                            schemaic_core::history::HistoryEntry {
+                                conn_id,
+                                database: database.clone(),
+                                sql: sql.clone(),
+                                ts,
+                                run_id,
+                                tab_name: tab_name.clone(),
+                                // Filled in by `finish_history` when the run lands.
+                                duration_ms: None,
+                                rows: None,
+                                rows_capped: false,
+                                outcome: schemaic_core::history::Outcome::Unknown,
+                            },
+                            dialect,
+                        );
+                    }
                 });
-                persist::save_json(
-                    "history.json",
-                    &schemaic_core::history::HistoryFile {
-                        entries: history_entries.get_untracked(),
-                    },
-                );
-                run_id
+                // Skipped when nothing was recorded — the same skip
+                // `finish_history` documents. A credential-bearing statement
+                // records nothing and used to cost a whole atomic rewrite for it.
+                if wrote {
+                    persist::save_json(
+                        "history.json",
+                        &schemaic_core::history::HistoryFile {
+                            entries: history_entries.get_untracked(),
+                        },
+                    );
+                }
+                ids
             },
         )
     };
@@ -1189,10 +1221,13 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // froze the window for as long as that took. The write is also skipped
     // entirely when nothing was updated — a credential-bearing statement is
     // never recorded, and would otherwise cost a file write for nothing.
-    let finish_history: FinishHistoryFn =
-        Rc::new(move |runs: &[(u64, schemaic_core::history::RunResult)]| {
+    // `dropped` is the runs that never happened — the tail of a script that
+    // stopped, which was pushed at launch and would otherwise evict the
+    // connection's real history under `MAX_PER_CONN`. See `history::drop_runs`.
+    let finish_history: FinishHistoryFn = Rc::new(
+        move |runs: &[(u64, schemaic_core::history::RunResult)], dropped: &[u64]| {
             let updated = history_entries.try_update(|v| {
-                let mut any = false;
+                let mut any = schemaic_core::history::drop_runs(v, dropped);
                 for (run_id, result) in runs {
                     any |= schemaic_core::history::finish(v, *run_id, *result);
                 }
@@ -1207,7 +1242,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     entries: history_entries.get_untracked(),
                 },
             );
-        });
+        },
+    );
 
     // Clear the active connection's history (the panel's trash button), persisting.
     let clear_history: Rc<dyn Fn()> = {
@@ -1278,14 +1314,16 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             let database = tab.database.get_untracked();
             // The run id this launch was recorded under, quoted back when it
             // lands. `None` for a view re-run, which records no history at all.
-            let run_id = (!is_view).then(|| {
-                (record_history)(
-                    tab.conn_id.get_untracked(),
-                    database.clone(),
-                    sql.clone(),
-                    tab.name.get_untracked(),
-                )
-            });
+            let run_id = (!is_view)
+                .then(|| {
+                    (record_history)(
+                        tab.conn_id.get_untracked(),
+                        database.clone(),
+                        std::slice::from_ref(&sql),
+                        tab.name.get_untracked(),
+                    )
+                })
+                .and_then(|ids| ids.first().copied());
 
             if let Some((_, old)) = tokens.borrow_mut().remove(&id) {
                 old.cancel();
@@ -1328,7 +1366,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     if let Some(run_id) = run_id
                         && let Some(result) = run_result(&state, took)
                     {
-                        (finish_history)(&[(run_id, result)]);
+                        // Nothing dropped: a *single* run the user cancels was
+                        // dispatched, may have written something, and is the
+                        // entry they are most likely to want back.
+                        (finish_history)(&[(run_id, result)], &[]);
                     }
                     // Only apply if this run still owns the tab (else a newer run or
                     // a close superseded it — don't clobber their state/token).
@@ -1610,10 +1651,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             // batch lands. A statement repeated in one script de-duplicates down
             // to a single entry, so only the later of the two ids matches — which
             // is the run whose result the entry should be reporting.
-            let stmt_run_ids: Vec<u64> = stmts
-                .iter()
-                .map(|s| (record_history)(conn_id, database.clone(), s.clone(), tab_name.clone()))
-                .collect();
+            let stmt_run_ids: Vec<u64> =
+                (record_history)(conn_id, database.clone(), &stmts, tab_name.clone());
 
             if let Some((_, old)) = tokens.borrow_mut().remove(&id) {
                 old.cancel();
@@ -1660,16 +1699,24 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     // Before the supersede check, for the same reasons as a single
                     // run's — and handed over as one batch, so the whole script
                     // costs one history save rather than one per statement.
-                    let runs: Vec<(u64, schemaic_core::history::RunResult)> = stmt_run_ids
-                        .iter()
-                        .zip(&states)
-                        .zip(&took)
-                        .filter_map(|((run_id, state), ms)| {
-                            run_result(state, *ms).map(|r| (*run_id, r))
-                        })
-                        .collect();
-                    if !runs.is_empty() {
-                        (finish_history)(&runs);
+                    let mut runs: Vec<(u64, schemaic_core::history::RunResult)> = Vec::new();
+                    // A statement that reached no verdict in a *batch* never
+                    // ran: the batch stops at its first failure (or at the
+                    // user's cancel) and reports every statement after it
+                    // `Cancelled` without dispatching it. Recorded at launch,
+                    // because an entry has to exist while a query is in flight —
+                    // but a 60-statement script failing at statement 2 then
+                    // evicted the connection's 50 real entries in favour of 48
+                    // that never ran, indistinguishable from cancelled ones.
+                    let mut undispatched: Vec<u64> = Vec::new();
+                    for ((run_id, state), ms) in stmt_run_ids.iter().zip(&states).zip(&took) {
+                        match run_result(state, *ms) {
+                            Some(r) => runs.push((*run_id, r)),
+                            None => undispatched.push(*run_id),
+                        }
+                    }
+                    if !runs.is_empty() || !undispatched.is_empty() {
+                        (finish_history)(&runs, &undispatched);
                     }
                     // Only apply if this batch still owns the tab (see `run`).
                     if tokens_done.borrow().get(&id).map(|(g, _)| *g) != Some(generation) {
@@ -5895,6 +5942,35 @@ mod app_tests {
     /// fetch of the same node, which is the interleaving that leaves the tree,
     /// the completion index and the schema editors holding a pre-`ALTER` model
     /// indefinitely.
+    /// The whole of the run-id allocator's correctness argument, which was
+    /// untested: deleting the `+ 1` at the call site or narrowing the seed to the
+    /// active connection left the suite green.
+    #[test]
+    fn a_run_id_is_seeded_past_every_id_on_disk() {
+        use super::run_id_seed;
+        use schemaic_core::history::{HistoryEntry, Outcome};
+        let e = |conn_id: u64, run_id: u64| HistoryEntry {
+            conn_id,
+            database: None,
+            sql: "SELECT 1".into(),
+            ts: 0,
+            run_id,
+            tab_name: None,
+            duration_ms: None,
+            rows: None,
+            rows_capped: false,
+            outcome: Outcome::Unknown,
+        };
+        // Across **all** connections: `finish` matches by id with no connection
+        // filter, so a per-connection seed would let one run's outcome land on
+        // another connection's entry.
+        assert_eq!(run_id_seed(&[e(1, 3), e(2, 9), e(1, 5)]), 9);
+        // Empty history seeds 0, so the first id handed out is 1 — never the 0
+        // that entries written before run ids carry.
+        assert_eq!(run_id_seed(&[]), 0);
+        assert_eq!(run_id_seed(&[e(1, 0), e(1, 0)]), 0);
+    }
+
     #[test]
     fn an_older_introspection_of_the_same_database_writes_nothing() {
         use super::fetch_landing;
