@@ -624,7 +624,11 @@ fn issue_list(ui: Ui) -> impl IntoView {
         move || (i.issues.get(), i.more_issues.get()),
         move |(issues, more)| {
             if issues.is_empty() {
-                return empty().into_any();
+                // `nothing()`, not `empty()`: taffy excludes a `display:none`
+                // child from gap accounting but counts a zero-sized one, so a
+                // bare `empty()` here leaves a whole gap of dead space in the
+                // *common* case — this section usually has nothing to show.
+                return crate::widgets::nothing();
             }
             let heading = text(format!(
                 "{} problem{} in the file — nothing was imported.",
@@ -699,7 +703,7 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
         },
         move |cols| {
             if cols.is_empty() {
-                return empty().into_any();
+                return crate::widgets::nothing();
             }
             text(format!(
                 "Not mapped, and can't be empty: {}. The import will fail unless \
@@ -725,7 +729,7 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
         move || import::json_memory_warning(i.format.get(), i.file_bytes.get()),
         move |warning| {
             let Some(warning) = warning else {
-                return empty().into_any();
+                return crate::widgets::nothing();
             };
             text(warning)
                 .style(|s| {
@@ -753,7 +757,7 @@ fn mapping_step(ui: Ui, ring: FocusRing) -> impl IntoView {
         },
         move |engine| {
             let Some(engine) = engine else {
-                return empty().into_any();
+                return crate::widgets::nothing();
             };
             text(format!(
                 "This table's storage engine ({engine}) is not transactional, so a \

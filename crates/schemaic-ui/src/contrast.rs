@@ -328,7 +328,14 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     pair!(conn_ok on bg_panel, Icon, "connection menu: the reachable dot"),
     pair!(text_muted on capsule_bg, Icon, "schema tree: the N cols / N keys capsule"),
     // ── Rows: hover, active and the keyboard-nav cursor.
-    pair!(text on row_hover, Body, "schema tree / history: a hovered row"),
+    pair!(text on row_hover, Body, "schema tree: a hovered row"),
+    // The query-history panel's own two surfaces. Both arrived with the panel and
+    // neither had a row, so the gate measured nothing it paints — and the unit
+    // here is the **pairing**, not the colour, so reusing a listed colour on a
+    // new surface is exactly what it cannot see.
+    pair!(text on row_hover_soft, Body, "history: a hovered row"),
+    pair!(text_faint on row_hover_soft, Recessive, "history: its timestamp and outcome line"),
+    pair!(text_faint on group_header_bg, Recessive, "history: the TODAY / THIS WEEK band"),
     pair!(text on row_active, Body, "schema tree: the selected row"),
     pair!(text on row_selected, Body, "schema tree: the keyboard-nav cursor row"),
     pair!(text_dim on row_selected, Body, "designer list: a selected row's detail"),
