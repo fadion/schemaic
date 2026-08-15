@@ -50,6 +50,15 @@ pub struct HistoryEntry {
     /// history row is three facts wide.
     #[serde(default)]
     pub rows: Option<u64>,
+    /// Whether [`HistoryEntry::rows`] is the **row cap** rather than what the
+    /// query returned — the fetch stopped early, so the true count was never
+    /// observed. Rendered as `200000+ rows`.
+    ///
+    /// Without it the entry cannot tell a query that returned exactly the cap
+    /// from one that returned millions, and the panel is read long after the
+    /// grid that would have said so has gone.
+    #[serde(default)]
+    pub rows_capped: bool,
     /// How it went, filled in when the run lands.
     #[serde(default)]
     pub outcome: Outcome,
@@ -100,6 +109,9 @@ pub struct RunResult {
     /// Rows returned or affected; `None` for a failure or a statement that
     /// reports neither.
     pub rows: Option<u64>,
+    /// `rows` is the row cap, not the query's own count — see
+    /// [`HistoryEntry::rows_capped`].
+    pub rows_capped: bool,
     pub ok: bool,
 }
 
@@ -182,6 +194,7 @@ pub fn finish(entries: &mut [HistoryEntry], conn_id: u64, sql: &str, result: Run
     };
     e.duration_ms = Some(result.duration_ms);
     e.rows = result.rows;
+    e.rows_capped = result.rows_capped;
     e.outcome = if result.ok {
         Outcome::Ok
     } else {
@@ -351,6 +364,7 @@ mod tests {
             tab_name: None,
             duration_ms: None,
             rows: None,
+            rows_capped: false,
             outcome: Outcome::Unknown,
         }
     }
@@ -359,8 +373,33 @@ mod tests {
         RunResult {
             duration_ms,
             rows: Some(rows),
+            rows_capped: false,
             ok: true,
         }
+    }
+
+    /// A fetch that stopped at the row cap says so, or the entry claims the cap
+    /// as the query's own count — indistinguishable, later, from a query that
+    /// really returned exactly that many.
+    #[test]
+    fn a_capped_fetch_records_that_its_count_is_the_cap() {
+        let mut v = Vec::new();
+        push(&mut v, entry(1, "SELECT * FROM big", 100));
+        finish(
+            &mut v,
+            1,
+            "SELECT * FROM big",
+            RunResult {
+                rows_capped: true,
+                ..ok(1200, 200_000)
+            },
+        );
+        assert_eq!(v[0].rows, Some(200_000));
+        assert!(v[0].rows_capped);
+        // …and an ordinary result still says nothing of the sort.
+        push(&mut v, entry(1, "SELECT 1", 200));
+        finish(&mut v, 1, "SELECT 1", ok(5, 1));
+        assert!(!v[0].rows_capped);
     }
 
     #[test]
@@ -386,6 +425,7 @@ mod tests {
             RunResult {
                 duration_ms: 50_000,
                 rows: None,
+                rows_capped: false,
                 ok: false,
             },
         );
@@ -437,6 +477,7 @@ mod tests {
         assert_eq!(e.sql, "SELECT 1");
         assert_eq!(e.duration_ms, None);
         assert_eq!(e.rows, None);
+        assert!(!e.rows_capped);
         assert_eq!(e.outcome, Outcome::Unknown);
     }
 
