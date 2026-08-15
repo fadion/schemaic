@@ -248,8 +248,11 @@ Zed-inspired, aiming to replace DataGrip.
     launches, `finish` when it lands (duration, rows, `Outcome`) — because the two moments
     answer different questions: an entry has to exist while the query is still running (one the
     user cancels, or that the app doesn't outlive, is one they may most want back), and only
-    the completion knows how it went. `finish` finds its entry by `(conn_id, sql)`, which works
-    because `push` de-duplicates on exactly that pair; nothing to update is normal, not an
+    the completion knows how it went. `finish` matches on `run_id` — an id the app hands out
+    per launch from a counter that only goes up — **not** on `(conn_id, sql)`, which identifies
+    the *statement*: two tabs can have one statement in flight at once, and keyed by statement
+    the slower, older run overwrote the newer one's result on landing. Keyed by run it finds
+    nothing, because `push` de-duplicated its entry away. Nothing to update is normal, not an
     error. `Outcome` has three states, not two — `Unknown` is what an entry starts in and what
     a cancelled run keeps, and the panel then shows no outcome line at all rather than guessing.
     Duration is the app's **wall-clock** around the whole call, not `ResultSet::elapsed_ms`: it
