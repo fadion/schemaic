@@ -303,6 +303,13 @@ impl Session {
                 }
             }
         };
+        // Same stamp `Db::fetch_query` applies, from this session's own pinned
+        // database — which is the one the statement ran under, and need not be
+        // the tab's current selection. See `ResultSet::database`.
+        let result = result.map(|mut rs| {
+            rs.database = self.database.clone();
+            rs
+        });
         // MySQL DDL commits the open transaction out from under us, so the flag
         // has to follow — otherwise the next statement would skip its `BEGIN`
         // and run auto-committed. `tx::tx_open_after` is that decision, pure and

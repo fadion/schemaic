@@ -209,25 +209,31 @@ impl Db {
         row_cap: usize,
         cancel: CancellationToken,
     ) -> Result<ResultSet, DbError> {
-        if self.engine == Engine::Postgres {
-            return pg::fetch_query(self, database, sql, row_cap, cancel).await;
-        }
-        let mut conn = self.open(database, false).await?;
-        // The connection id, so a second connection can KILL its in-flight query.
-        let conn_id = conn.id();
+        // Stamped here, in the one place that knows what the connection was
+        // actually scoped to, rather than by the caller from the tab it will land
+        // in — see `ResultSet::database`.
+        let mut rs = if self.engine == Engine::Postgres {
+            pg::fetch_query(self, database, sql, row_cap, cancel).await?
+        } else {
+            let mut conn = self.open(database, false).await?;
+            // The connection id, so a second connection can KILL its in-flight query.
+            let conn_id = conn.id();
 
-        let outcome = tokio::select! {
-            // `early_stop`: this connection is torn down right after, so we can bail
-            // out of the row stream at the cap without draining the rest.
-            r = collect_rows(&mut conn, sql, row_cap, true) => r,
-            _ = cancel.cancelled() => {
-                self.kill_query(conn_id).await;
-                Err(DbError::Cancelled)
-            }
+            let outcome = tokio::select! {
+                // `early_stop`: this connection is torn down right after, so we can bail
+                // out of the row stream at the cap without draining the rest.
+                r = collect_rows(&mut conn, sql, row_cap, true) => r,
+                _ = cancel.cancelled() => {
+                    self.kill_query(conn_id).await;
+                    Err(DbError::Cancelled)
+                }
+            };
+
+            let _ = conn.disconnect().await;
+            outcome?
         };
-
-        let _ = conn.disconnect().await;
-        outcome
+        rs.database = database.map(str::to_string);
+        Ok(rs)
     }
 
     /// Fetch up to `limit` rows of a single table for the Live Monitor:
@@ -524,8 +530,24 @@ impl Db {
         stmts: &[String],
         row_cap: usize,
         cancel: CancellationToken,
-        mut on_result: impl FnMut(usize, Result<ResultSet, DbError>),
+        on_result: impl FnMut(usize, Result<ResultSet, DbError>),
     ) {
+        // Wrap the sink once so the scope is stamped on every statement's result
+        // whichever engine produced it — a per-engine stamp is one a new path
+        // forgets. See `ResultSet::database`.
+        let db_name = database.map(str::to_string);
+        let mut on_result = {
+            let mut inner = on_result;
+            move |i: usize, r: Result<ResultSet, DbError>| {
+                inner(
+                    i,
+                    r.map(|mut rs| {
+                        rs.database = db_name.clone();
+                        rs
+                    }),
+                )
+            }
+        };
         if self.engine == Engine::Postgres {
             pg::run_batch(self, database, stmts, row_cap, cancel, on_result).await;
             return;

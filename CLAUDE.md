@@ -1465,6 +1465,21 @@ for keyboard nav.
   `commit_grid` → a `GridWrite { updates, inserts }` → the app's `commit_edits`. On success the app
   re-runs the query; on failure the error shows in the toolbar and green edits stay. No global "Edit"
   toggle. A read-only cell's double-click opens the value viewer.
+- **A result says which database it came from, and the answer lives on the result.** The grid's
+  stats line leads with `ResultSet::database` (`world · 100 rows · 15 cols · 1 ms`), stamped by the
+  loader that knows the scope — `Db::fetch_query`, `Session::fetch_query` (its *pinned* database,
+  which need not be the tab's current one) and `Db::run_batch`, which wraps its `on_result` sink
+  once so neither engine's path can forget. **Not read from the tab**: a tab's selection moves, so a
+  result outlives the database it ran under the moment someone changes the selector, and a label
+  sourced from the tab would be wrong in exactly the case it exists to catch (the other half of that
+  bug — a result landing in a rebound tab — was fixed by cancelling the run). On the result it is a
+  snapshot by construction and survives a commit splice, which mutates the columns in place;
+  a test pins that, because the label vanishing on first edit would strand it exactly when the user
+  is writing to whatever it names. It is also **per result**, which a status-bar or footer line
+  could not be: Run Everything renders a grid and a toolbar per statement. `None` (a connection with
+  no default database) prints nothing rather than inventing a name, and the field names the
+  statement's *scope*, not the origin of every row — a qualified `world.country` read while scoped
+  to `sakila` still reports `sakila`.
 - **Find (Ctrl+F) and Go to row (Ctrl+G)** are two popups sharing one anchor at the panel's
   top-right, and both are **split in the same way**: the bar renders at the RESULTS-*panel* level
   (`grid_find_bar`/`grid_goto_bar`, mounted in `results_section`) so it can sit at the panel's edge,
