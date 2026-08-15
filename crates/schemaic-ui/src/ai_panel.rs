@@ -16,12 +16,14 @@ use floem::reactive::{Scope, create_effect};
 use floem::style::{CursorStyle, ScaleX, ScaleY, Transition, TranslateX};
 use floem::unit::PxPct;
 
-use schemaic_core::transcript::{RecallDir, Seg, ToolCall, TurnStats, recall_step, user_prompts};
+use schemaic_core::transcript::{
+    Recall, RecallDir, Seg, ToolCall, TurnStats, recall_apply, user_prompts,
+};
 
 use crate::consts::{CHAT_PAD_H, FOLLOW_SLACK};
 use crate::markdown::{CodeActions, render_markdown};
 use crate::widgets::{
-    at_content_bottom, autohide_state, follow_after_scroll, jump_to_bottom_button, section_title,
+    autohide_state, follow_after_scroll, jump_to_bottom_button, next_floor, section_title,
     thin_scroll, toolbar_icon, verb_spinner, with_scroll_gesture,
 };
 use crate::{ChatMessage, FieldCfg, Role, Ui, edit_field, icons, theme};
@@ -125,16 +127,35 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     // without fighting the next one, which is exactly what re-pinning the reader
     // turned into.
     //
-    // A message only ever grows while it streams (a chunk appends; the spinner is
-    // replaced by something taller), so the dips are measurement, never content.
-    // Holding the highest height seen makes them invisible to the scroll: the list
-    // renders a few pixels of slack for one frame instead of collapsing, and the
-    // clamp never fires. Reset when the message count changes, so a shorter
-    // conversation — a restore, a connection switch — doesn't inherit a floor from
-    // the last one.
+    // A message only ever grows *while it streams* (a chunk appends; the spinner
+    // is replaced by something taller), so the dips are measurement, never
+    // content. Holding the highest height seen makes them invisible to the
+    // scroll: the list renders a few pixels of slack for one frame instead of
+    // collapsing, and the clamp never fires.
+    //
+    // **But that premise is about streaming, and does not hold across a
+    // re-layout.** Dragging the panel wider re-wraps every bubble shorter while
+    // the floor stays where the narrow layout put it, so ~300px of blank sat
+    // under the last message, `content_h` measured the *floored* box, the
+    // jump-to-bottom button lit up, and the next `bump` snapped to the bottom of
+    // the blank. Nor does it hold across a conversation *switch*: a memo on the
+    // message count dedups when the new conversation is the same length, so the
+    // reset never ran.
+    //
+    // So the floor is invalidated by everything that legitimately changes the
+    // content's true height — the message count, the wrap width, and which
+    // conversation this is — and only *raised* within one of those. The decision
+    // is `next_floor`, so the "release it" and "hold it" halves can't drift.
     let floor = RwSignal::new(0.0_f64);
+    let active_conn = ui.conn.active_conn;
     create_effect(move |_| {
-        msg_count.get();
+        // Width to the whole pixel: a fractional jitter from measurement is not a
+        // re-wrap, and re-releasing the floor every frame would undo the point.
+        let _key = (
+            msg_count.get(),
+            panel_w.get().round() as i64,
+            active_conn.get(),
+        );
         if floor.get_untracked() != 0.0 {
             floor.set(0.0);
         }
@@ -197,8 +218,17 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                     // drives the regenerate affordance, and appending a message
                     // flips it on the previously-last bubble, which is a change to
                     // that bubble even though its message didn't move.
+                    //
+                    // A **fingerprint**, not the message. The memo held an
+                    // `Option<ChatMessage>`, so every streamed chunk ran all N of
+                    // these closures — each a deep clone plus a deep `PartialEq`,
+                    // over segments that include untruncated tool output — and
+                    // kept a second resident copy of the whole conversation. The
+                    // fingerprint reads lengths, allocates nothing, and is
+                    // documented against exactly the mutations the stream makes.
                     let msg = floem::reactive::create_memo(move |_| {
-                        messages.with(|m| (m.get(i).cloned(), i + 1 == m.len()))
+                        messages
+                            .with(|m| (m.get(i).map(ChatMessage::fingerprint), i + 1 == m.len()))
                     });
                     // Also keyed on the UI-theme generation. `render_markdown` bakes
                     // its body colour into a text `Attrs` list rather than a style
@@ -208,19 +238,24 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                     // background and the panel goes two-toned.
                     dyn_container(
                         move || (msg.get(), theme::ui_generation()),
-                        move |((m, is_last), _)| match m {
-                            Some(m) => message_bubble(
-                                m,
-                                actions.clone(),
-                                elapsed_ms,
-                                is_last,
-                                regen.clone(),
-                                pop.replace(false),
-                            )
-                            .into_any(),
-                            // The vector shrank under the stack; the next diff
-                            // drops this item.
-                            None => empty().into_any(),
+                        move |((fp, is_last), _)| {
+                            // The message itself is read here, untracked, once
+                            // per *rebuild* — which the fingerprint above has
+                            // already decided is warranted.
+                            match fp.and_then(|_| messages.with_untracked(|m| m.get(i).cloned())) {
+                                Some(m) => message_bubble(
+                                    m,
+                                    actions.clone(),
+                                    elapsed_ms,
+                                    is_last,
+                                    regen.clone(),
+                                    pop.replace(false),
+                                )
+                                .into_any(),
+                                // The vector shrank under the stack; the next diff
+                                // drops this item.
+                                None => empty().into_any(),
+                            }
                         },
                     )
                 },
@@ -281,8 +316,11 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     let (scrolled, by_user) = with_scroll_gesture(scroll(convo.on_resize(move |r| {
         let h = r.height();
         content_h.set(h);
-        if h > floor.get_untracked() {
-            floor.set(h);
+        // The raise half of `next_floor` — the effect above owns the release.
+        // `set` never dedups, so this is guarded rather than written every frame.
+        let next = next_floor(floor.get_untracked(), h, false);
+        if next != floor.get_untracked() {
+            floor.set(next);
         }
     })));
     let scrolled = scrolled
@@ -321,14 +359,19 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
         })
         .style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0));
 
-    // Jump-to-bottom: shown once the user has scrolled up off the latest content —
-    // the negation of the same predicate that gates the follow, so the button
-    // appears exactly when following has been released. Clicking it re-arms the
-    // follow and bumps the trigger.
-    let show_jump = floem::reactive::create_memo(move |_| {
-        let vp = view_rect.get();
-        vp.height() > 1.0 && !at_content_bottom(content_h.get(), vp.y1, FOLLOW_SLACK)
-    });
+    // Jump-to-bottom: offered exactly when the follow has been **released**, which
+    // is what the button undoes. Derived from `follow` rather than re-deriving
+    // the geometry, and that is the fix rather than a simplification: since the
+    // follow became `follow_after_scroll`, the two deliberately answer
+    // differently — a relayout dip leaves the position nowhere near the bottom
+    // while the panel is still dutifully following, and the geometric form then
+    // offered "you have scrolled away" and re-triggered its 150 ms transition
+    // faster than it could settle. It also drops a per-chunk memo over
+    // `content_h`, which is written on every measurement.
+    //
+    // `view_rect` still gates it, so the button can't flash before first layout.
+    let show_jump =
+        floem::reactive::create_memo(move |_| view_rect.get().height() > 1.0 && !follow.get());
     let jump = jump_to_bottom_button(
         move || show_jump.get(),
         move || {
@@ -423,8 +466,12 @@ fn ai_input_row(
     // recall, so the next Ctrl+Up starts from the newest question again rather
     // than resuming wherever the last walk stopped. Guarded sets: `set` never
     // dedups, and this runs on every keystroke.
+    // `trim()`, like the send icon and Enter: they treat a box holding one space
+    // as empty, `user_prompts` trims on the way in, and this row disagreeing with
+    // itself about what "typed something" means is what made Ctrl+Up silently
+    // refuse after a stray space.
     create_effect(move |_| {
-        if input.with(|t| t.is_empty()) {
+        if input.with(|t| t.trim().is_empty()) {
             if recall.get_untracked().is_some() {
                 recall.set(None);
             }
@@ -434,30 +481,30 @@ fn ai_input_row(
         }
     });
     let step = move |dir: RecallDir| {
-        // Only an empty box, or one still holding a recalled question, may be
-        // rewritten — never text the user typed.
-        if !uncommitted.get_untracked() {
-            if !input.with_untracked(|t| t.is_empty()) {
-                return;
-            }
-            recall.set(None);
-        }
+        // Whether it may happen, where it lands and what the box then holds is
+        // `transcript::recall_apply` — in core with the arithmetic it was split
+        // from, rather than a second, differently-worded copy of the same rules
+        // in a view builder.
         let prompts = messages.with_untracked(|m| user_prompts(m));
-        let next = recall_step(prompts.len(), recall.get_untracked(), dir);
-        recall.set(next);
-        match next {
-            Some(i) => {
-                input.set(prompts[i].clone());
-                uncommitted.set(true);
-            }
-            None => {
-                // Order matters only for the redundant-notify guard: clearing
-                // `input` runs the effect above, which already resets the flag.
-                input.set(String::new());
-                if uncommitted.get_untracked() {
-                    uncommitted.set(false);
-                }
-            }
+        let action = input.with_untracked(|t| {
+            recall_apply(
+                t,
+                uncommitted.get_untracked(),
+                recall.get_untracked(),
+                &prompts,
+                dir,
+            )
+        });
+        let Recall::Show { cursor, text } = action else {
+            return;
+        };
+        recall.set(cursor);
+        // Order matters only for the redundant-notify guard: clearing `input`
+        // runs the effect above, which already resets the flag.
+        input.set(text);
+        let now_uncommitted = cursor.is_some();
+        if uncommitted.get_untracked() != now_uncommitted {
+            uncommitted.set(now_uncommitted);
         }
         caret_end.update(|n| *n = n.wrapping_add(1));
     };
