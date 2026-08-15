@@ -206,6 +206,29 @@ const _: () = {
 /// `ALTER`, and a key that means "newline" in one control and "apply the plan"
 /// in another is the shape of defect this ring's own review was full of. Reach
 /// the button and press it.
+///
+/// **The ring member is a wrapper this function builds, never the caller's own
+/// view**, and that is a correctness rule rather than a layout preference. Two
+/// things resolve by exact `ViewId` with no descendant propagation, and they
+/// were resolving to *different* ids depending on the order each call site
+/// happened to chain its decorators:
+///
+/// - Floem fires [`EventListener::Click`] on the **focused view** for any
+///   physical Enter / NumpadEnter / Space (`context.rs`'s keyboard-trigger
+///   path) and discards the result, then folds every registered `KeyDown`
+///   listener without short-circuiting. So registering a view that already
+///   carries `on_click_stop` made the arm below the *second* activation: one
+///   Space added two columns, opened two file dialogs, started **two bulk
+///   imports** of the same file.
+/// - `.focus(…)` resolves by exact id too, so a caller that chained
+///   `.tooltip()` (which allocates a fresh `ViewId`) before this call registered
+///   an id that carries no [`button_focus_ring`] — every list-row ↑/↓/✕ was a
+///   Tab stop that painted nothing.
+///
+/// A wrapper answers both at once: it never carries the caller's click listener,
+/// so Space fires exactly once, and it carries the focus outline itself, so the
+/// id in the ring is the id that paints. Callers therefore do **not** apply
+/// `button_focus_ring` to the face they pass in — it would never fire there.
 pub(crate) fn in_ring_button<V: IntoView + 'static>(
     view: V,
     ring: FocusRing,
@@ -213,10 +236,14 @@ pub(crate) fn in_ring_button<V: IntoView + 'static>(
     enabled: bool,
     on_press: impl Fn() + 'static,
 ) -> AnyView {
+    // Built for both states, so enabling a button doesn't change its box: a
+    // disabled action keeps its place in the footer (see [`action_button`]), and
+    // it would not if one state had a flex item the other lacked.
+    let wrapper = container(view).style(|s| button_focus_ring(s).flex_shrink(0.0_f32));
     if !enabled {
-        return view.into_any();
+        return wrapper.into_any();
     }
-    in_focus_ring(view, ring, tabindex)
+    in_focus_ring(wrapper, ring, tabindex)
         .on_event(EventListener::KeyDown, move |e| {
             let Event::KeyDown(ke) = e else {
                 return EventPropagation::Continue;
@@ -798,8 +825,11 @@ pub(crate) fn row_button(
     let pressed = act.clone();
     let button = row_slot(crate::icons::icon(glyph, ROW_ICON as f32))
         .on_click_stop(move |_| act())
-        // Colour-only hover, like every other icon button in the app.
-        .style(|s| button_focus_ring(s.color(theme::text_dim()).hover(|s| s.color(theme::text()))))
+        // Colour-only hover, like every other icon button in the app. The focus
+        // outline is `in_ring_button`'s, on the wrapper it registers — putting
+        // one here would paint on an id that never takes focus, which is what
+        // `.tooltip()` below used to guarantee.
+        .style(|s| s.color(theme::text_dim()).hover(|s| s.color(theme::text())))
         .tooltip(move || text(tip).style(tooltip_style));
     in_ring_button(button, ring, tabindex, true, move || pressed())
 }
@@ -848,7 +878,7 @@ pub(crate) fn control_button_enabled(
             }
         })
         .style(move |s| {
-            let s = button_focus_ring(control_surface(s))
+            let s = control_surface(s)
                 .font_size(theme::FONT_BODY)
                 .padding_horiz(10.0)
                 .padding_vert(5.0)
@@ -1030,7 +1060,7 @@ fn action_button_inner(
                 on_click()
             }
         })
-        .style(move |s| button_focus_ring(action_style(s, kind, enabled)));
+        .style(move |s| action_style(s, kind, enabled));
     in_ring_button(button, ring, tabindex, enabled, move || pressed())
 }
 
@@ -1065,7 +1095,7 @@ pub(crate) fn action_face<V: IntoView + 'static, F: Fn() + 'static>(
             }
         })
         .style(move |s| {
-            button_focus_ring(action_style(s, kind, enabled))
+            action_style(s, kind, enabled)
                 .width(w)
                 .justify_center()
                 .padding_horiz(0.0)
@@ -2403,6 +2433,29 @@ pub(crate) fn exit_action(busy: bool, cancellable: bool) -> ExitAction {
     }
 }
 
+/// Whether a modal's **destructive** action may launch: only when nothing of its
+/// own is already in flight, and only when the plan isn't marked read-only.
+///
+/// [`exit_action`]'s counterpart, and it exists for the same reason: the app has
+/// two of these actions — the DDL preview's Apply and Import — and they
+/// *disagreed*. Apply asked `if p.read_only || d.applying.get_untracked()
+/// { return; }`; Import set its busy flag and never read it, resting instead on
+/// a comment claiming "one at a time by construction: its Import button is
+/// disabled while one is in flight". That is true of the next update pass and
+/// false within a single key dispatch, so one Space on Import spawned **two**
+/// bulk loads of the same file: both validated clean, both opened a
+/// transaction, both committed — a 10,000-row CSV landed 20,000 rows — and the
+/// second launch overwrote the cancellation token, so the first load could no
+/// longer be stopped and nothing on screen knew it existed.
+///
+/// A guard that has to be re-derived at each site is one that will be derived
+/// differently, so it is one function with the launch inside the same
+/// synchronous step that reads it. The disabled button stays: it is what *says*
+/// the action is unavailable. This is what makes it so.
+pub(crate) fn accept_launch(in_flight: bool, read_only: bool) -> bool {
+    !in_flight && !read_only
+}
+
 #[cfg(test)]
 mod measure_tests {
     use super::*;
@@ -2517,6 +2570,29 @@ mod exit_tests {
     #[test]
     fn busy_and_uncancellable_refuses_the_exit() {
         assert_eq!(exit_action(true, false), ExitAction::Ignore);
+    }
+
+    /// The property the Critical was: a destructive action must not launch a
+    /// second time while its first launch is still in flight. One Space on
+    /// Import used to spawn two bulk loads of the same file — both committed —
+    /// because the disabled button was the only guard and it takes effect on a
+    /// later update pass, not within the key dispatch that fired twice.
+    #[test]
+    fn a_launch_in_flight_refuses_a_second_one() {
+        assert!(!accept_launch(true, false));
+        assert!(!accept_launch(true, true));
+    }
+
+    /// The other half, which only the DDL preview had: a plan the app has marked
+    /// read-only never runs, in flight or not.
+    #[test]
+    fn a_read_only_plan_never_launches() {
+        assert!(!accept_launch(false, true));
+    }
+
+    #[test]
+    fn idle_and_writable_launches() {
+        assert!(accept_launch(false, false));
     }
 }
 
@@ -2778,6 +2854,38 @@ mod ring_tests {
         assert_eq!(ring.ids(), vec![live.id()], "only the live one registered");
         assert_ne!(dead.id(), live.id());
         assert_eq!(ring.at(ACTION_TAB + 10), None);
+    }
+
+    /// **The ring member is a wrapper, never the face the caller passed in.**
+    /// Two things resolve by exact `ViewId` and were resolving to different ids
+    /// depending on how each call site happened to chain its decorators: floem
+    /// fires `Click` on the *focused* view for Space/Enter and then folds every
+    /// registered `KeyDown` listener, so registering a face that already carried
+    /// `on_click_stop` made the ring's own arm a **second** activation (one
+    /// Space added two columns, opened two file dialogs, started two bulk
+    /// imports); and `.focus(…)` resolves by exact id too, so a face decorated
+    /// with `.tooltip()` — which allocates a fresh `ViewId` — put an id in the
+    /// ring that carried no outline. A wrapper answers both, and this test is
+    /// what stops the registration sliding back onto the face.
+    #[test]
+    fn a_ring_button_registers_a_wrapper_not_the_face_it_was_given() {
+        let ring = FocusRing::new();
+        let face = empty();
+        let face_id = face.id();
+        let button = in_ring_button(face, ring.clone(), ACTION_TAB, true, || {});
+        assert_ne!(
+            button.id(),
+            face_id,
+            "the face carries the caller's click listener; it must stay out of the ring"
+        );
+        assert_eq!(ring.ids(), vec![button.id()]);
+
+        // The disabled arm is wrapped too, so enabling a button doesn't change
+        // its box — a footer action must not move as a form becomes valid.
+        let dead_face = empty();
+        let dead_face_id = dead_face.id();
+        let dead = in_ring_button(dead_face, ring.clone(), ACTION_TAB + 10, false, || {});
+        assert_ne!(dead.id(), dead_face_id);
     }
 
     /// What a dropdown refocuses through after its popup closes: the accept can

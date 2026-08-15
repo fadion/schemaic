@@ -176,7 +176,7 @@ fn apply(ui: Ui) {
     let Some(p) = d.preview.get_untracked() else {
         return;
     };
-    if p.read_only || d.applying.get_untracked() {
+    if !crate::widgets::accept_launch(d.applying.get_untracked(), p.read_only) {
         return;
     }
     d.applying.set(true);
