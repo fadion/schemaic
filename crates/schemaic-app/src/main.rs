@@ -2436,6 +2436,51 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         })
     };
 
+    // Close every tab of the active connection except the one the menu was
+    // opened on — `close_all_tabs`' set, less that tab — with the same rules:
+    // pinned tabs stay, open transactions are asked about one at a time, and
+    // Cancel stops the run.
+    //
+    // The kept tab is made active *before* the closes, and only once the user
+    // has said yes. Before, because the right-click may have landed on a tab
+    // that wasn't active and this is the one tab certain to survive, so nothing
+    // downstream has to pick a survivor. The keep-≥1 rule in `close_tab_now`
+    // therefore never fires here: the connection always still has this tab.
+    let close_other_tabs: Rc<dyn Fn(usize)> = {
+        let close_tab_now = close_tab_now.clone();
+        let guard_tx = guard_tx.clone();
+        Rc::new(move |keep: usize| {
+            let conn = active_conn.get_untracked();
+            let ids = tabs.with_untracked(|v| {
+                v.iter()
+                    .filter(|t| {
+                        t.id != keep
+                            && t.conn_id.get_untracked() == conn
+                            && !t.pinned.get_untracked()
+                    })
+                    .map(|t| t.id)
+                    .collect::<Vec<_>>()
+            });
+            // Nothing else closable (alone, or every other tab pinned) — no
+            // action, so nothing to ask and nothing to activate.
+            if ids.is_empty() {
+                return;
+            }
+            let guard_tx = guard_tx.clone();
+            let close_tab_now = close_tab_now.clone();
+            confirm.set(Some(Confirm {
+                title: "Close other tabs".to_string(),
+                message: "Are you sure you want to close all the other tabs?".to_string(),
+                resolve: Rc::new(move |yes| {
+                    if yes {
+                        active.set(keep);
+                        close_tabs_seq(ids.clone(), guard_tx.clone(), close_tab_now.clone());
+                    }
+                }),
+            }));
+        })
+    };
+
     // Place a freshly-built tab: reuse the active tab *in place* if it's a blank
     // slate (empty editor, no results / no Run-Everything panels) — the common
     // "app opened on an empty Query 1" case — otherwise open it as a new tab.
@@ -4941,6 +4986,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             },
             close_tab,
             close_all_tabs,
+            close_other_tabs,
             toggle_pin,
             duplicate_tab,
             open_table,

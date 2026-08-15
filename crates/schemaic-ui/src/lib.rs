@@ -1373,6 +1373,11 @@ pub struct TabsActions {
     /// rather than disappearing. Tabs holding an open transaction are asked
     /// about one at a time; answering Cancel stops the run.
     pub close_all_tabs: Rc<dyn Fn()>,
+    /// Close every tab of the active connection **except** the one named — the
+    /// same set [`TabsActions::close_all_tabs`] takes, less that tab. Pinned
+    /// tabs stay, and the kept tab is made active, since the right-click that
+    /// asked for this may well have landed on a tab that wasn't.
+    pub close_other_tabs: Rc<dyn Fn(usize)>,
     /// Toggle a tab's pinned state (by id) and re-order the strip so pinned tabs
     /// stay contiguous at the left, in pin order.
     pub toggle_pin: Rc<dyn Fn(usize)>,

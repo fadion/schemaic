@@ -110,6 +110,7 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
     let reopen = ui.tab_actions.reopen_closed_tab.clone();
     let can_reopen = ui.tab_actions.can_reopen_closed_tab.clone();
     let close_all = ui.tab_actions.close_all_tabs.clone();
+    let close_others = ui.tab_actions.close_other_tabs.clone();
     let overlay = ui.overlay;
 
     // Commit the inline rename: an empty/blank name reverts to the default
@@ -317,12 +318,21 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                 // the ring is per-connection, like the strip.
                 .disabled(!(can_reopen)()),
             );
+            // Before "Close all tabs", and unlike it this one *is* about the
+            // clicked tab — it is the one kept. Offered on a pinned tab too: a
+            // pinned tab is already the one that survives everything, so
+            // "close the others" is exactly as meaningful there.
+            entries.push(MenuEntry::action("Close other tabs", {
+                let close_others = close_others.clone();
+                move || (close_others)(tab.id)
+            }));
             entries.push(MenuEntry::action("Close all tabs", {
                 let close_all = close_all.clone();
                 move || (close_all)()
             }));
-            // Wider than the old Pin/Duplicate/Close set needed — "Reopen last
-            // tab" is the longest label here.
+            // Wider than the old Pin/Duplicate/Close set needed — "Close other
+            // tabs" is the longest label here. It's a `min_width`, so a longer
+            // one would widen the panel rather than be clipped.
             overlay.popup_width.set(150.0);
             overlay.popup_menu.set(Some(entries));
         })
