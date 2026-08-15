@@ -1092,6 +1092,53 @@ impl GridState {
     }
 }
 
+/// What a selection rectangle means for the aggregates bar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SelKind {
+    /// No readout: nothing selected, or a lone cell (which aggregates to
+    /// itself).
+    Nothing,
+    /// A row selection — counts only, no column named.
+    WholeRow,
+    /// A range read against this column.
+    Column(usize),
+}
+
+/// Whether a selection gets arithmetic, and about which column.
+///
+/// Three rules, and they were all inline in an effect while the arithmetic they
+/// gate had seventeen tests — so flipping `ncols > 1` to `>= 1` broke the
+/// single-column exemption with nothing failing.
+///
+/// **Which column**: the one the selection *started* on — the anchor's — so
+/// dragging from `price` across to `name` still reports `price`. The anchor
+/// rather than the rectangle is the point: `bounds` is normalised and has
+/// forgotten which corner you began at.
+///
+/// **A span covering every column is a row selection** (a gutter click, Ctrl+A,
+/// the Ctrl+G jump), and its anchor column is column 0 — usually an id, whose
+/// sum means nothing — so those get counts only. A **single-column result is
+/// exempt**: there, covering every column is covering the one you meant.
+pub(crate) fn selection_kind(
+    bounds: Option<(usize, usize, usize, usize)>,
+    anchor: Option<(usize, usize)>,
+    ncols: usize,
+) -> SelKind {
+    let Some((r0, c0, r1, c1)) = bounds else {
+        return SelKind::Nothing;
+    };
+    if r0 == r1 && c0 == c1 {
+        return SelKind::Nothing;
+    }
+    if ncols > 1 && c1 - c0 + 1 == ncols {
+        return SelKind::WholeRow;
+    }
+    match anchor {
+        Some((_, col)) => SelKind::Column(col),
+        None => SelKind::Nothing,
+    }
+}
+
 /// Exact rendered pixel width of `text` in the grid's cell font (the app default
 /// sans — IBM Plex Sans — at `FONT_BODY`), via a throwaway `TextLayout`. Used to
 /// Estimate a column's initial width from its header + a sample of cell values.
@@ -2670,58 +2717,79 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         step
     });
     // Selection aggregates. Rendered by the panel-level bar; computed here,
-    // because this is where the cells are.
-    //
-    // **Which column the arithmetic is about**: the one the selection *started*
-    // on — the anchor's column — so dragging from `price` across to `name` still
-    // reports `price`. Reading the anchor rather than `bounds()` is the point:
-    // bounds is a normalised rect and has forgotten which corner you began at.
-    //
-    // A selection covering *every* column is a row selection (the gutter click,
-    // Ctrl+A, the Ctrl+G jump), and its anchor column is column 0 — usually an
-    // id, whose sum means nothing. Those get the counts only. A single-column
-    // result is exempt from that rule: there, covering every column is just
-    // covering the one you meant.
+    // because this is where the cells are. See [`selection_kind`] for which
+    // column the arithmetic is about and when there is none.
     let sel_summary = gctx.sel_summary;
     create_effect(move |_| {
-        let Some((r0, c0, r1, c1)) = gs.bounds() else {
+        // **Everything the number is computed from is tracked**, not only where
+        // the selection is. The effect used to read `active`/`anchor` and take
+        // `rs` and `order` untracked, so an in-memory sort — which rewrites
+        // `order` and deliberately leaves the selection in display coordinates —
+        // left the previous total standing under the same highlighted cells now
+        // holding different values. A pure-`UPDATE` commit splice did the same,
+        // and a staged edit was never in the total at all. The find-count effect
+        // fifty lines below tracks `order` for exactly this reason.
+        let (rs, order) = (gs.rs.get(), gs.order.get());
+        gs.dirty.track();
+        gs.new_rows.track();
+        let kind = selection_kind(gs.bounds(), gs.anchor.get(), ncols);
+        let anchor_col = match kind {
+            SelKind::Nothing => {
+                sel_summary.set(None);
+                return;
+            }
+            // Count the span without reading a column nobody chose.
+            SelKind::WholeRow => None,
+            SelKind::Column(c) => Some(c),
+        };
+        let Some((r0, _, r1, _)) = gs.bounds() else {
             sel_summary.set(None);
             return;
         };
-        if r0 == r1 && c0 == c1 {
-            sel_summary.set(None); // a lone cell aggregates to itself
+        let column = anchor_col.and_then(|c| rs.columns.get(c));
+        if anchor_col.is_some() && column.is_none() {
+            sel_summary.set(None);
             return;
         }
-        let Some((_, anchor_col)) = gs.anchor.get_untracked() else {
-            sel_summary.set(None);
-            return;
-        };
-        let rs = gs.rs.get_untracked();
-        let Some(column) = rs.columns.get(anchor_col) else {
-            sel_summary.set(None);
-            return;
-        };
-        let whole_row = ncols > 1 && c1 - c0 + 1 == ncols;
-        let order = gs.order.get_untracked();
-        // Pending unsaved rows have no stored cells; they are counted by the row
-        // span but contribute nothing to read.
-        let cells = (r0..=r1)
-            .filter_map(|d| order.get(d).copied())
-            .filter_map(|di| rs.cell(di, anchor_col));
-        let agg = if whole_row {
-            // Count the span without reading a column nobody chose.
-            schemaic_core::aggregate::Aggregates {
+        let agg = match (anchor_col, column) {
+            (Some(ci), Some(column)) => {
+                // Read the cell **as the grid draws it**: a staged edit wins over
+                // the stored value, and a pending new row has only staged cells.
+                // The two branches also now count the same rows — the span — where
+                // the per-column one used to drop every pending row on the floor
+                // while the whole-row one kept them, so Ctrl+A and a drag over the
+                // same five rows reported 5 and 3.
+                gs.dirty.with_untracked(|dirty| {
+                    gs.new_rows.with_untracked(|pending| {
+                        let cells = (r0..=r1).map(|d| match order.get(d).copied() {
+                            Some(di) => match dirty.get(&(di, ci)) {
+                                Some(staged) => staged.as_deref(),
+                                None => rs
+                                    .cell(di, ci)
+                                    .and_then(|c| (!c.is_null()).then(|| c.text())),
+                            },
+                            // Past the real rows: a pending row, whose unset cells
+                            // are a server default rather than a value.
+                            None => pending
+                                .get(d - order.len())
+                                .and_then(|m| m.get(&ci))
+                                .and_then(|v| v.as_deref()),
+                        });
+                        schemaic_core::aggregate::aggregate_texts(column, cells)
+                    })
+                })
+            }
+            _ => schemaic_core::aggregate::Aggregates {
                 rows: r1 - r0 + 1,
+                // No column, so no cell to be NULL — the counts are all a row
+                // selection can honestly report.
                 non_null: r1 - r0 + 1,
                 numeric: None,
-            }
-        } else {
-            schemaic_core::aggregate::aggregate(column, cells)
+            },
         };
-        let label = if whole_row {
-            agg.summary()
-        } else {
-            format!("{} · {}", column.name, agg.summary())
+        let label = match column {
+            Some(column) => format!("{} · {}", column.name, agg.summary()),
+            None => agg.summary(),
         };
         sel_summary.set(Some(label));
     });
@@ -6603,6 +6671,69 @@ mod tests {
             }
         });
         assert_eq!(got, want);
+    }
+}
+
+#[cfg(test)]
+mod selection_kind_tests {
+    use super::*;
+
+    /// A lone cell aggregates to itself, so there is nothing worth saying.
+    #[test]
+    fn a_single_cell_gets_no_readout() {
+        assert_eq!(
+            selection_kind(Some((3, 1, 3, 1)), Some((3, 1)), 5),
+            SelKind::Nothing
+        );
+    }
+
+    #[test]
+    fn nothing_selected_gets_no_readout() {
+        assert_eq!(selection_kind(None, None, 5), SelKind::Nothing);
+    }
+
+    /// The column is the **anchor's**, not the rectangle's left edge: dragging
+    /// leftward from `price` still reports `price`, because `bounds` is
+    /// normalised and has forgotten which corner the drag began at.
+    #[test]
+    fn the_column_is_the_one_the_selection_started_on() {
+        // Dragged from (0,3) leftward to (4,1): the rect starts at column 1.
+        assert_eq!(
+            selection_kind(Some((0, 1, 4, 3)), Some((0, 3)), 8),
+            SelKind::Column(3)
+        );
+    }
+
+    /// A span over every column is a row selection — the gutter click, Ctrl+A,
+    /// the Ctrl+G jump — whose anchor column is 0, usually an id nobody wants a
+    /// sum of.
+    #[test]
+    fn a_span_over_every_column_is_counts_only() {
+        assert_eq!(
+            selection_kind(Some((0, 0, 9, 4)), Some((0, 0)), 5),
+            SelKind::WholeRow
+        );
+    }
+
+    /// The exemption: in a one-column result, covering every column *is*
+    /// covering the column you meant. Flipping the `ncols > 1` guard breaks
+    /// exactly this and nothing else.
+    #[test]
+    fn a_single_column_result_still_aggregates() {
+        assert_eq!(
+            selection_kind(Some((0, 0, 9, 0)), Some((0, 0)), 1),
+            SelKind::Column(0)
+        );
+    }
+
+    /// A partial span within a wide result names its anchor's column even when
+    /// it covers several — the readout is about one column by construction.
+    #[test]
+    fn a_partial_span_names_the_anchor_column() {
+        assert_eq!(
+            selection_kind(Some((0, 2, 3, 3)), Some((0, 2)), 5),
+            SelKind::Column(2)
+        );
     }
 }
 

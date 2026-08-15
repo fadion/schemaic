@@ -21,19 +21,49 @@ use crate::model::{CellRef, Column};
 /// `i128` because the sum of a wide column over a big selection has to fit:
 /// 200k rows of `BIGINT` is ~2 × 10²⁴, and the same at scale 10 is ~2 × 10³⁴,
 /// both comfortably inside i128's ~1.7 × 10³⁸. Beyond that the arithmetic is
-/// *checked* and the aggregate degrades to `None` rather than wrapping — a
-/// silently wrong total is worse than an absent one.
+/// *checked* and the aggregate degrades rather than wrapping — a silently wrong
+/// total is worse than an absent one.
+///
+/// The headroom above is the **sum's**. The average used to consume six orders
+/// of it before dividing, so a `DECIMAL(38,10)` selection totalling ≥1.7 × 10³²
+/// — inside the ceiling this paragraph advertises — produced no aggregate at
+/// all, average *and* Sum/Min/Max. [`NumericAggregates::avg`] is now an
+/// `Option` and divides before it scales, so the only thing an unrepresentable
+/// mean costs is the mean.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Fixed {
     pub units: i128,
     pub scale: u32,
 }
 
+/// What a cell's text turned out to be. See [`Fixed::parse`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Parsed {
+    /// A number this module can represent exactly.
+    Value(Fixed),
+    /// A number, but one no `i128` can hold — a `DOUBLE` cell of `1e39` arrives
+    /// as forty digits.
+    Overflow,
+    /// Not a number at all: `"n/a"`, `"1e3"`, an empty cell.
+    NotANumber,
+}
+
 impl Fixed {
     /// Parse a decimal literal as the wire delivers it: optional sign, digits,
     /// optional fraction. No exponent — a `DECIMAL` column never sends one, and
     /// accepting `1e3` here would mean accepting it from a `VARCHAR` too.
-    pub fn parse(s: &str) -> Option<Fixed> {
+    ///
+    /// **`Overflow` is a third answer, not a second kind of failure**, and that
+    /// distinction is the one place this module could print a number that is
+    /// simply untrue. Every *post*-parse overflow already degraded the whole
+    /// aggregate to `None`; this one returned the same `None` as `"n/a"`, and
+    /// [`aggregate`] then treated the cell as present-but-not-a-number —
+    /// counted in `rows`, left out of the arithmetic. So a `DOUBLE` column
+    /// holding `1e39` and `2` reported `Sum 2`: not a refusal to answer, an
+    /// answer that was wrong, under a selection the user could see two values
+    /// in. `Value::Float` stores `f64::to_string()`, which never uses exponent
+    /// form, so the forty digits really do arrive here.
+    pub fn parse(s: &str) -> Parsed {
         let s = s.trim();
         let (neg, digits) = match s.strip_prefix('-') {
             Some(rest) => (true, rest),
@@ -44,18 +74,24 @@ impl Fixed {
             None => (digits, ""),
         };
         if int_part.is_empty() && frac_part.is_empty() {
-            return None;
+            return Parsed::NotANumber;
         }
         if !int_part.bytes().all(|b| b.is_ascii_digit())
             || !frac_part.bytes().all(|b| b.is_ascii_digit())
         {
-            return None;
+            return Parsed::NotANumber;
         }
         let mut units: i128 = 0;
         for b in int_part.bytes().chain(frac_part.bytes()) {
-            units = units.checked_mul(10)?.checked_add((b - b'0') as i128)?;
+            let Some(next) = units
+                .checked_mul(10)
+                .and_then(|u| u.checked_add((b - b'0') as i128))
+            else {
+                return Parsed::Overflow;
+            };
+            units = next;
         }
-        Some(Fixed {
+        Parsed::Value(Fixed {
             units: if neg { -units } else { units },
             scale: frac_part.len() as u32,
         })
@@ -135,7 +171,14 @@ pub struct Aggregates {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NumericAggregates {
     pub sum: Fixed,
-    pub avg: Fixed,
+    /// `None` when the mean can't be represented — which is a far narrower case
+    /// than it was, since the division now happens before the scaling.
+    ///
+    /// Its own `Option` because it is the only member that can fail on its own:
+    /// carried as a plain `Fixed`, an average that overflowed took Sum, Min and
+    /// Max down with it through `numeric_of`'s `?`, and a total that fits was
+    /// withheld because the *mean* of it didn't.
+    pub avg: Option<Fixed>,
     pub min: Fixed,
     pub max: Fixed,
 }
@@ -148,49 +191,147 @@ pub struct NumericAggregates {
 /// arithmetic: the column type says what it should be, and a wire value that
 /// isn't a number is not something to guess about.
 pub fn aggregate<'a>(column: &Column, cells: impl Iterator<Item = CellRef<'a>>) -> Aggregates {
+    aggregate_texts(column, cells.map(|c| (!c.is_null()).then(|| c.text())))
+}
+
+/// [`aggregate`] over cell *texts*, `None` meaning NULL.
+///
+/// The stored cell is not always the cell on screen: a staged (green) edit and a
+/// pending new row are both visible and neither is in the [`crate::model::ResultSet`].
+/// The readout has to add up what the user can *see*, or it sits under an edit
+/// it silently doesn't include — and the whole point of a total beside a
+/// selection is that the two agree.
+pub fn aggregate_texts<'a>(
+    column: &Column,
+    cells: impl Iterator<Item = Option<&'a str>>,
+) -> Aggregates {
     let numeric_column = column.is_numeric();
     let mut agg = Aggregates::default();
-    let mut vals: Vec<Fixed> = Vec::new();
+    // `None` once anything has overflowed: there is then no honest number to
+    // report, only a total over some of what was selected.
+    let mut fold = Some(Fold::default());
     for cell in cells {
         agg.rows += 1;
-        if cell.is_null() {
+        let Some(text) = cell else {
             continue;
-        }
+        };
         agg.non_null += 1;
-        if numeric_column && let Some(f) = Fixed::parse(cell.text()) {
-            vals.push(f);
+        if numeric_column {
+            match Fixed::parse(text) {
+                Parsed::Value(f) => fold = fold.and_then(|acc| acc.push(f)),
+                // A number too wide to hold degrades the whole aggregate, the
+                // same answer every later overflow gives. Skipping it — which is
+                // what an untyped `None` bought — left a Sum computed over
+                // *some* of the selected values and labelled as if it were all
+                // of them.
+                Parsed::Overflow => fold = None,
+                // Deliberately not: the column type says what the cell should
+                // be, and a wire value that isn't a number is not something to
+                // guess about. It stays counted in `rows`/`non_null`.
+                Parsed::NotANumber => {}
+            }
         }
     }
-    agg.numeric = numeric_of(&vals);
+    agg.numeric = fold.and_then(Fold::finish);
     agg
 }
 
-/// Sum / average / min / max over the parsed values, at their common scale.
-fn numeric_of(vals: &[Fixed]) -> Option<NumericAggregates> {
-    let scale = vals.iter().map(|f| f.scale).max()?;
-    let mut sum = 0i128;
-    let mut min = i128::MAX;
-    let mut max = i128::MIN;
-    for v in vals {
-        let u = v.rescale(scale)?.units;
-        sum = sum.checked_add(u)?;
-        min = min.min(u);
-        max = max.max(u);
+/// The running total, min and max, held at the widest scale seen so far.
+///
+/// A fold rather than a `Vec<Fixed>` and a second pass over it. The vector cost
+/// 32 bytes per selected cell, allocated and freed on **every** recompute — 6.4
+/// MB for a Ctrl+A over a 200k-row column, on the UI thread, once per
+/// auto-repeat of Shift+↑ and once per cell crossed in a drag. Nothing in the
+/// arithmetic needs the values kept, only the widest scale, and the fold can
+/// raise its own accumulators when it meets one.
+#[derive(Clone, Copy, Debug, Default)]
+struct Fold {
+    scale: u32,
+    sum: i128,
+    min: i128,
+    max: i128,
+    n: i128,
+}
+
+impl Fold {
+    /// `None` on overflow, which is how every arithmetic failure here reports:
+    /// no number rather than a wrong one.
+    fn push(mut self, v: Fixed) -> Option<Fold> {
+        if v.scale > self.scale {
+            let factor = 10i128.checked_pow(v.scale - self.scale)?;
+            self.sum = self.sum.checked_mul(factor)?;
+            self.min = self.min.checked_mul(factor)?;
+            self.max = self.max.checked_mul(factor)?;
+            self.scale = v.scale;
+        }
+        // Overflows on scale *spread* alone: `0.000…1` at scale 34 beside
+        // `100000` needs 10³⁹ units for the second value, whatever the total
+        // would have been. Left as a degrade rather than fixed, deliberately —
+        // the fix is to cap the working scale, which would make this the one
+        // place in the module that rounds, and rounding the inputs to a Sum is
+        // precisely what the fixed-point arithmetic exists to avoid. It reports
+        // no number, never a wrong one.
+        let u = v.rescale(self.scale)?.units;
+        self.sum = self.sum.checked_add(u)?;
+        if self.n == 0 {
+            self.min = u;
+            self.max = u;
+        } else {
+            self.min = self.min.min(u);
+            self.max = self.max.max(u);
+        }
+        self.n += 1;
+        Some(self)
     }
-    // The average divides, so it carries extra places its inputs never had, then
-    // sheds the ones that turned out to be zeros.
-    let n = vals.len() as i128;
-    let avg = Fixed {
-        units: sum.checked_mul(10i128.checked_pow(AVG_EXTRA_SCALE)?)? / n,
-        scale: scale + AVG_EXTRA_SCALE,
+
+    /// `None` when nothing parsed — all NULL, all unparseable, or a non-numeric
+    /// column, which never pushes at all.
+    fn finish(self) -> Option<NumericAggregates> {
+        if self.n == 0 {
+            return None;
+        }
+        let scale = self.scale;
+        Some(NumericAggregates {
+            sum: Fixed {
+                units: self.sum,
+                scale,
+            },
+            avg: mean(self.sum, scale, self.n),
+            min: Fixed {
+                units: self.min,
+                scale,
+            },
+            max: Fixed {
+                units: self.max,
+                scale,
+            },
+        })
     }
-    .trimmed();
-    Some(NumericAggregates {
-        sum: Fixed { units: sum, scale },
-        avg,
-        min: Fixed { units: min, scale },
-        max: Fixed { units: max, scale },
-    })
+}
+
+/// The mean of `n` values totalling `sum` at `scale`, carrying
+/// [`AVG_EXTRA_SCALE`] places its inputs never had — then shedding the ones that
+/// turned out to be zeros.
+///
+/// **Divides before it scales.** `sum × 10⁶ / n` spends six orders of the
+/// accumulator's headroom up front, so any total above ~1.7 × 10³² overflowed —
+/// well inside the range the sum itself handles, and the doc above claimed as
+/// comfortable. Taking the quotient and the remainder separately means only the
+/// *quotient* is scaled, and the remainder is smaller than `n`, so its own
+/// scaling can't overflow for any selection a grid can hold.
+fn mean(sum: i128, scale: u32, n: i128) -> Option<Fixed> {
+    let factor = 10i128.checked_pow(AVG_EXTRA_SCALE)?;
+    let (q, r) = (sum / n, sum % n);
+    let units = q
+        .checked_mul(factor)?
+        .checked_add(r.checked_mul(factor)? / n)?;
+    Some(
+        Fixed {
+            units,
+            scale: scale + AVG_EXTRA_SCALE,
+        }
+        .trimmed(),
+    )
 }
 
 /// Group a rendered number's integer part in threes: `1234567.89` →
@@ -242,7 +383,12 @@ impl Aggregates {
         }
         if let Some(n) = &self.numeric {
             parts.push(format!("Sum {}", grouped(&n.sum.text())));
-            parts.push(format!("Avg {}", grouped(&n.avg.text())));
+            // Omitted, not printed as a placeholder, when the mean can't be
+            // represented: the other three are exact and saying so about them is
+            // the whole job. An `Avg —` beside them would read as a value.
+            if let Some(avg) = n.avg {
+                parts.push(format!("Avg {}", grouped(&avg.text())));
+            }
             parts.push(format!("Min {}", grouped(&n.min.text())));
             parts.push(format!("Max {}", grouped(&n.max.text())));
         }
@@ -277,29 +423,32 @@ mod tests {
     fn parses_a_decimal_literal_as_the_wire_sends_it() {
         assert_eq!(
             Fixed::parse("12"),
-            Some(Fixed {
+            Parsed::Value(Fixed {
                 units: 12,
                 scale: 0
             })
         );
         assert_eq!(
             Fixed::parse("12.34"),
-            Some(Fixed {
+            Parsed::Value(Fixed {
                 units: 1234,
                 scale: 2
             })
         );
         assert_eq!(
             Fixed::parse("-0.50"),
-            Some(Fixed {
+            Parsed::Value(Fixed {
                 units: -50,
                 scale: 2
             })
         );
-        assert_eq!(Fixed::parse("  7 "), Some(Fixed { units: 7, scale: 0 }));
+        assert_eq!(
+            Fixed::parse("  7 "),
+            Parsed::Value(Fixed { units: 7, scale: 0 })
+        );
         assert_eq!(
             Fixed::parse(".5"),
-            Some(Fixed { units: 5, scale: 1 }),
+            Parsed::Value(Fixed { units: 5, scale: 1 }),
             "a leading dot is what some servers send for 0.5"
         );
     }
@@ -307,8 +456,29 @@ mod tests {
     #[test]
     fn rejects_what_is_not_a_plain_decimal() {
         for s in ["", "  ", "abc", "1e3", "1.2.3", "1,234", "0x10", "-", "1 2"] {
-            assert_eq!(Fixed::parse(s), None, "{s:?}");
+            assert_eq!(Fixed::parse(s), Parsed::NotANumber, "{s:?}");
         }
+    }
+
+    /// **A number too wide is not the same answer as "not a number".** Both were
+    /// `None`, so [`aggregate`] skipped an unrepresentable value exactly as it
+    /// skips `"n/a"` — and reported a Sum over the rest as if it were the whole
+    /// selection.
+    #[test]
+    fn a_value_wider_than_i128_is_overflow_not_a_parse_failure() {
+        assert_eq!(Fixed::parse(&"9".repeat(39)), Parsed::Overflow);
+        assert_eq!(
+            Fixed::parse(&format!("-{}", "9".repeat(39))),
+            Parsed::Overflow
+        );
+        // The fraction counts toward the same accumulator, so the digits either
+        // side of the point are one budget.
+        assert_eq!(
+            Fixed::parse(&format!("{}.{}", "9".repeat(20), "9".repeat(19))),
+            Parsed::Overflow
+        );
+        // 38 nines still fits.
+        assert!(matches!(Fixed::parse(&"9".repeat(38)), Parsed::Value(_)));
     }
 
     /// The reason this module doesn't use `f64`. In binary floating point
@@ -345,7 +515,7 @@ mod tests {
         let a = agg_of("int", &[Value::Int(2), Value::Int(4), Value::Int(9)]);
         let n = a.numeric.unwrap();
         assert_eq!(n.sum.text(), "15");
-        assert_eq!(n.avg.text(), "5");
+        assert_eq!(n.avg.unwrap().text(), "5");
         assert_eq!(n.min.text(), "2");
         assert_eq!(n.max.text(), "9");
     }
@@ -355,9 +525,9 @@ mod tests {
     #[test]
     fn the_average_carries_decimals_its_inputs_did_not() {
         let a = agg_of("int", &[Value::Int(1), Value::Int(2)]);
-        assert_eq!(a.numeric.unwrap().avg.text(), "1.5");
+        assert_eq!(a.numeric.unwrap().avg.unwrap().text(), "1.5");
         let b = agg_of("int", &[Value::Int(1), Value::Int(3), Value::Int(3)]);
-        assert_eq!(b.numeric.unwrap().avg.text(), "2.333333");
+        assert_eq!(b.numeric.unwrap().avg.unwrap().text(), "2.333333");
     }
 
     /// NULLs are counted but excluded from the arithmetic, and the average
@@ -369,7 +539,7 @@ mod tests {
         assert_eq!(a.non_null, 2);
         let n = a.numeric.unwrap();
         assert_eq!(n.sum.text(), "6");
-        assert_eq!(n.avg.text(), "3", "divides by 2, not 3");
+        assert_eq!(n.avg.unwrap().text(), "3", "divides by 2, not 3");
     }
 
     #[test]
@@ -407,7 +577,11 @@ mod tests {
         assert_eq!((a.rows, a.non_null), (2, 2));
         let n = a.numeric.unwrap();
         assert_eq!(n.sum.text(), "1.00");
-        assert_eq!(n.avg.text(), "1", "averaged over the one value that parsed");
+        assert_eq!(
+            n.avg.unwrap().text(),
+            "1",
+            "averaged over the one value that parsed"
+        );
     }
 
     #[test]
@@ -420,12 +594,128 @@ mod tests {
 
     /// A total too large for the accumulator is absent rather than wrapped —
     /// a silently wrong sum is worse than no sum.
+    ///
+    /// Overflow site 3 of 4: the running `checked_add`. The other three are
+    /// below; they are tested apart because they did **not** degrade alike, and
+    /// that is how three different answers to one question shipped.
     #[test]
     fn an_overflowing_total_degrades_instead_of_wrapping() {
         let huge = i128::MAX.to_string();
         let a = agg_of("numeric", &[Value::Str(huge.clone()), Value::Str(huge)]);
         assert_eq!(a.non_null, 2);
         assert!(a.numeric.is_none());
+    }
+
+    /// Overflow site 1 of 4, and the only one that ever produced a *wrong*
+    /// number: a value wider than i128 was skipped like `"n/a"`, so the bar
+    /// reported the total of everything else under a selection that visibly
+    /// contained more. `1e39` is what a `DOUBLE` column really sends — through
+    /// `f64::to_string()`, which never uses exponent form, so it arrives as
+    /// forty digits.
+    #[test]
+    fn a_value_too_wide_to_hold_degrades_rather_than_being_left_out() {
+        let a = agg_of("double", &[Value::Float(1e39), Value::Float(2.0)]);
+        assert_eq!((a.rows, a.non_null), (2, 2), "both cells are still counted");
+        assert!(
+            a.numeric.is_none(),
+            "reported {:?} — a Sum over part of the selection",
+            a.numeric
+        );
+    }
+
+    /// Overflow site 2 of 4: bringing values to a common scale. Driven by the
+    /// *spread* of scales rather than by magnitude, so it can erase a total that
+    /// would have fitted comfortably. Left as a degrade on purpose — capping the
+    /// working scale would make this the module's first rounding decision, and
+    /// rounding the inputs to a Sum is what the fixed-point arithmetic exists to
+    /// avoid. It never reports a wrong number, only no number.
+    #[test]
+    fn scale_spread_alone_can_erase_the_arithmetic() {
+        let tiny = format!("0.{}1", "0".repeat(33)); // scale 34
+        let a = agg_of(
+            "decimal(65,34)",
+            &[Value::Str(tiny), Value::Str("100000".into())],
+        );
+        assert_eq!(a.non_null, 2);
+        assert!(a.numeric.is_none());
+    }
+
+    /// Overflow site 4 of 4, and the one that must **not** take the others with
+    /// it. The average alone divides, so it alone can fail to be representable;
+    /// carried as a plain `Fixed` it propagated `?` and withheld an exact Sum,
+    /// Min and Max because the *mean* of them didn't fit.
+    #[test]
+    fn an_unrepresentable_average_costs_only_the_average() {
+        // A single value large enough that `× 10^AVG_EXTRA_SCALE` cannot fit,
+        // while the sum itself is exact.
+        let huge = i128::MAX.to_string();
+        let a = agg_of("numeric", &[Value::Str(huge.clone())]);
+        let n = a
+            .numeric
+            .as_ref()
+            .expect("the sum fits and must still be reported");
+        assert_eq!(n.sum.text(), huge);
+        assert_eq!(n.min.text(), huge);
+        assert_eq!(n.max.text(), huge);
+        assert!(n.avg.is_none());
+        let s = a.summary();
+        assert!(s.contains("Sum "), "got {s}");
+        assert!(!s.contains("Avg"), "an absent average is omitted, got {s}");
+    }
+
+    /// The headroom argument in [`Fixed`]'s own doc, made a test: a
+    /// `DECIMAL(38,10)` selection whose units total ~2 × 10³⁴ is what that
+    /// paragraph calls comfortable, and it produced **no aggregate at all**
+    /// because the average spent six orders of magnitude before dividing.
+    #[test]
+    fn a_sum_that_fits_still_reports_when_the_average_would_have_overflowed() {
+        // 1000 values of 2 × 10²¹ at scale 10: the total is 2 × 10³⁴ units,
+        // inside i128 and outside i128 ÷ 10⁶ — the case `Fixed`'s own doc calls
+        // comfortable, and which produced no aggregate at all.
+        let v = format!("2{}.{}", "0".repeat(21), "0".repeat(10));
+        let rows = vec![Value::Str(v); 1000];
+        let a = agg_of("decimal(38,10)", &rows);
+        let n = a.numeric.expect("the total fits and must be reported");
+        assert_eq!(
+            n.sum.text(),
+            format!("2{}.{}", "0".repeat(24), "0".repeat(10))
+        );
+        assert_eq!(
+            n.avg
+                .expect("dividing before scaling keeps this one representable")
+                .text(),
+            format!("2{}", "0".repeat(21))
+        );
+    }
+
+    /// `Value::Float` is the one input path this crate formats itself, and no
+    /// test used it — which is why the forty-digit string it can produce went
+    /// unnoticed. Ordinary floats must still aggregate.
+    #[test]
+    fn a_float_column_aggregates_through_its_own_rendering() {
+        let a = agg_of("double", &[Value::Float(1.5), Value::Float(2.25)]);
+        let n = a.numeric.unwrap();
+        assert_eq!(n.sum.text(), "3.75");
+        assert_eq!(n.min.text(), "1.50");
+        assert_eq!(n.max.text(), "2.25");
+    }
+
+    /// `NaN` and the infinities render as words, so they are cells that aren't
+    /// numbers — present, counted, and out of the arithmetic, exactly like
+    /// `"n/a"`. Distinct from the overflow above, which degrades everything.
+    #[test]
+    fn a_float_that_is_not_a_number_is_skipped_not_overflowed() {
+        let a = agg_of(
+            "double",
+            &[
+                Value::Float(f64::NAN),
+                Value::Float(2.0),
+                Value::Float(f64::INFINITY),
+            ],
+        );
+        assert_eq!((a.rows, a.non_null), (3, 3));
+        let n = a.numeric.expect("the one real value still aggregates");
+        assert_eq!(n.sum.text(), "2");
     }
 
     #[test]
