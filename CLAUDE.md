@@ -611,6 +611,24 @@ Zed-inspired, aiming to replace DataGrip.
     the four floem work-arounds a keyboard-operable dropdown needs). `themed_toggle` and
     `settings_dropdown` are the un-ringed builders beneath, and are **private** on purpose: a
     control nobody can Tab to is one left out of the modal's keyboard order by accident.
+  - `shortcuts.rs` — the app's keyboard shortcuts as **one table** (`SHORTCUTS`), which
+    `settings::help_overlay` renders straight from — plus the tests that keep it honest. This list
+    is the app's *only* keyboard documentation and for Ctrl+H / Ctrl+G the only affordance of any
+    kind, so a binding missing from it is a feature nobody can find; it was a literal inside the
+    modal and drifted exactly as its own comment predicted, hiding Alt+↑/↓, Ctrl+↑/↓, Ctrl+Shift+C/V
+    and Ctrl+Home/End. **The handlers can't render from the table** — they are `match` arms on
+    `Key::Character` across four files — so the guarantee runs the other way: the tests scan those
+    files for the four idioms the codebase binds a **Ctrl/Alt + letter** with (the `"x" | "X"` case
+    pair, `eq_ignore_ascii_case`, `NavKeys`' `Some("x") =>`, and `KeyCode::KeyX` for the physical
+    match Ctrl+Alt+L needs) and fail when one has no row, with `EXEMPT` the justified-baseline
+    escape hatch in the spirit of `contrast::UI_SHORTFALL`. Deliberately **weak**, like
+    `doc_coverage`: it catches the binding nobody wrote down, not an inaccurate row. Two rules
+    earned their own tests — the scan skips `#[cfg(test)]` modules (a grid fixture's
+    `Some("b".to_string())` was reported as a phantom Ctrl+B, and a gate that cries wolf gets
+    deleted) and each idiom is pinned against synthetic input, since a scan that silently stops
+    matching still passes a test that looks for what's missing. Only **modified letters** are
+    gated: plain keys are bound in dozens of places for ordinary navigation, so gating them is all
+    noise, and they're what a user tries anyway.
   - `connection_form.rs` — Manage Connections modal + password-mask (+ tests).
   - `diff_view.rs` — Ctrl+K diff preview. `history_panel.rs` — Query History right-column panel.
   - `plan_view.rs` — Query Plan modal (`EXPLAIN`/`EXPLAIN ANALYZE` table + warnings + "Ask AI"),

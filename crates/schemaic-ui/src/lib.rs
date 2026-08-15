@@ -32,6 +32,7 @@ mod schema_tree;
 /// the format belongs to exactly one module.
 pub use schema_tree::{column_key_named, table_key_named, table_key_prefix};
 mod settings;
+mod shortcuts;
 pub mod sql_highlight;
 mod table_designer;
 mod tabs;
