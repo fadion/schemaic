@@ -980,11 +980,10 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
 //
 // This is the app's *only* keyboard documentation, and for Ctrl+H and Ctrl+G it
 // is the only affordance of any kind — so a binding missing here is a feature
-// nobody can find. The list is hand-maintained against handlers in three files
-// (`editor_pane.rs`, `grid.rs`, `lib.rs`); add the row in the same change as the
-// binding. Deriving it from the handlers would be better, but they are `match`
-// arms on `Key::Character` spread across those files, so the realistic version
-// is a shared table beside `NavKeys` — a bigger change than has been warranted.
+// nobody can find. It renders straight from `shortcuts::SHORTCUTS`, which is the
+// one place the list lives and where the reasoning about what earns a row is
+// written down; a test there fails the build when a Ctrl/Alt+letter binding
+// exists with no row. This view owns only the layout.
 pub(crate) fn help_overlay(ui: Ui) -> impl IntoView {
     let open = ui.layout.help_open;
 
@@ -996,54 +995,11 @@ pub(crate) fn help_overlay(ui: Ui) -> impl IntoView {
             }
             let close: Rc<dyn Fn()> = Rc::new(move || open.set(false));
 
-            let body = v_stack((
-                shortcut_group(
-                    "Global",
-                    &[
-                        ("Ctrl+P", "Find Anywhere"),
-                        ("Ctrl+Shift+P", "Command palette"),
-                        ("Ctrl+T", "New query tab"),
-                        ("Ctrl+W", "Close query tab"),
-                        ("Ctrl+Tab", "Cycle tabs (Shift = reverse)"),
-                        ("Ctrl+1…9", "Jump to tab"),
-                        ("Ctrl+Shift+T", "Reopen last closed tab"),
-                        ("Ctrl+Shift+E", "Toggle schema panel"),
-                        ("Ctrl+Shift+A", "Toggle AI panel"),
-                        ("Ctrl+`", "Toggle terminal"),
-                    ],
-                ),
-                shortcut_group(
-                    "Editor",
-                    &[
-                        ("Ctrl+Enter", "Run query"),
-                        ("Ctrl+Space", "Autocomplete"),
-                        ("Ctrl+K", "Inline AI edit"),
-                        ("Ctrl+F", "Find in editor"),
-                        // Ctrl+F collapses the replace row, so nothing in the UI
-                        // reveals Ctrl+H — this modal is its only affordance.
-                        ("Ctrl+H", "Find and replace"),
-                        ("Ctrl+G", "Go to line"),
-                        ("Ctrl+/", "Toggle line comment"),
-                        ("Ctrl+D", "Duplicate line / selection"),
-                        ("Ctrl+X", "Delete line"),
-                        ("Ctrl+Alt+L", "Format SQL"),
-                    ],
-                ),
-                shortcut_group(
-                    "Results grid",
-                    &[
-                        ("Ctrl+F", "Find in results"),
-                        // Ctrl+G in the grid has no affordance anywhere else —
-                        // same as its editor twin, this modal is all there is.
-                        ("Ctrl+G", "Go to row"),
-                        ("Ctrl+C", "Copy"),
-                        ("Ctrl+A", "Select all"),
-                        ("Enter", "Edit cell / open value"),
-                        ("Ctrl+Enter", "Commit edits"),
-                        ("Del", "Mark row for deletion"),
-                    ],
-                ),
-            ))
+            let body = v_stack_from_iter(
+                crate::shortcuts::SHORTCUTS
+                    .iter()
+                    .map(|(title, rows)| shortcut_group(title, rows)),
+            )
             .style(|s| s.flex_col().gap(25.0).padding(14.0).width_full());
             // Scroll the body so the modal never overflows the window.
             let body = autohide(scroll(body)).style(|s| s.width_full().max_height(560.0));
