@@ -1114,7 +1114,12 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     let primary = bound_toggle(
         &ui,
         "Primary key",
-        "Part of the table's primary key, appended in the order you add columns.",
+        // The order is the **column** order, not the order these were switched
+        // on — that is what `2279fcb` fixed, and this hint still promised the
+        // old rule. On InnoDB the primary key is the clustered index, so its
+        // order decides the physical layout, and nothing else on screen
+        // contradicts a wrong sentence before Preview SQL.
+        "Part of the table's primary key, in column order.",
         in_pk,
         ring.clone(),
         40,

@@ -454,13 +454,18 @@ fn mapping_row(ui: Ui, fi: usize, file_col: String, ring: FocusRing) -> impl Int
 
     let picker = Dropdown::custom(current, main, options, row)
         .style(|s| dropdown_box_style(s).width(300.0).flex_shrink(0.0_f32));
-    // One Tab stop per file column, in the order they appear. The row index is
-    // the index, spaced so the step's own controls (if any are ever added above)
-    // can sit in front of them.
+    // One Tab stop per file column, in the order they appear, through the shared
+    // constants rather than a hand-rolled base and stride.
+    //
+    // `100 + fi * 10` was an unbounded block whose base sat *below* the
+    // `assert!(110 < VALUE_TAB)` floor — the compile-time chain's own statement
+    // of where fixed controls end — and whose stride was a literal beside a
+    // named `ROW_TAB_STRIDE`. Nothing collided today; adding one fixed control
+    // at ≥100 to this step would have made Tab order build order.
     let picker = crate::settings::in_ring_dropdown(
         picker,
         ring,
-        100 + fi as u32 * 10,
+        crate::widgets::VALUE_TAB + fi as u32 * crate::widgets::ROW_TAB_STRIDE,
         move |chosen: Target| {
             i.mapping.update(|m| {
                 // One target per column: claiming a column frees it from whoever
