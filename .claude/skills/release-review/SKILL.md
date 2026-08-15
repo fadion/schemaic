@@ -127,7 +127,13 @@ which instance it exercised.
 
 ### Prior commit-time reviews
 
-The `commit` skill writes `review/commits/<sha>.md` whenever a commit was reviewed as it landed.
+**A legacy input, and an empty one from here on.** The `commit` skill used to write
+`review/commits/<sha>.md` when a commit was reviewed as it landed; it no longer records anything,
+because a review at commit time is now the user's call and its findings land as ordinary commits.
+Files written before that change are still valid leads until `release` archives them at the next
+tag, after which this section has nothing to read and can go. Expect none, and skip the step
+without comment when the directory is absent or holds nothing in range.
+
 Collect the ones whose SHA is in the range — a file outside it belongs to an earlier cycle and is
 ignored, not deleted:
 
@@ -413,5 +419,5 @@ Close by naming the two follow-ups the review deliberately doesn't do: a writer 
   go out, which is the only question this review exists for.
 - **Don't touch `review/findings.md`** — that's the periodic review's ledger. Read-only.
 - **A prior commit-time entry is a lead, not a finding.** It enters through the verification gate
-  like anything else, re-anchored against `HEAD`. `review/commits/` is read-only here — the `commit`
-  skill writes it and `release` archives it at the tag.
+  like anything else, re-anchored against `HEAD`. `review/commits/` is read-only here, and holds
+  only entries predating the `commit` skill dropping its ledger — `release` archives them at the tag.

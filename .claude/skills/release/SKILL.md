@@ -142,10 +142,12 @@ git push origin main
 git push origin vX.Y.Z
 ```
 
-The tag closes the cycle, so this is where the commit-time review records are
-retired. If `review/commits/` exists, **rename it, don't delete it** — the
-directory is gitignored, so a wrong delete is unrecoverable, and this matches
-what `release-review` does with a stale run directory:
+The tag closes the cycle, so this is where any commit-time review records are
+retired. The `commit` skill no longer writes them, so this usually finds nothing
+and the step is a no-op — say nothing and move on. When the directory *does*
+exist (entries predating that change), **rename it, don't delete it** — it is
+gitignored, so a wrong delete is unrecoverable, and this matches what
+`release-review` does with a stale run directory:
 
 ```bash
 mv review/commits review/commits-vX.Y.Z
