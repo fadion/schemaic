@@ -282,6 +282,25 @@ impl Connection {
         }
     }
 
+    /// The id a **new** connection takes: past every one in use.
+    ///
+    /// One function because the id is the sole component of the keyring account
+    /// string (`conn.{id}.password` / `.ssh_password` / `.ssh_passphrase`), so
+    /// two connections sharing one share all three secret slots — a saved
+    /// password appearing under a connection that never had it, and a delete
+    /// taking the other's with it. It was written out twice (Save, and
+    /// Duplicate) with a comment on the second saying it used "the same rule",
+    /// which is the arrangement `ident_sql` exists to rule out: four independent
+    /// copies that happened to agree.
+    ///
+    /// Past the **maximum**, not the count and not the first gap: an id freed by
+    /// a delete stays free, because whatever still refers to it — a keyring entry
+    /// a `forget` missed, a `history.json` this build didn't write — would
+    /// otherwise be adopted by the next connection created.
+    pub fn next_id(existing: &[Connection]) -> u64 {
+        existing.iter().map(|c| c.id).max().unwrap_or(0) + 1
+    }
+
     /// Do these two point at the same server — everything that decides *which*
     /// server the next query reaches, and nothing else?
     ///
@@ -460,6 +479,27 @@ mod tests {
         assert!(copy.read_only);
         assert!(copy.prominent_color);
         assert_eq!(copy.environment, Environment::Production);
+    }
+
+    /// The id is the **sole** component of the keyring account string, so two
+    /// connections sharing one share all three secret slots. Past the maximum,
+    /// not the count and not the first gap: an id freed by a delete stays free,
+    /// or whatever still refers to it is adopted by the next connection created.
+    #[test]
+    fn a_new_connection_takes_an_id_past_every_one_in_use() {
+        let with = |ids: &[u64]| -> Vec<Connection> {
+            ids.iter()
+                .map(|id| Connection { id: *id, ..conn() })
+                .collect()
+        };
+        assert_eq!(Connection::next_id(&[]), 1, "never 0");
+        assert_eq!(Connection::next_id(&with(&[1, 2, 3])), 4);
+        // A gap in the middle is not reused.
+        assert_eq!(Connection::next_id(&with(&[1, 3])), 4);
+        // Nor is one at the end, after a delete.
+        assert_eq!(Connection::next_id(&with(&[7])), 8);
+        // Order-independent.
+        assert_eq!(Connection::next_id(&with(&[9, 2, 5])), 10);
     }
 
     #[test]

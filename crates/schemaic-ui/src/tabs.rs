@@ -111,6 +111,7 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
     let can_reopen = ui.tab_actions.can_reopen_closed_tab.clone();
     let close_all = ui.tab_actions.close_all_tabs.clone();
     let close_others = ui.tab_actions.close_other_tabs.clone();
+    let can_close_others = ui.tab_actions.can_close_other_tabs.clone();
     let overlay = ui.overlay;
 
     // Commit the inline rename: an empty/blank name reverts to the default
@@ -322,10 +323,17 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
             // clicked tab — it is the one kept. Offered on a pinned tab too: a
             // pinned tab is already the one that survives everything, so
             // "close the others" is exactly as meaningful there.
-            entries.push(MenuEntry::action("Close other tabs", {
-                let close_others = close_others.clone();
-                move || (close_others)(tab.id)
-            }));
+            entries.push(
+                MenuEntry::action("Close other tabs", {
+                    let close_others = close_others.clone();
+                    move || (close_others)(tab.id)
+                })
+                // Dimmed with nothing else to close — the app's own opening
+                // state, where it used to return before the confirm with no
+                // dialog and no message, one row below an entry that *is*
+                // dimmed for the same kind of reason.
+                .disabled(!(can_close_others)(tab.id)),
+            );
             entries.push(MenuEntry::action("Close all tabs", {
                 let close_all = close_all.clone();
                 move || (close_all)()
