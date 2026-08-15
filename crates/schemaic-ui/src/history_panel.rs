@@ -315,8 +315,16 @@ fn history_row(
                 facts.push(history::format_duration(ms));
             }
             if let Some(n) = entry.rows.filter(|_| !failed) {
-                let word = schemaic_core::text::plural(n as usize, "row", "rows");
-                facts.push(format!("{n} {word}"));
+                // `200000+ rows` when the fetch stopped at the cap: that number
+                // is what came back, not what the query returned, and only the
+                // `+` says so once the grid is gone. Always plural there — the
+                // count means "at least this many", so it is never one.
+                if entry.rows_capped {
+                    facts.push(format!("{n}+ rows"));
+                } else {
+                    let word = schemaic_core::text::plural(n as usize, "row", "rows");
+                    facts.push(format!("{n} {word}"));
+                }
             }
             // The trailing separator belongs to the facts, so a row with none of
             // them doesn't open with a stray "· ".

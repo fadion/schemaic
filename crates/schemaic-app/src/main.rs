@@ -599,6 +599,12 @@ fn seed_connection() -> Connection {
 /// **affected** for a write (`ResultSet::affected`, which is `None` for exactly
 /// the row-returning case). A failure has neither.
 ///
+/// A fetch that stopped at the row cap carries `rows_capped`, because its count
+/// *is* the cap: the entry would otherwise claim that a 5-million-row table
+/// returned exactly 200,000, and the grid that said "truncated" is long gone by
+/// the time anyone reads the history. `affected` is the server's own number and
+/// is never capped.
+///
 /// Shared by both run paths so a single run and a statement inside Run
 /// Everything can't come to answer this differently.
 fn run_result(state: &QueryState, duration_ms: u64) -> Option<schemaic_core::history::RunResult> {
@@ -606,11 +612,13 @@ fn run_result(state: &QueryState, duration_ms: u64) -> Option<schemaic_core::his
         QueryState::Loaded(rs) => Some(schemaic_core::history::RunResult {
             duration_ms,
             rows: Some(rs.affected.unwrap_or_else(|| rs.row_count() as u64)),
+            rows_capped: rs.affected.is_none() && rs.truncated,
             ok: true,
         }),
         QueryState::Failed(_) => Some(schemaic_core::history::RunResult {
             duration_ms,
             rows: None,
+            rows_capped: false,
             ok: false,
         }),
         QueryState::Idle | QueryState::Running | QueryState::Cancelled => None,
@@ -1072,6 +1080,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                             // Filled in by `finish_history` when the run lands.
                             duration_ms: None,
                             rows: None,
+                            rows_capped: false,
                             outcome: schemaic_core::history::Outcome::Unknown,
                         },
                         dialect,
