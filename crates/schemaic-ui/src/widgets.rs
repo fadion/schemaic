@@ -2158,10 +2158,53 @@ pub(crate) fn highlight_text(
     bold: bool,
     line_height: f32,
 ) -> floem::views::RichText {
+    highlight_text_in(
+        "IBM Plex Sans",
+        full,
+        term,
+        font_size,
+        base,
+        bold,
+        line_height,
+    )
+}
+
+/// [`highlight_text`] in the app's monospace face — for text that is *code*, and
+/// still has to carry a search highlight (the history panel's SQL preview).
+pub(crate) fn highlight_mono(
+    full: String,
+    term: Option<String>,
+    font_size: f32,
+    base: impl Fn() -> floem::peniko::Color + 'static,
+    line_height: f32,
+) -> floem::views::RichText {
+    highlight_text_in(
+        crate::consts::MONO_FAMILY,
+        full,
+        term,
+        font_size,
+        base,
+        false,
+        line_height,
+    )
+}
+
+/// The shared body: the family is the only thing the two differ in, and a
+/// `rich_text` builds its own `Attrs`, so it can't be set from the outside with
+/// a `.style()` the way an ordinary label's font can.
+fn highlight_text_in(
+    family: &'static str,
+    full: String,
+    term: Option<String>,
+    font_size: f32,
+    base: impl Fn() -> floem::peniko::Color + 'static,
+    bold: bool,
+    line_height: f32,
+) -> floem::views::RichText {
     use floem::text::{Attrs, AttrsList, FamilyOwned, LineHeightValue, TextLayout, Weight};
     let base_weight = if bold { Weight::BOLD } else { Weight::NORMAL };
     floem::views::rich_text(move || {
-        let sans = [FamilyOwned::Name("IBM Plex Sans".to_string())];
+        let sans = [FamilyOwned::Name(family.to_string())];
         let lh = LineHeightValue::Normal(line_height);
         let base_attrs = Attrs::new()
             .family(&sans)
