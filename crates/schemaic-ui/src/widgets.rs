@@ -231,6 +231,14 @@ pub(crate) const TITLE_CLOSE_TAB: u32 = ACTION_TAB + 100;
 // unbounded upward and the footer must stay last. It has already been caught
 // once: `ROW_TAB_STRIDE` made every row cost ten indices instead of one, which
 // silently cut the headroom below `ACTION_TAB` tenfold on the day it landed.
+/// The highest tabindex a **fixed** form control may claim — a sequence
+/// editor's last field. Above it and below [`VALUE_TAB`] is a no-man's-land,
+/// and `FocusRing::register` refuses it: a growing block that starts there is
+/// unbounded upward into the fixed range, which is how a stride of ten and a
+/// base of a hundred collided with nothing today and would have collided with
+/// the next control added.
+pub(crate) const FIXED_TAB_END: u32 = 110;
+
 const _: () = {
     assert!(NAV_TAB < crate::table_designer::LIST_TAB);
     assert!(
@@ -238,7 +246,7 @@ const _: () = {
         "before the first field"
     );
     assert!(
-        110 < VALUE_TAB,
+        FIXED_TAB_END < VALUE_TAB,
         "past the highest fixed control (a sequence's)"
     );
     // A row costs a whole stride, so the headroom is in rows, not indices.
@@ -544,7 +552,28 @@ impl FocusRing {
 
     /// Add a control at `tabindex`, keeping the ring ordered. Re-registering the
     /// same view moves it rather than duplicating it.
+    ///
+    /// **This is where the tabindex band is actually enforced.** The
+    /// compile-time chain below the constants relates five *constants* and
+    /// cannot see a single registered index — which is how the import modal's
+    /// mapping rows came to claim `100 + i * 10`, an unbounded block whose base
+    /// sat below the floor that chain asserts, while the build stayed green. A
+    /// `debug_assert` here is the only check that sees the number a control
+    /// really claimed.
+    ///
+    /// Debug-only on purpose: it is a development tripwire for a band violation,
+    /// not a runtime condition a user can hit — the tabindex is always a literal
+    /// or a constant plus a row index.
     pub(crate) fn register(&self, tabindex: u32, id: floem::ViewId) {
+        debug_assert!(
+            tabindex <= TITLE_CLOSE_TAB,
+            "tabindex {tabindex} is past the title bar's ✕, which must stay last"
+        );
+        debug_assert!(
+            !(FIXED_TAB_END + 1..VALUE_TAB).contains(&tabindex),
+            "tabindex {tabindex} is between the fixed controls (≤{FIXED_TAB_END}) and \
+             VALUE_TAB ({VALUE_TAB}); a growing block starts at VALUE_TAB + i * ROW_TAB_STRIDE"
+        );
         let mut e = self.entries.borrow_mut();
         e.retain(|(_, x)| *x != id);
         let at = e.partition_point(|(t, _)| *t <= tabindex);
@@ -3087,6 +3116,42 @@ mod ring_tests {
         assert_eq!(ring.ids(), vec![live.id()], "only the live one registered");
         assert_ne!(dead.id(), live.id());
         assert_eq!(ring.at(ACTION_TAB + 10), None);
+    }
+
+    /// The band the compile-time chain asserts over *constants*, enforced where
+    /// a control actually claims a number — the only check that could have
+    /// caught the import modal's `100 + i * 10`, which sat below the floor that
+    /// chain states while the build stayed green.
+    #[test]
+    #[should_panic(expected = "VALUE_TAB")]
+    fn a_tabindex_between_the_fixed_controls_and_value_tab_is_refused() {
+        FocusRing::new().register(FIXED_TAB_END + 1, floem::ViewId::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "must stay last")]
+    fn a_tabindex_past_the_title_close_is_refused() {
+        FocusRing::new().register(TITLE_CLOSE_TAB + 1, floem::ViewId::new());
+    }
+
+    /// And the legal ones, so the guard can't be tightened into refusing what
+    /// the app really registers.
+    #[test]
+    fn every_band_the_app_uses_registers_cleanly() {
+        let ring = FocusRing::new();
+        for t in [
+            NAV_TAB,
+            crate::table_designer::LIST_TAB,
+            10,
+            FIXED_TAB_END,
+            VALUE_TAB,
+            VALUE_TAB + 90_000 * ROW_TAB_STRIDE,
+            ACTION_TAB,
+            ACTION_TAB + 20,
+            TITLE_CLOSE_TAB,
+        ] {
+            ring.register(t, floem::ViewId::new());
+        }
     }
 
     /// **The ring member is a wrapper, never the face the caller passed in.**

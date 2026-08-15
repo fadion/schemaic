@@ -1338,8 +1338,15 @@ struct PaletteItem {
     /// revealed the binding, and while the user was still reading it.
     ///
     /// The exception is an **option** row (`CmdArg::Options`), whose `primary` is
-    /// the option's label — "One Dark Pro", not "Editor Theme". That row runs one
-    /// choice of the command, which no key is bound to, so it carries none.
+    /// the option's label — "One Dark Pro", not "Editor Theme" — and which
+    /// carries none.
+    ///
+    /// Not because no key runs one: three of Toggle Panel's four options are
+    /// byte-for-byte the Ctrl+Shift+E / Ctrl+Shift+A / Ctrl+` handlers. It is
+    /// because the row's *own* label is not the command's, so a keycap on it
+    /// would read as belonging to "One Dark Pro" rather than to the command it
+    /// is a choice of — and there is nowhere on the row to say which. The keycap
+    /// belongs where the command's name is.
     keys: Option<&'static str>,
 }
 
@@ -1709,7 +1716,7 @@ impl Command {
 /// only a built registry can say whether its *names* still name anything. A
 /// renamed command would otherwise drop its keycap in silence.
 fn assert_names_match_labels(cmds: &[Command]) {
-    for (name, keys) in crate::shortcuts::COMMAND_KEYS {
+    for (name, _, keys) in crate::shortcuts::COMMAND_KEYS {
         debug_assert!(
             cmds.iter().any(|c| c.name == *name),
             "shortcuts::COMMAND_KEYS maps {name:?} to {keys:?}, but no palette \

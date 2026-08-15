@@ -15,17 +15,25 @@
 //! # What the test does, and what it deliberately doesn't
 //!
 //! The handlers can't render *from* this table — they are `match` arms on
-//! `Key::Character` spread across four files, and rewriting them to dispatch
+//! `Key::Character` spread across several files, and rewriting them to dispatch
 //! through a table would be a far larger change than the problem warrants. So the
-//! guarantee is enforced from the other side: the tests below scan those files
-//! for the four idioms the codebase actually uses to bind a **Ctrl/Alt + letter**
-//! key, and fail when one isn't named here.
+//! guarantee is enforced from the other side: the tests below scan the files in
+//! `KEY_FILES` for the five idioms the codebase actually uses to bind a
+//! **Ctrl/Alt + letter** key, and fail when one isn't named here.
 //!
-//! That scope is the point. Modified-letter keys are where every undiscoverable
-//! binding lives, because they are the ones with no menu item, no button and no
-//! hover text. Plain keys (arrows, Enter, Escape, Delete) are deliberately *not*
-//! gated: they are bound in dozens of places for ordinary navigation, so gating
-//! them would be all noise, and a user guesses them anyway.
+//! That scope is the point, and it is narrower than "every key". Modified-letter
+//! keys are where every undiscoverable binding lives, because they are the ones
+//! with no menu item, no button and no hover text. Two things are therefore
+//! outside the gate, and neither is an oversight:
+//!
+//! - **Plain keys** (arrows, Enter, Escape, Delete) are bound in dozens of
+//!   places for ordinary navigation, so gating them would be all noise, and a
+//!   user guesses them anyway.
+//! - **Named modified keys** — `Ctrl+Tab`, `Ctrl+Shift+Tab`, `Ctrl+Enter`,
+//!   Ctrl+1…9 — are matched as `NamedKey`s, not characters, so the letter scan
+//!   cannot see them and nothing checks that their rows are still true. They are
+//!   in the table because they belong there; the claim this module makes about
+//!   them is only that somebody wrote them down.
 //!
 //! Like [`doc_coverage`](../../../schemaic-core/tests/doc_coverage.rs), it is a
 //! deliberately weak test. It proves a binding was *thought about*, not that its
@@ -93,7 +101,10 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
             ("Ctrl+C", "Copy"),
             ("Ctrl+A", "Select all"),
             ("Ctrl+Home / Ctrl+End", "First / last cell"),
-            ("Enter", "Edit cell / open value"),
+            // "Edit cell" only. Enter on a **read-only** cell does nothing —
+            // viewing one is the right-click menu's View — and a row promising
+            // otherwise teaches a key that isn't there.
+            ("Enter", "Edit cell"),
             ("Tab / Shift+Tab", "Next / previous cell while editing"),
             ("Ctrl+Enter", "Commit edits"),
             ("Del", "Mark row for deletion"),
@@ -130,21 +141,29 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
 /// The keys string must be *byte-identical* to a [`SHORTCUTS`] row, which
 /// [`tests::every_command_key_is_a_real_shortcut`] enforces, so the palette can
 /// never advertise a binding the modal doesn't document or the app doesn't have.
-pub(crate) const COMMAND_KEYS: &[(&str, &str)] = &[
-    ("new tab", "Ctrl+T"),
-    ("close tab", "Ctrl+W"),
-    ("next tab", "Ctrl+Tab"),
-    ("previous tab", "Ctrl+Shift+Tab"),
-    ("format code", "Ctrl+Alt+L"),
-    ("go to line", "Ctrl+G"),
+///
+/// **Each entry names its row's group**, not just the key string. The table has
+/// two `Ctrl+G` rows meaning different things — the editor's Go to Line and the
+/// grid's Go to Row — so matching on the string alone let *either* vouch for the
+/// palette's keycap: deleting the Editor row would have left the palette
+/// advertising `Ctrl+G` for "Go to Line" while the surviving row means the
+/// grid's row jump. A nearly-right keycap is worse than none, because it teaches
+/// a key that does something else.
+pub(crate) const COMMAND_KEYS: &[(&str, &str, &str)] = &[
+    ("new tab", "Global", "Ctrl+T"),
+    ("close tab", "Global", "Ctrl+W"),
+    ("next tab", "Global", "Ctrl+Tab"),
+    ("previous tab", "Global", "Ctrl+Shift+Tab"),
+    ("format code", "Editor", "Ctrl+Alt+L"),
+    ("go to line", "Editor", "Ctrl+G"),
 ];
 
 /// The keys to show on a palette row for the command called `name`.
 pub(crate) fn command_keys(name: &str) -> Option<&'static str> {
     COMMAND_KEYS
         .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, k)| *k)
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, _, k)| *k)
 }
 
 #[cfg(test)]
@@ -153,16 +172,32 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
-    /// The files that bind keys. Not every module with a `KeyDown` listener —
-    /// only the ones that bind a *modified letter*, which is what this gate is
-    /// about. A new file of that kind belongs on this list.
-    const KEY_FILES: &[&str] = &[
-        "editor_pane.rs",
-        "grid.rs",
-        "lib.rs",
-        "ai_panel.rs",
-        "schema_tree.rs",
-        "overlays.rs",
+    /// The files that bind keys, each with the [`SHORTCUTS`] groups its bindings
+    /// may be documented in.
+    ///
+    /// Not every module with a `KeyDown` listener — only the ones that bind a
+    /// *modified letter*, which is what this gate is about. A new file of that
+    /// kind belongs on this list.
+    ///
+    /// **The groups are what makes a second binding of an already-listed letter
+    /// visible.** `documented` was letter-global, so adding a Ctrl+D to the grid
+    /// needed no row: Editor / "Ctrl+D — Duplicate line" vouched for it. Both
+    /// letters that really do have two bindings (`Ctrl+F`, `Ctrl+G`) got their
+    /// second row by hand, with nothing asking for it. Scoping the lookup to the
+    /// surface that binds it is what turns that into a failure.
+    ///
+    /// A file lists every group it may document into, not one — `lib.rs` is the
+    /// window root *and* the terminal panel, and the editor re-binds the global
+    /// navigation keys because it consumes every KeyDown itself. When a binding
+    /// legitimately belongs to a group not listed here, add the group; the
+    /// failure message says so.
+    const KEY_FILES: &[(&str, &[&str])] = &[
+        ("editor_pane.rs", &["Editor", "Global"]),
+        ("grid.rs", &["Results grid", "Global"]),
+        ("lib.rs", &["Global", "Terminal"]),
+        ("ai_panel.rs", &["Global"]),
+        ("schema_tree.rs", &["Schema tree", "Global"]),
+        ("overlays.rs", &["Global"]),
     ];
 
     /// Letters bound to something that is not a user-facing shortcut, each with
@@ -193,19 +228,25 @@ mod tests {
         }
     }
 
-    /// Every single letter bound with Ctrl or Alt in `src`, by the four idioms the
-    /// codebase actually uses:
+    /// Every single letter bound with Ctrl or Alt in `src`, by the five idioms
+    /// the codebase actually uses:
     ///
     /// - `"x" | "X"` — the case pair, covering both `matches!(s.as_str(), …)` and
     ///   a plain `match` arm (the grid, the root, the terminal's copy/paste)
     /// - `eq_ignore_ascii_case("x")` — the editor's style
     /// - `Some("x") =>` — `NavKeys`' match arms, requiring the `=>` so this
     ///   doesn't match every `Some("…")` in the crate
+    /// - `ch == Some("x")` — the *same* function's shifted arms, spelled as an
+    ///   equality rather than a pattern. This one was missing, and it is where
+    ///   **both** of the app's Ctrl+Shift+letter bindings live: the gate was
+    ///   green only because `p` and `t` happen to be bound a second time in the
+    ///   unshifted arms below, so adding a third Ctrl+Shift+letter in the
+    ///   file's own established style would have needed no `SHORTCUTS` row
     /// - `KeyCode::KeyX` — a *physical* key, which is how Ctrl+Alt+L has to be
     ///   matched (Windows delivers Ctrl+Alt as AltGr, so the logical character
     ///   isn't "l")
     ///
-    /// Anything spelled a fifth way slips through, which is the weakness this
+    /// Anything spelled a sixth way slips through, which is the weakness this
     /// test accepts: it exists to catch the binding nobody wrote down, not to
     /// prove the absence of one.
     fn bound_letters(src: &str) -> BTreeSet<char> {
@@ -250,6 +291,17 @@ mod tests {
                 }
             }
         }
+        // `== Some("x")` — the equality form, which is how the shifted arms of
+        // `NavKeys::handle` are written. The `==` is what distinguishes it from
+        // an ordinary `Some("…")`, exactly as the `=>` does above.
+        let mut rest = src;
+        while let Some(i) = rest.find("== Some(\"") {
+            rest = &rest[i + "== Some(\"".len()..];
+            let b = rest.as_bytes();
+            if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b'"' {
+                out.insert(b[0].to_ascii_lowercase() as char);
+            }
+        }
         // `KeyCode::KeyX` — a physical key.
         let mut rest = src;
         while let Some(i) = rest.find("KeyCode::Key") {
@@ -265,15 +317,28 @@ mod tests {
         out
     }
 
+    /// Does the table name this letter as a modified key, in one of `groups`?
+    ///
+    /// Scoped rather than table-wide: a Ctrl+D added to the grid must not be
+    /// vouched for by the *editor's* Ctrl+D, which does something else entirely.
+    /// `groups` empty means "anywhere", which is what the whole-table questions
+    /// below ask.
+    fn documented_in(letter: char, groups: &[&str]) -> bool {
+        let upper = letter.to_ascii_uppercase();
+        SHORTCUTS
+            .iter()
+            .filter(|(group, _)| groups.is_empty() || groups.contains(group))
+            .any(|(_, rows)| {
+                rows.iter().any(|(keys, _)| {
+                    keys.split(['+', ' ', '/'])
+                        .any(|part| part.len() == 1 && part.starts_with(upper))
+                })
+            })
+    }
+
     /// Does the table name this letter anywhere, as a modified key?
     fn documented(letter: char) -> bool {
-        let upper = letter.to_ascii_uppercase();
-        SHORTCUTS.iter().any(|(_, rows)| {
-            rows.iter().any(|(keys, _)| {
-                keys.split(['+', ' ', '/'])
-                    .any(|part| part.len() == 1 && part.starts_with(upper))
-            })
-        })
+        documented_in(letter, &[])
     }
 
     /// A binding with no row is a feature nobody can find. This is the whole
@@ -281,30 +346,36 @@ mod tests {
     #[test]
     fn every_bound_letter_is_documented() {
         let mut found = BTreeSet::new();
-        for name in KEY_FILES {
+        let mut missing: Vec<String> = Vec::new();
+        for (name, groups) in KEY_FILES {
             let path = src_dir().join(name);
             let src = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-            found.extend(bound_letters(&src));
+            let letters = bound_letters(&src);
+            // **In one of the file's own groups.** Table-wide, a Ctrl+D added to
+            // the grid was vouched for by the editor's Ctrl+D — a different key
+            // doing a different thing.
+            missing.extend(
+                letters
+                    .iter()
+                    .filter(|c| !EXEMPT.iter().any(|(e, _)| e.starts_with(**c)))
+                    .filter(|c| !documented_in(**c, groups))
+                    .map(|c| format!("{name}: Ctrl/Alt+{}", c.to_ascii_uppercase())),
+            );
+            found.extend(letters);
         }
         assert!(
             !found.is_empty(),
             "found no bound letters at all — the scan idioms have changed and \
              this gate is now vacuous, which is worse than it failing"
         );
-
-        let missing: Vec<String> = found
-            .iter()
-            .filter(|c| !EXEMPT.iter().any(|(e, _)| e.starts_with(**c)))
-            .filter(|c| !documented(**c))
-            .map(|c| format!("Ctrl/Alt+{}", c.to_ascii_uppercase()))
-            .collect();
-
         assert!(
             missing.is_empty(),
-            "these keys are bound in the handlers but appear in no SHORTCUTS row, \
-             so nothing in the app reveals them: {}. Add the row in the same \
-             change as the binding, or add the letter to EXEMPT with its reason.",
+            "these keys are bound in the handlers but appear in no SHORTCUTS row \
+             of the binding file's own groups, so nothing in the app reveals \
+             them: {}. Add the row in the same change as the binding; if the \
+             binding belongs to a group `KEY_FILES` doesn't list for that file, \
+             add the group there; or add the letter to EXEMPT with its reason.",
             missing.join(", ")
         );
     }
@@ -325,6 +396,10 @@ mod tests {
         assert!(arms.contains(&'c') && arms.contains(&'v'));
         assert!(bound_letters(r#"if c.eq_ignore_ascii_case("g") {"#).contains(&'g'));
         assert!(bound_letters(r#"Some("p") => { find(); }"#).contains(&'p'));
+        assert!(
+            bound_letters(r#"if ch == Some("b") { bold(); }"#).contains(&'b'),
+            "the equality form, where both Ctrl+Shift+letter bindings live"
+        );
         assert!(
             bound_letters("PhysicalKey::Code(KeyCode::KeyL)").contains(&'l'),
             "Ctrl+Alt+L is matched physically, not as a character"
@@ -356,7 +431,7 @@ mod tests {
     #[test]
     fn every_documented_letter_is_still_bound() {
         let mut found = BTreeSet::new();
-        for name in KEY_FILES {
+        for (name, _) in KEY_FILES {
             let src = std::fs::read_to_string(src_dir().join(name)).expect("read source");
             found.extend(bound_letters(&src));
         }
@@ -382,6 +457,40 @@ mod tests {
              because widening the scan is the right fix for the second case.",
             stale.join(", ")
         );
+    }
+
+    /// **A row in one group must not vouch for a binding in another.** Adding a
+    /// Ctrl+D to the grid was covered by Editor / "Ctrl+D — Duplicate line",
+    /// which is a different key doing a different thing — and the two letters
+    /// that really do have two bindings each got their second row by hand, with
+    /// nothing asking for it.
+    #[test]
+    fn a_row_only_vouches_for_its_own_group() {
+        // Ctrl+D exists, in the Editor group only.
+        assert!(documented('d'), "table-wide");
+        assert!(documented_in('d', &["Editor"]));
+        assert!(
+            !documented_in('d', &["Results grid"]),
+            "the grid has no Ctrl+D row, so a grid binding must fail the gate"
+        );
+        // And the letters that legitimately appear in two groups still do.
+        assert!(documented_in('f', &["Editor"]));
+        assert!(documented_in('f', &["Results grid"]));
+    }
+
+    /// Every group a `KEY_FILES` row names has to exist, or a typo silently
+    /// widens the gate to "documented nowhere" and every letter fails — or, if
+    /// the file's other groups cover it, silently narrows to nothing.
+    #[test]
+    fn every_key_file_names_real_shortcut_groups() {
+        for (file, groups) in KEY_FILES {
+            for g in *groups {
+                assert!(
+                    SHORTCUTS.iter().any(|(name, _)| name == g),
+                    "{file} names group {g:?}, which is not in SHORTCUTS"
+                );
+            }
+        }
     }
 
     /// The other half of the gate: a letter is "documented" only when it appears
@@ -413,17 +522,36 @@ mod tests {
     /// same key, which is worse than either being merely incomplete.
     #[test]
     fn every_command_key_is_a_real_shortcut() {
-        let all: Vec<&str> = SHORTCUTS
-            .iter()
-            .flat_map(|(_, rows)| rows.iter().map(|(keys, _)| *keys))
-            .collect();
-        for (name, keys) in COMMAND_KEYS {
+        for (name, group, keys) in COMMAND_KEYS {
+            // The row that *means* it, not any row with the same key string:
+            // the table has two `Ctrl+G` rows for two different things.
+            let found = SHORTCUTS
+                .iter()
+                .filter(|(g, _)| g == group)
+                .any(|(_, rows)| rows.iter().any(|(k, _)| k == keys));
             assert!(
-                all.contains(keys),
-                "palette command {name:?} shows {keys:?}, which is not a SHORTCUTS row — \
-                 add the row, or fix the spelling to match one exactly"
+                found,
+                "palette command {name:?} shows {keys:?} from group {group:?}, which is \
+                 not a SHORTCUTS row there — add the row, fix the spelling to match one \
+                 exactly, or name the group the binding really comes from"
             );
         }
+    }
+
+    /// Two rows can share a key string across groups (`Ctrl+G` is Go to Line in
+    /// the editor and Go to Row in the grid), which is exactly why the check
+    /// above names the group — this pins that the ambiguity is real.
+    #[test]
+    fn a_key_string_can_mean_two_things_in_two_groups() {
+        let with_ctrl_g: Vec<&str> = SHORTCUTS
+            .iter()
+            .filter(|(_, rows)| rows.iter().any(|(k, _)| *k == "Ctrl+G"))
+            .map(|(g, _)| *g)
+            .collect();
+        assert!(
+            with_ctrl_g.len() > 1,
+            "expected Ctrl+G in more than one group, got {with_ctrl_g:?}"
+        );
     }
 
     #[test]
@@ -444,7 +572,7 @@ mod tests {
     #[test]
     fn command_keys_names_are_unique() {
         let mut seen = BTreeSet::new();
-        for (name, _) in COMMAND_KEYS {
+        for (name, _, _) in COMMAND_KEYS {
             assert!(seen.insert(*name), "duplicate COMMAND_KEYS entry {name:?}");
         }
     }

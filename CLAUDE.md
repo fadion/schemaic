@@ -631,12 +631,19 @@ Zed-inspired, aiming to replace DataGrip.
     kind, so a binding missing from it is a feature nobody can find; it was a literal inside the
     modal and drifted exactly as its own comment predicted, hiding Alt+↑/↓, Ctrl+↑/↓, Ctrl+Shift+C/V
     and Ctrl+Home/End. **The handlers can't render from the table** — they are `match` arms on
-    `Key::Character` across four files — so the guarantee runs the other way: the tests scan those
-    files for the four idioms the codebase binds a **Ctrl/Alt + letter** with (the `"x" | "X"` case
-    pair, `eq_ignore_ascii_case`, `NavKeys`' `Some("x") =>`, and `KeyCode::KeyX` for the physical
-    match Ctrl+Alt+L needs) and fail when one has no row, with `EXEMPT` the justified-baseline
-    escape hatch in the spirit of `contrast::UI_SHORTFALL`. Deliberately **weak**, like
-    `doc_coverage`: it catches the binding nobody wrote down, not an inaccurate row. Two rules
+    `Key::Character` spread across the files `KEY_FILES` names — so the guarantee runs the other
+    way: the tests scan those files for the **five** idioms the codebase binds a
+    **Ctrl/Alt + letter** with (the `"x" | "X"` case pair, `eq_ignore_ascii_case`, `NavKeys`'
+    `Some("x") =>` *and* its `ch == Some("x")`, and `KeyCode::KeyX` for the physical match
+    Ctrl+Alt+L needs) and fail when one has no row, with `EXEMPT` the justified-baseline
+    escape hatch in the spirit of `contrast::UI_SHORTFALL`. The equality form is where **both**
+    Ctrl+Shift+letter bindings live and was missed; the gate was green only because `p`/`t` are
+    bound a second time in the unshifted arms. `KEY_FILES` pairs each file with the `SHORTCUTS`
+    **groups** its bindings may be documented in, because a table-wide lookup let the editor's
+    Ctrl+D vouch for a grid Ctrl+D — a different key doing a different thing. Deliberately
+    **weak**, like `doc_coverage`: it catches the binding nobody wrote down, not an inaccurate
+    row, and a *named* modified key (`Ctrl+Tab`, `Ctrl+Enter`, Ctrl+1‑9) is matched as a
+    `NamedKey` and so is outside the scan entirely. Two rules
     earned their own tests — the scan skips `#[cfg(test)]` modules (a grid fixture's
     `Some("b".to_string())` was reported as a phantom Ctrl+B, and a gate that cries wolf gets
     deleted) and each idiom is pinned against synthetic input, since a scan that silently stops
@@ -649,8 +656,10 @@ Zed-inspired, aiming to replace DataGrip.
     since `Run` runs all statements while Ctrl+Enter runs the one under the caret, `Terminal` and
     `Ask AI` act on an argument where the keys only toggle a panel, and `Toggle Panel` names its
     panel as an argument so it has three bindings and therefore none. A nearly-right keycap is worse
-    than none: it teaches a key that does something else. The string must be **byte-identical** to a
-    `SHORTCUTS` row (tested), so the palette can't advertise what the modal doesn't document; the
+    than none: it teaches a key that does something else. Each entry carries its row's **group**
+    as well as the key string, which must be **byte-identical** to a `SHORTCUTS` row in that group
+    (tested) — the table has two `Ctrl+G` rows meaning different things, so a string match alone
+    let either vouch for the keycap; the
     other half — that each name still names a live command — can only be checked against a built
     registry, so it rides `overlays::assert_names_match_labels`' `debug_assert`, without which a
     renamed command would drop its keycap in silence.
