@@ -304,37 +304,11 @@ fn history_row(
     // failed. Absent entirely when the outcome is unknown (recorded before this
     // was tracked, cancelled, or a run the app didn't outlive), since every part
     // of the line would then be a guess.
-    let outcome_row: Option<floem::AnyView> = match entry.outcome {
-        history::Outcome::Unknown => None,
-        outcome => {
-            let failed = outcome == history::Outcome::Failed;
-            // Duration first, then either the rows or the failure — the two are
-            // exclusive: a run that failed produced nothing to count.
-            let mut facts: Vec<String> = Vec::new();
-            if let Some(ms) = entry.duration_ms {
-                facts.push(history::format_duration(ms));
-            }
-            if let Some(n) = entry.rows.filter(|_| !failed) {
-                // `200000+ rows` when the fetch stopped at the cap: that number
-                // is what came back, not what the query returned, and only the
-                // `+` says so once the grid is gone. Always plural there — the
-                // count means "at least this many", so it is never one.
-                if entry.rows_capped {
-                    facts.push(format!("{n}+ rows"));
-                } else {
-                    let word = schemaic_core::text::plural(n as usize, "row", "rows");
-                    facts.push(format!("{n} {word}"));
-                }
-            }
-            // The trailing separator belongs to the facts, so a row with none of
-            // them doesn't open with a stray "· ".
-            let lead = if facts.is_empty() {
-                String::new()
-            } else if failed {
-                format!("{} · ", facts.join(" · "))
-            } else {
-                facts.join(" · ")
-            };
+    let outcome_row: Option<floem::AnyView> = {
+        // The composition is `history::outcome_line`'s, in core beside the
+        // `format_duration` it calls and under test; this only paints it.
+        let failed = entry.outcome == history::Outcome::Failed;
+        history::outcome_line(&entry).map(|lead| {
             let row = h_stack((
                 text(lead).style(|s| {
                     s.font_size(FONT_LABEL)
@@ -349,8 +323,8 @@ fn history_row(
                 }),
             ))
             .style(|s| s.items_center().width_full());
-            Some(row.into_any())
-        }
+            row.into_any()
+        })
     };
 
     // The originating tab's custom name (if any) on its own line below the footer,

@@ -148,12 +148,18 @@ pub struct HistoryFile {
 /// re-run bubbles to the top with a fresh timestamp instead of stacking copies.
 /// Then the connection is trimmed to its newest [`MAX_PER_CONN`] entries (other
 /// connections untouched).
-pub fn push(entries: &mut Vec<HistoryEntry>, entry: HistoryEntry, dialect: SqlDialect) {
+///
+/// Returns whether anything was recorded, so the caller can skip the file write
+/// — the same skip its sibling [`finish`]'s caller documents. A credential-bearing
+/// statement records nothing and used to cost a whole atomic rewrite of
+/// `history.json` (clone, serialize, temp file, read-back, `.bak`, rename) for it.
+#[must_use = "a `false` means nothing was recorded, so the file write can be skipped"]
+pub fn push(entries: &mut Vec<HistoryEntry>, entry: HistoryEntry, dialect: SqlDialect) -> bool {
     if entry.sql.trim().is_empty() {
-        return;
+        return false;
     }
     if sql::carries_credential(&entry.sql, dialect) {
-        return;
+        return false;
     }
     let conn = entry.conn_id;
     // Drop any earlier identical query for this connection (exact SQL match).
@@ -171,6 +177,76 @@ pub fn push(entries: &mut Vec<HistoryEntry>, entry: HistoryEntry, dialect: SqlDi
             true
         }
     });
+    true
+}
+
+/// Drop the entries for runs that never reached a verdict, by `run_id`. Returns
+/// whether anything went.
+///
+/// **What a stopped script leaves behind.** Every statement is recorded at
+/// launch, because an entry has to exist while the query is still running — but
+/// a batch stops at its first failure, and the statements after it are reported
+/// `Cancelled` without ever being dispatched. A 60-statement script failing at
+/// statement 2 therefore pushed all 60, and [`MAX_PER_CONN`] evicted the
+/// connection's 50 real entries in favour of 48 statements that never ran; with
+/// [`Outcome::Unknown`] on each, nothing on screen distinguished them from a run
+/// the user cancelled.
+///
+/// Deliberately **not** applied to a single run: one the user cancels *was*
+/// dispatched, may have written something, and is the entry they are most
+/// likely to want back. This is about the tail of a script, where the statements
+/// are noise that pushes real history out.
+pub fn drop_runs(entries: &mut Vec<HistoryEntry>, run_ids: &[u64]) -> bool {
+    if run_ids.is_empty() {
+        return false;
+    }
+    let before = entries.len();
+    entries.retain(|e| !run_ids.contains(&e.run_id));
+    entries.len() != before
+}
+
+impl RunResult {
+    /// What a run that produced a result set records.
+    ///
+    /// `affected` is the server's own count for a write and `None` for exactly
+    /// the row-returning case, so the row count is one or the other — never both
+    /// and never a guess.
+    ///
+    /// A fetch that stopped at the row cap carries `rows_capped`, because its
+    /// count *is* the cap: without it the entry claims a five-million-row table
+    /// returned exactly 200,000, and the grid that said "truncated" is long gone
+    /// by the time anyone reads the history. `affected` is never capped, which
+    /// is why the flag is gated on its absence.
+    ///
+    /// In core, with the arithmetic under test, because both run paths reach it
+    /// — a single run and each statement of Run Everything — and a wrong
+    /// `rows_capped` writes a number into a log read long after the grid it came
+    /// from.
+    pub fn loaded(
+        duration_ms: u64,
+        affected: Option<u64>,
+        row_count: u64,
+        truncated: bool,
+    ) -> Self {
+        RunResult {
+            duration_ms,
+            rows: Some(affected.unwrap_or(row_count)),
+            rows_capped: affected.is_none() && truncated,
+            ok: true,
+        }
+    }
+
+    /// What a run that failed records: no row count, and **its duration kept** —
+    /// a statement that spent fifty seconds behind someone else's row lock is
+    /// the case worth finding later.
+    pub fn failed(duration_ms: u64) -> Self {
+        RunResult {
+            duration_ms,
+            rows: None,
+            rows_capped: false,
+            ok: false,
+        }
+    }
 }
 
 /// Record how a run turned out, onto the entry [`push`] wrote when it launched.
@@ -309,10 +385,49 @@ pub fn count_conn(entries: &[HistoryEntry], conn_id: u64) -> usize {
     entries.iter().filter(|e| e.conn_id == conn_id).count()
 }
 
+/// How much of a statement [`preview`] keeps.
+///
+/// The panel wraps a preview to a few rows and clips the rest, but `clip()` and
+/// `max_height` bound **paint**, not layout: a multi-MB `INSERT` was laid out
+/// whole on every rebuild of the panel, and with a one-character search term the
+/// highlighter's span-splitting ran over every byte of it too. Generous enough
+/// that no ordinary statement is touched, and the panel already shows only the
+/// first few lines of one that is.
+pub const PREVIEW_MAX: usize = 2_000;
+
 /// A compact single-line preview of a SQL statement: runs of whitespace
 /// (including newlines) collapse to one space, so a multi-line statement reads as
 /// one flowing line that the UI can wrap to a few rows.
+///
+/// Clamped to [`PREVIEW_MAX`] bytes, at a char boundary, with an ellipsis. The
+/// *stored* SQL is untouched — [`matches_query`] still searches all of it, so a
+/// term that appears past the clamp still finds its entry, and re-running an
+/// entry re-runs the whole statement.
 pub fn preview(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len().min(PREVIEW_MAX + 1));
+    for (i, word) in sql.split_whitespace().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(word);
+        if out.len() >= PREVIEW_MAX {
+            // On a char boundary: `PREVIEW_MAX` counts bytes, and a word can
+            // straddle it.
+            let cut = (0..=PREVIEW_MAX).rev().find(|i| out.is_char_boundary(*i));
+            out.truncate(cut.unwrap_or(0));
+            out.push('…');
+            break;
+        }
+    }
+    out
+}
+
+/// [`preview`] without the clamp — what a *search* reads.
+///
+/// The two are separate so a term past [`PREVIEW_MAX`] still finds its entry:
+/// clamping what is drawn is a rendering decision, and it must not quietly become
+/// a decision about what is findable.
+fn full_preview(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -327,7 +442,7 @@ pub fn matches_query(entry: &HistoryEntry, query: &str) -> bool {
     if q.is_empty() {
         return true;
     }
-    contains_ignore_ascii_case(&preview(&entry.sql), q)
+    contains_ignore_ascii_case(&full_preview(&entry.sql), q)
         || entry
             .database
             .as_deref()
@@ -336,6 +451,54 @@ pub fn matches_query(entry: &HistoryEntry, query: &str) -> bool {
             .tab_name
             .as_deref()
             .is_some_and(|t| contains_ignore_ascii_case(t, q))
+}
+
+/// The facts line under a history row's SQL — `5 ms · 100 rows`, or the
+/// `4 ms · ` lead a red **Failed** follows.
+///
+/// Returns `None` when the outcome is [`Outcome::Unknown`] (recorded before this
+/// was tracked, cancelled, or a run the app didn't outlive), because every part
+/// of the line would then be a guess. A success is deliberately *not* labelled:
+/// the row count **is** the success, and a word saying so on every row would
+/// drown the one row that failed.
+///
+/// The trailing separator belongs to the facts, so a row with none of them
+/// doesn't open with a stray `· `.
+///
+/// In core rather than in the view builder, beside the `format_duration` it
+/// calls: it is three composition decisions (which facts, the `+` on a capped
+/// count, where the separator goes) and each has a wrong answer that reads as a
+/// number the query never produced.
+pub fn outcome_line(entry: &HistoryEntry) -> Option<String> {
+    if entry.outcome == Outcome::Unknown {
+        return None;
+    }
+    let failed = entry.outcome == Outcome::Failed;
+    // Duration first, then either the rows or the failure — the two are
+    // exclusive: a run that failed produced nothing to count.
+    let mut facts: Vec<String> = Vec::new();
+    if let Some(ms) = entry.duration_ms {
+        facts.push(format_duration(ms));
+    }
+    if let Some(n) = entry.rows.filter(|_| !failed) {
+        // `200000+ rows` when the fetch stopped at the cap: that number is what
+        // came back, not what the query returned, and only the `+` says so once
+        // the grid is gone. Always plural there — the count means "at least this
+        // many", so it is never one.
+        if entry.rows_capped {
+            facts.push(format!("{n}+ rows"));
+        } else {
+            facts.push(format!(
+                "{n} {}",
+                crate::text::plural(n as usize, "row", "rows")
+            ));
+        }
+    }
+    Some(match (facts.is_empty(), failed) {
+        (true, _) => String::new(),
+        (false, true) => format!("{} · ", facts.join(" · ")),
+        (false, false) => facts.join(" · "),
+    })
 }
 
 /// Human "time ago" for a history timestamp, given the current time (both unix
@@ -551,6 +714,12 @@ mod tests {
     /// The header and the row beneath it are read together, so they must not be
     /// able to disagree: nothing labelled "Nd ago" with N < 7 may sit under
     /// EARLIER, and nothing labelled in hours may sit outside TODAY.
+    ///
+    /// The EARLIER arm is **exact**. It used to accept either suffix, which made
+    /// it vacuous: `bucket` and `relative_time` cross over at the same threshold
+    /// by construction, so moving the week boundary to three days left the suite
+    /// green — the exact drift the pin exists to catch. `d ago` under EARLIER is
+    /// the failure, and it is what the loose form allowed.
     #[test]
     fn buckets_agree_with_the_relative_labels_they_sit_over() {
         let now = 100 * DAY;
@@ -560,10 +729,7 @@ mod tests {
             match bucket(ts, now) {
                 Bucket::Today => assert!(!label.ends_with("d ago"), "{label}"),
                 Bucket::ThisWeek => assert!(label.ends_with("d ago"), "{label}"),
-                Bucket::Earlier => assert!(
-                    label.ends_with("w ago") || label.ends_with("d ago"),
-                    "{label}"
-                ),
+                Bucket::Earlier => assert!(label.ends_with("w ago"), "{label}"),
             }
         }
     }
@@ -623,7 +789,166 @@ mod tests {
 
     /// The tests that aren't about the dialect record as MySQL.
     fn push(entries: &mut Vec<HistoryEntry>, e: HistoryEntry) {
-        push_with(entries, e, SqlDialect::MySql);
+        let _ = push_with(entries, e, SqlDialect::MySql);
+    }
+
+    /// The write to `history.json` is a clone of the whole cross-connection
+    /// vector, a serialize, and an atomic file dance — worth skipping when the
+    /// push recorded nothing at all.
+    #[test]
+    fn push_reports_whether_it_recorded_anything() {
+        let mut v = Vec::new();
+        assert!(push_with(
+            &mut v,
+            entry(1, "SELECT 1", 100),
+            SqlDialect::MySql
+        ));
+        assert!(!push_with(&mut v, entry(1, "   ", 200), SqlDialect::MySql));
+        assert!(!push_with(
+            &mut v,
+            entry(1, "CREATE USER 'a'@'%' IDENTIFIED BY 'hunter2'", 300),
+            SqlDialect::MySql
+        ));
+        assert_eq!(v.len(), 1);
+    }
+
+    /// **The tail of a script that stopped.** Every statement is recorded at
+    /// launch, because an entry has to exist while a query is in flight — but a
+    /// batch stops at its first failure and reports the rest `Cancelled` without
+    /// dispatching them. A 60-statement script failing at statement 2 evicted the
+    /// connection's real history in favour of 48 statements that never ran.
+    #[test]
+    fn drop_runs_removes_the_statements_that_never_ran() {
+        let mut v = vec![entry(1, "c", 3), entry(1, "b", 2), entry(1, "a", 1)];
+        assert!(drop_runs(&mut v, &[2, 3]));
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].sql, "a");
+    }
+
+    #[test]
+    fn drop_runs_with_nothing_to_drop_reports_no_change() {
+        let mut v = vec![entry(1, "a", 1)];
+        assert!(!drop_runs(&mut v, &[]));
+        assert!(!drop_runs(&mut v, &[99]), "a run id that isn't here");
+        assert_eq!(v.len(), 1);
+    }
+
+    /// `max_height` and `clip()` bound **paint**, not layout, so an unclamped
+    /// multi-MB statement was laid out whole on every rebuild of the panel.
+    #[test]
+    fn preview_clamps_a_huge_statement() {
+        let long = format!("SELECT {}", "x".repeat(PREVIEW_MAX * 3));
+        let p = preview(&long);
+        assert!(p.len() <= PREVIEW_MAX + 4, "{} bytes", p.len());
+        assert!(p.ends_with('…'));
+        // An ordinary statement is untouched, ellipsis included.
+        assert_eq!(preview("SELECT 1\n  FROM t"), "SELECT 1 FROM t");
+    }
+
+    /// Clamping what is *drawn* must not quietly become a decision about what is
+    /// *findable*: the search still reads the whole statement.
+    #[test]
+    fn a_term_past_the_preview_clamp_is_still_found() {
+        let sql = format!("SELECT {} needle", "x ".repeat(PREVIEW_MAX));
+        let mut e = entry(1, &sql, 1);
+        e.sql = sql;
+        assert!(!preview(&e.sql).contains("needle"));
+        assert!(matches_query(&e, "needle"));
+    }
+
+    /// The clamp counts bytes and a word can straddle it — truncating there
+    /// panics on a char boundary.
+    #[test]
+    fn preview_clamps_on_a_char_boundary() {
+        let sql = "é".repeat(PREVIEW_MAX);
+        assert!(preview(&sql).ends_with('…'));
+    }
+
+    /// The row count is one of two things and never a guess: `affected` for a
+    /// write, the returned count for a `SELECT`.
+    #[test]
+    fn a_loaded_run_records_affected_over_the_row_count() {
+        assert_eq!(RunResult::loaded(5, Some(3), 0, false).rows, Some(3));
+        assert_eq!(RunResult::loaded(5, None, 42, false).rows, Some(42));
+    }
+
+    /// A capped fetch's count *is* the cap, and only the flag says so once the
+    /// grid is gone. `affected` is the server's own number and is never capped.
+    #[test]
+    fn only_a_capped_fetch_is_marked_capped() {
+        assert!(RunResult::loaded(5, None, 200_000, true).rows_capped);
+        assert!(!RunResult::loaded(5, None, 200_000, false).rows_capped);
+        assert!(
+            !RunResult::loaded(5, Some(200_000), 0, true).rows_capped,
+            "an affected count is the server's own"
+        );
+    }
+
+    /// A failure keeps its duration — a statement that spent fifty seconds
+    /// behind someone else's row lock is the case worth finding later.
+    #[test]
+    fn a_failed_run_keeps_its_duration_and_counts_nothing() {
+        let r = RunResult::failed(50_000);
+        assert_eq!(r.duration_ms, 50_000);
+        assert_eq!(r.rows, None);
+        assert!(!r.ok);
+        assert!(!r.rows_capped);
+    }
+
+    fn finished(rows: Option<u64>, capped: bool, ok: bool) -> HistoryEntry {
+        let mut e = entry(1, "SELECT 1", 1);
+        e.duration_ms = Some(5);
+        e.rows = rows;
+        e.rows_capped = capped;
+        e.outcome = if ok { Outcome::Ok } else { Outcome::Failed };
+        e
+    }
+
+    /// A success is deliberately unlabelled — the row count *is* the success,
+    /// and a word saying so on every row would drown the one row that failed.
+    #[test]
+    fn the_outcome_line_states_the_facts_and_names_only_a_failure() {
+        assert_eq!(
+            outcome_line(&finished(Some(100), false, true)).as_deref(),
+            Some("5ms · 100 rows")
+        );
+        assert_eq!(
+            outcome_line(&finished(Some(1), false, true)).as_deref(),
+            Some("5ms · 1 row"),
+            "the singular follows the true count"
+        );
+    }
+
+    /// A capped count means "at least this many", so it is never one — and the
+    /// `+` is all that says so once the grid is gone.
+    #[test]
+    fn a_capped_count_is_marked_and_always_plural() {
+        assert_eq!(
+            outcome_line(&finished(Some(200_000), true, true)).as_deref(),
+            Some("5ms · 200000+ rows")
+        );
+    }
+
+    /// The trailing separator belongs to the facts, so the red **Failed** the
+    /// view paints after it never opens with a stray `· `. A failure counts no
+    /// rows, even if the entry somehow carries some.
+    #[test]
+    fn a_failure_leaves_a_trailing_separator_and_no_row_count() {
+        assert_eq!(
+            outcome_line(&finished(Some(9), false, false)).as_deref(),
+            Some("5ms · ")
+        );
+        let mut e = finished(None, false, false);
+        e.duration_ms = None;
+        assert_eq!(outcome_line(&e).as_deref(), Some(""), "no stray separator");
+    }
+
+    /// Unknown means every part of the line would be a guess, so there is no
+    /// line — a run recorded before this was tracked, cancelled, or one the app
+    /// didn't outlive.
+    #[test]
+    fn an_unknown_outcome_has_no_line_at_all() {
+        assert_eq!(outcome_line(&entry(1, "SELECT 1", 1)), None);
     }
 
     #[test]
