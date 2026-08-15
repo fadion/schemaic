@@ -629,6 +629,17 @@ Zed-inspired, aiming to replace DataGrip.
     matching still passes a test that looks for what's missing. Only **modified letters** are
     gated: plain keys are bound in dozens of places for ordinary navigation, so gating them is all
     noise, and they're what a user tries anyway.
+    `COMMAND_KEYS`/`command_keys` is the second consumer: the **command palette** shows a row's
+    binding as a keycap at its far right, which is where someone who can't remember a key actually
+    looks. Only where the command does *the same thing* the key does — a narrower set than it looks,
+    since `Run` runs all statements while Ctrl+Enter runs the one under the caret, `Terminal` and
+    `Ask AI` act on an argument where the keys only toggle a panel, and `Toggle Panel` names its
+    panel as an argument so it has three bindings and therefore none. A nearly-right keycap is worse
+    than none: it teaches a key that does something else. The string must be **byte-identical** to a
+    `SHORTCUTS` row (tested), so the palette can't advertise what the modal doesn't document; the
+    other half — that each name still names a live command — can only be checked against a built
+    registry, so it rides `overlays::assert_names_match_labels`' `debug_assert`, without which a
+    renamed command would drop its keycap in silence.
   - `connection_form.rs` — Manage Connections modal + password-mask (+ tests).
   - `diff_view.rs` — Ctrl+K diff preview. `history_panel.rs` — Query History right-column panel.
   - `plan_view.rs` — Query Plan modal (`EXPLAIN`/`EXPLAIN ANALYZE` table + warnings + "Ask AI"),

@@ -54,7 +54,10 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
             ("Ctrl+Shift+P", "Command palette"),
             ("Ctrl+T", "New query tab"),
             ("Ctrl+W", "Close query tab"),
-            ("Ctrl+Tab", "Cycle tabs (Shift = reverse)"),
+            // Split rather than "Ctrl+Tab (Shift = reverse)": the palette shows a
+            // command's own keys, and Previous Tab needs a row of its own to name.
+            ("Ctrl+Tab", "Next tab"),
+            ("Ctrl+Shift+Tab", "Previous tab"),
             ("Ctrl+1…9", "Jump to tab"),
             ("Ctrl+Shift+T", "Reopen last closed tab"),
             ("Ctrl+Shift+E", "Toggle schema panel"),
@@ -114,9 +117,39 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
     ),
 ];
 
+/// The keys a **command palette** entry should display, by the command's `name`.
+///
+/// Only where the command does *the same thing* the key does, which is a
+/// narrower set than it looks. `Run` runs all statements while Ctrl+Enter runs
+/// the one under the caret; `Terminal` and `Ask AI` take an argument and act on
+/// it, where Ctrl+` and Ctrl+Shift+A only toggle a panel; `Toggle Panel` names
+/// its panel as an argument, so it has three bindings and therefore none.
+/// Showing a nearly-right binding on a row is worse than showing none — it
+/// teaches a key that does something else.
+///
+/// The keys string must be *byte-identical* to a [`SHORTCUTS`] row, which
+/// [`tests::every_command_key_is_a_real_shortcut`] enforces, so the palette can
+/// never advertise a binding the modal doesn't document or the app doesn't have.
+pub(crate) const COMMAND_KEYS: &[(&str, &str)] = &[
+    ("new tab", "Ctrl+T"),
+    ("close tab", "Ctrl+W"),
+    ("next tab", "Ctrl+Tab"),
+    ("previous tab", "Ctrl+Shift+Tab"),
+    ("format code", "Ctrl+Alt+L"),
+    ("go to line", "Ctrl+G"),
+];
+
+/// The keys to show on a palette row for the command called `name`.
+pub(crate) fn command_keys(name: &str) -> Option<&'static str> {
+    COMMAND_KEYS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, k)| *k)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::SHORTCUTS;
+    use super::{COMMAND_KEYS, SHORTCUTS, command_keys};
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
@@ -373,6 +406,47 @@ mod tests {
             !documented('r'),
             "no Ctrl+R, and `Enter`/`Recall` must not count"
         );
+    }
+
+    /// The palette may only advertise a binding the modal documents, spelled
+    /// identically. Without this the two lists drift into disagreeing about the
+    /// same key, which is worse than either being merely incomplete.
+    #[test]
+    fn every_command_key_is_a_real_shortcut() {
+        let all: Vec<&str> = SHORTCUTS
+            .iter()
+            .flat_map(|(_, rows)| rows.iter().map(|(keys, _)| *keys))
+            .collect();
+        for (name, keys) in COMMAND_KEYS {
+            assert!(
+                all.contains(keys),
+                "palette command {name:?} shows {keys:?}, which is not a SHORTCUTS row — \
+                 add the row, or fix the spelling to match one exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn command_keys_looks_up_by_name_and_misses_cleanly() {
+        assert_eq!(command_keys("go to line"), Some("Ctrl+G"));
+        assert_eq!(command_keys("previous tab"), Some("Ctrl+Shift+Tab"));
+        // A command with no binding, and one that doesn't exist, both yield None
+        // — the row simply shows no keys.
+        assert_eq!(command_keys("duplicate tab"), None);
+        assert_eq!(command_keys("nonexistent"), None);
+        // Names are the palette's lowercased labels; a label-cased lookup is a
+        // miss rather than a silent match on the wrong thing.
+        assert_eq!(command_keys("Go to Line"), None);
+    }
+
+    /// A command name is what the parser matches and what Tab completes, so a
+    /// duplicate here would make one of the two entries dead.
+    #[test]
+    fn command_keys_names_are_unique() {
+        let mut seen = BTreeSet::new();
+        for (name, _) in COMMAND_KEYS {
+            assert!(seen.insert(*name), "duplicate COMMAND_KEYS entry {name:?}");
+        }
     }
 
     #[test]

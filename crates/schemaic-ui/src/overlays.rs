@@ -1268,6 +1268,24 @@ struct PaletteItem {
     /// A trailing (right-aligned) icon glyph — the rotate-ccw-clock on search-history
     /// rows; `None` for everything else.
     right_icon: Option<&'static str>,
+    /// The keyboard shortcut for this row's action, shown as a keycap at the far
+    /// right — `None` when the action has no binding, which is most rows.
+    ///
+    /// Comes from `shortcuts::command_keys`, so it can only ever be a binding the
+    /// Shortcuts modal also documents. This is where people look for a key: the
+    /// palette is what they open when they can't remember one.
+    ///
+    /// **Set it on every row whose `primary` is the command's own label**, which
+    /// means all four states an argument-command passes through as you type: the
+    /// command list, the just-completed row, a valid argument, and the "enter a
+    /// number" hint. Wiring only the first two made the keycap vanish the moment
+    /// Tab *selected* the command — the keystroke right after the one that
+    /// revealed the binding, and while the user was still reading it.
+    ///
+    /// The exception is an **option** row (`CmdArg::Options`), whose `primary` is
+    /// the option's label — "One Dark Pro", not "Editor Theme". That row runs one
+    /// choice of the command, which no key is bound to, so it carries none.
+    keys: Option<&'static str>,
 }
 
 /// The schema-style leading icon for a Find-Anywhere hit — mirrors the schema
@@ -1436,6 +1454,8 @@ fn object_result_item(
         match_term,
         icon: Some(ResultIcon::Object(kind)),
         right_icon: history.then_some(icons::ROTATE_CCW_CLOCK),
+        // A schema hit is a place, not an action — nothing binds a key to it.
+        keys: None,
     }
 }
 
@@ -1517,6 +1537,8 @@ fn search_result_item(
         match_term,
         icon: left_icon,
         right_icon: history.then_some(icons::ROTATE_CCW_CLOCK),
+        // A schema hit is a place, not an action — nothing binds a key to it.
+        keys: None,
     }
 }
 
@@ -1604,7 +1626,20 @@ impl Command {
 /// `schemaic_core::palette::parse` documents but cannot verify from inside — no
 /// argument-command name may be a word-prefix of another, or the longer one
 /// becomes unreachable.
+///
+/// And the half of the keycap mapping that no static test can reach:
+/// `shortcuts::COMMAND_KEYS` is checked against `SHORTCUTS` in that module, but
+/// only a built registry can say whether its *names* still name anything. A
+/// renamed command would otherwise drop its keycap in silence.
 fn assert_names_match_labels(cmds: &[Command]) {
+    for (name, keys) in crate::shortcuts::COMMAND_KEYS {
+        debug_assert!(
+            cmds.iter().any(|c| c.name == *name),
+            "shortcuts::COMMAND_KEYS maps {name:?} to {keys:?}, but no palette \
+             command is called that — it was renamed, and the keycap silently \
+             stopped showing"
+        );
+    }
     for c in cmds {
         debug_assert_eq!(
             c.name,
@@ -1892,6 +1927,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                                     match_term: Some(arg.to_string()),
                                     icon: None,
                                     right_icon: None,
+                                    keys: None,
                                 }
                             })
                             .collect()
@@ -1914,7 +1950,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                 Rc::new(move |arg: &str| {
                     let arg = arg.trim();
                     if arg.is_empty() {
-                        return vec![hint_item("Ask AI", "Type a prompt…")];
+                        return vec![hint_item("Ask AI", "Type a prompt…", None)];
                     }
                     let prompt = arg.to_string();
                     let ai_send = ai_send.clone();
@@ -1931,6 +1967,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                         match_term: None,
                         icon: None,
                         right_icon: None,
+                        keys: None,
                     }]
                 })
             }),
@@ -1944,7 +1981,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                 Rc::new(move |arg: &str| {
                     let arg = arg.trim();
                     if arg.is_empty() {
-                        return vec![hint_item("Run in Terminal", "Type a command…")];
+                        return vec![hint_item("Run in Terminal", "Type a command…", None)];
                     }
                     let cmd = arg.to_string();
                     let term_input = term_input.clone();
@@ -1961,6 +1998,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                         match_term: None,
                         icon: None,
                         right_icon: None,
+                        keys: None,
                     }]
                 })
             }),
@@ -2134,8 +2172,13 @@ fn cycle_tab(
 }
 
 /// A non-actionable informational row (Enter does nothing, palette stays open).
-fn hint_item(primary: &str, secondary: &str) -> PaletteItem {
+///
+/// Takes `keys` because a hint is one of the states an argument-command's row
+/// passes through while you type — see [`PaletteItem::keys`] on why the keycap
+/// has to survive all of them.
+fn hint_item(primary: &str, secondary: &str, keys: Option<&'static str>) -> PaletteItem {
     PaletteItem {
+        keys,
         primary: primary.to_string(),
         secondary: secondary.to_string(),
         activate: Rc::new(|| {}),
@@ -2291,6 +2334,10 @@ fn build_items(
                         match_term: Some(f.clone()),
                         icon: None,
                         right_icon: None,
+                        // The command list is the one place a keycap earns its
+                        // room: this is what people open when they can't
+                        // remember the key.
+                        keys: crate::shortcuts::command_keys(c.name),
                     }
                 })
                 .collect()
@@ -2309,6 +2356,7 @@ fn build_items(
                     match_term: None,
                     icon: None,
                     right_icon: None,
+                    keys: crate::shortcuts::command_keys(c.name),
                 }],
                 CmdArg::Options { list, run } => {
                     let a = arg.trim().to_lowercase();
@@ -2338,6 +2386,7 @@ fn build_items(
                                 match_term: Some(a.clone()),
                                 icon: None,
                                 right_icon: None,
+                                keys: None,
                             }
                         })
                         .collect()
@@ -2348,6 +2397,12 @@ fn build_items(
                     run,
                     empty,
                 } => {
+                    // The keycap rides every state of this row. Tab-completing
+                    // `>go` to `>Go to Line ` moves the row from the command list
+                    // into this branch, and dropping it here made the binding
+                    // blink out of existence on the keystroke that *selected* the
+                    // command — which is exactly when it was being read.
+                    let keys = crate::shortcuts::command_keys(c.name);
                     let t = arg.trim();
                     if t.is_empty() {
                         return match empty {
@@ -2359,8 +2414,9 @@ fn build_items(
                                 match_term: None,
                                 icon: None,
                                 right_icon: None,
+                                keys,
                             }],
-                            None => vec![hint_item(c.label, c.hint)],
+                            None => vec![hint_item(c.label, c.hint, keys)],
                         };
                     }
                     match t.parse::<i64>() {
@@ -2375,9 +2431,10 @@ fn build_items(
                                 match_term: None,
                                 icon: None,
                                 right_icon: None,
+                                keys,
                             }]
                         }
-                        Err(_) => vec![hint_item(c.label, "Enter a number")],
+                        Err(_) => vec![hint_item(c.label, "Enter a number", keys)],
                     }
                 }
                 CmdArg::Text(f) => f(&arg),
@@ -2633,9 +2690,32 @@ pub(crate) fn find_overlay(ui: Ui) -> impl IntoView {
                                 .style(|s| s.color(theme::text_muted()).font_size(14.0))
                                 .into_any(),
                         );
-                        // Trailing history marker, pushed to the far right by a spacer.
-                        if let Some(ri) = item.right_icon {
+                        // Trailing keycap and history marker, pushed to the far
+                        // right by a single spacer — two spacers would split the
+                        // free space between them and strand the keycap mid-row.
+                        if item.keys.is_some() || item.right_icon.is_some() {
                             cells.push(empty().style(|s| s.flex_grow(1.0_f32)).into_any());
+                        }
+                        if let Some(keys) = item.keys {
+                            // The Shortcuts modal's keycap, one size down: same
+                            // mono face, surface and radius, so a binding looks
+                            // like itself wherever the app shows it.
+                            cells.push(
+                                text(keys)
+                                    .style(|s| {
+                                        s.color(theme::text_muted())
+                                            .font_size(theme::FONT_LABEL)
+                                            .font_family("IBM Plex Mono".to_string())
+                                            .background(theme::bg_deepest())
+                                            .padding_horiz(6.0)
+                                            .padding_vert(1.0)
+                                            .border_radius(4.0)
+                                            .flex_shrink(0.0_f32)
+                                    })
+                                    .into_any(),
+                            );
+                        }
+                        if let Some(ri) = item.right_icon {
                             cells.push(
                                 icons::icon(ri, 15.0)
                                     .style(|s| s.color(theme::text_faint()).flex_shrink(0.0_f32))
