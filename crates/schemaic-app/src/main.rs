@@ -77,8 +77,10 @@ struct ClosedTab {
     /// The original "Query N" number, restored on reopen when no live tab claims it.
     label: usize,
 }
-/// Record one executed query into history: `(conn_id, database, sql, tab_name)`.
-type RecordHistoryFn = Rc<dyn Fn(u64, Option<String>, String, Option<String>)>;
+/// Record one executed query into history: `(conn_id, database, sql, tab_name)`,
+/// returning the **run id** it was recorded under — what
+/// [`FinishHistoryFn`] later reports that run's outcome against.
+type RecordHistoryFn = Rc<dyn Fn(u64, Option<String>, String, Option<String>) -> u64>;
 
 /// Resolve the pinned session a tab's statements must run on: `Ok(None)` in
 /// Auto-commit (fresh connection per op, as everywhere else), `Err` when the tab
@@ -98,12 +100,12 @@ type GuardTxFn = Rc<dyn Fn(usize, Rc<dyn Fn()>, Option<Rc<dyn Fn()>>)>;
 /// initial load, the connection-wide Refresh and the per-database Refresh all
 /// take, so what the tree shows while a fetch is out is decided once.
 type FetchSchemaFn = Rc<dyn Fn(&ConnNode, Db)>;
-/// Record how one or more runs turned out — `(connection, the statements and
-/// their outcomes)` — onto the history entries their launch already wrote.
+/// Record how one or more runs turned out — `(run id, outcome)` per run — onto
+/// the history entries their launch already wrote.
 ///
-/// A **slice**, not one statement, because Run Everything lands a whole batch at
-/// once and each recorded run costs a full rewrite of `history.json`.
-type FinishHistoryFn = Rc<dyn Fn(u64, &[(String, schemaic_core::history::RunResult)])>;
+/// A **slice**, not one run, because Run Everything lands a whole batch at once
+/// and each recorded run costs a full rewrite of `history.json`.
+type FinishHistoryFn = Rc<dyn Fn(&[(u64, schemaic_core::history::RunResult)])>;
 use schemaic_core::filter::{Order, table_query};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::persist::{self, ConnectionsFile, UiState};
@@ -1049,9 +1051,20 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let (ai_tx, ai_rx) = crossbeam_channel::unbounded::<AiStreamMsg>();
     let ai_stream = create_signal_from_channel(ai_rx);
 
+    // Run ids, handed out by `record_history` and quoted back by
+    // `finish_history` — see `HistoryEntry::run_id`. Seeded past every id on
+    // disk, and only ever counting up, so an id can't be reused while the run
+    // holding it is still in flight (which re-deriving `max + 1` per push would
+    // allow, once the per-connection cap evicted the entry holding the maximum).
+    let run_ids: Rc<Cell<u64>> =
+        Rc::new(Cell::new(history_entries.with_untracked(|v| {
+            v.iter().map(|e| e.run_id).max().unwrap_or(0)
+        })));
+
     // Record an executed query into the history (newest-first, capped) and persist
     // it. Called from every run path (single Run, Run Current, Run Everything).
     let record_history: RecordHistoryFn = {
+        let run_ids = run_ids.clone();
         Rc::new(
             move |conn_id: u64, database: Option<String>, sql: String, tab_name: Option<String>| {
                 let ts = std::time::SystemTime::now()
@@ -1068,6 +1081,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                             .map(|c| SqlDialect::from_db_type(&c.db_type))
                     })
                     .unwrap_or_default();
+                let run_id = run_ids.get() + 1;
+                run_ids.set(run_id);
                 history_entries.update(|v| {
                     schemaic_core::history::push(
                         v,
@@ -1076,6 +1091,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                             database,
                             sql,
                             ts,
+                            run_id,
                             tab_name,
                             // Filled in by `finish_history` when the run lands.
                             duration_ms: None,
@@ -1092,6 +1108,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         entries: history_entries.get_untracked(),
                     },
                 );
+                run_id
             },
         )
     };
@@ -1106,12 +1123,12 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // froze the window for as long as that took. The write is also skipped
     // entirely when nothing was updated — a credential-bearing statement is
     // never recorded, and would otherwise cost a file write for nothing.
-    let finish_history: FinishHistoryFn = Rc::new(
-        move |conn_id: u64, runs: &[(String, schemaic_core::history::RunResult)]| {
+    let finish_history: FinishHistoryFn =
+        Rc::new(move |runs: &[(u64, schemaic_core::history::RunResult)]| {
             let updated = history_entries.try_update(|v| {
                 let mut any = false;
-                for (sql, result) in runs {
-                    any |= schemaic_core::history::finish(v, conn_id, sql, *result);
+                for (run_id, result) in runs {
+                    any |= schemaic_core::history::finish(v, *run_id, *result);
                 }
                 any
             });
@@ -1124,8 +1141,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     entries: history_entries.get_untracked(),
                 },
             );
-        },
-    );
+        });
 
     // Clear the active connection's history (the panel's trash button), persisting.
     let clear_history: Rc<dyn Fn()> = {
@@ -1194,14 +1210,16 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 }
             };
             let database = tab.database.get_untracked();
-            if !is_view {
+            // The run id this launch was recorded under, quoted back when it
+            // lands. `None` for a view re-run, which records no history at all.
+            let run_id = (!is_view).then(|| {
                 (record_history)(
                     tab.conn_id.get_untracked(),
                     database.clone(),
                     sql.clone(),
                     tab.name.get_untracked(),
-                );
-            }
+                )
+            });
 
             if let Some((_, old)) = tokens.borrow_mut().remove(&id) {
                 old.cancel();
@@ -1224,8 +1242,6 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             let tokens_done = tokens.clone();
             let tx_sql = sql.clone();
             let engine = tx_engine(&db);
-            let hist_sql = sql.clone();
-            let hist_conn = tab.conn_id.get_untracked();
             let finish_history = finish_history.clone();
             let send = create_ext_action(
                 cx,
@@ -1237,12 +1253,16 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         tab.tx
                             .update(|t| *t = t.on_statement(engine, &tx_sql, stmt));
                     }
-                    // History is about the *statement*, not this tab's display, so
-                    // it too is recorded before the supersede check — and only for
-                    // a run that reached a verdict (a cancelled one leaves the
-                    // entry saying it ran, which is all anyone knows).
-                    if !is_view && let Some(result) = run_result(&state, took) {
-                        (finish_history)(hist_conn, &[(hist_sql.clone(), result)]);
+                    // History is about the *run*, not this tab's display, so it
+                    // too is recorded before the supersede check — and only for a
+                    // run that reached a verdict (a cancelled one leaves the entry
+                    // saying it ran, which is all anyone knows). Quoting the id
+                    // back is what keeps a superseded run from overwriting the one
+                    // that replaced it.
+                    if let Some(run_id) = run_id
+                        && let Some(result) = run_result(&state, took)
+                    {
+                        (finish_history)(&[(run_id, result)]);
                     }
                     // Only apply if this run still owns the tab (else a newer run or
                     // a close superseded it — don't clobber their state/token).
@@ -1520,9 +1540,14 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             // Record each statement (oldest first, so the batch lands newest-last).
             let conn_id = tab.conn_id.get_untracked();
             let tab_name = tab.name.get_untracked();
-            for s in &stmts {
-                (record_history)(conn_id, database.clone(), s.clone(), tab_name.clone());
-            }
+            // One run id per statement, in the same order, quoted back when the
+            // batch lands. A statement repeated in one script de-duplicates down
+            // to a single entry, so only the later of the two ids matches — which
+            // is the run whose result the entry should be reporting.
+            let stmt_run_ids: Vec<u64> = stmts
+                .iter()
+                .map(|s| (record_history)(conn_id, database.clone(), s.clone(), tab_name.clone()))
+                .collect();
 
             if let Some((_, old)) = tokens.borrow_mut().remove(&id) {
                 old.cancel();
@@ -1569,16 +1594,16 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     // Before the supersede check, for the same reasons as a single
                     // run's — and handed over as one batch, so the whole script
                     // costs one history save rather than one per statement.
-                    let runs: Vec<(String, schemaic_core::history::RunResult)> = tx_stmts
+                    let runs: Vec<(u64, schemaic_core::history::RunResult)> = stmt_run_ids
                         .iter()
                         .zip(&states)
                         .zip(&took)
-                        .filter_map(|((sql, state), ms)| {
-                            run_result(state, *ms).map(|r| (sql.clone(), r))
+                        .filter_map(|((run_id, state), ms)| {
+                            run_result(state, *ms).map(|r| (*run_id, r))
                         })
                         .collect();
                     if !runs.is_empty() {
-                        (finish_history)(conn_id, &runs);
+                        (finish_history)(&runs);
                     }
                     // Only apply if this batch still owns the tab (see `run`).
                     if tokens_done.borrow().get(&id).map(|(g, _)| *g) != Some(generation) {

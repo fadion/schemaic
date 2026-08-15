@@ -33,6 +33,17 @@ pub struct HistoryEntry {
     /// history panel). `None` for tabs left at the default "Query N".
     #[serde(default)]
     pub tab_name: Option<String>,
+    /// Identifies this *run*, so [`finish`] can record an outcome onto the run
+    /// that produced it rather than onto whatever entry currently holds the same
+    /// statement text. Allocated by the caller from a counter that only goes up;
+    /// `0` on entries written before this existed, which no allocation returns.
+    ///
+    /// It is not a key: [`push`] still de-duplicates on `(conn_id, sql)`, which
+    /// is what keeps the log short. The id only decides *which* run a landing
+    /// outcome belongs to — and a run whose entry has since been de-duplicated
+    /// away simply finds nothing.
+    #[serde(default)]
+    pub run_id: u64,
     /// Wall-clock milliseconds the run took, or `None` while it is still
     /// unknown — see [`Outcome::Unknown`].
     ///
@@ -170,26 +181,20 @@ pub fn push(entries: &mut Vec<HistoryEntry>, entry: HistoryEntry, dialect: SqlDi
 /// running — a run the user cancels, or that the app doesn't outlive, is one
 /// they may most want to see again — and only the completion knows the outcome.
 ///
-/// Finding the entry by `(conn_id, sql)` works because [`push`] de-duplicates on
-/// exactly that pair, so a connection holds at most one entry per statement, and
-/// the first (newest) match is it.
+/// Matched on [`HistoryEntry::run_id`], not on `(conn_id, sql)`. Those identify
+/// the *statement*, and two runs of one statement can be in flight at once — two
+/// tabs on the same connection, since a second run in the *same* tab cancels the
+/// first. Keyed by statement, whichever finished last won: an `UPDATE` that
+/// blocked 50 s on a row lock in one tab would overwrite the 5 ms success the
+/// other tab had already recorded, leaving the newest run reading as failed.
+/// Keyed by run, the loser finds nothing, because [`push`] de-duplicated its
+/// entry away when the newer run launched.
 ///
-/// That key is also the limit of what this can promise: **the last completion
-/// wins, which is not always the newest run.** Two tabs on one connection
-/// running the same statement text share the one entry, and if the earlier run
-/// is the slower one it lands second and overwrites — so an entry stamped at the
-/// newer run's launch can end up reporting the older run's duration and outcome.
-/// Within a tab it can't happen: a second run cancels the first, and a cancelled
-/// run reports nothing. Recording a run id per entry would fix it, at the cost of
-/// making the de-duplication that keeps this log short answer to two keys.
-///
-/// Nothing to update is normal, not an error — history may have been cleared, or
-/// the statement never recorded at all because it carries a credential.
-pub fn finish(entries: &mut [HistoryEntry], conn_id: u64, sql: &str, result: RunResult) -> bool {
-    let Some(e) = entries
-        .iter_mut()
-        .find(|e| e.conn_id == conn_id && e.sql == sql)
-    else {
+/// Nothing to update is normal, not an error — history may have been cleared,
+/// superseded, or the statement never recorded at all because it carries a
+/// credential.
+pub fn finish(entries: &mut [HistoryEntry], run_id: u64, result: RunResult) -> bool {
+    let Some(e) = entries.iter_mut().find(|e| e.run_id == run_id) else {
         return false;
     };
     e.duration_ms = Some(result.duration_ms);
@@ -355,12 +360,15 @@ mod tests {
     use super::push as push_with;
     use super::*;
 
+    /// `ts` doubles as the run id — every entry in a test gets its own, which is
+    /// what the caller's counter guarantees in the app.
     fn entry(conn_id: u64, sql: &str, ts: u64) -> HistoryEntry {
         HistoryEntry {
             conn_id,
             database: Some("db".to_string()),
             sql: sql.to_string(),
             ts,
+            run_id: ts,
             tab_name: None,
             duration_ms: None,
             rows: None,
@@ -387,8 +395,7 @@ mod tests {
         push(&mut v, entry(1, "SELECT * FROM big", 100));
         finish(
             &mut v,
-            1,
-            "SELECT * FROM big",
+            100,
             RunResult {
                 rows_capped: true,
                 ..ok(1200, 200_000)
@@ -398,7 +405,7 @@ mod tests {
         assert!(v[0].rows_capped);
         // …and an ordinary result still says nothing of the sort.
         push(&mut v, entry(1, "SELECT 1", 200));
-        finish(&mut v, 1, "SELECT 1", ok(5, 1));
+        finish(&mut v, 200, ok(5, 1));
         assert!(!v[0].rows_capped);
     }
 
@@ -406,7 +413,7 @@ mod tests {
     fn finish_fills_in_what_the_run_turned_out_to_be() {
         let mut v = Vec::new();
         push(&mut v, entry(1, "SELECT 1", 100));
-        assert!(finish(&mut v, 1, "SELECT 1", ok(48, 150)));
+        assert!(finish(&mut v, 100, ok(48, 150)));
         assert_eq!(v[0].duration_ms, Some(48));
         assert_eq!(v[0].rows, Some(150));
         assert_eq!(v[0].outcome, Outcome::Ok);
@@ -420,8 +427,7 @@ mod tests {
         push(&mut v, entry(1, "SELECT 1", 100));
         finish(
             &mut v,
-            1,
-            "SELECT 1",
+            100,
             RunResult {
                 duration_ms: 50_000,
                 rows: None,
@@ -434,14 +440,14 @@ mod tests {
         assert_eq!(v[0].outcome, Outcome::Failed);
     }
 
-    /// Scoped to the connection, like everything else here: the same statement
-    /// text is routinely run against two servers.
+    /// The same statement text is routinely run against two servers, and each
+    /// run is its own.
     #[test]
     fn finish_leaves_another_connections_identical_query_alone() {
         let mut v = Vec::new();
         push(&mut v, entry(2, "SELECT 1", 100));
         push(&mut v, entry(1, "SELECT 1", 200));
-        finish(&mut v, 1, "SELECT 1", ok(48, 150));
+        finish(&mut v, 200, ok(48, 150));
         let other = v.iter().find(|e| e.conn_id == 2).unwrap();
         assert_eq!(other.outcome, Outcome::Unknown);
         assert_eq!(other.duration_ms, None);
@@ -454,18 +460,47 @@ mod tests {
     fn finish_is_a_no_op_when_the_entry_is_gone() {
         let mut v = Vec::new();
         push(&mut v, entry(1, "SELECT 1", 100));
-        assert!(!finish(&mut v, 1, "SELECT 2", ok(1, 1)));
-        assert!(!finish(&mut Vec::new(), 1, "SELECT 1", ok(1, 1)));
+        assert!(!finish(&mut v, 999, ok(1, 1)));
+        assert!(!finish(&mut Vec::new(), 100, ok(1, 1)));
     }
 
-    /// Only the newest match. `push` de-dupes, so a second one exists only
-    /// transiently — but if it does, the run that just finished is the recent one.
+    /// The regression this id exists for. Two tabs on one connection run the
+    /// same statement; the second launch de-duplicates the first's entry away.
+    /// When the *first* run lands later — the slow one, blocked on a lock — it
+    /// must find nothing, not overwrite the second run's result with its own.
     #[test]
-    fn finish_updates_only_the_newest_match() {
-        let mut v = vec![entry(1, "SELECT 1", 200), entry(1, "SELECT 1", 100)];
-        finish(&mut v, 1, "SELECT 1", ok(48, 150));
+    fn a_superseded_run_cannot_overwrite_the_run_that_replaced_it() {
+        let mut v = Vec::new();
+        push(&mut v, entry(1, "UPDATE t SET a=1", 100)); // tab A launches
+        push(&mut v, entry(1, "UPDATE t SET a=1", 200)); // tab B launches
+        assert_eq!(v.len(), 1, "push de-duplicates on (conn, sql)");
+        assert!(finish(&mut v, 200, ok(5, 1))); // B finishes first
+        assert!(
+            !finish(
+                &mut v,
+                100,
+                RunResult {
+                    duration_ms: 50_000,
+                    rows: None,
+                    rows_capped: false,
+                    ok: false
+                }
+            ),
+            "A's entry is gone; its outcome has nowhere to land"
+        );
         assert_eq!(v[0].outcome, Outcome::Ok);
-        assert_eq!(v[1].outcome, Outcome::Unknown);
+        assert_eq!(v[0].duration_ms, Some(5));
+    }
+
+    /// Entries written before run ids carry `0`, and no allocated id is ever `0`
+    /// (the app's counter starts at `max + 1`), so a landing run can't match one.
+    #[test]
+    fn a_legacy_entry_is_never_matched_by_a_landing_run() {
+        let json = r#"{"conn_id":1,"sql":"SELECT 1","ts":5}"#;
+        let legacy: HistoryEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(legacy.run_id, 0);
+        let mut v = vec![legacy];
+        assert!(!finish(&mut v, 1, ok(1, 1)));
     }
 
     /// `history.json` predates these three fields, and a file that fails to
