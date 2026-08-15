@@ -545,26 +545,36 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                     );
                     container(label)
                         .on_click_stop(move |_| (select)(id))
-                        // Right-click opens the row's own menu — and selects the
-                        // row first, so the form is showing the connection the
-                        // menu is about to act on. Delete has no confirmation
-                        // step, so "which one is this about" has to be answered
-                        // before it is clicked, not after. Selecting discards an
-                        // unsaved draft, but a left-click on the same row
-                        // already does that, so the gesture costs nothing new.
+                        // Right-click opens the row's own menu, and **selects on
+                        // the action, not on the click**. Both entries already
+                        // take the id, so the menu never needed the selection to
+                        // say what it is about — and selecting first meant
+                        // *opening* the menu ran `draft.load`, overwriting every
+                        // field. Select "prod", type a new password, right-click
+                        // any row to see what the menu offers, press Escape: the
+                        // typed password was gone, with nothing to undo it and no
+                        // copy in the keyring. A dismissed right-click changes
+                        // nothing everywhere else in this app.
+                        //
+                        // "Which connection is this about" is now answered where
+                        // it is asked — Delete's confirm names it.
                         .on_secondary_click_stop(move |_| {
-                            (menu_select)(id);
-                            let (dup, del) = (dup.clone(), del.clone());
+                            let (dup, del, sel) = (dup.clone(), del.clone(), menu_select.clone());
+                            let sel_del = sel.clone();
                             popup_anchor.set(None);
                             popup_width.set(CONN_MENU_W);
                             popup_menu.set(Some(vec![
-                                MenuEntry::action("Duplicate", move || (dup)(id)),
-                                // Red, like every other destructive menu entry
-                                // in the app (the schema tree's Drop). It asks
-                                // nothing first, matching the form's own Delete
-                                // button — one action, one answer, wherever it
-                                // is reached from.
+                                MenuEntry::action("Duplicate", move || {
+                                    (sel)(id);
+                                    (dup)(id)
+                                }),
+                                // Red, like every other destructive menu entry in
+                                // the app (the schema tree's Drop), and it asks
+                                // before it runs — the connection, its keyring
+                                // secrets, its history and its tabs are all
+                                // unrecoverable.
                                 MenuEntry::action_colored("Delete", theme::error, move || {
+                                    (sel_del)(id);
                                     (del)(id)
                                 }),
                             ]));
@@ -663,9 +673,12 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                 .style(|s| s.width_full().flex_grow(1.0_f32).flex_row().min_height(0.0));
 
             let close: Rc<dyn Fn()> = Rc::new(move || open.set(false));
-            let panel = v_stack((modal_title("Manage Connections", close), body))
-                .on_click_stop(|_| {})
-                .style(|s| panel_style(s).width(720.0).height(500.0));
+            let panel = v_stack((
+                modal_title("Manage Connections", close, root_ring.clone()),
+                body,
+            ))
+            .on_click_stop(|_| {})
+            .style(|s| panel_style(s).width(720.0).height(500.0));
 
             // Dark backdrop, centered panel, click-away or Escape closes.
             //
@@ -677,21 +690,28 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
             //
             // The root also answers Tab, by entering the ring — it is where focus
             // sits when the modal opens and where Escape hands it back.
-            focus_root_with_ring(container(panel), root_ring)
-                .on_key_down(
-                    Key::Named(NamedKey::Escape),
-                    |_| true,
-                    move |_| open.set(false),
-                )
-                .on_click_stop(move |_| open.set(false))
-                .style(|s| {
-                    s.size_full()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .background(theme::modal_backdrop())
-                })
-                .into_any()
+            focus_root_with_ring(
+                // Click-to-dismiss on a sibling behind the panel, never on the
+                // focus root — see `widgets::dismiss_layer`.
+                stack((
+                    crate::widgets::dismiss_layer(move || open.set(false)),
+                    panel,
+                )),
+                root_ring,
+            )
+            .on_key_down(
+                Key::Named(NamedKey::Escape),
+                |_| true,
+                move |_| open.set(false),
+            )
+            .style(|s| {
+                s.size_full()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .background(theme::modal_backdrop())
+            })
+            .into_any()
         },
     )
     .style(move |s| {

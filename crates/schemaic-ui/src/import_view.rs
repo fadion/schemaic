@@ -1126,7 +1126,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
 
             let close_x: Rc<dyn Fn()> = exit_x.clone();
             let panel = v_stack((
-                modal_title_owned(format!("Import into {title}"), close_x),
+                modal_title_owned(format!("Import into {title}"), close_x, root_ring.clone()),
                 // `autohide`, not a plain `scroll`: each section inside scrolls on
                 // its own, so this outer one is only a safety net for the issue
                 // list that appears after a failed check. A permanently-visible

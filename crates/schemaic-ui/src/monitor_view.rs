@@ -276,17 +276,24 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                 });
 
             let close_bg = close.clone();
-            crate::widgets::focus_root_with_ring(container(panel), ring)
-                .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| (close)())
-                .on_click_stop(move |_| (close_bg)())
-                .style(|s| {
-                    s.size_full()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .background(theme::modal_backdrop())
-                })
-                .into_any()
+            // On a sibling behind the panel, never on the focus root: Space is
+            // the reflex for "scroll this log", and floem fires `Click` on the
+            // focused view for it — which closed the modal, stopped the poll and
+            // emptied the change log, deletes included. See
+            // `widgets::dismiss_layer`.
+            crate::widgets::focus_root_with_ring(
+                stack((crate::widgets::dismiss_layer(move || (close_bg)()), panel)),
+                ring,
+            )
+            .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| (close)())
+            .style(|s| {
+                s.size_full()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .background(theme::modal_backdrop())
+            })
+            .into_any()
         },
     )
     .style(move |s| {

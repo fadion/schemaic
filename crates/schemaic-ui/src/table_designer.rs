@@ -478,6 +478,10 @@ fn field_view(
 /// control asking a second question. Shared so the two type fields in the app —
 /// the designer's column type and the object editor's domain base type — are one
 /// control rather than two that merely offer the same list.
+/// In the ring one index above its field, so Tab walks the box you type in and
+/// then the list of things you could have typed. It was the one clickable
+/// control in either modal Tab couldn't reach, which left the curated type list
+/// needing a pointer.
 // `use<>`: the view captures only the two `Copy` overlay signals, not the `&Ui`
 // it read them off, so it can outlive the borrow and be returned from a form
 // builder that took `ui` by reference.
@@ -485,27 +489,37 @@ pub(crate) fn suggest_chevron(
     ui: &Ui,
     sig: RwSignal<String>,
     options: Vec<String>,
+    ring: FocusRing,
+    tabindex: u32,
 ) -> impl IntoView + use<> {
     let popup = ui.overlay.popup_menu;
     let anchor = ui.overlay.popup_anchor;
-    container(icons::icon(icons::CHEVRON_DOWN, 16.0))
-        .on_click_stop(move |_| {
-            anchor.set(None);
-            popup.set(Some(
-                options
-                    .iter()
-                    .map(|o| {
-                        let o = o.clone();
-                        MenuEntry::action(o.clone(), move || sig.set(o.clone()))
-                    })
-                    .collect(),
-            ));
-        })
-        .style(|s| {
-            s.padding(6.0)
-                .color(theme::text_dim())
-                .hover(|s| s.color(theme::text()))
-        })
+    let open = Rc::new(move || {
+        anchor.set(None);
+        popup.set(Some(
+            options
+                .iter()
+                .map(|o| {
+                    let o = o.clone();
+                    MenuEntry::action(o.clone(), move || sig.set(o.clone()))
+                })
+                .collect(),
+        ));
+    });
+    let pressed = open.clone();
+    crate::widgets::in_ring_button(
+        container(icons::icon(icons::CHEVRON_DOWN, 16.0))
+            .on_click_stop(move |_| (open)())
+            .style(|s| {
+                s.padding(6.0)
+                    .color(theme::text_dim())
+                    .hover(|s| s.color(theme::text()))
+            }),
+        ring,
+        tabindex,
+        true,
+        move || (pressed)(),
+    )
 }
 
 /// [`bound_field`] plus a [`suggest_chevron`] writing into it.
@@ -523,8 +537,8 @@ fn bound_field_with_menu(
 ) -> AnyView {
     let sig = bound_signal(ui, initial, apply);
     h_stack((
-        field_view(sig, width, placeholder, mono, ring, tabindex),
-        suggest_chevron(ui, sig, options),
+        field_view(sig, width, placeholder, mono, ring.clone(), tabindex),
+        suggest_chevron(ui, sig, options, ring, tabindex + 1),
     ))
     .style(|s| s.flex_row().items_center().gap(2.0))
     .into_any()
@@ -2044,7 +2058,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
 
             let close_x: Rc<dyn Fn()> = Rc::new(close);
             let panel = v_stack((
-                modal_title_owned(title, close_x),
+                modal_title_owned(title, close_x, root_ring.clone()),
                 tab_strip(ui.clone(), ring.clone()),
                 body,
                 // The count sits at the far left, the actions at the far right —

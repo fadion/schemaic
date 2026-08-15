@@ -54,8 +54,8 @@ use schemaic_core::schema::{DbSchema, SchemaState, classify_column_type};
 
 use crate::schema_tree::column_type_icon;
 use crate::widgets::{
-    centered_msg, focus_root, measure_text_px_at, measure_text_px_bold_at, modal_title_borderless,
-    panel_style, window_size,
+    centered_msg, measure_text_px_at, measure_text_px_bold_at, modal_title_borderless, panel_style,
+    window_size,
 };
 use crate::{ConnNode, Ui, icons, theme};
 
@@ -1368,8 +1368,13 @@ fn modal_frame(
 
     // Borderless header so the toolbar's own top border is the single divider —
     // two adjacent 1px lines (header bottom + toolbar top) read as a fuzzy 2px band.
+    // A ring for the ✕ — the diagram's own toolbar is pointer-driven (pan, zoom,
+    // fit), so this is the one control Tab has anywhere to go. Without a ring
+    // the root has no Tab handler at all and floem's whole-window traversal
+    // walks out of the modal.
+    let ring = crate::widgets::FocusRing::new();
     let panel = v_stack((
-        modal_title_borderless("ER Diagram", close.clone()),
+        modal_title_borderless("ER Diagram", close.clone(), ring.clone()),
         toolbar,
         body,
     ))
@@ -1383,15 +1388,18 @@ fn modal_frame(
     });
 
     let esc = close.clone();
-    focus_root(container(panel))
-        .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
-        .on_click_stop(move |_| close())
-        .style(|s| {
-            s.size_full()
-                .items_center()
-                .justify_center()
-                .background(theme::modal_backdrop())
-        })
+    // On a sibling behind the panel — see `widgets::dismiss_layer`.
+    crate::widgets::focus_root_with_ring(
+        crate::stack((crate::widgets::dismiss_layer(move || close()), panel)),
+        ring,
+    )
+    .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
+    .style(|s| {
+        s.size_full()
+            .items_center()
+            .justify_center()
+            .background(theme::modal_backdrop())
+    })
 }
 
 #[cfg(test)]

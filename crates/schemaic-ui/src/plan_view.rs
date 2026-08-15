@@ -61,9 +61,16 @@ pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
                 plan_open.set(false);
                 plan_state.set(PlanState::Idle);
             });
-            // One control, but it still gets a ring: without one the root has no
-            // Tab handler, so Tab falls through to floem's whole-window traversal
-            // and walks out of the modal into the workspace behind it.
+            // **Two** controls — the Analyze toggle and Ask AI. The modal's own
+            // commit message claimed one, and Ask AI was left a bare
+            // `h_stack(…).on_click_stop(…)`: Tab reached the toggle and wrapped
+            // to it forever, so the modal's one real action was unreachable by
+            // keyboard, and on a write statement (where the toggle isn't built)
+            // the ring was empty outright.
+            //
+            // The ring is what gives the root its Tab handler at all; without
+            // one, Tab falls through to floem's whole-window traversal and walks
+            // out of the modal into the workspace behind it.
             let ring = crate::widgets::FocusRing::new();
 
             // Drive the EXPLAIN: fires once on open, and again whenever the Analyze
@@ -113,6 +120,7 @@ pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
                     right_panel,
                     close.clone(),
                     plan_dialect(),
+                    ring.clone(),
                 ),
             ))
             .style(|s| {
@@ -145,7 +153,7 @@ pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
             .style(|s| s.width_full().flex_col());
 
             let panel = v_stack((
-                modal_title_borderless("Query plan", close.clone()),
+                modal_title_borderless("Query plan", close.clone(), ring.clone()),
                 body,
                 toolbar,
             ))
@@ -153,16 +161,20 @@ pub(crate) fn plan_overlay(ui: Ui) -> impl IntoView {
             .style(|s| panel_style(s).background(theme::bg_panel()).width(760.0));
 
             let esc = close.clone();
-            crate::widgets::focus_root_with_ring(container(panel), ring)
-                .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
-                .on_click_stop(move |_| close())
-                .style(|s| {
-                    s.size_full()
-                        .items_center()
-                        .justify_center()
-                        .background(theme::modal_backdrop())
-                })
-                .into_any()
+            // The dismiss listener goes on a sibling behind the panel, never on
+            // the focus root — see `widgets::dismiss_layer`.
+            crate::widgets::focus_root_with_ring(
+                stack((crate::widgets::dismiss_layer(move || close()), panel)),
+                ring,
+            )
+            .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
+            .style(|s| {
+                s.size_full()
+                    .items_center()
+                    .justify_center()
+                    .background(theme::modal_backdrop())
+            })
+            .into_any()
         },
     )
     .style(move |s| {
@@ -353,6 +365,10 @@ fn plan_table(plan: &QueryPlan) -> AnyView {
 
 /// The "Ask AI" button: reveals the AI panel and sends the plan + query for
 /// optimization suggestions. Dimmed until a plan has loaded.
+///
+/// In the ring at [`ACTION_TAB`](crate::widgets::ACTION_TAB), after the Analyze
+/// toggle — it is this modal's footer action, and the modal's only one.
+#[allow(clippy::too_many_arguments)] // a view builder; a struct adds no clarity
 fn ask_ai_button(
     plan_state: RwSignal<PlanState>,
     plan_sql: RwSignal<String>,
@@ -360,8 +376,15 @@ fn ask_ai_button(
     right_panel: RwSignal<RightPanel>,
     close: Rc<dyn Fn()>,
     dialect: schemaic_core::intel::SqlDialect,
+    ring: crate::widgets::FocusRing,
 ) -> impl IntoView {
-    h_stack((
+    let press = Rc::new({
+        let (ai_send, close) = (ai_send.clone(), close.clone());
+        move || ask_ai(plan_state, plan_sql, &ai_send, right_panel, &close, dialect)
+    });
+    let clicked = press.clone();
+    let loaded_now = move || matches!(plan_state.get_untracked(), PlanState::Loaded(_));
+    let face = h_stack((
         icons::icon(icons::SPARKLES, 15.0).style(|s| s.flex_shrink(0.0_f32)),
         text("Ask AI").style(|s| s.font_size(FONT_BODY)),
     ))
@@ -380,23 +403,46 @@ fn ask_ai_button(
             s.color(theme::key_foreign().multiply_alpha(0.4))
         }
     })
-    .on_click_stop(move |_| {
-        let PlanState::Loaded(plan) = plan_state.get_untracked() else {
-            return;
-        };
-        let sql = plan_sql.get_untracked();
-        // The plan's shape and the useful advice both differ by engine, and the
-        // modal already knows which one produced it.
-        let engine = dialect.engine_label();
-        let msg = format!(
-            "Here is the {engine} EXPLAIN plan for a query. Explain what it's \
-             doing, then suggest concrete optimizations — indexes to add, or query \
-             rewrites — to make it faster.\n\nQuery:\n```sql\n{sql}\n```\n\nEXPLAIN \
-             output:\n```\n{}\n```",
-            plan.to_prompt_text()
-        );
-        crate::reveal_ai_panel(right_panel);
-        (ai_send)(msg);
-        (close)();
-    })
+    .on_click_stop(move |_| (clicked)());
+    // Registered only once a plan has loaded, the same rule every disabled
+    // action follows: it keeps its place on screen but the keyboard walks past
+    // it, since pressing it would do nothing. The toolbar rebuilds when
+    // `plan_state` changes, so it joins the ring as soon as there is something
+    // to ask about.
+    crate::widgets::in_ring_button(
+        face,
+        ring,
+        crate::widgets::ACTION_TAB,
+        loaded_now(),
+        move || (press)(),
+    )
+}
+
+/// Reveal the AI panel and hand it the plan. Shared by the click and the
+/// keyboard press, so the two can't diverge.
+fn ask_ai(
+    plan_state: RwSignal<PlanState>,
+    plan_sql: RwSignal<String>,
+    ai_send: &Rc<dyn Fn(String)>,
+    right_panel: RwSignal<RightPanel>,
+    close: &Rc<dyn Fn()>,
+    dialect: schemaic_core::intel::SqlDialect,
+) {
+    let PlanState::Loaded(plan) = plan_state.get_untracked() else {
+        return;
+    };
+    let sql = plan_sql.get_untracked();
+    // The plan's shape and the useful advice both differ by engine, and the
+    // modal already knows which one produced it.
+    let engine = dialect.engine_label();
+    let msg = format!(
+        "Here is the {engine} EXPLAIN plan for a query. Explain what it's \
+         doing, then suggest concrete optimizations — indexes to add, or query \
+         rewrites — to make it faster.\n\nQuery:\n```sql\n{sql}\n```\n\nEXPLAIN \
+         output:\n```\n{}\n```",
+        plan.to_prompt_text()
+    );
+    crate::reveal_ai_panel(right_panel);
+    (ai_send)(msg);
+    (close)();
 }

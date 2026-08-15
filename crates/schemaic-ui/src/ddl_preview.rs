@@ -450,7 +450,11 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
 
             let close_x: Rc<dyn Fn()> = Rc::new(exit);
             let panel = v_stack((
-                modal_title_owned(format!("Apply changes to {}", p.subject), close_x),
+                modal_title_owned(
+                    format!("Apply changes to {}", p.subject),
+                    close_x,
+                    root_ring.clone(),
+                ),
                 autohide(scroll(v_stack((body, err)).style(|s| {
                     s.flex_col()
                         .width_full()

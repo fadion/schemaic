@@ -20,7 +20,7 @@ use schemaic_core::schema::{SchemaState, TableSource};
 
 use crate::consts::{CHAT_PAD_H, CHAT_PAD_V, DB_MENU_W};
 use crate::widgets::{
-    CURSOR_MENU_GAP, MenuEntry, autohide, cursor_menu_pos, dialog_button, focus_root,
+    ACTION_TAB, CURSOR_MENU_GAP, MenuEntry, autohide, cursor_menu_pos, dialog_button, focus_root,
     measure_text_px_at, menu_item_style, menu_panel, menu_panel_height, panel_style, window_size,
 };
 use crate::{
@@ -204,15 +204,19 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
             });
 
             // Transparent full-window layer: click outside the panel or Escape closes.
-            focus_root(container(panel))
-                .on_key_down(
-                    Key::Named(NamedKey::Escape),
-                    |_| true,
-                    move |_| open.set(false),
-                )
-                .on_click_stop(move |_| open.set(false))
-                .style(|s| s.size_full().flex_col().items_start().justify_start())
-                .into_any()
+            // The click goes on a sibling behind the panel — see
+            // `widgets::dismiss_layer` for why it must not be on the focus root.
+            focus_root(stack((
+                crate::widgets::dismiss_layer(move || open.set(false)),
+                panel,
+            )))
+            .on_key_down(
+                Key::Named(NamedKey::Escape),
+                |_| true,
+                move |_| open.set(false),
+            )
+            .style(|s| s.size_full().flex_col().items_start().justify_start())
+            .into_any()
         },
     )
     .style(move |s| {
@@ -284,15 +288,17 @@ pub(crate) fn active_db_menu_overlay(ui: Ui) -> impl IntoView {
                     .font_size(theme::FONT_TITLE)
             });
 
-            focus_root(container(panel))
-                .on_key_down(
-                    Key::Named(NamedKey::Escape),
-                    |_| true,
-                    move |_| open.set(false),
-                )
-                .on_click_stop(move |_| open.set(false))
-                .style(|s| s.size_full().flex_col().items_start().justify_start())
-                .into_any()
+            focus_root(stack((
+                crate::widgets::dismiss_layer(move || open.set(false)),
+                panel,
+            )))
+            .on_key_down(
+                Key::Named(NamedKey::Escape),
+                |_| true,
+                move |_| open.set(false),
+            )
+            .style(|s| s.size_full().flex_col().items_start().justify_start())
+            .into_any()
         },
     )
     .style(move |s| {
@@ -2861,12 +2867,19 @@ pub(crate) fn tx_prompt_overlay(ui: Ui) -> impl IntoView {
                 )
             };
 
-            // One button row: Cancel (quiet) · Rollback (danger) · Commit.
+            // One button row: Cancel (quiet) · Rollback (danger) · Commit — all
+            // three in a ring of their own, left to right. This modal asks about
+            // **uncommitted writes** and answered no key at all: Escape is a
+            // deliberate no-op (there is no safe "never mind" here), and its
+            // three buttons were outside every ring, so the keyboard could do
+            // nothing about a question the app itself had raised.
+            let ring = crate::widgets::FocusRing::new();
             let btn = |label: &'static str,
                        color: fn() -> Color,
                        hover: fn() -> Color,
+                       tabindex: u32,
                        act: Rc<dyn Fn()>| {
-                dialog_button(label, color, hover, move || (act)())
+                dialog_button(label, color, hover, ring.clone(), tabindex, move || (act)())
             };
             let resolve = p.resolve.clone();
             let cancel = {
@@ -2875,6 +2888,7 @@ pub(crate) fn tx_prompt_overlay(ui: Ui) -> impl IntoView {
                     "Cancel",
                     theme::text_dim,
                     theme::text,
+                    ACTION_TAB,
                     Rc::new(move || (r)(TxChoice::Cancel)),
                 )
             };
@@ -2885,19 +2899,26 @@ pub(crate) fn tx_prompt_overlay(ui: Ui) -> impl IntoView {
                     "Rollback",
                     theme::tx_rollback,
                     theme::tx_rollback_hover,
+                    ACTION_TAB + 10,
                     Rc::new(move || (r)(TxChoice::Rollback)),
                 )
             };
-            let commit = {
+            // Built only when it applies, never built-and-hidden: `hide()` is
+            // `display: none`, so the view is still in the tree and still in the
+            // ring, and Tab would land on a button nobody can see — offering to
+            // commit a transaction PostgreSQL has already aborted.
+            let commit: AnyView = if p.can_commit {
                 let r = resolve.clone();
-                let can = p.can_commit;
                 btn(
                     "Commit",
                     theme::tx_commit,
                     theme::tx_commit_hover,
+                    ACTION_TAB + 20,
                     Rc::new(move || (r)(TxChoice::Commit)),
                 )
-                .style(move |s| if can { s } else { s.hide() })
+                .into_any()
+            } else {
+                crate::widgets::nothing()
             };
 
             let panel = v_stack((
@@ -2941,7 +2962,11 @@ pub(crate) fn tx_prompt_overlay(ui: Ui) -> impl IntoView {
             // this one is asking about a transaction would be a mess. Escape
             // is swallowed rather than handled: unlike every other modal here,
             // there's no safe "never mind" for uncommitted writes.
-            focus_root(container(panel))
+            //
+            // The ring is what lets Tab reach the three answers. There is
+            // deliberately **no backdrop dismiss** either — clicking away from a
+            // question about uncommitted writes is not an answer.
+            crate::widgets::focus_root_with_ring(container(panel), ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| {})
                 .style(|s| {
                     s.size_full()
@@ -2989,11 +3014,15 @@ pub(crate) fn confirm_overlay(ui: Ui) -> impl IntoView {
                 })
             };
 
+            // No before Yes, left to right as they sit — so the *first* Tab
+            // lands on declining, which is always the safe side of a confirm.
+            let ring = crate::widgets::FocusRing::new();
             let btn = |label: &'static str,
                        color: fn() -> Color,
                        hover: fn() -> Color,
+                       tabindex: u32,
                        act: Rc<dyn Fn()>| {
-                dialog_button(label, color, hover, move || (act)())
+                dialog_button(label, color, hover, ring.clone(), tabindex, move || (act)())
             };
             let no = {
                 let a = answer.clone();
@@ -3001,6 +3030,7 @@ pub(crate) fn confirm_overlay(ui: Ui) -> impl IntoView {
                     "No",
                     theme::text_dim,
                     theme::text,
+                    ACTION_TAB,
                     Rc::new(move || (a)(false)),
                 )
             };
@@ -3010,6 +3040,7 @@ pub(crate) fn confirm_overlay(ui: Ui) -> impl IntoView {
                     "Yes",
                     theme::confirm_yes,
                     theme::confirm_yes_hover,
+                    ACTION_TAB + 10,
                     Rc::new(move || (a)(true)),
                 )
             };
@@ -3048,20 +3079,30 @@ pub(crate) fn confirm_overlay(ui: Ui) -> impl IntoView {
             // Focus so the shortcuts behind the backdrop stop firing while
             // the question is up (Ctrl+W closing a tab mid-confirm would be
             // a mess), and so Escape lands here.
-            focus_root(container(panel))
-                .on_key_down(Key::Named(NamedKey::Escape), |_| true, {
-                    let a = answer.clone();
-                    move |_| (a)(false)
-                })
-                .on_click_stop(move |_| (answer)(false))
-                .style(|s| {
-                    s.size_full()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .background(theme::modal_backdrop())
-                })
-                .into_any()
+            // The backdrop's "No" goes on a sibling, not on the focus root: this
+            // is a *question*, and floem fires `Click` on the focused view for
+            // Space — so Space answered `false` to something the user had not
+            // read. See `widgets::dismiss_layer`.
+            let backdrop_no = answer.clone();
+            crate::widgets::focus_root_with_ring(
+                stack((
+                    crate::widgets::dismiss_layer(move || (backdrop_no)(false)),
+                    panel,
+                )),
+                ring,
+            )
+            .on_key_down(Key::Named(NamedKey::Escape), |_| true, {
+                let a = answer.clone();
+                move |_| (a)(false)
+            })
+            .style(|s| {
+                s.size_full()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .background(theme::modal_backdrop())
+            })
+            .into_any()
         },
     )
     .style(move |s| {
@@ -3133,9 +3174,8 @@ pub(crate) fn error_modal_overlay(ui: Ui) -> impl IntoView {
                 open.set(false);
                 text_override.set(None);
             };
-            focus_root(container(panel))
+            focus_root(stack((crate::widgets::dismiss_layer(close), panel)))
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())
-                .on_click_stop(move |_| close())
                 .style(|s| {
                     s.size_full()
                         .flex_col()
