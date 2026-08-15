@@ -1406,8 +1406,30 @@ fn lookup_object(
         let SchemaState::Loaded(s) = node.schema.get_untracked() else {
             return None;
         };
-        s.find_object(schema, kind, name).filter(is_palette_target)
+        palette_object(&s, schema, kind, name)
     })
+}
+
+/// The palette's answer for one object: it, or `None` when the database has no
+/// such object **or** it isn't a destination.
+///
+/// Split out from [`lookup_object`] purely so the gate has a test. Deleting the
+/// `is_palette_target` filter — which is what this whole rule exists to keep —
+/// left `cargo test --workspace` green: the regression tests called the
+/// predicate directly, and nothing reached the site that applies it.
+///
+/// The **search-history** path is where it matters. A `serial`'s sequence is an
+/// ordinary object and a legitimate result, so it can be remembered; migrating
+/// its column to an identity column makes that same sequence *internal*, and
+/// only this second gate stops the remembered row from opening an editor the
+/// server would refuse.
+fn palette_object(
+    s: &schemaic_core::schema::DbSchema,
+    schema: Option<&str>,
+    kind: schemaic_core::ddl::ObjectKind,
+    name: &str,
+) -> Option<schemaic_core::schema::ObjectItem> {
+    s.find_object(schema, kind, name).filter(is_palette_target)
 }
 
 /// Build one object result row: records the activation to search history, then
@@ -3232,18 +3254,28 @@ fn find_matches(
     q: &str,
     limit: usize,
 ) -> Vec<FindHit> {
+    // `with_untracked`, not `get_untracked`: this runs on **every keystroke**
+    // (the palette is deliberately undebounced, unlike the schema tree's filter
+    // box), and `get` is documented as "try to *clone* and return" — so the two
+    // reads here allocated and freed a whole `HashSet<String>` and a whole
+    // `Vec<ConnNode>`, two `String`s per node, per character typed. On the one
+    // path CLAUDE.md names for both rules. `lookup_object` twenty lines below
+    // already did it this way.
     let mut out = Vec::new();
-    let hidden = hidden.get_untracked();
-    for node in db_nodes.get_untracked() {
-        if hidden.contains(&node.database) {
-            continue;
-        }
-        if let SchemaState::Loaded(schema) = node.schema.get_untracked()
-            && schema_hits(&node.database, &schema, q, limit, &mut out)
-        {
-            return out;
-        }
-    }
+    hidden.with_untracked(|hidden| {
+        db_nodes.with_untracked(|nodes| {
+            for node in nodes {
+                if hidden.contains(&node.database) {
+                    continue;
+                }
+                if let SchemaState::Loaded(schema) = node.schema.get_untracked()
+                    && schema_hits(&node.database, &schema, q, limit, &mut out)
+                {
+                    return;
+                }
+            }
+        })
+    });
     out
 }
 
@@ -3263,20 +3295,30 @@ fn schema_hits(
     let src = |t: &schemaic_core::schema::TableInfo| {
         TableSource::new(database.to_string(), t.schema.clone(), t.name.clone())
     };
+    let room = limit.saturating_sub(out.len());
+    if room == 0 {
+        return true;
+    }
+    // Each pass collects into its own bucket, bounded by the room left, and the
+    // three are then merged under `pass_shares` — see it for why ordering alone
+    // was not enough.
+    let mut names: Vec<FindHit> = Vec::new();
+    let mut objects: Vec<FindHit> = Vec::new();
+    let mut columns: Vec<FindHit> = Vec::new();
     // Pass 1 — table and view *names*.
     for t in &schema.tables {
         if !(q.is_empty() || t.name.to_lowercase().contains(q)) {
             continue;
         }
-        out.push(FindHit {
+        names.push(FindHit {
             target: FindTarget::Table {
                 source: src(t),
                 column: None,
             },
             icon: table_result_icon(t),
         });
-        if out.len() >= limit {
-            return true;
+        if names.len() >= room {
+            break;
         }
     }
     // Pass 2 — the PostgreSQL standalone objects the tree lists in its Types /
@@ -3289,9 +3331,10 @@ fn schema_hits(
     // one `user_id` foreign key repeated across a hundred tables is a hundred
     // hits, and with the objects appended last they were pushed past `limit`
     // entirely — reproducing the same "a type can't be found" symptom under a new
-    // cause. Names are few, so this costs the tail of a broad column search and
-    // buys the objects a place. (A database with `limit` *table-name* matches can
-    // still starve them, but a name match is rare where a column match is not.)
+    // cause. Ordering alone then opened the mirror hole: on a serial-heavy
+    // PostgreSQL schema, `id` filled every slot with `*_id_seq` and *no table or
+    // column was reachable at all*. Each pass now takes a share (`pass_shares`),
+    // so no category can crowd the others out from either side.
     //
     // A non-editable object is skipped — an identity column's counter, whose only
     // activation would be an editor that refuses to open. The tree can list it
@@ -3318,40 +3361,79 @@ fn schema_hits(
             if !is_palette_target(&o) {
                 continue;
             }
-            out.push(FindHit {
+            objects.push(FindHit {
                 target: FindTarget::Object {
                     database: database.to_string(),
                     item: o,
                 },
                 icon: ResultIcon::Object(kind),
             });
-            if out.len() >= limit {
-                return true;
+            if objects.len() >= room {
+                break;
             }
+        }
+        if objects.len() >= room {
+            break;
         }
     }
     // Pass 3 — columns, each as its own `table.column` hit, still grouped under
     // the table they belong to.
     if !q.is_empty() {
-        for t in &schema.tables {
+        'cols: for t in &schema.tables {
             for c in &t.columns {
                 if !c.name.to_lowercase().contains(q) {
                     continue;
                 }
-                out.push(FindHit {
+                columns.push(FindHit {
                     target: FindTarget::Table {
                         source: src(t),
                         column: Some(c.name.clone()),
                     },
                     icon: column_result_icon(t, c),
                 });
-                if out.len() >= limit {
-                    return true;
+                if columns.len() >= room {
+                    break 'cols;
                 }
             }
         }
     }
-    false
+    let take = pass_shares(room, [names.len(), objects.len(), columns.len()]);
+    for (bucket, n) in [names, objects, columns].into_iter().zip(take) {
+        out.extend(bucket.into_iter().take(n));
+    }
+    out.len() >= limit
+}
+
+/// How many hits each of [`schema_hits`]' three passes contributes, given the
+/// room left in the result list.
+///
+/// **A share each, not first-come.** Ordering alone decided which category could
+/// crowd the others out, and it did so in both directions: with the objects
+/// last, one `user_id` column repeated across a hundred tables pushed every type
+/// past the cap; with the objects moved ahead of the columns, a serial-heavy
+/// PostgreSQL schema answered `id` with eighty `*_id_seq` rows and no table or
+/// column at all. Neither is a *wrong* result — each is an absent one, for
+/// something the user typed precisely.
+///
+/// Each pass is guaranteed `room / 3` if it can use it, and a pass that can't
+/// hands its share straight on. The spare then goes in pass order — names,
+/// objects, columns — so a narrow search still fills the list with the most
+/// precise matches first, and only a search broad enough to overflow ever pays
+/// the share.
+fn pass_shares(room: usize, want: [usize; 3]) -> [usize; 3] {
+    let base = room / want.len();
+    let mut take = [0usize; 3];
+    let mut left = room;
+    for i in 0..want.len() {
+        take[i] = want[i].min(base);
+        left -= take[i];
+    }
+    for i in 0..want.len() {
+        let extra = (want[i] - take[i]).min(left);
+        take[i] += extra;
+        left -= extra;
+    }
+    take
 }
 
 #[cfg(test)]
@@ -3513,6 +3595,85 @@ mod find_tests {
             "the object must not be crowded out, got {labels:?}"
         );
         assert_eq!(labels.len(), 5, "the cap is still honoured");
+    }
+
+    /// **The mirror of the test above**, which the fix for it opened: moving the
+    /// objects ahead of the columns let *them* fill the list. On a serial-heavy
+    /// PostgreSQL schema, `id` answered with nothing but `*_id_seq` rows — the
+    /// same "typed it precisely, found nothing" symptom, from the other side.
+    #[test]
+    fn a_flood_of_sequences_does_not_crowd_out_tables_and_columns() {
+        let flooded = DbSchema {
+            tables: vec![TableInfo {
+                name: "id_map".into(),
+                schema: Some("public".into()),
+                columns: vec![schemaic_core::schema::ColumnInfo {
+                    name: "id".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            sequences: (0..40)
+                .map(|i| SequenceInfo {
+                    name: format!("t{i}_id_seq"),
+                    schema: Some("public".into()),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        schema_hits("shop", &flooded, "id", 9, &mut out);
+        let labels = labels_of(out);
+        assert_eq!(labels.len(), 9, "the cap is still honoured");
+        assert!(
+            labels.iter().any(|l| l.starts_with("table:")),
+            "the table must survive the sequences, got {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l.starts_with("column:")),
+            "so must the column, got {labels:?}"
+        );
+    }
+
+    /// Each pass is guaranteed its third if it can use it; a pass with nothing to
+    /// show hands its share on, and the spare goes in pass order, so a narrow
+    /// search still fills the list with the most precise matches first.
+    #[test]
+    fn each_pass_gets_a_share_and_the_spare_goes_in_order() {
+        use super::pass_shares;
+        // Everything fits: nothing is capped.
+        assert_eq!(pass_shares(80, [2, 3, 4]), [2, 3, 4]);
+        // One category floods; the others keep their share, and the spare left
+        // by a pass that couldn't fill its own goes to the earlier of the two.
+        assert_eq!(pass_shares(9, [1, 40, 40]), [1, 5, 3]);
+        assert_eq!(pass_shares(9, [40, 40, 40]), [3, 3, 3]);
+        // A pass with nothing hands its share on, in pass order.
+        assert_eq!(pass_shares(9, [0, 0, 40]), [0, 0, 9]);
+        assert_eq!(pass_shares(9, [40, 0, 40]), [6, 0, 3]);
+        // Degenerate rooms don't over-allocate.
+        assert_eq!(pass_shares(0, [5, 5, 5]), [0, 0, 0]);
+        assert_eq!(pass_shares(2, [5, 5, 5]), [2, 0, 0]);
+    }
+
+    /// **The site the gate is applied at**, not just the predicate. Deleting the
+    /// `is_palette_target` filter left the suite green, because both regression
+    /// tests called the predicate directly and nothing reached the resolver a
+    /// remembered search goes through.
+    #[test]
+    fn a_remembered_internal_sequence_does_not_resolve_to_a_destination() {
+        use super::palette_object;
+        let s = fixture();
+        let ns = Some("public");
+        assert!(
+            palette_object(&s, ns, ObjectKind::Sequence, "order_counter").is_some(),
+            "a serial's own sequence is an ordinary object and can be remembered"
+        );
+        assert!(
+            palette_object(&s, ns, ObjectKind::Sequence, "orders_id_seq").is_none(),
+            "an identity column's counter opens an editor that would refuse"
+        );
+        assert!(palette_object(&s, ns, ObjectKind::Sequence, "gone").is_none());
     }
 
     #[test]
