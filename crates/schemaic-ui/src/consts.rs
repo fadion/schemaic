@@ -141,6 +141,18 @@ pub(crate) const CHAT_MAX_ROWS: usize = 6;
 pub(crate) const CHAT_PAD_V: f64 = 6.0;
 pub(crate) const CHAT_PAD_H: f64 = 10.0;
 
+/// Height of a **compact single-line field** — the one every transient bar uses:
+/// the editor's find / replace / go-to-line, the grid's find and go-to-row, and
+/// the row panel's inputs.
+///
+/// It exists as one constant because leaving it off is not a neutral default but
+/// a *different* control: [`crate::FieldCfg::height`] is `Option`, and `None`
+/// derives the box from content as `line_h + CHAT_PAD_V * 2 + 3` — 34px at the
+/// 13px font these bars use, against this 26. The grid's find bar shipped
+/// without it and so stood 8px taller than the identical editor bar beside it.
+/// A bar that means to be compact says so with this, and never with a literal.
+pub(crate) const FIELD_INPUT_H: f64 = 26.0;
+
 // ── Data grid (interactive: sizing, selection, export) ──────────────────────
 
 pub(crate) const MIN_COL_W: f64 = 48.0;

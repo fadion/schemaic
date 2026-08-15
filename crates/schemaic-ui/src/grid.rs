@@ -360,6 +360,13 @@ struct GridState {
     /// live in `GridCtx` (written by `grid_view`, read by the panel-level bar).
     find_open: RwSignal<bool>,
     find_query: RwSignal<String>,
+    /// Go to row (Ctrl+G): the popup's open state, its buffer, and the submit
+    /// nonce it bumps on Enter. Same split as find — the popup renders at the
+    /// panel level, and `grid_view` does the jump because only it knows how many
+    /// rows there are.
+    goto_open: RwSignal<bool>,
+    goto_query: RwSignal<String>,
+    goto_step: RwSignal<u64>,
     /// Per result-column foreign-key "follow" specs (keyed by result-column index;
     /// a composite FK maps each member column to the same spec). Populated by
     /// `grid_view` from the source table's schema; empty when there's nothing to
@@ -511,6 +518,9 @@ impl GridState {
             // Shared with the find bar (rendered up at the RESULTS-panel level).
             find_open: gctx.find_open,
             find_query: gctx.find_query,
+            goto_open: gctx.goto_open,
+            goto_query: gctx.goto_query,
+            goto_step: gctx.goto_step,
             // Empty until `grid_view` resolves the source table's FKs into it.
             follow: RwSignal::new(Rc::new(HashMap::new())),
             follow_fk: RwSignal::new(Some(gctx.follow_fk.clone())),
@@ -1789,6 +1799,14 @@ pub(crate) struct GridCtx {
     pub(crate) find_total: RwSignal<usize>,
     pub(crate) find_pos: RwSignal<usize>,
     pub(crate) find_more: RwSignal<bool>,
+    /// Go to row (Ctrl+G). Same split as find, and for the same reason: the popup
+    /// renders at the panel level while `grid_view` performs the jump, since only
+    /// it knows the row count. `goto_step` is a nonce the popup bumps on Enter —
+    /// a nonce rather than watching `goto_query`, because the jump happens on
+    /// submit, not on every keystroke.
+    pub(crate) goto_open: RwSignal<bool>,
+    pub(crate) goto_query: RwSignal<String>,
+    pub(crate) goto_step: RwSignal<u64>,
     /// Last commit error (grid write-back), shown in a bottom error bar at the
     /// panel level (like the find bar at the top). Cleared by the next edit/commit.
     pub(crate) commit_err: RwSignal<Option<String>>,
@@ -1992,6 +2010,7 @@ pub(crate) fn grid_find_bar(
                     autofocus: true,
                     font_size: 13.0,
                     border_radius: 6.0,
+                    height: Some(FIELD_INPUT_H),
                     on_submit: Some(Rc::new(move || step(true))),
                     on_escape: Some(Rc::new(move || (esc)())),
                     on_arrow_up: Some(Rc::new(move || step(false))),
@@ -2049,6 +2068,81 @@ pub(crate) fn grid_find_bar(
                         .border_radius(8.0)
                 })
                 .into_any()
+        },
+    )
+    .style(|s| s.absolute().inset_top(5.0).inset_right(5.0))
+}
+
+/// The grid's **go to row** popup (Ctrl+G) — the editor's go-to-line popup, for
+/// the results grid. Rendered at the RESULTS-panel level beside the find bar, and
+/// at the same anchor: only one of the two is ever open (opening this one closes
+/// find, in `grid_view`), exactly as the editor does with its own pair.
+///
+/// The jump itself is `grid_view`'s, driven by the `goto_step` nonce — the row
+/// count lives there, not here.
+pub(crate) fn grid_goto_bar(
+    goto_open: RwSignal<bool>,
+    goto_query: RwSignal<String>,
+    goto_step: RwSignal<u64>,
+) -> impl IntoView {
+    dyn_container(
+        move || goto_open.get(),
+        move |open| {
+            if !open {
+                return empty().into_any();
+            }
+            let close: Rc<dyn Fn()> = Rc::new(move || {
+                goto_open.set(false);
+                goto_query.set(String::new());
+            });
+            // Enter bumps the nonce; `grid_view` resolves it and closes the popup,
+            // so an out-of-range number closes it too rather than sitting there
+            // looking broken — the editor's popup makes the same call.
+            let submit: Rc<dyn Fn()> = Rc::new(move || {
+                goto_step.update(|n| *n = n.wrapping_add(1));
+            });
+            let esc = close.clone();
+            let input = edit_field(
+                goto_query,
+                FieldCfg {
+                    placeholder: "",
+                    autofocus: true,
+                    font_size: 13.0,
+                    border_radius: 6.0,
+                    height: Some(FIELD_INPUT_H),
+                    on_submit: Some(submit),
+                    on_escape: Some(Rc::new(move || (esc)())),
+                    ..Default::default()
+                },
+            )
+            // Wider than the editor's: a row number runs to six figures where a
+            // line number rarely leaves three.
+            .style(|s| s.width(78.0));
+            let close_x = close.clone();
+            let close_btn = container(icons::icon(icons::X, 14.0))
+                .on_click_stop(move |_| (close_x)())
+                .style(|s| {
+                    s.items_center()
+                        .color(theme::text_dim())
+                        .hover(|s| s.color(theme::text()))
+                });
+            h_stack((
+                text("Go to row:")
+                    .style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_dim())),
+                input,
+                close_btn,
+            ))
+            .style(|s| {
+                s.items_center()
+                    .gap(8.0)
+                    .padding_horiz(8.0)
+                    .padding_vert(6.0)
+                    .background(theme::bg_panel())
+                    .border(1.0)
+                    .border_color(theme::border())
+                    .border_radius(8.0)
+            })
+            .into_any()
         },
     )
     .style(|s| s.absolute().inset_top(5.0).inset_right(5.0))
@@ -2438,6 +2532,78 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     create_effect(move |_| {
         let (_, forward) = find_step.get();
         grid_find(gs, forward, false);
+    });
+    // Closing the find bar has to hand the keyboard back to the grid.
+    //
+    // Escape and the ✕ only flip `find_open`, which disposes the field's view —
+    // and floem clears `app_state.focus` **silently** on removal (no
+    // `FocusGained` lands anywhere), so the grid was left focused on nothing and
+    // the next Ctrl+F reached nobody until the user clicked a cell. Watching the
+    // flag rather than patching the bar's `close()` covers every way the bar can
+    // shut, and is the only place that *can*: the bar is built a level up in
+    // `results_section`, where `focus_id` doesn't exist.
+    //
+    // Only on a true→false edge, so the build-time run doesn't steal focus from
+    // whatever the user is actually typing in.
+    create_effect(move |was_open: Option<bool>| {
+        let open = gs.find_open.get();
+        if was_open == Some(true)
+            && !open
+            && let Some(f) = gs.focus_id.get_untracked()
+        {
+            f.request_focus();
+        }
+        open
+    });
+    // Go to row (Ctrl+G). The popup bumps `goto_step` on Enter; the jump is here
+    // because the row count is — including the pending unsaved rows, which the
+    // gutter numbers too, so "row N" means the same thing typed as it does read.
+    //
+    // Selecting the whole row rather than a cell is the same gesture a gutter
+    // click makes (anchor at column 0, active at the last), so the row lights up
+    // the way the user already knows. The scroll is asked for at column 0: a jump
+    // should not also fling the viewport to the far right, which is what following
+    // the *active* cell would do.
+    create_effect(move |seen: Option<u64>| {
+        let step = gs.goto_step.get();
+        if seen == Some(step) || seen.is_none() {
+            return step;
+        }
+        let total = nrows + gs.new_rows.with_untracked(|v| v.len());
+        let target = gs
+            .goto_query
+            .with_untracked(|q| schemaic_core::model::goto_row_index(q, total));
+        if let Some(i) = target {
+            gs.anchor.set(Some((i, 0)));
+            gs.active.set(Some((i, ncols.saturating_sub(1))));
+            scroll_active_into_view(gs, i, 0);
+        }
+        // Always close, even on a miss — the editor's go-to-line does the same,
+        // and a popup that stays open after Enter reads as "still working".
+        // Closing is what hands the keyboard back, via the effect below; doing it
+        // here as well would be a second path to the same place.
+        gs.goto_open.set(false);
+        gs.goto_query.set(String::new());
+        step
+    });
+    // Only one of the two bars is up at a time — they share an anchor, so both
+    // open would paint one over the other. The editor's pair does this too.
+    create_effect(move |_| {
+        if gs.goto_open.get() {
+            gs.find_open.set(false);
+        }
+    });
+    // And hand the keyboard back when the goto popup closes, for the same reason
+    // the find bar does above.
+    create_effect(move |was_open: Option<bool>| {
+        let open = gs.goto_open.get();
+        if was_open == Some(true)
+            && !open
+            && let Some(f) = gs.focus_id.get_untracked()
+        {
+            f.request_focus();
+        }
+        open
     });
 
     // Match count for the `pos/total` readout. The full grid scan is potentially
@@ -3332,8 +3498,6 @@ const FIELD_NAME_W: f64 = 150.0;
 /// Fixed height of a scalar field row — so toggling sentinel/`<null>` ↔ input never
 /// reflows the rows below.
 const FIELD_ROW_H: f64 = 32.0;
-/// Height of the text input inside a field row.
-const FIELD_INPUT_H: f64 = 26.0;
 
 /// Per-field editing state for the structured row panel: the raw text buffer, a
 /// NULL flag, and the field editor's own pre-write flush (see [`flush_fields`]).
@@ -4273,12 +4437,15 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
         Key::Named(NamedKey::PageDown) => go(Nav::PageDown),
         Key::Named(NamedKey::PageUp) => go(Nav::PageUp),
         Key::Named(NamedKey::Escape) => {
-            // Esc closes the find bar first (so it closes from anywhere in the grid,
-            // not only when its input is focused), then the row view/edit panel, then
-            // the selection.
+            // Esc closes the find bar or the goto popup first (so either closes
+            // from anywhere in the grid, not only when its input is focused), then
+            // the row view/edit panel, then the selection.
             if gs.find_open.get_untracked() {
                 gs.find_open.set(false);
                 gs.find_query.set(String::new());
+            } else if gs.goto_open.get_untracked() {
+                gs.goto_open.set(false);
+                gs.goto_query.set(String::new());
             } else if gs.edit_row_open.get_untracked() {
                 gs.edit_row_open.set(false);
             } else {
@@ -4301,6 +4468,9 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
         }
         Key::Character(s) if ctrl && matches!(s.as_str(), "f" | "F") => {
             gs.find_open.set(true); // its input autofocuses on mount
+        }
+        Key::Character(s) if ctrl && matches!(s.as_str(), "g" | "G") => {
+            gs.goto_open.set(true); // its input autofocuses on mount
         }
         Key::Named(NamedKey::Delete)
             // Toggle the active real row's "marked for deletion" state (single

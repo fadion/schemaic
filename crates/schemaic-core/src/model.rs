@@ -864,6 +864,53 @@ pub fn drop_committed(staged: &mut StagedEdits, committed: &HashSet<(usize, usiz
     staged.retain(|k, _| !committed.contains(k));
 }
 
+/// Resolve what a person typed into the grid's **go to row** box against a grid
+/// currently showing `total` rows, as a 0-based *display* index — or `None` when
+/// there is nothing to go to.
+///
+/// The counterpart of [`crate::text_ops::offset_of_line`], which does this for the
+/// editor's go-to-line popup — but it deliberately **does not** share that one's
+/// contract. A number outside the grid clamps to the nearest end rather than
+/// resolving to nothing: past the last row goes to the last row, and `0` goes to
+/// the first. A row of 9s is how people ask for the bottom of a long result, and
+/// a silent no-op there is indistinguishable from a feature that doesn't work.
+/// Overshooting is cheap to recover from — the gutter number and the row
+/// highlight say plainly where you landed — where a jump that does nothing tells
+/// you nothing at all.
+///
+/// `None` is left for the two cases where no row can be meant: an empty grid, and
+/// input that isn't a number.
+///
+/// Display index, not data row: the grid numbers its gutter by display position,
+/// so "row 40" means the fortieth row *as sorted on screen*, which is the only
+/// reading that matches what the user is looking at. `total` therefore includes
+/// any pending unsaved rows, since those are numbered too.
+///
+/// Digit-group separators are accepted (`148,203`, `148 203`, `148_203`): the
+/// grid's own status line writes counts with separators, so a number read off the
+/// screen and typed back in has to work. Nothing else is stripped — a stray
+/// letter is still a miss rather than being quietly filtered into a number the
+/// user never asked for.
+pub fn goto_row_index(input: &str, total: usize) -> Option<usize> {
+    if total == 0 {
+        return None;
+    }
+    let mut digits = String::with_capacity(input.len());
+    for c in input.trim().chars() {
+        match c {
+            ',' | '_' | ' ' | '\u{202f}' | '\u{a0}' => continue,
+            _ => digits.push(c),
+        }
+    }
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // All digits but too wide for the machine is still just "past the end" — it
+    // must clamp with every other overshoot, not fall through to the miss above.
+    let n = digits.parse::<usize>().unwrap_or(usize::MAX);
+    Some(n.clamp(1, total) - 1)
+}
+
 /// A template for re-`SELECT`ing just-edited rows so the grid can splice DB
 /// truth back in without re-running the whole query (built by
 /// [`crate::edit::refetch_template`]). Only produced when the result is a single
@@ -1637,5 +1684,75 @@ mod tests {
     fn an_ordinary_result_caps_nothing() {
         let rs = ResultSet::from_rows(vec![col("text")], vec![vec![Value::Str("x".into())]]);
         assert!(rs.capped_columns.is_empty());
+    }
+
+    #[test]
+    fn goto_row_is_one_based_and_returns_a_zero_based_index() {
+        assert_eq!(goto_row_index("1", 100), Some(0));
+        assert_eq!(goto_row_index("2", 100), Some(1));
+        assert_eq!(
+            goto_row_index("100", 100),
+            Some(99),
+            "the last row is valid"
+        );
+    }
+
+    /// A number past the end goes to the end, and one below the start goes to the
+    /// start. Both ends clamp, so any number at all lands somewhere.
+    #[test]
+    fn goto_row_clamps_a_number_outside_the_grid_to_the_nearest_end() {
+        assert_eq!(goto_row_index("101", 100), Some(99));
+        assert_eq!(goto_row_index("900", 100), Some(99));
+        assert_eq!(
+            goto_row_index("0", 100),
+            Some(0),
+            "0 is before the first row"
+        );
+    }
+
+    /// The one range case that stays `None`: there is no row to land on.
+    #[test]
+    fn goto_row_finds_nothing_in_an_empty_grid() {
+        assert_eq!(goto_row_index("1", 0), None);
+        assert_eq!(goto_row_index("0", 0), None);
+    }
+
+    #[test]
+    fn goto_row_rejects_what_is_not_a_row_number() {
+        for s in ["", "   ", "abc", "1abc", "-1", "1.5", "1e3", "+"] {
+            assert_eq!(goto_row_index(s, 100), None, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn goto_row_ignores_surrounding_whitespace() {
+        assert_eq!(goto_row_index("  42  ", 100), Some(41));
+        assert_eq!(goto_row_index("\t7\n", 100), Some(6));
+    }
+
+    /// A count read off the screen carries separators, and typing it back in has
+    /// to work — the grid's own status line writes them.
+    #[test]
+    fn goto_row_accepts_digit_group_separators() {
+        assert_eq!(goto_row_index("148,203", 200_000), Some(148_202));
+        assert_eq!(goto_row_index("148 203", 200_000), Some(148_202));
+        assert_eq!(goto_row_index("148_203", 200_000), Some(148_202));
+        // A narrow no-break space is what some locales actually render.
+        assert_eq!(goto_row_index("148\u{202f}203", 200_000), Some(148_202));
+    }
+
+    /// Stripping separators must not turn a typo into a different valid row.
+    #[test]
+    fn goto_row_still_rejects_a_stray_letter_among_the_digits() {
+        assert_eq!(goto_row_index("14x8", 200_000), None);
+        assert_eq!(goto_row_index("1,4x8", 200_000), None);
+    }
+
+    /// A number too large for the machine is still just "past the end" — a row of
+    /// 9s is how someone asks for the bottom, and it must not fall through to the
+    /// garbage path and do nothing.
+    #[test]
+    fn goto_row_clamps_a_number_wider_than_usize() {
+        assert_eq!(goto_row_index("99999999999999999999999999", 100), Some(99));
     }
 }
