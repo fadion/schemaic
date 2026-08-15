@@ -975,6 +975,24 @@ pub struct ConnNode {
     pub name: String,
     pub database: String,
     pub schema: RwSignal<SchemaState>,
+    /// True while a re-introspection of this database is in flight.
+    ///
+    /// **What makes "the model on screen may already be out of date" askable.**
+    /// `SchemaState::begin_refresh` deliberately keeps a `Loaded` database
+    /// loaded while it refetches, so the tree doesn't blank — but that also
+    /// means `Loaded` stopped meaning "current", and the schema *editors* seed
+    /// their draft from it. Applying an `ALTER` starts a refresh and reports
+    /// before it lands, so within that window `table_designer::loaded_table`
+    /// still answers with the **pre-apply** `TableInfo`; one more edit to the
+    /// same column then emits a MySQL `MODIFY COLUMN` restating the old
+    /// definition, silently reverting what was just applied. `risks()`
+    /// discloses nothing, because from the plan's view the type did not change.
+    ///
+    /// Read by `loaded_table`, the one funnel all four editor entry points
+    /// already go through. Nothing renders it: at these durations an indicator
+    /// is a glyph flickering for a frame or two, which reads as a rendering
+    /// fault rather than as progress — the same call `begin_refresh` makes.
+    pub refreshing: RwSignal<bool>,
 }
 
 impl ConnNode {
@@ -984,6 +1002,7 @@ impl ConnNode {
             name: name.to_string(),
             database: database.to_string(),
             schema: cx.create_rw_signal(SchemaState::Loading),
+            refreshing: cx.create_rw_signal(false),
         }
     }
 }
