@@ -174,23 +174,35 @@ pub(crate) fn loaded_table(
 /// The namespace a *new* object in `database` should land in: `public` on
 /// PostgreSQL, `None` on MySQL (which has no level between database and table).
 ///
-/// Read off the loaded schema rather than the connection's engine, because it's
-/// the same question the tree answers by *showing* namespace nodes — a database
-/// node stands for `public`, and any other namespace has its own node.
+/// **Derived from the dialect, refined by the loaded schema.** It used to be
+/// read off the loaded schema alone, on the grounds that this is the same
+/// question the tree answers by *showing* namespace nodes — but that made it
+/// answer `None` for a PostgreSQL database whose schema was still `Loading`, or
+/// had `Failed`, which is permanent. The statement then went out unqualified:
+/// for a role whose `search_path` is `"$user", public` and which owns a schema
+/// of its own, `CREATE TABLE "orders" (…)` lands in `alice`, not the `public`
+/// the tree row stands for. The sibling gate in the same menu already reads the
+/// *dialect* to decide the entries exist at all, so it offered PostgreSQL-only
+/// entries in exactly the state where it couldn't say which namespace they
+/// targeted.
+///
+/// The loaded schema still refines it, and that is worth keeping: a PostgreSQL
+/// database really does report its namespaces, and `schemas()` being empty is a
+/// genuine "this database has no namespace level" rather than "not looked yet".
 pub(crate) fn default_schema(ui: &Ui, database: &str) -> Option<String> {
-    let has_namespaces =
-        ui.schema
-            .db_nodes
-            .with_untracked(|nodes| {
-                nodes.iter().find(|n| n.database == database).map(|n| {
-                    match n.schema.get_untracked() {
-                        schemaic_core::schema::SchemaState::Loaded(s) => !s.schemas().is_empty(),
-                        _ => false,
-                    }
-                })
+    if edit_ctx(ui).dialect != schemaic_core::intel::SqlDialect::Postgres {
+        return None;
+    }
+    let loaded_without_namespaces = ui.schema.db_nodes.with_untracked(|nodes| {
+        nodes
+            .iter()
+            .find(|n| n.database == database)
+            .is_some_and(|n| match n.schema.get_untracked() {
+                schemaic_core::schema::SchemaState::Loaded(s) => s.schemas().is_empty(),
+                _ => false,
             })
-            .unwrap_or(false);
-    has_namespaces.then(|| schemaic_core::schema::PG_DEFAULT_SCHEMA.to_string())
+    });
+    (!loaded_without_namespaces).then(|| schemaic_core::schema::PG_DEFAULT_SCHEMA.to_string())
 }
 
 /// Every table name in a database, for the foreign-key target picker. Views are

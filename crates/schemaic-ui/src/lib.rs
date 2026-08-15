@@ -1438,6 +1438,10 @@ pub struct TabsActions {
     /// connection — same per-connection scoping it applies itself. The tab menu
     /// dims its entry rather than offering a click that does nothing.
     pub can_reopen_closed_tab: Rc<dyn Fn() -> bool>,
+    /// Whether "Close other tabs" on this tab has anything to close, so the entry
+    /// can be dimmed rather than silently doing nothing. Answered by the same
+    /// `core::tabsel::others_to_close` the action itself calls.
+    pub can_close_other_tabs: Rc<dyn Fn(usize) -> bool>,
     /// Open a brand-new tab sourced from a table (so its grid stays editable)
     /// running `sql`, and auto-run it. Used by the grid's "Follow foreign key" to
     /// land on the referenced table filtered to a row.

@@ -90,6 +90,36 @@ pub fn nth(tabs: &[TabRef], conn: u64, n: usize) -> Option<usize> {
     visible(tabs, conn).get(n).copied()
 }
 
+/// One tab as the **closing** rules see it: id, connection, and whether it is
+/// pinned. Wider than [`TabRef`] because a pinned tab is visible and selectable
+/// but not closable.
+pub type ClosableRef = (usize, u64, bool);
+
+/// The tabs "Close all tabs" would close on `conn`: its unpinned ones.
+pub fn all_to_close(tabs: &[ClosableRef], conn: u64) -> Vec<usize> {
+    tabs.iter()
+        .filter(|(_, c, pinned)| *c == conn && !*pinned)
+        .map(|(id, _, _)| *id)
+        .collect()
+}
+
+/// The tabs "Close other tabs" would close: [`all_to_close`]'s set, less `keep`.
+///
+/// The **same expression the menu entry has to dim on**, which is why it is
+/// here. The action returned early on an empty set — no dialog, no message —
+/// while the entry directly above it (`Reopen last tab`) *is* dimmed for exactly
+/// this reason, so on the app's opening state (one tab) the two rows behaved
+/// differently for the same kind of reason.
+///
+/// `keep` is offered on a pinned tab too: a pinned tab is already the one that
+/// survives everything, so "close the others" is exactly as meaningful there.
+pub fn others_to_close(tabs: &[ClosableRef], conn: u64, keep: usize) -> Vec<usize> {
+    all_to_close(tabs, conn)
+        .into_iter()
+        .filter(|id| *id != keep)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +243,48 @@ mod tests {
         assert_eq!(nth(&t, 10, 3), None, "only three tabs on this connection");
         assert_eq!(nth(&t, 99, 0), None);
         assert_eq!(nth(&[], 10, 0), None);
+    }
+
+    /// `(id, conn, pinned)` across two connections, with one pinned on each.
+    fn closable() -> Vec<ClosableRef> {
+        vec![
+            (1, 10, false),
+            (2, 20, false),
+            (3, 10, true),
+            (4, 20, false),
+            (5, 10, false),
+        ]
+    }
+
+    #[test]
+    fn closing_covers_one_connections_unpinned_tabs() {
+        assert_eq!(all_to_close(&closable(), 10), vec![1, 5], "3 is pinned");
+        assert_eq!(all_to_close(&closable(), 20), vec![2, 4]);
+        assert_eq!(all_to_close(&closable(), 99), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn closing_the_others_keeps_the_one_the_menu_was_opened_on() {
+        assert_eq!(others_to_close(&closable(), 10, 1), vec![5]);
+        assert_eq!(others_to_close(&closable(), 10, 5), vec![1]);
+    }
+
+    /// **The state the app opens in.** One tab and nothing else to close, so the
+    /// entry has to be dimmed — it used to return before the confirm, with no
+    /// dialog and no message, one row below a `Reopen last tab` that *is* dimmed
+    /// for the same kind of reason.
+    #[test]
+    fn a_lone_tab_has_no_others_to_close() {
+        assert!(others_to_close(&[(1, 10, false)], 10, 1).is_empty());
+        // And with every other tab pinned, which is the same answer by another
+        // route.
+        assert!(others_to_close(&[(1, 10, false), (2, 10, true)], 10, 1).is_empty());
+    }
+
+    /// Offered on a pinned tab too: a pinned tab is already the one that
+    /// survives everything, so "close the others" is exactly as meaningful.
+    #[test]
+    fn a_pinned_tab_may_still_be_the_one_kept() {
+        assert_eq!(others_to_close(&closable(), 10, 3), vec![1, 5]);
     }
 }

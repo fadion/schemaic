@@ -67,38 +67,87 @@ fn conn_read_only(connections: &RwSignal<Vec<Connection>>, active_conn: RwSignal
 /// state — so on a read-only connection it opens onto entries that are all
 /// dimmed, which is the same thing the flat form said with the group it dimmed.
 fn create_submenu(ui: &Ui, database: &str, schema: Option<&str>, read_only: bool) -> MenuEntry {
+    let dialect = crate::table_designer::edit_ctx(ui).dialect;
+    let children = create_children(dialect, read_only)
+        .into_iter()
+        .map(|e| {
+            let (ui, db, ns) = (ui.clone(), database.to_string(), schema.map(str::to_string));
+            MenuEntry::action(e.label, move || match e.kind {
+                CreateKind::Table => {
+                    crate::table_designer::open_for_new(&ui, &db, ns.as_deref());
+                }
+                CreateKind::View => crate::view_editor::open_for_new(&ui, &db, ns.as_deref()),
+                CreateKind::Object(kind) => {
+                    crate::object_editor::open_for_new(&ui, &db, ns.as_deref(), kind);
+                }
+            })
+            .disabled(e.disabled)
+        })
+        .collect();
+    MenuEntry::sub("Create", children)
+}
+
+/// What a Create entry makes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CreateKind {
+    Table,
+    View,
+    Object(schemaic_core::ddl::ObjectKind),
+}
+
+/// One Create entry as data: its label, what it opens, and whether it is inert.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct CreateEntry {
+    pub label: &'static str,
+    pub kind: CreateKind,
+    pub disabled: bool,
+}
+
+/// Which Create entries exist, and which are inert.
+///
+/// Two gates, and neither could be asserted while it lived inside a menu
+/// builder that needs a `Ui`: **which entries exist** (the three PostgreSQL
+/// objects are absent on MySQL, which has none of them) and **which are
+/// disabled** (all of them, on a read-only connection). The second is a live
+/// DDL path if it ever drifts.
+///
+/// The engine gate hides rather than dims, unlike everything else here: a
+/// missing entry reads as "not supported" and a dimmed one as "not here", and
+/// hiding is the same call `trigger_editor`'s per-engine form makes about what
+/// an engine can't express.
+pub(crate) fn create_children(
+    dialect: schemaic_core::intel::SqlDialect,
+    read_only: bool,
+) -> Vec<CreateEntry> {
     use schemaic_core::ddl::ObjectKind;
-    let owned = || (ui.clone(), database.to_string(), schema.map(str::to_string));
-    let (table_ui, table_db, table_ns) = owned();
-    let (view_ui, view_db, view_ns) = owned();
-    let mut children = vec![
-        MenuEntry::action("Table", move || {
-            crate::table_designer::open_for_new(&table_ui, &table_db, table_ns.as_deref());
-        })
-        .disabled(read_only),
-        MenuEntry::action("View", move || {
-            crate::view_editor::open_for_new(&view_ui, &view_db, view_ns.as_deref());
-        })
-        .disabled(read_only),
+    let mut out = vec![
+        CreateEntry {
+            label: "Table",
+            kind: CreateKind::Table,
+            disabled: read_only,
+        },
+        CreateEntry {
+            label: "View",
+            kind: CreateKind::View,
+            disabled: read_only,
+        },
     ];
-    if crate::table_designer::edit_ctx(ui).dialect == schemaic_core::intel::SqlDialect::Postgres {
-        children.extend(
+    if dialect == schemaic_core::intel::SqlDialect::Postgres {
+        out.extend(
             [
                 (ObjectKind::Enum, "Type"),
                 (ObjectKind::Domain, "Domain"),
                 (ObjectKind::Sequence, "Sequence"),
             ]
             .into_iter()
-            .map(|(kind, label)| {
-                let (ui, db, ns) = owned();
-                MenuEntry::action(label, move || {
-                    crate::object_editor::open_for_new(&ui, &db, ns.as_deref(), kind);
-                })
-                .disabled(read_only)
+            .map(|(kind, label)| CreateEntry {
+                label,
+                kind: CreateKind::Object(kind),
+                disabled: read_only,
             }),
         );
     }
-    MenuEntry::sub("Create", children)
+    out
 }
 
 // ===== moved from lib.rs (overlays) =====
@@ -3434,6 +3483,67 @@ fn pass_shares(room: usize, want: [usize; 3]) -> [usize; 3] {
         left -= extra;
     }
     take
+}
+
+#[cfg(test)]
+mod create_menu_tests {
+    use super::{CreateKind, create_children};
+    use schemaic_core::ddl::ObjectKind;
+    use schemaic_core::intel::SqlDialect;
+
+    fn labels(dialect: SqlDialect) -> Vec<&'static str> {
+        create_children(dialect, false)
+            .into_iter()
+            .map(|e| e.label)
+            .collect()
+    }
+
+    /// MySQL has none of the three standalone objects, so they are **absent**
+    /// rather than dimmed: a missing entry reads as "not supported", a dimmed one
+    /// as "not here", and offering an entry that fails at apply is the thing this
+    /// gate exists to prevent.
+    #[test]
+    fn mysql_offers_only_what_it_has() {
+        assert_eq!(labels(SqlDialect::MySql), vec!["Table", "View"]);
+    }
+
+    #[test]
+    fn postgres_offers_its_standalone_objects_too() {
+        assert_eq!(
+            labels(SqlDialect::Postgres),
+            vec!["Table", "View", "Type", "Domain", "Sequence"]
+        );
+        let kinds: Vec<CreateKind> = create_children(SqlDialect::Postgres, false)
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                CreateKind::Table,
+                CreateKind::View,
+                CreateKind::Object(ObjectKind::Enum),
+                CreateKind::Object(ObjectKind::Domain),
+                CreateKind::Object(ObjectKind::Sequence),
+            ]
+        );
+    }
+
+    /// The gate that matters if it drifts: every one of these opens an editor
+    /// that ends at a live `run_ddl`.
+    #[test]
+    fn a_read_only_connection_can_create_nothing() {
+        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+            let entries = create_children(d, true);
+            assert!(!entries.is_empty());
+            assert!(entries.iter().all(|e| e.disabled), "{d:?}");
+        }
+        assert!(
+            create_children(SqlDialect::Postgres, false)
+                .iter()
+                .all(|e| !e.disabled)
+        );
+    }
 }
 
 #[cfg(test)]

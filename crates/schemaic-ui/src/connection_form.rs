@@ -616,12 +616,24 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                 move |delta| {
                     let ids: Vec<u64> =
                         connections.with_untracked(|cs| cs.iter().map(|c| c.id).collect());
+                    // **Nothing selected is not "the cursor is at 0".** With an
+                    // unsaved new connection in the form (`draft.id == None`),
+                    // folding the two together made the first ↓ select the
+                    // *second* row and ↑ do nothing at all — `list_step` clamps
+                    // by design, so a cursor at 0 has nowhere to go up. Entering
+                    // the list from outside starts at the near end, which is
+                    // exactly what `ring_step` does with its own `Option<usize>`.
                     let cur = draft
                         .id
                         .get_untracked()
-                        .and_then(|id| ids.iter().position(|x| *x == id))
-                        .unwrap_or(0);
-                    if let Some(next) = crate::widgets::list_step(ids.len(), cur, delta) {
+                        .and_then(|id| ids.iter().position(|x| *x == id));
+                    let next = match cur {
+                        Some(cur) => crate::widgets::list_step(ids.len(), cur, delta),
+                        None if ids.is_empty() => None,
+                        None if delta < 0 => Some(ids.len() - 1),
+                        None => Some(0),
+                    };
+                    if let Some(next) = next {
                         (arrow_select)(ids[next]);
                     }
                 },

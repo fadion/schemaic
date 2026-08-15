@@ -2507,6 +2507,15 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 .collect::<Vec<_>>()
         })
     };
+    // The same list with the pinned flag, for the closing rules — a pinned tab is
+    // visible and selectable but not closable.
+    let closable_refs = move || {
+        tabs.with_untracked(|v| {
+            v.iter()
+                .map(|t| (t.id, t.conn_id.get_untracked(), t.pinned.get_untracked()))
+                .collect::<Vec<_>>()
+        })
+    };
 
     // Close a tab. Closing the last one clears it and briefly flashes it away
     // (design keeps ≥1 tab); other tabs activate a neighbor.
@@ -2689,12 +2698,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         let guard_tx = guard_tx.clone();
         Rc::new(move || {
             let conn = active_conn.get_untracked();
-            let ids = tabs.with_untracked(|v| {
-                v.iter()
-                    .filter(|t| t.conn_id.get_untracked() == conn && !t.pinned.get_untracked())
-                    .map(|t| t.id)
-                    .collect::<Vec<_>>()
-            });
+            let ids = schemaic_core::tabsel::all_to_close(&closable_refs(), conn);
             // Nothing closable (every tab pinned) — no action, so nothing to ask.
             if ids.is_empty() {
                 return;
@@ -2728,16 +2732,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         let guard_tx = guard_tx.clone();
         Rc::new(move |keep: usize| {
             let conn = active_conn.get_untracked();
-            let ids = tabs.with_untracked(|v| {
-                v.iter()
-                    .filter(|t| {
-                        t.id != keep
-                            && t.conn_id.get_untracked() == conn
-                            && !t.pinned.get_untracked()
-                    })
-                    .map(|t| t.id)
-                    .collect::<Vec<_>>()
-            });
+            // The same call the menu entry dims on (`can_close_other_tabs`), so
+            // the row and the action can't disagree about whether there is
+            // anything to do.
+            let ids = schemaic_core::tabsel::others_to_close(&closable_refs(), conn, keep);
             // Nothing else closable (alone, or every other tab pinned) — no
             // action, so nothing to ask and nothing to activate.
             if ids.is_empty() {
@@ -3093,6 +3091,14 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             recently_closed.borrow().iter().any(|s| s.conn_id == conn)
         })
     };
+
+    // Whether "Close other tabs" has anything to close, so the entry can be
+    // dimmed rather than silently doing nothing — the same `tabsel` call the
+    // action makes.
+    let can_close_other_tabs: Rc<dyn Fn(usize) -> bool> = Rc::new(move |keep: usize| {
+        !schemaic_core::tabsel::others_to_close(&closable_refs(), active_conn.get_untracked(), keep)
+            .is_empty()
+    });
 
     // ── Persisted expand/collapse + database-visibility state ───────────────
     // Snapshot both sets to disk (best effort).
@@ -4040,8 +4046,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     cs.iter()
                         .filter_map(|c| c.color.clone())
                         .collect::<Vec<_>>(),
-                    // Same rule `save_conn` uses for a new connection's id.
-                    cs.iter().map(|c| c.id).max().unwrap_or(0) + 1,
+                    Connection::next_id(cs),
                 )
             });
             // A fresh colour, not the original's: the dot is what tells two
@@ -4098,9 +4103,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         let load_schema = load_schema.clone();
         let tunnels = tunnels.clone();
         Rc::new(move || {
-            let id = draft.id.get_untracked().unwrap_or_else(|| {
-                connections.with_untracked(|cs| cs.iter().map(|c| c.id).max().unwrap_or(0)) + 1
-            });
+            let id = draft
+                .id
+                .get_untracked()
+                .unwrap_or_else(|| connections.with_untracked(|cs| Connection::next_id(cs)));
             let conn = draft.to_connection(id);
             connections.update(|cs| {
                 if let Some(existing) = cs.iter_mut().find(|c| c.id == id) {
@@ -5356,6 +5362,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             open_query,
             reopen_closed_tab,
             can_reopen_closed_tab,
+            can_close_other_tabs,
             open_table_filtered,
             set_active_db,
             open_db_cli,
