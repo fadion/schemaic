@@ -630,7 +630,7 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                     let new_c = new_c.clone();
                     move |_| (new_c)()
                 })
-                .style(|s| crate::widgets::button_focus_ring(menu_item_style(s).justify_center())),
+                .style(|s| menu_item_style(s).justify_center()),
                 ring.clone(),
                 NAV_TAB + 1,
                 true,

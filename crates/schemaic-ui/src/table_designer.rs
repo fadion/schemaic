@@ -617,23 +617,25 @@ pub(crate) fn list_actions(
 ) -> impl IntoView {
     let btn = move |glyph: &'static str, tip: &'static str, slot: u32, act: Rc<dyn Fn()>| {
         let pressed = act.clone();
-        crate::widgets::in_ring_button(
-            container(icons::icon(glyph, 15.0)).on_click_stop(move |_| (act)()),
-            ring.clone(),
-            LIST_TAB + 1 + slot,
-            true,
-            move || (pressed)(),
-        )
-        // Colour is the whole affordance, as it is for every icon button in
-        // the app (`toolbar_icon`, the modal ✕, the grid's toolbar). The
-        // padding stays — it's the hitbox — but nothing paints behind it.
-        .style(|s| {
-            crate::widgets::button_focus_ring(s)
-                .padding(5.0)
-                .color(theme::text_dim())
-                .hover(|s| s.color(theme::text()))
+        // Everything the pointer touches — the padding that *is* the hitbox, the
+        // click listener, the hover colour — stays on the face, and only the
+        // face goes into `in_ring_button`. Styling the *returned* view instead
+        // moved the hitbox onto the ring wrapper while the click listener stayed
+        // inside it, and registered a view that already had one, which is the
+        // double-fire `in_ring_button` documents.
+        let face = container(icons::icon(glyph, 15.0))
+            .on_click_stop(move |_| (act)())
+            // Colour is the whole affordance, as it is for every icon button in
+            // the app (`toolbar_icon`, the modal ✕, the grid's toolbar).
+            .style(|s| {
+                s.padding(5.0)
+                    .color(theme::text_dim())
+                    .hover(|s| s.color(theme::text()))
+            })
+            .tooltip(move || text(tip).style(crate::widgets::tooltip_style));
+        crate::widgets::in_ring_button(face, ring.clone(), LIST_TAB + 1 + slot, true, move || {
+            (pressed)()
         })
-        .tooltip(move || text(tip).style(crate::widgets::tooltip_style))
     };
     let arrows: Vec<AnyView> = match (move_up, move_down) {
         (Some(u), Some(d)) => vec![
