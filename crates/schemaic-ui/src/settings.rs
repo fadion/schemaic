@@ -10,8 +10,7 @@ use floem::prelude::*;
 
 use crate::consts::{CHAT_PAD_H, TERM_FONT_SIZES};
 use crate::widgets::{
-    autohide, focus_root, focus_root_with_ring, form_hint, form_label_style, modal_title,
-    panel_style,
+    autohide, focus_root_with_ring, form_hint, form_label_style, modal_title, panel_style,
 };
 use crate::{AiEffort, AiModel, FieldCfg, SchemaScope, TermCursor, Ui, edit_field, icons, theme};
 
@@ -88,21 +87,29 @@ pub(crate) fn term_settings_overlay(ui: Ui) -> impl IntoView {
             ))
             .style(|s| s.flex_col().gap(25.0).padding(14.0).width_full());
 
-            let panel = v_stack((modal_title("Terminal", close.clone()), body))
-                .on_click_stop(|_| {})
-                .style(|s| panel_style(s).background(theme::bg_panel()).width(420.0));
+            let panel = v_stack((
+                modal_title("Terminal", close.clone(), root_ring.clone()),
+                body,
+            ))
+            .on_click_stop(|_| {})
+            .style(|s| panel_style(s).background(theme::bg_panel()).width(420.0));
 
             let esc = close.clone();
-            focus_root_with_ring(container(panel), root_ring)
-                .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
-                .on_click_stop(move |_| close())
-                .style(|s| {
-                    s.size_full()
-                        .items_center()
-                        .justify_center()
-                        .background(theme::modal_backdrop())
-                })
-                .into_any()
+            // Click-to-dismiss on a sibling behind the panel, never on the focus
+            // root — floem fires `Click` there for Space. See
+            // `widgets::dismiss_layer`.
+            focus_root_with_ring(
+                stack((crate::widgets::dismiss_layer(move || close()), panel)),
+                root_ring,
+            )
+            .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
+            .style(|s| {
+                s.size_full()
+                    .items_center()
+                    .justify_center()
+                    .background(theme::modal_backdrop())
+            })
+            .into_any()
         },
     )
     .style(move |s| {
@@ -739,21 +746,29 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
             ))
             .style(|s| s.flex_col().gap(25.0).padding(14.0).width_full());
 
-            let panel = v_stack((modal_title("AI Assistant — Settings", close.clone()), body))
-                .on_click_stop(|_| {})
-                .style(|s| panel_style(s).background(theme::bg_panel()).width(460.0));
+            let panel = v_stack((
+                modal_title("AI Assistant — Settings", close.clone(), root_ring.clone()),
+                body,
+            ))
+            .on_click_stop(|_| {})
+            .style(|s| panel_style(s).background(theme::bg_panel()).width(460.0));
 
             let esc = close.clone();
-            focus_root_with_ring(container(panel), root_ring)
-                .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
-                .on_click_stop(move |_| close())
-                .style(|s| {
-                    s.size_full()
-                        .items_center()
-                        .justify_center()
-                        .background(theme::modal_backdrop())
-                })
-                .into_any()
+            // Click-to-dismiss on a sibling behind the panel, never on the focus
+            // root — floem fires `Click` there for Space. See
+            // `widgets::dismiss_layer`.
+            focus_root_with_ring(
+                stack((crate::widgets::dismiss_layer(move || close()), panel)),
+                root_ring,
+            )
+            .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
+            .style(|s| {
+                s.size_full()
+                    .items_center()
+                    .justify_center()
+                    .background(theme::modal_backdrop())
+            })
+            .into_any()
         },
     )
     .style(move |s| {
@@ -947,21 +962,29 @@ pub(crate) fn theme_settings_overlay(ui: Ui) -> impl IntoView {
             // Scroll so the taller grouped modal never overflows the window.
             let body = autohide(scroll(body)).style(|s| s.width_full().max_height(560.0));
 
-            let panel = v_stack((modal_title("Settings", close.clone()), body))
-                .on_click_stop(|_| {})
-                .style(|s| panel_style(s).background(theme::bg_panel()).width(420.0));
+            let panel = v_stack((
+                modal_title("Settings", close.clone(), root_ring.clone()),
+                body,
+            ))
+            .on_click_stop(|_| {})
+            .style(|s| panel_style(s).background(theme::bg_panel()).width(420.0));
 
             let esc = close.clone();
-            focus_root_with_ring(container(panel), root_ring)
-                .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
-                .on_click_stop(move |_| close())
-                .style(|s| {
-                    s.size_full()
-                        .items_center()
-                        .justify_center()
-                        .background(theme::modal_backdrop())
-                })
-                .into_any()
+            // Click-to-dismiss on a sibling behind the panel, never on the focus
+            // root — floem fires `Click` there for Space. See
+            // `widgets::dismiss_layer`.
+            focus_root_with_ring(
+                stack((crate::widgets::dismiss_layer(move || close()), panel)),
+                root_ring,
+            )
+            .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
+            .style(|s| {
+                s.size_full()
+                    .items_center()
+                    .justify_center()
+                    .background(theme::modal_backdrop())
+            })
+            .into_any()
         },
     )
     .style(move |s| {
@@ -1004,21 +1027,27 @@ pub(crate) fn help_overlay(ui: Ui) -> impl IntoView {
             // Scroll the body so the modal never overflows the window.
             let body = autohide(scroll(body)).style(|s| s.width_full().max_height(560.0));
 
-            let panel = v_stack((modal_title("Shortcuts", close.clone()), body))
+            // A ring for one button — the ✕, this modal's only control. Without
+            // one the root has no Tab handler and Tab falls through to floem's
+            // whole-window traversal, out of the modal into the workspace.
+            let ring = crate::widgets::FocusRing::new();
+            let panel = v_stack((modal_title("Shortcuts", close.clone(), ring.clone()), body))
                 .on_click_stop(|_| {})
                 .style(|s| panel_style(s).background(theme::bg_panel()).width(420.0));
 
             let esc = close.clone();
-            focus_root(container(panel))
-                .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
-                .on_click_stop(move |_| close())
-                .style(|s| {
-                    s.size_full()
-                        .items_center()
-                        .justify_center()
-                        .background(theme::modal_backdrop())
-                })
-                .into_any()
+            focus_root_with_ring(
+                stack((crate::widgets::dismiss_layer(move || close()), panel)),
+                ring,
+            )
+            .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
+            .style(|s| {
+                s.size_full()
+                    .items_center()
+                    .justify_center()
+                    .background(theme::modal_backdrop())
+            })
+            .into_any()
         },
     )
     .style(move |s| {

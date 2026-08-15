@@ -2314,10 +2314,7 @@ pub fn workspace(ui: Ui) -> impl IntoView {
             // prevent. Step the innermost overlay's ring instead.
             if matches!(ke.key.logical_key, Key::Named(NamedKey::Tab))
                 && !m.control()
-                && let (Some(root), Some(ring)) = (
-                    widgets::innermost_focus_root(),
-                    widgets::innermost_focus_ring(),
-                )
+                && let Some((root, ring)) = widgets::innermost_ring_root()
             {
                 ring.step_from(root, m.shift());
                 return EventPropagation::Stop;
@@ -4726,13 +4723,12 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                         // 0, which made a `tab_indents` field — where Escape is
                         // the only way out — a trap: every control below it in
                         // the ring was unreachable by forward Tab.
-                        if let Some((ring, _)) = &key_focus {
-                            ring.remember(vid);
-                        }
                         vid.clear_focus();
-                    }
-                    if let Some(root) = widgets::innermost_focus_root() {
-                        root.request_focus();
+                        widgets::hand_keyboard_back(
+                            key_focus.as_ref().map(|(ring, _)| (ring, vid)),
+                        );
+                    } else {
+                        widgets::hand_keyboard_back(None);
                     }
                 }
             }
@@ -5254,18 +5250,19 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     let ring_cleanup = focus.map(|(ring, _)| ring);
     stack((inner, placeholder))
         .on_cleanup(move || {
-            if let (Some(ring), Some(vid)) = (ring_cleanup.as_ref(), registered.get()) {
-                ring.unregister(vid);
-            }
             // Hand the keyboard back if this field held it — floem clears the
             // focus of a removed view *silently*, so a field that unmounts while
             // focused (a branch folding away under the control that changed it)
             // otherwise leaves the modal around it answering neither Escape nor
-            // Tab. Same step `focus_root`'s and `in_focus_ring`'s cleanups take.
-            if focus_now.get()
-                && let Some(root) = widgets::innermost_focus_root()
-            {
-                root.request_focus();
+            // Tab. Same step `focus_root`'s and `in_focus_ring`'s cleanups take,
+            // through the same function, so the `remember` half can't be left out
+            // of one of the three again. Before unregistering, so the tabindex is
+            // still there to be remembered.
+            if focus_now.get() {
+                widgets::hand_keyboard_back(ring_cleanup.as_ref().zip(registered.get()));
+            }
+            if let (Some(ring), Some(vid)) = (ring_cleanup.as_ref(), registered.get()) {
+                ring.unregister(vid);
             }
         })
         .on_event_cont(EventListener::PointerDown, move |e| {

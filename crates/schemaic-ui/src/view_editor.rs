@@ -524,7 +524,7 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
 
             let close_x: Rc<dyn Fn()> = Rc::new(close);
             let panel = v_stack((
-                modal_title_owned(title, close_x),
+                modal_title_owned(title, close_x, root_ring.clone()),
                 body,
                 modal_footer_split(status.style(|s| s.min_width(0.0)), actions),
             ))

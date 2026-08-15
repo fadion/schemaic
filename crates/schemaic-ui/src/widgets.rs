@@ -66,21 +66,60 @@ fn focus_root_inner<V: IntoView + 'static>(view: V, ring: Option<FocusRing>) -> 
         .request_focus(|| {})
         .on_cleanup(move || {
             FOCUS_ROOTS.with_borrow_mut(|s| s.retain(|(x, _)| *x != id));
-            // **Hand the keyboard back.** Floem clears `app_state.focus` when a
-            // focused view is removed and does it *silently* — no
-            // `focus_changed`, so no `FocusGained` lands anywhere — and a key
-            // event then goes to the focused view and, failing that, only to the
-            // root's own listeners. So closing a popup menu opened over a modal
-            // left the modal underneath keyboard-dead: Escape did nothing, close
-            // and Cancel still worked. The nested editors escaped it only by
-            // accident, unmounting under the preview and being rebuilt.
-            //
-            // The same step `edit_field`'s Escape branch takes, for the same
-            // reason.
-            if let Some(r) = innermost_focus_root() {
-                r.request_focus();
-            }
+            // A root has no place in a ring, so there is nothing to remember —
+            // the ring it *carried* went with it.
+            hand_keyboard_back(None);
         })
+}
+
+/// **Hand the keyboard back** to the innermost mounted [`focus_root`], and
+/// remember where in `ring` the walk had got to.
+///
+/// Floem clears `app_state.focus` when a focused view is removed and does it
+/// *silently* — no `focus_changed`, so no `FocusGained` lands anywhere — and a
+/// key event then goes to the focused view and, failing that, only to the window
+/// root's own listeners. So closing a popup menu opened over a modal left the
+/// modal underneath keyboard-dead: Escape did nothing, while its close button
+/// and Cancel still worked.
+///
+/// The `remember` half is why this is one function rather than three copies of
+/// two lines. Without it, `step_from` finds neither `from` (the root is not a
+/// ring member) nor `last` (a removed `ViewId`), and `ring_step` returns 0 — so
+/// Tab-ing to an enum value's ✕ and pressing Space removed the row and sent the
+/// next Tab back to the **first** control in the modal. `FocusRing::focus_at`
+/// already knew a captured id doesn't survive a rebuild and resolves by
+/// tabindex; `last` was left as a raw id. The three sites that do this —
+/// `focus_root`'s cleanup, `in_focus_ring_with`'s cleanup, and `edit_field`'s
+/// Escape — spelled it out separately and **none** called `remember`, so
+/// `git grep remember` found the gap in neither of the two that had a ring.
+pub(crate) fn hand_keyboard_back(ring: Option<(&FocusRing, floem::ViewId)>) {
+    if let Some((ring, leaving)) = ring {
+        ring.remember(leaving);
+    }
+    if let Some(r) = innermost_focus_root() {
+        r.request_focus();
+    }
+}
+
+/// A modal's click-outside-to-dismiss layer: a full-size, absolutely-positioned
+/// sibling that sits **behind** the panel.
+///
+/// It exists so the dismiss listener is not on the [`focus_root`] itself. Floem
+/// fires [`EventListener::Click`] on the **focused** view for any physical
+/// Enter, NumpadEnter or Space, and a modal opens with focus on its own root —
+/// so with `.on_click_stop(close)` chained onto that root, **Space closed the
+/// modal**. Space is the reflex for "scroll this", and on the Live Monitor
+/// closing also stops the poll and does `log.set(Vec::new())`, destroying every
+/// change it had collected — deletes included, which is the one case where the
+/// row is gone from the database and the log is the only remaining record.
+///
+/// Build it as the **first** child of the backdrop stack: floem dispatches a
+/// pointer event to the first hit child in reverse paint order, so the panel,
+/// added after, stays on top of it.
+pub(crate) fn dismiss_layer(dismiss: impl Fn() + 'static) -> impl IntoView {
+    empty()
+        .on_click_stop(move |_| dismiss())
+        .style(|s| s.absolute().inset(0.0))
 }
 
 /// The innermost mounted [`focus_root`], or `None` when no overlay is open (a
@@ -89,14 +128,27 @@ pub(crate) fn innermost_focus_root() -> Option<floem::ViewId> {
     FOCUS_ROOTS.with_borrow(|s| s.last().map(|(id, _)| *id))
 }
 
-/// The innermost mounted overlay's [`FocusRing`], for the window root's Tab
-/// backstop: with focus on a dropdown's popup list — or on nothing at all, which
-/// is what a click on an unfocusable list row leaves behind — the key reaches
-/// neither a ring member nor the modal's own root, and floem's fallback walks
-/// the *whole window tree*, so Tab escaped the modal into the workspace behind
-/// it. The root can step this ring instead.
-pub(crate) fn innermost_focus_ring() -> Option<FocusRing> {
-    FOCUS_ROOTS.with_borrow(|s| s.last().and_then(|(_, r)| r.clone()))
+/// The innermost mounted overlay that **has** a [`FocusRing`], as
+/// `(root, ring)`, for the window root's Tab backstop.
+///
+/// With focus on a dropdown's popup list — or on nothing at all, which is what a
+/// click on an unfocusable list row leaves behind — a Tab reaches neither a ring
+/// member nor the modal's own root, and floem's fallback walks the *whole window
+/// tree*. The root steps this ring instead.
+///
+/// **The innermost ring that exists, not the innermost root's.** Reading
+/// `FOCUS_ROOTS.last()` and taking *its* ring meant a **ring-less** root on top
+/// answered `None` and the backstop was skipped entirely: `menu_panel` registers
+/// as one, so right-clicking a row in Manage Connections and pressing Tab sent
+/// focus out into the workspace behind the modal — the one outcome the ring
+/// exists to prevent. The pair is returned together so the root a step resumes
+/// from is the root that ring's `remember` cursor belongs to.
+pub(crate) fn innermost_ring_root() -> Option<(floem::ViewId, FocusRing)> {
+    FOCUS_ROOTS.with_borrow(|s| {
+        s.iter()
+            .rev()
+            .find_map(|(id, r)| r.clone().map(|r| (*id, r)))
+    })
 }
 
 // ── Tab order ───────────────────────────────────────────────────────────────
@@ -159,6 +211,15 @@ pub(crate) const ROW_TAB_STRIDE: u32 = 10;
 /// Where a row's ↑ / ↓ / ✕ sit within its [`ROW_TAB_STRIDE`] block — after its
 /// fields, which take the low half.
 pub(crate) const ROW_BUTTON_TAB: u32 = 5;
+
+/// The title bar's ✕ — **last** in the ring, past the footer.
+///
+/// It sits at the top-right on screen, but it is the same action the footer's
+/// Cancel or Close already offers, so putting it first would mean every Tab
+/// walk through a modal opened on "dismiss this". Last, it is the exit you
+/// arrive at after everything the modal is for — and in the four footer-less
+/// modals, where it is the only button, its position is moot.
+pub(crate) const TITLE_CLOSE_TAB: u32 = ACTION_TAB + 100;
 
 // The Tab order every modal in the app is laid out in, asserted at **compile
 // time** rather than in a test, because it is arithmetic over constants and a
@@ -398,7 +459,12 @@ pub(crate) struct FocusRing {
     /// `tab_indents` field (where Tab types an indent and Escape is the way out)
     /// a **trap**: every control after it in the ring was unreachable by forward
     /// Tab, because leaving the field always landed back at the top.
-    last: Rc<std::cell::Cell<Option<floem::ViewId>>>,
+    ///
+    /// A **tabindex**, not a `ViewId` — see [`FocusRing::remember`]. An id
+    /// resolves only while the control it names is mounted, and the two commonest
+    /// callers are a control that has just removed itself and one that has just
+    /// been rebuilt.
+    last: Rc<std::cell::Cell<Option<u32>>>,
 }
 
 /// Closes a control's open popup and returns the keyboard to it.
@@ -489,30 +555,79 @@ impl FocusRing {
         self.entries.borrow_mut().retain(|(_, x)| *x != id);
     }
 
-    /// Remember `id` as where the walk should resume — what a control calls on
-    /// its way out when it hands focus back to the modal root, so the root's own
-    /// Tab continues from it instead of restarting at the top.
+    /// Remember where the walk should resume — what a control calls on its way
+    /// out when it hands focus back to the modal root, so the root's own Tab
+    /// continues from it instead of restarting at the top.
+    ///
+    /// Stored as the **tabindex**, not the `ViewId`. A raw id only resolves
+    /// while the control it names is still mounted, and the two cases that call
+    /// this most are exactly the ones where it isn't: a control removed by its
+    /// own action (Tab to an enum value's ✕, press Space) and one rebuilt by it
+    /// (a dropdown's accept). `focus_at` already knew this; `last` did not, so
+    /// `target` found neither `from` nor `last`, `ring_step` returned 0, and the
+    /// next Tab restarted at the modal's first control.
     pub(crate) fn remember(&self, id: floem::ViewId) {
-        self.last.set(Some(id));
+        let t = self
+            .entries
+            .borrow()
+            .iter()
+            .find(|(_, x)| *x == id)
+            .map(|(t, _)| *t);
+        if t.is_some() {
+            self.last.set(t);
+        }
     }
 
     /// Where one step from `from` lands: the [remembered](Self::remember)
     /// position stands in when `from` isn't a ring member — which is every
     /// re-entry from a modal root, a popup list, or nowhere. Neither known:
     /// start at the near end.
-    pub(crate) fn target(&self, from: floem::ViewId, backwards: bool) -> Option<floem::ViewId> {
+    fn target_pos(&self, from: floem::ViewId, backwards: bool) -> Option<usize> {
         let e = self.entries.borrow();
-        let find = |id: floem::ViewId| e.iter().position(|(_, x)| *x == id);
-        let cur = find(from).or_else(|| self.last.get().and_then(find));
-        ring_step(e.len(), cur, backwards).map(|n| e[n].1)
+        let cur = e
+            .iter()
+            .position(|(_, x)| *x == from)
+            .or_else(|| self.resume_pos(&e));
+        ring_step(e.len(), cur, backwards)
+    }
+
+    /// The position a remembered tabindex resumes from.
+    ///
+    /// Still registered: its own position, so a forward step moves past it.
+    /// **Gone** — the control removed itself — the position *before* where it
+    /// was, so a forward step lands on its neighbour rather than skipping it.
+    /// `None` at the front of the ring is the same answer by another route:
+    /// `ring_step` starts a forward walk at 0.
+    fn resume_pos(&self, e: &[(u32, floem::ViewId)]) -> Option<usize> {
+        let t = self.last.get()?;
+        let p = e.partition_point(|(x, _)| *x < t);
+        if e.get(p).is_some_and(|(x, _)| *x == t) {
+            Some(p)
+        } else {
+            p.checked_sub(1)
+        }
+    }
+
+    /// Where one step from `from` lands. See [`FocusRing::remember`].
+    ///
+    /// `step_from` is what the app calls; this is the same decision without the
+    /// focus request, so the ring's walk can be asserted without a window.
+    #[cfg(test)]
+    fn target(&self, from: floem::ViewId, backwards: bool) -> Option<floem::ViewId> {
+        let pos = self.target_pos(from, backwards)?;
+        self.entries.borrow().get(pos).map(|(_, id)| *id)
     }
 
     /// Move focus one step from `from`, per [`FocusRing::target`].
     pub(crate) fn step_from(&self, from: floem::ViewId, backwards: bool) {
-        if let Some(id) = self.target(from, backwards) {
-            self.last.set(Some(id));
-            id.request_focus();
-        }
+        let Some(pos) = self.target_pos(from, backwards) else {
+            return;
+        };
+        let Some((tabindex, id)) = self.entries.borrow().get(pos).copied() else {
+            return;
+        };
+        self.last.set(Some(tabindex));
+        id.request_focus();
     }
 
     /// Whatever now sits at `tabindex`.
@@ -535,7 +650,7 @@ impl FocusRing {
     /// rebuild; the replacement re-registers under it.
     pub(crate) fn focus_at(&self, tabindex: u32) {
         if let Some(id) = self.at(tabindex) {
-            self.last.set(Some(id));
+            self.last.set(Some(tabindex));
             id.request_focus();
         }
     }
@@ -634,68 +749,90 @@ pub(crate) fn in_focus_ring_with<V: IntoView + 'static>(
             if ke.key.logical_key == Key::Named(NamedKey::Escape) {
                 // Remember where the walk was before handing the keyboard back,
                 // so the root's Tab resumes here rather than at the top.
-                step_ring.remember(id);
                 id.clear_focus();
-                if let Some(root) = innermost_focus_root() {
-                    root.request_focus();
-                }
+                hand_keyboard_back(Some((&step_ring, id)));
                 return EventPropagation::Stop;
             }
             EventPropagation::Continue
         })
         .on_cleanup(move || {
+            // `remember` *before* unregistering, so the tabindex is still known:
+            // the next Tab then resumes beside where the control was rather than
+            // at the top of the modal. Tab to an enum value's ✕, press Space, and
+            // the row — and the focused view with it — is gone.
+            if at_cleanup.get() {
+                hand_keyboard_back(Some((&cleanup_ring, id)));
+            }
             cleanup_ring.unregister(id);
             on_dispose();
-            // **Hand the keyboard back**, the same step `focus_root`'s cleanup
-            // takes and for the same reason: floem clears `app_state.focus`
-            // *silently* when the focused view is removed, so a control that
-            // unmounts while focused leaves the keyboard nowhere and the modal
-            // around it answers neither Escape nor Tab. One click on the
-            // designer's list `+` did it — the click focuses the pane, and the
-            // draft it edits is half the container's key.
-            if at_cleanup.get()
-                && let Some(root) = innermost_focus_root()
-            {
-                root.request_focus();
-            }
         })
 }
 
 // ===== moved from lib.rs (widgets cluster) =====
-// A title bar for a modal panel, with a close (×) button.
-pub(crate) fn modal_title(title: &'static str, close: Rc<dyn Fn()>) -> impl IntoView {
-    modal_title_impl(title, close, true)
+/// A title bar for a modal panel, with a close (×) button.
+///
+/// `ring` is **required**, and that is the point of the parameter: this ✕ was
+/// the one button in every modal that never joined one — and in the four
+/// footer-less modals (Settings, Terminal settings, AI settings, Shortcuts) it
+/// is the *only* button, so "every modal button goes through `in_ring_button`"
+/// was false in the chrome all fifteen of them wear.
+pub(crate) fn modal_title(
+    title: &'static str,
+    close: Rc<dyn Fn()>,
+    ring: FocusRing,
+) -> impl IntoView {
+    modal_title_impl(title, close, ring, true)
 }
 
 /// Like [`modal_title`] but without the bottom separator border — for modals
 /// whose body already reads as a distinct block (the plan modal's boxed table).
-pub(crate) fn modal_title_borderless(title: &'static str, close: Rc<dyn Fn()>) -> impl IntoView {
-    modal_title_impl(title, close, false)
+pub(crate) fn modal_title_borderless(
+    title: &'static str,
+    close: Rc<dyn Fn()>,
+    ring: FocusRing,
+) -> impl IntoView {
+    modal_title_impl(title, close, ring, false)
 }
 
 /// [`modal_title`] for a title that isn't known at compile time (the import
 /// modal names the table it's loading into).
-pub(crate) fn modal_title_owned(title: String, close: Rc<dyn Fn()>) -> impl IntoView {
-    modal_title_impl(title, close, true)
+pub(crate) fn modal_title_owned(
+    title: String,
+    close: Rc<dyn Fn()>,
+    ring: FocusRing,
+) -> impl IntoView {
+    modal_title_impl(title, close, ring, true)
 }
 
-fn modal_title_impl(title: impl Into<String>, close: Rc<dyn Fn()>, border: bool) -> impl IntoView {
+fn modal_title_impl(
+    title: impl Into<String>,
+    close: Rc<dyn Fn()>,
+    ring: FocusRing,
+    border: bool,
+) -> impl IntoView {
     let title = title.into();
+    let pressed = close.clone();
     h_stack((
         text(title).style(|s| s.font_size(15.0).font_bold().color(theme::text())),
         empty().style(|s| s.flex_grow(1.0_f32)),
         // Lucide X, 16px, vertically centred; `padding(6)` enlarges the click
         // hitbox (same idiom as `toolbar_icon`) so it's not fiddly to hit. Same
         // dim→bright colour as the old glyph.
-        container(icons::icon(icons::X, 16.0))
-            .on_click_stop(move |_| (close)())
-            .style(|s| {
-                s.flex_shrink(0.0_f32)
-                    .items_center()
-                    .padding(6.0)
-                    .color(theme::text_dim())
-                    .hover(|s| s.color(theme::text()))
-            }),
+        in_ring_button(
+            container(icons::icon(icons::X, 16.0))
+                .on_click_stop(move |_| (close)())
+                .style(|s| {
+                    s.flex_shrink(0.0_f32)
+                        .items_center()
+                        .padding(6.0)
+                        .color(theme::text_dim())
+                        .hover(|s| s.color(theme::text()))
+                }),
+            ring,
+            TITLE_CLOSE_TAB,
+            true,
+            move || (pressed)(),
+        ),
     ))
     .style(move |s| {
         s.width_full()
@@ -1112,13 +1249,30 @@ pub(crate) fn action_face<V: IntoView + 'static, F: Fn() + 'static>(
 /// This is now the *only* text-button family left. Every modal with a footer bar
 /// wears the filled [`action_button`] instead; a `footer_button` at a smaller
 /// padding sat beside this one until the last of those footers moved over.
+///
+/// `ring` is **required**, like [`modal_title`]'s. These were the last ring-less
+/// buttons in the app, and one of the two dialogs they build is the transaction
+/// prompt — raised when something would strand an **open transaction**, with
+/// Escape deliberately dead (there is no safe "never mind" for uncommitted
+/// writes) and no ring published, so no key did anything at all and the user had
+/// to reach for the mouse to answer a question about their own writes.
 pub(crate) fn dialog_button(
-    label: impl Into<String>,
+    label: impl Into<String> + 'static,
     color: fn() -> floem::peniko::Color,
     hover: fn() -> floem::peniko::Color,
+    ring: FocusRing,
+    tabindex: u32,
     on_click: impl Fn() + 'static,
-) -> impl IntoView {
-    text_button(label, color, hover, true, (10.0, 5.0), on_click)
+) -> AnyView {
+    let on_click = Rc::new(on_click);
+    let pressed = on_click.clone();
+    in_ring_button(
+        text_button(label, color, hover, true, (10.0, 5.0), move || on_click()),
+        ring,
+        tabindex,
+        true,
+        move || pressed(),
+    )
 }
 
 fn text_button(
@@ -2833,12 +2987,49 @@ mod ring_tests {
         assert_eq!(ring.target(root, true), Some(ids[0]));
     }
 
+    /// **A control removed by its own action resumes at its neighbour**, not at
+    /// the top of the modal. Tab to an enum value's ✕ and press Space: the row
+    /// goes, the focused view with it, and the next Tab used to restart at the
+    /// modal's first control — because `last` was a raw `ViewId` and `target`
+    /// resolves it by looking it up in the ring it has just left.
     #[test]
-    fn a_remembered_view_that_has_since_unmounted_starts_the_walk_over() {
+    fn a_remembered_control_that_has_since_unmounted_resumes_at_its_neighbour() {
         let (ring, ids) = ring_of(&[10, 20, 30]);
         ring.remember(ids[1]);
         ring.unregister(ids[1]);
-        assert_eq!(ring.target(floem::ViewId::new(), false), Some(ids[0]));
+        assert_eq!(ring.target(floem::ViewId::new(), false), Some(ids[2]));
+    }
+
+    /// The same, at the front of the ring: the removed control's neighbour is
+    /// the first entry, and a forward walk starts there anyway.
+    #[test]
+    fn removing_the_first_control_resumes_at_the_new_first() {
+        let (ring, ids) = ring_of(&[10, 20, 30]);
+        ring.remember(ids[0]);
+        ring.unregister(ids[0]);
+        assert_eq!(ring.target(floem::ViewId::new(), false), Some(ids[1]));
+    }
+
+    /// A control that is still there is stepped *past*, which is the ordinary
+    /// Escape-then-Tab case and the one the memory was added for.
+    #[test]
+    fn a_remembered_control_still_mounted_is_stepped_past() {
+        let (ring, ids) = ring_of(&[10, 20, 30]);
+        ring.remember(ids[1]);
+        assert_eq!(ring.target(floem::ViewId::new(), false), Some(ids[2]));
+        assert_eq!(ring.target(floem::ViewId::new(), true), Some(ids[0]));
+    }
+
+    /// And a control **rebuilt** under the same tabindex — a dropdown's accept
+    /// replaces the box — is found again, where a captured id would be stale.
+    #[test]
+    fn a_remembered_control_rebuilt_under_its_tabindex_is_still_found() {
+        let (ring, ids) = ring_of(&[10, 20, 30]);
+        ring.remember(ids[1]);
+        let rebuilt = floem::ViewId::new();
+        ring.register(20, rebuilt);
+        ring.unregister(ids[1]);
+        assert_eq!(ring.target(floem::ViewId::new(), false), Some(ids[2]));
     }
 
     /// **A disabled button is not a Tab stop.** It keeps its place on screen —

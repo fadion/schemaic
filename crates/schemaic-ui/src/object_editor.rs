@@ -627,6 +627,8 @@ fn domain_form(
                         .iter()
                         .map(|t| t.to_string())
                         .collect(),
+                    ring.clone(),
+                    21,
                 ),
             ))
             .style(|s| s.flex_row().items_center().gap(2.0)),
@@ -1128,7 +1130,7 @@ pub(crate) fn object_editor_overlay(ui: Ui) -> impl IntoView {
 
             let close_x: Rc<dyn Fn()> = Rc::new(close);
             let panel = v_stack((
-                modal_title_owned(title, close_x),
+                modal_title_owned(title, close_x, root_ring.clone()),
                 body,
                 modal_footer_split(status.style(|s| s.min_width(0.0)), actions),
             ))

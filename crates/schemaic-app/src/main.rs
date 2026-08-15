@@ -4075,7 +4075,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     };
 
     // Delete a connection; if it was active, fall back to the first remaining.
-    let delete_conn: Rc<dyn Fn(u64)> = {
+    let delete_conn_now: Rc<dyn Fn(u64)> = {
         let load_schema = load_schema.clone();
         let tunnels = tunnels.clone();
         let drop_session = drop_session.clone();
@@ -4210,6 +4210,46 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 persist::load_json("diagrams.json");
             schemaic_core::erd::clear_conn_layouts(&mut layouts, id);
             persist::save_json("diagrams.json", &layouts);
+        })
+    };
+
+    // Ask first. **Every one of those is unrecoverable**: the three keyring
+    // entries (`conn.{id}.password` / `.ssh_password` / `.ssh_passphrase`), the
+    // saved AI conversation, the query history, the tabs *and* their editor
+    // contents — and `recently_closed` is filtered too, so Ctrl+Shift+T cannot
+    // bring them back.
+    //
+    // It ran on the click, from a two-entry menu whose other entry is
+    // `Duplicate`, a few pixels above. Meanwhile the app raises a confirm for
+    // "close other tabs", whose tabs *are* recoverable — so this was an internal
+    // inconsistency rather than a house style, and the inconsistency ran the
+    // wrong way round.
+    //
+    // The message names the connection, because the menu is opened at the
+    // cursor over a list of rows that look alike, and says the stored password
+    // goes with it, because that is the part no re-typing of a host and port
+    // gets back.
+    let delete_conn: Rc<dyn Fn(u64)> = {
+        let delete_conn_now = delete_conn_now.clone();
+        Rc::new(move |id: u64| {
+            let name = connections.with_untracked(|cs| {
+                cs.iter()
+                    .find(|c| c.id == id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default()
+            });
+            let delete = delete_conn_now.clone();
+            confirm.set(Some(Confirm {
+                title: format!("Delete “{name}”"),
+                message: "This deletes the connection, its stored password, its saved AI \
+                          conversation, its query history and its tabs. It can't be undone."
+                    .to_string(),
+                resolve: Rc::new(move |yes| {
+                    if yes {
+                        (delete)(id);
+                    }
+                }),
+            }));
         })
     };
 
