@@ -47,40 +47,58 @@ fn conn_read_only(connections: &RwSignal<Vec<Connection>>, active_conn: RwSignal
     })
 }
 
-/// The `Create type` / `Create domain` / `Create sequence` entries a database or
-/// namespace node offers.
+/// The **Create** submenu a database or namespace node offers: `Table` and
+/// `View` on both engines, plus PostgreSQL's `Type` / `Domain` / `Sequence`.
 ///
-/// **Empty on MySQL**, which has none of these — the same call
-/// `trigger_editor`'s form makes about what an engine can't express: hide it,
-/// rather than offer it and fail at apply. That is also why these are hidden
-/// where every other schema-editing entry is merely *dimmed* on a read-only
-/// connection: a missing entry reads as "not supported", a dimmed one as "not
-/// here", and here both readings are true of a different engine.
-fn create_object_entries(
-    ui: &Ui,
-    database: &str,
-    schema: Option<&str>,
-    read_only: bool,
-) -> Vec<MenuEntry> {
+/// One submenu rather than five siblings, because the flat form put five rows
+/// that all began with the same verb into the middle of a menu whose every
+/// other entry is about the node itself — on PostgreSQL, most of the menu. The
+/// verb moves to the parent row and the labels become the nouns, which is the
+/// shape `Colour` here and `Copy` on a table node already use.
+///
+/// The three PostgreSQL objects are **absent on MySQL**, which has none of them
+/// — the same call `trigger_editor`'s form makes about what an engine can't
+/// express: hide it, rather than offer it and fail at apply. That is also why
+/// they are hidden where every other schema-editing entry is merely *dimmed* on
+/// a read-only connection: a missing entry reads as "not supported", a dimmed
+/// one as "not here", and here both readings are true of a different engine.
+///
+/// The parent row is never itself dimmed — a [`MenuEntry::Sub`] has no disabled
+/// state — so on a read-only connection it opens onto entries that are all
+/// dimmed, which is the same thing the flat form said with the group it dimmed.
+fn create_submenu(ui: &Ui, database: &str, schema: Option<&str>, read_only: bool) -> MenuEntry {
     use schemaic_core::ddl::ObjectKind;
-    if crate::table_designer::edit_ctx(ui).dialect != schemaic_core::intel::SqlDialect::Postgres {
-        return Vec::new();
-    }
-    [
-        (ObjectKind::Enum, "Create type"),
-        (ObjectKind::Domain, "Create domain"),
-        (ObjectKind::Sequence, "Create sequence"),
-    ]
-    .into_iter()
-    .map(|(kind, label)| {
-        let ui = ui.clone();
-        let (db, ns) = (database.to_string(), schema.map(str::to_string));
-        MenuEntry::action(label, move || {
-            crate::object_editor::open_for_new(&ui, &db, ns.as_deref(), kind);
+    let owned = || (ui.clone(), database.to_string(), schema.map(str::to_string));
+    let (table_ui, table_db, table_ns) = owned();
+    let (view_ui, view_db, view_ns) = owned();
+    let mut children = vec![
+        MenuEntry::action("Table", move || {
+            crate::table_designer::open_for_new(&table_ui, &table_db, table_ns.as_deref());
         })
-        .disabled(read_only)
-    })
-    .collect()
+        .disabled(read_only),
+        MenuEntry::action("View", move || {
+            crate::view_editor::open_for_new(&view_ui, &view_db, view_ns.as_deref());
+        })
+        .disabled(read_only),
+    ];
+    if crate::table_designer::edit_ctx(ui).dialect == schemaic_core::intel::SqlDialect::Postgres {
+        children.extend(
+            [
+                (ObjectKind::Enum, "Type"),
+                (ObjectKind::Domain, "Domain"),
+                (ObjectKind::Sequence, "Sequence"),
+            ]
+            .into_iter()
+            .map(|(kind, label)| {
+                let (ui, db, ns) = owned();
+                MenuEntry::action(label, move || {
+                    crate::object_editor::open_for_new(&ui, &db, ns.as_deref(), kind);
+                })
+                .disabled(read_only)
+            }),
+        );
+    }
+    MenuEntry::sub("Create", children)
 }
 
 // ===== moved from lib.rs (overlays) =====
@@ -553,36 +571,12 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     // namespace (other namespaces get their own node), so a new
                     // table lands where the tree says it will.
                     {
-                        let ui = import_ui.clone();
-                        let db = menu.name.clone();
-                        let ns = crate::table_designer::default_schema(&ui, &db);
-                        let dbn = menu.name.clone();
-                        let view_ui = ui.clone();
-                        let view_ns = ns.clone();
-                        let obj_ns = ns.clone();
-                        let view_db = menu.name.clone();
-                        let read_only = conn_read_only(&connections, active_conn);
-                        entries.push(
-                            MenuEntry::action("Create table", move || {
-                                crate::table_designer::open_for_new(&ui, &dbn, ns.as_deref());
-                            })
-                            .disabled(read_only),
-                        );
-                        entries.push(
-                            MenuEntry::action("Create view", move || {
-                                crate::view_editor::open_for_new(
-                                    &view_ui,
-                                    &view_db,
-                                    view_ns.as_deref(),
-                                );
-                            })
-                            .disabled(read_only),
-                        );
-                        entries.extend(create_object_entries(
+                        let ns = crate::table_designer::default_schema(&import_ui, &menu.name);
+                        entries.push(create_submenu(
                             &import_ui,
                             &menu.name,
-                            obj_ns.as_deref(),
-                            read_only,
+                            ns.as_deref(),
+                            conn_read_only(&connections, active_conn),
                         ));
                     }
                 }
@@ -698,35 +692,12 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             (oq)(ddl.clone());
                         }));
                     }
-                    {
-                        let ui = import_ui.clone();
-                        let (db, ns) = (database.clone(), menu.name.clone());
-                        let view_ui = import_ui.clone();
-                        let (view_db, view_ns) = (database.clone(), menu.name.clone());
-                        let read_only = conn_read_only(&connections, active_conn);
-                        entries.push(
-                            MenuEntry::action("Create table", move || {
-                                crate::table_designer::open_for_new(&ui, &db, Some(&ns));
-                            })
-                            .disabled(read_only),
-                        );
-                        entries.push(
-                            MenuEntry::action("Create view", move || {
-                                crate::view_editor::open_for_new(
-                                    &view_ui,
-                                    &view_db,
-                                    Some(&view_ns),
-                                );
-                            })
-                            .disabled(read_only),
-                        );
-                        entries.extend(create_object_entries(
-                            &import_ui,
-                            &database,
-                            Some(&menu.name),
-                            read_only,
-                        ));
-                    }
+                    entries.push(create_submenu(
+                        &import_ui,
+                        &database,
+                        Some(&menu.name),
+                        conn_read_only(&connections, active_conn),
+                    ));
                     // A namespace is introspected as part of its database, so
                     // refreshing targets the database.
                     let rf = refresh_db.clone();

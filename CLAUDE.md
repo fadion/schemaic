@@ -651,8 +651,9 @@ Zed-inspired, aiming to replace DataGrip.
     listed and droppable but not editable, the call a materialized view gets.
   - `object_editor.rs` — the **enum / domain / sequence** modal, over `core::ddl`'s
     `ObjectDraft`. Reached from a tree object's **Edit** and from a database or schema node's
-    **Create type / domain / sequence** (PostgreSQL only — on MySQL those entries don't
-    exist, the same "hide what an engine can't express" call `trigger_editor`'s form makes).
+    **Create ▸ Type / Domain / Sequence** (PostgreSQL only — on MySQL those entries don't
+    exist, the same "hide what an engine can't express" call `trigger_editor`'s form makes;
+    `overlays::create_submenu` is the one builder both nodes' Create submenu comes from).
     One modal for three objects because the chrome, the footer, the change count and the
     ending at `ddl_preview` are identical and only the middle section differs. Same
     seed-local-signals-then-write-back rule as the other editors, and three more written down:
