@@ -902,8 +902,21 @@ pub struct ImportUi {
     pub error: RwSignal<Option<String>>,
     /// Rows committed, once the import succeeds.
     pub imported: RwSignal<u64>,
-    /// True while a probe, check or load is running.
-    pub busy: RwSignal<bool>,
+    /// True while a **probe** is reading the file.
+    ///
+    /// Separate from [`loading`](Self::loading) because the two mean opposite
+    /// things to every exit. One flag meant both, and `exit_action` therefore
+    /// routed Escape / ✕ / Cancel during a *read* to `import_cancel`, which
+    /// cancels a token only the load ever writes — so a large file with one
+    /// unterminated quote left a modal that no key and no button could dismiss.
+    /// The same conflation reached `import::target_survives`, whose third
+    /// parameter is documented in core as "a load is running": a table that
+    /// really had gone during a probe took the Cancel arm, cancelled nothing,
+    /// and left `target` set — the one outcome Close exists to produce.
+    pub reading: RwSignal<bool>,
+    /// True while the check-and-load transaction is running. See
+    /// [`reading`](Self::reading) for why these are two flags.
+    pub loading: RwSignal<bool>,
     /// Set while the modal writes settings into its own controls, so the effect
     /// that re-reads the file on a settings change doesn't treat the app's own
     /// answer as a new question and loop.

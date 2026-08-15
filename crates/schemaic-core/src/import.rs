@@ -287,14 +287,63 @@ pub enum TargetVerdict {
 /// begins, so "I looked and it wasn't there" was true of every refresh and of
 /// every connection switch, and a hand-built twelve-column mapping was discarded
 /// by a background reload the user didn't ask for.
-pub fn target_survives(nodes_empty: bool, found: bool, busy: bool) -> TargetVerdict {
-    if nodes_empty || found {
+/// `loading` is a **bulk load**, not "anything is busy": the Cancel arm cancels
+/// a token only the load holds, so handing it a probe's flag made a genuinely
+/// vanished table cancel nothing and leave the modal open on it — the one
+/// outcome `Close` exists to produce.
+pub fn target_survives(no_evidence: bool, found: bool, loading: bool) -> TargetVerdict {
+    if no_evidence || found {
         TargetVerdict::Keep
-    } else if busy {
+    } else if loading {
         TargetVerdict::Cancel
     } else {
         TargetVerdict::Close
     }
+}
+
+/// One database row of the schema tree, reduced to what a modal open on a table
+/// needs to know.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DbNodeView<'a> {
+    pub database: &'a str,
+    /// Whether this database contains the table — `None` while its schema is
+    /// loading or has failed.
+    ///
+    /// Three states, not two, and that is the whole reason this type exists.
+    /// "I looked and it wasn't there" and "I haven't looked" are the same
+    /// `false` to a bool, and a refresh *empties* what there is to look at, so
+    /// the second was answering as the first and discarding hand-built mappings.
+    pub has_table: Option<bool>,
+}
+
+/// What the schema tree currently says about the table a modal is open on.
+///
+/// The evidence half of [`target_survives`], moved out of the view because two
+/// of its three inputs were bugs while the decision it fed was fully tested: the
+/// probe/load conflation above, and this function's `same_connection` — which
+/// the caller simply did not check. `db_nodes` holds only the **active**
+/// connection's databases, so switching connections replaces the list wholesale;
+/// with no connection check, "the table is not in this list" was true of another
+/// server's list, and Ctrl+Shift+P → Switch Connection discarded a twelve-column
+/// mapping the user had built by hand.
+///
+/// The two "no evidence" cases are deliberately different from the one "gone"
+/// case: no node for this connection at all means the list is about somewhere
+/// else (or is mid-reload), while a connection whose databases *are* listed and
+/// which no longer has this one means the database was dropped.
+pub fn target_verdict(
+    nodes: &[DbNodeView<'_>],
+    same_connection: bool,
+    database: &str,
+    loading: bool,
+) -> TargetVerdict {
+    if !same_connection || nodes.is_empty() {
+        return TargetVerdict::Keep;
+    }
+    let found = nodes
+        .iter()
+        .any(|n| n.database == database && n.has_table != Some(false));
+    target_survives(false, found, loading)
 }
 
 /// Propose a mapping from the file's columns onto the table's.
@@ -1417,6 +1466,84 @@ mod tests {
     #[test]
     fn a_running_load_is_cancelled_rather_than_abandoned() {
         assert_eq!(target_survives(false, false, true), TargetVerdict::Cancel);
+    }
+
+    fn node(database: &str, has_table: Option<bool>) -> DbNodeView<'_> {
+        DbNodeView {
+            database,
+            has_table,
+        }
+    }
+
+    /// The half that stayed in the view and was therefore never asserted:
+    /// `db_nodes` holds only the **active** connection's databases, so after a
+    /// connection switch the list is about a different server and says nothing
+    /// about this table. It used to say "not found" and discard the mapping.
+    #[test]
+    fn another_connections_database_list_is_not_evidence() {
+        let nodes = [node("other", Some(false))];
+        assert_eq!(
+            target_verdict(&nodes, false, "world", false),
+            TargetVerdict::Keep
+        );
+    }
+
+    #[test]
+    fn an_empty_list_mid_reload_is_not_evidence() {
+        assert_eq!(
+            target_verdict(&[], true, "world", false),
+            TargetVerdict::Keep
+        );
+    }
+
+    /// A database still loading has looked at nothing, so it is not a report
+    /// that the table has gone.
+    #[test]
+    fn a_database_whose_schema_has_not_loaded_is_not_evidence() {
+        let nodes = [node("world", None)];
+        assert_eq!(
+            target_verdict(&nodes, true, "world", false),
+            TargetVerdict::Keep
+        );
+    }
+
+    #[test]
+    fn a_loaded_database_that_still_has_the_table_keeps_the_modal() {
+        let nodes = [node("other", Some(false)), node("world", Some(true))];
+        assert_eq!(
+            target_verdict(&nodes, true, "world", false),
+            TargetVerdict::Keep
+        );
+    }
+
+    #[test]
+    fn a_loaded_database_that_lost_the_table_closes_the_modal() {
+        let nodes = [node("world", Some(false))];
+        assert_eq!(
+            target_verdict(&nodes, true, "world", false),
+            TargetVerdict::Close
+        );
+    }
+
+    /// The database itself was dropped: this connection's list *is* loaded and
+    /// simply doesn't have it any more. Distinct from an empty list, which is
+    /// what a reload looks like.
+    #[test]
+    fn a_dropped_database_closes_the_modal() {
+        let nodes = [node("other", Some(false))];
+        assert_eq!(
+            target_verdict(&nodes, true, "world", false),
+            TargetVerdict::Close
+        );
+    }
+
+    #[test]
+    fn a_running_load_still_cancels_rather_than_closing() {
+        let nodes = [node("world", Some(false))];
+        assert_eq!(
+            target_verdict(&nodes, true, "world", true),
+            TargetVerdict::Cancel
+        );
     }
 
     fn tbl(cols: &[(&str, &str, bool)]) -> TableInfo {

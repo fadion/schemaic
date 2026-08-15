@@ -2018,6 +2018,16 @@ pub(crate) async fn import_rows(
         r = import_on(&client, &target, rows) => r,
         _ = cancel.cancelled() => {
             let _ = token.cancel_query(NoTls).await;
+            // Explicit, like every other exit in `import_on` — the drop would
+            // abort the transaction too, but it leaves it open until the
+            // connection actually goes away, holding its locks meanwhile.
+            //
+            // No `Rollback::note()` here and none is owed: PostgreSQL has no
+            // non-transactional table, so `Cancelled` really does mean nothing
+            // was written. Its MySQL counterpart cannot say that (see
+            // `Db::import_rows`), and the divergence is the engines', not a
+            // difference in care between the two paths.
+            let _ = client.batch_execute("ROLLBACK").await;
             Err(DbError::Cancelled)
         }
     }

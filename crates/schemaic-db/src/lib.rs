@@ -2099,12 +2099,40 @@ impl Db {
         }
         let mut conn = self.open(Some(target.database), false).await?;
         let conn_id = conn.id();
-        let outcome = tokio::select! {
-            r = import_on(&mut conn, self.engine.dialect(), &target, rows) => r,
+        // `None` = the cancel arm won. The rollback can't happen inside the arm:
+        // `select!` keeps every future alive across its handler, so `import_on`'s
+        // `&mut conn` is still outstanding there — which is why the disconnect
+        // has always been after the block too.
+        let done: Option<Result<u64, DbError>> = tokio::select! {
+            r = import_on(&mut conn, self.engine.dialect(), &target, rows) => Some(r),
             _ = cancel.cancelled() => {
                 self.kill_query(conn_id).await;
-                Err(DbError::Cancelled)
+                None
             }
+        };
+        // **Cancelling is a write-path exit like any other, so it rolls back
+        // through `rollback()` and reports what that achieved.** It used to
+        // `kill_query` and disconnect, and the modal then said, unconditionally,
+        // "the transaction rolled back, so nothing was written" — which on
+        // `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV` is false: every batch already
+        // executed is durable there, so the user re-ran the import and doubled
+        // the rows it had already loaded. It was the one exit in this path that
+        // skipped `Rollback::note()`, and the only one whose sentence was
+        // composed in the UI, so there was nowhere for the note to attach.
+        //
+        // The connection is reused deliberately: the transaction belongs to it,
+        // so a `ROLLBACK` on a fresh one would undo nothing. A `ROLLBACK` that
+        // cannot be sent at all (the killed statement left the protocol mid-
+        // exchange) is `Rollback::Incomplete`, which is the safe reading — it
+        // says the rows may still be there rather than promising they aren't.
+        let outcome = match done {
+            Some(r) => r,
+            None => match rollback(&mut conn, "ROLLBACK").await {
+                Rollback::Complete => Err(DbError::Cancelled),
+                // Not `Cancelled`: that variant is what the modal renders as
+                // "nothing was written", and here something was.
+                undone => Err(DbError::Query(format!("Import cancelled{}", undone.note()))),
+            },
         };
         let _ = conn.disconnect().await;
         outcome

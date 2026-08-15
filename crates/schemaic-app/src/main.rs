@@ -1765,8 +1765,15 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // error per attempt. Reading it through first turns that into a single list
     // of everything wrong, with nothing written either way.
     // The running import's cancellation token, so the modal's Cancel can reach it.
-    // One at a time by construction: the modal is the only caller and its Import
-    // button is disabled while one is in flight.
+    //
+    // One at a time, enforced by `widgets::accept_launch` in the caller — *not*
+    // by the disabled Import button, which is what this comment used to claim.
+    // The button is disabled on a later update pass, so a single key dispatch
+    // that fired twice reached here twice, and the second launch overwrote this
+    // slot: the first load became uncancellable, and both committed.
+    //
+    // Cleared when a run reports, so `import_cancel` can no longer cancel a token
+    // belonging to a load that has already finished.
     let import_token: Rc<RefCell<Option<CancellationToken>>> = Rc::new(RefCell::new(None));
 
     let import_run: schemaic_ui::ImportFn = {
@@ -1786,7 +1793,16 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 let dialect = db.engine().dialect();
                 let token = CancellationToken::new();
                 *import_token.borrow_mut() = Some(token.clone());
-                let report = create_ext_action(cx, move |o: schemaic_ui::ImportOutcome| (done)(o));
+                let report = {
+                    let import_token = import_token.clone();
+                    create_ext_action(cx, move |o: schemaic_ui::ImportOutcome| {
+                        // This run is over, so the slot must not still name its
+                        // token: a later Cancel would otherwise "cancel" a load
+                        // that already committed and report nothing at all.
+                        *import_token.borrow_mut() = None;
+                        (done)(o)
+                    })
+                };
                 handle.spawn(async move {
                     let open = |path: &std::path::PathBuf| {
                         std::fs::File::open(path)
@@ -5239,7 +5255,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             more_issues: RwSignal::new(false),
             error: RwSignal::new(None),
             imported: RwSignal::new(0),
-            busy: RwSignal::new(false),
+            reading: RwSignal::new(false),
+            loading: RwSignal::new(false),
             applying: RwSignal::new(false),
             generation: RwSignal::new(0),
             probe_seq: RwSignal::new(0),
