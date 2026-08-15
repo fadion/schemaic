@@ -114,7 +114,8 @@ pub(crate) fn open_import(ui: &Ui, target: ImportTargetInfo) {
     i.more_issues.set(false);
     i.error.set(None);
     i.imported.set(0);
-    i.busy.set(false);
+    i.reading.set(false);
+    i.loading.set(false);
     i.applying.set(false);
     // Anything still in flight from a previous open belongs to that open.
     i.generation.update(|g| *g += 1);
@@ -131,7 +132,7 @@ fn probe(ui: Ui, sniff: bool) {
     };
     let format = i.format.get_untracked();
     let cfg = (!sniff).then(|| read_config(i));
-    i.busy.set(true);
+    i.reading.set(true);
     i.error.set(None);
     let target = i.target.get_untracked();
     // Which question this answer belongs to: which *opening* of the modal, and
@@ -143,12 +144,12 @@ fn probe(ui: Ui, sniff: bool) {
         ImportProbeRequest { path, format, cfg },
         Rc::new(move |res| {
             let current = (i.generation.get_untracked(), i.probe_seq.get_untracked());
-            // Discarded whole, `busy` included: a request still in flight is
+            // Discarded whole, `reading` included: a request still in flight is
             // still a reason the modal must not enable Next.
             if import::probe_verdict(mine, current) == import::ProbeVerdict::Discard {
                 return;
             }
-            i.busy.set(false);
+            i.reading.set(false);
             match res {
                 Err(e) => {
                     i.error.set(Some(e));
@@ -793,7 +794,15 @@ fn run_import(ui: Ui) {
     let (Some(target), Some(path)) = (i.target.get_untracked(), i.path.get_untracked()) else {
         return;
     };
-    i.busy.set(true);
+    // **The guard, in the same synchronous step as the launch.** The disabled
+    // Import button is what *says* a load is running; it is not what stops a
+    // second one, because it only takes effect on a later update pass. Two
+    // launches within one key dispatch each opened their own transaction and
+    // each committed — see `widgets::accept_launch`.
+    if !crate::widgets::accept_launch(i.loading.get_untracked(), false) {
+        return;
+    }
+    i.loading.set(true);
     i.error.set(None);
     i.issues.set(Vec::new());
     let opened = i.generation.get_untracked();
@@ -812,7 +821,7 @@ fn run_import(ui: Ui) {
             if i.generation.get_untracked() != opened {
                 return;
             }
-            i.busy.set(false);
+            i.loading.set(false);
             match outcome {
                 crate::ImportOutcome::Invalid(v) => {
                     i.issues.set(v.issues);
@@ -822,6 +831,13 @@ fn run_import(ui: Ui) {
                     i.imported.set(n);
                     i.step.set(ImportStep::Done);
                 }
+                // `Cancelled` now *means* the rollback completed: the write path
+                // rolls back through `rollback()` and downgrades a rollback that
+                // didn't undo everything to `Failed`, carrying
+                // `Rollback::note()`. This sentence used to be printed
+                // unconditionally, which on `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV`
+                // told the user nothing was written while ~250k rows sat in the
+                // table — and the re-run then doubled them.
                 crate::ImportOutcome::Cancelled => i.error.set(Some(
                     "Import cancelled — the transaction rolled back, so nothing was written."
                         .to_string(),
@@ -841,9 +857,16 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
     // closing would hide a bulk write that is still going and would leave its
     // outcome with no reader, since the modal's signals are the only channel
     // `import_run` reports to. The footer used to be the only exit that knew.
+    //
+    // **`loading`, not "anything is busy".** A *probe* is a read with no
+    // transaction and no token — `import_cancel` cancels a slot only the load
+    // ever writes — so routing an exit there during a read cancelled nothing and
+    // left the modal on screen with no way out at all: a large file with one
+    // unterminated quote reads for as long as the file is big, and Escape, ✕ and
+    // Cancel were all inert for the duration.
     let exit: Rc<dyn Fn()> = {
         let stop = ui.schema_actions.clone();
-        Rc::new(move || match exit_action(i.busy.get_untracked(), true) {
+        Rc::new(move || match exit_action(i.loading.get_untracked(), true) {
             ExitAction::Close => i.target.set(None),
             ExitAction::Cancel => (stop.import_cancel)(),
             // Unreachable for this modal (an import is always cancellable), but
@@ -897,28 +920,41 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
     // there was no node left to be loading.
     {
         let db_nodes = ui.schema.db_nodes;
+        let active_conn = ui.conn.active_conn;
         let stop = ui.schema_actions.clone();
         create_effect(move |_| {
             db_nodes.track();
             if let Some(t) = i.target.get_untracked()
                 && i.step.get_untracked() != ImportStep::Done
             {
-                let (empty, found) = db_nodes.with_untracked(|nodes| {
-                    let found = nodes.iter().any(|n| {
-                        n.database == t.database
-                            && match n.schema.get_untracked() {
-                                schemaic_core::schema::SchemaState::Loaded(db) => db
-                                    .tables
-                                    .iter()
-                                    .any(|x| x.name == t.table.name && x.schema == t.schema),
-                                // Mid-refresh: no evidence it's gone, so leave the
-                                // modal alone rather than closing it under the user.
-                                _ => true,
-                            }
-                    });
-                    (nodes.is_empty(), found)
+                // Reduced to plain data and decided in core: the decision was
+                // already tested there while its *evidence* was assembled here,
+                // untested — and two of the three inputs were the bug.
+                let verdict = db_nodes.with_untracked(|nodes| {
+                    let views: Vec<import::DbNodeView<'_>> = nodes
+                        .iter()
+                        .map(|n| import::DbNodeView {
+                            database: &n.database,
+                            has_table: match n.schema.get_untracked() {
+                                schemaic_core::schema::SchemaState::Loaded(db) => Some(
+                                    db.tables
+                                        .iter()
+                                        .any(|x| x.name == t.table.name && x.schema == t.schema),
+                                ),
+                                // Mid-refresh or failed: nothing was looked at,
+                                // which is not a report that the table is gone.
+                                _ => None,
+                            },
+                        })
+                        .collect();
+                    import::target_verdict(
+                        &views,
+                        active_conn.get_untracked() == t.conn_id,
+                        &t.database,
+                        i.loading.get_untracked(),
+                    )
                 });
-                match import::target_survives(empty, found, i.busy.get_untracked()) {
+                match verdict {
                     import::TargetVerdict::Keep => {}
                     import::TargetVerdict::Close => i.target.set(None),
                     // A load is running: cancelling rolls its transaction back,
@@ -999,7 +1035,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
             let ring_done = ring.clone();
             let footer = match step {
                 ImportStep::Source => dyn_container(
-                    move || (i.sample.get().is_some(), i.busy.get()),
+                    move || (i.sample.get().is_some(), i.reading.get()),
                     move |(has_sample, busy)| {
                         let ui = ui_next.clone();
                         let ring = ring_src.clone();
@@ -1029,7 +1065,7 @@ pub(crate) fn import_overlay(ui: Ui) -> impl IntoView {
                 )
                 .into_any(),
                 ImportStep::Mapping => dyn_container(
-                    move || (i.busy.get(), i.mapping.get(), i.target.get()),
+                    move || (i.loading.get(), i.mapping.get(), i.target.get()),
                     move |(busy, mapping, target)| {
                         let ui = ui_run.clone();
                         let back = ui_back.clone();
