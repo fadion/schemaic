@@ -502,6 +502,55 @@ mod tests {
         assert!(moved(|c| c.ssh.user = "deploy".into()), "ssh user");
     }
 
+    /// **The exclusion the doc spends a paragraph defending**, and which nothing
+    /// asserted: a corrected password reaches the same databases, so counting it
+    /// as a different server would blank the tree on every password fix.
+    /// Reversing it was free.
+    #[test]
+    fn a_corrected_password_is_the_same_server() {
+        let mut edited = conn();
+        edited.password = "the right one".into();
+        edited.ssh.password = "also corrected".into();
+        edited.ssh.key_passphrase = "and this".into();
+        assert!(conn().targets_same_server(&edited));
+    }
+
+    /// A **tripwire**, not a behaviour test. `SshTunnel` grows fields, and the
+    /// comparison names four of them by hand — so a second hop, a bind address or
+    /// a jump host would be excluded *silently*, and the tree would keep one
+    /// server's databases while queries went to another. Writing the struct out
+    /// in full means adding a field fails to compile here, at the one place that
+    /// asks whether it moves the target.
+    ///
+    /// Update the literal **and** decide, for the new field: does it change which
+    /// server the next query reaches? If so, add it to `targets_same_server` and
+    /// to `anything_that_moves_the_target_is_a_different_server` above.
+    #[test]
+    fn every_ssh_field_has_been_judged() {
+        let t = SshTunnel {
+            enabled: true,
+            host: "bastion".into(),
+            port: 2222,
+            user: "deploy".into(),
+            // Credentials for the same endpoint: excluded, like the DB password.
+            password: "p".into(),
+            auth: SshAuth::KeyPair,
+            key_path: "/k".into(),
+            key_passphrase: "q".into(),
+        };
+        // `auth` and `key_path` are excluded deliberately: they are *how* the
+        // same hop is authenticated, not a different hop.
+        let mut a = conn();
+        a.ssh = SshTunnel {
+            auth: SshAuth::Password,
+            key_path: String::new(),
+            ..t.clone()
+        };
+        let mut b = conn();
+        b.ssh = t;
+        assert!(a.targets_same_server(&b));
+    }
+
     #[test]
     fn ssh_auth_labels_and_all_cover_every_variant() {
         assert_eq!(SshAuth::ALL.len(), 3);
