@@ -131,6 +131,24 @@ pub(crate) fn db_flavour(ui: &Ui, database: &str) -> ServerFlavour {
     })
 }
 
+/// The introspected table a schema editor seeds its draft from — the **one**
+/// funnel all four editor entry points go through (`open_for_table`,
+/// `preview_draft_edit`, the trigger editor, the view editor).
+///
+/// `None` while a re-introspection of the database is in flight, and that is not
+/// caution for its own sake. `begin_refresh` keeps a `Loaded` database loaded
+/// across a refetch so the tree doesn't blank, which means `Loaded` no longer
+/// means *current*: applying an `ALTER` starts a refresh and reports before it
+/// lands, so within that window this used to hand back the **pre-apply**
+/// `TableInfo`, `TableDraft::from_table` seeded from it, and one more edit to
+/// the same column emitted a MySQL `MODIFY COLUMN` restating the old
+/// definition — silently reverting the change just applied, with `risks()`
+/// disclosing nothing, because from the plan's view the type did not change.
+///
+/// The caller's existing "no table, do nothing" arm is the right answer: this is
+/// the behaviour every refresh had before the tree learned to keep its rows, and
+/// the window is one round trip. Opening a designer on a model known to be stale
+/// is the outcome worth refusing.
 pub(crate) fn loaded_table(
     ui: &Ui,
     database: &str,
@@ -141,6 +159,7 @@ pub(crate) fn loaded_table(
         nodes
             .iter()
             .find(|n| n.database == database)
+            .filter(|n| !n.refreshing.get_untracked())
             .and_then(|n| match n.schema.get_untracked() {
                 schemaic_core::schema::SchemaState::Loaded(db) => db
                     .tables

@@ -574,6 +574,72 @@ fn load_landing(started: (u64, u64), current: (u64, u64)) -> LoadLanding {
     }
 }
 
+/// What one database of a landed connection load becomes: an existing node kept,
+/// or a fresh node at this id. Both carry the node id, because the schema tree's
+/// `dyn_stack` is keyed on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodePlan {
+    /// The database was already on screen: reuse its node, and with it its
+    /// `schema` signal (so the rows stay up while the re-introspection runs) and
+    /// its id (so the `dyn_stack` doesn't rebuild it at all).
+    Keep(usize),
+    Create(usize),
+}
+
+/// Which node each database name gets on a landed connection load.
+///
+/// Extracted because it silently decides three things nobody could assert while
+/// it lived inside a closure inside a closure: that a database dropped and
+/// re-created gets a **fresh** id rather than colliding with a live one, that
+/// reordering the server's list renumbers nothing (the tree keys on id, so it
+/// would rebuild every row), and that a reload against an empty node list still
+/// produces a usable set.
+///
+/// `reload` is "this is the connection already on screen". A **switch** reuses
+/// nothing: the rows would be another server's.
+fn plan_nodes(existing: &[(usize, String)], names: &[String], reload: bool) -> Vec<NodePlan> {
+    let existing = if reload { existing } else { &[][..] };
+    // Past every id in use, so a name that has come back doesn't take the id of
+    // one that is still there.
+    let mut next_id = existing.iter().map(|(id, _)| *id).max().unwrap_or(0) + 1;
+    names
+        .iter()
+        .map(|name| match existing.iter().find(|(_, db)| db == name) {
+            Some((id, _)) => NodePlan::Keep(*id),
+            None => {
+                let id = next_id;
+                next_id += 1;
+                NodePlan::Create(id)
+            }
+        })
+        .collect()
+}
+
+/// May a landed **per-database** introspection write its result?
+///
+/// [`load_landing`]'s counterpart, one level down, and the level that had no
+/// guard at all. `load_landing` covers the `fetch_databases` leg; the
+/// per-database legs it fans out were written with `sig.try_update`, which
+/// guards a *disposed* scope — a connection switch — and says nothing about a
+/// **superseded** fetch of the same node.
+///
+/// The interleaving is ordinary: press the SCHEMA header's Refresh (one fetch
+/// out per database, slow over an SSH tunnel), then apply an `ALTER TABLE`,
+/// whose own `refresh_db` starts a second fetch of that database and lands
+/// first with the post-`ALTER` schema. The connection-wide one then lands with
+/// its **pre-`ALTER`** snapshot and overwrites it. Nothing detects that and
+/// nothing schedules another refresh, so the tree, the completion index,
+/// `intel`'s catalog and `table_designer::loaded_table` hold the pre-apply model
+/// indefinitely — and reopening the designer emits a `MODIFY COLUMN` restating
+/// the old definition, which destroys what the `ALTER` added. MySQL's `MODIFY`
+/// replaces the whole column, so nothing warns and `risks()` discloses nothing:
+/// from the plan's view the type did not change.
+///
+/// Last writer *asked* wins, not last to land.
+fn fetch_landing(started: u64, current: u64) -> bool {
+    started == current
+}
+
 /// The default connection created on first launch (matches the local WSL
 /// MariaDB used in development).
 fn seed_connection() -> Connection {
@@ -3382,19 +3448,45 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // all come through here on purpose: they differ only in *which* `Db` and how
     // the node was obtained, and when they each decided for themselves what the
     // tree shows meanwhile, two of the three blanked it.
+    // The newest fetch asked for per node, so a slower older one can't land on
+    // top of it. Keyed on the node id, which survives the connection-wide
+    // refresh's node reuse — the case the two fetches actually race in. A switch
+    // disposes the scope and `try_update` below still covers that.
+    let fetch_seq: Rc<RefCell<HashMap<usize, u64>>> = Rc::new(RefCell::new(HashMap::new()));
+    let next_fetch_seq: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+
     let start_fetch: FetchSchemaFn = {
         let handle = handle.clone();
+        let fetch_seq = fetch_seq.clone();
+        let next_fetch_seq = next_fetch_seq.clone();
         Rc::new(move |node: &ConnNode, db: Db| {
             let sig = node.schema;
             let database = node.database.clone();
             if let Some(st) = sig.get_untracked().begin_refresh() {
                 sig.set(st);
             }
+            // What the schema editors ask before seeding a draft: a `Loaded`
+            // database is not necessarily a *current* one while this is out.
+            let refreshing = node.refreshing;
+            refreshing.set(true);
+            let seq = next_fetch_seq.get() + 1;
+            next_fetch_seq.set(seq);
+            fetch_seq.borrow_mut().insert(node.id, seq);
+            let (id, landed_seq) = (node.id, fetch_seq.clone());
             // `try_update`, not `set`: switching connections disposes the node
             // scope this signal lives in, and a fetch already in flight then
-            // lands on a freed one.
+            // lands on a freed one. The stamp is the *other* half — see
+            // `fetch_landing`, whose absence let a pre-`ALTER` snapshot overwrite
+            // a post-`ALTER` one with nothing to detect it.
             let send_schema = create_ext_action(cx, move |st: SchemaState| {
+                let current = landed_seq.borrow().get(&id).copied().unwrap_or(seq);
+                if !fetch_landing(seq, current) {
+                    // A newer fetch of the same node is still out, so the model
+                    // stays flagged stale until *it* lands.
+                    return;
+                }
                 let _ = sig.try_update(|v| *v = st);
+                let _ = refreshing.try_update(|v| *v = false);
             });
             handle.spawn(async move {
                 let st = match db.fetch_schema(&database).await {
@@ -3467,23 +3559,23 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         // old one (deferred, so the tree rebuilds off the new
                         // nodes before the old signals are freed) — schema
                         // signals must not accrete across switches (C14).
-                        let existing = if reload {
-                            db_nodes.get_untracked()
-                        } else {
-                            Vec::new()
-                        };
+                        let existing = db_nodes.get_untracked();
                         let kept_scope = nodes_scope_cb.borrow().filter(|_| reload);
                         let node_cx = kept_scope.unwrap_or_else(|| cx.create_child());
-                        let mut next_id = existing.iter().map(|n| n.id).max().unwrap_or(0) + 1;
-                        let nodes: Vec<ConnNode> = names
+                        let by_id: Vec<(usize, String)> = existing
                             .iter()
-                            .map(|name| match existing.iter().find(|n| &n.database == name) {
-                                Some(kept) => kept.clone(),
-                                None => {
-                                    let node = ConnNode::new(node_cx, next_id, name, name);
-                                    next_id += 1;
-                                    node
-                                }
+                            .map(|n| (n.id, n.database.clone()))
+                            .collect();
+                        let nodes: Vec<ConnNode> = plan_nodes(&by_id, &names, reload)
+                            .into_iter()
+                            .zip(names.iter())
+                            .map(|(plan, name)| match plan {
+                                NodePlan::Keep(id) => existing
+                                    .iter()
+                                    .find(|n| n.id == id)
+                                    .cloned()
+                                    .unwrap_or_else(|| ConnNode::new(node_cx, id, name, name)),
+                                NodePlan::Create(id) => ConnNode::new(node_cx, id, name, name),
                             })
                             .collect();
                         db_nodes.set(nodes.clone());
@@ -3518,6 +3610,24 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         // it for a connection that loaded perfectly well.
                         if landing == LoadLanding::Install {
                             db_nodes.set(Vec::new());
+                            // **And forget which connection the tree was for.**
+                            // Nothing references the node scope once the tree is
+                            // empty, and leaving it in place made the *next* load
+                            // of this connection take the reuse path against an
+                            // empty node list: `kept_scope` was `Some`, so the
+                            // deferred `dispose()` was skipped, and every node was
+                            // rebuilt inside a scope that still owned the previous
+                            // set's `RwSignal<SchemaState>` — each holding an
+                            // `Arc<DbSchema>`, unreachable and never freed. One
+                            // set per failed connect, indefinitely.
+                            //
+                            // A database *dropped* between two successful reloads
+                            // still leaves its signals in the surviving scope; that
+                            // one needs a scope per node and is not this fix.
+                            *nodes_conn_cb.borrow_mut() = None;
+                            if let Some(old) = nodes_scope_cb.borrow_mut().take() {
+                                exec_after(Duration::ZERO, move |_| old.dispose());
+                            }
                         }
                     }
                 }
@@ -5738,6 +5848,101 @@ mod app_tests {
         // and the first to land is not the one the tree should show — it would
         // also dispose the *newer* node scope.
         assert_eq!(load_landing((7, 3), (7, 4)), LoadLanding::KeepTunnelOnly);
+    }
+
+    /// The level `load_landing` doesn't reach. `try_update` guards a *disposed*
+    /// scope — a connection switch — and says nothing about a **superseded**
+    /// fetch of the same node, which is the interleaving that leaves the tree,
+    /// the completion index and the schema editors holding a pre-`ALTER` model
+    /// indefinitely.
+    #[test]
+    fn an_older_introspection_of_the_same_database_writes_nothing() {
+        use super::fetch_landing;
+        assert!(fetch_landing(4, 4), "nothing newer was asked for");
+        assert!(
+            !fetch_landing(3, 4),
+            "a newer fetch of this node is out; last asked wins, not last to land"
+        );
+        // The newer one still writes when it lands, whichever order they arrive.
+        assert!(fetch_landing(4, 4));
+    }
+
+    fn dbs(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn nodes(pairs: &[(usize, &str)]) -> Vec<(usize, String)> {
+        pairs.iter().map(|(i, n)| (*i, n.to_string())).collect()
+    }
+
+    /// A reload of the connection already on screen keeps every database that is
+    /// still there — same node, so the same `schema` signal keeps its rows up,
+    /// and the same id, so the tree doesn't rebuild the row at all.
+    #[test]
+    fn a_reload_keeps_the_node_of_every_surviving_database() {
+        use super::{NodePlan, plan_nodes};
+        let existing = nodes(&[(1, "world"), (2, "sakila")]);
+        assert_eq!(
+            plan_nodes(&existing, &dbs(&["world", "sakila"]), true),
+            vec![NodePlan::Keep(1), NodePlan::Keep(2)]
+        );
+    }
+
+    /// Reordering the server's list must not renumber anything: the `dyn_stack`
+    /// keys on the id, so a renumber rebuilds every database's subtree and drops
+    /// its expansion state.
+    #[test]
+    fn reordering_the_server_list_renumbers_nothing() {
+        use super::{NodePlan, plan_nodes};
+        let existing = nodes(&[(1, "world"), (2, "sakila")]);
+        assert_eq!(
+            plan_nodes(&existing, &dbs(&["sakila", "world"]), true),
+            vec![NodePlan::Keep(2), NodePlan::Keep(1)]
+        );
+    }
+
+    /// A database that has *appeared* gets a fresh id, past every one in use —
+    /// including the case that made an id counter necessary: a database dropped
+    /// and created again must not collide with a node that is still live.
+    #[test]
+    fn a_reappearing_database_takes_a_fresh_id() {
+        use super::{NodePlan, plan_nodes};
+        // `sakila` (id 2) is gone; `chinook` is new. The next id is past 2, not
+        // reusing it.
+        let existing = nodes(&[(1, "world"), (2, "sakila")]);
+        assert_eq!(
+            plan_nodes(&existing, &dbs(&["world", "chinook"]), true),
+            vec![NodePlan::Keep(1), NodePlan::Create(3)]
+        );
+        // And when it comes back it is a different node again.
+        let existing = nodes(&[(1, "world"), (3, "chinook")]);
+        assert_eq!(
+            plan_nodes(&existing, &dbs(&["world", "chinook", "sakila"]), true),
+            vec![NodePlan::Keep(1), NodePlan::Keep(3), NodePlan::Create(4)]
+        );
+    }
+
+    /// A **switch** reuses nothing, whatever is on screen — the rows belong to
+    /// another server.
+    #[test]
+    fn a_connection_switch_builds_every_node_fresh() {
+        use super::{NodePlan, plan_nodes};
+        let existing = nodes(&[(1, "world"), (2, "sakila")]);
+        assert_eq!(
+            plan_nodes(&existing, &dbs(&["world", "sakila"]), false),
+            vec![NodePlan::Create(1), NodePlan::Create(2)]
+        );
+    }
+
+    /// The case a failed connect leaves behind: `reload` is true and there is
+    /// nothing to reuse. It still has to produce a usable set.
+    #[test]
+    fn a_reload_against_an_empty_tree_still_builds_every_node() {
+        use super::{NodePlan, plan_nodes};
+        assert_eq!(
+            plan_nodes(&[], &dbs(&["world"]), true),
+            vec![NodePlan::Create(1)]
+        );
     }
 
     #[test]
