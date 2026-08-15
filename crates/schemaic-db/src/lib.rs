@@ -535,14 +535,27 @@ impl Db {
         // Wrap the sink once so the scope is stamped on every statement's result
         // whichever engine produced it — a per-engine stamp is one a new path
         // forgets. See `ResultSet::database`.
-        let db_name = database.map(str::to_string);
+        //
+        // **The scope follows a `USE`.** It was computed once before the loop, on
+        // a method whose own doc advertises that a `USE` carries across
+        // statements — so `USE sakila; SELECT * FROM actor;` from a tab scoped to
+        // `world` really ran statement 2 in `sakila` and labelled its result
+        // `world`, the stats line lying in exactly the case the label exists to
+        // catch. `sql::use_target` is deliberately conservative: a `USE` it can't
+        // read plainly drops the label to `None`, which prints nothing, rather
+        // than carrying a name that is now certainly wrong.
+        // `Arc<Mutex>` rather than `Rc<RefCell>`: this future is spawned onto the
+        // multi-threaded runtime and must be `Send`.
+        let dialect = self.engine.dialect();
+        let scope = std::sync::Arc::new(std::sync::Mutex::new(database.map(str::to_string)));
+        let stamp = scope.clone();
         let mut on_result = {
             let mut inner = on_result;
             move |i: usize, r: Result<ResultSet, DbError>| {
                 inner(
                     i,
                     r.map(|mut rs| {
-                        rs.database = db_name.clone();
+                        rs.database = stamp.lock().ok().and_then(|s| s.clone());
                         rs
                     }),
                 )
@@ -589,6 +602,14 @@ impl Db {
             };
             if outcome.is_err() {
                 stopped = true;
+            }
+            // Before the sink, so a `USE` labels its own (empty) result with the
+            // database it moved to — which is what the statement did.
+            if outcome.is_ok()
+                && schemaic_core::sql::leading_keyword(sql, dialect).as_deref() == Some("USE")
+                && let Ok(mut scope) = scope.lock()
+            {
+                *scope = schemaic_core::sql::use_target(sql, dialect);
             }
             on_result(i, outcome);
         }

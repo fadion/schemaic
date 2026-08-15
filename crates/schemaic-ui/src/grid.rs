@@ -1092,6 +1092,20 @@ impl GridState {
     }
 }
 
+/// Whether `Del` over `rows` should **mark** them all or unmark them all.
+///
+/// The whole range is driven to one state rather than each row flipping its own:
+/// on a mixed selection a per-row toggle both marks and unmarks, which reads as
+/// the key doing nothing. Any unmarked row in range means "mark them all"; only
+/// an already-fully-marked range unmarks.
+///
+/// An **empty** range answers "unmark", which is what `all` over nothing gives.
+/// Unreachable from the key — the caller returns early on an empty range — and
+/// the harmless answer if it ever isn't: unmarking nothing.
+pub(crate) fn delete_vote(marked: impl Fn(usize) -> bool, rows: &[usize]) -> bool {
+    !rows.iter().all(|di| marked(*di))
+}
+
 /// What a selection rectangle means for the aggregates bar.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SelKind {
@@ -2175,6 +2189,12 @@ pub(crate) fn grid_selection_bar(
                 .into_any(),
         },
     )
+    // **Clicks fall through it.** It is the last child of the results stack and
+    // has no interactive content, so without this it swallowed every pointer
+    // event over the cells it covers — no selection, no menu dismissal, no drag
+    // release, in the bottom-right corner of every grid. `grid_error_bar`
+    // legitimately keeps its events: it owns a clickable **View**.
+    .pointer_events(|| false)
     .style(move |s| {
         if sel_summary.with(Option::is_some) {
             // Clears `grid_error_bar`'s 35px + its own 5px inset when that one is
@@ -2623,6 +2643,18 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             });
 
             v_stack((header, body))
+                // Ends a drag-select **wherever in the grid the button comes
+                // up**. The data body has its own copy for the common case, but
+                // it is one of several siblings: floem dispatches a pointer event
+                // to the first hit child in reverse paint order and stops, so a
+                // release over the frozen pane, the header, or past the last row
+                // never reached it — and `selecting` stayed armed with no button
+                // held, so moving the cursor back over the grid kept extending
+                // the range. There is deliberately no pointer capture (that would
+                // stop the other cells' `PointerEnter`, which *is* the drag).
+                .on_event_cont(EventListener::PointerUp, move |_| {
+                    gs.selecting.set(false);
+                })
                 .style(|s| {
                     s.flex_grow(1.0_f32)
                         .width_full()
@@ -2686,8 +2718,8 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         open
     });
     // Go to row (Ctrl+G). The popup bumps `goto_step` on Enter; the jump is here
-    // because the row count is — including the pending unsaved rows, which the
-    // gutter numbers too, so "row N" means the same thing typed as it does read.
+    // because the row count is, and it counts what the gutter *numbers*, so
+    // "row N" means the same thing typed as it does read.
     //
     // Selecting the whole row rather than a cell is the same gesture a gutter
     // click makes (anchor at column 0, active at the last), so the row lights up
@@ -2699,7 +2731,11 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         if seen == Some(step) || seen.is_none() {
             return step;
         }
-        let total = nrows + gs.new_rows.with_untracked(|v| v.len());
+        // The **numbered** rows only. A pending unsaved row's gutter reads `*`,
+        // not a number, so counting them in made "row 101" land on a row showing
+        // no number at all, and made a row of 9s stop one short of the last row
+        // that does.
+        let total = nrows;
         let target = gs
             .goto_query
             .with_untracked(|q| schemaic_core::model::goto_row_index(q, total));
@@ -2794,10 +2830,22 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         sel_summary.set(Some(label));
     });
     // Only one of the two bars is up at a time — they share an anchor, so both
-    // open would paint one over the other. The editor's pair does this too.
+    // open would paint one over the other, and the one on top takes every
+    // keystroke while the one underneath is the one you can see. The editor's
+    // pair does this too.
+    //
+    // **Both directions.** The exclusion tracked `goto_open` alone and the Ctrl+F
+    // arm was a bare `find_open.set(true)`, so Ctrl+G then Ctrl+F left both
+    // mounted: the goto bar painted over the find bar while the find field
+    // autofocused and swallowed the typing, and Escape appeared to do nothing.
     create_effect(move |_| {
         if gs.goto_open.get() {
             gs.find_open.set(false);
+        }
+    });
+    create_effect(move |_| {
+        if gs.find_open.get() {
+            gs.goto_open.set(false);
         }
     });
     // And hand the keyboard back when the goto popup closes, for the same reason
@@ -4698,12 +4746,33 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
                 if rows.is_empty() {
                     return EventPropagation::Continue;
                 }
-                let all_marked = gs.del_rows.with_untracked(|d| rows.iter().all(|di| d.contains(di)));
-                for di in rows {
-                    let marked = gs.del_rows.with_untracked(|d| d.contains(&di));
-                    if marked == all_marked {
-                        gs.toggle_delete(di);
+                // **One notification each, not one per row.** `toggle_delete`
+                // writes `del_rows` *and* `dirty`, and every mounted cell's style
+                // closure and content container tracks both — so Ctrl+A then Del
+                // on a result at the default 200k row limit fired 400,000
+                // synchronous notifications and locked the window. The
+                // two-keystroke gesture this feature exists to enable was the one
+                // that couldn't be used. Observable behaviour is unchanged.
+                let mark = gs
+                    .del_rows
+                    .with_untracked(|d| delete_vote(|di| d.contains(&di), &rows));
+                gs.del_rows.update(|d| {
+                    for di in &rows {
+                        if mark {
+                            d.insert(*di);
+                        } else {
+                            d.remove(di);
+                        }
                     }
+                });
+                // Marking supersedes an update: a row can't be both `UPDATE`d and
+                // `DELETE`d in one commit.
+                if mark {
+                    let doomed: std::collections::HashSet<usize> = rows.into_iter().collect();
+                    gs.dirty.update(|m| m.retain(|(di, _), _| !doomed.contains(di)));
+                }
+                if gs.commit_err.get_untracked().is_some() {
+                    gs.commit_err.set(None);
                 }
             }
         _ => return EventPropagation::Continue,
@@ -6671,6 +6740,73 @@ mod tests {
             }
         });
         assert_eq!(got, want);
+    }
+}
+
+#[cfg(test)]
+mod human_count_tests {
+    use super::*;
+
+    /// Untested until now, and the tested namesake in `core::transcript` is a
+    /// **different** function with different buckets — so grepping the name found
+    /// coverage that did not apply. These are the exact strings the stats line
+    /// prints, and therefore the exact strings `goto_row_index` has to read back.
+    #[test]
+    fn a_count_reads_the_way_the_stats_line_prints_it() {
+        assert_eq!(human_count(0), "0");
+        assert_eq!(human_count(999), "999", "under 1000 stays exact");
+        assert_eq!(human_count(1_000), "1k");
+        assert_eq!(human_count(1_250), "1.25k");
+        assert_eq!(human_count(200_000), "200k");
+        assert_eq!(human_count(1_000_000), "1m");
+        assert_eq!(human_count(1_500_000), "1.5m");
+        assert_eq!(human_count(1_000_000_000), "1b");
+    }
+
+    /// Every shape the printer can emit round-trips through the go-to-row box,
+    /// which is the property the two functions have to hold together: the count
+    /// on screen is the one a user types back.
+    #[test]
+    fn every_printed_count_is_readable_by_go_to_row() {
+        for n in [1usize, 999, 1_000, 1_250, 200_000, 1_000_000, 1_500_000] {
+            let printed = human_count(n);
+            assert_eq!(
+                schemaic_core::model::goto_row_index(&printed, n),
+                Some(n - 1),
+                "{printed:?} came from {n}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod delete_vote_tests {
+    use super::*;
+
+    /// A mixed selection **marks**: a per-row toggle there both marks and
+    /// unmarks, which reads as the key doing nothing.
+    #[test]
+    fn a_mixed_range_marks_them_all() {
+        let marked = [1usize];
+        assert!(delete_vote(|di| marked.contains(&di), &[1, 2, 3]));
+    }
+
+    #[test]
+    fn a_range_with_nothing_marked_marks() {
+        assert!(delete_vote(|_| false, &[1, 2, 3]));
+    }
+
+    /// Only an already-fully-marked range unmarks — the second press of Del.
+    #[test]
+    fn a_fully_marked_range_unmarks() {
+        assert!(!delete_vote(|_| true, &[1, 2, 3]));
+    }
+
+    /// Unreachable from the key, which returns early on an empty range, and
+    /// harmless if it ever isn't: unmarking nothing.
+    #[test]
+    fn an_empty_range_unmarks_nothing() {
+        assert!(!delete_vote(|_| true, &[]));
     }
 }
 
