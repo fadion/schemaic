@@ -126,6 +126,17 @@ pub struct UiTheme {
     pub reject_text: Color,
     pub text_faint: Color,
     pub row_hover: Color,
+    /// A quieter row hover, for a list whose rows are *blocks* rather than
+    /// lines — the query history, where one row is a heading, three lines of
+    /// SQL and an outcome. `row_hover` across an area that size reads as a
+    /// selection; this lifts the row just off `bg_panel` instead.
+    pub row_hover_soft: Color,
+    /// Query history: the band behind a recency group's header (TODAY / THIS
+    /// WEEK / EARLIER). Deliberately **not** `row_hover` — a header that shares
+    /// the hover colour looks like a hovered row — and deliberately a *shade of
+    /// `bg_panel`* rather than a colour of its own: it is furniture dividing a
+    /// list, so it keeps the panel's hue and only changes its level.
+    pub group_header_bg: Color,
     pub row_active: Color,
     pub row_selected: Color,
     /// Pill tabs (the table designer's Table / Columns / …): the active pill's
@@ -321,6 +332,14 @@ impl UiTheme {
             reject_text: c("#3F0D0D"),
             text_faint: c("#50556C"),
             row_hover: c("#171820"),
+            // Just above `bg_panel` (#1B1C23), where `row_hover` sits just below
+            // it — the same small step, lifting rather than recessing, so the two
+            // can't be mistaken for each other.
+            row_hover_soft: c("#1E1F28"),
+            // A shade of `bg_panel` (#1B1C23) rather than a colour of its own:
+            // one step down, keeping most of the panel's blue lean (R→B spread 6
+            // against its 8) so the band reads as the same surface, darker.
+            group_header_bg: c("#1A1B20"),
             row_active: c("#222432"),
             row_selected: c("#2B314D"),
             pill_active_bg: c("#7C9CF0"),
@@ -454,6 +473,12 @@ impl UiTheme {
             reject_text: c("#FFF2F2"),
             text_faint: c("#A6AAB8"),
             row_hover: c("#ECEEF3"),
+            // Lighter than `row_hover`, i.e. nearer `bg_panel` (#F1F2F6): on a
+            // light surface the quieter hover is the one closer to white.
+            row_hover_soft: c("#EFF0F5"),
+            // Same idea on the light surface: a step *down* from `bg_panel`
+            // (#F1F2F6), since here darker is what reads as a band.
+            group_header_bg: c("#EEEFF2"),
             row_active: c("#DEE3F5"),
             row_selected: c("#C9D4F7"),
             // The active pill keeps the dark theme's fill: it's a filled accent

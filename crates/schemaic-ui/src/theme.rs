@@ -255,6 +255,16 @@ pub fn text_faint() -> Color {
 pub fn row_hover() -> Color {
     ui().row_hover
 }
+/// The quieter hover, for a list whose rows are blocks rather than lines (the
+/// query history's).
+pub fn row_hover_soft() -> Color {
+    ui().row_hover_soft
+}
+/// The band behind a query-history recency header (TODAY / THIS WEEK /
+/// EARLIER): a shade of [`bg_panel`], one step down at the same hue.
+pub fn group_header_bg() -> Color {
+    ui().group_header_bg
+}
 pub fn row_active() -> Color {
     ui().row_active
 }

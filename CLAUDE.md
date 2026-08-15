@@ -244,7 +244,22 @@ Zed-inspired, aiming to replace DataGrip.
     case where the row is gone from the database and the log is the only remaining record.
   - `diff.rs` — `line_diff`/`build_diff_rows` (Ctrl+K preview).
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
-    persisted to `history.json`.
+    persisted to `history.json`. An entry is written in **two passes** — `push` when the run
+    launches, `finish` when it lands (duration, rows, `Outcome`) — because the two moments
+    answer different questions: an entry has to exist while the query is still running (one the
+    user cancels, or that the app doesn't outlive, is one they may most want back), and only
+    the completion knows how it went. `finish` finds its entry by `(conn_id, sql)`, which works
+    because `push` de-duplicates on exactly that pair; nothing to update is normal, not an
+    error. `Outcome` has three states, not two — `Unknown` is what an entry starts in and what
+    a cancelled run keeps, and the panel then shows no outcome line at all rather than guessing.
+    Duration is the app's **wall-clock** around the whole call, not `ResultSet::elapsed_ms`: it
+    is what the user waited through, and it is the same measurement for a failure, which is the
+    case worth finding (a statement that spent 50 s behind someone else's row lock).
+    `bucket`/`group_by_recency` are the panel's TODAY / THIS WEEK / EARLIER groups, split on
+    **elapsed** time rather than calendar days — there is no timezone here, only millis, and a
+    query run twenty minutes ago shouldn't leave "today" because midnight passed. They share
+    `relative_time`'s arithmetic on purpose: a row's "3d ago" is read directly under its header,
+    and a test pins the two together.
   - `health.rs` — connection health-poll policy: `tick(HealthCfg, TickCtx) -> Tick` decides
     ping-or-skip + the delay until the next tick (exponential `backoff` on consecutive failures,
     longer interval for SSH-tunnelled connections, skip while the window is unfocused / a query is

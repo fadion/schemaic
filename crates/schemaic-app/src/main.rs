@@ -98,6 +98,12 @@ type GuardTxFn = Rc<dyn Fn(usize, Rc<dyn Fn()>, Option<Rc<dyn Fn()>>)>;
 /// initial load, the connection-wide Refresh and the per-database Refresh all
 /// take, so what the tree shows while a fetch is out is decided once.
 type FetchSchemaFn = Rc<dyn Fn(&ConnNode, Db)>;
+/// Record how one or more runs turned out — `(connection, the statements and
+/// their outcomes)` — onto the history entries their launch already wrote.
+///
+/// A **slice**, not one statement, because Run Everything lands a whole batch at
+/// once and each recorded run costs a full rewrite of `history.json`.
+type FinishHistoryFn = Rc<dyn Fn(u64, &[(String, schemaic_core::history::RunResult)])>;
 use schemaic_core::filter::{Order, table_query};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::persist::{self, ConnectionsFile, UiState};
@@ -585,6 +591,32 @@ fn seed_connection() -> Connection {
     }
 }
 
+/// What a finished run should record in history, or `None` for one that reached
+/// no verdict — still running, or cancelled, where the honest answer is the
+/// nothing the entry already says.
+///
+/// The row count is the result's own: rows **returned** for a `SELECT`, rows
+/// **affected** for a write (`ResultSet::affected`, which is `None` for exactly
+/// the row-returning case). A failure has neither.
+///
+/// Shared by both run paths so a single run and a statement inside Run
+/// Everything can't come to answer this differently.
+fn run_result(state: &QueryState, duration_ms: u64) -> Option<schemaic_core::history::RunResult> {
+    match state {
+        QueryState::Loaded(rs) => Some(schemaic_core::history::RunResult {
+            duration_ms,
+            rows: Some(rs.affected.unwrap_or_else(|| rs.row_count() as u64)),
+            ok: true,
+        }),
+        QueryState::Failed(_) => Some(schemaic_core::history::RunResult {
+            duration_ms,
+            rows: None,
+            ok: false,
+        }),
+        QueryState::Idle | QueryState::Running | QueryState::Cancelled => None,
+    }
+}
+
 /// Which engine's transaction semantics apply — the divergence that
 /// [`schemaic_core::tx`] encodes (Postgres poisons a transaction on any error;
 /// MySQL implicitly commits on DDL).
@@ -1037,6 +1069,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                             sql,
                             ts,
                             tab_name,
+                            // Filled in by `finish_history` when the run lands.
+                            duration_ms: None,
+                            rows: None,
+                            outcome: schemaic_core::history::Outcome::Unknown,
                         },
                         dialect,
                     );
@@ -1050,6 +1086,37 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             },
         )
     };
+
+    // Fill in how runs went, on the entries `record_history` wrote when they
+    // launched (see `history::finish` for why it is two passes and not one).
+    //
+    // Persists once for the whole slice, not once per statement: a save clones
+    // the entire history, serializes it, and does an atomic write (temp file,
+    // read-back, `.bak`, rename). Run Everything on a migration script lands a
+    // hundred statements in a single UI-thread callback, and one write each
+    // froze the window for as long as that took. The write is also skipped
+    // entirely when nothing was updated — a credential-bearing statement is
+    // never recorded, and would otherwise cost a file write for nothing.
+    let finish_history: FinishHistoryFn = Rc::new(
+        move |conn_id: u64, runs: &[(String, schemaic_core::history::RunResult)]| {
+            let updated = history_entries.try_update(|v| {
+                let mut any = false;
+                for (sql, result) in runs {
+                    any |= schemaic_core::history::finish(v, conn_id, sql, *result);
+                }
+                any
+            });
+            if updated != Some(true) {
+                return;
+            }
+            persist::save_json(
+                "history.json",
+                &schemaic_core::history::HistoryFile {
+                    entries: history_entries.get_untracked(),
+                },
+            );
+        },
+    );
 
     // Clear the active connection's history (the panel's trash button), persisting.
     let clear_history: Rc<dyn Fn()> = {
@@ -1078,6 +1145,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         let db_for = db_for.clone();
         let session_for = session_for.clone();
         let record_history = record_history.clone();
+        let finish_history = finish_history.clone();
         Rc::new(move |sql: String, is_view: bool| {
             if sql.trim().is_empty() {
                 return;
@@ -1147,15 +1215,25 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             let tokens_done = tokens.clone();
             let tx_sql = sql.clone();
             let engine = tx_engine(&db);
+            let hist_sql = sql.clone();
+            let hist_conn = tab.conn_id.get_untracked();
+            let finish_history = finish_history.clone();
             let send = create_ext_action(
                 cx,
-                move |(state, stmt): (QueryState, Option<StmtOutcome>)| {
+                move |(state, stmt, took): (QueryState, Option<StmtOutcome>, u64)| {
                     // Fold the transaction state first, and unconditionally: it
                     // tracks the *connection*, so it stays true even when a newer run
                     // has superseded this one for display purposes.
                     if let Some(stmt) = stmt {
                         tab.tx
                             .update(|t| *t = t.on_statement(engine, &tx_sql, stmt));
+                    }
+                    // History is about the *statement*, not this tab's display, so
+                    // it too is recorded before the supersede check — and only for
+                    // a run that reached a verdict (a cancelled one leaves the
+                    // entry saying it ran, which is all anyone knows).
+                    if !is_view && let Some(result) = run_result(&state, took) {
+                        (finish_history)(hist_conn, &[(hist_sql.clone(), result)]);
                     }
                     // Only apply if this run still owns the tab (else a newer run or
                     // a close superseded it — don't clobber their state/token).
@@ -1187,6 +1265,9 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             // Read the row cap on the UI thread (signals are single-threaded).
             let cap = row_limit.get_untracked();
             handle.spawn(async move {
+                // Wall-clock, and around everything: connecting, the statement,
+                // and pulling the rows back are all time the user waited.
+                let started = std::time::Instant::now();
                 let (res, stmt) = match &session {
                     Some(s) => {
                         // `BEGIN` is issued lazily, on the first statement of a
@@ -1227,7 +1308,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         QueryState::Failed(e.to_string())
                     }
                 };
-                send((state, stmt));
+                send((state, stmt, started.elapsed().as_millis() as u64));
             });
         })
     };
@@ -1402,6 +1483,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         let db_for = db_for.clone();
         let session_for = session_for.clone();
         let record_history = record_history.clone();
+        let finish_history = finish_history.clone();
         Rc::new(move |stmts: Vec<String>| {
             let stmts: Vec<String> = stmts.into_iter().filter(|s| !s.trim().is_empty()).collect();
             if stmts.is_empty() {
@@ -1462,13 +1544,32 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             // order — a MySQL DDL halfway through implicitly commits, and the
             // statements after it belong to a *new* transaction.
             let tx_stmts = stmts.clone();
+            let finish_history = finish_history.clone();
             let send = create_ext_action(
                 cx,
-                move |(states, outcomes): (Vec<QueryState>, Vec<Option<StmtOutcome>>)| {
+                move |(states, outcomes, took): (
+                    Vec<QueryState>,
+                    Vec<Option<StmtOutcome>>,
+                    Vec<u64>,
+                )| {
                     for (sql, stmt) in tx_stmts.iter().zip(&outcomes) {
                         if let Some(stmt) = stmt {
                             tab.tx.update(|t| *t = t.on_statement(engine, sql, *stmt));
                         }
+                    }
+                    // Before the supersede check, for the same reasons as a single
+                    // run's — and handed over as one batch, so the whole script
+                    // costs one history save rather than one per statement.
+                    let runs: Vec<(String, schemaic_core::history::RunResult)> = tx_stmts
+                        .iter()
+                        .zip(&states)
+                        .zip(&took)
+                        .filter_map(|((sql, state), ms)| {
+                            run_result(state, *ms).map(|r| (sql.clone(), r))
+                        })
+                        .collect();
+                    if !runs.is_empty() {
+                        (finish_history)(conn_id, &runs);
                     }
                     // Only apply if this batch still owns the tab (see `run`).
                     if tokens_done.borrow().get(&id).map(|(g, _)| *g) != Some(generation) {
@@ -1486,6 +1587,11 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             handle.spawn(async move {
                 let mut states: Vec<QueryState> = vec![QueryState::Cancelled; n];
                 let mut outcomes: Vec<Option<StmtOutcome>> = vec![None; n];
+                // Wall-clock per statement, for history. A statement that never
+                // ran keeps its 0 — `run_result` reads nothing off a cancelled
+                // one, so the number is never shown.
+                let mut took: Vec<u64> = vec![0; n];
+                let mut clock = std::time::Instant::now();
                 match &session {
                     Some(s) => {
                         // See `run_query_core`: the session owns the decision, and
@@ -1493,7 +1599,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         // outside the transaction the user asked for.
                         if let Err(e) = s.ensure_tx().await {
                             states[0] = QueryState::Failed(e.to_string());
-                            send((states, outcomes));
+                            took[0] = clock.elapsed().as_millis() as u64;
+                            send((states, outcomes, took));
                             return;
                         }
                         // The session runs statements one at a time on the pinned
@@ -1505,6 +1612,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                                 continue;
                             }
                             let out = s.fetch_query(sql, cap, token.clone()).await;
+                            took[i] = clock.elapsed().as_millis() as u64;
+                            clock = std::time::Instant::now();
                             outcomes[i] = Some(out.stmt);
                             states[i] = match out.result {
                                 Ok(rs) => QueryState::Loaded(Arc::new(rs)),
@@ -1520,7 +1629,12 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         }
                     }
                     None => {
+                        // The callback fires as each statement lands, so the gap
+                        // since the previous one *is* that statement's wall-clock
+                        // — the batch runs them back to back on one connection.
                         db.run_batch(database.as_deref(), &stmts, cap, token, |i, res| {
+                            took[i] = clock.elapsed().as_millis() as u64;
+                            clock = std::time::Instant::now();
                             states[i] = match res {
                                 Ok(rs) => QueryState::Loaded(Arc::new(rs)),
                                 Err(DbError::Cancelled) => QueryState::Cancelled,
@@ -1530,7 +1644,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         .await;
                     }
                 }
-                send((states, outcomes));
+                send((states, outcomes, took));
             });
         })
     };
