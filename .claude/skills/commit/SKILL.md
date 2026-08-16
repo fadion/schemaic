@@ -77,10 +77,10 @@ broken work "so it isn't lost" — that's what the working tree is already for.
 A docs-only or comment-only change may skip the bar. Say that you skipped it and
 why, rather than silently reporting a commit as verified.
 
-**One docs file is not exempt: CLAUDE.md.** `core/tests/doc_coverage.rs` asserts
-that every `crates/schemaic-core/src/*.rs` module is named somewhere in it, so an
-edit that drops or renames a module's mention turns the suite red — the one case
-where a change with no `.rs` in it can. Run the bar for any CLAUDE.md edit.
+**One docs file is not exempt: `docs/architecture.md`.** `core/tests/doc_coverage.rs`
+asserts that every `crates/schemaic-core/src/*.rs` module is named somewhere in it, so
+an edit that drops or renames a module's mention turns the suite red — the one case
+where a change with no `.rs` in it can. Run the bar for any edit to that file.
 
 ## Reviewing on request
 
@@ -103,10 +103,9 @@ in on top. That default suits a branch-per-change workflow; here commits batch o
 push was — twenty-seven, at the time this was written — and a pre-commit review
 reads all of them alongside the two files actually in question. The working tree
 isn't excluded, it arrives buried, and the review costs many times what it should.
-`/code-review`'s documented targets are a PR number, a branch or a path, none of
-which spell "working tree", so the scope goes in the argument as plain text — the
-skill body is instructions the reviewer follows, so a clearly stated scope is
-honoured even though it isn't one of the three named target types.
+None of `/code-review`'s documented targets (a PR number, a branch, a path) spells
+"working tree", so the scope goes in the argument as plain text — the skill body is
+instructions the reviewer follows, so a clearly stated scope is honoured anyway.
 
 Always name a level too: a bare `/code-review` silently reuses the last one
 typed, which makes the depth of the review a function of whatever happened to be
@@ -133,27 +132,25 @@ this brief:
 > Review the commits in `<range>` as one pass — no slicing, no ledger. Read
 > `git diff <range>` in full, plus enough surrounding code to judge it. Focus on
 > three things, in order: **correctness bugs** (wrong conditions, missing guards,
-> broken callers, disposal and focus hazards), **CLAUDE.md's architecture
+> broken callers, disposal and focus hazards), **`docs/architecture.md`'s architecture
 > invariants** for the surfaces the range touched, and **data safety** (writes,
 > DDL, secrets, quoting) where it touches them. Report findings inline, most
 > severe first, each with the concrete scenario in which the code misbehaves.
 > Don't fix anything.
 
-**One pass, deliberately — this is a smaller scope than the tool it replaced.**
-`release-review` is the wrong instrument here: its cost is dominated by fixed
-overhead rather than range size, since a mechanical fact sheet, three range
-sweeps and a final triage all run whether the range is two commits or
-twenty-seven. A two-commit feature was billed two hours of review plus an hour of
-fixes — what a whole release audit costs, for a fraction of the ground. A single
-reader finds less than a seven-pass fan-out; that is the trade, made knowingly,
-and it buys a review that fits inside a day's work instead of ending it.
+**One pass, deliberately.** `release-review` is the wrong instrument here: its
+cost is dominated by fixed overhead — a fact sheet, three range sweeps, a final
+triage — which runs whether the range is two commits or twenty-seven. A
+two-commit feature was billed two hours of review plus an hour of fixes, what a
+whole release audit costs, for a fraction of the ground. A single reader finds
+less than a seven-pass fan-out; that is the trade, made knowingly.
 `release-review` reads the same commits again before anything ships, so this is a
 first look and never the only one.
 
-**Nothing is recorded.** No `review/commits/` file and no ledger: the release
-review does its own full pass and takes what it needs from the diff, so a record
-here would only be a second copy to keep honest. Report the findings in the
-conversation and let the fixes land as ordinary commits.
+**Nothing is recorded** — no file, no ledger. `release-review` does its own full
+pass over the same commits, so a record here would only be a second copy to keep
+honest. Report the findings in the conversation and let the fixes land as
+ordinary commits.
 
 ## Phase 2 — the commit
 

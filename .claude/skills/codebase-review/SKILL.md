@@ -14,9 +14,9 @@ subagent and stopping only at the attended checkpoints.
 gate, the ledger format and its integrity rules, the orchestration contract. **Read it before
 Phase 2.** Both skills follow it, so it's the one place the method lives.
 
-**This skill is Schemaic-specific.** The parts below that name cargo commands, CLAUDE.md's
-invariants, this repo's traps and its scope decisions are the highest-yield content in it — a
-generic reviewer misses all of it. Copying this to another project means copying the whole
+**This skill is Schemaic-specific.** The parts below that name cargo commands, the invariants in
+`docs/architecture.md`, this repo's traps and its scope decisions are the highest-yield content in
+it — a generic reviewer misses all of it. Copying this to another project means copying the whole
 `.claude/skills/codebase-review*` pair and rewriting those sections for that repo; `reference.md`
 transfers unchanged.
 
@@ -88,8 +88,8 @@ the gap as covered.
 
 ## Phase 1 — generate the plan
 
-Inventory first: crates, line counts per file, test counts per file, and CLAUDE.md's architecture
-notes. Then cut slices.
+Inventory first: crates, line counts per file, test counts per file, and
+`docs/architecture.md`'s architecture notes. Then cut slices.
 
 **Slicing heuristics** — the part that makes or breaks the review:
 
@@ -167,7 +167,7 @@ Standard shapes in reference §2. What makes each concrete here:
 
 | # | Sweep | This codebase |
 | --- | --- | --- |
-| **A1** | Invariant conformance | Walk CLAUDE.md's *Architecture invariants* and *Floem 0.2 gotchas* one at a time, enumerating **every** site each governs: (a) every SQL scan → through `sql::skip_noncode`, with the right `SqlDialect`? (b) every `Db::` method + `Session` use → one-connection-per-op except manual-tx; do read-only side channels stay off the pinned connection? (c) every secret read/write → through `core::secrets` + the keyring store, never `persist::save_connections` directly? (d) every `ALTER`/`CREATE`/`DROP` string → originates in `ddl::emit`, terminates at `ddl_preview`? (e) every `create_child()`/`dispose()` → deferred? (f) every `Color` captured by value into a `.style(` closure. (g) `>= 0x80` word-byte handling in every identifier scanner. |
+| **A1** | Invariant conformance | Walk `docs/architecture.md`'s *Architecture invariants* and *Floem 0.2 gotchas* one at a time, enumerating **every** site each governs: (a) every SQL scan → through `sql::skip_noncode`, with the right `SqlDialect`? (b) every `Db::` method + `Session` use → one-connection-per-op except manual-tx; do read-only side channels stay off the pinned connection? (c) every secret read/write → through `core::secrets` + the keyring store, never `persist::save_connections` directly? (d) every `ALTER`/`CREATE`/`DROP` string → originates in `ddl::emit`, terminates at `ddl_preview`? (e) every `create_child()`/`dispose()` → deferred? (f) every `Color` captured by value into a `.style(` closure. (g) `>= 0x80` word-byte handling in every identifier scanner. |
 | **A2** | Architecture & boundaries | Crate dep graph; what leaks from `schemaic-db` up into `schemaic-ui`; the `Ui` bundles vs. what closures actually capture; the god modules (`intel.rs`, `grid.rs`, `ui/lib.rs`, `main.rs`) — still cohesive, or landfills? Are `SqlDialect` / `SecretStore` / `RowSource` / `Catalog` real seams, or is dialect logic still scattered? |
 | **A3** | Security & data safety | Secrets end to end (keyring ↔ JSON ↔ memory ↔ subprocess env ↔ logs); every identifier/literal reaching SQL text — is anything bypassing `export::ident_sql`/`sql_literal`? the MCP and AI read-only gates; the write-back 1-row net and `TxScope` SAVEPOINT nesting; `run_ddl` atomicity honesty per engine; SSH TOFU; import/export path handling; panic messages carrying data. |
 | **A4** | Performance map | Per-keystroke (diagnostics / completion / highlight), per-frame (grid render, the `ColWindow` memo), per-scroll, per-result-set (fetch → model → widths), import/export streaming. Output: ranked ≤8 paths worth deep L4 attention. |
@@ -181,8 +181,8 @@ delegate like any other pass. Run them one at a time, appending to the ledger, a
 These go into every subagent's brief. They are the difference between a review of this codebase and
 a generic one.
 
-- **The invariants are the point.** CLAUDE.md's *Architecture invariants* and *Floem 0.2 gotchas*
-  each encode a bug already paid for — five drifting SQL lexers, plaintext credentials,
+- **The invariants are the point.** `docs/architecture.md`'s *Architecture invariants* and *Floem
+  0.2 gotchas* each encode a bug already paid for — five drifting SQL lexers, plaintext credentials,
   disposed-signal panics, silent `MODIFY COLUMN` data loss. **L2 outranks everything else here.**
 - **This codebase is deliberately conservative in specific places**, and each is a trap for a
   plausible-but-wrong finding: `intel::colres` treats an unenumerable source as *open* so
@@ -217,11 +217,9 @@ escalated Critical, or a pass that degraded twice. Don't keep going yourself unl
 
 - **Edit no source file.** This phase produces findings; fixing is a separate phase with its own
   risk buckets. A session that starts fixing loses the ledger and the ranking.
-- **A Critical is escalated, not queued.** Finding data loss, corruption or a credential leak at
-  pass 3 of 40 and burying it for a fortnight is its own failure. Write it up, tell the user
-  immediately in that pass's report, and say plainly that it warrants fixing now. The fix still
-  doesn't happen here: it goes on a branch off the frozen SHA/tag, so the review's line references
-  stay valid and the ledger stays the record.
+- **A Critical is escalated, not queued** (reference §3) — written up, surfaced in that pass's
+  report immediately, and fixed on a branch off the frozen SHA/tag so the line references stay
+  valid. Burying data loss for a fortnight of passes is its own failure.
 - **No scripted or bulk edits** — of source or of the ledger (reference §5).
 - **The verification gate is not optional** (reference §3). Mature codebases are full of deliberate
   conservatism that makes plausible-sounding findings wrong.

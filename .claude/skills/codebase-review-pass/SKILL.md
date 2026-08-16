@@ -33,46 +33,27 @@ to a review built on a census nobody has.
 
 ## The loop
 
-Repeat until a stop condition fires.
+Reference §7's loop, run until a stop condition fires. Per iteration:
 
-**1. Confirm the ground.** `git rev-parse HEAD` must still match the ledger's frozen SHA. If it has
-moved, **stop and tell the user** — every `file:line` in the ledger is anchored to it. Do not
-re-anchor on your own initiative; offer it as their call, and say that earlier line refs will have
-drifted (file and symbol names survive). If the review runs in a worktree at a tag, this check is
-against *that* worktree and a moving `main` is irrelevant.
-
-**2. Audit the previous pass.** Mechanically, without reading the findings themselves:
-
-- its row has a findings count and a non-empty "Not covered", and isn't still `in progress`;
-- the ledger gained the number of blocks its report claimed, with that pass's ID prefix;
-- each new block carries **Failure**, **Evidence**, **Confidence**, **Status**;
-- the §5 integrity checks pass (size delta, monotonic counts, anchors intact).
-
-If it looks truncated, unverified, or short of what it reported, **re-run that pass instead of
-moving on**, and say why. This audit is what stands in for the checkpoint that delegation removed.
-
-**Cap re-runs at two**, recorded in the row (`attempt 2`). A pass that degrades twice is degrading
-for a structural reason — the slice is too big, the plan's split point is wrong, or the lens
-doesn't fit — so stop, say which you think it is, and let the user decide.
-
-**3. Pick the next pass** — the first in the plan's sequence whose row isn't `done`. If it's
-flagged **attended**, or it's a **triage checkpoint** (reference §6), stop and hand back. If every
-slice pass is done, the next thing is the **final triage**, which is attended — stop.
-
-**4. Mark it `in progress`** and snapshot the ledger to `review/.snapshots/findings-<pass-id>.md`.
-A pass that dies mid-way must re-run, not be skipped; the row is what decides that, and the
-snapshot is what makes a bad write recoverable.
-
-**5. Dispatch the subagent** (template below) and wait.
-
-**6. Check the guards.**
-
-- `git status --short` in the frozen tree must be **empty**. `review/` is gitignored, so anything
-  there means the subagent edited source: restore it, record `attempt 2`, re-run the pass.
-- The §5 ledger checks against the snapshot.
-
-**7. Close the row** — findings by severity, and what the pass did *not* cover, taken from its
-report. Append its findings to `review/index.md`, one line each. Loop.
+1. **Confirm the ground** — `git rev-parse HEAD` still matches the ledger's frozen SHA. In a
+   worktree at a tag the check is against *that* worktree, and a moving `main` is irrelevant. If it
+   has moved, stop and tell the user: don't re-anchor on your own initiative, offer it as their
+   call, and say that earlier line refs will have drifted (file and symbol names survive).
+2. **Audit the previous row** (§7), then the §5 integrity checks against its snapshot. Truncated,
+   unverified, or short of what it reported ⇒ **re-run that pass instead of moving on**, and say
+   why. **Cap re-runs at two**, recorded in the row (`attempt 2`) — twice means the slice, the
+   split point or the lens is wrong, so stop and say which you think it is.
+3. **Pick the next pass** — the first in the plan's sequence whose row isn't `done`. Attended, or a
+   triage checkpoint (reference §6) ⇒ stop and hand back. Every slice pass done ⇒ what's next is
+   the **final triage**, also attended.
+4. **Mark it `in progress`**, then snapshot to `review/.snapshots/findings-<pass-id>.md`. A pass
+   that dies mid-way re-runs rather than being skipped, and the row is what decides that.
+5. **Dispatch the subagent** (template below) and wait.
+6. **Guards on return** (§7): `git status --short` in the frozen tree empty — anything there means
+   the subagent edited source, so restore it, record `attempt 2`, re-run — then the §5 ledger
+   checks against the snapshot.
+7. **Close the row** — findings by severity and what the pass did *not* cover, from its report —
+   append them to `review/index.md` one line each, and loop.
 
 ## Stop conditions
 
@@ -103,7 +84,7 @@ You are running pass <ID> of an in-progress codebase review of Schemaic. Read th
   §4 the per-pass protocol, §5 the ledger format and its integrity rules. Follow them exactly.
 - .claude/skills/codebase-review/SKILL.md — "Project-specific notes for reviewers". The
   deliberate-conservatism traps listed there are the most common source of wrong findings.
-- CLAUDE.md — the architecture invariants and Floem gotchas. L2 is the highest-yield lens here.
+- docs/architecture.md — the architecture invariants and Floem gotchas. L2 is the highest-yield lens here.
 - review/index.md — every finding raised so far, one line each, plus the rejected candidates.
   Check it before writing anything: if your candidate is already there, it's a duplicate (say so
   in your report instead of re-raising it) or already rejected (don't re-raise it at all).

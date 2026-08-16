@@ -5164,7 +5164,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         let tunnels = tunnels.clone();
         Rc::new(move |db: Option<String>| {
             // Guard the panel reveal: a redundant `set` rebuilds the panel
-            // `dyn_container` (CLAUDE.md gotcha / review H11).
+            // `dyn_container` (docs/architecture.md gotcha / review H11).
             if !matches!(right_panel.get_untracked(), RightPanel::Terminal) {
                 right_panel.set(RightPanel::Terminal);
             }

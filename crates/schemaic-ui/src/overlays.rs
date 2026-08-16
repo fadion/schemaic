@@ -3357,7 +3357,7 @@ fn find_matches(
     // box), and `get` is documented as "try to *clone* and return" — so the two
     // reads here allocated and freed a whole `HashSet<String>` and a whole
     // `Vec<ConnNode>`, two `String`s per node, per character typed. On the one
-    // path CLAUDE.md names for both rules. `lookup_object` twenty lines below
+    // path docs/architecture.md names for both rules. `lookup_object` twenty lines below
     // already did it this way.
     let mut out = Vec::new();
     hidden.with_untracked(|hidden| {

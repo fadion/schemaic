@@ -14,7 +14,7 @@ evidence requirement produces no finding — that's the point, not a failure.
 | ID | Lens | In scope | Evidence required |
 | --- | --- | --- | --- |
 | **L1** | **Correctness / bugs** | wrong results, panics, hangs, races, off-by-one, unhandled error paths, platform/backend divergence, encoding & boundary bugs | a **concrete input + the wrong output/crash**. "Could be a problem" is not a finding. |
-| **L2** | **Invariant conformance** | the architecture rules the project documents for itself (CLAUDE.md, ADRs, conventions docs) and the framework hazards it has written down | the invariant quoted + the violating site |
+| **L2** | **Invariant conformance** | the architecture rules the project documents for itself (`docs/architecture.md`, ADRs, conventions docs) and the framework hazards it has written down | the invariant quoted + the violating site |
 | **L3** | **Code quality** | duplication, god functions, dead code, leaky abstractions, naming/altitude, comment drift | the duplicate/dead site named + a stated cost |
 | **L4** | **Performance** | work in hot paths (render, per-keystroke, per-request, per-row), superlinear algorithms, avoidable allocation, blocking the wrong thread, memory at realistic scale | the path it sits on + the input scale where it bites |
 | **L5** | **Security & data safety** | credential handling, injection & quoting, destructive operations, write paths, file/path handling, subprocess & env surfaces, authn/authz boundaries | the attack or data-loss scenario, end to end |

@@ -2221,7 +2221,7 @@ pub(crate) fn section_title(t: &'static str) -> impl IntoView {
 /// at the theme that was active then, so every caller of this — eleven of them —
 /// would keep painting the old palette after a live theme switch. Passing the
 /// accessor and calling it *inside* the reactive `.style` closure is what makes
-/// the switch free (CLAUDE.md → *Themable colors reach reactive styles as
+/// the switch free (docs/architecture.md → *Themable colors reach reactive styles as
 /// `fn() -> Color`*).
 pub(crate) fn centered_msg(
     msg: impl Into<String>,

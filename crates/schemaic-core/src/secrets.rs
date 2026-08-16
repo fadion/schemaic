@@ -11,7 +11,7 @@
 //! crate so the heavy `keyring` / D-Bus dependency stays out of the pure core;
 //! tests here drive the transforms through an in-memory fake.
 //!
-//! Design invariant (see CLAUDE.md): after a save, `connections.json` holds **no
+//! Design invariant (see `docs/architecture.md`): after a save, `connections.json` holds **no
 //! plaintext secret** whenever the keyring is available — the field is blanked and
 //! the value lives in the keyring. If the keyring is *unavailable* (e.g. a
 //! headless Linux box with no secret service), we deliberately fall back to
