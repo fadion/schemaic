@@ -423,6 +423,11 @@ pub struct DdlPreview {
     /// What the plan destroys, in plain language. Non-empty ⇒ the modal says so
     /// before the Apply button, in the error colour.
     pub destructive: Vec<String>,
+    /// What the plan asks for that this engine **can't express** — see
+    /// [`schemaic_core::ddl::ChangeSet::unsupported`]. Non-empty ⇒ the modal
+    /// names each one and Apply refuses, because `statements` is then less than
+    /// the change list above it and running it would do part of an edit.
+    pub withheld: Vec<String>,
     pub statements: Vec<String>,
     /// The same plan as one script a **client** can run — see
     /// [`schemaic_core::ddl::ChangeSet::editor_script`]. What "Copy" and "Open in
