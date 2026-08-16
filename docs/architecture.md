@@ -107,6 +107,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     engine now fills in the table rather than hoping a `!=` falls the right way. `comment_open` is
     the classification half, exposed because `pairs::region_at` has to tell a comment span from a
     string span after the lexer has found one and was answering it with its own byte test.
+    **The AI read-only gate's allowed heads are a per-dialect list too** — `read_only_heads`, which
+    `read_only_reason` both tests against and builds its rejection message from:
+    `SELECT/SHOW/DESCRIBE/DESC/EXPLAIN/WITH` on MySQL, `SELECT/SHOW/EXPLAIN/WITH` on PostgreSQL
+    (`SHOW search_path` is real SQL there, while `DESCRIBE` isn't — psql's `\d` is a client command
+    rather than a statement), `SELECT/EXPLAIN/WITH` on SQLite. One shared list was wrong in both
+    directions at once for a third engine: it waved `SHOW TABLES` through to SQLite, which has no
+    such syntax, so the model got a raw parser error instead of being told the engine has no such
+    thing, and a rejection named heads that connection couldn't use — which a model will keep
+    retrying. It is also what the MCP server builds `run_query`'s advertised description from, so
+    the tool text and the gate can't drift
+    (`the_read_only_heads_are_the_ones_the_engine_actually_has`,
+    `the_rejection_lists_only_this_engines_heads`). Only the head list is per dialect: the
+    single-statement check and the `DENY_KEYWORDS` scan — which is what refuses a write hidden
+    behind a `WITH` head — apply the same everywhere.
   - `intel.rs` — the **SQL intelligence** layer (structure-aware, dialect-pluggable). Parses a
     *complete* statement with a real per-dialect AST (`sqlparser`; `SqlDialect` seam — MySQL,
     PostgreSQL and SQLite all wired) and answers what a token stream can't: `statement_scope`
@@ -1108,8 +1122,27 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   to other same-user processes. Pure clusters split out: `claude_cli.rs` (`claude` binary
   discovery — PATH/PATHEXT/override) and `ai.rs` (`AiSession`/`start_ai_session` streaming,
   MCP-config plumbing, `ai_context`/`inline_system_prompt`). Reactive wiring (`app_view` closures)
-  stays in `main.rs`. The MCP server itself is `mcp.rs`; `secrets.rs` is the keyring-backed
-  `SecretStore` behind `core::secrets`.
+  stays in `main.rs`. The MCP server itself is `mcp.rs` — three tools (`run_query`, `list_schema`,
+  `describe_table`), described for **this** connection's engine: `tools_list(engine)` builds
+  `run_query`'s advertised statement heads from `schemaic_core::sql::read_only_heads`, the same list
+  the gate enforces, and names the engine with `SqlDialect::engine_label()`. A hard-coded
+  `SELECT/SHOW/DESCRIBE/EXPLAIN/WITH` told every model that a SQLite connection accepted
+  `SHOW TABLES`, so a model reasoning from the tool's own text spent turns on statements that could
+  only come back as parser errors; `run_query_advertises_exactly_the_heads_its_gate_allows` walks
+  every advertised head back through the gate. Everything dialect-shaped here reads `dialect_of` →
+  `Engine::dialect()`, whose match is exhaustive, and so does `main.rs`'s namesake (via
+  `dialect_for`). Both were `if engine == Postgres { Postgres } else { MySql }`, which compiled
+  cleanly when SQLite arrived and sorted it onto the MySQL side: the read-only gate lexed AI-issued
+  SQL by MySQL's backslash-escape and `#`-comment rules, neither of which SQLite has, and
+  `describe_table`'s sample query took `filter::table_query`'s MySQL branch — qualified `main.t`,
+  which is the SQLite name the surrounding entry says never to emit, and checked the name against
+  MySQL's reserved words rather than `SQLITE_RESERVED`, so a table named `isnull`, `notnull`,
+  `returning` or `transaction` (reserved in SQLite, not in MySQL) came out unquoted and would not
+  parse (`the_dialect_is_the_engines_own_for_every_engine`). The DDL paths escaped by luck alone:
+  `TableInfo::create_ddl` hands back SQLite's own `create_sql` for a real table without consulting
+  the dialect, and a **view** fell through to `ddl::view_ddl`'s MySQL shape, which was only cosmetic
+  because SQLite accepts backticks and its views carry no `view_options`. `secrets.rs` is the
+  keyring-backed `SecretStore` behind `core::secrets`.
   - `heap.rs` — process-wide heap accounting. `Tracking` is installed as the global allocator and
     adds only two atomics — **live** bytes (allocated − freed) and the running peak — over the
     system allocator. It exists to answer one question the OS can't: whether memory growth is a
@@ -1147,7 +1180,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   never the engine** — the rules are predicates on `SqlDialect` (see `sql.rs` above), because
   `dialect == Postgres` / `!= MySql` compiles cleanly while silently sorting a third engine onto
   whichever side it falls, and two of the answers it got wrong for SQLite could hide a `WHERE`
-  from the guard. **No exceptions** —
+  from the guard. **Deriving the dialect is the same question**: `Engine::dialect()` is the one
+  exhaustive answer, and the hand-written `if engine == Postgres { Postgres } else { MySql }` that
+  stood in for it in `app::mcp` and `app::main` is exactly how SQLite came to be lexed by MySQL's
+  rules on the AI path (see `schemaic-app` below). **No exceptions** —
   `intel::tokenize_range` (the mid-edit byte-position *fallback*) is dialect-aware too, and so are the
   `intel` entry points that reach it (`clause_context`/`clause_continuation`/`join_targets`/
   `expand_star`/`signature_help` all take a `SqlDialect`). It additionally lifts a **quoted identifier**
