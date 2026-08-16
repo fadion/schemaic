@@ -38,6 +38,7 @@ pub mod secrets;
 pub mod seed;
 pub mod sql;
 pub mod sqlfmt;
+pub mod stats;
 pub mod summary;
 pub mod tabsel;
 pub mod text;

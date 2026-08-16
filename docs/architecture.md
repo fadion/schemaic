@@ -982,7 +982,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       per-process CPU% (single-core-relative, so it exceeds 100 on a multi-core box) across the
       logical core count to give a whole-machine 0..=100. Sampling itself stays at the app boundary.
     - `text.rs` — `plural(n, one, many)`, returning only the noun form so a humanized count
-      (`"1.2k"`) can be displayed while the singular/plural decision still follows the true `n`.
+      (`"1.2k"`) can be displayed while the singular/plural decision still follows the true `n`;
+      `human_count` (`1250` → `1.25k`), the **row-count** printer, shared by the grid's stats line
+      and the properties surface so `200k` means one thing — and bound by a round-trip property:
+      every string it emits must parse back through `model::goto_row_index`. Not the namesake in
+      `transcript.rs`, which buckets token counts differently on purpose.
+    - `stats.rs` — table statistics: `TableStats`/`IndexStats`/`SchemaStats`, `format_bytes`
+      (1024-based, IEC units), `format_age`, and the honesty types. Every figure is an `Option`
+      because the three engines publish different facts — `supports_table_stats` is `false` for
+      SQLite, which keeps no per-table size at all. `RowCount::{Exact,Estimate}` stops an estimate
+      from printing as a fact, `Freshness` says *why* a figure may be stale (MySQL caches
+      `information_schema` stats for `information_schema_stats_expiry`, a day by default;
+      PostgreSQL's `reltuples` is only as fresh as the last `ANALYZE`), and `IndexStats::is_unused`
+      flags an index only when the server actually counted zero scans — `scans: None` is "nobody
+      was counting", never "drop this". Filled by `Db::fetch_table_stats`; rendered by
+      `ui/properties.rs`.
 - `schemaic-db` — MySQL/MariaDB (`mysql_async`) + SSH tunnels (`ssh.rs`), PostgreSQL in `pg.rs`,
   SQLite in `sqlite.rs`, and
   the pinned manual-transaction connection in `session.rs`. Populates each result column's
