@@ -414,6 +414,10 @@ pub(crate) async fn run_statement(
                             column: m.column.clone(),
                             flags: m.flags,
                             binary,
+                            // PostgreSQL's `ctid` is a physical location, not a
+                            // row identity: `VACUUM` moves it. There is nothing
+                            // here to key a write on that isn't a column.
+                            implicit_key: false,
                         });
                     }
                 }

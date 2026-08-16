@@ -1932,6 +1932,9 @@ fn column_origin(
         column: org_name.to_string(),
         flags,
         binary,
+        // MySQL's own row identity is always a column of the table; it has no
+        // analogue of SQLite's `rowid`.
+        implicit_key: false,
     })
 }
 
