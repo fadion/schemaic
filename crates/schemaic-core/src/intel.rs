@@ -2837,8 +2837,7 @@ const PG_RESERVED: &[&str] = &[
     "WITH",
 ];
 
-/// SQLite **reserved** words — those it will not accept as a bare
-/// identifier/alias.
+/// SQLite **reserved** words — those it will not accept as a bare **alias**.
 ///
 /// Deliberately much shorter than the other two, and that is not an omission.
 /// SQLite's parser *falls back* to treating most of its ~147 keywords as
@@ -2847,6 +2846,13 @@ const PG_RESERVED: &[&str] = &[
 /// **warning**, and the module's rule is that uncertainty never yields a false
 /// positive — a word wrongly listed here squiggles working SQL, which is worse
 /// than missing one the server will reject with a clearer message than ours.
+///
+/// **It is the alias set, not the identifier set**, and on SQLite those differ:
+/// a quoter must ask [`must_quote_ident`], which adds the three words that are
+/// refused as a bare table or column name yet accepted as an alias. Both sets are
+/// checked against the engine's own keyword table by `db::sqlite`'s
+/// `the_reserved_lists_match_what_sqlite_itself_refuses`, so neither is a
+/// transcription anybody has to trust.
 const SQLITE_RESERVED: &[&str] = &[
     "ADD",
     "ALL",
@@ -2884,6 +2890,7 @@ const SQLITE_RESERVED: &[&str] = &[
     "JOIN",
     "LIMIT",
     "NOT",
+    "NOTHING",
     "NOTNULL",
     "NULL",
     "ON",
@@ -2911,7 +2918,7 @@ const SQLITE_RESERVED: &[&str] = &[
 /// Backs the alias diagnostic and the scope's alias resolution so they agree on what
 /// counts as a valid alias. See [`MYSQL_RESERVED`] / [`PG_RESERVED`] /
 /// [`SQLITE_RESERVED`].
-pub(crate) fn is_reserved_word(word: &str, dialect: SqlDialect) -> bool {
+pub fn is_reserved_word(word: &str, dialect: SqlDialect) -> bool {
     let up = word.to_ascii_uppercase();
     let list = match dialect {
         SqlDialect::MySql => MYSQL_RESERVED,
@@ -2919,6 +2926,45 @@ pub(crate) fn is_reserved_word(word: &str, dialect: SqlDialect) -> bool {
         SqlDialect::Sqlite => SQLITE_RESERVED,
     };
     list.contains(&up.as_str())
+}
+
+/// Words that can't be a bare **identifier** (a table or column name) but *can*
+/// be an alias, so [`is_reserved_word`] must not list them.
+///
+/// Empty on MySQL and PostgreSQL: there, a reserved word is reserved everywhere,
+/// and one list answers both questions. SQLite is the engine where the two
+/// questions come apart — see [`must_quote_ident`].
+fn alias_ok_but_unquotable(dialect: SqlDialect) -> &'static [&'static str] {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres => &[],
+        // `CAST(x AS t)`, `IF NOT EXISTS`, `RAISE(ABORT, …)` — each is a bare
+        // keyword the parser commits to on sight in a name position, and each is
+        // still accepted as an alias, where `AS` has already told it what follows.
+        SqlDialect::Sqlite => &["CAST", "IF", "RAISE"],
+    }
+}
+
+/// Must `word` be quoted to be used as an identifier — a table or column name?
+///
+/// **This, not [`is_reserved_word`], is the question a quoter asks**, and the two
+/// have opposite costs, which is why they are separate. Missing a word here emits
+/// SQL that does not parse; listing one wrongly only adds quotes nobody needed.
+/// `is_reserved_word` backs a *warning* about an alias, where the trade runs the
+/// other way — a word wrongly listed there squiggles working SQL.
+///
+/// On SQLite the sets genuinely differ. Its parser falls back to treating most of
+/// its ~147 keywords as identifiers wherever the grammar allows one, so both sets
+/// are small, but `CAST`, `IF` and `RAISE` sit in the gap: refused as a bare
+/// column or table name, accepted as an `AS` alias. Both lists are checked
+/// against SQLite itself by `db::sqlite`'s
+/// `the_reserved_lists_match_what_sqlite_itself_refuses`, which walks the engine's
+/// own keyword table rather than a transcription of its documentation.
+pub fn must_quote_ident(word: &str, dialect: SqlDialect) -> bool {
+    if is_reserved_word(word, dialect) {
+        return true;
+    }
+    let up = word.to_ascii_uppercase();
+    alias_ok_but_unquotable(dialect).contains(&up.as_str())
 }
 
 /// Keywords that legitimately follow a *table reference* (so a reserved keyword here

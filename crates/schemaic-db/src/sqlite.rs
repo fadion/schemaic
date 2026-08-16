@@ -1656,6 +1656,164 @@ mod tests {
         assert!(o[1].as_ref().unwrap().binary);
     }
 
+    // ── the reserved-word lists, checked against SQLite itself ────────────
+
+    /// Every keyword this build of SQLite knows, from **SQLite's own table**
+    /// (`sqlite3_keyword_name`) rather than a list copied out of the docs. That
+    /// is what makes the test below a standing guard instead of a snapshot: a
+    /// keyword added by a future release arrives here on its own and fails the
+    /// assertion until somebody looks at it.
+    fn sqlite_keywords() -> Vec<String> {
+        let mut out = Vec::new();
+        // SAFETY: the two calls are SQLite's documented keyword-table accessors.
+        // They touch no connection and no shared state, and `sqlite3_keyword_name`
+        // hands back a pointer to a static string plus its length, which is read
+        // and copied before anything else runs.
+        unsafe {
+            for i in 0..rusqlite::ffi::sqlite3_keyword_count() {
+                let mut p: *const std::os::raw::c_char = std::ptr::null();
+                let mut len: std::os::raw::c_int = 0;
+                if rusqlite::ffi::sqlite3_keyword_name(i, &mut p, &mut len)
+                    != rusqlite::ffi::SQLITE_OK
+                    || p.is_null()
+                {
+                    continue;
+                }
+                let bytes = std::slice::from_raw_parts(p as *const u8, len as usize);
+                if let Ok(s) = std::str::from_utf8(bytes) {
+                    out.push(s.to_string());
+                }
+            }
+        }
+        assert!(out.len() > 100, "SQLite reported {} keywords", out.len());
+        out
+    }
+
+    /// Run `setup`, then compile `probe`, **on one connection** — a fresh
+    /// connection per statement would fail every `SELECT … FROM <just-created>`
+    /// with "no such table" and make every keyword look reserved.
+    fn compiles(setup: &str, probe: &str) -> bool {
+        let c = SqliteConn::open_in_memory().unwrap();
+        c.execute_batch(setup).is_ok() && c.prepare(probe).is_ok()
+    }
+
+    /// The reserved-word lists say what SQLite will refuse, so SQLite is what
+    /// they are checked against — not a reading of its documentation.
+    ///
+    /// Two lists because there are two questions with **opposite** costs. The
+    /// quoter must cover every word that can't be a bare identifier, or it emits
+    /// SQL that doesn't parse; the alias diagnostic must cover only words that
+    /// can't be an alias, or it squiggles working SQL. They are not the same set:
+    /// `CAST`, `IF` and `RAISE` need quoting as a column or table name yet are
+    /// perfectly good `AS` aliases.
+    #[test]
+    fn the_reserved_lists_match_what_sqlite_itself_refuses() {
+        use schemaic_core::intel::{SqlDialect, is_reserved_word, must_quote_ident};
+        let mut quote_wrong = Vec::new();
+        let mut alias_wrong = Vec::new();
+        for kw in sqlite_keywords() {
+            // Usable as a bare column name, and as a bare table name?
+            let as_ident = compiles(
+                &format!("CREATE TABLE zz ({kw} INTEGER);"),
+                &format!("SELECT {kw} FROM zz"),
+            ) && compiles(
+                &format!("CREATE TABLE {kw} (x INTEGER);"),
+                &format!("SELECT * FROM {kw}"),
+            );
+            // Usable as a bare `AS` alias?
+            let as_alias = compiles("CREATE TABLE t (x INTEGER);", &format!("SELECT 1 AS {kw}"));
+
+            if must_quote_ident(&kw, SqlDialect::Sqlite) != !as_ident {
+                quote_wrong.push(format!(
+                    "{kw}: SQLite {} it bare as an identifier, we say must_quote={}",
+                    if as_ident { "accepts" } else { "refuses" },
+                    must_quote_ident(&kw, SqlDialect::Sqlite)
+                ));
+            }
+            if is_reserved_word(&kw, SqlDialect::Sqlite) != !as_alias {
+                alias_wrong.push(format!(
+                    "{kw}: SQLite {} it as an alias, we say reserved={}",
+                    if as_alias { "accepts" } else { "refuses" },
+                    is_reserved_word(&kw, SqlDialect::Sqlite)
+                ));
+            }
+        }
+        assert!(
+            quote_wrong.is_empty(),
+            "must_quote_ident disagrees with SQLite:\n  {}",
+            quote_wrong.join("\n  ")
+        );
+        assert!(
+            alias_wrong.is_empty(),
+            "is_reserved_word disagrees with SQLite:\n  {}",
+            alias_wrong.join("\n  ")
+        );
+    }
+
+    /// The end of the chain: tables and columns named with the words that were
+    /// missing, opened through the statement the tree generates, against real
+    /// SQLite.
+    ///
+    /// **Each word is used in the position where it actually breaks**, which is
+    /// not the same position for all of them: `CAST` and `RAISE` are refused as a
+    /// bare *column* name but accepted as a table's, and `IF` is the reverse. A
+    /// first draft of this test put each one on the side it tolerates and passed
+    /// with the fix reverted.
+    #[tokio::test]
+    async fn a_table_named_for_a_keyword_still_opens() {
+        let (keeper, db) = shared_memory("kw_named_table");
+        keeper
+            .execute_batch(
+                r#"CREATE TABLE "if" ("cast" INTEGER PRIMARY KEY, "raise" TEXT);
+                   INSERT INTO "if" VALUES (1, 'x');
+                   CREATE TABLE "nothing" ("nothing" TEXT PRIMARY KEY);
+                   INSERT INTO "nothing" VALUES ('y');"#,
+            )
+            .unwrap();
+        let schema = fetch_schema(&db).await.expect("introspect");
+        for name in ["if", "nothing"] {
+            let t = schema
+                .tables
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from the catalogue"));
+            let pk: Vec<String> = t
+                .columns
+                .iter()
+                .filter(|c| c.primary_key)
+                .map(|c| c.name.clone())
+                .collect();
+            let sql = schemaic_core::filter::table_query(
+                schemaic_core::intel::SqlDialect::Sqlite,
+                MAIN,
+                None,
+                &t.name,
+                schemaic_core::filter::BrowseKey::pick(&pk, t.implicit_key.as_deref()),
+                schemaic_core::filter::Order::Asc,
+                10,
+            );
+            let rs = run_query(&keeper, &sql, 10).unwrap_or_else(|e| {
+                panic!("generated statement does not run: {sql}\n  {e}");
+            });
+            assert_eq!(rs.row_count(), 1, "{sql}");
+        }
+    }
+
+    /// The three words that separate the two lists, named so the distinction
+    /// can't be collapsed back into one by someone tidying up.
+    #[test]
+    fn a_word_can_need_quoting_as_a_name_yet_be_a_fine_alias() {
+        use schemaic_core::intel::{SqlDialect, is_reserved_word, must_quote_ident};
+        for w in ["CAST", "IF", "RAISE"] {
+            assert!(must_quote_ident(w, SqlDialect::Sqlite), "{w}");
+            assert!(!is_reserved_word(w, SqlDialect::Sqlite), "{w}");
+        }
+        // `NOTHING` (from `ON CONFLICT DO NOTHING`) is refused in both positions,
+        // so it belongs to both lists.
+        assert!(must_quote_ident("NOTHING", SqlDialect::Sqlite));
+        assert!(is_reserved_word("NOTHING", SqlDialect::Sqlite));
+    }
+
     // ── the implicit key: a keyless table's rowid ─────────────────────────
 
     /// A keyless table with a `rowid` column of its own, one with the first two
