@@ -1759,6 +1759,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   handler too, not only in `PointerUp`.
 - **Absolute overlays** (placeholders, action bars) intercept clicks — add `.pointer_events(|| false)`
   so clicks fall through.
+- **And nothing bounds them.** An absolute child is out of flow, so text in one that is longer than
+  the box lays out at its natural width and **paints across the border** into whatever sits beside
+  it — not clipped, not ellipsized. `edit_field`'s placeholder did this for every field in the app
+  whose placeholder outgrew its width, and it is invisible until someone opens that exact modal (it
+  was found by eye on the view editor's SQLite **Column names** row). The fix is an inset on *both*
+  sides — `inset_left` **and** `inset_right`, which is what gives the overlay a definite width — plus
+  `width_full().min_width(0.0).text_ellipsis()` on the text inside it: `width_full` because a label
+  otherwise sizes to its content and overflows the box meant to bound it, `min_width(0)` because
+  without it the label refuses to shrink below that content width. `placeholder_right_inset` is where
+  `edit_field` decides how much room the in-flow trailing action needs.
 - **Deferred layout**: `exec_after(Duration::ZERO, …)` runs after layout settles — so
   `scroll_to(bottom)` clamps against new content height, not stale.
 - **`.get()` clones the whole value — use `.with()` to read part of a collection.** `SignalGet::get`
