@@ -48,7 +48,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     only the column `Arc`s whose values actually changed, so an untouched column is never copied
     (29.6 ms → 1.8 ms at 200k×50, measured). `Column`/`ColumnOrigin`/`ColumnFlags` carry the
     write-back provenance the wire reports per column, and a binary column is unconditionally
-    read-only (it can't round-trip through text). The write path's shared decisions live here so the
+    read-only (it can't round-trip through text). `ColumnOrigin::implicit_key` is the one field no
+    wire reports: it marks a result column that identifies a row but is no column of the table —
+    SQLite's explicitly projected `rowid` — asserted by the backend on the same trust
+    `ColumnFlags::primary_key` already carries, and `false` on MySQL and PostgreSQL. It is a key
+    that is never *editable*, which is why it is a flag and not simply another key column. The
+    write path's shared decisions live here so the
     two engines can't drift: `GridWrite::plan` (the deletes → updates → inserts order),
     `one_row_verdict` (the 1-row safety net's verdict *and* its message),
     `Rollback`/`engine_is_transactional` (what a rollback actually achieved — see the invariant
@@ -135,9 +140,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     cell would `UPDATE` the wrong column silently, with the grid showing the change as though it had
     worked. Reading the projection positionally gets both right, and gets an alias right for the
     same reason MySQL's `org_name` does: an alias renames the output, not the column behind it. A
-    `*` mixed with anything else answers `None` overall rather than being partly resolved, since the
-    wildcard's width isn't knowable here and a provenance list off by one column is the worst
-    possible answer.
+    `*` mixed with anything else is resolved only as far as it safely can be: no position *after* a
+    wildcard is knowable, since its width isn't, and a provenance list off by one column is the
+    worst possible answer — so a `*` with anything behind it, or a second `*`, still answers `None`
+    overall. Positions *ahead* of a lone trailing wildcard were refused by that same rule for a
+    reason that never applied to them, because nothing the wildcard expands to can shift them.
+    They are placed now, as `Projection::LeadingThenWildcard(items)` — the leading items in order,
+    with the caller appending the source table's own columns exactly as it does for
+    `Projection::Wildcard`. That is what makes `SELECT rowid, * FROM t` analysable and so a keyless
+    SQLite table editable, but the relaxation is **general**: `intel` carries no SQLite vocabulary
+    and doesn't know why anyone wanted it. Two tests hold either side of the line —
+    `projection_places_the_columns_ahead_of_a_trailing_wildcard` and
+    `projection_still_refuses_a_wildcard_that_is_not_the_last_item`.
     **Every SQL fragment this module generates** (`join_condition`, `join_targets`, `expand_star`)
     is quoted through `export::ident_if_needed`, which quotes only what a bare name would get wrong
     — anything that isn't a plain lower-case non-reserved word. PostgreSQL folds an unquoted
@@ -161,12 +175,39 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     names a SQLite table **alone**: a connection *is* one file, so there is no server-level
     qualifier to add, and `main.t` would be noise on every generated query and wrong the moment the
     statement is copied somewhere the file is attached under another name.
+    What it keys and orders on arrives as a **`BrowseKey`**, and the two keyed variants are separate
+    because they do different things to the projection: `Columns` is the table's own key, already
+    returned by the `*`, while `Implicit` is a row identity that is **none of the table's columns**
+    (`TableInfo::implicit_key`, which only SQLite ever sets) and so has to be *named* —
+    `SELECT rowid, * FROM t ORDER BY rowid ASC LIMIT n`, the projection that makes such a table
+    editable at all, since nothing can key a write on a value the result doesn't contain. As two
+    parameters this was a precedence rule buried in the builder; `BrowseKey::pick` is now the one
+    place it lives, and it has to agree with `edit::analyze_edit` — projecting a rowid the write
+    path would then ignore carries a column for nothing, and projecting nothing it needed leaves the
+    table read-only for nothing. A keyed table's statement is byte-for-byte what it was, and two
+    tests pin that (`table_query_ignores_an_implicit_key_when_the_table_has_a_real_one`,
+    `table_query_without_an_implicit_key_is_unchanged`). Only the tree's "open table"
+    (`spawn_table_tab`, via `table_ddl_and_pk`) passes an implicit key: the MCP `describe_table`
+    sample and the AI seed sample (`sample_sql`) pass `BrowseKey::pick(pk, None)` deliberately,
+    because both read a table in order to *describe* it and neither writes back, so a rowid there
+    would be a column of noise.
     Quoting here goes through the same rules as the rest of the app; don't add a fourth.
   - `edit.rs` — `analyze_edit` → `EditModel` (write-back updatability analysis) + `refetch_template`
     and `refetch_key`, the **one** post-edit re-fetch key builder. A key column *is* editable
     (`EditModel::editable` asks only whether a column maps to a base table), so the `UPDATE` keys on
     the original row while the re-fetch must look for the value it just wrote; there were two
     builders and only one knew that.
+    **The one key column that is never editable is an implicit key** (`ColumnOrigin::implicit_key`).
+    `resolve_key` falls back to it only after a primary key and a fully-present unique NOT NULL
+    index have *both* failed — a real key is what the user means by the row's identity, and it is
+    what survives a re-fetch, where a rowid the engine may reassign is not — and `analyze_edit` then
+    leaves that column out of `col_table` altogether: it is the handle the write holds the row by,
+    not data the table has, and a newly inserted row has no value to offer for it. That exclusion is
+    also what keeps it out of a staged `RowInsert`, with no second rule to remember. Tested by
+    `keyless_table_is_editable_through_its_implicit_key`,
+    `a_real_key_still_wins_over_a_projected_implicit_one` and
+    `refetch_template_keys_on_the_implicit_key` — the last because a read-only key column is still
+    part of the row the splice re-reads.
   - `export.rs` — CSV/JSON/SQL/Markdown/HTML export (incl. CSV formula-injection guard;
     Markdown pipe/backslash escaping; HTML entity escaping). Every renderer has a **streaming**
     `*_to<W: io::Write>` form (`ExportFormat::render_to`) — what file export uses, so a large
@@ -470,7 +511,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     two halves of a MySQL account. `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the
     above; its **view** branch delegates to `ddl::view_ddl` so Copy DDL, the MCP table-info tool
     and the apply path all emit through one view emitter (it used to have its own, which restated
-    none of the options).
+    none of the options). **`TableInfo::implicit_key` is a capability, read rather than
+    asked-by-engine**: the spelling of a row identity the table has that is none of its columns
+    (SQLite's `rowid`), or `None` — which is every MySQL and PostgreSQL table, every view, and every
+    SQLite `WITHOUT ROWID` table. `filter::table_query` reads it to decide whether to project it, so
+    no caller has to test which engine it is holding.
     **`TableInfo::create_sql` short-circuits all of that where the engine keeps its own `CREATE`
     text** — which of the three only SQLite does (`sqlite_master.sql`, plus the `CREATE INDEX`
     statements it stores separately and without which a table's DDL is incomplete). That is a
@@ -753,7 +798,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   `tgisinternal = false` and can only be dropped through its parent), and `UPDATE OF` columns +
   a function's `proconfig` arrive **one row each** rather than string-aggregated — same rule the
   enum labels follow, and for the same reason.
-  **`sqlite.rs` is the third engine**, and four things make it unlike the other two rather than a
+  **`sqlite.rs` is the third engine**, and five things make it unlike the other two rather than a
   third set of catalogue queries. **There is no server**: a connection is a *file*
   (`Connection::file`), so host/port/user/password/SSH are all inert, `fetch_databases` answers
   without opening anything (the one database SQLite calls `main`), and `Db::connect` refuses to let
@@ -769,7 +814,42 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   against 0.32.1 and 0.40: there is no `column_metadata` feature and `libsqlite3-sys` generates no
   binding), so a result's `origin` is derived from the *statement* instead and anything but a
   plainly single-table `SELECT` is left `None`, which the editing system already reads as
-  not-editable. Introspection is `sqlite_master` plus the pragmas, and three of its decisions are
+  not-editable. **Every rowid table has a key, and it isn't a column.** A table with no primary key
+  and no usable unique index is read-only on the other two engines because there is genuinely no
+  way to name one of its rows; on SQLite there always is one, unless the table was declared
+  `WITHOUT ROWID`. Such a table is therefore opened as `SELECT rowid, * FROM t`
+  (`filter::table_query`) and its leading column marked `ColumnOrigin::implicit_key`, which is what
+  `edit::resolve_key` falls back to. Three details there are load-bearing. `has_rowid` asks
+  **`PRAGMA table_list`'s `wr` column** rather than searching the stored `CREATE` text, which a
+  comment, a newline, a trailing `, STRICT` or a column named `without_rowid` each defeat; a view or
+  a name that isn't there answers `false`. `implicit_row_key` **chooses** the spelling from
+  `ROWID_ALIASES = ["rowid", "_rowid_", "oid"]` instead of using the constant `"rowid"`, because
+  SQLite lets a table declare a column called `rowid` and then *that* column is what the word means:
+  the first unshadowed alias wins, case-insensitively, and a table that has taken all three has no
+  way left to name its rowid and stays read-only. And `attach_origins` looks a declared column up
+  **first**, synthesising an implicit-key origin (`not_null`, `auto_increment`, not `primary_key`)
+  only for an unshadowed alias on a table that has a rowid, recording the name **as written** so the
+  `WHERE` the write-back builds resolves to the same value the `SELECT` read. **Nothing in the write
+  path changed**: `GridWrite::plan`, the delete → update → insert order, the 1-row safety net and
+  `one_row_verdict` are untouched — the key simply names a column the table doesn't have, and SQLite
+  resolves `rowid` in a projection and in a `WHERE` alike, which is also why the in-place splice
+  re-fetch works (`a_keyless_table_writes_back_through_its_rowid`,
+  `a_refetch_reads_a_keyless_row_back_by_its_rowid`). A `WITHOUT ROWID` table is unchanged in every
+  respect — SQLite will not even prepare the statement against one — and a view gets
+  `implicit_key: None`. Verified end to end against a copy of the EdgeCases file: `keyless` opens as
+  `SELECT rowid, * FROM keyless ORDER BY rowid ASC LIMIT 100`, reports `editable = [false, true,
+  true]`, and an `UPDATE` plus a `DELETE` committed through it affected exactly 2 rows, while a bare
+  `SELECT * FROM keyless` stays read-only. **Showing the rowid is the trade, and it was the
+  argued-for one.** Hiding it would mean a result column that isn't a column, which `ResultSet` has
+  no notion of, so export, copy, aggregates, virtualization, widths, the header filter and the row
+  panel would each have to learn to skip it and every site that forgot would leak it — and the grid
+  would stop agreeing with the SQL in the editor. Re-fetching the rowid per row at write time is
+  circular: identifying the row is the problem, and matching on all non-key values is exactly what a
+  keyless table makes unsafe, duplicate rows being legal there. The cost is one extra column; the
+  gain is no new concept in `ResultSet` or the grid, the reason a table is editable staying legible
+  in the statement, and a hand-typed `SELECT rowid, * FROM t` that is editable with no
+  "this came from the tree" plumbing.
+  Introspection is `sqlite_master` plus the pragmas, and three of its decisions are
   the sort that only show up against a real database: `table_xinfo` rather than `table_info`,
   because only the former reports a **generated** column and a write path that can't see one offers
   to insert into it; a non-`INTEGER` `PRIMARY KEY` is reported **nullable**, because SQLite
@@ -780,7 +860,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   *is* the rowid and SQLite builds no separate index for it. Nothing needs to be synthesised —
   `edit::resolve_key` reads the primary key off `ColumnInfo::primary_key`, not off the index list,
   so write-back keys on it correctly (verified end to end against a real file); inventing a
-  `PRIMARY` index entry would only put an object in the tree that the database doesn't have. `EXPLAIN QUERY PLAN` is what `explain` runs — plain `EXPLAIN` disassembles to VDBE
+  `PRIMARY` index entry would only put an object in the tree that the database doesn't have. That
+  is not in tension with the implicit key above, which *is* synthesised: there the table declares no
+  key at all and the rowid is the only identity it has, whereas here the table already has a key and
+  it is a real column — the rowid under another name. `EXPLAIN QUERY PLAN` is what `explain` runs — plain `EXPLAIN` disassembles to VDBE
   opcodes, which is a different artefact and useless to `core::plan` — and there is no analyzing
   form, since SQLite will not execute a statement to time it. **Manual transaction mode is refused**
   (`Session::open`): a pinned `rusqlite::Connection` is blocking and `!Sync`, so holding one across
@@ -1143,7 +1226,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   (else roll back all) — so an over-optimistic updatability analysis can't corrupt data. On SQLite
   the *analysis* is the part that has to be conservative, since no driver reports provenance there
   and it is derived from the statement (`intel::projection_of`, positional): anything but a plainly
-  single-table `SELECT` is simply not editable. Its rollback, by contrast, is the one that needs no
+  single-table `SELECT` is simply not editable. That set has grown by exactly one well-defined
+  shape — items placed ahead of a lone *trailing* `*`, which is what makes `SELECT rowid, * FROM t`
+  (a keyless table opened through its rowid) analysable — and by nothing else. The guard did not
+  move with it: an implicit key is an ordinary key column to `commit_writes`, so the ordering and
+  the 1-row net apply to it unchanged, and widening the analysis further is still the way this
+  invariant gets regressed. Its rollback, by contrast, is the one that needs no
   hedging — there is no non-transactional table type. That
   promise is MySQL-engine-dependent: `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV` ignore `BEGIN`/`ROLLBACK`,
   and `ROLLBACK` *succeeds* there while raising warning 1196. So no write path may discard a
@@ -1672,7 +1760,9 @@ for keyboard nav.
   This is the row panel's counterpart to `commit_grid`'s "flush any open in-cell edit first".
   Read-only fields (expression/`binary`) are shown for context but edits to them are rejected —
   **a key column is editable**, here as in the grid (`EditModel::editable` asks only whether the
-  column maps to a base table), which is why both re-fetches go through the one `edit::refetch_key`:
+  column maps to a base table) — the single exception being an implicit key, which maps to no column
+  of the table and is left out when the model is built — which is why both re-fetches go through
+  the one `edit::refetch_key`:
   the `UPDATE` keys on the *original* row, but the re-fetch has to look for the key it just wrote.
   Because this path is separate from the staged batch, its splice un-stages **only its own** changed
   columns (`model::drop_committed`) — a green cell edit elsewhere in the grid is still unwritten.
@@ -1685,7 +1775,8 @@ for keyboard nav.
   (pk/unique/not_null/auto_increment), or `None` for an expression (read-only). `analyze_edit` builds
   an `EditModel`: which columns are editable + each base table's WHERE key (schema PK first —
   authoritative for composite keys; else a fully-present unique NOT NULL index; else wire PK flags
-  when schema isn't loaded). Flow: double-click an editable cell (or Enter) → inline editor; **Enter**
+  when schema isn't loaded; else, last, a backend-asserted implicit key — SQLite's projected
+  `rowid` — which keys the write but is itself never editable). Flow: double-click an editable cell (or Enter) → inline editor; **Enter**
   stages into `gs.dirty` and paints the cell `grid_edit_staged()`; **Ctrl+Enter** / toolbar ✓ calls
   `commit_grid` → a `GridWrite { updates, inserts }` → the app's `commit_edits`. On success the app
   re-runs the query; on failure the error shows in the toolbar and green edits stay. No global "Edit"
@@ -1786,7 +1877,10 @@ for keyboard nav.
   lives on the flag in `grid_view`. A new panel-level bar over the grid inherits this obligation.
 - **Row actions: new / clone / delete.** Gated on a single writable table (`EditModel::insert_target()`;
   hidden for joins / read-only), committed in the shared `GridWrite` transaction (`commit_writes` runs
-  **deletes → updates → inserts**, each exactly 1 row).
+  **deletes → updates → inserts**, each exactly 1 row). A keyless SQLite table opened through its
+  rowid qualifies as writable here too, and the rowid column stages nothing: it is never editable,
+  so it is absent from a new or cloned row by construction rather than by a rule anyone has to
+  apply.
     - **New (INSERT):** toolbar **"+ Row"** appends a blank pending row (`gs.new_rows`), rendered below
       real rows with a `*` gutter marker + faint green wash, first editable cell opened. Cells stage
       via `stage_new` (unset = server default; `Some("")` clears to default). Unset cells preview
