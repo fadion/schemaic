@@ -2075,6 +2075,18 @@ Re-introducing the anti-patterns these guard against is a regression:
   handing the keyboard back, a field unmounting under them), so the last real gesture stands.
   It rides in a detached-scope `thread_local` signal, the shape `window_size` and `pointer_released`
   already use. Buttons, the Settings toggle switch and the colour swatches all read it.
+  **A view that swallows a pointer-down inherits the clearing**, and forgetting that is a live bug
+  rather than a stray outline. A menu trigger must stop the press so the root's "close on down"
+  doesn't fire for the click it is about to act on — and stopping it takes the root's `keyboard_nav`
+  clear with it. Left set, `set_menu_return` is armed for a menu opened **by mouse** (the opener asks
+  the flag in the `Click` that follows), so closing that menu drags the keyboard back to the trigger
+  and pulls the arrow keys off whatever had them — the grid's cell navigation, in the case that
+  motivated the conditional slot. `widgets::menu_trigger_press` is that handler, and every trigger
+  installs it in place of a bare `|_| {}`: the grid's Copy / Save / AI icons, the status-bar
+  segments, the schema panel's eye and gear, and `suggest_chevron`. The *panels* that swallow a
+  press keep the bare closure, and the distinction is the point: they do it so a click inside isn't
+  read as a click away, and where focus goes when one closes was settled by `set_menu_return` when
+  it opened, not by the press that dismisses it.
   **Gate the ring on it and nothing else — least of all the answers to floem's own defaults.**
   `settings::themed_toggle` briefly put its whole focus block behind the flag's early return, and
   the flag being false is exactly the mouse path, so a click on the switch got floem's
@@ -2263,13 +2275,14 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   surfaces ask the anchor now.
 - **A trigger that toggles must also stop its own `PointerDown`**, and the two halves are not
   alternatives. The workspace root closes `popup_menu` on any pointer-down (`lib.rs`, the same
-  handler that clears `keyboard_nav`), so without `.on_event_stop(EventListener::PointerDown, |_| {})`
-  the press closes the menu *before* the click arrives and the click reopens it — down closes, up
-  reopens, and the trigger never toggles however it decides. That was `suggest_chevron`'s bug, and
-  it is a different one from the grid icons', which had the guard and no toggle: there the menu
-  never closed at all. Guard without toggle re-opens what was never closed; toggle without guard
-  closes what the click then reopens. The status-bar segments have carried both for as long as they
-  have toggled.
+  handler that clears `keyboard_nav`), so a trigger that doesn't stop the press has its menu closed
+  *before* the click arrives, and the click reopens it — down closes, up reopens, and the trigger
+  never toggles however it decides. That was `suggest_chevron`'s bug, and it is a different one from
+  the grid icons', which had the guard and no toggle: there the menu never closed at all. Guard
+  without toggle re-opens what was never closed; toggle without guard closes what the click then
+  reopens. The status-bar segments have carried both for as long as they have toggled. Stop it with
+  `widgets::menu_trigger_press` and not a bare `|_| {}` — swallowing the press also swallows the
+  root's `keyboard_nav` clear, which that handler is there to repay (see *`widgets::keyboard_nav`*).
 - **Not every menu can be *opened* from the keyboard**, which is a separate thing from navigating
   one. A menu on a ringed control can be — `suggest_chevron`, the Live Monitor's Export dropdown,
   and the grid toolbar's Copy / Save / AI dropdowns since the strip gained its ring — and the

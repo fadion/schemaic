@@ -1678,6 +1678,45 @@ pub(crate) fn keyboard_nav() -> RwSignal<bool> {
     })
 }
 
+/// The `PointerDown` handler a **menu trigger** installs — what the bare `|_| {}`
+/// it replaced was quietly getting wrong.
+///
+/// A trigger has to *stop* the press, and that part is not optional: the
+/// workspace root closes `popup_menu` on any pointer-down, so an unswallowed
+/// press closes the menu the click is about to open — or, on a trigger that
+/// toggles, closes the menu the click then re-opens, which is the bug
+/// [`menu_anchored_at`] exists next to.
+///
+/// But the root's handler does a **second** thing, and swallowing the event took
+/// that with it: it clears [`keyboard_nav`], the app's `:focus-visible`. A press
+/// on a trigger is still a pointer gesture, so the flag must fall here exactly as
+/// it would have at the root, and this is not only about a stray outline:
+///
+/// - The focus ring stays painted after a *mouse* press, which is the one gesture
+///   it is gated off in the first place.
+/// - [`set_menu_return`] is armed only when `keyboard_nav` is set, and openers ask
+///   it in the `Click` that follows this press. Left set, a menu opened **by
+///   mouse** arms a return, and closing it drags the keyboard back to the trigger
+///   — taking the arrow keys off whatever had them, which for the grid's toolbar
+///   is the cell navigation. The whole reason that slot is conditional.
+///
+/// Guarded like the root's own write, which never dedups: an unguarded `set` on
+/// every press would re-run the style closure of every view reading the flag.
+///
+/// **For a trigger, not a panel.** The other views that swallow a pointer-down —
+/// [`menu_panel`], the schema tree's two menu bodies, the grid's column popover,
+/// the editor's — do it so a click *inside* them isn't read as a click away, and
+/// they keep the bare `|_| {}`: a click on a menu row is a gesture within
+/// something the keyboard may legitimately still own, and where focus goes when
+/// it closes is already [`set_menu_return`]'s answer, decided when the menu
+/// opened rather than by the press that dismisses it.
+pub(crate) fn menu_trigger_press(_: &floem::event::Event) {
+    let kbd = keyboard_nav();
+    if kbd.get_untracked() {
+        kbd.set(false);
+    }
+}
+
 // ── Reusable themed popup menu (with nested submenus) ───────────────────────
 //
 // `menu_panel(entries, close, width)` renders a themed popup (matching the schema

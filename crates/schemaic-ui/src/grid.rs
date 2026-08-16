@@ -5341,7 +5341,10 @@ fn grid_toolbar(
     .on_click_stop(move |_| (copy_click)())
     .on_event_cont(EventListener::PointerEnter, move |_| copy_hov.set(true))
     .on_event_cont(EventListener::PointerLeave, move |_| copy_hov.set(false))
-    .on_event_stop(EventListener::PointerDown, |_| {})
+    .on_event_stop(
+        EventListener::PointerDown,
+        crate::widgets::menu_trigger_press,
+    )
     .style(|s| {
         s.items_center()
             .padding_vert(3.0)
@@ -5395,7 +5398,10 @@ fn grid_toolbar(
     .on_click_stop(move |_| (save_click)())
     .on_event_cont(EventListener::PointerEnter, move |_| save_hov.set(true))
     .on_event_cont(EventListener::PointerLeave, move |_| save_hov.set(false))
-    .on_event_stop(EventListener::PointerDown, |_| {})
+    .on_event_stop(
+        EventListener::PointerDown,
+        crate::widgets::menu_trigger_press,
+    )
     .style(|s| {
         s.items_center()
             .padding_vert(3.0)
@@ -5485,7 +5491,10 @@ fn grid_toolbar(
             .on_click_stop(move |_| (ai_click)())
             .on_event_cont(EventListener::PointerEnter, move |_| ai_hov.set(true))
             .on_event_cont(EventListener::PointerLeave, move |_| ai_hov.set(false))
-            .on_event_stop(EventListener::PointerDown, |_| {})
+            .on_event_stop(
+                EventListener::PointerDown,
+                crate::widgets::menu_trigger_press,
+            )
             .style(|s| {
                 s.items_center()
                     .padding_vert(3.0)
