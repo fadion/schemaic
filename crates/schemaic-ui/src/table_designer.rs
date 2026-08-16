@@ -564,7 +564,10 @@ pub(crate) fn suggest_chevron(
             // chevron never toggles however it decides. The toggle above is the
             // second half of the same fix, not an alternative to it: the guard
             // alone would leave a second press re-opening what was never closed.
-            .on_event_stop(floem::event::EventListener::PointerDown, |_| {})
+            .on_event_stop(
+                floem::event::EventListener::PointerDown,
+                crate::widgets::menu_trigger_press,
+            )
             .style(|s| {
                 s.padding(6.0)
                     .color(theme::text_dim())

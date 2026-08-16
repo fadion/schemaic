@@ -5555,8 +5555,10 @@ fn status_menu_seg(
     .on_move(move |p| origin.set((p.x, p.y)))
     .on_resize(move |r| size.set((r.width(), r.height())))
     // Stop the pointer-down so the workspace-root "close on down" handler doesn't
-    // fire for our own clicks (else down closes and up reopens — never toggling).
-    .on_event_stop(EventListener::PointerDown, |_| {})
+    // fire for our own clicks (else down closes and up reopens — never toggling),
+    // and do the one thing that handler owes us in return — see
+    // `widgets::menu_trigger_press`.
+    .on_event_stop(EventListener::PointerDown, widgets::menu_trigger_press)
     .on_click_stop(move |_| {
         // A second press closes what the first opened. This used to ask a
         // `menu_owner: RwSignal<u8>` tag written only by these segments, which

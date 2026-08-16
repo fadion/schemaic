@@ -961,7 +961,10 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
         schema_menu_open.set(false);
         db_menu_open.update(|o| *o = !*o);
     })
-    .on_event_stop(EventListener::PointerDown, |_| {})
+    .on_event_stop(
+        EventListener::PointerDown,
+        crate::widgets::menu_trigger_press,
+    )
     .on_event_cont(EventListener::PointerEnter, move |_| eye_hov.set(true))
     .on_event_cont(EventListener::PointerLeave, move |_| eye_hov.set(false))
     .style(|s| {
@@ -986,7 +989,10 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
         db_menu_open.set(false);
         schema_menu_open.update(|o| *o = !*o);
     })
-    .on_event_stop(EventListener::PointerDown, |_| {})
+    .on_event_stop(
+        EventListener::PointerDown,
+        crate::widgets::menu_trigger_press,
+    )
     .on_event_cont(EventListener::PointerEnter, move |_| gear_hov.set(true))
     .on_event_cont(EventListener::PointerLeave, move |_| gear_hov.set(false))
     .style(|s| {
