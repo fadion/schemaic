@@ -658,7 +658,8 @@ impl FocusRing {
         self.entries.borrow().get(pos).map(|(_, id)| *id)
     }
 
-    /// Move focus one step from `from`, per [`FocusRing::target`].
+    /// Move focus one step from `from`, per `FocusRing::target` (test-only, so
+    /// not linkable — it is this without the focus request).
     pub(crate) fn step_from(&self, from: floem::ViewId, backwards: bool) {
         let Some(pos) = self.target_pos(from, backwards) else {
             return;
@@ -716,7 +717,7 @@ impl FocusRing {
 ///
 /// The ring is also published for the *window* root, which is where a key lands
 /// when focus is on a dropdown's popup list or on nothing — see
-/// [`innermost_focus_ring`].
+/// [`innermost_ring_root`].
 pub(crate) fn focus_root_with_ring<V: IntoView + 'static>(view: V, ring: FocusRing) -> V::V {
     let view = focus_root_inner(view, Some(ring.clone()));
     let id = view.id();
