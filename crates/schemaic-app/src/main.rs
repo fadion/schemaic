@@ -431,11 +431,15 @@ fn dialect_of(db: &Db) -> SqlDialect {
     }
 }
 
+/// One loaded table's DDL, its primary-key column names, and the implicit row
+/// key it has if it has no key of its own
+/// ([`schemaic_core::schema::TableInfo::implicit_key`] — SQLite's rowid, `None`
+/// on the other two engines). Everything empty when the schema isn't loaded yet.
 fn table_ddl_and_pk(
     db_nodes: RwSignal<Vec<ConnNode>>,
     source: &TableSource,
     dialect: SqlDialect,
-) -> (String, Vec<String>) {
+) -> (String, Vec<String>, Option<String>) {
     db_nodes
         .with_untracked(|nodes| {
             nodes
@@ -451,7 +455,7 @@ fn table_ddl_and_pk(
                                 .filter(|c| c.primary_key)
                                 .map(|c| c.name.clone())
                                 .collect();
-                            (t.create_ddl(dialect), pk)
+                            (t.create_ddl(dialect), pk, t.implicit_key.clone())
                         }),
                     _ => None,
                 })
@@ -461,6 +465,10 @@ fn table_ddl_and_pk(
 
 /// The bottom-sample query for AI seed data: most-recent rows by primary key
 /// (`ORDER BY <pk> DESC`) so enums/sequences/FK values are representative.
+///
+/// No implicit key is passed: this sample is read to *describe* the table's data
+/// to the model, never written back, and a rowid column would be a column of
+/// noise in the prompt rather than a row identity anything here needs.
 fn sample_sql(engine: schemaic_db::Engine, source: &TableSource, pk_cols: &[String]) -> String {
     table_query(
         dialect_for(engine),
@@ -468,6 +476,7 @@ fn sample_sql(engine: schemaic_db::Engine, source: &TableSource, pk_cols: &[Stri
         source.schema.as_deref(),
         &source.table,
         pk_cols,
+        None,
         Order::Desc,
         AI_SAMPLE_ROWS,
     )
@@ -2880,13 +2889,17 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         .map(|c| SqlDialect::from_db_type(&c.db_type))
                 })
                 .unwrap_or_default();
-            let (_, pk_cols) = table_ddl_and_pk(db_nodes, &source, dialect);
+            // A table with no key of its own is opened with its implicit row key
+            // projected, which is the only thing that makes it editable — see
+            // `table_query`. `None` unless the engine has one to offer.
+            let (_, pk_cols, implicit_key) = table_ddl_and_pk(db_nodes, &source, dialect);
             let sql = table_query(
                 dialect,
                 &source.database,
                 source.schema.as_deref(),
                 &source.table,
                 &pk_cols,
+                implicit_key.as_deref(),
                 Order::Asc,
                 TABLE_TAB_ROWS,
             );
@@ -4711,7 +4724,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 };
                 // DDL skeleton + PK columns from the loaded schema (empty if
                 // introspection hasn't run — the sample still carries conventions).
-                let (ddl, pk_cols) = table_ddl_and_pk(db_nodes, &req.source, dialect_of(&db));
+                // The implicit row key is dropped: `sample_sql` doesn't project one.
+                let (ddl, pk_cols, _) = table_ddl_and_pk(db_nodes, &req.source, dialect_of(&db));
                 let bin = claude_bin(&ai_cli_path.get_untracked());
                 let model = ai_model.get_untracked().cli().to_string();
                 let finish = create_ext_action(cx, move |res: AiFillResult| (done)(res));
@@ -4790,7 +4804,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         return;
                     }
                 };
-                let (ddl, pk_cols) = table_ddl_and_pk(db_nodes, &req.source, dialect_of(&db));
+                // The implicit row key is dropped: `sample_sql` doesn't project one.
+                let (ddl, pk_cols, _) = table_ddl_and_pk(db_nodes, &req.source, dialect_of(&db));
                 let bin = claude_bin(&ai_cli_path.get_untracked());
                 let model = ai_model.get_untracked().cli().to_string();
                 let finish = create_ext_action(cx, move |res: AiSeedResult| (done)(res));

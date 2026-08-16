@@ -496,13 +496,17 @@ async fn describe_table(
         return (out, false);
     }
     // Reuse the same dialect-aware, properly quoted builder the grid's "open
-    // table" uses, so a reserved-word or spaced name is safe.
+    // table" uses, so a reserved-word or spaced name is safe. No key is passed
+    // for either purpose: the sample is unordered on purpose, and an implicit row
+    // key would add a column the assistant has no use for — nothing writes back
+    // through this path.
     let sql = schemaic_core::filter::table_query(
         dialect,
         database,
         info.schema.as_deref(),
         &info.name,
         &[],
+        None,
         schemaic_core::filter::Order::Asc,
         SAMPLE_ROWS,
     );

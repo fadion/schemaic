@@ -346,12 +346,26 @@ impl Order {
 /// `main.t` — correct but noise on every query the tree generates, and wrong the
 /// moment the same statement is copied into a session where the file is attached
 /// under another name.
+///
+/// `implicit_key` is a row identity the table has that is **not one of its
+/// columns** — [`crate::schema::TableInfo::implicit_key`], which only SQLite ever
+/// sets. It is used **only when `key_cols` is empty**, i.e. when the table has no
+/// key of its own, and then it is both projected and ordered on:
+/// `SELECT rowid, * FROM t ORDER BY rowid ASC`. That projection is what makes such
+/// a table editable at all, since `SELECT *` does not return a rowid and the write
+/// path has nothing to build a `WHERE` from without it.
+///
+/// The extra column is deliberately *shown* rather than hidden. A result column
+/// the grid must pretend isn't there would have to be skipped by export, copy,
+/// aggregates and the row panel too, and each place that forgot would leak it;
+/// here the statement and the grid agree, which is how the rest of the app reads.
 pub fn table_query(
     dialect: SqlDialect,
     database: &str,
     schema: Option<&str>,
     table: &str,
     key_cols: &[String],
+    implicit_key: Option<&str>,
     order: Order,
     limit: usize,
 ) -> String {
@@ -371,17 +385,34 @@ pub fn table_query(
         },
         SqlDialect::Sqlite => quote_if_needed(table, dialect),
     };
-    let order_by = if key_cols.is_empty() {
+    // The table's own key orders the page when it has one; an implicit key is
+    // what's left when it hasn't, and then it has to be projected as well —
+    // nothing can key a write on a column the result doesn't contain.
+    let (projection, order_cols): (String, Vec<String>) = match (key_cols.is_empty(), implicit_key)
+    {
+        (true, Some(k)) => {
+            let k = quote_if_needed(k, dialect);
+            (format!("{k}, *"), vec![k])
+        }
+        _ => (
+            "*".to_string(),
+            key_cols
+                .iter()
+                .map(|c| quote_if_needed(c, dialect))
+                .collect(),
+        ),
+    };
+    let order_by = if order_cols.is_empty() {
         String::new()
     } else {
-        let cols = key_cols
+        let cols = order_cols
             .iter()
-            .map(|c| format!("{} {}", quote_if_needed(c, dialect), order.keyword()))
+            .map(|c| format!("{c} {}", order.keyword()))
             .collect::<Vec<_>>()
             .join(", ");
         format!(" ORDER BY {cols}")
     };
-    format!("SELECT * FROM {name}{order_by} LIMIT {limit}")
+    format!("SELECT {projection} FROM {name}{order_by} LIMIT {limit}")
 }
 
 #[cfg(test)]
@@ -397,13 +428,68 @@ mod tests {
 
     fn tq(d: SqlDialect, table: &str, pk: &[&str], order: Order, limit: usize) -> String {
         let pk: Vec<String> = pk.iter().map(|c| c.to_string()).collect();
-        table_query(d, "shop", None, table, &pk, order, limit)
+        table_query(d, "shop", None, table, &pk, None, order, limit)
     }
 
     /// As [`tq`], but for a table in an explicit PostgreSQL namespace.
     fn tq_in(d: SqlDialect, schema: &str, table: &str, pk: &[&str]) -> String {
         let pk: Vec<String> = pk.iter().map(|c| c.to_string()).collect();
-        table_query(d, "shop", Some(schema), table, &pk, Order::Asc, 100)
+        table_query(d, "shop", Some(schema), table, &pk, None, Order::Asc, 100)
+    }
+
+    /// As [`tq`], with an implicit key the table may or may not need.
+    fn tq_implicit(table: &str, pk: &[&str], implicit: Option<&str>) -> String {
+        let pk: Vec<String> = pk.iter().map(|c| c.to_string()).collect();
+        table_query(
+            SqlDialect::Sqlite,
+            "main",
+            None,
+            table,
+            &pk,
+            implicit,
+            Order::Asc,
+            100,
+        )
+    }
+
+    /// A table with no key of its own is opened with its rowid projected — the
+    /// statement that makes it editable. `SELECT *` would not return one.
+    #[test]
+    fn table_query_projects_an_implicit_key_for_a_table_with_no_key() {
+        assert_eq!(
+            tq_implicit("notes", &[], Some("rowid")),
+            "SELECT rowid, * FROM notes ORDER BY rowid ASC LIMIT 100"
+        );
+        // The chosen spelling is used verbatim: a table declaring its own `rowid`
+        // column reaches the real one only as `_rowid_`.
+        assert_eq!(
+            tq_implicit("notes", &[], Some("_rowid_")),
+            "SELECT _rowid_, * FROM notes ORDER BY _rowid_ ASC LIMIT 100"
+        );
+    }
+
+    /// A real key makes the implicit one noise: it is neither projected nor
+    /// ordered on, so a keyed table's statement is byte-for-byte what it was.
+    #[test]
+    fn table_query_ignores_an_implicit_key_when_the_table_has_a_real_one() {
+        assert_eq!(
+            tq_implicit("notes", &["id"], Some("rowid")),
+            "SELECT * FROM notes ORDER BY id ASC LIMIT 100"
+        );
+        assert_eq!(
+            tq_implicit("notes", &["id"], None),
+            tq_implicit("notes", &["id"], Some("rowid"))
+        );
+    }
+
+    /// No implicit key — every MySQL and PostgreSQL table, and a SQLite
+    /// `WITHOUT ROWID` one — reads exactly as it always did.
+    #[test]
+    fn table_query_without_an_implicit_key_is_unchanged() {
+        assert_eq!(
+            tq_implicit("notes", &[], None),
+            "SELECT * FROM notes LIMIT 100"
+        );
     }
 
     #[test]
@@ -435,6 +521,7 @@ mod tests {
                 Some("we\"ird"),
                 "orders",
                 &[],
+                None,
                 Order::Asc,
                 10
             ),
@@ -552,6 +639,7 @@ mod tests {
                 None,
                 "ta`ble",
                 &["i`d".to_string()],
+                None,
                 Order::Asc,
                 10
             ),
@@ -565,6 +653,7 @@ mod tests {
                 None,
                 "ta\"ble",
                 &["i\"d".to_string()],
+                None,
                 Order::Asc,
                 10
             ),
