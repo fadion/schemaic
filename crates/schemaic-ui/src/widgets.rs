@@ -2138,6 +2138,37 @@ fn take_menu_return() -> Option<Rc<dyn Fn()>> {
     MENU_RETURN.with_borrow_mut(|s| s.take())
 }
 
+/// **Is the menu currently up the one anchored at `mine`?** — how a trigger on the
+/// shared `popup_menu` channel closes *its own* menu on a second press instead of
+/// dismissing and rebuilding an identical panel.
+///
+/// The channel is one slot serving every opener in the app and carries no tag
+/// saying who filled it, so the **anchor** stands in for one: a trigger compares
+/// `popup_anchor` against the [`crate::PopupAnchor`] it would set itself. That is
+/// self-invalidating by construction — every opener overwrites the anchor as it
+/// opens, so there is no separate marker to go stale and nothing for the other
+/// openers to reset. A tag beside the channel is the thing this replaced: written
+/// only by the triggers that cared, it kept naming a status-bar segment after a
+/// right-click elsewhere had replaced the menu, and the segment then closed
+/// someone else's.
+///
+/// `open` is whether the channel holds anything at all, and it is checked **first**
+/// for a reason: closing clears `popup_menu` but leaves `popup_anchor` naming the
+/// last opener, so the anchor alone would still name this trigger long after
+/// Escape dismissed its menu, and the next press would "toggle shut" a menu that
+/// isn't there.
+///
+/// Named rather than inlined so the rule is stated once and tested. Spelled out at
+/// each call site it is a copy of an `&&` that is only obviously right once you
+/// know why the order matters.
+pub(crate) fn menu_anchored_at(
+    open: bool,
+    anchor: Option<crate::PopupAnchor>,
+    mine: crate::PopupAnchor,
+) -> bool {
+    open && anchor == Some(mine)
+}
+
 /// A reusable themed popup menu with nested submenus, `width` px wide. Returns the
 /// panel; the caller positions it absolutely. Escape (and any action) calls `close`.
 ///
@@ -3538,6 +3569,63 @@ mod menu_key_tests {
 
         (taken.unwrap())();
         assert_eq!(fired.get(), 1);
+    }
+
+    // The grid toolbar's Copy icon, and Save's a few px to its right.
+    const COPY_AT: crate::PopupAnchor = crate::PopupAnchor::BelowIcon(100.0, 116.0, 40.0);
+    const SAVE_AT: crate::PopupAnchor = crate::PopupAnchor::BelowIcon(126.0, 142.0, 40.0);
+
+    #[test]
+    fn a_trigger_owns_the_menu_anchored_at_its_own_place() {
+        assert!(menu_anchored_at(true, Some(COPY_AT), COPY_AT));
+    }
+
+    /// The whole point of checking `open` first. Closing clears `popup_menu` but
+    /// leaves `popup_anchor` naming whoever opened last, so an anchor-only test
+    /// would report the Copy menu still open after Escape dismissed it — and the
+    /// next press would close nothing instead of opening.
+    #[test]
+    fn a_dismissed_menu_is_no_longer_owned() {
+        assert!(!menu_anchored_at(false, Some(COPY_AT), COPY_AT));
+    }
+
+    /// Adjacent triggers: whichever menu is up, only its own may close it.
+    /// Pressing Save while Copy's menu is open opens Save's, which is what the
+    /// opener does when this returns false.
+    #[test]
+    fn a_neighbours_menu_is_not_mine() {
+        assert!(!menu_anchored_at(true, Some(COPY_AT), SAVE_AT));
+    }
+
+    /// A cell or header right-click sets the anchor to `None` (open at the
+    /// cursor) on this same channel, and a press on Copy must open Copy's menu
+    /// rather than dismiss that one.
+    #[test]
+    fn a_cursor_menu_belongs_to_no_trigger() {
+        assert!(!menu_anchored_at(true, None, COPY_AT));
+    }
+
+    /// The two placements share the channel, so the variants must not compare
+    /// equal on their numbers — a status-bar segment sitting at the same
+    /// coordinates as a toolbar icon is not that icon's menu.
+    #[test]
+    fn a_footer_menu_is_never_a_toolbar_dropdown() {
+        assert!(!menu_anchored_at(
+            true,
+            Some(crate::PopupAnchor::AboveFooter(100.0, 116.0)),
+            COPY_AT
+        ));
+    }
+
+    /// Two status-bar segments are told apart by their own x-range, the same way
+    /// two toolbar icons are told apart by theirs. This is the case the
+    /// `menu_owner` tag used to answer.
+    #[test]
+    fn two_footer_segments_are_told_apart() {
+        let tabs = crate::PopupAnchor::AboveFooter(10.0, 60.0);
+        let model = crate::PopupAnchor::AboveFooter(70.0, 120.0);
+        assert!(menu_anchored_at(true, Some(tabs), tabs));
+        assert!(!menu_anchored_at(true, Some(tabs), model));
     }
 
     /// Left at the root is not the menu's key — nothing is open to leave, so it

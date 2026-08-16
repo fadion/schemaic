@@ -5521,16 +5521,15 @@ fn footer_text(s: String) -> AnyView {
 
 /// A clickable status-bar segment that opens a `menu_panel` popup centred above
 /// it (the Tabs/Spaces, AI-model and AI-effort menus, which share the one popup
-/// channel). `owner` disambiguates which segment owns the open popup: a second
-/// click on the *same* segment toggles it shut, while clicking a different one
-/// switches menus. Its window rect is tracked (its x shifts as segments to its
-/// left change width) so the popup can centre on it.
-#[allow(clippy::too_many_arguments)]
+/// channel). A second click on the *same* segment toggles it shut, while clicking
+/// a different one switches menus — which segment the open menu belongs to is
+/// [`widgets::menu_anchored_at`]'s question, answered from the anchor rather than
+/// a tag of its own. Its window rect is tracked (its x shifts as segments to its
+/// left change width) so the popup can centre on it, and that same rect is what
+/// identifies it.
 fn status_menu_seg(
     label: impl Fn() -> String + 'static,
-    owner: u8,
     build_entries: impl Fn() -> Vec<MenuEntry> + 'static,
-    menu_owner: RwSignal<u8>,
     popup_menu: RwSignal<Option<Vec<MenuEntry>>>,
     popup_anchor: RwSignal<Option<PopupAnchor>>,
     popup_width: RwSignal<f64>,
@@ -5539,6 +5538,15 @@ fn status_menu_seg(
     let origin: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
     let size: RwSignal<(f64, f64)> = RwSignal::new((0.0, 0.0));
     let build = Rc::new(build_entries);
+    // One spelling of this segment's placement, because the value that *places*
+    // the panel is the value that says the open menu is this segment's — see
+    // `widgets::menu_anchored_at`. Written twice, a pixel of drift would leave the
+    // menu opening correctly and silently refusing to toggle shut.
+    let anchor_here = move || {
+        let (ox, _oy) = origin.get_untracked();
+        let (sw, _sh) = size.get_untracked();
+        PopupAnchor::AboveFooter(ox, ox + sw)
+    };
     dyn_container(label, move |s| {
         text(s)
             .style(|s| s.font_size(theme::FONT_STATUS))
@@ -5550,14 +5558,21 @@ fn status_menu_seg(
     // fire for our own clicks (else down closes and up reopens — never toggling).
     .on_event_stop(EventListener::PointerDown, |_| {})
     .on_click_stop(move |_| {
-        if popup_menu.get_untracked().is_some() && menu_owner.get_untracked() == owner {
+        // A second press closes what the first opened. This used to ask a
+        // `menu_owner: RwSignal<u8>` tag written only by these segments, which
+        // went stale the moment anything else filled the shared channel: open a
+        // segment's menu, right-click a grid cell, press the segment again, and it
+        // closed the cell's menu instead of opening its own. The anchor cannot
+        // drift that way — every opener overwrites it.
+        if crate::widgets::menu_anchored_at(
+            popup_menu.get_untracked().is_some(),
+            popup_anchor.get_untracked(),
+            anchor_here(),
+        ) {
             popup_menu.set(None);
             return;
         }
-        menu_owner.set(owner);
-        let (ox, _oy) = origin.get_untracked();
-        let (sw, _sh) = size.get_untracked();
-        popup_anchor.set(Some(PopupAnchor::AboveFooter(ox, ox + sw)));
+        popup_anchor.set(Some(anchor_here()));
         popup_width.set(125.0);
         popup_menu.set(Some((build)()));
     })
@@ -5625,9 +5640,6 @@ fn footer(ui: Ui) -> impl IntoView {
     let popup_width = ui.overlay.popup_width;
     let toggle_read_only = ui.conn_actions.toggle_read_only.clone();
     let resources = ui.resources;
-    // Which status-bar segment owns the shared popup (0 none / 1 tabs / 2 model /
-    // 3 effort) — lets a second click on the same segment toggle it shut.
-    let menu_owner: RwSignal<u8> = RwSignal::new(0);
     let ai_model = ui.ai.model;
     let ai_effort = ui.ai.effort;
 
@@ -5765,7 +5777,6 @@ fn footer(ui: Ui) -> impl IntoView {
                 tab_width.get()
             )
         },
-        1,
         move || {
             let soft = soft_tabs.get_untracked();
             let w = tab_width.get_untracked();
@@ -5797,7 +5808,6 @@ fn footer(ui: Ui) -> impl IntoView {
             }
             entries
         },
-        menu_owner,
         popup_menu,
         popup_anchor,
         popup_width,
@@ -6051,7 +6061,6 @@ fn footer(ui: Ui) -> impl IntoView {
     // transaction controls, with CPU then RAM after (40px from effort).
     let model_seg = status_menu_seg(
         move || ai_model.get().label().to_string(),
-        2,
         move || {
             let cur = ai_model.get_untracked().cli();
             AiModel::ALL
@@ -6067,7 +6076,6 @@ fn footer(ui: Ui) -> impl IntoView {
                 })
                 .collect()
         },
-        menu_owner,
         popup_menu,
         popup_anchor,
         popup_width,
@@ -6075,7 +6083,6 @@ fn footer(ui: Ui) -> impl IntoView {
     );
     let effort_seg = status_menu_seg(
         move || ai_effort.get().label().to_string(),
-        3,
         move || {
             let cur = ai_effort.get_untracked().cli();
             AiEffort::ALL
@@ -6091,7 +6098,6 @@ fn footer(ui: Ui) -> impl IntoView {
                 })
                 .collect()
         },
-        menu_owner,
         popup_menu,
         popup_anchor,
         popup_width,
