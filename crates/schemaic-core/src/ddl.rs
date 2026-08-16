@@ -1460,6 +1460,16 @@ impl ObjectDraft {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
     CreateTable(Box<TableDraft>),
+    /// **SQLite only**: perform the rest of this set by rebuilding the table —
+    /// see [`sqlite_rebuild_sql`], which this carries the inputs for.
+    ///
+    /// It sits *alongside* the changes it performs rather than replacing them,
+    /// and that is the point: the preview still lists "change `a` to TEXT" in
+    /// the user's terms, and this line says how it is going to happen. Folding
+    /// them into one would trade a plan someone can check against what they drew
+    /// for a plan they can only take on trust — and this is a procedure that
+    /// drops the table in the middle.
+    RebuildTable(Box<Rebuild>),
     DropTable,
     TruncateTable,
     RenameTable {
@@ -1678,6 +1688,11 @@ impl Change {
                 d.columns.len(),
                 plural(d.columns.len())
             ),
+            Change::RebuildTable(r) => format!(
+                "Rebuild {} — SQLite can't alter a table in place, so the rows are \
+                 copied into a new one and it takes the old one's place",
+                r.current.name
+            ),
             Change::DropTable => "Drop the table".to_string(),
             Change::TruncateTable => "Delete every row".to_string(),
             Change::RenameTable { to } => format!("Rename the table to {to}"),
@@ -1862,6 +1877,14 @@ impl Change {
     /// statement will fail — which reads as a promise that nothing can be lost.
     pub fn risks(&self) -> Vec<String> {
         match self {
+            // The table really is dropped in the middle of this, so it belongs
+            // in the destructive block even though the plan puts it back. What
+            // protects the rows is that the whole procedure is one transaction.
+            Change::RebuildTable(r) => vec![format!(
+                "Drops {} and recreates it, copying every row across. \
+                 Anything about the table Schemaic didn't read is not carried over.",
+                r.current.name
+            )],
             Change::DropTable => vec!["Drops the table and every row in it.".to_string()],
             Change::TruncateTable => {
                 vec!["Deletes every row in the table. This can't be undone.".to_string()]
@@ -2273,6 +2296,34 @@ impl ChangeSet {
     ///
     /// Only SQLite ever produces one today — see [`supports_change`].
     pub fn unsupported(&self) -> Vec<String> {
+        // A rebuild performs the whole set — it writes the table the draft
+        // describes — so nothing beside it is withheld, however little of it has
+        // a statement of its own.
+        //
+        // **Except an index the model only partly read.** The rebuild drops the
+        // table, so every index has to be recreated, and one recreated from a
+        // partial reading is not the index that was there: a partial index comes
+        // back covering every row, an expression index comes back missing its
+        // key. That is the failure [`IndexInfo::lossy`] exists to name, and here
+        // it is not a warning to read past — the plan is refused until the user
+        // drops the index or leaves the table alone.
+        if let Some(Change::RebuildTable(r)) = self.changes.iter().find(|c| is_rebuild(c)) {
+            return r
+                .draft
+                .indexes
+                .iter()
+                .filter(|ix| ix.info.lossy)
+                .map(|ix| {
+                    format!(
+                        "Index {} can't be rebuilt faithfully — SQLite keeps the part \
+                         Schemaic couldn't read only in the index's own CREATE text, \
+                         and recreating it from what was read would change what it \
+                         indexes. Drop the index to go on without it.",
+                        ix.info.name
+                    )
+                })
+                .collect();
+        }
         self.changes
             .iter()
             .filter(|c| !supports_change(self.dialect, c))
@@ -2694,6 +2745,24 @@ impl ChangeSet {
     /// gate that drifts open shows an empty preview instead of handing SQLite a
     /// statement written for MySQL.
     fn emit_sqlite(&self) -> Vec<String> {
+        // A rebuild subsumes the set: the other entries describe what it
+        // achieves, and emitting them beside it would apply the same edit twice.
+        if let Some(Change::RebuildTable(r)) = self.changes.iter().find(|c| is_rebuild(c)) {
+            let mut out = sqlite_rebuild_sql(&r.current, &r.draft);
+            // The one thing the rebuild leaves out. It comes after, as a native
+            // statement, so SQLite repoints the references other objects hold —
+            // which is exactly what the rebuild's own rename must *not* do.
+            for c in &self.changes {
+                if let Change::RenameTable { to } = c {
+                    out.push(format!(
+                        "ALTER TABLE {} RENAME TO {};",
+                        self.qname(),
+                        self.q(to)
+                    ));
+                }
+            }
+            return out;
+        }
         let supported = || {
             self.changes
                 .iter()
@@ -4288,28 +4357,44 @@ pub fn checks_equal(a: &CheckInfo, b: &CheckInfo, dialect: SqlDialect) -> bool {
 /// Diffing a table against [`TableDraft::from_table`] of itself must produce
 /// nothing — that's the round-trip gate, and it's what catches a model-fidelity
 /// gap before a user ever sees a phantom change.
-/// Can this module emit schema-editing DDL for `dialect` at all?
+/// Can `dialect` have its **views** edited here?
 ///
-/// **SQLite cannot, and the reason is not that nobody has written the arm yet.**
-/// Its `ALTER TABLE` does `RENAME TABLE`, `RENAME COLUMN`, `ADD COLUMN` and
-/// `DROP COLUMN` and nothing else — no retype, no reorder, no adding or dropping
-/// a constraint — so every other edit needs the documented twelve-step rebuild:
-/// create a new table, copy the rows, drop the old one, rename the new one into
-/// place, and recreate every index, trigger and view that pointed at it. That is
-/// a *destructive* path built out of statements that each look harmless, and it
-/// deserves its own design and its own review rather than an arm in an emitter
-/// written for two engines that can alter in place.
-///
-/// So the UI offers no schema editing on a SQLite connection — the entries are
-/// absent rather than dimmed, which is what says "not supported" instead of "not
-/// here". Every entry that opens the designer reads this function.
-///
-/// It is **not** the whole capability question, and asking it about a single
-/// change would be wrong: `Db::run_ddl` runs a SQLite plan now, because a
-/// handful of drops need none of the machinery this gate withholds. See
-/// [`supports_change`], which is what the per-row menus and the emitter ask.
-pub fn supports_schema_editing(dialect: SqlDialect) -> bool {
+/// Its own question because SQLite's table designer works and its view editor
+/// does not: the view emitter writes MySQL's clause
+/// order and, worse, `CREATE OR REPLACE VIEW`, which SQLite has no form of — so
+/// a redefinition would fail at the engine having looked available all the way
+/// to Apply. `TableInfo::view_options` is also left `None` by SQLite
+/// introspection, so the form would offer fields it can't read back.
+pub fn supports_view_editing(dialect: SqlDialect) -> bool {
     !matches!(dialect, SqlDialect::Sqlite)
+}
+
+/// Can `dialect` have its **triggers** edited here?
+///
+/// SQLite has `CREATE TRIGGER` and `DROP TRIGGER`, but nothing reads its
+/// triggers into [`crate::schema::TriggerInfo`] — `fetch_schema` leaves the list
+/// empty and keeps the statements verbatim in
+/// [`crate::schema::TableInfo::dependent_ddl`] instead, which is what a rebuild
+/// replays. An editor over an empty list would show a table's triggers as gone
+/// and offer to "add" one that already exists.
+pub fn supports_trigger_editing(dialect: SqlDialect) -> bool {
+    !matches!(dialect, SqlDialect::Sqlite)
+}
+
+/// Is this the change that performs a whole set by rebuilding the table?
+fn is_rebuild(c: &Change) -> bool {
+    matches!(c, Change::RebuildTable(_))
+}
+
+/// What a rebuild needs: the table as it is, and as it should be.
+///
+/// Both sides, because the copy is the whole point — the new table comes from
+/// the draft, and which of its columns takes which of the old one's data can
+/// only be answered by looking at both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rebuild {
+    pub current: TableInfo,
+    pub draft: TableDraft,
 }
 
 /// The suffix the shadow table carries while a rebuild is in flight. It exists
@@ -4414,14 +4499,17 @@ pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
 
 /// Can `dialect` express this one change as SQL [`ChangeSet::emit`] writes?
 ///
-/// [`supports_schema_editing`] answers about the *designer* — a plan that
-/// reshapes a table, which SQLite can't have. This answers about a single
-/// change, because a handful of drops need none of the machinery that gate
-/// withholds: `DROP TABLE` and `DROP VIEW` are the same statement on every
-/// engine, `DROP INDEX` is a standalone statement SQLite has, and dropping a
-/// column is one of the four things its `ALTER TABLE` does. Those are worth
-/// keeping rather than hiding, because hiding them would take away something
-/// the engine genuinely supports.
+/// It asks about a change **on its own** — a context-menu shortcut, which has a
+/// change and no draft to build a table from. `DROP TABLE` and `DROP VIEW` are
+/// the same statement on every engine, `DROP INDEX` is a standalone statement
+/// SQLite has, and dropping a column is one of the four things its `ALTER TABLE`
+/// does; those shortcuts work there and are worth keeping, because hiding them
+/// would take away something the engine genuinely performs.
+///
+/// A *plan* is a different question. [`diff`] has both sides of the edit, so it
+/// can answer anything by rebuilding the table — which is why
+/// [`Change::RebuildTable`] is on this list, and why a designer edit is not
+/// limited to what one shortcut could raise.
 ///
 /// Everything else is `false` on SQLite, and each `false` is the twelve-step
 /// rebuild in disguise: a foreign key or a constraint-backed index can only
@@ -4446,6 +4534,11 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
                 constraint: None,
                 ..
             }
+            // The rebuild, which performs a whole set of table changes that have
+            // no statement of their own. `diff` is what puts one in a set; a
+            // context-menu shortcut has no draft to build from, which is why the
+            // changes it can raise on their own are still the four above.
+            | Change::RebuildTable(_)
     )
 }
 
@@ -4857,6 +4950,31 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
         changes.push(Change::RenameTable {
             to: draft.name.clone(),
         });
+    }
+
+    // **On SQLite, anything the engine can't do with a statement of its own is
+    // done by rebuilding the table**, and the rebuild performs the whole set at
+    // once — it writes the table the draft describes, so every change in the
+    // list is already in it.
+    //
+    // The test is "is there something here SQLite has no statement for", not
+    // "is this an alter": a set of nothing but the drops it does have keeps its
+    // direct path, and pays nothing. Everything else takes the long way, even
+    // where a narrower rule could have found a fast path — an `ADD COLUMN` is
+    // native, but only when the column carries no key, no uniqueness and a
+    // constant default, and getting that wrong writes the plan that half-applies.
+    // Correct first; the fast paths are an optimisation with a test each.
+    if dialect == SqlDialect::Sqlite
+        && !changes.is_empty()
+        && changes.iter().any(|c| !supports_change(dialect, c))
+    {
+        changes.insert(
+            0,
+            Change::RebuildTable(Box::new(Rebuild {
+                current: current.clone(),
+                draft: draft.clone(),
+            })),
+        );
     }
 
     ChangeSet {
@@ -10782,5 +10900,138 @@ mod sqlite_rebuild_tests {
             "{got:#?}"
         );
         assert!(got.iter().any(|s| s.starts_with("DROP TABLE")), "{got:#?}");
+    }
+}
+
+#[cfg(test)]
+mod sqlite_designer_tests {
+    use super::*;
+    use crate::intel::SqlDialect::Sqlite;
+    use crate::schema::{IndexColumn, IndexInfo};
+
+    fn col(name: &str, ty: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.into(),
+            type_name: ty.into(),
+            nullable: true,
+            ..Default::default()
+        }
+    }
+
+    fn table() -> TableInfo {
+        TableInfo {
+            name: "t".into(),
+            columns: vec![col("a", "INTEGER"), col("b", "TEXT")],
+            ..Default::default()
+        }
+    }
+
+    fn retyped(t: &TableInfo) -> ChangeSet {
+        let mut d = TableDraft::from_table(t);
+        d.columns[0].info.type_name = "TEXT".into();
+        diff(t, &d, Sqlite)
+    }
+
+    /// A retype has no statement of its own in SQLite, so the set grows the
+    /// change that performs it — **beside** the retype, not instead of it, so
+    /// the preview still says what the user asked for.
+    #[test]
+    fn a_change_with_no_statement_gains_a_rebuild() {
+        let cs = retyped(&table());
+        assert!(
+            matches!(cs.changes.first(), Some(Change::RebuildTable(_))),
+            "{:?}",
+            cs.changes
+        );
+        assert!(
+            cs.changes
+                .iter()
+                .any(|c| matches!(c, Change::AlterColumn { .. })),
+            "the retype is still listed: {:?}",
+            cs.changes
+        );
+        assert!(
+            cs.emit().iter().any(|s| s.contains("INSERT INTO")),
+            "{:?}",
+            cs.emit()
+        );
+        assert!(
+            cs.unsupported().is_empty(),
+            "the rebuild performs all of it"
+        );
+    }
+
+    /// A set SQLite can do directly keeps its direct path and pays nothing.
+    #[test]
+    fn a_plain_drop_needs_no_rebuild() {
+        let t = table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns.remove(0);
+        let cs = diff(&t, &d, Sqlite);
+        assert!(!cs.changes.iter().any(is_rebuild), "{:?}", cs.changes);
+        assert_eq!(cs.emit(), vec![r#"ALTER TABLE "t" DROP COLUMN "a";"#]);
+    }
+
+    /// The other engines alter in place and never grow one.
+    #[test]
+    fn the_full_engines_never_rebuild() {
+        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+            let t = table();
+            let mut draft = TableDraft::from_table(&t);
+            draft.columns[0].info.type_name = "TEXT".into();
+            assert!(!diff(&t, &draft, d).changes.iter().any(is_rebuild), "{d:?}");
+        }
+    }
+
+    /// A rename is left to SQLite's own statement, after the rebuild, so the
+    /// engine repoints the references other objects hold.
+    #[test]
+    fn a_rename_rides_after_the_rebuild_as_a_native_statement() {
+        let t = table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.type_name = "TEXT".into();
+        d.name = "t2".into();
+        let sql = diff(&t, &d, Sqlite).emit();
+        assert_eq!(
+            sql.last().map(String::as_str),
+            Some(r#"ALTER TABLE "t" RENAME TO "t2";"#),
+            "{sql:#?}"
+        );
+    }
+
+    /// **A partial index would come back covering every row.** SQLite keeps a
+    /// partial index's predicate only in its own `CREATE` text, so the model
+    /// carries `lossy` instead — and a rebuild recreates its indexes from the
+    /// model. Recreating this one silently widens it, which is the plan refusing
+    /// to be applied rather than a warning to read past.
+    #[test]
+    fn a_lossy_index_stops_the_rebuild() {
+        let mut t = table();
+        t.indexes.push(IndexInfo {
+            name: "ix_partial".into(),
+            columns: vec![IndexColumn::plain("a")],
+            lossy: true,
+            ..Default::default()
+        });
+        let withheld = retyped(&t).unsupported();
+        assert_eq!(withheld.len(), 1, "{withheld:?}");
+        assert!(withheld[0].contains("ix_partial"), "{withheld:?}");
+    }
+
+    /// Dropping the lossy index is a way to proceed — there is then nothing to
+    /// recreate unfaithfully.
+    #[test]
+    fn dropping_the_lossy_index_clears_the_way() {
+        let mut t = table();
+        t.indexes.push(IndexInfo {
+            name: "ix_partial".into(),
+            columns: vec![IndexColumn::plain("a")],
+            lossy: true,
+            ..Default::default()
+        });
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.type_name = "TEXT".into();
+        d.indexes.clear();
+        assert!(diff(&t, &d, Sqlite).unsupported().is_empty());
     }
 }
