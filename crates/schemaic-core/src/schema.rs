@@ -534,6 +534,18 @@ pub struct TableInfo {
     /// hang here rather than off [`DbSchema`] — a trigger has no independent
     /// existence to hang anywhere else.
     pub triggers: Vec<TriggerInfo>,
+    /// The `CREATE` text of objects that **go down with this table** and have to
+    /// be put back verbatim — SQLite's triggers, across the twelve-step rebuild
+    /// (`ddl::sqlite_rebuild_sql`). Empty on every other engine, which alters in
+    /// place and so never destroys the table its triggers hang off.
+    ///
+    /// Deliberately the server's own statement rather than a parsed model.
+    /// Re-emitting a trigger from [`TriggerInfo`] would put it through a
+    /// round-trip Schemaic doesn't yet do faithfully for SQLite, and the failure
+    /// mode is the one [`IndexInfo::lossy`] exists to prevent: the part that
+    /// didn't survive the parse is gone from a trigger that still looks armed.
+    /// Replaying the text SQLite stored cannot lose anything.
+    pub dependent_ddl: Vec<String>,
 }
 
 /// One `CHECK` constraint: a name and the predicate it enforces.
