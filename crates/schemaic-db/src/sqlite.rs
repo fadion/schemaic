@@ -3400,3 +3400,64 @@ mod rebuild_fk_tests {
         assert_eq!(artists, 1, "and the drop rolled back");
     }
 }
+
+/// The designer's own path, end to end: `diff` → `emit` → `run_ddl`. The
+/// rebuild tests above call the builder directly; this one goes the way the
+/// application does.
+#[cfg(test)]
+mod designer_path_tests {
+    use super::tests::shared_memory;
+    use super::*;
+    use schemaic_core::ddl::{TableDraft, diff};
+    use schemaic_core::intel::SqlDialect;
+    use tokio_util::sync::CancellationToken;
+
+    async fn table_of(db: &Db, name: &str) -> TableInfo {
+        fetch_schema(db)
+            .await
+            .expect("introspect")
+            .tables
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} is gone"))
+    }
+
+    /// Retype a column, add one, drop one, rename the table and add a key — a
+    /// designer session's worth of edits, none of which SQLite can do in place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_designer_session_applies_as_one_plan() {
+        let (keeper, db) = shared_memory("designer_path");
+        keeper
+            .execute_batch(
+                "CREATE TABLE person (id INTEGER, name TEXT, scratch TEXT);
+                 INSERT INTO person VALUES (1, 'ada', 'x');",
+            )
+            .unwrap();
+
+        let before = table_of(&db, "person").await;
+        let mut draft = TableDraft::from_table(&before);
+        draft.columns[0].info.type_name = "TEXT".into();
+        draft.columns.retain(|c| c.info.name != "scratch");
+        draft.primary_key = vec!["id".into()];
+        draft.name = "people".into();
+
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .expect("the designer's plan must be valid SQLite");
+
+        let after = table_of(&db, "people").await;
+        let cols: Vec<&str> = after.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(cols, vec!["id", "name"]);
+        assert!(
+            after.indexes.iter().any(|i| i.is_primary()),
+            "the key was added: {:?}",
+            after.indexes
+        );
+        let name: String = keeper
+            .query_row("SELECT name FROM people WHERE id = '1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "ada", "the row came across and the id retyped");
+    }
+}

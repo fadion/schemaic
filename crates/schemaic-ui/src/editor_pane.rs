@@ -1871,10 +1871,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let stmt = sql.get(lo..hi).unwrap_or_default().trim().to_string();
             if !read_only.get_untracked()
                 && active_db.get_untracked().is_some()
-                // …and an engine this build can emit a `CREATE VIEW` for. On
-                // SQLite there is no schema-editing emitter, so the entry would
-                // open a modal ending at a preview with nothing to apply.
-                && schemaic_core::ddl::supports_schema_editing(dialect.get_untracked())
+                // …and an engine this build can emit a `CREATE VIEW` for. The
+                // view emitter is MySQL/PostgreSQL-shaped — see
+                // `ddl::supports_view_editing` — so on SQLite the entry would
+                // open a modal ending at a statement the engine has no form of.
+                && schemaic_core::ddl::supports_view_editing(dialect.get_untracked())
                 && schemaic_core::ddl::can_be_view_body(&stmt)
             {
                 // Its own group, as in the schema tree: it's the one entry here

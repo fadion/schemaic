@@ -131,7 +131,11 @@ pub(crate) fn object_entries(
     // What this build can emit for the engine — see `ddl::supports_schema_editing`
     // for why SQLite can't, which is a statement about SQLite's `ALTER TABLE`
     // rather than about unfinished work.
-    let ddl = schemaic_core::ddl::supports_schema_editing(dialect);
+    // Two different questions, and the table designer is the one every engine
+    // now answers yes to — SQLite by rebuilding. A view editor and a trigger
+    // editor are not the same capability and are still MySQL/PostgreSQL only.
+    let edits_views = schemaic_core::ddl::supports_view_editing(dialect);
+    let edits_triggers = schemaic_core::ddl::supports_trigger_editing(dialect);
     ObjectEntries {
         // A view is not insertable, and owns no rows to delete.
         import: !is_view,
@@ -142,8 +146,10 @@ pub(crate) fn object_entries(
         // PostgreSQL: the server refuses outright (`relation "mv" cannot have
         // triggers`), which is the same call `is_editable_view` makes.
         // Editing one is still schema DDL, so it needs an emitter too.
-        triggers: ddl && (!is_view || (is_pg && !materialized)),
-        edit: ddl,
+        triggers: edits_triggers && (!is_view || (is_pg && !materialized)),
+        // A table's designer, or a view's editor — the entry reads "Edit table"
+        // or "Edit view" and they are not the same capability.
+        edit: if is_view { edits_views } else { true },
     }
 }
 
@@ -169,13 +175,13 @@ pub(crate) struct KeyEntries {
 /// [`object_entries`] is: so the rule can be asserted without a `Ui`.
 ///
 /// The two questions really are different, which is why this asks twice.
-/// **Edit** opens the designer and needs an engine that can alter a table in
-/// place; **Drop** needs only a statement for that one change, and SQLite has
-/// `ALTER TABLE … DROP COLUMN`. Answering both with `supports_schema_editing`
-/// would hide a drop the engine performs perfectly well.
+/// **Edit** opens the designer, which every engine now has — SQLite reaches a
+/// retype or a constraint by rebuilding the table. **Drop** is a shortcut with
+/// no draft behind it, so it needs a statement for that one change, which is a
+/// narrower thing to ask (`ddl::supports_change`).
 pub(crate) fn field_entries(dialect: schemaic_core::intel::SqlDialect) -> FieldEntries {
     FieldEntries {
-        edit: schemaic_core::ddl::supports_schema_editing(dialect),
+        edit: true,
         // The predicate reads the *shape* of the change, not its names — a
         // dropped column is expressible or not whatever it is called.
         drop: schemaic_core::ddl::supports_change(
@@ -197,7 +203,9 @@ pub(crate) fn key_entries(
 ) -> KeyEntries {
     use schemaic_core::ddl::{Change, supports_change};
     KeyEntries {
-        edit: schemaic_core::ddl::supports_schema_editing(dialect),
+        // The designer, which reaches what these shortcuts can't: dropping a
+        // foreign key on SQLite is a rebuild, and the draft is what has one.
+        edit: true,
         drop_foreign_key: supports_change(
             dialect,
             &Change::DropForeignKey {
@@ -247,24 +255,20 @@ pub(crate) fn create_children(
     read_only: bool,
 ) -> Vec<CreateEntry> {
     use schemaic_core::ddl::ObjectKind;
-    let mut out = vec![
-        CreateEntry {
-            label: "Table",
-            kind: CreateKind::Table,
-            disabled: read_only,
-        },
-        CreateEntry {
+    // Every engine can create a table. A view is a separate capability — see
+    // `ddl::supports_view_editing` — and is absent rather than dimmed where the
+    // emitter would write a statement the engine has no form of.
+    let mut out = vec![CreateEntry {
+        label: "Table",
+        kind: CreateKind::Table,
+        disabled: read_only,
+    }];
+    if schemaic_core::ddl::supports_view_editing(dialect) {
+        out.push(CreateEntry {
             label: "View",
             kind: CreateKind::View,
             disabled: read_only,
-        },
-    ];
-    // An engine this build can't emit schema DDL for offers nothing to create —
-    // not even a table, since there is no emitter to build the statement and
-    // `run_ddl` would refuse the plan. The caller drops an empty submenu rather
-    // than showing one that opens onto nothing.
-    if !schemaic_core::ddl::supports_schema_editing(dialect) {
-        return Vec::new();
+        });
     }
     if dialect == schemaic_core::intel::SqlDialect::Postgres {
         out.extend(
@@ -3687,17 +3691,26 @@ mod object_menu_tests {
         assert!(!object_entries(true, Postgres, true).triggers);
     }
 
-    /// SQLite has no schema-editing emitter (`ddl::supports_schema_editing`), so
-    /// the entries that open one are **absent** — the "not supported" reading,
-    /// which is what is true of it. What doesn't need an emitter is untouched:
-    /// a SQLite table still imports and still truncates.
+    /// **A SQLite table is designable** — the engine can't alter one in place,
+    /// but the rebuild reaches everything the designer can ask for, so the entry
+    /// is offered rather than absent.
     #[test]
-    fn sqlite_offers_no_schema_editing_but_keeps_the_rest() {
+    fn sqlite_designs_a_table() {
         let e = object_entries(false, Sqlite, false);
-        assert!(!e.edit, "no designer without an emitter");
-        assert!(!e.triggers, "editing a trigger is schema DDL too");
-        assert!(e.import, "a bulk load needs no DDL emitter");
-        assert!(e.truncate, "nor does a DELETE");
+        assert!(e.edit, "the rebuild is what makes this possible");
+        assert!(e.import, "unchanged");
+        assert!(e.truncate, "unchanged");
+    }
+
+    /// Two capabilities that did **not** come with it, and are absent rather
+    /// than dimmed for the usual reason. The view emitter writes `CREATE OR
+    /// REPLACE VIEW`, which SQLite has no form of; nothing reads a SQLite
+    /// trigger into the model, so a trigger editor would show a table's
+    /// triggers as gone.
+    #[test]
+    fn sqlite_still_edits_no_view_and_no_trigger() {
+        assert!(!object_entries(false, Sqlite, false).triggers, "trigger");
+        assert!(!object_entries(true, Sqlite, false).edit, "view");
     }
 }
 
@@ -4143,14 +4156,16 @@ mod row_menu_tests {
     use super::{field_entries, key_entries};
     use schemaic_core::intel::SqlDialect::{MySql, Postgres, Sqlite};
 
-    /// The regression this pair exists for. Both of these entries open the
-    /// designer, and both were built unconditionally — so a SQLite connection
-    /// offered them from the column and key rows while the table row above,
-    /// which asks `object_entries`, correctly offered nothing.
+    /// These two rows open the designer, which every engine now has — SQLite
+    /// reaches a retype or a constraint by rebuilding the table. They were once
+    /// ungated for the wrong reason (nobody had gated them) and are ungated now
+    /// for the right one.
     #[test]
-    fn sqlite_offers_no_designer_from_a_column_or_a_key() {
-        assert!(!field_entries(Sqlite).edit, "Edit column");
-        assert!(!key_entries(Sqlite, None).edit, "Edit table");
+    fn every_engine_designs_from_a_column_or_a_key_row() {
+        for d in [MySql, Postgres, Sqlite] {
+            assert!(field_entries(d).edit, "Edit column {d:?}");
+            assert!(key_entries(d, None).edit, "Edit table {d:?}");
+        }
     }
 
     /// What SQLite *can* do stays. Hiding these would take away drops the
@@ -4187,5 +4202,27 @@ mod row_menu_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sqlite_create_menu_tests {
+    use super::create_children;
+    use schemaic_core::intel::SqlDialect::Sqlite;
+
+    /// The submenu used to be empty on SQLite — there was no emitter to build a
+    /// `CREATE TABLE` with. There is now, so the entry is there.
+    #[test]
+    fn sqlite_can_create_a_table_but_not_a_view() {
+        let labels: Vec<&str> = create_children(Sqlite, false)
+            .into_iter()
+            .map(|e| e.label)
+            .collect();
+        assert_eq!(labels, vec!["Table"]);
+    }
+
+    #[test]
+    fn a_read_only_sqlite_connection_can_create_nothing() {
+        assert!(create_children(Sqlite, true).iter().all(|e| e.disabled));
     }
 }

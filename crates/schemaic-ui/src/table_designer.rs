@@ -914,7 +914,11 @@ fn field_with_hint(field: impl IntoView + 'static, h: &'static str) -> impl Into
 
 fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     let d = ui.ddl.draft;
-    let mysql = target.dialect != SqlDialect::Postgres;
+    // **The engine, not "not PostgreSQL".** A storage engine and a table
+    // collation are MySQL's, and asking the question the other way put SQLite —
+    // which has neither, and no comments either — on the side that gets both.
+    let mysql = target.dialect == SqlDialect::MySql;
+    let has_comments = target.dialect != SqlDialect::Sqlite;
     let draft = d.get_untracked();
     let name = form_setting(
         "Name",
@@ -928,18 +932,26 @@ fn table_section(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             |d, v| d.name = v.trim().to_string(),
         ),
     );
-    let comment = form_setting(
-        "Comment",
-        bound_field(
-            &ui,
-            draft.comment.clone().unwrap_or_default(),
-            FIELD_W * 1.6,
-            "What this table is for",
-            ring.clone(),
-            20,
-            |d, v| d.comment = Some(v.to_string()).filter(|s| !s.is_empty()),
-        ),
-    );
+    // SQLite has no comment on anything — not a table, not a column — so the
+    // control isn't built rather than built and ignored, for the same reason
+    // the engine and collation fields aren't.
+    let comment: AnyView = if has_comments {
+        form_setting(
+            "Comment",
+            bound_field(
+                &ui,
+                draft.comment.clone().unwrap_or_default(),
+                FIELD_W * 1.6,
+                "What this table is for",
+                ring.clone(),
+                20,
+                |d, v| d.comment = Some(v.to_string()).filter(|s| !s.is_empty()),
+            ),
+        )
+        .into_any()
+    } else {
+        crate::widgets::nothing()
+    };
     // Engine and collation exist on MySQL only; PostgreSQL has neither, so the
     // controls aren't built rather than built and ignored. Built, not hidden: a
     // `hide()`n view is still in the tree, so its fields would still be in the
@@ -1038,8 +1050,11 @@ fn columns_list(ui: Ui, ring: FocusRing) -> AnyView {
                 ui.ddl.draft.update(|d| d.remove_column(i));
                 clamp_selection(&ui, |d| d.columns.len());
             },
-            // Only MySQL can move a column; offering arrows on PostgreSQL would
-            // promise an edit no statement can carry out.
+            // MySQL moves a column with `AFTER`, and SQLite gets there by
+            // rebuilding — the new table is created in the draft's column order,
+            // so a move costs nothing beyond the rebuild already under way.
+            // PostgreSQL has neither, and arrows there would promise an edit no
+            // statement can carry out.
             mysql.then(|| Rc::new(move || swap_selected(&up_ui, -1)) as Rc<dyn Fn()>),
             mysql.then(|| Rc::new(move || swap_selected(&down_ui, 1)) as Rc<dyn Fn()>),
             ring.clone(),
@@ -1060,6 +1075,12 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
         return empty_hint("No column selected.").into_any();
     };
     let pg = target.dialect == SqlDialect::Postgres;
+    // Asked as capabilities, because SQLite is neither of the other two here: it
+    // *has* a column collation (`COLLATE NOCASE`), has no comment on anything,
+    // and has no `ON UPDATE` — that one is MySQL's timestamp attribute, and a
+    // field for it would take input the emitter then drops on the floor.
+    let has_comments = target.dialect != SqlDialect::Sqlite;
+    let has_on_update = target.dialect == SqlDialect::MySql;
     let in_pk = draft.is_in_primary_key(i);
 
     let name = form_setting(
@@ -1180,22 +1201,27 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
             "An expression, e.g. qty * price. A generated column takes no default.",
         ),
     );
-    let comment = form_setting(
-        "Comment",
-        bound_field(
-            &ui,
-            c.comment.clone().unwrap_or_default(),
-            FIELD_W,
-            "",
-            ring.clone(),
-            100,
-            move |d, v| {
-                if let Some(col) = d.columns.get_mut(i) {
-                    col.info.comment = Some(v.to_string()).filter(|s| !s.is_empty());
-                }
-            },
-        ),
-    );
+    let comment: AnyView = if has_comments {
+        form_setting(
+            "Comment",
+            bound_field(
+                &ui,
+                c.comment.clone().unwrap_or_default(),
+                FIELD_W,
+                "",
+                ring.clone(),
+                100,
+                move |d, v| {
+                    if let Some(col) = d.columns.get_mut(i) {
+                        col.info.comment = Some(v.to_string()).filter(|s| !s.is_empty());
+                    }
+                },
+            ),
+        )
+        .into_any()
+    } else {
+        crate::widgets::nothing()
+    };
     let collation = form_setting(
         "Collation",
         bound_field(
@@ -1214,7 +1240,7 @@ fn column_form(ui: Ui, target: &DesignerTarget, ring: FocusRing) -> AnyView {
     );
     // `ON UPDATE CURRENT_TIMESTAMP` is MySQL's alone. Built only there rather
     // than built and hidden: a `hide()`n field is still in the Tab order.
-    let on_update: AnyView = if pg {
+    let on_update: AnyView = if !has_on_update {
         crate::widgets::nothing()
     } else {
         form_setting(
