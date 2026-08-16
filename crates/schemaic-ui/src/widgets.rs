@@ -339,6 +339,56 @@ pub(crate) fn in_ring_button<V: IntoView + 'static>(
         .into_any()
 }
 
+/// [`in_ring_button`] for a control in a **toolbar strip** rather than a modal
+/// form — the results grid's icon cluster, which is the app's first ring outside
+/// an overlay.
+///
+/// Two keys separate a strip from a modal's Tab order, and both are about the
+/// strip being somewhere you *visit* rather than somewhere you are:
+///
+/// - **Left/Right step it**, because a horizontal row of icons is read that way.
+///   Tab still works (that is [`in_focus_ring`]'s, and it wraps the same ring),
+///   so neither reflex is wrong.
+/// - **Escape calls `leave`**, which is how you get back out. A modal's Escape
+///   hands the keyboard to the innermost [`focus_root`]; in the main workspace
+///   there isn't one — `innermost_focus_root` is `None` and focus would simply be
+///   dropped — so the strip has to name its own way home.
+///
+/// `leave` must **defer** its focus request (`exec_after(ZERO, …)`), because
+/// `in_focus_ring`'s own Escape arm runs too — floem folds every `KeyDown`
+/// listener without short-circuiting — and queues a `ClearFocus` for this pass.
+/// A deferred request lands in a later tick and therefore wins, whichever order
+/// the two listeners happen to run in. The grid's `refocus_grid` already works
+/// this way, for the same reason.
+pub(crate) fn in_strip_button<V: IntoView + 'static>(
+    view: V,
+    ring: FocusRing,
+    tabindex: u32,
+    enabled: bool,
+    leave: impl Fn() + 'static,
+    on_press: impl Fn() + 'static,
+) -> AnyView {
+    let button = in_ring_button(view, ring.clone(), tabindex, enabled, 0.0, on_press);
+    if !enabled {
+        return button; // not in the ring, so no key of ours can reach it
+    }
+    let id = button.id();
+    button
+        .on_event(EventListener::KeyDown, move |e| {
+            let Event::KeyDown(ke) = e else {
+                return EventPropagation::Continue;
+            };
+            match ke.key.logical_key {
+                Key::Named(NamedKey::ArrowRight) => ring.step_from(id, false),
+                Key::Named(NamedKey::ArrowLeft) => ring.step_from(id, true),
+                Key::Named(NamedKey::Escape) => leave(),
+                _ => return EventPropagation::Continue,
+            }
+            EventPropagation::Stop
+        })
+        .into_any()
+}
+
 /// Which arrows move inside a [`nav_group`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum NavAxis {
@@ -2059,6 +2109,35 @@ impl From<MenuSub> for MenuLevel {
     }
 }
 
+thread_local! {
+    static MENU_RETURN: std::cell::RefCell<Option<Rc<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// **Where focus goes when the popup menu about to open closes again.**
+///
+/// A menu panel is a [`focus_root`], so it takes the keyboard while it is up and
+/// its teardown calls [`hand_keyboard_back`] — which hands to the innermost *other*
+/// focus root. Inside a modal that is the modal. In the **main workspace** there
+/// is none, so focus is simply dropped: close the grid toolbar's Copy menu with
+/// Escape and nothing is focused, which meant F6 (a listener on the grid body)
+/// stopped working entirely until something was clicked.
+///
+/// Set by an opener that was reached from the keyboard, and **taken by
+/// [`menu_panel`] as it builds** — so the slot lives only between the two and
+/// cannot go stale. A menu opened with no return set simply has none.
+///
+/// Only the keyboard wants this: after a *click*, moving focus to the control
+/// that was clicked would take the arrow keys away from whatever had them
+/// (the grid's own cell navigation). `keyboard_nav` is what an opener asks.
+pub(crate) fn set_menu_return(f: Rc<dyn Fn()>) {
+    MENU_RETURN.with_borrow_mut(|s| *s = Some(f));
+}
+
+fn take_menu_return() -> Option<Rc<dyn Fn()>> {
+    MENU_RETURN.with_borrow_mut(|s| s.take())
+}
+
 /// A reusable themed popup menu with nested submenus, `width` px wide. Returns the
 /// panel; the caller positions it absolutely. Escape (and any action) calls `close`.
 ///
@@ -2081,6 +2160,18 @@ pub(crate) fn menu_panel(
     width: f64,
 ) -> impl IntoView {
     let level = MenuLevel::new();
+    // Taken at build, so the slot is empty again the moment this panel owns it.
+    // Folded into `close`, which is what Escape and every action call — the one
+    // path that matters, because it is the keyboard's. A click-away dismissal
+    // sets the channel to `None` directly and skips this, which is right: the
+    // pointer put focus wherever it clicked.
+    let close = match take_menu_return() {
+        None => close,
+        Some(back) => Rc::new(move || {
+            (close)();
+            (back)();
+        }) as Rc<dyn Fn()>,
+    };
     // Taken before the entries become views, which consumes them. Each `Sub`'s
     // children are kept for the same reason, keyed by the row they hang off.
     let stops = Rc::new(menu_stops(&entries));
@@ -3426,6 +3517,27 @@ mod menu_key_tests {
         assert_eq!(m.sub_cursor(), None);
         assert_eq!(m.cursor(), Some(3));
         assert_eq!(m.closed.get(), 0);
+    }
+
+    /// **The return slot is consumed, not merely read.** It lives only between
+    /// the opener and the panel that takes it, which is what stops a menu opened
+    /// later — from a right-click somewhere else entirely — inheriting a return
+    /// to a control the user has long since left.
+    #[test]
+    fn a_menu_return_is_taken_once_and_only_once() {
+        let fired = Rc::new(Cell::new(0));
+        let f = fired.clone();
+        set_menu_return(Rc::new(move || f.set(f.get() + 1)));
+
+        let taken = take_menu_return();
+        assert!(taken.is_some(), "the panel that builds first gets it");
+        assert!(
+            take_menu_return().is_none(),
+            "and the next one gets nothing"
+        );
+
+        (taken.unwrap())();
+        assert_eq!(fired.get(), 1);
     }
 
     /// Left at the root is not the menu's key — nothing is open to leave, so it

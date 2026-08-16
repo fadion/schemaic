@@ -46,8 +46,8 @@ use schemaic_core::tx::{WRITE_WAIT_MS, WaitNote, write_wait_note};
 
 use crate::consts::*;
 use crate::widgets::{
-    MenuEntry, autohide, autohide_state, centered_msg, loading_dots, measure_text_px,
-    shift_hscroll, thin_scroll, toolbar_icon, verb_spinner,
+    MenuEntry, autohide, autohide_state, centered_msg, in_strip_button, loading_dots,
+    measure_text_px, shift_hscroll, thin_scroll, toolbar_icon, verb_spinner,
 };
 use crate::{ConnNode, FieldCfg, PopupAnchor, edit_field, icons, theme};
 
@@ -2424,6 +2424,13 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     // Click a header to sort by that column (ASC → DESC → reset).
     let sort: RwSignal<SortState> = RwSignal::new(None);
 
+    // **The app's first focus ring outside an overlay.** It holds the toolbar
+    // strip only: F6 enters it from the grid body, arrows and Tab walk it,
+    // Escape returns to the grid. A ring wraps, which is what makes a modal's Tab
+    // order a trap — here that same property keeps the walk inside the strip
+    // instead of falling into floem's whole-window traversal, and Escape is the
+    // deliberate way out rather than the last Tab.
+    let strip = crate::widgets::FocusRing::new();
     let toolbar = grid_toolbar(
         gs,
         nrows,
@@ -2433,6 +2440,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         capped_columns,
         sort,
         rs.database.clone(),
+        strip.clone(),
     );
 
     // Header + body rebuild together on a sort change OR a freeze toggle (both
@@ -2441,11 +2449,15 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     // optional frozen first column) and a horizontally-scrolling data pane. Both
     // panes are vertical scrolls kept in lockstep through `gs.scroll_to` (the
     // shared offset — data pane also owns the horizontal `h_off`).
+    // The body rebuilds on every sort/freeze/new-row change, so the ring is cloned
+    // per build rather than captured once.
+    let strip_for_body = strip.clone();
     let grid = dyn_container(
         // Rebuild on sort / freeze change, and when the number of pending new rows
         // changes (adding/removing a row extends the virtual-stack length).
         move || (sort.get(), gs.frozen.get(), gs.new_rows.with(|v| v.len())),
         move |(sort_val, frozen_col, new_len)| {
+            let strip_entry = strip_for_body.clone();
             let rs = gs.rs.get_untracked();
             // Total displayed rows = real rows + pending new rows (rendered below).
             let total = nrows + new_len;
@@ -2663,6 +2675,23 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                 gs.selecting.set(false);
             })
             .on_event(EventListener::KeyDown, move |e| {
+                // **F6 steps out to the toolbar** — the OS-conventional "next
+                // pane" key, and free here where every other reflex is taken
+                // (Tab hops cells while editing, the arrows move the selection,
+                // Escape closes the find/goto bars). Handled at the view rather
+                // than in `grid_key` because it is about *focus*, not grid state.
+                //
+                // `step_from` with the body's own id, which is not a ring member:
+                // it enters at the first control, or resumes where the strip was
+                // last left. It also arms `keyboard_nav`, so the ring it lands on
+                // is visible.
+                if let Event::KeyDown(ke) = e
+                    && ke.key.logical_key == Key::Named(NamedKey::F6)
+                    && let Some(from) = gs.focus_id.get_untracked()
+                {
+                    strip_entry.step_from(from, false);
+                    return EventPropagation::Stop;
+                }
                 grid_key(gs, nrows, ncols, e)
             })
             .style(|s| {
@@ -4926,6 +4955,18 @@ fn filter_bar(gs: GridState) -> impl IntoView {
     )
 }
 
+/// The toolbar strip's Tab order, left to right as the icons read. Local to this
+/// ring — it holds nothing else — and spaced by ten so a control can be added
+/// between two without renumbering.
+const TB_COMMIT: u32 = 10;
+const TB_DISCARD: u32 = 20;
+const TB_ADD: u32 = 30;
+const TB_DELETE: u32 = 40;
+const TB_CLONE: u32 = 50;
+const TB_AI: u32 = 60;
+const TB_COPY: u32 = 70;
+const TB_SAVE: u32 = 80;
+
 #[allow(clippy::too_many_arguments)]
 fn grid_toolbar(
     gs: GridState,
@@ -4936,7 +4977,33 @@ fn grid_toolbar(
     capped_columns: Vec<String>,
     sort: RwSignal<SortState>,
     database: Option<String>,
+    strip: crate::widgets::FocusRing,
 ) -> impl IntoView {
+    // Escape's way home. Deferred inside `refocus_grid`, which is what makes it
+    // win over the `ClearFocus` that `in_focus_ring`'s own Escape arm queues in
+    // the same pass — see `in_strip_button`.
+    let leave = move || refocus_grid(gs);
+    // **Closing a menu must give the keyboard back to the icon that opened it.**
+    // The panel is a `focus_root` with no other root above it out here, so its
+    // teardown drops focus altogether and F6 — a listener on the grid body — had
+    // nothing to fire on. Asked of `keyboard_nav` because it is only true of a
+    // menu the keyboard raised: after a *click*, taking focus to the icon would
+    // take the arrow keys away from the grid's own cell navigation.
+    //
+    // By tabindex and deferred, both for the reasons `in_ring_dropdown` gives:
+    // the strip may have been rebuilt by the action just run, and floem's focus
+    // request has no existence check, so a captured id can park the keyboard on a
+    // removed view.
+    let publish_return = move |tabindex: u32, ring: &crate::widgets::FocusRing| {
+        if !crate::widgets::keyboard_nav().get_untracked() {
+            return;
+        }
+        let ring = ring.clone();
+        crate::widgets::set_menu_return(Rc::new(move || {
+            let ring = ring.clone();
+            floem::action::exec_after(std::time::Duration::ZERO, move |_| ring.focus_at(tabindex));
+        }));
+    };
     let cap = if truncated { " (capped)" } else { "" };
     // The database leads the line, because it is the fact that says what the rest
     // of the line is *about*. Taken from the result rather than the tab: the tab's
@@ -4984,6 +5051,11 @@ fn grid_toolbar(
     // glyph + the change count (Ctrl+Enter); discard a red (#9D3434) ✗. Both
     // background-free with the same padded hitbox as the other icons; brighten on
     // hover.
+    // A clone per rebuilding block: each `dyn_container` child closure owns what
+    // it captures, and re-clones inside because it runs on every rebuild.
+    let strip_commit = strip.clone();
+    let strip_rows = strip.clone();
+    let strip_ai = strip.clone();
     let commit_ctrl = dyn_container(
         move || {
             (
@@ -5048,9 +5120,16 @@ fn grid_toolbar(
                     .padding_horiz(5.0)
                     .cursor(CursorStyle::Default)
             });
-            h_stack((commit, discard, toolbar_sep()))
-                .style(|s| s.items_center().flex_row().gap(3.0))
-                .into_any()
+            let (r1, r2) = (strip_commit.clone(), strip_commit.clone());
+            h_stack((
+                in_strip_button(commit, r1, TB_COMMIT, true, leave, move || commit_grid(gs)),
+                in_strip_button(discard, r2, TB_DISCARD, true, leave, move || {
+                    discard_edits(gs)
+                }),
+                toolbar_sep(),
+            ))
+            .style(|s| s.items_center().flex_row().gap(3.0))
+            .into_any()
         },
     );
     // (A commit failure now shows in the panel-level error bar at the bottom — the
@@ -5066,24 +5145,66 @@ fn grid_toolbar(
         }
         gs.order.get_untracked().get(r).copied()
     };
+    // Tracks `row_selected` as well as insertability: − and clone are disabled
+    // without a selected row, and a disabled control is deliberately *not* a ring
+    // member, so the strip has to be rebuilt when that flips.
     let row_actions = dyn_container(
-        move || gs.edit_model.get().insert_target().is_some(),
-        move |show| {
+        move || {
+            (
+                gs.edit_model.get().insert_target().is_some(),
+                row_selected(),
+            )
+        },
+        move |(show, live)| {
             if !show {
                 return empty().into_any();
             }
+            // The face keeps its own click listener and the ring gets an
+            // equivalent one for Enter/Space — `in_ring_button`'s rule, and the
+            // reason it is two closures rather than one: the registered view is
+            // the *wrapper*, and floem fires `Click` on the focused view for
+            // Enter, so a click listener there would activate twice.
+            //
+            // `live` is a snapshot, which is only sound because the `dyn_container`
+            // above tracks `row_selected()` too: a disabled control is not a ring
+            // member, so the strip has to be rebuilt when that changes or Tab
+            // would keep walking onto a control that no longer does anything.
+            let del = move || {
+                if let Some(di) = selected_data_row() {
+                    gs.toggle_delete(di);
+                }
+            };
+            let clone = move || {
+                if let Some(di) = selected_data_row() {
+                    clone_row(gs, di);
+                }
+            };
+            let (r1, r2, r3) = (strip_rows.clone(), strip_rows.clone(), strip_rows.clone());
             h_stack((
-                toolbar_icon(icons::PLUS, 0.0, 0.0, || true, move || add_pending_row(gs)),
-                toolbar_icon(icons::MINUS, 0.0, 0.0, row_selected, move || {
-                    if let Some(di) = selected_data_row() {
-                        gs.toggle_delete(di);
-                    }
-                }),
-                toolbar_icon(icons::COPY_PLUS, 0.0, 0.0, row_selected, move || {
-                    if let Some(di) = selected_data_row() {
-                        clone_row(gs, di);
-                    }
-                }),
+                in_strip_button(
+                    toolbar_icon(icons::PLUS, 0.0, 0.0, || true, move || add_pending_row(gs)),
+                    r1,
+                    TB_ADD,
+                    true,
+                    leave,
+                    move || add_pending_row(gs),
+                ),
+                in_strip_button(
+                    toolbar_icon(icons::MINUS, 0.0, 0.0, row_selected, del),
+                    r2,
+                    TB_DELETE,
+                    live,
+                    leave,
+                    del,
+                ),
+                in_strip_button(
+                    toolbar_icon(icons::COPY_PLUS, 0.0, 0.0, row_selected, clone),
+                    r3,
+                    TB_CLONE,
+                    live,
+                    leave,
+                    clone,
+                ),
                 toolbar_sep(),
             ))
             .style(|s| s.items_center().flex_row().gap(3.0))
@@ -5096,25 +5217,24 @@ fn grid_toolbar(
     // `on_move` tracks the glyph origin so the dropdown anchors under it.
     let copy_origin = RwSignal::new(Point::ZERO);
     let copy_hov = RwSignal::new(false);
-    let copy_menu = container(
-        icons::icon(icons::COPY, 16.0)
-            .on_move(move |p| copy_origin.set(p))
-            .style(move |s| {
-                let c = if copy_hov.get() {
-                    theme::text()
-                } else {
-                    theme::text_muted()
-                };
-                s.color(c).flex_shrink(0.0_f32)
-            }),
-    )
-    .on_click_stop(move |_| {
+    // Named, because the pointer and the keyboard both raise it: the face keeps
+    // the click listener and `in_strip_button` gets the same action for
+    // Enter/Space (see `in_ring_button` on why they cannot be one listener).
+    let strip_copy = strip.clone();
+    // `Rc`, not a bare closure: it captures the ring (not `Copy`) and is used
+    // twice — the face's click listener and the ring's Enter/Space arm, which
+    // `in_ring_button` requires to be separate listeners.
+    let open_copy: Rc<dyn Fn()> = Rc::new(move || {
         // Close any other open menu (schema eye/settings, connection switcher, …)
         // so this dropdown is mutually exclusive with them.
         if let Some(d) = gs.dismiss.get_untracked() {
             (d)();
         }
+        publish_return(TB_COPY, &strip_copy);
         // Anchor the panel just below the icon (left/right edges + bottom).
+        // `on_move` reports the *view's* window origin — floem fires it during
+        // layout, not on pointer movement — so this is right however the menu was
+        // raised.
         let o = copy_origin.get_untracked();
         let sz = 16.0; // the COPY glyph size above
         gs.popup_width.set(GRID_COPY_MENU_W);
@@ -5130,7 +5250,21 @@ fn grid_toolbar(
                 })
                 .collect(),
         ));
-    })
+    });
+    let copy_click = open_copy.clone();
+    let copy_menu = container(
+        icons::icon(icons::COPY, 16.0)
+            .on_move(move |p| copy_origin.set(p))
+            .style(move |s| {
+                let c = if copy_hov.get() {
+                    theme::text()
+                } else {
+                    theme::text_muted()
+                };
+                s.color(c).flex_shrink(0.0_f32)
+            }),
+    )
+    .on_click_stop(move |_| (copy_click)())
     .on_event_cont(EventListener::PointerEnter, move |_| copy_hov.set(true))
     .on_event_cont(EventListener::PointerLeave, move |_| copy_hov.set(false))
     .on_event_stop(EventListener::PointerDown, |_| {})
@@ -5146,6 +5280,25 @@ fn grid_toolbar(
     // so the pair reads as one control: copy it, or save it.
     let save_origin = RwSignal::new(Point::ZERO);
     let save_hov = RwSignal::new(false);
+    let strip_save = strip.clone();
+    let open_save: Rc<dyn Fn()> = Rc::new(move || {
+        if let Some(d) = gs.dismiss.get_untracked() {
+            (d)();
+        }
+        publish_return(TB_SAVE, &strip_save);
+        let o = save_origin.get_untracked();
+        let sz = 16.0; // the DOWNLOAD glyph size above
+        gs.popup_width.set(GRID_COPY_MENU_W);
+        gs.popup_anchor
+            .set(Some(PopupAnchor::BelowIcon(o.x, o.x + sz, o.y + sz)));
+        gs.popup.set(Some(
+            ExportFormat::ALL
+                .iter()
+                .map(|&f| MenuEntry::action(f.label(), move || save_export(gs, f)))
+                .collect(),
+        ));
+    });
+    let save_click = open_save.clone();
     let save_menu = container(
         icons::icon(icons::DOWNLOAD, 16.0)
             .on_move(move |p| save_origin.set(p))
@@ -5158,22 +5311,7 @@ fn grid_toolbar(
                 s.color(c).flex_shrink(0.0_f32)
             }),
     )
-    .on_click_stop(move |_| {
-        if let Some(d) = gs.dismiss.get_untracked() {
-            (d)();
-        }
-        let o = save_origin.get_untracked();
-        let sz = 16.0; // the DOWNLOAD glyph size above
-        gs.popup_width.set(GRID_COPY_MENU_W);
-        gs.popup_anchor
-            .set(Some(PopupAnchor::BelowIcon(o.x, o.x + sz, o.y + sz)));
-        gs.popup.set(Some(
-            ExportFormat::ALL
-                .iter()
-                .map(|&f| MenuEntry::action(f.label(), move || save_export(gs, f)))
-                .collect(),
-        ));
-    })
+    .on_click_stop(move |_| (save_click)())
     .on_event_cont(EventListener::PointerEnter, move |_| save_hov.set(true))
     .on_event_cont(EventListener::PointerLeave, move |_| save_hov.set(false))
     .on_event_stop(EventListener::PointerDown, |_| {})
@@ -5198,22 +5336,8 @@ fn grid_toolbar(
             }
             let ai_origin = RwSignal::new(Point::ZERO);
             let ai_hov = RwSignal::new(false);
-            container(
-                icons::icon(icons::SPARKLES, 16.0)
-                    .on_move(move |p| ai_origin.set(p))
-                    .style(move |s| {
-                        // Dimmed + inert while a request is in flight.
-                        let c = if gs.ai_busy.get() {
-                            theme::text_muted().multiply_alpha(0.3)
-                        } else if ai_hov.get() {
-                            theme::text()
-                        } else {
-                            theme::text_muted()
-                        };
-                        s.color(c).flex_shrink(0.0_f32)
-                    }),
-            )
-            .on_click_stop(move |_| {
+            let strip_ai_open = strip_ai.clone();
+            let open_ai: Rc<dyn Fn()> = Rc::new(move || {
                 if gs.ai_busy.get_untracked() {
                     return; // a generation is already running
                 }
@@ -5221,6 +5345,7 @@ fn grid_toolbar(
                 if let Some(d) = gs.dismiss.get_untracked() {
                     (d)();
                 }
+                publish_return(TB_AI, &strip_ai_open);
                 let o = ai_origin.get_untracked();
                 let sz = 16.0; // the SPARKLES glyph size above
                 gs.popup_width.set(GRID_COPY_MENU_W);
@@ -5252,7 +5377,24 @@ fn grid_toolbar(
                         move || open_seed_popover(gs),
                     ),
                 ]));
-            })
+            });
+            let ai_click = open_ai.clone();
+            let face = container(
+                icons::icon(icons::SPARKLES, 16.0)
+                    .on_move(move |p| ai_origin.set(p))
+                    .style(move |s| {
+                        // Dimmed + inert while a request is in flight.
+                        let c = if gs.ai_busy.get() {
+                            theme::text_muted().multiply_alpha(0.3)
+                        } else if ai_hov.get() {
+                            theme::text()
+                        } else {
+                            theme::text_muted()
+                        };
+                        s.color(c).flex_shrink(0.0_f32)
+                    }),
+            )
+            .on_click_stop(move |_| (ai_click)())
             .on_event_cont(EventListener::PointerEnter, move |_| ai_hov.set(true))
             .on_event_cont(EventListener::PointerLeave, move |_| ai_hov.set(false))
             .on_event_stop(EventListener::PointerDown, |_| {})
@@ -5261,6 +5403,13 @@ fn grid_toolbar(
                     .padding_vert(3.0)
                     .padding_horiz(5.0)
                     .cursor(CursorStyle::Default)
+            });
+            // `open_ai` no-ops while a request is in flight, so the control stays
+            // in the ring rather than leaving and re-entering it on every
+            // generation — a Tab stop that came and went with a background task
+            // would move the strip under the user mid-walk.
+            in_strip_button(face, strip_ai.clone(), TB_AI, true, leave, move || {
+                (open_ai)()
             })
             .into_any()
         },
@@ -5269,8 +5418,18 @@ fn grid_toolbar(
     // The icon cluster — 3px between icons (on top of each icon's padded hitbox),
     // separators pushed further out by their own margin:
     // [commit ✓][discard ✗] │ [＋][－][clone] │ [✦ AI][copy].
-    let icons_cluster = h_stack((commit_ctrl, row_actions, ai_menu, copy_menu, save_menu))
-        .style(|s| s.items_center().flex_row().gap(3.0));
+    let icons_cluster = h_stack((
+        commit_ctrl,
+        row_actions,
+        ai_menu,
+        in_strip_button(copy_menu, strip.clone(), TB_COPY, true, leave, move || {
+            (open_copy)()
+        }),
+        in_strip_button(save_menu, strip.clone(), TB_SAVE, true, leave, move || {
+            (open_save)()
+        }),
+    ))
+    .style(|s| s.items_center().flex_row().gap(3.0));
 
     h_stack((
         stats,
