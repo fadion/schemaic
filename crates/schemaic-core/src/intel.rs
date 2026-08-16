@@ -4528,6 +4528,166 @@ pub fn parses(stmt: &str, dialect: SqlDialect) -> bool {
     sqlparser::parser::Parser::parse_sql(&*dialect.parser(), stmt).is_ok()
 }
 
+/// A table a statement reads from, as written: the bare name plus whatever
+/// qualified it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceTable {
+    /// The qualifier before the name — a database on MySQL, a namespace on
+    /// PostgreSQL, an attached database on SQLite. Unquoted; `None` for a bare
+    /// name.
+    pub qualifier: Option<String>,
+    /// The table's own name, **unquoted** — the form the catalogue is keyed on.
+    pub name: String,
+}
+
+/// Is `query` the structurally simple single-table `SELECT` that both the header
+/// filter's rewrite and SQLite's write-back provenance require, and if so, which
+/// table does it read?
+///
+/// **One definition of "simple enough", deliberately.** Two callers ask this
+/// question for different reasons — [`crate::filter::build_query`] needs to know
+/// it may splice a `WHERE` into the statement that produced a result, and the
+/// SQLite backend needs to know which base table a grid row belongs to before it
+/// will let anything write to it — but a wrong answer costs the same thing in
+/// both: SQL aimed at rows the user didn't mean. Two predicates that agreed on
+/// the day they were written is precisely the arrangement `ident_sql` exists to
+/// rule out.
+///
+/// Simple means: one statement, a `SELECT` body (not a set operation), no CTE,
+/// exactly one `FROM` entry, no joins, and a plain named table rather than a
+/// derived subquery or a table function.
+pub(crate) fn simple_select_source(
+    query: &sqlparser::ast::Query,
+) -> Option<&sqlparser::ast::ObjectName> {
+    use sqlparser::ast::{SetExpr, TableFactor};
+    if query.with.is_some() {
+        return None;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return None;
+    }
+    match &select.from[0].relation {
+        TableFactor::Table { name, .. } => Some(name),
+        _ => None,
+    }
+}
+
+/// The single base table `sql` selects from, or `None` when the statement isn't
+/// simple enough to say — see [`simple_select_source`] for what that means.
+///
+/// Identifiers come back **unquoted**: `ObjectNamePart`'s `Display` re-adds the
+/// quoting, so a `"t"` name would never match a catalogue keyed on bare names.
+pub fn single_source_table(sql: &str, dialect: SqlDialect) -> Option<SourceTable> {
+    let stmts = sqlparser::parser::Parser::parse_sql(&*dialect.parser(), sql).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let sqlparser::ast::Statement::Query(query) = &stmts[0] else {
+        return None;
+    };
+    let parts = object_name_parts(simple_select_source(query)?);
+    match parts.len() {
+        1 => Some(SourceTable {
+            qualifier: None,
+            name: parts[0].clone(),
+        }),
+        2 => Some(SourceTable {
+            qualifier: Some(parts[0].clone()),
+            name: parts[1].clone(),
+        }),
+        // Three parts is `db.schema.table`, which no engine here produces from
+        // its own generated SQL; reading only the last two would silently drop a
+        // qualifier that changes which table this is.
+        _ => None,
+    }
+}
+
+/// What a simple single-table `SELECT` projects, in result-column order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Projection {
+    /// `SELECT *` / `SELECT t.*` alone — every column of the source table, in
+    /// table order. The caller expands it, since only the catalogue knows them.
+    Wildcard,
+    /// One entry per result column: the **base column** it is a reference to, or
+    /// `None` where it is computed and belongs to no column.
+    Items(Vec<Option<String>>),
+}
+
+/// Which base column each result column of a simple single-table `SELECT` comes
+/// from — the statement-derived stand-in for the per-column provenance MySQL and
+/// PostgreSQL get from their wire protocols.
+///
+/// **It is positional, not name-matched, and that is the whole point.** Matching
+/// a result column's *name* against the table's columns looks equivalent and
+/// isn't: `SELECT a AS b, b FROM t` produces a first column named `b` that holds
+/// `a`, and a name match would map it to column `b` — so an edit to it would
+/// `UPDATE` the wrong column, silently, with the grid showing the change as
+/// though it had worked. Reading the projection positionally gets both columns
+/// right, and gets an alias right for the same reason MySQL's `org_name` does: an
+/// alias renames the output, not the column behind it.
+///
+/// Everything that isn't a bare column reference — an expression, a literal, a
+/// function call — is `None` and therefore not editable, which is exactly what
+/// the other two engines report for the same statement.
+///
+/// A `*` mixed with anything else returns `None` overall rather than being
+/// partly resolved: the wildcard's width isn't knowable here, so the positions
+/// after it can't be either, and a provenance list that is off by one column is
+/// the worst possible answer.
+pub fn projection_of(sql: &str, dialect: SqlDialect) -> Option<(SourceTable, Projection)> {
+    use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement};
+
+    let source = single_source_table(sql, dialect)?;
+    let stmts = sqlparser::parser::Parser::parse_sql(&*dialect.parser(), sql).ok()?;
+    let Statement::Query(query) = &stmts[0] else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+
+    // A lone wildcard; anything alongside one is refused above.
+    if select.projection.len() == 1
+        && matches!(
+            select.projection[0],
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+        )
+    {
+        return Some((source, Projection::Wildcard));
+    }
+    if select.projection.iter().any(|p| {
+        matches!(
+            p,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+        )
+    }) {
+        return None;
+    }
+
+    let base_of = |e: &Expr| -> Option<String> {
+        match e {
+            Expr::Identifier(id) => Some(id.value.clone()),
+            // `t.a` — the qualifier is the source table or its alias either way,
+            // since a single-table SELECT has nothing else it could name.
+            Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some(parts[1].value.clone()),
+            _ => None,
+        }
+    };
+    let items = select
+        .projection
+        .iter()
+        .map(|p| match p {
+            SelectItem::UnnamedExpr(e) => base_of(e),
+            SelectItem::ExprWithAlias { expr, .. } => base_of(expr),
+            _ => None,
+        })
+        .collect();
+    Some((source, Projection::Items(items)))
+}
+
 /// The column names a `SELECT` produces, **in order**, when they can be read off
 /// the statement alone.
 ///
@@ -4728,6 +4888,102 @@ mod tests {
         let mut v: Vec<String> = scope.tables.iter().map(|t| t.name.clone()).collect();
         v.sort();
         v
+    }
+
+    #[test]
+    fn single_source_table_reads_a_plain_select_and_refuses_everything_else() {
+        let t = |s: &str| single_source_table(s, SqlDialect::Sqlite);
+        assert_eq!(
+            t("SELECT * FROM artist"),
+            Some(SourceTable {
+                qualifier: None,
+                name: "artist".into()
+            })
+        );
+        // A quoted name comes back **unquoted** — `Display` would re-add the
+        // quotes and never match a catalogue keyed on bare names.
+        assert_eq!(t(r#"SELECT * FROM "my tbl""#).unwrap().name, "my tbl");
+        assert_eq!(t("SELECT * FROM `my tbl`").unwrap().name, "my tbl");
+        assert_eq!(t("SELECT * FROM [my tbl]").unwrap().name, "my tbl");
+        // A qualifier is kept, since it is part of which table this is.
+        assert_eq!(
+            t("SELECT * FROM main.artist"),
+            Some(SourceTable {
+                qualifier: Some("main".into()),
+                name: "artist".into()
+            })
+        );
+        // Everything a write must not be aimed at from one statement.
+        for sql in [
+            "SELECT * FROM a JOIN b ON a.id = b.a_id",
+            "SELECT * FROM a, b",
+            "WITH c AS (SELECT 1) SELECT * FROM c",
+            "SELECT * FROM (SELECT * FROM a) x",
+            "SELECT a FROM t UNION SELECT b FROM u",
+            "SELECT 1",
+            "UPDATE t SET a = 1",
+            "SELECT * FROM a; SELECT * FROM b",
+            "not sql at all",
+        ] {
+            assert_eq!(t(sql), None, "{sql}");
+        }
+    }
+
+    /// The case a name match gets wrong, and the reason the derivation is
+    /// positional: the first result column is *named* `b` but *is* `a`, so a
+    /// name-matched provenance would aim an edit to it at column `b`.
+    #[test]
+    fn projection_is_positional_so_an_alias_cannot_shadow_another_column() {
+        let (src, proj) = projection_of("SELECT a AS b, b FROM t", SqlDialect::Sqlite).unwrap();
+        assert_eq!(src.name, "t");
+        assert_eq!(
+            proj,
+            Projection::Items(vec![Some("a".into()), Some("b".into())])
+        );
+    }
+
+    #[test]
+    fn projection_reads_bare_references_and_refuses_computed_ones() {
+        let p = |s: &str| projection_of(s, SqlDialect::Sqlite).map(|(_, p)| p);
+        assert_eq!(p("SELECT * FROM t"), Some(Projection::Wildcard));
+        assert_eq!(p("SELECT t.* FROM t"), Some(Projection::Wildcard));
+        // A qualified reference is still the column behind it.
+        assert_eq!(
+            p("SELECT t.a, a FROM t"),
+            Some(Projection::Items(vec![Some("a".into()), Some("a".into())]))
+        );
+        // Anything computed belongs to no column — not editable, exactly as the
+        // other two engines report for the same statement.
+        assert_eq!(
+            p("SELECT a, a * 2, count(*), 'x' FROM t"),
+            Some(Projection::Items(vec![Some("a".into()), None, None, None]))
+        );
+        // A `*` beside anything else can't be placed positionally, so the whole
+        // answer is withheld rather than being off by however wide it is.
+        assert_eq!(p("SELECT *, 1 FROM t"), None);
+        assert_eq!(p("SELECT a FROM x JOIN y ON x.id = y.id"), None);
+    }
+
+    /// The filter rewrite and the write-back provenance ask the same question, so
+    /// they must answer it identically — a statement one calls simple and the
+    /// other doesn't is a statement where a `WHERE` gets spliced into rows nobody
+    /// meant to touch, or an `UPDATE` gets aimed at the wrong table.
+    #[test]
+    fn the_filter_rewrite_and_single_source_table_agree_on_eligibility() {
+        for sql in [
+            "SELECT * FROM artist",
+            "SELECT id, name FROM artist ORDER BY id",
+            "SELECT * FROM a JOIN b ON a.id = b.a_id",
+            "WITH c AS (SELECT 1) SELECT * FROM c",
+            "SELECT a FROM t UNION SELECT b FROM u",
+            "SELECT * FROM (SELECT 1) x",
+        ] {
+            let filterable = crate::filter::build_query(sql, "1=1", &[], SqlDialect::Sqlite)
+                .expect("a valid filter never errors here")
+                .is_some();
+            let has_source = single_source_table(sql, SqlDialect::Sqlite).is_some();
+            assert_eq!(filterable, has_source, "{sql}");
+        }
     }
 
     #[test]

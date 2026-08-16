@@ -17,7 +17,7 @@
 use crate::intel::SqlDialect;
 use sqlparser::ast::{
     BinaryOperator, Expr, Ident, OrderBy, OrderByExpr, OrderByKind, OrderByOptions, SetExpr,
-    Statement, TableFactor, Value, visit_expressions_mut,
+    Statement, Value, visit_expressions_mut,
 };
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
@@ -82,19 +82,19 @@ pub fn build_query(
         return Ok(None);
     };
     // No CTE, a plain SELECT body (not UNION/…), one table, no joins, and a plain
-    // named table (not a derived subquery / table function).
-    if query.with.is_some() {
+    // named table (not a derived subquery / table function). The test belongs to
+    // `intel`, which is where structure-aware SQL analysis lives and where the
+    // *other* caller of it is — SQLite's write-back has to answer the same
+    // question about the same statement, and a second copy of the rule that
+    // agreed on the day it was written is what the one-quoter invariant exists to
+    // prevent.
+    if crate::intel::simple_select_source(query).is_none() {
         return Ok(None);
     }
     let SetExpr::Select(select) = query.body.as_mut() else {
+        // Unreachable: `simple_select_source` just established this is a Select.
         return Ok(None);
     };
-    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
-        return Ok(None);
-    }
-    if !matches!(select.from[0].relation, TableFactor::Table { .. }) {
-        return Ok(None);
-    }
 
     // WHERE: AND the parsed condition onto any existing selection, parenthesizing
     // both sides so e.g. a base `a OR b` + filter `c` becomes `(a OR b) AND (c)`.

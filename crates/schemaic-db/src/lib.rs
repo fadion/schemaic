@@ -2290,14 +2290,7 @@ impl Db {
         }
         match self.engine {
             Engine::Postgres => return pg::import_rows(self, target, rows, cancel).await,
-            // Wired in the write-back commit that follows this one; refusing is
-            // the safe intermediate state, since falling through would build
-            // MySQL's multi-row `INSERT` syntax and run it against SQLite.
-            Engine::Sqlite => {
-                return Err(DbError::Query(
-                    "importing into SQLite isn't wired yet".to_string(),
-                ));
-            }
+            Engine::Sqlite => return sqlite::import_rows(self, target, rows, cancel).await,
             Engine::MySql => {}
         }
         let mut conn = self.open(Some(target.database), false).await?;
@@ -2479,17 +2472,7 @@ impl Db {
         }
         match self.engine {
             Engine::Postgres => return pg::commit_writes(self, write, cancel).await,
-            // Wired in the commit that follows this one. Refusing beats falling
-            // through: the MySQL path builds `db`.`table` qualified statements
-            // with backtick quoting, which SQLite rejects outright — but a write
-            // path that *happened* to be accepted while keying on the wrong
-            // columns is the failure this whole layer exists to prevent, so it
-            // must not be reachable by accident even for a moment.
-            Engine::Sqlite => {
-                return Err(DbError::Query(
-                    "writing to SQLite isn't wired yet".to_string(),
-                ));
-            }
+            Engine::Sqlite => return sqlite::commit_writes(self, write, cancel).await,
             Engine::MySql => {}
         }
         // `client_found_rows` so the 1-row guard counts matches, not changes.
@@ -2663,12 +2646,7 @@ impl Db {
         }
         match self.engine {
             Engine::Postgres => return pg::refetch_rows(self, template, rows, cancel).await,
-            // The other half of `commit_writes`, wired with it.
-            Engine::Sqlite => {
-                return Err(DbError::Query(
-                    "writing to SQLite isn't wired yet".to_string(),
-                ));
-            }
+            Engine::Sqlite => return sqlite::refetch_rows(self, template, rows, cancel).await,
             Engine::MySql => {}
         }
         let mut conn = self.open(None, false).await?;
