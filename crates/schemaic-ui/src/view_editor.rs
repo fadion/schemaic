@@ -345,10 +345,13 @@ fn form(ui: Ui, target: &ViewTarget, ring: FocusRing) -> AnyView {
                 },
                 |d, v| d.options.column_list = Some(v.trim().to_string()).filter(|s| !s.is_empty()),
             )
-            // Wider than the form's other single-line fields, which is what the
-            // placeholder needs: it doesn't clip at the field's edge, it paints
-            // over it. Same width the trigger editor's `When` and `Of columns`
-            // fields take, so the two SQLite forms line up.
+            // Wider than the form's other single-line fields: the placeholder is
+            // a sentence, and at `FIELD_W` it now ellipsizes away the half that
+            // says what happens when the field is left empty. (It used to *paint
+            // over* the border instead — that is fixed in `edit_field`, and this
+            // width is no longer a workaround for it.) Same width the trigger
+            // editor's `When` and `Of columns` fields take, so the two SQLite
+            // forms line up.
             .style(move |s| s.width(FIELD_W * 1.6)),
         )
         .into_any()
