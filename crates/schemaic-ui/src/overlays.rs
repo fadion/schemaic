@@ -579,13 +579,16 @@ pub(crate) fn db_visibility_overlay(ui: Ui) -> impl IntoView {
     })
 }
 
-// The SCHEMA settings dropdown (opened by the gear): a single "Refresh" action
-// for now. Same style as the other dropdowns, dropped 3px below the gear.
+// The SCHEMA settings dropdown (opened by the gear): Refresh, Collapse all, and
+// the size-column toggle. Same style as the other dropdowns, dropped 3px below
+// the gear.
 pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
     let open = ui.schema.schema_menu_open;
     let anchor = ui.schema.schema_menu_anchor;
     let refresh = ui.schema_actions.refresh_schema.clone();
     let collapse_all = ui.schema_actions.collapse_all.clone();
+    let toggle_sizes = ui.schema_actions.toggle_table_sizes.clone();
+    let sizes_on = ui.schema.table_sizes;
 
     dyn_container(
         move || open.get(),
@@ -610,7 +613,31 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
                 .style(menu_item_style)
                 .style(|s| s.padding_vert(8.0));
 
-            focus_root(v_stack((refresh_item, collapse_item)))
+            // A toggle, so it carries its own state: the check is the only thing
+            // that says whether the column is on, since a tree of views and
+            // engines with no statistics can legitimately show no sizes at all.
+            // The menu stays open — this one is a view mode you flip and look at.
+            let toggle_sizes = toggle_sizes.clone();
+            let sizes_item = container(
+                h_stack((
+                    // Faded rather than hidden: `hide()` takes it out of layout,
+                    // and the label would then shift sideways as you toggle.
+                    icons::icon(icons::CHECK, 13.0).style(move |s| {
+                        s.flex_shrink(0.0_f32).width(13.0).color(if sizes_on.get() {
+                            theme::text()
+                        } else {
+                            theme::text().multiply_alpha(0.0)
+                        })
+                    }),
+                    text("Show table sizes").style(|s| s.color(theme::text())),
+                ))
+                .style(|s| s.items_center().gap(7.0)),
+            )
+            .on_click_stop(move |_| (toggle_sizes)())
+            .style(menu_item_style)
+            .style(|s| s.padding_vert(8.0));
+
+            focus_root(v_stack((refresh_item, collapse_item, sizes_item)))
                 .on_key_down(
                     Key::Named(NamedKey::Escape),
                     |_| true,
