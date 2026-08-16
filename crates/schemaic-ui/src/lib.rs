@@ -1792,7 +1792,21 @@ pub struct LayoutUi {
 /// Two distinct placements share the one `popup_menu` channel, so the opener must
 /// say which it wants — a bare tuple let the status-bar and toolbar cases blur into
 /// one and mis-placed the grid's Copy dropdown at the footer.
-#[derive(Clone, Copy)]
+///
+/// **`PartialEq` is load-bearing, not a convenience.** `popup_menu` is one slot
+/// with no tag saying who filled it, so a trigger that wants to *close* the menu
+/// it opened — rather than dismiss and rebuild the identical panel — has to
+/// recognise it, and the anchor is the only part of the open state that names a
+/// place rather than a payload. The grid's toolbar dropdowns compare against
+/// their own (see `grid::grid_toolbar`), which works precisely because every
+/// opener overwrites this signal with its own placement as it opens: there is no
+/// separate marker to go stale, and nothing for the other openers to reset.
+///
+/// The comparison is exact, floats included, and that is the intent — both sides
+/// are computed from one origin signal, so they agree until a relayout moves the
+/// icon, at which point the anchor is stale anyway and failing the test merely
+/// reopens.
+#[derive(Clone, Copy, PartialEq)]
 pub enum PopupAnchor {
     /// Toolbar dropdown (grid Copy): the panel drops a few px below the icon and
     /// grows downward, left-aligned under it (overlapping it); if that would spill
