@@ -2187,22 +2187,15 @@ impl Db {
         }
         match self.engine {
             Engine::Postgres => return pg::run_ddl(self, database, stmts, cancel).await,
-            // **Schema editing is not wired for SQLite**, and this is the backstop
-            // rather than the gate — the designer and the object editors aren't
-            // offered on such a connection at all. It refuses instead of falling
-            // into the MySQL path, which would emit `ALTER TABLE … MODIFY COLUMN`
-            // at a server that has no such statement; the honest reason is that
-            // SQLite's `ALTER TABLE` does only RENAME/ADD/DROP COLUMN, and
-            // anything else needs the twelve-step create-copy-drop-rename rebuild,
-            // which is a destructive path that deserves its own design rather than
-            // an arm in an emitter written for two other engines.
-            Engine::Sqlite => {
-                return Err(DdlError {
-                    message: "schema editing isn't supported on SQLite yet".to_string(),
-                    at: 0,
-                    applied: 0,
-                });
-            }
+            // **SQLite runs the plan; it does not get to run every plan.** What
+            // it can express is decided upstream by `ddl::supports_change` — the
+            // menus hide the rest and the emitter writes nothing for it — because
+            // that predicate can see the `Change`, and this function has only
+            // strings. Refusing wholesale here instead would take away the drops
+            // SQLite genuinely has (`DROP TABLE`, `DROP VIEW`, `DROP INDEX`, and
+            // the one `ALTER TABLE … DROP COLUMN` form) for the sake of the ones
+            // it doesn't, which still need the twelve-step rebuild.
+            Engine::Sqlite => return sqlite::run_ddl(self, stmts, cancel).await,
             Engine::MySql => {}
         }
         let mut conn = self

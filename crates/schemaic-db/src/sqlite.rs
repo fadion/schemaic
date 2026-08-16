@@ -766,6 +766,75 @@ pub(crate) async fn import_rows(
     })
 }
 
+/// Run a DDL plan, all or nothing.
+///
+/// **SQLite's DDL is transactional**, which MySQL's is not, so this backend can
+/// do what the MySQL path cannot: wrap the whole plan in one transaction and
+/// roll it back whole. That is why every [`crate::DdlError`] from here carries
+/// `applied: 0` — a half-applied plan is a state this engine never leaves behind,
+/// so there is no partial progress for the report to have to admit to.
+///
+/// What may reach here is decided in `core::ddl::supports_change`, not here: the
+/// menus hide what SQLite can't express and the emitter writes nothing for it, so
+/// a plan that arrives is one made of statements this engine has. Anything that
+/// slipped through still fails at the engine rather than half-applying.
+pub(crate) async fn run_ddl(
+    db: &Db,
+    stmts: &[String],
+    cancel: CancellationToken,
+) -> Result<(), crate::DdlError> {
+    let fail = |at: usize, message: String| crate::DdlError {
+        message,
+        at,
+        applied: 0,
+    };
+    if stmts.is_empty() {
+        return Ok(());
+    }
+    let conn = tokio::task::block_in_place(|| open(db)).map_err(|e| fail(0, format!("{e}")))?;
+
+    tokio::task::block_in_place(|| {
+        if cancel.is_cancelled() {
+            return Err(fail(0, "the plan was cancelled".into()));
+        }
+        // Outside the transaction: SQLite ignores this pragma inside one.
+        let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
+        conn.execute_batch("BEGIN")
+            .map_err(|e| fail(0, format!("{e}")))?;
+
+        // Any early return past this point must undo the transaction, so the
+        // body runs to a result first and the rollback is applied to it once.
+        let result = (|| -> Result<(), crate::DdlError> {
+            for (i, sql) in stmts.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    return Err(fail(i, "the plan was cancelled".into()));
+                }
+                conn.execute_batch(sql)
+                    .map_err(|e| fail(i, format!("{e}")))?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => conn
+                .execute_batch("COMMIT")
+                .map_err(|e| fail(stmts.len() - 1, format!("{e}"))),
+            Err(e) => {
+                // Reported only if the rollback itself fails — the original
+                // error is the one worth surfacing.
+                match conn.execute_batch("ROLLBACK") {
+                    Ok(()) => Err(e),
+                    Err(u) => Err(crate::DdlError {
+                        message: format!("{} — and the rollback failed too: {u}", e.message),
+                        at: e.at,
+                        applied: 0,
+                    }),
+                }
+            }
+        }
+    })
+}
+
 /// The databases this connection offers: the one file, under the name SQLite
 /// gives it.
 ///
@@ -1948,7 +2017,7 @@ mod tests {
     /// only while at least one connection to it is open, so tests must hold it for
     /// their duration. `name` must be unique per test, since the suite runs
     /// threaded and the name is the whole identity.
-    fn shared_memory(name: &str) -> (SqliteConn, Db) {
+    pub(super) fn shared_memory(name: &str) -> (SqliteConn, Db) {
         let uri = format!("file:{name}?mode=memory&cache=shared");
         let keeper = SqliteConn::open_with_flags(
             &uri,
@@ -2546,5 +2615,114 @@ mod tests {
         );
         // A plain column has no expression.
         assert_eq!(generated_expr_of(sql, "a"), None);
+    }
+}
+
+/// `run_ddl` on SQLite — see [`crate::Db::run_ddl`] for why this exists at all.
+#[cfg(test)]
+mod ddl_tests {
+    use super::tests::shared_memory;
+    use super::*;
+    use tokio_util::sync::CancellationToken;
+
+    fn objects(keeper: &SqliteConn, name: &str) -> i64 {
+        keeper
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plan_drops_a_table() {
+        let (keeper, db) = shared_memory("ddl_drop_table");
+        keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        db.run_ddl(
+            MAIN,
+            &["DROP TABLE \"t\";".to_string()],
+            CancellationToken::new(),
+        )
+        .await
+        .expect("SQLite can drop a table");
+        assert_eq!(objects(&keeper, "t"), 0);
+    }
+
+    /// The order the emitter puts them in is the order that works: the index has
+    /// to go before the column it names.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plan_runs_its_statements_in_order() {
+        let (keeper, db) = shared_memory("ddl_order");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT);\
+                 CREATE INDEX ix_email ON t (email);",
+            )
+            .unwrap();
+        db.run_ddl(
+            MAIN,
+            &[
+                "DROP INDEX \"ix_email\";".to_string(),
+                "ALTER TABLE \"t\" DROP COLUMN \"email\";".to_string(),
+            ],
+            CancellationToken::new(),
+        )
+        .await
+        .expect("index then column");
+        assert_eq!(objects(&keeper, "ix_email"), 0);
+        let cols: i64 = keeper
+            .query_row("SELECT count(*) FROM pragma_table_info('t')", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(cols, 1, "only id is left");
+    }
+
+    /// **All or nothing.** SQLite's DDL is transactional, unlike MySQL's, so a
+    /// half-applied plan is a state this backend never has to report.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_plan_leaves_nothing_behind() {
+        let (keeper, db) = shared_memory("ddl_rollback");
+        keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT);")
+            .unwrap();
+        let err = db
+            .run_ddl(
+                MAIN,
+                &[
+                    "ALTER TABLE \"t\" DROP COLUMN \"a\";".to_string(),
+                    "ALTER TABLE \"t\" DROP COLUMN \"nope\";".to_string(),
+                ],
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("the second statement names no column");
+        assert_eq!(err.at, 1, "the failure is the second statement");
+        assert_eq!(err.applied, 0, "and the first one went back");
+        let cols: i64 = keeper
+            .query_row("SELECT count(*) FROM pragma_table_info('t')", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(cols, 3, "the dropped column is still there");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_plan_applies_nothing() {
+        let (keeper, db) = shared_memory("ddl_cancel");
+        keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = db
+            .run_ddl(MAIN, &["DROP TABLE \"t\";".to_string()], cancel)
+            .await
+            .expect_err("cancelled before it ran");
+        assert!(format!("{err}").to_lowercase().contains("cancel"), "{err}");
+        assert_eq!(objects(&keeper, "t"), 1, "the table is untouched");
     }
 }

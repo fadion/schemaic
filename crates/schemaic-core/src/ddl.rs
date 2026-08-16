@@ -2263,11 +2263,32 @@ impl ChangeSet {
             .collect()
     }
 
+    /// The changes in this set the dialect **can't express**, in plain language.
+    ///
+    /// Non-empty means [`ChangeSet::emit`] is writing less than the plan asks
+    /// for, and the preview says so instead of applying the remainder. That is
+    /// the same call [`Change::KeepLossyIndex`] makes: the user asked for
+    /// something and it isn't in the script, and a preview that didn't mention
+    /// it would be the dishonest half of a destructive operation.
+    ///
+    /// Only SQLite ever produces one today — see [`supports_change`].
+    pub fn unsupported(&self) -> Vec<String> {
+        self.changes
+            .iter()
+            .filter(|c| !supports_change(self.dialect, c))
+            .map(Change::summary)
+            .collect()
+    }
+
     /// The statements, in the order they must run. Ready to hand to the preview
     /// modal, the clipboard, or a query tab — they're the same text either way.
     pub fn emit(&self) -> Vec<String> {
         match self.dialect {
             SqlDialect::Postgres => self.emit_postgres(),
+            // Not a fall-through any more: SQLite's `ALTER TABLE` takes one
+            // operation and has no `DROP INDEX` form, so MySQL's shapes are not
+            // merely unidiomatic there — they are statements the engine refuses.
+            SqlDialect::Sqlite => self.emit_sqlite(),
             _ => self.emit_mysql(),
         }
     }
@@ -2652,6 +2673,57 @@ impl ChangeSet {
             if let Change::RenameTable { to } = c {
                 // `RENAME TO` takes a bare name — the table can't change schema.
                 out.push(format!("ALTER TABLE {} RENAME TO {};", self.qname(), q(to)));
+            }
+        }
+        out
+    }
+
+    // ── SQLite ───────────────────────────────────────────────────────────────
+
+    /// SQLite emits **one statement per change**, and only for the changes
+    /// [`supports_change`] allows.
+    ///
+    /// Two things separate it from the MySQL emitter it used to fall through to.
+    /// Its `ALTER TABLE` takes exactly one operation — there is no clause list —
+    /// so two dropped columns are two statements. And an index is dropped by its
+    /// own `DROP INDEX`, as on PostgreSQL, not by an `ALTER TABLE … DROP INDEX`
+    /// that SQLite has no form of.
+    ///
+    /// Filtering on [`supports_change`] rather than trusting the caller is
+    /// deliberate: a change this engine can't express emits **nothing**, so a
+    /// gate that drifts open shows an empty preview instead of handing SQLite a
+    /// statement written for MySQL.
+    fn emit_sqlite(&self) -> Vec<String> {
+        let supported = || {
+            self.changes
+                .iter()
+                .filter(|c| supports_change(self.dialect, c))
+        };
+        let mut out: Vec<String> = Vec::new();
+        for c in supported() {
+            match c {
+                Change::DropView { .. } => out.push(format!("DROP VIEW {};", self.qname())),
+                Change::DropTable => out.push(format!("DROP TABLE {};", self.qname())),
+                _ => {}
+            }
+        }
+        // Indexes before columns: SQLite refuses to drop a column an index still
+        // names, so the two in one plan only work in this order.
+        for c in supported() {
+            if let Change::DropIndex { name, .. } = c {
+                out.push(format!(
+                    "DROP INDEX {};",
+                    qualified(name, self.schema.as_deref(), self.dialect)
+                ));
+            }
+        }
+        for c in supported() {
+            if let Change::DropColumn { name, .. } = c {
+                out.push(format!(
+                    "ALTER TABLE {} DROP COLUMN {};",
+                    self.qname(),
+                    self.q(name)
+                ));
             }
         }
         out
@@ -4196,10 +4268,51 @@ pub fn checks_equal(a: &CheckInfo, b: &CheckInfo, dialect: SqlDialect) -> bool {
 ///
 /// So the UI offers no schema editing on a SQLite connection — the entries are
 /// absent rather than dimmed, which is what says "not supported" instead of "not
-/// here" — and `Db::run_ddl` refuses such a plan as the backstop. This function
-/// is the one fact both of them read.
+/// here". Every entry that opens the designer reads this function.
+///
+/// It is **not** the whole capability question, and asking it about a single
+/// change would be wrong: `Db::run_ddl` runs a SQLite plan now, because a
+/// handful of drops need none of the machinery this gate withholds. See
+/// [`supports_change`], which is what the per-row menus and the emitter ask.
 pub fn supports_schema_editing(dialect: SqlDialect) -> bool {
     !matches!(dialect, SqlDialect::Sqlite)
+}
+
+/// Can `dialect` express this one change as SQL [`ChangeSet::emit`] writes?
+///
+/// [`supports_schema_editing`] answers about the *designer* — a plan that
+/// reshapes a table, which SQLite can't have. This answers about a single
+/// change, because a handful of drops need none of the machinery that gate
+/// withholds: `DROP TABLE` and `DROP VIEW` are the same statement on every
+/// engine, `DROP INDEX` is a standalone statement SQLite has, and dropping a
+/// column is one of the four things its `ALTER TABLE` does. Those are worth
+/// keeping rather than hiding, because hiding them would take away something
+/// the engine genuinely supports.
+///
+/// Everything else is `false` on SQLite, and each `false` is the twelve-step
+/// rebuild in disguise: a foreign key or a constraint-backed index can only
+/// come off by recreating the table around it.
+///
+/// **This is the gate now that `run_ddl` executes a SQLite plan instead of
+/// refusing every one.** The menus consult it so an entry that can't work is
+/// absent, and the emitter honours it so a change that slipped through emits
+/// nothing rather than MySQL's spelling of it.
+pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
+    if dialect != SqlDialect::Sqlite {
+        return true;
+    }
+    matches!(
+        change,
+        Change::DropTable
+            | Change::DropView {
+                materialized: false
+            }
+            | Change::DropColumn { .. }
+            | Change::DropIndex {
+                constraint: None,
+                ..
+            }
+    )
 }
 
 pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) -> ChangeSet {
@@ -10001,5 +10114,195 @@ mod object_tests {
         d.info.values.remove(0);
         let risk = diff_enum(&cur, &d, &[], Postgres).destructive().join(" ");
         assert!(risk.contains("Nothing uses it today"), "{risk}");
+    }
+}
+
+#[cfg(test)]
+mod sqlite_drop_tests {
+    use super::*;
+    use crate::intel::SqlDialect::{MySql, Postgres, Sqlite};
+
+    fn drop_index(name: &str, constraint: Option<&str>) -> Change {
+        Change::DropIndex {
+            name: name.into(),
+            constraint: constraint.map(str::to_string),
+        }
+    }
+
+    fn drop_column(name: &str) -> Change {
+        Change::DropColumn {
+            name: name.into(),
+            type_name: "TEXT".into(),
+        }
+    }
+
+    /// The four SQLite has a statement for. Each is a whole-object drop or the
+    /// one `ALTER TABLE` form it does have — none needs the rebuild.
+    #[test]
+    fn sqlite_expresses_the_drops_it_has_statements_for() {
+        for c in [
+            Change::DropTable,
+            Change::DropView {
+                materialized: false,
+            },
+            drop_column("email"),
+            drop_index("ix_email", None),
+        ] {
+            assert!(supports_change(Sqlite, &c), "{c:?}");
+        }
+    }
+
+    /// No `ALTER TABLE … DROP CONSTRAINT` exists in SQLite, so this one really
+    /// does need the twelve-step rebuild — the menu hides it.
+    #[test]
+    fn sqlite_cannot_express_a_dropped_foreign_key() {
+        assert!(!supports_change(
+            Sqlite,
+            &Change::DropForeignKey { name: "fk".into() }
+        ));
+    }
+
+    /// A UNIQUE constraint's backing index is part of the table definition in
+    /// SQLite; `DROP INDEX` refuses it, so it is the rebuild again.
+    #[test]
+    fn sqlite_cannot_express_a_constraint_backed_index() {
+        assert!(!supports_change(Sqlite, &drop_index("uq", Some("uq"))));
+    }
+
+    /// Anything that reaches the designer stays out on SQLite, whatever else
+    /// this predicate lets through.
+    #[test]
+    fn sqlite_expresses_no_designer_change() {
+        for c in [
+            Change::RenameTable { to: "t2".into() },
+            Change::TruncateTable,
+            Change::PrimaryKey {
+                from: vec!["id".into()],
+                to: vec![],
+                drop_constraint: None,
+            },
+        ] {
+            assert!(!supports_change(Sqlite, &c), "{c:?}");
+        }
+    }
+
+    /// The predicate is about SQLite. The two engines with a full emitter
+    /// express everything it is ever asked about.
+    #[test]
+    fn the_full_engines_express_every_drop() {
+        for d in [MySql, Postgres] {
+            for c in [
+                Change::DropTable,
+                Change::DropForeignKey { name: "fk".into() },
+                drop_index("uq", Some("uq")),
+                Change::RenameTable { to: "t2".into() },
+            ] {
+                assert!(supports_change(d, &c), "{d:?} {c:?}");
+            }
+        }
+    }
+
+    /// SQLite has no `ALTER TABLE … DROP INDEX` — the index is dropped by its
+    /// own statement, as it is on PostgreSQL.
+    #[test]
+    fn sqlite_drops_an_index_by_its_own_statement() {
+        let cs = single("t", None, Sqlite, drop_index("ix_email", None));
+        assert_eq!(cs.emit(), vec!["DROP INDEX \"ix_email\";"]);
+    }
+
+    /// **One operation per `ALTER TABLE`** — SQLite refuses a clause list, so
+    /// two dropped columns are two statements, not MySQL's single coalesced
+    /// `ALTER`.
+    #[test]
+    fn sqlite_drops_each_column_in_its_own_alter() {
+        let cs = ChangeSet {
+            table: "users".into(),
+            schema: None,
+            dialect: Sqlite,
+            flavour: ServerFlavour::Unknown,
+            changes: vec![drop_column("email"), drop_column("phone")],
+        };
+        assert_eq!(
+            cs.emit(),
+            vec![
+                "ALTER TABLE \"users\" DROP COLUMN \"email\";",
+                "ALTER TABLE \"users\" DROP COLUMN \"phone\";",
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlite_drops_a_table_and_a_view_like_anyone_else() {
+        assert_eq!(
+            single("t", None, Sqlite, Change::DropTable).emit(),
+            vec!["DROP TABLE \"t\";"]
+        );
+        assert_eq!(
+            single(
+                "v",
+                None,
+                Sqlite,
+                Change::DropView {
+                    materialized: false
+                }
+            )
+            .emit(),
+            vec!["DROP VIEW \"v\";"]
+        );
+    }
+
+    /// The emitter is the backstop, not a second gate: a change SQLite can't
+    /// express must not come out as MySQL's spelling of it, which is what the
+    /// missing arm used to do.
+    #[test]
+    fn sqlite_emits_nothing_for_a_change_it_cannot_express() {
+        let cs = single(
+            "t",
+            None,
+            Sqlite,
+            Change::DropForeignKey { name: "fk".into() },
+        );
+        assert!(cs.emit().is_empty(), "{:?}", cs.emit());
+    }
+
+    /// Emitting less than the plan asks for is only honest if the plan says so
+    /// — dropping a column a foreign key stands on is the case that reaches
+    /// here, because the draft differ takes the constraint off first.
+    #[test]
+    fn a_withheld_change_is_reported_rather_than_dropped() {
+        let cs = ChangeSet {
+            table: "orders".into(),
+            schema: None,
+            dialect: Sqlite,
+            flavour: ServerFlavour::Unknown,
+            changes: vec![
+                Change::DropForeignKey {
+                    name: "fk_customer".into(),
+                },
+                drop_column("customer_id"),
+            ],
+        };
+        assert_eq!(cs.emit().len(), 1, "only the column drop is expressible");
+        let withheld = cs.unsupported();
+        assert_eq!(withheld.len(), 1);
+        assert!(withheld[0].contains("fk_customer"), "{withheld:?}");
+    }
+
+    /// Nothing is withheld when everything is expressible, on any engine.
+    #[test]
+    fn a_plan_the_engine_can_express_withholds_nothing() {
+        assert!(
+            single("t", None, Sqlite, Change::DropTable)
+                .unsupported()
+                .is_empty()
+        );
+        for d in [MySql, Postgres] {
+            assert!(
+                single("t", None, d, Change::DropForeignKey { name: "fk".into() })
+                    .unsupported()
+                    .is_empty(),
+                "{d:?}"
+            );
+        }
     }
 }
