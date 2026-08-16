@@ -231,13 +231,18 @@ pub(crate) const TITLE_CLOSE_TAB: u32 = ACTION_TAB + 100;
 // unbounded upward and the footer must stay last. It has already been caught
 // once: `ROW_TAB_STRIDE` made every row cost ten indices instead of one, which
 // silently cut the headroom below `ACTION_TAB` tenfold on the day it landed.
-/// The highest tabindex a **fixed** form control may claim — a sequence
-/// editor's last field. Above it and below [`VALUE_TAB`] is a no-man's-land,
-/// and `FocusRing::register` refuses it: a growing block that starts there is
-/// unbounded upward into the fixed range, which is how a stride of ten and a
-/// base of a hundred collided with nothing today and would have collided with
-/// the next control added.
-pub(crate) const FIXED_TAB_END: u32 = 110;
+/// The ceiling on a **fixed** form control's tabindex — the headroom the forms
+/// have below [`VALUE_TAB`], where the growing blocks start.
+///
+/// The compile-time chain asserted `110 < VALUE_TAB` and called 110 "the highest
+/// fixed control (a sequence's)". That was already false when it was written:
+/// the **Settings** modal spaces its sections by hundreds and reaches 310, and
+/// several forms pass 200. The number was harmless as a lower bound in a
+/// constants-only assertion and stopped being harmless the moment something
+/// checked a *registered* index against it — clicking Settings then panicked.
+/// So it is stated as what it is, with room, and pinned by
+/// `tests::every_band_the_app_uses_registers_cleanly` against the real indices.
+pub(crate) const FIXED_TAB_END: u32 = 400;
 
 const _: () = {
     assert!(NAV_TAB < crate::table_designer::LIST_TAB);
@@ -553,26 +558,32 @@ impl FocusRing {
     /// Add a control at `tabindex`, keeping the ring ordered. Re-registering the
     /// same view moves it rather than duplicating it.
     ///
-    /// **This is where the tabindex band is actually enforced.** The
-    /// compile-time chain below the constants relates five *constants* and
-    /// cannot see a single registered index — which is how the import modal's
-    /// mapping rows came to claim `100 + i * 10`, an unbounded block whose base
-    /// sat below the floor that chain asserts, while the build stayed green. A
-    /// `debug_assert` here is the only check that sees the number a control
-    /// really claimed.
+    /// The one thing a single registration can be held to is the **ceiling**:
+    /// nothing may sit past the title bar's ✕, which is last by construction.
     ///
-    /// Debug-only on purpose: it is a development tripwire for a band violation,
-    /// not a runtime condition a user can hit — the tabindex is always a literal
-    /// or a constant plus a row index.
+    /// It deliberately does *not* police the band between the fixed controls and
+    /// [`VALUE_TAB`], and the attempt to is worth recording. R2-L6-06 asks for a
+    /// check that sees a real registered index, because the compile-time chain
+    /// below the constants relates only constants — which is how the import
+    /// modal's mapping rows came to claim `100 + i * 10`, a growing block based
+    /// in the fixed range, with the build green. But **the hazard is the block,
+    /// not the number**, and `register` is handed one index at a time: a
+    /// legitimate fixed control at 200 (Settings' row-limit dropdown) and the
+    /// first row of a misplaced block at 200 are indistinguishable here. A band
+    /// assert therefore either passes the bug or, as this one did, panics the app
+    /// on correct code — it shipped asserting fixed controls end at 110, a number
+    /// taken from a stale comment while the app really registers up to
+    /// [`FIXED_TAB_END`], and clicking Settings crashed.
+    ///
+    /// What covers the real rule instead: the growing blocks all read
+    /// `VALUE_TAB + i * ROW_TAB_STRIDE` (grep is honest here — there are four),
+    /// the compile-time chain keeps that band clear of the footer, and
+    /// `tests::every_band_the_app_uses_registers_cleanly` walks the indices the
+    /// app actually uses.
     pub(crate) fn register(&self, tabindex: u32, id: floem::ViewId) {
         debug_assert!(
             tabindex <= TITLE_CLOSE_TAB,
             "tabindex {tabindex} is past the title bar's ✕, which must stay last"
-        );
-        debug_assert!(
-            !(FIXED_TAB_END + 1..VALUE_TAB).contains(&tabindex),
-            "tabindex {tabindex} is between the fixed controls (≤{FIXED_TAB_END}) and \
-             VALUE_TAB ({VALUE_TAB}); a growing block starts at VALUE_TAB + i * ROW_TAB_STRIDE"
         );
         let mut e = self.entries.borrow_mut();
         e.retain(|(_, x)| *x != id);
@@ -3118,32 +3129,42 @@ mod ring_tests {
         assert_eq!(ring.at(ACTION_TAB + 10), None);
     }
 
-    /// The band the compile-time chain asserts over *constants*, enforced where
-    /// a control actually claims a number — the only check that could have
-    /// caught the import modal's `100 + i * 10`, which sat below the floor that
-    /// chain states while the build stayed green.
-    #[test]
-    #[should_panic(expected = "VALUE_TAB")]
-    fn a_tabindex_between_the_fixed_controls_and_value_tab_is_refused() {
-        FocusRing::new().register(FIXED_TAB_END + 1, floem::ViewId::new());
-    }
-
     #[test]
     #[should_panic(expected = "must stay last")]
     fn a_tabindex_past_the_title_close_is_refused() {
         FocusRing::new().register(TITLE_CLOSE_TAB + 1, floem::ViewId::new());
     }
 
-    /// And the legal ones, so the guard can't be tightened into refusing what
-    /// the app really registers.
+    /// **Every index the app really registers must go in without complaint**,
+    /// and this list is the app's, not an idealised one.
+    ///
+    /// It is here because the opposite mistake shipped: a `debug_assert` that
+    /// fixed controls end at 110 — a number lifted from a stale comment, while
+    /// the Settings modal spaces its sections by hundreds and reaches 310 —
+    /// panicked the app on the *correct* code the moment anyone opened Settings.
+    /// A guard on registration has to be checked against reality before it is
+    /// checked against intent.
     #[test]
     fn every_band_the_app_uses_registers_cleanly() {
         let ring = FocusRing::new();
         for t in [
             NAV_TAB,
             crate::table_designer::LIST_TAB,
+            // Form fields: spaced by 10 within a section, by 100 between them.
+            // 200/210/220 and 300/310 are the Settings modal; 21 and 31 are a
+            // suggestion chevron sitting one past its field.
+            5,
             10,
+            21,
+            31,
+            60,
+            100,
+            140,
+            200,
+            220,
+            310,
             FIXED_TAB_END,
+            // Growing blocks, and the footer they must stay clear of.
             VALUE_TAB,
             VALUE_TAB + 90_000 * ROW_TAB_STRIDE,
             ACTION_TAB,

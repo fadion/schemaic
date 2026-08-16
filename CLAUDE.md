@@ -1381,14 +1381,24 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
   by exact id too, so a face decorated with `.tooltip()` — a fresh `ViewId` — put an id in the ring
   that carried no outline. A caller therefore styles only the *face* (padding, hover, the click
   listener) and never applies `button_focus_ring` itself.
-  Order is `NAV_TAB` → `LIST_TAB` → the form (10, 20, …) → `VALUE_TAB` + `i * ROW_TAB_STRIDE` for a
-  growing list → `ACTION_TAB` for the footer → `TITLE_CLOSE_TAB` for the title bar's ✕ (last, since
+  Order is `NAV_TAB` → `LIST_TAB` → the form (10, 20, … within a section, by 100 between them, up
+  to `FIXED_TAB_END`) → `VALUE_TAB` + `i * ROW_TAB_STRIDE` for a growing list → `ACTION_TAB` for
+  the footer → `TITLE_CLOSE_TAB` for the title bar's ✕ (last, since
   it is the same action the footer's Cancel already offers), and that chain is asserted at
   **compile time** in `widgets.rs` (`const _: () = { … }`). It has already caught one regression:
-  adding `ROW_TAB_STRIDE` cut the footer's headroom tenfold the day it landed. The compile-time
-  chain relates *constants* only, though, and cannot see a number a control actually claims — the
-  import modal's mapping rows claimed `100 + i * 10`, based **below** the floor that chain asserts,
-  with the build green. `FocusRing::register` therefore `debug_assert`s the band as well.
+  adding `ROW_TAB_STRIDE` cut the footer's headroom tenfold the day it landed.
+  The compile-time chain relates *constants* only and cannot see a number a control actually
+  claims — the import modal's mapping rows claimed `100 + i * 10`, a growing block based in the
+  fixed range, with the build green. **A per-registration check cannot close that gap, and trying
+  it caused a crash**: `FocusRing::register` is handed one index at a time, so a legitimate fixed
+  control at 200 (Settings' row-limit dropdown) and the first row of a misplaced block at 200 are
+  indistinguishable there — a band `debug_assert` asserting fixed controls end at 110, a number
+  taken from a stale comment while Settings really reaches 310, panicked the app on correct code.
+  `register` therefore asserts only the **ceiling** (nothing past the ✕). What covers the real
+  rule is that every growing block reads `VALUE_TAB + i * ROW_TAB_STRIDE` — four sites, greppable
+  — and `ring_tests::every_band_the_app_uses_registers_cleanly`, whose list is the app's real
+  indices rather than an idealised one. Check a guard against reality before checking it against
+  intent.
 - **A modal's click-to-dismiss goes on `widgets::dismiss_layer`, never on the `focus_root`.** Floem
   fires `Click` on the focused view for Enter and Space, and a modal opens with focus on its own
   root — so `.on_click_stop(close)` there meant **Space closed the modal**. On the Live Monitor
