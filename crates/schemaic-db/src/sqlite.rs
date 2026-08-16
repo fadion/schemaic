@@ -1056,6 +1056,22 @@ pub(crate) async fn fetch_table_list(db: &Db) -> Result<DbSchema, DbError> {
     .await
 }
 
+/// The SQLite half of [`Db::count_rows`].
+///
+/// The whole of SQLite's contribution to the properties surface. It publishes no
+/// per-table statistics to fetch — see
+/// [`schemaic_core::stats::supports_table_stats`] — so the exact count is not a
+/// fallback here, it is the only figure there is.
+pub(crate) async fn count_rows(db: &Db, sql: &str) -> Result<u64, DbError> {
+    let sql = sql.to_string();
+    with_conn(db, move |conn| {
+        conn.query_row(&sql, [], |r| r.get::<_, i64>(0))
+            .map(|n| n.max(0) as u64)
+            .map_err(query_err)
+    })
+    .await
+}
+
 /// Names and kinds from `sqlite_master`, tables before views, each alphabetically.
 ///
 /// `sqlite_` -prefixed names are SQLite's own bookkeeping (`sqlite_sequence`,
@@ -2483,6 +2499,56 @@ mod tests {
                 .map(|(c, v)| (c.to_string(), v.clone()))
                 .collect(),
         }
+    }
+
+    /// The exact count is the properties surface's whole answer on SQLite, so it
+    /// is the one part of that feature with a live database behind its test.
+    #[tokio::test]
+    async fn counting_rows_returns_the_real_number() {
+        let (keeper, db) = shared_memory("count_rows");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY);
+                 INSERT INTO t VALUES (1), (2), (3);
+                 CREATE TABLE empty_one (id INTEGER PRIMARY KEY);",
+            )
+            .unwrap();
+
+        assert_eq!(db.count_rows(MAIN, None, "t").await.unwrap(), 3);
+        assert_eq!(db.count_rows(MAIN, None, "empty_one").await.unwrap(), 0);
+    }
+
+    /// The name goes through the one quoter, so a table named after a keyword —
+    /// or holding a quote character — counts rather than producing a syntax
+    /// error.
+    #[tokio::test]
+    async fn counting_rows_quotes_an_awkward_table_name() {
+        let (keeper, db) = shared_memory("count_rows_quoting");
+        keeper
+            .execute_batch(
+                "CREATE TABLE \"order\" (id INTEGER PRIMARY KEY);
+                 INSERT INTO \"order\" VALUES (1), (2);
+                 CREATE TABLE \"we\"\"ird\" (id INTEGER PRIMARY KEY);
+                 INSERT INTO \"we\"\"ird\" VALUES (7);",
+            )
+            .unwrap();
+
+        assert_eq!(db.count_rows(MAIN, None, "order").await.unwrap(), 2);
+        assert_eq!(db.count_rows(MAIN, None, "we\"ird").await.unwrap(), 1);
+    }
+
+    /// SQLite publishes no per-table statistics, and the fetch says so by
+    /// returning nothing — not by failing, and not by inventing zeroes.
+    #[tokio::test]
+    async fn sqlite_reports_no_table_statistics() {
+        let (keeper, db) = shared_memory("no_stats");
+        keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1);")
+            .unwrap();
+
+        let stats = db.fetch_table_stats(MAIN).await.expect("no error");
+        assert!(stats.is_empty());
+        assert!(stats.get(None, "t").is_none());
     }
 
     #[tokio::test]
