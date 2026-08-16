@@ -1716,6 +1716,40 @@ impl MenuEntry {
     }
 }
 
+/// What pressing Enter on a row does — the keyboard half of [`MenuEntry`], taken
+/// off the entries before they are consumed into views.
+#[derive(Clone)]
+pub(crate) enum MenuAct {
+    /// Run it and close the whole menu, exactly as a click does.
+    Run(Rc<dyn Fn()>),
+    /// Open this row's submenu instead. Enter and Right both do it.
+    Open,
+}
+
+/// The rows a keyboard cursor may land on, in order, paired with what Enter does
+/// there.
+///
+/// **Separators and disabled rows are not stops**, which is the whole reason this
+/// is a function rather than a range over the entries: a cursor that could rest on
+/// a separator would make Down look like it did nothing, and one that could rest
+/// on a disabled row would offer an Enter that silently does nothing — the two
+/// failures a menu's arrow keys are most often shipped with.
+///
+/// The index is into `entries`, so a row view can ask "am I the cursor?" by
+/// comparing its own position, while the cursor itself steps through *this* list
+/// and therefore cannot land anywhere it shouldn't.
+pub(crate) fn menu_stops(entries: &[MenuEntry]) -> Vec<(usize, MenuAct)> {
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match e {
+            MenuEntry::Action { disabled: true, .. } | MenuEntry::Separator => None,
+            MenuEntry::Action { action, .. } => Some((i, MenuAct::Run(action.clone()))),
+            MenuEntry::Sub { .. } => Some((i, MenuAct::Open)),
+        })
+        .collect()
+}
+
 /// One menu row's content: `[icon] label [→]` (the chevron only for submenus).
 /// `label_color` tints the label (a `fn` so it follows theme switches); `None`
 /// uses the default text colour.
@@ -1725,6 +1759,7 @@ fn menu_row(
     label_color: Option<fn() -> floem::peniko::Color>,
     chevron: bool,
     disabled: bool,
+    cursor: impl Fn() -> bool + 'static,
 ) -> impl IntoView {
     let mut kids: Vec<AnyView> = Vec::new();
     if let Some((svg, color)) = icon {
@@ -1776,18 +1811,33 @@ fn menu_row(
                 s
             }
         })
+        .style(move |s| {
+            // The keyboard cursor wears the **hover** highlight rather than one of
+            // its own: the pointer and the arrows move the same cursor (a row's
+            // `PointerEnter` sets it), so two different marks would be two answers
+            // to one question. `menu_item_style`'s hover already states the
+            // colour; this is the same fill, applied because the keyboard is here.
+            if cursor() {
+                s.background(theme::accent().multiply_alpha(0.15))
+            } else {
+                s
+            }
+        })
 }
 
 /// Render one entry. `open_sub` is this level's "which sibling submenu is open"
 /// signal — entering a leaf clears it, entering a submenu row sets it, so moving
 /// between rows switches/closes submenus while moving *onto* an open submenu (it's
 /// flush with the panel's right edge) keeps it open.
-fn menu_entry_view(
-    i: usize,
-    entry: MenuEntry,
-    open_sub: RwSignal<Option<usize>>,
-    close: Rc<dyn Fn()>,
-) -> AnyView {
+fn menu_entry_view(i: usize, entry: MenuEntry, level: MenuLevel, close: Rc<dyn Fn()>) -> AnyView {
+    let open_sub = level.open_sub;
+    let cursor = level.cursor;
+    // The pointer and the keyboard share one cursor, so entering a row with the
+    // mouse moves it — otherwise a menu opened by Tab and then grazed by the
+    // pointer would show two highlights, and Enter would run the one the user
+    // wasn't looking at.
+    let take_cursor = move || cursor.set(Some(i));
+    let is_cursor = move || cursor.get() == Some(i);
     match entry {
         MenuEntry::Separator => empty()
             .style(|s| {
@@ -1803,7 +1853,7 @@ fn menu_entry_view(
             label_color,
             disabled,
             action,
-        } => menu_row(icon, label, label_color, false, disabled)
+        } => menu_row(icon, label, label_color, false, disabled, is_cursor)
             .on_click_stop(move |_| {
                 if disabled {
                     return; // inert; the stop keeps the menu open
@@ -1813,6 +1863,11 @@ fn menu_entry_view(
             })
             .on_event(EventListener::PointerEnter, move |_| {
                 open_sub.set(None);
+                // A disabled row is not a stop, so the keyboard can't rest there
+                // and the pointer must not park the cursor there either.
+                if !disabled {
+                    take_cursor();
+                }
                 EventPropagation::Continue
             })
             .into_any(),
@@ -1823,7 +1878,9 @@ fn menu_entry_view(
         } => {
             let n = children.len();
             // Submenus keep the standard width (they only appear in the grid menus).
-            let sub = menu_stack(children, close, 170.0);
+            // The sub-level's own cursor is the one `menu_panel` drives while this
+            // submenu is the open one.
+            let sub = menu_stack(children, level.sub.into(), close, 170.0);
             // The parent row's window position/width, to decide edge-flips.
             let row_origin: RwSignal<Point> = RwSignal::new(Point::ZERO);
             let row_w = RwSignal::new(0.0_f64);
@@ -1855,27 +1912,35 @@ fn menu_entry_view(
                     s.inset_left_pct(100.0)
                 }
             });
-            stack((menu_row(icon, label, None, true, false), sub_wrap))
-                .on_move(move |p| row_origin.set(p))
-                .on_resize(move |r| row_w.set(r.width()))
-                .on_event(EventListener::PointerEnter, move |_| {
-                    open_sub.set(Some(i));
-                    EventPropagation::Continue
-                })
-                .on_click_stop(|_| {}) // clicking the parent just holds it open
-                .into_any()
+            stack((
+                menu_row(icon, label, None, true, false, is_cursor),
+                sub_wrap,
+            ))
+            .on_move(move |p| row_origin.set(p))
+            .on_resize(move |r| row_w.set(r.width()))
+            .on_event(EventListener::PointerEnter, move |_| {
+                open_sub.set(Some(i));
+                take_cursor();
+                EventPropagation::Continue
+            })
+            .on_click_stop(|_| {}) // clicking the parent just holds it open
+            .into_any()
         }
     }
 }
 
 /// One menu level: the styled panel of rows (used for the root and every submenu).
 /// `width` is the panel's `min_width` (short labels never exceed it).
-fn menu_stack(entries: Vec<MenuEntry>, close: Rc<dyn Fn()>, width: f64) -> impl IntoView {
-    let open_sub: RwSignal<Option<usize>> = RwSignal::new(None);
+fn menu_stack(
+    entries: Vec<MenuEntry>,
+    level: MenuLevel,
+    close: Rc<dyn Fn()>,
+    width: f64,
+) -> impl IntoView {
     let rows: Vec<AnyView> = entries
         .into_iter()
         .enumerate()
-        .map(|(i, e)| menu_entry_view(i, e, open_sub, close.clone()))
+        .map(|(i, e)| menu_entry_view(i, e, level, close.clone()))
         .collect();
     v_stack_from_iter(rows)
         .on_event_stop(EventListener::PointerDown, |_| {})
@@ -1943,19 +2008,213 @@ pub(crate) fn cursor_menu_pos(
     )
 }
 
+/// One menu level's keyboard state: where the cursor is, which sibling's submenu
+/// is open, and the cursor of *that* submenu.
+///
+/// One level of nesting, deliberately, and it is the level the widget itself
+/// supports — only the grid menus have submenus, and none of them nests twice.
+/// `sub` being the parent's field rather than the child's own is what lets
+/// [`menu_panel`]'s one key handler drive whichever level is open without walking
+/// a tree it would then have to keep in step with the views.
+#[derive(Clone, Copy)]
+struct MenuLevel {
+    cursor: RwSignal<Option<usize>>,
+    open_sub: RwSignal<Option<usize>>,
+    /// The cursor a child [`menu_stack`] uses. Unused at the child's own level.
+    sub: MenuSub,
+}
+
+/// The child level's signals — the same three fields, minus a third generation.
+#[derive(Clone, Copy)]
+struct MenuSub {
+    cursor: RwSignal<Option<usize>>,
+    open_sub: RwSignal<Option<usize>>,
+}
+
+impl MenuLevel {
+    fn new() -> MenuLevel {
+        MenuLevel {
+            cursor: RwSignal::new(None),
+            open_sub: RwSignal::new(None),
+            sub: MenuSub {
+                cursor: RwSignal::new(None),
+                open_sub: RwSignal::new(None),
+            },
+        }
+    }
+}
+
+impl From<MenuSub> for MenuLevel {
+    /// A child level, with a `sub` of its own that nothing opens — the widget
+    /// stops at one level of submenu and this is where that stops.
+    fn from(s: MenuSub) -> MenuLevel {
+        MenuLevel {
+            cursor: s.cursor,
+            open_sub: s.open_sub,
+            sub: MenuSub {
+                cursor: RwSignal::new(None),
+                open_sub: RwSignal::new(None),
+            },
+        }
+    }
+}
+
 /// A reusable themed popup menu with nested submenus, `width` px wide. Returns the
 /// panel; the caller positions it absolutely. Escape (and any action) calls `close`.
+///
+/// **Fully operable from the keyboard**, which it was not: the panel took focus
+/// (it is a [`focus_root`]) and answered Escape, but nothing moved a cursor and no
+/// row was marked, so a menu opened with Enter from a ringed button — the type
+/// chevron in the designer, every dropdown built on this channel — could only be
+/// finished with the mouse, and read as though it had never taken focus at all.
+///
+/// Up/Down step [`menu_stops`] and **wrap**, the swatches' rule rather than the
+/// item list's: a menu is short and its ends are visibly adjacent, so wrapping is
+/// the shorter path to the last entry rather than a surprise. Home/End jump.
+/// Enter or Space runs the cursor row and closes; on a submenu row, Enter and
+/// Right open it and take the cursor inside, Left comes back out. Escape closes
+/// the submenu first if one is open, and only then the menu — so the key that
+/// means "back" doesn't skip a level.
 pub(crate) fn menu_panel(
     entries: Vec<MenuEntry>,
     close: Rc<dyn Fn()>,
     width: f64,
 ) -> impl IntoView {
+    let level = MenuLevel::new();
+    // Taken before the entries become views, which consumes them. Each `Sub`'s
+    // children are kept for the same reason, keyed by the row they hang off.
+    let stops = Rc::new(menu_stops(&entries));
+    let sub_stops: Rc<std::collections::HashMap<usize, Vec<(usize, MenuAct)>>> = Rc::new(
+        entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                MenuEntry::Sub { children, .. } => Some((i, menu_stops(children))),
+                _ => None,
+            })
+            .collect(),
+    );
     let esc = close.clone();
-    focus_root(menu_stack(entries, close, width)).on_key_down(
-        Key::Named(NamedKey::Escape),
-        |_| true,
-        move |_| (esc)(),
-    )
+    let act = close.clone();
+    focus_root(menu_stack(entries, level, close, width))
+        .on_key_down(
+            Key::Named(NamedKey::Escape),
+            |_| true,
+            move |_| {
+                // One level at a time: an open submenu is what Escape closes
+                // first, so "back" never skips past the menu the user was in.
+                if level.open_sub.get_untracked().is_some() {
+                    level.open_sub.set(None);
+                    level.sub.cursor.set(None);
+                    return;
+                }
+                (esc)();
+            },
+        )
+        .on_event(EventListener::KeyDown, move |e| {
+            let Event::KeyDown(ke) = e else {
+                return EventPropagation::Continue;
+            };
+            let Key::Named(k) = ke.key.logical_key else {
+                return EventPropagation::Continue;
+            };
+            menu_key(k, level, &stops, &sub_stops, &act)
+        })
+}
+
+/// One keypress against an open menu. Split out so the whole decision is in one
+/// place rather than spread down a listener, and `Continue` is returned for
+/// anything this doesn't claim.
+fn menu_key(
+    k: NamedKey,
+    level: MenuLevel,
+    stops: &[(usize, MenuAct)],
+    sub_stops: &std::collections::HashMap<usize, Vec<(usize, MenuAct)>>,
+    close: &Rc<dyn Fn()>,
+) -> EventPropagation {
+    // Which level the keys drive: the submenu when one is open, else the root.
+    // The open row also names which stop list the submenu's cursor indexes.
+    let open = level.open_sub.get_untracked();
+    let (cursor, stops) = match open.and_then(|i| sub_stops.get(&i)) {
+        Some(sub) => (level.sub.cursor, sub.as_slice()),
+        None => (level.cursor, stops),
+    };
+    // A stop's *position in the list*, since the signal holds its entry index —
+    // the two differ wherever a separator or a disabled row sits above.
+    let pos = cursor
+        .get_untracked()
+        .and_then(|entry| stops.iter().position(|(i, _)| *i == entry));
+    let step = |backwards: bool| {
+        if let Some(p) = ring_step(stops.len(), pos, backwards)
+            && let Some((entry, _)) = stops.get(p)
+        {
+            cursor.set(Some(*entry));
+        }
+    };
+    match k {
+        NamedKey::ArrowDown => step(false),
+        NamedKey::ArrowUp => step(true),
+        NamedKey::Home => {
+            if let Some((entry, _)) = stops.first() {
+                cursor.set(Some(*entry));
+            }
+        }
+        NamedKey::End => {
+            if let Some((entry, _)) = stops.last() {
+                cursor.set(Some(*entry));
+            }
+        }
+        // Into a submenu — but only from the root, since nothing nests twice.
+        NamedKey::ArrowRight => {
+            if open.is_some() {
+                return EventPropagation::Continue;
+            }
+            let Some((entry, MenuAct::Open)) = pos.and_then(|p| stops.get(p)) else {
+                return EventPropagation::Continue;
+            };
+            open_submenu(level, *entry, sub_stops);
+        }
+        // …and back out of it. The parent's cursor is still on the row that
+        // opened it, so there is nothing to restore.
+        NamedKey::ArrowLeft => {
+            if open.is_none() {
+                return EventPropagation::Continue;
+            }
+            level.open_sub.set(None);
+            level.sub.cursor.set(None);
+        }
+        NamedKey::Enter | NamedKey::Space => {
+            let Some((entry, act)) = pos.and_then(|p| stops.get(p)) else {
+                return EventPropagation::Continue;
+            };
+            match act {
+                MenuAct::Run(run) => {
+                    (run)();
+                    (close)();
+                }
+                // Enter on a submenu row opens it, as Right does — the row has no
+                // action of its own, so closing the menu on it would be a keypress
+                // that threw the menu away and did nothing.
+                MenuAct::Open => open_submenu(level, *entry, sub_stops),
+            }
+        }
+        _ => return EventPropagation::Continue,
+    }
+    EventPropagation::Stop
+}
+
+/// Open the submenu hanging off entry `row` and put the cursor on its first stop,
+/// so the next Down is a *second* row rather than the arrival.
+fn open_submenu(
+    level: MenuLevel,
+    row: usize,
+    sub_stops: &std::collections::HashMap<usize, Vec<(usize, MenuAct)>>,
+) {
+    level.open_sub.set(Some(row));
+    level
+        .sub
+        .cursor
+        .set(sub_stops.get(&row).and_then(|s| s.first()).map(|(i, _)| *i));
 }
 
 /// Measure a string's rendered width (px) at `FONT_BODY`, through the same global
@@ -2983,6 +3242,202 @@ mod exit_tests {
     #[test]
     fn idle_and_writable_launches() {
         assert!(accept_launch(false, false));
+    }
+}
+
+/// Driving an open menu from the keyboard. `menu_key` is the whole decision and
+/// takes only signals, so the arrow/Enter behaviour asserts without a window —
+/// which is the point, because every way of getting it wrong is silent: a cursor
+/// that can rest on a separator makes Down look dead, and one that can rest on a
+/// disabled row offers an Enter that does nothing.
+#[cfg(test)]
+mod menu_key_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// `[Action, Separator, Action(disabled), Sub[Action, Action]]` — one of each
+    /// thing the cursor has to treat differently, in one menu.
+    fn entries(hits: Rc<Cell<u32>>) -> Vec<MenuEntry> {
+        let a = hits.clone();
+        let b = hits.clone();
+        vec![
+            MenuEntry::action("first", move || a.set(a.get() + 1)),
+            MenuEntry::Separator,
+            MenuEntry::action("inert", || {}).disabled(true),
+            MenuEntry::sub(
+                "more",
+                vec![
+                    MenuEntry::action("child", move || b.set(b.get() + 100)),
+                    MenuEntry::action("other", || {}),
+                ],
+            ),
+        ]
+    }
+
+    struct Menu {
+        level: MenuLevel,
+        stops: Vec<(usize, MenuAct)>,
+        subs: std::collections::HashMap<usize, Vec<(usize, MenuAct)>>,
+        close: Rc<dyn Fn()>,
+        hits: Rc<Cell<u32>>,
+        closed: Rc<Cell<u32>>,
+    }
+
+    fn menu() -> Menu {
+        let hits = Rc::new(Cell::new(0));
+        let closed = Rc::new(Cell::new(0));
+        let es = entries(hits.clone());
+        let subs = es
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                MenuEntry::Sub { children, .. } => Some((i, menu_stops(children))),
+                _ => None,
+            })
+            .collect();
+        let c = closed.clone();
+        Menu {
+            level: MenuLevel::new(),
+            stops: menu_stops(&es),
+            subs,
+            close: Rc::new(move || c.set(c.get() + 1)),
+            hits,
+            closed,
+        }
+    }
+
+    impl Menu {
+        /// `true` when the menu **claimed** the key (`EventPropagation::Stop`),
+        /// which is as much of the return value as any caller cares about —
+        /// floem's enum is neither `PartialEq` nor `Debug`.
+        fn press(&self, k: NamedKey) -> bool {
+            matches!(
+                menu_key(k, self.level, &self.stops, &self.subs, &self.close),
+                EventPropagation::Stop
+            )
+        }
+        fn cursor(&self) -> Option<usize> {
+            self.level.cursor.get_untracked()
+        }
+        fn sub_cursor(&self) -> Option<usize> {
+            self.level.sub.cursor.get_untracked()
+        }
+    }
+
+    /// **A separator and a disabled row are not stops.** The indices kept are the
+    /// *entry* indices, so a row view can still ask whether it is the cursor.
+    #[test]
+    fn only_the_rows_a_cursor_may_rest_on_are_stops() {
+        let stops = menu_stops(&entries(Rc::new(Cell::new(0))));
+        assert_eq!(
+            stops.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![0, 3],
+            "the separator at 1 and the disabled row at 2 are skipped"
+        );
+        assert!(matches!(stops[0].1, MenuAct::Run(_)));
+        assert!(matches!(stops[1].1, MenuAct::Open));
+    }
+
+    /// The first Down on a freshly-opened menu lands on the first entry, and the
+    /// first Up on the last — the ring's answer for a cursor that is nowhere yet.
+    #[test]
+    fn the_first_arrow_enters_from_the_matching_end() {
+        let m = menu();
+        m.press(NamedKey::ArrowDown);
+        assert_eq!(m.cursor(), Some(0));
+
+        let m = menu();
+        m.press(NamedKey::ArrowUp);
+        assert_eq!(m.cursor(), Some(3));
+    }
+
+    /// Down walks stop to stop — **over** the separator and the disabled row, not
+    /// onto them — and wraps, a menu being short enough that its ends read as
+    /// adjacent.
+    #[test]
+    fn down_skips_the_gaps_and_wraps() {
+        let m = menu();
+        m.press(NamedKey::ArrowDown);
+        m.press(NamedKey::ArrowDown);
+        assert_eq!(m.cursor(), Some(3), "1 and 2 are not stops");
+        m.press(NamedKey::ArrowDown);
+        assert_eq!(m.cursor(), Some(0), "wrapped");
+    }
+
+    #[test]
+    fn home_and_end_jump_to_the_outer_stops() {
+        let m = menu();
+        m.press(NamedKey::End);
+        assert_eq!(m.cursor(), Some(3));
+        m.press(NamedKey::Home);
+        assert_eq!(m.cursor(), Some(0));
+    }
+
+    /// Enter on an action is a click: run it, then close.
+    #[test]
+    fn enter_runs_the_cursor_row_and_closes() {
+        let m = menu();
+        m.press(NamedKey::ArrowDown);
+        assert!(m.press(NamedKey::Enter));
+        assert_eq!(m.hits.get(), 1);
+        assert_eq!(m.closed.get(), 1);
+    }
+
+    /// **Enter on a submenu row must not close the menu.** The row has no action
+    /// of its own, so treating it like one would be a keypress that threw the
+    /// menu away and did nothing — it opens instead, exactly as Right does, and
+    /// arrives with the cursor on the first child.
+    #[test]
+    fn enter_on_a_submenu_opens_it_rather_than_closing() {
+        for key in [NamedKey::Enter, NamedKey::ArrowRight] {
+            let m = menu();
+            m.press(NamedKey::End);
+            m.press(key);
+            assert_eq!(m.closed.get(), 0, "{key:?} must not close the menu");
+            assert_eq!(m.level.open_sub.get_untracked(), Some(3));
+            assert_eq!(m.sub_cursor(), Some(0), "{key:?} lands on the first child");
+        }
+    }
+
+    /// With a submenu open the arrows drive **it**, and the parent's cursor stays
+    /// where it was — it is still on the row holding the submenu open.
+    #[test]
+    fn the_arrows_follow_the_open_submenu() {
+        let m = menu();
+        m.press(NamedKey::End);
+        m.press(NamedKey::ArrowRight);
+        m.press(NamedKey::ArrowDown);
+        assert_eq!(m.sub_cursor(), Some(1));
+        assert_eq!(m.cursor(), Some(3), "the parent row keeps the cursor");
+        assert!(m.press(NamedKey::Enter));
+        assert_eq!(m.hits.get(), 0, "the child's action ran, not the parent's");
+        assert_eq!(m.closed.get(), 1);
+    }
+
+    /// Left comes back out one level, and leaves the parent's cursor on the row
+    /// that opened it — so Down from there is the *next* row, not a re-entry.
+    #[test]
+    fn left_leaves_the_submenu_without_closing_the_menu() {
+        let m = menu();
+        m.press(NamedKey::End);
+        m.press(NamedKey::ArrowRight);
+        assert!(m.press(NamedKey::ArrowLeft));
+        assert_eq!(m.level.open_sub.get_untracked(), None);
+        assert_eq!(m.sub_cursor(), None);
+        assert_eq!(m.cursor(), Some(3));
+        assert_eq!(m.closed.get(), 0);
+    }
+
+    /// Left at the root is not the menu's key — nothing is open to leave, so it
+    /// passes through rather than being swallowed.
+    #[test]
+    fn a_key_the_menu_has_no_use_for_passes_through() {
+        let m = menu();
+        assert!(!m.press(NamedKey::ArrowLeft));
+        assert!(!m.press(NamedKey::Tab));
+        // Enter with the cursor nowhere: there is no row to run.
+        assert!(!m.press(NamedKey::Enter));
+        assert_eq!(m.closed.get(), 0);
     }
 }
 

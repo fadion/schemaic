@@ -38,8 +38,8 @@ use crate::widgets::{
     panel_style,
 };
 use crate::{
-    DdlPreview, DesignerTab, DesignerTarget, FieldCfg, Ui, ddl_preview, edit_field, icons,
-    object_location, theme,
+    DdlPreview, DesignerTab, DesignerTarget, FieldCfg, PopupAnchor, Ui, ddl_preview, edit_field,
+    icons, object_location, theme,
 };
 
 const PANEL_W: f64 = 900.0;
@@ -506,8 +506,24 @@ pub(crate) fn suggest_chevron(
 ) -> impl IntoView + use<> {
     let popup = ui.overlay.popup_menu;
     let anchor = ui.overlay.popup_anchor;
+    // **The chevron's own id, so the menu can open under the chevron.** The
+    // shared `popup_menu` channel falls back to `last_mouse` when no anchor is
+    // set, which is right for a right-click and wrong for a button: reached by
+    // Tab and pressed with Enter, the pointer is wherever it was left, so the
+    // menu opened across the modal — or across the window — from the control
+    // that raised it. Filled just below, once the view it names exists.
+    let anchor_id: RwSignal<Option<floem::ViewId>> = RwSignal::new(None);
     let open = Rc::new(move || {
-        anchor.set(None);
+        // `ViewId::layout_rect` is already in window coordinates (floem sets it
+        // from `window_origin` during layout), which is the frame `PopupAnchor`
+        // is stated in. `None` only before the first layout, and then the cursor
+        // fallback is as good an answer as any.
+        anchor.set(
+            anchor_id
+                .get_untracked()
+                .map(|id| id.layout_rect())
+                .map(|r| PopupAnchor::BelowIcon(r.x0, r.x1, r.y1)),
+        );
         popup.set(Some(
             options
                 .iter()
@@ -519,7 +535,7 @@ pub(crate) fn suggest_chevron(
         ));
     });
     let pressed = open.clone();
-    crate::widgets::in_ring_button(
+    let button = crate::widgets::in_ring_button(
         container(icons::icon(icons::CHEVRON_DOWN, 16.0))
             .on_click_stop(move |_| (open)())
             .style(|s| {
@@ -532,7 +548,11 @@ pub(crate) fn suggest_chevron(
         true,
         0.0, // an icon face, square
         move || (pressed)(),
-    )
+    );
+    // The ring wrapper, not the face: it is the outermost view of this control,
+    // so its rect is the whole chevron's.
+    anchor_id.set(Some(button.id()));
+    button
 }
 
 /// [`bound_field`] plus a [`suggest_chevron`] writing into it.
