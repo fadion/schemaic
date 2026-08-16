@@ -2052,6 +2052,49 @@ mod tests {
         assert_eq!(got[0].1[1].display(), "b");
     }
 
+    /// The splice path keyed on a rowid. An UPDATE-only commit re-fetches its
+    /// edited rows in place rather than re-running the query, and the key it
+    /// re-fetches by is whatever `analyze_edit` resolved — so a keyless table's
+    /// `WHERE` here names a column the table doesn't have. SQLite resolves
+    /// `rowid` in a `SELECT` list and a `WHERE` alike, which is what makes the
+    /// re-fetch work with no special case; this is the test that says so.
+    #[tokio::test]
+    async fn a_refetch_reads_a_keyless_row_back_by_its_rowid() {
+        let (keeper, db) = shared_memory("refetch_rowid");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (a TEXT, b TEXT);
+                 INSERT INTO t VALUES ('one', 'x'), ('two', 'y');",
+            )
+            .unwrap();
+        let rs = run_query(&keeper, "SELECT rowid, * FROM t", 100).unwrap();
+        let m =
+            schemaic_core::edit::analyze_edit(&rs, |_, _, name| Some(table_info_of(&keeper, name)));
+        let template =
+            schemaic_core::edit::refetch_template(&rs, &m).expect("a keyless table is spliceable");
+        assert_eq!(template.columns, ["rowid", "a", "b"]);
+        assert_eq!(template.key_cols, vec![0]);
+
+        keeper
+            .execute("UPDATE t SET b = 'written' WHERE rowid = 2", [])
+            .unwrap();
+        let got = refetch_rows(
+            &db,
+            &template,
+            &[RefetchRow {
+                data_row: 1,
+                key: vec![Value::Int(2)],
+            }],
+            CancellationToken::new(),
+        )
+        .await
+        .expect("refetch");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, 1);
+        assert_eq!(got[0].1[0].display(), "2", "the rowid comes back too");
+        assert_eq!(got[0].1[2].display(), "written");
+    }
+
     /// `block_in_place` needs the multi-threaded runtime, which the app uses.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_import_loads_every_batch_in_one_transaction() {
