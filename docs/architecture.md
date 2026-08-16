@@ -300,9 +300,27 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     new one into place, and recreate every index, trigger and view that pointed at it. That is a
     destructive path built from statements each of which looks harmless, and it deserves its own
     design and its own review rather than an arm in an emitter written for two engines that don't
-    need it. The schema tree, the editor's right-click and the Create submenu all read that one
-    function and offer **nothing** on such a connection (absent, not dimmed — "not supported" rather
-    than "not here"), and `Db::run_ddl` refuses the plan as the backstop.
+    need it. The schema tree's table/view menu, the editor's right-click and the Create submenu all
+    read that one function and offer **nothing** on such a connection (absent, not dimmed — "not
+    supported" rather than "not here").
+    **`supports_change(dialect, &Change)` is the second gate, and it answers a different
+    question.** `supports_schema_editing` is about the *designer* — a plan that reshapes a table,
+    which SQLite can't have; this is about one change, because a handful of drops need none of that
+    machinery. On SQLite it is true only for `DropTable`, `DropView { materialized: false }`,
+    `DropColumn` and `DropIndex { constraint: None }` — the drops the engine genuinely has
+    statements for — and false for everything else, where each false is the twelve-step rebuild in
+    disguise: a foreign key or a constraint-backed index comes off only by recreating the table
+    around it. Every non-SQLite dialect answers true. It exists because the per-row menus were built
+    with **no** gate at all — not this one, not `supports_schema_editing`, not even `read_only` — so
+    a column row's **Edit column** and a key row's **Edit table** opened the designer on a SQLite
+    connection, ran `diff`, and reached a preview that only `Db::run_ddl` refused at the last
+    moment. Those two rows now ask `overlays::field_entries`/`key_entries` (separate from the menu
+    builder so the rule can be asserted without a `Ui`, the same shape as `object_entries`): Edit
+    column and Edit table are absent on SQLite, **Drop** (column) and **Drop index** stay because
+    the engine performs them, and Drop foreign key — plus Drop index when the index backs a
+    constraint — is absent (`overlays::row_menu_tests`). `ChangeSet::unsupported()` is the same
+    predicate read over a whole set, returning the plain-language summaries of what the dialect
+    can't express, which is what the preview shows and refuses to apply around.
     `TableDraft` (the desired table; column/index/FK
     entries each carry the name they had on the server, which is what tells a *rename*
     from a drop-plus-add) → `diff(current, draft, dialect) -> ChangeSet` → `emit()`.
@@ -313,7 +331,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `ALTER TABLE` and restates a whole column via `definition_sql` (`MODIFY` replaces it,
     so anything omitted is destroyed); PostgreSQL splits renames / `DROP INDEX` /
     `CREATE INDEX` / `COMMENT ON` into their own statements and drops a key by
-    *constraint* name (`IndexInfo::constraint` — it has no `DROP PRIMARY KEY`). Ordering
+    *constraint* name (`IndexInfo::constraint` — it has no `DROP PRIMARY KEY`).
+    **SQLite has its own arm (`emit_sqlite`) rather than the fall-through to MySQL's it used to
+    take**, because two shapes there are refusals and not merely infelicities: its `ALTER TABLE`
+    takes exactly one operation — there is no clause list — so two dropped columns are two
+    statements, and an index comes off by a standalone `DROP INDEX` as on PostgreSQL, MySQL's
+    `ALTER TABLE … DROP INDEX` having no SQLite form at all. It emits indexes before columns
+    (SQLite refuses to drop a column an index still names, so the two in one plan only work in
+    that order) and filters every change through `supports_change`, so a gate that drifts open
+    shows an empty preview instead of handing SQLite MySQL's spelling of the change
+    (`ddl::sqlite_drop_tests`). Ordering
     is dependency-first (FKs and indexes off before the columns under them; keys back on
     after). `normalize_type`/`types_equal` + `defaults_equal` are the reason a designer
     opens clean — `int(11)` ≡ `int`, `character varying(45)` ≡ `varchar(45)`. **The
@@ -829,7 +856,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   atomicity**: PostgreSQL runs the whole plan in one transaction (transactional DDL), MySQL runs
   it sequentially and reports which statement failed *and how many already stuck*
   (`DdlError::applied`) — every MySQL DDL statement commits implicitly, so a transaction there
-  would be theatre.
+  would be theatre. **SQLite's DDL is transactional too**, so `sqlite::run_ddl` wraps the whole
+  plan in one and rolls it back whole, which is why every `DdlError` from that backend carries
+  `applied: 0` — a half-applied plan is a state this engine never leaves behind, so there is no
+  partial progress for the report to admit to (`sqlite::ddl_tests`, over in-memory SQLite). That
+  arm no longer refuses every plan: the gate moved upstream to `ddl::supports_change`, which can
+  see the `Change` where `run_ddl` has only strings, and refusing wholesale here would have taken
+  away the drops SQLite genuinely has.
   **`Db::trigger_source` is the fourth MySQL-vs-MariaDB text divergence** (with `mysql_column`'s
   defaults, the view `ALGORITHM` and `mysql_check_clause`) and the only one that is not an
   optimisation: `information_schema.TRIGGERS.ACTION_STATEMENT` on MySQL 8 returns the body with
@@ -1039,7 +1072,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `focusable_owned_dropdown`, the picker for a value that isn't `Copy`.
     **Every path ends at `ddl_preview`** — designer, Create table, and the context-menu
     shortcuts — so there's one place that shows the SQL, one that names what's destroyed, and
-    one "Open in editor" escape hatch. Never run generated DDL without it. Entry points:
+    one "Open in editor" escape hatch. Never run generated DDL without it.
+    `DdlPreview::withheld` (from `ChangeSet::unsupported()`) is the other half of that honesty:
+    when the dialect can't express part of the plan the modal shows a "This engine can't express
+    part of this plan" block listing each one, and Apply refuses — **both on the button and inside
+    `apply()`**, the same rule the write guard follows, since a disabled button is not a guard. It
+    is a block of its own rather than a line in the risk list because it says the opposite thing —
+    the risk block warns what will happen, this one what won't — and it is the call
+    `Change::KeepLossyIndex` already established: the SQL is *less* than the change list above it,
+    and a preview that didn't say so would be the dishonest half of a destructive operation. Only
+    SQLite produces one today, and the column row's Drop is the shortcut that can reach it: it goes
+    through the draft, so it takes the column's dependents with it, and a foreign key or the
+    primary key among them is a `Change` that engine can't express — the preview then says so and
+    refuses, rather than dropping the column out from under them. Entry
+    points:
     `table_designer::open_for_table`/`open_for_new`/`preview_draft_edit` (a shortcut whose
     edit has dependents — dropping a column takes its index and FK with it) and
     `ddl_preview::preview_change` (a lone `Change`).
@@ -1285,7 +1331,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   schema edit goes `TableDraft`/`ViewDraft` → `ddl::diff`/`diff_view` → `ChangeSet::emit` →
   the preview modal → `Db::run_ddl`. Don't add a path that builds `ALTER`/`CREATE`/`DROP` text somewhere else, and
   don't add one that applies a plan without the preview — the preview is where the destructive
-  consequence is stated in plain language and where "Open in editor" hands the script over. A
+  consequence is stated in plain language and where "Open in editor" hands the script over.
+  **Nor is a plan applied in part**: what the dialect can't express is `ChangeSet::unsupported()`,
+  the preview names each one and Apply refuses while it does — on the action, not only on the
+  disabled button. Which of the two gates to ask depends on the question: `supports_change` for a
+  single change, `supports_schema_editing` for a designer plan. Gate the menu entry on the right
+  one rather than leaving the refusal to `Db::run_ddl`, which sees only strings. A
   new engine is a `SqlDialect` arm in `ddl.rs`'s emitter, not a parallel emitter. The
   round-trip gate (a draft built from a table must diff to *nothing*) is the test that keeps
   the introspected model and the emitter honest with each other; extend its fixtures when you
