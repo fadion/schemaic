@@ -2,9 +2,11 @@
 
 A native SQL editor (Rust + [Floem](https://github.com/lapce/floem) 0.2.0), MySQL/MariaDB-first,
 Zed-inspired, aiming to replace DataGrip. PostgreSQL and SQLite are wired too; SQLite is
-read/write and edits **tables** through the twelve-step rebuild, but has no view or trigger
-editing and no manual-transaction mode — see `core::ddl`'s `supports_view_editing`/
-`supports_trigger_editing` and `db::sqlite` for what each of those is a statement about.
+read/write and edits **tables** (through the twelve-step rebuild), **views** and **triggers**, but
+has no manual-transaction mode — see `db::sqlite`'s `Session::open` for what that one is a
+statement about. All three engines now edit all three of those objects, and they get there
+differently, so ask the *narrow* capability (`ddl::supports_or_replace_view`,
+`ddl::supports_view_rename`) rather than the engine.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `CLAUDE.md` at the repo root
@@ -293,16 +295,23 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `false` to a bool and a refresh empties what there is to look at, and the caller passes
     `same_connection` because `db_nodes` holds only the **active** connection's databases — nothing
     compared them, so switching connection discarded a hand-built mapping. Pure + unit-tested.
-  - `ddl.rs` — **schema editing**, and since the rebuild landed every engine can reshape a table.
-    `supports_schema_editing(dialect)` is **gone**: it would have become "always true", and a
-    vacuous predicate invites deletion for the wrong reason. The capabilities it used to answer for
-    came apart, so two narrower facts replaced it, both still false on SQLite and only there.
-    `supports_view_editing` — the view emitter writes `CREATE OR REPLACE VIEW`, which SQLite has no
-    form of, and its introspection leaves `view_options` `None`, so the form would offer fields it
-    can't read back and the modal would end at a statement the engine refuses. And
-    `supports_trigger_editing` — nothing reads a SQLite trigger into `TriggerInfo` (`fetch_schema`
-    keeps the statements verbatim in `TableInfo::dependent_ddl` instead), so an editor would show a
-    table's triggers as gone and offer to "add" one that is already there. The schema tree's
+  - `ddl.rs` — **schema editing**, and every engine now reshapes a table, edits a view and edits a
+    trigger. `supports_schema_editing(dialect)` is **gone**: it would have become "always true", and
+    a vacuous predicate invites deletion for the wrong reason. The capabilities it used to answer
+    for came apart into `supports_view_editing` and `supports_trigger_editing` — and both of those
+    have since gone true everywhere too. They stay because the question is per *object* and the
+    menus ask it per object; what actually varies moved down a level, into two narrower facts that
+    are false on SQLite and only there. `supports_or_replace_view` — SQLite has no
+    `CREATE OR REPLACE VIEW` in any form, so a redefinition there is a `DROP` plus a `CREATE`, the
+    arm PostgreSQL already takes when `pg_replaceable` says no, reached unconditionally rather than
+    on a body test. And `supports_view_rename` — SQLite has no verb that renames a view at all:
+    `ALTER VIEW` is not a statement there, and `ALTER TABLE v RENAME TO v2` refuses with *"view v
+    may not be altered"* (measured against the engine, not read off the grammar), so `diff_view`
+    turns a bare rename into a re-create and the new name comes out of the `CREATE` half.
+    `ChangeSet::view_statements`' `RenameView` arm is therefore spelled out per dialect with a
+    `debug_assert!` on the SQLite one — unreachable by construction, and a `_ =>` there is exactly
+    what would hand SQLite MySQL's `RENAME TABLE`. **Triggers needed the reader before the
+    emitter**; that is `sqlite_trigger_info`, below. The schema tree's
     table/view menu, the editor's right-click and the Create submenu each ask the predicate for the
     object in front of them and offer **nothing** where the answer is no (absent, not dimmed — "not
     supported" rather than "not here").
@@ -342,9 +351,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     **`supports_change(dialect, &Change)` is the second gate, and it answers a different
     question.** It is about one change **on its own** — a context-menu shortcut, which has no draft
     behind it to build a table from — where the designer's plan can answer anything by rebuilding.
-    On SQLite it is true for `DropTable`, `DropView { materialized: false }`, `DropColumn` and
-    `DropIndex { constraint: None }` — the drops the engine genuinely has statements for — and for
-    `RebuildTable`, which only `diff` raises. It is false for everything else, where each false is
+    On SQLite it is true for `DropTable`, `DropView { materialized: false }`, `DropColumn`,
+    `DropIndex { constraint: None }` and `DropTrigger` — the drops the engine genuinely has
+    statements for — for the whole-statement objects it creates like anyone else (`CreateView`,
+    `ReplaceView`, `CreateTrigger`, `ReplaceTrigger`, the replaces being a drop-and-create on every
+    engine), and for `RebuildTable`, which only `diff` raises. `RenameView` is deliberately **not**
+    on the list: `diff_view` resolves a SQLite rename into the re-create before it can reach here.
+    It is false for everything else, where each false is
     the twelve-step rebuild in disguise: a foreign key or a constraint-backed index comes off only
     by recreating the table around it. Every non-SQLite dialect answers true. It exists because the
     per-row menus were built with **no** gate at all — not this one, not even `read_only` — so a
@@ -442,7 +455,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     column) degrades to the pre-flag behaviour rather than losing its checks.
     **Views** ride the same rails: `ViewDraft` (name + body + the `ViewOptions` it
     carries) → `diff_view` → `Change::{CreateView, ReplaceView, RenameView, DropView}`
-    → the same preview. Two engine rules live here. MySQL's `CREATE OR REPLACE VIEW`
+    → the same preview. One engine rule each lives here. MySQL's `CREATE OR REPLACE VIEW`
     replaces the *whole* view, so the emitter restates `ALGORITHM`/`DEFINER`/
     `SQL SECURITY`/`CHECK OPTION` — omitting the security type silently turns a
     `DEFINER` view into an `INVOKER` one, which is a privilege change, the same class
@@ -451,6 +464,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     views and grants with it: `pg_replaceable` (over `intel::select_output_names`)
     decides where it can, **uncertainty resolves to replace-and-let-the-server-refuse,
     never to drop**, and `ViewDraft::force_recreate` is the user's override.
+    SQLite's is the pair of predicates above: every edit is a drop and a create, so nothing is
+    carried through a *replace* there — it is carried through the re-create, which is why
+    `ViewOptions::column_list` had to be modelled (see `core::schema`). `create_view_sql`
+    asks per engine (`my`/`pg` locals) rather than `!pg`, which had been sorting SQLite onto
+    MySQL's side and would have emitted `ALGORITHM`/`DEFINER`/`SQL SECURITY` at an engine that
+    has none of them; the check option is likewise MySQL-and-PostgreSQL only. `emit_sqlite`
+    now calls `view_statements`/`trigger_statements` rather than keeping a hand-rolled
+    `DropView` arm, so there is still one view emitter.
     The MySQL `ALGORITHM` a replace would reset arrives *after* the editor opens
     (`SchemaActions::view_algorithm` → `Db::view_algorithm`; see `schemaic-db`), and
     `view_editor::fetch_algorithm` patches **both** sides of the diff with it — writing
@@ -495,7 +516,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     **Triggers and PostgreSQL trigger functions** ride the same rails again:
     `TriggerSetDraft`/`TriggerDraft` → `diff_triggers` and `FunctionDraft` → `diff_function`
     → `Change::{CreateTrigger, ReplaceTrigger, DropTrigger, CreateFunction, ReplaceFunction,
-    RenameFunction, DropFunction}` → the same preview. Neither engine can *alter* a trigger,
+    RenameFunction, DropFunction}` → the same preview. None of the three can *alter* a trigger,
     so **every** edit is a drop-and-create and `ReplaceTrigger` is that pair — which is why
     `trigger_statements` emits **all the drops, then all the creates** rather than each pair
     together: adjacent pairs collide the moment two triggers swap names, and on MySQL
@@ -506,7 +527,29 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     under, yet all three are part of what it does, so the values are set on the session around
     the statement and restored after (`run_ddl` runs a MySQL plan in order on one connection,
     which is what makes that safe). Nothing is emitted when nothing is known — `None` means
-    "not fetched", and inventing a session state is a change nobody asked for.
+    "not fetched", and inventing a session state is a change nobody asked for. It early-returns
+    on `!= MySql`; the old `== Postgres` test would have handed SQLite `SET SESSION sql_mode = …`.
+    **SQLite got here through the reader, not the emitter.** It publishes no catalogue of a
+    trigger's parts — no `information_schema`, no pragma, only the statement text — so
+    `sqlite_trigger_info(create_sql)` is what made an editor possible at all, and until it existed
+    the list was empty and an editor over it would show a table's triggers as gone and offer to
+    "add" one that is already there. **Structure from the AST, body from the text**: the
+    per-dialect sqlparser AST (`intel`'s `SqlDialect::parser()`) answers the timing, event,
+    `UPDATE OF` columns and `WHEN` guard, which a scanner gets wrong on a body containing the same
+    words, while `sqlite_trigger_body` takes the `BEGIN … END` block verbatim over `skip_noncode` —
+    re-printing it from the AST would normalise away the user's comments, casing and line breaks,
+    which is a phantom change on every open and a rewritten trigger on every apply. A statement it
+    can't read yields `None` and the caller drops it, safe in the one way that matters because
+    `diff_triggers` only drops what the *server copy* lists. `TriggerDraft::validate`'s SQLite arm
+    is the engine's own grammar, every rule measured against 3.45 rather than inferred: one event
+    per trigger, no `TRUNCATE`, `INSTEAD OF` only on a view *and* a view taking only `INSTEAD OF`
+    (`cannot create INSTEAD OF trigger on table` / `cannot create BEFORE trigger on view`), row
+    level only (`FOR EACH STATEMENT` is a syntax error), and a body that must be a `BEGIN … END`
+    block with at least one statement in it — a bare statement and an empty block are both syntax
+    errors. `is_begin_end_block` asks that last one through the shared lexer rather than with a
+    `starts_with`, since a body may open with a comment and a `BEGIN` inside a string is not the
+    block's own. It is refused in the modal rather than at Apply because the `DROP` has already run
+    by the time the `CREATE` fails.
   - `erd.rs` — the **ER-diagram** model (the UI half is `ui/erd_view.rs`). `build_graph` turns an
     introspected `DbSchema` into a `DiagramGraph` — nodes = tables, edges = FKs — seeded either by
     `DiagramSeed::Database` (whole database, hiding FK-less "island" tables) or `::Table` (one
@@ -637,7 +680,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     idea for a view (check option, MySQL definer/security/algorithm, PG storage params +
     `materialized`) — `CREATE OR REPLACE VIEW` replaces the whole view, so what isn't restated
     resets, and `SQL SECURITY DEFINER → INVOKER` is a privilege change. `definer_sql` quotes the
-    two halves of a MySQL account. `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the
+    two halves of a MySQL account. **`column_list` is SQLite's alone and arrives by the opposite
+    route**: the explicit `(x, y)` of `CREATE VIEW v (x, y) AS …`, held verbatim and without its
+    parentheses, `None` on the two engines that bake the names into the body they report. It has to
+    be modelled because *every* SQLite view edit is a drop-and-re-create
+    (`ddl::supports_or_replace_view`), so a list left behind would silently rename the view's
+    columns to whatever the body calls them; verbatim rather than a parsed `Vec<String>` because
+    SQLite hands the list back with whatever quoting it was written with and re-quoting it is a way
+    to change it. `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the
     above; its **view** branch delegates to `ddl::view_ddl` so Copy DDL, the MCP table-info tool
     and the apply path all emit through one view emitter (it used to have its own, which restated
     none of the options). **`TableInfo::implicit_key` is a capability, read rather than
@@ -661,8 +711,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     of the objects that go down with the table and have to be put back — SQLite's triggers, filled
     by `sqlite::trigger_statements`, empty on the two engines that alter in place and so never
     destroy the table their triggers hang off. Deliberately the server's own statement rather than a
-    re-emission from `TriggerInfo`, which would put a trigger through a round trip Schemaic doesn't
-    do faithfully for SQLite, and the failure mode is the one `IndexInfo::lossy` exists to prevent:
+    re-emission from `TriggerInfo` — and that stays the call now that `sqlite::triggers_of` *does*
+    read a SQLite trigger into the model. The two are not redundant: the model is what the **editor**
+    diffs, the text is what a **rebuild** puts back without depending on the parse being perfect,
+    and the failure mode the rebuild has to avoid is the one `IndexInfo::lossy` exists to prevent:
     the part that didn't survive the parse is gone from a trigger that still looks armed. Views need
     nothing here — `DROP TABLE` leaves a view that selects from the table in place, SQLite resolving
     a view's references when it runs rather than when it is declared, and the table returns under
@@ -681,6 +733,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     what fires during replication apply; `old_table`/`new_table` are `REFERENCING OLD/NEW
     TABLE`, whose loss breaks *every write to the table* rather than failing the plan.
     `TriggerSource` is the MySQL body + session state, fetched lazily — see `schemaic-db`.
+    `TriggerInfo::create_sql` is the one trigger emitter and has **three** arms, not two: SQLite's
+    shape is neither of the others' — PostgreSQL's `UPDATE OF` and `WHEN` with MySQL's inline
+    body, no definer, no ordering clause, no session state and always `FOR EACH ROW` — so it is
+    asked for by name rather than reached by falling off the end of a `!pg`. `update_columns` and
+    `condition` are consequently **not** PostgreSQL-only fields: MySQL is the engine with neither.
     `CheckInfo::validated`/`inherited` are PostgreSQL's `NOT VALID` / `NO INHERIT`, carried and
     restated: they are part of the clause, and `pg_get_constraintdef` prints them *after* the
     parens, which is why `ddl::check_predicate` must strip them before peeling. **An unnamed check
@@ -1035,9 +1092,23 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   read alike, because SQLite makes no distinction once the table exists and a rebuild restates both
   as table constraints; a constraint written without `CONSTRAINT <name>` keeps an **empty** name,
   which is the honest answer rather than a gap (`sqlite::check_text_tests`/`check_schema_tests`).
-  `trigger_statements` fills `TableInfo::dependent_ddl` the same way and from the same catalogue,
-  re-terminating each statement — SQLite stores it without its `;` and a trigger body is full of
-  internal ones, so a replay would otherwise run into whatever follows it.
+  **One catalogue read of the trigger text feeds two consumers** — `trigger_sql` is the query, and
+  the two things made from it are not redundant (see `TableInfo::dependent_ddl` above).
+  `trigger_statements` re-terminates each one into `dependent_ddl`, because SQLite stores a
+  statement without its `;` and a trigger body is full of internal ones, so a replay would
+  otherwise run into whatever follows it. `triggers_of` parses the *same* text into `TriggerInfo`
+  through `ddl::sqlite_trigger_info`, this being the one engine where introspecting a trigger means
+  reading SQL; a statement the parse can't read is left out rather than guessed at, the direction
+  `view_body_of` already refuses in. `fetch_schema` fills `triggers` for a **view** as well as a
+  table — an `INSTEAD OF` trigger is the only way a SQLite view is written to — while
+  `dependent_ddl` stays a table's business, nothing rebuilding a view.
+  A view now also gets `view_options: Some(…)` rather than `None`. SQLite has none of the options
+  the other two carry — no definer, security type, algorithm, storage parameters or check option —
+  and exactly one the re-create behind every view edit would otherwise drop: the explicit column
+  list, read by `view_columns_of`, a third positional reader over the shared lexer beside
+  `view_body_of` and `checks_of`. It is the one parenthesised group *before* the header's `AS` at
+  code position and paren depth zero, both qualifications carrying the weight they do in
+  `view_body_of` — after that `AS` a `(` is the user's own arithmetic or a subquery.
   `EXPLAIN QUERY PLAN` is what `explain` runs — plain `EXPLAIN` disassembles to VDBE
   opcodes, which is a different artefact and useless to `core::plan` — and there is no analyzing
   form, since SQLite will not execute a statement to time it. **Manual transaction mode is refused**
@@ -1204,10 +1275,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     open; only the footer is keyed on the draft). The options are shown because they're
     *carried* through a replace, and the PG "re-create instead of replacing" toggle is the
     override for the cases `ddl::pg_replaceable` can't read off the statement.
+    The form is built **per engine** — check option for MySQL and PostgreSQL, the security/definer
+    block for MySQL, the re-create toggle for PostgreSQL, and a SQLite-only "Column names" field
+    for `ViewOptions::column_list`. `needs_algorithm` asked `!= Postgres`, which sent a SQLite
+    connection off to fetch a `SHOW CREATE VIEW` algorithm; it asks `== MySql`.
     `is_editable_view` is the entry point's gate — a materialized view is drop-only.
   - `trigger_editor.rs` — the **trigger** modal *and* the **function** modal, over `core::ddl`'s
     `TriggerSetDraft`/`FunctionDraft`. Reached from the schema context menu's per-table
-    **Triggers…** entry; same chrome, same seed-local-signals-then-write-back rule and same
+    **Triggers…** entry — and from a **view's**, on every engine but MySQL, since `INSTEAD OF`
+    lives on PostgreSQL and on SQLite, where it is the only way a view is written to at all
+    (`overlays::object_entries`, which still excludes a materialized view: PostgreSQL refuses one
+    outright); same chrome, same seed-local-signals-then-write-back rule and same
     `ddl_preview` ending as `view_editor`. The trigger modal is the **designer's list-plus-form
     shape** — the table's triggers on the left, the selected one's form on the right, `+`/`−`
     under the list (no ↑/↓: list position is display order, while firing order is MySQL's
@@ -1222,8 +1300,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     no body, only a **function** to call, so the trigger form would be a dead end without a way to
     write one. Three rules are written down because each was a bug waiting: **the form is
     per-engine because the objects are** (MySQL owns a body and one event; PG calls a function,
-    takes several events and a `WHEN`), so it *hides* what an engine can't express rather than
-    offering it and failing at apply; **the function list is fetched lazily** (`Db::trigger_functions`
+    takes several events and a `WHEN`; SQLite owns a body, one event, a `WHEN` and `UPDATE OF`
+    columns through a "Of columns" field, and offers a view only `INSTEAD OF`), so it *hides* what
+    an engine can't express rather than offering it and failing at apply — which is also why
+    `blank_trigger`/`trigger_list` take a `SqlDialect` rather than a `pg: bool`, and why the
+    MySQL-only `fetch_sources` (`SHOW CREATE TRIGGER`) is gated `== MySql`;
+    **the function list is fetched lazily** (`Db::trigger_functions`
     via `TriggerFnFn`, the same call `view_algorithm` makes) and arrives a round trip late, so the
     picker keeps whatever the draft already names instead of selecting the first entry and silently
     re-pointing the trigger; and **the trigger target is never cleared while the function modal is
@@ -1362,7 +1444,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   `read_only_reason`, `has_top_level_where`/`unsafe_reason`/`first_unsafe`/`contains_write`) take a
   `SqlDialect`, so pass the connection's dialect (Postgres `#` is an operator not a comment, `$tag$…$tag$`
   is a string, `"…"` an identifier, `\`-escapes only in MySQL / PG `E'…'`; SQLite takes `"x"`,
-  `` `x` `` *and* `[x]` as identifiers and has no backslash escape at all). **Ask the capability,
+  `` `x` `` *and* `[x]` as identifiers and has no backslash escape at all). **It is dialect-aware
+  about statement *boundaries* too, not only tokens:** on SQLite a `;` inside a `CREATE TRIGGER`'s
+  `BEGIN … END` block does not end the statement. SQLite has no `DELIMITER` directive to hide those
+  semicolons behind, so without this `statement_bounds` cut a trigger in half and Run Everything
+  sent `… BEGIN UPDATE log SET n = 1;` and `END;` as two statements. A private `TriggerScan` state
+  machine counts block openers (`BEGIN`, `CASE`) against `END`, so a `CASE … END` inside the body
+  can't end it early — the same thing `sqlite3_complete()` does for SQLite's own shell. MySQL and
+  PostgreSQL boundaries are deliberately untouched: MySQL's trigger bodies go behind `DELIMITER`,
+  and changing that would silently alter what Run Everything sends a server. The other half of that
+  is `ChangeSet::editor_script`, which asks `!= MySql` before reaching for `DELIMITER $$` so a
+  SQLite plan is never handed a directive the engine has never heard of. **Ask the capability,
   never the engine** — the rules are predicates on `SqlDialect` (see `sql.rs` above), because
   `dialect == Postgres` / `!= MySql` compiles cleanly while silently sorting a third engine onto
   whichever side it falls, and two of the answers it got wrong for SQLite could hide a `WHERE`
@@ -1445,9 +1537,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   the preview names each one and Apply refuses while it does — on the action, not only on the
   disabled button. Which gate to ask depends on the question: `supports_change` for a single change
   with no draft behind it, and for an editor the capability for *that object* —
-  `supports_view_editing` or `supports_trigger_editing`, there being no predicate for the table
-  designer any more because every engine now has one (SQLite by rebuilding, `Change::RebuildTable`).
-  Gate the menu entry on the right
+  `supports_view_editing` or `supports_trigger_editing`. Both of those now answer true for every
+  engine, as does the table designer — which is why it has no predicate at all any more (SQLite
+  reaches one by rebuilding, `Change::RebuildTable`). **Keep asking them, and keep them apart**:
+  they are per-object questions the menus ask per object, and what differs between engines has
+  moved down to the narrower predicates that decide how an edit is *performed* rather than whether
+  it is offered — `supports_or_replace_view` and `supports_view_rename`, both false on SQLite and
+  only there. Gate the menu entry on the right
   one rather than leaving the refusal to `Db::run_ddl`, which sees only strings. A
   new engine is a `SqlDialect` arm in `ddl.rs`'s emitter, not a parallel emitter. The
   round-trip gate (a draft built from a table must diff to *nothing*) is the test that keeps
@@ -1769,8 +1865,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   still in the tree and still registered in the ring, and Tab moves focus onto something nobody can
   see. Every engine-conditional block that was built-and-hidden is therefore now **built
   conditionally**: import's CSV settings, the designer's MySQL-only engine/collation and `ON UPDATE`
-  and PostgreSQL-only index method/predicate, the view editor's MySQL options and PG recreate
-  toggle, the trigger form's `Fires`/`When`. Nothing is lost by rebuilding — each of those binds
+  and PostgreSQL-only index method/predicate, the view editor's MySQL options, PG recreate toggle
+  and SQLite-only column list, the trigger form's `Fires`/`When` and SQLite-only `Of columns`.
+  Nothing is lost by rebuilding — each of those binds
   straight to a draft or a persisted signal — and a control an engine can't express shouldn't be
   reachable at all, which is the same call `trigger_editor`'s per-engine form already made.
   **The else-arm is still `display:none`, via `widgets::nothing()`** — taffy skips a `display:none`
