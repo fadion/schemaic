@@ -2187,14 +2187,15 @@ impl Db {
         }
         match self.engine {
             Engine::Postgres => return pg::run_ddl(self, database, stmts, cancel).await,
-            // **SQLite runs the plan; it does not get to run every plan.** What
-            // it can express is decided upstream by `ddl::supports_change` — the
-            // menus hide the rest and the emitter writes nothing for it — because
-            // that predicate can see the `Change`, and this function has only
-            // strings. Refusing wholesale here instead would take away the drops
-            // SQLite genuinely has (`DROP TABLE`, `DROP VIEW`, `DROP INDEX`, and
-            // the one `ALTER TABLE … DROP COLUMN` form) for the sake of the ones
-            // it doesn't, which still need the twelve-step rebuild.
+            // **SQLite runs the plan**, whether that plan is a drop it performs
+            // directly or the twelve-step rebuild a designer edit compiles to
+            // (`ddl::sqlite_rebuild_sql`). What may reach here is decided
+            // upstream, by `ddl::supports_change` and by `diff` — both can see
+            // the `Change`, where this function has only strings.
+            //
+            // Unlike the MySQL path below, that arm also suspends foreign-key
+            // enforcement for the transaction and checks it before committing;
+            // the reason is in `sqlite::run_ddl`, and it is not an optimisation.
             Engine::Sqlite => return sqlite::run_ddl(self, stmts, cancel).await,
             Engine::MySql => {}
         }

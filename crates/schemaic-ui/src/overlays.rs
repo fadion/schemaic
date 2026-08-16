@@ -128,9 +128,6 @@ pub(crate) fn object_entries(
     materialized: bool,
 ) -> ObjectEntries {
     let is_pg = dialect == schemaic_core::intel::SqlDialect::Postgres;
-    // What this build can emit for the engine — see `ddl::supports_schema_editing`
-    // for why SQLite can't, which is a statement about SQLite's `ALTER TABLE`
-    // rather than about unfinished work.
     // Two different questions, and the table designer is the one every engine
     // now answers yes to — SQLite by rebuilding. A view editor and a trigger
     // editor are not the same capability and are still MySQL/PostgreSQL only.

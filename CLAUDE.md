@@ -7,11 +7,12 @@ tunnels), `schemaic-ai`, `schemaic-term`, `schemaic-ui` (the Floem views), `sche
 wiring, the built-in MCP server).
 
 **Three engines, and they are not equal.** MySQL/MariaDB and PostgreSQL are full; SQLite reads,
-writes and imports but has **no schema editing** and **no manual-transaction mode**, both of which
-are statements about SQLite rather than unfinished work (`ddl::supports_schema_editing` and
-`session::Session::open` carry the reasons). Ask a **capability**, never an engine: a
-`dialect == Postgres` or `!= MySql` compiles cleanly while silently sorting a third engine onto
-whichever side it happens to fall.
+writes, imports and edits **tables** (through the twelve-step rebuild — `ddl::sqlite_rebuild_sql`),
+but has **no view or trigger editing** and **no manual-transaction mode**, all of which are
+statements about SQLite rather than unfinished work (`ddl::supports_view_editing`,
+`ddl::supports_trigger_editing` and `session::Session::open` carry the reasons). Ask a
+**capability**, never an engine: a `dialect == Postgres` or `!= MySql` compiles cleanly while
+silently sorting a third engine onto whichever side it happens to fall.
 
 **`docs/architecture.md` is the reference document** — the module map (one entry per source file),
 the architecture invariants, the UI conventions, the Floem hazards, and the data grid end to end.

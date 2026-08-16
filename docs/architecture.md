@@ -2,8 +2,9 @@
 
 A native SQL editor (Rust + [Floem](https://github.com/lapce/floem) 0.2.0), MySQL/MariaDB-first,
 Zed-inspired, aiming to replace DataGrip. PostgreSQL and SQLite are wired too; SQLite is
-read/write but has no schema editing and no manual-transaction mode — see `core::ddl`'s
-`supports_schema_editing` and `db::sqlite` for what that is a statement about.
+read/write and edits **tables** through the twelve-step rebuild, but has no view or trigger
+editing and no manual-transaction mode — see `core::ddl`'s `supports_view_editing`/
+`supports_trigger_editing` and `db::sqlite` for what each of those is a statement about.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `CLAUDE.md` at the repo root
@@ -292,35 +293,76 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `false` to a bool and a refresh empties what there is to look at, and the caller passes
     `same_connection` because `db_nodes` holds only the **active** connection's databases — nothing
     compared them, so switching connection discarded a hand-built mapping. Pure + unit-tested.
-  - `ddl.rs` — **schema editing**, on the two engines that can alter a table in place.
-    `supports_schema_editing(dialect)` is the fact that says which, and it is a statement about
-    SQLite rather than a note about unfinished work: its `ALTER TABLE` does `RENAME TABLE`,
-    `RENAME COLUMN`, `ADD COLUMN` and `DROP COLUMN` and nothing else, so every other edit needs the
-    documented twelve-step rebuild — create a new table, copy the rows, drop the old one, rename the
-    new one into place, and recreate every index, trigger and view that pointed at it. That is a
-    destructive path built from statements each of which looks harmless, and it deserves its own
-    design and its own review rather than an arm in an emitter written for two engines that don't
-    need it. The schema tree's table/view menu, the editor's right-click and the Create submenu all
-    read that one function and offer **nothing** on such a connection (absent, not dimmed — "not
+  - `ddl.rs` — **schema editing**, and since the rebuild landed every engine can reshape a table.
+    `supports_schema_editing(dialect)` is **gone**: it would have become "always true", and a
+    vacuous predicate invites deletion for the wrong reason. The capabilities it used to answer for
+    came apart, so two narrower facts replaced it, both still false on SQLite and only there.
+    `supports_view_editing` — the view emitter writes `CREATE OR REPLACE VIEW`, which SQLite has no
+    form of, and its introspection leaves `view_options` `None`, so the form would offer fields it
+    can't read back and the modal would end at a statement the engine refuses. And
+    `supports_trigger_editing` — nothing reads a SQLite trigger into `TriggerInfo` (`fetch_schema`
+    keeps the statements verbatim in `TableInfo::dependent_ddl` instead), so an editor would show a
+    table's triggers as gone and offer to "add" one that is already there. The schema tree's
+    table/view menu, the editor's right-click and the Create submenu each ask the predicate for the
+    object in front of them and offer **nothing** where the answer is no (absent, not dimmed — "not
     supported" rather than "not here").
+    **The twelve-step rebuild is `sqlite_rebuild_sql(current, draft)`**, over
+    `Rebuild { current, draft }` — both sides, because which new column takes which old one's data
+    can only be answered by looking at both. SQLite's `ALTER TABLE` does `RENAME TABLE`,
+    `RENAME COLUMN`, `ADD COLUMN` and `DROP COLUMN` and nothing else, so every other edit is reached
+    by creating the table the draft describes under a shadow name (`_schemaic_rebuild`, deliberately
+    not the manual's `new_X`, since a collision with a real table fails the whole plan), copying the
+    rows into it, dropping the original, renaming the shadow into place, recreating the indexes
+    **after** the rename (an index name is unique per schema, so creating one earlier collides with
+    the index it replaces) and replaying `TableInfo::dependent_ddl`. The copy is what makes a rename
+    a rename rather than a drop-and-add: each new column is mapped to the one it came from, a column
+    the user added is in neither list so its default applies, and a generated column is in neither
+    because it cannot be inserted into. It is `INSERT … SELECT` and not `CREATE TABLE … AS SELECT`,
+    which takes its column types from the query and discards every constraint. **A rename of the
+    table itself is not part of it** — the rebuild always ends under the original name and
+    `ALTER TABLE … RENAME TO` is emitted after it, natively, which is what makes SQLite repoint the
+    references other objects hold. **And the plan carries `PRAGMA legacy_alter_table = ON` around
+    the drop-and-rename**, or the rename fails on any view over the table: from 3.25 SQLite
+    re-parses every view and trigger during `ALTER TABLE … RENAME`, and by then the original table
+    is gone, so a view selecting from it kills the rebuild with `error in view v: no such table:
+    main.t`. The pragma rides in the plan rather than in the backend because it is a property of
+    these statements and not of the connection — and so the preview shows the whole procedure, which
+    is the honest thing to put in front of someone about to approve it
+    (`ddl::sqlite_rebuild_tests`).
+    `Change::RebuildTable(Box<Rebuild>)` is how it reaches a plan: `diff` inserts one at the
+    **front** of the set the moment that set holds a change SQLite has no statement of its own for,
+    and that one change performs the whole set. It sits *beside* the changes it performs rather than
+    instead of them, so the preview still lists the user's edits in their own terms and one line
+    says how they will happen. The trigger is "is there a change here with no statement of its own",
+    not "is this an alter" — a set of nothing but the drops the engine does have keeps its direct
+    path and pays nothing. An `ADD COLUMN` deliberately takes the rebuild even though it is native,
+    because it is native *only* when the column carries no key, no uniqueness and a constant
+    default, and getting that wrong writes the plan that half-applies; the fast paths are a later
+    optimisation with a test each (`ddl::sqlite_designer_tests`).
     **`supports_change(dialect, &Change)` is the second gate, and it answers a different
-    question.** `supports_schema_editing` is about the *designer* — a plan that reshapes a table,
-    which SQLite can't have; this is about one change, because a handful of drops need none of that
-    machinery. On SQLite it is true only for `DropTable`, `DropView { materialized: false }`,
-    `DropColumn` and `DropIndex { constraint: None }` — the drops the engine genuinely has
-    statements for — and false for everything else, where each false is the twelve-step rebuild in
-    disguise: a foreign key or a constraint-backed index comes off only by recreating the table
-    around it. Every non-SQLite dialect answers true. It exists because the per-row menus were built
-    with **no** gate at all — not this one, not `supports_schema_editing`, not even `read_only` — so
-    a column row's **Edit column** and a key row's **Edit table** opened the designer on a SQLite
+    question.** It is about one change **on its own** — a context-menu shortcut, which has no draft
+    behind it to build a table from — where the designer's plan can answer anything by rebuilding.
+    On SQLite it is true for `DropTable`, `DropView { materialized: false }`, `DropColumn` and
+    `DropIndex { constraint: None }` — the drops the engine genuinely has statements for — and for
+    `RebuildTable`, which only `diff` raises. It is false for everything else, where each false is
+    the twelve-step rebuild in disguise: a foreign key or a constraint-backed index comes off only
+    by recreating the table around it. Every non-SQLite dialect answers true. It exists because the
+    per-row menus were built with **no** gate at all — not this one, not even `read_only` — so a
+    column row's **Edit column** and a key row's **Edit table** opened the designer on a SQLite
     connection, ran `diff`, and reached a preview that only `Db::run_ddl` refused at the last
     moment. Those two rows now ask `overlays::field_entries`/`key_entries` (separate from the menu
     builder so the rule can be asserted without a `Ui`, the same shape as `object_entries`): Edit
-    column and Edit table are absent on SQLite, **Drop** (column) and **Drop index** stay because
-    the engine performs them, and Drop foreign key — plus Drop index when the index backs a
-    constraint — is absent (`overlays::row_menu_tests`). `ChangeSet::unsupported()` is the same
+    column and Edit table are offered on every engine, since the designer is the thing that reaches
+    a rebuild, **Drop** (column) and **Drop index** stay because the engine performs them, and Drop
+    foreign key — plus Drop index when the index backs a constraint — is absent
+    (`overlays::row_menu_tests`). `ChangeSet::unsupported()` is the same
     predicate read over a whole set, returning the plain-language summaries of what the dialect
-    can't express, which is what the preview shows and refuses to apply around.
+    can't express, which is what the preview shows and refuses to apply around. **Where a rebuild is
+    present it withholds nothing except an index flagged `IndexInfo::lossy`**: the rebuild has to
+    recreate every index, and one recreated from a partial reading is not the index that was there —
+    a partial index comes back covering every row, an expression index missing its key. That is not
+    a warning to read past; the plan is refused until the user drops the index or leaves the table
+    alone.
     `TableDraft` (the desired table; column/index/FK
     entries each carry the name they had on the server, which is what tells a *rename*
     from a drop-plus-add) → `diff(current, draft, dialect) -> ChangeSet` → `emit()`.
@@ -340,7 +382,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     (SQLite refuses to drop a column an index still names, so the two in one plan only work in
     that order) and filters every change through `supports_change`, so a gate that drifts open
     shows an empty preview instead of handing SQLite MySQL's spelling of the change
-    (`ddl::sqlite_drop_tests`). Ordering
+    (`ddl::sqlite_drop_tests`). Where the set holds a `RebuildTable` that arm returns the rebuild's
+    statements and the trailing `RENAME TO` **and nothing else** — the other entries describe what
+    the rebuild achieves, so emitting them beside it would apply the same edit twice.
+    `create_table_sql` splits on the same fault line, and for the same reason: it used to split on
+    PostgreSQL and give everything else MySQL's shape, which for SQLite is not unidiomatic but
+    invalid — inline `KEY`/`UNIQUE KEY`, `ENGINE=`, `COLLATE=` and `COMMENT=` are each a syntax
+    error there. It now sides with PostgreSQL on indexes (statements of their own) and has no table
+    options at all. Its one real divergence is `AUTOINCREMENT`, which is legal *only* inline as
+    `INTEGER PRIMARY KEY AUTOINCREMENT` on a single column: that column takes the whole declaration
+    and the table-level `PRIMARY KEY (…)` clause stands down rather than declaring a second key (a
+    composite key is unaffected). `ColumnInfo::definition_sql` makes the same distinction — SQLite
+    keeps `COLLATE`, the generated expression, `NOT NULL` and `DEFAULT`, and drops `AUTO_INCREMENT`,
+    `ON UPDATE` and the column comment (`ddl::sqlite_create_tests`). Ordering
     is dependency-first (FKs and indexes off before the columns under them; keys back on
     after). `normalize_type`/`types_equal` + `defaults_equal` are the reason a designer
     opens clean — `int(11)` ≡ `int`, `character varying(45)` ≡ `varchar(45)`. **The
@@ -603,6 +657,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     on SQLite: there the model is genuinely complete (a name and a body), so the shared emitter is
     both correct and consistent with the other engines. The test asserts SQLite takes its own DDL
     back, which is the only assertion that would have caught the `AUTO_INCREMENT` case.
+    **`TableInfo::dependent_ddl` is the same fidelity call made for the rebuild**: the `CREATE` text
+    of the objects that go down with the table and have to be put back — SQLite's triggers, filled
+    by `sqlite::trigger_statements`, empty on the two engines that alter in place and so never
+    destroy the table their triggers hang off. Deliberately the server's own statement rather than a
+    re-emission from `TriggerInfo`, which would put a trigger through a round trip Schemaic doesn't
+    do faithfully for SQLite, and the failure mode is the one `IndexInfo::lossy` exists to prevent:
+    the part that didn't survive the parse is gone from a trigger that still looks armed. Views need
+    nothing here — `DROP TABLE` leaves a view that selects from the table in place, SQLite resolving
+    a view's references when it runs rather than when it is declared, and the table returns under
+    the same name before the transaction ends.
     **`TriggerInfo`/`TriggerAction`/`TriggerEvent`/`TriggerEnabled`/`TriggerSource` +
     `RoutineInfo`** are the trigger and PG-trigger-function half, and carry three rules the
     same "restate everything or it silently resets" logic as `ViewOptions`.
@@ -619,7 +683,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `TriggerSource` is the MySQL body + session state, fetched lazily — see `schemaic-db`.
     `CheckInfo::validated`/`inherited` are PostgreSQL's `NOT VALID` / `NO INHERIT`, carried and
     restated: they are part of the clause, and `pg_get_constraintdef` prints them *after* the
-    parens, which is why `ddl::check_predicate` must strip them before peeling.
+    parens, which is why `ddl::check_predicate` must strip them before peeling. **An unnamed check
+    stays unnamed**: `CheckInfo::clause_sql` writes a bare `CHECK (…)` when the name is empty,
+    because most SQLite checks have none and `CONSTRAINT "" CHECK (…)` is not a nameless constraint
+    but a syntax error — while inventing a name would make a rebuild read as though it renamed
+    something.
     **The standalone PostgreSQL objects** — `EnumInfo`/`DomainInfo`/`SequenceInfo` — sit here
     beside the tables and, unlike `RoutineInfo`, **on `DbSchema` itself** rather than being
     fetched lazily: the tree lists them and a column's type *is* one of them, so a separately
@@ -863,6 +931,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   arm no longer refuses every plan: the gate moved upstream to `ddl::supports_change`, which can
   see the `Change` where `run_ddl` has only strings, and refusing wholesale here would have taken
   away the drops SQLite genuinely has.
+  **It also suspends foreign keys for the duration and checks them before the commit** — `PRAGMA
+  foreign_keys = OFF` outside the transaction, since SQLite ignores the pragma inside one. It used
+  to turn them *on*, and enforcing during a plan is not the safe reading it looks like: with them
+  on, a rebuild's `DROP TABLE` on a parent is an implicit `DELETE FROM parent`, which fires
+  `ON DELETE CASCADE` and empties the child tables — the table comes back exactly as the user drew
+  it and another one has quietly lost every row (`sqlite::rebuild_fk_tests` rebuilds a one-row
+  `artist` and watches both `album` rows behind an `ON DELETE CASCADE` vanish). That is why step 1
+  of SQLite's own twelve-step procedure turns them off. Nothing is given up by it: `PRAGMA
+  foreign_key_check` runs against the *finished* state before the commit and refuses the plan if a
+  reference dangles, naming the child table and the parent so the refusal is actionable — a stricter
+  question than the per-statement one, since a plan is allowed to pass through states no single
+  statement could.
   **`Db::trigger_source` is the fourth MySQL-vs-MariaDB text divergence** (with `mysql_column`'s
   defaults, the view `ALGORITHM` and `mysql_check_clause`) and the only one that is not an
   optimisation: `information_schema.TRIGGERS.ACTION_STATEMENT` on MySQL 8 returns the body with
@@ -944,7 +1024,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   `PRIMARY` index entry would only put an object in the tree that the database doesn't have. That
   is not in tension with the implicit key above, which *is* synthesised: there the table declares no
   key at all and the rowid is the only identity it has, whereas here the table already has a key and
-  it is a real column — the rowid under another name. `EXPLAIN QUERY PLAN` is what `explain` runs — plain `EXPLAIN` disassembles to VDBE
+  it is a real column — the rowid under another name.
+  **CHECK constraints have no pragma at all**, and `fetch_schema` used to hard-code
+  `check_constraints` empty — harmless until a rebuild could write the table from the draft, where a
+  check missing from the draft is a check the rebuild silently drops. `checks_of` reads them off the
+  table's own `CREATE` text instead, the position `generated_expr_of` is already in and with the
+  same tools: the shared boundary lexer, so a column called `check_sum` or the word inside a string
+  or a comment can't match, and `core::sql::balanced_paren_span` for the predicate, which may
+  perfectly well hold a comma or a `')'` inside a literal. A column-level and a table-level check
+  read alike, because SQLite makes no distinction once the table exists and a rebuild restates both
+  as table constraints; a constraint written without `CONSTRAINT <name>` keeps an **empty** name,
+  which is the honest answer rather than a gap (`sqlite::check_text_tests`/`check_schema_tests`).
+  `trigger_statements` fills `TableInfo::dependent_ddl` the same way and from the same catalogue,
+  re-terminating each statement — SQLite stores it without its `;` and a trigger body is full of
+  internal ones, so a replay would otherwise run into whatever follows it.
+  `EXPLAIN QUERY PLAN` is what `explain` runs — plain `EXPLAIN` disassembles to VDBE
   opcodes, which is a different artefact and useless to `core::plan` — and there is no analyzing
   form, since SQLite will not execute a statement to time it. **Manual transaction mode is refused**
   (`Session::open`): a pinned `rusqlite::Connection` is blocking and `!Sync`, so holding one across
@@ -1070,6 +1164,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     It also owns two things the other editors reuse: `list_pane` — the list-plus-action-bar that
     is **one** Tab stop with Up/Down inside it (over `widgets::list_step`) — and
     `focusable_owned_dropdown`, the picker for a value that isn't `Copy`.
+    **The form asks the engine for a capability, not "is this PostgreSQL".** It asked the latter in
+    three places, which put SQLite on the side that gets a storage engine, a table collation, table
+    and column comments and `ON UPDATE` — it has none of them (a collation is per column there, and
+    `ON UPDATE` is MySQL's timestamp attribute), so each was a field whose input the emitter then
+    dropped on the floor. Column reorder arrows are the one place the old question happens to be the
+    right one and stay offered on SQLite: MySQL moves a column with `AFTER`, SQLite gets there by
+    rebuilding — the new table is created in the draft's column order, so a move costs nothing
+    beyond the rebuild already under way — and PostgreSQL has neither, where an arrow would promise
+    an edit no statement can carry out.
     **Every path ends at `ddl_preview`** — designer, Create table, and the context-menu
     shortcuts — so there's one place that shows the SQL, one that names what's destroyed, and
     one "Open in editor" escape hatch. Never run generated DDL without it.
@@ -1081,10 +1184,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the risk block warns what will happen, this one what won't — and it is the call
     `Change::KeepLossyIndex` already established: the SQL is *less* than the change list above it,
     and a preview that didn't say so would be the dishonest half of a destructive operation. Only
-    SQLite produces one today, and the column row's Drop is the shortcut that can reach it: it goes
-    through the draft, so it takes the column's dependents with it, and a foreign key or the
+    SQLite produces one today, and two things reach it. The column row's Drop is the shortcut: it
+    goes through the draft, so it takes the column's dependents with it, and a foreign key or the
     primary key among them is a `Change` that engine can't express — the preview then says so and
-    refuses, rather than dropping the column out from under them. Entry
+    refuses, rather than dropping the column out from under them. The other is a designer plan that
+    rebuilds a table carrying an index `IndexInfo::lossy` marked: the rebuild has to recreate every
+    index and can't recreate that one faithfully, so the block names it and Apply refuses until the
+    user drops it. Entry
     points:
     `table_designer::open_for_table`/`open_for_new`/`preview_draft_edit` (a shortcut whose
     edit has dependents — dropping a column takes its index and FK with it) and
@@ -1260,7 +1366,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   never the engine** — the rules are predicates on `SqlDialect` (see `sql.rs` above), because
   `dialect == Postgres` / `!= MySql` compiles cleanly while silently sorting a third engine onto
   whichever side it falls, and two of the answers it got wrong for SQLite could hide a `WHERE`
-  from the guard. **Deriving the dialect is the same question**: `Engine::dialect()` is the one
+  from the guard. It is the same rule away from the lexer: the table designer's form asked
+  `!= Postgres` in three places and thereby offered a SQLite table a storage engine, a table
+  collation, comments and `ON UPDATE`, none of which that engine has — each now asks for the
+  capability. **Deriving the dialect is the same question**: `Engine::dialect()` is the one
   exhaustive answer, and the hand-written `if engine == Postgres { Postgres } else { MySql }` that
   stood in for it in `app::mcp` and `app::main` is exactly how SQLite came to be lexed by MySQL's
   rules on the AI path (see `schemaic-app` below). **No exceptions** —
@@ -1334,8 +1443,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   consequence is stated in plain language and where "Open in editor" hands the script over.
   **Nor is a plan applied in part**: what the dialect can't express is `ChangeSet::unsupported()`,
   the preview names each one and Apply refuses while it does — on the action, not only on the
-  disabled button. Which of the two gates to ask depends on the question: `supports_change` for a
-  single change, `supports_schema_editing` for a designer plan. Gate the menu entry on the right
+  disabled button. Which gate to ask depends on the question: `supports_change` for a single change
+  with no draft behind it, and for an editor the capability for *that object* —
+  `supports_view_editing` or `supports_trigger_editing`, there being no predicate for the table
+  designer any more because every engine now has one (SQLite by rebuilding, `Change::RebuildTable`).
+  Gate the menu entry on the right
   one rather than leaving the refusal to `Db::run_ddl`, which sees only strings. A
   new engine is a `SqlDialect` arm in `ddl.rs`'s emitter, not a parallel emitter. The
   round-trip gate (a draft built from a table must diff to *nothing*) is the test that keeps
