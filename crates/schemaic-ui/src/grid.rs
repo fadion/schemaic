@@ -2688,10 +2688,12 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                 // it is one of several siblings: floem dispatches a pointer event
                 // to the first hit child in reverse paint order and stops, so a
                 // release over the frozen pane, the header, or past the last row
-                // never reached it — and `selecting` stayed armed with no button
-                // held, so moving the cursor back over the grid kept extending
-                // the range. There is deliberately no pointer capture (that would
-                // stop the other cells' `PointerEnter`, which *is* the drag).
+                // never reached it. Releases *outside* the grid entirely — the
+                // status bar, the schema panel, the results toolbar — are the
+                // root's `pointer_released`, tracked by the effect beside the
+                // find bar below. There is deliberately no pointer capture (it
+                // would stop the other cells' `PointerEnter`, which *is* the
+                // drag).
                 .on_event_cont(EventListener::PointerUp, move |_| {
                     gs.selecting.set(false);
                 })
@@ -2867,6 +2869,26 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             None => agg.summary(),
         };
         sel_summary.set(Some(label));
+    });
+    // **The rest of the window's pointer-ups.** A drag-select is armed by a
+    // cell's `PointerDown` and continued by other cells' `PointerEnter`, which
+    // is why it can't take pointer capture — capture would stop exactly those
+    // events. So the release is delivered wherever the cursor happens to be, and
+    // for a drag that leaves the table that is the status bar, the schema panel,
+    // or the results panel's own toolbar and filter bar. None of them is inside
+    // the grid, so none reaches the handler on it: the flag stayed armed, and
+    // coming back over the rows with no button held kept extending the range.
+    //
+    // `widgets::pointer_released` is bumped by the workspace root, which every
+    // release reaches. The guard matters as much as the clear — this effect runs
+    // on **every** pointer-up in the app, and `set` never dedups, so an
+    // unguarded write would notify every cell's style closure each time anyone
+    // clicked anything.
+    create_effect(move |_| {
+        crate::widgets::pointer_released().track();
+        if gs.alive() && gs.selecting.get_untracked() {
+            gs.selecting.set(false);
+        }
     });
     one_bar_at_a_time(gs.find_open, gs.goto_open);
     // And hand the keyboard back when the goto popup closes, for the same reason
