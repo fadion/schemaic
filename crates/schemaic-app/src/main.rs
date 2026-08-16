@@ -1108,6 +1108,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let monitor_error: RwSignal<Option<String>> = RwSignal::new(None);
     let monitor_partial: RwSignal<bool> = RwSignal::new(false);
     let monitor_interval: RwSignal<u64> = RwSignal::new(MONITOR_INTERVAL_SECS);
+    let monitor_paused: RwSignal<bool> = RwSignal::new(false);
+    let monitor_export_err: RwSignal<Option<String>> = RwSignal::new(None);
 
     // AI panel state. `ai_session` holds the live CLI conversation (bound to a
     // connection); the reader task streams transcript snapshots over a channel
@@ -1596,6 +1598,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             monitor_cols.set(Vec::new());
             monitor_error.set(None);
             monitor_partial.set(false);
+            monitor_paused.set(false);
+            monitor_export_err.set(None);
             monitor_title.set(Some(format!("{}.{}", source.database, source.display())));
             monitor_open.set(true);
             let ctx = MonitorCtx {
@@ -1614,6 +1618,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 started: Instant::now(),
                 target: (conn_id, source),
                 interval: monitor_interval,
+                paused: monitor_paused,
             };
             monitor_tick(ctx, g);
         })
@@ -5419,6 +5424,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             monitor_error,
             monitor_partial,
             monitor_interval,
+            monitor_paused,
+            monitor_export_err,
             erd: RwSignal::new(None),
             run_guard,
         },
@@ -5631,14 +5638,12 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     schemaic_ui::workspace(ui)
 }
 
-/// Live Monitor tuning: poll interval, per-poll row cap (the monitor is bounded by
-/// construction — it never polls an unbounded table), and the max change-log
-/// length kept in memory (older entries drop off the top).
+/// Live Monitor tuning: the poll interval. The two caps — per-poll rows and
+/// change-log length — live in `core::monitor`, because the modal's status line
+/// has to name both: past `ROW_CAP` it is watching a page rather than a table,
+/// and past `LOG_CAP` the log it can export is missing its oldest entries.
 const MONITOR_INTERVAL_SECS: u64 = 2;
-/// The per-poll row cap lives in `core::monitor` — the modal names it in the
-/// status line when a table is bigger than it.
-use schemaic_core::monitor::ROW_CAP as MONITOR_LIMIT;
-const MONITOR_LOG_MAX: usize = 1000;
+use schemaic_core::monitor::{LOG_CAP as MONITOR_LOG_MAX, ROW_CAP as MONITOR_LIMIT};
 
 /// Everything a Live Monitor poll tick needs, so it can re-arm itself across ticks
 /// (all fields cheap to clone: `Copy` signals, `Rc`s, a `Handle`). See the
@@ -5665,13 +5670,27 @@ struct MonitorCtx {
     /// Poll interval (seconds), read fresh on each re-arm so the popup's dropdown
     /// takes effect on the next tick.
     interval: RwSignal<u64>,
+    /// The modal's Pause toggle. Read fresh on each tick, like `interval`.
+    paused: RwSignal<bool>,
 }
 
 /// One Live Monitor poll: fetch the watched table (bounded), then hand the result
 /// to [`monitor_apply`] on the UI thread. Stops silently if the modal was closed
 /// (`open` false) or a newer session superseded this one (`generation` bumped).
+///
+/// **Pause skips the fetch, not the loop.** Re-arming while paused costs one
+/// signal read per interval and keeps resuming free — a pause that unwound the
+/// loop would need `open_monitor` to restart it, which resets the baseline and
+/// the log, which is the opposite of what Pause is for. The cost is that the
+/// baseline ages: the first poll after a resume diffs against the pre-pause
+/// table and logs the *net* change at the resume timestamp. That is the log's
+/// standing rule (an entry is stamped when a poll observed it), just coarser.
 fn monitor_tick(ctx: MonitorCtx, my_gen: u64) {
     if ctx.open.try_get_untracked() != Some(true) || ctx.generation.get() != my_gen {
+        return;
+    }
+    if ctx.paused.try_get_untracked() == Some(true) {
+        monitor_reschedule(ctx, my_gen);
         return;
     }
     let (conn_id, source) = ctx.target.clone();

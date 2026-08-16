@@ -1864,6 +1864,21 @@ pub struct OverlayUi {
     /// Poll interval in seconds (the popup's dropdown). Read by the poll loop on
     /// each re-arm, so a change takes effect on the next tick. Session-only.
     pub monitor_interval: RwSignal<u64>,
+    /// The Pause toggle. The loop keeps re-arming while paused and skips only the
+    /// *fetch*, so resuming costs nothing and needs no fresh `open_monitor` — but
+    /// it also means the baseline snapshot ages: the first poll after a resume
+    /// diffs against the pre-pause table and logs the **net** change, stamped at
+    /// the resume. That is the log's existing rule (an entry is timestamped when
+    /// a poll observed it, not when it happened), just at a coarser interval.
+    pub monitor_paused: RwSignal<bool>,
+    /// A change-log export that failed to write, held until the next export
+    /// attempt or a close.
+    ///
+    /// Deliberately **not** `monitor_error`: the poll loop clears that on its
+    /// next success, so a write failure reported there would vanish within one
+    /// interval — on the one action whose whole point is that the log outlives
+    /// the modal.
+    pub monitor_export_err: RwSignal<Option<String>>,
     /// ER-diagram modal: `Some(target)` opens it for that database/seed.
     pub erd: RwSignal<Option<ErdTarget>>,
     /// A run the write guard held back, or `None`. Set by
@@ -1895,14 +1910,12 @@ pub struct RunGuard {
     pub pending: Option<PendingRun>,
 }
 
-/// One entry in the Live Monitor's change log: a detected
-/// [`schemaic_core::monitor::RowChange`] plus the
-/// elapsed-since-start timestamp (`M:SS`) at which the monitor observed it.
-#[derive(Clone, Debug)]
-pub struct MonitorEntry {
-    pub at: String,
-    pub change: schemaic_core::monitor::RowChange,
-}
+/// One entry in the Live Monitor's change log. Defined in the core beside the
+/// diff that produces it, because the log's **export** is a pure projection of
+/// these entries ([`schemaic_core::monitor::log_result_set`]) and belongs with
+/// the rest of the change detection; re-exported here so the signal's type still
+/// reads as a UI type at every use site.
+pub use schemaic_core::monitor::MonitorEntry;
 
 /// Open the Live Monitor for a table on a connection — starts polling that table
 /// and reveals the modal. Built in the app, invoked from the grid toolbar.

@@ -7,19 +7,33 @@
 //! inserts/updates/deletes to `overlay.monitor_log`; this modal renders that log
 //! as a scrollable table (Time · Action · ID · Data). Closing (✕ / Esc /
 //! backdrop) sets `overlay.monitor_open` false, which stops the poll loop.
+//!
+//! Three controls sit left of the interval dropdown, and they are what make the
+//! log something you can *use* rather than only watch: **Pause** holds the poll
+//! (the loop keeps re-arming and skips the fetch, so resuming is free),
+//! **Clear** empties the log without disturbing the baseline snapshot, and
+//! **Export** writes it to a file through the ordinary
+//! [`schemaic_core::export`] renderers — the log is projected to a `ResultSet`
+//! by [`schemaic_core::monitor::log_result_set`] so no second renderer exists.
+//! Export matters most on a delete, where the log is the only remaining record
+//! of a row the database no longer has.
 
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use floem::AnyView;
+use floem::action::save_as;
 use floem::event::EventListener;
+use floem::file::{FileDialogOptions, FileSpec};
 use floem::keyboard::{Key, NamedKey};
 use floem::kurbo::{Point, Rect};
 use floem::peniko::Color;
 use floem::prelude::*;
 use floem::reactive::create_effect;
 
-use schemaic_core::monitor::{ChangeKind, RowChange};
+use schemaic_core::export::{ExportFormat, suggested_filename};
+use schemaic_core::monitor::{ChangeKind, LOG_FORMATS, RowChange, log_result_set};
 
 use crate::settings::focusable_dropdown;
 use crate::theme::{FONT_BODY, FONT_LABEL};
@@ -27,15 +41,19 @@ use crate::widgets::{
     autohide_state, follow_after_scroll, loading_dots, panel_style, shift_hscroll, thin_scroll,
     with_scroll_gesture,
 };
+use crate::{MenuEntry, PopupAnchor};
 
 /// The log's rows are shorter than a chat bubble, so it counts as "at the bottom"
 /// a little tighter than the AI panel's `FOLLOW_SLACK`.
 const MONITOR_FOLLOW_SLACK: f64 = 24.0;
 use crate::{MonitorEntry, Ui, icons, theme};
 
-/// Modal size (fixed so the log scrolls within it).
-const MON_W: f64 = 660.0;
-const MON_H: f64 = 460.0;
+/// Modal size (fixed so the log scrolls within it). The width carries the
+/// sub-header's three icon buttons and the interval dropdown alongside a status
+/// line that has to stay readable — at 660 the partial-window warning wrapped
+/// into the controls.
+const MON_W: f64 = 760.0;
+const MON_H: f64 = 510.0;
 
 // Column widths + shared row metrics (header and rows must agree so they align).
 const TIME_W: f64 = 54.0;
@@ -60,6 +78,14 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
     let error = ui.overlay.monitor_error;
     let partial = ui.overlay.monitor_partial;
     let interval = ui.overlay.monitor_interval;
+    let paused = ui.overlay.monitor_paused;
+    let export_err = ui.overlay.monitor_export_err;
+    // The shared popup channel — `popup_menu_overlay` is mounted last in the
+    // workspace stack, so a menu raised from in here paints above this modal and
+    // its backdrop rather than behind them.
+    let popup_menu = ui.overlay.popup_menu;
+    let popup_anchor = ui.overlay.popup_anchor;
+    let export_file = ui.tab_actions.export_file.clone();
 
     dyn_container(
         move || open.get(),
@@ -75,11 +101,20 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                 error.set(None);
                 title.set(None);
                 cols.set(Vec::new());
+                // Pause is a property of the session being watched, not of the
+                // modal: leaving it set would silently un-monitor the *next*
+                // table someone opens.
+                paused.set(false);
+                export_err.set(None);
             });
             // One control, but it still gets a ring: without one the root has no
             // Tab handler, so Tab falls through to floem's whole-window traversal
             // and walks out of the modal into the workspace behind it.
             let ring = crate::widgets::FocusRing::new();
+            // Filled once the Export button exists, so its menu opens under the
+            // button rather than at the last cursor position — which, reached by
+            // Tab and pressed with Enter, is wherever the pointer was left.
+            let export_anchor: RwSignal<Option<floem::ViewId>> = RwSignal::new(None);
 
             // Scroll bookkeeping: `bump` triggers a scroll-to-bottom, `view_rect` +
             // `content_h` decide whether we're at the bottom, `hscroll` mirrors the
@@ -134,45 +169,157 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
             });
 
             // Sub-line under the separator: a live note (or the latest poll error)
-            // on the left, and the poll-interval dropdown on the right — inline with
-            // the subtitle, below the header's X.
+            // on the left, then the Pause/Clear/Export controls and the poll-interval
+            // dropdown on the right — inline with the subtitle, below the header's X.
             let status_text = dyn_container(
-                move || (error.get(), partial.get()),
-                move |(err, partial)| match err {
-                    // `error()`, not `reject_text()`: the latter is the foreground
-                    // for a `reject_bg` pill and measures ~1.03:1 free-standing on
-                    // the panel in *both* themes — legible nowhere.
-                    Some(msg) => text(msg)
-                        .style(|s| s.color(theme::error()).font_size(FONT_LABEL))
-                        .into_any(),
-                    // A table bigger than the poll's cap is watched a page at a
-                    // time, ordered by its key. Changes past that page can't be
-                    // seen at all, so the status line says which rows are covered
-                    // rather than implying the whole table is.
-                    None if partial => text(format!(
-                        "Watching the first {} rows by primary key — changes beyond \
-                         them aren't visible.",
-                        schemaic_core::monitor::ROW_CAP
-                    ))
-                    .style(|s| s.color(theme::plan_warn()).font_size(FONT_LABEL))
-                    .into_any(),
-                    None => {
-                        text("Watching for inserts, updates and deletes — newest at the bottom.")
-                            .style(|s| s.color(theme::text_dim()).font_size(FONT_LABEL))
-                            .into_any()
-                    }
+                move || {
+                    status_line(
+                        export_err.get(),
+                        error.get(),
+                        paused.get(),
+                        partial.get(),
+                        // `>=`, not `==`: the app trims *after* appending, so a
+                        // poll landing several changes at once passes through the
+                        // cap rather than resting on it.
+                        log.with(|l| l.len() >= schemaic_core::monitor::LOG_CAP),
+                    )
+                },
+                move |(msg, tone)| {
+                    text(msg).style(move |s| s.color(tone.color()()).font_size(FONT_LABEL))
                 },
             )
             .style(|s| s.flex_grow(1.0_f32).min_width(0.0));
+
+            // Pause / Clear / Export, left of the interval dropdown. All three are
+            // in the modal's ring, in reading order, so the log is operable without
+            // a pointer — a monitor is watched with both hands off the mouse.
+            let pause_btn = crate::widgets::in_ring_button(
+                dyn_container(
+                    move || paused.get(),
+                    // `toolbar_icon` takes a `&'static str`, so the play/pause swap
+                    // is a rebuild of the *face*. The ring registers the wrapper,
+                    // whose id is stable across it.
+                    move |p| {
+                        crate::widgets::toolbar_icon(
+                            if p {
+                                icons::CIRCLE_PLAY
+                            } else {
+                                icons::CIRCLE_PAUSE
+                            },
+                            0.0,
+                            0.0,
+                            || true,
+                            // Read-modify-write rather than `set(!p)`: `p` is the
+                            // value this face was built for, and the keyboard arm
+                            // below toggles the same way.
+                            move || paused.update(|v| *v = !*v),
+                        )
+                        .into_any()
+                    },
+                )
+                .tooltip(move || {
+                    let t = if paused.get() {
+                        "Resume polling"
+                    } else {
+                        "Pause polling"
+                    };
+                    text(t).style(crate::widgets::tooltip_style)
+                }),
+                ring.clone(),
+                10,
+                true,
+                0.0,
+                move || paused.update(|p| *p = !*p),
+            );
+            // Clear and Export are dimmed on an empty log rather than removed, so
+            // the row doesn't reflow the moment the first change lands. They stay
+            // in the ring either way (`in_ring_button`'s `enabled` is decided once,
+            // at build); each guards itself instead, so Enter on a dimmed button
+            // does nothing.
+            let has_log = move || log.with_untracked(|l| !l.is_empty());
+            let clear_btn = crate::widgets::in_ring_button(
+                crate::widgets::toolbar_icon(
+                    icons::TRASH_2,
+                    0.0,
+                    0.0,
+                    move || log.with(|l| !l.is_empty()),
+                    // Only the log — the baseline snapshot lives in the app and is
+                    // deliberately untouched, so clearing loses the history you
+                    // already read, never a change that hasn't been reported yet.
+                    move || log.set(Vec::new()),
+                )
+                .tooltip(|| text("Clear the log").style(crate::widgets::tooltip_style)),
+                ring.clone(),
+                11,
+                true,
+                0.0,
+                move || {
+                    if has_log() {
+                        log.set(Vec::new());
+                    }
+                },
+            );
+            let export_file = export_file.clone();
+            let export_menu: Rc<dyn Fn()> = {
+                let export_file = export_file.clone();
+                Rc::new(move || {
+                    let export_file = export_file.clone();
+                    popup_anchor.set(
+                        export_anchor
+                            .get_untracked()
+                            .map(|id| id.layout_rect())
+                            .map(|r| PopupAnchor::BelowIcon(r.x0, r.x1, r.y1)),
+                    );
+                    popup_menu.set(Some(
+                        LOG_FORMATS
+                            .iter()
+                            .map(|&f| {
+                                let export_file = export_file.clone();
+                                MenuEntry::action(f.label(), move || {
+                                    save_log(log, cols, title, export_err, export_file.clone(), f);
+                                })
+                            })
+                            .collect(),
+                    ));
+                })
+            };
+            let export_click = export_menu.clone();
+            let export_key = export_menu.clone();
+            let export_btn = crate::widgets::in_ring_button(
+                crate::widgets::toolbar_icon(
+                    icons::DOWNLOAD,
+                    0.0,
+                    0.0,
+                    move || log.with(|l| !l.is_empty()),
+                    move || (export_click)(),
+                )
+                .tooltip(|| text("Export the log…").style(crate::widgets::tooltip_style)),
+                ring.clone(),
+                12,
+                true,
+                0.0,
+                move || {
+                    if has_log() {
+                        (export_key)();
+                    }
+                },
+            );
+            // The ring wrapper's id, not the glyph's: it is the outermost view of
+            // the control, so the menu opens under the whole button. Set after the
+            // button exists, like `table_designer::suggest_chevron`.
+            export_anchor.set(Some(export_btn.id()));
+            let controls = h_stack((pause_btn, clear_btn, export_btn))
+                .style(|s| s.flex_row().items_center().flex_shrink(0.0_f32));
+
             let interval_dd = container(focusable_dropdown(
                 interval,
                 [1u64, 2, 5, 10],
                 interval_label,
                 ring.clone(),
-                10,
+                13,
             ))
             .style(|s| s.width(84.0).flex_shrink(0.0_f32));
-            let status = h_stack((status_text, interval_dd)).style(|s| {
+            let status = h_stack((status_text, controls, interval_dd)).style(|s| {
                 s.width_full()
                     .flex_row()
                     .items_center()
@@ -184,15 +331,32 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
             });
 
             // Body: the change table (header + rows), or a centred placeholder while
-            // empty — so an empty monitor shows just "No changes yet", not a bare
-            // header. Rows are content-sized (no wrap), so it scrolls both axes.
+            // empty — so an empty monitor shows just "Waiting…", not a bare header.
+            // Rows are content-sized (no wrap), so it scrolls both axes.
             let content = dyn_container(
                 move || log.with(|l| l.is_empty()),
                 move |empty_log| {
                     if empty_log {
-                        return container(loading_dots("Waiting", theme::text_dim, 13.0))
-                            .style(|s| s.size_full().items_center().justify_center())
-                            .into_any();
+                        // `paused` is tracked *here*, inside the empty branch, not in
+                        // the outer selector: adding it there would rebuild the whole
+                        // table on every pause toggle and throw away its scroll
+                        // position, which is the thing someone pauses in order to read.
+                        return container(dyn_container(
+                            move || paused.get(),
+                            move |is_paused| {
+                                if is_paused {
+                                    // Static, not `loading_dots`: cycling dots say
+                                    // "any moment now", and a paused monitor is not
+                                    // waiting for anything.
+                                    return text("Paused.")
+                                        .style(|s| s.color(theme::text_dim()).font_size(13.0))
+                                        .into_any();
+                                }
+                                loading_dots("Waiting", theme::text_dim, 13.0).into_any()
+                            },
+                        ))
+                        .style(|s| s.size_full().items_center().justify_center())
+                        .into_any();
                     }
                     // Header: full-width separator bar whose labels scroll
                     // horizontally in sync with the body (reads `hscroll`; never
@@ -422,6 +586,147 @@ fn data_view(change: &RowChange, cols: &[String]) -> impl IntoView + use<> {
     h_stack_from_iter(spans).style(|s| s.flex_row().items_center().flex_shrink(0.0_f32))
 }
 
+/// How loudly the sub-header's status line should read. Separate from the colour
+/// so the line itself is a pure, testable decision — the colour is looked up
+/// through [`Tone::color`], which hands back a `fn() -> Color` rather than a
+/// `Color` because it is read inside a reactive style (see the themable-colour
+/// invariant).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tone {
+    Error,
+    /// The monitor is working, but not on what you'd assume from the log alone.
+    Warn,
+    Calm,
+}
+
+impl Tone {
+    fn color(self) -> fn() -> Color {
+        match self {
+            // `error()`, not `reject_text()`: the latter is the foreground for a
+            // `reject_bg` pill and measures ~1.03:1 free-standing on the panel in
+            // *both* themes — legible nowhere.
+            Tone::Error => theme::error,
+            Tone::Warn => theme::plan_warn,
+            Tone::Calm => theme::text_dim,
+        }
+    }
+}
+
+/// What the sub-header's status line says, and how loudly.
+///
+/// Errors take the line outright, worst-to-mislead first: a **failed export**
+/// beats everything, because the user believes they have a file and doesn't; a
+/// **poll error** beats the rest, because nothing below it is true while polling
+/// is broken.
+///
+/// Otherwise the line is a lead plus every caveat that currently applies, because
+/// they *co-occur* and each one is a different reason the log isn't the whole
+/// story: a paused monitor watching a capped page of an oversized table is three
+/// things at once, and any of them dropped for brevity is the one the reader
+/// needed. `partial` and `capped` are the two silent truncations — rows the poll
+/// can't see, and changes the log has already dropped — and the second only
+/// became load-bearing when the log became exportable.
+fn status_line(
+    export_err: Option<String>,
+    poll_err: Option<String>,
+    paused: bool,
+    partial: bool,
+    capped: bool,
+) -> (String, Tone) {
+    if let Some(msg) = export_err.or(poll_err) {
+        return (msg, Tone::Error);
+    }
+    let mut caveats: Vec<String> = Vec::new();
+    if partial {
+        caveats.push(format!(
+            "only the first {} rows by primary key are covered",
+            schemaic_core::monitor::ROW_CAP
+        ));
+    }
+    if capped {
+        caveats.push(format!(
+            "the log is at its {}-change cap, so the oldest are dropping",
+            schemaic_core::monitor::LOG_CAP
+        ));
+    }
+    if caveats.is_empty() {
+        return match paused {
+            true => (
+                "Paused — the log keeps what it has; nothing new is being captured.".to_string(),
+                Tone::Warn,
+            ),
+            false => (
+                "Watching for inserts, updates and deletes — newest at the bottom.".to_string(),
+                Tone::Calm,
+            ),
+        };
+    }
+    let lead = if paused { "Paused" } else { "Watching" };
+    (format!("{lead} — {}.", caveats.join("; ")), Tone::Warn)
+}
+
+/// Write the change log to a file the user picks, in `format`.
+///
+/// The log is **snapshotted before the dialog opens**, for the reason
+/// `grid::save_export` gives: the dialog is modal and slow, and here the poll
+/// keeps appending behind it, so rendering afterwards would save a log the user
+/// never saw. The rendering itself is the ordinary [`schemaic_core::export`]
+/// path over [`log_result_set`]'s projection — the app owns the worker thread
+/// that actually writes, exactly as it does for a results export.
+fn save_log(
+    log: RwSignal<Vec<crate::MonitorEntry>>,
+    cols: RwSignal<Vec<String>>,
+    title: RwSignal<Option<String>>,
+    export_err: RwSignal<Option<String>>,
+    export_file: crate::ExportFn,
+    format: ExportFormat,
+) {
+    export_err.set(None);
+    // `sakila.actor-monitor.csv` — the watched table, marked as the log of it
+    // rather than a dump of it. `suggested_filename` sanitizes and adds the
+    // extension.
+    let base = title.get_untracked().map(|t| format!("{t}-monitor"));
+    let opts = FileDialogOptions::new()
+        .title("Export change log")
+        .default_name(suggested_filename(base.as_deref(), format))
+        .allowed_types(vec![FileSpec {
+            name: format.label(),
+            extensions: format.extensions(),
+        }]);
+    let rs = Arc::new(log_result_set(&log.get_untracked(), &cols.get_untracked()));
+    // The log is already in the order it should be read (oldest first) and the
+    // export applies no sort of its own, so display order is row order.
+    let order: Arc<Vec<usize>> = Arc::new((0..rs.row_count()).collect());
+    save_as(opts, move |file| {
+        let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
+            return; // cancelled
+        };
+        (export_file)(
+            crate::ExportRequest {
+                path,
+                format,
+                // `save_as` takes an `Fn`, so the snapshot is cloned per call —
+                // two `Arc` bumps, not the rows.
+                rs: rs.clone(),
+                order: order.clone(),
+                // No base table, and the dialect is unread: only the SQL renderer
+                // consults either, and `LOG_FORMATS` deliberately doesn't offer
+                // it — these rows are observations *about* a table, not rows of
+                // one, so there is nothing to `INSERT INTO`.
+                source: None,
+                dialect: Default::default(),
+            },
+            // `try_update`: the modal may have closed while the dialog was open
+            // or the write ran, and a plain `set` would panic on a freed signal.
+            Rc::new(move |res| {
+                if let Err(e) = res {
+                    export_err.try_update(|v| *v = Some(format!("Export failed — {e}")));
+                }
+            }),
+        );
+    });
+}
+
 /// Poll-interval option labels for the dropdown.
 fn interval_label(secs: u64) -> &'static str {
     match secs {
@@ -438,5 +743,123 @@ fn cell(c: &Option<String>) -> String {
     match c {
         Some(s) => s.clone(),
         None => "NULL".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `status_line` with no error and nothing paused/capped — the two truncation
+    /// flags are what most of these vary.
+    fn line(paused: bool, partial: bool, capped: bool) -> (String, Tone) {
+        status_line(None, None, paused, partial, capped)
+    }
+
+    #[test]
+    fn idle_watching_reads_calm() {
+        let (msg, tone) = line(false, false, false);
+        assert_eq!(tone, Tone::Calm);
+        assert!(msg.starts_with("Watching for inserts"), "{msg}");
+    }
+
+    #[test]
+    fn a_failed_export_outranks_everything_else() {
+        // The user believes they have a file. Nothing else on this line matters
+        // as much, and a poll error two seconds later must not bury it.
+        let (msg, tone) = status_line(
+            Some("Export failed — access denied".into()),
+            Some("connection lost".into()),
+            true,
+            true,
+            true,
+        );
+        assert_eq!(tone, Tone::Error);
+        assert_eq!(msg, "Export failed — access denied");
+    }
+
+    #[test]
+    fn a_poll_error_outranks_the_caveats() {
+        let (msg, tone) = status_line(None, Some("connection lost".into()), false, true, true);
+        assert_eq!(tone, Tone::Error);
+        assert_eq!(msg, "connection lost");
+    }
+
+    #[test]
+    fn paused_says_the_log_is_kept_and_nothing_is_captured() {
+        let (msg, tone) = line(true, false, false);
+        assert_eq!(tone, Tone::Warn);
+        assert!(msg.starts_with("Paused —"), "{msg}");
+        assert!(msg.contains("nothing new is being captured"), "{msg}");
+    }
+
+    #[test]
+    fn a_partial_window_names_the_row_cap() {
+        let (msg, tone) = line(false, true, false);
+        assert_eq!(tone, Tone::Warn);
+        assert!(msg.starts_with("Watching —"), "{msg}");
+        assert!(
+            msg.contains(&schemaic_core::monitor::ROW_CAP.to_string()),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_full_log_says_the_oldest_are_dropping() {
+        // The caveat that makes an export honest: a log at its cap has already
+        // lost entries, and a file written from it looks complete.
+        let (msg, tone) = line(false, false, true);
+        assert_eq!(tone, Tone::Warn);
+        assert!(msg.contains("oldest are dropping"), "{msg}");
+        assert!(
+            msg.contains(&schemaic_core::monitor::LOG_CAP.to_string()),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn co_occurring_caveats_are_both_said() {
+        // The case the earlier one-branch-per-state shape got wrong: these are
+        // different reasons the log isn't the whole story, so neither replaces
+        // the other.
+        let (msg, tone) = line(false, true, true);
+        assert_eq!(tone, Tone::Warn);
+        assert!(msg.contains("by primary key are covered"), "{msg}");
+        assert!(msg.contains("oldest are dropping"), "{msg}");
+    }
+
+    #[test]
+    fn pausing_changes_the_lead_and_keeps_the_caveats() {
+        let (msg, tone) = line(true, true, true);
+        assert_eq!(tone, Tone::Warn);
+        assert!(msg.starts_with("Paused —"), "{msg}");
+        assert!(msg.contains("by primary key are covered"), "{msg}");
+        assert!(msg.contains("oldest are dropping"), "{msg}");
+    }
+
+    #[test]
+    fn every_line_is_one_sentence_ending_in_a_stop() {
+        for paused in [false, true] {
+            for partial in [false, true] {
+                for capped in [false, true] {
+                    let (msg, _) = line(paused, partial, capped);
+                    assert!(msg.ends_with('.'), "{paused}/{partial}/{capped}: {msg}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_tones_map_to_distinct_theme_colours() {
+        // Guards the `fn() -> Color` indirection: a `Tone` that resolved to the
+        // same colour as another would make a warning unreadable as one.
+        let (e, w, c) = (
+            Tone::Error.color()(),
+            Tone::Warn.color()(),
+            Tone::Calm.color()(),
+        );
+        assert_ne!(e, w);
+        assert_ne!(w, c);
+        assert_ne!(e, c);
     }
 }
