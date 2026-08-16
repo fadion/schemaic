@@ -84,7 +84,7 @@ pub async fn serve(endpoint: crate::ai::McpEndpoint) {
                     "serverInfo": { "name": "schemaic", "version": env!("CARGO_PKG_VERSION") }
                 }))
             }
-            "tools/list" => Some(json!({ "tools": tools_list() })),
+            "tools/list" => Some(json!({ "tools": tools_list(db.engine()) })),
             "tools/call" => {
                 let name = req
                     .pointer("/params/name")
@@ -110,12 +110,26 @@ pub async fn serve(endpoint: crate::ai::McpEndpoint) {
     }
 }
 
-fn tools_list() -> Value {
+/// The tools this server offers, described for **this** connection's engine.
+///
+/// `run_query`'s advertised statement heads come from
+/// [`schemaic_core::sql::read_only_heads`], the same list the gate enforces — a
+/// hard-coded `SELECT/SHOW/DESCRIBE/EXPLAIN/WITH` told every model that a SQLite
+/// connection accepted `SHOW TABLES` and `DESCRIBE t`, which SQLite has no syntax
+/// for, so a model reasoning from the tool's own text would spend turns on
+/// statements that could only ever come back as parser errors.
+fn tools_list(engine: schemaic_db::Engine) -> Value {
+    let dialect = engine.dialect();
+    let heads = schemaic_core::sql::read_only_heads(dialect).join("/");
     json!([
         {
             "name": "run_query",
-            "description": "Execute ONE read-only SQL statement (SELECT/SHOW/DESCRIBE/EXPLAIN/WITH \
-                            only) against the user's active database connection and return the rows.",
+            "description": format!(
+                "Execute ONE read-only SQL statement ({heads} only) against the user's active \
+                 database connection and return the rows. The connection is {}, so write it in \
+                 that dialect.",
+                dialect.engine_label(),
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -535,6 +549,51 @@ mod tests {
         format_database_schema, format_table, format_table_detail, format_table_heading,
         negotiate_protocol, normalize_stmt,
     };
+
+    /// What `run_query` advertises is what the gate enforces, per engine. The
+    /// description used to be a fixed `SELECT/SHOW/DESCRIBE/EXPLAIN/WITH`, so a
+    /// SQLite connection told the model it could `SHOW TABLES` — a statement
+    /// SQLite has no syntax for, and the model had only a parser error to learn
+    /// from. This walks the advertised heads back through the gate.
+    #[test]
+    fn run_query_advertises_exactly_the_heads_its_gate_allows() {
+        for engine in [
+            schemaic_db::Engine::MySql,
+            schemaic_db::Engine::Postgres,
+            schemaic_db::Engine::Sqlite,
+        ] {
+            let dialect = engine.dialect();
+            let tools = super::tools_list(engine);
+            let desc = tools[0]["description"].as_str().expect("a description");
+            assert_eq!(tools[0]["name"], "run_query");
+            assert!(
+                desc.contains(dialect.engine_label()),
+                "{engine:?} is not named: {desc}"
+            );
+            // Every head it names is one the gate accepts…
+            for head in schemaic_core::sql::read_only_heads(dialect) {
+                assert!(desc.contains(head), "{engine:?} omits {head}: {desc}");
+                let sql = if *head == "WITH" {
+                    "WITH c AS (SELECT 1) SELECT * FROM c".to_string()
+                } else {
+                    format!("{head} t")
+                };
+                assert!(
+                    schemaic_core::sql::read_only_reason(&sql, dialect).is_ok(),
+                    "{engine:?} advertises {head} but the gate refuses it"
+                );
+            }
+            // …and it names no head the gate would refuse.
+            for head in ["SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH"] {
+                if desc.contains(head) {
+                    assert!(
+                        schemaic_core::sql::read_only_heads(dialect).contains(&head),
+                        "{engine:?} advertises {head}, which its gate rejects: {desc}"
+                    );
+                }
+            }
+        }
+    }
 
     /// Every engine reaches its **own** dialect. This was an
     /// `if Postgres { … } else { MySql }`, which compiles cleanly while sorting a
