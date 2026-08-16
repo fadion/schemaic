@@ -1023,7 +1023,7 @@ fn columns_list(ui: Ui, ring: FocusRing) -> AnyView {
     let del_ui = ui.clone();
     let up_ui = ui.clone();
     let down_ui = ui.clone();
-    let mysql = d
+    let can_reorder = d
         .designer
         .get_untracked()
         .is_some_and(|t| t.dialect != SqlDialect::Postgres);
@@ -1055,8 +1055,8 @@ fn columns_list(ui: Ui, ring: FocusRing) -> AnyView {
             // so a move costs nothing beyond the rebuild already under way.
             // PostgreSQL has neither, and arrows there would promise an edit no
             // statement can carry out.
-            mysql.then(|| Rc::new(move || swap_selected(&up_ui, -1)) as Rc<dyn Fn()>),
-            mysql.then(|| Rc::new(move || swap_selected(&down_ui, 1)) as Rc<dyn Fn()>),
+            can_reorder.then(|| Rc::new(move || swap_selected(&up_ui, -1)) as Rc<dyn Fn()>),
+            can_reorder.then(|| Rc::new(move || swap_selected(&down_ui, 1)) as Rc<dyn Fn()>),
             ring.clone(),
         ),
         d.selected,
