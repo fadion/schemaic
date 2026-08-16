@@ -1885,6 +1885,22 @@ Re-introducing the anti-patterns these guard against is a regression:
   the editor stole the keyboard out from under the modal, which then had to be clicked again
   before it answered Escape. The registry is the honest test — a list of the modals that are open
   would rot on the next one added.
+- **The results toolbar is the one `FocusRing` outside an overlay.** Every other ring belongs to a
+  modal, and a ring *wraps* precisely so a modal's Tab order is a trap — which is why the workspace
+  has none. Scoped to a single strip that property is the right one: the walk stays in the toolbar
+  instead of falling into floem's whole-window traversal, and **Escape** is the deliberate way out
+  rather than the last Tab. **F6** enters it from the grid body (`step_from` with the body's own
+  non-member id, so it enters at the first control or resumes where the strip was left, and arms
+  `keyboard_nav` on the way); ←/→ walk it, Tab does too, Enter/Space activates. `widgets::in_strip_button`
+  is `in_ring_button` plus those two keys, and its `leave` must **defer** its focus request —
+  `in_focus_ring`'s own Escape arm runs too (floem folds every KeyDown listener) and queues a
+  `ClearFocus` in the same pass, so only a request landing in a later tick wins. Two smaller rules
+  ride along: a disabled control is not a ring member, so the block holding − and clone tracks the
+  row selection as well as insertability or Tab would walk onto controls that had since gone live;
+  and closing a menu raised from the strip has to hand focus **back to the icon**
+  (`widgets::set_menu_return`), because the panel is a `focus_root` with no other root above it out
+  here and its teardown would otherwise drop focus entirely — which left F6, a listener on the grid
+  body, with nothing to fire on.
 - **Tab navigation is ours, not floem's, and a modal's Tab order is a `widgets::FocusRing`.**
   Floem has `view_tab_navigation`, and it is unusable here on three counts: it is `pub(crate)`; it
   walks the *whole window tree*, so Tab would leave the modal for the workspace behind it; and it
@@ -2138,9 +2154,15 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   fires during **layout** with the view's window origin, not on pointer movement, so what they
   anchor to is the widget and not the cursor.
 - **Not every menu can be *opened* from the keyboard**, which is a separate thing from navigating
-  one. Only a menu on a ringed control can be — `suggest_chevron` today. `grid.rs` registers nothing
-  in a `FocusRing` at all, so its Copy/Save/AI dropdowns are pointer-only, and a right-click menu
-  needs a right-click (a Menu/Shift+F10 key is the usual answer, and there isn't one).
+  one. Only a menu on a ringed control can be: `suggest_chevron`, and the grid toolbar's Copy / Save
+  / AI dropdowns since the strip gained its ring. A right-click menu still needs a right-click (a
+  Menu/Shift+F10 key is the usual answer, and there isn't one).
+- **A menu the keyboard opened gives focus back when it closes** — `widgets::set_menu_return`, set
+  by the opener and **taken** by `menu_panel` as it builds, so the slot lives only between the two
+  and a later menu cannot inherit a stale return. Folded into `close`, the path Escape and every
+  action take. Gated on `keyboard_nav` because it is only wanted there: after a click, moving focus
+  to the control clicked would take the arrow keys away from whatever had them (the grid's own cell
+  navigation), and a click-away dismissal sets the channel to `None` directly and skips it anyway.
 
 ## Data grid (results grid)
 
