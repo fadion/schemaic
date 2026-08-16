@@ -81,7 +81,10 @@ pub(crate) fn open_for_view(ui: &Ui, database: &str, schema: Option<&str>, view:
         return;
     };
     let ctx = edit_ctx(ui);
-    let needs_algorithm = ctx.dialect != SqlDialect::Postgres
+    // MySQL's question and nobody else's — `SHOW CREATE VIEW` is the only place
+    // the algorithm lives. Asked as `== MySql`, not `!= Postgres`: the second
+    // spelling sent SQLite off to fetch an option it has no concept of.
+    let needs_algorithm = ctx.dialect == SqlDialect::MySql
         && info
             .view_options
             .as_ref()
@@ -248,7 +251,11 @@ fn bound_choice(
 fn form(ui: Ui, target: &ViewTarget, ring: FocusRing) -> AnyView {
     let d = ui.ddl.view_draft;
     let draft = d.get_untracked();
+    // Asked per engine rather than as `pg` / `!pg`: SQLite is a third shape, not
+    // MySQL's, and every option below belongs to exactly one of them.
+    let my = target.dialect == SqlDialect::MySql;
     let pg = target.dialect == SqlDialect::Postgres;
+    let sqlite = target.dialect == SqlDialect::Sqlite;
 
     // No "In {database}" row: the modal title names the place now.
     let name = form_setting(
@@ -296,26 +303,61 @@ fn form(ui: Ui, target: &ViewTarget, ring: FocusRing) -> AnyView {
     // ── options ──────────────────────────────────────────────────────────────
     // Shown because they're *preserved*: a replace that doesn't restate them
     // resets them, so the form is where the user sees what's coming along.
-    // The one option both engines spell the same way.
-    let check = form_setting(
-        "Check option",
-        bound_choice(
-            &ui,
-            draft.options.check_option.clone().unwrap_or_default(),
-            ["", "CASCADED", "LOCAL"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            ring.clone(),
-            30,
-            |d, v| d.options.check_option = Some(v.to_string()).filter(|s| !s.is_empty()),
-        ),
-    );
+    // The one option two of the three engines spell the same way — SQLite has no
+    // check option at all.
+    let check: AnyView = if sqlite {
+        crate::widgets::nothing()
+    } else {
+        form_setting(
+            "Check option",
+            bound_choice(
+                &ui,
+                draft.options.check_option.clone().unwrap_or_default(),
+                ["", "CASCADED", "LOCAL"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                ring.clone(),
+                30,
+                |d, v| d.options.check_option = Some(v.to_string()).filter(|s| !s.is_empty()),
+            ),
+        )
+        .into_any()
+    };
+
+    // SQLite's alone, and the only option it has. It matters more here than the
+    // others do anywhere: every edit to a SQLite view is a drop and a re-create,
+    // so a list that isn't restated is a view whose columns quietly take the
+    // body's names.
+    let sqlite_only: AnyView = if !sqlite {
+        crate::widgets::nothing()
+    } else {
+        form_setting(
+            "Column names",
+            bound_field(
+                &ui,
+                draft.options.column_list.clone().unwrap_or_default(),
+                FieldCfg {
+                    placeholder: "optional — taken from the SELECT when empty",
+                    focus: Some((ring.clone(), 30)),
+                    mono: true,
+                    ..Default::default()
+                },
+                |d, v| d.options.column_list = Some(v.trim().to_string()).filter(|s| !s.is_empty()),
+            )
+            // Wider than the form's other single-line fields, which is what the
+            // placeholder needs: it doesn't clip at the field's edge, it paints
+            // over it. Same width the trigger editor's `When` and `Of columns`
+            // fields take, so the two SQLite forms line up.
+            .style(move |s| s.width(FIELD_W * 1.6)),
+        )
+        .into_any()
+    };
 
     // MySQL's alone, and built only there rather than built and hidden: a
     // `hide()`n control is still in the modal's Tab order, so Tab would land on
     // something nobody can see.
-    let mysql_only: AnyView = if pg {
+    let mysql_only: AnyView = if !my {
         crate::widgets::nothing()
     } else {
         let security = form_setting(
@@ -377,6 +419,7 @@ fn form(ui: Ui, target: &ViewTarget, ring: FocusRing) -> AnyView {
         body,
         form_section("Options").style(|s| s.margin_top(4.0)),
         check,
+        sqlite_only,
         mysql_only,
         recreate,
     ))
