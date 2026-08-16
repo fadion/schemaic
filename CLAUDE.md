@@ -97,7 +97,12 @@ start with a failing test, then the code that makes it pass.
   export, diffing, key selection, gating) must have unit tests covering the happy path, empty/edge
   inputs, and known failure modes. Prefer many small, named tests over one broad one.
 - **Keep the suite green + fast.** `cargo test --workspace` must pass before any commit; tests stay
-  pure (no live DB / network / filesystem — model those at the boundary). Don't commit with failing
+  pure (no live DB / network / filesystem — model those at the boundary). **In-memory SQLite is
+  allowed** and is not an exception to that rule: it needs no server, touches no file and is
+  deterministic, which is why `db::sqlite` is the one backend whose DB layer is tested directly.
+  Use SQLite's shared-cache memory URI (`file:name?mode=memory&cache=shared`, unique name per test)
+  where several connections must reach one database, as the write paths do — a plain `:memory:` is
+  private to one connection, and a temp file would break the rule for real. Don't commit with failing
   or `#[ignore]`d tests unless the user asks. The single exception is
   `core/tests/doc_coverage.rs`, which asserts every `src/*.rs` module is named somewhere in
   `docs/architecture.md` — the thing under test *is* a file. A new module fails it until it's on the
