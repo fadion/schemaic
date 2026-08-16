@@ -1485,6 +1485,46 @@ pub(crate) fn window_size() -> RwSignal<(f64, f64)> {
     })
 }
 
+/// The stored pointer-release nonce plus the scope that owns it.
+type PointerReleaseSlot = (RwSignal<u64>, Scope);
+
+thread_local! {
+    static POINTER_RELEASED: std::cell::RefCell<Option<PointerReleaseSlot>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Bumped whenever the pointer is released **anywhere in the window**. Set once
+/// from `workspace`'s root `PointerUp`; read by anything holding a
+/// button-is-down flag.
+///
+/// This exists because "the button came up" is the one pointer fact a view
+/// cannot observe locally. A drag that begins in one view routinely ends
+/// somewhere else entirely — floem delivers the release to whatever is under
+/// the cursor — and there is no capture to fall back on: the grid's drag-select
+/// is *driven* by other cells' `PointerEnter`, so `request_active` would stop
+/// the very events that make it work.
+///
+/// The grid's `selecting` flag latched on for exactly that reason: released over
+/// the status bar, the schema panel, or its own results toolbar, it stayed
+/// armed, and moving the cursor back over the rows kept extending the selection
+/// with no button held. Its own `PointerUp` covers releases inside the grid;
+/// this covers the rest of the window, which is most of it.
+///
+/// A nonce rather than a bool: a flag would have to be un-set by someone, and
+/// two consecutive releases must be two events. Readers track it and act on the
+/// change.
+pub(crate) fn pointer_released() -> RwSignal<u64> {
+    POINTER_RELEASED.with(|cell| {
+        if cell.borrow().is_none() {
+            // Detached scope → lives for the whole process, like `window_size`.
+            let scope = Scope::new();
+            let sig = scope.create_rw_signal(0u64);
+            *cell.borrow_mut() = Some((sig, scope));
+        }
+        cell.borrow().as_ref().unwrap().0
+    })
+}
+
 // ── Reusable themed popup menu (with nested submenus) ───────────────────────
 //
 // `menu_panel(entries, close, width)` renders a themed popup (matching the schema
@@ -1957,19 +1997,30 @@ pub(crate) fn with_scroll_gesture(s: Scroll) -> (Scroll, ScrollGestureByUser) {
         })
         // The release we would otherwise never see: no pointer capture, so a
         // drag that ends outside this view delivers its `PointerUp` elsewhere and
-        // the flag latches on forever.
+        // the flag latches on forever. `PointerLeave` catches it first and
+        // cheaply, which matters because the stamp it guards expires in 500 ms.
         .on_event_cont(EventListener::PointerLeave, {
             let h = held.clone();
             move |_| h.set(false)
-        })
-        .on_event_cont(EventListener::PointerMove, {
-            let (p, h) = (pending.clone(), held.clone());
-            move |_| {
-                if h.get() {
-                    p.set(Some(Instant::now()));
-                }
-            }
         });
+    // …and the backstop for what `PointerLeave` can still miss — a window that
+    // loses focus mid-drag, or a release delivered to a view the pointer never
+    // visibly left. The root sees every release; see [`pointer_released`].
+    {
+        let h = held.clone();
+        floem::reactive::create_effect(move |_| {
+            pointer_released().track();
+            h.set(false);
+        });
+    }
+    let s = s.on_event_cont(EventListener::PointerMove, {
+        let (p, h) = (pending.clone(), held.clone());
+        move |_| {
+            if h.get() {
+                p.set(Some(Instant::now()));
+            }
+        }
+    });
     let by_user: ScrollGestureByUser = Rc::new(move || {
         matches!(pending.replace(None),
             Some(t) if t.elapsed() < std::time::Duration::from_millis(SCROLL_GESTURE_MS))

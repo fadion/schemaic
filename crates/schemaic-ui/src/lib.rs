@@ -2300,6 +2300,14 @@ pub fn workspace(ui: Ui) -> impl IntoView {
         }
         EventPropagation::Continue
     })
+    // Publish "the pointer came up", wherever it came up. A drag that starts in
+    // one view routinely ends in another — floem delivers the release to
+    // whatever is under the cursor — so a view holding a button-is-down flag
+    // cannot see the end of its own gesture. `_cont`, so this observes without
+    // taking the event from anyone. See `widgets::pointer_released`.
+    .on_event_cont(EventListener::PointerUp, |_| {
+        widgets::pointer_released().update(|n| *n = n.wrapping_add(1));
+    })
     // Publish the window size (for menu edge-flipping).
     .on_resize(|r| window_size().set((r.width(), r.height())))
     // Publish window focus (for the connection health poll). These two events
