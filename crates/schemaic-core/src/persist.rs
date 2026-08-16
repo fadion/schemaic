@@ -850,6 +850,7 @@ mod tests {
             port: 3306,
             user: "u".to_string(),
             password: String::new(),
+            file: String::new(),
             ssh: crate::connection::SshTunnel {
                 auth: SshAuth::Agent,
                 ..Default::default()

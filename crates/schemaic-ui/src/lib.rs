@@ -1019,6 +1019,10 @@ pub struct DraftSignals {
     pub port: RwSignal<String>,
     pub user: RwSignal<String>,
     pub password: RwSignal<String>,
+    /// The database file, for SQLite — the one engine with no server. Kept
+    /// alongside the server coordinates rather than replacing them so switching
+    /// the engine picker back and forth doesn't discard either set.
+    pub file: RwSignal<String>,
     pub ssh_enabled: RwSignal<bool>,
     pub ssh_host: RwSignal<String>,
     pub ssh_port: RwSignal<String>,
@@ -1049,6 +1053,7 @@ impl DraftSignals {
             port: cx.create_rw_signal("3306".to_string()),
             user: cx.create_rw_signal(String::new()),
             password: cx.create_rw_signal(String::new()),
+            file: cx.create_rw_signal(String::new()),
             ssh_enabled: cx.create_rw_signal(false),
             ssh_host: cx.create_rw_signal(String::new()),
             ssh_port: cx.create_rw_signal("22".to_string()),
@@ -1073,6 +1078,7 @@ impl DraftSignals {
         self.port.set(c.port.to_string());
         self.user.set(c.user.clone());
         self.password.set(c.password.clone());
+        self.file.set(c.file.clone());
         self.ssh_enabled.set(c.ssh.enabled);
         self.ssh_host.set(c.ssh.host.clone());
         self.ssh_port.set(c.ssh.port.to_string());
@@ -1096,6 +1102,7 @@ impl DraftSignals {
         self.port.set("3306".to_string());
         self.user.set(String::new());
         self.password.set(String::new());
+        self.file.set(String::new());
         self.ssh_enabled.set(false);
         self.ssh_host.set(String::new());
         self.ssh_port.set("22".to_string());
@@ -1131,6 +1138,7 @@ impl DraftSignals {
             db_type,
             user: self.user.get_untracked(),
             password: self.password.get_untracked(),
+            file: self.file.get_untracked().trim().to_string(),
             ssh: schemaic_core::connection::SshTunnel {
                 enabled: self.ssh_enabled.get_untracked(),
                 host: self.ssh_host.get_untracked(),

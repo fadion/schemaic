@@ -5,6 +5,13 @@
 //! optional SSH tunnel is captured here (password / key-pair / agent auth); it's
 //! established by `schemaic_db::ssh::open_tunnel`.
 //!
+//! **SQLite is the exception to all of that**, and it is worth stating once here
+//! rather than at each field: there is no server, so [`Connection::file`] is the
+//! whole target and `host`/`port`/`user`/`password`/`ssh` are inert. It follows
+//! that such a connection has no secret to keep (nothing reaches the keyring — an
+//! empty password is deleted from the store, not written), no tunnel to open, and
+//! exactly one database, which SQLite itself calls `main`.
+//!
 //! NOTE: secrets (the DB password, the SSH tunnel password, and the SSH key
 //! passphrase) are NOT persisted in this struct's JSON — they live in the OS
 //! keyring and are hydrated back into these fields on load. See [`crate::secrets`]
@@ -213,13 +220,27 @@ impl Default for SshTunnel {
 pub struct Connection {
     pub id: u64,
     pub name: String,
-    /// Engine label; only "MySQL" is wired for now.
+    /// Engine label — `MySQL`/`MariaDB`, `PostgreSQL` or `SQLite`, read through
+    /// [`is_postgres`]/[`is_sqlite`] rather than compared here, since the aliases
+    /// are theirs to know. Anything unrecognised is MySQL, which is what keeps a
+    /// connection saved before the field existed working.
     #[serde(default = "default_db_type")]
     pub db_type: String,
     pub host: String,
     pub port: u16,
     pub user: String,
     pub password: String,
+    /// The database **file**, for the one engine that has no server:
+    /// [`is_sqlite`]. Empty on every other engine, and empty on every connection
+    /// saved before this field existed — which is why it is `#[serde(default)]`
+    /// and a `String` rather than an `Option`, matching how `host`/`user` already
+    /// spell "not set" here.
+    ///
+    /// It sits beside the server coordinates rather than replacing them because a
+    /// connection's engine is editable in place: switching a saved connection from
+    /// MySQL to SQLite and back must not discard the host it is going back to.
+    #[serde(default)]
+    pub file: String,
     #[serde(default)]
     pub ssh: SshTunnel,
     /// Optional identity colour (a `#rrggbb` hex), shown as a dot across the
@@ -246,15 +267,36 @@ fn default_db_type() -> String {
 }
 
 impl Connection {
-    /// `host:port`, shown in the UI.
+    /// `host:port`, shown in the UI — or, on SQLite, the file's **name**.
     ///
     /// There is deliberately no `mysql://user:pass@host/db` URL builder: the DB
     /// layer takes a [`crate::connection::Connection`] and passes credentials to
     /// the driver structurally (`schemaic_db::Db`), so nothing threads a
     /// plaintext credential URL as identity (review §3.1) and passwords need no
     /// percent-encoding (review B7).
+    ///
+    /// A SQLite connection has no host and no port, so `host:port` there would
+    /// read `:0` — a coordinate that looks like a misconfiguration. It shows the
+    /// last path component instead: this string is a *subtitle* under the
+    /// connection's own name in a narrow list, and a full path is both too long
+    /// for it and, on a work machine, often the one part of the row nobody wants
+    /// to read out. [`file_label`] is the full path, for the places that have room.
     pub fn endpoint(&self) -> String {
+        if is_sqlite(&self.db_type) {
+            return file_name(&self.file).to_string();
+        }
         format!("{}:{}", self.host, self.port)
+    }
+
+    /// The whole path of a SQLite connection's file, empty for any other engine.
+    /// For a tooltip or a form, where [`Self::endpoint`]'s short name isn't enough
+    /// to tell two files of the same name apart.
+    pub fn file_label(&self) -> &str {
+        if is_sqlite(&self.db_type) {
+            &self.file
+        } else {
+            ""
+        }
     }
 
     /// A copy of this connection ready to be saved as a new one: everything
@@ -316,9 +358,14 @@ impl Connection {
     /// tree for a change that moves nothing. Nor is anything presentational
     /// (name, colour, environment) or a guard-rail (`read_only`) — those don't
     /// change what the server holds.
+    /// On SQLite the file **is** the server, so it joins the comparison: pointing
+    /// a saved connection at another `.db` reaches an entirely different set of
+    /// tables, which is the case this exists to catch, and it is reached by
+    /// editing a connection in place exactly as a repointed host is.
     pub fn targets_same_server(&self, other: &Connection) -> bool {
         self.id == other.id
             && self.db_type == other.db_type
+            && self.file == other.file
             && self.host == other.host
             && self.port == other.port
             && self.user == other.user
@@ -326,6 +373,19 @@ impl Connection {
             && self.ssh.host == other.ssh.host
             && self.ssh.port == other.ssh.port
             && self.ssh.user == other.ssh.user
+    }
+}
+
+/// The last path component of `path`, splitting on both separators.
+///
+/// Both, deliberately: `connections.json` is portable and the app runs on
+/// Windows and Linux, so a path saved on one can be read on the other, and
+/// `std::path` on Linux does not treat `\` as a separator — a Windows path would
+/// come back whole as its own "file name".
+fn file_name(path: &str) -> &str {
+    match path.rfind(['/', '\\']) {
+        Some(i) => &path[i + 1..],
+        None => path,
     }
 }
 
@@ -422,6 +482,7 @@ mod tests {
             port: 3307,
             user: "root".to_string(),
             password: "secret".to_string(),
+            file: String::new(),
             ssh: SshTunnel::default(),
             color: None,
             prominent_color: false,
@@ -429,6 +490,80 @@ mod tests {
             environment: Environment::None,
         };
         assert_eq!(c.endpoint(), "db.example.com:3307");
+        // A server connection has no file to label.
+        assert_eq!(c.file_label(), "");
+    }
+
+    /// A SQLite connection has no host and no port, so `host:port` would read
+    /// `:0` — a coordinate that looks like a misconfiguration. It shows the file's
+    /// name, with the whole path available separately for somewhere with room.
+    #[test]
+    fn a_sqlite_endpoint_is_the_file_name_not_a_host_and_port() {
+        let mut c = conn();
+        c.db_type = "SQLite".to_string();
+        c.file = "/home/me/data/chinook.db".to_string();
+        assert_eq!(c.endpoint(), "chinook.db");
+        assert_eq!(c.file_label(), "/home/me/data/chinook.db");
+    }
+
+    /// `connections.json` is portable and the app runs on both platforms, so a
+    /// path saved on Windows can be read on Linux — where `std::path` does not
+    /// treat `\` as a separator and would hand back the whole path as the name.
+    #[test]
+    fn a_file_name_splits_on_either_platforms_separator() {
+        let mut c = conn();
+        c.db_type = "sqlite".to_string();
+        for (path, name) in [
+            (r"C:\Users\me\app.sqlite", "app.sqlite"),
+            ("/var/lib/app.db", "app.db"),
+            ("bare.db", "bare.db"),
+            ("", ""),
+            // A trailing separator has no name after it — not a panic.
+            ("/var/lib/", ""),
+        ] {
+            c.file = path.to_string();
+            assert_eq!(c.endpoint(), name, "{path}");
+        }
+    }
+
+    /// Pointing a saved connection at another file reaches an entirely different
+    /// set of tables — the same class of change as a repointed host, reached the
+    /// same way (an edit in place, so the id doesn't move).
+    #[test]
+    fn repointing_a_sqlite_file_is_a_different_server() {
+        let mut a = conn();
+        a.db_type = "SQLite".to_string();
+        a.file = "/data/one.db".to_string();
+        let mut b = a.clone();
+        assert!(a.targets_same_server(&b));
+        b.file = "/data/two.db".to_string();
+        assert!(
+            !a.targets_same_server(&b),
+            "another file is another database"
+        );
+        // And the presentational fields still don't count, as for any engine.
+        let mut c = a.clone();
+        c.name = "renamed".to_string();
+        c.color = Some("#ff0000".to_string());
+        assert!(a.targets_same_server(&c));
+    }
+
+    /// Every connection written before the field existed has no `file` key. It
+    /// must load, not fail the whole file and take every saved connection with it.
+    #[test]
+    fn a_connection_saved_before_the_file_field_still_loads() {
+        let json = r#"{
+            "id": 3,
+            "name": "old",
+            "db_type": "MySQL",
+            "host": "h",
+            "port": 3306,
+            "user": "u",
+            "password": ""
+        }"#;
+        let c: Connection = serde_json::from_str(json).unwrap();
+        assert_eq!(c.file, "");
+        assert_eq!(c.id, 3);
     }
 
     fn conn() -> Connection {
@@ -440,6 +575,7 @@ mod tests {
             port: 3307,
             user: "root".to_string(),
             password: "secret".to_string(),
+            file: String::new(),
             ssh: SshTunnel::default(),
             color: None,
             prominent_color: false,
@@ -477,6 +613,22 @@ mod tests {
         assert_eq!(copy.password, "secret");
         assert_eq!(copy.db_type, "MySQL");
         assert_eq!(copy.ssh, tunnelled().ssh);
+    }
+
+    /// The struct-update form is supposed to carry a *newly added* field by
+    /// construction. `file` is the first one added since, so this is what says the
+    /// guarantee held — the failure it guards against (a copy silently pointing at
+    /// no database) produces no compiler error in the field-by-field form.
+    #[test]
+    fn a_duplicate_carries_the_sqlite_file() {
+        let src = Connection {
+            db_type: "SQLite".to_string(),
+            file: "/data/one.db".to_string(),
+            ..conn()
+        };
+        let copy = src.duplicate(7, "copy".to_string(), None);
+        assert_eq!(copy.file, "/data/one.db");
+        assert_eq!(copy.endpoint(), "one.db");
     }
 
     /// …and only what identifies it *to the user* is replaced.

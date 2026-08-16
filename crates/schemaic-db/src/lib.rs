@@ -2840,6 +2840,7 @@ mod tests {
             port: 3306,
             user: "u".to_string(),
             password: "p".to_string(),
+            file: String::new(),
             ssh: Default::default(),
             color: None,
             prominent_color: false,

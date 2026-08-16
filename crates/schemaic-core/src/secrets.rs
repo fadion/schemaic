@@ -319,6 +319,7 @@ mod tests {
             port: 3306,
             user: "u".to_string(),
             password: String::new(),
+            file: String::new(),
             ssh: SshTunnel::default(),
             color: None,
             prominent_color: false,
