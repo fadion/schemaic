@@ -66,9 +66,20 @@ fn conn_read_only(connections: &RwSignal<Vec<Connection>>, active_conn: RwSignal
 /// The parent row is never itself dimmed — a [`MenuEntry::Sub`] has no disabled
 /// state — so on a read-only connection it opens onto entries that are all
 /// dimmed, which is the same thing the flat form said with the group it dimmed.
-fn create_submenu(ui: &Ui, database: &str, schema: Option<&str>, read_only: bool) -> MenuEntry {
+/// `None` when the engine offers nothing to create at all, so the caller leaves
+/// the row out rather than showing a submenu that opens onto nothing.
+fn create_submenu(
+    ui: &Ui,
+    database: &str,
+    schema: Option<&str>,
+    read_only: bool,
+) -> Option<MenuEntry> {
     let dialect = crate::table_designer::edit_ctx(ui).dialect;
-    let children = create_children(dialect, read_only)
+    let entries = create_children(dialect, read_only);
+    if entries.is_empty() {
+        return None;
+    }
+    let children = entries
         .into_iter()
         .map(|e| {
             let (ui, db, ns) = (ui.clone(), database.to_string(), schema.map(str::to_string));
@@ -84,7 +95,7 @@ fn create_submenu(ui: &Ui, database: &str, schema: Option<&str>, read_only: bool
             .disabled(e.disabled)
         })
         .collect();
-    MenuEntry::sub("Create", children)
+    Some(MenuEntry::sub("Create", children))
 }
 
 /// Which of the per-object entries the schema tree's table/view menu offers **at
@@ -104,11 +115,23 @@ pub(crate) struct ObjectEntries {
     pub import: bool,
     pub triggers: bool,
     pub truncate: bool,
+    /// Whether **Edit table** / **Edit view** is offered — false on an engine
+    /// this build can't emit schema DDL for.
+    pub edit: bool,
 }
 
 /// See [`ObjectEntries`]. `materialized` is only meaningful on PostgreSQL, which
 /// is the only engine that has one.
-pub(crate) fn object_entries(is_view: bool, is_pg: bool, materialized: bool) -> ObjectEntries {
+pub(crate) fn object_entries(
+    is_view: bool,
+    dialect: schemaic_core::intel::SqlDialect,
+    materialized: bool,
+) -> ObjectEntries {
+    let is_pg = dialect == schemaic_core::intel::SqlDialect::Postgres;
+    // What this build can emit for the engine — see `ddl::supports_schema_editing`
+    // for why SQLite can't, which is a statement about SQLite's `ALTER TABLE`
+    // rather than about unfinished work.
+    let ddl = schemaic_core::ddl::supports_schema_editing(dialect);
     ObjectEntries {
         // A view is not insertable, and owns no rows to delete.
         import: !is_view,
@@ -118,7 +141,9 @@ pub(crate) fn object_entries(is_view: bool, is_pg: bool, materialized: bool) -> 
         // simply `!is_view`. A *materialized* view is excluded even on
         // PostgreSQL: the server refuses outright (`relation "mv" cannot have
         // triggers`), which is the same call `is_editable_view` makes.
-        triggers: !is_view || (is_pg && !materialized),
+        // Editing one is still schema DDL, so it needs an emitter too.
+        triggers: ddl && (!is_view || (is_pg && !materialized)),
+        edit: ddl,
     }
 }
 
@@ -167,6 +192,13 @@ pub(crate) fn create_children(
             disabled: read_only,
         },
     ];
+    // An engine this build can't emit schema DDL for offers nothing to create —
+    // not even a table, since there is no emitter to build the statement and
+    // `run_ddl` would refuse the plan. The caller drops an empty submenu rather
+    // than showing one that opens onto nothing.
+    if !schemaic_core::ddl::supports_schema_editing(dialect) {
+        return Vec::new();
+    }
     if dialect == schemaic_core::intel::SqlDialect::Postgres {
         out.extend(
             [
@@ -662,7 +694,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     // table lands where the tree says it will.
                     {
                         let ns = crate::table_designer::default_schema(&import_ui, &menu.name);
-                        entries.push(create_submenu(
+                        entries.extend(create_submenu(
                             &import_ui,
                             &menu.name,
                             ns.as_deref(),
@@ -782,7 +814,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             (oq)(ddl.clone());
                         }));
                     }
-                    entries.push(create_submenu(
+                    entries.extend(create_submenu(
                         &import_ui,
                         &database,
                         Some(&menu.name),
@@ -889,8 +921,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let ns = schema.clone();
                         let is_view = info.as_ref().is_some_and(|i| i.is_view);
                         let has_columns = info.as_ref().is_some_and(|i| !i.columns.is_empty());
-                        let is_pg = crate::table_designer::edit_ctx(&ui).dialect
-                            == schemaic_core::intel::SqlDialect::Postgres;
+                        let dialect = crate::table_designer::edit_ctx(&ui).dialect;
                         // A view Schemaic can edit — read before `info` is moved
                         // into the Import entry below.
                         let editable_view = crate::view_editor::is_editable_view(info.as_ref());
@@ -905,7 +936,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // dimmed — see `object_entries`, which owns that split
                         // and is where the PostgreSQL-view-has-triggers case is
                         // stated.
-                        let offers = object_entries(is_view, is_pg, materialized);
+                        let offers = object_entries(is_view, dialect, materialized);
                         if offers.import {
                             entries.push(
                                 MenuEntry::action("Import", move || {
@@ -929,8 +960,11 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
 
                         // ── Schema editing ────────────────────────────────────
                         // Everything here ends at the DDL preview; nothing runs
-                        // a statement from the menu.
-                        {
+                        // a statement from the menu. Absent entirely on an engine
+                        // with no emitter (see `object_entries`), rather than
+                        // dimmed: "not supported" is what is true of SQLite here,
+                        // and dimming would say "not here".
+                        if offers.edit {
                             let ui = import_ui.clone();
                             let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
                             // Same entry, two editors: a view is a name and a
@@ -3537,13 +3571,14 @@ fn pass_shares(room: usize, want: [usize; 3]) -> [usize; 3] {
 #[cfg(test)]
 mod object_menu_tests {
     use super::object_entries;
+    use schemaic_core::intel::SqlDialect::{MySql, Postgres, Sqlite};
 
-    /// A table offers all three, on either engine.
+    /// A table offers all four, on either engine with an emitter.
     #[test]
     fn a_table_offers_everything() {
-        for is_pg in [false, true] {
-            let e = object_entries(false, is_pg, false);
-            assert!(e.import && e.triggers && e.truncate, "pg={is_pg}");
+        for d in [MySql, Postgres] {
+            let e = object_entries(false, d, false);
+            assert!(e.import && e.triggers && e.truncate && e.edit, "{d:?}");
         }
     }
 
@@ -3552,10 +3587,10 @@ mod object_menu_tests {
     /// "not supported", which is what is true.
     #[test]
     fn a_view_never_offers_import_or_truncate() {
-        for is_pg in [false, true] {
-            let e = object_entries(true, is_pg, false);
-            assert!(!e.import, "pg={is_pg}");
-            assert!(!e.truncate, "pg={is_pg}");
+        for d in [MySql, Postgres] {
+            let e = object_entries(true, d, false);
+            assert!(!e.import, "{d:?}");
+            assert!(!e.truncate, "{d:?}");
         }
     }
 
@@ -3564,9 +3599,9 @@ mod object_menu_tests {
     /// this to `!is_view` would remove a live feature from the PG menu.
     #[test]
     fn only_mysql_views_lose_the_triggers_entry() {
-        assert!(!object_entries(true, false, false).triggers, "MySQL view");
+        assert!(!object_entries(true, MySql, false).triggers, "MySQL view");
         assert!(
-            object_entries(true, true, false).triggers,
+            object_entries(true, Postgres, false).triggers,
             "PostgreSQL view"
         );
     }
@@ -3575,7 +3610,20 @@ mod object_menu_tests {
     /// outright (`relation "mv" cannot have triggers`).
     #[test]
     fn a_materialized_view_has_no_triggers_entry() {
-        assert!(!object_entries(true, true, true).triggers);
+        assert!(!object_entries(true, Postgres, true).triggers);
+    }
+
+    /// SQLite has no schema-editing emitter (`ddl::supports_schema_editing`), so
+    /// the entries that open one are **absent** — the "not supported" reading,
+    /// which is what is true of it. What doesn't need an emitter is untouched:
+    /// a SQLite table still imports and still truncates.
+    #[test]
+    fn sqlite_offers_no_schema_editing_but_keeps_the_rest() {
+        let e = object_entries(false, Sqlite, false);
+        assert!(!e.edit, "no designer without an emitter");
+        assert!(!e.triggers, "editing a trigger is schema DDL too");
+        assert!(e.import, "a bulk load needs no DDL emitter");
+        assert!(e.truncate, "nor does a DELETE");
     }
 }
 

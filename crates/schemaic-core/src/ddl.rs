@@ -4182,6 +4182,26 @@ pub fn checks_equal(a: &CheckInfo, b: &CheckInfo, dialect: SqlDialect) -> bool {
 /// Diffing a table against [`TableDraft::from_table`] of itself must produce
 /// nothing — that's the round-trip gate, and it's what catches a model-fidelity
 /// gap before a user ever sees a phantom change.
+/// Can this module emit schema-editing DDL for `dialect` at all?
+///
+/// **SQLite cannot, and the reason is not that nobody has written the arm yet.**
+/// Its `ALTER TABLE` does `RENAME TABLE`, `RENAME COLUMN`, `ADD COLUMN` and
+/// `DROP COLUMN` and nothing else — no retype, no reorder, no adding or dropping
+/// a constraint — so every other edit needs the documented twelve-step rebuild:
+/// create a new table, copy the rows, drop the old one, rename the new one into
+/// place, and recreate every index, trigger and view that pointed at it. That is
+/// a *destructive* path built out of statements that each look harmless, and it
+/// deserves its own design and its own review rather than an arm in an emitter
+/// written for two engines that can alter in place.
+///
+/// So the UI offers no schema editing on a SQLite connection — the entries are
+/// absent rather than dimmed, which is what says "not supported" instead of "not
+/// here" — and `Db::run_ddl` refuses such a plan as the backstop. This function
+/// is the one fact both of them read.
+pub fn supports_schema_editing(dialect: SqlDialect) -> bool {
+    !matches!(dialect, SqlDialect::Sqlite)
+}
+
 pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) -> ChangeSet {
     let Target { dialect, flavour } = target.into();
     let mut changes: Vec<Change> = Vec::new();
