@@ -53,6 +53,7 @@
 //! the burden of skipping it on export, copy and every aggregate. See
 //! [`implicit_row_key`] for why the *spelling* is chosen rather than fixed.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use rusqlite::types::ValueRef;
@@ -958,10 +959,9 @@ pub(crate) async fn fetch_schema(db: &Db) -> Result<DbSchema, DbError> {
             let create_sql = (!is_view).then(|| {
                 let mut out = sql.trim().trim_end_matches(';').to_string();
                 out.push(';');
-                for ix in index_statements(conn, &name)? {
+                for (_, ix) in index_sql(conn, &name)? {
                     out.push('\n');
-                    out.push_str(ix.trim().trim_end_matches(';'));
-                    out.push(';');
+                    out.push_str(&ix);
                 }
                 Ok::<_, DbError>(out)
             });
@@ -1143,23 +1143,40 @@ fn table_columns(conn: &SqliteConn, table: &str) -> Result<Vec<ColumnInfo>, DbEr
     Ok(out)
 }
 
-/// The `CREATE INDEX` statements SQLite stores for `table`, in catalogue order.
+/// The `CREATE INDEX` statements SQLite stores for `table`, each terminated and
+/// paired with the index's name, in catalogue order.
 ///
 /// Only the ones the user wrote: an index SQLite created itself to back a
 /// `UNIQUE` or `PRIMARY KEY` constraint has a **NULL** `sql`, because it is part
 /// of the table's own declaration and re-issuing it would be an error.
-fn index_statements(conn: &SqliteConn, table: &str) -> Result<Vec<String>, DbError> {
+///
+/// One query behind two consumers, the same pairing [`trigger_sql`] has: Copy
+/// DDL appends the statements to the table's own text ([`fetch_schema`]), and
+/// [`table_indexes`] hands each one to its index as [`IndexInfo::create_sql`],
+/// where a rebuild can replay it instead of re-emitting an index it only partly
+/// read.
+fn index_sql(conn: &SqliteConn, table: &str) -> Result<Vec<(String, String)>, DbError> {
     let mut stmt = conn
         .prepare(
-            "SELECT sql FROM sqlite_master \
+            "SELECT name, sql FROM sqlite_master \
              WHERE type = 'index' AND tbl_name = ?1 AND sql IS NOT NULL \
              ORDER BY name",
         )
         .map_err(query_err)?;
     let rows = stmt
-        .query_map([table], |r| r.get::<_, String>(0))
+        .query_map([table], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
         .map_err(query_err)?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(query_err)
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(query_err)
+        // SQLite stores the statement without its terminator; every consumer
+        // here is stringing statements together, so it goes back on once.
+        .map(|v| {
+            v.into_iter()
+                .map(|(n, s)| (n, format!("{};", s.trim().trim_end_matches(';'))))
+                .collect()
+        })
 }
 
 /// The `CREATE TRIGGER` statements SQLite stores for `table`, each terminated,
@@ -1660,7 +1677,11 @@ fn as_expression(sql: &str, at: usize) -> Option<String> {
 /// constraint-backed index can't on PostgreSQL — so the same field carries it,
 /// `IndexInfo::constraint`, and the primary one is renamed `PRIMARY` so
 /// `IndexInfo::is_primary` answers the MySQL way, as PG's does.
+///
+/// Each index also carries the statement that declared it ([`index_sql`]), which
+/// is the only complete record of the ones the pragmas read `lossy`.
 fn table_indexes(conn: &SqliteConn, table: &str) -> Result<Vec<IndexInfo>, DbError> {
+    let declared: HashMap<String, String> = index_sql(conn, table)?.into_iter().collect();
     let mut stmt = conn
         .prepare("SELECT name, \"unique\", origin, partial FROM pragma_index_list(?1)")
         .map_err(query_err)?;
@@ -1702,6 +1723,10 @@ fn table_indexes(conn: &SqliteConn, table: &str) -> Result<Vec<IndexInfo>, DbErr
             // a partial index, and an expression key column, which `index_xinfo`
             // reports with a NULL name and nothing else.
             lossy: partial || dropped_expression,
+            // Keyed on the catalogue name, not the `PRIMARY` this may have been
+            // renamed to — and absent for exactly the indexes SQLite declares
+            // itself, which have no statement of their own to keep.
+            create_sql: declared.get(&name).cloned(),
         });
     }
     Ok(out)
@@ -1997,6 +2022,29 @@ mod tests {
         assert!(explicit.columns[0].descending, "DESC is part of the key");
         // Declared with CREATE INDEX, so nothing but its own name drops it.
         assert_eq!(explicit.constraint, None);
+        // And the statement that declared it, terminated — what a rebuild
+        // replays when the pragmas above could only partly read the index.
+        assert_eq!(
+            explicit.create_sql.as_deref(),
+            Some("CREATE UNIQUE INDEX album_title ON album(title DESC);")
+        );
+    }
+
+    /// An index SQLite wrote itself has **no statement of its own** — its `sql`
+    /// is NULL, because it is part of the table's declaration. Carrying the
+    /// table's text here would be the wrong string in the right field, and
+    /// replaying it a second `CREATE TABLE`.
+    #[test]
+    fn an_index_the_engine_declared_carries_no_text() {
+        let conn = SqliteConn::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE);")
+            .unwrap();
+        let ix = table_indexes(&conn, "t").unwrap();
+        let backing = ix
+            .iter()
+            .find(|i| i.constraint.is_some())
+            .expect("the UNIQUE constraint's index");
+        assert_eq!(backing.create_sql, None);
     }
 
     #[test]
@@ -3752,6 +3800,102 @@ mod rebuild_roundtrip_tests {
             .query_row("SELECT count(*) FROM log", [], |r| r.get(0))
             .unwrap();
         assert_eq!(logged, 1, "the trigger survived the rebuild");
+    }
+
+    /// **The limitation this lifted.** A partial index and an expression index
+    /// are both `lossy` — the pragmas report neither the predicate nor the
+    /// expression — and a rebuild that re-emitted them from the model would put
+    /// back an index over every row, and one over no key at all. So a table
+    /// carrying either used to be uneditable outright.
+    ///
+    /// Replaying each index's own `CREATE` text is what makes the edit possible,
+    /// and the assertion is against the **engine's** copy of that text
+    /// afterwards, plus `partial` from the pragma the model can't read — an
+    /// index that came back narrower or wider fails here, where a comparison of
+    /// what Schemaic itself emitted would not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lossy_index_comes_back_exactly_as_it_was() {
+        let (keeper, db) = shared_memory("rebuild_lossy_index");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, title TEXT);
+                 CREATE INDEX ix_lower ON t (lower(title));
+                 CREATE INDEX ix_live  ON t (title) WHERE n IS NOT NULL;
+                 INSERT INTO t VALUES (1, 5, 'A'), (2, NULL, 'B');",
+            )
+            .unwrap();
+
+        let before = table_of(&db, "t").await;
+        // Introspection is what supplies the text, so this covers the wiring too.
+        for name in ["ix_lower", "ix_live"] {
+            let ix = before
+                .indexes
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap_or_else(|| panic!("{name}"));
+            assert!(ix.lossy, "{name} must read lossy: {ix:?}");
+            assert!(ix.create_sql.is_some(), "{name} keeps its own text");
+        }
+
+        let mut draft = TableDraft::from_table(&before);
+        draft.columns[1].info.type_name = "TEXT".into();
+        let cs =
+            schemaic_core::ddl::diff(&before, &draft, schemaic_core::intel::SqlDialect::Sqlite);
+        assert!(
+            cs.unsupported().is_empty(),
+            "the plan must no longer be refused: {:?}",
+            cs.unsupported()
+        );
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .expect("rebuild");
+
+        let after = table_of(&db, "t").await;
+        for name in ["ix_lower", "ix_live"] {
+            let was = before.indexes.iter().find(|i| i.name == name).unwrap();
+            let now = after
+                .indexes
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap_or_else(|| panic!("{name} did not come back"));
+            assert_eq!(now.create_sql, was.create_sql, "{name} came back different");
+        }
+        // Still partial, as the engine sees it — the failure this prevents is an
+        // index that reads back under the same name covering twice the rows.
+        let partial: i64 = keeper
+            .query_row(
+                "SELECT partial FROM pragma_index_list('t') WHERE name = 'ix_live'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(partial, 1, "the predicate survived");
+    }
+
+    /// The other half of the same rule: the text is a snapshot, so an edit to a
+    /// column it may name puts the plan back on the refusal. Nothing is applied
+    /// and the message says which column.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn renaming_a_column_under_a_lossy_index_is_still_refused() {
+        let (keeper, db) = shared_memory("rebuild_lossy_rename");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, title TEXT);
+                 CREATE INDEX ix_live ON t (title) WHERE n IS NOT NULL;",
+            )
+            .unwrap();
+        let before = table_of(&db, "t").await;
+        let mut draft = TableDraft::from_table(&before);
+        draft.columns[2].info.type_name = "BLOB".into();
+        // `n` appears only in the predicate, which no pragma reports — so the
+        // model cannot see that this rename breaks the index at all.
+        draft.rename_column(1, "count");
+        let withheld =
+            schemaic_core::ddl::diff(&before, &draft, schemaic_core::intel::SqlDialect::Sqlite)
+                .unsupported();
+        assert_eq!(withheld.len(), 1, "{withheld:?}");
+        assert!(withheld[0].contains("ix_live"), "{withheld:?}");
+        assert!(withheld[0].contains('n'), "{withheld:?}");
     }
 }
 
