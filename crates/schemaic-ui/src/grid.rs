@@ -40,7 +40,7 @@ use schemaic_core::model::{
 use schemaic_core::rowjson::{self, ColSpec};
 use schemaic_core::schema::{DbSchema, ForeignKeyInfo, SchemaState, TableInfo, TableSource};
 use schemaic_core::summary;
-use schemaic_core::text::{hides_detail, plural};
+use schemaic_core::text::{hides_detail, human_count, plural};
 use schemaic_core::text_ops::contains_ignore_ascii_case;
 use schemaic_core::tx::{WRITE_WAIT_MS, WaitNote, write_wait_note};
 
@@ -6511,24 +6511,6 @@ fn numeric_edit_pad_left(w: f64, text_px: f64) -> f64 {
     (content - text_px - SLACK).max(0.0)
 }
 
-/// Compact row-count label: `1000 → 1k`, `1250 → 1.25k`, `1_000_000 → 1m`.
-/// Up to two decimals, trailing zeros trimmed. Under 1000 stays exact.
-fn human_count(n: usize) -> String {
-    let f = n as f64;
-    let (val, suffix) = if f >= 1e9 {
-        (f / 1e9, "b")
-    } else if f >= 1e6 {
-        (f / 1e6, "m")
-    } else if f >= 1e3 {
-        (f / 1e3, "k")
-    } else {
-        return n.to_string();
-    };
-    let s = format!("{val:.2}");
-    let s = s.trim_end_matches('0').trim_end_matches('.');
-    format!("{s}{suffix}")
-}
-
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() > max {
         let mut out: String = s.chars().take(max).collect();
@@ -7057,42 +7039,6 @@ mod tests {
             }
         });
         assert_eq!(got, want);
-    }
-}
-
-#[cfg(test)]
-mod human_count_tests {
-    use super::*;
-
-    /// Untested until now, and the tested namesake in `core::transcript` is a
-    /// **different** function with different buckets — so grepping the name found
-    /// coverage that did not apply. These are the exact strings the stats line
-    /// prints, and therefore the exact strings `goto_row_index` has to read back.
-    #[test]
-    fn a_count_reads_the_way_the_stats_line_prints_it() {
-        assert_eq!(human_count(0), "0");
-        assert_eq!(human_count(999), "999", "under 1000 stays exact");
-        assert_eq!(human_count(1_000), "1k");
-        assert_eq!(human_count(1_250), "1.25k");
-        assert_eq!(human_count(200_000), "200k");
-        assert_eq!(human_count(1_000_000), "1m");
-        assert_eq!(human_count(1_500_000), "1.5m");
-        assert_eq!(human_count(1_000_000_000), "1b");
-    }
-
-    /// Every shape the printer can emit round-trips through the go-to-row box,
-    /// which is the property the two functions have to hold together: the count
-    /// on screen is the one a user types back.
-    #[test]
-    fn every_printed_count_is_readable_by_go_to_row() {
-        for n in [1usize, 999, 1_000, 1_250, 200_000, 1_000_000, 1_500_000] {
-            let printed = human_count(n);
-            assert_eq!(
-                schemaic_core::model::goto_row_index(&printed, n),
-                Some(n - 1),
-                "{printed:?} came from {n}"
-            );
-        }
     }
 }
 
