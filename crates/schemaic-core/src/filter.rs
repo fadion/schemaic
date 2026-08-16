@@ -312,6 +312,48 @@ impl Order {
     }
 }
 
+/// What a generated browse query ([`table_query`]) keys and orders its page on.
+///
+/// The two keyed cases are separate variants rather than one list of names, and
+/// that distinction is the point: a key made of the table's **own** columns is
+/// already in a `SELECT *`, while one that isn't has to be named in the
+/// projection or the result simply won't contain it — and then nothing can write
+/// the rows back. Collapsing them would make the projection depend on a fact the
+/// name alone doesn't carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowseKey<'a> {
+    /// The table's own key columns, in key order — normally the primary key.
+    /// Already projected by the `*`.
+    Columns(&'a [String]),
+    /// A row identity that is **not** one of the table's columns, so the
+    /// statement must name it: SQLite's `rowid`, via
+    /// [`crate::schema::TableInfo::implicit_key`].
+    Implicit(&'a str),
+    /// Nothing to key on — no primary key, or the schema hasn't been
+    /// introspected yet. The page is unordered rather than ordered by a guess at
+    /// some column, and the result is read-only.
+    None,
+}
+
+impl<'a> BrowseKey<'a> {
+    /// The key to browse a table by: its own columns when it has any, else the
+    /// implicit one, else nothing.
+    ///
+    /// **One definition of that precedence, deliberately.** It has to agree with
+    /// [`crate::edit::analyze_edit`], which resolves the *write* key from the
+    /// result and reaches for an implicit key only once a real one has failed. A
+    /// statement projecting a rowid the write path then ignored would carry a
+    /// column for no reason; one projecting nothing the write path needed would
+    /// be read-only for no reason.
+    pub fn pick(key_cols: &'a [String], implicit: Option<&'a str>) -> Self {
+        match (key_cols.is_empty(), implicit) {
+            (false, _) => Self::Columns(key_cols),
+            (true, Some(k)) => Self::Implicit(k),
+            (true, None) => Self::None,
+        }
+    }
+}
+
 /// The `SELECT` Schemaic generates for a table — opening one from the schema
 /// tree, and the AI's bottom-sample.
 ///
@@ -329,10 +371,6 @@ impl Order {
 /// appended to) when a column header is clicked, since [`build_query`] rewrites
 /// an existing `ORDER BY`.
 ///
-/// `key_cols` is normally the primary key, in key order; empty (no PK, or the
-/// schema hasn't been introspected yet) means no `ORDER BY` at all rather than a
-/// guess at some column.
-///
 /// Dialect-aware, matching the write path: MySQL qualifies `` `db`.`table` ``
 /// (its connection is server-level), Postgres emits the double-quoted name
 /// (its connection is already bound to the database) — bare for a table in
@@ -347,25 +385,15 @@ impl Order {
 /// moment the same statement is copied into a session where the file is attached
 /// under another name.
 ///
-/// `implicit_key` is a row identity the table has that is **not one of its
-/// columns** — [`crate::schema::TableInfo::implicit_key`], which only SQLite ever
-/// sets. It is used **only when `key_cols` is empty**, i.e. when the table has no
-/// key of its own, and then it is both projected and ordered on:
-/// `SELECT rowid, * FROM t ORDER BY rowid ASC`. That projection is what makes such
-/// a table editable at all, since `SELECT *` does not return a rowid and the write
-/// path has nothing to build a `WHERE` from without it.
-///
-/// The extra column is deliberately *shown* rather than hidden. A result column
-/// the grid must pretend isn't there would have to be skipped by export, copy,
-/// aggregates and the row panel too, and each place that forgot would leak it;
-/// here the statement and the grid agree, which is how the rest of the app reads.
+/// See [`BrowseKey`] for what `key` does to the projection — a key that is not one
+/// of the table's columns has to be named in it, and that is what makes a keyless
+/// SQLite table editable.
 pub fn table_query(
     dialect: SqlDialect,
     database: &str,
     schema: Option<&str>,
     table: &str,
-    key_cols: &[String],
-    implicit_key: Option<&str>,
+    key: BrowseKey<'_>,
     order: Order,
     limit: usize,
 ) -> String {
@@ -385,22 +413,18 @@ pub fn table_query(
         },
         SqlDialect::Sqlite => quote_if_needed(table, dialect),
     };
-    // The table's own key orders the page when it has one; an implicit key is
-    // what's left when it hasn't, and then it has to be projected as well —
-    // nothing can key a write on a column the result doesn't contain.
-    let (projection, order_cols): (String, Vec<String>) = match (key_cols.is_empty(), implicit_key)
-    {
-        (true, Some(k)) => {
+    let (projection, order_cols): (String, Vec<String>) = match key {
+        // Not one of the table's columns, so `*` won't return it and it has to be
+        // named — nothing can key a write on a value the result doesn't contain.
+        BrowseKey::Implicit(k) => {
             let k = quote_if_needed(k, dialect);
             (format!("{k}, *"), vec![k])
         }
-        _ => (
+        BrowseKey::Columns(cols) => (
             "*".to_string(),
-            key_cols
-                .iter()
-                .map(|c| quote_if_needed(c, dialect))
-                .collect(),
+            cols.iter().map(|c| quote_if_needed(c, dialect)).collect(),
         ),
+        BrowseKey::None => ("*".to_string(), Vec::new()),
     };
     let order_by = if order_cols.is_empty() {
         String::new()
@@ -428,28 +452,42 @@ mod tests {
 
     fn tq(d: SqlDialect, table: &str, pk: &[&str], order: Order, limit: usize) -> String {
         let pk: Vec<String> = pk.iter().map(|c| c.to_string()).collect();
-        table_query(d, "shop", None, table, &pk, None, order, limit)
+        let key = BrowseKey::pick(&pk, None);
+        table_query(d, "shop", None, table, key, order, limit)
     }
 
     /// As [`tq`], but for a table in an explicit PostgreSQL namespace.
     fn tq_in(d: SqlDialect, schema: &str, table: &str, pk: &[&str]) -> String {
         let pk: Vec<String> = pk.iter().map(|c| c.to_string()).collect();
-        table_query(d, "shop", Some(schema), table, &pk, None, Order::Asc, 100)
+        let key = BrowseKey::pick(&pk, None);
+        table_query(d, "shop", Some(schema), table, key, Order::Asc, 100)
     }
 
-    /// As [`tq`], with an implicit key the table may or may not need.
+    /// As [`tq`], with an implicit key the table may or may not need — routed
+    /// through `BrowseKey::pick`, which is where the precedence lives.
     fn tq_implicit(table: &str, pk: &[&str], implicit: Option<&str>) -> String {
         let pk: Vec<String> = pk.iter().map(|c| c.to_string()).collect();
+        let key = BrowseKey::pick(&pk, implicit);
         table_query(
             SqlDialect::Sqlite,
             "main",
             None,
             table,
-            &pk,
-            implicit,
+            key,
             Order::Asc,
             100,
         )
+    }
+
+    #[test]
+    fn browse_key_prefers_the_tables_own_columns() {
+        let pk = vec!["id".to_string()];
+        assert_eq!(BrowseKey::pick(&pk, Some("rowid")), BrowseKey::Columns(&pk));
+        assert_eq!(
+            BrowseKey::pick(&[], Some("rowid")),
+            BrowseKey::Implicit("rowid")
+        );
+        assert_eq!(BrowseKey::pick(&[], None), BrowseKey::None);
     }
 
     /// A table with no key of its own is opened with its rowid projected — the
@@ -520,8 +558,7 @@ mod tests {
                 "shop",
                 Some("we\"ird"),
                 "orders",
-                &[],
-                None,
+                BrowseKey::None,
                 Order::Asc,
                 10
             ),
@@ -638,8 +675,7 @@ mod tests {
                 "we`ird",
                 None,
                 "ta`ble",
-                &["i`d".to_string()],
-                None,
+                BrowseKey::Columns(&["i`d".to_string()]),
                 Order::Asc,
                 10
             ),
@@ -652,8 +688,7 @@ mod tests {
                 "db",
                 None,
                 "ta\"ble",
-                &["i\"d".to_string()],
-                None,
+                BrowseKey::Columns(&["i\"d".to_string()]),
                 Order::Asc,
                 10
             ),

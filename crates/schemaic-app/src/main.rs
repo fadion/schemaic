@@ -118,7 +118,7 @@ type FetchSchemaFn = Rc<dyn Fn(&ConnNode, Db)>;
 ///
 /// One call for the whole slice, and one file write for both halves.
 type FinishHistoryFn = Rc<dyn Fn(&[(u64, schemaic_core::history::RunResult)], &[u64])>;
-use schemaic_core::filter::{Order, table_query};
+use schemaic_core::filter::{BrowseKey, Order, table_query};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::persist::{self, ConnectionsFile, UiState};
 use schemaic_core::schema::{SchemaState, TableSource};
@@ -475,8 +475,7 @@ fn sample_sql(engine: schemaic_db::Engine, source: &TableSource, pk_cols: &[Stri
         &source.database,
         source.schema.as_deref(),
         &source.table,
-        pk_cols,
-        None,
+        BrowseKey::pick(pk_cols, None),
         Order::Desc,
         AI_SAMPLE_ROWS,
     )
@@ -2898,8 +2897,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 &source.database,
                 source.schema.as_deref(),
                 &source.table,
-                &pk_cols,
-                implicit_key.as_deref(),
+                BrowseKey::pick(&pk_cols, implicit_key.as_deref()),
                 Order::Asc,
                 TABLE_TAB_ROWS,
             );
