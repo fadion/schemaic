@@ -1362,13 +1362,13 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
         let Some(menu) = ctx.get() else {
             return s;
         };
+        // `at` when the opener named a place (Shift+F10, which opens at the nav
+        // cursor's row), else the pointer. Both go through the same edge-flip:
+        // a row low in the tree runs its last entries off the bottom otherwise,
+        // however the menu was raised.
+        let from = menu.at.unwrap_or_else(|| last_mouse.get_untracked());
         let h = menu_panel_height(&(build)(menu));
-        let (x, y) = cursor_menu_pos(
-            last_mouse.get_untracked(),
-            (CTX_MENU_W, h),
-            window_size().get(),
-            CURSOR_MENU_GAP,
-        );
+        let (x, y) = cursor_menu_pos(from, (CTX_MENU_W, h), window_size().get(), CURSOR_MENU_GAP);
         s.absolute().inset_left(x).inset_top(y)
     })
 }

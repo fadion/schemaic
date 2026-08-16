@@ -117,7 +117,12 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
     ),
     (
         "Schema tree",
-        &[("Enter", "Open the selected table, column or object")],
+        &[
+            ("Enter", "Open the selected table, column or object"),
+            // The same menu the right-click builds, opened at the row rather
+            // than at the pointer.
+            ("Shift+F10", "Context menu for the selected row"),
+        ],
     ),
     (
         "AI panel",
