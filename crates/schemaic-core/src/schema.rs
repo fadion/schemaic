@@ -615,11 +615,19 @@ impl CheckInfo {
     /// `ADD CONSTRAINT`. Both engines spell it the same; only `NOT ENFORCED` is
     /// MySQL's alone.
     pub fn clause_sql(&self, dialect: crate::intel::SqlDialect) -> String {
-        let mut out = format!(
-            "CONSTRAINT {} CHECK ({})",
-            ddl_ident_in(&self.name, dialect),
-            self.expression
-        );
+        // **An unnamed check stays unnamed.** SQLite doesn't require a name and
+        // most of its constraints don't have one; `CONSTRAINT "" CHECK (…)` is
+        // not a nameless constraint but a syntax error, and inventing a name
+        // would make a rebuild read as though it renamed something.
+        let mut out = if self.name.is_empty() {
+            format!("CHECK ({})", self.expression)
+        } else {
+            format!(
+                "CONSTRAINT {} CHECK ({})",
+                ddl_ident_in(&self.name, dialect),
+                self.expression
+            )
+        };
         if dialect == crate::intel::SqlDialect::Postgres {
             // PostgreSQL's own order, as `pg_get_constraintdef` prints it:
             // `CHECK (…) NO INHERIT NOT VALID`.

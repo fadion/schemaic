@@ -64,7 +64,7 @@ use schemaic_core::model::{
     ResultSet, Value, WriteStep, one_row_verdict,
 };
 use schemaic_core::schema::{
-    ColumnInfo, DbSchema, ForeignKeyInfo, IndexColumn, IndexInfo, TableInfo,
+    CheckInfo, ColumnInfo, DbSchema, ForeignKeyInfo, IndexColumn, IndexInfo, TableInfo,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -937,7 +937,12 @@ pub(crate) async fn fetch_schema(db: &Db) -> Result<DbSchema, DbError> {
                 engine: None,
                 collation: None,
                 comment: None,
-                check_constraints: Vec::new(),
+                // Read out of the table's own `CREATE` text, there being no
+                // pragma for them. They have to be *modelled* rather than left
+                // to `create_sql`, because a rebuild writes the new table from
+                // the draft: a check missing from the draft is a check the
+                // rebuild silently drops.
+                check_constraints: if is_view { Vec::new() } else { checks_of(&sql) },
                 triggers: Vec::new(),
             });
         }
@@ -1214,6 +1219,165 @@ fn generated_expr_of(create_sql: &str, column: &str) -> Option<String> {
     // Not found, or the name matched something that wasn't a column declaration.
     let _ = balanced_paren_span;
     None
+}
+
+/// Every `CHECK` constraint a table declares, in declaration order.
+///
+/// **No pragma exposes these**, so the table's own `CREATE TABLE` text is the
+/// only source — the same position `generated_expr_of` is in, and the same tools
+/// answer it: the shared boundary lexer, so a column called `check_sum` or the
+/// word inside a string or a comment can't match, and
+/// [`schemaic_core::sql::balanced_paren_span`] for the predicate, which may
+/// perfectly well contain a comma or a `')'` inside a literal.
+///
+/// It reads a column-level `CHECK` and a table constraint alike, because SQLite
+/// makes no distinction between them once the table exists — both constrain the
+/// table, and a rebuild restates both as table constraints. A constraint written
+/// without `CONSTRAINT <name>` comes back with an empty name, which is the
+/// honest answer: most SQLite checks have none, and inventing one would make a
+/// rebuild look like it renamed something.
+fn checks_of(create_sql: &str) -> Vec<CheckInfo> {
+    use schemaic_core::intel::SqlDialect;
+    use schemaic_core::sql::{balanced_paren_span, is_word_byte, is_word_start, skip_noncode};
+
+    let b = create_sql.as_bytes();
+    let mut out: Vec<CheckInfo> = Vec::new();
+    // Step into the table body. Everything before its `(` is the header, where a
+    // quoted table name could otherwise be mistaken for content.
+    let mut i = 0usize;
+    let body = loop {
+        if i >= b.len() {
+            return out;
+        }
+        if let Some(j) = skip_noncode(b, i, SqlDialect::Sqlite) {
+            i = j.max(i + 1);
+            continue;
+        }
+        if b[i] == b'(' {
+            break i + 1;
+        }
+        i += 1;
+    };
+
+    let mut i = body;
+    let mut depth = 1i32;
+    // The name from a `CONSTRAINT <name>` seen since the last comma, and whether
+    // anything has been read in this item at all — both reset per item, so a
+    // name can't carry across into the constraint that follows it.
+    let mut pending: Option<String> = None;
+    while i < b.len() && depth > 0 {
+        if let Some(j) = skip_noncode(b, i, SqlDialect::Sqlite) {
+            i = j.max(i + 1);
+            continue;
+        }
+        match b[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+                continue;
+            }
+            b',' if depth == 1 => {
+                pending = None;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if !is_word_start(b[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i + 1;
+        while end < b.len() && is_word_byte(b[end]) {
+            end += 1;
+        }
+        let word = &create_sql[start..end];
+        // Only ever at the item's own level: a `CHECK` nested inside another
+        // constraint's parens is part of that predicate, not a new constraint.
+        if depth == 1 && word.eq_ignore_ascii_case("CONSTRAINT") {
+            let (name, next) = ident_at(create_sql, end);
+            pending = name;
+            i = next;
+            continue;
+        }
+        if depth == 1 && word.eq_ignore_ascii_case("CHECK") {
+            let mut k = end;
+            while k < b.len() && b[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if b.get(k) == Some(&b'(')
+                && let Some(close) = balanced_paren_span(b, k, SqlDialect::Sqlite)
+            {
+                out.push(CheckInfo {
+                    name: pending.take().unwrap_or_default(),
+                    expression: create_sql[k + 1..close].trim().to_string(),
+                    enforced: true,
+                    validated: true,
+                    inherited: true,
+                    ..Default::default()
+                });
+                i = close + 1;
+                continue;
+            }
+        }
+        i = end;
+    }
+    out
+}
+
+/// The identifier starting at or after `at`, unquoted, and the offset just past
+/// it. SQLite accepts four spellings of a quoted name (`"x"`, `` `x` ``, `[x]`
+/// and `'x'`), and a doubled quote inside one is a literal quote.
+fn ident_at(sql: &str, at: usize) -> (Option<String>, usize) {
+    let b = sql.as_bytes();
+    let mut i = at;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= b.len() {
+        return (None, i);
+    }
+    let close = match b[i] {
+        b'"' => b'"',
+        b'`' => b'`',
+        b'\'' => b'\'',
+        b'[' => b']',
+        _ => {
+            let start = i;
+            while i < b.len() && schemaic_core::sql::is_word_byte(b[i]) {
+                i += 1;
+            }
+            return if i > start {
+                (Some(sql[start..i].to_string()), i)
+            } else {
+                (None, i)
+            };
+        }
+    };
+    let mut name = String::new();
+    i += 1;
+    while i < b.len() {
+        if b[i] == close {
+            // A doubled closing quote is one literal character — `[x]` has no
+            // such rule, its content simply runs to the first `]`.
+            if close != b']' && b.get(i + 1) == Some(&close) {
+                name.push(close as char);
+                i += 2;
+                continue;
+            }
+            return (Some(name), i + 1);
+        }
+        let ch_len = sql[i..].chars().next().map_or(1, char::len_utf8);
+        name.push_str(&sql[i..i + ch_len]);
+        i += ch_len;
+    }
+    (Some(name), i)
 }
 
 /// From `at`, scan forward for `AS (` at a code position and return the text
@@ -2724,5 +2888,138 @@ mod ddl_tests {
             .expect_err("cancelled before it ran");
         assert!(format!("{err}").to_lowercase().contains("cancel"), "{err}");
         assert_eq!(objects(&keeper, "t"), 1, "the table is untouched");
+    }
+}
+
+#[cfg(test)]
+mod check_text_tests {
+    use super::checks_of;
+
+    fn one(sql: &str) -> (String, String) {
+        let c = checks_of(sql);
+        assert_eq!(c.len(), 1, "{c:?}");
+        (c[0].name.clone(), c[0].expression.clone())
+    }
+
+    #[test]
+    fn a_named_table_constraint_keeps_its_name() {
+        let (name, expr) = one(r#"CREATE TABLE "people" (
+                 "age" INTEGER,
+                 CONSTRAINT "ck_age" CHECK ("age" >= 0)
+               )"#);
+        assert_eq!(name, "ck_age");
+        assert_eq!(expr, r#""age" >= 0"#);
+    }
+
+    /// SQLite doesn't require a name, and most checks in the wild don't have
+    /// one. An empty name is the honest answer, not a generated one.
+    #[test]
+    fn an_unnamed_constraint_comes_back_nameless() {
+        let (name, expr) = one(r#"CREATE TABLE t ("age" INTEGER, CHECK ("age" >= 0))"#);
+        assert_eq!(name, "");
+        assert_eq!(expr, r#""age" >= 0"#);
+    }
+
+    /// Written inside the column definition rather than after it — the same
+    /// constraint as far as the table is concerned.
+    #[test]
+    fn a_column_level_check_is_found_too() {
+        let (name, expr) = one(r#"CREATE TABLE t ("age" INTEGER CHECK ("age" >= 0), b TEXT)"#);
+        assert_eq!(name, "");
+        assert_eq!(expr, r#""age" >= 0"#);
+    }
+
+    /// The predicate is not scanned for a comma or a closing paren — both are
+    /// ordinary content inside one, and a naive split truncates the constraint
+    /// into something that means something else.
+    #[test]
+    fn a_predicate_may_contain_commas_parens_and_a_literal() {
+        let (_, expr) = one(r#"CREATE TABLE t (
+                 s TEXT,
+                 CHECK (substr(s, 1, 2) IN ('a)', 'b,c'))
+               )"#);
+        assert_eq!(expr, "substr(s, 1, 2) IN ('a)', 'b,c')");
+    }
+
+    /// The word has to be a keyword at the right place, not text that happens to
+    /// read `CHECK` — the boundary lexer is what makes that distinction.
+    #[test]
+    fn the_word_check_elsewhere_is_not_a_constraint() {
+        assert!(
+            checks_of(r#"CREATE TABLE t ("check_sum" INTEGER, note TEXT DEFAULT 'CHECK (x)')"#)
+                .is_empty()
+        );
+        assert!(checks_of("CREATE TABLE t (a INT) -- CHECK (a > 0)").is_empty());
+    }
+
+    #[test]
+    fn several_checks_all_come_back_in_order() {
+        let cs = checks_of(
+            r#"CREATE TABLE t (
+                 a INT CHECK (a > 0),
+                 b INT,
+                 CONSTRAINT ck_b CHECK (b < 10),
+                 CHECK (a <> b)
+               )"#,
+        );
+        let got: Vec<(&str, &str)> = cs
+            .iter()
+            .map(|c| (c.name.as_str(), c.expression.as_str()))
+            .collect();
+        assert_eq!(got, vec![("", "a > 0"), ("ck_b", "b < 10"), ("", "a <> b")]);
+    }
+
+    #[test]
+    fn a_table_without_checks_reports_none() {
+        assert!(checks_of(r#"CREATE TABLE t (a INT PRIMARY KEY, b TEXT NOT NULL)"#).is_empty());
+        assert!(checks_of("").is_empty());
+    }
+}
+
+/// Introspection carrying the checks it reads — the wiring behind
+/// [`check_text_tests`], over a real database.
+#[cfg(test)]
+mod check_schema_tests {
+    use super::tests::shared_memory;
+    use super::*;
+
+    #[tokio::test]
+    async fn a_tables_checks_reach_the_model() {
+        let (keeper, db) = shared_memory("checks_modelled");
+        keeper
+            .execute_batch(
+                r#"CREATE TABLE account (
+                     id      INTEGER PRIMARY KEY,
+                     balance INTEGER NOT NULL CHECK (balance >= 0),
+                     kind    TEXT,
+                     CONSTRAINT ck_kind CHECK (kind IN ('a', 'b'))
+                   );
+                   CREATE VIEW rich AS SELECT * FROM account WHERE balance > 100;"#,
+            )
+            .unwrap();
+        let schema = fetch_schema(&db).await.expect("introspect");
+        let t = schema
+            .tables
+            .iter()
+            .find(|t| t.name == "account")
+            .expect("account");
+        let got: Vec<(&str, &str)> = t
+            .check_constraints
+            .iter()
+            .map(|c| (c.name.as_str(), c.expression.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("", "balance >= 0"), ("ck_kind", "kind IN ('a', 'b')")]
+        );
+
+        // A view has no constraints of its own, and its body is full of words
+        // that would match if this were a text search.
+        let v = schema
+            .tables
+            .iter()
+            .find(|t| t.name == "rich")
+            .expect("rich");
+        assert!(v.check_constraints.is_empty());
     }
 }
