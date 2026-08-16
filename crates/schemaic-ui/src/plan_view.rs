@@ -414,6 +414,7 @@ fn ask_ai_button(
         ring,
         crate::widgets::ACTION_TAB,
         loaded_now(),
+        0.0, // an icon face, square
         move || (press)(),
     )
 }

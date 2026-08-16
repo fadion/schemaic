@@ -530,6 +530,7 @@ pub(crate) fn suggest_chevron(
         ring,
         tabindex,
         true,
+        0.0, // an icon face, square
         move || (pressed)(),
     )
 }
@@ -678,9 +679,15 @@ pub(crate) fn list_actions(
                     .hover(|s| s.color(theme::text()))
             })
             .tooltip(move || text(tip).style(crate::widgets::tooltip_style));
-        crate::widgets::in_ring_button(face, ring.clone(), LIST_TAB + 1 + slot, true, move || {
-            (pressed)()
-        })
+        // 0.0: an icon face, square.
+        crate::widgets::in_ring_button(
+            face,
+            ring.clone(),
+            LIST_TAB + 1 + slot,
+            true,
+            0.0,
+            move || (pressed)(),
+        )
     };
     let arrows: Vec<AnyView> = match (move_up, move_down) {
         (Some(u), Some(d)) => vec![

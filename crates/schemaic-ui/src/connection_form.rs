@@ -268,8 +268,13 @@ fn color_picker(color: RwSignal<Option<String>>, ring: FocusRing, tabindex: u32)
                 // the row. An outline is painted outside the box and costs no
                 // layout — the same reason the dropdowns suppress floem's with
                 // `outline(0)` rather than restyling it.
-                if cursor.get() == Some(i) {
-                    s.outline(2.0).outline_color(theme::field_border_active())
+                //
+                // Gated on `keyboard_nav` and coloured like every other focus
+                // ring, because that is what it is: the halo says which swatch
+                // the *arrows* will land on, and which one is chosen is already
+                // said by the white border above. Clicking one needs no halo.
+                if cursor.get() == Some(i) && crate::widgets::keyboard_nav().get() {
+                    s.outline(2.0).outline_color(theme::accent())
                 } else {
                     s
                 }
@@ -668,6 +673,7 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
                 ring.clone(),
                 NAV_TAB + 1,
                 true,
+                0.0, // a full-width menu row, square like the list above it
                 move || (new_c)(),
             );
 

@@ -303,17 +303,22 @@ const _: () = {
 /// so Space fires exactly once, and it carries the focus outline itself, so the
 /// id in the ring is the id that paints. Callers therefore do **not** apply
 /// `button_focus_ring` to the face they pass in — it would never fire there.
+///
+/// `radius` is the face's own corner radius, so the outline can follow it rather
+/// than boxing it — see [`button_focus_ring`]. `0.0` for the icon buttons, whose
+/// faces are square.
 pub(crate) fn in_ring_button<V: IntoView + 'static>(
     view: V,
     ring: FocusRing,
     tabindex: u32,
     enabled: bool,
+    radius: f64,
     on_press: impl Fn() + 'static,
 ) -> AnyView {
     // Built for both states, so enabling a button doesn't change its box: a
     // disabled action keeps its place in the footer (see [`action_button`]), and
     // it would not if one state had a flex item the other lacked.
-    let wrapper = container(view).style(|s| button_focus_ring(s).flex_shrink(0.0_f32));
+    let wrapper = container(view).style(move |s| button_focus_ring(s, radius).flex_shrink(0.0_f32));
     if !enabled {
         return wrapper.into_any();
     }
@@ -401,19 +406,51 @@ pub(crate) fn nav_group<V: IntoView + 'static>(
         .into_any()
 }
 
+/// The corner radius of a filled [`action_button`], and of the
+/// [`control_surface`] family ([`control_button_enabled`], [`dialog_button`]).
+///
+/// Named because two views read each of them: the button's own face, and the
+/// focus outline [`in_ring_button`] paints on the wrapper around it. Floem draws
+/// an outline at *the painting view's* `border_radius` (`view::paint_outline`),
+/// so a wrapper that doesn't know the face's radius draws a **square ring around
+/// a rounded button** — which is what every ringed action button in the app did
+/// until these were shared.
+pub(crate) const ACTION_RADIUS: f64 = 5.0;
+pub(crate) const CONTROL_RADIUS: f64 = 6.0;
+
 /// The focus signal every ringed button wears: an **outline**, painted outside
 /// the box, so gaining the keyboard costs no layout — the rule a swatch and a
 /// list pane already follow, and the reason neither takes a border.
+///
+/// `radius` is the **face's** corner radius, and the wrapper takes it purely so
+/// the outline can follow it: floem strokes the ring at the radius of the view
+/// it paints on, plus half the stroke, which is exactly concentric when the two
+/// agree and a square around a rounded chip when they don't. It sets nothing
+/// visible on the wrapper itself, which has no fill and no border of its own.
 ///
 /// Painted in `.focus`, **not** `.focus_visible`, and that is not a style
 /// choice. Floem gates `FocusVisible` on `app_state.keyboard_navigation`, which
 /// only its *own* `view_tab_navigation` ever sets — every path that reaches
 /// `UpdateMessage::Focus`, which is all [`FocusRing`] has, leaves the flag
-/// `false`. So a `focus_visible` rule on a ring member never fires at all.
-pub(crate) fn button_focus_ring(s: floem::style::Style) -> floem::style::Style {
-    s.focus(|s| s.outline(2.0).outline_color(theme::field_border_active()))
+/// `false`. So a `focus_visible` rule on a ring member never fires at all, and
+/// [`keyboard_nav`] is the app's own answer to the same question.
+///
+/// **Gating on it is what lets the ring be bright.** It used to be
+/// `field_border_active` — `#303453` on the dark theme, a shade off the panel it
+/// sits on — because anything legible was a distraction on a *mouse* click,
+/// where a focus ring marks the thing you just pointed at and tells you nothing.
+/// Drawn only when the keyboard put focus there, it is information again, so it
+/// is `accent` now and actually findable at a glance.
+pub(crate) fn button_focus_ring(s: floem::style::Style, radius: f64) -> floem::style::Style {
+    let s = s.border_radius(radius);
+    // Read reactively: this runs inside the caller's `.style` closure, so the
+    // ring appears and disappears with the flag without rebuilding the button.
+    if !keyboard_nav().get() {
+        return s;
+    }
+    s.focus(|s| s.outline(2.0).outline_color(theme::accent()))
         // Floem's own is a 3px magenta ring belonging to no palette here.
-        .focus_visible(|s| s.outline(2.0).outline_color(theme::field_border_active()))
+        .focus_visible(|s| s.outline(2.0).outline_color(theme::accent()))
 }
 
 /// Where a **growing** block of Tab stops starts — a list of enum values, of
@@ -668,6 +705,10 @@ impl FocusRing {
             return;
         };
         self.last.set(Some(tabindex));
+        // Every keyboard-driven focus change in the app arrives here, which is
+        // what makes this the whole "set" half of [`keyboard_nav`] — see there
+        // for why it isn't a key listener on the window root.
+        keyboard_nav().set(true);
         id.request_focus();
     }
 
@@ -872,6 +913,7 @@ fn modal_title_impl(
             ring,
             TITLE_CLOSE_TAB,
             true,
+            0.0, // a square face — the padding is the hitbox, not a chip
             move || (pressed)(),
         ),
     ))
@@ -1009,7 +1051,7 @@ pub(crate) fn row_button(
         // `.tooltip()` below used to guarantee.
         .style(|s| s.color(theme::text_dim()).hover(|s| s.color(theme::text())))
         .tooltip(move || text(tip).style(tooltip_style));
-    in_ring_button(button, ring, tabindex, true, move || pressed())
+    in_ring_button(button, ring, tabindex, true, 0.0, move || pressed())
 }
 
 /// [`row_button`]'s footprint with nothing in it — what a move button becomes on
@@ -1068,7 +1110,9 @@ pub(crate) fn control_button_enabled(
                 s.color(theme::text_faint())
             }
         });
-    in_ring_button(button, ring, tabindex, enabled, move || pressed())
+    in_ring_button(button, ring, tabindex, enabled, CONTROL_RADIUS, move || {
+        pressed()
+    })
 }
 
 /// How much weight a modal action carries.
@@ -1198,7 +1242,7 @@ fn action_style(s: floem::style::Style, kind: ActionKind, enabled: bool) -> floe
         .padding_horiz(ACTION_PAD_H)
         .padding_vert(ACTION_PAD_V)
         .height(action_height())
-        .border_radius(5.0)
+        .border_radius(ACTION_RADIUS)
         .flex_shrink(0.0_f32);
     if enabled {
         s.background(fill())
@@ -1239,7 +1283,9 @@ fn action_button_inner(
             }
         })
         .style(move |s| action_style(s, kind, enabled));
-    in_ring_button(button, ring, tabindex, enabled, move || pressed())
+    in_ring_button(button, ring, tabindex, enabled, ACTION_RADIUS, move || {
+        pressed()
+    })
 }
 
 /// An [`action_button`] whose face the caller supplies and can swap, held at the
@@ -1278,7 +1324,9 @@ pub(crate) fn action_face<V: IntoView + 'static, F: Fn() + 'static>(
                 .justify_center()
                 .padding_horiz(0.0)
         });
-    in_ring_button(button, ring, tabindex, enabled, move || pressed())
+    in_ring_button(button, ring, tabindex, enabled, ACTION_RADIUS, move || {
+        pressed()
+    })
 }
 
 /// A text-only action: no fill, a colour that carries the meaning, brightening
@@ -1312,6 +1360,7 @@ pub(crate) fn dialog_button(
         ring,
         tabindex,
         true,
+        CONTROL_RADIUS, // `text_button`'s own
         move || pressed(),
     )
 }
@@ -1335,7 +1384,7 @@ fn text_button(
                 .font_size(theme::FONT_BODY)
                 .padding_horiz(pad_h)
                 .padding_vert(pad_v)
-                .border_radius(6.0);
+                .border_radius(CONTROL_RADIUS);
             if enabled {
                 s.color(color()).hover(move |s| s.color(hover()))
             } else {
@@ -1520,6 +1569,59 @@ pub(crate) fn pointer_released() -> RwSignal<u64> {
             // Detached scope → lives for the whole process, like `window_size`.
             let scope = Scope::new();
             let sig = scope.create_rw_signal(0u64);
+            *cell.borrow_mut() = Some((sig, scope));
+        }
+        cell.borrow().as_ref().unwrap().0
+    })
+}
+
+/// The stored keyboard-navigation flag plus the scope that owns it.
+type KeyboardNavSlot = (RwSignal<bool>, Scope);
+
+thread_local! {
+    static KEYBOARD_NAV: std::cell::RefCell<Option<KeyboardNavSlot>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// **Was the keyboard the last thing to move focus?** The app's own
+/// `:focus-visible`, and the reason a focus ring can be bright without being
+/// noise.
+///
+/// A focus outline is information the *keyboard* needs; on a mouse click it
+/// marks what you just pointed at, which you already know, so a ring visible
+/// enough to be useful under Tab is a distraction under the pointer. The web
+/// solves this with `:focus-visible`, and floem has the same idea in
+/// `FocusVisible` — but it is unreachable here, for the reason
+/// [`button_focus_ring`] records: floem gates it on `app_state.keyboard_navigation`,
+/// which only its own `view_tab_navigation` sets, and everything [`FocusRing`]
+/// does goes through `UpdateMessage::Focus`. So this is that flag, kept by the
+/// app.
+///
+/// **Set by [`FocusRing::step_from`], cleared by the root's `PointerDown`**, and
+/// those two are chosen rather than a list of "navigation keys":
+///
+/// - Every keyboard-driven focus change in the app is a Tab or Shift+Tab through
+///   the ring, so `step_from` *is* the definition — no key allowlist to keep in
+///   step, and typing in a text field can't set it.
+/// - Watching keys at the window root would have missed the only case that
+///   matters. Floem delivers a key to the focused view and then to the root's
+///   listeners **only if nothing consumed it**, and Tab is precisely the key the
+///   ring consumes.
+/// - The pointer half has no such problem: the root sees every press
+///   (`lib.rs`'s catch-all `PointerDown`), which is also where
+///   [`pointer_released`] is driven from.
+///
+/// Deliberately *not* touched by [`FocusRing::focus_at`] or
+/// [`hand_keyboard_back`]. Both move focus on behalf of something the user may
+/// have reached either way — a dropdown handing the keyboard back once its popup
+/// closes, a field unmounting under them — so leaving the flag alone keeps
+/// whatever their last real gesture said, which is the answer in both directions.
+pub(crate) fn keyboard_nav() -> RwSignal<bool> {
+    KEYBOARD_NAV.with(|cell| {
+        if cell.borrow().is_none() {
+            // Detached scope → lives for the whole process, like `window_size`.
+            let scope = Scope::new();
+            let sig = scope.create_rw_signal(false);
             *cell.borrow_mut() = Some((sig, scope));
         }
         cell.borrow().as_ref().unwrap().0
@@ -2202,7 +2304,7 @@ pub(crate) fn control_surface(s: floem::style::Style) -> floem::style::Style {
     s.background(theme::control_bg())
         .border(1.0)
         .border_color(theme::control_border())
-        .border_radius(6.0)
+        .border_radius(CONTROL_RADIUS)
 }
 
 pub(crate) fn section_title(t: &'static str) -> impl IntoView {
@@ -3075,6 +3177,58 @@ mod ring_tests {
         assert_eq!(ring.ids(), vec![ids[1], ids[2], ids[0]]);
     }
 
+    // ── the app's `:focus-visible` ──────────────────────────────────────────
+    //
+    // `keyboard_nav` is a `thread_local`, so each test *thread* has its own —
+    // but cargo runs several tests per thread, so these set it explicitly rather
+    // than assuming a starting value. A leftover `true` from a neighbour that
+    // happened to land on the same thread would make a green run mean nothing.
+
+    /// **Stepping the ring is the whole "set" half.** Asserted through
+    /// `step_from` rather than by calling the setter, because the claim is that
+    /// no keyboard-driven focus change can bypass it — a key listener added
+    /// somewhere else would have to be found by eye.
+    #[test]
+    fn a_tab_through_the_ring_arms_the_focus_ring() {
+        let (ring, ids) = ring_of(&[10, 20]);
+        keyboard_nav().set(false);
+        ring.step_from(ids[0], false);
+        assert!(keyboard_nav().get_untracked());
+    }
+
+    /// Shift+Tab is the same gesture backwards, and a step that finds nowhere to
+    /// go is still a keypress — the flag tracks the *gesture*, not whether focus
+    /// actually moved.
+    #[test]
+    fn stepping_backwards_arms_it_too() {
+        let (ring, ids) = ring_of(&[10, 20]);
+        keyboard_nav().set(false);
+        ring.step_from(ids[1], true);
+        assert!(keyboard_nav().get_untracked());
+    }
+
+    /// **Handing the keyboard back is not a keyboard gesture.** A dropdown
+    /// returning focus once its popup closes, and a field unmounting under the
+    /// user, both move focus on behalf of something they may have reached with
+    /// the mouse — so these leave the flag exactly as the last real gesture set
+    /// it, in both directions.
+    #[test]
+    fn refocusing_by_tabindex_leaves_the_flag_alone() {
+        let (ring, _) = ring_of(&[10, 20]);
+        keyboard_nav().set(false);
+        ring.focus_at(10);
+        assert!(
+            !keyboard_nav().get_untracked(),
+            "a mouse-driven hand-back must not light the ring"
+        );
+        keyboard_nav().set(true);
+        ring.focus_at(20);
+        assert!(
+            keyboard_nav().get_untracked(),
+            "nor must it put out a ring the keyboard earned"
+        );
+    }
+
     #[test]
     fn re_registering_a_view_moves_it_rather_than_duplicating_it() {
         let (ring, ids) = ring_of(&[10, 20]);
@@ -3174,8 +3328,22 @@ mod ring_tests {
     #[test]
     fn a_disabled_button_is_not_a_tab_stop() {
         let ring = FocusRing::new();
-        let live = in_ring_button(empty(), ring.clone(), ACTION_TAB, true, || {});
-        let dead = in_ring_button(empty(), ring.clone(), ACTION_TAB + 10, false, || {});
+        let live = in_ring_button(
+            empty(),
+            ring.clone(),
+            ACTION_TAB,
+            true,
+            ACTION_RADIUS,
+            || {},
+        );
+        let dead = in_ring_button(
+            empty(),
+            ring.clone(),
+            ACTION_TAB + 10,
+            false,
+            ACTION_RADIUS,
+            || {},
+        );
         assert_eq!(ring.ids(), vec![live.id()], "only the live one registered");
         assert_ne!(dead.id(), live.id());
         assert_eq!(ring.at(ACTION_TAB + 10), None);
@@ -3243,7 +3411,7 @@ mod ring_tests {
         let ring = FocusRing::new();
         let face = empty();
         let face_id = face.id();
-        let button = in_ring_button(face, ring.clone(), ACTION_TAB, true, || {});
+        let button = in_ring_button(face, ring.clone(), ACTION_TAB, true, ACTION_RADIUS, || {});
         assert_ne!(
             button.id(),
             face_id,
@@ -3255,7 +3423,14 @@ mod ring_tests {
         // its box — a footer action must not move as a form becomes valid.
         let dead_face = empty();
         let dead_face_id = dead_face.id();
-        let dead = in_ring_button(dead_face, ring.clone(), ACTION_TAB + 10, false, || {});
+        let dead = in_ring_button(
+            dead_face,
+            ring.clone(),
+            ACTION_TAB + 10,
+            false,
+            ACTION_RADIUS,
+            || {},
+        );
         assert_ne!(dead.id(), dead_face_id);
     }
 
