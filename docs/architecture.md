@@ -1,7 +1,9 @@
 # Schemaic — architecture
 
 A native SQL editor (Rust + [Floem](https://github.com/lapce/floem) 0.2.0), MySQL/MariaDB-first,
-Zed-inspired, aiming to replace DataGrip.
+Zed-inspired, aiming to replace DataGrip. PostgreSQL and SQLite are wired too; SQLite is
+read/write but has no schema editing and no manual-transaction mode — see `core::ddl`'s
+`supports_schema_editing` and `db::sqlite` for what that is a statement about.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `CLAUDE.md` at the repo root
@@ -87,9 +89,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     read-only gate, `edit_distance`. The *single* SQL boundary lexer; `intel` (scope/context/
     diagnostics)/`sql_highlight`/`sqlfmt` all build on it so string/`#`/`--`/`/* */`/backtick
     boundaries agree by construction.
+    **The per-dialect rules are a capability table on `SqlDialect`**, one predicate per divergence
+    (`dash_comment_needs_space`, `hash_line_comment`, `backslash_escapes`, `e_string_backslash`,
+    `double_quote_is_ident`, `backtick_ident`, `bracket_ident`, `dollar_quoted`,
+    `delimiter_directive`), and they are predicates because the question stopped being binary. The
+    scanner used to ask `dialect == Postgres` / `!= MySql`, which silently sorts any *third* engine
+    onto whichever side each comparison happens to put it — with nothing failing to compile, since
+    `!=` is exhaustive over any number of variants. Three of those defaults were wrong for SQLite
+    and two dangerously: it has no `\` escape inside a string, so `'C:\'` under MySQL's rule latches
+    the scanner into a literal that never ends and swallows the rest of the statement, which is
+    exactly how a `WHERE` gets hidden from the guard this module was consolidated to kill. Adding an
+    engine now fills in the table rather than hoping a `!=` falls the right way. `comment_open` is
+    the classification half, exposed because `pairs::region_at` has to tell a comment span from a
+    string span after the lexer has found one and was answering it with its own byte test.
   - `intel.rs` — the **SQL intelligence** layer (structure-aware, dialect-pluggable). Parses a
-    *complete* statement with a real per-dialect AST (`sqlparser`; `SqlDialect` seam — MySQL wired,
-    Postgres/SQLite are future arms) and answers what a token stream can't: `statement_scope`
+    *complete* statement with a real per-dialect AST (`sqlparser`; `SqlDialect` seam — MySQL,
+    PostgreSQL and SQLite all wired) and answers what a token stream can't: `statement_scope`
     (tables/aliases/CTEs/derived-tables in scope, AST-backed with a `skip_noncode` lexer fallback for
     mid-edit), `clause_context`/`clause_continuation` (caret context + expected-token model for
     completion), and `diagnostics` → `Vec<Diagnostic>` (catalog-aware unknown-table, unknown-column via
@@ -106,6 +121,23 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `JOIN … ON` auto-fill), `db_error_diagnostic` (positions a live DB error within the statement),
     `parses` (Tier-2 gate), and `select_output_names` (a projection's column names *in order*, or
     `None` when the statement alone can't say — what `ddl::pg_replaceable` reads).
+    **`simple_select_source` is the one definition of "structurally simple enough to aim a write
+    at"** — one statement, a `SELECT` body, no CTE, one `FROM` entry, no joins, a plain named table
+    — shared by `filter::build_query` (which needs to know it may splice a `WHERE` into the
+    statement that produced a result) and by SQLite's write-back (which needs to know which base
+    table a grid row belongs to). Two predicates that agreed on the day they were written is the
+    arrangement `ident_sql` exists to rule out, and a test pins that the two callers still agree.
+    `single_source_table` is its entry point for a caller holding only SQL, and
+    **`projection_of`** the derivation over it: which base column each result column reads, or
+    `None` where it is computed. It is **positional, not name-matched**, and that is the whole
+    reason it is a function rather than a lookup — `SELECT a AS b, b FROM t` produces a first
+    column *named* `b` that *is* `a`, so matching by name maps it to column `b` and an edit to that
+    cell would `UPDATE` the wrong column silently, with the grid showing the change as though it had
+    worked. Reading the projection positionally gets both right, and gets an alias right for the
+    same reason MySQL's `org_name` does: an alias renames the output, not the column behind it. A
+    `*` mixed with anything else answers `None` overall rather than being partly resolved, since the
+    wildcard's width isn't knowable here and a provenance list off by one column is the worst
+    possible answer.
     **Every SQL fragment this module generates** (`join_condition`, `join_targets`, `expand_star`)
     is quoted through `export::ident_if_needed`, which quotes only what a bare name would get wrong
     — anything that isn't a plain lower-case non-reserved word. PostgreSQL folds an unquoted
@@ -119,11 +151,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     splices a `WHERE`/`ORDER BY` into the `SELECT` that produced the result and hands back SQL to
     re-run — so filtering covers the whole table, not the loaded page. `build_query` rewrites only
     a structurally simple, join-free, CTE-free single-table `SELECT` and degrades to `Ok(None)`
-    ("not filterable") rather than erroring, because eligibility is the caller's question.
+    ("not filterable") rather than erroring, because eligibility is the caller's question — a
+    question it now asks `intel::simple_select_source`, which is also what SQLite's write-back
+    asks, rather than answering inline.
     `eq_condition` is the right-click "Filter by / Exclude" fragment. `table_query` is what opening
-    a table from the tree generates: it orders by the PK on purpose — neither engine promises row
+    a table from the tree generates: it orders by the PK on purpose — no engine promises row
     order for a capped page, and PG heap order shifts under an `UPDATE` — while leaving an ordinary
-    name unquoted, since a quoted identifier blinds the mid-edit tokenizer behind completion.
+    name unquoted, since a quoted identifier blinds the mid-edit tokenizer behind completion. It
+    names a SQLite table **alone**: a connection *is* one file, so there is no server-level
+    qualifier to add, and `main.t` would be noise on every generated query and wrong the moment the
+    statement is copied somewhere the file is attached under another name.
     Quoting here goes through the same rules as the rest of the app; don't add a fourth.
   - `edit.rs` — `analyze_edit` → `EditModel` (write-back updatability analysis) + `refetch_template`
     and `refetch_key`, the **one** post-edit re-fetch key builder. A key column *is* editable
@@ -166,7 +203,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `false` to a bool and a refresh empties what there is to look at, and the caller passes
     `same_connection` because `db_nodes` holds only the **active** connection's databases — nothing
     compared them, so switching connection discarded a hand-built mapping. Pure + unit-tested.
-  - `ddl.rs` — **schema editing**. `TableDraft` (the desired table; column/index/FK
+  - `ddl.rs` — **schema editing**, on the two engines that can alter a table in place.
+    `supports_schema_editing(dialect)` is the fact that says which, and it is a statement about
+    SQLite rather than a note about unfinished work: its `ALTER TABLE` does `RENAME TABLE`,
+    `RENAME COLUMN`, `ADD COLUMN` and `DROP COLUMN` and nothing else, so every other edit needs the
+    documented twelve-step rebuild — create a new table, copy the rows, drop the old one, rename the
+    new one into place, and recreate every index, trigger and view that pointed at it. That is a
+    destructive path built from statements each of which looks harmless, and it deserves its own
+    design and its own review rather than an arm in an emitter written for two engines that don't
+    need it. The schema tree, the editor's right-click and the Create submenu all read that one
+    function and offer **nothing** on such a connection (absent, not dimmed — "not supported" rather
+    than "not here"), and `Db::run_ddl` refuses the plan as the backstop.
+    `TableDraft` (the desired table; column/index/FK
     entries each carry the name they had on the server, which is what tells a *rename*
     from a drop-plus-add) → `diff(current, draft, dialect) -> ChangeSet` → `emit()`.
     Every `Change` answers `summary()` and `risks()`, which is what the preview
@@ -349,6 +397,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     longer interval for SSH-tunnelled connections, skip while the window is unfocused / a query is
     already in flight / the tunnel isn't up). The app owns only the timer + `Db::ping`.
   - `tx.rs` — the **manual-transaction** state machine behind `TxMode::Manual` (no DB, no UI).
+    Two engines only: **SQLite has no manual mode**, so the status-bar segment offering it is
+    hidden on such a connection and `Session::open` refuses one — not because SQLite lacks
+    transactions but because a pinned `rusqlite::Connection` is blocking and `!Sync`, needing a
+    thread of its own and a channel, which is worth building deliberately rather than as a side
+    effect of adding an engine. Running the tab's statements on fresh connections instead would
+    break the single promise the mode makes.
     `TxState::on_statement(engine, sql, outcome)` folds one statement into
     `Idle`/`Open{stmts}`/`Poisoned{stmts}`/`Lost`. It is a state machine rather than a bool because
     the engines diverge: PostgreSQL aborts the *whole* transaction on any error (`Poisoned` — only
@@ -370,7 +424,23 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   - `format.rs` — per-column display formatters (`ColumnFormat`/`apply`: epoch→datetime, bytes,
     bool). Display-only; edit/copy stay raw. Persisted to `format.json`.
   - `connection.rs` — the saved-connection model. A `Connection` is a database **server**, not one
-    database — the sidebar lists all of its databases. `SshTunnel`/`SshAuth` cover the tunnel's own
+    database — the sidebar lists all of its databases. **SQLite is the exception to that whole
+    sentence**: there is no server, so `Connection::file` is the entire target and
+    `host`/`port`/`user`/`password`/`ssh` are inert, which in turn means no secret reaches the
+    keyring (an empty password is *deleted* from the store, not written), no tunnel is opened, and
+    the connection has exactly one database — the one SQLite calls `main`. `file` is
+    `#[serde(default)]` so every connection saved before it loads unchanged, and it sits *beside*
+    the server coordinates rather than replacing them because a connection's engine is editable in
+    place: switching to SQLite and back must not discard the host it is going back to. Three
+    consequences are written down where they are easy to get wrong — `endpoint()` shows the file's
+    *name* (`host:port` would read `:0`, which looks like a misconfiguration), the split handles
+    **both** platforms' separators since `connections.json` is portable and `std::path` on Linux
+    returns a whole Windows path as its own file name, and `targets_same_server` counts the file,
+    because pointing a connection at another `.db` reaches an entirely different set of tables and
+    is reached the same way a repointed host is. `is_sqlite`/`is_postgres` are the one answer to
+    which engine a label names — `schemaic_db::Engine::from_db_type`, the form's picker and
+    `SqlDialect::from_db_type` all delegate, the last of which used to re-spell the aliases itself.
+    `SshTunnel`/`SshAuth` cover the tunnel's own
     auth, including `Agent` (delegates to the running SSH agent, storing no secret at all).
     `ConnStatus::is_down` treats `Unknown` (not yet checked, or a tunnel still coming up) as
     *non*-blocking — only a confirmed failure gates work. `SshAuth`/`Environment` deserialize
@@ -693,7 +763,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   to insert into it; a non-`INTEGER` `PRIMARY KEY` is reported **nullable**, because SQLite
   documents that it really is; and an index whose predicate or expression key the pragmas don't
   return is marked `lossy`, since an index edit is a drop-and-create and would otherwise silently
-  widen it. `EXPLAIN QUERY PLAN` is what `explain` runs — plain `EXPLAIN` disassembles to VDBE
+  widen it. A fourth is a **non**-finding worth recording, because it looks like a gap: a table
+  whose primary key is an `INTEGER PRIMARY KEY` reports **no indexes at all**, since that column
+  *is* the rowid and SQLite builds no separate index for it. Nothing needs to be synthesised —
+  `edit::resolve_key` reads the primary key off `ColumnInfo::primary_key`, not off the index list,
+  so write-back keys on it correctly (verified end to end against a real file); inventing a
+  `PRIMARY` index entry would only put an object in the tree that the database doesn't have. `EXPLAIN QUERY PLAN` is what `explain` runs — plain `EXPLAIN` disassembles to VDBE
   opcodes, which is a different artefact and useless to `core::plan` — and there is no analyzing
   form, since SQLite will not execute a statement to time it. **Manual transaction mode is refused**
   (`Session::open`): a pinned `rusqlite::Connection` is blocking and `!Sync`, so holding one across
@@ -972,12 +1047,19 @@ Re-introducing the anti-patterns these guard against is a regression:
   `skip_comment` (and the `sql.rs` helpers built on them — `statement_bounds`/`ranges`/`range`,
   `read_only_reason`, `has_top_level_where`/`unsafe_reason`/`first_unsafe`/`contains_write`) take a
   `SqlDialect`, so pass the connection's dialect (Postgres `#` is an operator not a comment, `$tag$…$tag$`
-  is a string, `"…"` an identifier, `\`-escapes only in MySQL / PG `E'…'`). **No exceptions** —
+  is a string, `"…"` an identifier, `\`-escapes only in MySQL / PG `E'…'`; SQLite takes `"x"`,
+  `` `x` `` *and* `[x]` as identifiers and has no backslash escape at all). **Ask the capability,
+  never the engine** — the rules are predicates on `SqlDialect` (see `sql.rs` above), because
+  `dialect == Postgres` / `!= MySql` compiles cleanly while silently sorting a third engine onto
+  whichever side it falls, and two of the answers it got wrong for SQLite could hide a `WHERE`
+  from the guard. **No exceptions** —
   `intel::tokenize_range` (the mid-edit byte-position *fallback*) is dialect-aware too, and so are the
   `intel` entry points that reach it (`clause_context`/`clause_continuation`/`join_targets`/
   `expand_star`/`signature_help` all take a `SqlDialect`). It additionally lifts a **quoted identifier**
-  out as a word — `` `t` `` on MySQL, `"t"` on PG — since that's the form Schemaic itself generates and
-  the fallback is exactly what runs mid-`WHERE`.
+  out as a word — `` `t` `` on MySQL, `"t"` on PG, any of the three on SQLite — since that's the form
+  Schemaic itself generates and the fallback is exactly what runs mid-`WHERE`; `intel::ident_quote`
+  answers per *byte* rather than holding one quote char, because SQLite's `[` doesn't even close
+  with the byte it opened with.
 - **Structure-aware SQL analysis goes through `schemaic_core::intel` (real per-dialect AST), not new
   hand-rolled scanners.** Scope resolution, completion context, and diagnostics build on the
   `sqlparser` AST (with a `skip_noncode` fallback for mid-edit); the **DB stays the semantic
@@ -1000,6 +1082,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   since no other connection can see uncommitted rows). Read-only side channels (schema
   introspection, live-validate `PREPARE`, EXPLAIN, Live Monitor, AI/MCP) stay on fresh connections so
   a long transaction can't block them. Don't add a second connection-caching path; extend `Session`.
+  **SQLite has no exception at all** — every operation opens its own connection inside
+  `spawn_blocking`, which is this invariant rather than a concession to a blocking driver, and
+  `Session::open` refuses it (see `core::tx` above for why the pinned form needs its own design).
   In-transaction writes nest under a `SAVEPOINT` (`TxScope`) so the 1-row guard can roll back its own
   batch without ending the user's transaction, and the transaction *state* is the pure, tested
   `schemaic_core::tx::TxState` — engine divergence (PG poisons on error, MySQL implicitly commits on
@@ -1043,7 +1128,11 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **Write-back is transactional with a 1-row safety net — and the *report* never claims more than
   the engine delivered.** `commit_writes` runs a `GridWrite`
   (DELETEs → UPDATEs → INSERTs) in one transaction, each statement required to affect exactly 1 row
-  (else roll back all) — so an over-optimistic updatability analysis can't corrupt data. That
+  (else roll back all) — so an over-optimistic updatability analysis can't corrupt data. On SQLite
+  the *analysis* is the part that has to be conservative, since no driver reports provenance there
+  and it is derived from the statement (`intel::projection_of`, positional): anything but a plainly
+  single-table `SELECT` is simply not editable. Its rollback, by contrast, is the one that needs no
+  hedging — there is no non-transactional table type. That
   promise is MySQL-engine-dependent: `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV` ignore `BEGIN`/`ROLLBACK`,
   and `ROLLBACK` *succeeds* there while raising warning 1196. So no write path may discard a
   rollback's outcome (`let _ = conn.query_drop("ROLLBACK")` was the bug): roll back through
@@ -1073,12 +1162,16 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **One identifier quoter, as there is one boundary lexer.** Every path that quotes an identifier
   ends at `export::ident_sql` (unconditional — for SQL that is only executed) or its sibling
   `export::ident_if_needed` (only when a bare name would name something else — for SQL the user
-  reads and edits). `filter::quote_ident`, `schema::ddl_ident_in`, `db::pg::pg_ident` and
-  `db::ident` are all thin delegations; the two engine-fixed ones in `schemaic-db` are bound by a
+  reads and edits). `filter::quote_ident`, `schema::ddl_ident_in`, `db::pg::pg_ident`,
+  `db::ident_sqlite` and
+  `db::ident` are all thin delegations; the three engine-fixed ones in `schemaic-db` are bound by a
   test in that crate, since they can't take a dialect. **Don't write a fifth** — there were four,
   each having independently arrived at the same escaping, which is the drift hazard rather than the
   reassurance: the literal half of the same split (`schema::ddl_string` missing MySQL's backslash
   escaping while `export::sql_literal` had it) shipped as a High.
+  SQLite *reads* three quotings but **emits only `"x"`**: it is the one of the three with a defined
+  escape, since a `]` cannot be written inside brackets at all. Its literals take Postgres' arm —
+  no backslash escape, so doubling one would corrupt the value.
 - **Both schema-search surfaces match through one predicate.** The schema tree's filter box and the
   Find-Anywhere palette answer the same question over the same `DbSchema`, so they go through
   `schema::TableInfo::matches_search` (name or any column) and `schema::ObjectItem::matches_search`
