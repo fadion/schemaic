@@ -2154,15 +2154,31 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   fires during **layout** with the view's window origin, not on pointer movement, so what they
   anchor to is the widget and not the cursor.
 - **Not every menu can be *opened* from the keyboard**, which is a separate thing from navigating
-  one. Only a menu on a ringed control can be: `suggest_chevron`, and the grid toolbar's Copy / Save
-  / AI dropdowns since the strip gained its ring. A right-click menu still needs a right-click (a
-  Menu/Shift+F10 key is the usual answer, and there isn't one).
+  one. A menu on a ringed control can be — `suggest_chevron`, and the grid toolbar's Copy / Save /
+  AI dropdowns since the strip gained its ring — and the **schema tree** answers `Shift+F10` and the
+  `ContextMenu` key on the row the nav cursor is on. The grid's cell and header menus, the editor's,
+  the tab strip's and the connection list's still need a right-click.
+  The tree's route is worth reading before copying it: focus lives on the tree **container**, never
+  on a row, so a key arriving there knows neither which row it is about nor where that row is. Both
+  ride on the per-row effect that already existed to scroll the cursor into view — `Nav::cursor_menu`
+  is the row's own `CtxOpener` (the same closure its `on_secondary_click_stop` calls, so the two
+  routes cannot offer different menus for one row) and `Nav::cursor_at` is where to open it.
+  That point comes from **`on_move`**, which floem fires during *layout* with the view's window
+  origin — not on pointer movement, and unlike `on_resize`'s rect, which is view-local and supplies
+  only the height. It is the row's **content** corner, `origin.x + get_content_rect().x0`: a tree row
+  spans the whole panel and the panel is flush left, so every row's own x is 0 at every depth and a
+  menu anchored to the box hugged the window edge. The indent that makes the tree a tree is the row's
+  `padding_left`. Both geometry signals are read *inside* the cursor guard, so only the cursor row
+  subscribes and a scroll that moves it refreshes the point.
 - **A menu the keyboard opened gives focus back when it closes** — `widgets::set_menu_return`, set
   by the opener and **taken** by `menu_panel` as it builds, so the slot lives only between the two
   and a later menu cannot inherit a stale return. Folded into `close`, the path Escape and every
   action take. Gated on `keyboard_nav` because it is only wanted there: after a click, moving focus
   to the control clicked would take the arrow keys away from whatever had them (the grid's own cell
   navigation), and a click-away dismissal sets the channel to `None` directly and skips it anyway.
+  Without it the surface that raised the menu goes **keyboard-dead**: the panel is a `focus_root`
+  with no other root above it in the workspace, so its teardown drops focus and the next key reaches
+  nothing. Both the grid toolbar's F6 and the tree's Shift+F10 hit exactly that.
 
 ## Data grid (results grid)
 
