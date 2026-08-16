@@ -170,13 +170,15 @@ pub fn analyze_edit(
             });
             for &ci in cis {
                 // C2: binary columns can't round-trip as text → never editable,
-                // even when their table has a usable key.
-                let binary = rs.columns[ci]
+                // even when their table has a usable key. An implicit key is
+                // excluded for a different reason (see `ColumnOrigin`): it is no
+                // column of the table, so there is nothing to write to.
+                let excluded = rs.columns[ci]
                     .origin
                     .as_ref()
-                    .map(|o| o.binary)
+                    .map(|o| o.binary || o.implicit_key)
                     .unwrap_or(false);
-                if !binary {
+                if !excluded {
                     col_table[ci] = Some(idx);
                 }
             }
@@ -263,6 +265,24 @@ fn resolve_key(
         (!flagged.is_empty()).then_some(flagged)
     };
 
+    // Last resort: a row key the table doesn't have a column for, asserted by the
+    // backend and projected into the result (SQLite's `rowid` — see
+    // [`crate::model::ColumnOrigin::implicit_key`]). It comes after the real keys
+    // and never instead of one: a primary key is what the user means by the row's
+    // identity, it survives a re-fetch, and it is stable in a way a rowid the
+    // engine may reassign is not.
+    let candidate = candidate.or_else(|| {
+        cis.iter()
+            .copied()
+            .find(|&ci| {
+                rs.columns[ci]
+                    .origin
+                    .as_ref()
+                    .is_some_and(|o| o.implicit_key)
+            })
+            .map(|ci| vec![ci])
+    });
+
     let key = candidate?;
     // C2/C4: a binary or floating-point key column can't be matched reliably in
     // a WHERE (lossy bytes / FLOAT↔DOUBLE precision), so the table is read-only.
@@ -317,6 +337,7 @@ mod tests {
                     ..Default::default()
                 },
                 binary,
+                implicit_key: false,
             }),
         }
     }
@@ -390,6 +411,95 @@ mod tests {
         assert!(m.insert_target().is_none());
         // And the result isn't spliceable (a join across two base tables).
         assert!(refetch_template(&r, &m).is_none());
+    }
+
+    // ── the implicit key: a row identity outside the table's columns ──────
+
+    /// A result column carrying a table's implicit row key (SQLite's `rowid`) —
+    /// a real origin on the table, but no column of it.
+    fn implicit_col(name: &str, table: &str) -> Column {
+        let mut c = col(name, "", table, false, false);
+        c.origin.as_mut().unwrap().implicit_key = true;
+        c
+    }
+
+    /// A table with no primary key and no index at all — read-only on every
+    /// engine, and the case an implicit key exists to rescue.
+    fn schema_keyless(table: &str, cols: &[(&str, &str)]) -> TableInfo {
+        schema_with_pk(table, &[], cols)
+    }
+
+    #[test]
+    fn keyless_table_is_editable_through_its_implicit_key() {
+        let r = rs(vec![
+            implicit_col("rowid", "notes"),
+            col("a", "TEXT", "notes", false, false),
+            col("b", "TEXT", "notes", false, false),
+        ]);
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "notes").then(|| schema_keyless("notes", &[("a", "text"), ("b", "text")]))
+        };
+        let m = analyze_edit(&r, schema);
+        // The key is the implicit column, and the data columns are writable.
+        assert_eq!(m.table(0).map(|t| t.key_cols.clone()), Some(vec![0]));
+        assert!(m.editable(1));
+        assert!(m.editable(2));
+        // The key itself is not: it is the handle on the row, not the table's
+        // data, and a new row has no value to offer for it.
+        assert!(!m.editable(0));
+        assert!(m.insert_target().is_some());
+    }
+
+    /// The implicit key is the last resort, never a shortcut past a real one:
+    /// the table's own key is what an `UPDATE` should match on, and it is what
+    /// survives a re-fetch.
+    #[test]
+    fn a_real_key_still_wins_over_a_projected_implicit_one() {
+        let r = rs(vec![
+            implicit_col("rowid", "users"),
+            col("id", "INT", "users", true, false),
+            col("name", "VARCHAR", "users", false, false),
+        ]);
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "users")
+                .then(|| schema_with_pk("users", &["id"], &[("id", "int"), ("name", "varchar")]))
+        };
+        let m = analyze_edit(&r, schema);
+        assert_eq!(m.table(0).map(|t| t.key_cols.clone()), Some(vec![1]));
+    }
+
+    /// Nothing changes for a table that has no implicit key to offer — a
+    /// `WITHOUT ROWID` table, and every MySQL/PostgreSQL table there is.
+    #[test]
+    fn a_keyless_table_with_no_implicit_key_stays_read_only() {
+        let r = rs(vec![
+            col("a", "TEXT", "notes", false, false),
+            col("b", "TEXT", "notes", false, false),
+        ]);
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "notes").then(|| schema_keyless("notes", &[("a", "text"), ("b", "text")]))
+        };
+        let m = analyze_edit(&r, schema);
+        assert!(!m.editable(0));
+        assert!(!m.editable(1));
+        assert!(m.insert_target().is_none());
+    }
+
+    /// A read-only key column is still part of the row, so the post-commit
+    /// re-fetch must select it and match on it.
+    #[test]
+    fn refetch_template_keys_on_the_implicit_key() {
+        let r = rs(vec![
+            implicit_col("rowid", "notes"),
+            col("a", "TEXT", "notes", false, false),
+        ]);
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "notes").then(|| schema_keyless("notes", &[("a", "text")]))
+        };
+        let m = analyze_edit(&r, schema);
+        let tpl = refetch_template(&r, &m).expect("single base table is spliceable");
+        assert_eq!(tpl.columns, vec!["rowid".to_string(), "a".to_string()]);
+        assert_eq!(tpl.key_cols, vec![0]);
     }
 
     #[test]

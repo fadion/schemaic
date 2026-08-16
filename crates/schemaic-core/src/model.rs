@@ -178,6 +178,20 @@ pub struct ColumnOrigin {
     /// value can't round-trip through the text protocol without loss, so the
     /// editing system treats it as read-only and refuses it as a WHERE key.
     pub binary: bool,
+    /// This column is the table's **implicit** row key — a value that identifies
+    /// a row uniquely but is no column of the table (SQLite's `rowid`, projected
+    /// explicitly because `SELECT *` does not return it). `false` everywhere
+    /// else, including a SQLite `WITHOUT ROWID` table, which has none.
+    ///
+    /// It makes a keyless table writable, and it is asserted by the backend
+    /// rather than derived from the schema — the same trust
+    /// [`ColumnFlags::primary_key`] already carries. Two consequences follow, and
+    /// both are why this is a flag and not just another key column:
+    /// [`crate::edit::analyze_edit`] falls back to it only after a primary key
+    /// and a unique index have both failed, and the column itself is never
+    /// **editable** — it is the handle the write holds the row by, not data the
+    /// table has, and a newly inserted row has no value to offer for it.
+    pub implicit_key: bool,
 }
 
 /// Per-column key/nullability flags from the wire column definition. Used by the
@@ -1097,6 +1111,7 @@ mod tests {
                 column: real.to_string(),
                 flags: ColumnFlags::default(),
                 binary: false,
+                implicit_key: false,
             }),
         }
     }

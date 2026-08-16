@@ -245,6 +245,7 @@ fn attach_origins(conn: &SqliteConn, sql: &str, columns: &mut [Column]) {
             // the other two engines make for a binary charset. It is the
             // *declared* type that decides, since that is what the column is for.
             binary: ci.type_name.eq_ignore_ascii_case("BLOB"),
+            implicit_key: false,
         });
     }
 }
