@@ -3023,3 +3023,143 @@ mod check_schema_tests {
         assert!(v.check_constraints.is_empty());
     }
 }
+
+/// The rebuild emitted by `core::ddl` is only correct if SQLite accepts it, and
+/// the only way to know that is to run it.
+#[cfg(test)]
+mod rebuild_roundtrip_tests {
+    use super::tests::shared_memory;
+    use super::*;
+    use schemaic_core::ddl::{TableDraft, sqlite_rebuild_sql};
+    use tokio_util::sync::CancellationToken;
+
+    async fn table_of(db: &Db, name: &str) -> TableInfo {
+        fetch_schema(db)
+            .await
+            .expect("introspect")
+            .tables
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} is gone"))
+    }
+
+    /// Retype a column and drop another — neither is something SQLite's
+    /// `ALTER TABLE` can do — and check the rows came across.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rebuild_retypes_a_column_and_keeps_the_rows() {
+        let (keeper, db) = shared_memory("rebuild_retype");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, scratch TEXT);
+                 CREATE INDEX ix_n ON t (n);
+                 INSERT INTO t VALUES (1, 42, 'x'), (2, 7, 'y');",
+            )
+            .unwrap();
+
+        let before = table_of(&db, "t").await;
+        let mut draft = TableDraft::from_table(&before);
+        draft.columns[1].info.type_name = "TEXT".into();
+        draft.columns.retain(|c| c.info.name != "scratch");
+
+        let stmts = sqlite_rebuild_sql(&before, &draft, &[]);
+        db.run_ddl(MAIN, &stmts, CancellationToken::new())
+            .await
+            .expect("the rebuild must be valid SQLite");
+
+        let after = table_of(&db, "t").await;
+        let cols: Vec<(&str, &str)> = after
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.type_name.as_str()))
+            .collect();
+        assert_eq!(cols, vec![("id", "INTEGER"), ("n", "TEXT")]);
+        assert!(
+            after.indexes.iter().any(|i| i.name == "ix_n"),
+            "the index came back: {:?}",
+            after.indexes
+        );
+        let rows: i64 = keeper
+            .query_row("SELECT count(*) FROM t WHERE n IN ('42', '7')", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 2, "both rows survived the copy");
+    }
+
+    /// The case the plain `ALTER TABLE` path can't reach at all: adding a CHECK
+    /// constraint, which only exists as part of a table declaration.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rebuild_adds_a_check_that_then_bites() {
+        let (keeper, db) = shared_memory("rebuild_check");
+        keeper
+            .execute_batch(
+                "CREATE TABLE account (id INTEGER PRIMARY KEY, balance INTEGER);
+                 INSERT INTO account VALUES (1, 10);",
+            )
+            .unwrap();
+
+        let before = table_of(&db, "account").await;
+        let mut draft = TableDraft::from_table(&before);
+        draft
+            .check_constraints
+            .push(schemaic_core::ddl::CheckDraft::new(CheckInfo {
+                name: "ck_positive".into(),
+                expression: "balance >= 0".into(),
+                enforced: true,
+                validated: true,
+                inherited: true,
+                ..Default::default()
+            }));
+        let stmts = sqlite_rebuild_sql(&before, &draft, &[]);
+        db.run_ddl(MAIN, &stmts, CancellationToken::new())
+            .await
+            .expect("rebuild");
+
+        // The constraint is real, not just recorded.
+        let refused = keeper.execute_batch("INSERT INTO account VALUES (2, -5)");
+        assert!(refused.is_err(), "the CHECK must be enforced");
+        assert_eq!(
+            table_of(&db, "account").await.check_constraints.len(),
+            1,
+            "and it reads back"
+        );
+    }
+
+    /// A trigger goes down with the table it hangs off. Replaying it is what
+    /// stops the rebuild quietly disarming it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replayed_trigger_still_fires_afterwards() {
+        let (keeper, db) = shared_memory("rebuild_trigger");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER);
+                 CREATE TABLE log (n INTEGER);
+                 CREATE TRIGGER t_ai AFTER INSERT ON t
+                   BEGIN INSERT INTO log VALUES (NEW.n); END;",
+            )
+            .unwrap();
+        let trigger: String = keeper
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 't_ai'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let before = table_of(&db, "t").await;
+        let mut draft = TableDraft::from_table(&before);
+        draft.columns[1].info.type_name = "TEXT".into();
+        let stmts = sqlite_rebuild_sql(&before, &draft, &[format!("{};", trigger.trim())]);
+        db.run_ddl(MAIN, &stmts, CancellationToken::new())
+            .await
+            .expect("rebuild");
+
+        keeper
+            .execute_batch("INSERT INTO t VALUES (1, 5);")
+            .unwrap();
+        let logged: i64 = keeper
+            .query_row("SELECT count(*) FROM log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(logged, 1, "the trigger survived the rebuild");
+    }
+}

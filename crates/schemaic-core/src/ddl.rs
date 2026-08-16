@@ -4312,6 +4312,95 @@ pub fn supports_schema_editing(dialect: SqlDialect) -> bool {
     !matches!(dialect, SqlDialect::Sqlite)
 }
 
+/// The suffix the shadow table carries while a rebuild is in flight. It exists
+/// only between the `CREATE` and the `RENAME`, both inside one transaction, so
+/// nothing ever sees it — but a name that collided with a real table would fail
+/// the whole plan, so it is deliberately not the `new_X` the SQLite manual uses
+/// in its example.
+const REBUILD_SUFFIX: &str = "_schemaic_rebuild";
+
+/// The twelve-step rebuild, as statements: the only way to change most of a
+/// SQLite table.
+///
+/// Its `ALTER TABLE` does `RENAME TABLE`, `RENAME COLUMN`, `ADD COLUMN` and
+/// `DROP COLUMN`. Everything else — a retype, a reorder, a key, a constraint —
+/// has to be done by building the table you wanted, moving the rows into it, and
+/// putting it where the old one was. The order is not negotiable and each step
+/// is destructive on its own, which is why this is one function with one test
+/// suite rather than a shape assembled at each call site:
+///
+/// 1. **create** the shadow table from `draft`, under a name nothing else holds;
+/// 2. **copy** the rows, column by column, mapping each new column to the old
+///    one it came from — that mapping is what makes a rename a rename rather
+///    than a drop and an add;
+/// 3. **drop** the original, which takes its indexes and triggers with it;
+/// 4. **rename** the shadow into its place;
+/// 5. **recreate** the indexes, *after* the rename — an index name is unique per
+///    schema in SQLite, so creating one before the old table is gone collides
+///    with the index it is replacing;
+/// 6. **replay** `dependents`, the `CREATE` text of the triggers that hung off
+///    the table and went down with it.
+///
+/// The rows move with `INSERT … SELECT`, not `CREATE TABLE … AS SELECT`, because
+/// the latter takes its column types from the query rather than from the
+/// declaration and would quietly discard every constraint on the new table.
+///
+/// **A rename of the table itself is not part of this.** The rebuild always ends
+/// under the original name, and `ALTER TABLE … RENAME TO` is emitted after it —
+/// that statement is native, and letting SQLite perform it is what keeps the
+/// references in other tables' foreign keys pointing at the right place.
+pub fn sqlite_rebuild_sql(
+    current: &TableInfo,
+    draft: &TableDraft,
+    dependents: &[String],
+) -> Vec<String> {
+    let d = SqlDialect::Sqlite;
+    let q = |s: &str| ddl_ident_in(s, d);
+    let original = qualified(&current.name, current.schema.as_deref(), d);
+    let shadow_name = format!("{}{REBUILD_SUFFIX}", current.name);
+    let shadow = qualified(&shadow_name, current.schema.as_deref(), d);
+
+    // The table to build: the draft, under the shadow name and without its
+    // indexes, which are created against the real table further down.
+    let mut build = draft.clone();
+    build.name = shadow_name;
+    build.indexes.clear();
+    let mut out = create_table_sql(&build, d);
+
+    // Which new column takes which old one's data. A column the user added has
+    // no `original` and is left out of both lists so its default applies, and a
+    // generated column is left out because it cannot be inserted into — it is
+    // computed from the rows this statement moves.
+    let live: HashSet<&str> = current.columns.iter().map(|c| c.name.as_str()).collect();
+    let (into, from): (Vec<String>, Vec<String>) = draft
+        .columns
+        .iter()
+        .filter(|c| c.info.generated.is_none())
+        .filter_map(|c| {
+            let was = c.original.as_deref().filter(|o| live.contains(o))?;
+            Some((q(&c.info.name), q(was)))
+        })
+        .unzip();
+    if !into.is_empty() {
+        out.push(format!(
+            "INSERT INTO {shadow} ({}) SELECT {} FROM {original};",
+            into.join(", "),
+            from.join(", ")
+        ));
+    }
+
+    out.push(format!("DROP TABLE {original};"));
+    out.push(format!(
+        "ALTER TABLE {shadow} RENAME TO {};",
+        q(&current.name)
+    ));
+    for ix in &draft.indexes {
+        out.push(create_index_sql(&ix.info, &original, d));
+    }
+    out.extend(dependents.iter().cloned());
+    out
+}
+
 /// Can `dialect` express this one change as SQL [`ChangeSet::emit`] writes?
 ///
 /// [`supports_schema_editing`] answers about the *designer* — a plan that
@@ -10518,5 +10607,167 @@ mod sqlite_create_tests {
     #[test]
     fn no_identity_syntax_leaks_in() {
         assert!(!one(&autoinc()).contains("AS IDENTITY"));
+    }
+}
+
+#[cfg(test)]
+mod sqlite_rebuild_tests {
+    use super::*;
+    use crate::schema::{IndexColumn, IndexInfo};
+
+    fn col(name: &str, ty: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.into(),
+            type_name: ty.into(),
+            nullable: true,
+            ..Default::default()
+        }
+    }
+
+    /// `t (a INTEGER, b TEXT)`, no key, no indexes.
+    fn table() -> TableInfo {
+        TableInfo {
+            name: "t".into(),
+            columns: vec![col("a", "INTEGER"), col("b", "TEXT")],
+            ..Default::default()
+        }
+    }
+
+    fn plan(current: &TableInfo, draft: &TableDraft) -> Vec<String> {
+        sqlite_rebuild_sql(current, draft, &[])
+    }
+
+    /// The shape of the whole thing, on the simplest edit there is: a retype,
+    /// which SQLite's `ALTER TABLE` cannot do at all.
+    #[test]
+    fn a_retype_becomes_create_copy_drop_rename() {
+        let t = table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.type_name = "TEXT".into();
+        let got = plan(&t, &d);
+        assert_eq!(got.len(), 4, "{got:#?}");
+        assert!(
+            got[0].starts_with(r#"CREATE TABLE "t_schemaic_rebuild" ("#),
+            "{}",
+            got[0]
+        );
+        assert!(got[0].contains(r#""a" TEXT"#), "{}", got[0]);
+        assert_eq!(
+            got[1],
+            r#"INSERT INTO "t_schemaic_rebuild" ("a", "b") SELECT "a", "b" FROM "t";"#
+        );
+        assert_eq!(got[2], r#"DROP TABLE "t";"#);
+        assert_eq!(got[3], r#"ALTER TABLE "t_schemaic_rebuild" RENAME TO "t";"#);
+    }
+
+    /// The copy is what carries a rename across: the new table's column takes
+    /// the old one's data, which is the whole difference between a rename and a
+    /// drop-plus-add.
+    #[test]
+    fn a_renamed_column_copies_from_its_old_name() {
+        let t = table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.name = "z".into();
+        assert!(
+            plan(&t, &d)[1].contains(r#"("z", "b") SELECT "a", "b""#),
+            "{:#?}",
+            plan(&t, &d)
+        );
+    }
+
+    /// A column the user added has nothing to copy from — leaving it out of both
+    /// lists is what lets its DEFAULT (or NULL) apply.
+    #[test]
+    fn an_added_column_is_left_out_of_the_copy() {
+        let t = table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns.push(ColumnDraft::new(col("c", "TEXT")));
+        let got = plan(&t, &d);
+        assert!(got[0].contains(r#""c" TEXT"#), "still created: {}", got[0]);
+        assert_eq!(
+            got[1],
+            r#"INSERT INTO "t_schemaic_rebuild" ("a", "b") SELECT "a", "b" FROM "t";"#
+        );
+    }
+
+    #[test]
+    fn a_dropped_column_is_in_neither_list() {
+        let t = table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns.remove(0);
+        let got = plan(&t, &d);
+        assert!(!got[0].contains(r#""a""#), "{}", got[0]);
+        assert_eq!(
+            got[1],
+            r#"INSERT INTO "t_schemaic_rebuild" ("b") SELECT "b" FROM "t";"#
+        );
+    }
+
+    /// **A generated column cannot be inserted into.** It is created with the
+    /// table and computed from the copied rows; naming it in the `INSERT` makes
+    /// the statement fail outright.
+    #[test]
+    fn a_generated_column_is_created_but_never_copied() {
+        let mut t = table();
+        t.columns.push(ColumnInfo {
+            generated: Some("upper(b)".into()),
+            ..col("shout", "TEXT")
+        });
+        let d = TableDraft::from_table(&t);
+        let got = plan(&t, &d);
+        assert!(
+            got[0].contains("GENERATED ALWAYS AS (upper(b))"),
+            "{}",
+            got[0]
+        );
+        assert!(!got[1].contains("shout"), "{}", got[1]);
+    }
+
+    /// Indexes are recreated **after** the rename, against the real table. Doing
+    /// it earlier would collide with the old table's index of the same name,
+    /// which is still there until the drop.
+    #[test]
+    fn indexes_are_recreated_after_the_rename() {
+        let mut t = table();
+        t.indexes.push(IndexInfo {
+            name: "ix_b".into(),
+            columns: vec![IndexColumn::plain("b")],
+            ..Default::default()
+        });
+        let d = TableDraft::from_table(&t);
+        let got = plan(&t, &d);
+        assert!(
+            !got[0].contains("CREATE INDEX"),
+            "not against the shadow table: {}",
+            got[0]
+        );
+        let rename = got.iter().position(|s| s.contains("RENAME TO")).unwrap();
+        let index = got.iter().position(|s| s.contains("CREATE INDEX")).unwrap();
+        assert!(index > rename, "{got:#?}");
+        assert_eq!(got[index], r#"CREATE INDEX "ix_b" ON "t" ("b");"#);
+    }
+
+    /// A trigger is dropped with the table it hangs off, so a rebuild that
+    /// didn't put it back would quietly disarm it.
+    #[test]
+    fn dependents_are_replayed_last() {
+        let t = table();
+        let d = TableDraft::from_table(&t);
+        let trg = r#"CREATE TRIGGER "t_ai" AFTER INSERT ON "t" BEGIN SELECT 1; END;"#;
+        let got = sqlite_rebuild_sql(&t, &d, &[trg.to_string()]);
+        assert_eq!(got.last().map(String::as_str), Some(trg), "{got:#?}");
+    }
+
+    /// Every column is new, so there is nothing to carry over — and
+    /// `INSERT INTO t () SELECT FROM …` is not a statement.
+    #[test]
+    fn nothing_to_copy_emits_no_insert() {
+        let t = table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns.clear();
+        d.columns.push(ColumnDraft::new(col("fresh", "TEXT")));
+        let got = plan(&t, &d);
+        assert!(!got.iter().any(|s| s.starts_with("INSERT")), "{got:#?}");
+        assert_eq!(got.len(), 3, "{got:#?}");
     }
 }
