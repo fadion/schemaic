@@ -1410,12 +1410,10 @@ pub fn build_insert(
         return None;
     }
     let q = |s: &str| crate::export::ident_sql(s, dialect);
-    // A PostgreSQL namespace qualifies the table instead of the database — a PG
-    // connection is bound to one database, exactly as the export path has it.
-    let target = match schema {
-        Some(ns) => format!("{}.{}", q(ns), q(table)),
-        None => format!("{}.{}", q(database), q(table)),
-    };
+    // How a table is addressed per engine is `export::qualified_table`'s rule —
+    // this was a second copy of it, which is what let SQLite's bare-name case
+    // reach one and not the other.
+    let target = crate::export::qualified_table(database, schema, table, dialect);
     let cols = columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
     let values = rows
         .iter()

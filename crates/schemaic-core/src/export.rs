@@ -592,6 +592,35 @@ pub fn export_inserts(
     to_string(|w| export_inserts_to(w, rs, order, source, dialect))
 }
 
+/// How generated SQL addresses a table, per engine — **the one rule**, shared by
+/// the SQL export and by [`crate::import::build_insert`], which had it twice.
+///
+/// MySQL qualifies with the **database**, since its connection is server-level.
+/// PostgreSQL qualifies with the **namespace** (the connection is already bound
+/// to one database), falling back to the database when no namespace is given.
+///
+/// SQLite names the table **bare**, and that is the case worth stating: a
+/// connection *is* one file, so there is nothing to disambiguate — and `main` is
+/// not a name the user chose but SQLite's word for "the file you opened", so
+/// emitting `"main"."t"` is noise on every row of an export and actively wrong
+/// the moment that SQL is pasted into a session where a *different* file is
+/// attached under that name. Same reasoning as [`crate::filter::table_query`]'s.
+pub fn qualified_table(
+    database: &str,
+    schema: Option<&str>,
+    table: &str,
+    dialect: SqlDialect,
+) -> String {
+    let q = |s: &str| ident_sql(s, dialect);
+    match dialect {
+        SqlDialect::Sqlite => q(table),
+        _ => match schema {
+            Some(ns) => format!("{}.{}", q(ns), q(table)),
+            None => format!("{}.{}", q(database), q(table)),
+        },
+    }
+}
+
 /// [`export_inserts`], streamed. One statement per row and no batching, so a row
 /// carries no state into the next — the table and column lists are computed once
 /// and repeated verbatim.
@@ -604,8 +633,7 @@ pub fn export_inserts_to<W: Write>(
 ) -> io::Result<()> {
     let q = |s: &str| ident_sql(s, dialect);
     let table_sql = match source {
-        Some((_, Some(ns), table)) => format!("{}.{}", q(ns), q(table)),
-        Some((db, None, table)) => format!("{}.{}", q(db), q(table)),
+        Some((db, ns, table)) => qualified_table(db, ns, table, dialect),
         None => q("table"),
     };
     let cols = rs
@@ -866,6 +894,40 @@ mod tests {
         // The other dialect's quote char is NOT special — it's just a character.
         assert_eq!(ident_sql("a\"b", MySql), "`a\"b`");
         assert_eq!(ident_sql("a`b", Postgres), "\"a`b\"");
+    }
+
+    /// How a table is addressed in generated SQL, per engine — and the reason
+    /// SQLite names it **bare**.
+    #[test]
+    fn a_table_is_qualified_the_way_its_engine_needs() {
+        // MySQL: a connection is server-level, so the database qualifies.
+        assert_eq!(
+            qualified_table("shop", None, "orders", MySql),
+            "`shop`.`orders`"
+        );
+        // Postgres: the connection is already bound to the database, so the
+        // *namespace* qualifies — and `public` is dropped by the caller.
+        assert_eq!(
+            qualified_table("shop", Some("sales"), "orders", Postgres),
+            "\"sales\".\"orders\""
+        );
+        assert_eq!(
+            qualified_table("shop", None, "orders", Postgres),
+            "\"shop\".\"orders\""
+        );
+        // SQLite: a connection *is* one file. `main` is not a name the user
+        // chose — it is SQLite's word for "the file you opened" — so qualifying
+        // with it is noise here and actively wrong in a session where another
+        // file is attached under that name.
+        assert_eq!(
+            qualified_table("main", None, "orders", Sqlite),
+            "\"orders\""
+        );
+        // …and it stays bare whatever it is asked to qualify with.
+        assert_eq!(
+            qualified_table("other", Some("x"), "orders", Sqlite),
+            "\"orders\""
+        );
     }
 
     /// SQLite *reads* `"x"`, `` `x` `` and `[x]`, but emits only the standard
