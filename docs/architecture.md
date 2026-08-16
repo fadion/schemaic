@@ -344,10 +344,40 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     instead of them, so the preview still lists the user's edits in their own terms and one line
     says how they will happen. The trigger is "is there a change here with no statement of its own",
     not "is this an alter" — a set of nothing but the drops the engine does have keeps its direct
-    path and pays nothing. An `ADD COLUMN` deliberately takes the rebuild even though it is native,
-    because it is native *only* when the column carries no key, no uniqueness and a constant
-    default, and getting that wrong writes the plan that half-applies; the fast paths are a later
-    optimisation with a test each (`ddl::sqlite_designer_tests`).
+    path and pays nothing. **An `ADD COLUMN` is the one fast path taken**, through
+    `sqlite_native_add(column, position)`: appending a column is the commonest designer edit there
+    is and SQLite performs it instantly, so copying the whole table to achieve it was correct and
+    absurd. The predicate answers false for anything it isn't sure of, because the failure mode is a
+    plan that *half-applies* — fast path taken, engine refuses the statement, and the edit the
+    preview promised is simply gone. A needless rebuild is slow; a wrong fast path is a lie. The
+    rules, each measured against SQLite 3.46 rather than read off the grammar: `position` must be
+    `None`, since `ADD COLUMN` always appends and a column dropped into the middle would land at the
+    end, leaving the designer showing one order and the table having another — **this is the one
+    rule with no error message behind it, the statement succeeds, in the wrong place** (and
+    `apply_positions` runs for MySQL and SQLite alike, so a `Position` is a reliable signal); no
+    primary key (*"Cannot add a PRIMARY KEY column"*); no `auto_increment`, because `AUTOINCREMENT`
+    is legal only inline as `INTEGER PRIMARY KEY AUTOINCREMENT` and `ColumnInfo::definition_sql`
+    therefore drops it for SQLite, so a native add would silently lose the counter the rebuild's
+    table builder can place; a constant default if there is one (*"Cannot add a column with
+    non-constant default"*); and `NOT NULL` requires a non-null default (*"Cannot add a NOT NULL
+    column with default value NULL"*). Two deliberate non-rules: **uniqueness** isn't on
+    `ColumnInfo` at all — it arrives as an index, which has no native arm and takes the set back to
+    a rebuild by itself, and that is a fact about *this gate* rather than about SQLite, which
+    refuses only an inline `UNIQUE` in the column definition and would take a native add followed by
+    a `CREATE UNIQUE INDEX` quite happily — and a **generated** column *is* addable, since the
+    emitter writes no `VIRTUAL`/`STORED` keyword so SQLite's own default (`VIRTUAL`) applies and
+    `STORED` is the form the engine refuses; it carries its expression instead of a default, so the
+    null-default rule has nothing to reach. `sqlite_constant_default` decides the default: the `CURRENT_TIME`/
+    `CURRENT_DATE`/`CURRENT_TIMESTAMP` keywords and anything parenthesised are not constants (the
+    paren test also catches a bare `now()`, which isn't a legal `DEFAULT` there at all), and the
+    parenthesis is looked for at a **code** position through `sql::skip_noncode` rather than with a
+    `contains('(')`, so a default of `'a (b)'` stays native — its parens are data. A native add
+    *beside* an unsupported change is still subsumed by the rebuild and must not also emit its own
+    `ADD COLUMN`. There is a test per restriction in `ddl::sqlite_designer_tests`, and
+    `db::sqlite`'s `every_natively_added_column_is_one_sqlite_accepts` runs every shape the
+    predicate calls native through `run_ddl` at real in-memory SQLite — which is what the fast path
+    actually rests on, since a predicate drifting from the engine's restrictions can't be caught by
+    reasoning, only by asking SQLite.
     **`supports_change(dialect, &Change)` is the second gate, and it answers a different
     question.** It is about one change **on its own** — a context-menu shortcut, which has no draft
     behind it to build a table from — where the designer's plan can answer anything by rebuilding.
@@ -357,7 +387,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `ReplaceView`, `CreateTrigger`, `ReplaceTrigger`, the replaces being a drop-and-create on every
     engine), and for `RebuildTable`, which only `diff` raises. `RenameView` is deliberately **not**
     on the list: `diff_view` resolves a SQLite rename into the re-create before it can reach here.
-    It is false for everything else, where each false is
+    **It is no longer purely a question of the change's kind**: `AddColumn` is answered by asking
+    `sqlite_native_add` above, the one arm that depends on what the change *contains*, and it falls
+    through to that list only after. It is false for everything else, where each false is
     the twelve-step rebuild in disguise: a foreign key or a constraint-backed index comes off only
     by recreating the table around it. Every non-SQLite dialect answers true. It exists because the
     per-row menus were built with **no** gate at all — not this one, not even `read_only` — so a
@@ -395,9 +427,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     (SQLite refuses to drop a column an index still names, so the two in one plan only work in
     that order) and filters every change through `supports_change`, so a gate that drifts open
     shows an empty preview instead of handing SQLite MySQL's spelling of the change
-    (`ddl::sqlite_drop_tests`). Where the set holds a `RebuildTable` that arm returns the rebuild's
-    statements and the trailing `RENAME TO` **and nothing else** — the other entries describe what
-    the rebuild achieves, so emitting them beside it would apply the same edit twice.
+    (`ddl::sqlite_drop_tests`). Its `AddColumn` arm writes
+    `ALTER TABLE <t> ADD COLUMN <definition>` from `ColumnInfo::definition_sql` — the same column
+    emitter the rebuild's `CREATE TABLE` uses, so the two can't disagree about what the column is,
+    only about how it gets there — and adds come **after** drops, so a column replacing a dropped
+    one of the same name finds the name free. Where the set holds a `RebuildTable` that arm returns
+    the rebuild's statements and the trailing `RENAME TO` **and nothing else** — the other entries
+    describe what the rebuild achieves, so emitting them beside it would apply the same edit twice.
     `create_table_sql` splits on the same fault line, and for the same reason: it used to split on
     PostgreSQL and give everything else MySQL's shape, which for SQLite is not unidiomatic but
     invalid — inline `KEY`/`UNIQUE KEY`, `ENGINE=`, `COLLATE=` and `COMMENT=` are each a syntax
