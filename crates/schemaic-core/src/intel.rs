@@ -4614,6 +4614,16 @@ pub enum Projection {
     /// One entry per result column: the **base column** it is a reference to, or
     /// `None` where it is computed and belongs to no column.
     Items(Vec<Option<String>>),
+    /// The items projected *ahead* of a lone trailing `*`, in order — one entry
+    /// each, read exactly as [`Projection::Items`] reads them. The wildcard then
+    /// expands into every result column after them, so the caller appends the
+    /// source table's own columns the way it does for [`Projection::Wildcard`].
+    ///
+    /// This is the shape `SELECT rowid, * FROM t` has, and the reason it is
+    /// answered rather than refused: a leading item sits at a position the
+    /// wildcard's unknown width cannot move. Only a *trailing* wildcard qualifies
+    /// — see [`projection_of`].
+    LeadingThenWildcard(Vec<Option<String>>),
 }
 
 /// Which base column each result column of a simple single-table `SELECT` comes
@@ -4633,10 +4643,15 @@ pub enum Projection {
 /// function call — is `None` and therefore not editable, which is exactly what
 /// the other two engines report for the same statement.
 ///
-/// A `*` mixed with anything else returns `None` overall rather than being
-/// partly resolved: the wildcard's width isn't knowable here, so the positions
-/// after it can't be either, and a provenance list that is off by one column is
-/// the worst possible answer.
+/// A `*` mixed with anything else is resolved only as far as it safely can be.
+/// The wildcard's width isn't knowable here, so no position *after* one can be
+/// either, and a provenance list off by one column is the worst possible answer
+/// — a `*` with anything behind it, or a second `*`, still returns `None`
+/// overall. Positions *ahead* of a lone trailing wildcard are a different case:
+/// nothing the wildcard expands to can shift them, so they are placed and
+/// returned as [`Projection::LeadingThenWildcard`]. That is what makes
+/// `SELECT rowid, * FROM t` — a keyless SQLite table's editable form — analysable
+/// without the caller having to spell out every column.
 pub fn projection_of(sql: &str, dialect: SqlDialect) -> Option<(SourceTable, Projection)> {
     use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement};
 
@@ -4649,22 +4664,28 @@ pub fn projection_of(sql: &str, dialect: SqlDialect) -> Option<(SourceTable, Pro
         return None;
     };
 
-    // A lone wildcard; anything alongside one is refused above.
-    if select.projection.len() == 1
-        && matches!(
-            select.projection[0],
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
-        )
-    {
-        return Some((source, Projection::Wildcard));
-    }
-    if select.projection.iter().any(|p| {
+    let is_wildcard = |p: &SelectItem| {
         matches!(
             p,
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
         )
-    }) {
-        return None;
+    };
+    // Where the wildcards are. More than one, or one that isn't last, leaves
+    // every position after it at an unknowable offset — refuse the statement.
+    let wildcards: Vec<usize> = select
+        .projection
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| is_wildcard(p))
+        .map(|(i, _)| i)
+        .collect();
+    let trailing_wildcard = match wildcards.as_slice() {
+        [] => None,
+        [i] if *i == select.projection.len() - 1 => Some(*i),
+        _ => return None,
+    };
+    if trailing_wildcard == Some(0) {
+        return Some((source, Projection::Wildcard));
     }
 
     let base_of = |e: &Expr| -> Option<String> {
@@ -4676,8 +4697,10 @@ pub fn projection_of(sql: &str, dialect: SqlDialect) -> Option<(SourceTable, Pro
             _ => None,
         }
     };
-    let items = select
-        .projection
+    // The wildcard itself, when there is one, is the last item and is dropped —
+    // the caller expands it into the columns after these.
+    let placed = trailing_wildcard.unwrap_or(select.projection.len());
+    let items: Vec<Option<String>> = select.projection[..placed]
         .iter()
         .map(|p| match p {
             SelectItem::UnnamedExpr(e) => base_of(e),
@@ -4685,7 +4708,13 @@ pub fn projection_of(sql: &str, dialect: SqlDialect) -> Option<(SourceTable, Pro
             _ => None,
         })
         .collect();
-    Some((source, Projection::Items(items)))
+    Some((
+        source,
+        match trailing_wildcard {
+            Some(_) => Projection::LeadingThenWildcard(items),
+            None => Projection::Items(items),
+        },
+    ))
 }
 
 /// The column names a `SELECT` produces, **in order**, when they can be read off
@@ -4962,6 +4991,48 @@ mod tests {
         // answer is withheld rather than being off by however wide it is.
         assert_eq!(p("SELECT *, 1 FROM t"), None);
         assert_eq!(p("SELECT a FROM x JOIN y ON x.id = y.id"), None);
+    }
+
+    /// Columns *ahead* of a trailing `*` sit at positions the wildcard's unknown
+    /// width can't move, so they are placed — which is what makes
+    /// `SELECT rowid, * FROM t` an editable statement.
+    #[test]
+    fn projection_places_the_columns_ahead_of_a_trailing_wildcard() {
+        let p = |s: &str| projection_of(s, SqlDialect::Sqlite).map(|(_, p)| p);
+        assert_eq!(
+            p("SELECT rowid, * FROM t"),
+            Some(Projection::LeadingThenWildcard(vec![Some("rowid".into())]))
+        );
+        assert_eq!(
+            p("SELECT a, b, * FROM t"),
+            Some(Projection::LeadingThenWildcard(vec![
+                Some("a".into()),
+                Some("b".into())
+            ]))
+        );
+        // Qualified on both sides is the same statement.
+        assert_eq!(
+            p("SELECT t.rowid, t.* FROM t"),
+            Some(Projection::LeadingThenWildcard(vec![Some("rowid".into())]))
+        );
+        // A computed leading item is still a placed position — just not one that
+        // belongs to a column.
+        assert_eq!(
+            p("SELECT a * 2, * FROM t"),
+            Some(Projection::LeadingThenWildcard(vec![None]))
+        );
+    }
+
+    /// The relaxation above is only sound while the wildcard is *last* and alone.
+    /// Anything after one, or a second one, puts every following position at an
+    /// unknowable offset again.
+    #[test]
+    fn projection_still_refuses_a_wildcard_that_is_not_the_last_item() {
+        let p = |s: &str| projection_of(s, SqlDialect::Sqlite).map(|(_, p)| p);
+        assert_eq!(p("SELECT *, 1 FROM t"), None);
+        assert_eq!(p("SELECT a, *, b FROM t"), None);
+        assert_eq!(p("SELECT *, * FROM t"), None);
+        assert_eq!(p("SELECT rowid, *, rowid FROM t"), None);
     }
 
     /// The filter rewrite and the write-back provenance ask the same question, so

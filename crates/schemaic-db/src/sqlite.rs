@@ -200,6 +200,13 @@ fn attach_origins(conn: &SqliteConn, sql: &str, columns: &mut [Column]) {
     let bases: Vec<Option<String>> = match projection {
         Projection::Wildcard => info.iter().map(|c| Some(c.name.clone())).collect(),
         Projection::Items(items) => items,
+        // The wildcard expands into whatever follows the placed leading items —
+        // `SELECT rowid, * FROM t` is one of these. The width check below is what
+        // keeps the expansion honest.
+        Projection::LeadingThenWildcard(lead) => lead
+            .into_iter()
+            .chain(info.iter().map(|c| Some(c.name.clone())))
+            .collect(),
     };
     // A wildcard's width has to agree with the table's, or the placement is off —
     // which happens for real when a generated column is present, since SQLite
