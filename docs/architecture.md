@@ -2096,8 +2096,11 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
 (`context_menu_overlay`).
 
 - **Nested submenus**: a `Sub` entry hover-expands a child `menu_stack` anchored to the parent row's
-  right edge (`inset_left_pct(100.0)` + `inset_top(-6.0)`). Recursive — each level owns its `open_sub`
-  signal.
+  right edge (`inset_left_pct(100.0)` + `inset_top(-6.0)`). Recursive for the *pointer* — each level
+  owns its `open_sub` signal — while the **keyboard** stops at one level (`MenuLevel`/`MenuSub`),
+  which is as deep as any menu in the app goes. One flat pair of cursors is what lets `menu_key`
+  drive whichever level is open without walking a tree it would then have to keep in step with the
+  views.
 - **Hover intent (no timers)**: entering a leaf clears `open_sub`, entering a submenu row sets it;
   nothing closes on leave. The submenu is flush with the panel's right edge, so a diagonal move never
   crosses a gap — the close-on-diagonal problem is avoided structurally.
@@ -2112,7 +2115,32 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
 - **Two menu channels**: the schema tree uses `ui.context_menu` (typed `CtxMenu`) +
   `context_menu_overlay`; everything else uses the generic `ui.popup_menu`
   (`RwSignal<Option<Vec<MenuEntry>>>`) + `popup_menu_overlay`. Both overlays live at the workspace
-  root (window coords) and close on the root pointer-down.
+  root (window coords) and close on the root pointer-down. **Both render through `menu_panel`**,
+  which is why everything below is stated once and holds for all fourteen openers.
+- **Keyboard operation lives in `menu_key`.** The panel is a `focus_root`, so it took focus and
+  answered Escape from the start — but nothing moved a cursor and no row was marked, so a menu
+  opened with Enter from a ringed button could only be finished with the mouse and read as though
+  it had never taken focus. Up/Down step `menu_stops` and **wrap** (the swatches' rule, not the item
+  list's: a menu is short and its ends read as adjacent), Home/End jump, Enter/Space runs the row and
+  closes, Right/Enter opens a submenu and lands on its first child, Left comes back out, and Escape
+  closes an open submenu **before** the menu so "back" never skips a level. Two things the cursor
+  must not do are why `menu_stops` exists rather than a range: resting on a **separator** makes Down
+  look dead, and resting on a **disabled** row offers an Enter that silently does nothing. The
+  pointer moves the same cursor (each row's `PointerEnter` sets it), so there is never a second
+  highlight disagreeing with what Enter would run. `menu_key` takes only signals, so the whole
+  decision asserts without a window (`widgets::menu_key_tests`).
+- **A menu raised by a *button* must set `popup_anchor`.** With it `None` the panel opens at
+  `last_mouse`, which is right for a right-click and wrong for a button: reached by Tab and pressed
+  with Enter, the pointer is wherever it was left, so the menu opened across the window from the
+  control that raised it. `table_designer::suggest_chevron` anchors to its own ring wrapper —
+  `ViewId::layout_rect()` is already in window coordinates, the frame `PopupAnchor` is stated in.
+  The grid's toolbar dropdowns and the status-bar segments were always right: floem's `on_move`
+  fires during **layout** with the view's window origin, not on pointer movement, so what they
+  anchor to is the widget and not the cursor.
+- **Not every menu can be *opened* from the keyboard**, which is a separate thing from navigating
+  one. Only a menu on a ringed control can be — `suggest_chevron` today. `grid.rs` registers nothing
+  in a `FocusRing` at all, so its Copy/Save/AI dropdowns are pointer-only, and a right-click menu
+  needs a right-click (a Menu/Shift+F10 key is the usual answer, and there isn't one).
 
 ## Data grid (results grid)
 
