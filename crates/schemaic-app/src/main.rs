@@ -481,10 +481,7 @@ const TABLE_TAB_ROWS: usize = 100;
 /// The engine's SQL dialect — the two enums are parallel (one is the driver, the
 /// other the parser/quoting rules).
 fn dialect_for(engine: schemaic_db::Engine) -> SqlDialect {
-    match engine {
-        schemaic_db::Engine::Postgres => SqlDialect::Postgres,
-        schemaic_db::Engine::MySql => SqlDialect::MySql,
-    }
+    engine.dialect()
 }
 
 /// A throwaway shell that just prints `msg` and stays open — used to surface "no
@@ -717,10 +714,15 @@ fn run_result(state: &QueryState, duration_ms: u64) -> Option<schemaic_core::his
 /// Which engine's transaction semantics apply — the divergence that
 /// [`schemaic_core::tx`] encodes (Postgres poisons a transaction on any error;
 /// MySQL implicitly commits on DDL).
+///
+/// SQLite takes MySQL's arm and never reaches it: manual-transaction mode isn't
+/// offered on a SQLite connection and `Session::open` refuses one. Of the two,
+/// MySQL's is the safe default to answer with — Postgres' would report a
+/// transaction as poisoned when there is no transaction at all.
 fn tx_engine(db: &Db) -> TxEngine {
     match db.engine() {
         schemaic_db::Engine::Postgres => TxEngine::Postgres,
-        schemaic_db::Engine::MySql => TxEngine::MySql,
+        schemaic_db::Engine::MySql | schemaic_db::Engine::Sqlite => TxEngine::MySql,
     }
 }
 
