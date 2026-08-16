@@ -4852,18 +4852,18 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
     EventPropagation::Stop
 }
 
-/// A uniform toolbar icon button: a 16px Lucide glyph in a padded hitbox (3px
-/// vertical / 5px horizontal, matching the footer icons), coloured `text_muted`
-/// and brightening to `text` on hover. `enabled` gates the click + hover; when it
-/// returns false the glyph dims to 30% alpha and is inert.
-/// A thin vertical divider between toolbar icon groups. Extra horizontal margin so
-/// it sits clear of the icons on either side (combined with the group gap).
+/// A thin vertical divider between toolbar icon groups. Extra horizontal margin
+/// so it sits clear of the icons on either side — 8px, on top of the cluster's
+/// own 3px gap, for 11px of air between the rule and the nearest glyph. The
+/// icons carry a padded hitbox rather than a visible edge, so a divider set at
+/// the plain group gap reads as *part of* the group beside it instead of the
+/// boundary between two.
 fn toolbar_sep() -> impl IntoView {
     empty().style(|s| {
         s.width(1.0)
             .height(14.0)
             .flex_shrink(0.0_f32)
-            .margin_horiz(5.0)
+            .margin_horiz(8.0)
             .background(theme::border())
     })
 }
@@ -5101,6 +5101,21 @@ fn grid_toolbar(
                     .padding_vert(3.0)
                     .padding_horiz(5.0)
                     .cursor(CursorStyle::Default)
+            })
+            // The count beside the glyph is the one label in the strip, and a bare
+            // number says neither what it counts nor what pressing it does. Built
+            // from this rebuild's `n`/`busy` rather than read reactively: the
+            // `dyn_container` above already keys on both, so the face and its tip
+            // are replaced together.
+            .tooltip(move || {
+                let t = if busy {
+                    "Committing…".to_string()
+                } else if n == 1 {
+                    "Commit 1 change (Ctrl+Enter)".to_string()
+                } else {
+                    format!("Commit {n} changes (Ctrl+Enter)")
+                };
+                text(t).style(crate::widgets::tooltip_style)
             });
             let discard_hov = RwSignal::new(false);
             let discard = container(icons::icon(icons::CIRCLE_X, 16.0).style(move |s| {
@@ -5119,7 +5134,11 @@ fn grid_toolbar(
                     .padding_vert(3.0)
                     .padding_horiz(5.0)
                     .cursor(CursorStyle::Default)
-            });
+            })
+            // "all", because it throws away the pending deletes and new rows too,
+            // not just the edited cells — the ✗ sits next to a count that reads
+            // like it belongs to the ✓ alone.
+            .tooltip(|| text("Discard all pending changes").style(crate::widgets::tooltip_style));
             let (r1, r2) = (strip_commit.clone(), strip_commit.clone());
             h_stack((
                 in_strip_button(commit, r1, TB_COMMIT, true, leave, move || commit_grid(gs)),
@@ -5180,9 +5199,19 @@ fn grid_toolbar(
                 }
             };
             let (r1, r2, r3) = (strip_rows.clone(), strip_rows.clone(), strip_rows.clone());
+            // Tips on the *face*, before `in_strip_button` wraps it — `.tooltip()`
+            // allocates a fresh `ViewId`, and it is the wrapper that carries the
+            // ring's focus outline and Enter/Space arm (see `in_ring_button`).
+            // Decorating the wrapper instead would put an id in the ring that
+            // paints nothing, which is the bug `row_button` documents.
+            //
+            // Delete and clone keep their tip while dimmed, and it names the
+            // selection: "the selected row" is also the answer to why the glyph is
+            // inert right now.
             h_stack((
                 in_strip_button(
-                    toolbar_icon(icons::PLUS, 0.0, 0.0, || true, move || add_pending_row(gs)),
+                    toolbar_icon(icons::PLUS, 0.0, 0.0, || true, move || add_pending_row(gs))
+                        .tooltip(|| text("Add a row").style(crate::widgets::tooltip_style)),
                     r1,
                     TB_ADD,
                     true,
@@ -5190,7 +5219,10 @@ fn grid_toolbar(
                     move || add_pending_row(gs),
                 ),
                 in_strip_button(
-                    toolbar_icon(icons::MINUS, 0.0, 0.0, row_selected, del),
+                    toolbar_icon(icons::MINUS, 0.0, 0.0, row_selected, del).tooltip(|| {
+                        text("Mark the selected row for deletion (Del)")
+                            .style(crate::widgets::tooltip_style)
+                    }),
                     r2,
                     TB_DELETE,
                     live,
@@ -5198,7 +5230,9 @@ fn grid_toolbar(
                     del,
                 ),
                 in_strip_button(
-                    toolbar_icon(icons::COPY_PLUS, 0.0, 0.0, row_selected, clone),
+                    toolbar_icon(icons::COPY_PLUS, 0.0, 0.0, row_selected, clone).tooltip(|| {
+                        text("Clone the selected row").style(crate::widgets::tooltip_style)
+                    }),
                     r3,
                     TB_CLONE,
                     live,
@@ -5273,7 +5307,12 @@ fn grid_toolbar(
             .padding_vert(3.0)
             .padding_horiz(5.0)
             .cursor(CursorStyle::Default)
-    });
+    })
+    // Trailing `…` because it raises the format menu rather than copying — the
+    // convention the menu-opening icons in the monitor toolbar already follow.
+    // Deliberately *not* labelled Ctrl+C: that key copies the selection straight
+    // to the clipboard, which is a different action from this menu.
+    .tooltip(|| text("Copy the results…").style(crate::widgets::tooltip_style));
 
     // Download icon → the same format dropdown as Copy, but each choice opens a
     // save dialog and writes the file. Identical styling/anchoring to `copy_menu`
@@ -5320,7 +5359,10 @@ fn grid_toolbar(
             .padding_vert(3.0)
             .padding_horiz(5.0)
             .cursor(CursorStyle::Default)
-    });
+    })
+    // Named against its twin: the two icons are identical but for the glyph, and
+    // "Export" would leave the pair reading as two spellings of the same thing.
+    .tooltip(|| text("Save the results to a file…").style(crate::widgets::tooltip_style));
 
     // AI seed-data menu → purple-sparkle actions (Fill Value / Insert Row / Seed
     // Table). Gated on a single writable table, like the row actions above. The
@@ -5403,6 +5445,19 @@ fn grid_toolbar(
                     .padding_vert(3.0)
                     .padding_horiz(5.0)
                     .cursor(CursorStyle::Default)
+            })
+            // A bare sparkle is the least self-describing glyph in the strip, and
+            // it is the one control here that writes rows. Read reactively for the
+            // in-flight state, since `ai_busy` dims this face without rebuilding
+            // the block around it — a tip still offering to generate would be the
+            // only thing on screen disagreeing with the greyed glyph.
+            .tooltip(move || {
+                let t = if gs.ai_busy.get() {
+                    "Generating…"
+                } else {
+                    "Generate rows with AI…"
+                };
+                text(t).style(crate::widgets::tooltip_style)
             });
             // `open_ai` no-ops while a request is in flight, so the control stays
             // in the ring rather than leaving and re-entering it on every
@@ -5416,8 +5471,12 @@ fn grid_toolbar(
     );
 
     // The icon cluster — 3px between icons (on top of each icon's padded hitbox),
-    // separators pushed further out by their own margin:
-    // [commit ✓][discard ✗] │ [＋][－][clone] │ [✦ AI][copy].
+    // separators pushed further out by their own 8px margin:
+    // [commit ✓][discard ✗] │ [＋][－][clone] │ [✦ AI][copy][save].
+    //
+    // Every one of them carries a tooltip. Nothing here is labelled but the commit
+    // count, and that is a bare number; the glyphs that do the least reversible
+    // work (discard, delete, AI) are among the least self-describing.
     let icons_cluster = h_stack((
         commit_ctrl,
         row_actions,
