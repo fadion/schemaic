@@ -940,6 +940,28 @@ fn word_tokens(sql: &str, dialect: SqlDialect) -> (Vec<String>, bool) {
     (words, multi)
 }
 
+/// The statement heads this dialect will accept as read-only, in the order they
+/// should be listed to a reader.
+///
+/// **Per dialect, because the engines don't have the same statements.** This was
+/// one shared list, and a third engine made it wrong in both directions at once:
+/// it advertised `SHOW` and `DESCRIBE` to SQLite, which has neither, so the gate
+/// passed a statement the engine then rejected with a raw parser error, and the
+/// rejection message named heads the connection couldn't use. `DESCRIBE`/`DESC`
+/// are MySQL's alone — PostgreSQL's equivalent is psql's `\d`, a client command
+/// rather than SQL — while `SHOW` is real on PostgreSQL (`SHOW search_path`).
+///
+/// This is the **one** definition: the MCP server builds `run_query`'s advertised
+/// description from it too, so what the model is told and what the gate enforces
+/// cannot drift.
+pub fn read_only_heads(dialect: SqlDialect) -> &'static [&'static str] {
+    match dialect {
+        SqlDialect::MySql => &["SELECT", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "WITH"],
+        SqlDialect::Postgres => &["SELECT", "SHOW", "EXPLAIN", "WITH"],
+        SqlDialect::Sqlite => &["SELECT", "EXPLAIN", "WITH"],
+    }
+}
+
 /// Is `sql` a single read-only statement we're willing to run on the AI's
 /// behalf? Returns the rejection reason on failure.
 pub fn read_only_reason(sql: &str, dialect: SqlDialect) -> Result<(), String> {
@@ -947,14 +969,15 @@ pub fn read_only_reason(sql: &str, dialect: SqlDialect) -> Result<(), String> {
     if multi {
         return Err("only a single statement is allowed".to_string());
     }
+    let heads = read_only_heads(dialect);
     let head = words.first().map(|s| s.as_str()).unwrap_or("");
-    if !matches!(
-        head,
-        "SELECT" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN" | "WITH"
-    ) {
-        return Err(
-            "only read-only queries (SELECT/SHOW/DESCRIBE/EXPLAIN/WITH) are allowed".to_string(),
-        );
+    if !heads.contains(&head) {
+        // Naming this engine's heads, not a union of all three: a model told it
+        // may `SHOW` on SQLite will keep trying.
+        return Err(format!(
+            "only read-only queries ({}) are allowed",
+            heads.join("/")
+        ));
     }
     if let Some(bad) = words.iter().find(|w| DENY_KEYWORDS.contains(&w.as_str())) {
         return Err(format!("`{bad}` is not permitted in an AI query"));
@@ -1566,6 +1589,46 @@ mod tests {
         // Dangerous words inside a string / identifier are fine.
         assert!(read_only_reason("SELECT 'delete from t'").is_ok());
         assert!(read_only_reason("SELECT `update` FROM t").is_ok());
+    }
+
+    /// The allowed heads are the ones the *engine* has. `SHOW` and `DESCRIBE`
+    /// were allowed on all three, which let the gate wave through a statement
+    /// SQLite has no syntax for at all — the model then got a raw parser error
+    /// instead of being told the engine has no such thing.
+    #[test]
+    fn the_read_only_heads_are_the_ones_the_engine_actually_has() {
+        use super::read_only_reason as gate;
+        // Every engine reads with these.
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert!(gate("SELECT 1", d).is_ok(), "{d:?} SELECT");
+            assert!(
+                gate("WITH c AS (SELECT 1) SELECT * FROM c", d).is_ok(),
+                "{d:?} WITH"
+            );
+            assert!(gate("EXPLAIN SELECT 1", d).is_ok(), "{d:?} EXPLAIN");
+        }
+        // `SHOW` is MySQL's and PostgreSQL's (`SHOW search_path`); SQLite has none.
+        assert!(gate("SHOW TABLES", SqlDialect::MySql).is_ok());
+        assert!(gate("SHOW search_path", SqlDialect::Postgres).is_ok());
+        assert!(gate("SHOW TABLES", SqlDialect::Sqlite).is_err());
+        // `DESCRIBE`/`DESC` are MySQL's alone — psql's `\d` is a client command,
+        // not SQL, and SQLite has nothing of the kind.
+        assert!(gate("DESCRIBE t", SqlDialect::MySql).is_ok());
+        assert!(gate("DESC t", SqlDialect::MySql).is_ok());
+        assert!(gate("DESCRIBE t", SqlDialect::Postgres).is_err());
+        assert!(gate("DESCRIBE t", SqlDialect::Sqlite).is_err());
+    }
+
+    /// The rejection names what *this* engine allows, so the model can retry with
+    /// something that exists rather than re-reading a list that includes `SHOW`.
+    #[test]
+    fn the_rejection_lists_only_this_engines_heads() {
+        let err = super::read_only_reason("DELETE FROM t", SqlDialect::Sqlite).unwrap_err();
+        assert!(err.contains("SELECT"), "{err}");
+        assert!(!err.contains("SHOW"), "SQLite has no SHOW: {err}");
+        assert!(!err.contains("DESCRIBE"), "SQLite has no DESCRIBE: {err}");
+        let err = super::read_only_reason("DELETE FROM t", SqlDialect::MySql).unwrap_err();
+        assert!(err.contains("SHOW") && err.contains("DESCRIBE"), "{err}");
     }
 
     #[test]
