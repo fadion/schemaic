@@ -139,8 +139,9 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
 /// teaches a key that does something else.
 ///
 /// The keys string must be *byte-identical* to a [`SHORTCUTS`] row, which
-/// [`tests::every_command_key_is_a_real_shortcut`] enforces, so the palette can
-/// never advertise a binding the modal doesn't document or the app doesn't have.
+/// `tests::every_command_key_is_a_real_shortcut` enforces (a `#[cfg(test)]`
+/// item, so not linkable), and the palette can therefore never advertise a
+/// binding the modal doesn't document or the app doesn't have.
 ///
 /// **Each entry names its row's group**, not just the key string. The table has
 /// two `Ctrl+G` rows meaning different things — the editor's Go to Line and the
