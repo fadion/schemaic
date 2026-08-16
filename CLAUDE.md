@@ -37,6 +37,24 @@ Zed-inspired, aiming to replace DataGrip.
     is present-but-skipped rather than treated as zero, and a non-numeric column gets counts only:
     there is nothing to sum in a name, and a lexicographic min/max reads as a bug more often than
     it answers anything.
+    **There are four overflow sites and they do not degrade alike**, which is how three different
+    answers to one question shipped; each is tested apart. `Fixed::parse` answers
+    `Parsed::{Value, Overflow, NotANumber}` — three, not two, because a number too wide returning
+    the same `None` as `"n/a"` made `aggregate` *skip* it, and a `double` column holding `1e39` and
+    `2` then reported `Sum 2`: the one path in the app that printed a number simply untrue
+    (`Value::Float` stores `f64::to_string()`, which never uses exponent form, so forty digits
+    really arrive). `rescale` overflows on scale **spread** alone and is left as a degrade
+    deliberately — capping the working scale would make it the module's first rounding decision.
+    The running `checked_add` is the third. The fourth is the average, and it alone is an `Option`
+    on `NumericAggregates`: carried as a plain `Fixed` it propagated `?` and withheld an exact Sum,
+    Min and Max because the *mean* of them didn't fit — and it divides before it scales, so the
+    `DECIMAL(38,10)` case `Fixed`'s own headroom paragraph calls comfortable is representable.
+    `aggregate_texts` is the entry point the grid uses: a staged (green) edit and a pending new row
+    are both on screen and neither is in the `ResultSet`, and a total under an edit it doesn't
+    include is the same defect as a stale one. The fold keeps no `Vec` — it raises its own
+    accumulators when it meets a wider scale — because the vector was 32 bytes per selected cell,
+    allocated and freed on **every** recompute (6.4 MB for a Ctrl+A over 200k rows, once per
+    auto-repeat and once per cell crossed in a drag).
   - `sql.rs` — one `skip_noncode` tokenizer → statement splitting, unsafe-statement guard, AI
     read-only gate, `edit_distance`. The *single* SQL boundary lexer; `intel` (scope/context/
     diagnostics)/`sql_highlight`/`sqlfmt` all build on it so string/`#`/`--`/`/* */`/backtick
@@ -111,7 +129,15 @@ Zed-inspired, aiming to replace DataGrip.
     stream past, so a sample really stops at its limit instead of deserializing the file first
     (a whole-file walk still buffers, for the key union). NULL tokens match the *trimmed* field,
     except the empty one, which is exact — a blank field is data, and `trim` is the setting that
-    says otherwise. Pure + unit-tested.
+    says otherwise. `read_sample` is bounded at `SAMPLE_MAX_BYTES`, because a **record count is not
+    a byte bound**: the CSV reader sets no field-size limit, so one stray `"` makes the whole
+    remainder of a file a single unterminated field and a sample "of 200 records" reads to EOF —
+    from a file the user only meant to look at. `target_verdict` over `DbNodeView` is the modal's
+    other half: whether a schema change means the table it is open on has *gone*. `has_table` is an
+    `Option<bool>` because "I looked and it wasn't there" and "I haven't looked" are the same
+    `false` to a bool and a refresh empties what there is to look at, and the caller passes
+    `same_connection` because `db_nodes` holds only the **active** connection's databases — nothing
+    compared them, so switching connection discarded a hand-built mapping. Pure + unit-tested.
   - `ddl.rs` — **schema editing**. `TableDraft` (the desired table; column/index/FK
     entries each carry the name they had on the server, which is what tells a *rename*
     from a drop-plus-add) → `diff(current, draft, dialect) -> ChangeSet` → `emit()`.
@@ -276,7 +302,20 @@ Zed-inspired, aiming to replace DataGrip.
     **elapsed** time rather than calendar days — there is no timezone here, only millis, and a
     query run twenty minutes ago shouldn't leave "today" because midnight passed. They share
     `relative_time`'s arithmetic on purpose: a row's "3d ago" is read directly under its header,
-    and a test pins the two together.
+    and a test pins the two together (exactly — the pin accepted either suffix under EARLIER and
+    was therefore vacuous, since the two functions cross over at the same threshold anyway).
+    `push` returns whether it recorded anything, so a credential-bearing statement doesn't cost a
+    whole atomic rewrite of the file for nothing, and `drop_runs` deletes the entries of runs that
+    never happened: a batch stops at its first failure and reports the rest `Cancelled` without
+    dispatching them, so a 60-statement script failing at statement 2 evicted the connection's 50
+    real entries in favour of 48 that never ran. Deliberately **not** applied to a single run —
+    one the user cancels *was* dispatched and may have written something. `RunResult::loaded`/
+    `failed` own the rows-vs-`affected` choice and the `rows_capped` rule, and `outcome_line` the
+    facts line's composition, so both are in core rather than in a view builder: a wrong
+    `rows_capped` writes a number into a log read long after the grid it came from. `preview`
+    clamps at `PREVIEW_MAX` while `matches_query` searches the unclamped text — `max_height` and
+    `clip()` bound *paint*, not layout, so a multi-MB `INSERT` was laid out whole on every rebuild
+    of the panel, but clamping what is drawn must not become a decision about what is findable.
   - `health.rs` — connection health-poll policy: `tick(HealthCfg, TickCtx) -> Tick` decides
     ping-or-skip + the delay until the next tick (exponential `backoff` on consecutive failures,
     longer interval for SSH-tunnelled connections, skip while the window is unfocused / a query is
@@ -387,7 +426,19 @@ Zed-inspired, aiming to replace DataGrip.
     hop; *not* the password, name, colour or `read_only`): a **switch** must still clear and
     dispose, or the tree shows one server's databases while another's load — and a saved
     connection repointed at a new host keeps its id, which is the case an id comparison alone
-    gets wrong.
+    gets wrong. **Keeping the rows means `Loaded` stopped meaning *current*, and two things
+    follow.** `main.rs`'s `fetch_landing` stamps each per-database fetch so an older one can't
+    overwrite a newer (`try_update` guards a *disposed* scope, not a superseded fetch — press the
+    connection-wide Refresh, apply an `ALTER`, and the pre-`ALTER` snapshot landed last and stayed,
+    with nothing to detect it and no further refresh scheduled). And `ConnNode::refreshing` makes
+    "a re-introspection is in flight" askable, which `table_designer::loaded_table` — the one
+    funnel all four schema editors go through — answers `None` for: seeding a draft from a
+    pre-apply `TableInfo` is what makes MySQL's `MODIFY COLUMN` silently restate the old column
+    definition, and `risks()` discloses nothing because from the plan's view nothing changed.
+    The plan behind the reuse is `plan_nodes`, pure and tested: it decides that a dropped and
+    re-created database gets a **fresh** id rather than colliding with a live node, that reordering
+    the server's list renumbers nothing (the tree keys on id), and that a reload against an empty
+    list still works.
   - `secrets.rs` — keeps connection secrets (DB/SSH passwords + SSH key passphrase) out of the
     plaintext `connections.json`: the `SecretStore` seam + pure transforms `hydrate_file` (load →
     fill empty fields from the store, flag legacy plaintext for migration), `sanitize_file` (save →
@@ -435,7 +486,17 @@ Zed-inspired, aiming to replace DataGrip.
       `recall_step`, which is a **cycle** — `None → newest → … → oldest → None` — rather than a
       list that stops at its ends, because the empty box is the only way back out of a recall and
       both keys have to reach it. A cursor past the end of a conversation that has since changed
-      reads as `None`, so a stale walk restarts instead of landing somewhere arbitrary.
+      reads as `None`, so a stale walk restarts instead of landing somewhere arbitrary. The
+      **gating** is `recall_apply` → `Recall::{Refuse, Show}`, here beside the arithmetic rather
+      than in the view: it trims, like the send icon and Enter and like `user_prompts` itself, and
+      the view's own copy did not — so one space in the box refused the recall silently, the row
+      disagreeing with itself about whether anything was typed.
+      `ChatMessage::fingerprint` is what the panel's per-message memo compares. The memo held a
+      whole `ChatMessage`, so every streamed chunk deep-cloned and deep-compared all N of them —
+      over segments that include a tool call's untruncated result — and kept a permanent second
+      resident copy of the conversation. It is `O(segments)` and allocates nothing, on the stated
+      assumption that a message is only ever *extended*; a test walks every mutation the stream
+      makes, because a fingerprint that misses one freezes a bubble's content on screen.
     - `chat.rs` — per-connection conversations persisted to `chats.json`. `ChatFile::of` replaces
       every tool `result` with `RESULT_OMITTED` before it reaches disk — a `run_query` result is up
       to 200 rows of real table data, and writing it verbatim exported user data to a plaintext
@@ -485,7 +546,12 @@ Zed-inspired, aiming to replace DataGrip.
       for Ctrl+1‑9) is answered *within one connection*. `nth` especially: the Nth visible chip is
       not the Nth entry of the flat `Vec` once another connection's tabs interleave.
       `pick_active` prefers the remembered per-connection tab, so switching away and back doesn't
-      dump the user on tab 1.
+      dump the user on tab 1. `all_to_close`/`others_to_close` are the **closing** half, over a
+      `ClosableRef` that carries the pinned flag as well (a pinned tab is visible and selectable
+      but not closable): they are here rather than in the menu builder because the entry has to
+      *dim* on the same expression the action evaluates — "Close other tabs" was always enabled and
+      silently returned on a connection with one tab, one row below an entry that is dimmed for the
+      same kind of reason.
     - `palette.rs` — parses the command palette's `>` command mode into
       `Parsed::{Search,Filter,Command{name,arg}}`. The hard part is when typing stops filtering the
       command list and becomes an argument: longest-word-prefix match against the caller's
@@ -924,7 +990,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   and `ROLLBACK` *succeeds* there while raising warning 1196. So no write path may discard a
   rollback's outcome (`let _ = conn.query_drop("ROLLBACK")` was the bug): roll back through
   `rollback()`, which reads `SHOW WARNINGS`, and append `core::model::Rollback::note()` to the
-  error. `one_row_verdict` states only what the guard saw — it runs *before* the rollback and can't
+  error. **A cancel is an exit like any other**: `Db::import_rows` used to `kill_query` and
+  disconnect, and the modal then said "the transaction rolled back, so nothing was written" —
+  which on those engines is false, so the user re-ran the import and doubled ~250k rows. It rolls
+  back on the same connection now and reports what that achieved, `DbError::Cancelled` meaning the
+  rollback completed and an incomplete one arriving as an error carrying the note.
+  `one_row_verdict` states only what the guard saw — it runs *before* the rollback and can't
   know what it achieved. `engine_is_transactional` is the predicate (unknown ⇒ not transactional,
   same rule as `pg_replaceable`); the import modal warns from it before the load starts. Commits
   with inserts/deletes full-re-run the query (membership/order changed); pure-UPDATE commits splice
@@ -932,6 +1003,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   executors call them: `GridWrite::plan` is the statement order and `one_row_verdict` is the
   per-statement verdict *and* its message — so neither can drift between MySQL and PostgreSQL, and
   a change to `affected != 1` fails a test rather than passing silently.
+- **A destructive modal action guards its own launch, in the same step that launches it.** Import
+  and the DDL preview's Apply are the two, and they go through `widgets::accept_launch(in_flight,
+  read_only)` — not through the disabled button, which is what *says* the action is unavailable and
+  takes effect on a later update pass. `run_import` set a busy flag and never read it, resting on a
+  comment that "its Import button is disabled while one is in flight": true of the next pass and
+  false within a single key dispatch, so one Space started **two** bulk loads of the same file,
+  both committing, with the second launch overwriting the cancellation token so the first could no
+  longer be stopped. A new destructive action asks the same function; a guard re-derived per site
+  is one that will be derived differently.
 - **One identifier quoter, as there is one boundary lexer.** Every path that quotes an identifier
   ends at `export::ident_sql` (unconditional — for SQL that is only executed) or its sibling
   `export::ident_if_needed` (only when a bare name would name something else — for SQL the user
@@ -1282,18 +1362,41 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
   arm with nothing inside it has nothing to be Tab-reachable. Where the conditional is a
   `dyn_container`, the hide goes on the **container** — that is the flex child, not its inner view.
 - **Buttons are in the ring too, and Space or Enter presses them — but there is no default Enter.**
-  Every button a modal has goes through `widgets::in_ring_button` (which the six builders —
+  Every button a modal has goes through `widgets::in_ring_button` (which the builders —
   `action_button`/`action_button_icon`/`action_face`/`control_button`/`control_button_enabled`/
-  `row_button` — call for you; the ring parameter is *required*, so a modal button that isn't
-  reachable won't compile). Enter in a *field* fires nothing: the DDL preview's Apply is an
+  `row_button`/`dialog_button` and `modal_title`'s ✕ — call for you; the ring parameter is
+  *required*, so a modal button that isn't reachable won't compile). Enter in a *field* fires
+  nothing: the DDL preview's Apply is an
   irreversible `ALTER`, and a key meaning "newline" in one control and "apply the plan" in another
   is the shape of defect the ring's own review was full of. **A disabled button is not a stop** —
   it keeps its place on screen (which action is affirmative shouldn't move as a form becomes valid)
   but the keyboard walks past it, since its click handler is inert anyway.
+  **The ring member is a wrapper `in_ring_button` builds, never the caller's own view**, and that
+  is a correctness rule rather than a layout preference. Two things resolve by exact `ViewId` with
+  no descendant propagation, and they were resolving to *different* ids depending on each call
+  site's decorator order: floem fires `EventListener::Click` on the **focused** view for any
+  physical Enter/Space and then folds every registered `KeyDown` listener, so registering a face
+  that already carried `on_click_stop` made the ring's own arm a **second** activation (one Space
+  added two columns, opened two file dialogs, started two bulk imports); and `.focus(…)` resolves
+  by exact id too, so a face decorated with `.tooltip()` — a fresh `ViewId` — put an id in the ring
+  that carried no outline. A caller therefore styles only the *face* (padding, hover, the click
+  listener) and never applies `button_focus_ring` itself.
   Order is `NAV_TAB` → `LIST_TAB` → the form (10, 20, …) → `VALUE_TAB` + `i * ROW_TAB_STRIDE` for a
-  growing list → `ACTION_TAB` for the footer, and that chain is asserted at **compile time** in
-  `widgets.rs` (`const _: () = { … }`). It has already caught one regression: adding
-  `ROW_TAB_STRIDE` cut the footer's headroom tenfold the day it landed.
+  growing list → `ACTION_TAB` for the footer → `TITLE_CLOSE_TAB` for the title bar's ✕ (last, since
+  it is the same action the footer's Cancel already offers), and that chain is asserted at
+  **compile time** in `widgets.rs` (`const _: () = { … }`). It has already caught one regression:
+  adding `ROW_TAB_STRIDE` cut the footer's headroom tenfold the day it landed. The compile-time
+  chain relates *constants* only, though, and cannot see a number a control actually claims — the
+  import modal's mapping rows claimed `100 + i * 10`, based **below** the floor that chain asserts,
+  with the build green. `FocusRing::register` therefore `debug_assert`s the band as well.
+- **A modal's click-to-dismiss goes on `widgets::dismiss_layer`, never on the `focus_root`.** Floem
+  fires `Click` on the focused view for Enter and Space, and a modal opens with focus on its own
+  root — so `.on_click_stop(close)` there meant **Space closed the modal**. On the Live Monitor
+  that also stopped the poll and emptied the change log (deletes included, which is the one record
+  of a row that is gone); on the confirm dialog it answered `false` to a question nobody had read.
+  The layer is an absolutely-positioned sibling built *before* the panel, so the panel stays on top
+  of it. The transaction prompt deliberately has none: clicking away from a question about
+  uncommitted writes is not an answer.
   A **button's** focus signal is an outline, painted in `.focus`, *not* `.focus_visible` — floem
   gates `FocusVisible` on `app_state.keyboard_navigation`, which only its own `view_tab_navigation`
   ever sets, so a `focus_visible` rule on a ring member usually never fires at all. A **group**
@@ -1492,21 +1595,37 @@ for keyboard nav.
   rect (`bounds`), the paint and `copy_selection` were always multi-cell aware; only the *input*
   had been gated off ("the grid has no multi-cell actions"). Shift+click, Shift+arrow and
   drag-select are live again — drag needs no pointer capture, just `gs.selecting` set on a cell's
-  `PointerDown`, extended by each cell's `PointerEnter`, and cleared by the **body's** `PointerUp`
-  (the release routinely lands outside the cell, past the last row, or outside the grid) **and by
-  the double-click handler**, since floem's `DoubleClick` swallows the second `PointerUp` and the
-  flag would otherwise stay armed with no button down. `Del` now drives the whole range to *one*
-  state rather than flipping each row: on a mixed selection a per-row toggle both marks and
-  unmarks, which reads as the key doing nothing.
+  `PointerDown`, extended by each cell's `PointerEnter`, and cleared by the **whole grid's**
+  `PointerUp` (floem dispatches a pointer event to the first hit child in reverse paint order and
+  stops, so a release over the frozen pane, the header or past the last row never reached the data
+  body's own copy — and the flag stayed armed with no button down, the selection following the bare
+  cursor) **and by the double-click handler**, since floem's `DoubleClick` swallows the second
+  `PointerUp`. `Del` drives the whole range to *one*
+  state rather than flipping each row (on a mixed selection a per-row toggle both marks and
+  unmarks, which reads as the key doing nothing) — that vote is `delete_vote`, and it is applied in
+  **one** `del_rows.update` and one `dirty.update`: `toggle_delete` per row was two notifications
+  each, so Ctrl+A then Del at the 200k row limit fired 400,000 of them and locked the window, on
+  the two-keystroke gesture the feature exists to enable.
   **Which column the arithmetic is about is the *anchor's*** — the one the selection started on, so
   dragging from `price` across to `name` still reports `price`. It reads `gs.anchor` rather than
   `bounds()`, which is a normalised rect and has forgotten which corner you began at. A selection
   covering *every* column is a row selection (gutter click, Ctrl+A, the Ctrl+G jump) whose anchor
   column is column 0 — usually an id, whose sum means nothing — so those get counts only; a
   single-column result is exempt, since there covering every column is covering the one you meant.
+  Those three rules are `selection_kind`, extracted and tested — they were inline in the effect
+  while the arithmetic they gate had seventeen tests, so flipping `ncols > 1` to `>= 1` broke the
+  exemption with nothing failing. The effect tracks `rs`, `order`, `dirty` and `new_rows` as well
+  as the selection, and reads each cell **as the grid draws it**: tracking only `active`/`anchor`
+  left the previous total standing under a sort or a commit splice, and a staged green edit was
+  never in it at all.
   `grid_selection_bar` renders at panel level (like the find bar, so it can sit at the panel's
   edge) while `grid_view` computes it, and it lifts itself above `grid_error_bar` when that one is
-  up: they coincide exactly when a bulk delete fails, which is when both have something to say.
+  up: they coincide exactly when a bulk delete fails, which is when both have something to say. It
+  sets `.pointer_events(|| false)` — it has no interactive content and otherwise swallowed every
+  click on the cells it covers — where `grid_error_bar` keeps its events, owning a clickable
+  **View**. **Every panel-level bar is cleared when the result stops being `Loaded`**, in one
+  effect in `results_section`: their only writer lives inside `grid_view`, so a failed re-run left
+  the previous total and a live-looking Go-to-row popup pinned to a panel saying "Query failed."
 - **A result says which database it came from, and the answer lives on the result.** The grid's
   stats line leads with `ResultSet::database` (`world · 100 rows · 15 cols · 1 ms`), stamped by the
   loader that knows the scope — `Db::fetch_query`, `Session::fetch_query` (its *pinned* database,
@@ -1521,25 +1640,45 @@ for keyboard nav.
   could not be: Run Everything renders a grid and a toolbar per statement. `None` (a connection with
   no default database) prints nothing rather than inventing a name, and the field names the
   statement's *scope*, not the origin of every row — a qualified `world.country` read while scoped
-  to `sakila` still reports `sakila`.
+  to `sakila` still reports `sakila`. **The scope follows a `USE`**, in both `run_batch` and
+  `Session::fetch_query`: it was computed once, on a method whose own doc advertises that a `USE`
+  carries across statements, so `USE sakila; SELECT * FROM actor;` from a `world` tab really ran
+  statement 2 in `sakila` and labelled it `world` — the label lying in exactly the case it exists to
+  catch. `sql::use_target` reads it and is deliberately conservative: a `USE` it can't read plainly
+  drops the label to `None`, which prints nothing, rather than carrying a name now certainly wrong.
 - **Find (Ctrl+F) and Go to row (Ctrl+G)** are two popups sharing one anchor at the panel's
   top-right, and both are **split in the same way**: the bar renders at the RESULTS-*panel* level
   (`grid_find_bar`/`grid_goto_bar`, mounted in `results_section`) so it can sit at the panel's edge,
   while the work happens in `grid_view`, which is the only place that has the row data. Find is
   incremental on `find_query`; goto fires on a `goto_step` **nonce** the popup bumps on Enter,
   because a jump belongs to submit rather than to every keystroke. `grid_view` keeps at most one of
-  the two open, as the editor does with its own pair. Go to row resolves through the pure
+  the two open, as the editor does with its own pair — in **both** directions: the exclusion
+  tracked `goto_open` alone, so Ctrl+F over an open Go-to-row left both mounted on one anchor and
+  you typed into the one you couldn't see. Go to row resolves through the pure
   `model::goto_row_index` — 1-based, in **display** coordinates (the gutter numbers what is on
-  screen, so "row N" means the Nth row *as sorted*, and the total includes pending unsaved rows),
-  **clamping** to the nearest end when the number is outside the grid: past the last row goes to the
+  screen, so "row N" means the Nth row *as sorted*), over the rows the gutter **numbers**: a
+  pending unsaved row reads `*`, so counting them in made "row 101" land on a row showing no number
+  and made the clamp stop one short of the last one that does. It
+  **clamps** to the nearest end when the number is outside the grid: past the last row goes to the
   last, `0` goes to the first, and a number too wide for a `usize` clamps with every other overshoot
   rather than falling through to the not-a-number path. A row of 9s is how people ask for the bottom
   of a long result, and a silent no-op there can't be told apart from a broken feature, while
   overshooting is cheap to recover from — the gutter number and the row highlight say where you
-  landed. `None` is left for the only two cases that can mean no row: an empty grid, and input that
-  isn't a number. It then selects the whole row with the gutter click's own gesture (anchor column 0,
-  active last column) and scrolls at **column 0**, so a jump doesn't also fling the viewport to the
-  far right.
+  landed. **It accepts exactly the forms the grid prints**, which is why it isn't a
+  `parse::<usize>()`: `human_count` writes `200k`, and typing that back returned `None` — the count
+  on screen was a miss. `200k`/`1.25k`/`3m`/`1b` all read, in fixed point; separators are accepted
+  for a count pasted from elsewhere (the app writes none). `None` is left for the only two cases
+  that can mean no row: an empty grid, and input that isn't a number.
+  The three decisions around it are **`model::goto_target`** — which row, the landing gesture, and
+  the scroll column — so `grid_view` is a wrapper rather than a place any of them can quietly
+  change. The gesture is `model::row_selection`, shared with the gutter click so the two can't
+  drift: a divergence would also stop the aggregates bar reading the jump as a *row* and start it
+  summing ids, which is why one test asserts that agreement across the crate boundary. `scroll_col`
+  is **0**, not the active cell's column, so a jump doesn't also fling the viewport to the far
+  right of a wide result. `goto_fires` is the first-run nonce guard (the effect is created whenever
+  the grid is, and must not jump on its build run), and `one_bar_at_a_time` the find/goto exclusion
+  — which is a **reactive** test over two signals in a `Scope`, the pattern to reach for when a
+  rule is genuinely about signal propagation rather than about a value.
   **Closing either bar hands the keyboard back** (`focus_id.request_focus()`, on a true→false edge
   of the open flag). This is not optional and it is not the bar's job: Escape only flips the flag,
   floem then disposes the field's view and clears `app_state.focus` **silently**, and the grid was
