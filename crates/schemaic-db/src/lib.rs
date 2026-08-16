@@ -1770,6 +1770,10 @@ pub(crate) fn assemble_schema(
                 // afterwards (PostgreSQL only); the catalogue rows folded here
                 // don't carry it.
                 constraint: None,
+                // Neither engine assembled here keeps a statement per index —
+                // that is SQLite's `sqlite_master`, and SQLite doesn't come
+                // through this fold.
+                create_sql: None,
             });
         }
     }

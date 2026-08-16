@@ -145,6 +145,25 @@ pub struct IndexInfo {
     /// unrelated edit — the same "uncertainty resolves to don't destroy" rule
     /// `ddl::pg_replaceable` follows for views.
     pub lossy: bool,
+    /// The engine's **own** `CREATE INDEX` text for this index, terminated —
+    /// which of the three only SQLite keeps (`sqlite_master.sql`), and only for
+    /// an index the user wrote. `None` for one the engine created itself to back
+    /// a `UNIQUE` or `PRIMARY KEY` constraint, which has a NULL `sql` because it
+    /// is part of the table's declaration.
+    ///
+    /// It exists for the one job [`IndexInfo::lossy`] otherwise makes impossible.
+    /// SQLite's twelve-step rebuild drops the table, so every index has to be
+    /// created again — and an index re-emitted from a partial reading is a
+    /// *different* index. Replaying this text puts back exactly what was there,
+    /// the same fidelity argument [`TableInfo::dependent_ddl`] makes for
+    /// triggers, and it is what lets a table with a partial or expression index
+    /// be edited at all (`ddl::sqlite_rebuild_sql`).
+    ///
+    /// **Only ever replayed for an index the plan leaves alone.** The text is a
+    /// snapshot of the index as it was; an edited one has to come from the model,
+    /// and if the model can't carry it the plan is refused instead
+    /// (`ddl::ChangeSet::unsupported`).
+    pub create_sql: Option<String>,
 }
 
 impl IndexInfo {

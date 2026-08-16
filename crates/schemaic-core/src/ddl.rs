@@ -2404,23 +2404,22 @@ impl ChangeSet {
         // table, so every index has to be recreated, and one recreated from a
         // partial reading is not the index that was there: a partial index comes
         // back covering every row, an expression index comes back missing its
-        // key. That is the failure [`IndexInfo::lossy`] exists to name, and here
-        // it is not a warning to read past — the plan is refused until the user
-        // drops the index or leaves the table alone.
+        // key. That is the failure [`IndexInfo::lossy`] exists to name.
+        //
+        // It is not a blanket refusal of the table, though — most such an index
+        // needs is to be put back the way it was, which is what its own stored
+        // `CREATE` text does. So the question is asked per index and per plan
+        // ([`sqlite_index_replay`]), and what is left here is the narrow case
+        // where no faithful statement exists: the index was edited, or the plan
+        // moves a column the unread part may name.
         if let Some(Change::RebuildTable(r)) = self.changes.iter().find(|c| is_rebuild(c)) {
             return r
                 .draft
                 .indexes
                 .iter()
-                .filter(|ix| ix.info.lossy)
-                .map(|ix| {
-                    format!(
-                        "Index {} can't be rebuilt faithfully — SQLite keeps the part \
-                         Schemaic couldn't read only in the index's own CREATE text, \
-                         and recreating it from what was read would change what it \
-                         indexes. Drop the index to go on without it.",
-                        ix.info.name
-                    )
+                .filter_map(|ix| match sqlite_index_replay(&r.current, &r.draft, ix) {
+                    IndexReplay::Refuse(why) => Some(why),
+                    IndexReplay::Emit | IndexReplay::Verbatim(_) => None,
                 })
                 .collect();
         }
@@ -4847,6 +4846,114 @@ fn sqlite_trigger_body(create_sql: &str) -> Option<String> {
     None
 }
 
+/// What a rebuild does with one of the draft's indexes.
+///
+/// The rebuild drops the table, so **every** index has to be created again —
+/// there is no "leave that one alone" for SQLite the way there is on an engine
+/// that alters in place. This is the three-way answer to how.
+enum IndexReplay<'a> {
+    /// Emit `CREATE INDEX` from the model. Every index the model reads whole,
+    /// which is all of them on the other two engines and nearly all here — and
+    /// it is the *only* form that follows a renamed column into its index.
+    Emit,
+    /// Put the engine's own `CREATE` text back, exactly as it stored it. The way
+    /// an index the pragmas only partly read survives a rebuild, on the same
+    /// argument [`TableInfo::dependent_ddl`] makes for triggers: replaying the
+    /// text cannot lose what the parse never saw.
+    Verbatim(&'a str),
+    /// Neither is faithful, so the plan is refused — the string says why.
+    Refuse(String),
+}
+
+/// How this draft index gets back onto the rebuilt table.
+///
+/// Only an [`IndexInfo::lossy`] index can be anything but [`IndexReplay::Emit`],
+/// and for one of those the verbatim text is a **snapshot**: it describes the
+/// index as it was, against the table as it was. Each condition below is a way
+/// that snapshot has stopped being true, and the part that makes them necessary
+/// rather than cautious is the same part that makes the index lossy — the
+/// predicate of a partial index, the expression of an expression key. Those name
+/// columns the model never read, so "does this edit touch a column the index
+/// uses?" is a question that cannot be answered from the model at all. It is
+/// asked of the whole table instead.
+fn sqlite_index_replay<'a>(
+    current: &'a TableInfo,
+    draft: &TableDraft,
+    ix: &IndexDraft,
+) -> IndexReplay<'a> {
+    if !ix.info.lossy {
+        return IndexReplay::Emit;
+    }
+    let name = &ix.info.name;
+    let partly_read = format!(
+        "Index {name} was only partly read — SQLite keeps a partial index's \
+         predicate, and an expression key, only in the index's own CREATE text"
+    );
+    // A column this plan renames or removes may be one the unread part names,
+    // and replaying the text would then create an index over a column that is
+    // gone. Asked first, so the reason the user is given is the edit they made
+    // rather than the rewrite the designer did to the index on their behalf.
+    if let Some(moved) = column_moved(current, draft) {
+        return IndexReplay::Refuse(format!(
+            "{partly_read}, and that text may name {moved}. Drop the index to go \
+             on without it."
+        ));
+    }
+    let Some(cur) = ix
+        .original
+        .as_deref()
+        .and_then(|o| current.indexes.iter().find(|c| c.name == o))
+    else {
+        return IndexReplay::Refuse(format!(
+            "{partly_read}, so it can't be created from what was read. Drop the \
+             index to go on without it."
+        ));
+    };
+    if !indexes_equal(cur, &ix.info) {
+        return IndexReplay::Refuse(format!(
+            "{partly_read}, so this edit to it can't be written — what was read \
+             is not the whole index. Undo the change to keep the index as it is, \
+             or drop it."
+        ));
+    }
+    match cur.create_sql.as_deref() {
+        Some(sql) => IndexReplay::Verbatim(sql),
+        None => IndexReplay::Refuse(format!(
+            "{partly_read} — and there is no such text for this one, so \
+             recreating it would change what it indexes. Drop the index to go on \
+             without it."
+        )),
+    }
+}
+
+/// The first column this plan renames or drops, named the way a message wants
+/// it — or `None` when every column of `current` is still there under its own
+/// name.
+///
+/// Only these two edits invalidate SQL that refers to a column: a retype, a
+/// default, a new column or a constraint all leave every existing name pointing
+/// at the same thing.
+fn column_moved(current: &TableInfo, draft: &TableDraft) -> Option<String> {
+    for c in &draft.columns {
+        match &c.original {
+            Some(o) if *o != c.info.name => {
+                return Some(format!("{o}, which this plan renames to {}", c.info.name));
+            }
+            _ => {}
+        }
+    }
+    let kept: HashSet<&str> = draft
+        .columns
+        .iter()
+        .filter_map(|c| c.original.as_deref())
+        .collect();
+    current
+        .columns
+        .iter()
+        .find(|c| !kept.contains(c.name.as_str()))
+        .map(|c| format!("{}, which this plan drops", c.name))
+}
+
 pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> {
     let d = SqlDialect::Sqlite;
     let q = |s: &str| ddl_ident_in(s, d);
@@ -4904,7 +5011,18 @@ pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
     ));
     out.push("PRAGMA legacy_alter_table = OFF;".to_string());
     for ix in &draft.indexes {
-        out.push(create_index_sql(&ix.info, &original, d));
+        match sqlite_index_replay(current, draft, ix) {
+            IndexReplay::Emit => out.push(create_index_sql(&ix.info, &original, d)),
+            IndexReplay::Verbatim(sql) => out.push(sql.to_string()),
+            // Nothing, and the index is therefore gone from the rebuilt table —
+            // which is why this arm is unreachable in the application:
+            // [`ChangeSet::unsupported`] reports the same refusal and the preview
+            // refuses to apply while it does. Emitting the model's version here
+            // instead would be the silent unfaithfulness the whole check exists
+            // to prevent, so a plan that somehow got this far loses the index
+            // visibly rather than keeping a different one.
+            IndexReplay::Refuse(_) => {}
+        }
     }
     out.extend(current.dependent_ddl.iter().cloned());
     out
@@ -12123,21 +12241,127 @@ mod sqlite_designer_tests {
         );
     }
 
-    /// **A partial index would come back covering every row.** SQLite keeps a
-    /// partial index's predicate only in its own `CREATE` text, so the model
-    /// carries `lossy` instead — and a rebuild recreates its indexes from the
-    /// model. Recreating this one silently widens it, which is the plan refusing
-    /// to be applied rather than a warning to read past.
-    #[test]
-    fn a_lossy_index_stops_the_rebuild() {
-        let mut t = table();
-        t.indexes.push(IndexInfo {
+    // ── a lossy index across a rebuild ───────────────────────────────────────
+    //
+    // A rebuild drops the table, so every index has to be created again — and an
+    // index the pragmas only partly read cannot be re-emitted from the model
+    // without becoming a different index. The way through is the one a trigger
+    // takes: put SQLite's own `CREATE` text back, verbatim. Each test below pins
+    // one condition on doing that, because the text is a snapshot and every one
+    // of them is a way the snapshot has stopped describing the table.
+
+    /// SQLite's own text for the index, as `sqlite_master` stores it: the
+    /// predicate the pragmas never report is right there in it.
+    const PARTIAL_SQL: &str = r#"CREATE INDEX "ix_partial" ON "t" ("a") WHERE "b" IS NOT NULL;"#;
+
+    fn lossy_index() -> IndexInfo {
+        IndexInfo {
             name: "ix_partial".into(),
             columns: vec![IndexColumn::plain("a")],
             lossy: true,
+            create_sql: Some(PARTIAL_SQL.into()),
+            ..Default::default()
+        }
+    }
+
+    fn with_lossy_index() -> TableInfo {
+        let mut t = table();
+        t.indexes.push(lossy_index());
+        t
+    }
+
+    /// **The case that used to make the whole table uneditable.** Nothing about
+    /// the index is changing, so it doesn't have to be re-emitted at all — the
+    /// statement SQLite stored for it goes back exactly as it was, and the
+    /// unrelated edit goes through.
+    #[test]
+    fn an_untouched_lossy_index_is_replayed_from_its_own_text() {
+        let cs = retyped(&with_lossy_index());
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        let sql = cs.emit();
+        assert!(sql.iter().any(|s| s == PARTIAL_SQL), "{sql:#?}");
+        assert!(
+            !sql.iter()
+                .any(|s| s.contains("ix_partial") && s != PARTIAL_SQL),
+            "the model's version must not be emitted beside it: {sql:#?}"
+        );
+    }
+
+    /// An index read *whole* still comes from the model — that is what carries a
+    /// column rename into it, which a verbatim replay could never do.
+    #[test]
+    fn an_ordinary_index_is_still_emitted_from_the_model() {
+        let mut t = table();
+        t.indexes.push(IndexInfo {
+            name: "ix_a".into(),
+            columns: vec![IndexColumn::plain("a")],
+            create_sql: Some(r#"CREATE INDEX "ix_a" ON "t" ("a");"#.into()),
             ..Default::default()
         });
+        let mut d = TableDraft::from_table(&t);
+        d.columns[1].info.type_name = "BLOB".into();
+        d.rename_column(0, "z");
+        let sql = diff(&t, &d, Sqlite).emit();
+        assert!(
+            sql.iter().any(|s| s.contains(r#"ON "t" ("z")"#)),
+            "the rename reached the index: {sql:#?}"
+        );
+    }
+
+    /// No text to put back — a pre-`create_sql` model, or an engine that keeps
+    /// none — and the refusal stands where it always did.
+    #[test]
+    fn a_lossy_index_with_no_text_of_its_own_stops_the_rebuild() {
+        let mut t = with_lossy_index();
+        t.indexes[0].create_sql = None;
         let withheld = retyped(&t).unsupported();
+        assert_eq!(withheld.len(), 1, "{withheld:?}");
+        assert!(withheld[0].contains("ix_partial"), "{withheld:?}");
+    }
+
+    /// **The refusal narrows to what it was always about.** Editing the index is
+    /// asking for an index the model can't describe, and the stored text is the
+    /// *old* one — so there is nothing faithful to write either way.
+    #[test]
+    fn an_edited_lossy_index_still_stops_the_rebuild() {
+        let t = with_lossy_index();
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.type_name = "TEXT".into();
+        d.indexes[0].info.unique = true;
+        let withheld = diff(&t, &d, Sqlite).unsupported();
+        assert_eq!(withheld.len(), 1, "{withheld:?}");
+        assert!(withheld[0].contains("ix_partial"), "{withheld:?}");
+    }
+
+    /// **A rename is the trap the replay walks into.** The part that was never
+    /// read may name any column of the table — this index's predicate names `b`,
+    /// which is in no field of the model — so replaying the text after a rename
+    /// creates an index over a column that is gone.
+    #[test]
+    fn renaming_any_column_stops_the_replay() {
+        let t = with_lossy_index();
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.type_name = "TEXT".into();
+        // `b` is not a key column of the index, and is not in the model's reading
+        // of it at all — only in the predicate.
+        d.rename_column(1, "c");
+        let withheld = diff(&t, &d, Sqlite).unsupported();
+        assert_eq!(withheld.len(), 1, "{withheld:?}");
+        assert!(withheld[0].contains("ix_partial"), "{withheld:?}");
+        assert!(
+            withheld[0].contains('b'),
+            "it names the column: {withheld:?}"
+        );
+    }
+
+    /// And a drop, for the same reason.
+    #[test]
+    fn dropping_any_column_stops_the_replay() {
+        let t = with_lossy_index();
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.type_name = "TEXT".into();
+        d.columns.remove(1);
+        let withheld = diff(&t, &d, Sqlite).unsupported();
         assert_eq!(withheld.len(), 1, "{withheld:?}");
         assert!(withheld[0].contains("ix_partial"), "{withheld:?}");
     }
@@ -12146,13 +12370,7 @@ mod sqlite_designer_tests {
     /// recreate unfaithfully.
     #[test]
     fn dropping_the_lossy_index_clears_the_way() {
-        let mut t = table();
-        t.indexes.push(IndexInfo {
-            name: "ix_partial".into(),
-            columns: vec![IndexColumn::plain("a")],
-            lossy: true,
-            ..Default::default()
-        });
+        let t = with_lossy_index();
         let mut d = TableDraft::from_table(&t);
         d.columns[0].info.type_name = "TEXT".into();
         d.indexes.clear();
