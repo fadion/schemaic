@@ -513,17 +513,38 @@ pub(crate) fn suggest_chevron(
     // menu opened across the modal — or across the window — from the control
     // that raised it. Filled just below, once the view it names exists.
     let anchor_id: RwSignal<Option<floem::ViewId>> = RwSignal::new(None);
+    // Stated once, because the value that *places* the menu is the value that says
+    // the open menu is this chevron's — see [`crate::widgets::menu_anchored_at`].
+    //
+    // `ViewId::layout_rect` is already in window coordinates (floem sets it from
+    // `window_origin` during layout), which is the frame `PopupAnchor` is stated
+    // in. `None` only before the first layout, and then the cursor fallback is as
+    // good an answer as any.
+    let anchor_now = move || {
+        anchor_id
+            .get_untracked()
+            .map(|id| id.layout_rect())
+            .map(|r| PopupAnchor::BelowIcon(r.x0, r.x1, r.y1))
+    };
     let open = Rc::new(move || {
-        // `ViewId::layout_rect` is already in window coordinates (floem sets it
-        // from `window_origin` during layout), which is the frame `PopupAnchor`
-        // is stated in. `None` only before the first layout, and then the cursor
-        // fallback is as good an answer as any.
-        anchor.set(
-            anchor_id
-                .get_untracked()
-                .map(|id| id.layout_rect())
-                .map(|r| PopupAnchor::BelowIcon(r.x0, r.x1, r.y1)),
-        );
+        let here = anchor_now();
+        // A second press closes the menu the first opened. Recomputed rather than
+        // remembered, so it is the *current* rect that has to match: these fields
+        // sit in a scrolling modal body, and scrolling with the menu up moves the
+        // chevron out from under it. Then this reports "not mine" and the press
+        // reopens at the new position — which is the better answer anyway, and the
+        // reason the fallback direction matters more than the exact equality.
+        if here.is_some_and(|mine| {
+            crate::widgets::menu_anchored_at(
+                popup.get_untracked().is_some(),
+                anchor.get_untracked(),
+                mine,
+            )
+        }) {
+            popup.set(None);
+            return;
+        }
+        anchor.set(here);
         popup.set(Some(
             options
                 .iter()
@@ -538,6 +559,12 @@ pub(crate) fn suggest_chevron(
     let button = crate::widgets::in_ring_button(
         container(icons::icon(icons::CHEVRON_DOWN, 16.0))
             .on_click_stop(move |_| (open)())
+            // Without this the workspace root's "close on down" handler fires
+            // first and the click then reopens — down closes, up reopens, and the
+            // chevron never toggles however it decides. The toggle above is the
+            // second half of the same fix, not an alternative to it: the guard
+            // alone would leave a second press re-opening what was never closed.
+            .on_event_stop(floem::event::EventListener::PointerDown, |_| {})
             .style(|s| {
                 s.padding(6.0)
                     .color(theme::text_dim())
