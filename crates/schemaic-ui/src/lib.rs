@@ -26,6 +26,7 @@ mod monitor_view;
 mod object_editor;
 mod overlays;
 mod plan_view;
+mod properties;
 mod schema_tree;
 /// The tree-node key builders. Public because the persisted expanded-node set is
 /// the app's to edit (collapsing a database drops every `tbl:<db>:*` key), and
@@ -1653,6 +1654,13 @@ pub struct SchemaActions {
     /// Read a MySQL trigger's body as written, which `information_schema`
     /// cannot report faithfully.
     pub trigger_source: TriggerSrcFn,
+    /// Fetch table statistics for the properties modal (whole database, one
+    /// round trip) and drop the result into `overlay.properties_state`.
+    pub table_stats: Rc<dyn Fn(PropertiesTarget)>,
+    /// Run the exact `SELECT COUNT(*)` behind the properties modal's **Count
+    /// rows**. Separate from [`SchemaActions::table_stats`] because it is a full
+    /// scan the user asked for, not part of opening the panel.
+    pub count_rows: Rc<dyn Fn(PropertiesTarget)>,
 }
 
 /// Result of a "Test" of the Manage-Connections draft (host + credentials),
@@ -1680,6 +1688,53 @@ pub enum PlanState {
     /// The plan loaded successfully.
     Loaded(schemaic_core::plan::QueryPlan),
     /// The EXPLAIN failed (message shown in the modal body).
+    Failed(String),
+}
+
+/// The object the properties modal is describing.
+///
+/// Carries the namespace as well as the name because that is the table's
+/// identity (`sales.orders` and `archive.orders` are different tables), and the
+/// connection id so a fetch that lands after the user has switched connections
+/// can be discarded rather than shown against the wrong server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PropertiesTarget {
+    pub conn_id: u64,
+    pub database: String,
+    pub schema: Option<String>,
+    pub table: String,
+    /// A view (or materialized view) rather than a base table. Views have
+    /// structure but, on two of the three engines, no statistics — the modal
+    /// says which rather than showing an empty grid of figures.
+    pub is_view: bool,
+}
+
+impl PropertiesTarget {
+    /// How the object is named in the UI — `table`, or `schema.table` outside
+    /// PostgreSQL's `public`.
+    pub fn display(&self) -> String {
+        schemaic_core::schema::display_name(self.schema.as_deref(), &self.table)
+    }
+}
+
+/// UI-facing lifecycle of the properties modal's statistics fetch.
+#[derive(Clone, Debug, Default)]
+pub enum PropertiesState {
+    /// The fetch is in flight (the state the modal opens in).
+    #[default]
+    Loading,
+    /// Loaded. The stats may still be *empty* — a view on MySQL has no figures —
+    /// which the modal renders as "nothing to report" rather than as zeroes.
+    ///
+    /// Boxed: `TableStats` is a wide struct of optional figures, and this enum
+    /// lives in a signal every other variant of which is a word or two.
+    Loaded(Box<schemaic_core::stats::TableStats>),
+    /// This engine publishes no per-table statistics at all
+    /// ([`schemaic_core::stats::supports_table_stats`]). Distinct from an empty
+    /// `Loaded`: the modal explains the engine rather than the table, and still
+    /// offers the exact count, which every engine can answer.
+    Unsupported,
+    /// The fetch failed (message shown in the modal body).
     Failed(String),
 }
 
@@ -1895,6 +1950,20 @@ pub struct OverlayUi {
     pub monitor_export_err: RwSignal<Option<String>>,
     /// ER-diagram modal: `Some(target)` opens it for that database/seed.
     pub erd: RwSignal<Option<ErdTarget>>,
+    /// Table-properties modal: `Some(target)` opens it for that object, and the
+    /// statistics fetch it kicks off lands in `properties_state`.
+    ///
+    /// The exact `COUNT(*)` is tracked apart from that state on purpose. It is a
+    /// second, slower request over the same object, and folding it into
+    /// `properties_state` would mean a failed count replacing statistics that
+    /// loaded perfectly well — so `properties_counting` drives only the button's
+    /// own spinner, `properties_count_err` only the line beneath it, and a
+    /// successful count is written into the loaded [`PropertiesState::Loaded`]'s
+    /// `exact_rows` where the rest of the panel can read it.
+    pub properties: RwSignal<Option<PropertiesTarget>>,
+    pub properties_state: RwSignal<PropertiesState>,
+    pub properties_counting: RwSignal<bool>,
+    pub properties_count_err: RwSignal<Option<String>>,
     /// A run the write guard held back, or `None`. Set by
     /// [`TabsActions::run`]/[`TabsActions::run_all`] — which *are* the guarded
     /// run path — and rendered as the editor's guard bar. It lives here, not in
@@ -2322,8 +2391,14 @@ pub fn workspace(ui: Ui) -> impl IntoView {
         {
             let mon_open = ui.overlay.monitor_open;
             let erd_open = ui.overlay.erd;
-            stack((monitor_overlay(ui.clone()), erd_overlay(ui.clone()))).style(move |s| {
-                if mon_open.get() || erd_open.get().is_some() {
+            let props_open = ui.overlay.properties;
+            stack((
+                monitor_overlay(ui.clone()),
+                erd_overlay(ui.clone()),
+                properties::properties_overlay(ui.clone()),
+            ))
+            .style(move |s| {
+                if mon_open.get() || erd_open.get().is_some() || props_open.get().is_some() {
                     s.absolute().inset(0.0)
                 } else {
                     s

@@ -943,6 +943,44 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     entries.push(MenuEntry::action("Refresh", move || {
                         (rf)(refresh_database.clone())
                     }));
+                    // The full `TableInfo` (columns, nullability) that the
+                    // schema-editing entries below map onto, and which only
+                    // exists once the schema has loaded. Read here rather than
+                    // there because Properties — the first entry to want it —
+                    // sits above them.
+                    let info = db_nodes.with_untracked(|nodes| {
+                        nodes
+                            .iter()
+                            .find(|n| n.database == *database)
+                            .and_then(|n| match n.schema.get_untracked() {
+                                schemaic_core::schema::SchemaState::Loaded(db) => db
+                                    .tables
+                                    .iter()
+                                    .find(|t| {
+                                        t.name == *table && t.schema.as_deref() == schema.as_deref()
+                                    })
+                                    .cloned(),
+                                _ => None,
+                            })
+                    });
+                    let is_view = info.as_ref().is_some_and(|i| i.is_view);
+                    // Sizes, row estimate and index usage — the one surface that
+                    // reports them. Offered for a view too: it has no storage of
+                    // its own, and the panel says so rather than the menu hiding
+                    // the question.
+                    {
+                        let ui = import_ui.clone();
+                        let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
+                        entries.push(MenuEntry::action("Properties", move || {
+                            crate::properties::open_for_table(
+                                &ui,
+                                &db,
+                                ns.as_deref(),
+                                &tbl,
+                                is_view,
+                            );
+                        }));
+                    }
                     // ER diagram seeded on this table's FK neighbourhood.
                     {
                         let db = database.clone();
@@ -969,29 +1007,9 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     entries.push(MenuEntry::Separator);
                     {
                         let read_only = conn_read_only(&connections, active_conn);
-                        // The full `TableInfo` (columns, nullability) is what the
-                        // modal maps onto, and it only exists once the schema has
-                        // loaded.
-                        let info = db_nodes.with_untracked(|nodes| {
-                            nodes
-                                .iter()
-                                .find(|n| n.database == *database)
-                                .and_then(|n| match n.schema.get_untracked() {
-                                    schemaic_core::schema::SchemaState::Loaded(db) => db
-                                        .tables
-                                        .iter()
-                                        .find(|t| {
-                                            t.name == *table
-                                                && t.schema.as_deref() == schema.as_deref()
-                                        })
-                                        .cloned(),
-                                    _ => None,
-                                })
-                        });
                         let ui = import_ui.clone();
                         let db = database.clone();
                         let ns = schema.clone();
-                        let is_view = info.as_ref().is_some_and(|i| i.is_view);
                         let has_columns = info.as_ref().is_some_and(|i| !i.columns.is_empty());
                         let dialect = crate::table_designer::edit_ctx(&ui).dialect;
                         // A view Schemaic can edit — read before `info` is moved
