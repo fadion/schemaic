@@ -323,7 +323,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     not the manual's `new_X`, since a collision with a real table fails the whole plan), copying the
     rows into it, dropping the original, renaming the shadow into place, recreating the indexes
     **after** the rename (an index name is unique per schema, so creating one earlier collides with
-    the index it replaces) and replaying `TableInfo::dependent_ddl`. The copy is what makes a rename
+    the index it replaces) and replaying `TableInfo::dependent_ddl`. Each index goes back the way
+    `ddl::sqlite_index_replay` says: emitted from the model, which is the only form that follows a
+    renamed column into its index, or — for one the pragmas read `lossy` and this plan leaves alone
+    — replayed verbatim from `IndexInfo::create_sql`. The copy is what makes a rename
     a rename rather than a drop-and-add: each new column is mapped to the one it came from, a column
     the user added is in neither list so its default applies, and a generated column is in neither
     because it cannot be inserted into. It is `INSERT … SELECT` and not `CREATE TABLE … AS SELECT`,
@@ -403,11 +406,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     (`overlays::row_menu_tests`). `ChangeSet::unsupported()` is the same
     predicate read over a whole set, returning the plain-language summaries of what the dialect
     can't express, which is what the preview shows and refuses to apply around. **Where a rebuild is
-    present it withholds nothing except an index flagged `IndexInfo::lossy`**: the rebuild has to
-    recreate every index, and one recreated from a partial reading is not the index that was there —
-    a partial index comes back covering every row, an expression index missing its key. That is not
-    a warning to read past; the plan is refused until the user drops the index or leaves the table
-    alone.
+    present it withholds nothing except an index flagged `IndexInfo::lossy` that cannot be put back
+    as it was**: the rebuild drops the table, so every index has to be created again, and one
+    re-emitted from a partial reading is not the index that was there — a partial index comes back
+    covering every row, an expression index missing its key. The way through is the one a trigger
+    takes: `ddl::sqlite_index_replay` replays the index's **own** `CREATE` text
+    (`IndexInfo::create_sql`) verbatim, which cannot lose what the pragmas never read. That leaves
+    three narrow cases where no faithful statement exists, and only those are withheld — the index
+    was **edited** (the stored text is the old one, and the model can't describe the new one), the
+    index has no stored text of its own, or the plan **renames or drops a column**
+    (`ddl::column_moved`). The last is not caution: the unread part is exactly where a partial
+    index's predicate and an expression key live, so which columns the index uses is a question the
+    model cannot answer, and it is asked of the whole table instead. A withheld index is not a
+    warning to read past; the plan is refused until the user drops it or undoes the edit.
     `TableDraft` (the desired table; column/index/FK
     entries each carry the name they had on the server, which is what tells a *rename*
     from a drop-plus-add) → `diff(current, draft, dialect) -> ChangeSet` → `emit()`.
@@ -1109,7 +1120,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   to insert into it; a non-`INTEGER` `PRIMARY KEY` is reported **nullable**, because SQLite
   documents that it really is; and an index whose predicate or expression key the pragmas don't
   return is marked `lossy`, since an index edit is a drop-and-create and would otherwise silently
-  widen it. A fourth is a **non**-finding worth recording, because it looks like a gap: a table
+  widen it. That last one is also why every index carries `IndexInfo::create_sql`, the statement
+  that declared it — `sqlite::index_sql` is one `sqlite_master` query behind two consumers, Copy
+  DDL's appended `CREATE INDEX` block and the per-index text a rebuild replays instead of
+  re-emitting a `lossy` index from the model. It is `None` for an index SQLite wrote itself to back
+  a `UNIQUE` or `PRIMARY KEY`, whose `sql` is NULL because it is part of the table's declaration.
+  A fourth is a **non**-finding worth recording, because it looks like a gap: a table
   whose primary key is an `INTEGER PRIMARY KEY` reports **no indexes at all**, since that column
   *is* the rowid and SQLite builds no separate index for it. Nothing needs to be synthesised —
   `edit::resolve_key` reads the primary key off `ColumnInfo::primary_key`, not off the index list,
@@ -1295,9 +1311,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     goes through the draft, so it takes the column's dependents with it, and a foreign key or the
     primary key among them is a `Change` that engine can't express — the preview then says so and
     refuses, rather than dropping the column out from under them. The other is a designer plan that
-    rebuilds a table carrying an index `IndexInfo::lossy` marked: the rebuild has to recreate every
-    index and can't recreate that one faithfully, so the block names it and Apply refuses until the
-    user drops it. Entry
+    rebuilds a table carrying an index `IndexInfo::lossy` marked **and cannot replay it** — it was
+    edited, it has no `CREATE` text of its own, or the plan moves a column that text may name — so
+    the block names it and Apply refuses until the user drops the index or undoes the edit. An
+    untouched one is simply replayed and never reaches this block. Entry
     points:
     `table_designer::open_for_table`/`open_for_new`/`preview_draft_edit` (a shortcut whose
     edit has dependents — dropping a column takes its index and FK with it) and
