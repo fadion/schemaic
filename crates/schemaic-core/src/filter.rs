@@ -208,11 +208,12 @@ fn parse_condition(cond: &str, dialect: SqlDialect) -> Result<Expr, FilterError>
 }
 
 /// Identifier quote character for the dialect (backtick on MySQL, double-quote on
-/// Postgres) — used when we emit an `ORDER BY` column via the AST.
+/// Postgres and SQLite) — used when we emit an `ORDER BY` column via the AST.
+/// Matches what [`crate::export::ident_sql`] emits, which is the authority.
 fn quote_char(dialect: SqlDialect) -> char {
     match dialect {
         SqlDialect::MySql => '`',
-        SqlDialect::Postgres => '"',
+        SqlDialect::Postgres | SqlDialect::Sqlite => '"',
     }
 }
 
@@ -238,7 +239,7 @@ pub(crate) fn quoted_ident_for_test(name: &str, dialect: SqlDialect) -> String {
 fn quote_value(v: &str, dialect: SqlDialect) -> String {
     let escaped = match dialect {
         SqlDialect::MySql => v.replace('\\', "\\\\").replace('\'', "''"),
-        SqlDialect::Postgres => v.replace('\'', "''"),
+        SqlDialect::Postgres | SqlDialect::Sqlite => v.replace('\'', "''"),
     };
     format!("'{escaped}'")
 }
@@ -249,7 +250,9 @@ fn quote_value(v: &str, dialect: SqlDialect) -> String {
 /// dialects differ on case: Postgres folds an unquoted identifier to lower case,
 /// so anything with an upper-case letter must be quoted or it resolves to a
 /// different (probably missing) table; MySQL doesn't fold, so mixed case is fine
-/// bare.
+/// bare. **SQLite doesn't fold either** — it compares identifiers
+/// case-insensitively and stores them as written, so `ArtistId` bare resolves to
+/// the same column as `artistid` and quoting it would only be decoration.
 ///
 /// Used to keep generated SQL free of decorative quoting — which reads better,
 /// and keeps names visible to the mid-edit tokenizer that backs completion.
@@ -271,6 +274,14 @@ fn needs_quoting(name: &str, dialect: SqlDialect) -> bool {
                 && name
                     .chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        }
+        // SQLite: letters, digits, `_`, `$`; no leading digit — MySQL's rule, and
+        // case-preserving like it, so mixed case needs no quoting.
+        SqlDialect::Sqlite => {
+            !name.starts_with(|c: char| c.is_ascii_digit())
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
         }
     };
     !bare || crate::intel::is_reserved_word(name, dialect)
@@ -328,6 +339,13 @@ impl Order {
 /// `public`, which resolves through `search_path`, and `"schema"."table"` for one
 /// in any other namespace. `schema` is the table's PostgreSQL namespace and is
 /// always `None` on MySQL, where the database already is the namespace.
+///
+/// **SQLite names the table alone.** A connection *is* one file, so there is no
+/// server-level qualifier to add; `database` there is the schema name SQLite
+/// itself uses (`main`, or an `ATTACH`ed one), and qualifying with it would emit
+/// `main.t` — correct but noise on every query the tree generates, and wrong the
+/// moment the same statement is copied into a session where the file is attached
+/// under another name.
 pub fn table_query(
     dialect: SqlDialect,
     database: &str,
@@ -351,6 +369,7 @@ pub fn table_query(
             ),
             None => quote_if_needed(table, dialect),
         },
+        SqlDialect::Sqlite => quote_if_needed(table, dialect),
     };
     let order_by = if key_cols.is_empty() {
         String::new()

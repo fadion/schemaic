@@ -69,11 +69,13 @@ fn classify(ch: char, dialect: SqlDialect) -> Option<Cat> {
 /// True if the non-code span opening at `b[i]` is a comment (vs. a string /
 /// quoted identifier). Only classifies a span the lexer already found — it does
 /// **not** re-scan boundaries.
+///
+/// Delegates to [`crate::sql::comment_open`], as the boundary invariant requires:
+/// this was a private byte test that had to be kept in step with the lexer by
+/// hand, and it said `#` opened a comment on everything but Postgres — a claim
+/// that stopped being true the moment SQLite existed.
 fn is_comment_start(b: &[u8], i: usize, dialect: SqlDialect) -> bool {
-    let n = b.len();
-    (b[i] == b'-' && i + 1 < n && b[i + 1] == b'-')
-        || (b[i] == b'#' && dialect != SqlDialect::Postgres)
-        || (b[i] == b'/' && i + 1 < n && b[i + 1] == b'*')
+    crate::sql::comment_open(b, i, dialect)
 }
 
 /// Classify what span the byte at `offset` sits inside, walking the shared

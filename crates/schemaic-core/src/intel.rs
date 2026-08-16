@@ -17,22 +17,22 @@
 //! cover the instant, catalog-only cases (unknown table/column); dialect-exact
 //! validation via PREPARE/EXPLAIN is a later, additive tier.
 
-use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect};
+use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 
 use crate::sql::skip_noncode;
 
-/// Which SQL dialect a connection speaks. MySQL and PostgreSQL are wired; the
-/// point of the seam is that adding an engine is a dialect swap, not a rewrite
-/// (sqlparser already ships those dialects). The AST classification is
-/// dialect-exact here; the byte-position lexer (`crate::sql::skip_noncode`) is
-/// still MySQL-flavored for its comment/quote boundaries — dialect-aware
-/// tokenization (Postgres `#`-operator / `$$` / `"ident"` handling) is a tracked
-/// follow-up.
+/// Which SQL dialect a connection speaks. MySQL, PostgreSQL and SQLite are wired;
+/// the point of the seam is that adding an engine is a dialect swap, not a
+/// rewrite (sqlparser already ships those dialects). The AST classification is
+/// dialect-exact here, and so are the byte positions — `crate::sql`'s lexer reads
+/// its boundary rules off the per-dialect table in that module rather than
+/// comparing against one engine.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SqlDialect {
     #[default]
     MySql,
     Postgres,
+    Sqlite,
 }
 
 impl SqlDialect {
@@ -41,6 +41,7 @@ impl SqlDialect {
         match self {
             SqlDialect::MySql => Box::new(MySqlDialect {}),
             SqlDialect::Postgres => Box::new(PostgreSqlDialect {}),
+            SqlDialect::Sqlite => Box::new(SQLiteDialect {}),
         }
     }
 
@@ -54,19 +55,24 @@ impl SqlDialect {
         match self {
             SqlDialect::MySql => "MySQL/MariaDB",
             SqlDialect::Postgres => "PostgreSQL",
+            SqlDialect::Sqlite => "SQLite",
         }
     }
 
     /// Map a saved connection's `db_type` label to a dialect. Anything not
-    /// recognizably Postgres falls back to MySQL (the historical default), so old
-    /// saved connections keep parsing as before.
+    /// recognizably Postgres or SQLite falls back to MySQL (the historical
+    /// default), so old saved connections keep parsing as before.
+    ///
+    /// It **delegates** to [`crate::connection`]'s predicates rather than
+    /// re-spelling the label match, which is what it used to do: the aliases were
+    /// written out twice, in two modules, with no test comparing them, and a label
+    /// the connection list accepted could have parsed here as a different engine
+    /// entirely. Same rule as the one identifier quoter and the one boundary lexer.
     pub fn from_db_type(db_type: &str) -> SqlDialect {
-        let t = db_type.trim();
-        if t.eq_ignore_ascii_case("postgresql")
-            || t.eq_ignore_ascii_case("postgres")
-            || t.eq_ignore_ascii_case("pg")
-        {
+        if crate::connection::is_postgres(db_type) {
             SqlDialect::Postgres
+        } else if crate::connection::is_sqlite(db_type) {
+            SqlDialect::Sqlite
         } else {
             SqlDialect::MySql
         }
@@ -1018,13 +1024,25 @@ fn object_name_parts(name: &sqlparser::ast::ObjectName) -> Vec<String> {
         .collect()
 }
 
-/// The byte that quotes an identifier in `dialect`: `` ` `` on MySQL, `"` on
-/// PostgreSQL. Everything else `skip_noncode` consumes at that position is a
-/// string or comment, i.e. genuinely not code.
-fn ident_quote(dialect: SqlDialect) -> u8 {
-    match dialect {
-        SqlDialect::MySql => b'`',
-        SqlDialect::Postgres => b'"',
+/// If `open` starts a quoted *identifier* in `dialect`, the byte that closes it
+/// and whether doubling that byte escapes it. Everything else `skip_noncode`
+/// consumes at that position is a string or comment, i.e. genuinely not code.
+///
+/// It answers per-byte rather than returning "the" quote character because
+/// **SQLite has three** — `"x"` (standard), `` `x` `` (MySQL compatibility) and
+/// `[x]` (SQL-Server compatibility) — and the third doesn't even close with the
+/// byte it opened with. A single-byte answer silently picked one of the three and
+/// tokenized names written the other two ways as opaque non-code, which is a
+/// completion popup that goes blank on a name the user quoted.
+fn ident_quote(dialect: SqlDialect, open: u8) -> Option<(u8, bool)> {
+    match (dialect, open) {
+        (SqlDialect::MySql, b'`') => Some((b'`', true)),
+        (SqlDialect::Postgres, b'"') => Some((b'"', true)),
+        (SqlDialect::Sqlite, b'"') => Some((b'"', true)),
+        (SqlDialect::Sqlite, b'`') => Some((b'`', true)),
+        // No escape exists inside `[…]`, so nothing is doubled.
+        (SqlDialect::Sqlite, b'[') => Some((b']', false)),
+        _ => None,
     }
 }
 
@@ -1048,7 +1066,6 @@ fn ident_quote(dialect: SqlDialect) -> u8 {
 /// quoted-identifier span is lifted out.
 fn tokenize_range(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<Token> {
     let b = sql.as_bytes();
-    let quote = ident_quote(dialect);
     let mut out = Vec::new();
     let mut i = lo;
     let push = |out: &mut Vec<Token>, at: usize, end: usize, kind: TkKind| {
@@ -1062,27 +1079,33 @@ fn tokenize_range(sql: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Vec<T
     while i < hi {
         // Quoted identifier → a word. Must be tried before `skip_noncode`, which
         // would otherwise consume it as an opaque non-code run.
-        if b[i] == quote
+        if let Some((close, doubles)) = ident_quote(dialect, b[i])
             && let Some(j) = skip_noncode(b, i, dialect)
         {
             let end = j.min(hi);
             // `j` points past the closing quote; an unterminated quote runs to the
             // end of the range, in which case there's no closer to trim.
-            let closed = j <= hi && b.get(j - 1) == Some(&quote) && j - 1 > i;
+            let closed = j <= hi && b.get(j - 1) == Some(&close) && j - 1 > i;
             let inner = sql
                 .get(i + 1..if closed { j - 1 } else { end })
                 .unwrap_or("");
             if !inner.is_empty() {
-                // A doubled quote inside the name is one literal quote char.
-                let doubled = [quote, quote];
-                let doubled = std::str::from_utf8(&doubled).unwrap_or("");
-                let single = [quote];
-                let single = std::str::from_utf8(&single).unwrap_or("");
+                // A doubled quote inside the name is one literal quote char —
+                // where the dialect has such an escape at all (`[…]` has none).
+                let text = if doubles {
+                    let doubled = [close, close];
+                    let doubled = std::str::from_utf8(&doubled).unwrap_or("");
+                    let single = [close];
+                    let single = std::str::from_utf8(&single).unwrap_or("");
+                    inner.replace(doubled, single)
+                } else {
+                    inner.to_string()
+                };
                 out.push(Token {
                     at: i,
                     // Past the closing quote — the span the user sees.
                     end,
-                    kind: TkKind::Word(inner.replace(doubled, single)),
+                    kind: TkKind::Word(text),
                     quoted: true,
                 });
             }
@@ -2814,14 +2837,86 @@ const PG_RESERVED: &[&str] = &[
     "WITH",
 ];
 
+/// SQLite **reserved** words — those it will not accept as a bare
+/// identifier/alias.
+///
+/// Deliberately much shorter than the other two, and that is not an omission.
+/// SQLite's parser *falls back* to treating most of its ~147 keywords as
+/// identifiers wherever the grammar allows one (`SELECT key FROM t` is fine), so
+/// the set that genuinely can't be an alias is small. This list backs a
+/// **warning**, and the module's rule is that uncertainty never yields a false
+/// positive — a word wrongly listed here squiggles working SQL, which is worse
+/// than missing one the server will reject with a clearer message than ours.
+const SQLITE_RESERVED: &[&str] = &[
+    "ADD",
+    "ALL",
+    "ALTER",
+    "AND",
+    "AS",
+    "AUTOINCREMENT",
+    "BETWEEN",
+    "CASE",
+    "CHECK",
+    "COLLATE",
+    "COMMIT",
+    "CONSTRAINT",
+    "CREATE",
+    "DEFAULT",
+    "DEFERRABLE",
+    "DELETE",
+    "DISTINCT",
+    "DROP",
+    "ELSE",
+    "ESCAPE",
+    "EXCEPT",
+    "EXISTS",
+    "FOREIGN",
+    "FROM",
+    "GROUP",
+    "HAVING",
+    "IN",
+    "INDEX",
+    "INSERT",
+    "INTERSECT",
+    "INTO",
+    "IS",
+    "ISNULL",
+    "JOIN",
+    "LIMIT",
+    "NOT",
+    "NOTNULL",
+    "NULL",
+    "ON",
+    "OR",
+    "ORDER",
+    "PRIMARY",
+    "REFERENCES",
+    "RETURNING",
+    "SELECT",
+    "SET",
+    "TABLE",
+    "THEN",
+    "TO",
+    "TRANSACTION",
+    "UNION",
+    "UNIQUE",
+    "UPDATE",
+    "USING",
+    "VALUES",
+    "WHEN",
+    "WHERE",
+];
+
 /// A word that can't be a bare (unquoted) identifier/alias in `dialect` — reserved.
 /// Backs the alias diagnostic and the scope's alias resolution so they agree on what
-/// counts as a valid alias. See [`MYSQL_RESERVED`] / [`PG_RESERVED`].
+/// counts as a valid alias. See [`MYSQL_RESERVED`] / [`PG_RESERVED`] /
+/// [`SQLITE_RESERVED`].
 pub(crate) fn is_reserved_word(word: &str, dialect: SqlDialect) -> bool {
     let up = word.to_ascii_uppercase();
     let list = match dialect {
         SqlDialect::MySql => MYSQL_RESERVED,
         SqlDialect::Postgres => PG_RESERVED,
+        SqlDialect::Sqlite => SQLITE_RESERVED,
     };
     list.contains(&up.as_str())
 }

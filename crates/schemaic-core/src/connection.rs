@@ -358,6 +358,20 @@ pub fn is_postgres(db_type: &str) -> bool {
         || t.eq_ignore_ascii_case("pg")
 }
 
+/// Is this saved `db_type` label SQLite?
+///
+/// **The one answer**, on the same terms as [`is_postgres`]: `schemaic_db::Engine`,
+/// the connection form's picker and `intel::SqlDialect::from_db_type` all read it,
+/// so a label can't mean SQLite to the driver and MySQL to the form.
+///
+/// This is the question most of the app ends up asking, because SQLite is the one
+/// engine with **no server behind it**: [`Connection::file`] is the whole target,
+/// and `host`/`port`/`user`/`password`/`ssh` mean nothing on such a connection.
+pub fn is_sqlite(db_type: &str) -> bool {
+    let t = db_type.trim();
+    t.eq_ignore_ascii_case("sqlite") || t.eq_ignore_ascii_case("sqlite3")
+}
+
 /// How to name a connection's engine on screen.
 ///
 /// Normalises the PostgreSQL aliases [`is_postgres`] accepts onto the one label
@@ -367,6 +381,9 @@ pub fn is_postgres(db_type: &str) -> bool {
 pub fn engine_label(db_type: &str) -> String {
     if is_postgres(db_type) {
         return "PostgreSQL".to_string();
+    }
+    if is_sqlite(db_type) {
+        return "SQLite".to_string();
     }
     match db_type.trim() {
         "" => "MySQL".to_string(),
@@ -380,7 +397,14 @@ pub fn engine_label(db_type: &str) -> String {
 /// that doesn't parse — the second of which used to be a bare `3306`, so clearing
 /// a PostgreSQL connection's port and saving pointed it silently at the MySQL
 /// port and redisplayed that as though the user had typed it.
+///
+/// SQLite answers **0**, which is not a port but the absence of one: there is no
+/// server to reach, so any real number here would be a coordinate the app might
+/// later show or try. The form doesn't build a port field for SQLite at all.
 pub fn default_port(db_type: &str) -> u16 {
+    if is_sqlite(db_type) {
+        return 0;
+    }
     if is_postgres(db_type) { 5432 } else { 3306 }
 }
 
@@ -679,6 +703,47 @@ mod tests {
         for label in ["PostgreSQL", "postgres", "PG", "  postgresql  "] {
             assert!(is_postgres(label), "{label}");
             assert_eq!(default_port(label), 5432, "{label}");
+        }
+    }
+
+    #[test]
+    fn sqlite_is_recognised_by_any_of_its_labels() {
+        for label in ["SQLite", "sqlite", "SQLITE3", "  sqlite  "] {
+            assert!(is_sqlite(label), "{label}");
+            assert!(!is_postgres(label), "{label}");
+            assert_eq!(engine_label(label), "SQLite", "{label}");
+            // Not a port but the absence of one — there is no server to reach.
+            assert_eq!(default_port(label), 0, "{label}");
+        }
+    }
+
+    /// The label predicates and the dialect must never disagree about an engine:
+    /// `SqlDialect::from_db_type` used to re-spell the alias match in another
+    /// module, so a label the connection list called Postgres could have parsed as
+    /// MySQL. It delegates here now, and this is what says so.
+    #[test]
+    fn the_dialect_agrees_with_the_label_predicates() {
+        use crate::intel::SqlDialect;
+        for label in [
+            "MySQL",
+            "MariaDB",
+            "",
+            "PostgreSQL",
+            "postgres",
+            "PG",
+            "SQLite",
+            "sqlite3",
+            "  SQLITE ",
+            "something else",
+        ] {
+            let by_predicate = if is_postgres(label) {
+                SqlDialect::Postgres
+            } else if is_sqlite(label) {
+                SqlDialect::Sqlite
+            } else {
+                SqlDialect::MySql
+            };
+            assert_eq!(SqlDialect::from_db_type(label), by_predicate, "{label}");
         }
     }
 
