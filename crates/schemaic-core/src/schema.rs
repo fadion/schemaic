@@ -463,6 +463,22 @@ pub struct TableInfo {
     pub foreign_keys: Vec<ForeignKeyInfo>,
     /// True if this is a VIEW rather than a base table (`TABLE_TYPE = 'VIEW'`).
     pub is_view: bool,
+    /// The name of a row identity this table has that is **not one of its
+    /// columns** — SQLite's `rowid`, and nothing on MySQL or PostgreSQL, where
+    /// every way of naming a row is a column. `None` for a table that has none,
+    /// including a SQLite `WITHOUT ROWID` table.
+    ///
+    /// It exists so a table with no primary key and no usable unique index can
+    /// still be edited: [`crate::filter::table_query`] projects it (a `SELECT *`
+    /// would not return it), and the backend marks the resulting column
+    /// [`crate::model::ColumnOrigin::implicit_key`] so the key resolver can fall
+    /// back to it. This is a **capability**, not an engine tag: read it, don't
+    /// ask which database this is.
+    ///
+    /// It states only that the table *has* one and how to spell it, never that it
+    /// should be used — a real key still wins, and the projection is gated on the
+    /// table having no key of its own.
+    pub implicit_key: Option<String>,
     /// For views, the stored SELECT (`information_schema.VIEWS.VIEW_DEFINITION`),
     /// used to emit `CREATE VIEW`. `None` for base tables (and views whose
     /// definition couldn't be read).

@@ -39,9 +39,19 @@
 //! deliberately conservative: anything but a plainly single-table `SELECT` leaves
 //! `origin: None`, which the editing system already reads as "not editable" for an
 //! expression column. Guessing wider would make a wrong `UPDATE`, which is the one
-//! failure this whole layer exists to prevent. **Until that derivation lands,
-//! every column here carries `None`** — a SQLite result is readable and not yet
-//! editable, and the grid degrades to exactly what it does for a computed column.
+//! failure this whole layer exists to prevent. See [`attach_origins`] for what the
+//! derivation does accept.
+//!
+//! **Every rowid table has a key, and it isn't a column.** A table with no primary
+//! key and no usable unique index is read-only on the other two engines because
+//! there is genuinely no way to name one of its rows. On SQLite there always is,
+//! unless the table was declared `WITHOUT ROWID` — so such a table is made
+//! editable by projecting its `rowid` explicitly (`SELECT rowid, * FROM t`, which
+//! [`schemaic_core::filter::table_query`] generates) and marking that result
+//! column [`ColumnOrigin::implicit_key`]. The column is shown rather than hidden:
+//! the grid has no notion of a column that isn't one, and inventing one would put
+//! the burden of skipping it on export, copy and every aggregate. See
+//! [`implicit_row_key`] for why the *spelling* is chosen rather than fixed.
 
 use std::time::Instant;
 
@@ -219,6 +229,37 @@ fn attach_origins(conn: &SqliteConn, sql: &str, columns: &mut [Column]) {
     for (col, base) in columns.iter_mut().zip(bases) {
         let Some(base) = base else { continue };
         let Some(ci) = info.iter().find(|c| c.name.eq_ignore_ascii_case(&base)) else {
+            // Not a declared column — but it may still be the table's rowid,
+            // named explicitly because `SELECT *` does not return it. A declared
+            // column of the same name is looked for *first* and wins, which is
+            // what SQLite itself does with the name, so a table with its own
+            // `rowid` column is unaffected by any of this.
+            //
+            // The name is recorded **as written**: `_rowid_` is the spelling that
+            // reaches the true rowid of a table that has taken `rowid`, and the
+            // `WHERE` the write-back builds from this must resolve to the same
+            // value the `SELECT` read.
+            if ROWID_ALIASES.iter().any(|a| a.eq_ignore_ascii_case(&base))
+                && has_rowid(conn, &source.name)
+            {
+                col.origin = Some(ColumnOrigin {
+                    database: MAIN.to_string(),
+                    schema: None,
+                    table: source.name.clone(),
+                    column: base,
+                    flags: ColumnFlags {
+                        // Not a primary key: it is one only in the sense that it
+                        // identifies a row, and `implicit_key` is the field that
+                        // says so. A rowid is never NULL and is always assigned
+                        // by the engine.
+                        not_null: true,
+                        auto_increment: true,
+                        ..Default::default()
+                    },
+                    binary: false,
+                    implicit_key: true,
+                });
+            }
             continue;
         };
         col.origin = Some(ColumnOrigin {
@@ -248,6 +289,51 @@ fn attach_origins(conn: &SqliteConn, sql: &str, columns: &mut [Column]) {
             implicit_key: false,
         });
     }
+}
+
+/// The names SQLite accepts for a rowid table's implicit key, in the order a
+/// generated query should prefer them. All three mean the same thing; they exist
+/// as three because any of them may have been taken by a declared column.
+const ROWID_ALIASES: [&str; 3] = ["rowid", "_rowid_", "oid"];
+
+/// Does `table` have a `rowid` — the implicit 64-bit key SQLite gives every table
+/// that wasn't declared `WITHOUT ROWID`?
+///
+/// `PRAGMA table_list`'s `wr` column is the authority, and it is the reason the
+/// stored `CREATE` text isn't searched for the clause instead: `WITHOUT ROWID`
+/// can be separated by a comment or a newline, may be followed by `, STRICT`, and
+/// a column named `without_rowid` reads identically to a substring match. A view,
+/// or a name that isn't there, answers `false` — neither has a rowid either.
+fn has_rowid(conn: &SqliteConn, table: &str) -> bool {
+    let wr: Option<i64> = conn
+        .query_row(
+            "SELECT wr FROM pragma_table_list(?1) WHERE schema = ?2 AND type = 'table'",
+            rusqlite::params![table, MAIN],
+            |r| r.get(0),
+        )
+        .ok();
+    wr == Some(0)
+}
+
+/// The spelling of `table`'s implicit row key to project, or `None` for a table
+/// that has none to reach.
+///
+/// Which spelling matters, and that is the whole reason this is a choice rather
+/// than the constant `"rowid"`. All three of [`ROWID_ALIASES`] name the rowid —
+/// but only while no *declared* column has taken the name, because SQLite lets a
+/// table define a column called `rowid` and then that column is what the word
+/// means. Projecting the first unshadowed spelling keeps the generated `SELECT`
+/// and the `WHERE` the write-back builds from it referring to the same value; a
+/// table that has taken all three has no way left to name its rowid, so it has no
+/// implicit key and stays read-only, which is the conservative answer.
+fn implicit_row_key(columns: &[ColumnInfo], has_rowid: bool) -> Option<String> {
+    if !has_rowid {
+        return None;
+    }
+    ROWID_ALIASES
+        .iter()
+        .find(|alias| !columns.iter().any(|c| c.name.eq_ignore_ascii_case(alias)))
+        .map(|alias| (*alias).to_string())
 }
 
 /// Is this name a view rather than a base table? `None` when it is neither.
@@ -760,6 +846,13 @@ pub(crate) async fn fetch_schema(db: &Db) -> Result<DbSchema, DbError> {
                 Some(r) => Some(r?),
                 None => None,
             };
+            // A rowid table always has a key even when it declares none, so a
+            // keyless SQLite table is editable where the same table on the other
+            // two engines could not be. Views and `WITHOUT ROWID` tables get
+            // `None` and go on behaving as they did.
+            let implicit_key = (!is_view)
+                .then(|| implicit_row_key(&columns, has_rowid(conn, &name)))
+                .flatten();
             tables.push(TableInfo {
                 name,
                 schema: None,
@@ -767,6 +860,7 @@ pub(crate) async fn fetch_schema(db: &Db) -> Result<DbSchema, DbError> {
                 indexes,
                 foreign_keys,
                 is_view,
+                implicit_key,
                 create_sql,
                 // The **body**, not the statement — see `view_body_of`.
                 view_definition: is_view.then(|| view_body_of(&sql)).flatten(),
@@ -1562,6 +1656,129 @@ mod tests {
         assert!(o[1].as_ref().unwrap().binary);
     }
 
+    // ── the implicit key: a keyless table's rowid ─────────────────────────
+
+    /// A keyless table with a `rowid` column of its own, one with the first two
+    /// spellings taken, and one with nothing taken.
+    fn shadowing() -> SqliteConn {
+        let conn = SqliteConn::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE plain    (a TEXT, b TEXT);
+             CREATE TABLE owns_it  (rowid TEXT, b TEXT);
+             CREATE TABLE owns_two (RowId TEXT, _ROWID_ TEXT);
+             CREATE TABLE owns_all (rowid TEXT, _rowid_ TEXT, oid TEXT);
+             CREATE TABLE wr (a TEXT, b TEXT, PRIMARY KEY (a)) WITHOUT ROWID;
+             CREATE VIEW v AS SELECT a FROM plain;
+             INSERT INTO plain VALUES ('no', 'key');",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// One table's schema as `fetch_schema` would assemble it, without the async
+    /// `Db` round trip — enough for `analyze_edit`, which reads the columns, the
+    /// indexes and nothing else.
+    fn table_info_of(conn: &SqliteConn, name: &str) -> TableInfo {
+        let columns = table_columns(conn, name).unwrap();
+        let implicit_key = implicit_row_key(&columns, has_rowid(conn, name));
+        TableInfo {
+            name: name.to_string(),
+            indexes: table_indexes(conn, name).unwrap(),
+            columns,
+            implicit_key,
+            ..Default::default()
+        }
+    }
+
+    /// A rowid table always has a rowid; a `WITHOUT ROWID` table never does, and
+    /// nor does a view or a name that isn't there. `PRAGMA table_list` is asked
+    /// rather than the `CREATE` text searched.
+    #[test]
+    fn has_rowid_answers_for_tables_views_and_without_rowid() {
+        let conn = shadowing();
+        assert!(has_rowid(&conn, "plain"));
+        assert!(has_rowid(&conn, "owns_it"));
+        assert!(!has_rowid(&conn, "wr"));
+        assert!(!has_rowid(&conn, "v"));
+        assert!(!has_rowid(&conn, "nonexistent"));
+    }
+
+    /// The spelling is chosen, not fixed: a declared column takes the name away,
+    /// and a table that has taken all three has no way left to name its rowid.
+    #[test]
+    fn implicit_row_key_picks_the_first_spelling_no_column_has_taken() {
+        let conn = shadowing();
+        let cols = |t: &str| table_columns(&conn, t).unwrap();
+        let key = |t: &str| implicit_row_key(&cols(t), has_rowid(&conn, t));
+        assert_eq!(key("plain").as_deref(), Some("rowid"));
+        assert_eq!(key("owns_it").as_deref(), Some("_rowid_"));
+        // Case-insensitively taken — `RowId` and `_ROWID_` are the same names.
+        assert_eq!(key("owns_two").as_deref(), Some("oid"));
+        assert_eq!(key("owns_all"), None);
+        // No rowid to reach, whatever the columns are called.
+        assert_eq!(key("wr"), None);
+    }
+
+    /// The point of the whole change: a table with no primary key and no unique
+    /// index becomes editable, keyed on a rowid the projection asks for by name.
+    #[test]
+    fn a_keyless_table_is_editable_through_its_projected_rowid() {
+        let conn = shadowing();
+        let o = origins_for(&conn, "SELECT rowid, * FROM plain");
+        assert_eq!(o.len(), 3, "the wildcard expands after the leading item");
+        let key = o[0].as_ref().expect("the rowid is attributed");
+        assert!(key.implicit_key);
+        assert_eq!(key.column, "rowid");
+        assert_eq!(key.table, "plain");
+        // The data columns are ordinary origins — the leading item didn't shift
+        // the wildcard's expansion by one.
+        assert_eq!(o[1].as_ref().unwrap().column, "a");
+        assert_eq!(o[2].as_ref().unwrap().column, "b");
+        assert!(!o[1].as_ref().unwrap().implicit_key);
+
+        // And the editing system reaches the same conclusion end to end.
+        let rs = run_query(&conn, "SELECT rowid, * FROM plain", 100).unwrap();
+        let m = schemaic_core::edit::analyze_edit(&rs, |_, _, t| Some(table_info_of(&conn, t)));
+        assert_eq!(m.table(0).map(|t| t.key_cols.clone()), Some(vec![0]));
+        assert!(m.editable(1) && m.editable(2));
+        assert!(!m.editable(0), "the key is a handle, not the table's data");
+    }
+
+    /// Without the rowid projected, the same table is exactly as read-only as it
+    /// was — nothing here makes a bare `SELECT *` editable by guessing.
+    #[test]
+    fn the_same_keyless_table_stays_read_only_without_the_rowid() {
+        let conn = shadowing();
+        let rs = run_query(&conn, "SELECT * FROM plain", 100).unwrap();
+        let m = schemaic_core::edit::analyze_edit(&rs, |_, _, t| Some(table_info_of(&conn, t)));
+        assert!(!m.editable(0));
+        assert!(m.insert_target().is_none());
+    }
+
+    /// A table that declares its own `rowid` column means *that* column by the
+    /// name, and SQLite agrees — so nothing is synthesised, and the duplicate the
+    /// projection now contains is caught by the edit model's own self-join guard.
+    #[test]
+    fn a_declared_rowid_column_wins_over_the_implicit_one() {
+        let conn = shadowing();
+        let o = origins_for(&conn, "SELECT rowid, * FROM owns_it");
+        let first = o[0].as_ref().expect("the declared column is attributed");
+        assert!(!first.implicit_key);
+        assert_eq!(first.column, "rowid");
+        // `rowid` is now exposed twice — once named, once through the wildcard.
+        assert_eq!(o[1].as_ref().unwrap().column, "rowid");
+    }
+
+    /// A `WITHOUT ROWID` table has no rowid to name, and SQLite will not even
+    /// prepare the statement that asks for one. Nothing about it changes.
+    #[test]
+    fn a_without_rowid_table_cannot_be_asked_for_a_rowid() {
+        let conn = shadowing();
+        assert!(conn.prepare("SELECT rowid, * FROM wr").is_err());
+        let cols = table_columns(&conn, "wr").unwrap();
+        assert_eq!(implicit_row_key(&cols, has_rowid(&conn, "wr")), None);
+    }
+
     /// A **shared** in-memory database plus a `Db` pointing at it.
     ///
     /// The write paths each open their own connection, so a plain `:memory:` —
@@ -1651,6 +1868,75 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(rows, [(1, "z".to_string()), (2, "B".to_string())]);
+    }
+
+    /// The implicit key end to end: read a keyless table, resolve its key, and
+    /// commit an `UPDATE` and a `DELETE` through it.
+    ///
+    /// The two rows are **identical** on purpose. That is legal in a table with no
+    /// key, it is the case a "match the row by all its values" scheme gets wrong,
+    /// and it is the reason the 1-row net would fire if the key weren't really
+    /// unique — the `WHERE` here matches exactly one of them.
+    #[tokio::test]
+    async fn a_keyless_table_writes_back_through_its_rowid() {
+        let (keeper, db) = shared_memory("rowid_writeback");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (a TEXT, b TEXT);
+                 INSERT INTO t VALUES ('same', 'same'), ('same', 'same'), ('third', 'row');",
+            )
+            .unwrap();
+
+        // The key is resolved the way the app resolves it, not hand-written.
+        let rs = run_query(&keeper, "SELECT rowid, * FROM t", 100).unwrap();
+        let m =
+            schemaic_core::edit::analyze_edit(&rs, |_, _, name| Some(table_info_of(&keeper, name)));
+        let tbl = m.insert_target().expect("a single writable table");
+        assert_eq!(tbl.key_cols, vec![0]);
+        let key_of = |row: usize| {
+            let ci = tbl.key_cols[0];
+            vec![(
+                rs.columns[ci].origin.as_ref().unwrap().column.clone(),
+                rs.cell(row, ci).unwrap().to_value(),
+            )]
+        };
+
+        let write = GridWrite {
+            updates: vec![RowEdit {
+                database: MAIN.to_string(),
+                schema: None,
+                table: "t".to_string(),
+                set: vec![("b".to_string(), Some("edited".to_string()))],
+                key: key_of(1),
+            }],
+            deletes: vec![RowDelete {
+                database: MAIN.to_string(),
+                schema: None,
+                table: "t".to_string(),
+                key: key_of(2),
+            }],
+            ..Default::default()
+        };
+        let n = commit_writes(&db, &write, CancellationToken::new())
+            .await
+            .expect("commit");
+        assert_eq!(n, 2);
+
+        let rows: Vec<(i64, String, String)> = keeper
+            .prepare("SELECT rowid, a, b FROM t ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        // Only the second of the two identical rows changed, and the third is gone.
+        assert_eq!(
+            rows,
+            [
+                (1, "same".to_string(), "same".to_string()),
+                (2, "same".to_string(), "edited".to_string()),
+            ]
+        );
     }
 
     /// The 1-row safety net, which is the whole promise of this path: a key that
