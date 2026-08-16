@@ -36,6 +36,7 @@ use schemaic_core::schema::{
     TriggerEvent, TriggerInfo, TriggerOrder, TriggerSource, TriggerTiming, ViewOptions,
 };
 use schemaic_core::sql;
+use schemaic_core::stats::{Freshness, IndexStats, SchemaStats, TableStats, count_rows_sql};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, thiserror::Error)]
@@ -868,6 +869,190 @@ impl Db {
         let _ = conn.disconnect().await;
         out
     }
+
+    /// Size, row estimate and index usage for **every** table in `database`.
+    ///
+    /// Whole-database rather than per-table because it costs the same round trip
+    /// either way, and having the set is what lets the schema tree put a size
+    /// beside every table at once.
+    ///
+    /// **Deliberately not part of [`Db::fetch_schema`].** On MySQL, selecting
+    /// `DATA_LENGTH` and friends from `information_schema.TABLES` makes the
+    /// server materialize per-table statistics, and on a schema with thousands
+    /// of tables with a cold stats cache that is slow enough to notice. The
+    /// schema fetch runs on every connect; this one runs when someone asks to
+    /// see the numbers.
+    ///
+    /// SQLite returns an empty set — see
+    /// [`schemaic_core::stats::supports_table_stats`] for why that is a fact
+    /// about SQLite and not a gap here.
+    pub async fn fetch_table_stats(&self, database: &str) -> Result<SchemaStats, DbError> {
+        match self.engine {
+            Engine::Postgres => return pg::fetch_table_stats(self, database).await,
+            Engine::Sqlite => return Ok(SchemaStats::default()),
+            Engine::MySql => {}
+        }
+        let mut conn = self.open(None, false).await?;
+        let out = collect_table_stats(&mut conn, database).await;
+        let _ = conn.disconnect().await;
+        out
+    }
+
+    /// `SELECT COUNT(*)` — the exact row count, on demand.
+    ///
+    /// The one figure every engine can answer without qualification, and the
+    /// answer to an estimate the user doesn't believe. Unbounded by nature: on a
+    /// large table this is a full scan, which is why nothing calls it
+    /// automatically.
+    pub async fn count_rows(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<u64, DbError> {
+        let sql = count_rows_sql(schema, table, self.engine.dialect());
+        match self.engine {
+            Engine::Postgres => return pg::count_rows(self, database, &sql).await,
+            Engine::Sqlite => return sqlite::count_rows(self, &sql).await,
+            Engine::MySql => {}
+        }
+        let mut conn = self.open(Some(database), false).await?;
+        let out = conn
+            .query_first::<u64, _>(sql)
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))
+            .and_then(|n| n.ok_or_else(|| DbError::Query("COUNT(*) returned no row".into())));
+        let _ = conn.disconnect().await;
+        out
+    }
+}
+
+/// One `information_schema.TABLES` statistics row. Every figure is nullable —
+/// a view has none of them, and `AUTO_INCREMENT` is null on a table without one.
+type MyStatRow = (
+    String,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// The MySQL/MariaDB half of [`Db::fetch_table_stats`]: three queries, only the
+/// first of which is required.
+async fn collect_table_stats(conn: &mut Conn, database: &str) -> Result<SchemaStats, DbError> {
+    let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
+
+    // Sizes and estimates. `CAST(… AS CHAR)` on the timestamps because these are
+    // shown, not computed with, and the server's own rendering is the one the
+    // user would see in a client.
+    let rows: Vec<MyStatRow> = conn
+        .exec_map(
+            "SELECT CAST(TABLE_NAME AS CHAR), TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH, \
+                    DATA_FREE, AUTO_INCREMENT, CAST(ROW_FORMAT AS CHAR), \
+                    CAST(ENGINE AS CHAR), CAST(CREATE_TIME AS CHAR), \
+                    CAST(UPDATE_TIME AS CHAR) \
+             FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
+            (database,),
+            |r: MyStatRow| r,
+        )
+        .await
+        .map_err(qerr)?;
+
+    // Cardinality per index. `information_schema.STATISTICS` has one row per key
+    // *position*, each carrying the cardinality of the prefix ending there, so
+    // the index's own figure is the last one — `MAX` over the group. `NON_UNIQUE`
+    // is constant within a group; `MIN` just picks it out.
+    let idx_rows: Vec<(String, String, Option<u64>, Option<i64>)> = conn
+        .exec_map(
+            "SELECT CAST(TABLE_NAME AS CHAR), CAST(INDEX_NAME AS CHAR), \
+                    MAX(CARDINALITY), MIN(NON_UNIQUE) \
+             FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = ? \
+             GROUP BY TABLE_NAME, INDEX_NAME \
+             ORDER BY TABLE_NAME, INDEX_NAME",
+            (database,),
+            |r: (String, String, Option<u64>, Option<i64>)| r,
+        )
+        .await
+        .map_err(qerr)?;
+
+    // How often each index has actually been used. Performance Schema is the
+    // only place MySQL keeps this, and it is routinely off, not instrumented, or
+    // not granted — all of which must leave the scan count **absent** rather than
+    // zero, because zero is what marks an index unused. So a failure here drops
+    // the whole map and every index reports "we don't know".
+    let usage: HashMap<(String, String), u64> = conn
+        .exec_map(
+            "SELECT CAST(OBJECT_NAME AS CHAR), CAST(INDEX_NAME AS CHAR), COUNT_STAR \
+             FROM performance_schema.table_io_waits_summary_by_index_usage \
+             WHERE OBJECT_SCHEMA = ? AND INDEX_NAME IS NOT NULL",
+            (database,),
+            |(t, i, n): (String, String, u64)| ((t, i), n),
+        )
+        .await
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default();
+
+    // How stale the figures above may be. MySQL 8 serves them from a cache whose
+    // maximum age is this variable — 86400 (a day) out of the box, which is long
+    // enough that a size can be badly wrong and the user has to be told. MariaDB
+    // has no such variable and the statement errors there, which is the honest
+    // `Unknown`: its statistics are refreshed on a different rule entirely.
+    let freshness = match conn
+        .query_first::<u64, _>("SELECT @@information_schema_stats_expiry")
+        .await
+    {
+        Ok(Some(secs)) => Freshness::CachedUpTo(secs),
+        _ => Freshness::Unknown,
+    };
+
+    let mut by_table: HashMap<&str, Vec<IndexStats>> = HashMap::new();
+    for (table, index, cardinality, non_unique) in &idx_rows {
+        let is_primary = index == "PRIMARY";
+        by_table.entry(table).or_default().push(IndexStats {
+            name: index.clone(),
+            // MySQL reports one `INDEX_LENGTH` for the whole table and never
+            // breaks it down, so no index here has a size of its own.
+            bytes: None,
+            cardinality: *cardinality,
+            scans: usage.get(&(table.clone(), index.clone())).copied(),
+            is_primary,
+            is_unique: is_primary || *non_unique == Some(0),
+        });
+    }
+
+    let tables = rows
+        .into_iter()
+        .map(
+            |(name, rows, data, index, free, auto, row_format, engine, created, updated)| {
+                let indexes = by_table.remove(name.as_str()).unwrap_or_default();
+                TableStats {
+                    indexes,
+                    table: name,
+                    schema: None,
+                    rows,
+                    exact_rows: None,
+                    data_bytes: data,
+                    index_bytes: index,
+                    free_bytes: free,
+                    dead_rows: None,
+                    auto_increment: auto,
+                    row_format,
+                    engine,
+                    created,
+                    updated,
+                    freshness: freshness.clone(),
+                }
+            },
+        )
+        .collect();
+    Ok(SchemaStats { tables })
 }
 
 async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbError> {

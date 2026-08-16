@@ -58,6 +58,7 @@ use schemaic_core::schema::{
     TriggerLevel, TriggerTiming, ViewOptions, Volatility,
 };
 use schemaic_core::sql;
+use schemaic_core::stats::{Freshness, IndexStats, SchemaStats, TableStats};
 use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
@@ -646,6 +647,134 @@ pub(crate) async fn fetch_table_list(db: &Db, database: &str) -> Result<DbSchema
         tables,
         ..Default::default()
     })
+}
+
+/// Sizes and row estimates for every relation that **has** storage, per
+/// namespace.
+///
+/// `reltuples` is `-1` on a relation that has never been analyzed, and `-1` is
+/// not a row count — it is the catalogue saying it doesn't know, so it becomes
+/// `NULL` here and `None` in the model rather than a negative number nobody
+/// checks for.
+///
+/// Only `r` (ordinary) and `m` (materialized view) are asked for a size. A
+/// **partitioned** parent (`p`) has no storage of its own — `pg_table_size`
+/// would return a truthful `0` that reads as "this 40 GB table is empty" — so it
+/// is listed with null sizes; its partitions are ordinary relations and appear
+/// in their own right. Foreign tables (`f`) are excluded for the same reason.
+/// Plain views (`v`) are not here at all, having neither rows nor bytes.
+fn table_stats_sql() -> String {
+    format!(
+        "SELECT n.nspname, c.relname, \
+                CASE WHEN c.reltuples < 0 THEN NULL ELSE c.reltuples::bigint END, \
+                CASE WHEN c.relkind = 'p' THEN NULL ELSE pg_table_size(c.oid) END, \
+                CASE WHEN c.relkind = 'p' THEN NULL ELSE pg_indexes_size(c.oid) END, \
+                s.n_dead_tup, \
+                GREATEST(s.last_analyze, s.last_autoanalyze) \
+         FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid \
+         WHERE c.relkind IN ('r','m','p') AND {} \
+         ORDER BY n.nspname, c.relname",
+        user_schema_filter("n.nspname")
+    )
+}
+
+/// Per-index size and scan count. The primary key's index is renamed `PRIMARY`
+/// exactly as [`index_list_sql`] does it, so the properties surface and the
+/// designer name the same index the same way.
+fn index_stats_sql() -> String {
+    format!(
+        "SELECT n.nspname, c.relname, \
+                CASE WHEN ix.indisprimary THEN 'PRIMARY' ELSE ic.relname END, \
+                pg_relation_size(ic.oid), si.idx_scan, \
+                ix.indisprimary, ix.indisunique \
+         FROM pg_index ix \
+         JOIN pg_class c ON c.oid = ix.indrelid \
+         JOIN pg_class ic ON ic.oid = ix.indexrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_stat_all_indexes si ON si.indexrelid = ix.indexrelid \
+         WHERE {} \
+         ORDER BY n.nspname, c.relname, ic.relname",
+        user_schema_filter("n.nspname")
+    )
+}
+
+/// The PostgreSQL half of [`Db::fetch_table_stats`].
+///
+/// Both queries go through [`query_all_optional`]: the `pg_stat_*` views can be
+/// restricted or absent, and a properties panel is not worth failing a whole
+/// fetch over.
+pub(crate) async fn fetch_table_stats(db: &Db, database: &str) -> Result<SchemaStats, DbError> {
+    let client = connect_to(db, database).await?;
+
+    let mut by_table: HashMap<(String, String), Vec<IndexStats>> = HashMap::new();
+    for r in query_all_optional(&client, &index_stats_sql()).await? {
+        by_table
+            .entry((cell(&r, 0), cell(&r, 1)))
+            .or_default()
+            .push(IndexStats {
+                name: cell(&r, 2),
+                bytes: num(&r, 3),
+                cardinality: None, // PostgreSQL keeps per-column n_distinct, not this.
+                scans: num(&r, 4),
+                is_primary: flag(&r, 5),
+                is_unique: flag(&r, 6),
+            });
+    }
+
+    let tables = query_all_optional(&client, &table_stats_sql())
+        .await?
+        .into_iter()
+        .map(|r| {
+            let (ns, name) = (cell(&r, 0), cell(&r, 1));
+            let rows = num(&r, 2);
+            let analyzed = opt(&r, 6);
+            // "Never analyzed" is a claim about the table, and it explains a
+            // *missing* estimate. With an estimate in hand and no timestamp —
+            // a stats reset, or a figure VACUUM set — saying it would
+            // contradict the number right next to it, so that case says
+            // nothing instead.
+            let freshness = match (&analyzed, rows) {
+                (Some(_), _) => Freshness::Analyzed(analyzed.clone()),
+                (None, None) => Freshness::Analyzed(None),
+                (None, Some(_)) => Freshness::Unknown,
+            };
+            TableStats {
+                indexes: by_table
+                    .remove(&(ns.clone(), name.clone()))
+                    .unwrap_or_default(),
+                table: name,
+                schema: Some(ns),
+                rows,
+                exact_rows: None,
+                data_bytes: num(&r, 3),
+                index_bytes: num(&r, 4),
+                // PostgreSQL has no "allocated but unused" figure to report;
+                // dead tuples are how it expresses the same idea.
+                free_bytes: None,
+                dead_rows: num(&r, 5),
+                auto_increment: None,
+                row_format: None,
+                engine: None,
+                created: None,
+                updated: None,
+                freshness,
+            }
+        })
+        .collect();
+    Ok(SchemaStats { tables })
+}
+
+/// The PostgreSQL half of [`Db::count_rows`].
+pub(crate) async fn count_rows(db: &Db, database: &str, sql: &str) -> Result<u64, DbError> {
+    let client = connect_to(db, database).await?;
+    query_all(&client, sql)
+        .await?
+        .first()
+        .and_then(|r| opt(r, 0))
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| DbError::Query("COUNT(*) returned no row".into()))
 }
 
 pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, DbError> {
@@ -1749,6 +1878,26 @@ fn expr_key(def: &str) -> String {
 
 fn cell(row: &[Option<String>], i: usize) -> String {
     row.get(i).and_then(|c| c.clone()).unwrap_or_default()
+}
+
+/// Column `i` as an owned `String`, keeping the NULL — the distinction
+/// [`cell`] flattens away, and the one the statistics model is built on: a
+/// missing figure and an empty one mean different things there.
+fn opt(row: &[Option<String>], i: usize) -> Option<String> {
+    row.get(i).and_then(|c| c.clone()).filter(|s| !s.is_empty())
+}
+
+/// Column `i` as a count. `None` for NULL, for anything unparseable, and for a
+/// negative — the catalogue writes `-1` for "unknown", which must not survive as
+/// a number.
+fn num(row: &[Option<String>], i: usize) -> Option<u64> {
+    opt(row, i)?.parse().ok()
+}
+
+/// Column `i` as a boolean. `simple_query` returns everything as text, so a
+/// PostgreSQL `bool` arrives as `t` or `f`.
+fn flag(row: &[Option<String>], i: usize) -> bool {
+    opt(row, i).as_deref() == Some("t")
 }
 
 /// Map a PostgreSQL wire type to a human SQL type name. See [`pg_type_name_str`].

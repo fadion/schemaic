@@ -445,6 +445,28 @@ pub fn format_bytes(n: u64) -> String {
     format!("{s} {}", UNITS[unit])
 }
 
+/// The statement behind **Count rows** — the one figure every engine can answer
+/// exactly, including the one that publishes no statistics at all.
+///
+/// Built here rather than three times in the db crate so the quoting has one
+/// spelling: [`crate::export::ident_sql`], unconditional and quote-doubling,
+/// because this is SQL that is executed rather than read.
+///
+/// It is a plain `COUNT(*)` with no cap and no `WHERE`, and on a large table it
+/// is a full scan that can take a while — which is exactly why it is a button
+/// the user presses rather than something the properties surface does on open.
+pub fn count_rows_sql(schema: Option<&str>, table: &str, dialect: SqlDialect) -> String {
+    let name = match schema {
+        Some(ns) => format!(
+            "{}.{}",
+            crate::export::ident_sql(ns, dialect),
+            crate::export::ident_sql(table, dialect)
+        ),
+        None => crate::export::ident_sql(table, dialect),
+    };
+    format!("SELECT COUNT(*) FROM {name}")
+}
+
 /// A duration in seconds as the shortest sensible unit: `30s`, `5m`, `1h`,
 /// `24h`, `2d`. For naming a staleness window, not for precision.
 pub fn format_age(secs: u64) -> String {
@@ -860,6 +882,42 @@ mod tests {
         assert!(md.contains("orders"), "{md}");
         assert!(!md.contains(" 0 "), "no fabricated zeroes: {md}");
         assert!(!md.contains("B\n"), "no fabricated sizes: {md}");
+    }
+
+    // ── The exact count ──────────────────────────────────────────────────────
+
+    #[test]
+    fn a_count_is_quoted_in_the_engines_own_dialect() {
+        assert_eq!(
+            count_rows_sql(None, "orders", SqlDialect::MySql),
+            "SELECT COUNT(*) FROM `orders`"
+        );
+        assert_eq!(
+            count_rows_sql(None, "orders", SqlDialect::Sqlite),
+            "SELECT COUNT(*) FROM \"orders\""
+        );
+    }
+
+    #[test]
+    fn a_namespace_qualifies_the_count() {
+        assert_eq!(
+            count_rows_sql(Some("sales"), "orders", SqlDialect::Postgres),
+            "SELECT COUNT(*) FROM \"sales\".\"orders\""
+        );
+    }
+
+    #[test]
+    fn a_name_that_could_break_out_is_quoted_shut() {
+        // Unconditional quoting, doubling the quote character — the executed-SQL
+        // rule, not the readable-SQL one.
+        assert_eq!(
+            count_rows_sql(None, "we`ird", SqlDialect::MySql),
+            "SELECT COUNT(*) FROM `we``ird`"
+        );
+        assert_eq!(
+            count_rows_sql(Some("s\"ales"), "or\"ders", SqlDialect::Postgres),
+            "SELECT COUNT(*) FROM \"s\"\"ales\".\"or\"\"ders\""
+        );
     }
 
     // ── Capability ───────────────────────────────────────────────────────────
