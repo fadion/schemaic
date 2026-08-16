@@ -2249,14 +2249,27 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   next press closes nothing instead of opening. Six tests in `widgets::menu_key_tests` pin it,
   including `a_dismissed_menu_is_no_longer_owned` and `a_cursor_menu_belongs_to_no_trigger` — a
   right-click menu sets the anchor to `None` on this same channel. Each trigger states its anchor
-  **once** (`grid_toolbar`'s `anchor_below`, `status_menu_seg`'s `anchor_here`) because the value
-  that *places* the panel is the value that *identifies* it: written twice, a pixel of drift would
-  open the menu correctly and silently refuse to toggle it shut.
+  **once** (`grid_toolbar`'s `anchor_below`, `status_menu_seg`'s `anchor_here`,
+  `suggest_chevron`'s `anchor_now`) because the value that *places* the panel is the value that
+  *identifies* it: written twice, a pixel of drift would open the menu correctly and silently refuse
+  to toggle it shut. Recomputed on each press rather than remembered, so it is the *current* rect
+  that must match — `suggest_chevron` sits in a scrolling modal body, and scrolling with its menu up
+  moves the chevron out from under it, at which point reopening at the new position is the better
+  answer than closing. Which way the test fails matters more than its exactness.
   A tag beside the channel is what this replaced, and why it isn't the pattern: the status-bar
   segments carried a `menu_owner: RwSignal<u8>` written only by the segments themselves, so it went
   stale the moment anything else filled the channel — open a segment's menu, right-click a grid
-  cell, press the segment again, and it closed the cell's menu instead of opening its own. Both
+  cell, press the segment again, and it closed the cell's menu instead of opening its own. All three
   surfaces ask the anchor now.
+- **A trigger that toggles must also stop its own `PointerDown`**, and the two halves are not
+  alternatives. The workspace root closes `popup_menu` on any pointer-down (`lib.rs`, the same
+  handler that clears `keyboard_nav`), so without `.on_event_stop(EventListener::PointerDown, |_| {})`
+  the press closes the menu *before* the click arrives and the click reopens it — down closes, up
+  reopens, and the trigger never toggles however it decides. That was `suggest_chevron`'s bug, and
+  it is a different one from the grid icons', which had the guard and no toggle: there the menu
+  never closed at all. Guard without toggle re-opens what was never closed; toggle without guard
+  closes what the click then reopens. The status-bar segments have carried both for as long as they
+  have toggled.
 - **Not every menu can be *opened* from the keyboard**, which is a separate thing from navigating
   one. A menu on a ringed control can be — `suggest_chevron`, the Live Monitor's Export dropdown,
   and the grid toolbar's Copy / Save / AI dropdowns since the strip gained its ring — and the
