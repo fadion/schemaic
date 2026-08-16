@@ -2186,6 +2186,19 @@ pub fn workspace(ui: Ui) -> impl IntoView {
         schema_settings_overlay(ui.clone()),
         context_menu_overlay(ui.clone()),
         find_overlay(ui.clone()),
+        // **Before the confirm below, because it raises one.** Siblings paint in
+        // tuple order, so a modal that can put a question up has to come *first*
+        // or its own panel covers the question: right-click a connection →
+        // Delete, and the "are you sure" opened behind Manage Connections, its
+        // backdrop dimming the modal that was still on top of it. The rule is
+        // the one the popup menu states at the end of this tuple — this is the
+        // second instance of it, and the reason it is worth stating as a rule.
+        //
+        // Nothing else in the group below is reachable from here (the schema
+        // editors are opened from the tree, and a full-screen backdrop keeps the
+        // title bar out of reach while this is up), so moving it up costs
+        // nothing else its place.
+        manage_modal(ui.clone()),
         // Error modal + open-transaction prompt + the shared confirm share one
         // tuple element, for the same 16-arity reason as monitor/ERD below (and
         // with the same fill-only-when-open wrapper, or it would eat every click).
@@ -2202,7 +2215,6 @@ pub fn workspace(ui: Ui) -> impl IntoView {
             let ddl_preview_open = ui.ddl.preview;
             stack((
                 error_modal_overlay(ui.clone()),
-                tx_prompt_overlay(ui.clone()),
                 confirm_overlay(ui.clone()),
                 import_view::import_overlay(ui.clone()),
                 table_designer::table_designer_overlay(ui.clone()),
@@ -2223,6 +2235,15 @@ pub fn workspace(ui: Ui) -> impl IntoView {
                 }),
                 object_editor::object_editor_overlay(ui.clone()),
                 ddl_preview::ddl_preview_overlay(ui.clone()),
+                // **Last in this group, because the DDL preview raises it.**
+                // `run_ddl` asks about every open transaction on the connection
+                // *before* applying (`tx::ddl_blocking_tabs`), and the preview is
+                // still on screen while it asks — painted earlier, the question
+                // sat entirely behind the preview's own backdrop, so an Apply
+                // looked hung on "Applying…" with nothing to answer and no way to
+                // reach it. Same rule as `manage_modal` above and the popup menu
+                // below: whatever can raise a question comes first.
+                tx_prompt_overlay(ui.clone()),
             ))
             .style(move |s| {
                 if err_open.get()
@@ -2264,7 +2285,6 @@ pub fn workspace(ui: Ui) -> impl IntoView {
         ai_settings_overlay(ui.clone()),
         theme_settings_overlay(ui.clone()),
         help_overlay(ui.clone()),
-        manage_modal(ui.clone()),
         // **Last on purpose.** A sibling paints in tuple order, so anything after
         // this would cover it — and the shared popup menu is opened from *inside*
         // modals too (the designer's type shortcut), where being painted behind
