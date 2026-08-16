@@ -734,6 +734,24 @@ pub(crate) async fn fetch_schema(db: &Db) -> Result<DbSchema, DbError> {
                     table_foreign_keys(conn, &name)?,
                 )
             };
+            // The table's own `CREATE` text, plus the `CREATE INDEX` statements
+            // SQLite stores separately — a table's DDL is incomplete without
+            // them, and Copy DDL is the one place that matters. Views keep using
+            // the shared emitter (see `TableInfo::create_sql`).
+            let create_sql = (!is_view).then(|| {
+                let mut out = sql.trim().trim_end_matches(';').to_string();
+                out.push(';');
+                for ix in index_statements(conn, &name)? {
+                    out.push('\n');
+                    out.push_str(ix.trim().trim_end_matches(';'));
+                    out.push(';');
+                }
+                Ok::<_, DbError>(out)
+            });
+            let create_sql = match create_sql {
+                Some(r) => Some(r?),
+                None => None,
+            };
             tables.push(TableInfo {
                 name,
                 schema: None,
@@ -741,6 +759,7 @@ pub(crate) async fn fetch_schema(db: &Db) -> Result<DbSchema, DbError> {
                 indexes,
                 foreign_keys,
                 is_view,
+                create_sql,
                 // The **body**, not the statement — see `view_body_of`.
                 view_definition: is_view.then(|| view_body_of(&sql)).flatten(),
                 view_options: None,
@@ -867,6 +886,25 @@ fn table_columns(conn: &SqliteConn, table: &str) -> Result<Vec<ColumnInfo>, DbEr
         });
     }
     Ok(out)
+}
+
+/// The `CREATE INDEX` statements SQLite stores for `table`, in catalogue order.
+///
+/// Only the ones the user wrote: an index SQLite created itself to back a
+/// `UNIQUE` or `PRIMARY KEY` constraint has a **NULL** `sql`, because it is part
+/// of the table's own declaration and re-issuing it would be an error.
+fn index_statements(conn: &SqliteConn, table: &str) -> Result<Vec<String>, DbError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT sql FROM sqlite_master \
+             WHERE type = 'index' AND tbl_name = ?1 AND sql IS NOT NULL \
+             ORDER BY name",
+        )
+        .map_err(query_err)?;
+    let rows = stmt
+        .query_map([table], |r| r.get::<_, String>(0))
+        .map_err(query_err)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(query_err)
 }
 
 /// A view's **body** — the `SELECT` — read out of the `CREATE VIEW` statement
@@ -1861,6 +1899,106 @@ mod tests {
         ] {
             assert_eq!(view_body_of(sql), None, "{sql:?}");
         }
+    }
+
+    /// Copy DDL on a **table** hands back SQLite's own text, plus the
+    /// `CREATE INDEX` statements it stores separately.
+    ///
+    /// The assertion is that SQLite *accepts the output*, because the bug this
+    /// replaces was not a formatting difference: reconstructing from the model
+    /// emitted `AUTO_INCREMENT` (which SQLite silently swallows into the type
+    /// name), MySQL's inline `KEY name (cols)` (a syntax error), and an empty
+    /// column list for an expression index — while dropping the foreign key,
+    /// `WITHOUT ROWID`, and the partial index's predicate outright.
+    #[tokio::test]
+    async fn copy_ddl_on_a_table_is_sqlites_own_text_and_replays() {
+        let (keeper, db) = shared_memory("table_ddl");
+        keeper
+            .execute_batch(
+                "CREATE TABLE artist (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                 CREATE TABLE album (
+                     id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                     title     TEXT NOT NULL COLLATE NOCASE,
+                     artist_id INTEGER REFERENCES artist ON DELETE CASCADE,
+                     slug      TEXT GENERATED ALWAYS AS (lower(title)) VIRTUAL,
+                     CHECK (length(title) > 0)
+                 );
+                 CREATE INDEX album_lower ON album(lower(title));
+                 CREATE INDEX album_partial ON album(title) WHERE artist_id IS NOT NULL;
+                 CREATE TABLE pair (a TEXT, b TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID;",
+            )
+            .unwrap();
+        let schema = fetch_schema(&db).await.expect("schema");
+        let ddl_of = |name: &str| {
+            schema
+                .tables
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name}"))
+                .create_ddl(schemaic_core::intel::SqlDialect::Sqlite)
+        };
+
+        let album = ddl_of("album");
+        // Everything the model cannot carry, and therefore could not restate.
+        assert!(album.contains("AUTOINCREMENT"), "{album}");
+        assert!(
+            !album.contains("AUTO_INCREMENT"),
+            "MySQL's spelling: {album}"
+        );
+        assert!(album.contains("REFERENCES artist"), "the FK: {album}");
+        assert!(album.contains("ON DELETE CASCADE"), "its action: {album}");
+        assert!(album.contains("COLLATE NOCASE"), "the collation: {album}");
+        assert!(
+            album.contains("CHECK (length(title) > 0)"),
+            "the check: {album}"
+        );
+        // The separately-stored index statements, including the ones whose keys
+        // the pragmas report as `lossy`.
+        assert!(album.contains("CREATE INDEX album_lower"), "{album}");
+        assert!(
+            album.contains("lower(title)"),
+            "the expression key: {album}"
+        );
+        assert!(
+            album.contains("WHERE artist_id IS NOT NULL"),
+            "the partial predicate: {album}"
+        );
+        // MySQL's inline index syntax must not appear at all.
+        assert!(!album.contains("KEY \""), "MySQL inline index: {album}");
+
+        assert!(ddl_of("pair").contains("WITHOUT ROWID"));
+
+        // And the whole thing replays: the real test of DDL is that the engine
+        // takes it back.
+        let replay = SqliteConn::open_in_memory().unwrap();
+        for name in ["artist", "album", "pair"] {
+            let sql = ddl_of(name);
+            replay
+                .execute_batch(&sql)
+                .unwrap_or_else(|e| panic!("SQLite rejected its own DDL for {name}: {e}\n{sql}"));
+        }
+    }
+
+    /// The other engines are untouched: with no `create_sql`, `create_ddl` still
+    /// builds from the model exactly as before.
+    #[test]
+    fn a_table_without_its_own_text_still_goes_through_the_shared_emitter() {
+        use schemaic_core::intel::SqlDialect;
+        use schemaic_core::schema::{ColumnInfo, TableInfo};
+        let t = TableInfo {
+            name: "t".into(),
+            columns: vec![ColumnInfo {
+                name: "id".into(),
+                type_name: "int".into(),
+                primary_key: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(t.create_sql, None);
+        let ddl = t.create_ddl(SqlDialect::MySql);
+        assert!(ddl.starts_with("CREATE TABLE `t`"), "{ddl}");
+        assert!(ddl.contains("PRIMARY KEY (`id`)"), "{ddl}");
     }
 
     /// End to end through the real `fetch_schema` and the real DDL emitter,

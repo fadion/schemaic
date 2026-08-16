@@ -467,6 +467,26 @@ pub struct TableInfo {
     /// used to emit `CREATE VIEW`. `None` for base tables (and views whose
     /// definition couldn't be read).
     pub view_definition: Option<String>,
+    /// The engine's **own** `CREATE` text for this table, when it keeps one —
+    /// which of the three only SQLite does (`sqlite_master.sql`), including the
+    /// separate `CREATE INDEX` statements a table's DDL is incomplete without.
+    ///
+    /// [`TableInfo::create_ddl`] returns it verbatim when present, and that is a
+    /// fidelity decision rather than a shortcut. Reconstructing a SQLite table
+    /// from this model emits MySQL's shape and gets it wrong in three ways at
+    /// once: `AUTO_INCREMENT` instead of `AUTOINCREMENT` — which SQLite
+    /// *accepts*, silently, by reading it as part of the type name — MySQL's
+    /// inline `KEY name (cols)`, which SQLite has no syntax for at all, and an
+    /// empty column list for an index whose keys are [`IndexInfo::lossy`]. It
+    /// would also drop what the model doesn't carry: `WITHOUT ROWID`, CHECK
+    /// constraints, column-level collations.
+    ///
+    /// `None` on MySQL and PostgreSQL, where the shared emitter is the answer and
+    /// the model is complete enough to be. It is deliberately **not** used for a
+    /// *view* even on SQLite: there the model genuinely is complete (a name and a
+    /// body), so the emitter's output is both correct and consistent with the
+    /// other engines'.
+    pub create_sql: Option<String>,
     /// For views, everything about them that isn't the SELECT — see
     /// [`ViewOptions`], which exists because redefining a view **replaces** it.
     /// `None` for base tables.
@@ -1754,6 +1774,16 @@ impl TableInfo {
                     "-- View definition for {qname} was not available.\nCREATE VIEW {qname} AS\nSELECT ...;"
                 ),
             };
+        }
+        // The engine's own text wins where it has one — see `create_sql` for why
+        // reconstructing a SQLite table is not merely different but wrong.
+        if let Some(sql) = self
+            .create_sql
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return sql.to_string();
         }
         let mut lines: Vec<String> = Vec::new();
         for c in &self.columns {
