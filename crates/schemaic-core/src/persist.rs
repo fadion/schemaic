@@ -141,6 +141,12 @@ pub struct UiState {
     /// Keys of expanded schema-tree nodes (`db:<name>`, `tbl:<db>:<name>`).
     #[serde(default)]
     pub expanded: Vec<String>,
+    /// Show each table's on-disk size in the schema tree. Default: off — it
+    /// costs a catalogue query per expanded database (see
+    /// [`crate::stats`]), so it is something the user asks for rather than
+    /// something every session pays for.
+    #[serde(default)]
+    pub show_table_sizes: bool,
     /// Names of databases hidden from the schema panel and search. Default: none
     /// hidden (every database is shown).
     #[serde(default)]
@@ -218,6 +224,7 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             expanded: Vec::new(),
+            show_table_sizes: false,
             hidden_dbs: Vec::new(),
             schema_visible: true,
             right_panel: RightPanelState::Ai,

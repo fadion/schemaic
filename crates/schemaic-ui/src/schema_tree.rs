@@ -94,7 +94,13 @@ fn nav_select(nav: Nav, key: String) {
 // `public`), which keeps every MySQL and single-schema key byte-identical to
 // what earlier versions wrote — a saved expansion set still applies.
 
-fn db_key(database: &str) -> String {
+/// The expansion-set key for a database row.
+///
+/// Public because the app needs it too: the size column is fetched only for
+/// *expanded* databases, and that check is a lookup in the same `HashSet` the
+/// tree writes. A second `format!("db:{…}")` over there is exactly the drift
+/// the comment above warns about.
+pub fn db_key(database: &str) -> String {
     format!("db:{database}")
 }
 
@@ -1747,7 +1753,68 @@ fn object_row(
 // A table node: a header row (double-click opens & runs `SELECT *`) over its
 // columns then indexes, shown when expanded. Highlighted while it is the
 // active tab's source table.
+/// The table's on-disk size at the right edge of its row — the size *column*.
+///
+/// This is the half of the properties work that answers a question a modal
+/// cannot: not "how big is this table" but "which of these is the big one",
+/// which needs them all on screen at once.
+///
+/// Renders nothing at all unless the column is on **and** this table has a size,
+/// so a view, a partitioned parent, or an engine that publishes nothing leaves
+/// the row exactly as it was rather than showing a placeholder dash down the
+/// whole tree. `flex_grow` on the spacer pushes it right without giving the
+/// name a fixed width.
+fn size_badge(
+    stats: Option<RwSignal<crate::DbStatsState>>,
+    enabled: RwSignal<bool>,
+    schema: Option<String>,
+    table: String,
+) -> impl IntoView {
+    dyn_container(
+        move || {
+            if !enabled.get() {
+                return None;
+            }
+            let stats = stats?;
+            stats.with(|st| match st {
+                crate::DbStatsState::Loaded(set) => set
+                    .get(schema.as_deref(), &table)
+                    .and_then(|t| t.total_bytes())
+                    .map(schemaic_core::stats::format_bytes),
+                _ => None,
+            })
+        },
+        move |size| match size {
+            None => empty().into_any(),
+            Some(s) => h_stack((
+                empty().style(|s| s.flex_grow(1.0_f32).min_width(6.0)),
+                text(s).style(|s| {
+                    s.font_size(theme::FONT_STATUS)
+                        .color(theme::text_faint())
+                        .flex_shrink(0.0_f32)
+                        .margin_right(6.0)
+                }),
+            ))
+            .style(|s| s.flex_grow(1.0_f32).items_center().min_width(0.0))
+            .into_any(),
+        },
+    )
+    .style(|s| s.flex_grow(1.0_f32).min_width(0.0))
+}
+
 fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl IntoView {
+    // The size column's two inputs, read before `ctx` is destructured. The stats
+    // signal is looked up by database name rather than threaded through
+    // `SchemaTreeCtx`: `db_nodes` is replaced wholesale on a connection switch,
+    // which rebuilds this node anyway, so the handle captured here is always the
+    // live one for the row on screen.
+    let table_sizes = ctx.ui.schema.table_sizes;
+    let db_stats = ctx.ui.schema.db_nodes.with_untracked(|nodes| {
+        nodes
+            .iter()
+            .find(|n| n.database == database)
+            .map(|n| n.stats)
+    });
     let SchemaTreeCtx {
         expanded,
         filter,
@@ -1839,6 +1906,12 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
             theme::text,
             false,
             1.0,
+        ),
+        size_badge(
+            db_stats,
+            table_sizes,
+            source.schema.clone(),
+            table.name.clone(),
         ),
     ))
     .on_double_click_stop(move |_| (open_table)(dbl_source.clone()))

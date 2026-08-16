@@ -31,7 +31,7 @@ mod schema_tree;
 /// The tree-node key builders. Public because the persisted expanded-node set is
 /// the app's to edit (collapsing a database drops every `tbl:<db>:*` key), and
 /// the format belongs to exactly one module.
-pub use schema_tree::{column_key_named, table_key_named, table_key_prefix};
+pub use schema_tree::{column_key_named, db_key, table_key_named, table_key_prefix};
 mod settings;
 mod shortcuts;
 pub mod sql_highlight;
@@ -999,6 +999,10 @@ pub struct ConnNode {
     /// is a glyph flickering for a frame or two, which reads as a rendering
     /// fault rather than as progress — the same call `begin_refresh` makes.
     pub refreshing: RwSignal<bool>,
+    /// This database's table statistics, for the tree's size column. Its own
+    /// lifecycle rather than a field on `schema`, because it is fetched by a
+    /// **separate, slower and optional** query — see [`DbStatsState`].
+    pub stats: RwSignal<DbStatsState>,
 }
 
 impl ConnNode {
@@ -1009,8 +1013,31 @@ impl ConnNode {
             database: database.to_string(),
             schema: cx.create_rw_signal(SchemaState::Loading),
             refreshing: cx.create_rw_signal(false),
+            stats: cx.create_rw_signal(DbStatsState::Idle),
         }
     }
+}
+
+/// Lifecycle of one database's table statistics — the schema tree's size column.
+///
+/// Four states rather than an `Option`, because this signal is also the fetch's
+/// **trigger and its guard**: the app's effect fetches exactly for the nodes
+/// sitting at `Idle`, and moving one to `Loading` is what stops it firing again
+/// on the next tick. Setting a node back to `Idle` is how a refresh asks for
+/// fresh figures.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum DbStatsState {
+    /// Nobody has asked. Where every node starts, and where a refresh puts it
+    /// back.
+    #[default]
+    Idle,
+    Loading,
+    Loaded(schemaic_core::stats::SchemaStats),
+    /// The fetch failed, or this engine publishes no statistics. Either way the
+    /// column stays empty and nothing retries until a refresh — a size column
+    /// that re-queried a failing server on every expand would be worse than no
+    /// column.
+    Unavailable,
 }
 
 /// Text-field signals backing the "Manage Connections" form. `id == None`
@@ -1609,6 +1636,13 @@ pub struct SchemaUi {
     pub active_table: RwSignal<Option<TableSource>>,
     /// Names of databases hidden from the schema panel and search.
     pub hidden_dbs: RwSignal<HashSet<String>>,
+    /// Show each table's on-disk size at the right edge of its tree row.
+    ///
+    /// Off by default and persisted. It is the cheap half of the properties
+    /// work and answers the comparison question a modal can't — "which of these
+    /// is the big one" — but it costs a catalogue query per expanded database,
+    /// so it is opt-in.
+    pub table_sizes: RwSignal<bool>,
     /// Whether the database-visibility menu is open.
     pub db_menu_open: RwSignal<bool>,
     /// Whether the SCHEMA settings menu (Refresh) is open.
@@ -1661,6 +1695,9 @@ pub struct SchemaActions {
     /// rows**. Separate from [`SchemaActions::table_stats`] because it is a full
     /// scan the user asked for, not part of opening the panel.
     pub count_rows: Rc<dyn Fn(PropertiesTarget)>,
+    /// Toggle the schema tree's size column, persisting the choice. Switching it
+    /// on is what makes the app fetch statistics for the expanded databases.
+    pub toggle_table_sizes: Rc<dyn Fn()>,
 }
 
 /// Result of a "Test" of the Manage-Connections draft (host + credentials),

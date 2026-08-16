@@ -1117,6 +1117,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         RwSignal::new(schemaic_ui::PropertiesState::Loading);
     let properties_counting: RwSignal<bool> = RwSignal::new(false);
     let properties_count_err: RwSignal<Option<String>> = RwSignal::new(None);
+    // The schema tree's size column (persisted; see `UiState::show_table_sizes`).
+    let table_sizes = RwSignal::new(ui_state.show_table_sizes);
 
     // AI panel state. `ai_session` holds the live CLI conversation (bound to a
     // connection); the reader task streams transcript snapshots over a channel
@@ -3153,6 +3155,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             word_wrap: word_wrap.get_untracked(),
             restore_tabs: restore_tabs.get_untracked(),
             live_validate: live_validate.get_untracked(),
+            show_table_sizes: table_sizes.get_untracked(),
         });
     });
 
@@ -3163,6 +3166,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         create_effect(move |_| {
             schema_visible.get();
             right_panel.get();
+            table_sizes.get();
             save_ui();
         });
     }
@@ -3548,6 +3552,11 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             // database is not necessarily a *current* one while this is out.
             let refreshing = node.refreshing;
             refreshing.set(true);
+            // Sizes go back to unasked, so the tree's size column refetches
+            // alongside the schema. Refresh is the one gesture that means "these
+            // figures are out of date", and it is also the only thing that ever
+            // retries a database whose statistics fetch failed.
+            node.stats.set(schemaic_ui::DbStatsState::Idle);
             let seq = next_fetch_seq.get() + 1;
             next_fetch_seq.set(seq);
             fetch_seq.borrow_mut().insert(node.id, seq);
@@ -3956,6 +3965,61 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             });
         })
     };
+
+    let toggle_table_sizes: Rc<dyn Fn()> = Rc::new(move || table_sizes.update(|on| *on = !*on));
+
+    // Fill the schema tree's size column, one database at a time and only for
+    // the ones the user can actually see: sizes on, and the database expanded.
+    //
+    // `ConnNode::stats` is both the trigger and the guard — this fetches exactly
+    // the nodes at `Idle` and moves each to `Loading` before spawning, so
+    // re-running (on another expand, or a connection switch) cannot double-fetch
+    // a database already in flight. Nothing here retries a failure: a size column
+    // that re-queried a failing server every time you expanded a node would cost
+    // more than it is worth.
+    {
+        let db_for = db_for.clone();
+        let handle = handle.clone();
+        create_effect(move |_| {
+            if !table_sizes.get() {
+                return;
+            }
+            let open = expanded.get();
+            let conn_id = active_conn.get();
+            let pending: Vec<(String, RwSignal<schemaic_ui::DbStatsState>)> =
+                db_nodes.with(|nodes| {
+                    nodes
+                        .iter()
+                        .filter(|n| open.contains(&schemaic_ui::db_key(&n.database)))
+                        .filter(|n| n.stats.get_untracked() == schemaic_ui::DbStatsState::Idle)
+                        .map(|n| (n.database.clone(), n.stats))
+                        .collect()
+                });
+            for (database, slot) in pending {
+                let Ok(db) = db_for(conn_id) else {
+                    continue;
+                };
+                // An engine with nothing to publish is settled here rather than
+                // by a round trip that would come back empty and be retried on
+                // the next expand.
+                if !schemaic_core::stats::supports_table_stats(db.engine().dialect()) {
+                    slot.set(schemaic_ui::DbStatsState::Unavailable);
+                    continue;
+                }
+                slot.set(schemaic_ui::DbStatsState::Loading);
+                let report =
+                    create_ext_action(cx, move |res: Option<schemaic_core::stats::SchemaStats>| {
+                        slot.set(match res {
+                            Some(set) => schemaic_ui::DbStatsState::Loaded(set),
+                            None => schemaic_ui::DbStatsState::Unavailable,
+                        });
+                    });
+                handle.spawn(async move {
+                    report(db.fetch_table_stats(&database).await.ok());
+                });
+            }
+        });
+    }
 
     let trigger_functions: schemaic_ui::TriggerFnFn = {
         let handle = handle.clone();
@@ -5557,6 +5621,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             expanded,
             active_table,
             hidden_dbs,
+            table_sizes,
             db_menu_open,
             schema_menu_open,
             db_menu_anchor: RwSignal::new(floem::kurbo::Point::ZERO),
@@ -5585,6 +5650,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             trigger_source,
             table_stats,
             count_rows,
+            toggle_table_sizes,
         }),
         // Reset on every open (`import_view::open_import`), so one bundle serves
         // every table rather than a per-open scope that would need disposing.
