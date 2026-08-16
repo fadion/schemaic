@@ -300,7 +300,9 @@ pub fn ident_if_needed(name: &str, dialect: SqlDialect) -> String {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
         && !name.as_bytes()[0].is_ascii_digit()
-        && !crate::intel::is_reserved_word(name, dialect);
+        // The identifier question, not the alias one: `CAST`/`IF`/`RAISE` are
+        // valid SQLite aliases but cannot be a bare column or table name.
+        && !crate::intel::must_quote_ident(name, dialect);
     if plain {
         name.to_string()
     } else {

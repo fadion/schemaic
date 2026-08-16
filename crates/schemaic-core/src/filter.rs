@@ -284,7 +284,10 @@ fn needs_quoting(name: &str, dialect: SqlDialect) -> bool {
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
         }
     };
-    !bare || crate::intel::is_reserved_word(name, dialect)
+    // `must_quote_ident`, not `is_reserved_word`: this name goes into a statement
+    // as a table or column, where SQLite refuses a few words it would accept as
+    // an alias.
+    !bare || crate::intel::must_quote_ident(name, dialect)
 }
 
 /// Quote `name` only if it needs it.
