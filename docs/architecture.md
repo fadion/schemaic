@@ -2027,7 +2027,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   added two columns, opened two file dialogs, started two bulk imports); and `.focus(…)` resolves
   by exact id too, so a face decorated with `.tooltip()` — a fresh `ViewId` — put an id in the ring
   that carried no outline. A caller therefore styles only the *face* (padding, hover, the click
-  listener) and never applies `button_focus_ring` itself.
+  listener, its tooltip) and never applies `button_focus_ring` itself;
+  `widgets::a_ring_button_registers_a_wrapper_not_the_face_it_was_given` pins which of the two views
+  is the one registered.
   Order is `NAV_TAB` → `LIST_TAB` → the form (10, 20, … within a section, by 100 between them, up
   to `FIXED_TAB_END`) → `VALUE_TAB` + `i * ROW_TAB_STRIDE` for a growing list → `ACTION_TAB` for
   the footer → `TITLE_CLOSE_TAB` for the title bar's ✕ (last, since
@@ -2073,6 +2075,20 @@ Re-introducing the anti-patterns these guard against is a regression:
   handing the keyboard back, a field unmounting under them), so the last real gesture stands.
   It rides in a detached-scope `thread_local` signal, the shape `window_size` and `pointer_released`
   already use. Buttons, the Settings toggle switch and the colour swatches all read it.
+  **Gate the ring on it and nothing else — least of all the answers to floem's own defaults.**
+  `settings::themed_toggle` briefly put its whole focus block behind the flag's early return, and
+  the flag being false is exactly the mouse path, so a click on the switch got floem's
+  `ToggleButtonClass` styling back: a 1px `#8c8c8c` border (grey around the dark off-track,
+  invisible on the lit on-track), the faint magenta ring users reported, and a near-white
+  `#eae6ec` track when focused *and* hovered. All three come from `floem-0.2.0`'s
+  `theme::default_theme` — the magenta is `border_color(#724a8c)` applied on plain **`.focus`**, not
+  `.focus_visible`, which is why the pointer saw it and the keyboard never did. The border is
+  answered with `.border(0.0)` rather than a transparent colour: the handle is positioned from
+  `layout.size`, so the width costs no geometry, and a border that cannot paint is a border floem's
+  `.focus` rule cannot colour. `button_focus_ring`'s identical early return is safe only because it
+  decorates a bare wrapper container, and floem's border/focus defaults reach widgets through
+  **classes** (`ToggleButtonClass`, `ButtonClass`, `TextInputClass`), never plain containers — so a
+  view sitting on a classed widget has to answer those defaults on every path, not inside a branch.
   **The outline follows the face's corner radius, and `in_ring_button` has to be told it.** Floem
   strokes an outline at *the painting view's* `border_radius` (`view::paint_outline`), and the ring
   member is a wrapper around the face — so with no radius on the wrapper every rounded button in
@@ -2210,6 +2226,31 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   The grid's toolbar dropdowns and the status-bar segments were always right: floem's `on_move`
   fires during **layout** with the view's window origin, not on pointer movement, so what they
   anchor to is the widget and not the cursor.
+- **`popup_anchor` carries the menu's *identity*, not only its placement — so an opener must write
+  it immediately before `popup_menu`.** One channel serves eleven openers across six modules
+  (`connection_form`, `editor_pane`, `grid` ×5, `lib`'s status bar, `monitor_view`,
+  `table_designer::suggest_chevron`, `tabs`) and nothing in it says who filled it, so the grid
+  toolbar's AI / Copy / Save icons ran "dismiss, then open" unconditionally and a second press
+  rebuilt an identical panel instead of closing it. The menus that already toggled could not lend
+  their answer: the schema panel's eye and gear, the connection switcher and the tab selector each
+  render their *own* menu and so keep a private `RwSignal<bool>` (`db_menu_open`/`schema_menu_open`
+  /`conn_menu_open`/`active_db_menu_open`), while the status-bar segments do ride this channel but
+  carry a separate `menu_owner: RwSignal<u8>` tag beside it. The grid's icons instead ask the
+  anchor — `grid::menu_anchored_at(open, anchor, mine)`, comparing `popup_anchor` against the
+  `PopupAnchor::BelowIcon(…)` the icon would set itself, which is why `PopupAnchor` derives
+  `PartialEq` and why its rustdoc calls that derive load-bearing rather than a convenience. The
+  marker is self-invalidating **only because every opener overwrites the anchor as it opens**:
+  there is no separate flag to go stale and nothing for the other ten to reset. An opener that
+  fills `popup_menu` without setting `popup_anchor` first therefore hands its menu to whoever
+  opened last, silently, and the test that would catch it doesn't exist.
+  `open` (is the channel non-empty) is checked **before** the anchor, which is the reason this is a
+  named function rather than an inline `&&`: closing clears `popup_menu` but leaves `popup_anchor`
+  naming the last opener, so an anchor-only test reports the menu still up after Escape and the
+  next press closes nothing instead of opening. Five tests in `grid::tests` pin it, including
+  `a_dismissed_menu_is_no_longer_owned` and `a_cursor_menu_belongs_to_no_icon` — a right-click menu
+  sets the anchor to `None` on this same channel. The three icons share one `anchor_below` closure
+  because the value that *places* the panel is the value that *identifies* it: written twice, a
+  pixel of drift would open the menu correctly and silently refuse to toggle it shut.
 - **Not every menu can be *opened* from the keyboard**, which is a separate thing from navigating
   one. A menu on a ringed control can be — `suggest_chevron`, the Live Monitor's Export dropdown,
   and the grid toolbar's Copy / Save / AI dropdowns since the strip gained its ring — and the
@@ -2237,6 +2278,12 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   Without it the surface that raised the menu goes **keyboard-dead**: the panel is a `focus_root`
   with no other root above it in the workspace, so its teardown drops focus and the next key reaches
   nothing. Both the grid toolbar's F6 and the tree's Shift+F10 hit exactly that.
+  **An icon closing its own menu deliberately does not arm the slot.** The slot is consumed by the
+  next `menu_panel` as it *builds*, and a toggle-shut builds no panel, so a return armed there would
+  sit in the thread-local waiting for the next keyboard-opened menu anywhere in the app to collect
+  it. `grid_toolbar`'s `close_mine` hands the keyboard back directly instead — `focus_icon`, by
+  tabindex and deferred, because the strip may have been rebuilt by the action just run and floem's
+  focus request has no existence check — and still only when `keyboard_nav` is true.
 
 ## Data grid (results grid)
 
@@ -2422,6 +2469,27 @@ for keyboard nav.
   left focused on nothing — the next Ctrl+F reached nobody until the user clicked a cell. The bar
   can't do it either, being built a level up where `focus_id` doesn't exist, which is why the rule
   lives on the flag in `grid_view`. A new panel-level bar over the grid inherits this obligation.
+- **Every control on the results toolbar carries a tooltip**, and where it sits is a correctness
+  rule. The eight are commit ✓, discard ✗, ＋, －, clone, ✦ AI, copy and save; before they were added
+  nothing in the strip was labelled but the commit count, which is a bare number saying neither what
+  it counts nor what pressing it does, and the glyphs doing the least reversible work (discard,
+  delete, AI) are among the least self-describing. The tip goes on the **face, before
+  `in_strip_button` wraps it**: `.tooltip()` allocates a fresh `ViewId` and it is the *wrapper* the
+  ring registers and paints the focus outline on, so decorating the wrapper puts an id in the ring
+  that paints nothing (the hazard `row_button` documents — see *Buttons are in the ring too*). The
+  commit tip is built from that rebuild's count and busy flag rather than read reactively, since the
+  `dyn_container` around it already keys on both and replaces face and tip together; the AI tip *is*
+  reactive, because `ai_busy` dims its sparkle without rebuilding the block and a tip still offering
+  to generate would be the only thing on screen disagreeing with the greyed glyph. Copy is
+  deliberately **not** labelled Ctrl+C: that key copies the selection straight to the clipboard,
+  which is a different action from the format menu the icon raises. `－` and clone keep their tip
+  while dimmed and it names the selection, which is also the answer to why they are inert.
+  `toolbar_sep` takes 8px of horizontal margin on top of the cluster's own 3px gap: the icons carry
+  a padded hitbox and no visible edge, so a divider set at the plain group gap reads as *part of*
+  the group beside it rather than the boundary between two.
+- **The three dropdown icons toggle.** A second press on AI, copy or save closes the menu it opened
+  instead of dismissing and rebuilding an identical panel — the mechanism, and the ordering rules
+  that make it correct, are under *Popup menus* (`popup_anchor` carries identity).
 - **Row actions: new / clone / delete.** Gated on a single writable table (`EditModel::insert_target()`;
   hidden for joins / read-only), committed in the shared `GridWrite` transaction (`commit_writes` runs
   **deletes → updates → inserts**, each exactly 1 row). A keyless SQLite table opened through its
