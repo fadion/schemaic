@@ -49,7 +49,36 @@ struct Nav {
     /// `with_nav_scroll`. Set only by keyboard navigation — NOT by focus-gain — so
     /// clicking a row to focus the tree never yanks the viewport to another row.
     reveal: RwSignal<Option<String>>,
+    /// Where the cursor row's **content** starts along the bottom edge, in window
+    /// coords — where a menu raised from the keyboard should drop from. Its
+    /// content and not its box, because a row spans the whole panel and the panel
+    /// is flush left, so every row's own x is 0.
+    ///
+    /// Focus lives on the tree container, not on a row, so a key pressed in the
+    /// tree has no idea where the cursor is on screen, and a context menu it
+    /// raises has to appear at the row it is about rather than at whatever the
+    /// pointer last touched.
+    ///
+    /// From `on_move`/`on_resize` on the row, which is how every other anchored
+    /// menu in the app finds its widget: floem fires `on_move` **during layout**
+    /// with the view's *window* origin, so it stays true across scrolling, and
+    /// `on_resize` supplies the height (its own rect is view-local, so only the
+    /// size is taken from it).
+    cursor_at: RwSignal<Option<(f64, f64)>>,
+    /// How to raise the cursor row's context menu — see [`CtxOpener`]. Published
+    /// beside `cursor_view` by the same effect, so the two always describe the
+    /// same row.
+    cursor_menu: RwSignal<Option<CtxOpener>>,
 }
+
+/// A row's context menu, as a function of **where** to open it: `None` at the
+/// pointer (a right-click), `Some(window coords)` at a named place (Shift+F10,
+/// which opens at the row itself).
+///
+/// One per row that has a menu, called by that row's `on_secondary_click_stop`
+/// and published to [`Nav::cursor_menu`] while the row is the cursor — so the two
+/// routes cannot drift into offering different menus for the same row.
+type CtxOpener = Rc<dyn Fn(Option<(f64, f64)>)>;
 
 /// Move the nav cursor to `key` AND request it scrolled into view (keyboard nav).
 fn nav_select(nav: Nav, key: String) {
@@ -511,8 +540,37 @@ fn is_nav_selected(nav: Nav, key: &str) -> bool {
 
 // Attach a self-scroll-into-view effect to a row's view: whenever it becomes the
 // focused nav cursor, scroll it into the tree viewport. Returns the same view.
-fn with_nav_scroll(view: AnyView, nav: Nav, key: String) -> AnyView {
+fn with_nav_scroll(view: AnyView, nav: Nav, key: String, menu: Option<CtxOpener>) -> AnyView {
     let id = view.id();
+    // Where this row is, kept live by layout. `on_move` is the window origin and
+    // `on_resize`'s rect is view-local, so only its *height* is taken.
+    let origin = RwSignal::new(Point::ZERO);
+    let height = RwSignal::new(0.0_f64);
+    let view = view
+        .on_move(move |p| origin.set(p))
+        .on_resize(move |r| height.set(r.height()))
+        .into_any();
+    // The cursor row publishes where it is and what its menu is, so Shift+F10 —
+    // which arrives at the tree *container*, focus never being on a row — can
+    // open the right menu in the right place. Both geometry signals are read
+    // **inside** the effect, so a scroll that moves the row refreshes this
+    // rather than leaving a stale point behind.
+    let cursor_key = key.clone();
+    create_effect(move |_| {
+        if is_nav_selected(nav, &cursor_key) {
+            let o = origin.get();
+            // **The row's content, not the row.** A tree row spans the whole
+            // panel and the panel is flush against the window's left edge, so a
+            // row's own x is 0 at every depth and the menu hugged the edge. The
+            // indent that makes the tree a tree is the row's `padding_left`
+            // (`tree_row`), which `get_content_rect` reports — read from the same
+            // layout that positioned the row rather than passed down from six
+            // call sites that each compute it their own way.
+            let indent = id.get_content_rect().x0;
+            nav.cursor_at.set(Some((o.x + indent, o.y + height.get())));
+            nav.cursor_menu.set(menu.clone());
+        }
+    });
     create_effect(move |_| {
         if nav.reveal.with(|r| r.as_deref() == Some(key.as_str())) {
             // Defer to the next tick so the scroll target is computed against
@@ -583,7 +641,11 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
         focused: RwSignal::new(false),
         selected: RwSignal::new(None),
         reveal: RwSignal::new(None),
+        cursor_at: RwSignal::new(None),
+        cursor_menu: RwSignal::new(None),
     };
+
+    let nav_tree_id: RwSignal<Option<floem::ViewId>> = RwSignal::new(None);
 
     // Cloned up front: `on_toggle`/`open_table` are moved into the tree's
     // dyn_stack closure below, but the keyboard-nav handler needs them too
@@ -696,6 +758,38 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
             let Event::KeyDown(ke) = e else {
                 return EventPropagation::Continue;
             };
+            // **Shift+F10 / the Menu key** raise the cursor row's context menu —
+            // the same menu its right-click builds, from the same closure
+            // (`CtxOpener`), so the two can't drift apart.
+            //
+            // It opens **at the row**, not at the pointer, which may be anywhere
+            // or never have been in the tree; `cursor_view` is the row's own view
+            // and `layout_rect` is already in window coordinates. And it publishes
+            // a focus return, because the menu panel is a `focus_root` with none
+            // above it out here: without one, closing the menu would drop focus
+            // and the tree would answer no further keys — the same fault the grid
+            // toolbar hit (`widgets::set_menu_return`).
+            let menu_key = match &ke.key.logical_key {
+                // The dedicated Menu key, where a keyboard has one.
+                Key::Named(NamedKey::ContextMenu) => true,
+                // …and the shifted-F10 spelling every platform accepts, for the
+                // keyboards that don't.
+                Key::Named(NamedKey::F10) => ke.modifiers.shift(),
+                _ => false,
+            };
+            if menu_key {
+                if let Some(open) = nav.cursor_menu.get_untracked() {
+                    let at = nav.cursor_at.get_untracked();
+                    let tree_id = nav_tree_id.get_untracked();
+                    crate::widgets::set_menu_return(Rc::new(move || {
+                        if let Some(id) = tree_id {
+                            exec_after(Duration::ZERO, move |_| id.request_focus());
+                        }
+                    }));
+                    (open)(at);
+                }
+                return EventPropagation::Stop;
+            }
             // Enter opens the selected row: a table row → open it (new tab, or the
             // existing one — see `open_table`); a column row → open its table and
             // highlight the column (mirrors the column double-click). BOTH are
@@ -827,6 +921,10 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                 .min_height(0.0)
                 .min_width(0.0)
         });
+    // The tree's own id, so a context menu it raised can give the keyboard back
+    // when it closes. Filled after the view exists; the handler above reads it
+    // through the signal for that reason.
+    nav_tree_id.set(Some(tree.id()));
 
     // Title row: "SCHEMA" left; the visibility (eye) and settings (gear) menus
     // right. The gear is rightmost; the eye sits 10px to its left. Each icon
@@ -995,6 +1093,21 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
     let toggle_row = on_toggle.clone();
     let key_row = key.clone();
     let ctx_db = conn.database.clone();
+    // The row's context menu as a *function of where to open it*, so the pointer
+    // and Shift+F10 raise the same menu — the second being what
+    // `with_nav_scroll` publishes for whichever row the nav cursor is on.
+    let open_menu: CtxOpener = Rc::new(move |at| {
+        let ai_prompt = format!(
+            "Give me a concise overview of the `{ctx_db}` database — the domain it models, \
+             its key tables, and how they relate."
+        );
+        context_menu.set(Some(CtxMenu {
+            kind: CtxKind::Database,
+            name: ctx_db.clone(),
+            ai_prompt,
+            at,
+        }));
+    });
     let dot_db = conn.database.clone();
     let star_db = conn.database.clone();
     let icon_fav_db = conn.database.clone();
@@ -1057,16 +1170,9 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
         ),
     ))
     .on_double_click_stop(move |_| (toggle_row)(key_row.clone()))
-    .on_secondary_click_stop(move |_| {
-        let ai_prompt = format!(
-            "Give me a concise overview of the `{ctx_db}` database — the domain it models, \
-             its key tables, and how they relate."
-        );
-        context_menu.set(Some(CtxMenu {
-            kind: CtxKind::Database,
-            name: ctx_db.clone(),
-            ai_prompt,
-        }));
+    .on_secondary_click_stop({
+        let open = open_menu.clone();
+        move |_| (open)(None)
     })
     .style({
         let hl = key.clone();
@@ -1084,7 +1190,7 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
             }
         }
     });
-    let header = with_nav_scroll(header.into_any(), nav, key.clone());
+    let header = with_nav_scroll(header.into_any(), nav, key.clone(), Some(open_menu));
 
     // Children rebuild on expand/schema/filter change. A non-empty filter
     // force-expands the node and narrows its tables to name matches.
@@ -1250,6 +1356,29 @@ fn schema_node(
 
     let toggle_row = on_toggle.clone();
     let key_row = key.clone();
+    let open_menu: CtxOpener = {
+        let ctx_db = database.clone();
+        let ctx_ns = ns.clone();
+        let ddl_schema = schema.clone();
+        Rc::new(move |at| {
+            let ai_prompt = format!(
+                "Give me a concise overview of the `{ctx_ns}` schema in the `{ctx_db}` \
+                 database — what it models, its key tables, and how they relate."
+            );
+            // Built here rather than per render: a namespace can hold a lot of
+            // tables, and the script is only ever needed once the menu opens.
+            let ddl = ddl_schema.create_ddl_script(Some(&ctx_ns), dialect);
+            context_menu.set(Some(CtxMenu {
+                kind: CtxKind::Schema {
+                    database: ctx_db.clone(),
+                    ddl,
+                },
+                name: ctx_ns.clone(),
+                ai_prompt,
+                at,
+            }));
+        })
+    };
     let name_term = {
         let f = filter.get_untracked();
         let f = f.trim();
@@ -1280,26 +1409,8 @@ fn schema_node(
     ))
     .on_double_click_stop(move |_| (toggle_row)(key_row.clone()))
     .on_secondary_click_stop({
-        let ctx_db = database.clone();
-        let ctx_ns = ns.clone();
-        let ddl_schema = schema.clone();
-        move |_| {
-            let ai_prompt = format!(
-                "Give me a concise overview of the `{ctx_ns}` schema in the `{ctx_db}` \
-                 database — what it models, its key tables, and how they relate."
-            );
-            // Built here rather than per render: a namespace can hold a lot of
-            // tables, and the script is only ever needed once the menu opens.
-            let ddl = ddl_schema.create_ddl_script(Some(&ctx_ns), dialect);
-            context_menu.set(Some(CtxMenu {
-                kind: CtxKind::Schema {
-                    database: ctx_db.clone(),
-                    ddl,
-                },
-                name: ctx_ns.clone(),
-                ai_prompt,
-            }));
-        }
+        let open = open_menu.clone();
+        move |_| (open)(None)
     })
     .style({
         let hl = key.clone();
@@ -1312,7 +1423,7 @@ fn schema_node(
             }
         }
     });
-    let header = with_nav_scroll(header.into_any(), nav, key.clone());
+    let header = with_nav_scroll(header.into_any(), nav, key.clone(), Some(open_menu));
 
     let key_children = key.clone();
     let ns_children = ns.clone();
@@ -1472,7 +1583,9 @@ fn object_group_node(
             }
         }
     });
-    let header = with_nav_scroll(header.into_any(), nav, key.clone());
+    // No menu: a group folder is structural — right-clicking one offers nothing,
+    // so Shift+F10 on it must offer nothing too.
+    let header = with_nav_scroll(header.into_any(), nav, key.clone(), None);
 
     let key_children = key.clone();
     let ns_hit_base = scope_ns.clone();
@@ -1547,6 +1660,29 @@ fn object_row(
     // An identity column's counter isn't an object anyone can act on alone, so
     // it reads quieter — the same signal a lossy index gets.
     let dim = o.is_internal();
+    let open_menu: CtxOpener = {
+        let (db, obj) = (database.clone(), o.clone());
+        let display = schemaic_core::schema::display_name(obj.schema(), obj.name());
+        Rc::new(move |at| {
+            let ai_prompt = format!(
+                "In the `{db}` database, explain the `{display}` {} — what it is for \
+                 and where it is used.",
+                kind.label()
+            );
+            context_menu.set(Some(CtxMenu {
+                kind: CtxKind::Object {
+                    database: db.clone(),
+                    item: Box::new(obj.clone()),
+                    // Built here rather than per render: it is only ever needed
+                    // once the menu opens, as a namespace's script is.
+                    ddl: obj.create_sql(dialect),
+                },
+                name: display.clone(),
+                ai_prompt,
+                at,
+            }));
+        })
+    };
     let row = h_stack((
         icons::icon(object_icon(kind), SCHEMA_ICON as f32).style(move |s| {
             s.color(theme::text_muted().multiply_alpha(if dim { 0.4 } else { 0.7 }))
@@ -1585,26 +1721,8 @@ fn object_row(
         }
     })
     .on_secondary_click_stop({
-        let (db, obj) = (database.clone(), o.clone());
-        let display = schemaic_core::schema::display_name(obj.schema(), obj.name());
-        move |_| {
-            let ai_prompt = format!(
-                "In the `{db}` database, explain the `{display}` {} — what it is for \
-                 and where it is used.",
-                kind.label()
-            );
-            context_menu.set(Some(CtxMenu {
-                kind: CtxKind::Object {
-                    database: db.clone(),
-                    item: Box::new(obj.clone()),
-                    // Built here rather than per render: it is only ever needed
-                    // once the menu opens, as a namespace's script is.
-                    ddl: obj.create_sql(dialect),
-                },
-                name: display.clone(),
-                ai_prompt,
-            }));
-        }
+        let open = open_menu.clone();
+        move |_| (open)(None)
     })
     .style({
         let hl = nav_key.clone();
@@ -1617,7 +1735,7 @@ fn object_row(
             }
         }
     });
-    with_nav_scroll(row.into_any(), nav, nav_key)
+    with_nav_scroll(row.into_any(), nav, nav_key, Some(open_menu))
 }
 
 // A table node: a header row (double-click opens & runs `SELECT *`) over its
@@ -1679,6 +1797,26 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
     // Qualified in the AI prompt + the context menu's title, so a question about
     // `sales.orders` isn't answered about `public.orders`.
     let ctx_display = source.display();
+    let open_menu: CtxOpener = {
+        let ctx_schema = source.schema.clone();
+        Rc::new(move |at| {
+            let ai_prompt = format!(
+                "Explain the `{ctx_display}` table in the `{ctx_db}` database: what each column \
+                 represents, the primary key, and any foreign-key relationships. Keep it concise."
+            );
+            context_menu.set(Some(CtxMenu {
+                kind: CtxKind::Table {
+                    database: ctx_db.clone(),
+                    schema: ctx_schema.clone(),
+                    table: ctx_table.clone(),
+                    ddl: ddl.clone(),
+                },
+                name: ctx_display.clone(),
+                ai_prompt,
+                at,
+            }));
+        })
+    };
     let col_source = source.clone();
     let header = h_stack((
         chevron(expanded, key.clone(), on_toggle),
@@ -1698,21 +1836,9 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
         ),
     ))
     .on_double_click_stop(move |_| (open_table)(dbl_source.clone()))
-    .on_secondary_click_stop(move |_| {
-        let ai_prompt = format!(
-            "Explain the `{ctx_display}` table in the `{ctx_db}` database: what each column \
-             represents, the primary key, and any foreign-key relationships. Keep it concise."
-        );
-        context_menu.set(Some(CtxMenu {
-            kind: CtxKind::Table {
-                database: ctx_db.clone(),
-                schema: source.schema.clone(),
-                table: ctx_table.clone(),
-                ddl: ddl.clone(),
-            },
-            name: ctx_display.clone(),
-            ai_prompt,
-        }));
+    .on_secondary_click_stop({
+        let open = open_menu.clone();
+        move |_| (open)(None)
     })
     .style({
         let hl = key.clone();
@@ -1727,7 +1853,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
             }
         }
     });
-    let header = with_nav_scroll(header.into_any(), nav, key.clone());
+    let header = with_nav_scroll(header.into_any(), nav, key.clone(), Some(open_menu));
 
     let key_children = key.clone();
     let cols = table.columns;
@@ -1887,6 +2013,21 @@ fn column_row(
     let dbl_col = name.clone();
     let (database, table) = (source.database.clone(), source.display());
     let nav_key = column_key_named(&database, &table, &name);
+    let open_menu: CtxOpener = Rc::new(move |at| {
+        let ai_prompt = format!(
+            "In `{database}`.`{table}`, explain the `{ctx_name}` column (type `{ctx_ty}`) — \
+             what it stores and how it's typically used."
+        );
+        context_menu.set(Some(CtxMenu {
+            kind: CtxKind::Field {
+                source: ctx_source.clone(),
+                column: ctx_name.clone(),
+            },
+            name: ctx_name.clone(),
+            ai_prompt,
+            at,
+        }));
+    });
     // The glyph always reflects the column's *type* family — the key glyph is for
     // the key/index rows, not the columns they cover (so `id` is a numeric column,
     // and `PRIMARY(id)` is the key). Key membership only tints the row: a PK column
@@ -1917,19 +2058,9 @@ fn column_row(
     // the type text to muted.
     .style(move |s| s.color(kind.color()).items_center())
     .on_double_click_stop(move |_| (open_table_col)(dbl_source.clone(), dbl_col.clone()))
-    .on_secondary_click_stop(move |_| {
-        let ai_prompt = format!(
-            "In `{database}`.`{table}`, explain the `{ctx_name}` column (type `{ctx_ty}`) — \
-             what it stores and how it's typically used."
-        );
-        context_menu.set(Some(CtxMenu {
-            kind: CtxKind::Field {
-                source: ctx_source.clone(),
-                column: ctx_name.clone(),
-            },
-            name: ctx_name.clone(),
-            ai_prompt,
-        }));
+    .on_secondary_click_stop({
+        let open = open_menu.clone();
+        move |_| (open)(None)
     })
     .style({
         let hl = nav_key.clone();
@@ -1942,7 +2073,7 @@ fn column_row(
             }
         }
     });
-    with_nav_scroll(row.into_any(), nav, nav_key)
+    with_nav_scroll(row.into_any(), nav, nav_key, Some(open_menu))
 }
 
 // A single key (leaf): name + its columns, colored by kind (PRIMARY gold,
@@ -2002,6 +2133,9 @@ fn key_row(
             },
             name: ctx_name.clone(),
             ai_prompt,
+            // Always at the pointer: a key row is deliberately out of the nav
+            // sequence (see below), so Shift+F10 can never be about one.
+            at: None,
         }));
     })
     // Non-interactive: static layout (no hover), and not in the nav sequence, so

@@ -1232,6 +1232,15 @@ pub struct CtxMenu {
     pub kind: CtxKind,
     pub name: String,
     pub ai_prompt: String,
+    /// Where to open, in window coords — `None` means "at the pointer", which is
+    /// what a right-click wants and every opener but one uses.
+    ///
+    /// The exception is the **keyboard**: Shift+F10 on the schema tree raises the
+    /// menu for the row the cursor is on, and the pointer may be anywhere at all
+    /// (or never have been in the tree). Carried on the menu rather than in a
+    /// signal beside it because it is a property of *this* opening, and the
+    /// channel holds exactly one menu at a time.
+    pub at: Option<(f64, f64)>,
 }
 
 /// Result channel for the editor's inline (Ctrl+K) AI prompt: the app writes the
