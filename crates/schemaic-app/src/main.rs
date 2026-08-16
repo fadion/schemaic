@@ -423,12 +423,12 @@ fn sample_rows(rs: &schemaic_core::model::ResultSet) -> Vec<schemaic_core::seed:
 /// skeleton (prompt structure) + its primary-key column names (to order the
 /// bottom-sample). Empty/`([], "")` when the schema hasn't been introspected yet.
 /// Map a resolved `Db`'s engine to the SQL dialect (for dialect-aware DDL).
+///
+/// The same `Engine::dialect()` [`dialect_for`] uses, which is exhaustive. This
+/// was a two-engine `if Postgres { … } else { MySql }` that sorted SQLite onto
+/// the MySQL side — the shape a third engine makes silently wrong.
 fn dialect_of(db: &Db) -> SqlDialect {
-    if db.engine() == schemaic_db::Engine::Postgres {
-        SqlDialect::Postgres
-    } else {
-        SqlDialect::MySql
-    }
+    dialect_for(db.engine())
 }
 
 /// One loaded table's DDL, its primary-key column names, and the implicit row

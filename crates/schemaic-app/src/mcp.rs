@@ -191,12 +191,17 @@ async fn call_tool(
 
 /// The connection's SQL dialect — shared by the read-only gate, the DDL
 /// skeleton, and the sample-row query builder so all three agree on quoting.
+///
+/// It delegates to [`schemaic_db::Engine::dialect`], whose `match` is
+/// exhaustive, and that is the point. This read
+/// `if engine == Postgres { Postgres } else { MySql }` — which compiled cleanly
+/// when SQLite arrived and quietly sorted it onto the MySQL side, so the
+/// read-only gate lexed AI-issued SQL by MySQL's backslash and `#` rules (SQLite
+/// has neither) and `describe_table`'s sample query quoted against MySQL's
+/// reserved words instead of SQLite's, leaving a table named `virtual` or
+/// `indexed` unquoted.
 fn dialect_of(db: &Db) -> SqlDialect {
-    if db.engine() == schemaic_db::Engine::Postgres {
-        SqlDialect::Postgres
-    } else {
-        SqlDialect::MySql
-    }
+    db.engine().dialect()
 }
 
 /// Statement timeout for AI-issued queries — a backstop against `SLEEP()` /
@@ -526,10 +531,36 @@ async fn describe_table(
 #[cfg(test)]
 mod tests {
     use super::{
-        SUPPORTED_PROTOCOLS, find_described, format_database_list, format_database_schema,
-        format_table, format_table_detail, format_table_heading, negotiate_protocol,
-        normalize_stmt,
+        SUPPORTED_PROTOCOLS, dialect_of, find_described, format_database_list,
+        format_database_schema, format_table, format_table_detail, format_table_heading,
+        negotiate_protocol, normalize_stmt,
     };
+
+    /// Every engine reaches its **own** dialect. This was an
+    /// `if Postgres { … } else { MySql }`, which compiles cleanly while sorting a
+    /// third engine onto whichever side it happens to fall — so a SQLite
+    /// connection had the read-only gate lexed by MySQL's rules and its sample
+    /// query quoted against MySQL's reserved words.
+    #[test]
+    fn the_dialect_is_the_engines_own_for_every_engine() {
+        let db = |engine| {
+            schemaic_db::Db::from_parts(
+                engine,
+                String::new(),
+                0,
+                String::new(),
+                String::new(),
+                String::new(),
+            )
+        };
+        for (engine, want) in [
+            (schemaic_db::Engine::MySql, SqlDialect::MySql),
+            (schemaic_db::Engine::Postgres, SqlDialect::Postgres),
+            (schemaic_db::Engine::Sqlite, SqlDialect::Sqlite),
+        ] {
+            assert_eq!(dialect_of(&db(engine)), want, "{engine:?}");
+        }
+    }
     use schemaic_core::intel::SqlDialect;
     use schemaic_core::model::{Column, ResultSet, Value};
     use schemaic_core::schema::{ColumnInfo, DbSchema, ForeignKeyInfo, IndexInfo, TableInfo};
