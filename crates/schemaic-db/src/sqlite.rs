@@ -922,6 +922,14 @@ pub(crate) async fn fetch_schema(db: &Db) -> Result<DbSchema, DbError> {
             let implicit_key = (!is_view)
                 .then(|| implicit_row_key(&columns, has_rowid(conn, &name)))
                 .flatten();
+            // What a rebuild has to put back. Not modelled as `triggers` below —
+            // see `TableInfo::dependent_ddl` for why the statement itself is the
+            // safer thing to keep.
+            let dependent_ddl = if is_view {
+                Vec::new()
+            } else {
+                trigger_statements(conn, &name)?
+            };
             tables.push(TableInfo {
                 name,
                 schema: None,
@@ -944,6 +952,7 @@ pub(crate) async fn fetch_schema(db: &Db) -> Result<DbSchema, DbError> {
                 // rebuild silently drops.
                 check_constraints: if is_view { Vec::new() } else { checks_of(&sql) },
                 triggers: Vec::new(),
+                dependent_ddl,
             });
         }
         Ok(DbSchema {
@@ -1081,6 +1090,38 @@ fn index_statements(conn: &SqliteConn, table: &str) -> Result<Vec<String>, DbErr
         .query_map([table], |r| r.get::<_, String>(0))
         .map_err(query_err)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(query_err)
+}
+
+/// The `CREATE TRIGGER` statements SQLite stores for `table`, each terminated,
+/// in catalogue order.
+///
+/// **A trigger is owned by its table and dropped with it**, so these are what
+/// the twelve-step rebuild has to put back (`TableInfo::dependent_ddl`). Views
+/// are not here and need none of this: `DROP TABLE` leaves a view that selects
+/// from the table in place — SQLite resolves a view's references when it runs,
+/// not when it is declared — and the table comes back under the same name, so
+/// the view is whole again by the end of the transaction.
+fn trigger_statements(conn: &SqliteConn, table: &str) -> Result<Vec<String>, DbError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT sql FROM sqlite_master \
+             WHERE type = 'trigger' AND tbl_name = ?1 AND sql IS NOT NULL \
+             ORDER BY name",
+        )
+        .map_err(query_err)?;
+    let rows = stmt
+        .query_map([table], |r| r.get::<_, String>(0))
+        .map_err(query_err)?;
+    rows.collect::<Result<Vec<String>, _>>()
+        .map_err(query_err)
+        // SQLite stores the statement without its terminator, and a trigger body
+        // is full of internal `;` — so the one that ends it has to be added back
+        // or the replay runs into whatever follows.
+        .map(|v| {
+            v.into_iter()
+                .map(|s| format!("{};", s.trim().trim_end_matches(';')))
+                .collect()
+        })
 }
 
 /// A view's **body** — the `SELECT` — read out of the `CREATE VIEW` statement
@@ -3061,7 +3102,7 @@ mod rebuild_roundtrip_tests {
         draft.columns[1].info.type_name = "TEXT".into();
         draft.columns.retain(|c| c.info.name != "scratch");
 
-        let stmts = sqlite_rebuild_sql(&before, &draft, &[]);
+        let stmts = sqlite_rebuild_sql(&before, &draft);
         db.run_ddl(MAIN, &stmts, CancellationToken::new())
             .await
             .expect("the rebuild must be valid SQLite");
@@ -3110,7 +3151,7 @@ mod rebuild_roundtrip_tests {
                 inherited: true,
                 ..Default::default()
             }));
-        let stmts = sqlite_rebuild_sql(&before, &draft, &[]);
+        let stmts = sqlite_rebuild_sql(&before, &draft);
         db.run_ddl(MAIN, &stmts, CancellationToken::new())
             .await
             .expect("rebuild");
@@ -3138,18 +3179,13 @@ mod rebuild_roundtrip_tests {
                    BEGIN INSERT INTO log VALUES (NEW.n); END;",
             )
             .unwrap();
-        let trigger: String = keeper
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 't_ai'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-
         let before = table_of(&db, "t").await;
+        // Introspection is what supplies it — the rebuild reads
+        // `TableInfo::dependent_ddl`, so this covers the wiring as well.
+        assert_eq!(before.dependent_ddl.len(), 1, "{:?}", before.dependent_ddl);
         let mut draft = TableDraft::from_table(&before);
         draft.columns[1].info.type_name = "TEXT".into();
-        let stmts = sqlite_rebuild_sql(&before, &draft, &[format!("{};", trigger.trim())]);
+        let stmts = sqlite_rebuild_sql(&before, &draft);
         db.run_ddl(MAIN, &stmts, CancellationToken::new())
             .await
             .expect("rebuild");
@@ -3161,5 +3197,56 @@ mod rebuild_roundtrip_tests {
             .query_row("SELECT count(*) FROM log", [], |r| r.get(0))
             .unwrap();
         assert_eq!(logged, 1, "the trigger survived the rebuild");
+    }
+}
+
+/// A rebuild happens under objects that reference the table. These are the ones
+/// that bite.
+#[cfg(test)]
+mod rebuild_bystander_tests {
+    use super::tests::shared_memory;
+    use super::*;
+    use schemaic_core::ddl::{TableDraft, sqlite_rebuild_sql};
+    use tokio_util::sync::CancellationToken;
+
+    async fn table_of(db: &Db, name: &str) -> TableInfo {
+        fetch_schema(db)
+            .await
+            .expect("introspect")
+            .tables
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} is gone"))
+    }
+
+    /// **A view over the table is the trap.** From 3.25 SQLite re-parses every
+    /// view and trigger during `ALTER TABLE … RENAME`, and at that moment the
+    /// original table has already been dropped — so a view selecting from it
+    /// refers to nothing and the rename fails, taking the whole rebuild with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_view_over_the_table_does_not_break_the_rename() {
+        let (keeper, db) = shared_memory("rebuild_view");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER);
+                 CREATE VIEW big AS SELECT id FROM t WHERE n > 10;
+                 INSERT INTO t VALUES (1, 50);",
+            )
+            .unwrap();
+        let before = table_of(&db, "t").await;
+        let mut draft = TableDraft::from_table(&before);
+        draft.columns[1].info.type_name = "TEXT".into();
+        db.run_ddl(
+            MAIN,
+            &sqlite_rebuild_sql(&before, &draft),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the rename must survive a view that references the table");
+
+        let seen: i64 = keeper
+            .query_row("SELECT count(*) FROM big", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(seen, 1, "and the view still resolves afterwards");
     }
 }

@@ -4338,8 +4338,8 @@ const REBUILD_SUFFIX: &str = "_schemaic_rebuild";
 /// 5. **recreate** the indexes, *after* the rename — an index name is unique per
 ///    schema in SQLite, so creating one before the old table is gone collides
 ///    with the index it is replacing;
-/// 6. **replay** `dependents`, the `CREATE` text of the triggers that hung off
-///    the table and went down with it.
+/// 6. **replay** [`TableInfo::dependent_ddl`], the `CREATE` text of the triggers
+///    that hung off the table and went down with it.
 ///
 /// The rows move with `INSERT … SELECT`, not `CREATE TABLE … AS SELECT`, because
 /// the latter takes its column types from the query rather than from the
@@ -4349,11 +4349,7 @@ const REBUILD_SUFFIX: &str = "_schemaic_rebuild";
 /// under the original name, and `ALTER TABLE … RENAME TO` is emitted after it —
 /// that statement is native, and letting SQLite perform it is what keeps the
 /// references in other tables' foreign keys pointing at the right place.
-pub fn sqlite_rebuild_sql(
-    current: &TableInfo,
-    draft: &TableDraft,
-    dependents: &[String],
-) -> Vec<String> {
+pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> {
     let d = SqlDialect::Sqlite;
     let q = |s: &str| ddl_ident_in(s, d);
     let original = qualified(&current.name, current.schema.as_deref(), d);
@@ -4389,15 +4385,30 @@ pub fn sqlite_rebuild_sql(
         ));
     }
 
+    // **Without this the rename fails on any view over the table.** From 3.25
+    // SQLite re-parses every view and trigger during `ALTER TABLE … RENAME` so
+    // it can update their references — and by this point the original table is
+    // already gone, so a view selecting from it resolves to nothing and the
+    // whole rebuild dies on `error in view v: no such table: main.t`. The legacy
+    // behaviour is the right one here precisely *because* nothing should be
+    // rewritten: the table is coming back under the name it had, so every
+    // reference to it is already correct.
+    //
+    // It rides in the plan rather than in the backend because it is a property
+    // of these statements and not of the connection — and because the preview
+    // then shows the whole procedure, which is the honest thing to put in front
+    // of someone about to approve it.
+    out.push("PRAGMA legacy_alter_table = ON;".to_string());
     out.push(format!("DROP TABLE {original};"));
     out.push(format!(
         "ALTER TABLE {shadow} RENAME TO {};",
         q(&current.name)
     ));
+    out.push("PRAGMA legacy_alter_table = OFF;".to_string());
     for ix in &draft.indexes {
         out.push(create_index_sql(&ix.info, &original, d));
     }
-    out.extend(dependents.iter().cloned());
+    out.extend(current.dependent_ddl.iter().cloned());
     out
 }
 
@@ -10634,7 +10645,7 @@ mod sqlite_rebuild_tests {
     }
 
     fn plan(current: &TableInfo, draft: &TableDraft) -> Vec<String> {
-        sqlite_rebuild_sql(current, draft, &[])
+        sqlite_rebuild_sql(current, draft)
     }
 
     /// The shape of the whole thing, on the simplest edit there is: a retype,
@@ -10644,20 +10655,17 @@ mod sqlite_rebuild_tests {
         let t = table();
         let mut d = TableDraft::from_table(&t);
         d.columns[0].info.type_name = "TEXT".into();
-        let got = plan(&t, &d);
-        assert_eq!(got.len(), 4, "{got:#?}");
-        assert!(
-            got[0].starts_with(r#"CREATE TABLE "t_schemaic_rebuild" ("#),
-            "{}",
-            got[0]
-        );
-        assert!(got[0].contains(r#""a" TEXT"#), "{}", got[0]);
         assert_eq!(
-            got[1],
-            r#"INSERT INTO "t_schemaic_rebuild" ("a", "b") SELECT "a", "b" FROM "t";"#
+            plan(&t, &d),
+            vec![
+                "CREATE TABLE \"t_schemaic_rebuild\" (\n  \"a\" TEXT,\n  \"b\" TEXT\n);",
+                r#"INSERT INTO "t_schemaic_rebuild" ("a", "b") SELECT "a", "b" FROM "t";"#,
+                "PRAGMA legacy_alter_table = ON;",
+                r#"DROP TABLE "t";"#,
+                r#"ALTER TABLE "t_schemaic_rebuild" RENAME TO "t";"#,
+                "PRAGMA legacy_alter_table = OFF;",
+            ]
         );
-        assert_eq!(got[2], r#"DROP TABLE "t";"#);
-        assert_eq!(got[3], r#"ALTER TABLE "t_schemaic_rebuild" RENAME TO "t";"#);
     }
 
     /// The copy is what carries a rename across: the new table's column takes
@@ -10751,10 +10759,11 @@ mod sqlite_rebuild_tests {
     /// didn't put it back would quietly disarm it.
     #[test]
     fn dependents_are_replayed_last() {
-        let t = table();
-        let d = TableDraft::from_table(&t);
         let trg = r#"CREATE TRIGGER "t_ai" AFTER INSERT ON "t" BEGIN SELECT 1; END;"#;
-        let got = sqlite_rebuild_sql(&t, &d, &[trg.to_string()]);
+        let mut t = table();
+        t.dependent_ddl = vec![trg.to_string()];
+        let d = TableDraft::from_table(&t);
+        let got = sqlite_rebuild_sql(&t, &d);
         assert_eq!(got.last().map(String::as_str), Some(trg), "{got:#?}");
     }
 
@@ -10768,6 +10777,10 @@ mod sqlite_rebuild_tests {
         d.columns.push(ColumnDraft::new(col("fresh", "TEXT")));
         let got = plan(&t, &d);
         assert!(!got.iter().any(|s| s.starts_with("INSERT")), "{got:#?}");
-        assert_eq!(got.len(), 3, "{got:#?}");
+        assert!(
+            got.iter().any(|s| s.starts_with("CREATE TABLE")),
+            "{got:#?}"
+        );
+        assert!(got.iter().any(|s| s.starts_with("DROP TABLE")), "{got:#?}");
     }
 }
