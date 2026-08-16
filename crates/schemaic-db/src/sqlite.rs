@@ -797,8 +797,24 @@ pub(crate) async fn run_ddl(
         if cancel.is_cancelled() {
             return Err(fail(0, "the plan was cancelled".into()));
         }
-        // Outside the transaction: SQLite ignores this pragma inside one.
-        let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
+        // **Enforcement off for the duration, and verified before the commit.**
+        // Outside the transaction, because SQLite ignores this pragma inside
+        // one.
+        //
+        // Enforcing it *during* a plan is not the safe reading it looks like.
+        // With foreign keys on, the rebuild's `DROP TABLE` on a parent is an
+        // implicit `DELETE FROM parent`, which fires `ON DELETE CASCADE` and
+        // empties the child tables — the table comes back exactly as the user
+        // drew it and another table has quietly lost every row. That is the
+        // reason step 1 of SQLite's own twelve-step procedure turns them off,
+        // and a test here does the cascade to prove it.
+        //
+        // Nothing is given up by doing so: `PRAGMA foreign_key_check` below runs
+        // against the finished state and refuses the commit if the plan left a
+        // reference dangling, which is a stricter question than the per-statement
+        // one — a plan is allowed to pass through states no single statement
+        // could.
+        let _ = conn.execute_batch("PRAGMA foreign_keys = OFF");
         conn.execute_batch("BEGIN")
             .map_err(|e| fail(0, format!("{e}")))?;
 
@@ -811,6 +827,15 @@ pub(crate) async fn run_ddl(
                 }
                 conn.execute_batch(sql)
                     .map_err(|e| fail(i, format!("{e}")))?;
+            }
+            // The last statement's index, so a violation is reported against the
+            // plan rather than against nothing.
+            let last = stmts.len() - 1;
+            if let Some(row) = first_fk_violation(&conn).map_err(|e| fail(last, format!("{e}")))? {
+                return Err(fail(
+                    last,
+                    format!("the plan leaves a foreign key pointing at nothing: {row}"),
+                ));
             }
             Ok(())
         })();
@@ -833,6 +858,34 @@ pub(crate) async fn run_ddl(
             }
         }
     })
+}
+
+/// The first foreign-key violation in the database, described, or `None` when
+/// there is none.
+///
+/// `PRAGMA foreign_key_check` returns one row per violation — the child table,
+/// the rowid, the parent it names, and which of that table's foreign keys it
+/// was. One is enough to refuse the plan, and naming it is what makes the
+/// refusal actionable rather than a bare "constraint failed".
+fn first_fk_violation(conn: &SqliteConn) -> Result<Option<String>, DbError> {
+    let mut stmt = conn
+        .prepare("SELECT \"table\", \"parent\" FROM pragma_foreign_key_check() LIMIT 1")
+        .map_err(query_err)?;
+    let mut rows = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })
+        .map_err(query_err)?;
+    match rows.next() {
+        None => Ok(None),
+        Some(row) => {
+            let (child, parent) = row.map_err(query_err)?;
+            Ok(Some(match parent {
+                Some(p) => format!("a row in {child} refers to {p}"),
+                None => format!("a row in {child}"),
+            }))
+        }
+    }
 }
 
 /// The databases this connection offers: the one file, under the name SQLite
@@ -3248,5 +3301,102 @@ mod rebuild_bystander_tests {
             .query_row("SELECT count(*) FROM big", [], |r| r.get(0))
             .unwrap();
         assert_eq!(seen, 1, "and the view still resolves afterwards");
+    }
+}
+
+/// Foreign keys around a rebuild — the part of the twelve steps that is about
+/// the *other* tables.
+#[cfg(test)]
+mod rebuild_fk_tests {
+    use super::tests::shared_memory;
+    use super::*;
+    use schemaic_core::ddl::{TableDraft, sqlite_rebuild_sql};
+    use tokio_util::sync::CancellationToken;
+
+    async fn table_of(db: &Db, name: &str) -> TableInfo {
+        fetch_schema(db)
+            .await
+            .expect("introspect")
+            .tables
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} is gone"))
+    }
+
+    /// **The one that eats data.** With foreign keys enforced, the rebuild's
+    /// `DROP TABLE` on a parent is an implicit `DELETE FROM parent`, which fires
+    /// `ON DELETE CASCADE` and takes every child row with it. The table comes
+    /// back looking exactly as asked for, and another table has been emptied.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rebuilding_a_parent_does_not_cascade_into_its_children() {
+        let (keeper, db) = shared_memory("rebuild_cascade");
+        keeper
+            .execute_batch(
+                "CREATE TABLE artist (id INTEGER PRIMARY KEY, name TEXT);
+                 CREATE TABLE album (
+                     id        INTEGER PRIMARY KEY,
+                     artist_id INTEGER REFERENCES artist (id) ON DELETE CASCADE
+                 );
+                 INSERT INTO artist VALUES (1, 'a');
+                 INSERT INTO album  VALUES (1, 1), (2, 1);",
+            )
+            .unwrap();
+
+        let before = table_of(&db, "artist").await;
+        let mut draft = TableDraft::from_table(&before);
+        draft.columns[1].info.type_name = "BLOB".into();
+        db.run_ddl(
+            MAIN,
+            &sqlite_rebuild_sql(&before, &draft),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("rebuild");
+
+        let albums: i64 = keeper
+            .query_row("SELECT count(*) FROM album", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(albums, 2, "the children must not have been cascaded away");
+        let artists: i64 = keeper
+            .query_row("SELECT count(*) FROM artist", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(artists, 1);
+    }
+
+    /// Enforcement is suspended for the plan, not abandoned: what the plan
+    /// leaves behind is checked before it is allowed to commit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plan_that_leaves_a_dangling_reference_is_refused() {
+        let (keeper, db) = shared_memory("rebuild_fk_check");
+        keeper
+            .execute_batch(
+                "CREATE TABLE artist (id INTEGER PRIMARY KEY, name TEXT);
+                 CREATE TABLE album (
+                     id        INTEGER PRIMARY KEY,
+                     artist_id INTEGER REFERENCES artist (id)
+                 );
+                 INSERT INTO artist VALUES (1, 'a');
+                 INSERT INTO album  VALUES (1, 1);",
+            )
+            .unwrap();
+
+        // Dropping the parent outright leaves album.artist_id pointing at
+        // nothing — with enforcement suspended, only the final check catches it.
+        let err = db
+            .run_ddl(
+                MAIN,
+                &[r#"DROP TABLE "artist";"#.to_string()],
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a dangling reference must not commit");
+        assert!(
+            format!("{err}").to_lowercase().contains("foreign key"),
+            "{err}"
+        );
+        let artists: i64 = keeper
+            .query_row("SELECT count(*) FROM artist", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(artists, 1, "and the drop rolled back");
     }
 }
