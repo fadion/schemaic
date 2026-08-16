@@ -108,6 +108,11 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
             ("Tab / Shift+Tab", "Next / previous cell while editing"),
             ("Ctrl+Enter", "Commit edits"),
             ("Del", "Mark row for deletion"),
+            // The toolbar strip is the app's one ring outside an overlay, and F6
+            // is its only affordance — nothing on screen says the icons can be
+            // reached at all.
+            ("F6", "Go to the results toolbar"),
+            ("← / →", "Move along the toolbar (Esc returns to the grid)"),
         ],
     ),
     (
