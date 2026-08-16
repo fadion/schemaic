@@ -4399,6 +4399,40 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
 /// the box doesn't move it horizontally.
 const TRAILING_SIZE: f64 = 16.0;
 
+/// The gaps either side of [`FieldCfg::trailing`]'s action. The right one is
+/// negative on purpose — it pulls the control 4px closer to the box edge, for a
+/// 14px gap rather than the padding's 10.
+///
+/// Named because two things read them: the control's own layout, and
+/// [`placeholder_right_inset`], which has to reserve exactly the width they take.
+const TRAILING_GAP_L: f64 = 6.0;
+const TRAILING_GAP_R: f64 = -4.0;
+
+/// The right inset of [`edit_field`]'s placeholder overlay, measured from the
+/// box's padding edge the way its left one is.
+///
+/// **A placeholder is absolutely positioned, so nothing in the flow bounds it.**
+/// With a left inset only, a string longer than the field laid out at its
+/// natural width and painted *over* the border and into whatever sat beside it —
+/// not clipped, not ellipsized. Found by eye on the view editor's SQLite
+/// **Column names** row, and true of every field in the app whose placeholder
+/// outgrows its width. Bounding the overlay on the right is what turns that
+/// overflow into an ellipsis.
+///
+/// Symmetrical with the left inset when nothing sits beside the editor. A
+/// [`FieldCfg::trailing`] action is **in flow** and shortens the editor, so the
+/// placeholder stops short of it by the control's own width plus what its
+/// margins add — read from the constants that place it, so moving the control
+/// can't leave this behind. The clearable × needs no room: it shows only while
+/// the field has text, which is exactly when the placeholder is hidden.
+fn placeholder_right_inset(has_trailing: bool) -> f64 {
+    if has_trailing {
+        CHAT_PAD_H + TRAILING_SIZE + TRAILING_GAP_L + TRAILING_GAP_R
+    } else {
+        CHAT_PAD_H
+    }
+}
+
 /// A `fn`-pointer transparent background for [`FieldCfg::background`] (the
 /// Ctrl+K field, whose surface is owned by an animated outer container).
 pub(crate) fn bg_transparent() -> floem::peniko::Color {
@@ -5221,8 +5255,11 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
     }
 
     // Placeholder overlay: shown only when EMPTY *and* unfocused, positioned over
-    // where the first line of text renders.
+    // where the first line of text renders — and bounded on *both* sides, so one
+    // longer than the field ellipsizes at its edge instead of painting across the
+    // border (see `placeholder_right_inset`).
     let ph_top = pad_v + (line_h - font_size as f64) / 2.0;
+    let ph_right = placeholder_right_inset(trailing.is_some());
     let placeholder = dyn_container(
         move || text_sig.with(|t| t.is_empty()) && !focused.get(),
         move |show| {
@@ -5232,6 +5269,14 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                         s.font_size(font_size)
                             .font_family("IBM Plex Sans".to_string())
                             .color(placeholder_color())
+                            // The trim itself. `width_full` is what makes it
+                            // definite — a label sizes to its content otherwise
+                            // and overflows the box that was meant to bound it —
+                            // and `min_width(0)` is what lets it shrink below
+                            // that content width in the first place.
+                            .width_full()
+                            .min_width(0.0)
+                            .text_ellipsis()
                     })
                     .into_any()
             } else {
@@ -5239,7 +5284,12 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
             }
         },
     )
-    .style(move |s| s.absolute().inset_left(CHAT_PAD_H).inset_top(ph_top))
+    .style(move |s| {
+        s.absolute()
+            .inset_left(CHAT_PAD_H)
+            .inset_right(ph_right)
+            .inset_top(ph_top)
+    })
     // Let clicks fall through to the editor beneath — otherwise clicking on the
     // placeholder text (which sits on top) fails to focus the field.
     .pointer_events(|| false);
@@ -5265,8 +5315,8 @@ pub(crate) fn edit_field(text_sig: RwSignal<String>, cfg: FieldCfg) -> impl Into
                 .items_center()
                 .justify_center()
                 .align_self(Some(floem::taffy::style::AlignItems::FlexEnd))
-                .margin_left(6.0)
-                .margin_right(-4.0)
+                .margin_left(TRAILING_GAP_L)
+                .margin_right(TRAILING_GAP_R)
         });
         h_stack((editor, side))
             .style(|s| s.width_full().height_full().min_width(0.0).items_center())
@@ -6079,6 +6129,37 @@ pub(crate) fn search_box(
         },
     )
     .style(|s| s.width_full())
+}
+
+#[cfg(test)]
+mod field_layout_tests {
+    use super::{CHAT_PAD_H, TRAILING_SIZE, placeholder_right_inset};
+
+    /// With nothing beside the editor the overlay spans the content box exactly —
+    /// the same edges the text it stands in for starts and ends at.
+    #[test]
+    fn a_plain_field_bounds_the_placeholder_symmetrically() {
+        assert_eq!(placeholder_right_inset(false), CHAT_PAD_H);
+    }
+
+    /// With a trailing action it stops clear of it. Asserted as the **property**
+    /// — the placeholder can never reach the control — rather than by restating
+    /// the sum, which would agree with itself however the margins move.
+    #[test]
+    fn a_trailing_action_is_never_painted_over() {
+        let inset = placeholder_right_inset(true);
+        assert!(
+            inset >= CHAT_PAD_H + TRAILING_SIZE,
+            "{inset} leaves the control uncovered by only part of its width"
+        );
+    }
+
+    /// And reserving that room is the only thing that widens the gutter: a field
+    /// without the action must not pay for it.
+    #[test]
+    fn a_field_without_the_action_reserves_nothing_for_it() {
+        assert!(placeholder_right_inset(false) < placeholder_right_inset(true));
+    }
 }
 
 #[cfg(test)]
