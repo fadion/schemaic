@@ -87,6 +87,41 @@ fn create_submenu(ui: &Ui, database: &str, schema: Option<&str>, read_only: bool
     MenuEntry::sub("Create", children)
 }
 
+/// Which of the per-object entries the schema tree's table/view menu offers **at
+/// all** — as opposed to offering dimmed.
+///
+/// The distinction is the one [`create_children`] already draws: a **missing**
+/// entry reads as "not supported", a **dimmed** one as "not here". For these
+/// three the first is what's true of a view, so a view's menu simply doesn't
+/// carry them; a read-only connection or a schema that hasn't loaded still dims,
+/// because there the action is real and merely unavailable.
+///
+/// Separate from the menu builder so the rule can be asserted at all — the
+/// builder needs a `Ui` — and because one of the three is **not uniform** and is
+/// exactly the kind of thing a later edit flattens.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ObjectEntries {
+    pub import: bool,
+    pub triggers: bool,
+    pub truncate: bool,
+}
+
+/// See [`ObjectEntries`]. `materialized` is only meaningful on PostgreSQL, which
+/// is the only engine that has one.
+pub(crate) fn object_entries(is_view: bool, is_pg: bool, materialized: bool) -> ObjectEntries {
+    ObjectEntries {
+        // A view is not insertable, and owns no rows to delete.
+        import: !is_view,
+        truncate: !is_view,
+        // **A PostgreSQL view really does carry triggers** — `INSTEAD OF` lives
+        // there and `pg_triggers` already introspects them — so this one is not
+        // simply `!is_view`. A *materialized* view is excluded even on
+        // PostgreSQL: the server refuses outright (`relation "mv" cannot have
+        // triggers`), which is the same call `is_editable_view` makes.
+        triggers: !is_view || (is_pg && !materialized),
+    }
+}
+
 /// What a Create entry makes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CreateKind {
@@ -866,24 +901,31 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             .as_ref()
                             .map(|i| i.triggers.clone())
                             .unwrap_or_default();
-                        entries.push(
-                            MenuEntry::action("Import", move || {
-                                if let Some(info) = info.clone() {
-                                    crate::import_view::open_import(
-                                        &ui,
-                                        crate::ImportTargetInfo {
-                                            conn_id: active_conn.get_untracked(),
-                                            database: db.clone(),
-                                            schema: ns.clone(),
-                                            table: info,
-                                        },
-                                    );
-                                }
-                            })
-                            // A view isn't insertable, and a table whose schema
-                            // hasn't loaded has no columns to map onto.
-                            .disabled(read_only || is_view || !has_columns),
-                        );
+                        // What a view cannot have at all is **absent**, not
+                        // dimmed — see `object_entries`, which owns that split
+                        // and is where the PostgreSQL-view-has-triggers case is
+                        // stated.
+                        let offers = object_entries(is_view, is_pg, materialized);
+                        if offers.import {
+                            entries.push(
+                                MenuEntry::action("Import", move || {
+                                    if let Some(info) = info.clone() {
+                                        crate::import_view::open_import(
+                                            &ui,
+                                            crate::ImportTargetInfo {
+                                                conn_id: active_conn.get_untracked(),
+                                                database: db.clone(),
+                                                schema: ns.clone(),
+                                                table: info,
+                                            },
+                                        );
+                                    }
+                                })
+                                // A table whose schema hasn't loaded has no
+                                // columns to map onto.
+                                .disabled(read_only || !has_columns),
+                            );
+                        }
 
                         // ── Schema editing ────────────────────────────────────
                         // Everything here ends at the DDL preview; nothing runs
@@ -932,7 +974,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // form on the right. Its own plan rather than a designer
                         // tab, because a trigger needs its own statement and
                         // can't join the table's coalesced `ALTER TABLE`.
-                        {
+                        if offers.triggers {
                             let ui = import_ui.clone();
                             let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
                             let n = triggers.len();
@@ -957,20 +999,20 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                     },
                                 )
                                 // An unloaded schema has no trigger list to show.
-                                // A view carries triggers on PostgreSQL — that
-                                // is where `INSTEAD OF` lives, and `pg_triggers`
-                                // already introspects them — so only MySQL's
-                                // views are excluded, plus a materialized one
-                                // (`relation "mv" cannot have triggers`, the
-                                // same call `is_editable_view` makes).
-                                .disabled(!has_columns || (is_view && (!is_pg || materialized))),
+                                // Which *objects* can have triggers at all is
+                                // `view_has_no_triggers` above, and decides
+                                // whether this entry exists rather than dimming it.
+                                .disabled(!has_columns),
                             );
                         }
                         // Truncate and drop are the two that can't be taken back
                         // and sit next to harmless entries, so they ask first and
                         // *then* show the plan. Everything else relies on the
                         // preview alone, which already names the consequence.
-                        {
+                        //
+                        // Drop applies to a view; Truncate does not — a view owns
+                        // no rows to delete — so only the second is conditional.
+                        if offers.truncate {
                             let ui = import_ui.clone();
                             let confirm = ui.overlay.confirm;
                             let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
@@ -997,7 +1039,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                         }),
                                     }));
                                 })
-                                .disabled(read_only || is_view),
+                                .disabled(read_only),
                             );
                         }
                         {
@@ -3490,6 +3532,51 @@ fn pass_shares(room: usize, want: [usize; 3]) -> [usize; 3] {
         left -= extra;
     }
     take
+}
+
+#[cfg(test)]
+mod object_menu_tests {
+    use super::object_entries;
+
+    /// A table offers all three, on either engine.
+    #[test]
+    fn a_table_offers_everything() {
+        for is_pg in [false, true] {
+            let e = object_entries(false, is_pg, false);
+            assert!(e.import && e.triggers && e.truncate, "pg={is_pg}");
+        }
+    }
+
+    /// A view is not insertable and owns no rows to delete, on either engine —
+    /// so those two entries are **absent**, not dimmed: a missing entry reads as
+    /// "not supported", which is what is true.
+    #[test]
+    fn a_view_never_offers_import_or_truncate() {
+        for is_pg in [false, true] {
+            let e = object_entries(true, is_pg, false);
+            assert!(!e.import, "pg={is_pg}");
+            assert!(!e.truncate, "pg={is_pg}");
+        }
+    }
+
+    /// **The one that isn't uniform.** MySQL's views can't have triggers;
+    /// PostgreSQL's can, and that is where `INSTEAD OF` lives — so flattening
+    /// this to `!is_view` would remove a live feature from the PG menu.
+    #[test]
+    fn only_mysql_views_lose_the_triggers_entry() {
+        assert!(!object_entries(true, false, false).triggers, "MySQL view");
+        assert!(
+            object_entries(true, true, false).triggers,
+            "PostgreSQL view"
+        );
+    }
+
+    /// A materialized view is excluded even on PostgreSQL: the server refuses
+    /// outright (`relation "mv" cannot have triggers`).
+    #[test]
+    fn a_materialized_view_has_no_triggers_entry() {
+        assert!(!object_entries(true, true, true).triggers);
+    }
 }
 
 #[cfg(test)]
