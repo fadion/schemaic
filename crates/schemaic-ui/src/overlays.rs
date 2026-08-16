@@ -147,6 +147,73 @@ pub(crate) fn object_entries(
     }
 }
 
+/// What a **column** row's context menu offers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct FieldEntries {
+    /// Whether **Edit column** is offered — it opens the designer, so it needs
+    /// the whole schema-editing emitter, not just a statement for one drop.
+    pub edit: bool,
+    pub drop: bool,
+}
+
+/// What a **key / index** row's context menu offers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct KeyEntries {
+    /// Whether **Edit table** is offered. Same designer as [`FieldEntries::edit`].
+    pub edit: bool,
+    pub drop_foreign_key: bool,
+    pub drop_index: bool,
+}
+
+/// See [`FieldEntries`]. Separate from the menu builder for the reason
+/// [`object_entries`] is: so the rule can be asserted without a `Ui`.
+///
+/// The two questions really are different, which is why this asks twice.
+/// **Edit** opens the designer and needs an engine that can alter a table in
+/// place; **Drop** needs only a statement for that one change, and SQLite has
+/// `ALTER TABLE … DROP COLUMN`. Answering both with `supports_schema_editing`
+/// would hide a drop the engine performs perfectly well.
+pub(crate) fn field_entries(dialect: schemaic_core::intel::SqlDialect) -> FieldEntries {
+    FieldEntries {
+        edit: schemaic_core::ddl::supports_schema_editing(dialect),
+        // The predicate reads the *shape* of the change, not its names — a
+        // dropped column is expressible or not whatever it is called.
+        drop: schemaic_core::ddl::supports_change(
+            dialect,
+            &schemaic_core::ddl::Change::DropColumn {
+                name: String::new(),
+                type_name: String::new(),
+            },
+        ),
+    }
+}
+
+/// See [`KeyEntries`]. `constraint` is the constraint an index backs, when it
+/// backs one — SQLite can't drop those, because they are part of the table
+/// definition rather than objects of their own.
+pub(crate) fn key_entries(
+    dialect: schemaic_core::intel::SqlDialect,
+    constraint: Option<&str>,
+) -> KeyEntries {
+    use schemaic_core::ddl::{Change, supports_change};
+    KeyEntries {
+        edit: schemaic_core::ddl::supports_schema_editing(dialect),
+        drop_foreign_key: supports_change(
+            dialect,
+            &Change::DropForeignKey {
+                name: String::new(),
+            },
+        ),
+        drop_index: supports_change(
+            dialect,
+            &Change::DropIndex {
+                name: String::new(),
+                constraint: constraint.map(str::to_string),
+            },
+        ),
+    }
+}
+
 /// What a Create entry makes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CreateKind {
@@ -1136,7 +1203,8 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     entries.push(MenuEntry::action("Copy name", copy(menu.name.clone())));
                     let read_only = conn_read_only(&connections, active_conn);
                     entries.push(MenuEntry::Separator);
-                    {
+                    let offers = field_entries(crate::table_designer::edit_ctx(&import_ui).dialect);
+                    if offers.edit {
                         let ui = import_ui.clone();
                         let (src, col) = (source.clone(), column.clone());
                         entries.push(MenuEntry::action("Edit column", move || {
@@ -1149,7 +1217,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             );
                         }));
                     }
-                    {
+                    if offers.drop {
                         let ui = import_ui.clone();
                         let (src, col) = (source.clone(), column.clone());
                         // Through the draft, not as a lone `DropColumn`: the
@@ -1184,11 +1252,15 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     entries.push(MenuEntry::action("Copy name", copy(menu.name.clone())));
                     let read_only = conn_read_only(&connections, active_conn);
                     entries.push(MenuEntry::Separator);
+                    let offers = key_entries(
+                        crate::table_designer::edit_ctx(&import_ui).dialect,
+                        index.constraint.as_deref(),
+                    );
                     // A foreign key's backing index can't be dropped while the
                     // constraint stands, so the entry offers the constraint —
                     // which is what the row is really showing.
                     match foreign_key {
-                        Some(name) => {
+                        Some(name) if offers.drop_foreign_key => {
                             let ui = import_ui.clone();
                             let src = source.clone();
                             entries.push(
@@ -1208,7 +1280,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         }
                         // The primary key isn't dropped on its own — you replace
                         // it, which is a designer edit.
-                        None if !index.is_primary() => {
+                        None if !index.is_primary() && offers.drop_index => {
                             let ui = import_ui.clone();
                             let src = source.clone();
                             let ix = index.clone();
@@ -1228,19 +1300,21 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 .disabled(read_only),
                             );
                         }
-                        None => {}
+                        _ => {}
                     }
-                    let ui = import_ui.clone();
-                    let src = source.clone();
-                    entries.push(MenuEntry::action("Edit table", move || {
-                        crate::table_designer::open_for_table(
-                            &ui,
-                            &src.database,
-                            src.schema.as_deref(),
-                            &src.table,
-                            None,
-                        );
-                    }));
+                    if offers.edit {
+                        let ui = import_ui.clone();
+                        let src = source.clone();
+                        entries.push(MenuEntry::action("Edit table", move || {
+                            crate::table_designer::open_for_table(
+                                &ui,
+                                &src.database,
+                                src.schema.as_deref(),
+                                &src.table,
+                                None,
+                            );
+                        }));
+                    }
                 }
             }
             entries.push(MenuEntry::Separator);
@@ -4061,5 +4135,57 @@ mod tests {
             ghost_suffix("日本語table", "日本").as_deref(),
             Some("語table")
         );
+    }
+}
+
+#[cfg(test)]
+mod row_menu_tests {
+    use super::{field_entries, key_entries};
+    use schemaic_core::intel::SqlDialect::{MySql, Postgres, Sqlite};
+
+    /// The regression this pair exists for. Both of these entries open the
+    /// designer, and both were built unconditionally — so a SQLite connection
+    /// offered them from the column and key rows while the table row above,
+    /// which asks `object_entries`, correctly offered nothing.
+    #[test]
+    fn sqlite_offers_no_designer_from_a_column_or_a_key() {
+        assert!(!field_entries(Sqlite).edit, "Edit column");
+        assert!(!key_entries(Sqlite, None).edit, "Edit table");
+    }
+
+    /// What SQLite *can* do stays. Hiding these would take away drops the
+    /// engine performs — it has `ALTER TABLE … DROP COLUMN` and `DROP INDEX`.
+    #[test]
+    fn sqlite_still_drops_a_column_and_a_plain_index() {
+        assert!(field_entries(Sqlite).drop);
+        assert!(key_entries(Sqlite, None).drop_index);
+    }
+
+    /// The two that really do need the twelve-step rebuild.
+    #[test]
+    fn sqlite_drops_no_constraint() {
+        assert!(
+            !key_entries(Sqlite, None).drop_foreign_key,
+            "no ALTER TABLE … DROP CONSTRAINT"
+        );
+        assert!(
+            !key_entries(Sqlite, Some("uq_email")).drop_index,
+            "a UNIQUE index is part of the table definition"
+        );
+    }
+
+    #[test]
+    fn the_full_engines_offer_every_row_entry() {
+        for d in [MySql, Postgres] {
+            let f = field_entries(d);
+            assert!(f.edit && f.drop, "{d:?} column");
+            for constraint in [None, Some("uq_email")] {
+                let k = key_entries(d, constraint);
+                assert!(
+                    k.edit && k.drop_foreign_key && k.drop_index,
+                    "{d:?} key {constraint:?}"
+                );
+            }
+        }
     }
 }

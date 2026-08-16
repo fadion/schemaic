@@ -99,6 +99,7 @@ pub(crate) fn preview_of(
         subject: subject.into(),
         changes: cs.changes.iter().map(|c| c.summary()).collect(),
         destructive: cs.destructive(),
+        withheld: cs.unsupported(),
         statements: cs.emit(),
         script: cs.editor_script(),
         read_only,
@@ -185,6 +186,53 @@ fn risk_block(risks: Vec<String>) -> impl IntoView {
     })
 }
 
+/// The withheld block. Present ⇒ this engine has no statement for part of the
+/// plan, so the SQL below is **less** than the change list above it.
+///
+/// It is a block of its own rather than a line in the risk list because it says
+/// the opposite thing: the risk block warns about what will happen, this one
+/// says what won't. Apply refuses while it is showing — half an edit is not a
+/// smaller version of the edit.
+fn withheld_block(withheld: Vec<String>) -> impl IntoView {
+    let empty_block = withheld.is_empty();
+    v_stack((
+        h_stack((
+            icons::icon(icons::TRIANGLE_ALERT, 15.0)
+                .style(|s| s.color(theme::accent()).flex_shrink(0.0_f32)),
+            text("This engine can't express part of this plan").style(|s| {
+                s.color(theme::accent())
+                    .font_size(theme::FONT_BODY)
+                    .font_bold()
+            }),
+        ))
+        .style(|s| s.flex_row().items_center().gap(7.0).margin_bottom(5.0)),
+        v_stack_from_iter(withheld.into_iter().map(|w| {
+            text(w).style(|s| {
+                s.color(theme::text())
+                    .font_size(theme::FONT_BODY)
+                    .width_full()
+                    .margin_bottom(2.0)
+            })
+        })),
+        text("Nothing is applied while this is listed.").style(|s| {
+            s.color(theme::text_faint())
+                .font_size(theme::FONT_BODY)
+                .margin_top(4.0)
+        }),
+    ))
+    .style(move |s| {
+        let s = s
+            .flex_col()
+            .width_full()
+            .padding(10.0)
+            .border(1.0)
+            .border_color(theme::accent())
+            .border_radius(6.0)
+            .background(theme::accent().multiply_alpha(0.08));
+        if empty_block { s.hide() } else { s }
+    })
+}
+
 /// Hand the plan to the app, and fold the outcome back into the modal.
 fn apply(ui: Ui) {
     let d = ui.ddl;
@@ -192,6 +240,12 @@ fn apply(ui: Ui) {
         return;
     };
     if !crate::widgets::accept_launch(d.applying.get_untracked(), p.read_only) {
+        return;
+    }
+    // The guard belongs on the action, not only on the disabled button — the
+    // same rule the write guard follows. `statements` here is short of what the
+    // change list promised, so running it would apply half an edit.
+    if !p.withheld.is_empty() {
         return;
     }
     d.applying.set(true);
@@ -298,6 +352,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                     v_stack_from_iter(p.changes.iter().cloned().map(change_line))
                         .style(|s| s.flex_col().width_full()),
                     risk_block(p.destructive.clone()).style(|s| s.margin_top(14.0)),
+                    withheld_block(p.withheld.clone()).style(|s| s.margin_top(14.0)),
                     form_section("SQL").style(|s| s.margin_top(18.0)),
                     // Read-only, but a real editor field: the script is meant to
                     // be read and selected, and it's the same widget the rest of
@@ -438,7 +493,10 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             } else {
                                 ActionKind::Danger
                             },
-                            !busy && !p.read_only && !p.statements.is_empty(),
+                            !busy
+                                && !p.read_only
+                                && !p.statements.is_empty()
+                                && p.withheld.is_empty(),
                             ring,
                             ACTION_TAB + 30,
                             move || apply(ui.clone()),
