@@ -404,10 +404,17 @@ fn themed_toggle(sig: RwSignal<bool>) -> impl IntoView {
                 // Floem dresses every `ToggleButtonClass` in a 1px `#8c8c8c`
                 // border (`theme::default_theme`'s `border_style`), which reads
                 // as a grey outline around the dark off track and vanishes under
-                // the lit on one. Zeroed rather than made transparent: the handle
-                // is placed from `layout.size`, so the width costs no geometry,
-                // and a border that cannot paint is also a border floem's `.focus`
-                // rule cannot colour — see below.
+                // the lit on one.
+                //
+                // **This is also where the reported magenta ring came from.** The
+                // same theme's `focus_style` carries
+                // `.focus(|_| border_color(#724a8c))` — a *border colour*, on plain
+                // `.focus` rather than `.focus_visible`, which is exactly why it
+                // appeared on a mouse click and never on a Tab. Zeroing the width
+                // answers both at once, and is free where a transparent colour
+                // would not have been: the handle is placed from `layout.size`, so
+                // the border costs no geometry either way, and a border that
+                // cannot paint is one floem's `.focus` rule cannot colour.
                 .border(0.0)
                 .border_radius(9.0)
                 .flex_shrink(0.0_f32)
@@ -417,7 +424,7 @@ fn themed_toggle(sig: RwSignal<bool>) -> impl IntoView {
                 .background(bg)
                 .hover(move |s| s.background(bg_hover))
                 .active(move |s| s.background(bg_hover))
-                // Two more defaults from the same class, both of which must be
+                // Two further defaults from the same class, both of which must be
                 // answered whether or not this switch is wearing a ring:
                 //
                 // - `.focus(|s| s.hover(|s| s.background(#eae6ec)))` — a near-white
