@@ -3404,14 +3404,43 @@ fn pg_column_clauses(from: &ColumnInfo, to: &ColumnInfo, d: SqlDialect) -> Vec<S
 /// carry: indexes and comments).
 fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
     let pg = dialect == SqlDialect::Postgres;
+    // SQLite sides with PostgreSQL on indexes — they are statements of their own,
+    // there being no inline `KEY` — and has neither engine's table options.
+    let sqlite = dialect == SqlDialect::Sqlite;
+    let separate_indexes = pg || sqlite;
     let q = |s: &str| ddl_ident_in(s, dialect);
     let qname = qualified(&d.name, d.schema.as_deref(), dialect);
+    // **SQLite's `AUTOINCREMENT` exists only inline**, as `INTEGER PRIMARY KEY
+    // AUTOINCREMENT` on one column — there is no table-level spelling of it, and
+    // a `PRIMARY KEY (…)` clause alongside would declare a second key. So the
+    // one column it can apply to takes the whole declaration, and the table
+    // constraint below stands down.
+    let inline_key: Option<&str> = match d.primary_key.as_slice() {
+        [only] if sqlite => d
+            .columns
+            .iter()
+            .find(|c| &c.info.name == only && c.info.auto_increment)
+            .map(|c| c.info.name.as_str()),
+        _ => None,
+    };
     let mut lines: Vec<String> = d
         .columns
         .iter()
-        .map(|c| format!("  {}", c.info.definition_sql(dialect)))
+        .map(|c| {
+            if Some(c.info.name.as_str()) == inline_key {
+                // Deliberately not `definition_sql` plus a suffix: `NOT NULL` is
+                // implied by the rowid alias, and this is the form SQLite itself
+                // writes back when asked for the table's DDL.
+                return format!(
+                    "  {} {} PRIMARY KEY AUTOINCREMENT",
+                    q(&c.info.name),
+                    c.info.type_name
+                );
+            }
+            format!("  {}", c.info.definition_sql(dialect))
+        })
         .collect();
-    if !d.primary_key.is_empty() {
+    if !d.primary_key.is_empty() && inline_key.is_none() {
         lines.push(format!(
             "  PRIMARY KEY ({})",
             d.primary_key
@@ -3421,8 +3450,8 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
                 .join(", ")
         ));
     }
-    if !pg {
-        // MySQL inlines its indexes; PostgreSQL can't and emits them after.
+    if !separate_indexes {
+        // MySQL inlines its indexes; the other two can't and emit them after.
         for ix in &d.indexes {
             let kw = if ix.info.unique { "UNIQUE KEY" } else { "KEY" };
             lines.push(format!(
@@ -3441,7 +3470,10 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
         lines.push(format!("  {}", ck.info.clause_sql(dialect)));
     }
     let mut head = format!("CREATE TABLE {qname} (\n{}\n)", lines.join(",\n"));
-    if !pg {
+    // None of the three exists in SQLite: no storage engine to name, no table
+    // collation (it is per column there), and no comments anywhere in the
+    // language.
+    if !pg && !sqlite {
         if let Some(e) = d.engine.as_deref().filter(|e| !e.is_empty()) {
             head.push_str(&format!(" ENGINE={e}"));
         }
@@ -3454,10 +3486,12 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
     }
     head.push(';');
     let mut out = vec![head];
-    if pg {
+    if separate_indexes {
         for ix in &d.indexes {
             out.push(create_index_sql(&ix.info, &qname, dialect));
         }
+    }
+    if pg {
         if let Some(c) = d.comment.as_deref().filter(|c| !c.is_empty()) {
             out.push(format!(
                 "COMMENT ON TABLE {qname} IS {};",
@@ -10304,5 +10338,185 @@ mod sqlite_drop_tests {
                 "{d:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sqlite_create_tests {
+    use super::*;
+    use crate::intel::SqlDialect::Sqlite;
+    use crate::schema::{CheckInfo, ForeignKeyInfo, IndexColumn, IndexInfo};
+
+    fn col(name: &str, ty: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.into(),
+            type_name: ty.into(),
+            nullable: true,
+            ..Default::default()
+        }
+    }
+
+    fn emit(t: &TableInfo) -> Vec<String> {
+        create_table_sql(&TableDraft::from_table(t), Sqlite)
+    }
+
+    fn one(t: &TableInfo) -> String {
+        emit(t).join("\n")
+    }
+
+    /// A rowid table with an `INTEGER PRIMARY KEY AUTOINCREMENT`. The keyword is
+    /// **inline or nothing** in SQLite — there is no table-level form of it, and
+    /// `AUTO_INCREMENT` is MySQL's spelling of a different thing.
+    fn autoinc() -> TableInfo {
+        TableInfo {
+            name: "users".into(),
+            columns: vec![
+                ColumnInfo {
+                    name: "id".into(),
+                    type_name: "INTEGER".into(),
+                    nullable: false,
+                    primary_key: true,
+                    auto_increment: true,
+                    ..Default::default()
+                },
+                col("email", "TEXT"),
+            ],
+            indexes: vec![IndexInfo {
+                name: "PRIMARY".into(),
+                columns: vec![IndexColumn::plain("id")],
+                unique: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_autoincrement_key_is_written_inline() {
+        let sql = one(&autoinc());
+        assert!(
+            sql.contains(r#""id" INTEGER PRIMARY KEY AUTOINCREMENT"#),
+            "{sql}"
+        );
+        assert!(!sql.contains("AUTO_INCREMENT"), "MySQL's spelling: {sql}");
+        assert!(
+            !sql.contains("PRIMARY KEY (\"id\")"),
+            "the table-level clause would be a second key: {sql}"
+        );
+    }
+
+    /// A composite key has no autoincrement to inline, so it takes the ordinary
+    /// table-level clause.
+    #[test]
+    fn a_composite_key_is_written_as_a_table_constraint() {
+        let t = TableInfo {
+            name: "memberships".into(),
+            columns: vec![col("team", "TEXT"), col("person", "TEXT")],
+            indexes: vec![IndexInfo {
+                name: "PRIMARY".into(),
+                columns: vec![IndexColumn::plain("team"), IndexColumn::plain("person")],
+                unique: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            one(&t).contains(r#"PRIMARY KEY ("team", "person")"#),
+            "{}",
+            one(&t)
+        );
+    }
+
+    /// SQLite has no inline `KEY`/`UNIQUE KEY` — that is MySQL-only syntax, and
+    /// emitting it is a syntax error rather than an infelicity. Indexes come
+    /// after the table, as they do on PostgreSQL.
+    #[test]
+    fn indexes_come_after_the_table_not_inside_it() {
+        let mut t = autoinc();
+        t.indexes.push(IndexInfo {
+            name: "ix_email".into(),
+            columns: vec![IndexColumn::plain("email")],
+            ..Default::default()
+        });
+        t.indexes.push(IndexInfo {
+            name: "uq_email".into(),
+            columns: vec![IndexColumn::plain("email")],
+            unique: true,
+            ..Default::default()
+        });
+        let stmts = emit(&t);
+        assert!(!stmts[0].contains(" KEY \""), "no inline key: {}", stmts[0]);
+        let rest = stmts[1..].join("\n");
+        assert!(rest.contains(r#"CREATE INDEX "ix_email""#), "{rest}");
+        assert!(rest.contains(r#"CREATE UNIQUE INDEX "uq_email""#), "{rest}");
+    }
+
+    /// None of the three table options exists in SQLite, and `COMMENT` doesn't
+    /// exist at all — not on a table, not on a column.
+    #[test]
+    fn no_table_options_and_no_comments_survive() {
+        let mut t = autoinc();
+        t.engine = Some("InnoDB".into());
+        t.collation = Some("utf8mb4_bin".into());
+        t.comment = Some("people".into());
+        t.columns[1].comment = Some("login".into());
+        let sql = one(&t);
+        for banned in ["ENGINE=", "COLLATE=", "COMMENT", "InnoDB"] {
+            assert!(!sql.contains(banned), "{banned} in:\n{sql}");
+        }
+    }
+
+    /// `ON UPDATE CURRENT_TIMESTAMP` is a MySQL column attribute. SQLite has no
+    /// such clause, and a stray one makes the whole statement unparseable.
+    #[test]
+    fn a_mysql_on_update_clause_is_not_carried_over() {
+        let mut t = autoinc();
+        t.columns[1].on_update = Some("CURRENT_TIMESTAMP".into());
+        assert!(!one(&t).contains("ON UPDATE"), "{}", one(&t));
+    }
+
+    /// What SQLite *does* have stays: a column collation, a default, NOT NULL,
+    /// a generated expression, and inline FK and CHECK constraints.
+    #[test]
+    fn what_sqlite_does_have_is_kept() {
+        let mut t = autoinc();
+        t.columns[1].collation = Some("NOCASE".into());
+        t.columns[1].nullable = false;
+        t.columns[1].default = Some("''".into());
+        t.columns.push(ColumnInfo {
+            name: "domain".into(),
+            type_name: "TEXT".into(),
+            nullable: true,
+            generated: Some("substr(email, instr(email, '@'))".into()),
+            ..Default::default()
+        });
+        t.foreign_keys.push(ForeignKeyInfo {
+            name: "fk_team".into(),
+            columns: vec!["email".into()],
+            ref_table: "teams".into(),
+            ref_columns: vec!["email".into()],
+            on_delete: Some("CASCADE".into()),
+            ..Default::default()
+        });
+        t.check_constraints.push(CheckInfo {
+            name: "ck_email".into(),
+            expression: "length(email) > 3".into(),
+            enforced: true,
+            ..Default::default()
+        });
+        let sql = one(&t);
+        assert!(sql.contains("COLLATE NOCASE"), "{sql}");
+        assert!(sql.contains("NOT NULL"), "{sql}");
+        assert!(sql.contains("DEFAULT ''"), "{sql}");
+        assert!(sql.contains("GENERATED ALWAYS AS ("), "{sql}");
+        assert!(sql.contains(r#"REFERENCES "teams""#), "{sql}");
+        assert!(sql.contains("ON DELETE CASCADE"), "{sql}");
+        assert!(sql.contains("CHECK (length(email) > 3)"), "{sql}");
+    }
+
+    /// PostgreSQL's identity spelling must not leak either.
+    #[test]
+    fn no_identity_syntax_leaks_in() {
+        assert!(!one(&autoinc()).contains("AS IDENTITY"));
     }
 }
