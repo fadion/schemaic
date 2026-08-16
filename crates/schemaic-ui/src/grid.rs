@@ -4852,22 +4852,6 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
     EventPropagation::Stop
 }
 
-/// **Is the menu currently up the one anchored at `mine`?** — the test that makes
-/// the grid toolbar's three dropdown icons toggle rather than dismiss-and-rebuild.
-///
-/// `open` is whether the shared `popup_menu` channel holds anything at all, and it
-/// is checked first for a reason: closing a menu clears the channel but leaves
-/// `popup_anchor` behind, so the anchor alone would still name this icon long
-/// after its menu was dismissed with Escape, and the next press would "toggle
-/// shut" a menu that isn't there.
-///
-/// Separated from the view so the rule can be stated once and tested. Inlined in
-/// the three openers it would be three copies of an `&&` that is only obviously
-/// right once you know why the order matters.
-fn menu_anchored_at(open: bool, anchor: Option<PopupAnchor>, mine: PopupAnchor) -> bool {
-    open && anchor == Some(mine)
-}
-
 /// A thin vertical divider between toolbar icon groups. Extra horizontal margin
 /// so it sits clear of the icons on either side — 8px, on top of the cluster's
 /// own 3px gap, for 11px of air between the rule and the nearest glyph. The
@@ -5030,13 +5014,11 @@ fn grid_toolbar(
         let sz = 16.0; // every toolbar glyph above
         PopupAnchor::BelowIcon(o.x, o.x + sz, o.y + sz)
     };
-    // **Is the menu currently up the one this icon opened?** `popup` is a single
-    // slot shared by eleven openers and carries no tag saying who filled it, so
-    // the anchor stands in for one. Self-invalidating by construction: every
-    // opener overwrites `popup_anchor` as it opens, so there is no marker to go
-    // stale here and no reset for the other ten to forget.
+    // Is the menu currently up the one this icon opened? The rule, and why the
+    // anchor is what answers it, is `widgets::menu_anchored_at` — shared with the
+    // status bar's segments, which toggle off the same channel.
     let menu_is_mine = move |origin: RwSignal<Point>| {
-        menu_anchored_at(
+        crate::widgets::menu_anchored_at(
             gs.popup.get_untracked().is_some(),
             gs.popup_anchor.get_untracked(),
             anchor_below(origin.get_untracked()),
@@ -6560,51 +6542,6 @@ mod tests {
             type_name: ty.to_string(),
             origin: None,
         }
-    }
-
-    // The copy icon's anchor, and the save icon's a few px to its right.
-    const COPY_AT: PopupAnchor = PopupAnchor::BelowIcon(100.0, 116.0, 40.0);
-    const SAVE_AT: PopupAnchor = PopupAnchor::BelowIcon(126.0, 142.0, 40.0);
-
-    #[test]
-    fn an_icon_owns_the_menu_anchored_under_it() {
-        assert!(menu_anchored_at(true, Some(COPY_AT), COPY_AT));
-    }
-
-    /// The whole point of checking `open` first. Closing clears `popup_menu` but
-    /// leaves `popup_anchor` naming whoever opened last, so an anchor-only test
-    /// would report the copy menu still open after Escape dismissed it — and the
-    /// next press would close nothing instead of opening.
-    #[test]
-    fn a_dismissed_menu_is_no_longer_owned() {
-        assert!(!menu_anchored_at(false, Some(COPY_AT), COPY_AT));
-    }
-
-    /// Adjacent icons on one strip: whichever is up, only its own icon may close
-    /// it. Pressing save while copy's menu is open opens save's, which is what
-    /// `open_save` does when this returns false.
-    #[test]
-    fn a_neighbours_menu_is_not_mine() {
-        assert!(!menu_anchored_at(true, Some(COPY_AT), SAVE_AT));
-    }
-
-    /// A cell or header right-click sets the anchor to `None` (open at the
-    /// cursor). It shares the one `popup_menu` channel with these icons, and a
-    /// press on copy must open copy's menu rather than dismiss that one.
-    #[test]
-    fn a_cursor_menu_belongs_to_no_icon() {
-        assert!(!menu_anchored_at(true, None, COPY_AT));
-    }
-
-    /// The status bar's segment menus ride the same channel with the other
-    /// placement, so the two variants must not compare equal on their numbers.
-    #[test]
-    fn a_footer_menu_is_never_a_toolbar_dropdown() {
-        assert!(!menu_anchored_at(
-            true,
-            Some(PopupAnchor::AboveFooter(100.0, 116.0)),
-            COPY_AT
-        ));
     }
 
     // Single-column result of the given cells, so `compute_order` sorts column 0.

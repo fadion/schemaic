@@ -2231,26 +2231,32 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   (`connection_form`, `editor_pane`, `grid` ×5, `lib`'s status bar, `monitor_view`,
   `table_designer::suggest_chevron`, `tabs`) and nothing in it says who filled it, so the grid
   toolbar's AI / Copy / Save icons ran "dismiss, then open" unconditionally and a second press
-  rebuilt an identical panel instead of closing it. The menus that already toggled could not lend
-  their answer: the schema panel's eye and gear, the connection switcher and the tab selector each
-  render their *own* menu and so keep a private `RwSignal<bool>` (`db_menu_open`/`schema_menu_open`
-  /`conn_menu_open`/`active_db_menu_open`), while the status-bar segments do ride this channel but
-  carry a separate `menu_owner: RwSignal<u8>` tag beside it. The grid's icons instead ask the
-  anchor — `grid::menu_anchored_at(open, anchor, mine)`, comparing `popup_anchor` against the
-  `PopupAnchor::BelowIcon(…)` the icon would set itself, which is why `PopupAnchor` derives
-  `PartialEq` and why its rustdoc calls that derive load-bearing rather than a convenience. The
-  marker is self-invalidating **only because every opener overwrites the anchor as it opens**:
-  there is no separate flag to go stale and nothing for the other ten to reset. An opener that
-  fills `popup_menu` without setting `popup_anchor` first therefore hands its menu to whoever
-  opened last, silently, and the test that would catch it doesn't exist.
+  rebuilt an identical panel instead of closing it. The menus that already toggled could only half
+  lend their answer: the schema panel's eye and gear, the connection switcher and the tab selector
+  each render their *own* menu and so keep a private `RwSignal<bool>`
+  (`db_menu_open`/`schema_menu_open`/`conn_menu_open`/`active_db_menu_open`), which is available
+  only to a trigger that owns its panel. **`widgets::menu_anchored_at(open, anchor, mine)` is the
+  answer for a trigger that shares the channel**, comparing `popup_anchor` against the
+  `PopupAnchor` it would set itself — which is why `PopupAnchor` derives `PartialEq` and why its
+  rustdoc calls that derive load-bearing rather than a convenience. It is self-invalidating **only
+  because every opener overwrites the anchor as it opens**: there is no separate flag to go stale
+  and nothing for the other ten to reset. An opener that fills `popup_menu` without setting
+  `popup_anchor` first therefore hands its menu to whoever opened last, silently, and the test that
+  would catch it doesn't exist.
   `open` (is the channel non-empty) is checked **before** the anchor, which is the reason this is a
   named function rather than an inline `&&`: closing clears `popup_menu` but leaves `popup_anchor`
   naming the last opener, so an anchor-only test reports the menu still up after Escape and the
-  next press closes nothing instead of opening. Five tests in `grid::tests` pin it, including
-  `a_dismissed_menu_is_no_longer_owned` and `a_cursor_menu_belongs_to_no_icon` — a right-click menu
-  sets the anchor to `None` on this same channel. The three icons share one `anchor_below` closure
-  because the value that *places* the panel is the value that *identifies* it: written twice, a
-  pixel of drift would open the menu correctly and silently refuse to toggle it shut.
+  next press closes nothing instead of opening. Six tests in `widgets::menu_key_tests` pin it,
+  including `a_dismissed_menu_is_no_longer_owned` and `a_cursor_menu_belongs_to_no_trigger` — a
+  right-click menu sets the anchor to `None` on this same channel. Each trigger states its anchor
+  **once** (`grid_toolbar`'s `anchor_below`, `status_menu_seg`'s `anchor_here`) because the value
+  that *places* the panel is the value that *identifies* it: written twice, a pixel of drift would
+  open the menu correctly and silently refuse to toggle it shut.
+  A tag beside the channel is what this replaced, and why it isn't the pattern: the status-bar
+  segments carried a `menu_owner: RwSignal<u8>` written only by the segments themselves, so it went
+  stale the moment anything else filled the channel — open a segment's menu, right-click a grid
+  cell, press the segment again, and it closed the cell's menu instead of opening its own. Both
+  surfaces ask the anchor now.
 - **Not every menu can be *opened* from the keyboard**, which is a separate thing from navigating
   one. A menu on a ringed control can be — `suggest_chevron`, the Live Monitor's Export dropdown,
   and the grid toolbar's Copy / Save / AI dropdowns since the strip gained its ring — and the
