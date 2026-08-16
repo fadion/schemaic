@@ -2,9 +2,16 @@
 
 A native SQL editor (Rust + [Floem](https://github.com/lapce/floem) 0.2.0), MySQL/MariaDB-first,
 Zed-inspired, aiming to replace DataGrip. Workspace crates: `schemaic-core` (models + the pure,
-unit-tested SQL/edit/export/DDL logic), `schemaic-db` (MySQL/MariaDB + PostgreSQL + SSH tunnels),
-`schemaic-ai`, `schemaic-term`, `schemaic-ui` (the Floem views), `schemaic-app` (signal wiring, the
-built-in MCP server).
+unit-tested SQL/edit/export/DDL logic), `schemaic-db` (MySQL/MariaDB + PostgreSQL + SQLite + SSH
+tunnels), `schemaic-ai`, `schemaic-term`, `schemaic-ui` (the Floem views), `schemaic-app` (signal
+wiring, the built-in MCP server).
+
+**Three engines, and they are not equal.** MySQL/MariaDB and PostgreSQL are full; SQLite reads,
+writes and imports but has **no schema editing** and **no manual-transaction mode**, both of which
+are statements about SQLite rather than unfinished work (`ddl::supports_schema_editing` and
+`session::Session::open` carry the reasons). Ask a **capability**, never an engine: a
+`dialect == Postgres` or `!= MySql` compiles cleanly while silently sorting a third engine onto
+whichever side it happens to fall.
 
 **`docs/architecture.md` is the reference document** — the module map (one entry per source file),
 the architecture invariants, the UI conventions, the Floem hazards, and the data grid end to end.
