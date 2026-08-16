@@ -741,7 +741,8 @@ pub(crate) async fn fetch_schema(db: &Db) -> Result<DbSchema, DbError> {
                 indexes,
                 foreign_keys,
                 is_view,
-                view_definition: is_view.then(|| sql.clone()),
+                // The **body**, not the statement — see `view_body_of`.
+                view_definition: is_view.then(|| view_body_of(&sql)).flatten(),
                 view_options: None,
                 engine: None,
                 collation: None,
@@ -866,6 +867,83 @@ fn table_columns(conn: &SqliteConn, table: &str) -> Result<Vec<ColumnInfo>, DbEr
         });
     }
     Ok(out)
+}
+
+/// A view's **body** — the `SELECT` — read out of the `CREATE VIEW` statement
+/// `sqlite_master` stores.
+///
+/// **Normalised on the way in**, like `mysql_column`'s defaults and
+/// `mysql_check_clause`, because `TableInfo::view_definition` is contracted to
+/// hold the stored `SELECT` and nothing else: MySQL's `VIEW_DEFINITION` and
+/// PostgreSQL's `pg_get_viewdef` both hand back a body, while SQLite is the one
+/// engine that keeps the *whole statement*. Storing that verbatim made Copy DDL
+/// emit `CREATE VIEW "v" AS` wrapped around a second, complete `CREATE VIEW` —
+/// reported from a real database, and the reason this is a function with tests
+/// rather than a `strip_prefix`.
+///
+/// It is a **positional reader** over the shared lexer, beside
+/// `view_algorithm_of` and `trigger_body_of` in `lib.rs`: the header is
+/// `CREATE [TEMP|TEMPORARY] VIEW [IF NOT EXISTS] [schema.]name [(columns)] AS`,
+/// so the body starts after the first `AS` at a **code** position and at paren
+/// depth zero. Both qualifications carry weight — a view may be *named* `as` in
+/// any of SQLite's three quotings, and a column list may hold one — and after
+/// that point every remaining `AS` belongs to the user's own SQL.
+///
+/// `None` for anything it can't read, which `view_definition` documents and
+/// `create_ddl` already degrades on. That is the safe direction: a body it
+/// guessed wrong would be *emitted*.
+fn view_body_of(create_sql: &str) -> Option<String> {
+    use schemaic_core::intel::SqlDialect;
+    use schemaic_core::sql::{is_word_byte, is_word_start, skip_noncode};
+
+    let b = create_sql.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0i32;
+    let mut seen_create = false;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, SqlDialect::Sqlite) {
+            i = j.max(i + 1);
+            continue;
+        }
+        match b[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if !is_word_start(b[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i + 1;
+        while end < b.len() && is_word_byte(b[end]) {
+            end += 1;
+        }
+        let word = &create_sql[start..end];
+        if !seen_create {
+            // Whatever this is, it isn't a `CREATE VIEW`; refuse rather than
+            // hand back a body read out of something else.
+            if !word.eq_ignore_ascii_case("CREATE") {
+                return None;
+            }
+            seen_create = true;
+        } else if depth == 0 && word.eq_ignore_ascii_case("AS") {
+            // The tail — trailing whitespace and a terminating `;` — is
+            // `ddl::view_body`'s rule, shared rather than repeated here.
+            let body = schemaic_core::ddl::view_body(&create_sql[end..]);
+            return (!body.is_empty()).then_some(body);
+        }
+        i = end;
+    }
+    None
 }
 
 /// A generated column's expression, dug out of the table's own `CREATE` text.
@@ -1701,6 +1779,124 @@ mod tests {
             .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0, "the committed batch rolled back with the rest");
+    }
+
+    /// `sqlite_master.sql` stores the **whole** `CREATE VIEW …` statement, but
+    /// `TableInfo::view_definition` is contracted to hold only the body — so
+    /// storing the statement made Copy DDL emit a `CREATE VIEW "v" AS` header
+    /// wrapped around a second, complete `CREATE VIEW`. Reported from a real
+    /// database; this is the regression test.
+    #[test]
+    fn a_views_body_is_read_out_of_its_create_statement() {
+        assert_eq!(
+            view_body_of("CREATE VIEW v AS SELECT 1").as_deref(),
+            Some("SELECT 1")
+        );
+        // The reported shape, newlines and all.
+        let real = "CREATE VIEW album_titles AS\n    SELECT album.id, album.title\n    \
+                    FROM album JOIN artist ON album.artist_id = artist.id";
+        assert_eq!(
+            view_body_of(real).as_deref(),
+            Some(
+                "SELECT album.id, album.title\n    \
+                 FROM album JOIN artist ON album.artist_id = artist.id"
+            )
+        );
+    }
+
+    /// The header has several optional parts, and the body's own `AS` must not be
+    /// mistaken for the one that ends the header — only the first at paren depth
+    /// zero counts.
+    #[test]
+    fn the_view_header_is_read_past_every_optional_part() {
+        for (sql, body) in [
+            ("CREATE TEMP VIEW v AS SELECT 1", "SELECT 1"),
+            (
+                "CREATE TEMPORARY VIEW IF NOT EXISTS v AS SELECT 1",
+                "SELECT 1",
+            ),
+            ("CREATE VIEW main.v AS SELECT 1", "SELECT 1"),
+            // A column list is parenthesised, so nothing in it is at depth 0.
+            ("CREATE VIEW v (a, b) AS SELECT 1, 2", "SELECT 1, 2"),
+            // The body's own alias must survive — the *first* AS ends the header.
+            (
+                "CREATE VIEW v AS SELECT a AS b FROM t",
+                "SELECT a AS b FROM t",
+            ),
+            // A trailing semicolon isn't part of the body.
+            ("CREATE VIEW v AS SELECT 1;", "SELECT 1"),
+            ("CREATE VIEW v /* c */ AS SELECT 1", "SELECT 1"),
+        ] {
+            assert_eq!(view_body_of(sql).as_deref(), Some(body), "{sql}");
+        }
+    }
+
+    /// A view *named* `as`, in each of SQLite's three quotings. The lexer skips a
+    /// quoted identifier whole, so none of them ends the header early — which a
+    /// byte search for "as" would get wrong three different ways.
+    #[test]
+    fn a_view_named_as_does_not_end_its_own_header() {
+        for sql in [
+            r#"CREATE VIEW "as" AS SELECT 1"#,
+            "CREATE VIEW `as` AS SELECT 1",
+            "CREATE VIEW [as] AS SELECT 1",
+            r#"CREATE VIEW "my as view" AS SELECT 1"#,
+        ] {
+            assert_eq!(view_body_of(sql).as_deref(), Some("SELECT 1"), "{sql}");
+        }
+    }
+
+    /// Anything it can't read is `None`, which `TableInfo::view_definition`
+    /// documents ("views whose definition couldn't be read") and `create_ddl`
+    /// already degrades on — better than handing back a statement that would be
+    /// wrapped in a second header.
+    #[test]
+    fn an_unreadable_header_yields_no_body_rather_than_the_whole_statement() {
+        for sql in [
+            "SELECT 1",            // not a CREATE at all
+            "CREATE VIEW v",       // no AS
+            "CREATE VIEW v AS",    // nothing after it
+            "CREATE VIEW v AS   ", // …still nothing
+            "",
+        ] {
+            assert_eq!(view_body_of(sql), None, "{sql:?}");
+        }
+    }
+
+    /// End to end through the real `fetch_schema` and the real DDL emitter,
+    /// because the bug was in the **wiring** — the reader can be perfect and the
+    /// field still be filled from the wrong string. It asserts the artefact the
+    /// user actually saw: one `CREATE VIEW`, not two.
+    #[tokio::test]
+    async fn copy_ddl_on_a_view_emits_one_create_statement() {
+        let (keeper, db) = shared_memory("view_ddl");
+        keeper
+            .execute_batch(
+                "CREATE TABLE album (id INTEGER PRIMARY KEY, title TEXT);
+                 CREATE VIEW album_titles AS
+                     SELECT album.id, album.title FROM album;",
+            )
+            .unwrap();
+        let schema = fetch_schema(&db).await.expect("schema");
+        let view = schema
+            .tables
+            .iter()
+            .find(|t| t.name == "album_titles")
+            .expect("the view");
+
+        let body = view.view_definition.as_deref().expect("a definition");
+        assert!(
+            body.to_ascii_uppercase().starts_with("SELECT"),
+            "the field holds the SELECT, not the statement: {body:?}"
+        );
+
+        let ddl = view.create_ddl(schemaic_core::intel::SqlDialect::Sqlite);
+        assert_eq!(
+            ddl.to_ascii_uppercase().matches("CREATE VIEW").count(),
+            1,
+            "exactly one CREATE VIEW, not a header wrapped around a statement:\n{ddl}"
+        );
+        assert!(ddl.contains("album_titles"));
     }
 
     #[test]
