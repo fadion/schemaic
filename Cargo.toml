@@ -51,6 +51,16 @@ mysql_async = { version = "0.34", default-features = false, features = ["minimal
 # exotic type round-trip losslessly as their text form (mirrors the MySQL text path).
 tokio-postgres = "0.7"
 futures-util = "0.3"
+# SQLite (third engine). `bundled` compiles SQLite's own amalgamation in, so there
+# is no system library to find and the version is the one we tested against;
+# SQLite is public domain, so it adds no licence obligation for `cargo deny`.
+# `column_metadata` sets SQLITE_ENABLE_COLUMN_METADATA, which is what makes
+# `sqlite3_column_table_name`/`origin_name` available — the same per-column
+# provenance the editing system needs from MySQL's org_table/org_name, and without
+# it no SQLite result would be editable at all. The driver is *blocking*, so every
+# call runs inside `spawn_blocking`; that suits the one-connection-per-operation
+# invariant, which already opens and closes a connection per call.
+rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
 # SSH tunnelling. Use the `ring` crypto backend instead of the default
 # `aws-lc-rs` to avoid the aws-lc-sys C/cmake build.
 russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }

@@ -13,6 +13,7 @@
 
 pub mod pg;
 pub mod session;
+pub mod sqlite;
 pub mod ssh;
 
 pub use session::{Outcome, Session};
@@ -59,6 +60,7 @@ pub enum Engine {
     #[default]
     MySql,
     Postgres,
+    Sqlite,
 }
 
 impl Engine {
@@ -68,6 +70,7 @@ impl Engine {
         match self {
             Engine::MySql => schemaic_core::intel::SqlDialect::MySql,
             Engine::Postgres => schemaic_core::intel::SqlDialect::Postgres,
+            Engine::Sqlite => schemaic_core::intel::SqlDialect::Sqlite,
         }
     }
 
@@ -77,15 +80,34 @@ impl Engine {
         match self {
             Engine::MySql => "mysql",
             Engine::Postgres => "postgres",
+            Engine::Sqlite => "sqlite",
         }
     }
 
+    /// Is this engine reached over the network — i.e. does a host, a port, a user,
+    /// a password or an SSH tunnel mean anything for it?
+    ///
+    /// SQLite is the one that answers `false`, and it is worth a predicate rather
+    /// than an `== Engine::Sqlite` at each site because the *question* is what the
+    /// callers actually have: whether to open a tunnel, whether to show a port
+    /// field, whether a credential is worth keyring space.
+    pub fn is_networked(self) -> bool {
+        !matches!(self, Engine::Sqlite)
+    }
+
     /// Map a saved connection's `db_type` label to an engine. Anything that isn't
-    /// recognizably Postgres falls back to MySQL (the historical default), so old
-    /// saved connections and the "MySQL"/"MariaDB" labels keep working.
+    /// recognizably Postgres or SQLite falls back to MySQL (the historical
+    /// default), so old saved connections and the "MySQL"/"MariaDB" labels keep
+    /// working.
+    ///
+    /// Delegates to [`schemaic_core::connection`]'s predicates — they own the
+    /// aliases, and a label that meant SQLite to the connection list and MySQL to
+    /// the driver would open a TCP socket for a file path.
     pub fn from_db_type(db_type: &str) -> Engine {
         if schemaic_core::connection::is_postgres(db_type) {
             Engine::Postgres
+        } else if schemaic_core::connection::is_sqlite(db_type) {
+            Engine::Sqlite
         } else {
             Engine::MySql
         }
@@ -110,6 +132,10 @@ pub struct Db {
     pub(crate) port: u16,
     pub(crate) user: String,
     pub(crate) pass: String,
+    /// The database file, for [`Engine::Sqlite`] — the whole target, since that
+    /// engine has no server. Empty for every other engine, where the coordinates
+    /// above are the target instead. See [`sqlite`].
+    pub(crate) file: String,
 }
 
 impl Db {
@@ -119,13 +145,20 @@ impl Db {
     /// from the connection's `db_type` (MySQL/MariaDB vs PostgreSQL).
     pub fn connect(conn: &schemaic_core::connection::Connection, tunnel_port: Option<u16>) -> Db {
         let engine = Engine::from_db_type(&conn.db_type);
-        match tunnel_port {
+        // A SQLite target is a local file, so a tunnel port is meaningless — and
+        // rewriting the endpoint to `127.0.0.1:<port>` for one would be actively
+        // wrong. The caller shouldn't open a tunnel for such a connection at all
+        // (`Engine::is_networked`), but the rewrite is ignored here as well, so a
+        // caller that does can't repoint the file.
+        let file = conn.file.clone();
+        match tunnel_port.filter(|_| engine.is_networked()) {
             Some(port) => Db {
                 engine,
                 host: "127.0.0.1".to_string(),
                 port,
                 user: conn.user.clone(),
                 pass: conn.password.clone(),
+                file,
             },
             None => Db {
                 engine,
@@ -133,6 +166,7 @@ impl Db {
                 port: conn.port,
                 user: conn.user.clone(),
                 pass: conn.password.clone(),
+                file,
             },
         }
     }
@@ -140,20 +174,37 @@ impl Db {
     /// Reconstruct from raw parts + engine — used by the MCP subprocess, which
     /// receives the (already-tunnelled) endpoint (incl. engine) over its
     /// environment, so AI queries run against the right driver.
-    pub fn from_parts(engine: Engine, host: String, port: u16, user: String, pass: String) -> Db {
+    ///
+    /// `file` carries a SQLite connection's target and is empty for the other
+    /// engines. It is part of the endpoint for the same reason `host` is: without
+    /// it the subprocess has an engine it can't reach anything with.
+    pub fn from_parts(
+        engine: Engine,
+        host: String,
+        port: u16,
+        user: String,
+        pass: String,
+        file: String,
+    ) -> Db {
         Db {
             engine,
             host,
             port,
             user,
             pass,
+            file,
         }
     }
 
-    /// Borrow the endpoint parts `(host, port, user, pass)` — used to serialize
-    /// the endpoint for the MCP subprocess handoff.
-    pub fn parts(&self) -> (&str, u16, &str, &str) {
-        (&self.host, self.port, &self.user, &self.pass)
+    /// Borrow the endpoint parts `(host, port, user, pass, file)` — used to
+    /// serialize the endpoint for the MCP subprocess handoff.
+    pub fn parts(&self) -> (&str, u16, &str, &str, &str) {
+        (&self.host, self.port, &self.user, &self.pass, &self.file)
+    }
+
+    /// The database file this handle points at — empty unless it is SQLite.
+    pub fn file(&self) -> &str {
+        &self.file
     }
 
     /// The engine this handle speaks.
@@ -212,27 +263,34 @@ impl Db {
         // Stamped here, in the one place that knows what the connection was
         // actually scoped to, rather than by the caller from the tab it will land
         // in — see `ResultSet::database`.
-        let mut rs = if self.engine == Engine::Postgres {
-            pg::fetch_query(self, database, sql, row_cap, cancel).await?
-        } else {
-            let mut conn = self.open(database, false).await?;
-            // The connection id, so a second connection can KILL its in-flight query.
-            let conn_id = conn.id();
+        let mut rs = match self.engine {
+            Engine::Postgres => pg::fetch_query(self, database, sql, row_cap, cancel).await?,
+            Engine::Sqlite => sqlite::fetch_query(self, sql, row_cap, cancel).await?,
+            Engine::MySql => {
+                let mut conn = self.open(database, false).await?;
+                // The connection id, so a second connection can KILL its in-flight query.
+                let conn_id = conn.id();
 
-            let outcome = tokio::select! {
-                // `early_stop`: this connection is torn down right after, so we can bail
-                // out of the row stream at the cap without draining the rest.
-                r = collect_rows(&mut conn, sql, row_cap, true) => r,
-                _ = cancel.cancelled() => {
-                    self.kill_query(conn_id).await;
-                    Err(DbError::Cancelled)
-                }
-            };
+                let outcome = tokio::select! {
+                    // `early_stop`: this connection is torn down right after, so we can bail
+                    // out of the row stream at the cap without draining the rest.
+                    r = collect_rows(&mut conn, sql, row_cap, true) => r,
+                    _ = cancel.cancelled() => {
+                        self.kill_query(conn_id).await;
+                        Err(DbError::Cancelled)
+                    }
+                };
 
-            let _ = conn.disconnect().await;
-            outcome?
+                let _ = conn.disconnect().await;
+                outcome?
+            }
         };
-        rs.database = database.map(str::to_string);
+        // A SQLite connection has exactly one database and the caller passes none,
+        // so the label comes from the engine rather than from a scope nobody set.
+        rs.database = match self.engine {
+            Engine::Sqlite => Some(sqlite::MAIN.to_string()),
+            _ => database.map(str::to_string),
+        };
         Ok(rs)
     }
 
@@ -258,8 +316,23 @@ impl Db {
         limit: usize,
         cancel: CancellationToken,
     ) -> Result<ResultSet, DbError> {
-        if self.engine == Engine::Postgres {
-            return pg::fetch_table(self, database, schema, table, order_by, limit, cancel).await;
+        match self.engine {
+            Engine::Postgres => {
+                return pg::fetch_table(self, database, schema, table, order_by, limit, cancel)
+                    .await;
+            }
+            Engine::Sqlite => {
+                // One file, one namespace: the table stands alone, and the
+                // `main.` qualifier would only be noise.
+                let sql = format!(
+                    "SELECT * FROM {}{} LIMIT {}",
+                    ident_sqlite(table),
+                    order_by_clause(order_by, ident_sqlite),
+                    limit
+                );
+                return self.fetch_query(None, &sql, limit, cancel).await;
+            }
+            Engine::MySql => {}
         }
         // MySQL has no namespace level — the database already is one.
         debug_assert!(schema.is_none(), "MySQL tables carry no namespace");
@@ -307,8 +380,27 @@ impl Db {
         analyze: bool,
         cancel: CancellationToken,
     ) -> Result<ResultSet, DbError> {
-        if self.engine == Engine::Postgres {
-            return pg::explain(self, database, sql, analyze, cancel).await;
+        match self.engine {
+            Engine::Postgres => return pg::explain(self, database, sql, analyze, cancel).await,
+            Engine::Sqlite => {
+                // SQLite's `EXPLAIN` disassembles the statement into VDBE opcodes,
+                // which is a different artefact from the other two engines' plans
+                // and useless to `core::plan`'s heuristics. `EXPLAIN QUERY PLAN` is
+                // the one that answers the question the panel asks — which index,
+                // which scan — so that is what runs.
+                //
+                // There is no analyzing form at all: SQLite will not execute a
+                // statement to time it. `analyze` is therefore ignored rather than
+                // refused, since the plan it falls back to is still the right
+                // answer to "how will this run", and the caller has already gated
+                // the toggle on the statement being read-only.
+                let stmt = sql.trim().trim_end_matches(';').trim_end();
+                let plan = format!("EXPLAIN QUERY PLAN {stmt}");
+                return self
+                    .fetch_query(database, &plan, EXPLAIN_ROW_CAP, cancel)
+                    .await;
+            }
+            Engine::MySql => {}
         }
         let (primary, fallback) = explain_commands(sql, analyze);
         if !analyze {
@@ -397,10 +489,12 @@ impl Db {
         &self,
         database: &str,
     ) -> Result<Vec<schemaic_core::schema::RoutineInfo>, DbError> {
-        if self.engine != Engine::Postgres {
-            return Ok(Vec::new());
+        // PostgreSQL alone has trigger functions as objects of their own; a MySQL
+        // trigger carries its body, and SQLite's carries a statement list.
+        match self.engine {
+            Engine::Postgres => pg::trigger_functions(self, database).await,
+            Engine::MySql | Engine::Sqlite => Ok(Vec::new()),
         }
-        pg::trigger_functions(self, database).await
     }
 
     /// A MySQL trigger's body **as written**, plus the session state it was
@@ -421,7 +515,11 @@ impl Db {
         database: Option<&str>,
         trigger: &str,
     ) -> Result<Option<TriggerSource>, DbError> {
-        if self.engine == Engine::Postgres {
+        // The lazy second round-trip exists for MySQL's escape-mangling alone —
+        // PostgreSQL reports a faithful body already, and SQLite stores the
+        // trigger's original `CREATE` text verbatim in `sqlite_master`, so neither
+        // needs it.
+        if self.engine != Engine::MySql {
             return Ok(None);
         }
         let mut conn = self.open(database, false).await?;
@@ -449,7 +547,9 @@ impl Db {
         database: Option<&str>,
         view: &str,
     ) -> Result<Option<String>, DbError> {
-        if self.engine == Engine::Postgres {
+        // `ALGORITHM` is MySQL's alone — neither other engine has the clause, so
+        // there is nothing to fetch and nothing a replace would reset.
+        if self.engine != Engine::MySql {
             return Ok(None);
         }
         let mut conn = self.open(database, false).await?;
@@ -464,12 +564,14 @@ impl Db {
     }
 
     pub async fn prepare_check(&self, database: Option<&str>, sql: &str) -> Result<(), DbError> {
-        if self.engine == Engine::Postgres {
-            return pg::prepare_check(self, database, sql).await;
-        }
         let stmt = sql.trim().trim_end_matches(';').trim_end();
         if stmt.is_empty() {
             return Ok(());
+        }
+        match self.engine {
+            Engine::Postgres => return pg::prepare_check(self, database, sql).await,
+            Engine::Sqlite => return sqlite::prepare_check(self, stmt).await,
+            Engine::MySql => {}
         }
         let mut conn = self.open(database, false).await?;
         let result = match conn.prep(stmt).await {
@@ -561,9 +663,38 @@ impl Db {
                 )
             }
         };
-        if self.engine == Engine::Postgres {
-            pg::run_batch(self, database, stmts, row_cap, cancel, on_result).await;
-            return;
+        match self.engine {
+            Engine::Postgres => {
+                pg::run_batch(self, database, stmts, row_cap, cancel, on_result).await;
+                return;
+            }
+            Engine::Sqlite => {
+                // Statement by statement on a fresh connection each, which is what
+                // `fetch_query` already does. There is no `USE` to carry and no
+                // session state to keep, so a batch here needs nothing a loop
+                // doesn't give it — the `scope` stamping above is a no-op for an
+                // engine with one database.
+                for (i, stmt) in stmts.iter().enumerate() {
+                    if cancel.is_cancelled() {
+                        on_result(i, Err(DbError::Cancelled));
+                        continue;
+                    }
+                    let r = sqlite::fetch_query(self, stmt, row_cap, cancel.clone()).await;
+                    let failed = r.is_err();
+                    on_result(i, r);
+                    // A batch stops at its first failure, as the other two do:
+                    // the statements after it were written against a state that
+                    // never happened.
+                    if failed {
+                        for (j, _) in stmts.iter().enumerate().skip(i + 1) {
+                            on_result(j, Err(DbError::Cancelled));
+                        }
+                        return;
+                    }
+                }
+                return;
+            }
+            Engine::MySql => {}
         }
         let mut conn = match self.open(database, false).await {
             Ok(c) => c,
@@ -632,8 +763,17 @@ impl Db {
     /// `timeout` so a dead host/tunnel can't hang the caller. `Ok(())` means the
     /// server answered.
     pub async fn ping(&self, timeout: std::time::Duration) -> Result<(), DbError> {
-        if self.engine == Engine::Postgres {
-            return pg::ping(self, timeout).await;
+        match self.engine {
+            Engine::Postgres => return pg::ping(self, timeout).await,
+            Engine::Sqlite => {
+                // The timeout still applies: a file on a disconnected network
+                // share can block in `open` for as long as the OS lets it.
+                return match tokio::time::timeout(timeout, sqlite::ping(self)).await {
+                    Ok(r) => r,
+                    Err(_) => Err(DbError::Connect("timed out".to_string())),
+                };
+            }
+            Engine::MySql => {}
         }
         let check = async {
             let mut conn = self.open(None, false).await?;
@@ -652,8 +792,10 @@ impl Db {
     /// List the user databases on a server (excludes the built-in system schemas),
     /// sorted by name. Connects at the server level (no specific database needed).
     pub async fn fetch_databases(&self) -> Result<Vec<String>, DbError> {
-        if self.engine == Engine::Postgres {
-            return pg::fetch_databases(self).await;
+        match self.engine {
+            Engine::Postgres => return pg::fetch_databases(self).await,
+            Engine::Sqlite => return sqlite::fetch_databases(self).await,
+            Engine::MySql => {}
         }
         let mut conn = self.open(None, false).await?;
         let out = conn
@@ -674,8 +816,10 @@ impl Db {
     /// `information_schema` (ARCHITECTURE §11). Everything is `CAST` to a known type
     /// so the protocol never surprises us with a width mismatch.
     pub async fn fetch_schema(&self, database: &str) -> Result<DbSchema, DbError> {
-        if self.engine == Engine::Postgres {
-            return pg::fetch_schema(self, database).await;
+        match self.engine {
+            Engine::Postgres => return pg::fetch_schema(self, database).await,
+            Engine::Sqlite => return sqlite::fetch_schema(self).await,
+            Engine::MySql => {}
         }
         let mut conn = self.open(None, false).await?;
         let out = collect_schema(&mut conn, database).await;
@@ -694,8 +838,13 @@ impl Db {
     /// and then printed the names. That is the assistant's usual first tool call,
     /// and the cost was unrelated to the answer.
     pub async fn fetch_table_list(&self, database: &str) -> Result<DbSchema, DbError> {
-        if self.engine == Engine::Postgres {
-            return pg::fetch_table_list(self, database).await;
+        match self.engine {
+            Engine::Postgres => return pg::fetch_table_list(self, database).await,
+            // SQLite's names come from one `sqlite_master` scan, which is already
+            // what the full introspection starts from; the saving this method
+            // exists for is the *per-table* pragmas, so the list path skips those.
+            Engine::Sqlite => return sqlite::fetch_table_list(self).await,
+            Engine::MySql => {}
         }
         let mut conn = self.open(None, false).await?;
         let out = conn
@@ -1966,10 +2115,17 @@ const _: () = assert!(DDL_LOCK_WAIT_SECS >= 1);
 /// MySQL's variable is `lock_wait_timeout`, not `innodb_lock_wait_timeout`: what
 /// an `ALTER TABLE` waits on is the **metadata** lock, and the InnoDB one covers
 /// row locks (and is already bounded at 50s by default).
+/// SQLite's answer is the empty string, and the caller skips an empty statement.
+/// It has no lock-timeout *setting* — waiting is configured per connection as a
+/// busy timeout, not as SQL — and it takes a single write lock over the whole
+/// file, so the failure mode this bounds (a plan queued behind someone else's
+/// metadata lock) has no analogue: the write either starts or returns
+/// `SQLITE_BUSY` immediately.
 fn lock_wait_sql(engine: Engine) -> String {
     match engine {
         Engine::MySql => format!("SET SESSION lock_wait_timeout = {DDL_LOCK_WAIT_SECS}"),
         Engine::Postgres => format!("SET lock_timeout = '{DDL_LOCK_WAIT_SECS}s'"),
+        Engine::Sqlite => String::new(),
     }
 }
 
@@ -2026,8 +2182,25 @@ impl Db {
         if stmts.is_empty() {
             return Ok(());
         }
-        if self.engine == Engine::Postgres {
-            return pg::run_ddl(self, database, stmts, cancel).await;
+        match self.engine {
+            Engine::Postgres => return pg::run_ddl(self, database, stmts, cancel).await,
+            // **Schema editing is not wired for SQLite**, and this is the backstop
+            // rather than the gate — the designer and the object editors aren't
+            // offered on such a connection at all. It refuses instead of falling
+            // into the MySQL path, which would emit `ALTER TABLE … MODIFY COLUMN`
+            // at a server that has no such statement; the honest reason is that
+            // SQLite's `ALTER TABLE` does only RENAME/ADD/DROP COLUMN, and
+            // anything else needs the twelve-step create-copy-drop-rename rebuild,
+            // which is a destructive path that deserves its own design rather than
+            // an arm in an emitter written for two other engines.
+            Engine::Sqlite => {
+                return Err(DdlError {
+                    message: "schema editing isn't supported on SQLite yet".to_string(),
+                    at: 0,
+                    applied: 0,
+                });
+            }
+            Engine::MySql => {}
         }
         let mut conn = self
             .open(Some(database), false)
@@ -2115,8 +2288,17 @@ impl Db {
         if target.columns.is_empty() {
             return Err(DbError::Query("No columns to import into".to_string()));
         }
-        if self.engine == Engine::Postgres {
-            return pg::import_rows(self, target, rows, cancel).await;
+        match self.engine {
+            Engine::Postgres => return pg::import_rows(self, target, rows, cancel).await,
+            // Wired in the write-back commit that follows this one; refusing is
+            // the safe intermediate state, since falling through would build
+            // MySQL's multi-row `INSERT` syntax and run it against SQLite.
+            Engine::Sqlite => {
+                return Err(DbError::Query(
+                    "importing into SQLite isn't wired yet".to_string(),
+                ));
+            }
+            Engine::MySql => {}
         }
         let mut conn = self.open(Some(target.database), false).await?;
         let conn_id = conn.id();
@@ -2295,8 +2477,20 @@ impl Db {
         if write.is_empty() {
             return Ok(0);
         }
-        if self.engine == Engine::Postgres {
-            return pg::commit_writes(self, write, cancel).await;
+        match self.engine {
+            Engine::Postgres => return pg::commit_writes(self, write, cancel).await,
+            // Wired in the commit that follows this one. Refusing beats falling
+            // through: the MySQL path builds `db`.`table` qualified statements
+            // with backtick quoting, which SQLite rejects outright — but a write
+            // path that *happened* to be accepted while keying on the wrong
+            // columns is the failure this whole layer exists to prevent, so it
+            // must not be reachable by accident even for a moment.
+            Engine::Sqlite => {
+                return Err(DbError::Query(
+                    "writing to SQLite isn't wired yet".to_string(),
+                ));
+            }
+            Engine::MySql => {}
         }
         // `client_found_rows` so the 1-row guard counts matches, not changes.
         let mut conn = self.open(None, true).await?;
@@ -2467,8 +2661,15 @@ impl Db {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
-        if self.engine == Engine::Postgres {
-            return pg::refetch_rows(self, template, rows, cancel).await;
+        match self.engine {
+            Engine::Postgres => return pg::refetch_rows(self, template, rows, cancel).await,
+            // The other half of `commit_writes`, wired with it.
+            Engine::Sqlite => {
+                return Err(DbError::Query(
+                    "writing to SQLite isn't wired yet".to_string(),
+                ));
+            }
+            Engine::MySql => {}
         }
         let mut conn = self.open(None, false).await?;
         let conn_id = conn.id();
@@ -2629,6 +2830,17 @@ fn build_refetch_sql(template: &RefetchTemplate) -> String {
 /// `pg.rs`'s).
 fn ident(name: &str) -> String {
     schemaic_core::export::ident_sql(name, schemaic_core::intel::SqlDialect::MySql)
+}
+
+/// Double-quote an identifier for SQLite, doubling any embedded double-quote.
+///
+/// The same thin delegation as [`ident`], pinned to the other engine this file
+/// builds statements for. SQLite would also accept backticks or brackets, but
+/// what it *emits* is the standard form for the reason
+/// [`schemaic_core::export::ident_sql`] gives: `"` is the only one of the three
+/// with a defined escape.
+pub(crate) fn ident_sqlite(name: &str) -> String {
+    schemaic_core::export::ident_sql(name, schemaic_core::intel::SqlDialect::Sqlite)
 }
 
 /// Convert a typed cell value into a bound parameter for a `WHERE` comparison.
@@ -2849,10 +3061,40 @@ mod tests {
         };
         // No tunnel → direct host/port passthrough.
         let direct = Db::connect(&conn, None);
-        assert_eq!(direct.parts(), ("remote.example", 3306, "u", "p"));
+        assert_eq!(direct.parts(), ("remote.example", 3306, "u", "p", ""));
         // Tunnel → rewritten to 127.0.0.1:<local port>, credentials preserved.
         let tunneled = Db::connect(&conn, Some(55001));
-        assert_eq!(tunneled.parts(), ("127.0.0.1", 55001, "u", "p"));
+        assert_eq!(tunneled.parts(), ("127.0.0.1", 55001, "u", "p", ""));
+    }
+
+    /// A SQLite connection's target is its file, and **a tunnel port must not
+    /// repoint it**. Nothing should open a tunnel for one in the first place
+    /// (`Engine::is_networked`), but a rewrite to `127.0.0.1:<port>` there would
+    /// silently swap which database the app is talking to, so the rewrite is
+    /// skipped by engine rather than by trusting every caller.
+    #[test]
+    fn a_tunnel_port_cannot_repoint_a_sqlite_file() {
+        let conn = schemaic_core::connection::Connection {
+            id: 1,
+            name: "c".to_string(),
+            db_type: "SQLite".to_string(),
+            host: "ignored".to_string(),
+            port: 0,
+            user: String::new(),
+            password: String::new(),
+            file: "/data/app.db".to_string(),
+            ssh: Default::default(),
+            color: None,
+            prominent_color: false,
+            read_only: false,
+            environment: Default::default(),
+        };
+        let db = Db::connect(&conn, Some(55001));
+        assert_eq!(db.engine(), Engine::Sqlite);
+        assert_eq!(db.file(), "/data/app.db");
+        assert!(!db.engine().is_networked());
+        // The coordinates are carried untouched rather than rewritten.
+        assert_eq!(db.parts().0, "ignored");
     }
 
     #[test]
@@ -2863,9 +3105,21 @@ mod tests {
             3307,
             "user".into(),
             "pass".into(),
+            String::new(),
         );
-        assert_eq!(db.parts(), ("h", 3307, "user", "pass"));
+        assert_eq!(db.parts(), ("h", 3307, "user", "pass", ""));
         assert_eq!(db.engine(), Engine::Postgres);
+        // The file rides the endpoint too, or the MCP subprocess gets an engine
+        // it can't reach anything with.
+        let lite = Db::from_parts(
+            Engine::Sqlite,
+            String::new(),
+            0,
+            String::new(),
+            String::new(),
+            "/data/app.db".into(),
+        );
+        assert_eq!(lite.parts().4, "/data/app.db");
     }
 
     #[test]
@@ -3637,12 +3891,12 @@ mod tests {
         assert_eq!(primary, "EXPLAIN SELECT 1");
     }
 
-    /// This crate's two identifier quoters answer to `core`'s, so the SQL a
+    /// This crate's three identifier quoters answer to `core`'s, so the SQL a
     /// write path builds can't drift from the SQL the export and DDL paths
     /// build. Each is engine-fixed by construction — `pg.rs` only ever emits
-    /// PostgreSQL, this module's statement builders only ever MySQL — which is
-    /// why they take no dialect and why the binding has to be asserted rather
-    /// than typed.
+    /// PostgreSQL, `sqlite.rs`'s statements only ever SQLite, this module's
+    /// remaining builders only ever MySQL — which is why they take no dialect and
+    /// why the binding has to be asserted rather than typed.
     #[test]
     fn the_write_paths_quote_identifiers_the_way_core_does() {
         use schemaic_core::export::ident_sql;
@@ -3661,6 +3915,11 @@ mod tests {
             assert_eq!(
                 crate::pg::pg_ident_for_test(name),
                 ident_sql(name, SqlDialect::Postgres),
+                "{name:?}"
+            );
+            assert_eq!(
+                ident_sqlite(name),
+                ident_sql(name, SqlDialect::Sqlite),
                 "{name:?}"
             );
         }

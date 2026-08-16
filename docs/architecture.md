@@ -590,7 +590,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       logical core count to give a whole-machine 0..=100. Sampling itself stays at the app boundary.
     - `text.rs` — `plural(n, one, many)`, returning only the noun form so a humanized count
       (`"1.2k"`) can be displayed while the singular/plural decision still follows the true `n`.
-- `schemaic-db` — MySQL/MariaDB (`mysql_async`) + SSH tunnels (`ssh.rs`), PostgreSQL in `pg.rs`, and
+- `schemaic-db` — MySQL/MariaDB (`mysql_async`) + SSH tunnels (`ssh.rs`), PostgreSQL in `pg.rs`,
+  SQLite in `sqlite.rs`, and
   the pinned manual-transaction connection in `session.rs`. Populates each result column's
   `origin` (real table/column + key flags) from the wire protocol. Connection **identity** is the
   `Db` handle (`Db::connect(&Connection, tunnel_port)`), not a `mysql://…` URL — credentials go
@@ -670,6 +671,35 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   `tgisinternal = false` and can only be dropped through its parent), and `UPDATE OF` columns +
   a function's `proconfig` arrive **one row each** rather than string-aggregated — same rule the
   enum labels follow, and for the same reason.
+  **`sqlite.rs` is the third engine**, and four things make it unlike the other two rather than a
+  third set of catalogue queries. **There is no server**: a connection is a *file*
+  (`Connection::file`), so host/port/user/password/SSH are all inert, `fetch_databases` answers
+  without opening anything (the one database SQLite calls `main`), and `Db::connect` refuses to let
+  a tunnel port repoint the file. **The driver is blocking**, so every call runs in
+  `spawn_blocking` and opens its own connection there — which is not a compromise but exactly the
+  one-connection-per-operation invariant, at microsecond cost on a local file; cancellation goes
+  through `Connection::get_interrupt_handle`, the analogue of `KILL QUERY` that needs no second
+  connection. **Values are dynamically typed**: a declared type is an *affinity*, so `value_of`
+  reads the storage class of the value in front of it rather than trusting the column, and a BLOB
+  renders as its size, having no lossless text form. **Column provenance is not available from the
+  driver at all** — SQLite's C API has `sqlite3_column_table_name`, but only under
+  `SQLITE_ENABLE_COLUMN_METADATA`, and rusqlite exposes neither the flag nor the call (measured
+  against 0.32.1 and 0.40: there is no `column_metadata` feature and `libsqlite3-sys` generates no
+  binding), so a result's `origin` is derived from the *statement* instead and anything but a
+  plainly single-table `SELECT` is left `None`, which the editing system already reads as
+  not-editable. Introspection is `sqlite_master` plus the pragmas, and three of its decisions are
+  the sort that only show up against a real database: `table_xinfo` rather than `table_info`,
+  because only the former reports a **generated** column and a write path that can't see one offers
+  to insert into it; a non-`INTEGER` `PRIMARY KEY` is reported **nullable**, because SQLite
+  documents that it really is; and an index whose predicate or expression key the pragmas don't
+  return is marked `lossy`, since an index edit is a drop-and-create and would otherwise silently
+  widen it. `EXPLAIN QUERY PLAN` is what `explain` runs — plain `EXPLAIN` disassembles to VDBE
+  opcodes, which is a different artefact and useless to `core::plan` — and there is no analyzing
+  form, since SQLite will not execute a statement to time it. **Manual transaction mode is refused**
+  (`Session::open`): a pinned `rusqlite::Connection` is blocking and `!Sync`, so holding one across
+  awaits means a dedicated thread and a channel, which is worth building deliberately rather than as
+  a side effect — and silently running the tab's statements on fresh connections would break exactly
+  the promise the mode makes.
   SSH tunnels return a `TunnelHandle` (drop → port freed) with
   keepalives + TOFU host-key verification (`ssh_known_hosts.json`).
   `import_rows` is the bulk-load path (both engines): one transaction of batched multi-row

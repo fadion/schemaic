@@ -122,6 +122,29 @@ impl Session {
                 };
                 Backend::Postgres { client }
             }
+            // **SQLite has no manual-transaction mode here, deliberately.**
+            //
+            // Not because the engine lacks transactions — it has them — but
+            // because a pinned SQLite connection is a different concurrency
+            // structure than this type is: `rusqlite::Connection` is blocking and
+            // `!Sync`, so holding one across the awaits this `Mutex<Backend>` is
+            // built around means owning a dedicated thread and talking to it over
+            // a channel. That is worth building deliberately, not as a side
+            // effect of adding an engine.
+            //
+            // Refusing here rather than silently running the tab's statements on
+            // fresh connections is the whole point: Manual mode's promise is that
+            // nothing commits until the user says so, and a mode that quietly
+            // auto-committed would break exactly that promise. The UI doesn't
+            // offer the mode for a SQLite connection, and this is the backstop for
+            // any path that reaches it anyway.
+            Engine::Sqlite => {
+                return Err(DbError::Connect(
+                    "SQLite connections don't support manual transaction mode yet — \
+                     statements run and commit as they are sent"
+                        .to_string(),
+                ));
+            }
         };
         Ok(Arc::new(Session {
             db: db.clone(),
@@ -352,10 +375,17 @@ impl Session {
     }
 
     /// This session's engine, in the vocabulary `schemaic_core::tx` speaks.
+    ///
+    /// SQLite can't reach here — [`Session::open`] refuses it — but the arm has to
+    /// answer something, and MySQL's is the safe reading of the two: it assumes a
+    /// statement may have implicitly committed, where Postgres' assumes the
+    /// transaction is poisoned and only a rollback escapes. Claiming the stricter
+    /// one for an engine we never opened would tell a user their transaction had
+    /// died when there was no transaction at all.
     fn tx_engine(&self) -> tx::TxEngine {
         match self.db.engine() {
             Engine::Postgres => tx::TxEngine::Postgres,
-            Engine::MySql => tx::TxEngine::MySql,
+            Engine::MySql | Engine::Sqlite => tx::TxEngine::MySql,
         }
     }
 

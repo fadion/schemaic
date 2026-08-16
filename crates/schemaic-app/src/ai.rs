@@ -137,8 +137,15 @@ fn endpoint_from_value(v: &serde_json::Value) -> McpEndpoint {
     let engine = schemaic_db::Engine::from_db_type(
         v.get("engine").and_then(|x| x.as_str()).unwrap_or("mysql"),
     );
+    // The SQLite target. Absent in every endpoint blob written before SQLite
+    // existed, where an empty string is right: those are all networked engines.
+    let file = v
+        .get("file")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string();
     McpEndpoint {
-        db: Db::from_parts(engine, host, port, user, pass),
+        db: Db::from_parts(engine, host, port, user, pass, file),
         database,
         // Absent → on, matching the endpoint blobs written before the flag
         // existed (which also predate any tool that reads rows from schema).
@@ -150,9 +157,9 @@ fn endpoint_from_value(v: &serde_json::Value) -> McpEndpoint {
 /// sample-rows permission) as the JSON blob handed to the MCP subprocess via its
 /// environment.
 fn endpoint_json(db: &Db, database: Option<&str>, samples: bool) -> String {
-    let (host, port, user, pass) = db.parts();
+    let (host, port, user, pass, file) = db.parts();
     serde_json::json!({
-        "host": host, "port": port, "user": user, "pass": pass,
+        "host": host, "port": port, "user": user, "pass": pass, "file": file,
         "database": database, "engine": db.engine().as_str(), "samples": samples
     })
     .to_string()
@@ -1107,6 +1114,7 @@ mod tests {
             3307,
             "u".into(),
             "p".into(),
+            String::new(),
         );
         let out = endpoint_json(&db, Some("shop"), true);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -1133,6 +1141,7 @@ mod tests {
             3306,
             "u".into(),
             "p".into(),
+            String::new(),
         );
         let json = endpoint_json(&db, Some("shop"), false);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1152,11 +1161,12 @@ mod tests {
             3306,
             "user".into(),
             "pw".into(),
+            String::new(),
         );
         let json = endpoint_json(&db, Some("db1"), true);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let parsed = endpoint_from_value(&v);
-        assert_eq!(parsed.db.parts(), ("host", 3306, "user", "pw"));
+        assert_eq!(parsed.db.parts(), ("host", 3306, "user", "pw", ""));
         assert_eq!(parsed.db.engine(), schemaic_db::Engine::Postgres);
         assert_eq!(parsed.database.as_deref(), Some("db1"));
     }
@@ -1165,14 +1175,37 @@ mod tests {
     fn endpoint_from_value_fills_defaults() {
         // Empty/Null object → local defaults, no database, MySQL engine.
         let e = endpoint_from_value(&serde_json::Value::Null);
-        assert_eq!(e.db.parts(), ("127.0.0.1", 3306, "", ""));
+        assert_eq!(e.db.parts(), ("127.0.0.1", 3306, "", "", ""));
         assert_eq!(e.db.engine(), schemaic_db::Engine::MySql);
         assert!(e.database.is_none());
         // Partial object → only the missing keys default.
         let v = serde_json::json!({ "host": "h", "user": "u" });
         let e = endpoint_from_value(&v);
-        assert_eq!(e.db.parts(), ("h", 3306, "u", ""));
+        assert_eq!(e.db.parts(), ("h", 3306, "u", "", ""));
         assert!(e.database.is_none());
+    }
+
+    /// A SQLite endpoint carries its file, and every blob written before SQLite
+    /// existed has no `file` key at all — which must read as empty rather than
+    /// failing the parse, since those are all networked engines that don't need it.
+    #[test]
+    fn an_endpoint_carries_a_sqlite_file_and_tolerates_its_absence() {
+        let db = Db::from_parts(
+            schemaic_db::Engine::Sqlite,
+            String::new(),
+            0,
+            String::new(),
+            String::new(),
+            "/data/app.db".into(),
+        );
+        let json = endpoint_json(&db, None, true);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let parsed = endpoint_from_value(&v);
+        assert_eq!(parsed.db.file(), "/data/app.db");
+        assert_eq!(parsed.db.engine(), schemaic_db::Engine::Sqlite);
+        // An older blob: no `file` key.
+        let old = serde_json::json!({ "host": "h", "engine": "mysql" });
+        assert_eq!(endpoint_from_value(&old).db.file(), "");
     }
 
     #[test]

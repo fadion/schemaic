@@ -280,7 +280,7 @@ impl Connection {
     /// last path component instead: this string is a *subtitle* under the
     /// connection's own name in a narrow list, and a full path is both too long
     /// for it and, on a work machine, often the one part of the row nobody wants
-    /// to read out. [`file_label`] is the full path, for the places that have room.
+    /// to read out. [`Self::file_label`] is the full path, for places with room.
     pub fn endpoint(&self) -> String {
         if is_sqlite(&self.db_type) {
             return file_name(&self.file).to_string();
