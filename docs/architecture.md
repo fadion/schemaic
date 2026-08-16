@@ -618,6 +618,25 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `Snapshot`. The caller must skip the *first* poll itself — diffing against an empty prior reads
     every row as an insert. A delete carries the row's last-seen cells deliberately: it is the one
     case where the row is gone from the database and the log is the only remaining record.
+    The **log** lives here too, not just the diff. `MonitorEntry { at, change }` — a change plus the
+    `M:SS` at which a poll *observed* it — moved down from `ui/lib.rs`, which re-exports it so every
+    use site still reads as a UI type, because the log's export is a pure projection of these
+    entries and belongs beside the diff that produces them. `log_result_set` is that projection: it
+    renders the log to a `ResultSet` so it exports through the ordinary `core::export` renderers
+    instead of a second set written for it. One row per change — `Time`, `Action`, `Key`, then one
+    column per watched-table column — with an insert carrying the new values, a delete the last-seen
+    ones, and an update `old → new` in the columns that changed and the plain value everywhere else.
+    A value standing alone is a real NULL cell, so each format spells NULL its own way; a NULL
+    *inside* a transition can only be the literal text `NULL`, because the transition is one cell.
+    **Width comes from the data, not from `cols`** — a change carrying more cells than the baseline
+    named widens the result (the extra columns become `column_N`) rather than being truncated,
+    because a silently narrowed export is the failure nobody notices later. `LOG_FORMATS` is
+    everything the grid offers **except SQL**: SQL renders `INSERT INTO <table>`, and a change log
+    has no such table — its rows are observations *about* one, a third of them deletions. Both caps
+    are here for one reason, that the modal has to be able to *name* them: `ROW_CAP` (rows per poll,
+    past which the monitor watches a page rather than a table) and `LOG_CAP` (changes kept, oldest
+    dropping — the app's old private `MONITOR_LOG_MAX`, moved once the log became exportable, since
+    a silently truncated record looks complete and isn't).
   - `diff.rs` — `line_diff`/`build_diff_rows` (Ctrl+K preview).
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
     persisted to `history.json`. An entry is written in **two passes** — `push` when the run
@@ -1416,7 +1435,33 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     title bar with the tab's `(conn_id, database, table)`. It renders `overlay.monitor_log` — built
     by the app's poll loop through `core::monitor::diff_snapshots` — as a Time·Action·ID·Data table,
     and owns *none* of the polling: closing the modal flips `overlay.monitor_open` false, and that
-    is what stops the loop.
+    is what stops the loop. Three icon buttons sit in the sub-header between the status line and
+    the interval dropdown — Pause, Clear, Export — and they join the modal's `FocusRing` at
+    tabindex 10/11/12 with the dropdown moved to 13, so a monitor is watchable with both hands off
+    the mouse. **Pause holds the fetch, not the loop**: `monitor_tick` reads
+    `overlay.monitor_paused`, calls `monitor_reschedule` and returns, because a pause that unwound
+    the loop would need `open_monitor` to restart it and that resets the baseline and the log — the
+    opposite of what Pause is for. The cost is that the baseline ages, so the first poll after a
+    resume diffs against the pre-pause table and logs the *net* change stamped at the resume; that
+    is the log's standing rule (an entry is stamped when a poll observed it, not when it happened),
+    just coarser. **Clear empties `overlay.monitor_log` only** — the app's baseline snapshot is
+    deliberately untouched, so clearing loses history you have already read and never a change that
+    hasn't been reported yet. **Export** raises the shared `overlay.popup_menu` over
+    `core::monitor::LOG_FORMATS`, anchored `PopupAnchor::BelowIcon` from the ring wrapper's
+    `layout_rect()` exactly as `table_designer::suggest_chevron` does (it paints above the modal
+    because `popup_menu_overlay` is mounted last in the workspace stack); choosing a format runs
+    `save_log`, which mirrors `grid::save_export` in snapshotting the log **before** the file dialog
+    opens — the dialog is modal and slow and the poll keeps appending behind it — then renders
+    through `log_result_set` and hands an `ExportRequest` to the app's `ExportFn` worker with
+    `source: None` and a default dialect, both of which only the SQL renderer would read.
+    `status_line(export_err, poll_err, paused, partial, capped)` decides what the sub-header says:
+    an error takes the line outright, worst-to-mislead first (a failed export beats a poll error,
+    because the user believes they have a file and doesn't), and otherwise it is a lead — `Watching`
+    or `Paused` — plus **every** caveat that applies, joined. `partial` (only the first `ROW_CAP`
+    rows are watched) and `capped` (the log is at `LOG_CAP`, oldest dropping) co-occur and neither
+    replaces the other. `Tone` resolves to a `fn() -> Color`, per the themable-colour invariant.
+    It is pure and tested inline, which is what keeps the copy honest: the two caveats co-occurring
+    is precisely the case a per-state `match` got wrong.
   - `theme.rs`/`themes.rs`/`icons.rs`/`fonts.rs`/`sql_highlight.rs`.
   - `contrast.rs` — the **legibility gate** over `themes.rs`: WCAG relative-luminance maths plus
     `UI_PAIRINGS`/`EDITOR_PAIRINGS`, one row per (foreground, background) combination the UI really
@@ -1964,6 +2009,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   is the shape of defect the ring's own review was full of. **A disabled button is not a stop** —
   it keeps its place on screen (which action is affirmative shouldn't move as a form becomes valid)
   but the keyboard walks past it, since its click handler is inert anyway.
+  That is a **build-time** decision — `enabled` is a plain `bool`, not a signal — so a control whose
+  availability changes while the modal is open has two spellings and they are not interchangeable.
+  Either the block holding it is rebuilt when availability changes (the results strip's − and clone,
+  which track the row selection as well as insertability, or Tab would walk onto controls that had
+  since gone live), or the control is registered unconditionally and the action guards itself. The
+  Live Monitor's Clear and Export take the second: they *dim* on an empty log rather than leaving
+  the ring, because rebuilding would reflow the sub-header the moment the first change lands, and
+  Enter on a dimmed one does nothing because each closure re-checks the log. Passing `has_log()`
+  into `enabled` is the tidy-looking edit that breaks this — it is read once, at build.
   **The ring member is a wrapper `in_ring_button` builds, never the caller's own view**, and that
   is a correctness rule rather than a layout preference. Two things resolve by exact `ViewId` with
   no descendant propagation, and they were resolving to *different* ids depending on each call
@@ -2132,7 +2186,10 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   `context_menu_overlay`; everything else uses the generic `ui.popup_menu`
   (`RwSignal<Option<Vec<MenuEntry>>>`) + `popup_menu_overlay`. Both overlays live at the workspace
   root (window coords) and close on the root pointer-down. **Both render through `menu_panel`**,
-  which is why everything below is stated once and holds for all fourteen openers.
+  which is why everything below is stated once and holds for every opener. (It said "all fourteen"
+  until the Live Monitor's Export made it fifteen. The count was never reproducible — the openers
+  are *logical* menus, not `popup_menu.set` sites, several of which are helper-driven — so it is
+  gone rather than incremented: the sentence needs "all of them", not a number that silently rots.)
 - **Keyboard operation lives in `menu_key`.** The panel is a `focus_root`, so it took focus and
   answered Escape from the start — but nothing moved a cursor and no row was marked, so a menu
   opened with Enter from a ringed button could only be finished with the mouse and read as though
@@ -2154,10 +2211,11 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   fires during **layout** with the view's window origin, not on pointer movement, so what they
   anchor to is the widget and not the cursor.
 - **Not every menu can be *opened* from the keyboard**, which is a separate thing from navigating
-  one. A menu on a ringed control can be — `suggest_chevron`, and the grid toolbar's Copy / Save /
-  AI dropdowns since the strip gained its ring — and the **schema tree** answers `Shift+F10` and the
-  `ContextMenu` key on the row the nav cursor is on. The grid's cell and header menus, the editor's,
-  the tab strip's and the connection list's still need a right-click.
+  one. A menu on a ringed control can be — `suggest_chevron`, the Live Monitor's Export dropdown,
+  and the grid toolbar's Copy / Save / AI dropdowns since the strip gained its ring — and the
+  **schema tree** answers `Shift+F10` and the `ContextMenu` key on the row the nav cursor is on.
+  The grid's cell and header menus, the editor's, the tab strip's and the connection list's still
+  need a right-click.
   The tree's route is worth reading before copying it: focus lives on the tree **container**, never
   on a row, so a key arriving there knows neither which row it is about nor where that row is. Both
   ride on the per-row effect that already existed to scroll the cursor into view — `Nav::cursor_menu`
