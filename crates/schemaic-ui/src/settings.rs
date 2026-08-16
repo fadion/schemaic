@@ -401,6 +401,14 @@ fn themed_toggle(sig: RwSignal<bool>) -> impl IntoView {
             let s = s
                 .width(36.0)
                 .height(18.0)
+                // Floem dresses every `ToggleButtonClass` in a 1px `#8c8c8c`
+                // border (`theme::default_theme`'s `border_style`), which reads
+                // as a grey outline around the dark off track and vanishes under
+                // the lit on one. Zeroed rather than made transparent: the handle
+                // is placed from `layout.size`, so the width costs no geometry,
+                // and a border that cannot paint is also a border floem's `.focus`
+                // rule cannot colour — see below.
+                .border(0.0)
                 .border_radius(9.0)
                 .flex_shrink(0.0_f32)
                 .set(ToggleButtonInset, PxPct::Pct(12.0))
@@ -408,11 +416,28 @@ fn themed_toggle(sig: RwSignal<bool>) -> impl IntoView {
                 .set(Foreground, Some(Brush::Solid(handle)))
                 .background(bg)
                 .hover(move |s| s.background(bg_hover))
-                .active(move |s| s.background(bg_hover));
+                .active(move |s| s.background(bg_hover))
+                // Two more defaults from the same class, both of which must be
+                // answered whether or not this switch is wearing a ring:
+                //
+                // - `.focus(|s| s.hover(|s| s.background(#eae6ec)))` — a near-white
+                //   track for focused-and-hovered, which washes out both states.
+                //   Restated here as this switch's own hover fill.
+                // - `.focus_visible(|s| s.outline(3.0))` over an `outline_color` of
+                //   `#d5d0d8`. Floem gates `FocusVisible` on `keyboard_navigation`,
+                //   which only its own Tab traversal sets — but that flag latches
+                //   *globally* once floem has stepped anywhere in the window, so it
+                //   is suppressed here exactly as the fields do it.
+                .focus(move |s| s.hover(move |s| s.background(bg_hover)))
+                .focus_visible(|s| s.outline(0.0));
             // The one form control that follows the *buttons* rather than the
             // fields: a switch reached by Tab has nothing else to say it is the
             // thing Space will flip, but on a click the ring is noise, so it is
-            // gated on `keyboard_nav` exactly as `button_focus_ring` is.
+            // gated on `keyboard_nav` exactly as `button_focus_ring` is. Only the
+            // ring is gated — the three lines above are unconditional, because
+            // floem's defaults do not stop applying when the pointer is what moved
+            // focus. Leaving them to this branch is what put a magenta border and
+            // a white track under the mouse.
             //
             // An **outline** now, not the lit border this used to wear. The
             // border was a workaround for a cost that has gone: it was declared
@@ -429,7 +454,6 @@ fn themed_toggle(sig: RwSignal<bool>) -> impl IntoView {
                     .outline_color(theme::accent())
                     .hover(move |s| s.background(bg_hover))
             })
-            .focus_visible(|s| s.outline(2.0).outline_color(theme::accent()))
         })
 }
 
