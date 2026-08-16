@@ -398,13 +398,9 @@ fn themed_toggle(sig: RwSignal<bool>) -> impl IntoView {
                     theme::toggle_handle_off(),
                 )
             };
-            s.width(36.0)
+            let s = s
+                .width(36.0)
                 .height(18.0)
-                // A transparent border at rest, so gaining focus changes only its
-                // colour: giving the switch a border *on focus* would grow it by
-                // 2px and nudge the row it sits in.
-                .border(1.0)
-                .border_color(floem::peniko::Color::TRANSPARENT)
                 .border_radius(9.0)
                 .flex_shrink(0.0_f32)
                 .set(ToggleButtonInset, PxPct::Pct(12.0))
@@ -412,14 +408,28 @@ fn themed_toggle(sig: RwSignal<bool>) -> impl IntoView {
                 .set(Foreground, Some(Brush::Solid(handle)))
                 .background(bg)
                 .hover(move |s| s.background(bg_hover))
-                .active(move |s| s.background(bg_hover))
-                // Keyboard focus: the field's lit border, since a switch reached
-                // by Tab had nothing to say it was the thing Space would flip.
-                .focus(move |s| {
-                    s.border_color(theme::field_border_active())
-                        .hover(move |s| s.background(bg_hover))
-                })
-                .focus_visible(|s| s.outline(0.0))
+                .active(move |s| s.background(bg_hover));
+            // The one form control that follows the *buttons* rather than the
+            // fields: a switch reached by Tab has nothing else to say it is the
+            // thing Space will flip, but on a click the ring is noise, so it is
+            // gated on `keyboard_nav` exactly as `button_focus_ring` is.
+            //
+            // An **outline** now, not the lit border this used to wear. The
+            // border was a workaround for a cost that has gone: it was declared
+            // transparent at rest so that lighting it on focus wouldn't grow the
+            // switch by 2px and nudge its row. An outline is painted outside the
+            // box and costs no layout at all, so the ring can be the buttons'
+            // — same colour, same width — instead of a dim border that was the
+            // most this could afford.
+            if !crate::widgets::keyboard_nav().get() {
+                return s;
+            }
+            s.focus(move |s| {
+                s.outline(2.0)
+                    .outline_color(theme::accent())
+                    .hover(move |s| s.background(bg_hover))
+            })
+            .focus_visible(|s| s.outline(2.0).outline_color(theme::accent()))
         })
 }
 

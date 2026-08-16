@@ -2431,6 +2431,17 @@ pub fn workspace(ui: Ui) -> impl IntoView {
         if schema_menu_open.get_untracked() {
             schema_menu_open.set(false);
         }
+        // The "clear" half of the app's `:focus-visible`
+        // (`widgets::keyboard_nav`): from here on the focus ring stays dark until
+        // the next Tab, because on a pointer gesture it marks what the user just
+        // pointed at. The root is the only place that sees *every* press — the
+        // same reason `pointer_released` is driven from its `PointerUp` twin —
+        // and `set` is guarded because it never dedups, and an unguarded write on
+        // every click in the app would re-run every button's style closure.
+        let kbd = widgets::keyboard_nav();
+        if kbd.get_untracked() {
+            kbd.set(false);
+        }
         EventPropagation::Continue
     })
     .style(|s| {
