@@ -471,6 +471,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     above; its **view** branch delegates to `ddl::view_ddl` so Copy DDL, the MCP table-info tool
     and the apply path all emit through one view emitter (it used to have its own, which restated
     none of the options).
+    **`TableInfo::create_sql` short-circuits all of that where the engine keeps its own `CREATE`
+    text** — which of the three only SQLite does (`sqlite_master.sql`, plus the `CREATE INDEX`
+    statements it stores separately and without which a table's DDL is incomplete). That is a
+    fidelity decision, not a shortcut: reconstructing a SQLite table from this model emitted
+    `AUTO_INCREMENT`, which SQLite **accepts** by reading it as part of the type name — so the
+    statement replayed silently into a different column — plus MySQL's inline `KEY name (cols)`,
+    which SQLite cannot parse at all, and an empty column list for an index whose keys are
+    `lossy`; and it dropped the foreign key, `WITHOUT ROWID`, CHECK constraints and column
+    collations, none of which the model carries. It is deliberately **not** used for a *view*, even
+    on SQLite: there the model is genuinely complete (a name and a body), so the shared emitter is
+    both correct and consistent with the other engines. The test asserts SQLite takes its own DDL
+    back, which is the only assertion that would have caught the `AUTO_INCREMENT` case.
     **`TriggerInfo`/`TriggerAction`/`TriggerEvent`/`TriggerEnabled`/`TriggerSource` +
     `RoutineInfo`** are the trigger and PG-trigger-function half, and carry three rules the
     same "restate everything or it silently resets" logic as `ViewOptions`.
@@ -1162,7 +1174,14 @@ Re-introducing the anti-patterns these guard against is a regression:
 - **One identifier quoter, as there is one boundary lexer.** Every path that quotes an identifier
   ends at `export::ident_sql` (unconditional — for SQL that is only executed) or its sibling
   `export::ident_if_needed` (only when a bare name would name something else — for SQL the user
-  reads and edits). `filter::quote_ident`, `schema::ddl_ident_in`, `db::pg::pg_ident`,
+  reads and edits). **How a table is *addressed* is the same rule once over**:
+  `export::qualified_table` — MySQL qualifies with the database (its connection is server-level),
+  PostgreSQL with the namespace, and SQLite names it **bare**, since a connection *is* one file and
+  `main` is SQLite's word for "the file you opened" rather than a name the user chose, so
+  `INSERT INTO "main"."t"` is noise on every exported row and wrong the moment that SQL is pasted
+  where another file is attached under that name. `import::build_insert` held a second copy of it,
+  which is how the SQLite case reached one path and not the other.
+  `filter::quote_ident`, `schema::ddl_ident_in`, `db::pg::pg_ident`,
   `db::ident_sqlite` and
   `db::ident` are all thin delegations; the three engine-fixed ones in `schemaic-db` are bound by a
   test in that crate, since they can't take a dialect. **Don't write a fifth** — there were four,
