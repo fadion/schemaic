@@ -86,6 +86,11 @@ const BODY_ROWS: usize = 12;
 /// something the preview can emit as-is.
 const NEW_BODY: &str = "BEGIN\n    \nEND";
 
+/// The same for SQLite, which needs a statement in the block: `BEGIN END` with
+/// nothing between is a syntax error there, so MySQL's empty placeholder would
+/// open the form on the one validation error this constant exists to avoid.
+const NEW_BODY_SQLITE: &str = "BEGIN\n    SELECT 1;\nEND";
+
 // ── opening ──────────────────────────────────────────────────────────────────
 
 fn open_editor(ui: &Ui, target: TriggerTarget, draft: TriggerSetDraft) {
@@ -105,10 +110,15 @@ fn open_editor(ui: &Ui, target: TriggerTarget, draft: TriggerSetDraft) {
     d.view.set(None);
     d.function.set(None);
     d.functions.set(Vec::new());
+    let dialect = target.dialect;
     d.trigger.set(Some(target));
     if pg {
         fetch_functions(ui);
-    } else {
+    } else if dialect == SqlDialect::MySql {
+        // MySQL's correction alone, and asked for by name: SQLite's bodies come
+        // from `sqlite_master`, which is the source, so there is nothing to
+        // correct — and `trigger_source` is a `SHOW CREATE TRIGGER` no SQLite
+        // connection can answer.
         fetch_sources(ui);
     }
 }
@@ -246,25 +256,26 @@ fn blank_trigger(
     existing: &[TriggerDraft],
     table: &str,
     schema: Option<String>,
-    pg: bool,
+    dialect: SqlDialect,
     is_view: bool,
 ) -> TriggerDraft {
     let taken: Vec<String> = existing.iter().map(|t| t.info.name.clone()).collect();
     let mut draft = TriggerDraft::blank(unique_name(&taken, "new_trigger"), table, schema);
     draft.info.events = vec![TriggerEvent::Insert];
-    // A view's row-level trigger can only be `INSTEAD OF`, so opening on
-    // `BEFORE` there would be the same "opens on a validation error" the rest of
-    // this function exists to avoid.
-    if pg && is_view {
+    // A view's row-level trigger can only be `INSTEAD OF` — on SQLite that is
+    // the *only* trigger a view takes at all — so opening on `BEFORE` there
+    // would be the same "opens on a validation error" the rest of this function
+    // exists to avoid.
+    if is_view && dialect != SqlDialect::MySql {
         draft.info.timing = TriggerTiming::InsteadOf;
     }
-    draft.info.action = if pg {
-        TriggerAction::Function {
+    draft.info.action = match dialect {
+        SqlDialect::Postgres => TriggerAction::Function {
             name: String::new(),
             args: Vec::new(),
-        }
-    } else {
-        TriggerAction::Body(NEW_BODY.to_string())
+        },
+        SqlDialect::Sqlite => TriggerAction::Body(NEW_BODY_SQLITE.to_string()),
+        SqlDialect::MySql => TriggerAction::Body(NEW_BODY.to_string()),
     };
     draft
 }
@@ -555,6 +566,10 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
         return empty_hint("No trigger selected.").into_any();
     };
     let pg = target.dialect == SqlDialect::Postgres;
+    // SQLite is a third shape here, not MySQL's: it has PostgreSQL's `WHEN` and
+    // `UPDATE OF` alongside MySQL's inline body, so every control below asks for
+    // the engines that have it rather than falling off a `!pg`.
+    let sqlite = target.dialect == SqlDialect::Sqlite;
 
     // A constraint trigger is shown so it can be seen and removed, but its
     // deferral settings aren't modelled, so editing it would silently drop them.
@@ -597,14 +612,23 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
         .style(move |s| s.width(FIELD_W)),
     );
 
-    // `INSTEAD OF` is PostgreSQL's alone **and a view's alone**: on a table the
-    // server answers `Tables cannot have INSTEAD OF triggers`, so offering it
-    // there is the "hide what it can't express" rule broken in the direction
-    // that fails at Apply. `BEFORE`/`AFTER` stay on the list for a view — those
-    // are legal there statement-level, which `TriggerDraft::validate` is the
-    // authority on.
-    let timings: Vec<String> = match (pg, target.is_view) {
-        (true, true) => vec!["BEFORE".into(), "AFTER".into(), "INSTEAD OF".into()],
+    // `INSTEAD OF` is **a view's alone** on both engines that have it: on a table
+    // the server answers `Tables cannot have INSTEAD OF triggers` (PostgreSQL) or
+    // `cannot create INSTEAD OF trigger on table` (SQLite), so offering it there
+    // is the "hide what it can't express" rule broken in the direction that fails
+    // at Apply.
+    //
+    // The two differ on the other half. PostgreSQL keeps `BEFORE`/`AFTER` on a
+    // view's list — legal there statement-level — while SQLite refuses them
+    // outright (`cannot create BEFORE trigger on view`), so a SQLite view is
+    // offered the one timing it can have. `TriggerDraft::validate` is the
+    // authority on all of it; this list is what keeps the form from opening on
+    // an error.
+    let timings: Vec<String> = match (target.dialect, target.is_view) {
+        (SqlDialect::Postgres, true) => {
+            vec!["BEFORE".into(), "AFTER".into(), "INSTEAD OF".into()]
+        }
+        (SqlDialect::Sqlite, true) => vec!["INSTEAD OF".into()],
         _ => vec!["BEFORE".into(), "AFTER".into()],
     };
     let timing = form_setting(
@@ -622,9 +646,9 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
         ),
     );
 
-    // MySQL fires on exactly one event, PostgreSQL on any combination — so this
-    // is a dropdown on one engine and a row of toggles on the other, rather than
-    // one control that lies about what the server accepts.
+    // MySQL and SQLite fire on exactly one event, PostgreSQL on any combination
+    // — so this is a dropdown on two engines and a row of toggles on the third,
+    // rather than one control that lies about what the server accepts.
     let events: AnyView = if pg {
         let mut rows: Vec<AnyView> = Vec::new();
         for (n, ev) in [
@@ -702,9 +726,10 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
         .into_any()
     };
 
-    // FOR EACH ROW is the only level MySQL has, so the control is PostgreSQL's —
-    // and it is built only there rather than built and hidden, since a `hide()`n
-    // control is still in the modal's Tab order.
+    // FOR EACH ROW is the only level MySQL and SQLite have — `FOR EACH STATEMENT`
+    // is a syntax error on SQLite — so the control is PostgreSQL's, and it is
+    // built only there rather than built and hidden, since a `hide()`n control is
+    // still in the modal's Tab order.
     let level: AnyView = if !pg {
         crate::widgets::nothing()
     } else {
@@ -729,7 +754,11 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
         .into_any()
     };
 
-    let when: AnyView = if !pg {
+    // A `WHEN` guard is **not** PostgreSQL's alone — SQLite has one too, and had
+    // it all along. MySQL is the engine without one, which is why this asks for
+    // the two that have it rather than for "not MySQL".
+    let has_when = pg || sqlite;
+    let when: AnyView = if !has_when {
         crate::widgets::nothing()
     } else {
         form_setting(
@@ -739,13 +768,51 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
                 i,
                 draft.info.condition.clone().unwrap_or_default(),
                 FieldCfg {
-                    placeholder: "new.total > 0",
+                    placeholder: if sqlite {
+                        "NEW.total > 0"
+                    } else {
+                        "new.total > 0"
+                    },
                     mono: true,
                     focus: Some((ring.clone(), 50)),
                     ..Default::default()
                 },
                 |d, v| {
                     d.info.condition = Some(v.trim().to_string()).filter(|c| !c.is_empty());
+                },
+            )
+            .style(move |s| s.width(FIELD_W * 1.6)),
+        )
+        .into_any()
+    };
+
+    // `UPDATE OF a, b` narrows an UPDATE trigger to named columns. SQLite's, and
+    // built only there: PostgreSQL has the clause too but no control for it yet,
+    // and MySQL has no such thing at all. Shown whatever the event, because
+    // hiding it on a switch to INSERT would hide a value the model still carries
+    // — `TriggerDraft::validate` is what says the pairing is wrong.
+    let update_of: AnyView = if !sqlite {
+        crate::widgets::nothing()
+    } else {
+        form_setting(
+            "Of columns",
+            bound_field(
+                &ui,
+                i,
+                draft.info.update_columns.join(", "),
+                FieldCfg {
+                    placeholder: "optional — every column when empty",
+                    mono: true,
+                    focus: Some((ring.clone(), 55)),
+                    ..Default::default()
+                },
+                |d, v| {
+                    d.info.update_columns = v
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|c| !c.is_empty())
+                        .map(str::to_string)
+                        .collect();
                 },
             )
             .style(move |s| s.width(FIELD_W * 1.6)),
@@ -798,9 +865,10 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
         level,
         form_section("Condition").style(move |s| {
             let s = s.margin_top(4.0);
-            if pg { s } else { s.hide() }
+            if has_when { s } else { s.hide() }
         }),
         when,
+        update_of,
         form_section("Action").style(|s| s.margin_top(4.0)),
         action,
     ))
@@ -1163,7 +1231,7 @@ fn change_set(target: &TriggerTarget, draft: &TriggerSetDraft) -> ddl::ChangeSet
 /// rename shows in the list as you type it. Same split as the designer's.
 fn trigger_list(
     ui: Ui,
-    pg: bool,
+    dialect: SqlDialect,
     is_view: bool,
     table: String,
     schema: Option<String>,
@@ -1209,7 +1277,7 @@ fn trigger_list(
 
     let add = move || {
         d.update(|s| {
-            let fresh = blank_trigger(&s.triggers, &table, schema.clone(), pg, is_view);
+            let fresh = blank_trigger(&s.triggers, &table, schema.clone(), dialect, is_view);
             s.triggers.push(fresh);
         });
         // Select what was just added, and bump `rev`: `selected` may be
@@ -1336,7 +1404,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
             let body = h_stack((
                 trigger_list(
                     ui.clone(),
-                    target.dialect == SqlDialect::Postgres,
+                    target.dialect,
                     target.is_view,
                     target.table.clone(),
                     target.schema.clone(),

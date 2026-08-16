@@ -392,9 +392,66 @@ pub fn is_delimiter_directive(sql: &str, lo: usize, hi: usize, dialect: SqlDiale
     delimiter_directive(sql, lo, dialect).is_some_and(|(end, _)| end >= hi)
 }
 
+/// Where a scan through a SQLite statement stands with respect to a
+/// `CREATE TRIGGER` body.
+///
+/// SQLite is the one engine whose statements can *contain* `;` with no way to
+/// say so: a trigger body is a `BEGIN … END` block of whole statements, and
+/// SQLite has no `DELIMITER` directive to hide them behind. Its own shell solves
+/// this in `sqlite3_complete()` by tracking the block, and so does this.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TriggerScan {
+    /// At the start of a segment, still able to become a trigger.
+    Start,
+    /// `CREATE` seen; `TEMP`/`TEMPORARY` may follow before `TRIGGER` does.
+    Create,
+    /// Inside a `CREATE TRIGGER`, `depth` block openers deep. A `;` splits only
+    /// at depth zero — which is the `;` after the body's own `END`.
+    In { depth: u32 },
+    /// This segment is something else; stop looking until the next one.
+    No,
+}
+
+impl TriggerScan {
+    /// Advance on one **code** word. `BEGIN` and `CASE` both open a block that
+    /// `END` closes — counting openers rather than stopping at the first `END`
+    /// is what keeps a `CASE … END` inside the body from ending the statement.
+    fn word(self, w: &str) -> TriggerScan {
+        let is = |k: &str| w.eq_ignore_ascii_case(k);
+        match self {
+            TriggerScan::Start if is("CREATE") => TriggerScan::Create,
+            // `TEMP`/`TEMPORARY` sit between `CREATE` and `TRIGGER`; `IF NOT
+            // EXISTS` sits after it and needs nothing here.
+            TriggerScan::Create if is("TEMP") || is("TEMPORARY") => TriggerScan::Create,
+            TriggerScan::Create if is("TRIGGER") => TriggerScan::In { depth: 0 },
+            TriggerScan::In { depth } if is("BEGIN") || is("CASE") => {
+                TriggerScan::In { depth: depth + 1 }
+            }
+            TriggerScan::In { depth } => TriggerScan::In {
+                depth: if is("END") {
+                    depth.saturating_sub(1)
+                } else {
+                    depth
+                },
+            },
+            TriggerScan::No => TriggerScan::No,
+            // Any other leading word: not a trigger, and nothing later in the
+            // segment can make it one.
+            _ => TriggerScan::No,
+        }
+    }
+
+    /// Is a `;` here inside a trigger body rather than the end of a statement?
+    fn inside_body(self) -> bool {
+        matches!(self, TriggerScan::In { depth } if depth > 0)
+    }
+}
+
 /// Byte offsets bounding each top-level statement: `[0, after-`;`, …, len]`.
-/// `;` inside strings / identifiers / comments does not split, and on MySQL a
-/// `DELIMITER` directive changes what does — see [`delimiter_directive`].
+/// `;` inside strings / identifiers / comments does not split, on MySQL a
+/// `DELIMITER` directive changes what does (see [`delimiter_directive`]), and on
+/// SQLite a `;` inside a `CREATE TRIGGER`'s `BEGIN … END` block does not split
+/// either (see [`TriggerScan`]).
 pub fn statement_bounds(sql: &str, dialect: SqlDialect) -> Vec<usize> {
     let b = sql.as_bytes();
     let n = b.len();
@@ -404,6 +461,11 @@ pub fn statement_bounds(sql: &str, dialect: SqlDialect) -> Vec<usize> {
     // Where the current segment begins, for recognising a directive only at the
     // start of one.
     let mut seg = 0usize;
+    // SQLite alone. The other two engines keep exactly the boundaries they had —
+    // MySQL's trigger bodies go behind `DELIMITER`, and changing that would
+    // silently alter what Run Everything sends to a server.
+    let track_triggers = dialect == SqlDialect::Sqlite;
+    let mut scan = TriggerScan::Start;
     while i < n {
         if let Some(j) = skip_noncode(b, i, dialect) {
             i = j;
@@ -417,12 +479,30 @@ pub fn statement_bounds(sql: &str, dialect: SqlDialect) -> Vec<usize> {
             delim = token.into_bytes();
             i = end;
             seg = end;
+            scan = TriggerScan::Start;
+            continue;
+        }
+        // The word walk is SQLite's only, and it is safe to skip a whole word
+        // here because no word can contain the delimiter.
+        if track_triggers && is_word_start(b[i]) {
+            let start = i;
+            let mut end = i + 1;
+            while end < n && is_word_byte(b[end]) {
+                end += 1;
+            }
+            scan = scan.word(&sql[start..end]);
+            i = end;
             continue;
         }
         if b[i..].starts_with(&delim) {
+            if scan.inside_body() {
+                i += delim.len();
+                continue;
+            }
             bounds.push(i + delim.len());
             i += delim.len();
             seg = i;
+            scan = TriggerScan::Start;
             continue;
         }
         i += 1;
@@ -2182,5 +2262,108 @@ mod tests {
     #[test]
     fn postgres_has_no_use_statement() {
         assert_eq!(use_target("USE sakila", SqlDialect::Postgres), None);
+    }
+
+    // ── SQLite trigger bodies ────────────────────────────────────────────────
+
+    fn sqlite_stmts(sql: &str) -> Vec<&str> {
+        super::statement_ranges(sql, SqlDialect::Sqlite)
+            .into_iter()
+            .map(|(lo, hi)| &sql[lo..hi])
+            .collect()
+    }
+
+    /// **A SQLite trigger body is full of `;` and none of them ends the
+    /// statement.** MySQL solves this with `DELIMITER`, which SQLite has no form
+    /// of — so the boundary rule has to know that a `CREATE TRIGGER` runs to the
+    /// `;` after its `END`, exactly as `sqlite3_complete()` does for SQLite's own
+    /// shell.
+    ///
+    /// Without this the splitter cuts the trigger in half: Run Everything sends
+    /// `… BEGIN UPDATE log SET n = n + 1;` as one statement and `END;` as
+    /// another, which is the application handing the user a script it cannot run
+    /// itself.
+    #[test]
+    fn a_sqlite_trigger_body_is_one_statement() {
+        let sql = "CREATE TRIGGER t AFTER INSERT ON emp BEGIN \
+                   UPDATE log SET n = n + 1; DELETE FROM tmp; END;\nSELECT 1;";
+        assert_eq!(
+            sqlite_stmts(sql),
+            [
+                "CREATE TRIGGER t AFTER INSERT ON emp BEGIN \
+                 UPDATE log SET n = n + 1; DELETE FROM tmp; END;",
+                "SELECT 1;"
+            ]
+        );
+    }
+
+    /// A `CASE … END` inside the body must not be mistaken for the block's own
+    /// `END`. This is why the rule counts openers rather than looking for the
+    /// first `END;` — the naive version ends the statement in the middle of an
+    /// expression.
+    #[test]
+    fn a_case_expression_does_not_end_the_block() {
+        let sql = "CREATE TRIGGER t AFTER UPDATE ON emp BEGIN \
+                   UPDATE log SET n = CASE WHEN NEW.a > 1 THEN 1 ELSE 2 END; END;\nSELECT 2;";
+        assert_eq!(
+            sqlite_stmts(sql),
+            [
+                "CREATE TRIGGER t AFTER UPDATE ON emp BEGIN \
+                 UPDATE log SET n = CASE WHEN NEW.a > 1 THEN 1 ELSE 2 END; END;",
+                "SELECT 2;"
+            ]
+        );
+    }
+
+    /// The words only count as code: `BEGIN`/`END` inside a string, a quoted
+    /// identifier or a comment belong to the data, and the shared lexer is what
+    /// sees through them.
+    #[test]
+    fn begin_and_end_inside_literals_do_not_count() {
+        let sql = "CREATE TRIGGER t AFTER INSERT ON emp BEGIN \
+                   INSERT INTO log VALUES ('END; BEGIN'); -- END;\n END;\nSELECT 3;";
+        assert_eq!(sqlite_stmts(sql).len(), 2, "{:#?}", sqlite_stmts(sql));
+        assert!(sqlite_stmts(sql)[1].starts_with("SELECT 3"));
+    }
+
+    /// `TEMP`/`TEMPORARY` and `IF NOT EXISTS` sit between `CREATE` and the
+    /// trigger's name, and the rule has to reach past them — as does a plain
+    /// `CREATE TABLE`, which must keep splitting on its own `;`.
+    #[test]
+    fn the_rule_reaches_past_the_optional_header_words_and_no_further() {
+        let sql = "CREATE TEMP TRIGGER IF NOT EXISTS t BEFORE DELETE ON emp \
+                   BEGIN SELECT 1; END;\nSELECT 4;";
+        assert_eq!(sqlite_stmts(sql).len(), 2);
+        // Not a trigger: every `;` still splits, including inside parentheses.
+        let plain = "CREATE TABLE t (a INT); SELECT 5;";
+        assert_eq!(
+            sqlite_stmts(plain),
+            ["CREATE TABLE t (a INT);", "SELECT 5;"]
+        );
+    }
+
+    /// An unterminated trigger is one (incomplete) statement, not a pile of
+    /// fragments — the same answer the splitter gives any unterminated tail.
+    #[test]
+    fn an_unfinished_trigger_stays_one_statement() {
+        let sql = "CREATE TRIGGER t AFTER INSERT ON emp BEGIN UPDATE log SET n = 1;";
+        assert_eq!(sqlite_stmts(sql), [sql]);
+    }
+
+    /// The rule is SQLite's alone. MySQL keeps `DELIMITER`, and a MySQL trigger
+    /// body written without one still splits the way it always did — changing
+    /// that would silently alter what Run Everything sends to a MySQL server.
+    #[test]
+    fn other_engines_are_untouched() {
+        let sql = "CREATE TRIGGER t AFTER INSERT ON emp FOR EACH ROW \
+                   BEGIN SET NEW.a = 1; END;";
+        assert!(
+            super::statement_ranges(sql, SqlDialect::MySql).len() > 1,
+            "MySQL's boundary rule must not change"
+        );
+        assert!(
+            super::statement_ranges(sql, SqlDialect::Postgres).len() > 1,
+            "PostgreSQL's boundary rule must not change"
+        );
     }
 }

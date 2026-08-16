@@ -721,6 +721,7 @@ impl TriggerDraft {
     pub fn validate(&self, dialect: SqlDialect, host: TriggerHost) -> Vec<String> {
         let t = &self.info;
         let pg = dialect == SqlDialect::Postgres;
+        let sqlite = dialect == SqlDialect::Sqlite;
         let view = host == TriggerHost::View;
         let mut out = Vec::new();
         if t.name.trim().is_empty() {
@@ -775,6 +776,65 @@ impl TriggerDraft {
                         .to_string(),
                 );
             }
+        } else if sqlite {
+            // Every rule below is one SQLite states itself, quoted from 3.45:
+            // `cannot create INSTEAD OF trigger on table: emp`, `cannot create
+            // BEFORE trigger on view: v`, and a plain `syntax error` for the
+            // rest. They are refused here rather than at Apply because the
+            // modal can say which control is wrong, and because a `DROP` has
+            // already run by the time a `CREATE` fails.
+            if t.events.len() > 1 {
+                out.push(
+                    "SQLite fires a trigger on one event — make a separate trigger per event."
+                        .to_string(),
+                );
+            }
+            if t.events.contains(&TriggerEvent::Truncate) {
+                out.push("SQLite has no TRUNCATE trigger.".to_string());
+            }
+            // The two halves are exact opposites, as they are on PostgreSQL, but
+            // stricter: a view takes *only* INSTEAD OF here, at either level.
+            if t.timing == TriggerTiming::InsteadOf && !view {
+                out.push(
+                    "Only a view can have an INSTEAD OF trigger — a table takes \
+                     BEFORE or AFTER."
+                        .to_string(),
+                );
+            }
+            if view && t.timing != TriggerTiming::InsteadOf {
+                out.push(
+                    "A view's trigger has to be INSTEAD OF — SQLite has no BEFORE or \
+                     AFTER trigger on a view."
+                        .to_string(),
+                );
+            }
+            if t.level != TriggerLevel::Row {
+                out.push(
+                    "SQLite has only FOR EACH ROW triggers — there is no statement-level one."
+                        .to_string(),
+                );
+            }
+            if !t.update_columns.is_empty() && !t.events.contains(&TriggerEvent::Update) {
+                out.push("UPDATE OF names columns on an UPDATE trigger.".to_string());
+            }
+            match &t.action {
+                TriggerAction::Body(b) if b.trim().is_empty() => {
+                    out.push("A SQLite trigger needs a body.".to_string())
+                }
+                // Not a style rule: SQLite's grammar has no bare-statement form,
+                // and `BEGIN END` with nothing between is a syntax error too.
+                TriggerAction::Body(b) if !is_begin_end_block(b) => out.push(
+                    "A SQLite trigger's body has to be a BEGIN … END block holding at \
+                     least one statement."
+                        .to_string(),
+                ),
+                TriggerAction::Function { .. } => out.push(
+                    "A SQLite trigger runs a body, not a function — write the statements \
+                     to run."
+                        .to_string(),
+                ),
+                _ => {}
+            }
         } else {
             if t.events.len() > 1 {
                 out.push(
@@ -811,6 +871,46 @@ impl TriggerDraft {
         }
         out
     }
+}
+
+/// Is `body` a `BEGIN … END` block with something inside it?
+///
+/// SQLite's trigger grammar has **no bare-statement form** — `CREATE TRIGGER …
+/// SELECT 1;` is a syntax error, and so is `BEGIN END` with nothing between —
+/// so this is a rule of the engine rather than a house style. Asked through the
+/// shared lexer, not by `starts_with`: a body may open with a comment, and
+/// `BEGIN`/`END` inside a string literal are not the block's own.
+fn is_begin_end_block(body: &str) -> bool {
+    let b = body.as_bytes();
+    let mut words: Vec<&str> = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(j) = sql::skip_noncode(b, i, SqlDialect::Sqlite) {
+            // A string or a quoted identifier is content; a comment is not.
+            if b[i] != b'-' && b[i] != b'/' && b[i] != b'#' {
+                words.push("");
+            }
+            i = j.max(i + 1);
+            continue;
+        }
+        if !sql::is_word_start(b[i]) {
+            if !b[i].is_ascii_whitespace() {
+                words.push("");
+            }
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i + 1;
+        while end < b.len() && sql::is_word_byte(b[end]) {
+            end += 1;
+        }
+        words.push(&body[start..end]);
+        i = end;
+    }
+    matches!(words.first(), Some(w) if w.eq_ignore_ascii_case("BEGIN"))
+        && matches!(words.last(), Some(w) if w.eq_ignore_ascii_case("END"))
+        && words.len() > 2
 }
 
 /// What a trigger fires on — the half of the rules that isn't the dialect.
@@ -2367,7 +2467,12 @@ impl ChangeSet {
     /// already sees through.
     pub fn editor_script(&self) -> String {
         let stmts = self.emit();
-        if self.dialect == SqlDialect::Postgres
+        // `DELIMITER` is **MySQL's client directive**, so this is asked as
+        // `!= MySql` rather than `!= Postgres`: SQLite would be handed a word it
+        // has no idea about, at the top of the very script the escape hatch
+        // exists to make runnable. It needs none of it — `statement_bounds`
+        // knows a SQLite trigger's body runs to the `;` after its `END`.
+        if self.dialect != SqlDialect::MySql
             || !stmts.iter().any(|s| needs_delimiter(s, self.dialect))
         {
             return stmts.join("\n\n");
@@ -2768,12 +2873,15 @@ impl ChangeSet {
                 .iter()
                 .filter(|c| supports_change(self.dialect, c))
         };
-        let mut out: Vec<String> = Vec::new();
+        // The view and trigger statements, from the same builders the other two
+        // emitters use — including the view drop, which this emitter used to
+        // spell out for itself. Each of those change sets holds nothing else, so
+        // nothing below ever sees them.
+        let mut out = self.view_statements();
+        out.extend(self.trigger_statements());
         for c in supported() {
-            match c {
-                Change::DropView { .. } => out.push(format!("DROP VIEW {};", self.qname())),
-                Change::DropTable => out.push(format!("DROP TABLE {};", self.qname())),
-                _ => {}
+            if matches!(c, Change::DropTable) {
+                out.push(format!("DROP TABLE {};", self.qname()));
             }
         }
         // Indexes before columns: SQLite refuses to drop a column an index still
@@ -2842,19 +2950,27 @@ impl ChangeSet {
                     out.push(drop_view_sql(&self.qname(), *materialized))
                 }
                 // MySQL has no `ALTER VIEW … RENAME`; `RENAME TABLE` is what it
-                // renames a view with.
-                Change::RenameView { to } => out.push(match d {
-                    SqlDialect::Postgres => format!(
+                // renames a view with. Spelled out per engine rather than
+                // `_ =>`, which silently handed SQLite MySQL's statement.
+                Change::RenameView { to } => match d {
+                    SqlDialect::Postgres => out.push(format!(
                         "ALTER VIEW {} RENAME TO {};",
                         self.qname(),
                         ddl_ident_in(to, d)
-                    ),
-                    _ => format!(
+                    )),
+                    SqlDialect::MySql => out.push(format!(
                         "RENAME TABLE {} TO {};",
                         self.qname(),
                         qualified(to, self.schema.as_deref(), d)
-                    ),
-                }),
+                    )),
+                    // Unreachable rather than unimplemented: SQLite has no verb
+                    // that renames a view ([`supports_view_rename`]), so
+                    // `diff_view` turns a rename there into the drop-and-create
+                    // above and this change never reaches the emitter.
+                    SqlDialect::Sqlite => {
+                        debug_assert!(false, "SQLite has no statement that renames a view")
+                    }
+                },
                 _ => {}
             }
         }
@@ -2877,13 +2993,14 @@ impl ChangeSet {
         let drop = |name: &str| -> String {
             match d {
                 // PostgreSQL scopes a trigger to its table and needs it named;
-                // MySQL scopes it to the database and refuses the `ON` clause.
+                // MySQL and SQLite scope it to the database and take the bare
+                // name — SQLite refuses an `ON` clause here just as MySQL does.
                 SqlDialect::Postgres => format!(
                     "DROP TRIGGER {} ON {};",
                     ddl_ident_in(name, d),
                     self.qname()
                 ),
-                _ => format!(
+                SqlDialect::MySql | SqlDialect::Sqlite => format!(
                     "DROP TRIGGER {};",
                     qualified(name, self.schema.as_deref(), d)
                 ),
@@ -3273,16 +3390,23 @@ pub fn view_ddl(t: &TableInfo, dialect: SqlDialect) -> Option<String> {
 /// `draft.name` — a replace has to name the view the server already has, since
 /// the rename runs after it.
 fn create_view_sql(v: &ViewDraft, name: &str, dialect: SqlDialect, replace: bool) -> String {
+    // Asked per engine, never as `!= Postgres`: SQLite shares none of MySQL's
+    // view clauses, and sorting it onto whichever side it happens to fall would
+    // emit `ALGORITHM`/`DEFINER`/`SQL SECURITY` at a server that has no idea
+    // what they are.
+    let my = dialect == SqlDialect::MySql;
     let pg = dialect == SqlDialect::Postgres;
     let o = &v.options;
     fn set(s: &Option<String>) -> Option<&str> {
         s.as_deref().map(str::trim).filter(|s| !s.is_empty())
     }
     let mut sql = String::from("CREATE ");
-    if replace {
+    // Guarded on the capability as well as on the caller's answer: a `replace`
+    // that reached SQLite would emit a statement the engine has no form of.
+    if replace && supports_or_replace_view(dialect) {
         sql.push_str("OR REPLACE ");
     }
-    if !pg {
+    if my {
         // MySQL's clause order is fixed: ALGORITHM, DEFINER, SQL SECURITY, VIEW.
         // `UNDEFINED` is the default and says nothing, so it isn't emitted.
         if let Some(a) = set(&o.algorithm).filter(|a| !a.eq_ignore_ascii_case("UNDEFINED")) {
@@ -3301,13 +3425,20 @@ fn create_view_sql(v: &ViewDraft, name: &str, dialect: SqlDialect, replace: bool
     }
     sql.push_str("VIEW ");
     sql.push_str(&qualified(name, v.schema.as_deref(), dialect));
+    // SQLite's explicit column list, restated because the re-create would
+    // otherwise rename the view's columns to whatever the body calls them.
+    if let Some(cols) = set(&o.column_list).filter(|_| dialect == SqlDialect::Sqlite) {
+        sql.push_str(&format!(" ({cols})"));
+    }
     if pg && !o.storage.is_empty() {
         sql.push_str(&format!(" WITH ({})", o.storage.join(", ")));
     }
     sql.push_str(" AS\n");
     sql.push_str(&view_body(&v.select));
-    // A materialized view has no check option — it isn't updatable at all.
-    if !o.materialized
+    // A materialized view has no check option — it isn't updatable at all — and
+    // neither does SQLite, at any view.
+    if (my || pg)
+        && !o.materialized
         && let Some(co) = set(&o.check_option).filter(|c| !c.eq_ignore_ascii_case("NONE"))
     {
         sql.push_str(&format!("\nWITH {} CHECK OPTION", co.to_ascii_uppercase()));
@@ -4003,7 +4134,10 @@ fn fks_equal(a: &ForeignKeyInfo, b: &ForeignKeyInfo) -> bool {
 /// the connection as it was found, whatever it was.
 fn session_wrapped_create(t: &TriggerInfo, d: SqlDialect) -> Vec<String> {
     let create = t.create_sql(d);
-    if d == SqlDialect::Postgres {
+    // MySQL's problem alone. PostgreSQL's trigger carries no session state, and
+    // SQLite has no `SET SESSION` to carry it with — asked as `!= MySql` so a
+    // third engine can't inherit `SET SESSION sql_mode = …` by falling through.
+    if d != SqlDialect::MySql {
         return vec![create];
     }
     let settings: Vec<(&str, &str)> = [
@@ -4359,26 +4493,52 @@ pub fn checks_equal(a: &CheckInfo, b: &CheckInfo, dialect: SqlDialect) -> bool {
 /// gap before a user ever sees a phantom change.
 /// Can `dialect` have its **views** edited here?
 ///
-/// Its own question because SQLite's table designer works and its view editor
-/// does not: the view emitter writes MySQL's clause
-/// order and, worse, `CREATE OR REPLACE VIEW`, which SQLite has no form of — so
-/// a redefinition would fail at the engine having looked available all the way
-/// to Apply. `TableInfo::view_options` is also left `None` by SQLite
-/// introspection, so the form would offer fields it can't read back.
-pub fn supports_view_editing(dialect: SqlDialect) -> bool {
+/// All three, now — but they don't get there the same way, which is why the two
+/// predicates below exist rather than a `dialect == Postgres` at each site.
+/// SQLite has neither `CREATE OR REPLACE VIEW` nor a verb that renames a view,
+/// so every edit is a drop and a create; the other two replace in place and
+/// rename with a statement.
+pub fn supports_view_editing(_dialect: SqlDialect) -> bool {
+    true
+}
+
+/// Can `dialect` redefine a view **in place**, with `CREATE OR REPLACE VIEW`?
+///
+/// MySQL replaces anything and PostgreSQL replaces what it can append to
+/// ([`pg_replaceable`]). SQLite has no form of the statement at all, so a
+/// redefinition there is a `DROP` plus a `CREATE` — the same arm PostgreSQL
+/// already takes when a replace won't do, reached unconditionally instead of on
+/// a body test.
+pub fn supports_or_replace_view(dialect: SqlDialect) -> bool {
+    !matches!(dialect, SqlDialect::Sqlite)
+}
+
+/// Can `dialect` rename a view with a statement, leaving its body alone?
+///
+/// PostgreSQL has `ALTER VIEW … RENAME TO` and MySQL renames one with
+/// `RENAME TABLE`. SQLite has neither: `ALTER VIEW` isn't a statement there, and
+/// `ALTER TABLE v RENAME TO …` refuses a view outright — *"view v may not be
+/// altered"*. A rename there rides along with the re-create every edit already
+/// performs, which is why [`diff_view`] treats a bare rename as a redefinition.
+pub fn supports_view_rename(dialect: SqlDialect) -> bool {
     !matches!(dialect, SqlDialect::Sqlite)
 }
 
 /// Can `dialect` have its **triggers** edited here?
 ///
-/// SQLite has `CREATE TRIGGER` and `DROP TRIGGER`, but nothing reads its
-/// triggers into [`crate::schema::TriggerInfo`] — `fetch_schema` leaves the list
-/// empty and keeps the statements verbatim in
-/// [`crate::schema::TableInfo::dependent_ddl`] instead, which is what a rebuild
-/// replays. An editor over an empty list would show a table's triggers as gone
-/// and offer to "add" one that already exists.
-pub fn supports_trigger_editing(dialect: SqlDialect) -> bool {
-    !matches!(dialect, SqlDialect::Sqlite)
+/// All three. SQLite was the holdout, and the thing that had to come first was
+/// the *reader*, not the emitter: it keeps no catalogue of a trigger's parts, so
+/// until [`sqlite_trigger_info`] could parse `sqlite_master`'s `CREATE TRIGGER`
+/// text into [`crate::schema::TriggerInfo`], the list was empty — and an editor
+/// over an empty list shows a table's triggers as gone and offers to "add" one
+/// that already exists.
+///
+/// [`crate::schema::TableInfo::dependent_ddl`] still holds the same statements
+/// verbatim, and still is what a rebuild replays. The two are not redundant: the
+/// model is what the *editor* diffs, and the text is what a table rebuild puts
+/// back without depending on the parse being perfect.
+pub fn supports_trigger_editing(_dialect: SqlDialect) -> bool {
+    true
 }
 
 /// Is this the change that performs a whole set by rebuilding the table?
@@ -4434,6 +4594,151 @@ const REBUILD_SUFFIX: &str = "_schemaic_rebuild";
 /// under the original name, and `ALTER TABLE … RENAME TO` is emitted after it —
 /// that statement is native, and letting SQLite perform it is what keeps the
 /// references in other tables' foreign keys pointing at the right place.
+/// One SQLite trigger, read out of the `CREATE TRIGGER` text `sqlite_master`
+/// stores. `None` for anything that isn't a readable `CREATE TRIGGER`.
+///
+/// SQLite keeps **no catalogue of a trigger's parts** — there is no
+/// `information_schema.TRIGGERS` and no pragma, only the statement — so this is
+/// the one engine where introspection is a parse, and it is the thing that had
+/// to exist before a trigger editor could be offered at all
+/// ([`supports_trigger_editing`]). It is also why the rebuild keeps replaying
+/// [`TableInfo::dependent_ddl`] verbatim rather than re-emitting from this
+/// model: a table rebuild must not depend on the parse being perfect.
+///
+/// **Structure from the AST, body from the text.** The per-dialect parser
+/// ([`crate::intel`]) answers what the timing, events, `UPDATE OF` columns and
+/// `WHEN` guard are — questions a scanner gets wrong on a trigger whose body
+/// contains the same words. The **body** is then taken verbatim from the
+/// original text, because re-printing it from the AST normalises away the
+/// user's comments, casing and line breaks, and a body that comes back
+/// different is a phantom change on every open and a rewritten trigger on every
+/// apply.
+pub fn sqlite_trigger_info(create_sql: &str) -> Option<TriggerInfo> {
+    use sqlparser::ast::{Statement, TriggerEvent as PEvent, TriggerPeriod};
+
+    let d = SqlDialect::Sqlite;
+    let mut stmts = sqlparser::parser::Parser::parse_sql(&*d.parser(), create_sql).ok()?;
+    let Statement::CreateTrigger(t) = stmts.pop()? else {
+        return None;
+    };
+
+    // `Ident::value` is the name with its quoting already removed, which is the
+    // bare form the model holds and the emitter quotes again.
+    let name = t.name.0.last()?.as_ident()?.value.clone();
+    let table = t.table_name.0.last()?.as_ident()?.value.clone();
+
+    // SQLite's timing is optional and defaults to `BEFORE`. Falling back to the
+    // enum's own default would say `Before` too, but only by coincidence — this
+    // is the engine's rule, written down.
+    let timing = match t.period {
+        Some(TriggerPeriod::After) => TriggerTiming::After,
+        Some(TriggerPeriod::InsteadOf) => TriggerTiming::InsteadOf,
+        Some(TriggerPeriod::Before) | None => TriggerTiming::Before,
+        // `FOR` is a period no SQLite trigger has; refuse rather than file it
+        // under a timing the statement didn't say.
+        Some(TriggerPeriod::For) => return None,
+    };
+
+    let mut events = Vec::new();
+    let mut update_columns = Vec::new();
+    for e in &t.events {
+        events.push(match e {
+            PEvent::Insert => TriggerEvent::Insert,
+            PEvent::Delete => TriggerEvent::Delete,
+            PEvent::Update(cols) => {
+                update_columns = cols.iter().map(|c| c.value.clone()).collect();
+                TriggerEvent::Update
+            }
+            // SQLite has no TRUNCATE trigger; a statement claiming one isn't one
+            // of its own.
+            PEvent::Truncate => return None,
+        });
+    }
+    if events.is_empty() {
+        return None;
+    }
+
+    Some(TriggerInfo {
+        name,
+        schema: None,
+        table,
+        timing,
+        events,
+        update_columns,
+        // SQLite has only row-level triggers — `FOR EACH STATEMENT` is a syntax
+        // error there, and `FOR EACH ROW` is accepted but says nothing.
+        level: TriggerLevel::Row,
+        condition: t
+            .condition
+            .as_ref()
+            .map(|c| peel_parens(&c.to_string(), d).to_string()),
+        action: TriggerAction::Body(sqlite_trigger_body(create_sql)?),
+        // Everything below belongs to one of the other two engines. Left `None`
+        // rather than guessed, so the round-trip gate stays meaningful.
+        definer: None,
+        order: None,
+        sql_mode: None,
+        charset_client: None,
+        collation_connection: None,
+        old_table: None,
+        new_table: None,
+        enabled: crate::schema::TriggerEnabled::default(),
+        constraint: false,
+    })
+}
+
+/// A SQLite trigger's body — the `BEGIN … END` block — taken verbatim from the
+/// statement that declares it.
+///
+/// The body starts at the first `BEGIN` at a **code** position and paren depth
+/// zero, both qualifications carrying the weight they do in `db::sqlite`'s
+/// `view_body_of`: the header's `WHEN` guard may hold a string or a quoted
+/// identifier spelling `begin`, and the shared lexer is what sees through them.
+/// Everything from there to the end of the statement is the block, `END`
+/// included — SQLite stores one statement per row, so its last token is the
+/// block's own terminator.
+fn sqlite_trigger_body(create_sql: &str) -> Option<String> {
+    use crate::sql::{is_word_byte, is_word_start, skip_noncode};
+
+    let b = create_sql.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0i32;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, SqlDialect::Sqlite) {
+            i = j.max(i + 1);
+            continue;
+        }
+        match b[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if !is_word_start(b[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i + 1;
+        while end < b.len() && is_word_byte(b[end]) {
+            end += 1;
+        }
+        if depth == 0 && create_sql[start..end].eq_ignore_ascii_case("BEGIN") {
+            let body = create_sql[start..].trim().trim_end_matches(';').trim_end();
+            return (!body.is_empty()).then(|| body.to_string());
+        }
+        i = end;
+    }
+    None
+}
+
 pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> {
     let d = SqlDialect::Sqlite;
     let q = |s: &str| ddl_ident_in(s, d);
@@ -4539,6 +4844,19 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
             // context-menu shortcut has no draft to build from, which is why the
             // changes it can raise on their own are still the four above.
             | Change::RebuildTable(_)
+            // Views. SQLite creates and drops them like anyone else; what it has
+            // no form of is replacing one in place or renaming it, and
+            // `diff_view` resolves both into a drop plus a create before they
+            // reach here ([`supports_or_replace_view`], [`supports_view_rename`]).
+            | Change::CreateView(_)
+            | Change::ReplaceView { .. }
+            // Triggers. SQLite has `CREATE TRIGGER` and `DROP TRIGGER` and no
+            // form that alters one, which is the same drop-and-create every
+            // engine here already performs — see [`supports_trigger_editing`]
+            // for what had to exist first.
+            | Change::CreateTrigger(_)
+            | Change::ReplaceTrigger { .. }
+            | Change::DropTrigger { .. }
     )
 }
 
@@ -5106,14 +5424,21 @@ pub fn diff_view(current: &TableInfo, draft: &ViewDraft, dialect: SqlDialect) ->
     let old_options = server.map(|v| v.options).unwrap_or_default();
     let renamed = draft.name != current.name && !draft.name.trim().is_empty();
 
-    if view_body(&draft.select) != old_body || draft.options != old_options {
-        // MySQL's `CREATE OR REPLACE VIEW` redefines anything, so the whole
-        // question — and the override — is PostgreSQL's.
-        let recreate = dialect == SqlDialect::Postgres
-            && (draft.force_recreate || {
-                let cols: Vec<String> = current.columns.iter().map(|c| c.name.clone()).collect();
-                pg_replaceable(&cols, &draft.select, dialect) == Some(false)
-            });
+    // A rename is a redefinition on an engine with no verb for it: SQLite gets
+    // the new name out of the `CREATE` half of the re-create, so a bare rename
+    // has to take that path rather than fall through to `RenameView` below.
+    let redefined = view_body(&draft.select) != old_body || draft.options != old_options;
+    if redefined || (renamed && !supports_view_rename(dialect)) {
+        // MySQL's `CREATE OR REPLACE VIEW` redefines anything, so among the
+        // engines that *have* the statement the question — and the override —
+        // is PostgreSQL's. SQLite doesn't have it and always re-creates.
+        let recreate = !supports_or_replace_view(dialect)
+            || (dialect == SqlDialect::Postgres
+                && (draft.force_recreate || {
+                    let cols: Vec<String> =
+                        current.columns.iter().map(|c| c.name.clone()).collect();
+                    pg_replaceable(&cols, &draft.select, dialect) == Some(false)
+                }));
         changes.push(Change::ReplaceView {
             draft: Box::new(draft.clone()),
             recreate,
@@ -8751,8 +9076,31 @@ mod tests {
             }
         }
 
+        /// A SQLite view. It carries no definer, security type or algorithm —
+        /// SQLite has none of them — and the one thing it *does* carry is the
+        /// explicit column list, which is part of the object rather than of its
+        /// body and would otherwise be dropped by the re-create every edit
+        /// there is.
+        pub(super) fn sqlite_view() -> TableInfo {
+            TableInfo {
+                name: "recent".into(),
+                columns: vec![col("who"), col("what")],
+                is_view: true,
+                view_definition: Some("SELECT name, action FROM audit WHERE at > 0".into()),
+                view_options: Some(ViewOptions {
+                    column_list: Some("who, what".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
         pub(super) fn view_fixtures() -> Vec<(SqlDialect, TableInfo)> {
-            vec![(MySql, my_view()), (Postgres, pg_view())]
+            vec![
+                (MySql, my_view()),
+                (Postgres, pg_view()),
+                (SqlDialect::Sqlite, sqlite_view()),
+            ]
         }
 
         #[test]
@@ -10900,6 +11248,445 @@ mod sqlite_rebuild_tests {
             "{got:#?}"
         );
         assert!(got.iter().any(|s| s.starts_with("DROP TABLE")), "{got:#?}");
+    }
+}
+
+/// Reading a SQLite trigger back into the model. SQLite keeps no catalogue of a
+/// trigger's parts — `sqlite_master` holds the `CREATE TRIGGER` text and nothing
+/// else — so this is the one engine where introspection is a *parse*, and the
+/// editor is only as honest as it is.
+#[cfg(test)]
+mod sqlite_trigger_read_tests {
+    use super::*;
+    use crate::intel::SqlDialect::Sqlite;
+
+    fn read(sql: &str) -> TriggerInfo {
+        sqlite_trigger_info(sql).unwrap_or_else(|| panic!("should read: {sql}"))
+    }
+
+    #[test]
+    fn a_plain_trigger_reads_back() {
+        let t = read("CREATE TRIGGER t AFTER INSERT ON emp BEGIN UPDATE log SET n = n + 1; END");
+        assert_eq!(t.name, "t");
+        assert_eq!(t.table, "emp");
+        assert_eq!(t.timing, TriggerTiming::After);
+        assert_eq!(t.events, vec![TriggerEvent::Insert]);
+        // SQLite has only row-level triggers — `FOR EACH STATEMENT` is a syntax
+        // error there — so the level is never in doubt.
+        assert_eq!(t.level, TriggerLevel::Row);
+        assert_eq!(t.condition, None);
+        assert!(t.update_columns.is_empty());
+        assert_eq!(
+            t.action,
+            TriggerAction::Body("BEGIN UPDATE log SET n = n + 1; END".into())
+        );
+        // None of the other engines' fields are invented.
+        assert_eq!(t.schema, None);
+        assert_eq!(t.definer, None);
+        assert_eq!(t.sql_mode, None);
+        assert!(!t.constraint);
+    }
+
+    /// SQLite's timing is optional, and omitting it means `BEFORE`. Read as
+    /// `After` — the enum's own default — the editor would show the wrong answer
+    /// and a re-create would move the trigger.
+    #[test]
+    fn an_omitted_timing_is_before() {
+        let t = read("CREATE TRIGGER t DELETE ON emp BEGIN SELECT 1; END");
+        assert_eq!(t.timing, TriggerTiming::Before);
+        assert_eq!(t.events, vec![TriggerEvent::Delete]);
+    }
+
+    /// Two things SQLite has that MySQL doesn't, and that the model documented as
+    /// PostgreSQL's alone: `UPDATE OF` and `WHEN`.
+    #[test]
+    fn update_of_columns_and_a_when_guard_are_read() {
+        let t = read(
+            "CREATE TRIGGER t BEFORE UPDATE OF a, b ON emp \
+             FOR EACH ROW WHEN NEW.a > OLD.a \
+             BEGIN SELECT RAISE(ABORT, 'nope'); END",
+        );
+        assert_eq!(t.timing, TriggerTiming::Before);
+        assert_eq!(t.events, vec![TriggerEvent::Update]);
+        assert_eq!(t.update_columns, vec!["a".to_string(), "b".to_string()]);
+        // Held bare, without the parens the emitter puts back — the same rule
+        // `check_predicate` follows, so a round trip doesn't grow a layer.
+        assert_eq!(t.condition.as_deref(), Some("NEW.a > OLD.a"));
+    }
+
+    #[test]
+    fn an_instead_of_trigger_on_a_view_reads_back() {
+        let t = read(
+            "CREATE TRIGGER t INSTEAD OF DELETE ON v BEGIN DELETE FROM emp WHERE a = OLD.a; END",
+        );
+        assert_eq!(t.timing, TriggerTiming::InsteadOf);
+        assert_eq!(t.table, "v");
+    }
+
+    /// The body is the user's own SQL and is kept **verbatim** — comments,
+    /// newlines and indentation included. Re-printing it from the AST would hand
+    /// back a trigger nobody wrote, and the round trip below is what would then
+    /// report a phantom change on every open.
+    #[test]
+    fn the_body_is_kept_exactly_as_written() {
+        let sql = "CREATE TRIGGER t AFTER INSERT ON emp\n  BEGIN\n    -- keep me\n    \
+                   SELECT 1;\n  END";
+        let TriggerAction::Body(b) = read(sql).action else {
+            panic!("a SQLite trigger runs a body")
+        };
+        assert_eq!(b, "BEGIN\n    -- keep me\n    SELECT 1;\n  END");
+    }
+
+    /// Quoted identifiers arrive unquoted in the model, as they do from every
+    /// other introspection path — the emitter is what quotes them again.
+    #[test]
+    fn quoted_names_are_unquoted_in_the_model() {
+        let t = read(r#"CREATE TRIGGER "odd ;name" AFTER DELETE ON "my emp" BEGIN SELECT 1; END"#);
+        assert_eq!(t.name, "odd ;name");
+        assert_eq!(t.table, "my emp");
+    }
+
+    /// Anything it can't read is `None`, and the caller drops that trigger rather
+    /// than showing a guess. The safe direction: a trigger read wrong would be
+    /// *emitted* wrong, and a trigger not read at all is simply never touched by
+    /// [`diff_triggers`], which only drops what the server copy lists.
+    #[test]
+    fn an_unreadable_statement_reads_back_as_nothing() {
+        for sql in [
+            "SELECT 1",
+            "CREATE TABLE t (a INT)",
+            "CREATE TRIGGER t AFTER INSERT ON emp",
+            "not sql at all",
+            "",
+        ] {
+            assert!(sqlite_trigger_info(sql).is_none(), "{sql:?}");
+        }
+    }
+
+    /// **The round-trip gate**, and the reason the reader can be trusted at all:
+    /// what SQLite stores, read into the model and emitted again, must diff to
+    /// nothing against itself. A field the reader drops shows up here as a
+    /// phantom change on a trigger nobody touched.
+    #[test]
+    fn every_shape_diffs_to_nothing_against_itself() {
+        for sql in [
+            "CREATE TRIGGER t AFTER INSERT ON emp BEGIN SELECT 1; END",
+            "CREATE TRIGGER t DELETE ON emp BEGIN SELECT 1; END",
+            "CREATE TRIGGER t BEFORE UPDATE OF a, b ON emp FOR EACH ROW \
+             WHEN NEW.a > OLD.a BEGIN SELECT 1; END",
+            "CREATE TRIGGER t INSTEAD OF UPDATE ON v BEGIN SELECT 1; END",
+            r#"CREATE TRIGGER "odd ;name" AFTER DELETE ON "my emp" BEGIN SELECT 1; END"#,
+            // A guard the user already parenthesised. The model holds it bare
+            // and the emitter wraps it exactly once, so this must not grow a
+            // layer of parens per edit.
+            "CREATE TRIGGER t AFTER INSERT ON emp WHEN (NEW.a > 1) BEGIN SELECT 1; END",
+            // A body whose statements contain the words the header uses.
+            "CREATE TRIGGER t AFTER INSERT ON emp BEGIN \
+             UPDATE log SET n = CASE WHEN NEW.a > 1 THEN 1 ELSE 2 END; END",
+        ] {
+            let info = read(sql);
+            let draft = TriggerDraft::from_info(&info);
+            let cs = diff_triggers(std::slice::from_ref(&info), &set_of(&draft), Sqlite);
+            assert!(cs.is_empty(), "phantom change on {sql}: {:#?}", cs.changes);
+            // …and the statement it emits reads back as the same trigger, which
+            // is the half a self-diff can't see.
+            let again = read(&info.create_sql(Sqlite));
+            assert_eq!(again, info, "emitting and re-reading changed it: {sql}");
+        }
+    }
+
+    fn set_of(d: &TriggerDraft) -> TriggerSetDraft {
+        TriggerSetDraft {
+            table: d.info.table.clone(),
+            schema: d.info.schema.clone(),
+            triggers: vec![d.clone()],
+        }
+    }
+}
+
+/// What SQLite refuses a trigger for. Each rule is the engine's own, measured
+/// against 3.45 rather than inferred, and each is refused in the modal because
+/// by the time a `CREATE` fails at Apply the matching `DROP` has already run.
+#[cfg(test)]
+mod sqlite_trigger_rule_tests {
+    use super::*;
+    use crate::intel::SqlDialect::Sqlite;
+
+    fn draft() -> TriggerDraft {
+        let mut d = TriggerDraft::blank("t", "emp", None);
+        d.info.timing = TriggerTiming::After;
+        d.info.events = vec![TriggerEvent::Insert];
+        d.info.action = TriggerAction::Body("BEGIN SELECT 1; END".into());
+        d
+    }
+
+    fn errs(d: &TriggerDraft, host: TriggerHost) -> Vec<String> {
+        d.validate(Sqlite, host)
+    }
+
+    #[test]
+    fn a_well_formed_trigger_validates_clean() {
+        assert!(errs(&draft(), TriggerHost::Table).is_empty());
+    }
+
+    /// `cannot create INSTEAD OF trigger on table: emp`, and its exact opposite
+    /// on a view — `cannot create BEFORE trigger on view: v`. SQLite is stricter
+    /// than PostgreSQL here: a view takes *only* INSTEAD OF.
+    #[test]
+    fn instead_of_belongs_to_views_and_nothing_else_does() {
+        let mut d = draft();
+        d.info.timing = TriggerTiming::InsteadOf;
+        assert!(!errs(&d, TriggerHost::Table).is_empty(), "table");
+        assert!(errs(&d, TriggerHost::View).is_empty(), "view");
+
+        let d = draft(); // AFTER
+        assert!(!errs(&d, TriggerHost::View).is_empty(), "AFTER on a view");
+    }
+
+    #[test]
+    fn there_is_no_statement_level_trigger() {
+        let mut d = draft();
+        d.info.level = TriggerLevel::Statement;
+        assert!(!errs(&d, TriggerHost::Table).is_empty());
+    }
+
+    #[test]
+    fn one_event_per_trigger_and_never_truncate() {
+        let mut d = draft();
+        d.info.events = vec![TriggerEvent::Insert, TriggerEvent::Update];
+        assert!(!errs(&d, TriggerHost::Table).is_empty(), "two events");
+
+        let mut d = draft();
+        d.info.events = vec![TriggerEvent::Truncate];
+        assert!(!errs(&d, TriggerHost::Table).is_empty(), "truncate");
+    }
+
+    /// SQLite's grammar has no bare-statement body, and an empty block is a
+    /// syntax error too — both refused before Apply rather than after the drop.
+    #[test]
+    fn the_body_has_to_be_a_begin_end_block() {
+        for body in ["", "SELECT 1;", "BEGIN END", "BEGIN  END", "-- nothing"] {
+            let mut d = draft();
+            d.info.action = TriggerAction::Body(body.into());
+            assert!(!errs(&d, TriggerHost::Table).is_empty(), "{body:?}");
+        }
+        for body in [
+            "BEGIN SELECT 1; END",
+            "  begin\n select 'END'; \nend  ",
+            "BEGIN /* c */ SELECT 1; END",
+        ] {
+            let mut d = draft();
+            d.info.action = TriggerAction::Body(body.into());
+            assert!(errs(&d, TriggerHost::Table).is_empty(), "{body:?}");
+        }
+    }
+
+    /// "Open in editor" must hand back a script Schemaic can run itself. On
+    /// MySQL that means `DELIMITER $$` around a body full of `;`; SQLite has no
+    /// such directive, and emitting one would put a word the engine has never
+    /// heard of at the top of the script. It needs none: the splitter knows a
+    /// trigger body runs to the `;` after its `END`.
+    #[test]
+    fn the_editor_script_never_hands_sqlite_a_delimiter_directive() {
+        let mut d = draft();
+        d.info.action = TriggerAction::Body("BEGIN UPDATE log SET n = 1; SELECT 2; END".into());
+        let script = create_trigger(&d, Sqlite).editor_script();
+        assert!(
+            !script.to_ascii_uppercase().contains("DELIMITER"),
+            "{script}"
+        );
+        // …and it really is one statement to the splitter.
+        assert_eq!(
+            crate::sql::statement_ranges(&script, Sqlite).len(),
+            1,
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn a_function_action_is_not_a_sqlite_trigger() {
+        let mut d = draft();
+        d.info.action = TriggerAction::Function {
+            name: "f".into(),
+            args: vec![],
+        };
+        assert!(!errs(&d, TriggerHost::Table).is_empty());
+    }
+
+    #[test]
+    fn update_of_needs_an_update_event() {
+        let mut d = draft(); // INSERT
+        d.info.update_columns = vec!["a".into()];
+        assert!(!errs(&d, TriggerHost::Table).is_empty());
+        d.info.events = vec![TriggerEvent::Update];
+        assert!(errs(&d, TriggerHost::Table).is_empty());
+    }
+
+    /// The MySQL messages must not reach a SQLite user: it *has* a `WHEN` guard
+    /// and it *has* `UPDATE OF`, both of which MySQL's arm rejects outright.
+    #[test]
+    fn mysqls_refusals_do_not_apply_here() {
+        let mut d = draft();
+        d.info.events = vec![TriggerEvent::Update];
+        d.info.update_columns = vec!["a".into(), "b".into()];
+        d.info.condition = Some("NEW.a > OLD.a".into());
+        assert!(
+            errs(&d, TriggerHost::Table).is_empty(),
+            "{:?}",
+            errs(&d, TriggerHost::Table)
+        );
+    }
+}
+
+/// SQLite's view editing, which is a different shape from the other two engines
+/// rather than a subset of them: it has no `CREATE OR REPLACE VIEW` and no verb
+/// that renames a view, so *every* edit is a drop and a create.
+#[cfg(test)]
+mod sqlite_view_tests {
+    use super::*;
+    use crate::intel::SqlDialect::Sqlite;
+
+    fn view() -> TableInfo {
+        TableInfo {
+            name: "v".into(),
+            columns: vec![
+                ColumnInfo {
+                    name: "a".into(),
+                    type_name: "INTEGER".into(),
+                    nullable: true,
+                    ..Default::default()
+                },
+                ColumnInfo {
+                    name: "b".into(),
+                    type_name: "TEXT".into(),
+                    nullable: true,
+                    ..Default::default()
+                },
+            ],
+            is_view: true,
+            view_definition: Some("SELECT a, b FROM t".into()),
+            view_options: Some(ViewOptions::default()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sqlite_edits_views() {
+        assert!(supports_view_editing(Sqlite));
+    }
+
+    #[test]
+    fn a_body_change_drops_and_creates_rather_than_replacing() {
+        let cur = view();
+        let mut d = ViewDraft::from_table(&cur).unwrap();
+        d.select = "SELECT a, b FROM t WHERE a > 1".into();
+        let cs = diff_view(&cur, &d, Sqlite);
+        assert!(
+            matches!(
+                cs.changes.as_slice(),
+                [Change::ReplaceView { recreate: true, .. }]
+            ),
+            "{:#?}",
+            cs.changes
+        );
+        let sql = cs.script();
+        assert!(
+            !sql.to_ascii_uppercase().contains("OR REPLACE"),
+            "SQLite has no CREATE OR REPLACE VIEW: {sql}"
+        );
+        let drop_at = sql.find("DROP VIEW").expect("drops the old view");
+        let create_at = sql.find("CREATE VIEW").expect("creates the new one");
+        assert!(drop_at < create_at, "the drop has to come first: {sql}");
+    }
+
+    #[test]
+    fn a_rename_drops_and_creates_too() {
+        // SQLite refuses `ALTER TABLE v RENAME TO …` on a view outright ("view v
+        // may not be altered") and has no `ALTER VIEW` at all, so the rename verb
+        // the other two engines use isn't available to fall back on.
+        let cur = view();
+        let mut d = ViewDraft::from_table(&cur).unwrap();
+        d.name = "v2".into();
+        let cs = diff_view(&cur, &d, Sqlite);
+        assert!(
+            !cs.changes
+                .iter()
+                .any(|c| matches!(c, Change::RenameView { .. })),
+            "SQLite can't rename a view: {:#?}",
+            cs.changes
+        );
+        let sql = cs.script();
+        assert!(sql.contains("DROP VIEW \"v\""), "{sql}");
+        assert!(sql.contains("CREATE VIEW \"v2\""), "{sql}");
+        assert!(!sql.to_ascii_uppercase().contains("RENAME"), "{sql}");
+    }
+
+    #[test]
+    fn the_column_list_survives_the_re_create() {
+        // `CREATE VIEW v (x, y) AS SELECT a, b …` names the view's columns
+        // independently of the body. Dropping it on the way through would
+        // silently rename every column of the view to whatever the SELECT calls
+        // them — the reason the list is carried in the model at all.
+        let mut cur = view();
+        cur.view_options = Some(ViewOptions {
+            column_list: Some("x, y".into()),
+            ..Default::default()
+        });
+        let mut d = ViewDraft::from_table(&cur).unwrap();
+        d.select = "SELECT a, b FROM t WHERE a > 1".into();
+        let sql = diff_view(&cur, &d, Sqlite).script();
+        assert!(sql.contains("CREATE VIEW \"v\" (x, y) AS"), "{sql}");
+    }
+
+    #[test]
+    fn no_column_list_emits_no_parentheses() {
+        let cur = view();
+        let d = ViewDraft::from_table(&cur).unwrap();
+        let sql = create_view(&d, Sqlite).script();
+        assert!(sql.contains("CREATE VIEW \"v\" AS"), "{sql}");
+    }
+
+    #[test]
+    fn the_other_engines_options_are_never_emitted() {
+        // Nothing in the SQLite form can set these, but a model that picked them
+        // up anywhere (a draft carried across a reconnect, a future importer)
+        // must not emit MySQL's clauses at a SQLite server, which would fail at
+        // Apply having looked fine in the preview.
+        let mut cur = view();
+        cur.view_options = Some(ViewOptions {
+            check_option: Some("CASCADED".into()),
+            definer: Some("root@localhost".into()),
+            security: Some("DEFINER".into()),
+            algorithm: Some("MERGE".into()),
+            storage: vec!["security_barrier=true".into()],
+            ..Default::default()
+        });
+        let d = ViewDraft::from_table(&cur).unwrap();
+        let sql = create_view(&d, Sqlite).script().to_ascii_uppercase();
+        for clause in [
+            "ALGORITHM",
+            "DEFINER",
+            "SQL SECURITY",
+            "CHECK OPTION",
+            "WITH (",
+        ] {
+            assert!(!sql.contains(clause), "{clause} reached SQLite: {sql}");
+        }
+    }
+
+    #[test]
+    fn a_materialized_flag_cannot_reach_sqlite() {
+        // `MATERIALIZED` is PostgreSQL's word; SQLite has no such object, and the
+        // draft validator is what stops the modal before the emitter has to.
+        let mut cur = view();
+        cur.view_options = Some(ViewOptions {
+            materialized: true,
+            ..Default::default()
+        });
+        let d = ViewDraft::from_table(&cur).unwrap();
+        assert!(!d.validate().is_empty());
+        let sql = create_view(&d, Sqlite).script().to_ascii_uppercase();
+        assert!(!sql.contains("MATERIALIZED"), "{sql}");
     }
 }
 

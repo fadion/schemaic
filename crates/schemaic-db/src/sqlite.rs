@@ -65,6 +65,7 @@ use schemaic_core::model::{
 };
 use schemaic_core::schema::{
     CheckInfo, ColumnInfo, DbSchema, ForeignKeyInfo, IndexColumn, IndexInfo, TableInfo,
+    TriggerInfo, ViewOptions,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -975,13 +976,21 @@ pub(crate) async fn fetch_schema(db: &Db) -> Result<DbSchema, DbError> {
             let implicit_key = (!is_view)
                 .then(|| implicit_row_key(&columns, has_rowid(conn, &name)))
                 .flatten();
-            // What a rebuild has to put back. Not modelled as `triggers` below —
-            // see `TableInfo::dependent_ddl` for why the statement itself is the
-            // safer thing to keep.
+            // One read of the catalogue, two things made from it — the model the
+            // *editor* diffs, and the statements a *rebuild* replays. They are
+            // not redundant: see `TableInfo::dependent_ddl` for why a rebuild
+            // keeps the server's own text rather than re-emitting from a parse.
+            let trigger_sql = trigger_sql(conn, &name)?;
+            // Parsed out of each trigger's own `CREATE` text — SQLite has no
+            // catalogue of the parts. Read for a **view** as well as a table: an
+            // `INSTEAD OF` trigger is the only way a SQLite view is written to,
+            // and it hangs off the view.
+            let triggers = triggers_of(&trigger_sql);
+            // What a rebuild has to put back, which is a table's business only.
             let dependent_ddl = if is_view {
                 Vec::new()
             } else {
-                trigger_statements(conn, &name)?
+                trigger_statements(&trigger_sql)
             };
             tables.push(TableInfo {
                 name,
@@ -994,7 +1003,15 @@ pub(crate) async fn fetch_schema(db: &Db) -> Result<DbSchema, DbError> {
                 create_sql,
                 // The **body**, not the statement — see `view_body_of`.
                 view_definition: is_view.then(|| view_body_of(&sql)).flatten(),
-                view_options: None,
+                // SQLite has none of the options the other two engines carry —
+                // no definer, no security type, no algorithm, no storage
+                // parameters and no check option. It has exactly one, and it is
+                // the one the re-create behind every view edit would otherwise
+                // drop: the explicit column list.
+                view_options: is_view.then(|| ViewOptions {
+                    column_list: view_columns_of(&sql),
+                    ..Default::default()
+                }),
                 engine: None,
                 collation: None,
                 comment: None,
@@ -1004,7 +1021,7 @@ pub(crate) async fn fetch_schema(db: &Db) -> Result<DbSchema, DbError> {
                 // the draft: a check missing from the draft is a check the
                 // rebuild silently drops.
                 check_constraints: if is_view { Vec::new() } else { checks_of(&sql) },
-                triggers: Vec::new(),
+                triggers,
                 dependent_ddl,
             });
         }
@@ -1154,7 +1171,21 @@ fn index_statements(conn: &SqliteConn, table: &str) -> Result<Vec<String>, DbErr
 /// from the table in place — SQLite resolves a view's references when it runs,
 /// not when it is declared — and the table comes back under the same name, so
 /// the view is whole again by the end of the transaction.
-fn trigger_statements(conn: &SqliteConn, table: &str) -> Result<Vec<String>, DbError> {
+fn trigger_statements(raw: &[String]) -> Vec<String> {
+    raw.iter()
+        // SQLite stores the statement without its terminator, and a trigger body
+        // is full of internal `;` — so the one that ends it has to be added back
+        // or the replay runs into whatever follows.
+        .map(|s| format!("{};", s.trim().trim_end_matches(';')))
+        .collect()
+}
+
+/// The raw `CREATE TRIGGER` text SQLite stores for `table`, exactly as the
+/// catalogue holds it — unterminated, and carrying the user's own spacing and
+/// comments. The one query behind both consumers: [`trigger_statements`], which
+/// terminates it for replay, and [`triggers_of`], which parses it into the
+/// model.
+fn trigger_sql(conn: &SqliteConn, table: &str) -> Result<Vec<String>, DbError> {
     let mut stmt = conn
         .prepare(
             "SELECT sql FROM sqlite_master \
@@ -1165,16 +1196,26 @@ fn trigger_statements(conn: &SqliteConn, table: &str) -> Result<Vec<String>, DbE
     let rows = stmt
         .query_map([table], |r| r.get::<_, String>(0))
         .map_err(query_err)?;
-    rows.collect::<Result<Vec<String>, _>>()
-        .map_err(query_err)
-        // SQLite stores the statement without its terminator, and a trigger body
-        // is full of internal `;` — so the one that ends it has to be added back
-        // or the replay runs into whatever follows.
-        .map(|v| {
-            v.into_iter()
-                .map(|s| format!("{};", s.trim().trim_end_matches(';')))
-                .collect()
-        })
+    rows.collect::<Result<Vec<String>, _>>().map_err(query_err)
+}
+
+/// The triggers on `table`, as the model holds them.
+///
+/// SQLite publishes no catalogue of a trigger's parts, so each one is *parsed*
+/// out of its own `CREATE TRIGGER` text (`ddl::sqlite_trigger_info`) — this is
+/// the one engine where introspecting a trigger means reading SQL.
+///
+/// **A statement it can't read is left out rather than guessed at**, the same
+/// direction `view_body_of` refuses in. That is safe in the one way that
+/// matters: `ddl::diff_triggers` only drops what the *server copy* lists, so a
+/// trigger missing from this list is never touched by an edit to its
+/// neighbours — where a trigger read *wrong* would be dropped and recreated
+/// wrong. It also stays out of the rebuild's way, which replays
+/// `TableInfo::dependent_ddl` verbatim and never consults this list.
+fn triggers_of(raw: &[String]) -> Vec<TriggerInfo> {
+    raw.iter()
+        .filter_map(|s| schemaic_core::ddl::sqlite_trigger_info(s))
+        .collect()
 }
 
 /// A view's **body** — the `SELECT` — read out of the `CREATE VIEW` statement
@@ -1251,6 +1292,91 @@ fn view_body_of(create_sql: &str) -> Option<String> {
         }
         i = end;
     }
+    None
+}
+
+/// A view's explicit **column list** — the `(x, y)` of `CREATE VIEW v (x, y) AS
+/// …` — read out of the statement `sqlite_master` stores, without its
+/// parentheses. `None` for the usual view, which takes its column names from its
+/// body.
+///
+/// The third positional reader over the shared lexer, beside [`view_body_of`]
+/// and `checks_of`, and it splits the same header: the list is the one
+/// parenthesised group that can appear *before* the `AS` at code position and
+/// paren depth zero. Everything after that `AS` is the user's own SQL, where a
+/// `(` is arithmetic or a subquery rather than a column list.
+///
+/// Kept **verbatim**, quoting and spacing included. SQLite hands back whatever
+/// the list was written with, and it goes straight back out again on the
+/// re-create that every view edit there performs
+/// ([`schemaic_core::ddl::supports_or_replace_view`]) — parsing the names apart
+/// and re-quoting them is a way to change them, and this list is what stops the
+/// view's columns silently taking the body's names.
+fn view_columns_of(create_sql: &str) -> Option<String> {
+    use schemaic_core::intel::SqlDialect;
+    use schemaic_core::sql::{is_word_byte, is_word_start, skip_noncode};
+
+    let b = create_sql.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0i32;
+    let mut seen_create = false;
+    // The most recent depth-0 parenthesised group, as byte bounds of its
+    // contents. Only the one still in hand when the header's `AS` arrives is a
+    // column list.
+    let mut group: Option<(usize, usize)> = None;
+    let mut open: Option<usize> = None;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, SqlDialect::Sqlite) {
+            i = j.max(i + 1);
+            continue;
+        }
+        match b[i] {
+            b'(' => {
+                if depth == 0 {
+                    open = Some(i + 1);
+                }
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0
+                    && let Some(start) = open.take()
+                {
+                    group = Some((start, i));
+                }
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if !is_word_start(b[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i + 1;
+        while end < b.len() && is_word_byte(b[end]) {
+            end += 1;
+        }
+        let word = &create_sql[start..end];
+        if !seen_create {
+            // Whatever this is, it isn't a `CREATE VIEW`; refuse rather than
+            // hand back a list read out of something else.
+            if !word.eq_ignore_ascii_case("CREATE") {
+                return None;
+            }
+            seen_create = true;
+        } else if depth == 0 && word.eq_ignore_ascii_case("AS") {
+            let (s, e) = group?;
+            let cols = create_sql[s..e].trim();
+            return (!cols.is_empty()).then(|| cols.to_string());
+        }
+        i = end;
+    }
+    // No header-ending `AS`: the statement is unreadable, and a list without the
+    // body it names is nothing to hand back.
     None
 }
 
@@ -2723,6 +2849,53 @@ mod tests {
         }
     }
 
+    /// `CREATE VIEW v (x, y) AS …` names the view's columns independently of its
+    /// body, and SQLite is the only engine that reports the two separately — the
+    /// other two bake the names into the definition they hand back. Since every
+    /// edit to a SQLite view is a drop and a re-create, a list read wrong is a
+    /// list *emitted* wrong, and the view's columns quietly take the body's
+    /// names instead.
+    #[test]
+    fn a_views_column_list_is_read_out_of_its_create_statement() {
+        for (sql, cols) in [
+            ("CREATE VIEW v (x, y) AS SELECT a, b FROM t", "x, y"),
+            // No space before the paren, and none inside it.
+            ("CREATE VIEW v(x,y) AS SELECT 1,2", "x,y"),
+            // Each of SQLite's three quotings, kept verbatim: re-quoting a
+            // parsed list is a way to change it.
+            (
+                r#"CREATE VIEW v ("odd name", [b], `c`) AS SELECT 1, 2, 3"#,
+                r#""odd name", [b], `c`"#,
+            ),
+            // A column *named* `as` doesn't end the header — it's quoted, and
+            // the lexer skips it whole.
+            (r#"CREATE VIEW v ("as") AS SELECT 1"#, r#""as""#),
+            // …and neither does a view named `as`.
+            (r#"CREATE VIEW "as" (a) AS SELECT 1"#, "a"),
+            ("CREATE TEMP VIEW IF NOT EXISTS main.v (a) AS SELECT 1", "a"),
+        ] {
+            assert_eq!(view_columns_of(sql).as_deref(), Some(cols), "{sql}");
+        }
+    }
+
+    /// The usual view has no column list, and parentheses in the *body* are not
+    /// one — the list can only appear before the `AS` that ends the header.
+    #[test]
+    fn a_view_without_a_column_list_reports_none() {
+        for sql in [
+            "CREATE VIEW v AS SELECT 1",
+            "CREATE VIEW v AS SELECT (1 + 2)",
+            "CREATE VIEW v AS SELECT a FROM (SELECT 1 AS a)",
+            // An unreadable header yields nothing, the same direction
+            // `view_body_of` refuses in: a list guessed wrong would be emitted.
+            "CREATE VIEW v (a, b)",
+            "SELECT 1",
+            "",
+        ] {
+            assert_eq!(view_columns_of(sql), None, "{sql:?}");
+        }
+    }
+
     /// Copy DDL on a **table** hands back SQLite's own text, plus the
     /// `CREATE INDEX` statements it stores separately.
     ///
@@ -2907,6 +3080,216 @@ mod ddl_tests {
         .await
         .expect("SQLite can drop a table");
         assert_eq!(objects(&keeper, "t"), 0);
+    }
+
+    /// Editing a view, end to end through the real `fetch_schema`, the real
+    /// differ, the real emitter and real SQLite — because every part of this is
+    /// a *different shape* from the other two engines, and each one is only
+    /// right if the engine accepts the result.
+    ///
+    /// The view carries an explicit column list, which is the whole hazard: the
+    /// edit is a `DROP` plus a `CREATE` (SQLite has no `CREATE OR REPLACE
+    /// VIEW`), so a list left behind doesn't fail — it silently renames the
+    /// view's columns to whatever the body calls them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn editing_a_view_keeps_its_column_list() {
+        use schemaic_core::ddl::{self, ViewDraft};
+        use schemaic_core::intel::SqlDialect::Sqlite;
+
+        let (keeper, db) = shared_memory("ddl_view_edit");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (a INTEGER, b TEXT);
+                 CREATE VIEW v (x, y) AS SELECT a, b FROM t;
+                 INSERT INTO t VALUES (1, 'one'), (2, 'two');",
+            )
+            .unwrap();
+
+        let schema = fetch_schema(&db).await.expect("schema");
+        let view = schema.tables.iter().find(|t| t.name == "v").expect("view");
+        let mut draft = ViewDraft::from_table(view).expect("a view drafts");
+        draft.select = "SELECT a, b FROM t WHERE a > 1".into();
+
+        let plan = ddl::diff_view(view, &draft, Sqlite);
+        db.run_ddl(MAIN, &plan.emit(), CancellationToken::new())
+            .await
+            .expect("SQLite accepts the plan");
+
+        // The columns are still the view's own names, not the body's.
+        let cols: Vec<String> = keeper
+            .prepare("SELECT name FROM pragma_table_info('v')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(cols, ["x", "y"], "the column list was dropped by the edit");
+        // …and the edit itself landed.
+        let rows: i64 = keeper
+            .query_row("SELECT count(*) FROM v", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "the new WHERE didn't take effect");
+    }
+
+    /// A rename, which on SQLite is the same drop-and-create: `ALTER VIEW` isn't
+    /// a statement there and `ALTER TABLE … RENAME TO` refuses a view outright.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn renaming_a_view_lands_under_the_new_name() {
+        use schemaic_core::ddl::{self, ViewDraft};
+        use schemaic_core::intel::SqlDialect::Sqlite;
+
+        let (keeper, db) = shared_memory("ddl_view_rename");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (a INTEGER);
+                 CREATE VIEW v AS SELECT a FROM t;",
+            )
+            .unwrap();
+
+        let schema = fetch_schema(&db).await.expect("schema");
+        let view = schema.tables.iter().find(|t| t.name == "v").expect("view");
+        let mut draft = ViewDraft::from_table(view).expect("a view drafts");
+        draft.name = "v2".into();
+
+        let plan = ddl::diff_view(view, &draft, Sqlite);
+        db.run_ddl(MAIN, &plan.emit(), CancellationToken::new())
+            .await
+            .expect("SQLite accepts the rename plan");
+
+        assert_eq!(objects(&keeper, "v"), 0, "the old view is gone");
+        assert_eq!(objects(&keeper, "v2"), 1, "the new one is there");
+    }
+
+    /// Editing a trigger, end to end: real `fetch_schema` (which for SQLite
+    /// means a real *parse* of `sqlite_master`), real differ, real emitter, real
+    /// engine. The trigger carries the parts MySQL has no form of — `UPDATE OF`
+    /// and a `WHEN` guard — because those are what a reader written to MySQL's
+    /// shape would silently drop, leaving a trigger that fires on every column
+    /// and never checks its guard.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn editing_a_trigger_keeps_its_when_guard_and_update_columns() {
+        use schemaic_core::ddl::{self, TriggerDraft, TriggerSetDraft};
+        use schemaic_core::intel::SqlDialect::Sqlite;
+        use schemaic_core::schema::TriggerAction;
+
+        let (keeper, db) = shared_memory("ddl_trigger_edit");
+        keeper
+            .execute_batch(
+                "CREATE TABLE emp (a INTEGER, b TEXT);
+                 CREATE TABLE log (n INTEGER);
+                 INSERT INTO log VALUES (0);
+                 CREATE TRIGGER bump BEFORE UPDATE OF a, b ON emp
+                   FOR EACH ROW WHEN NEW.a > OLD.a
+                   BEGIN UPDATE log SET n = n + 1; END;",
+            )
+            .unwrap();
+
+        let schema = fetch_schema(&db).await.expect("schema");
+        let table = schema.tables.iter().find(|t| t.name == "emp").expect("emp");
+        assert_eq!(table.triggers.len(), 1, "the trigger was read back");
+        let cur = &table.triggers[0];
+        assert_eq!(cur.update_columns, ["a", "b"]);
+        assert_eq!(cur.condition.as_deref(), Some("NEW.a > OLD.a"));
+
+        // Edit only the body; everything else has to survive untouched.
+        let mut d = TriggerDraft::from_info(cur);
+        d.info.action = TriggerAction::Body("BEGIN UPDATE log SET n = n + 10; END".into());
+        let set = TriggerSetDraft {
+            schema: None,
+            table: "emp".into(),
+            triggers: vec![d],
+        };
+        let plan = ddl::diff_triggers(&table.triggers, &set, Sqlite);
+        db.run_ddl(MAIN, &plan.emit(), CancellationToken::new())
+            .await
+            .expect("SQLite accepts the plan");
+
+        // The guard still holds: an update that doesn't raise `a` must not fire.
+        keeper
+            .execute_batch("INSERT INTO emp VALUES (5, 'x'); UPDATE emp SET a = 1;")
+            .unwrap();
+        let n: i64 = keeper
+            .query_row("SELECT n FROM log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "the WHEN guard was dropped by the edit");
+        // …and raising it fires the *new* body.
+        keeper.execute_batch("UPDATE emp SET a = 9;").unwrap();
+        let n: i64 = keeper
+            .query_row("SELECT n FROM log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 10, "the new body didn't take effect");
+    }
+
+    /// An `INSTEAD OF` trigger on a **view** — the only way a SQLite view is
+    /// written to, and the case that needs triggers read for views and not just
+    /// for tables.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_views_instead_of_trigger_is_read_and_rebuilt() {
+        use schemaic_core::ddl::{self, TriggerDraft, TriggerSetDraft};
+        use schemaic_core::intel::SqlDialect::Sqlite;
+        use schemaic_core::schema::{TriggerAction, TriggerTiming};
+
+        let (keeper, db) = shared_memory("ddl_trigger_view");
+        keeper
+            .execute_batch(
+                "CREATE TABLE emp (a INTEGER);
+                 CREATE VIEW v AS SELECT a FROM emp;
+                 CREATE TRIGGER v_ins INSTEAD OF INSERT ON v
+                   BEGIN INSERT INTO emp VALUES (NEW.a); END;",
+            )
+            .unwrap();
+
+        let schema = fetch_schema(&db).await.expect("schema");
+        let view = schema.tables.iter().find(|t| t.name == "v").expect("view");
+        assert_eq!(view.triggers.len(), 1, "a view's trigger is read too");
+        assert_eq!(view.triggers[0].timing, TriggerTiming::InsteadOf);
+
+        let mut d = TriggerDraft::from_info(&view.triggers[0]);
+        d.info.action = TriggerAction::Body("BEGIN INSERT INTO emp VALUES (NEW.a * 2); END".into());
+        let set = TriggerSetDraft {
+            schema: None,
+            table: "v".into(),
+            triggers: vec![d],
+        };
+        let plan = ddl::diff_triggers(&view.triggers, &set, Sqlite);
+        db.run_ddl(MAIN, &plan.emit(), CancellationToken::new())
+            .await
+            .expect("SQLite accepts the plan");
+
+        keeper.execute_batch("INSERT INTO v VALUES (21);").unwrap();
+        let a: i64 = keeper
+            .query_row("SELECT a FROM emp", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(a, 42, "the replaced INSTEAD OF trigger didn't run");
+    }
+
+    /// A trigger removed from the draft is dropped, and the drops all run before
+    /// the creates — the ordering `trigger_statements` documents.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_trigger_left_out_of_the_draft_is_dropped() {
+        use schemaic_core::ddl::{self, TriggerSetDraft};
+        use schemaic_core::intel::SqlDialect::Sqlite;
+
+        let (keeper, db) = shared_memory("ddl_trigger_drop");
+        keeper
+            .execute_batch(
+                "CREATE TABLE emp (a INTEGER);
+                 CREATE TRIGGER gone AFTER INSERT ON emp BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+        let schema = fetch_schema(&db).await.expect("schema");
+        let table = schema.tables.iter().find(|t| t.name == "emp").expect("emp");
+
+        let set = TriggerSetDraft {
+            schema: None,
+            table: "emp".into(),
+            triggers: vec![],
+        };
+        let plan = ddl::diff_triggers(&table.triggers, &set, Sqlite);
+        db.run_ddl(MAIN, &plan.emit(), CancellationToken::new())
+            .await
+            .expect("SQLite accepts the drop");
+        assert_eq!(objects(&keeper, "gone"), 0);
     }
 
     /// The order the emitter puts them in is the order that works: the index has

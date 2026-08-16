@@ -678,9 +678,10 @@ impl CheckInfo {
 /// asked for. Same for PostgreSQL's `security_barrier`, whose loss makes a view
 /// leak rows it was written to hide.
 ///
-/// Half the fields belong to one engine (as [`TableInfo::engine`] does): MySQL
-/// has the definer and the security type, PostgreSQL the storage parameters and
-/// materialization. `check_option` is the one both spell the same way.
+/// Most fields belong to one engine (as [`TableInfo::engine`] does): MySQL has
+/// the definer and the security type, PostgreSQL the storage parameters and
+/// materialization, SQLite the explicit column list. `check_option` is the one
+/// two of them spell the same way — SQLite has no form of it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ViewOptions {
     /// `WITH {CASCADED|LOCAL} CHECK OPTION`, upper-cased. `None` for a view
@@ -704,6 +705,21 @@ pub struct ViewOptions {
     /// `CREATE OR REPLACE` and no check option, so Schemaic shows it rather than
     /// editing it.
     pub materialized: bool,
+    /// **SQLite.** The explicit column list of `CREATE VIEW v (x, y) AS …`,
+    /// verbatim and without its parentheses — `None` for the usual view, which
+    /// takes its column names from the body.
+    ///
+    /// Carried because on SQLite it is the one part of a view that is neither
+    /// the body nor recoverable from it, and *every* edit there is a drop and a
+    /// re-create ([`crate::ddl::supports_or_replace_view`]). Left out, an edit to
+    /// the `WHERE` of `CREATE VIEW v (x, y) AS SELECT a, b …` would silently
+    /// rename the view's columns to `a` and `b`.
+    ///
+    /// Verbatim rather than a `Vec<String>` because it round-trips exactly:
+    /// SQLite hands back whatever quoting the list was written with, and
+    /// re-quoting a parsed list is a way to change it. The other two engines
+    /// bake the names into the body they report, so this stays `None` there.
+    pub column_list: Option<String>,
 }
 
 /// A MySQL `DEFINER` clause from the catalogue's `user@host` form.
@@ -868,11 +884,16 @@ impl Default for TriggerAction {
 
 /// One trigger on a table.
 ///
-/// Carries its whole definition for the reason [`ColumnInfo`] does: **neither
-/// engine can alter a trigger in place.** MySQL has no `CREATE OR REPLACE
-/// TRIGGER` at all, and PostgreSQL's replaces the entire object — so every edit
-/// is a drop-and-create, and anything this model doesn't hold is destroyed the
-/// first time a user changes the timing.
+/// Carries its whole definition for the reason [`ColumnInfo`] does: **none of
+/// the three engines can alter a trigger in place.** MySQL and SQLite have no
+/// `CREATE OR REPLACE TRIGGER` at all, and PostgreSQL's replaces the entire
+/// object — so every edit is a drop-and-create, and anything this model doesn't
+/// hold is destroyed the first time a user changes the timing.
+///
+/// On SQLite that cuts deeper than on the other two, because the model is the
+/// only structured account of the trigger there is: the server publishes no
+/// catalogue of a trigger's parts, so this is filled by *parsing* the stored
+/// statement ([`crate::ddl::sqlite_trigger_info`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TriggerInfo {
     pub name: String,
@@ -883,18 +904,29 @@ pub struct TriggerInfo {
     pub table: String,
     pub timing: TriggerTiming,
     /// The events it fires on. PostgreSQL allows several on one trigger
-    /// (`BEFORE INSERT OR UPDATE`); MySQL allows exactly one. The model holds
-    /// both shapes and `TriggerDraft::validate` is what refuses the impossible
-    /// one, so introspection never has to lie about what the server reported.
+    /// (`BEFORE INSERT OR UPDATE`); MySQL and SQLite allow exactly one. The
+    /// model holds both shapes and `TriggerDraft::validate` is what refuses the
+    /// impossible one, so introspection never has to lie about what the server
+    /// reported.
     pub events: Vec<TriggerEvent>,
-    /// `UPDATE OF a, b` — narrows an `Update` event to named columns.
-    /// **PostgreSQL only**; empty means every column.
+    /// `UPDATE OF a, b` — narrows an `Update` event to named columns. Empty
+    /// means every column.
+    ///
+    /// **PostgreSQL and SQLite**, which is not what this said when only two
+    /// engines were wired: MySQL is the one with no such clause. Emitted for
+    /// both ([`TriggerInfo::create_sql`]), and reading it as PostgreSQL's alone
+    /// would drop it from a SQLite trigger on the re-create every edit there
+    /// performs — leaving one that fires on every column instead.
     pub update_columns: Vec<String>,
     pub level: TriggerLevel,
-    /// PostgreSQL's `WHEN (…)` guard, held **bare** — without the parens the
-    /// server prints around it and the emitter adds back. Same rule as
+    /// The `WHEN (…)` guard, held **bare** — without the parens the server
+    /// prints around it and the emitter adds back. Same rule as
     /// [`crate::ddl::check_predicate`]: normalize on the way in, wrap exactly
     /// once on the way out, so a round trip doesn't grow a layer per edit.
+    ///
+    /// **PostgreSQL and SQLite**, for the reason [`TriggerInfo::update_columns`]
+    /// spells out — MySQL is again the engine without one, and its
+    /// `TriggerDraft::validate` arm is what says so.
     pub condition: Option<String>,
     pub action: TriggerAction,
     /// MySQL's `DEFINER`, unquoted (`root@localhost`). Modelled for the reason
@@ -1069,6 +1101,10 @@ impl TriggerInfo {
     /// stopped at the create would quietly switch it back on.
     pub fn create_sql(&self, dialect: crate::intel::SqlDialect) -> String {
         let pg = dialect == crate::intel::SqlDialect::Postgres;
+        // SQLite's shape is neither of the other two: it has PostgreSQL's
+        // `UPDATE OF` and `WHEN` but MySQL's inline body, so it is asked for by
+        // name rather than reached by falling off the end of a `!pg`.
+        let sqlite = dialect == crate::intel::SqlDialect::Sqlite;
         let q = |s: &str| ddl_ident_in(s, dialect);
         let qtable = match sql_qualifier(self.schema.as_deref()) {
             Some(s) => format!("{}.{}", q(s), q(&self.table)),
@@ -1079,7 +1115,7 @@ impl TriggerInfo {
             .events
             .iter()
             .map(|e| {
-                if pg && *e == TriggerEvent::Update && !self.update_columns.is_empty() {
+                if (pg || sqlite) && *e == TriggerEvent::Update && !self.update_columns.is_empty() {
                     let cols = self
                         .update_columns
                         .iter()
@@ -1093,6 +1129,41 @@ impl TriggerInfo {
             })
             .collect::<Vec<_>>()
             .join(" OR ");
+
+        if sqlite {
+            // `CREATE TRIGGER name timing event ON table [FOR EACH ROW]
+            //  [WHEN expr] BEGIN … END`. No definer, no ordering clause and no
+            // session state to restate — SQLite has none of them — and the level
+            // is always row: `FOR EACH STATEMENT` is a syntax error there.
+            let mut out = format!(
+                "CREATE TRIGGER {} {} {} ON {}\nFOR EACH ROW",
+                q(&self.name),
+                self.timing.sql(),
+                events,
+                qtable,
+            );
+            if let Some(w) = self
+                .condition
+                .as_deref()
+                .map(str::trim)
+                .filter(|w| !w.is_empty())
+            {
+                // Wrapped exactly once, the guard being held bare in the model.
+                out.push_str(&format!("\nWHEN ({w})"));
+            }
+            let body = match &self.action {
+                TriggerAction::Body(b) => b.trim().to_string(),
+                // Symmetric to the other two branches: say so rather than emit a
+                // statement that looks fine and isn't.
+                TriggerAction::Function { name, .. } => {
+                    format!("-- Schemaic can't call the function {name} from a SQLite trigger.")
+                }
+            };
+            out.push('\n');
+            out.push_str(&body);
+            out.push(';');
+            return out;
+        }
 
         if !pg {
             let mut out = String::from("CREATE ");

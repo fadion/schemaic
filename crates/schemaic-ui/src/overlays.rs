@@ -127,23 +127,27 @@ pub(crate) fn object_entries(
     dialect: schemaic_core::intel::SqlDialect,
     materialized: bool,
 ) -> ObjectEntries {
-    let is_pg = dialect == schemaic_core::intel::SqlDialect::Postgres;
-    // Two different questions, and the table designer is the one every engine
-    // now answers yes to — SQLite by rebuilding. A view editor and a trigger
-    // editor are not the same capability and are still MySQL/PostgreSQL only.
+    // Three questions that every engine now answers yes to, each for its own
+    // reason — SQLite designs a table by rebuilding it, edits a view by dropping
+    // and re-creating it, and edits a trigger now that its `CREATE` text can be
+    // read back into the model. They stay separate capabilities: what differs
+    // between engines is no longer *whether* an editor opens but what each one
+    // offers, which is the form's business rather than this menu's.
     let edits_views = schemaic_core::ddl::supports_view_editing(dialect);
     let edits_triggers = schemaic_core::ddl::supports_trigger_editing(dialect);
     ObjectEntries {
         // A view is not insertable, and owns no rows to delete.
         import: !is_view,
         truncate: !is_view,
-        // **A PostgreSQL view really does carry triggers** — `INSTEAD OF` lives
-        // there and `pg_triggers` already introspects them — so this one is not
-        // simply `!is_view`. A *materialized* view is excluded even on
-        // PostgreSQL: the server refuses outright (`relation "mv" cannot have
-        // triggers`), which is the same call `is_editable_view` makes.
-        // Editing one is still schema DDL, so it needs an emitter too.
-        triggers: edits_triggers && (!is_view || (is_pg && !materialized)),
+        // **A view really does carry triggers on two of the three engines** —
+        // `INSTEAD OF` lives on PostgreSQL and on SQLite, where it is the only
+        // way a view is written to at all — so this is not simply `!is_view`.
+        // MySQL is the one that takes no trigger on a view. A *materialized*
+        // view is excluded even on PostgreSQL: the server refuses outright
+        // (`relation "mv" cannot have triggers`), which is the same call
+        // `is_editable_view` makes.
+        triggers: edits_triggers
+            && (!is_view || (dialect != schemaic_core::intel::SqlDialect::MySql && !materialized)),
         // A table's designer, or a view's editor — the entry reads "Edit table"
         // or "Edit view" and they are not the same capability.
         edit: if is_view { edits_views } else { true },
@@ -3699,15 +3703,26 @@ mod object_menu_tests {
         assert!(e.truncate, "unchanged");
     }
 
-    /// Two capabilities that did **not** come with it, and are absent rather
-    /// than dimmed for the usual reason. The view emitter writes `CREATE OR
-    /// REPLACE VIEW`, which SQLite has no form of; nothing reads a SQLite
-    /// trigger into the model, so a trigger editor would show a table's
-    /// triggers as gone.
+    /// **A SQLite view is editable too**, now that the emitter has its own arm:
+    /// no `CREATE OR REPLACE VIEW` and no rename verb, so every edit is a drop
+    /// and a create.
     #[test]
-    fn sqlite_still_edits_no_view_and_no_trigger() {
-        assert!(!object_entries(false, Sqlite, false).triggers, "trigger");
-        assert!(!object_entries(true, Sqlite, false).edit, "view");
+    fn sqlite_edits_a_view() {
+        assert!(object_entries(true, Sqlite, false).edit, "view");
+    }
+
+    /// **And its triggers**, which needed a reader before an editor: SQLite
+    /// publishes no catalogue of a trigger's parts, so until `sqlite_trigger_info`
+    /// could parse them out of `sqlite_master`, the list was empty and the editor
+    /// would have shown a table's triggers as gone.
+    ///
+    /// A SQLite **view** carries triggers too — `INSTEAD OF` is the only way one
+    /// is written to — so this is not `!is_view` there any more than it is on
+    /// PostgreSQL.
+    #[test]
+    fn sqlite_edits_triggers_on_a_table_and_on_a_view() {
+        assert!(object_entries(false, Sqlite, false).triggers, "table");
+        assert!(object_entries(true, Sqlite, false).triggers, "view");
     }
 }
 
@@ -4208,14 +4223,16 @@ mod sqlite_create_menu_tests {
     use schemaic_core::intel::SqlDialect::Sqlite;
 
     /// The submenu used to be empty on SQLite — there was no emitter to build a
-    /// `CREATE TABLE` with. There is now, so the entry is there.
+    /// `CREATE TABLE` with, and then none to build a `CREATE VIEW` with either.
+    /// Both are there now. There is still no `CREATE TRIGGER` entry, because
+    /// nothing reads a SQLite trigger back.
     #[test]
-    fn sqlite_can_create_a_table_but_not_a_view() {
+    fn sqlite_can_create_a_table_and_a_view() {
         let labels: Vec<&str> = create_children(Sqlite, false)
             .into_iter()
             .map(|e| e.label)
             .collect();
-        assert_eq!(labels, vec!["Table"]);
+        assert_eq!(labels, vec!["Table", "View"]);
     }
 
     #[test]
