@@ -5815,6 +5815,28 @@ fn footer(ui: Ui) -> impl IntoView {
     let tx_mode = create_memo(move |_| active_tab().map(|t| t.tx_mode.get()).unwrap_or_default());
     let tx_state = create_memo(move |_| active_tab().map(|t| t.tx.get()).unwrap_or_default());
 
+    // Does the active tab's engine have a manual-transaction mode at all?
+    //
+    // SQLite doesn't yet — `schemaic_db::session::Session::open` refuses one,
+    // because a pinned `rusqlite::Connection` is blocking and `!Sync` and needs a
+    // thread of its own. The segment is hidden rather than left clickable: a
+    // control that reports an error every time it is pressed is worse than one
+    // that isn't there, and the cluster below it (the pill, Commit, Rollback)
+    // only ever appears while a transaction is open, which can't happen here.
+    let conns_for_tx = ui.conn.connections;
+    let manual_supported = create_memo(move |_| {
+        let Some(tab) = active_tab() else { return true };
+        let cid = tab.conn_id.get();
+        conns_for_tx.with(|cs| {
+            cs.iter()
+                .find(|c| c.id == cid)
+                .map(|c| !schemaic_core::connection::is_sqlite(&c.db_type))
+                // An unknown connection keeps the segment: hiding chrome on a
+                // lookup miss would be a worse guess than showing it.
+                .unwrap_or(true)
+        })
+    });
+
     let set_tx_mode = ui.tab_actions.set_tx_mode.clone();
     let mode_seg = dyn_container(
         move || tx_mode.get(),
@@ -5825,6 +5847,11 @@ fn footer(ui: Ui) -> impl IntoView {
         },
     )
     .on_click_stop(move |_| {
+        // The hidden segment can't be clicked, but the guard is stated here too:
+        // this is the one path into a mode the engine has no session for.
+        if !manual_supported.get_untracked() {
+            return;
+        }
         let id = active.get_untracked();
         // Flipping out of Manual with a transaction open is guarded app-side —
         // it raises the prompt instead of silently discarding the work.
@@ -5835,6 +5862,9 @@ fn footer(ui: Ui) -> impl IntoView {
         (set_tx_mode)(id, next);
     })
     .style(move |s| {
+        if !manual_supported.get() {
+            return s.hide();
+        }
         // Manual is a held state worth noticing; Auto is the quiet default.
         let manual = tx_mode.get().is_manual();
         let base = if manual {

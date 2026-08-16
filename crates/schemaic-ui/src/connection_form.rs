@@ -47,15 +47,17 @@ const CONN_MENU_W: f64 = 130.0;
 enum DbKind {
     MySql,
     Postgres,
+    Sqlite,
 }
 
 impl DbKind {
-    const ALL: [DbKind; 2] = [DbKind::MySql, DbKind::Postgres];
+    const ALL: [DbKind; 3] = [DbKind::MySql, DbKind::Postgres, DbKind::Sqlite];
 
     fn label(self) -> &'static str {
         match self {
             DbKind::MySql => "MySQL",
             DbKind::Postgres => "PostgreSQL",
+            DbKind::Sqlite => "SQLite",
         }
     }
 
@@ -65,11 +67,21 @@ impl DbKind {
         schemaic_core::connection::default_port(self.label())
     }
 
+    /// Does this engine live behind a host and port at all?
+    ///
+    /// SQLite doesn't, which is why the form builds a different block for it
+    /// rather than showing empty coordinates.
+    fn is_networked(self) -> bool {
+        !matches!(self, DbKind::Sqlite)
+    }
+
     /// Map a persisted `db_type` label back to a picker value (anything not
-    /// recognizably Postgres is MySQL — the historical default).
+    /// recognizably Postgres or SQLite is MySQL — the historical default).
     fn from_db_type(s: &str) -> DbKind {
         if schemaic_core::connection::is_postgres(s) {
             DbKind::Postgres
+        } else if schemaic_core::connection::is_sqlite(s) {
+            DbKind::Sqlite
         } else {
             DbKind::MySql
         }
@@ -735,39 +747,13 @@ pub(crate) fn manage_modal(ui: Ui) -> impl IntoView {
     })
 }
 
-#[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
-fn conn_form(
-    draft: DraftSignals,
-    save_conn: Rc<dyn Fn()>,
-    delete_conn: Rc<dyn Fn(u64)>,
-    test_conn: Rc<dyn Fn()>,
-    conn_test: RwSignal<crate::TestState>,
-    save_flash: RwSignal<bool>,
-    test_flash: RwSignal<bool>,
-    // Owned by the modal (Escape consults it there). Indices below are spaced by
-    // 10 so a field can be inserted between two without renumbering, and the SSH
-    // block — built only once its toggle is on — claims the 100s so it lands
-    // between the toggle that reveals it and the fields below.
-    ring: FocusRing,
-) -> impl IntoView {
-    // Editing any connection parameter invalidates a prior Test result, so reset
-    // the indicator whenever host/port/user/password or the SSH fields change.
-    create_effect(move |_| {
-        draft.host.track();
-        draft.port.track();
-        draft.user.track();
-        draft.password.track();
-        draft.ssh_enabled.track();
-        draft.ssh_host.track();
-        draft.ssh_port.track();
-        draft.ssh_user.track();
-        draft.ssh_password.track();
-        draft.ssh_auth.track();
-        draft.ssh_key_path.track();
-        draft.ssh_key_passphrase.track();
-        conn_test.set(crate::TestState::Idle);
-    });
-
+/// The half of the form that only a **networked** engine has: where the server
+/// is, who you are on it, and the optional tunnel to reach it.
+///
+/// Split out so it can be built per engine rather than built and hidden — see the
+/// `engine_block` comment in [`conn_form`]. Its Tab indices are the ones the
+/// server form has always used (60–150), so nothing else in the modal renumbers.
+fn server_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
     // SSH tunnel fields, shown only when enabled. The toggle is the themed switch
     // (like the other toggles); the fields lay out exactly like the normal ones.
     let ssh_enabled = draft.ssh_enabled;
@@ -856,6 +842,150 @@ fn conn_form(
     )
     .style(|s| s.width_full());
 
+    v_stack((
+        host_port_row("Host", draft.host, "Port", draft.port, ring.clone(), 60),
+        field("User", draft.user, ring.clone(), 70).style(|s| s.width(CONN_FIELD_W)),
+        masked_field("Password", draft.password, ring.clone(), 80).style(|s| s.width(CONN_FIELD_W)),
+        ssh_toggle,
+        ssh_fields,
+    ))
+    .style(|s| s.flex_col().gap(20.0).width_full())
+}
+
+/// The half of the form a **SQLite** connection has instead: one path, and a
+/// browse button to fill it in.
+///
+/// There is no user, no password and no tunnel, so none is offered — a field an
+/// engine can't express shouldn't be reachable at all, which is the same call the
+/// trigger editor's per-engine form makes.
+///
+/// It takes tab index 60, where the host field would be, so the order down the
+/// form is unchanged and the indices after it are untouched.
+fn sqlite_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
+    use floem::file::FileDialogOptions;
+    use floem::file_action::open_file;
+
+    let file = draft.file;
+    // Its own stop right after the path, as the SSH key field's picker is: the
+    // field is editable by hand, but a keyboard user shouldn't have to reach for
+    // the mouse to open the dialog. A cancelled dialog leaves the field alone.
+    let browse = control_button("Browse…", ring.clone(), 62, move || {
+        open_file(
+            FileDialogOptions::new().title("Select SQLite database"),
+            move |f| {
+                if let Some(info) = f
+                    && let Some(path) = info.path.first()
+                {
+                    file.set(path.to_string_lossy().to_string());
+                }
+            },
+        )
+    });
+    v_stack((
+        v_stack((
+            text("Database file").style(form_label_style),
+            h_stack((
+                edit_field(
+                    draft.file,
+                    FieldCfg {
+                        focus: Some((ring.clone(), 60)),
+                        ..Default::default()
+                    },
+                )
+                .style(|s| s.flex_grow(1.0_f32)),
+                browse,
+            ))
+            .style(|s| s.gap(8.0).width_full().items_center()),
+        ))
+        .style(|s| s.flex_col().gap(6.0).width_full()),
+        form_hint(
+            "A SQLite database is a single file, so there is no server to reach — \
+             no host, user, password or tunnel. Schema editing and manual \
+             transactions aren't available on one yet.",
+        )
+        .style(|s| s.width_full()),
+    ))
+    .style(|s| s.flex_col().gap(20.0).width_full())
+}
+
+#[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
+fn conn_form(
+    draft: DraftSignals,
+    save_conn: Rc<dyn Fn()>,
+    delete_conn: Rc<dyn Fn(u64)>,
+    test_conn: Rc<dyn Fn()>,
+    conn_test: RwSignal<crate::TestState>,
+    save_flash: RwSignal<bool>,
+    test_flash: RwSignal<bool>,
+    // Owned by the modal (Escape consults it there). Indices below are spaced by
+    // 10 so a field can be inserted between two without renumbering, and the SSH
+    // block — built only once its toggle is on — claims the 100s so it lands
+    // between the toggle that reveals it and the fields below.
+    ring: FocusRing,
+) -> impl IntoView {
+    // Editing any connection parameter invalidates a prior Test result, so reset
+    // the indicator whenever host/port/user/password or the SSH fields change.
+    create_effect(move |_| {
+        draft.host.track();
+        draft.port.track();
+        draft.user.track();
+        draft.password.track();
+        draft.ssh_enabled.track();
+        draft.ssh_host.track();
+        draft.ssh_port.track();
+        draft.ssh_user.track();
+        draft.ssh_password.track();
+        draft.ssh_auth.track();
+        draft.ssh_key_path.track();
+        draft.ssh_key_passphrase.track();
+        // The SQLite target is a connection parameter like any other: pointing at
+        // a different file invalidates a Test result exactly as a different host
+        // does.
+        draft.file.track();
+        conn_test.set(crate::TestState::Idle);
+    });
+
+    // Type: engine picker. The selection drives `draft.db_type`; switching engine
+    // also swaps in that engine's default port — but only when the port is still
+    // the *other* engine's default (or empty), so a port the user typed is never
+    // clobbered. `create_effect`'s `prev` is `None` on the first (load) run, so
+    // opening an existing connection never rewrites its saved port.
+    let engine = RwSignal::new(DbKind::from_db_type(&draft.db_type.get_untracked()));
+    create_effect(move |prev: Option<DbKind>| {
+        let k = engine.get();
+        draft.db_type.set(k.label().to_string());
+        if let Some(prev) = prev
+            && prev != k
+            // SQLite has no port on either side of the switch: coming *from* it
+            // there is nothing to compare against, and going *to* it the field
+            // isn't built. Leaving the saved port alone means switching away and
+            // back doesn't discard it.
+            && prev.is_networked()
+            && k.is_networked()
+        {
+            let cur = draft.port.get_untracked();
+            let c = cur.trim();
+            if c.is_empty() || c == prev.default_port().to_string() {
+                draft.port.set(k.default_port().to_string());
+            }
+        }
+        k
+    });
+
+    // The engine-specific half of the form is built per engine rather than built
+    // and hidden — `hide()` is `display:none`, so the view stays in the tree and
+    // stays registered in the Tab ring, and Tab would move focus onto a port field
+    // nobody can see on a connection that has no port.
+    let ring_engine = ring.clone();
+    let engine_block = dyn_container(
+        move || engine.get(),
+        move |k| match k {
+            DbKind::Sqlite => sqlite_fields(draft, ring_engine.clone()).into_any(),
+            _ => server_fields(draft, ring_engine.clone()).into_any(),
+        },
+    )
+    .style(|s| s.width_full());
+
     // "Prominent color in editor" — when on, the identity colour frames the
     // query+results editor (a guard-rail for e.g. production connections). Uses
     // the same themed switch as the AI/terminal settings toggles.
@@ -875,26 +1005,6 @@ fn conn_form(
         30,
     );
 
-    // Type: engine picker (MySQL / PostgreSQL). The selection drives `draft.db_type`;
-    // switching engine also swaps in that engine's default port — but only when the
-    // port is still the *other* engine's default (or empty), so a port the user typed
-    // is never clobbered. `create_effect`'s `prev` is `None` on the first (load) run,
-    // so opening an existing connection never rewrites its saved port.
-    let engine = RwSignal::new(DbKind::from_db_type(&draft.db_type.get_untracked()));
-    create_effect(move |prev: Option<DbKind>| {
-        let k = engine.get();
-        draft.db_type.set(k.label().to_string());
-        if let Some(prev) = prev
-            && prev != k
-        {
-            let cur = draft.port.get_untracked();
-            let c = cur.trim();
-            if c.is_empty() || c == prev.default_port().to_string() {
-                draft.port.set(k.default_port().to_string());
-            }
-        }
-        k
-    });
     let type_field = v_stack((
         text("Type").style(form_label_style),
         // 150px wide (not full width), matching the settings dropdowns' look.
@@ -938,11 +1048,7 @@ fn conn_form(
         read_only_toggle,
         env_field,
         type_field,
-        host_port_row("Host", draft.host, "Port", draft.port, ring.clone(), 60),
-        field("User", draft.user, ring.clone(), 70).style(|s| s.width(CONN_FIELD_W)),
-        masked_field("Password", draft.password, ring.clone(), 80).style(|s| s.width(CONN_FIELD_W)),
-        ssh_toggle,
-        ssh_fields,
+        engine_block,
     ))
     .style(|s| s.flex_col().gap(20.0).width_full().padding(14.0));
 
