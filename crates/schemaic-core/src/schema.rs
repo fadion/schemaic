@@ -294,6 +294,14 @@ impl ColumnInfo {
     /// what keeps the two from drifting apart.
     pub fn definition_sql(&self, dialect: crate::intel::SqlDialect) -> String {
         let pg = dialect == crate::intel::SqlDialect::Postgres;
+        // SQLite shares MySQL's shape for the parts it has — `COLLATE`, the
+        // generated expression, `NOT NULL`, `DEFAULT` — and has none of the
+        // rest. Its key counter is `AUTOINCREMENT`, which is *only* legal
+        // spelled inline as `INTEGER PRIMARY KEY AUTOINCREMENT`, so it belongs
+        // to the table builder rather than to a column definition; `ON UPDATE`
+        // is a MySQL timestamp attribute; and there are no comments at all, on
+        // a column or anywhere else.
+        let sqlite = dialect == crate::intel::SqlDialect::Sqlite;
         let mut out = format!("{} {}", ddl_ident_in(&self.name, dialect), self.type_name);
         if let Some(col) = &self.collation
             && !pg
@@ -325,7 +333,7 @@ impl ColumnInfo {
             {
                 out.push_str(&format!(" DEFAULT {d}"));
             }
-            if self.auto_increment {
+            if self.auto_increment && !sqlite {
                 // PostgreSQL's identity is a column attribute; MySQL's is a flag.
                 // `ALWAYS` vs `BY DEFAULT` is a real difference in what the
                 // column accepts, so restate the one the server reported.
@@ -338,6 +346,7 @@ impl ColumnInfo {
         }
         if let Some(u) = &self.on_update
             && !pg
+            && !sqlite
         {
             out.push_str(&format!(" ON UPDATE {u}"));
         }
@@ -345,6 +354,7 @@ impl ColumnInfo {
         // statement, which the DDL emitter adds alongside.
         if let Some(c) = &self.comment
             && !pg
+            && !sqlite
             && !c.is_empty()
         {
             out.push_str(&format!(" COMMENT {}", ddl_string(c, dialect)));
