@@ -739,7 +739,7 @@ fn render_segments(segs: Vec<Seg>, role: Role, actions: CodeActions) -> impl Int
 }
 
 /// A footer action icon (copy / regenerate): 16px, footer-text colour, brightens
-/// on hover. No pointer cursor (native feel — see CLAUDE.md).
+/// on hover. No pointer cursor (native feel — see `docs/architecture.md`).
 fn footer_icon(svg: &'static str, on_click: impl Fn() + 'static) -> impl IntoView {
     container(icons::icon(svg, 16.0))
         .on_click_stop(move |_| on_click())

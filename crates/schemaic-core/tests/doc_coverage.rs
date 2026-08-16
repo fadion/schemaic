@@ -1,11 +1,11 @@
-//! Guard: every source module is named somewhere in `CLAUDE.md`.
+//! Guard: every source module is named somewhere in `docs/architecture.md`.
 //!
-//! CLAUDE.md is this project's architecture document *and* its agent-instruction
-//! file — every contributor and every AI session reads it as the map. A review
-//! found 19 modules missing from it, ~12% of the codebase, including the whole
-//! ER-diagram subsystem: an undocumented module is where the invariants quietly
-//! stop applying, which is exactly what happened to `core/filter.rs` (it builds
-//! SQL that reaches the server, and the quoting invariants never mentioned it).
+//! That file is this project's architecture document — every contributor and
+//! every AI session reads it as the map. A review found 19 modules missing from
+//! it, ~12% of the codebase, including the whole ER-diagram subsystem: an
+//! undocumented module is where the invariants quietly stop applying, which is
+//! exactly what happened to `core/filter.rs` (it builds SQL that reaches the
+//! server, and the quoting invariants never mentioned it).
 //!
 //! A basename match is a deliberately weak test — it says a module was *thought
 //! about*, not that the entry is accurate. It only has to catch the one failure
@@ -46,9 +46,9 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn every_module_is_named_in_claude_md() {
+fn every_module_is_named_in_the_architecture_doc() {
     let root = repo_root();
-    let Ok(doc) = fs::read_to_string(root.join("CLAUDE.md")) else {
+    let Ok(doc) = fs::read_to_string(root.join("docs").join("architecture.md")) else {
         // Checked out without the doc (or built from a package) — nothing to
         // guard, and failing here would be about the checkout, not the code.
         return;
@@ -77,8 +77,8 @@ fn every_module_is_named_in_claude_md() {
 
     assert!(
         missing.is_empty(),
-        "these modules are not named anywhere in CLAUDE.md — add them to the \
-         Crates section at the same altitude as their peers: {}",
+        "these modules are not named anywhere in docs/architecture.md — add them \
+         to its Crates section at the same altitude as their peers: {}",
         missing.join(", ")
     );
 }

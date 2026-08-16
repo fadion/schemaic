@@ -110,7 +110,7 @@ fn scan_dollar(b: &[u8], i: usize) -> Option<usize> {
 /// word runs.
 ///
 /// It is one function rather than four because the invariant is stated in
-/// CLAUDE.md and was upheld by four private copies across two crates, each with
+/// `docs/architecture.md` and was upheld by four private copies across two crates, each with
 /// its own comment restating the rule and no test comparing them — a fifth
 /// scanner written without the `>= 0x80` clause, or one of the four edited in
 /// isolation, would have reverted a documented invariant silently. The crate had

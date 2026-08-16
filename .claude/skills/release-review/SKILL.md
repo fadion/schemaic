@@ -39,13 +39,11 @@ One directory per run, under the already-gitignored `review/`:
 already exists from a run at a **different** head SHA, rename it to
 `review/release-<base-tag>-<old-head-sha>/` and start clean; same head SHA means resume (below).
 
-**The base need not be a tag.** The `commit` skill defers a multi-commit feature's review to the
-commit that finishes it and then points here with `<first-sha>^..HEAD`, so a mid-cycle run is a
-normal use, not a misuse — the base is simply a SHA and the directory is named after it. Such a run
-reviews a feature, not a release: it says nothing about whether the tag should go out, and the
-pre-release run over the full `<last-tag>..HEAD` still happens and still reads every slice. Being
-reviewed mid-cycle is never a reason to narrow that one, for the same reason a prior commit-time
-record isn't.
+**The base need not be a tag.** A mid-cycle run over `<first-sha>^..HEAD` is a normal use — the base
+is simply a SHA and the directory is named after it. Such a run reviews a feature, not a release: it
+says nothing about whether the tag should go out, and the pre-release run over the full
+`<last-tag>..HEAD` still happens and still reads every slice. Being reviewed mid-cycle is never a
+reason to narrow that one.
 
 The periodic review's `review/findings.md` is a different, longer-lived ledger. Never write to it.
 Do **read** its `## Rejected` section if it exists — re-raising something a previous round already
@@ -67,11 +65,9 @@ out?** A Critical the range introduced is a regression and blocks it; the same s
 that shipped three releases ago is a bug worth fixing on its own schedule, and conflating the two
 either holds a good release for old news or ships a regression under cover of a long list.
 Reference §6's buckets sort by *how to fix safely*, which is a different axis and doesn't answer
-this — so both are recorded and triage reports them crossed.
-
-The instruction to read whole functions and trace into unchanged callers is what makes the field
-necessary: this review is *designed* to surface pre-existing bugs, and they are welcome. They just
-aren't release blockers.
+this — so both are recorded and triage reports them crossed. This review is *designed* to surface
+pre-existing bugs, by reading whole functions and tracing into unchanged callers; they are welcome,
+they just aren't release blockers.
 
 ## Phase 0 — the range and the ground
 
@@ -107,11 +103,10 @@ CI's passes a tree CI will reject, which is the one thing a pre-release gate exi
 1. `git status --short` empty. Reviewing a dirty tree reviews something that isn't shipping.
 2. `cargo fmt --all --check` → exit 0.
 3. `cargo clippy --workspace --all-targets -- -D warnings` → clean.
-4. `$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --workspace --no-deps` → clean. Easy to forget
-   because it is the one gate no local habit runs; a doc link pointing at a renamed item has failed
-   a release push on exactly this. **PowerShell**, not a POSIX env-var prefix — `RUSTDOCFLAGS="…"
-   cargo doc` is a *parse error* on this machine, and a parse error's exit code is indistinguishable
-   at a glance from a rustdoc warning while the correct reaction to each is the opposite.
+4. `$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --workspace --no-deps` → clean. The one gate no
+   local habit runs, and a doc link pointing at a renamed item has failed a release push on exactly
+   it. PowerShell form deliberately: a POSIX env-var prefix is a *parse error* here, whose exit code
+   reads at a glance like a rustdoc warning while the right reaction to each is the opposite.
 5. `cargo deny check` → advisories / bans / licenses / sources ok. It also appears in Pass 0's
    census, but a policy failure is a stop, not a fact.
 6. `cargo test --workspace` → green, no `#[ignore]`.
@@ -124,36 +119,6 @@ Two environment facts that have already cost a pass: on Windows, stop a running 
 before building; and the agent's `%APPDATA%` view is MSIX-redirected, so an app instance the agent
 launches shares no connections, tabs or history with the user's. Any pass that drives the GUI states
 which instance it exercised.
-
-### Prior commit-time reviews
-
-**A legacy input, and an empty one from here on.** The `commit` skill used to write
-`review/commits/<sha>.md` when a commit was reviewed as it landed; it no longer records anything,
-because a review at commit time is now the user's call and its findings land as ordinary commits.
-Files written before that change are still valid leads until `release` archives them at the next
-tag, after which this section has nothing to read and can go. Expect none, and skip the step
-without comment when the directory is absent or holds nothing in range.
-
-Collect the ones whose SHA is in the range — a file outside it belongs to an earlier cycle and is
-ignored, not deleted:
-
-```bash
-git log --format=%h <base>..HEAD
-```
-
-They are **leads, not findings.** Each entry names a `file:line` as of *its own* commit, which a
-later commit in the same range may have rewritten, fixed, or deleted — so an entry enters through
-reference §3's verification gate exactly like anything a pass discovers, and is re-anchored against
-`HEAD` before it can reach the ledger. An unverified import would hold a tag on a bug fixed four
-commits later.
-
-Their real value is directional: Phase 1 notes on each slice's plan row which prior entries land in
-it, and each subagent brief carries its slice's entries as prior art — "this was flagged here, check
-whether it survived" is a cheaper start than a cold read. A `clean` record is context only, and
-never a reason to narrow a slice.
-
-Phase 5 states what became of them: confirmed, superseded, or dropped as already fixed. An imported
-lead nobody accounted for is the failure this line catches.
 
 ## Phase 1 — cut the diff into slices
 
@@ -201,7 +166,7 @@ periodic review's job, and repeating it buries the twenty facts that are about t
 | `unwrap()` / `expect()` / `panic!` / raw `[i]` **added** by the range, outside tests | census | L1 panic surface |
 | `#[allow(...)]` added | census — each is a silenced signal | L3 |
 | `TODO` / `FIXME` / `HACK` added | census | L3 / triage |
-| New `src/*.rs` modules, and whether each is named in CLAUDE.md | census | L8 (`doc_coverage` asserts the name exists, not that the description is true) |
+| New `src/*.rs` modules, and whether each is named in `docs/architecture.md` | census | L8 (`doc_coverage` asserts the name exists, not that the description is true) |
 | Test-count delta per changed file (`#[test]` added vs. changed lines) | census | L6 — the house rule is TDD |
 | `cargo deny check` | census | L5 |
 | New `exec_after(` / `create_child(` / `dispose(` sites | census (enumerable) | L1 disposed-signal hazards |
@@ -217,8 +182,8 @@ Three, in order. Each is one delegated pass with a ledger row.
 
 | # | Sweep | Lenses | Shape |
 | --- | --- | --- | --- |
-| **R1** | **Invariant conformance on what changed** | L2 | Walk CLAUDE.md's *Architecture invariants* and *Floem 0.2 gotchas*, and for each, enumerate the sites **the range added or moved**: new SQL scans (on `sql::skip_noncode`, with the connection's `SqlDialect`?), new identifier quoting (ends at `export::ident_sql`/`ident_if_needed`?), new `Db::` methods and `Session` uses (one-connection-per-op except manual-tx; read-only side channels off the pinned connection?), new secret reads/writes (through `core::secrets`, never `persist::save_connections`), new generated DDL (originates in `ddl::emit`, terminates at `ddl_preview`), new `create_child()`/`dispose()` (deferred?), new `Color` captured by value into a `.style(` closure, new identifier scanners (`>= 0x80` word bytes), new run paths (through the guarded `TabsActions::run`?). This is the highest-yield sweep on a feature range and it is cheap, because the candidate sites are already enumerated in `facts.md`. |
-| **R2** | **Doc drift & test map** | L8, L6 | CLAUDE.md is this project's real specification and a large feature range is where it goes stale: every claim the range touched, checked against the code that now exists; every new module on the map with an accurate description, not just a mention; new decision functions (parsing, diffing, gating, key selection, emitting) against the tests that should exist per the TDD house rule; and whether the four invariant-enforcing tests still enforce over the new surface — the DDL round-trip gate's fixtures, the 1-row write-back net, lexer agreement, export `*_to` byte-equality. |
+| **R1** | **Invariant conformance on what changed** | L2 | Walk `docs/architecture.md`'s *Architecture invariants* and *Floem 0.2 gotchas*, and for each, enumerate the sites **the range added or moved**: new SQL scans (on `sql::skip_noncode`, with the connection's `SqlDialect`?), new identifier quoting (ends at `export::ident_sql`/`ident_if_needed`?), new `Db::` methods and `Session` uses (one-connection-per-op except manual-tx; read-only side channels off the pinned connection?), new secret reads/writes (through `core::secrets`, never `persist::save_connections`), new generated DDL (originates in `ddl::emit`, terminates at `ddl_preview`), new `create_child()`/`dispose()` (deferred?), new `Color` captured by value into a `.style(` closure, new identifier scanners (`>= 0x80` word bytes), new run paths (through the guarded `TabsActions::run`?). This is the highest-yield sweep on a feature range and it is cheap, because the candidate sites are already enumerated in `facts.md`. |
+| **R2** | **Doc drift & test map** | L8, L6 | `docs/architecture.md` is this project's real specification and a large feature range is where it goes stale: every claim the range touched, checked against the code that now exists; every new module on the map with an accurate description, not just a mention; new decision functions (parsing, diffing, gating, key selection, emitting) against the tests that should exist per the TDD house rule; and whether the four invariant-enforcing tests still enforce over the new surface — the DDL round-trip gate's fixtures, the 1-row write-back net, lexer agreement, export `*_to` byte-equality. |
 | **R3** | **Security & data safety across the range** | L5 | Run it **only if** the range touches write paths, DDL apply, secrets, subprocess/env, file or path handling, or SQL text construction — the plan decides from `--name-only` and says which. Trace end to end rather than per slice: what a new write can destroy, what a new quoter can inject, what a new error message can leak, whether a new engine divergence silently loses data. |
 
 R1's findings are **candidates, not settled facts**, and the slice-pass briefs say so — in the
@@ -337,7 +302,7 @@ range <base>..<head>. Read these first:
   deliberate-conservatism traps listed there are the most common source of wrong findings.
 - .claude/skills/release-review/SKILL.md — "Reviewing a diff, not a tree". Those rules are what
   this pass is for.
-- CLAUDE.md — the architecture invariants and Floem gotchas. L2 is the highest-yield lens here.
+- docs/architecture.md — the architecture invariants and Floem gotchas. L2 is the highest-yield lens here.
 - <run-dir>/index.md — every finding raised so far, one line each, plus the rejected ones. Check
   it before writing: a candidate already there is a duplicate (say so in your report instead of
   re-raising) or already rejected (don't re-raise it at all).
@@ -418,6 +383,3 @@ Close by naming the two follow-ups the review deliberately doesn't do: a writer 
 - **Every finding states its `Origin`.** Without it the ledger can't answer whether the tag should
   go out, which is the only question this review exists for.
 - **Don't touch `review/findings.md`** — that's the periodic review's ledger. Read-only.
-- **A prior commit-time entry is a lead, not a finding.** It enters through the verification gate
-  like anything else, re-anchored against `HEAD`. `review/commits/` is read-only here, and holds
-  only entries predating the `commit` skill dropping its ledger — `release` archives them at the tag.

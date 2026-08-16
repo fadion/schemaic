@@ -6218,7 +6218,7 @@ fn data_cell(
 
 /// Left padding that right-aligns `text_px` of text inside the in-place editor of
 /// a numeric cell `w` px wide — Floem 0.2 has no `text-align`, so the free space
-/// is padded rather than aligned (see the CLAUDE.md note).
+/// is padded rather than aligned (see the `docs/architecture.md` note).
 ///
 /// **It must be computed from the cell's real content box**, which is the column
 /// width less the cell's own padding *and* its right divider — a border, so it
@@ -6534,7 +6534,7 @@ mod tests {
 
     // ── Column virtualization (`compute_window`) ──
     //
-    // The invariant CLAUDE.md states for the data pane: `gs.widths` stays
+    // The invariant docs/architecture.md states for the data pane: `gs.widths` stays
     // full-length and each row's total width = `sum(widths[data_cols])`, the
     // spacers making up the hidden columns. If that ever stops holding, nothing
     // fails — the two panes just drift out of column alignment and

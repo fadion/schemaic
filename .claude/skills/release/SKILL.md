@@ -50,9 +50,8 @@ cargo test --workspace
 ```
 
 An unformatted tree is historically the most common CI failure, and rustdoc the
-most commonly *forgotten* check — nothing in day-to-day work runs it, so a doc
-link left pointing at a renamed item sits green locally and fails the release
-push. It has already cost one.
+most commonly *forgotten* check — nothing in day-to-day work runs it, and a stale
+doc link has already failed a release push.
 
 If `fmt --check` fails, run `cargo fmt --all`, commit the result as its own
 `style:` or `chore:` commit, and carry on. A broken doc link is the same shape:
@@ -141,23 +140,6 @@ git push origin main
 ```bash
 git push origin vX.Y.Z
 ```
-
-The tag closes the cycle, so this is where any commit-time review records are
-retired. The `commit` skill no longer writes them, so this usually finds nothing
-and the step is a no-op — say nothing and move on. When the directory *does*
-exist (entries predating that change), **rename it, don't delete it** — it is
-gitignored, so a wrong delete is unrecoverable, and this matches what
-`release-review` does with a stale run directory:
-
-```bash
-mv review/commits review/commits-vX.Y.Z
-```
-
-The tag is the trigger rather than the review finishing: a finished review can
-sit for days while its fixes land, and that is exactly the window where the
-per-commit record is still being read. Nothing later in this flow reads the
-directory, so if the rename fails, say so and carry on — it is bookkeeping, not
-a gate.
 
 ## Phase 3 — wait for the Release workflow
 
@@ -253,9 +235,9 @@ If a bullet needs a third sentence to make sense, either it deserves its own
 Highlight or the extra sentence isn't needed. Prose paragraphs are the signal
 you've drifted — go back to v0.3.0 and cut to its shape.
 
-Write the body to a file and set it with `--notes-file`. Passing multi-line
-markdown as a `-m` argument through PowerShell gets mangled (a `>=` in the text
-is read as a redirect), and a file sidesteps quoting entirely:
+Write the body to a file and set it with `--notes-file` — multi-line markdown
+through `-m` gets mangled here (see *Command notes*), and a file sidesteps
+quoting entirely:
 
 ```bash
 gh release edit vX.Y.Z --notes-file notes.md

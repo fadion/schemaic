@@ -311,7 +311,7 @@ fn connections_path() -> Option<PathBuf> {
 /// truncating an existing file.
 ///
 /// Every config write goes through this. `connections.json` holds plaintext
-/// credentials whenever the keyring is unavailable — the fallback CLAUDE.md
+/// credentials whenever the keyring is unavailable — the fallback `docs/architecture.md`
 /// documents — and `std::fs::write` creates at `0o666 & !umask`, i.e. 0644 under
 /// the usual umask, which on a shared Unix host hands the DB password, the SSH
 /// password and the key passphrase to every other local account. The `.bak` and
