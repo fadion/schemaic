@@ -2903,6 +2903,19 @@ impl ChangeSet {
                 ));
             }
         }
+        // Adds after drops, so a column that replaces a dropped one of the same
+        // name finds the name free. The definition comes from the one column
+        // emitter the rebuild's `CREATE TABLE` also uses, so the two can't
+        // disagree about what the column is — only about how it gets there.
+        for c in supported() {
+            if let Change::AddColumn { column, .. } = c {
+                out.push(format!(
+                    "ALTER TABLE {} ADD COLUMN {};",
+                    self.qname(),
+                    column.definition_sql(self.dialect)
+                ));
+            }
+        }
         out
     }
 
@@ -4546,6 +4559,101 @@ fn is_rebuild(c: &Change) -> bool {
     matches!(c, Change::RebuildTable(_))
 }
 
+/// Can SQLite add this column with its own `ALTER TABLE … ADD COLUMN`, instead
+/// of by rebuilding the table around it?
+///
+/// Appending a column is the most common designer edit there is, and SQLite
+/// performs it instantly — copying the whole table to achieve it was correct and
+/// absurd. But the engine's restrictions are **narrow and unforgiving**, and
+/// each one is a way to write the plan that half-applies: the fast path is
+/// taken, the engine refuses the statement, and the edit the preview promised is
+/// simply gone. So this answers `false` for anything it isn't sure of — a
+/// needless rebuild is slow, a wrong fast path is a lie.
+///
+/// The rules, each measured against SQLite 3.46 rather than read off the
+/// grammar, with the engine's own wording where it has some:
+///
+/// * **`position` must be empty.** `ADD COLUMN` always appends; a column the
+///   user dropped into the middle carries one, and taking the fast path there
+///   leaves the designer showing one order and the table having another. This is
+///   the rule with no error message behind it — the statement *succeeds*, in the
+///   wrong place.
+/// * **No primary key** — *"Cannot add a PRIMARY KEY column"*.
+/// * **No counter.** `AUTOINCREMENT` is legal only spelled inline as `INTEGER
+///   PRIMARY KEY AUTOINCREMENT`, so [`ColumnInfo::definition_sql`] drops it for
+///   SQLite; a native add would silently lose it where the rebuild's table
+///   builder can place it.
+/// * **A constant default**, if any — *"Cannot add a column with non-constant
+///   default"*.
+/// * **`NOT NULL` needs a non-null default** — *"Cannot add a NOT NULL column
+///   with default value NULL"*.
+///
+/// Two things deliberately absent. **Uniqueness** isn't on [`ColumnInfo`] at
+/// all: it arrives as an index, which has no native arm in [`supports_change`]
+/// and so takes the set back to a rebuild on its own. That is a fact about this
+/// gate, *not* about SQLite — what the engine refuses is an inline `UNIQUE` in
+/// the column definition, and there is none to emit, so a native add followed by
+/// a `CREATE UNIQUE INDEX` would be two legal statements the day that arm
+/// exists. And a **generated** column is addable — the
+/// emitter writes no `VIRTUAL`/`STORED` keyword, so SQLite's own default
+/// (`VIRTUAL`) applies, and it is `STORED` that the engine refuses. A generated
+/// column also carries its expression *instead of* a default, so the null-default
+/// rule has nothing to reach.
+fn sqlite_native_add(column: &ColumnInfo, position: Option<&Position>) -> bool {
+    if position.is_some() || column.primary_key || column.auto_increment {
+        return false;
+    }
+    if column.generated.is_some() {
+        return true;
+    }
+    let default = column.default.as_deref().map(str::trim);
+    if let Some(d) = default
+        && !sqlite_constant_default(d)
+    {
+        return false;
+    }
+    if !column.nullable && !default.is_some_and(|d| !d.eq_ignore_ascii_case("NULL")) {
+        return false;
+    }
+    true
+}
+
+/// Is `default` a *constant* in SQLite's sense — something `ADD COLUMN` will
+/// take?
+///
+/// Two forms are not: the `CURRENT_*` keywords, and anything parenthesised
+/// (which covers a bare `now()` too — not a legal `DEFAULT` there at all).
+/// Everything else a column can carry is a literal and is accepted, which the
+/// engine confirms for signed numbers, blob literals, `TRUE`/`FALSE` and even a
+/// bare word.
+///
+/// The parenthesis is looked for at a **code** position through the shared
+/// lexer, not with a `contains('(')`: a default of `'a (b)'` is a string whose
+/// parens are data, and rejecting it would send an ordinary edit the long way
+/// round.
+fn sqlite_constant_default(default: &str) -> bool {
+    let d = default.trim();
+    if ["CURRENT_TIME", "CURRENT_DATE", "CURRENT_TIMESTAMP"]
+        .iter()
+        .any(|k| d.eq_ignore_ascii_case(k))
+    {
+        return false;
+    }
+    let b = d.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(j) = sql::skip_noncode(b, i, SqlDialect::Sqlite) {
+            i = j.max(i + 1);
+            continue;
+        }
+        if b[i] == b'(' {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// What a rebuild needs: the table as it is, and as it should be.
 ///
 /// Both sides, because the copy is the whole point — the new table comes from
@@ -4827,6 +4935,12 @@ pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
 pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     if dialect != SqlDialect::Sqlite {
         return true;
+    }
+    // The one change whose answer depends on what it *contains* rather than on
+    // what kind it is: SQLite adds a column natively, but only a column that
+    // meets every one of its restrictions — see [`sqlite_native_add`].
+    if let Change::AddColumn { column, position } = change {
+        return sqlite_native_add(column, position.as_ref());
     }
     matches!(
         change,
@@ -5276,12 +5390,14 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
     // list is already in it.
     //
     // The test is "is there something here SQLite has no statement for", not
-    // "is this an alter": a set of nothing but the drops it does have keeps its
-    // direct path, and pays nothing. Everything else takes the long way, even
-    // where a narrower rule could have found a fast path — an `ADD COLUMN` is
-    // native, but only when the column carries no key, no uniqueness and a
-    // constant default, and getting that wrong writes the plan that half-applies.
-    // Correct first; the fast paths are an optimisation with a test each.
+    // "is this an alter": a set of nothing but the statements it does have keeps
+    // its direct path and pays nothing.
+    //
+    // **This stays a question about the whole set, not about each change.** An
+    // `ADD COLUMN` that `sqlite_native_add` calls native still rides the rebuild
+    // when anything beside it needs one — the rebuild writes the table the draft
+    // describes, so the column is already in it, and emitting the `ADD COLUMN`
+    // as well would add it twice.
     if dialect == SqlDialect::Sqlite
         && !changes.is_empty()
         && changes.iter().any(|c| !supports_change(dialect, c))
@@ -11745,6 +11861,227 @@ mod sqlite_designer_tests {
         assert!(
             cs.unsupported().is_empty(),
             "the rebuild performs all of it"
+        );
+    }
+
+    // ── the native ADD COLUMN fast path ──────────────────────────────────────
+    //
+    // A test per condition, deliberately, rather than one happy path: each of
+    // SQLite's restrictions is a way to write the plan that **half-applies** —
+    // the fast path is taken, the engine refuses the statement, and the edit the
+    // preview promised is gone. Every rule below was measured against SQLite
+    // 3.46 rather than read off the grammar; the engine's own wording is quoted
+    // where it has some.
+
+    /// The added column, with everything else about it left alone.
+    fn added(t: &TableInfo, c: ColumnInfo) -> ChangeSet {
+        let mut d = TableDraft::from_table(t);
+        d.columns.push(ColumnDraft::new(c));
+        diff(t, &d, Sqlite)
+    }
+
+    fn new_col() -> ColumnInfo {
+        ColumnInfo {
+            name: "c".into(),
+            type_name: "TEXT".into(),
+            nullable: true,
+            ..Default::default()
+        }
+    }
+
+    /// **The case this exists for.** Appending an ordinary column is the most
+    /// common designer edit there is, and SQLite does it instantly — copying the
+    /// whole table to achieve it was correct and absurd.
+    #[test]
+    fn appending_a_plain_column_is_native() {
+        let cs = added(&table(), new_col());
+        assert!(!cs.changes.iter().any(is_rebuild), "{:?}", cs.changes);
+        assert_eq!(cs.emit(), vec![r#"ALTER TABLE "t" ADD COLUMN "c" TEXT;"#]);
+    }
+
+    /// Everything the column may legally carry, all at once — so the rule can't
+    /// pass by being timid. A generated column is addable (SQLite's default is
+    /// `VIRTUAL`, which is what the emitter writes by omitting the keyword), and
+    /// so is one that is `NOT NULL` *because* it is generated.
+    #[test]
+    fn the_things_a_column_may_carry_stay_native() {
+        for c in [
+            ColumnInfo {
+                default: Some("'x'".into()),
+                nullable: false,
+                ..new_col()
+            },
+            ColumnInfo {
+                collation: Some("NOCASE".into()),
+                default: Some("''".into()),
+                ..new_col()
+            },
+            ColumnInfo {
+                default: Some("-1".into()),
+                type_name: "INTEGER".into(),
+                ..new_col()
+            },
+            ColumnInfo {
+                generated: Some("a * 2".into()),
+                type_name: "INTEGER".into(),
+                ..new_col()
+            },
+            // Generated *and* NOT NULL: the null-default rule doesn't reach a
+            // column that has no default to speak of. Verified against 3.46.
+            ColumnInfo {
+                generated: Some("'x'".into()),
+                nullable: false,
+                ..new_col()
+            },
+        ] {
+            let cs = added(&table(), c.clone());
+            assert!(
+                !cs.changes.iter().any(is_rebuild),
+                "{} should be native: {:?}",
+                c.name,
+                cs.changes
+            );
+        }
+    }
+
+    /// *"Cannot add a PRIMARY KEY column"*.
+    #[test]
+    fn a_key_column_still_rebuilds() {
+        let c = ColumnInfo {
+            primary_key: true,
+            type_name: "INTEGER".into(),
+            ..new_col()
+        };
+        assert!(added(&table(), c).changes.iter().any(is_rebuild));
+    }
+
+    /// `AUTOINCREMENT` is legal only spelled inline as `INTEGER PRIMARY KEY
+    /// AUTOINCREMENT`, so `column_sql` drops it for SQLite — a native add would
+    /// silently lose the counter, where the rebuild's table builder can place it.
+    #[test]
+    fn a_counter_column_still_rebuilds() {
+        let c = ColumnInfo {
+            auto_increment: true,
+            type_name: "INTEGER".into(),
+            ..new_col()
+        };
+        assert!(added(&table(), c).changes.iter().any(is_rebuild));
+    }
+
+    /// *"Cannot add a NOT NULL column with default value NULL"* — which covers
+    /// both no default at all and an explicit `DEFAULT NULL`.
+    #[test]
+    fn not_null_without_a_usable_default_still_rebuilds() {
+        for default in [None, Some("NULL".to_string()), Some("null".to_string())] {
+            let c = ColumnInfo {
+                nullable: false,
+                default,
+                ..new_col()
+            };
+            let cs = added(&table(), c.clone());
+            assert!(
+                cs.changes.iter().any(is_rebuild),
+                "{:?} should rebuild: {:?}",
+                c.default,
+                cs.changes
+            );
+        }
+    }
+
+    /// *"Cannot add a column with non-constant default"* — the `CURRENT_*`
+    /// keywords and anything parenthesised. A bare function call isn't a legal
+    /// `DEFAULT` at all, and is caught by the same paren test.
+    #[test]
+    fn a_non_constant_default_still_rebuilds() {
+        for default in [
+            "CURRENT_TIMESTAMP",
+            "current_timestamp",
+            "CURRENT_DATE",
+            "CURRENT_TIME",
+            "(1 + 1)",
+            "(SELECT max(a) FROM t)",
+            "now()",
+        ] {
+            let c = ColumnInfo {
+                default: Some(default.into()),
+                ..new_col()
+            };
+            let cs = added(&table(), c);
+            assert!(
+                cs.changes.iter().any(is_rebuild),
+                "{default} should rebuild: {:?}",
+                cs.changes
+            );
+        }
+    }
+
+    /// A paren *inside a string literal* is data, not an expression — asked
+    /// through the shared lexer rather than with a `contains('(')`.
+    #[test]
+    fn a_paren_inside_a_literal_default_is_not_an_expression() {
+        let c = ColumnInfo {
+            default: Some("'a (b)'".into()),
+            ..new_col()
+        };
+        assert!(!added(&table(), c).changes.iter().any(is_rebuild));
+    }
+
+    /// **`ADD COLUMN` always appends.** A column the user dropped into the
+    /// middle carries a `Position`, and taking the fast path there would put it
+    /// at the end instead — the designer showing one order and the table having
+    /// another.
+    #[test]
+    fn a_column_added_in_the_middle_still_rebuilds() {
+        let t = table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns.insert(1, ColumnDraft::new(new_col()));
+        let cs = diff(&t, &d, Sqlite);
+        assert!(
+            cs.changes.iter().any(is_rebuild),
+            "an ADD COLUMN would land at the end: {:?}",
+            cs.changes
+        );
+    }
+
+    /// Uniqueness isn't on `ColumnInfo` — it arrives as an index, which SQLite
+    /// has no native `supports_change` arm for and which therefore takes the set
+    /// back to a rebuild. Pinned because the fast path would otherwise be one
+    /// `AddIndex` arm away from adding *"Cannot add a UNIQUE column"* to a plan.
+    #[test]
+    fn a_column_that_brings_an_index_still_rebuilds() {
+        let t = table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns.push(ColumnDraft::new(new_col()));
+        d.indexes.push(IndexDraft {
+            original: None,
+            info: IndexInfo {
+                name: "ix_c".into(),
+                columns: vec![IndexColumn {
+                    name: "c".into(),
+                    ..Default::default()
+                }],
+                unique: true,
+                ..Default::default()
+            },
+        });
+        assert!(diff(&t, &d, Sqlite).changes.iter().any(is_rebuild));
+    }
+
+    /// The fast path is one column's answer, not the set's: an add that could
+    /// have gone native rides the rebuild when anything else in the same edit
+    /// needs one, because the rebuild already writes the column.
+    #[test]
+    fn a_native_add_beside_a_retype_is_subsumed_by_the_rebuild() {
+        let t = table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.type_name = "TEXT".into();
+        d.columns.push(ColumnDraft::new(new_col()));
+        let cs = diff(&t, &d, Sqlite);
+        assert!(cs.changes.iter().any(is_rebuild), "{:?}", cs.changes);
+        assert!(
+            !cs.emit().iter().any(|s| s.contains("ADD COLUMN")),
+            "the rebuild writes the column; adding it again would be twice: {:?}",
+            cs.emit()
         );
     }
 

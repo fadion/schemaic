@@ -3082,6 +3082,125 @@ mod ddl_tests {
         assert_eq!(objects(&keeper, "t"), 0);
     }
 
+    /// **Every column shape the fast path calls native, run at real SQLite.**
+    ///
+    /// This is the test the `ADD COLUMN` fast path actually rests on. Its
+    /// failure mode is not a wrong answer but a *half-applied plan*: the rebuild
+    /// is skipped, the engine refuses the statement, and the edit the preview
+    /// promised is gone. A predicate that drifts away from the engine's
+    /// restrictions can't be caught by reasoning about it — only by asking
+    /// SQLite, which is what this does, one shape per restriction.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_natively_added_column_is_one_sqlite_accepts() {
+        use schemaic_core::ddl::{self, ColumnDraft, TableDraft};
+        use schemaic_core::intel::SqlDialect::Sqlite;
+        use schemaic_core::schema::ColumnInfo;
+
+        // `ColumnInfo::default()` is NOT NULL with no default, which is a shape
+        // SQLite genuinely refuses — so the shapes are built off an addable base
+        // rather than off `Default`, or the test proves the opposite of what it
+        // says.
+        let base = || ColumnInfo {
+            name: "c".into(),
+            type_name: "TEXT".into(),
+            nullable: true,
+            ..Default::default()
+        };
+        let shapes: Vec<(&str, ColumnInfo)> = vec![
+            ("plain", base()),
+            (
+                "not null with a constant default",
+                ColumnInfo {
+                    nullable: false,
+                    default: Some("'x'".into()),
+                    ..base()
+                },
+            ),
+            (
+                "collated",
+                ColumnInfo {
+                    collation: Some("NOCASE".into()),
+                    ..base()
+                },
+            ),
+            (
+                "negative number default",
+                ColumnInfo {
+                    type_name: "INTEGER".into(),
+                    default: Some("-1".into()),
+                    ..base()
+                },
+            ),
+            (
+                "a default whose parens are inside a literal",
+                ColumnInfo {
+                    default: Some("'a (b)'".into()),
+                    ..base()
+                },
+            ),
+            (
+                "generated",
+                ColumnInfo {
+                    type_name: "INTEGER".into(),
+                    generated: Some("a * 2".into()),
+                    ..base()
+                },
+            ),
+            (
+                "generated and not null",
+                ColumnInfo {
+                    generated: Some("'x'".into()),
+                    nullable: false,
+                    ..base()
+                },
+            ),
+        ];
+
+        for (i, (label, shape)) in shapes.into_iter().enumerate() {
+            let (keeper, db) = shared_memory(&format!("add_col_{i}"));
+            keeper
+                .execute_batch("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (7);")
+                .unwrap();
+            let schema = fetch_schema(&db).await.expect("schema");
+            let table = schema.tables.iter().find(|t| t.name == "t").expect("t");
+
+            let mut draft = TableDraft::from_table(table);
+            draft.columns.push(ColumnDraft::new(shape));
+            let plan = ddl::diff(table, &draft, Sqlite);
+            let sql = plan.emit();
+            assert!(
+                sql.iter().any(|s| s.contains("ADD COLUMN")),
+                "{label} should take the fast path: {sql:?}"
+            );
+            assert!(
+                !sql.iter().any(|s| s.contains("INSERT INTO")),
+                "{label} rebuilt instead: {sql:?}"
+            );
+            db.run_ddl(MAIN, &sql, CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("SQLite refused the {label} column: {e}\n{sql:?}"));
+
+            // The column is there, and the row that was already in the table
+            // survived — the half-applied plan this test exists to catch would
+            // have left one or the other wrong.
+            //
+            // `table_xinfo`, not `table_info`: the latter omits generated
+            // columns entirely, so it reports a successful add as a missing one.
+            let cols: Vec<String> = keeper
+                .prepare("SELECT name FROM pragma_table_xinfo('t')")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(cols, ["a", "c"], "{label}");
+            let a: i64 = keeper
+                .query_row("SELECT a FROM t", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(a, 7, "{label} lost the existing row");
+        }
+    }
+
     /// Editing a view, end to end through the real `fetch_schema`, the real
     /// differ, the real emitter and real SQLite — because every part of this is
     /// a *different shape* from the other two engines, and each one is only
