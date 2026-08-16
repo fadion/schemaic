@@ -1988,6 +1988,27 @@ Re-introducing the anti-patterns these guard against is a regression:
   gates `FocusVisible` on `app_state.keyboard_navigation`, which only its own `view_tab_navigation`
   ever sets, so a `focus_visible` rule on a ring member usually never fires at all. A **group**
   (below) deliberately shows nothing.
+  **`widgets::keyboard_nav` is the app's own `:focus-visible`**, and the reason the ring can be
+  `accent` rather than something apologetic. A focus outline is information the *keyboard* needs;
+  under the pointer it marks what you just clicked, so a ring bright enough to be useful under Tab
+  is noise under the mouse — which is why it used to be `field_border_active`, `#303453` against
+  the dark panel, a shade off the surface it sat on. The flag is **set in `FocusRing::step_from`**
+  and **cleared on the root's `PointerDown`**, and both halves are the way they are for a reason:
+  every keyboard-driven focus change in the app is a Tab through the ring, so `step_from` *is* the
+  definition (no key allowlist to keep in step, and typing in a field can't arm it), while a key
+  listener on the window root — the obvious spelling — would have missed the only case that
+  matters, since floem bubbles a key to the root **only if nothing consumed it** and Tab is exactly
+  what the ring consumes. `FocusRing::focus_at` and `hand_keyboard_back` deliberately leave it
+  alone: both move focus on behalf of something the user may have reached either way (a dropdown
+  handing the keyboard back, a field unmounting under them), so the last real gesture stands.
+  It rides in a detached-scope `thread_local` signal, the shape `window_size` and `pointer_released`
+  already use. Buttons, the Settings toggle switch and the colour swatches all read it.
+  **The outline follows the face's corner radius, and `in_ring_button` has to be told it.** Floem
+  strokes an outline at *the painting view's* `border_radius` (`view::paint_outline`), and the ring
+  member is a wrapper around the face — so with no radius on the wrapper every rounded button in
+  the app wore a **square** ring. `widgets::ACTION_RADIUS`/`CONTROL_RADIUS` are read by both the
+  face's own style and the wrapper, so the two cannot drift; icon buttons pass `0.0`, their faces
+  being genuinely square.
 - **A group of like things is *one* Tab stop, and arrows move within it.** Manage Connections'
   colour swatches (`connection_form::color_picker`) and connection list, the designer's section
   strip, and the designer/trigger item list (`table_designer::list_pane`) each take a single ring
@@ -2008,7 +2029,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   indication must cost **no layout**, so the list recolours the border it already has and a swatch
   takes an `outline` (painted outside the box) rather than a border that would nudge the row along.
   The swatch cursor is a signal of its own, cleared on `FocusLost`, so the halo never outlives the
-  focus it stands for.
+  focus it stands for — and it is gated on `keyboard_nav` like a button's ring, because it says
+  which swatch the *arrows* will land on, while which one is **chosen** is already said by the
+  white border it wears.
 - **In a field holding *code*, Tab is typing.** `FieldCfg::tab_indents` suppresses only the ring's
   step-away, so Tab still *arrives* at the field and floem's own `InsertTab` then runs; Escape is
   the way out, blurring to the `focus_root` whose Tab re-enters the ring **after this field** (the
