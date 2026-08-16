@@ -1092,6 +1092,46 @@ impl GridState {
     }
 }
 
+/// Whether a reading of the Go-to-row **nonce** means "jump now".
+///
+/// `seen` is the effect's previous value: `None` on its build run, which must not
+/// jump — the effect is created whenever the grid is, and jumping there would
+/// move the selection every time a result loaded. An unchanged `step` must not
+/// re-fire either: the effect re-runs when anything else it reads changes, and a
+/// second jump to the same row would fight a scroll the user had since made.
+pub(crate) fn goto_fires(seen: Option<u64>, step: u64) -> bool {
+    seen.is_some_and(|s| s != step)
+}
+
+/// Keep at most one of the grid's two panel-level bars open: opening either
+/// closes the other.
+///
+/// They share one anchor at the panel's top-right, so both open paints one over
+/// the other — and the one on top takes every keystroke while the one underneath
+/// is the one you can see. The editor's find/goto pair does the same.
+///
+/// **Both directions, which is the fix.** The exclusion tracked `goto_open`
+/// alone and the Ctrl+F arm was a bare `find_open.set(true)`, so Ctrl+G then
+/// Ctrl+F left both mounted: the goto bar painted over the find bar while the
+/// find field autofocused and swallowed the typing, and Escape appeared to do
+/// nothing. One function so a third bar joins here rather than adding a third
+/// half-rule, and so the pair can be asserted at all.
+///
+/// The sets are guarded: `RwSignal::set` never dedups, and a redundant write
+/// would re-run the other effect and dispose a field mid-keystroke.
+pub(crate) fn one_bar_at_a_time(find_open: RwSignal<bool>, goto_open: RwSignal<bool>) {
+    create_effect(move |_| {
+        if goto_open.get() && find_open.get_untracked() {
+            find_open.set(false);
+        }
+    });
+    create_effect(move |_| {
+        if find_open.get() && goto_open.get_untracked() {
+            goto_open.set(false);
+        }
+    });
+}
+
 /// Whether `Del` over `rows` should **mark** them all or unmark them all.
 ///
 /// The whole range is driven to one state rather than each row flipping its own:
@@ -2728,21 +2768,20 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     // the *active* cell would do.
     create_effect(move |seen: Option<u64>| {
         let step = gs.goto_step.get();
-        if seen == Some(step) || seen.is_none() {
+        if !goto_fires(seen, step) {
             return step;
         }
-        // The **numbered** rows only. A pending unsaved row's gutter reads `*`,
-        // not a number, so counting them in made "row 101" land on a row showing
-        // no number at all, and made a row of 9s stop one short of the last row
-        // that does.
-        let total = nrows;
+        // `nrows` — the **numbered** rows only. A pending unsaved row's gutter
+        // reads `*`, not a number, so counting them in made "row 101" land on a
+        // row showing no number at all, and made a row of 9s stop one short of
+        // the last row that does.
         let target = gs
             .goto_query
-            .with_untracked(|q| schemaic_core::model::goto_row_index(q, total));
-        if let Some(i) = target {
-            gs.anchor.set(Some((i, 0)));
-            gs.active.set(Some((i, ncols.saturating_sub(1))));
-            scroll_active_into_view(gs, i, 0);
+            .with_untracked(|q| schemaic_core::model::goto_target(q, nrows, ncols));
+        if let Some(t) = target {
+            gs.anchor.set(Some(t.anchor));
+            gs.active.set(Some(t.active));
+            scroll_active_into_view(gs, t.active.0, t.scroll_col);
         }
         // Always close, even on a miss — the editor's go-to-line does the same,
         // and a popup that stays open after Enter reads as "still working".
@@ -2829,25 +2868,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         };
         sel_summary.set(Some(label));
     });
-    // Only one of the two bars is up at a time — they share an anchor, so both
-    // open would paint one over the other, and the one on top takes every
-    // keystroke while the one underneath is the one you can see. The editor's
-    // pair does this too.
-    //
-    // **Both directions.** The exclusion tracked `goto_open` alone and the Ctrl+F
-    // arm was a bare `find_open.set(true)`, so Ctrl+G then Ctrl+F left both
-    // mounted: the goto bar painted over the find bar while the find field
-    // autofocused and swallowed the typing, and Escape appeared to do nothing.
-    create_effect(move |_| {
-        if gs.goto_open.get() {
-            gs.find_open.set(false);
-        }
-    });
-    create_effect(move |_| {
-        if gs.find_open.get() {
-            gs.goto_open.set(false);
-        }
-    });
+    one_bar_at_a_time(gs.find_open, gs.goto_open);
     // And hand the keyboard back when the goto popup closes, for the same reason
     // the find bar does above.
     create_effect(move |was_open: Option<bool>| {
@@ -5290,8 +5311,9 @@ fn gutter_cell(gs: GridState, pos: usize, ncols: usize, pending: Option<usize>) 
     container(text(label).style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_faint())))
         .on_click_stop(move |_| {
             gs.dismiss_overlays();
-            gs.anchor.set(Some((pos, 0)));
-            gs.active.set(Some((pos, ncols.saturating_sub(1))));
+            let (anchor, active) = schemaic_core::model::row_selection(pos, ncols);
+            gs.anchor.set(Some(anchor));
+            gs.active.set(Some(active));
             if let Some(f) = gs.focus_id.get_untracked() {
                 f.request_focus();
             }
@@ -6807,6 +6829,119 @@ mod delete_vote_tests {
     #[test]
     fn an_empty_range_unmarks_nothing() {
         assert!(!delete_vote(|_| true, &[]));
+    }
+}
+
+#[cfg(test)]
+mod one_bar_tests {
+    use super::*;
+    use floem::reactive::Scope;
+
+    /// Opening either bar closes the other — **both** directions. The exclusion
+    /// tracked `goto_open` alone, so Ctrl+F over an open Go-to-row left both
+    /// mounted on one anchor and you typed into the one you couldn't see.
+    #[test]
+    fn opening_either_bar_closes_the_other() {
+        let scope = Scope::new();
+        let find = scope.create_rw_signal(false);
+        let goto = scope.create_rw_signal(false);
+        one_bar_at_a_time(find, goto);
+
+        // Ctrl+G, then Ctrl+F — the direction that was missing.
+        goto.set(true);
+        find.set(true);
+        assert!(find.get_untracked());
+        assert!(!goto.get_untracked(), "Ctrl+F must close the goto bar");
+
+        // And the direction that already worked.
+        goto.set(true);
+        assert!(goto.get_untracked());
+        assert!(!find.get_untracked(), "Ctrl+G must close the find bar");
+
+        scope.dispose();
+    }
+
+    /// Closing one must not open or re-close the other: `set` never dedups, so an
+    /// unguarded write here would re-run the sibling effect and dispose a field
+    /// the user is typing into.
+    #[test]
+    fn closing_a_bar_leaves_the_other_alone() {
+        let scope = Scope::new();
+        let find = scope.create_rw_signal(false);
+        let goto = scope.create_rw_signal(false);
+        one_bar_at_a_time(find, goto);
+
+        find.set(true);
+        find.set(false);
+        assert!(!find.get_untracked());
+        assert!(!goto.get_untracked());
+        scope.dispose();
+    }
+}
+
+#[cfg(test)]
+mod goto_fires_tests {
+    use super::*;
+
+    /// The build run must not jump: this effect is created whenever the grid is,
+    /// and jumping there would move the selection every time a result loaded.
+    #[test]
+    fn the_first_run_never_jumps() {
+        assert!(!goto_fires(None, 0));
+        assert!(!goto_fires(None, 7));
+    }
+
+    /// The effect re-runs when anything else it reads changes, and a second jump
+    /// to the same row would fight a scroll the user had since made.
+    #[test]
+    fn an_unchanged_nonce_does_not_re_fire() {
+        assert!(!goto_fires(Some(7), 7));
+    }
+
+    #[test]
+    fn a_bumped_nonce_jumps() {
+        assert!(goto_fires(Some(7), 8));
+        // It only has to *differ* — a wrap is a bump like any other.
+        assert!(goto_fires(Some(u64::MAX), 0));
+    }
+}
+
+#[cfg(test)]
+mod row_selection_tests {
+    use super::*;
+    use schemaic_core::model::{goto_target, row_selection};
+
+    /// The **link between the two halves**: a row gesture — whether it came from
+    /// the gutter or from Ctrl+G — must read as a *row* to the aggregates bar,
+    /// not as column 0's arithmetic, which is usually an id whose sum means
+    /// nothing. Core owns the gesture and `grid.rs` owns the reading, so the
+    /// agreement between them can only be asserted here.
+    #[test]
+    fn a_row_gesture_reads_as_a_row_selection() {
+        let (anchor, active) = row_selection(4, 5);
+        let bounds = Some((anchor.0, anchor.1, active.0, active.1));
+        assert_eq!(selection_kind(bounds, Some(anchor), 5), SelKind::WholeRow);
+    }
+
+    /// On a **one-column** result a row gesture selects a single cell, and the
+    /// lone-cell rule wins over the single-column exemption — a cell aggregates
+    /// to itself, so there is nothing to say. Worth pinning because the two
+    /// rules meet here and either reading looks defensible in isolation.
+    #[test]
+    fn a_row_gesture_on_a_single_column_result_is_one_cell() {
+        let (anchor, active) = row_selection(4, 1);
+        assert_eq!(active, (4, 0), "the last column is also the first");
+        let bounds = Some((anchor.0, anchor.1, active.0, active.1));
+        assert_eq!(selection_kind(bounds, Some(anchor), 1), SelKind::Nothing);
+    }
+
+    /// And the jump lands on the same shape the gutter click makes, so it reads
+    /// as a row selection too.
+    #[test]
+    fn a_jump_reads_as_a_row_selection() {
+        let t = goto_target("5", 100, 5).unwrap();
+        let bounds = Some((t.anchor.0, t.anchor.1, t.active.0, t.active.1));
+        assert_eq!(selection_kind(bounds, Some(t.anchor), 5), SelKind::WholeRow);
     }
 }
 
