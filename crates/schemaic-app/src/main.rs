@@ -1110,6 +1110,13 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let monitor_interval: RwSignal<u64> = RwSignal::new(MONITOR_INTERVAL_SECS);
     let monitor_paused: RwSignal<bool> = RwSignal::new(false);
     let monitor_export_err: RwSignal<Option<String>> = RwSignal::new(None);
+    // Table-properties modal. `properties` is both the open flag and the object
+    // being described, so a stale fetch can check it before writing.
+    let properties: RwSignal<Option<schemaic_ui::PropertiesTarget>> = RwSignal::new(None);
+    let properties_state: RwSignal<schemaic_ui::PropertiesState> =
+        RwSignal::new(schemaic_ui::PropertiesState::Loading);
+    let properties_counting: RwSignal<bool> = RwSignal::new(false);
+    let properties_count_err: RwSignal<Option<String>> = RwSignal::new(None);
 
     // AI panel state. `ai_session` holds the live CLI conversation (bound to a
     // connection); the reader task streams transcript snapshots over a channel
@@ -3838,6 +3845,118 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         )
     };
 
+    // ── Table properties ────────────────────────────────────────────────────
+    // The statistics behind the properties modal. Fetched for the whole database
+    // (one round trip either way) and then narrowed to the object asked about,
+    // so the set is there for a future size column in the tree without a second
+    // query shape.
+    //
+    // Every landing checks the target is still the one on screen before writing:
+    // this is a fresh connection and a slow-ish catalogue read, so the user can
+    // close the panel or open another table while it is in flight, and a late
+    // reply must not overwrite the newer one.
+    let table_stats: Rc<dyn Fn(schemaic_ui::PropertiesTarget)> = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(move |target: schemaic_ui::PropertiesTarget| {
+            let db = match db_for(target.conn_id) {
+                Ok(db) => db,
+                Err(e) => {
+                    properties_state.set(schemaic_ui::PropertiesState::Failed(e));
+                    return;
+                }
+            };
+            // Asked before the round trip: an engine that publishes nothing has
+            // a different thing to say than one whose fetch failed, and finding
+            // that out by running a query would be the same query returning
+            // empty either way.
+            if !schemaic_core::stats::supports_table_stats(db.engine().dialect()) {
+                properties_state.set(schemaic_ui::PropertiesState::Unsupported);
+                return;
+            }
+            let want = target.clone();
+            let report = create_ext_action(
+                cx,
+                move |res: Result<schemaic_core::stats::SchemaStats, String>| {
+                    if properties.with_untracked(|t| t.as_ref() != Some(&want)) {
+                        return;
+                    }
+                    properties_state.set(match res {
+                        Ok(set) => schemaic_ui::PropertiesState::Loaded(Box::new(
+                            set.get(want.schema.as_deref(), &want.table)
+                                .cloned()
+                                // A table the catalogue didn't list — a view on
+                                // MySQL, a partitioned parent — is "nothing to
+                                // report", not a failure.
+                                .unwrap_or_default(),
+                        )),
+                        Err(e) => schemaic_ui::PropertiesState::Failed(e),
+                    });
+                },
+            );
+            handle.spawn(async move {
+                let res = db
+                    .fetch_table_stats(&target.database)
+                    .await
+                    .map_err(|e| e.to_string());
+                report(res);
+            });
+        })
+    };
+
+    // The exact `COUNT(*)`. Its result is folded into the loaded statistics
+    // rather than kept beside them, so everything that prints a row figure —
+    // the headline, the Markdown copy — reads one place and cannot disagree.
+    let count_rows: Rc<dyn Fn(schemaic_ui::PropertiesTarget)> = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(move |target: schemaic_ui::PropertiesTarget| {
+            let db = match db_for(target.conn_id) {
+                Ok(db) => db,
+                Err(e) => {
+                    properties_count_err.set(Some(e));
+                    return;
+                }
+            };
+            properties_counting.set(true);
+            properties_count_err.set(None);
+            let want = target.clone();
+            let report = create_ext_action(cx, move |res: Result<u64, String>| {
+                if properties.with_untracked(|t| t.as_ref() != Some(&want)) {
+                    return;
+                }
+                properties_counting.set(false);
+                match res {
+                    Ok(n) => {
+                        properties_state.update(|st| {
+                            // An engine with no statistics still gets its count:
+                            // the state becomes a `Loaded` holding nothing but
+                            // the one figure it could answer.
+                            let mut stats = match st {
+                                schemaic_ui::PropertiesState::Loaded(s) => s.clone(),
+                                _ => Box::new(schemaic_core::stats::TableStats {
+                                    table: want.table.clone(),
+                                    schema: want.schema.clone(),
+                                    ..Default::default()
+                                }),
+                            };
+                            stats.exact_rows = Some(n);
+                            *st = schemaic_ui::PropertiesState::Loaded(stats);
+                        });
+                    }
+                    Err(e) => properties_count_err.set(Some(e)),
+                }
+            });
+            handle.spawn(async move {
+                let res = db
+                    .count_rows(&target.database, target.schema.as_deref(), &target.table)
+                    .await
+                    .map_err(|e| e.to_string());
+                report(res);
+            });
+        })
+    };
+
     let trigger_functions: schemaic_ui::TriggerFnFn = {
         let handle = handle.clone();
         let db_for = db_for.clone();
@@ -5427,6 +5546,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             monitor_paused,
             monitor_export_err,
             erd: RwSignal::new(None),
+            properties,
+            properties_state,
+            properties_counting,
+            properties_count_err,
             run_guard,
         },
         schema: SchemaUi {
@@ -5460,6 +5583,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             view_algorithm,
             trigger_functions,
             trigger_source,
+            table_stats,
+            count_rows,
         }),
         // Reset on every open (`import_view::open_import`), so one bundle serves
         // every table rather than a per-open scope that would need disposing.

@@ -655,7 +655,10 @@ pub(crate) async fn fetch_table_list(db: &Db, database: &str) -> Result<DbSchema
 /// `reltuples` is `-1` on a relation that has never been analyzed, and `-1` is
 /// not a row count — it is the catalogue saying it doesn't know, so it becomes
 /// `NULL` here and `None` in the model rather than a negative number nobody
-/// checks for.
+/// checks for. **PostgreSQL 13 and earlier wrote `0` for the same thing**, which
+/// is indistinguishable from an empty table; on those servers an unanalyzed
+/// table reports zero rows, and the estimate label plus **Count rows** are the
+/// only remedy. 13 went end-of-life in November 2025.
 ///
 /// Only `r` (ordinary) and `m` (materialized view) are asked for a size. A
 /// **partitioned** parent (`p`) has no storage of its own — `pg_table_size`
