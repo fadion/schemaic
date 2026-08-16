@@ -253,7 +253,10 @@ pub fn sql_literal(v: &Value, dialect: SqlDialect) -> String {
         Value::Str(s) => {
             let escaped = match dialect {
                 SqlDialect::MySql => s.replace('\\', "\\\\").replace('\'', "''"),
-                SqlDialect::Postgres => s.replace('\'', "''"),
+                // SQLite is standard-conforming like Postgres and has no
+                // backslash escape at all, so doubling one would corrupt the
+                // value exactly as it would there.
+                SqlDialect::Postgres | SqlDialect::Sqlite => s.replace('\'', "''"),
             };
             format!("'{escaped}'")
         }
@@ -261,12 +264,20 @@ pub fn sql_literal(v: &Value, dialect: SqlDialect) -> String {
 }
 
 /// Quote a SQL identifier in the connection's dialect, doubling the embedded
-/// quote character: MySQL `` `name` ``, PostgreSQL `"name"`. The *other*
-/// dialect's quote char is an ordinary character and passes through untouched.
+/// quote character: MySQL `` `name` ``, PostgreSQL and SQLite `"name"`. The
+/// *other* dialect's quote char is an ordinary character and passes through
+/// untouched.
+///
+/// SQLite accepts `"x"`, `` `x` `` and `[x]` when *reading* (the lexer knows all
+/// three), but **emits only the standard form**: `"` is the one with a defined
+/// escape, since a `]` cannot be written inside brackets at all, so a name
+/// containing one would be unquotable in the form we chose to generate.
 pub fn ident_sql(name: &str, dialect: SqlDialect) -> String {
     match dialect {
         SqlDialect::MySql => format!("`{}`", name.replace('`', "``")),
-        SqlDialect::Postgres => format!("\"{}\"", name.replace('"', "\"\"")),
+        SqlDialect::Postgres | SqlDialect::Sqlite => {
+            format!("\"{}\"", name.replace('"', "\"\""))
+        }
     }
 }
 
@@ -646,7 +657,7 @@ mod tests {
         )
     }
 
-    use crate::intel::SqlDialect::{MySql, Postgres};
+    use crate::intel::SqlDialect::{MySql, Postgres, Sqlite};
 
     /// A writer that fails after `ok_bytes` bytes — stands in for a full disk or a
     /// revoked permission part-way through a large export.
@@ -857,6 +868,34 @@ mod tests {
         assert_eq!(ident_sql("a`b", Postgres), "\"a`b\"");
     }
 
+    /// SQLite *reads* `"x"`, `` `x` `` and `[x]`, but emits only the standard
+    /// form: `"` is the one of the three with a defined escape, and a name
+    /// carrying a `]` could not be written in brackets at all.
+    #[test]
+    fn sqlite_emits_the_standard_quoting_of_its_three() {
+        assert_eq!(ident_sql("plain", Sqlite), "\"plain\"");
+        assert_eq!(ident_sql("a\"b", Sqlite), "\"a\"\"b\"");
+        // The two compatibility quotings are ordinary characters on the way out.
+        assert_eq!(ident_sql("a`b", Sqlite), "\"a`b\"");
+        assert_eq!(ident_sql("a]b", Sqlite), "\"a]b\"");
+    }
+
+    /// SQLite has no backslash escape, so doubling one would corrupt the value —
+    /// the same reason Postgres doesn't, and the same failure (`C:\tmp` →
+    /// `C:\\tmp` written into the row).
+    #[test]
+    fn sql_literal_does_not_touch_a_backslash_on_sqlite() {
+        let v = Value::Str("C:\\tmp".to_string());
+        assert_eq!(sql_literal(&v, Sqlite), "'C:\\tmp'");
+        assert_eq!(sql_literal(&v, Postgres), "'C:\\tmp'");
+        assert_eq!(sql_literal(&v, MySql), "'C:\\\\tmp'");
+        // The injection guard is doubling the quote, and that is on everywhere.
+        assert_eq!(
+            sql_literal(&Value::Str("O'Hara".to_string()), Sqlite),
+            "'O''Hara'"
+        );
+    }
+
     /// Every identifier-quoting entry point in the workspace answers to
     /// `ident_sql`. The *reading* side has had a single-lexer invariant since
     /// round 1; the writing side had four implementations that had each
@@ -879,7 +918,7 @@ mod tests {
             "",
         ];
         for name in nasty {
-            for d in [MySql, Postgres] {
+            for d in [MySql, Postgres, Sqlite] {
                 assert_eq!(
                     crate::schema::ddl_ident_in(name, d),
                     ident_sql(name, d),

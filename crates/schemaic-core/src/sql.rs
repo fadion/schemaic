@@ -18,17 +18,98 @@
 
 use crate::intel::SqlDialect;
 
+/// The lexical boundary rules, one predicate per divergence — the table
+/// [`skip_noncode`] and [`skip_comment`] read instead of comparing against one
+/// engine.
+///
+/// **They are predicates because the question stopped being binary.** The scanner
+/// used to ask `dialect == SqlDialect::Postgres` and `!= SqlDialect::MySql`, which
+/// silently sorts any *third* engine onto whichever side each comparison happens
+/// to put it — with nothing failing to compile, because `!=` is exhaustive over
+/// any number of variants. Three of those defaults would have been wrong for
+/// SQLite and two of them dangerously: it has no `\` escape inside a string, so
+/// `'C:\'` under MySQL's rule latches the scanner into a literal that never ends
+/// and swallows the rest of the statement — which is precisely how a `WHERE` gets
+/// hidden from the unsafe-statement guard (the bug this module was consolidated
+/// to kill). Naming the capability makes each site say what it means, and adding
+/// an engine fills in a table rather than hoping a `!=` falls the right way.
+impl SqlDialect {
+    /// Does `--` need whitespace (or EOL) after it to open a comment?
+    ///
+    /// MySQL alone requires it, so there `1--2` is `1 - -2`. PostgreSQL and SQLite
+    /// follow the standard: `--` opens a comment wherever it appears.
+    fn dash_comment_needs_space(self) -> bool {
+        matches!(self, SqlDialect::MySql)
+    }
+
+    /// Is `#` a line comment? MySQL only — PostgreSQL spells operators with it
+    /// (`#>`/`#>>`/`#-`), and SQLite doesn't accept the character at all, so
+    /// treating it as a comment there would swallow a line the server would have
+    /// rejected outright.
+    fn hash_line_comment(self) -> bool {
+        matches!(self, SqlDialect::MySql)
+    }
+
+    /// Does `\` escape inside an ordinary `'…'` string?
+    ///
+    /// MySQL only. PostgreSQL confines it to `E'…'` ([`Self::e_string_backslash`]),
+    /// and SQLite has no backslash escape whatsoever — `'a\'` there is a complete
+    /// string whose last character is a backslash, where MySQL reads the quote as
+    /// escaped and keeps scanning.
+    fn backslash_escapes(self) -> bool {
+        matches!(self, SqlDialect::MySql)
+    }
+
+    /// Does an `E'…'` prefix turn `\` escapes on? PostgreSQL only.
+    fn e_string_backslash(self) -> bool {
+        matches!(self, SqlDialect::Postgres)
+    }
+
+    /// Is `"…"` a quoted *identifier* rather than a string literal?
+    ///
+    /// MySQL reads it as a string and `\`-escapes it; PostgreSQL and SQLite read it
+    /// as an identifier, escaped only by doubling. (SQLite additionally *falls back*
+    /// to reading one as a string when it resolves to no identifier, but that is a
+    /// name-resolution rule, not a lexical one — the span is the same either way.)
+    fn double_quote_is_ident(self) -> bool {
+        !matches!(self, SqlDialect::MySql)
+    }
+
+    /// Are `` `…` `` identifiers accepted? MySQL's own syntax, which SQLite also
+    /// takes for compatibility; PostgreSQL doesn't.
+    fn backtick_ident(self) -> bool {
+        matches!(self, SqlDialect::MySql | SqlDialect::Sqlite)
+    }
+
+    /// Are `[…]` identifiers accepted? SQLite only (taken for SQL-Server/Access
+    /// compatibility). There is **no escape inside one** — the span ends at the
+    /// first `]`, because SQLite defines no way to write one.
+    fn bracket_ident(self) -> bool {
+        matches!(self, SqlDialect::Sqlite)
+    }
+
+    /// Are `$tag$ … $tag$` strings accepted? PostgreSQL only.
+    fn dollar_quoted(self) -> bool {
+        matches!(self, SqlDialect::Postgres)
+    }
+
+    /// Does the client honour a `DELIMITER` directive? MySQL only — see
+    /// [`delimiter_directive`] for why it exists there at all.
+    fn delimiter_directive(self) -> bool {
+        matches!(self, SqlDialect::MySql)
+    }
+}
+
 /// If `b[i..]` starts a comment, return the index just past it. Handles `--`
-/// (**MySQL only** requires whitespace/EOL after it, so there `1--2` is
-/// `1 - -2`, not a comment; Postgres follows the standard and needs none),
-/// `#` line comments (**MySQL only** — Postgres uses `#` in operators), and
-/// `/* … */` block comments (both dialects; non-nesting).
+/// (whitespace after it required per [`SqlDialect::dash_comment_needs_space`]),
+/// `#` line comments (per [`SqlDialect::hash_line_comment`]), and `/* … */` block
+/// comments (every dialect; non-nesting).
 fn skip_comment(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
     let n = b.len();
     if b[i] == b'-'
         && i + 1 < n
         && b[i + 1] == b'-'
-        && (dialect == SqlDialect::Postgres || i + 2 >= n || b[i + 2].is_ascii_whitespace())
+        && (!dialect.dash_comment_needs_space() || i + 2 >= n || b[i + 2].is_ascii_whitespace())
     {
         let mut j = i + 2;
         while j < n && b[j] != b'\n' {
@@ -36,7 +117,7 @@ fn skip_comment(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
         }
         return Some(j);
     }
-    if b[i] == b'#' && dialect != SqlDialect::Postgres {
+    if b[i] == b'#' && dialect.hash_line_comment() {
         let mut j = i + 1;
         while j < n && b[j] != b'\n' {
             j += 1;
@@ -51,6 +132,18 @@ fn skip_comment(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
         return Some((j + 2).min(n));
     }
     None
+}
+
+/// Does a comment open at `b[i]`?
+///
+/// The classification half of [`skip_comment`], exposed because
+/// [`crate::pairs::region_at`] has to tell a comment span from a string span
+/// *after* the lexer has found one, and was answering it with its own byte test —
+/// a second copy of the rule, which said `#` opened a comment on every dialect
+/// but Postgres. That was right until it wasn't: SQLite has no `#` comment, and a
+/// duplicated rule is one that gets a new engine wrong in exactly one place.
+pub(crate) fn comment_open(b: &[u8], i: usize, dialect: SqlDialect) -> bool {
+    i < b.len() && skip_comment(b, i, dialect).is_some()
 }
 
 /// Scan a quoted span opening at `b[i]` (quote byte `q`) to just past its close,
@@ -134,36 +227,50 @@ pub fn is_word_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_' || b >= 0x80
 }
 
-/// If `b[i..]` starts a string literal, quoted/backtick identifier, dollar-quoted
-/// string, or comment, return the index just past it; otherwise `None`. Boundary
-/// rules follow `dialect` (see the module docs): MySQL `\`-escapes every quote and
-/// treats `"`/`` ` `` as strings/identifiers; PostgreSQL uses `"` identifiers,
-/// `$tag$` strings, and `\`-escapes only in `E'…'`.
+/// Is the `'` at `i` preceded by a standalone `E`/`e` prefix (not the tail of a
+/// longer word), i.e. PostgreSQL's escape-string syntax?
+fn e_prefixed(b: &[u8], i: usize) -> bool {
+    i >= 1
+        && matches!(b[i - 1], b'e' | b'E')
+        && (i < 2 || !(b[i - 2].is_ascii_alphanumeric() || b[i - 2] == b'_'))
+}
+
+/// Scan a SQLite `[…]` bracketed identifier to just past its `]`. There is no
+/// escape inside one, so the span simply ends at the first `]`; unterminated →
+/// end of input, matching [`scan_quoted`]'s policy.
+fn scan_bracket(b: &[u8], i: usize) -> usize {
+    let n = b.len();
+    let mut j = i + 1;
+    while j < n {
+        if b[j] == b']' {
+            return j + 1;
+        }
+        j += 1;
+    }
+    n
+}
+
+/// If `b[i..]` starts a string literal, quoted/backtick/bracketed identifier,
+/// dollar-quoted string, or comment, return the index just past it; otherwise
+/// `None`. Every boundary rule comes off the [`SqlDialect`] capability table
+/// above, so no engine is the implicit default: MySQL `\`-escapes every quote and
+/// reads `"` as a string; PostgreSQL uses `"` identifiers, `$tag$` strings and
+/// `\`-escapes only in `E'…'`; SQLite reads `"`, `` ` `` *and* `[…]` as
+/// identifiers and has no backslash escape at all.
 pub fn skip_noncode(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
     if let Some(j) = skip_comment(b, i, dialect) {
         return Some(j);
     }
-    let pg = dialect == SqlDialect::Postgres;
     match b[i] {
         b'\'' => {
-            // MySQL: `\` escapes. Postgres: only in an `E'…'`/`e'…'` string — a
-            // standalone `E` prefix (not the tail of a longer word).
-            let backslash = if pg {
-                i >= 1
-                    && matches!(b[i - 1], b'e' | b'E')
-                    && (i < 2 || !(b[i - 2].is_ascii_alphanumeric() || b[i - 2] == b'_'))
-            } else {
-                true
-            };
+            let backslash =
+                dialect.backslash_escapes() || (dialect.e_string_backslash() && e_prefixed(b, i));
             Some(scan_quoted(b, i, b'\'', backslash))
         }
-        // MySQL: `"` is a string (with `\` escapes). Postgres: a quoted identifier
-        // (no `\` escapes; only `""` doubling).
-        b'"' => Some(scan_quoted(b, i, b'"', !pg)),
-        // MySQL backtick identifier (Postgres doesn't use backticks).
-        b'`' if !pg => Some(scan_quoted(b, i, b'`', false)),
-        // Postgres dollar-quoted string (`$tag$ … $tag$`); `None` for `$1` params.
-        b'$' if pg => scan_dollar(b, i),
+        b'"' => Some(scan_quoted(b, i, b'"', !dialect.double_quote_is_ident())),
+        b'`' if dialect.backtick_ident() => Some(scan_quoted(b, i, b'`', false)),
+        b'[' if dialect.bracket_ident() => Some(scan_bracket(b, i)),
+        b'$' if dialect.dollar_quoted() => scan_dollar(b, i),
         _ => None,
     }
 }
@@ -243,7 +350,7 @@ pub fn find_code(hay: &str, needle: &str, dialect: SqlDialect) -> Option<usize> 
 /// script into fragments that are each a syntax error. It is recognised only at
 /// the start of a statement, so `SELECT delimiter FROM t` is untouched.
 fn delimiter_directive(sql: &str, i: usize, dialect: SqlDialect) -> Option<(usize, String)> {
-    if dialect == SqlDialect::Postgres {
+    if !dialect.delimiter_directive() {
         return None;
     }
     let b = sql.as_bytes();
@@ -975,6 +1082,129 @@ mod tests {
     }
     fn leading_keyword(s: &str) -> Option<String> {
         super::leading_keyword(s, SqlDialect::MySql)
+    }
+
+    // ── SQLite boundaries ────────────────────────────────────────────────────
+    // Every one of these passed *the wrong way* before the capability table
+    // existed, and none of them would have failed to compile: `!= Postgres` and
+    // `== Postgres` each sort a third engine silently. They are written as
+    // separate named tests rather than one sweep so a regression says which rule
+    // broke.
+
+    /// SQLite has **no** backslash escape in a string, so `'a\'` ends at its own
+    /// quote. Under MySQL's rule the scanner reads `\'` as escaped, runs past the
+    /// end of the literal and swallows the rest of the statement — which is how a
+    /// `WHERE` disappears from the unsafe-statement guard. This is the dangerous
+    /// one.
+    #[test]
+    fn sqlite_has_no_backslash_escape_in_a_string() {
+        let s = br"'C:\' , x";
+        let end = super::skip_noncode(s, 0, SqlDialect::Sqlite).expect("a string");
+        assert_eq!(&s[..end], br"'C:\'", "the literal ends at its own quote");
+        // MySQL genuinely differs here — the contrast is the point.
+        let my = super::skip_noncode(s, 0, SqlDialect::MySql).expect("a string");
+        assert!(my > end, "MySQL keeps scanning past the escaped quote");
+    }
+
+    /// The consequence, at the level the guard actually works on: a `DELETE`
+    /// whose `WHERE` follows a path literal is only safe if the literal ended.
+    #[test]
+    fn a_windows_path_literal_does_not_hide_a_sqlite_where() {
+        let sql = r"DELETE FROM files WHERE dir = 'C:\' AND id > 0";
+        assert!(super::has_top_level_where(sql, SqlDialect::Sqlite));
+        assert_eq!(super::unsafe_reason(sql, SqlDialect::Sqlite), None);
+    }
+
+    /// SQLite follows the standard: `--` opens a comment with no whitespace after
+    /// it, where MySQL needs some and reads `1--2` as arithmetic.
+    #[test]
+    fn sqlite_dash_comment_needs_no_whitespace() {
+        let s = b"1--2\nx";
+        assert_eq!(super::skip_noncode(s, 1, SqlDialect::Sqlite), Some(4));
+        assert_eq!(super::skip_noncode(s, 1, SqlDialect::MySql), None);
+    }
+
+    /// `#` is not a comment in SQLite — it isn't even valid there — so treating it
+    /// as one would swallow a line the engine would have rejected.
+    #[test]
+    fn sqlite_hash_is_not_a_comment() {
+        let s = b"#nope\nx";
+        assert_eq!(super::skip_noncode(s, 0, SqlDialect::Sqlite), None);
+        assert_eq!(super::skip_noncode(s, 0, SqlDialect::MySql), Some(5));
+    }
+
+    /// SQLite accepts all three identifier quotings, which no other engine here
+    /// does: `"x"` (standard), `` `x` `` (MySQL compatibility) and `[x]`
+    /// (SQL-Server compatibility).
+    #[test]
+    fn sqlite_takes_all_three_identifier_quotings() {
+        // Each closer sits at index 7, so the span ends at 8.
+        for (src, end) in [
+            (&br#""my tbl" x"#[..], 8),
+            (&b"`my tbl` x"[..], 8),
+            (&b"[my tbl] x"[..], 8),
+        ] {
+            assert_eq!(
+                super::skip_noncode(src, 0, SqlDialect::Sqlite),
+                Some(end),
+                "{}",
+                String::from_utf8_lossy(src)
+            );
+        }
+    }
+
+    /// A bracketed identifier has no escape, so the span ends at the first `]` —
+    /// and, more to the point, the space inside it must not split a statement or
+    /// end a word.
+    #[test]
+    fn a_bracketed_identifier_does_not_split_a_statement() {
+        let sql = "SELECT * FROM [my; tbl]; SELECT 2;";
+        let r = super::statement_ranges(sql, SqlDialect::Sqlite);
+        assert_eq!(r.len(), 2, "{:?}", r);
+        assert_eq!(&sql[r[0].0..r[0].1], "SELECT * FROM [my; tbl];");
+    }
+
+    /// Brackets are SQLite's alone: on the other engines `[` is ordinary code, so
+    /// the same text splits where its semicolons are.
+    #[test]
+    fn brackets_are_not_identifiers_on_the_other_engines() {
+        let sql = "SELECT * FROM [my; tbl]; SELECT 2;";
+        assert_eq!(super::statement_ranges(sql, SqlDialect::MySql).len(), 3);
+        assert_eq!(super::statement_ranges(sql, SqlDialect::Postgres).len(), 3);
+    }
+
+    /// `$` is a parameter sigil in SQLite, not a dollar-quote: `$tag$` must stay
+    /// ordinary code, or everything after it is swallowed as a string.
+    #[test]
+    fn sqlite_has_no_dollar_quoting() {
+        let s = b"$tag$ x $tag$";
+        assert_eq!(super::skip_noncode(s, 0, SqlDialect::Sqlite), None);
+        assert_eq!(super::skip_noncode(s, 0, SqlDialect::Postgres), Some(13));
+    }
+
+    /// `DELIMITER` is MySQL's client-side word. SQLite has no such directive, so
+    /// the line is just the head of the statement that follows — the call
+    /// PostgreSQL already gets.
+    ///
+    /// It asserts the *terminator actually moves*, not just a statement count:
+    /// the obvious `DELIMITER $$\nSELECT 1;` splits into one range either way (with
+    /// the terminator changed there is simply no `$$` to split on), so a count
+    /// there is vacuous — which a flip of the capability proved.
+    #[test]
+    fn sqlite_has_no_delimiter_directive() {
+        let sql = "DELIMITER $$\nSELECT 1;";
+        assert!(super::is_delimiter_directive(sql, 0, 13, SqlDialect::MySql));
+        assert!(!super::is_delimiter_directive(
+            sql,
+            0,
+            13,
+            SqlDialect::Sqlite
+        ));
+        // And the consequence: `$$` terminates a statement only where the
+        // directive was honoured.
+        let script = "DELIMITER $$\nSELECT 1$$ SELECT 2$$";
+        assert_eq!(super::statement_ranges(script, SqlDialect::MySql).len(), 2);
+        assert_eq!(super::statement_ranges(script, SqlDialect::Sqlite).len(), 1);
     }
 
     /// A MySQL compound trigger body holds its own semicolons, so a script
