@@ -49,13 +49,16 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Connection as SqliteConn, OpenFlags};
 #[cfg(test)]
 use schemaic_core::model::CellTag;
-use schemaic_core::model::{Column, ResultBuilder, ResultSet, Value};
+use schemaic_core::model::{
+    Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder,
+    ResultSet, Value, WriteStep, one_row_verdict,
+};
 use schemaic_core::schema::{
     ColumnInfo, DbSchema, ForeignKeyInfo, IndexColumn, IndexInfo, TableInfo,
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{Db, DbError};
+use crate::{Db, DbError, ident_sqlite};
 
 /// The one database name SQLite gives the file you opened.
 ///
@@ -151,6 +154,123 @@ fn columns_of(stmt: &rusqlite::Statement<'_>) -> Vec<Column> {
         .collect()
 }
 
+/// Fill in each result column's `origin`, so the editing system can decide what
+/// is writable — the statement-derived stand-in for the provenance MySQL reads
+/// off the wire and PostgreSQL off a prepared statement's `table_oid`.
+///
+/// Everything about it is deliberately conservative, because the failure it
+/// guards against is an `UPDATE` aimed at the wrong row or the wrong column:
+///
+/// - the statement must be a plainly single-table `SELECT`
+///   ([`schemaic_core::intel::projection_of`]) — a join, a CTE, a subquery or a
+///   set operation leaves every column unattributed and the result read-only;
+/// - a **view** is skipped. SQLite will not accept a write to one without an
+///   `INSTEAD OF` trigger, and offering an edit that the server refuses at commit
+///   time is worse than not offering it;
+/// - a qualifier other than `main` is skipped, since an `ATTACH`ed database is a
+///   different file and nothing here has introspected it;
+/// - the projection is placed **positionally**, never matched by name — see
+///   `projection_of` for the aliasing case that makes the difference.
+///
+/// Flags come from the table's own pragmas, so `analyze_edit` gets the same
+/// material it gets from the other two engines and needs no SQLite-specific
+/// branch.
+fn attach_origins(conn: &SqliteConn, sql: &str, columns: &mut [Column]) {
+    use schemaic_core::intel::{Projection, SqlDialect, projection_of};
+
+    let Some((source, projection)) = projection_of(sql, SqlDialect::Sqlite) else {
+        return;
+    };
+    if source
+        .qualifier
+        .as_deref()
+        .is_some_and(|q| !q.eq_ignore_ascii_case(MAIN))
+    {
+        return;
+    }
+    if is_view(conn, &source.name).unwrap_or(true) {
+        return;
+    }
+    let Ok(info) = table_columns(conn, &source.name) else {
+        return;
+    };
+    let unique = single_column_unique_indexes(conn, &source.name).unwrap_or_default();
+
+    // The base column each result column reads, by position.
+    let bases: Vec<Option<String>> = match projection {
+        Projection::Wildcard => info.iter().map(|c| Some(c.name.clone())).collect(),
+        Projection::Items(items) => items,
+    };
+    // A wildcard's width has to agree with the table's, or the placement is off —
+    // which happens for real when a generated column is present, since SQLite
+    // omits a VIRTUAL column from `SELECT *` in some versions but `table_xinfo`
+    // always lists it.
+    if bases.len() != columns.len() {
+        return;
+    }
+
+    for (col, base) in columns.iter_mut().zip(bases) {
+        let Some(base) = base else { continue };
+        let Some(ci) = info.iter().find(|c| c.name.eq_ignore_ascii_case(&base)) else {
+            continue;
+        };
+        col.origin = Some(ColumnOrigin {
+            database: MAIN.to_string(),
+            // SQLite has no namespace level; `main` is the database, not a schema.
+            schema: None,
+            table: source.name.clone(),
+            column: ci.name.clone(),
+            flags: ColumnFlags {
+                primary_key: ci.primary_key,
+                unique_key: unique.iter().any(|u| u.eq_ignore_ascii_case(&ci.name)),
+                not_null: !ci.nullable,
+                auto_increment: ci.auto_increment,
+                // A new row must supply this column or the INSERT fails. Nullable
+                // columns have an implicit NULL default, and a rowid alias fills
+                // itself in, so neither counts.
+                no_default: !ci.nullable
+                    && !ci.auto_increment
+                    && ci.default.is_none()
+                    && ci.generated.is_none(),
+            },
+            // A BLOB cell is rendered as its size and cannot round-trip, so the
+            // editing system must treat such a column as read-only — the same call
+            // the other two engines make for a binary charset. It is the
+            // *declared* type that decides, since that is what the column is for.
+            binary: ci.type_name.eq_ignore_ascii_case("BLOB"),
+        });
+    }
+}
+
+/// Is this name a view rather than a base table? `None` when it is neither.
+fn is_view(conn: &SqliteConn, name: &str) -> Result<bool, DbError> {
+    let kind: Option<String> = conn
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name = ?1 AND type IN ('table','view')",
+            [name],
+            |r| r.get(0),
+        )
+        .ok();
+    match kind.as_deref() {
+        Some("view") => Ok(true),
+        Some(_) => Ok(false),
+        // Not found — treated as "don't attribute", by the caller's `unwrap_or(true)`.
+        None => Err(DbError::Query(format!("no such table: {name}"))),
+    }
+}
+
+/// Columns covered by a single-column UNIQUE index — what the editing system can
+/// use as a `WHERE` key when there is no primary key.
+fn single_column_unique_indexes(conn: &SqliteConn, table: &str) -> Result<Vec<String>, DbError> {
+    let mut out = Vec::new();
+    for ix in table_indexes(conn, table)? {
+        if ix.unique && ix.columns.len() == 1 {
+            out.push(ix.columns[0].name.clone());
+        }
+    }
+    Ok(out)
+}
+
 /// Run `sql` and collect up to `row_cap` rows.
 ///
 /// Cancellation is armed *before* the statement runs and disarmed after: the
@@ -209,7 +329,8 @@ fn run_query(conn: &SqliteConn, sql: &str, row_cap: usize) -> Result<ResultSet, 
         return Ok(rs);
     }
 
-    let columns = columns_of(&stmt);
+    let mut columns = columns_of(&stmt);
+    attach_origins(conn, sql, &mut columns);
     let ncols = columns.len();
     let mut builder = ResultBuilder::new(columns);
     let mut rows = stmt.query([]).map_err(query_err)?;
@@ -232,6 +353,323 @@ fn run_query(conn: &SqliteConn, sql: &str, row_cap: usize) -> Result<ResultSet, 
     rs.truncated = truncated;
     rs.elapsed_ms = start.elapsed().as_millis();
     Ok(rs)
+}
+
+// ── Write-back ───────────────────────────────────────────────────────────────
+
+/// Bind a [`Value`] as a parameter.
+///
+/// `Value::Str` covers everything the text protocols hand back, and SQLite's
+/// dynamic typing means binding it as text is not the lossy choice it would be
+/// elsewhere: the comparison in a `WHERE` applies the column's affinity to the
+/// bound value, so `WHERE id = '3'` finds the row whose `id` is the integer 3.
+fn bind(v: &Value) -> rusqlite::types::Value {
+    use rusqlite::types::Value as Sq;
+    match v {
+        Value::Null => Sq::Null,
+        Value::Int(i) => Sq::Integer(*i),
+        // The model's u64 exceeds i64 only above 2^63, which no SQLite integer
+        // can hold anyway; the lossy case is unreachable from a SQLite result.
+        Value::UInt(u) => i64::try_from(*u)
+            .map(Sq::Integer)
+            .unwrap_or(Sq::Real(*u as f64)),
+        Value::Float(f) => Sq::Real(*f),
+        Value::Str(s) => Sq::Text(s.clone()),
+    }
+}
+
+/// `col = ?` … ` AND ` …, with a NULL key column compared as `IS NULL`.
+///
+/// `= NULL` is never true in SQL, so a key column holding NULL would silently
+/// match no rows — which the 1-row guard would then report as a failed write
+/// rather than as the wrong `WHERE`. It arises for real here: SQLite allows NULL
+/// in a non-`INTEGER` `PRIMARY KEY`.
+fn where_clause(key: &[(String, Value)], params: &mut Vec<rusqlite::types::Value>) -> String {
+    key.iter()
+        .map(|(col, v)| {
+            if v.is_null() {
+                format!("{} IS NULL", ident_sqlite(col))
+            } else {
+                params.push(bind(v));
+                format!("{} = ?", ident_sqlite(col))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// Commit a batch of grid edits in one transaction, each statement required to
+/// affect exactly one row.
+///
+/// The order and the per-statement verdict both come from `core::model`
+/// ([`GridWrite::plan`], [`one_row_verdict`]) rather than from here, so the
+/// promise cannot drift between the three engines.
+///
+/// **The rollback is unconditional and complete**, which is the one way this
+/// engine is simpler than MySQL: SQLite has no non-transactional table type, so
+/// there is no `Rollback::note` case where the rollback succeeds without
+/// achieving anything. A failure here really does leave the file untouched.
+/// Returns the total number of rows affected, which the 1-row guard makes equal
+/// to the number of statements — the caller reports it either way.
+pub(crate) async fn commit_writes(
+    db: &Db,
+    write: &GridWrite,
+    cancel: CancellationToken,
+) -> Result<u64, DbError> {
+    if write.is_empty() {
+        return Ok(0);
+    }
+    let write = write.clone();
+    let db = db.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let work = tokio::task::spawn_blocking(move || {
+        let mut conn = open(&db)?;
+        let _ = tx.send(conn.get_interrupt_handle());
+        // Foreign keys are **off by default** in SQLite, per connection. A grid
+        // delete that orphans rows would otherwise succeed here and fail nowhere,
+        // which is not what the table declares.
+        let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
+        let txn = conn.transaction().map_err(query_err)?;
+        let mut total = 0u64;
+        for step in write.plan() {
+            let (sql, params) = statement_for(step);
+            let affected = txn
+                .execute(&sql, rusqlite::params_from_iter(params))
+                .map_err(query_err)? as u64;
+            one_row_verdict(step, affected).map_err(DbError::Query)?;
+            total += affected;
+        }
+        txn.commit().map_err(query_err)?;
+        Ok(total)
+    });
+
+    let interrupt = rx.await.ok();
+    tokio::select! {
+        r = work => r.map_err(|e| DbError::Query(format!("worker failed: {e}")))?,
+        _ = cancel.cancelled() => {
+            if let Some(h) = interrupt { h.interrupt(); }
+            Err(DbError::Cancelled)
+        }
+    }
+}
+
+/// The SQL and bound parameters for one step of a [`GridWrite`].
+///
+/// The table is named **bare**, not `main.t`: a connection is one file, so there
+/// is nothing to disambiguate, and `main` would be wrong if this statement were
+/// ever run somewhere the file is attached under another name.
+fn statement_for(step: WriteStep<'_>) -> (String, Vec<rusqlite::types::Value>) {
+    let mut params = Vec::new();
+    let sql = match step {
+        WriteStep::Delete(d) => {
+            let w = where_clause(&d.key, &mut params);
+            format!("DELETE FROM {} WHERE {w}", ident_sqlite(&d.table))
+        }
+        WriteStep::Update(u) => {
+            // The SET parameters bind before the WHERE ones, matching the order
+            // they appear in the statement.
+            let sets = u
+                .set
+                .iter()
+                .map(|(col, val)| {
+                    params.push(match val {
+                        Some(t) => rusqlite::types::Value::Text(t.clone()),
+                        None => rusqlite::types::Value::Null,
+                    });
+                    format!("{} = ?", ident_sqlite(col))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let w = where_clause(&u.key, &mut params);
+            format!("UPDATE {} SET {sets} WHERE {w}", ident_sqlite(&u.table))
+        }
+        WriteStep::Insert(i) => {
+            let cols = i
+                .cols
+                .iter()
+                .map(|(col, val)| {
+                    params.push(match val {
+                        Some(t) => rusqlite::types::Value::Text(t.clone()),
+                        None => rusqlite::types::Value::Null,
+                    });
+                    ident_sqlite(col)
+                })
+                .collect::<Vec<_>>();
+            if cols.is_empty() {
+                // Every column left to its default. SQLite spells that
+                // `DEFAULT VALUES`; an empty `() VALUES ()` is a syntax error.
+                format!("INSERT INTO {} DEFAULT VALUES", ident_sqlite(&i.table))
+            } else {
+                let holes = vec!["?"; cols.len()].join(", ");
+                format!(
+                    "INSERT INTO {} ({}) VALUES ({holes})",
+                    ident_sqlite(&i.table),
+                    cols.join(", ")
+                )
+            }
+        }
+    };
+    (sql, params)
+}
+
+/// Re-read the rows a commit changed, so the grid can splice them in place
+/// instead of re-running the whole query.
+pub(crate) async fn refetch_rows(
+    db: &Db,
+    template: &RefetchTemplate,
+    rows: &[RefetchRow],
+    cancel: CancellationToken,
+) -> Result<Vec<(usize, Vec<Value>)>, DbError> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let template = template.clone();
+    let rows = rows.to_vec();
+    let db = db.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let work = tokio::task::spawn_blocking(move || {
+        let conn = open(&db)?;
+        let _ = tx.send(conn.get_interrupt_handle());
+        let cols = template
+            .columns
+            .iter()
+            .map(|c| ident_sqlite(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let key: Vec<(String, Value)> = template
+                .key_cols
+                .iter()
+                .zip(&row.key)
+                .map(|(&ci, v)| (template.columns[ci].clone(), v.clone()))
+                .collect();
+            let mut params = Vec::new();
+            let w = where_clause(&key, &mut params);
+            let sql = format!(
+                "SELECT {cols} FROM {} WHERE {w} LIMIT 1",
+                ident_sqlite(&template.table)
+            );
+            let mut stmt = conn.prepare(&sql).map_err(query_err)?;
+            let mut got = stmt
+                .query(rusqlite::params_from_iter(params))
+                .map_err(query_err)?;
+            // A row that isn't there any more is skipped rather than reported: the
+            // key was written by the commit that just ran, and a concurrent delete
+            // is a real possibility whose right answer is "nothing to splice".
+            if let Some(r) = got.next().map_err(query_err)? {
+                let cells = (0..template.columns.len())
+                    .map(|i| r.get_ref(i).map(value_of).map_err(query_err))
+                    .collect::<Result<Vec<_>, _>>()?;
+                out.push((row.data_row, cells));
+            }
+        }
+        Ok(out)
+    });
+
+    let interrupt = rx.await.ok();
+    tokio::select! {
+        r = work => r.map_err(|e| DbError::Query(format!("worker failed: {e}")))?,
+        _ = cancel.cancelled() => {
+            if let Some(h) = interrupt { h.interrupt(); }
+            Err(DbError::Cancelled)
+        }
+    }
+}
+
+/// Bulk-load rows into one table in a single transaction, as batched multi-row
+/// `INSERT`s — the same shape as the other two engines, and the same guarantee:
+/// each batch must affect exactly as many rows as it carried, or the whole thing
+/// rolls back.
+///
+/// The statement text comes from [`schemaic_core::import::build_insert`], so the
+/// quoting and literal escaping are the ones the SQL *export* is tested for
+/// rather than a second set written here.
+///
+/// **It uses `block_in_place`, not `spawn_blocking`**, because `RowSource` is a
+/// borrowed `&mut dyn Iterator` that cannot be moved into a `'static` task. The
+/// alternative — pulling rows on the async side and shipping batches over a
+/// channel — would need the connection to outlive each batch, which is exactly
+/// what the transaction requires and what `spawn_blocking` per batch cannot give.
+///
+/// **The rollback here is unconditional**, unlike MySQL's: SQLite has no
+/// non-transactional table type, so there is no `Rollback::note` case where the
+/// rollback succeeds having achieved nothing. A cancelled or failed import really
+/// does leave the file as it was.
+pub(crate) async fn import_rows(
+    db: &Db,
+    target: crate::ImportTarget<'_>,
+    rows: crate::RowSource<'_>,
+    cancel: CancellationToken,
+) -> Result<u64, DbError> {
+    use schemaic_core::import::{INSERT_BATCH_ROWS, build_insert};
+    use schemaic_core::intel::SqlDialect;
+
+    let conn = tokio::task::block_in_place(|| open(db))?;
+    let cols: Vec<&str> = target.columns.iter().map(String::as_str).collect();
+
+    tokio::task::block_in_place(|| {
+        let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
+        conn.execute_batch("BEGIN").map_err(query_err)?;
+
+        // Any early return past this point must undo the transaction, so the body
+        // runs to a result first and the rollback is applied to it once.
+        let result = (|| -> Result<u64, DbError> {
+            let mut total = 0u64;
+            let mut batch: Vec<Vec<Value>> = Vec::with_capacity(INSERT_BATCH_ROWS);
+            let flush = |batch: &mut Vec<Vec<Value>>| -> Result<u64, DbError> {
+                let Some(sql) = build_insert(
+                    target.database,
+                    target.schema,
+                    target.table,
+                    &cols,
+                    batch,
+                    SqlDialect::Sqlite,
+                ) else {
+                    return Ok(0);
+                };
+                let affected = conn.execute(&sql, []).map_err(query_err)? as u64;
+                if affected != batch.len() as u64 {
+                    return Err(DbError::Query(format!(
+                        "a batch of {} rows affected {affected} — the import was rolled back",
+                        batch.len()
+                    )));
+                }
+                batch.clear();
+                Ok(affected)
+            };
+
+            for row in rows {
+                if cancel.is_cancelled() {
+                    return Err(DbError::Cancelled);
+                }
+                batch.push(row.map_err(DbError::Query)?);
+                if batch.len() >= INSERT_BATCH_ROWS {
+                    total += flush(&mut batch)?;
+                }
+            }
+            total += flush(&mut batch)?;
+            Ok(total)
+        })();
+
+        match result {
+            Ok(total) => {
+                conn.execute_batch("COMMIT").map_err(query_err)?;
+                Ok(total)
+            }
+            Err(e) => {
+                // Reported only if the rollback itself fails — the original error
+                // is the one worth surfacing.
+                let undo = conn.execute_batch("ROLLBACK");
+                match undo {
+                    Ok(()) => Err(e),
+                    Err(u) => Err(DbError::Query(format!(
+                        "{e} — and the rollback failed too: {u}"
+                    ))),
+                }
+            }
+        }
+    })
 }
 
 /// The databases this connection offers: the one file, under the name SQLite
@@ -728,6 +1166,7 @@ fn primary_key_of(conn: &SqliteConn, table: &str) -> Result<Vec<String>, DbError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use schemaic_core::model::{RowDelete, RowEdit, RowInsert};
 
     /// An in-memory database, seeded. This is the one backend whose DB layer can
     /// be tested hermetically — SQLite needs no server — so it is, and the tests
@@ -918,6 +1357,350 @@ mod tests {
         );
         assert_eq!(names, ["album", "artist", "big"]);
         assert_eq!(entries[2].1, "view");
+    }
+
+    // ── Provenance and write-back ────────────────────────────────────────────
+
+    fn origins_for(conn: &SqliteConn, sql: &str) -> Vec<Option<ColumnOrigin>> {
+        let stmt = conn.prepare(sql).expect("prepare");
+        let mut cols = columns_of(&stmt);
+        drop(stmt);
+        attach_origins(conn, sql, &mut cols);
+        cols.into_iter().map(|c| c.origin).collect()
+    }
+
+    #[test]
+    fn a_plain_select_attributes_every_column_to_its_base_table() {
+        let conn = seeded();
+        let o = origins_for(&conn, "SELECT id, name, note FROM artist");
+        assert_eq!(o.len(), 3);
+        let id = o[0].as_ref().expect("id has an origin");
+        assert_eq!(id.table, "artist");
+        assert_eq!(id.column, "id");
+        assert_eq!(id.database, "main");
+        assert_eq!(id.schema, None, "SQLite has no namespace level");
+        assert!(id.flags.primary_key);
+        assert!(
+            id.flags.auto_increment,
+            "an INTEGER PRIMARY KEY is the rowid"
+        );
+        let name = o[1].as_ref().expect("name has an origin");
+        assert!(name.flags.not_null);
+        assert!(!name.flags.primary_key);
+    }
+
+    /// The case that makes the derivation positional rather than name-matched: the
+    /// first result column is *named* `name` but holds `note`. Matching by name
+    /// would map it to column `name`, and an edit to it would silently `UPDATE`
+    /// the wrong column.
+    #[test]
+    fn an_alias_is_attributed_to_the_column_behind_it() {
+        let conn = seeded();
+        let o = origins_for(&conn, "SELECT note AS name, name AS note FROM artist");
+        assert_eq!(o[0].as_ref().unwrap().column, "note");
+        assert_eq!(o[1].as_ref().unwrap().column, "name");
+    }
+
+    #[test]
+    fn a_computed_column_and_a_joined_statement_are_not_editable() {
+        let conn = seeded();
+        // An expression belongs to no column.
+        let o = origins_for(&conn, "SELECT id, id * 2 FROM artist");
+        assert!(o[0].is_some());
+        assert!(o[1].is_none(), "an expression has no base column");
+        // A join leaves the whole result unattributed.
+        let o = origins_for(
+            &conn,
+            "SELECT album.id, artist.name FROM album JOIN artist ON album.artist_id = artist.id",
+        );
+        assert!(o.iter().all(|x| x.is_none()), "a join is not editable");
+    }
+
+    /// A view has no rows of its own, and SQLite refuses a write to one without an
+    /// `INSTEAD OF` trigger — so offering the edit and failing at commit time
+    /// would be worse than not offering it.
+    #[test]
+    fn a_view_is_not_editable() {
+        let conn = seeded();
+        let o = origins_for(&conn, "SELECT id, title FROM big");
+        assert!(o.iter().all(|x| x.is_none()));
+    }
+
+    /// A BLOB cell renders as its size and cannot round-trip, so its column is
+    /// marked binary — the call the other two engines make for a binary charset.
+    #[test]
+    fn a_blob_column_is_marked_binary_and_so_read_only() {
+        let conn = SqliteConn::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB);")
+            .unwrap();
+        let o = origins_for(&conn, "SELECT id, b FROM t");
+        assert!(!o[0].as_ref().unwrap().binary);
+        assert!(o[1].as_ref().unwrap().binary);
+    }
+
+    /// A **shared** in-memory database plus a `Db` pointing at it.
+    ///
+    /// The write paths each open their own connection, so a plain `:memory:` —
+    /// which is private to one connection — wouldn't do; SQLite's shared-cache
+    /// memory URI gives several connections one database, with **no file
+    /// anywhere**, so the suite stays as pure as the rest of the workspace.
+    ///
+    /// The returned connection is the keeper: a shared-memory database exists
+    /// only while at least one connection to it is open, so tests must hold it for
+    /// their duration. `name` must be unique per test, since the suite runs
+    /// threaded and the name is the whole identity.
+    fn shared_memory(name: &str) -> (SqliteConn, Db) {
+        let uri = format!("file:{name}?mode=memory&cache=shared");
+        let keeper = SqliteConn::open_with_flags(
+            &uri,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .expect("open a shared in-memory database");
+        let db = Db::from_parts(
+            crate::Engine::Sqlite,
+            String::new(),
+            0,
+            String::new(),
+            String::new(),
+            uri,
+        );
+        (keeper, db)
+    }
+
+    fn edit(table: &str, set: &[(&str, Option<&str>)], key: &[(&str, Value)]) -> RowEdit {
+        RowEdit {
+            database: MAIN.to_string(),
+            schema: None,
+            table: table.to_string(),
+            set: set
+                .iter()
+                .map(|(c, v)| (c.to_string(), v.map(str::to_string)))
+                .collect(),
+            key: key
+                .iter()
+                .map(|(c, v)| (c.to_string(), v.clone()))
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_commit_applies_deletes_updates_and_inserts_in_that_order() {
+        let (keeper, db) = shared_memory("commit_order");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO t VALUES (1, 'a'), (2, 'b');",
+            )
+            .unwrap();
+        let write = GridWrite {
+            updates: vec![edit("t", &[("v", Some("B"))], &[("id", Value::Int(2))])],
+            inserts: vec![RowInsert {
+                database: MAIN.to_string(),
+                schema: None,
+                table: "t".to_string(),
+                cols: vec![
+                    ("id".into(), Some("1".into())),
+                    ("v".into(), Some("z".into())),
+                ],
+            }],
+            deletes: vec![RowDelete {
+                database: MAIN.to_string(),
+                schema: None,
+                table: "t".to_string(),
+                key: vec![("id".to_string(), Value::Int(1))],
+            }],
+        };
+        // The insert reuses id 1, which only works because the delete runs first —
+        // which is `GridWrite::plan`'s order, shared with the other two engines.
+        let n = commit_writes(&db, &write, CancellationToken::new())
+            .await
+            .expect("commit");
+        assert_eq!(n, 3);
+
+        let rows: Vec<(i64, String)> = keeper
+            .prepare("SELECT id, v FROM t ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows, [(1, "z".to_string()), (2, "B".to_string())]);
+    }
+
+    /// The 1-row safety net, which is the whole promise of this path: a key that
+    /// matches nothing must roll the *entire* batch back, not just fail its own
+    /// statement.
+    #[tokio::test]
+    async fn a_statement_matching_no_row_rolls_the_whole_batch_back() {
+        let (keeper, db) = shared_memory("one_row_guard");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO t VALUES (1, 'a');",
+            )
+            .unwrap();
+        let write = GridWrite {
+            updates: vec![
+                edit("t", &[("v", Some("ok"))], &[("id", Value::Int(1))]),
+                // No such row.
+                edit("t", &[("v", Some("no"))], &[("id", Value::Int(99))]),
+            ],
+            ..Default::default()
+        };
+        let err = commit_writes(&db, &write, CancellationToken::new())
+            .await
+            .expect_err("the guard must fire");
+        assert!(
+            format!("{err}").contains("affected 0 rows"),
+            "the message names what the guard saw: {err}"
+        );
+
+        // The *first* update must be gone too — SQLite has no non-transactional
+        // table type, so unlike MySQL this rollback is unconditionally complete.
+        let v: String = keeper
+            .query_row("SELECT v FROM t WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, "a", "the batch rolled back whole");
+    }
+
+    /// `= NULL` is never true, so a NULL key column would match no rows and the
+    /// guard would report a failed write rather than the wrong `WHERE`. SQLite
+    /// makes this reachable by allowing NULL in a non-INTEGER primary key.
+    #[tokio::test]
+    async fn a_null_key_column_is_compared_with_is_null() {
+        let (keeper, db) = shared_memory("null_key");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (k TEXT PRIMARY KEY, v TEXT);
+                 INSERT INTO t VALUES (NULL, 'a');",
+            )
+            .unwrap();
+        let write = GridWrite {
+            updates: vec![edit("t", &[("v", Some("B"))], &[("k", Value::Null)])],
+            ..Default::default()
+        };
+        commit_writes(&db, &write, CancellationToken::new())
+            .await
+            .expect("a NULL key must match its row");
+        let v: String = keeper
+            .query_row("SELECT v FROM t WHERE k IS NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, "B");
+    }
+
+    /// An insert that names no columns at all — every one left to its default.
+    /// `INSERT INTO t () VALUES ()` is a syntax error in SQLite; the spelling is
+    /// `DEFAULT VALUES`.
+    #[test]
+    fn an_insert_with_no_columns_uses_default_values() {
+        let ins = RowInsert {
+            database: MAIN.to_string(),
+            schema: None,
+            table: "t".to_string(),
+            cols: Vec::new(),
+        };
+        let (sql, params) = statement_for(WriteStep::Insert(&ins));
+        assert_eq!(sql, r#"INSERT INTO "t" DEFAULT VALUES"#);
+        assert!(params.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refetch_reads_the_row_the_commit_just_wrote() {
+        let (_keeper, db) = shared_memory("refetch");
+        _keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO t VALUES (1, 'a'), (2, 'b');",
+            )
+            .unwrap();
+        let template = RefetchTemplate {
+            database: MAIN.to_string(),
+            schema: None,
+            table: "t".to_string(),
+            columns: vec!["id".into(), "v".into()],
+            key_cols: vec![0],
+        };
+        let rows = vec![
+            RefetchRow {
+                data_row: 7,
+                key: vec![Value::Int(2)],
+            },
+            // A row that no longer exists is skipped, not reported: a concurrent
+            // delete is a real possibility and "nothing to splice" is the answer.
+            RefetchRow {
+                data_row: 8,
+                key: vec![Value::Int(404)],
+            },
+        ];
+        let got = refetch_rows(&db, &template, &rows, CancellationToken::new())
+            .await
+            .expect("refetch");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, 7, "the grid row index is carried through");
+        assert_eq!(got[0].1[1].display(), "b");
+    }
+
+    /// `block_in_place` needs the multi-threaded runtime, which the app uses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_import_loads_every_batch_in_one_transaction() {
+        let (keeper, db) = shared_memory("import_ok");
+        keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
+            .unwrap();
+        // More than one batch, so the batching itself is exercised.
+        let n = schemaic_core::import::INSERT_BATCH_ROWS + 7;
+        let mut rows = (1..=n).map(|i| Ok(vec![Value::Int(i as i64), Value::Str(format!("v{i}"))]));
+        let cols = vec!["id".to_string(), "v".to_string()];
+        let target = crate::ImportTarget {
+            database: MAIN,
+            schema: None,
+            table: "t",
+            columns: &cols,
+        };
+        let loaded = import_rows(&db, target, &mut rows, CancellationToken::new())
+            .await
+            .expect("import");
+        assert_eq!(loaded, n as u64);
+        let count: i64 = keeper
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, n as i64);
+    }
+
+    /// All-or-nothing: a reader error partway through leaves nothing behind, and
+    /// unlike MySQL there is no engine here that ignores the rollback.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_import_leaves_no_rows() {
+        let (keeper, db) = shared_memory("import_fail");
+        keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
+            .unwrap();
+        // Fails after enough rows to have flushed a full batch already.
+        let n = schemaic_core::import::INSERT_BATCH_ROWS + 3;
+        let mut rows = (1..=n).map(|i| {
+            if i == n {
+                Err("row 503 is malformed".to_string())
+            } else {
+                Ok(vec![Value::Int(i as i64), Value::Str(format!("v{i}"))])
+            }
+        });
+        let cols = vec!["id".to_string(), "v".to_string()];
+        let target = crate::ImportTarget {
+            database: MAIN,
+            schema: None,
+            table: "t",
+            columns: &cols,
+        };
+        let err = import_rows(&db, target, &mut rows, CancellationToken::new())
+            .await
+            .expect_err("the reader error must abort the import");
+        assert!(format!("{err}").contains("malformed"), "{err}");
+        let count: i64 = keeper
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "the committed batch rolled back with the rest");
     }
 
     #[test]
