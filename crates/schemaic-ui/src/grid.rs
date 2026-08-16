@@ -4852,6 +4852,22 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
     EventPropagation::Stop
 }
 
+/// **Is the menu currently up the one anchored at `mine`?** — the test that makes
+/// the grid toolbar's three dropdown icons toggle rather than dismiss-and-rebuild.
+///
+/// `open` is whether the shared `popup_menu` channel holds anything at all, and it
+/// is checked first for a reason: closing a menu clears the channel but leaves
+/// `popup_anchor` behind, so the anchor alone would still name this icon long
+/// after its menu was dismissed with Escape, and the next press would "toggle
+/// shut" a menu that isn't there.
+///
+/// Separated from the view so the rule can be stated once and tested. Inlined in
+/// the three openers it would be three copies of an `&&` that is only obviously
+/// right once you know why the order matters.
+fn menu_anchored_at(open: bool, anchor: Option<PopupAnchor>, mine: PopupAnchor) -> bool {
+    open && anchor == Some(mine)
+}
+
 /// A thin vertical divider between toolbar icon groups. Extra horizontal margin
 /// so it sits clear of the icons on either side — 8px, on top of the cluster's
 /// own 3px gap, for 11px of air between the rule and the nearest glyph. The
@@ -4994,15 +5010,54 @@ fn grid_toolbar(
     // the strip may have been rebuilt by the action just run, and floem's focus
     // request has no existence check, so a captured id can park the keyboard on a
     // removed view.
+    let focus_icon = move |tabindex: u32, ring: &crate::widgets::FocusRing| {
+        let ring = ring.clone();
+        floem::action::exec_after(std::time::Duration::ZERO, move |_| ring.focus_at(tabindex));
+    };
     let publish_return = move |tabindex: u32, ring: &crate::widgets::FocusRing| {
         if !crate::widgets::keyboard_nav().get_untracked() {
             return;
         }
         let ring = ring.clone();
-        crate::widgets::set_menu_return(Rc::new(move || {
-            let ring = ring.clone();
-            floem::action::exec_after(std::time::Duration::ZERO, move |_| ring.focus_at(tabindex));
-        }));
+        crate::widgets::set_menu_return(Rc::new(move || focus_icon(tabindex, &ring)));
+    };
+    // The three dropdown icons all place their panel the same way, and this is the
+    // one spelling of it — because the *same* value is what tells an icon the menu
+    // already up is its own (see [`PopupAnchor`]). Written twice, an anchor that
+    // drifted by a pixel would leave the menu opening correctly and silently
+    // refusing to toggle shut.
+    let anchor_below = |o: Point| {
+        let sz = 16.0; // every toolbar glyph above
+        PopupAnchor::BelowIcon(o.x, o.x + sz, o.y + sz)
+    };
+    // **Is the menu currently up the one this icon opened?** `popup` is a single
+    // slot shared by eleven openers and carries no tag saying who filled it, so
+    // the anchor stands in for one. Self-invalidating by construction: every
+    // opener overwrites `popup_anchor` as it opens, so there is no marker to go
+    // stale here and no reset for the other ten to forget.
+    let menu_is_mine = move |origin: RwSignal<Point>| {
+        menu_anchored_at(
+            gs.popup.get_untracked().is_some(),
+            gs.popup_anchor.get_untracked(),
+            anchor_below(origin.get_untracked()),
+        )
+    };
+    // Pressing the icon again closes its menu, rather than dismissing and
+    // rebuilding the identical panel — the toggle the schema panel's eye and gear
+    // and the connection switcher already have.
+    //
+    // `publish_return` is deliberately *not* called on this path. That slot is
+    // consumed by the next `menu_panel` as it builds, and no panel is being built
+    // here, so arming it would leave a return for the next keyboard-opened menu
+    // anywhere in the app to take. The keyboard is handed back directly instead,
+    // and only when it was the keyboard that pressed: the panel is a `focus_root`
+    // with no other root above it out here, so its teardown would otherwise drop
+    // focus and leave F6 with nothing to fire on.
+    let close_mine = move |tabindex: u32, ring: &crate::widgets::FocusRing| {
+        gs.popup.set(None);
+        if crate::widgets::keyboard_nav().get_untracked() {
+            focus_icon(tabindex, ring);
+        }
     };
     let cap = if truncated { " (capped)" } else { "" };
     // The database leads the line, because it is the fact that says what the rest
@@ -5259,6 +5314,11 @@ fn grid_toolbar(
     // twice — the face's click listener and the ring's Enter/Space arm, which
     // `in_ring_button` requires to be separate listeners.
     let open_copy: Rc<dyn Fn()> = Rc::new(move || {
+        // A second press closes what the first opened.
+        if menu_is_mine(copy_origin) {
+            close_mine(TB_COPY, &strip_copy);
+            return;
+        }
         // Close any other open menu (schema eye/settings, connection switcher, …)
         // so this dropdown is mutually exclusive with them.
         if let Some(d) = gs.dismiss.get_untracked() {
@@ -5269,11 +5329,9 @@ fn grid_toolbar(
         // `on_move` reports the *view's* window origin — floem fires it during
         // layout, not on pointer movement — so this is right however the menu was
         // raised.
-        let o = copy_origin.get_untracked();
-        let sz = 16.0; // the COPY glyph size above
         gs.popup_width.set(GRID_COPY_MENU_W);
         gs.popup_anchor
-            .set(Some(PopupAnchor::BelowIcon(o.x, o.x + sz, o.y + sz)));
+            .set(Some(anchor_below(copy_origin.get_untracked())));
         gs.popup.set(Some(
             ExportFormat::ALL
                 .iter()
@@ -5321,15 +5379,17 @@ fn grid_toolbar(
     let save_hov = RwSignal::new(false);
     let strip_save = strip.clone();
     let open_save: Rc<dyn Fn()> = Rc::new(move || {
+        if menu_is_mine(save_origin) {
+            close_mine(TB_SAVE, &strip_save);
+            return;
+        }
         if let Some(d) = gs.dismiss.get_untracked() {
             (d)();
         }
         publish_return(TB_SAVE, &strip_save);
-        let o = save_origin.get_untracked();
-        let sz = 16.0; // the DOWNLOAD glyph size above
         gs.popup_width.set(GRID_COPY_MENU_W);
         gs.popup_anchor
-            .set(Some(PopupAnchor::BelowIcon(o.x, o.x + sz, o.y + sz)));
+            .set(Some(anchor_below(save_origin.get_untracked())));
         gs.popup.set(Some(
             ExportFormat::ALL
                 .iter()
@@ -5380,6 +5440,12 @@ fn grid_toolbar(
             let ai_hov = RwSignal::new(false);
             let strip_ai_open = strip_ai.clone();
             let open_ai: Rc<dyn Fn()> = Rc::new(move || {
+                // Ahead of the busy guard: a generation started while the menu was
+                // up must not leave it stuck open with its own icon inert.
+                if menu_is_mine(ai_origin) {
+                    close_mine(TB_AI, &strip_ai_open);
+                    return;
+                }
                 if gs.ai_busy.get_untracked() {
                     return; // a generation is already running
                 }
@@ -5388,11 +5454,9 @@ fn grid_toolbar(
                     (d)();
                 }
                 publish_return(TB_AI, &strip_ai_open);
-                let o = ai_origin.get_untracked();
-                let sz = 16.0; // the SPARKLES glyph size above
                 gs.popup_width.set(GRID_COPY_MENU_W);
                 gs.popup_anchor
-                    .set(Some(PopupAnchor::BelowIcon(o.x, o.x + sz, o.y + sz)));
+                    .set(Some(anchor_below(ai_origin.get_untracked())));
                 // AI Fill Value targets the active cell — enabled only when an
                 // editable cell is selected (a read-only/expression cell can't be
                 // filled).
@@ -6496,6 +6560,51 @@ mod tests {
             type_name: ty.to_string(),
             origin: None,
         }
+    }
+
+    // The copy icon's anchor, and the save icon's a few px to its right.
+    const COPY_AT: PopupAnchor = PopupAnchor::BelowIcon(100.0, 116.0, 40.0);
+    const SAVE_AT: PopupAnchor = PopupAnchor::BelowIcon(126.0, 142.0, 40.0);
+
+    #[test]
+    fn an_icon_owns_the_menu_anchored_under_it() {
+        assert!(menu_anchored_at(true, Some(COPY_AT), COPY_AT));
+    }
+
+    /// The whole point of checking `open` first. Closing clears `popup_menu` but
+    /// leaves `popup_anchor` naming whoever opened last, so an anchor-only test
+    /// would report the copy menu still open after Escape dismissed it — and the
+    /// next press would close nothing instead of opening.
+    #[test]
+    fn a_dismissed_menu_is_no_longer_owned() {
+        assert!(!menu_anchored_at(false, Some(COPY_AT), COPY_AT));
+    }
+
+    /// Adjacent icons on one strip: whichever is up, only its own icon may close
+    /// it. Pressing save while copy's menu is open opens save's, which is what
+    /// `open_save` does when this returns false.
+    #[test]
+    fn a_neighbours_menu_is_not_mine() {
+        assert!(!menu_anchored_at(true, Some(COPY_AT), SAVE_AT));
+    }
+
+    /// A cell or header right-click sets the anchor to `None` (open at the
+    /// cursor). It shares the one `popup_menu` channel with these icons, and a
+    /// press on copy must open copy's menu rather than dismiss that one.
+    #[test]
+    fn a_cursor_menu_belongs_to_no_icon() {
+        assert!(!menu_anchored_at(true, None, COPY_AT));
+    }
+
+    /// The status bar's segment menus ride the same channel with the other
+    /// placement, so the two variants must not compare equal on their numbers.
+    #[test]
+    fn a_footer_menu_is_never_a_toolbar_dropdown() {
+        assert!(!menu_anchored_at(
+            true,
+            Some(PopupAnchor::AboveFooter(100.0, 116.0)),
+            COPY_AT
+        ));
     }
 
     // Single-column result of the given cells, so `compute_order` sorts column 0.
