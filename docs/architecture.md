@@ -168,11 +168,43 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `projection_still_refuses_a_wildcard_that_is_not_the_last_item`.
     **Every SQL fragment this module generates** (`join_condition`, `join_targets`, `expand_star`)
     is quoted through `export::ident_if_needed`, which quotes only what a bare name would get wrong
-    — anything that isn't a plain lower-case non-reserved word. PostgreSQL folds an unquoted
+    — anything that isn't a plain lower-case word that can stand unquoted as an *identifier*
+    (`must_quote_ident`, below). PostgreSQL folds an unquoted
     `ArtistId` to `artistid`, so unquoted output couldn't run on any mixed-case schema, while
     unconditional quoting would backtick every ordinary MySQL name in text the user is about to
     edit. `JoinTarget` therefore carries the **bare** name for the popup to display and prefix-match
-    and `table_sql` for what is actually inserted. The live DB stays the semantic authority: **Tier-2 live validation**
+    and `table_sql` for what is actually inserted.
+    **A reserved word is two questions, and they carry opposite costs.** `is_reserved_word` (over
+    `MYSQL_RESERVED` / `PG_RESERVED` / `SQLITE_RESERVED`) asks whether a word can be a bare
+    **alias**, and backs the nine diagnostic sites here — the alias check, the scope's alias
+    resolution, the botched-alias warning — where listing a word wrongly squiggles working SQL, so
+    those lists deliberately lean towards missing one. `must_quote_ident` asks whether it can be a
+    bare **identifier**, a table or column name, which is the question a quoter has: miss a word
+    there and the SQL emitted does not parse. On MySQL and PostgreSQL the two coincide, so
+    `alias_ok_but_unquotable` is empty for both — a reserved word is reserved everywhere and one
+    list answers both. SQLite is where they come apart, because its parser falls back to treating
+    most of its ~147 keywords as identifiers wherever the grammar allows one: `CAST`, `IF` and
+    `RAISE` are refused as a bare name yet are perfectly good `AS` aliases. Until the two were
+    split, `export::ident_if_needed` and `filter::needs_quoting` were asking the **alias** set, so
+    `filter::table_query` over a table `if` keyed on a `cast` column generated
+    `SELECT * FROM if ORDER BY cast ASC LIMIT 10` and SQLite answered `near "ASC": syntax error`.
+    Neither list is a transcription of anybody's documentation any more: `db::sqlite`'s
+    `the_reserved_lists_match_what_sqlite_itself_refuses` walks the engine's own keyword table
+    (`sqlite3_keyword_count`/`sqlite3_keyword_name`) and compiles every keyword on a real in-memory
+    connection in three positions — bare column name, bare table name, bare `AS` alias — asserting
+    both predicates against what SQLite actually accepts. It is a standing guard rather than a
+    snapshot, so a keyword a future release adds arrives on its own and fails. Against 3.46.0's 147
+    keywords it found the 57 existing `SQLITE_RESERVED` entries all correct and exactly four words
+    missing from the identifier set: the three above, plus `NOTHING` (from `ON CONFLICT DO
+    NOTHING`), which is refused in every position and so joined `SQLITE_RESERVED` itself.
+    **Which position a word breaks in is load-bearing**: `CAST` and `RAISE` are refused as a bare
+    *column* name but accepted as a table's, and `IF` is the reverse — a first draft of the
+    end-to-end `a_table_named_for_a_keyword_still_opens` put each one on the side it tolerates and
+    passed with the fix reverted. `a_word_can_need_quoting_as_a_name_yet_be_a_fine_alias` pins the
+    three-word gap so the two lists can't be tidied back into one. Existing data saw no change:
+    across the Chinook, Northwind and EdgeCases files no identifier changed quoting status and no
+    generated statement failed, so this closed a latent bug rather than altering behaviour.
+    The live DB stays the semantic authority: **Tier-2 live validation**
     PREPAREs the statement under the cursor (`Db::prepare_check`, non-executing) behind the
     `live_validate` setting (off by default), merging dialect-exact errors into the editor squiggles.
   - `filter.rs` — the header filter/sort bar: a dialect-aware `sqlparser` **AST rewrite** that
@@ -205,7 +237,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     sample and the AI seed sample (`sample_sql`) pass `BrowseKey::pick(pk, None)` deliberately,
     because both read a table in order to *describe* it and neither writes back, so a rowid there
     would be a column of noise.
-    Quoting here goes through the same rules as the rest of the app; don't add a fourth.
+    Quoting here goes through the same rules as the rest of the app; don't add a fourth, and
+    `needs_quoting` asks `intel::must_quote_ident` — the identifier question — never
+    `is_reserved_word`, which answers the alias one and on SQLite is a shorter list.
   - `edit.rs` — `analyze_edit` → `EditModel` (write-back updatability analysis) + `refetch_template`
     and `refetch_key`, the **one** post-edit re-fetch key builder. A key column *is* editable
     (`EditModel::editable` asks only whether a column maps to a base table), so the `UPDATE` keys on
@@ -1315,6 +1349,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   SQLite *reads* three quotings but **emits only `"x"`**: it is the one of the three with a defined
   escape, since a `]` cannot be written inside brackets at all. Its literals take Postgres' arm —
   no backslash escape, so doubling one would corrupt the value.
+  **The other half of a *conditional* quoter is which predicate the condition asks**, and that is
+  the same bug by a second route: `ident_if_needed` and `filter::needs_quoting` ask
+  `intel::must_quote_ident` (can this be a bare **identifier**), never `intel::is_reserved_word`
+  (can this be a bare **alias**) — a diagnostic's question, answered by a deliberately laxer list.
+  They asked the alias set, and on SQLite `CAST`, `IF` and `RAISE` sit in the gap, so a table named
+  for one of them produced an `ORDER BY` that would not parse. Right quoter, wrong question. See
+  `core::intel` for the measurement and the test that holds both lists to the engine itself.
 - **Both schema-search surfaces match through one predicate.** The schema tree's filter box and the
   Find-Anywhere palette answer the same question over the same `DbSchema`, so they go through
   `schema::TableInfo::matches_search` (name or any column) and `schema::ObjectItem::matches_search`
