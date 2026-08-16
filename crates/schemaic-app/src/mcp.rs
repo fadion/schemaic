@@ -505,8 +505,7 @@ async fn describe_table(
         database,
         info.schema.as_deref(),
         &info.name,
-        &[],
-        None,
+        schemaic_core::filter::BrowseKey::None,
         schemaic_core::filter::Order::Asc,
         SAMPLE_ROWS,
     );
