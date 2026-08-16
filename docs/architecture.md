@@ -995,8 +995,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       `information_schema` stats for `information_schema_stats_expiry`, a day by default;
       PostgreSQL's `reltuples` is only as fresh as the last `ANALYZE`), and `IndexStats::is_unused`
       flags an index only when the server actually counted zero scans — `scans: None` is "nobody
-      was counting", never "drop this". Filled by `Db::fetch_table_stats`; rendered by
-      `ui/properties.rs`.
+      was counting", never "drop this". `count_rows_sql` builds the exact-count statement here
+      rather than three times in the db crate, through the one quoter (`export::ident_sql`).
+      Filled by `Db::fetch_table_stats`; rendered by `ui/properties.rs` and the schema tree's
+      size column.
 - `schemaic-db` — MySQL/MariaDB (`mysql_async`) + SSH tunnels (`ssh.rs`), PostgreSQL in `pg.rs`,
   SQLite in `sqlite.rs`, and
   the pinned manual-transaction connection in `session.rs`. Populates each result column's
@@ -1056,8 +1058,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   folded on *after* the shared `assemble_schema` (which both engines share and neither's
   extras belong in).
   `fetch_query`/`run_batch`/`fetch_schema`/`ping`/`commit_writes`/`refetch_rows`/`prepare_check`
-  (non-executing `PREPARE` for the editor's live validation)/`run_ddl` are `Db` methods taking
-  the target DB per call. `run_ddl` is the schema-editing apply path and is **honest about
+  (non-executing `PREPARE` for the editor's live validation)/`run_ddl`/`fetch_table_stats`/
+  `count_rows` are `Db` methods taking the target DB per call.
+  `fetch_table_stats` fills `core::stats::SchemaStats` for a whole database — one round trip
+  either way, and having the set is what feeds the schema tree's size column. It is **lazy and
+  deliberately not part of `fetch_schema`**: selecting `DATA_LENGTH` from
+  `information_schema.TABLES` makes MySQL materialize per-table statistics, and the schema fetch
+  runs on every connect. MySQL adds `STATISTICS` for cardinality and
+  `performance_schema.table_io_waits_summary_by_index_usage` for index usage — that last one is
+  routinely off or ungranted, and a failure there leaves every scan count `None`, because zero is
+  what marks an index unused. PostgreSQL reads `pg_table_size`/`pg_indexes_size`, `reltuples`
+  (`-1` is "don't know", so it becomes `None`), `n_dead_tup` and the last analyze, through
+  `query_all_optional` so a restricted `pg_stat_*` can't fail the fetch; a **partitioned parent**
+  is listed with null sizes rather than the truthful `0` that would read as an empty table.
+  SQLite returns an empty set — it publishes none (`stats::supports_table_stats`), and
+  `count_rows` is not a fallback there but the only figure there is. `run_ddl` is the schema-editing apply path and is **honest about
   atomicity**: PostgreSQL runs the whole plan in one transaction (transactional DDL), MySQL runs
   it sequentially and reports which statement failed *and how many already stuck*
   (`DdlError::applied`) — every MySQL DDL statement commits implicitly, so a transaction there
@@ -1292,6 +1307,26 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   - `diff_view.rs` — Ctrl+K diff preview. `history_panel.rs` — Query History right-column panel.
   - `plan_view.rs` — Query Plan modal (`EXPLAIN`/`EXPLAIN ANALYZE` table + warnings + "Ask AI"),
     via `TabsActions::run_plan` → `Db::explain`.
+  - `properties.rs` — the **table properties** modal (`properties_overlay`), opened from a Table or
+    View row's context menu by setting `overlay.properties`; an effect in the modal calls
+    `SchemaActions::table_stats`, whose result lands in `overlay.properties_state`. Sizes, row
+    estimate, the storage-split bar, table options and the index list — deliberately **not**
+    structure, which the tree, the designer and Generate DDL already show three times over. The
+    column/key counts and the collation come free from the in-memory `TableInfo`
+    (`table_designer::loaded_table`), which is what gives a view something to show on an engine
+    that publishes no statistics for one.
+    - **Qualifying the figures is the feature.** An estimate prints `~4.21m` via
+      `RowCount::label`, `Freshness::note` prints the staleness caveat in words, and an index is
+      called unused only where `IndexStats::is_unused` says so — worded with its window attached,
+      because the counter resets when the server does. An *uncounted* index says "usage not
+      counted"; blank would read as none.
+    - **Count rows** (`SchemaActions::count_rows` → `Db::count_rows`) is a button because it is an
+      uncapped `COUNT(*)`. Its result is folded into the loaded `TableStats::exact_rows` rather
+      than kept beside it, so the headline and the Markdown copy read one figure. Its lifecycle is
+      separate from the fetch's (`properties_counting`/`properties_count_err`) for the opposite
+      reason: a failed count must not replace statistics that loaded.
+    - Both requests outlive a close, so each checks `overlay.properties` still holds the target it
+      was asked about before writing.
   - `import_view.rs` — the file-import modal (schema context menu → **Import**), over
     `core::import`. Two steps (Source → Mapping) in one panel driven by the `ImportUi` bundle;
     `SchemaActions::import_probe`/`import_run` do the file + DB work off the UI thread. A probe or
@@ -1430,7 +1465,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     and a namespace both survive a search that only one of their **objects** matches, or the
     match would be hidden by the row that contains it. `nav_rows` carries the folders and their
     leaves like everything else — it is the function that must stay bug-for-bug identical to
-    the render. `completion.rs` — SQL autocomplete: the ranking + popup layer
+    the render.
+    - The **size column** (`size_badge`) puts each table's on-disk size at the right edge of its
+      row, from the same `core::stats` figures the properties modal shows. It answers the question
+      that modal cannot — *which* of these is the big one — and is off by default behind SCHEMA
+      gear → **Show table sizes** (`SchemaUi::table_sizes`, persisted as
+      `UiState::show_table_sizes`). `ConnNode::stats` holds one database's `SchemaStats` and is
+      both the fetch's trigger and its guard: the app's effect fetches only nodes at
+      `DbStatsState::Idle` that are *expanded* with the column on, moving each to `Loading` before
+      spawning, and settles a failure at `Unavailable` rather than retrying on every expand.
+      `start_fetch` resets a node to `Idle`, which is what makes Refresh both the way to get fresh
+      figures and the only thing that retries a failed one. A table with no size renders nothing —
+      a dash down a tree of views and SQLite tables is worse than a blank.
+    `completion.rs` — SQL autocomplete: the ranking + popup layer
     (`recompute_completions`/`accept_completion`/`completion_popup` + `SchemaIndex`/`fuzzy_score`)
     over `schemaic_core::intel`'s scope/context engine.
   - `tabs.rs` — query-tab strip. `grid.rs` — the whole results grid (`GridState`/`GridCtx`;
