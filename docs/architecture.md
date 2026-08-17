@@ -1602,16 +1602,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     file — an ordinary tab is session-persisted and has nothing to be unsaved *against*. The chip's
     content is a `dyn_container` keyed on `(editing, title, pinned, modified)`: the `modified` read
     tracks `query`, so the closure re-runs on every keystroke, but the key only *changes* when the
-    flag flips, which is the one thing that has to rebuild the row. When it is set, a 6px
-    accent-tinted dot sits between the label and the ×, tooltipped ("Unsaved changes" — a bare dot
-    says nothing on its own) and tinted rather than neutral so it doesn't read as a second close
-    affordance. Its `TAB_MODIFIED_W` (13px — the glyph plus the 7px gap the label/× pair
-    already use) comes off the title cap the way the DB-identity dot's `TAB_DOT_W` does, and for the
-    same reason: `TAB_TITLE_AVAIL` covers neither, so a full-width truncated title would push the ×
-    past the chip cap and clip it. The context menu gains Save / Save As… / Reload from disk, after
-    Duplicate and before Close — Save is offered on a tab with no file too, since it falls through
-    to Save As, which is the answer to "save this" there, while Reload is *dimmed* rather than
-    hidden, the way "Reopen last tab" is on an empty ring, so the menu keeps one shape.
+    flag flips, which is the one thing that has to rebuild the row. When it is set, **the title goes
+    italic** — and the slant is the whole marker. It was a 6px accent dot before the ×, which is the
+    obvious spelling and the wrong one on *this* chip: a tab can already carry a DB-identity dot, so
+    the strip ended up with two dots of unrelated meanings a few pixels apart. Italic also costs no
+    width, so unlike `TAB_DOT_W` there is nothing to shed from `TAB_TITLE_AVAIL` (truncation is
+    still measured upright — an italic face is a hair wider, and being a hair late to ellipsize
+    isn't worth a second text measurement). The tooltip carries what the slant means when nothing
+    else on screen would: the full title when the chip clipped it, "Unsaved changes" when it didn't,
+    both when both.
+    The context menu is three groups, separated: the clicked tab (Pin / Rename / Duplicate / Close),
+    then its file (Open File… / Save / Save As… / Reload from disk), then the strip (Reopen last tab
+    / Close other tabs / Close all tabs). Open leads the file group because Ctrl+O is otherwise
+    keyboard-only — there is no menu bar to put it on. Save is offered on a tab with no file too,
+    since it falls through to Save As, which is the answer to "save this" there, while Reload is
+    *dimmed* rather than hidden, the way "Reopen last tab" is on an empty ring, so the menu keeps
+    one shape.
   - `grid.rs` — the whole results grid (`GridState`/`GridCtx`; `results_view`/`loaded_view` are the
     entry points). `editor_pane.rs` — SQL editor pane
     (`query_pane` + Ctrl+K popup, statement highlight, custom scrollbars). `compute_diagnostics`
@@ -1699,6 +1705,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   `Confirm` channel when the tab is modified, since nothing else in the app can put those edits
   back. None of the four is connection-gated, deliberately and like the export: a file is between
   the editor and the disk.
+  **Closing a modified file tab asks too, and `guard_close` is where both close questions live.**
+  It has `GuardTxFn`'s signature (aliased `GuardCloseFn`) and wraps `guard_tx`, so it drops into
+  every path that already took one — `close_tab` (×, middle-click, Ctrl+W) and `close_tabs_seq`,
+  which means Close all / Close other tabs ask per dirty file tab as their chain reaches it. The
+  blanket "close all tabs?" confirm is about closing tabs, not about discarding file edits, and the
+  chain keeps one question on screen at a time. **The file question comes first because it is the
+  one with no side effect:** answering the transaction prompt *commits or rolls back*, so asking it
+  first and then hearing No to discarding the file edits would leave a committed transaction behind
+  a close that never happened. It skips a pinned tab — `close_tab_now` gates every close path on
+  pinned, so asking and then not closing would be the worst of both — and skips an ordinary tab,
+  since `Tab::modified` is false there. `close_tab_now`'s keep-≥1 branch clears `path`/`disk_sql`/
+  `file_crlf` along with the text: the blank slate it leaves behind must not still point at a file,
+  or the next Ctrl+S would overwrite that file with an empty document.
   A file tab survives both kinds of restore. `persist::SavedTab` carries `path`, `file_crlf` and
   `file_dirty`, each `#[serde(default, skip_serializing_if = …)]` so a session file written before
   the feature still restores its tabs; `ClosedTab` carries `path`/`disk_sql`/`file_crlf` so

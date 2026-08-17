@@ -110,6 +110,10 @@ type EndTxFn = Rc<dyn Fn(usize, bool, Option<Rc<dyn Fn()>>)>;
 /// (a tab isn't closed, a mode isn't switched). It is `Some` for the one caller
 /// that has already told a modal work is under way and has to take that back.
 type GuardTxFn = Rc<dyn Fn(usize, Rc<dyn Fn()>, Option<Rc<dyn Fn()>>)>;
+/// The same shape, for the guard that asks about a tab's **unsaved `.sql` file**
+/// before closing it — so `guard_close` can compose the two and drop into every
+/// place that already takes a [`GuardTxFn`].
+type GuardCloseFn = GuardTxFn;
 /// Start one database's introspection against a `Db` — the single path the
 /// initial load, the connection-wide Refresh and the per-database Refresh all
 /// take, so what the tree shows while a fetch is out is decided once.
@@ -2642,6 +2646,13 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 record(&tab);
                 tab.query.set(String::new());
                 tab.source.set(None);
+                // Shed the `.sql` binding too, or the "blank slate" left behind
+                // still points at a file — and the next Ctrl+S would overwrite
+                // that file with the empty document. The path went into the
+                // reopen ring with the text (`record` above).
+                tab.path.set(None);
+                tab.disk_sql.set(None);
+                tab.file_crlf.set(false);
                 // Also reset the results pane so the reopened tab is fully fresh
                 // (single-grid Idle state, no leftover Run-Everything tabs).
                 tab.results.set(QueryState::Idle);
@@ -2707,29 +2718,89 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         })
     };
 
-    // Closing a tab with an open transaction asks first — the pinned connection
-    // dies with the tab, so an unanswered transaction would just vanish.
+    // Everything a close has to ask about, in one guard: unsaved `.sql` edits
+    // first, then an open transaction. Same signature as `guard_tx`, so it drops
+    // straight into the close paths that already took one.
+    //
+    // **The file question comes first because it has no side effect.** Answering
+    // the transaction prompt *commits or rolls back*; if that ran first and the
+    // user then said No to discarding their file edits, they'd be left with a
+    // committed transaction for a close that never happened, and no way back.
+    // A No here, by contrast, has changed nothing.
+    //
+    // Only ever asked about a file-backed tab: `Tab::modified` is false for an
+    // ordinary tab, whose text is in the session and in the reopen ring anyway.
+    let guard_close: GuardCloseFn = {
+        let guard_tx = guard_tx.clone();
+        Rc::new(
+            move |id: usize, proceed: Rc<dyn Fn()>, on_cancel: Option<Rc<dyn Fn()>>| {
+                let guard_tx = guard_tx.clone();
+                let tx_then = {
+                    let proceed = proceed.clone();
+                    let on_cancel = on_cancel.clone();
+                    Rc::new(move || (guard_tx)(id, proceed.clone(), on_cancel.clone()))
+                };
+                let Some(tab) = tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied())
+                else {
+                    return; // already gone
+                };
+                // A pinned tab isn't closable at all (`close_tab_now` gates every
+                // close path on it), so there is nothing to warn about — asking
+                // and then not closing would be the worst of both.
+                if tab.pinned.get_untracked() || !tab.modified() {
+                    (tx_then)();
+                    return;
+                }
+                let name = tab
+                    .path
+                    .get_untracked()
+                    .map(|p| schemaic_core::sqlfile::tab_title(&p))
+                    .unwrap_or_else(|| tab.title());
+                confirm.set(Some(Confirm {
+                    title: format!("Close “{name}”"),
+                    message: format!(
+                        "“{name}” has unsaved changes. Closing discards them; the file on \
+                         disk is left as it is. Close anyway?"
+                    ),
+                    resolve: Rc::new(move |yes| {
+                        if yes {
+                            (tx_then)();
+                        } else if let Some(cancel) = on_cancel.clone() {
+                            (cancel)();
+                        }
+                    }),
+                }));
+            },
+        )
+    };
+
+    // Closing a tab asks about unsaved file changes and about an open transaction
+    // — the pinned connection dies with the tab, so an unanswered transaction
+    // would just vanish. Every close path (× click, middle-click, Ctrl+W, and the
+    // Close-all/Close-others sequences) goes through `guard_close`.
     let close_tab: Rc<dyn Fn(usize)> = {
         let close_tab_now = close_tab_now.clone();
-        let guard_tx = guard_tx.clone();
+        let guard_close = guard_close.clone();
         Rc::new(move |id: usize| {
             let close_tab_now = close_tab_now.clone();
-            (guard_tx)(id, Rc::new(move || (close_tab_now)(id)), None);
+            (guard_close)(id, Rc::new(move || (close_tab_now)(id)), None);
         })
     };
 
     // Close `ids` one at a time, each tab waiting on the one before it. Recursion
-    // rather than a loop because the wait is a *continuation*: `guard_tx` may
-    // return having only opened a prompt, and the close happens whenever the user
-    // answers it.
-    fn close_tabs_seq(ids: Vec<usize>, guard_tx: GuardTxFn, close_now: Rc<dyn Fn(usize)>) {
+    // rather than a loop because the wait is a *continuation*: `guard` may return
+    // having only opened a prompt, and the close happens whenever the user answers
+    // it. `guard` is `guard_close`, so each tab's unsaved-file question and its
+    // transaction prompt take their turn in the same chain — the blanket "close
+    // all tabs?" confirm is about closing tabs, not about discarding file edits.
+    fn close_tabs_seq(ids: Vec<usize>, guard: GuardCloseFn, close_now: Rc<dyn Fn(usize)>) {
         let Some((&id, rest)) = ids.split_first() else {
             return;
         };
         let rest = rest.to_vec();
-        let g = guard_tx.clone();
+        let g = guard.clone();
         let c = close_now.clone();
-        (guard_tx)(
+        (guard)(
             id,
             Rc::new(move || {
                 (c)(id);
@@ -2754,7 +2825,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // click, and undoing it means pressing Ctrl+Shift+T once per tab.
     let close_all_tabs: Rc<dyn Fn()> = {
         let close_tab_now = close_tab_now.clone();
-        let guard_tx = guard_tx.clone();
+        let guard_close = guard_close.clone();
         Rc::new(move || {
             let conn = active_conn.get_untracked();
             let ids = schemaic_core::tabsel::all_to_close(&closable_refs(), conn);
@@ -2762,14 +2833,14 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             if ids.is_empty() {
                 return;
             }
-            let guard_tx = guard_tx.clone();
+            let guard_close = guard_close.clone();
             let close_tab_now = close_tab_now.clone();
             confirm.set(Some(Confirm {
                 title: "Close all tabs".to_string(),
                 message: "Are you sure you want to close all the tabs?".to_string(),
                 resolve: Rc::new(move |yes| {
                     if yes {
-                        close_tabs_seq(ids.clone(), guard_tx.clone(), close_tab_now.clone());
+                        close_tabs_seq(ids.clone(), guard_close.clone(), close_tab_now.clone());
                     }
                 }),
             }));
@@ -2788,7 +2859,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // therefore never fires here: the connection always still has this tab.
     let close_other_tabs: Rc<dyn Fn(usize)> = {
         let close_tab_now = close_tab_now.clone();
-        let guard_tx = guard_tx.clone();
+        let guard_close = guard_close.clone();
         Rc::new(move |keep: usize| {
             let conn = active_conn.get_untracked();
             // The same call the menu entry dims on (`can_close_other_tabs`), so
@@ -2800,7 +2871,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             if ids.is_empty() {
                 return;
             }
-            let guard_tx = guard_tx.clone();
+            let guard_close = guard_close.clone();
             let close_tab_now = close_tab_now.clone();
             confirm.set(Some(Confirm {
                 title: "Close other tabs".to_string(),
@@ -2808,7 +2879,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 resolve: Rc::new(move |yes| {
                     if yes {
                         active.set(keep);
-                        close_tabs_seq(ids.clone(), guard_tx.clone(), close_tab_now.clone());
+                        close_tabs_seq(ids.clone(), guard_close.clone(), close_tab_now.clone());
                     }
                 }),
             }));
