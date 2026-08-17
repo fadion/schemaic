@@ -95,6 +95,26 @@ pub fn nth(tabs: &[TabRef], conn: u64, n: usize) -> Option<usize> {
 /// but not closable.
 pub type ClosableRef = (usize, u64, bool);
 
+/// Can `id` be closed at all?
+///
+/// False for a pinned tab, and false for an unknown one — there is nothing there
+/// to close, and both callers want the same answer for it.
+///
+/// This exists because the answer is needed **before** anything is asked, not
+/// only before the close happens. The app's close path guards a close with two
+/// questions — unsaved `.sql` edits, and an open transaction — and the
+/// transaction one is not a question but an action: answering it commits or rolls
+/// back. The pinned test used to sit only at the far end, in the app's
+/// `close_tab_now`, so Ctrl+W on a pinned tab holding a transaction prompted,
+/// took the commit, and *then* declined to close: a transaction settled for a
+/// close that could never have happened, with no way back.
+///
+/// [`all_to_close`] is the set form of the same rule, and
+/// `all_to_close_is_every_closable_tab` holds the two to it.
+pub fn can_close(tabs: &[ClosableRef], id: usize) -> bool {
+    tabs.iter().any(|(i, _, pinned)| *i == id && !*pinned)
+}
+
 /// The tabs "Close all tabs" would close on `conn`: its unpinned ones.
 pub fn all_to_close(tabs: &[ClosableRef], conn: u64) -> Vec<usize> {
     tabs.iter()
@@ -254,6 +274,37 @@ mod tests {
             (4, 20, false),
             (5, 10, false),
         ]
+    }
+
+    /// The regression this predicate exists for: a pinned tab must answer "no"
+    /// *before* the app asks anything about closing it, because one of those
+    /// questions settles a transaction.
+    #[test]
+    fn a_pinned_tab_cannot_be_closed() {
+        assert!(can_close(&closable(), 1));
+        assert!(!can_close(&closable(), 3), "3 is pinned");
+        // An unknown id has nothing to close, so it is not closable either — the
+        // caller must not prompt about a tab that isn't there.
+        assert!(!can_close(&closable(), 99));
+        assert!(!can_close(&[], 1));
+    }
+
+    /// One rule, two shapes: whatever `can_close` says about a tab one at a time
+    /// is what `all_to_close` collects for its connection. The bug this guards is
+    /// the two drifting — the set form is what dims the menu, the single form is
+    /// what gates the prompts, and a tab the menu offers but the gate refuses
+    /// (or the reverse) is a click that does nothing.
+    #[test]
+    fn all_to_close_is_every_closable_tab() {
+        let tabs = closable();
+        for conn in [10, 20, 99] {
+            let expected: Vec<usize> = tabs
+                .iter()
+                .filter(|(id, c, _)| *c == conn && can_close(&tabs, *id))
+                .map(|(id, _, _)| *id)
+                .collect();
+            assert_eq!(all_to_close(&tabs, conn), expected, "conn {conn}");
+        }
     }
 
     #[test]

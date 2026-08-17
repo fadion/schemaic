@@ -1032,12 +1032,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       for Ctrl+1‑9) is answered *within one connection*. `nth` especially: the Nth visible chip is
       not the Nth entry of the flat `Vec` once another connection's tabs interleave.
       `pick_active` prefers the remembered per-connection tab, so switching away and back doesn't
-      dump the user on tab 1. `all_to_close`/`others_to_close` are the **closing** half, over a
-      `ClosableRef` that carries the pinned flag as well (a pinned tab is visible and selectable
-      but not closable): they are here rather than in the menu builder because the entry has to
-      *dim* on the same expression the action evaluates — "Close other tabs" was always enabled and
-      silently returned on a connection with one tab, one row below an entry that is dimmed for the
-      same kind of reason.
+      dump the user on tab 1. `can_close`/`all_to_close`/`others_to_close` are the **closing** half,
+      over a `ClosableRef` that carries the pinned flag as well (a pinned tab is visible and
+      selectable but not closable): they are here rather than in the menu builder because the entry
+      has to *dim* on the same expression the action evaluates — "Close other tabs" was always
+      enabled and silently returned on a connection with one tab, one row below an entry that is
+      dimmed for the same kind of reason. `can_close` is the single-tab form, and the app's
+      `guard_close` asks it *before* prompting: one rule, two shapes, held together by
+      `all_to_close_is_every_closable_tab`, because a tab the menu offers and the gate refuses (or
+      the reverse) is a click that does nothing.
     - `palette.rs` — parses the command palette's `>` command mode into
       `Parsed::{Search,Filter,Command{name,arg}}`. The hard part is when typing stops filtering the
       command list and becomes an argument: longest-word-prefix match against the caller's
@@ -1710,12 +1713,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   every path that already took one — `close_tab` (×, middle-click, Ctrl+W) and `close_tabs_seq`,
   which means Close all / Close other tabs ask per dirty file tab as their chain reaches it. The
   blanket "close all tabs?" confirm is about closing tabs, not about discarding file edits, and the
-  chain keeps one question on screen at a time. **The file question comes first because it is the
-  one with no side effect:** answering the transaction prompt *commits or rolls back*, so asking it
-  first and then hearing No to discarding the file edits would leave a committed transaction behind
-  a close that never happened. It skips a pinned tab — `close_tab_now` gates every close path on
-  pinned, so asking and then not closing would be the worst of both — and skips an ordinary tab,
-  since `Tab::modified` is false there. `close_tab_now`'s keep-≥1 branch clears `path`/`disk_sql`/
+  chain keeps one question on screen at a time.
+  **The order of the two questions is load-bearing, and so is asking neither of a tab that can't
+  close.** Answering the transaction prompt is not an answer but an *action* — it commits or rolls
+  back — so anything that can still call the close off has to be settled first. `guard_close`
+  therefore checks `tabsel::can_close` before it opens anything (a pinned tab, or an id already
+  gone), then asks about the file, then hands over to `guard_tx`. Both orderings were wrong before:
+  Ctrl+W on a pinned tab holding a transaction prompted, took the commit and then declined to close,
+  because the pinned test lived only at the far end in `close_tab_now` — which still refuses, as the
+  backstop every close path passes through, but by then the damage is done. The file question is
+  raised only on a file-backed tab, since `Tab::modified` is false for an ordinary one.
+  `close_tab_now`'s keep-≥1 branch clears `path`/`disk_sql`/
   `file_crlf` along with the text: the blank slate it leaves behind must not still point at a file,
   or the next Ctrl+S would overwrite that file with an empty document.
   A file tab survives both kinds of restore. `persist::SavedTab` carries `path`, `file_crlf` and

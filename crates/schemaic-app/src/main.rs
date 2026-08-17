@@ -2613,9 +2613,14 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     file_crlf: tab.file_crlf.get_untracked(),
                 });
             };
-            // Pinned tabs aren't closable — this is the single choke point for
-            // every close path (× click, middle-click, Ctrl+W), so gating here
-            // covers them all. Unpin first to close.
+            // Pinned tabs aren't closable, and this is the last thing every close
+            // path (× click, middle-click, Ctrl+W, the Close-all/others chains)
+            // passes through, so gating here covers them all. Unpin first to close.
+            //
+            // It is the **backstop**, not the only gate: refusing this late is too
+            // late to stop the questions a close asks on the way here, one of which
+            // settles a transaction. `guard_close` answers the same question first,
+            // through `tabsel::can_close`.
             if tabs
                 .with_untracked(|v| {
                     v.iter()
@@ -2718,22 +2723,39 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         })
     };
 
-    // Everything a close has to ask about, in one guard: unsaved `.sql` edits
-    // first, then an open transaction. Same signature as `guard_tx`, so it drops
-    // straight into the close paths that already took one.
+    // Everything a close has to ask about, in one guard: is this closable at all,
+    // then unsaved `.sql` edits, then an open transaction. Same signature as
+    // `guard_tx`, so it drops straight into the close paths that already took one.
     //
-    // **The file question comes first because it has no side effect.** Answering
-    // the transaction prompt *commits or rolls back*; if that ran first and the
-    // user then said No to discarding their file edits, they'd be left with a
-    // committed transaction for a close that never happened, and no way back.
-    // A No here, by contrast, has changed nothing.
+    // **Closability is settled before anything is asked**
+    // (`tabsel::can_close`), because one of the questions is not a question:
+    // answering the transaction prompt *commits or rolls back*. The pinned test
+    // used to live only at the far end, in `close_tab_now`, so Ctrl+W on a pinned
+    // tab holding a transaction prompted, took the commit, and then declined to
+    // close — a transaction settled for a close that could never have happened.
+    // `close_tab_now` still refuses; that gate is the backstop for every close
+    // path, and this one exists so nothing is *asked* about an impossible close.
     //
-    // Only ever asked about a file-backed tab: `Tab::modified` is false for an
-    // ordinary tab, whose text is in the session and in the reopen ring anyway.
+    // **Then the file question, because it has no side effect either.** If the
+    // transaction ran first and the user then said No to discarding their file
+    // edits, they'd again be left with a settled transaction and no close. A No
+    // here has changed nothing.
+    //
+    // The file question is only ever raised on a file-backed tab: `Tab::modified`
+    // is false for an ordinary one, whose text is in the session and in the reopen
+    // ring anyway.
     let guard_close: GuardCloseFn = {
         let guard_tx = guard_tx.clone();
         Rc::new(
             move |id: usize, proceed: Rc<dyn Fn()>, on_cancel: Option<Rc<dyn Fn()>>| {
+                // Unknown ids answer `false` too, which is the same "nothing to
+                // close, so nothing to ask" — see `tabsel::can_close`.
+                if !schemaic_core::tabsel::can_close(&closable_refs(), id) {
+                    if let Some(cancel) = on_cancel {
+                        (cancel)();
+                    }
+                    return;
+                }
                 let guard_tx = guard_tx.clone();
                 let tx_then = {
                     let proceed = proceed.clone();
@@ -2744,10 +2766,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 else {
                     return; // already gone
                 };
-                // A pinned tab isn't closable at all (`close_tab_now` gates every
-                // close path on it), so there is nothing to warn about — asking
-                // and then not closing would be the worst of both.
-                if tab.pinned.get_untracked() || !tab.modified() {
+                if !tab.modified() {
                     (tx_then)();
                     return;
                 }
