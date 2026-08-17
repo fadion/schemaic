@@ -55,6 +55,14 @@ pub const BRACES: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" h
 /// Lucide `file-digit` (blob / binary column types).
 pub const FILE_DIGIT: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="4" height="6" x="2" y="12" rx="2"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M4 12V4a2 2 0 0 1 2-2h8l6 6v10a2 2 0 0 1-2 2h-2.4"/><path d="M10 12h2v6"/><path d="M10 18h4"/></svg>"#;
 
+/// Lucide `file` — a tab bound to a `.sql` file on disk, leading its title in the
+/// tab strip.
+///
+/// Plain rather than `file-code`: at the 14px this is drawn at, that icon's two
+/// inner chevrons are ~4px of ~1.2px stroke and read as fuzz, not as code. The
+/// bare outline is the same silhouette and stays crisp.
+pub const FILE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/></svg>"#;
+
 /// Lucide `panel-left-dashed` (any other/unrecognised column type).
 pub const PANEL_LEFT_DASHED: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 14v1"/><path d="M9 19v2"/><path d="M9 3v2"/><path d="M9 9v1"/></svg>"#;
 

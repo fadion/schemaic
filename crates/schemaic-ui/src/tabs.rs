@@ -101,6 +101,11 @@ const TAB_TITLE_AVAIL: f64 = TAB_MAX_W - 40.0;
 // full-width truncated title pushes the × past the chip cap and clips it.
 const TAB_DOT_W: f64 = 12.0;
 
+// And the same for the file glyph a `.sql`-backed tab leads its title with:
+// 14px plus a 5px right margin, neither of them in `TAB_TITLE_AVAIL`'s 40 either.
+// A tab can show both, and then the title sheds both.
+const TAB_FILE_W: f64 = 19.0;
+
 fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
     let active = ui.tabs_ui.active;
     let close_tab = ui.tab_actions.close_tab.clone();
@@ -134,19 +139,27 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
     let close_mid = close_tab.clone();
     let content = dyn_container(
         // Keyed on pinned too, so toggling pin swaps the × for the pin indicator,
-        // and on `modified` so the unsaved dot appears/disappears with it. The
-        // modified read tracks `query`, so this closure re-runs on every
-        // keystroke — but the key only *changes* when the flag flips, which is
-        // the one thing that has to rebuild the row.
+        // and on `modified` so the italic title follows it. The modified read
+        // tracks `query`, so this closure re-runs on every keystroke — but the key
+        // only *changes* when the flag flips, which is the one thing that has to
+        // rebuild the row.
+        //
+        // The **path** is in the key as its display string, not as an
+        // `is_some()`: it drives the file icon *and* the tooltip, and a Save As
+        // from one file to another on a tab that also carries a user-assigned name
+        // moves neither the title nor the icon — the tooltip would have gone on
+        // naming the old file.
         move || {
             (
                 tab.editing.get(),
                 tab.title(),
                 tab.pinned.get(),
                 tab.modified(),
+                tab.path
+                    .with(|p| p.as_ref().map(|p| p.to_string_lossy().into_owned())),
             )
         },
-        move |(editing, title, pinned, modified)| -> AnyView {
+        move |(editing, title, pinned, modified, path)| -> AnyView {
             if editing {
                 // Inline rename field. `edit_field` (unlike floem's `text_input`,
                 // which swallows Escape into its own `clear_focus`) routes Escape
@@ -204,8 +217,9 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
 
             // Display: label (ellipsized past the tab width) + close ×. A title
             // that would be clipped gets a tooltip with its full text; a title
-            // that fits gets none. The DB dot eats into the width the title has.
-            let avail = move || TAB_TITLE_AVAIL - if has_dot() { TAB_DOT_W } else { 0.0 };
+            // that fits gets none. Both leading glyphs eat into the title's width.
+            let file_w = if path.is_some() { TAB_FILE_W } else { 0.0 };
+            let avail = move || TAB_TITLE_AVAIL - if has_dot() { TAB_DOT_W } else { 0.0 } - file_w;
             let truncated = measure_text_px(&title) > avail();
             // Left inset moved to the row's `padding_left` so the (optional) DB
             // colour dot can lead the label without shifting the text when absent.
@@ -229,14 +243,18 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                 }
             });
             // Tooltip chrome comes from the global `TooltipClass` style (see
-            // `tooltip_style`), so the tip is just its text. It carries the full
-            // title when the chip clipped it, and says what the slant means when
-            // the tab is modified — nothing on screen otherwise explains it.
-            let tip = match (truncated, modified) {
-                (true, true) => Some(format!("{title} — unsaved changes")),
-                (true, false) => Some(title),
-                (false, true) => Some("Unsaved changes".to_string()),
-                (false, false) => None,
+            // `tooltip_style`), so the tip is just its text.
+            //
+            // A file tab tips its **full path**, which subsumes the truncated-title
+            // case and answers the question the chip can't: *which* `orders.sql`.
+            // A modified tab also says what the italic means, since nothing else on
+            // screen does. (`modified` implies a path — `Tab::modified` is false
+            // without one — so there is no unsaved-but-pathless arm to write.)
+            let tip = match (path, truncated, modified) {
+                (Some(p), _, true) => Some(format!("{p} — unsaved changes")),
+                (Some(p), _, false) => Some(p),
+                (None, true, _) => Some(title),
+                (None, false, _) => None,
             };
             let label: AnyView = match tip {
                 Some(tip) => label.tooltip(move || text(tip.clone())).into_any(),
@@ -278,7 +296,24 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                 6.0,
                 -1.0,
             );
-            h_stack((dot, label, close))
+            // A `.sql`-backed tab leads its title with a dim file glyph — the
+            // standing sign that this tab *is* a file, where the italic is only
+            // the transient sign that it has drifted from one. Tinted
+            // `tab_close`, the same muted tint as the trailing ×/pin, so it reads
+            // as chrome rather than as a third piece of state competing with the
+            // DB-identity dot beside it. Zero-footprint when there's no file.
+            let file_icon: AnyView = if file_w > 0.0 {
+                icons::icon(icons::FILE, 14.0)
+                    .style(|s| {
+                        s.flex_shrink(0.0_f32)
+                            .margin_right(5.0)
+                            .color(theme::tab_close())
+                    })
+                    .into_any()
+            } else {
+                empty().into_any()
+            };
+            h_stack((dot, file_icon, label, close))
                 .style(|s| s.flex_row().items_center().padding_left(10.0))
                 .into_any()
         },
@@ -349,17 +384,21 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
             // otherwise reachable by keyboard alone. Open leads it, matching the
             // key order and the palette's.
             entries.push(MenuEntry::Separator);
-            entries.push(MenuEntry::action("Open File…", {
+            // Sentence case and no trailing ellipsis, like every other entry here
+            // ("Reopen last tab", "Reload from disk") — this menu doesn't mark the
+            // entries that open something, and two of the three that do are the
+            // ones the user is least likely to be surprised by.
+            entries.push(MenuEntry::action("Open file", {
                 let open = open_file.clone();
                 move || (open)()
             }));
-            // Save is offered on a tab with no file too — it opens Save As, which
+            // Save is offered on a tab with no file too — it opens Save as, which
             // is the answer to "save this" there.
             entries.push(MenuEntry::action("Save", {
                 let save = save_file.clone();
                 move || (save)(tab.id)
             }));
-            entries.push(MenuEntry::action("Save As…", {
+            entries.push(MenuEntry::action("Save as", {
                 let save_as = save_file_as.clone();
                 move || (save_as)(tab.id)
             }));
