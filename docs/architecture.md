@@ -979,6 +979,31 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `identifier_occurrences` (every whole-word, ASCII-case-insensitive occurrence of the identifier
     under the caret — excludes keywords/numbers/strings, needs ≥2 to fire), and `region_at`
     (`Code`/`Str`/`Comment` classification). Pure + unit-tested; dialect-aware (no backtick on PG).
+  - `sqlfile.rs` — the pure half of opening and saving a tab's SQL as a `.sql` file on disk: what a
+    file's bytes become in the editor (`decode`), what the editor's text becomes on the way back
+    (`encode`), what the tab is called once it has a file (`tab_title` — the file name *with* its
+    extension, or `orders.sql` and `orders.txt` would give two tabs one title), and what the Save
+    dialog should suggest for a tab that hasn't got one (`suggested_name`), plus the
+    `SQL_EXT`/`SQL_EXTENSIONS`/`SQL_FILTER_NAME` both dialogs filter on.
+    **Line endings are remembered, not normalised away.** The editor works in `\n` and a `.sql` file
+    checked into a repository on Windows very often does not, so a save that rewrote every line
+    ending would turn a one-line edit into a whole-file diff — the kind of change that survives
+    review only because nobody can read it. `decode` collapses `\r\n` and *records* that it did, the
+    flag rides on the tab and on its `persist::SavedTab`, and `encode` puts it back (guarding
+    against a `\r\n` pasted into the buffer doubling into `\r\r\n`). Mixed endings resolve to the
+    majority and a tie to CRLF, because normalising the odd stray LF is the smaller lie; a lone `\r`
+    is not a line ending at all and is left exactly as it is, since that is what a string literal
+    may legitimately hold. `decode` also strips a UTF-8 BOM — a Windows tool writes one and it
+    arrives as an invisible character in front of the first keyword — and decodes lossily, because a
+    mis-encoded byte should cost a replacement character rather than the whole file.
+    The naming half is entirely about what a file system will refuse: `suggested_name` maps the
+    characters Windows forbids to `-`, trims the trailing dots and spaces it also refuses, appends
+    `.sql` only when it isn't already there (a tab opened from `orders.sql` must not suggest
+    `orders.sql.sql`), and falls back to `query.sql` when nothing alphanumeric survives — a title of
+    `///` scrubs to `---`, which is legal and useless. `ensure_extension` fills a *missing*
+    extension only: the native dialogs mostly append the filter's own but not on every platform,
+    while `schema.ddl` is the user saying what they want and quietly writing `schema.ddl.sql`
+    instead is worse than honouring it. Pure + unit-tested inline.
   - **Small persisted / UI-state models**, each a flat `Vec` keyed by `conn_id` and each pure +
     tested (they share `history.rs`'s shape; a new one belongs here, not in the UI):
     - `search_history.rs` — recent Find-Anywhere targets (`MAX_PER_CONN`, newest-first, deduped).
