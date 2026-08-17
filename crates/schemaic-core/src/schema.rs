@@ -1713,9 +1713,16 @@ impl SequenceInfo {
     }
 }
 
-/// Does a standalone object's **name** match a schema-search term?
-/// `needle_lower` must already be lower-cased; an empty needle matches nothing,
-/// since every caller answers "no filter" separately.
+/// Does a **name** match a schema-search term? `needle_lower` must already be
+/// lower-cased; an empty needle matches nothing, since every caller answers "no
+/// filter" separately.
+///
+/// This is the single name-versus-term rule for the whole schema-search family —
+/// standalone objects, table names ([`TableInfo::matches_search`]), column names
+/// ([`TableInfo::any_column_matches`]) and the ER diagram's find bar
+/// ([`crate::erd::search`]) all ask it rather than spelling
+/// `to_lowercase().contains` again. Three of those did spell it themselves, which
+/// is how the empty-needle case came to be handled in some of them and not others.
 ///
 /// The rule lives here as a free function, not only as
 /// [`ObjectItem::matches_search`], so a caller can ask it of a *borrowed*
@@ -1978,17 +1985,14 @@ impl TableInfo {
     pub fn any_column_matches(&self, needle_lower: &str) -> bool {
         self.columns
             .iter()
-            .any(|c| c.name.to_lowercase().contains(needle_lower))
+            .any(|c| object_name_matches(&c.name, needle_lower))
     }
 
     /// Does this table match a schema-search term — by its own name OR by any of
     /// its column names? `needle_lower` must already be lower-cased. An empty
     /// needle matches nothing (callers treat "no filter" separately).
     pub fn matches_search(&self, needle_lower: &str) -> bool {
-        if needle_lower.is_empty() {
-            return false;
-        }
-        self.name.to_lowercase().contains(needle_lower) || self.any_column_matches(needle_lower)
+        object_name_matches(&self.name, needle_lower) || self.any_column_matches(needle_lower)
     }
 
     /// The foreign key whose referencing columns include `column`, if any — the

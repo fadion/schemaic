@@ -643,6 +643,23 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     pure bezier geometry + hover hit-test the custom paint canvas uses. `DiagramLayoutsFile`
     persists manual drags per `(conn_id, database)` to `diagrams.json`, falling back to auto-layout
     for an unknown or stale id.
+    **Find-in-diagram** is the pure half of the modal's Ctrl+F bar. `search(graph, needle)` returns
+    one `NodeMatch { node, name, columns }` per node the term touches, kept per-card because both
+    things the diagram does with a search are per-card: highlight the matched parts of a card, and
+    pan to it when every hit landed in one. The term is trimmed and lower-cased here so the UI stays
+    a thin caller, and every name goes through `schema::object_name_matches` rather than a third
+    hand-rolled `to_lowercase().contains` (see the one-predicate invariant); an empty or
+    whitespace-only term finds nothing, which is that predicate's rule. A `NodeKind::Stub` answers
+    on its name alone, having no columns to search. `hits()` counts the name as one plus one per
+    matched column, `total_hits`/`match_label` are the bar's readout, and `sole_node` — the
+    pan-and-flash trigger — asks about **cards, not hits**: three matches inside `orders` still name
+    one place to go, while two cards leave the choice to the user and moving the canvas would only
+    be guessing which was meant. The stated limitation is that a collapsed card shows only its key
+    columns, so a matched column can be real and off-screen — the count is the truth about the
+    diagram and the card outline is what says where to look. Auto-expanding the card to reveal it is
+    deliberately not done: that resizes the card and re-routes every edge touching it, as a side
+    effect of typing. `search_tests` covers case and surrounding space, the empty needle, a stub,
+    hits versus cards, and each form of the readout.
   - `monitor.rs` — the **Live Monitor**'s pure change detector: no DB, no timer, no UI.
     `Snapshot::from_result` captures a `ResultSet` keyed by its table's key columns (cells are
     `Option<String>` so NULL stays distinct from `""`), and `diff_snapshots` matches two snapshots
@@ -1737,6 +1754,51 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     strengths reachable from the two built-ins; white → light, near-black → the header's). The first
     is a **comparison, not a WCAG floor**, which is why it lives here rather than in `contrast`'s
     pairing table — borders are furniture, and holding one to a text floor would mean nothing.
+    **Ctrl+F opens a find bar over the canvas** (`Find` + `find_bar`, over `erd::search`), carrying
+    the editor's and grid's chrome in the diagram's top-right corner. It is a **sibling of the
+    canvas layer, not a child**: the canvas is `.clip()`ped and pan/zoom-transformed, so a popup
+    inside it would scroll away with the diagram. The flex-grow wrapper that measures the viewport
+    is therefore a `stack((canvas_inner, find_bar(…)))`, and because that wrapper *is* the modal
+    body, `inset_top(10.0)` already means "10px below the toolbar" without knowing how tall the
+    toolbar is. There is **no prev/next pair**, unlike the other two find bars: those step a caret
+    through an ordered document, while this lights up every match at once and moves the canvas only
+    when `erd::sole_node` names a single card — a "next" button would have to invent a sequence over
+    a 2-D canvas before it had anything to do. The bar also carries `on_event_stop(PointerDown)`,
+    because the canvas pans on a primary drag and the popup sits on top of it, so aiming for the
+    text field would otherwise drag the whole diagram out from under the pointer.
+    One `Memo<Vec<NodeMatch>>` per diagram recomputes per keystroke and each card derives its own
+    `Option<NodeMatch>` memo from it, so a card whose match didn't change doesn't re-render because
+    a character was typed elsewhere — memos specifically, since `dyn_container` is built on
+    `create_updater` and does not diff, it rebuilds whenever a dependency fires. Highlighting is
+    `theme::match_highlight` on the table name and on the matched column names, the same colour the
+    schema tree marks a filter hit with, and deliberately **not** the tree's per-character
+    `highlight_text`: that bakes a fixed font size into a text layout, and a card's type scales with
+    the zoom, so the name would stop growing with the diagram. A find hit outranks a column's key
+    tint — the gold/purple says what the column *is*, which is still true and still on the glyph
+    beside it. The pan is a `create_effect` on the matches memo: given a `sole_node` it solves the
+    cards' own `pan + logical·z` for `pan` to centre that card, reading viewport, positions, sizes
+    and zoom **untracked** so panning can't re-trigger it, then flashes the card for `FIND_FLASH`
+    (3s). **The flash ring is an `outline(2.0)`, not a fatter border** — a border is part of the
+    box, so widening one would nudge the card's content by a pixel as the ring came and went — and
+    it is read with `with`, not `get`, so it doesn't clone a `String` per card on every pan and zoom
+    frame. `flash_seq` is bumped per flash so an expiring timer only clears the outline **it** set
+    (searching twice inside three seconds otherwise lets the first search's timer wipe the second's
+    ring early), and the expiry reads it through `try_get_untracked`, because the modal can close
+    inside those three seconds and take the signals' scope with it.
+    **The modal's whole keyboard policy is one `on_event(EventListener::KeyDown, …)` on the root**,
+    where a single `on_key_down(Escape, …)` used to be, so the order Escape is offered around in is
+    readable in one place — the grid's `grid_key` for the same reason. It sits on the same `ViewId`
+    as `focus_root_with_ring`'s own Tab handler and does not displace it: `add_event_listener`
+    appends, and `on_key_down` was only ever `on_event(KeyDown, …)` with a key filter in front.
+    Escape dismisses the find popup first and closes the diagram only when there was no popup to
+    close: `Find::dismiss` returns whether it *was* open, and that answer is the whole mechanism.
+    Ctrl+F opens it. The field's own `FieldCfg::on_escape` dismisses too and covers the case where
+    the field has focus, since floem registers the editor's KeyDown listener with `on_event_stop`
+    and it consumes the key outright; the root handler covers the rest of the modal, which is most
+    of it, the canvas being pointer-driven — pan, zoom or drag anything and focus has left the
+    search box. That mirrors the grid's focus-independent Escape rather than trusting the field
+    alone. `modal_frame` takes a `find: Option<Find>` and the two message-only bodies pass `None`:
+    nothing to search there, so neither binds Ctrl+F.
   - `monitor_view.rs` — the **Live Monitor** modal (`monitor_overlay`), opened from the results
     title bar with the tab's `(conn_id, database, table)`. It renders `overlay.monitor_log` — built
     by the app's poll loop through `core::monitor::diff_snapshots` — as a Time·Action·ID·Data table,
@@ -2082,13 +2144,19 @@ Re-introducing the anti-patterns these guard against is a regression:
   They asked the alias set, and on SQLite `CAST`, `IF` and `RAISE` sit in the gap, so a table named
   for one of them produced an `ORDER BY` that would not parse. Right quoter, wrong question. See
   `core::intel` for the measurement and the test that holds both lists to the engine itself.
-- **Both schema-search surfaces match through one predicate.** The schema tree's filter box and the
-  Find-Anywhere palette answer the same question over the same `DbSchema`, so they go through
+- **Every schema-search surface matches through one predicate.** The schema tree's filter box and
+  the Find-Anywhere palette answer the same question over the same `DbSchema`, so they go through
   `schema::TableInfo::matches_search` (name or any column) and `schema::ObjectItem::matches_search`
   (name only — a `detail()` match would surface a sequence because some unrelated table's name
   appeared in its owner). They were two predicates and the palette's simply **had no object arm**,
   so on a PostgreSQL connection Ctrl+P for a type you were looking at in the sidebar returned
-  nothing. `overlays::schema_hits` is the palette's half split out as plain data for exactly this
+  nothing. **The name-versus-term rule underneath all of them is `schema::object_name_matches`** —
+  the ER diagram's find bar (`erd::search`) is the third surface and is a *caller*, not a fourth
+  spelling, and `TableInfo::matches_search`/`any_column_matches` were folded onto it rather than
+  each keeping its own `to_lowercase().contains`. The empty needle is why that matters beyond
+  tidiness: the predicate owns the rule that an empty term matches nothing (every caller answers "no
+  filter" separately), and while the callers spelled the comparison themselves that case was handled
+  in some of them and not others. `overlays::schema_hits` is the palette's half split out as plain data for exactly this
   reason, and `overlays::find_tests` asserts the two surfaces return the same objects for a set of
   terms. **One deliberate divergence, and it is the only one allowed without a test change:** an
   *internal* object (an identity column's counter) is listed by the tree and withheld by the
