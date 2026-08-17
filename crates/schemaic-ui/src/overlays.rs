@@ -2272,29 +2272,18 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             name: "format code",
             label: "Format Code",
             hint: "",
+            // Ask the editor pane to do it, don't reformat the text here. This
+            // command used to run `sqlfmt` itself and write the result into
+            // `t.query` — where nothing ever read it, because the mounted editor
+            // owns its document and the next keystroke pushed the unformatted
+            // text back over the signal. `format_req` reaches the same
+            // `format_editor` Ctrl+Alt+L uses, which lands one undoable edit and
+            // keeps the caret. (It also takes the indent settings from the
+            // editor's own theme globals, so nothing here needs them.)
             arg: instant(
                 Rc::new(move || {
                     if let Some(t) = active_tab() {
-                        let unit = if soft_tabs.get_untracked() {
-                            " ".repeat(tab_width.get_untracked())
-                        } else {
-                            "\t".to_string()
-                        };
-                        let dialect = connections
-                            .with_untracked(|cs| {
-                                cs.iter()
-                                    .find(|c| c.id == t.conn_id.get_untracked())
-                                    .map(|c| {
-                                        schemaic_core::intel::SqlDialect::from_db_type(&c.db_type)
-                                    })
-                            })
-                            .unwrap_or_default();
-                        let out = schemaic_core::sqlfmt::format_sql(
-                            &t.query.get_untracked(),
-                            &unit,
-                            dialect,
-                        );
-                        t.query.set(out);
+                        t.format_req.set(true);
                     }
                 }),
                 &close,

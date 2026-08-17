@@ -846,6 +846,10 @@ pub(crate) struct QueryPaneParams {
     /// When set, jump the caret to this byte offset (move + centre + focus), then
     /// clear it. Driven by the status-bar warning count.
     pub jump_offset: RwSignal<Option<usize>>,
+    /// When set, reformat this tab and clear it — the palette's "Format Code".
+    /// See [`Tab::format_req`](crate::Tab::format_req) for why it comes through
+    /// the pane instead of being written straight into `query`.
+    pub format_req: RwSignal<bool>,
     /// Where this pane publishes its (debounced) offline diagnostics. Lives on
     /// the tab so the status bar reads the analysis rather than repeating it —
     /// see [`Tab::diagnostics`](crate::Tab::diagnostics).
@@ -910,6 +914,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         cursor_offset,
         goto_open,
         jump_offset,
+        format_req,
         syntax,
         results,
         run,
@@ -1687,6 +1692,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let ed_cursor = ed.clone(); // mirror caret offset out for the status bar
     let ed_goto = ed.clone(); // Ctrl+G go-to-line: move caret + centre
     let ed_jump = ed.clone(); // status-bar warning count: jump to first warning
+    let ed_fmt_req = ed.clone(); // palette "Format Code": reformat on request
     let ed_mount = ed.clone(); // take focus once this pane is on screen
 
     // Focus the editor as soon as the pane exists — typing after opening a tab
@@ -1762,6 +1768,20 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             vid.request_focus();
         }
         jump_offset.set(None);
+    });
+
+    // Reformat on request from outside the pane (the palette's "Format Code"),
+    // then clear it — same shape as the jump above, and deliberately the *same*
+    // `format_editor` Ctrl+Alt+L and the right-click "Format SQL" use, so the
+    // three can't disagree about what formatting means. The palette used to set
+    // `query` itself, which the mounted editor never reads back (see
+    // `Tab::format_req`), so the command silently did nothing.
+    create_effect(move |_| {
+        if !format_req.get() {
+            return;
+        }
+        format_editor(&ed_fmt_req, comp, dialect.get_untracked());
+        format_req.set(false);
     });
 
     // Builds the right-click menu entries (Ask AI… / Explain / Optimize) for the

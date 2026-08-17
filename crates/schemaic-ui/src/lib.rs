@@ -721,6 +721,17 @@ pub struct Tab {
     /// A byte offset the editor should jump the caret to (move + centre + focus),
     /// then clear. Set by the status-bar warning count to reach the first warning.
     pub jump_offset: RwSignal<Option<usize>>,
+    /// Set to ask the editor pane to reformat this tab (the command palette's
+    /// "Format Code"), which it does and then clears — the same request-and-clear
+    /// shape as `jump_offset`.
+    ///
+    /// It has to go through the pane rather than rewriting `query`, because the
+    /// mounted editor owns its document: the palette command *did* rewrite the
+    /// signal, and the formatted text was never shown — the next keystroke
+    /// overwrote it back from the doc. Routing it here also means one formatter
+    /// (`format_editor`), so the palette can't drift from Ctrl+Alt+L, and the
+    /// result lands as one undoable edit instead of a pane remount.
+    pub format_req: RwSignal<bool>,
     /// This tab's offline diagnostics — the squiggles — published by the editor
     /// pane's **debounced** analysis (`editor_pane`, 120 ms with a generation
     /// guard).
@@ -822,6 +833,7 @@ impl Tab {
             cursor_offset: cx.create_rw_signal(0),
             goto_open: cx.create_rw_signal(false),
             jump_offset: cx.create_rw_signal(None),
+            format_req: cx.create_rw_signal(false),
             diagnostics: cx.create_rw_signal(Vec::new()),
             highlight_col: cx.create_rw_signal(None),
             results_maximized: cx.create_rw_signal(false),
@@ -3709,6 +3721,7 @@ fn center(ui: Ui) -> impl IntoView {
                     cursor_offset: tab.cursor_offset,
                     goto_open: tab.goto_open,
                     jump_offset: tab.jump_offset,
+                    format_req: tab.format_req,
                     syntax: tab.diagnostics,
                     results: tab.results,
                     run: run.clone(),
