@@ -101,11 +101,6 @@ const TAB_TITLE_AVAIL: f64 = TAB_MAX_W - 40.0;
 // full-width truncated title pushes the × past the chip cap and clips it.
 const TAB_DOT_W: f64 = 12.0;
 
-// The modified dot on a file-backed tab sits between the label and the ×, and
-// costs the same way: its 6px glyph plus the 7px gap the label/× pair already use
-// between themselves. Shed from the title cap for the same reason as `TAB_DOT_W`.
-const TAB_MODIFIED_W: f64 = 13.0;
-
 fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
     let active = ui.tabs_ui.active;
     let close_tab = ui.tab_actions.close_tab.clone();
@@ -117,6 +112,7 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
     let close_all = ui.tab_actions.close_all_tabs.clone();
     let close_others = ui.tab_actions.close_other_tabs.clone();
     let can_close_others = ui.tab_actions.can_close_other_tabs.clone();
+    let open_file = ui.tab_actions.open_sql_file.clone();
     let save_file = ui.tab_actions.save_sql_file.clone();
     let save_file_as = ui.tab_actions.save_sql_file_as.clone();
     let reload_file = ui.tab_actions.reload_sql_file.clone();
@@ -208,28 +204,43 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
 
             // Display: label (ellipsized past the tab width) + close ×. A title
             // that would be clipped gets a tooltip with its full text; a title
-            // that fits gets none. Both dots eat into the width the title has.
-            let avail = move || {
-                TAB_TITLE_AVAIL
-                    - if has_dot() { TAB_DOT_W } else { 0.0 }
-                    - if modified { TAB_MODIFIED_W } else { 0.0 }
-            };
+            // that fits gets none. The DB dot eats into the width the title has.
+            let avail = move || TAB_TITLE_AVAIL - if has_dot() { TAB_DOT_W } else { 0.0 };
             let truncated = measure_text_px(&title) > avail();
-            let full = title.clone();
             // Left inset moved to the row's `padding_left` so the (optional) DB
             // colour dot can lead the label without shifting the text when absent.
-            let label = text(title).style(move |s| {
-                s.margin_right(7.0)
+            //
+            // **Italic is the unsaved marker.** It was a small accent dot before
+            // the ×, which read as a second glyph on a chip that can already carry
+            // the DB-identity dot — two dots of different meanings, 6px apart. The
+            // slant costs no width, so it also needs nothing shed from the title
+            // cap. (Measured upright: an italic face is a hair wider, and being a
+            // hair late to ellipsize is not worth a second text measurement.)
+            let label = text(title.clone()).style(move |s| {
+                let s = s
+                    .margin_right(7.0)
                     .max_width(avail())
                     .text_overflow(TextOverflow::Ellipsis)
-                    .font_size(theme::FONT_BODY)
+                    .font_size(theme::FONT_BODY);
+                if modified {
+                    s.font_style(floem::text::Style::Italic)
+                } else {
+                    s
+                }
             });
             // Tooltip chrome comes from the global `TooltipClass` style (see
-            // `tooltip_style`), so the tip is just its text.
-            let label: AnyView = if truncated {
-                label.tooltip(move || text(full.clone())).into_any()
-            } else {
-                label.into_any()
+            // `tooltip_style`), so the tip is just its text. It carries the full
+            // title when the chip clipped it, and says what the slant means when
+            // the tab is modified — nothing on screen otherwise explains it.
+            let tip = match (truncated, modified) {
+                (true, true) => Some(format!("{title} — unsaved changes")),
+                (true, false) => Some(title),
+                (false, true) => Some("Unsaved changes".to_string()),
+                (false, false) => None,
+            };
+            let label: AnyView = match tip {
+                Some(tip) => label.tooltip(move || text(tip.clone())).into_any(),
+                None => label.into_any(),
             };
 
             // Trailing icon (16px, muted `tab_close` tint, same footprint either
@@ -267,26 +278,7 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                 6.0,
                 -1.0,
             );
-            // Unsaved-changes dot, between the label and the ×: this tab has a
-            // `.sql` file and has drifted from it. Zero-footprint otherwise —
-            // a tab with no file has nothing to be unsaved against, since the
-            // session persists it either way. Accent-tinted so it reads as a
-            // state and not as another close affordance, and tooltipped because
-            // a bare dot doesn't say what it means.
-            let modified_dot: AnyView = if modified {
-                icons::icon(icons::DOT, 6.0)
-                    .style(|s| {
-                        s.flex_shrink(0.0_f32)
-                            .margin_right(7.0)
-                            .margin_top(-1.0)
-                            .color(theme::accent())
-                    })
-                    .tooltip(|| text("Unsaved changes"))
-                    .into_any()
-            } else {
-                empty().into_any()
-            };
-            h_stack((dot, label, modified_dot, close))
+            h_stack((dot, label, close))
                 .style(|s| s.flex_row().items_center().padding_left(10.0))
                 .into_any()
         },
@@ -321,8 +313,9 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
         // left/up near the window edge, so a right-most tab doesn't overflow). A
         // pinned tab shows Unpin and omits Close (unpin to close).
         //
-        // The last group is strip-wide rather than about the clicked tab, hence
-        // the separator: reopen the last close, or close the lot.
+        // Three groups: the clicked tab, then its `.sql` file, then the strip
+        // (reopen the last close, or close the lot) — the last being the reason
+        // the separators were there before a file group needed fencing off.
         .on_secondary_click_stop(move |_| {
             overlay.context_menu.set(None);
             overlay.popup_anchor.set(None);
@@ -346,16 +339,31 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                     let duplicate = duplicate.clone();
                     move || (duplicate)(tab.id)
                 }),
-                // The file group. Save is offered on a tab with no file too —
-                // it opens Save As, which is the answer to "save this" there.
-                MenuEntry::action("Save", {
-                    let save = save_file.clone();
-                    move || (save)(tab.id)
-                }),
-                MenuEntry::action("Save As…", {
-                    let save_as = save_file_as.clone();
-                    move || (save_as)(tab.id)
-                }),
+            ];
+            if !pinned {
+                let close = close_tab.clone();
+                entries.push(MenuEntry::action("Close", move || (close)(tab.id)));
+            }
+            // The `.sql` file group, fenced off on both sides: these are the only
+            // entries about a file rather than about the tab, and Ctrl+O is
+            // otherwise reachable by keyboard alone. Open leads it, matching the
+            // key order and the palette's.
+            entries.push(MenuEntry::Separator);
+            entries.push(MenuEntry::action("Open File…", {
+                let open = open_file.clone();
+                move || (open)()
+            }));
+            // Save is offered on a tab with no file too — it opens Save As, which
+            // is the answer to "save this" there.
+            entries.push(MenuEntry::action("Save", {
+                let save = save_file.clone();
+                move || (save)(tab.id)
+            }));
+            entries.push(MenuEntry::action("Save As…", {
+                let save_as = save_file_as.clone();
+                move || (save_as)(tab.id)
+            }));
+            entries.push(
                 // Dimmed rather than hidden on a tab with no file, the way
                 // "Reopen last tab" is when the ring is empty — the menu keeps
                 // one shape and says why an entry is unavailable by looking it.
@@ -364,11 +372,7 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                     move || (reload)(tab.id)
                 })
                 .disabled(tab.path.get_untracked().is_none()),
-            ];
-            if !pinned {
-                let close = close_tab.clone();
-                entries.push(MenuEntry::action("Close", move || (close)(tab.id)));
-            }
+            );
             entries.push(MenuEntry::Separator);
             entries.push(
                 MenuEntry::action("Reopen last tab", {
