@@ -71,8 +71,9 @@ substitute for the statement, and none of these is a style preference.
   (`widgets::accept_launch`) — not via the disabled button.
 - **One identifier quoter** — `export::ident_sql` (executed SQL) or `ident_if_needed` (SQL the user
   reads). Don't write a fifth.
-- **Both schema-search surfaces match through one predicate**, and Find-Anywhere searches names →
-  objects → columns in that order, undebounced.
+- **Every schema-search surface matches through one predicate** (`schema::object_name_matches`,
+  which the ER diagram's find bar calls too), and Find-Anywhere searches names → objects → columns
+  in that order, undebounced.
 - **Identifier scanning treats bytes `>= 0x80` as word bytes** — `sql::is_word_byte`/`is_word_start`
   are the only definitions.
 - **Splitting `lib.rs`/`main.rs`** has its own procedure; read it before starting one.

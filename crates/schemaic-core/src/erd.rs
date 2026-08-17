@@ -950,6 +950,255 @@ pub fn upsert_layout(
         .insert(layout_key(conn_id, database), positions);
 }
 
+// ── Find-in-diagram ─────────────────────────────────────────────────────────
+
+/// What a diagram search found inside one node.
+///
+/// Kept per-node rather than as a flat hit list because both things the diagram
+/// does with a search are per-card: highlight the card's matched parts, and — when
+/// every hit landed in one card — pan to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeMatch {
+    /// The node id, which is also its card label.
+    pub node: String,
+    /// The table name itself matched.
+    pub name: bool,
+    /// The matched column names, in the node's column order. Always empty for a
+    /// stub, which has no columns to search.
+    pub columns: Vec<String>,
+}
+
+impl NodeMatch {
+    /// How many separate things matched here: the name, plus each column.
+    pub fn hits(&self) -> usize {
+        usize::from(self.name) + self.columns.len()
+    }
+}
+
+/// Every node a find term touches, in the graph's node order.
+///
+/// The term is trimmed and lower-cased here so the UI stays a thin caller, and
+/// each name goes through [`crate::schema::object_name_matches`] — the same
+/// predicate the schema tree's filter and Find-Anywhere use, rather than a third
+/// hand-rolled `to_lowercase().contains`. An empty or whitespace-only term finds
+/// nothing, which is that predicate's rule too: "no filter" is the caller's
+/// separate case.
+///
+/// Note what this counts and the canvas may not show: a card collapsed to its key
+/// columns hides the rest, so a matched column can be real but off-screen. The
+/// count is the truth about the diagram, and the card outline is what says where
+/// to look.
+pub fn search(graph: &DiagramGraph, needle: &str) -> Vec<NodeMatch> {
+    let needle = needle.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    graph
+        .nodes
+        .iter()
+        .filter_map(|n| {
+            let name = crate::schema::object_name_matches(&n.id, &needle);
+            let columns: Vec<String> = n
+                .columns
+                .iter()
+                .filter(|c| crate::schema::object_name_matches(&c.name, &needle))
+                .map(|c| c.name.clone())
+                .collect();
+            (name || !columns.is_empty()).then(|| NodeMatch {
+                node: n.id.clone(),
+                name,
+                columns,
+            })
+        })
+        .collect()
+}
+
+/// Everything the search found, across every node.
+pub fn total_hits(matches: &[NodeMatch]) -> usize {
+    matches.iter().map(NodeMatch::hits).sum()
+}
+
+/// The one card every hit landed in, or `None` when the hits span several cards
+/// (or there are none).
+///
+/// This is the pan-and-flash trigger, and it asks about **cards, not hits**: three
+/// matches inside `orders` still name one place to go, so the diagram goes there.
+/// Two cards leave the choice to the user, and moving the canvas would only be
+/// guessing which one was meant.
+pub fn sole_node(matches: &[NodeMatch]) -> Option<&str> {
+    match matches {
+        [only] => Some(only.node.as_str()),
+        _ => None,
+    }
+}
+
+/// The find bar's readout: how much was found, and whether it is all in one card.
+///
+/// The card span is only worth saying when there is more than one — "2 matches"
+/// inside a single table is already unambiguous, and the diagram will have panned
+/// to it.
+pub fn match_label(matches: &[NodeMatch]) -> String {
+    let hits = total_hits(matches);
+    match (hits, matches.len()) {
+        (0, _) => "No matches".to_string(),
+        (1, _) => "1 match".to_string(),
+        (h, 1) => format!("{h} matches"),
+        (h, t) => format!("{h} matches in {t} tables"),
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    fn dcol(name: &str) -> DiagramColumn {
+        DiagramColumn {
+            name: name.to_string(),
+            type_name: "int".into(),
+            nullable: false,
+            pk: false,
+            fk: false,
+        }
+    }
+
+    fn dnode(id: &str, cols: &[&str]) -> DiagramNode {
+        DiagramNode {
+            id: id.to_string(),
+            kind: NodeKind::Table,
+            columns: cols.iter().map(|c| dcol(c)).collect(),
+        }
+    }
+
+    fn graph(nodes: Vec<DiagramNode>) -> DiagramGraph {
+        let total = nodes.len();
+        DiagramGraph {
+            nodes,
+            edges: Vec::new(),
+            hidden_islands: Vec::new(),
+            total_tables: total,
+        }
+    }
+
+    #[test]
+    fn a_table_name_and_a_column_name_both_match() {
+        let g = graph(vec![
+            dnode("orders", &["id", "customer_id"]),
+            dnode("customers", &["id", "email"]),
+        ]);
+        let m = search(&g, "customer");
+        assert_eq!(m.len(), 2);
+        // `orders` matched only on a column, `customers` only on its name.
+        assert_eq!(m[0].node, "orders");
+        assert!(!m[0].name);
+        assert_eq!(m[0].columns, ["customer_id"]);
+        assert_eq!(m[1].node, "customers");
+        assert!(m[1].name);
+        assert!(m[1].columns.is_empty());
+    }
+
+    /// A node whose name *and* columns match counts every one of them — the
+    /// readout says how many things were found, not how many cards.
+    #[test]
+    fn hits_count_the_name_and_each_column_separately() {
+        let g = graph(vec![dnode("orders", &["order_id", "order_date", "total"])]);
+        let m = search(&g, "order");
+        assert_eq!(m.len(), 1);
+        assert!(m[0].name);
+        assert_eq!(m[0].columns, ["order_id", "order_date"]);
+        assert_eq!(m[0].hits(), 3);
+        assert_eq!(total_hits(&m), 3);
+    }
+
+    #[test]
+    fn matching_ignores_case_and_surrounding_space() {
+        let g = graph(vec![dnode("Orders", &["Customer_ID"])]);
+        assert_eq!(search(&g, "  ORDERS  ").len(), 1);
+        assert_eq!(search(&g, "customer_id")[0].columns, ["Customer_ID"]);
+    }
+
+    /// An empty or whitespace-only box is "no search", not "match everything" —
+    /// the same rule [`crate::schema::object_name_matches`] states.
+    #[test]
+    fn an_empty_needle_matches_nothing() {
+        let g = graph(vec![dnode("orders", &["id"])]);
+        assert!(search(&g, "").is_empty());
+        assert!(search(&g, "   ").is_empty());
+    }
+
+    #[test]
+    fn a_needle_nothing_contains_matches_nothing() {
+        let g = graph(vec![dnode("orders", &["id"])]);
+        assert!(search(&g, "zzz").is_empty());
+        assert_eq!(total_hits(&[]), 0);
+    }
+
+    /// A stub is a named card on the canvas, so it answers a name search — it
+    /// just has no columns to offer.
+    #[test]
+    fn a_stub_matches_on_its_name() {
+        let mut g = graph(vec![dnode("orders", &["id"])]);
+        g.nodes.push(DiagramNode {
+            id: "archive.orders".into(),
+            kind: NodeKind::Stub,
+            columns: Vec::new(),
+        });
+        let m = search(&g, "archive");
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].node, "archive.orders");
+        assert!(m[0].name);
+    }
+
+    /// The pan-and-flash trigger: every hit is in one card, however many hits
+    /// that is. Two cards means the user still has to choose, so nothing moves.
+    #[test]
+    fn sole_node_is_the_one_card_every_hit_landed_in() {
+        let g = graph(vec![
+            dnode("orders", &["order_id", "order_date"]),
+            dnode("customers", &["id"]),
+        ]);
+        // Three hits, one card → still sole.
+        let m = search(&g, "order");
+        assert_eq!(total_hits(&m), 3);
+        assert_eq!(sole_node(&m), Some("orders"));
+        // Two cards → no single place to go.
+        let m = search(&g, "id");
+        assert!(m.len() > 1);
+        assert_eq!(sole_node(&m), None);
+        // Nothing found → nowhere to go.
+        assert_eq!(sole_node(&[]), None);
+    }
+
+    #[test]
+    fn the_readout_counts_hits_and_names_the_card_span() {
+        let one = vec![NodeMatch {
+            node: "orders".into(),
+            name: true,
+            columns: vec![],
+        }];
+        let two_in_one = vec![NodeMatch {
+            node: "orders".into(),
+            name: true,
+            columns: vec!["order_id".into()],
+        }];
+        let across = vec![
+            NodeMatch {
+                node: "orders".into(),
+                name: true,
+                columns: vec![],
+            },
+            NodeMatch {
+                node: "customers".into(),
+                name: true,
+                columns: vec![],
+            },
+        ];
+        assert_eq!(match_label(&[]), "No matches");
+        assert_eq!(match_label(&one), "1 match");
+        assert_eq!(match_label(&two_in_one), "2 matches");
+        assert_eq!(match_label(&across), "2 matches in 2 tables");
+    }
+}
+
 #[cfg(test)]
 mod layout_clear_tests {
     use super::*;

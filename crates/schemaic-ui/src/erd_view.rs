@@ -42,7 +42,7 @@ use floem::event::{Event, EventListener, EventPropagation};
 use floem::keyboard::{Key, NamedKey};
 use floem::kurbo::{BezPath, Line, Point, Stroke};
 use floem::prelude::*;
-use floem::reactive::create_effect;
+use floem::reactive::{Memo, create_effect, create_memo};
 use floem::views::{container, empty, v_stack_from_iter};
 use floem::{View, ViewId};
 use floem_renderer::Renderer;
@@ -141,6 +141,167 @@ pub(crate) fn card_border(tint: Option<floem::peniko::Color>) -> floem::peniko::
         Some(c) => tinted_border(c, theme::erd_node_header(), theme::erd_canvas()),
         None => theme::border(),
     }
+}
+
+// ── Find in diagram (Ctrl+F) ────────────────────────────────────────────────
+
+/// How long the outline stays on the card a find panned to. Long enough to catch
+/// the eye after the canvas has finished moving, short enough that it doesn't
+/// become a second, stale selection the user has to dismiss.
+const FIND_FLASH: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The find popup's state, one instance per open diagram.
+///
+/// `Copy`, so it threads down to the cards without a clone at every hop — every
+/// field is a signal, and a signal is a handle.
+#[derive(Clone, Copy)]
+struct Find {
+    open: RwSignal<bool>,
+    query: RwSignal<String>,
+    /// The node currently wearing the find outline, if any.
+    flash: RwSignal<Option<String>>,
+    /// Bumped on every flash, so an expiring timer only clears the outline **it**
+    /// set. Without it, searching twice inside three seconds lets the first
+    /// search's timer wipe the second search's outline early.
+    flash_seq: RwSignal<u64>,
+}
+
+impl Find {
+    fn new() -> Self {
+        Self {
+            open: RwSignal::new(false),
+            query: RwSignal::new(String::new()),
+            flash: RwSignal::new(None),
+            flash_seq: RwSignal::new(0),
+        }
+    }
+
+    /// Close the popup and forget the query, reporting whether it was open at all.
+    ///
+    /// That answer is what keeps Escape from closing the whole diagram while the
+    /// user is only trying to leave the search box — see the modal's key handler.
+    fn dismiss(self) -> bool {
+        if !self.open.get_untracked() {
+            return false;
+        }
+        self.open.set(false);
+        self.query.set(String::new());
+        self.flash.set(None);
+        true
+    }
+
+    /// Outline `id` for [`FIND_FLASH`], then clear it.
+    fn flash_node(self, id: &str) {
+        let seq = self.flash_seq.get_untracked().wrapping_add(1);
+        self.flash_seq.set(seq);
+        self.flash.set(Some(id.to_string()));
+        let (flash, flash_seq) = (self.flash, self.flash_seq);
+        floem::action::exec_after(FIND_FLASH, move |_| {
+            // `try_get_untracked` — the diagram may have been closed inside the
+            // three seconds, taking these signals' scope with it, and a plain read
+            // of a disposed signal is not a question with an answer.
+            if flash_seq.try_get_untracked() == Some(seq) {
+                flash.set(None);
+            }
+        });
+    }
+}
+
+/// The find popup: the editor's and grid's bar, in the diagram's top-right corner.
+///
+/// 10px in from the canvas's top and right edges — the canvas starts below the
+/// toolbar, so that clears it without having to know its height.
+///
+/// There is **no prev/next pair** here, unlike the other two bars. Those step a
+/// caret through an ordered document; a diagram has no such order, and this search
+/// answers a different question — it lights up every match at once, and moves the
+/// canvas only when there is exactly one card to move to. A "next" button would
+/// have to invent a sequence over a 2-D canvas before it had anything to do.
+fn find_bar(find: Find, matches: Memo<Vec<erd::NodeMatch>>) -> impl IntoView {
+    dyn_container(
+        move || find.open.get(),
+        move |open| {
+            if !open {
+                return empty().into_any();
+            }
+            let input = crate::edit_field(
+                find.query,
+                crate::FieldCfg {
+                    placeholder: "Find table or column",
+                    autofocus: true,
+                    font_size: 13.0,
+                    border_radius: 6.0,
+                    height: Some(crate::FIELD_INPUT_H),
+                    // Escape inside the field closes the search and nothing else.
+                    // The field consumes the key outright (floem registers the
+                    // editor's KeyDown listener with `on_event_stop`), so it never
+                    // reaches the modal root's handler — which is the whole point:
+                    // leaving the search box must not also leave the diagram.
+                    on_escape: Some(Rc::new(move || {
+                        find.dismiss();
+                    })),
+                    ..Default::default()
+                },
+            )
+            .style(|s| s.width(190.0));
+            // Blank until something is typed, then what was found — matching the
+            // grid bar's dim readout in the same slot.
+            let count = dyn_container(
+                move || {
+                    find.query
+                        .with(|q| !q.trim().is_empty())
+                        .then(|| matches.with(|m| erd::match_label(m)))
+                },
+                move |label| match label {
+                    Some(label) => text(label)
+                        .style(|s| {
+                            s.font_size(theme::FONT_LABEL)
+                                .color(theme::text_dim())
+                                .min_width(30.0)
+                        })
+                        .into_any(),
+                    None => empty().into_any(),
+                },
+            );
+            let close_btn = container(icons::icon(icons::X, 14.0))
+                .on_click_stop(move |_| {
+                    find.dismiss();
+                })
+                .style(|s| {
+                    s.items_center()
+                        .color(theme::text_dim())
+                        .hover(|s| s.color(theme::text()))
+                });
+            h_stack((input, count, close_btn))
+                .style(|s| {
+                    s.items_center()
+                        .gap(8.0)
+                        .padding_horiz(8.0)
+                        .padding_vert(6.0)
+                        .background(theme::bg_panel())
+                        .border(1.0)
+                        .border_color(theme::border())
+                        .border_radius(8.0)
+                })
+                // Consume the press so it stops here, and **do nothing with it**.
+                // The field focuses itself on a click; this handler sees that same
+                // press on the way up, so anything it does about focus undoes what
+                // the click just did.
+                //
+                // It grabbed focus for a while, to cover a press landing on the
+                // popup's padding rather than the field. `edit_field` returns a
+                // *wrapper*, and "a `request_focus` on the outer view doesn't reach
+                // the editor" (its own words) — so that call didn't focus the field,
+                // it moved app focus onto the wrapper and off the editor the click
+                // had just put it on. Clicking the box stopped working while Ctrl+F
+                // still did, because reopening autofocuses through the editor's real
+                // id. Reaching that id needs a `FieldCfg` hook that doesn't exist,
+                // and the padding is 8px, so the nicety isn't worth one.
+                .on_event_stop(EventListener::PointerDown, |_| {})
+                .into_any()
+        },
+    )
+    .style(|s| s.absolute().inset_top(10.0).inset_right(10.0))
 }
 
 /// The key role tint for a column, matching the schema panel / Find-Anywhere:
@@ -558,6 +719,8 @@ fn column_row(
     hovered: RwSignal<Option<usize>>,
     graph: Rc<DiagramGraph>,
     node_id: Rc<str>,
+    // `found`: this column's name is one the find bar matched.
+    found: bool,
 ) -> AnyView {
     let name = c.name.clone();
     let hl_name = c.name.clone();
@@ -575,8 +738,15 @@ fn column_row(
                 .height(13.0 * z)
         }),
         text(name).style(move |s| {
+            // A find hit outranks the key tint: the gold/purple says what the
+            // column *is*, which is still true and still on the glyph beside it,
+            // while the highlight answers the question being asked right now.
             s.font_size(11.5 * zoom.get() as f32)
-                .color(col_tint(pk, fk))
+                .color(if found {
+                    theme::match_highlight()
+                } else {
+                    col_tint(pk, fk)
+                })
                 .flex_grow(1.0_f32)
                 .min_width(0.0)
                 .text_ellipsis()
@@ -592,7 +762,8 @@ fn column_row(
         let hl = hovered
             .get()
             .is_some_and(|idx| erd::edge_touches_column(&graph, idx, &node_id, &hl_name));
-        s.items_center()
+        let s = s
+            .items_center()
             .gap(8.0 * z)
             .height(ROW_H * z)
             .width_full()
@@ -601,7 +772,20 @@ fn column_row(
                 theme::erd_row_highlight()
             } else {
                 floem::peniko::Color::TRANSPARENT
-            })
+            });
+        // A found row is ringed as well as recoloured. The text colour alone was
+        // too quiet to find by eye at a diagram's zoom levels — a row is 11.5px
+        // type inside a card among dozens — and the ring is the same language the
+        // flashed card wears, one weight down: 1px against the card's 2px, so a
+        // row never reads louder than the card it is in. An outline rather than a
+        // border for the same reason as there — it must not move the row's
+        // contents, since every row's height feeds the card's measured size and
+        // the edges routed to it.
+        if found {
+            s.outline(1.0).outline_color(theme::match_highlight())
+        } else {
+            s
+        }
     })
     .pointer_events(|| false)
     .into_any()
@@ -610,6 +794,12 @@ fn column_row(
 /// The visible column rows for `node` at a collapse state, plus a clickable
 /// expand/collapse toggle row when the node has hidden columns. Pressing the
 /// toggle flips `collapsed[id]` and updates `sizes[id]` so edges re-route.
+///
+/// `hit_columns` are the column names the find bar matched in this node. A
+/// collapsed card shows only its key columns, so a matched column can be real and
+/// still not on screen — the card's outline is what points at it, and expanding is
+/// left to the user rather than having a search silently resize cards and re-route
+/// every edge around them.
 #[allow(clippy::too_many_arguments)]
 fn column_rows(
     node: Rc<DiagramNode>,
@@ -619,18 +809,21 @@ fn column_rows(
     zoom: RwSignal<f64>,
     hovered: RwSignal<Option<usize>>,
     graph: Rc<DiagramGraph>,
+    hit_columns: Vec<String>,
 ) -> impl IntoView {
     let (visible, collapsible, _h) = card_metrics(&node, is_collapsed);
     let node_id: Rc<str> = Rc::from(node.id.as_str());
     let mut rows: Vec<AnyView> = visible
         .iter()
         .map(|&ci| {
+            let col = &node.columns[ci];
             column_row(
-                &node.columns[ci],
+                col,
                 zoom,
                 hovered,
                 graph.clone(),
                 node_id.clone(),
+                hit_columns.contains(&col.name),
             )
         })
         .collect();
@@ -657,6 +850,9 @@ fn column_rows(
                 })
                 // Toggle on press, consumed so it doesn't start a card drag.
                 .on_event_stop(EventListener::PointerDown, move |_| {
+                    // Consuming the press means the canvas below never gets to take
+                    // the keyboard back for us — see its PointerDown.
+                    crate::widgets::hand_keyboard_back(None);
                     let now = !is_collapsed;
                     collapsed.update(|m| {
                         m.insert(id.clone(), now);
@@ -697,6 +893,8 @@ fn node_card(
     persist: Rc<dyn Fn()>,
     reveal: Rc<dyn Fn(String)>,
     tint: Option<floem::peniko::Color>,
+    find: Find,
+    matches: Memo<Vec<erd::NodeMatch>>,
 ) -> AnyView {
     let id = p.node.id.clone();
     let (ix, iy, w) = (p.x, p.y, p.w);
@@ -735,6 +933,20 @@ fn node_card(
         .into_any();
     }
 
+    // What the find bar found *in this card*, as a memo so a card only re-renders
+    // when its own match changes: `matches` fires on every keystroke, but a card
+    // nobody is searching for sees the same `None` each time and stays put.
+    let mine = {
+        let id = id.clone();
+        create_memo(move |_| matches.with(|v| v.iter().find(|m| m.node == id).cloned()))
+    };
+    // The name is painted in the shared match colour when the search hit it —
+    // `theme::match_highlight`, the same colour the schema tree marks a filter hit
+    // with. Not the tree's per-character `highlight_text`: that bakes a fixed font
+    // size into a text layout, and a card's type scales with the zoom, so the name
+    // would stop growing with the diagram it belongs to.
+    let name_hit = create_memo(move |_| mine.with(|m| m.as_ref().is_some_and(|m| m.name)));
+
     let name = p.node.id.clone();
     // Does the name ellipsize at this card's width? The header lays out as
     // icon (13) + gap (7) + name, inside 10px horizontal padding each side, so the
@@ -767,7 +979,11 @@ fn node_card(
         text(name).style(move |s| {
             s.font_size(13.0 * zoom.get() as f32)
                 .font_bold()
-                .color(theme::text())
+                .color(if name_hit.get() {
+                    theme::match_highlight()
+                } else {
+                    theme::text()
+                })
                 .flex_grow(1.0_f32)
                 .min_width(0.0)
                 .text_ellipsis()
@@ -808,9 +1024,15 @@ fn node_card(
         let id_k = id.clone();
         dyn_container(
             // `with`: `get` would clone the whole collapse map per card (see the
-            // position read above).
-            move || collapsed.with(|m| m.get(&id_k).copied().unwrap_or(false)),
-            move |is_collapsed| {
+            // position read above). The find's matched columns join the key so the
+            // rows repaint when a search starts or stops touching them.
+            move || {
+                (
+                    collapsed.with(|m| m.get(&id_k).copied().unwrap_or(false)),
+                    mine.with(|m| m.as_ref().map(|m| m.columns.clone()).unwrap_or_default()),
+                )
+            },
+            move |(is_collapsed, hit_columns)| {
                 column_rows(
                     node.clone(),
                     is_collapsed,
@@ -819,6 +1041,7 @@ fn node_card(
                     zoom,
                     hovered,
                     graph.clone(),
+                    hit_columns,
                 )
                 .into_any()
             },
@@ -837,7 +1060,8 @@ fn node_card(
         let z = zoom.get();
         let (panx, pany) = pan.get();
         let (x, y) = at(&id_style);
-        s.absolute()
+        let s = s
+            .absolute()
             .inset_left(panx + x * z)
             .inset_top(pany + y * z)
             .width(w * z)
@@ -845,12 +1069,26 @@ fn node_card(
             // Carries the header's tint around the whole card — see `card_border`.
             .border_color(card_border(tint))
             .border_radius(6.0 * z)
-            .background(theme::erd_node_bg())
+            .background(theme::erd_node_bg());
+        // The find's "here it is" ring, for the three seconds after a search
+        // panned to this card. An **outline**, not a fatter border: a border is
+        // part of the box, so widening one would nudge the card's content by a
+        // pixel as the ring came and went. `with`, not `get`, so this doesn't
+        // clone a String per card on every pan and zoom frame.
+        if find.flash.with(|f| f.as_deref() == Some(id_style.as_str())) {
+            s.outline(2.0).outline_color(theme::match_highlight())
+        } else {
+            s
+        }
     })
     .on_event(EventListener::PointerDown, move |e| {
         if let Event::PointerDown(pe) = e
             && pe.button.is_primary()
         {
+            // Floem clears `app_state.focus` on *every* pointer press and never
+            // puts it back, so grabbing a card left the modal keyboard-dead — see
+            // the canvas's own PointerDown for the whole story.
+            crate::widgets::hand_keyboard_back(None);
             grab.set((pe.pos.x, pe.pos.y));
             dragging.set(true);
             moved.set(false);
@@ -1025,8 +1263,16 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                     theme::text_dim,
                 )
                 .into_any();
-                return modal_frame(win, close, "—".to_string(), Vec::new(), Vec::new(), body)
-                    .into_any();
+                return modal_frame(
+                    win,
+                    close,
+                    "—".to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                    body,
+                    None,
+                )
+                .into_any();
             };
 
             let graph = erd::build_graph(&schema, &target.database, &target.seed);
@@ -1040,7 +1286,8 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                 let body =
                     centered_msg("No foreign-key relationships to diagram.", theme::text_dim)
                         .into_any();
-                return modal_frame(win, close, scope, chips(&graph), Vec::new(), body).into_any();
+                return modal_frame(win, close, scope, chips(&graph), Vec::new(), body, None)
+                    .into_any();
             }
 
             let (placed, collapsed_defaults) = build_placed(&graph);
@@ -1217,6 +1464,41 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                     .height_full()
             });
 
+            // ── Find (Ctrl+F) ─────────────────────────────────────────────────
+            // One search per keystroke for the whole diagram; each card then reads
+            // its own row out of the result. `Memo`, not a plain derived read: it
+            // compares, so a card whose match didn't change doesn't re-render just
+            // because a character was typed somewhere else in the box.
+            let find = Find::new();
+            let search_graph = graph.clone();
+            let matches: Memo<Vec<erd::NodeMatch>> = create_memo(move |_| {
+                let q = find.query.get();
+                erd::search(&search_graph, &q)
+            });
+
+            // Every hit in one card → go there and ring it. The pan is what makes
+            // a one-of-a-kind match useful on a canvas the size of a schema: the
+            // highlight alone is invisible if the card is off-screen. More than one
+            // card and nothing moves — see `erd::sole_node`.
+            create_effect(move |_| {
+                let Some(id) = matches.with(|m| erd::sole_node(m).map(|s| s.to_string())) else {
+                    return;
+                };
+                let (vw, vh) = viewport_size.get_untracked();
+                if vw > 1.0 && vh > 1.0 {
+                    let at = positions.with_untracked(|m| m.get(&id).copied());
+                    let size = sizes.with_untracked(|m| m.get(&id).copied());
+                    if let (Some((x, y)), Some((cw, ch))) = (at, size) {
+                        // Centre the card's own centre in the viewport, in the
+                        // same screen-space transform the cards lay themselves out
+                        // with (`pan + logical·z`), solved for `pan`.
+                        let z = zoom.get_untracked();
+                        pan.set((vw / 2.0 - (x + cw / 2.0) * z, vh / 2.0 - (y + ch / 2.0) * z));
+                    }
+                }
+                find.flash_node(&id);
+            });
+
             // Each card's identity colour, resolved **once** per card. A node id is
             // the table's display name, which is exactly how `db_color` keys a
             // table colour, so no reparsing is needed. Untracked, and not read
@@ -1255,6 +1537,8 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                     persist.clone(),
                     reveal.clone(),
                     tint_of(&p.node.id),
+                    find,
+                    matches,
                 ));
             }
 
@@ -1277,6 +1561,20 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
             let vid = base.id();
             let canvas_inner = base
                 .on_event(EventListener::PointerDown, move |e| {
+                    // **Take the keyboard back before anything else.** Floem clears
+                    // `app_state.focus` on every pointer press and never restores
+                    // it (`window_handle`: `focus.take()` on PointerDown), and a
+                    // KeyDown with no focused view is offered to the *window* root
+                    // only — never to a modal's own listeners. This canvas is
+                    // entirely pointer-driven, so one pan, one click on empty space,
+                    // and Escape and Ctrl+F both stopped working until the user
+                    // happened to click a focusable control in the toolbar. Escape
+                    // had been dead this way since the diagram shipped; Ctrl+F
+                    // inherited it.
+                    //
+                    // `hand_keyboard_back` is the house fix for exactly this and
+                    // aims at the innermost focus root, which is this modal.
+                    crate::widgets::hand_keyboard_back(None);
                     // Primary on empty space (cards consume their own primary) or
                     // middle anywhere → begin panning, capturing the pointer.
                     if let Event::PointerDown(pe) = e
@@ -1379,7 +1677,14 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
             // Flex-grow wrapper fills the modal body; its measured size feeds
             // `viewport_size`, which sizes the clip layer above. `min_*(0)` lets it
             // shrink within the panel column.
-            let canvas = container(canvas_inner)
+            //
+            // The find bar is a sibling of the canvas rather than a child of it:
+            // the canvas layer is `.clip()`ped and pan/zoom-transformed, so a popup
+            // inside it would scroll away with the diagram. Here it is absolute
+            // against this wrapper, which *is* the modal body — so "10px from the
+            // top" already means "10px below the toolbar", with no knowledge of how
+            // tall the toolbar is. Second child, so it paints over the cards.
+            let canvas = crate::stack((canvas_inner, find_bar(find, matches)))
                 .on_resize(move |rect| {
                     let (w, h) = (rect.width(), rect.height());
                     if viewport_size.get_untracked() != (w, h) {
@@ -1406,7 +1711,16 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                         .min_width(0.0)
                 });
 
-            modal_frame(win, close, scope, counts, controls, canvas.into_any()).into_any()
+            modal_frame(
+                win,
+                close,
+                scope,
+                counts,
+                controls,
+                canvas.into_any(),
+                Some(find),
+            )
+            .into_any()
         },
     )
     .style(move |s| {
@@ -1440,6 +1754,10 @@ fn chips(graph: &DiagramGraph) -> Vec<AnyView> {
 
 /// Assemble the modal: backdrop + panel (header, toolbar, body). `body` is the
 /// canvas (or a message). Sized ~80% of the window.
+///
+/// `find` is the diagram's find state, and `None` for the two bodies that are just
+/// a message — there is nothing to search in either, so neither binds Ctrl+F.
+#[allow(clippy::too_many_arguments)]
 fn modal_frame(
     win: RwSignal<(f64, f64)>,
     close: Rc<dyn Fn()>,
@@ -1447,6 +1765,7 @@ fn modal_frame(
     counts: Vec<AnyView>,
     controls: Vec<AnyView>,
     body: AnyView,
+    find: Option<Find>,
 ) -> impl IntoView {
     let toolbar = h_stack((
         // Left: scope breadcrumb (label + value grouped) then the count pills 10px
@@ -1509,7 +1828,38 @@ fn modal_frame(
         crate::stack((crate::widgets::dismiss_layer(move || close()), panel)),
         ring,
     )
-    .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| esc())
+    // The diagram's whole keyboard policy, in one handler rather than a stack of
+    // per-key ones, so the order Escape is offered around in is readable in a
+    // single place — the grid's `grid_key` for the same reason.
+    .on_event(EventListener::KeyDown, move |e| {
+        let Event::KeyDown(ke) = e else {
+            return EventPropagation::Continue;
+        };
+        match &ke.key.logical_key {
+            // Escape closes the find popup first, and the diagram only once there
+            // is no popup left to close. The field's own `on_escape` already covers
+            // the case where it has focus; this covers the rest of the modal, which
+            // is most of it — the canvas is pointer-driven, so pan, zoom or drag
+            // anything and focus is no longer in the search box.
+            Key::Named(NamedKey::Escape) => {
+                if !find.is_some_and(Find::dismiss) {
+                    (esc)();
+                }
+                EventPropagation::Stop
+            }
+            Key::Character(c) if ke.modifiers.control() && c.eq_ignore_ascii_case("f") => {
+                match find {
+                    // Its input autofocuses on mount, as the grid's does.
+                    Some(find) => {
+                        find.open.set(true);
+                        EventPropagation::Stop
+                    }
+                    None => EventPropagation::Continue,
+                }
+            }
+            _ => EventPropagation::Continue,
+        }
+    })
     .style(|s| {
         s.size_full()
             .items_center()
