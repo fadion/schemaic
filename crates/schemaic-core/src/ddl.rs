@@ -173,6 +173,21 @@ impl CheckDraft {
     }
 }
 
+/// Where one of a table's keys lives inside a [`TableDraft`] — the answer
+/// [`TableDraft::find_key`] gives, and what the designer needs to land on it:
+/// the section names the tab, the number names the row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DraftKey {
+    /// A row of [`TableDraft::indexes`].
+    Index(usize),
+    /// A row of [`TableDraft::foreign_keys`].
+    ForeignKey(usize),
+    /// The primary key, which has **no row of its own** — it is a per-column
+    /// flag ([`TableDraft::is_in_primary_key`]) — so this is a position into
+    /// [`TableDraft::columns`]: the first column in key order.
+    PrimaryKeyColumn(usize),
+}
+
 /// The whole desired shape of one table.
 ///
 /// The primary key lives here as an **ordered list** rather than as the
@@ -341,6 +356,47 @@ impl TableDraft {
             self.columns[idx].key_name = new.clone();
             self.move_references(&old, &new);
         }
+    }
+
+    /// Where one of a table's keys sits in this draft — which of the designer's
+    /// sections holds it, and which row of that section.
+    ///
+    /// The arguments are exactly what a schema-tree key row carries: the
+    /// [`IndexInfo`] the row stands for, and the foreign-key constraint it backs
+    /// when it backs one. The two are asked together because they answer one
+    /// question, and because **the answer is not a position in the tree**: the
+    /// tree lists the primary key among the keys and a foreign key under its
+    /// backing index, while the draft keeps three separate collections and
+    /// leaves the primary key out of [`TableDraft::indexes`] altogether.
+    ///
+    /// `None` for a key this draft doesn't hold, which is a caller's cue to open
+    /// on nothing in particular rather than on row 0.
+    pub fn find_key(&self, index: &IndexInfo, foreign_key: Option<&str>) -> Option<DraftKey> {
+        // A foreign key is looked up by the **constraint** name, never by the
+        // backing index's — the two needn't match, and dropping or editing the
+        // constraint is what the row is really about.
+        if let Some(name) = foreign_key {
+            return self
+                .foreign_keys
+                .iter()
+                .position(|f| f.info.name == name)
+                .map(DraftKey::ForeignKey);
+        }
+        if index.is_primary() {
+            // The primary key has no row of its own: it is a tick on each
+            // column, which is what the index form's own hint says. Land on the
+            // first column in key order.
+            let first = self.primary_key.first()?;
+            return self
+                .columns
+                .iter()
+                .position(|c| c.key_name == *first)
+                .map(DraftKey::PrimaryKeyColumn);
+        }
+        self.indexes
+            .iter()
+            .position(|i| i.info.name == index.name)
+            .map(DraftKey::Index)
     }
 
     /// Is the column at `idx` part of the primary key?
@@ -6914,6 +6970,115 @@ mod tests {
         assert_eq!(d.primary_key, vec!["a"]);
         assert_eq!(d.foreign_keys[0].info.columns, vec!["a"]);
         assert!(d.validate().is_empty(), "{:?}", d.validate());
+    }
+
+    /// The schema tree's key rows and the designer's Indexes list are **not**
+    /// the same sequence: the tree shows the primary key among the keys, the
+    /// draft leaves it out of `indexes` entirely. A position taken from
+    /// `TableInfo.indexes` would land one row late in every table with a
+    /// primary key — which is nearly all of them.
+    #[test]
+    fn find_key_positions_an_index_in_the_primary_key_less_list() {
+        let t = TableInfo {
+            name: "orders".into(),
+            indexes: vec![
+                IndexInfo::plain("PRIMARY", vec!["id"], true),
+                IndexInfo::plain("idx_customer", vec!["customer_id"], false),
+                IndexInfo::plain("idx_placed", vec!["placed_at"], false),
+            ],
+            ..Default::default()
+        };
+        let d = TableDraft::from_table(&t);
+        assert_eq!(
+            d.find_key(&t.indexes[1], None),
+            Some(DraftKey::Index(0)),
+            "the first index the tree shows after PRIMARY is row 0 of the draft"
+        );
+        assert_eq!(d.find_key(&t.indexes[2], None), Some(DraftKey::Index(1)));
+    }
+
+    /// The primary key has no row of its own in the designer — it is a tick on
+    /// each column — so it resolves to the first column in key order, which is
+    /// where the index form's own hint sends you.
+    #[test]
+    fn find_key_sends_the_primary_key_to_its_first_column() {
+        let t = TableInfo {
+            name: "line_items".into(),
+            columns: vec![
+                col("note", "text"),
+                col("order_id", "int"),
+                col("sku", "varchar(20)"),
+            ],
+            indexes: vec![IndexInfo::plain("PRIMARY", vec!["order_id", "sku"], true)],
+            ..Default::default()
+        };
+        let d = TableDraft::from_table(&t);
+        assert_eq!(d.primary_key, vec!["order_id", "sku"]);
+        assert_eq!(
+            d.find_key(&t.indexes[0], None),
+            Some(DraftKey::PrimaryKeyColumn(1)),
+            "column 1 is `order_id`, not the composite's first *column*"
+        );
+    }
+
+    /// A foreign key is resolved against `foreign_keys` by the **constraint**
+    /// name, never against `indexes` by the backing index's — the two needn't
+    /// match (classicmodels' `customerNumber` index backs `orders_ibfk_1`), and
+    /// the tree row carries both.
+    #[test]
+    fn find_key_resolves_a_foreign_key_by_its_constraint_name() {
+        let mut backing = IndexInfo::plain("customerNumber", vec!["customerNumber"], false);
+        backing.foreign = true;
+        let t = TableInfo {
+            name: "orders".into(),
+            indexes: vec![
+                IndexInfo::plain("PRIMARY", vec!["orderNumber"], true),
+                backing.clone(),
+            ],
+            foreign_keys: vec![
+                ForeignKeyInfo {
+                    name: "orders_ibfk_9".into(),
+                    columns: vec!["shipperNumber".into()],
+                    ref_table: "shippers".into(),
+                    ..Default::default()
+                },
+                ForeignKeyInfo {
+                    name: "orders_ibfk_1".into(),
+                    columns: vec!["customerNumber".into()],
+                    ref_table: "customers".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let d = TableDraft::from_table(&t);
+        assert_eq!(
+            d.find_key(&backing, Some("orders_ibfk_1")),
+            Some(DraftKey::ForeignKey(1)),
+            "the constraint's own row, not the index's"
+        );
+    }
+
+    /// A key the draft doesn't hold resolves to nothing rather than to row 0 —
+    /// the caller opens the designer unfocused, which is what it did before it
+    /// asked at all.
+    #[test]
+    fn find_key_answers_nothing_for_a_key_the_draft_does_not_hold() {
+        let t = TableInfo {
+            name: "orders".into(),
+            columns: vec![col("id", "int")],
+            indexes: vec![IndexInfo::plain("idx_placed", vec!["placed_at"], false)],
+            ..Default::default()
+        };
+        let d = TableDraft::from_table(&t);
+        let ghost = IndexInfo::plain("idx_gone", vec!["x"], false);
+        assert_eq!(d.find_key(&ghost, None), None);
+        // A foreign key names a constraint that isn't there.
+        assert_eq!(d.find_key(&t.indexes[0], Some("fk_gone")), None);
+        // And a PRIMARY row on a table whose draft has no primary key at all.
+        let pk = IndexInfo::plain("PRIMARY", vec!["id"], true);
+        assert!(d.primary_key.is_empty());
+        assert_eq!(d.find_key(&pk, None), None);
     }
 
     #[test]

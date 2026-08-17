@@ -1194,7 +1194,13 @@ impl DraftSignals {
 /// precomputed when the menu opens, since the row has the context then.
 #[derive(Clone)]
 pub enum CtxKind {
-    Database,
+    Database {
+        /// A `CREATE` script for the whole database — every namespace of it,
+        /// built lazily when the menu is staged (see
+        /// `DbSchema::create_ddl_script_all`). Empty when the schema hasn't
+        /// loaded, in which case the entry isn't offered.
+        ddl: String,
+    },
     /// A PostgreSQL namespace group — only rendered when a database has more than
     /// one, so this never appears on MySQL.
     Schema {
@@ -1213,10 +1219,7 @@ pub enum CtxKind {
     },
     /// A column. Carries its table, because the schema-editing entries act on
     /// the column *in* a table — a bare name can't be dropped.
-    Field {
-        source: TableSource,
-        column: String,
-    },
+    Field { source: TableSource, column: String },
     /// One of PostgreSQL's standalone objects — an enum type, a domain or a
     /// sequence. Carries the whole object rather than its name, because the menu
     /// needs it: its `CREATE` for Copy DDL, and its current state to seed the
@@ -1225,6 +1228,22 @@ pub enum CtxKind {
         database: String,
         item: Box<schemaic_core::schema::ObjectItem>,
         /// Its `CREATE`, built when the menu is staged.
+        ddl: String,
+    },
+    /// One of the `Types`/`Domains`/`Sequences` **folders**, which hold the
+    /// [`CtxKind::Object`] rows. A folder is structural, so its menu is about
+    /// the *set*: the script for what's in it, and creating one more of the one
+    /// kind it holds — which is the entry the database node's `Create` submenu
+    /// makes you find the long way round.
+    ObjectGroup {
+        database: String,
+        /// The namespace the folder sits under (`None` when the tree is flat).
+        schema: Option<String>,
+        kind: schemaic_core::ddl::ObjectKind,
+        /// A `CREATE` script for every object in the folder, built when the
+        /// menu is staged. Empty for a folder that is somehow empty, in which
+        /// case the entry isn't offered — but a folder with nothing in it
+        /// renders no row at all, so that case is unreachable from the tree.
         ddl: String,
     },
     /// An index or foreign-key row under a table.

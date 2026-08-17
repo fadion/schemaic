@@ -2434,6 +2434,38 @@ impl DbSchema {
             .join("\n\n")
     }
 
+    /// A `CREATE` script for the **whole database** — the database node's
+    /// analogue of [`DbSchema::create_ddl_script`], which covers one namespace.
+    ///
+    /// Namespaces are walked in [`DbSchema::schemas`] order, which is the order
+    /// the tree shows them (`public` first, then alphabetical), so the script
+    /// reads down the tree it was raised from. Where an engine has no
+    /// namespaces at all — MySQL and SQLite, whose tables all carry `None` —
+    /// there is nothing to walk and this *is* the flat script.
+    ///
+    /// Ordering **between** namespaces is display order rather than dependency
+    /// order: a type in one namespace used by a table in another is emitted
+    /// after it if the alphabet says so. That is the same class of gap
+    /// `create_ddl_script` already documents for foreign keys — the script is
+    /// read and edited before it is run, and the DDL preview is what runs
+    /// anything.
+    ///
+    /// Empty when the database holds nothing.
+    pub fn create_ddl_script_all(&self, dialect: crate::intel::SqlDialect) -> String {
+        let namespaces = self.schemas();
+        if namespaces.is_empty() {
+            return self.create_ddl_script(None, dialect);
+        }
+        namespaces
+            .iter()
+            .map(|ns| self.create_ddl_script(Some(ns), dialect))
+            // An empty namespace contributes nothing rather than a blank run:
+            // `join` over the parts that exist, not over every namespace.
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
     /// Every namespace present, in display order (`public` first, then
     /// alphabetical). Empty on MySQL, where tables carry no namespace — which is
     /// how the schema tree decides whether to render a schema level at all.
@@ -3600,6 +3632,69 @@ mod tests {
             out.contains("CREATE SEQUENCE \"s31a\".\"ticket_no\""),
             "{out}"
         );
+    }
+
+    /// The database-node script on an engine with no namespaces is exactly the
+    /// one the namespace call already builds — MySQL and SQLite carry every
+    /// table under `None`, so there is nothing to walk.
+    #[test]
+    fn create_ddl_script_all_is_the_flat_script_without_namespaces() {
+        use crate::intel::SqlDialect::MySql;
+        let s = DbSchema {
+            tables: vec![
+                TableInfo {
+                    name: "users".into(),
+                    columns: vec![col("id", "int", false, false)],
+                    ..Default::default()
+                },
+                TableInfo {
+                    name: "orders".into(),
+                    columns: vec![col("id", "int", false, false)],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(s.schemas().is_empty(), "MySQL carries no namespace");
+        assert_eq!(
+            s.create_ddl_script_all(MySql),
+            s.create_ddl_script(None, MySql)
+        );
+    }
+
+    /// Every namespace, in the order the tree shows them — `public` first, then
+    /// alphabetical — so the script reads down the tree it was raised from.
+    #[test]
+    fn create_ddl_script_all_walks_every_namespace_in_display_order() {
+        use crate::intel::SqlDialect::Postgres;
+        let tbl = |ns: &str, name: &str| TableInfo {
+            name: name.into(),
+            schema: Some(ns.into()),
+            columns: vec![col("id", "integer", false, false)],
+            ..Default::default()
+        };
+        let s = DbSchema {
+            // Deliberately not in display order: `schemas()` sorts, and this is
+            // what would pass by accident if it didn't.
+            tables: vec![
+                tbl("sales", "orders"),
+                tbl("public", "users"),
+                tbl("archive", "old_orders"),
+            ],
+            ..Default::default()
+        };
+        let out = s.create_ddl_script_all(Postgres);
+        let at = |t: &str| out.find(t).unwrap_or_else(|| panic!("{t} missing: {out}"));
+        assert!(at("users") < at("old_orders"), "public first: {out}");
+        assert!(at("old_orders") < at("orders"), "then alphabetical: {out}");
+    }
+
+    /// A namespace that holds nothing contributes no blank run to the script —
+    /// the join is over the non-empty parts, not over every namespace.
+    #[test]
+    fn create_ddl_script_all_is_empty_for_an_empty_database() {
+        use crate::intel::SqlDialect::Postgres;
+        assert_eq!(DbSchema::default().create_ddl_script_all(Postgres), "");
     }
 
     #[test]
