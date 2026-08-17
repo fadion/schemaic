@@ -76,6 +76,11 @@ struct ClosedTab {
     name: Option<String>,
     /// The original "Query N" number, restored on reopen when no live tab claims it.
     label: usize,
+    /// The `.sql` file the tab was bound to, and the file state that goes with it
+    /// — so Ctrl+Shift+T brings back a *file* tab, not an untitled copy of its text.
+    path: Option<std::path::PathBuf>,
+    disk_sql: Option<String>,
+    file_crlf: bool,
 }
 /// Record one executed query into history: `(conn_id, database, sql, tab_name)`,
 /// returning the **run id** it was recorded under — what
@@ -882,6 +887,14 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         }));
                         t.name.set(s.name.clone());
                         t.pinned.set(s.pinned);
+                        t.path.set(s.path.clone());
+                        t.file_crlf.set(s.file_crlf);
+                        // The file's text isn't persisted. A tab saved *clean*
+                        // therefore has its on-disk copy right here in `query`;
+                        // one saved dirty leaves it unknown (`None`), which the
+                        // tab shows as modified until a save or reload settles it.
+                        t.disk_sql
+                            .set((s.path.is_some() && !s.file_dirty).then(|| s.query.clone()));
                         t
                     })
                     .collect();
@@ -2574,7 +2587,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 let query = tab.query.get_untracked();
                 let source = tab.source.get_untracked();
                 let name = tab.name.get_untracked();
-                if query.trim().is_empty() && source.is_none() && name.is_none() {
+                let path = tab.path.get_untracked();
+                // A file-backed tab is worth restoring even when the file is
+                // empty: the binding to the path is the thing being lost.
+                if query.trim().is_empty() && source.is_none() && name.is_none() && path.is_none() {
                     return;
                 }
                 let mut ring = recently_closed.borrow_mut();
@@ -2588,6 +2604,9 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     source,
                     name,
                     label: tab.label,
+                    path,
+                    disk_sql: tab.disk_sql.get_untracked(),
+                    file_crlf: tab.file_crlf.get_untracked(),
                 });
             };
             // Pinned tabs aren't closable — this is the single choke point for
@@ -2797,8 +2816,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     };
 
     // Place a freshly-built tab: reuse the active tab *in place* if it's a blank
-    // slate (empty editor, no results / no Run-Everything panels) — the common
-    // "app opened on an empty Query 1" case — otherwise open it as a new tab.
+    // slate (empty editor, no results / no Run-Everything panels, no `.sql` file)
+    // — the common "app opened on an empty Query 1" case — else open it as a new tab.
     // Keeps the reused tab's visible number so it reads as the same tab.
     let place_tab: Rc<dyn Fn(Tab)> = Rc::new(move |new_tab: Tab| {
         let active_id = active.get_untracked();
@@ -2809,6 +2828,10 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     && t.query.get_untracked().trim().is_empty()
                     && matches!(t.results.get_untracked(), QueryState::Idle)
                     && t.result_tabs.get_untracked().is_empty()
+                    // A tab bound to a `.sql` file is not a blank slate even when
+                    // the file is empty: reusing it would silently drop the
+                    // binding, and the next Ctrl+S would go somewhere else.
+                    && t.path.with_untracked(|p| p.is_none())
             })
         });
         // When reusing a blank tab in place, its (empty) signals are replaced by
@@ -3056,6 +3079,261 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         })
     };
 
+    // ── `.sql` files ────────────────────────────────────────────────────────
+    //
+    // Two halves, split the way the results export is: the *dialog* and the tab
+    // bookkeeping run here on the UI thread, and the actual read/write goes to a
+    // worker (`spawn_blocking` — synchronous file IO, and a large script would
+    // otherwise freeze the window) with `create_ext_action` bringing the outcome
+    // back. Every decision about bytes and names is `core::sqlfile`.
+
+    /// Report a file operation's outcome — invoked on the UI thread.
+    type FileReadDone = Rc<dyn Fn(Result<schemaic_core::sqlfile::SqlText, String>)>;
+    type FileWriteDone = Rc<dyn Fn(Result<(), String>)>;
+
+    let read_sql_file: Rc<dyn Fn(std::path::PathBuf, FileReadDone)> = {
+        let handle = handle.clone();
+        Rc::new(move |path: std::path::PathBuf, done: FileReadDone| {
+            let report = create_ext_action(cx, move |res| (done)(res));
+            handle.spawn_blocking(move || {
+                let res = std::fs::read(&path)
+                    .map(|bytes| schemaic_core::sqlfile::decode(&bytes))
+                    .map_err(|e| format!("Couldn't read {}: {e}", path.display()));
+                report(res);
+            });
+        })
+    };
+
+    let write_sql_file: Rc<dyn Fn(std::path::PathBuf, String, FileWriteDone)> = {
+        let handle = handle.clone();
+        Rc::new(
+            move |path: std::path::PathBuf, contents: String, done: FileWriteDone| {
+                let report = create_ext_action(cx, move |res| (done)(res));
+                handle.spawn_blocking(move || {
+                    let res = std::fs::write(&path, contents.as_bytes())
+                        .map_err(|e| format!("Couldn't save {}: {e}", path.display()));
+                    report(res);
+                });
+            },
+        )
+    };
+
+    // Surface a file error where the app already puts the ones it can't attach to
+    // a result: the shared error modal. A failed Open or Save has no grid and no
+    // error bar of its own to land in, and silence is the one thing it must not be.
+    let file_error: Rc<dyn Fn(String)> = Rc::new(move |msg: String| {
+        error_modal_text.set(Some(msg));
+        error_modal_open.set(true);
+    });
+
+    // Write a tab's current text to `path` and, on success, bind the tab to it and
+    // record what's now on disk. The snapshot is taken *before* the write, so
+    // typing during it correctly leaves the tab modified afterwards.
+    let write_tab_to: Rc<dyn Fn(Tab, std::path::PathBuf)> = {
+        let write_sql_file = write_sql_file.clone();
+        let file_error = file_error.clone();
+        Rc::new(move |tab: Tab, path: std::path::PathBuf| {
+            let text = tab.query.get_untracked();
+            let contents = schemaic_core::sqlfile::encode(&text, tab.file_crlf.get_untracked());
+            let file_error = file_error.clone();
+            let landed = path.clone();
+            (write_sql_file)(
+                path,
+                contents,
+                Rc::new(move |res| match res {
+                    // The dialog and the write take a moment; a tab closed in the
+                    // meantime has had its scope disposed, and reading a freed
+                    // signal panics. Absent is the answer — the bytes are on disk
+                    // either way, there is just no tab left to mark saved.
+                    Ok(()) => {
+                        if tab.path.try_get_untracked().is_none() {
+                            return;
+                        }
+                        tab.path.set(Some(landed.clone()));
+                        tab.disk_sql.set(Some(text.clone()));
+                    }
+                    Err(e) => (file_error)(e),
+                }),
+            );
+        })
+    };
+
+    let tab_by_id =
+        move |id: usize| tabs.with_untracked(|v| v.iter().find(|t| t.id == id).copied());
+
+    // Ctrl+Shift+S — pick a path and write the tab there. The suggestion is the
+    // file's own name when it has one, else the tab's title scrubbed into
+    // something a file system will accept.
+    let save_sql_file_as: Rc<dyn Fn(usize)> = {
+        let write_tab_to = write_tab_to.clone();
+        Rc::new(move |id: usize| {
+            let Some(tab) = tab_by_id(id) else {
+                return;
+            };
+            let default_name = match tab.path.get_untracked() {
+                Some(p) => schemaic_core::sqlfile::tab_title(&p),
+                None => schemaic_core::sqlfile::suggested_name(&tab.title()),
+            };
+            let opts = floem::file::FileDialogOptions::new()
+                .title("Save SQL file")
+                .default_name(default_name)
+                .allowed_types(vec![floem::file::FileSpec {
+                    name: schemaic_core::sqlfile::SQL_FILTER_NAME,
+                    extensions: schemaic_core::sqlfile::SQL_EXTENSIONS,
+                }]);
+            let write_tab_to = write_tab_to.clone();
+            // `save_as` takes an `Fn`, so everything it needs is cloned per call.
+            floem::action::save_as(opts, move |file| {
+                let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
+                    return; // cancelled
+                };
+                // The native dialogs mostly append the filter's extension, but
+                // not on every platform — see `sqlfile::ensure_extension`.
+                (write_tab_to)(tab, schemaic_core::sqlfile::ensure_extension(path));
+            });
+        })
+    };
+
+    // Ctrl+S — write the tab back to its file, or fall through to Save As when it
+    // hasn't got one. Always the answer to "save this".
+    let save_sql_file: Rc<dyn Fn(usize)> = {
+        let write_tab_to = write_tab_to.clone();
+        let save_sql_file_as = save_sql_file_as.clone();
+        Rc::new(move |id: usize| {
+            let Some(tab) = tab_by_id(id) else {
+                return;
+            };
+            match tab.path.get_untracked() {
+                Some(path) => (write_tab_to)(tab, path),
+                None => (save_sql_file_as)(id),
+            }
+        })
+    };
+
+    // Ctrl+O — pick a `.sql` file and open it in a tab, reusing a blank one the
+    // way every other "open something in a tab" path does (`place_tab`).
+    let open_sql_file: Rc<dyn Fn()> = {
+        let next_id = next_id.clone();
+        let default_tab_target = default_tab_target.clone();
+        let place_tab = place_tab.clone();
+        let read_sql_file = read_sql_file.clone();
+        let file_error = file_error.clone();
+        Rc::new(move || {
+            let opts = floem::file::FileDialogOptions::new()
+                .title("Open SQL file")
+                .allowed_types(vec![floem::file::FileSpec {
+                    name: schemaic_core::sqlfile::SQL_FILTER_NAME,
+                    extensions: schemaic_core::sqlfile::SQL_EXTENSIONS,
+                }]);
+            let next_id = next_id.clone();
+            let default_tab_target = default_tab_target.clone();
+            let place_tab = place_tab.clone();
+            let read_sql_file = read_sql_file.clone();
+            let file_error = file_error.clone();
+            floem::file_action::open_file(opts, move |file| {
+                let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
+                    return; // cancelled
+                };
+                // Already open on this connection? Activate that tab instead of
+                // opening a second view of one file — two tabs saving over each
+                // other is a lost edit, and the strip is per-connection anyway.
+                let conn = active_conn.get_untracked();
+                let already = tabs.with_untracked(|v| {
+                    v.iter()
+                        .find(|t| {
+                            t.conn_id.get_untracked() == conn
+                                && t.path
+                                    .with_untracked(|p| p.as_deref() == Some(path.as_path()))
+                        })
+                        .map(|t| t.id)
+                });
+                if let Some(id) = already {
+                    active.set(id);
+                    return;
+                }
+                let next_id = next_id.clone();
+                let default_tab_target = default_tab_target.clone();
+                let place_tab = place_tab.clone();
+                let file_error = file_error.clone();
+                let opened = path.clone();
+                (read_sql_file)(
+                    path,
+                    Rc::new(move |res| match res {
+                        Ok(f) => {
+                            let id = next_id.get();
+                            next_id.set(id + 1);
+                            let (conn_id, database) = default_tab_target();
+                            let tab = Tab::new(cx, id, &f.text, conn_id, database);
+                            tab.path.set(Some(opened.clone()));
+                            tab.disk_sql.set(Some(f.text.clone()));
+                            tab.file_crlf.set(f.crlf);
+                            (place_tab)(tab);
+                        }
+                        Err(e) => (file_error)(e),
+                    }),
+                );
+            });
+        })
+    };
+
+    // Re-read the tab's file, discarding unsaved edits — confirmed first when
+    // there are any, since nothing else in the app can put them back.
+    let reload_sql_file: Rc<dyn Fn(usize)> = {
+        let read_sql_file = read_sql_file.clone();
+        let file_error = file_error.clone();
+        Rc::new(move |id: usize| {
+            let Some(tab) = tab_by_id(id) else {
+                return;
+            };
+            let Some(path) = tab.path.get_untracked() else {
+                return; // no file to reload from
+            };
+            let reload: Rc<dyn Fn()> = {
+                let read_sql_file = read_sql_file.clone();
+                let file_error = file_error.clone();
+                let path = path.clone();
+                Rc::new(move || {
+                    let file_error = file_error.clone();
+                    (read_sql_file)(
+                        path.clone(),
+                        Rc::new(move |res| match res {
+                            Ok(f) => {
+                                // Closed while the read was in flight (see
+                                // `write_tab_to`) — nothing left to reload into.
+                                if tab.query.try_get_untracked().is_none() {
+                                    return;
+                                }
+                                tab.query.set(f.text.clone());
+                                tab.disk_sql.set(Some(f.text.clone()));
+                                tab.file_crlf.set(f.crlf);
+                                // The mounted editor owns its document, so the
+                                // new text only shows once the pane remounts.
+                                tab.reload_gen.update(|g| *g = g.wrapping_add(1));
+                            }
+                            Err(e) => (file_error)(e),
+                        }),
+                    );
+                })
+            };
+            if !tab.modified() {
+                (reload)();
+                return;
+            }
+            confirm.set(Some(schemaic_ui::Confirm {
+                title: "Reload from disk".to_string(),
+                message: format!(
+                    "“{}” has unsaved changes. Reloading discards them. Reload anyway?",
+                    schemaic_core::sqlfile::tab_title(&path)
+                ),
+                resolve: Rc::new(move |yes| {
+                    if yes {
+                        (reload)();
+                    }
+                }),
+            }));
+        })
+    };
+
     // Reopen a query-history entry in a new tab. Unlike `open_query` (which
     // targets the *active* connection/db), this restores the entry's own
     // `conn_id`/`database` and its originating tab name — all recorded on the
@@ -3102,6 +3380,9 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             let tab = Tab::new(cx, id, &snap.query, snap.conn_id, snap.database);
             tab.source.set(snap.source);
             tab.name.set(snap.name);
+            tab.path.set(snap.path);
+            tab.disk_sql.set(snap.disk_sql);
+            tab.file_crlf.set(snap.file_crlf);
             (place_tab)(tab);
             if restore_label {
                 // A clash only matters within the connection — that's the scope
@@ -3232,6 +3513,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     t.source.get();
                     t.name.get();
                     t.pinned.get();
+                    t.path.get();
+                    t.disk_sql.get();
                 }
             });
             active.get();
@@ -3266,6 +3549,11 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                                     source_schema: src.and_then(|s| s.schema),
                                     name: t.name.get_untracked(),
                                     pinned: t.pinned.get_untracked(),
+                                    path: t.path.get_untracked(),
+                                    file_crlf: t.file_crlf.get_untracked(),
+                                    // One bit instead of a second copy of the
+                                    // file's text — see `SavedTab::file_dirty`.
+                                    file_dirty: t.modified(),
                                 }
                             })
                             .collect(),
@@ -5591,6 +5879,13 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             open_table_new,
             open_table_col,
             open_query,
+            // Deliberately un-gated on the connection, like the export: reading
+            // and writing a `.sql` file is between the editor and the disk, and
+            // works perfectly well against a server that has gone away.
+            open_sql_file,
+            save_sql_file,
+            save_sql_file_as,
+            reload_sql_file,
             reopen_closed_tab,
             can_reopen_closed_tab,
             can_close_other_tabs,

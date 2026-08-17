@@ -2089,6 +2089,9 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
     let add_tab = ui.tab_actions.add_tab.clone();
     let close_tab = ui.tab_actions.close_tab.clone();
     let duplicate_tab = ui.tab_actions.duplicate_tab.clone();
+    let open_sql_file = ui.tab_actions.open_sql_file.clone();
+    let save_sql_file = ui.tab_actions.save_sql_file.clone();
+    let save_sql_file_as = ui.tab_actions.save_sql_file_as.clone();
     let run_all = ui.tab_actions.run_all.clone();
     let schema_visible = ui.layout.schema_visible;
     let right_panel = ui.layout.right_panel;
@@ -2201,6 +2204,46 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                     Rc::new(move || {
                         if let Some(t) = active_tab() {
                             (close_tab)(t.id);
+                        }
+                    })
+                },
+                &close,
+            ),
+        },
+        // The file group, right after the tab lifecycle it belongs to: a tab is
+        // where a `.sql` file is opened into and saved from.
+        Command {
+            name: "open file",
+            label: "Open File",
+            hint: "a .sql script",
+            arg: instant(open_sql_file.clone(), &close),
+        },
+        Command {
+            name: "save file",
+            label: "Save File",
+            hint: "",
+            arg: instant(
+                {
+                    let save = save_sql_file.clone();
+                    Rc::new(move || {
+                        if let Some(t) = active_tab() {
+                            (save)(t.id);
+                        }
+                    })
+                },
+                &close,
+            ),
+        },
+        Command {
+            name: "save file as",
+            label: "Save File As",
+            hint: "",
+            arg: instant(
+                {
+                    let save_as = save_sql_file_as.clone();
+                    Rc::new(move || {
+                        if let Some(t) = active_tab() {
+                            (save_as)(t.id);
                         }
                     })
                 },

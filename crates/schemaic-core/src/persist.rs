@@ -255,6 +255,11 @@ impl Default for UiState {
 /// plus the connection/database it ran against (by id — never a credential URL)
 /// and the `(database, table)` it was opened from, so a restored tab lands on the
 /// same connection and highlights its source table in the schema sidebar.
+///
+/// A tab opened from (or saved to) a `.sql` file also carries `path` and how to
+/// write it back, so the binding survives a relaunch. The file's *contents* are
+/// never persisted here — `query` is the session's copy, and the file on disk is
+/// its own record.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedTab {
     pub query: String,
@@ -276,6 +281,23 @@ pub struct SavedTab {
     /// preserves both the flag and the left-of-strip position.
     #[serde(default)]
     pub pinned: bool,
+    /// The `.sql` file this tab is bound to (Open/Save), if any. Restored so a
+    /// file-backed tab still knows where Ctrl+S writes after a relaunch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    /// The file's line endings were CRLF, so a save writes them back that way
+    /// (see [`crate::sqlfile`]). Meaningless without `path`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub file_crlf: bool,
+    /// `query` differed from the file on disk when the session was saved.
+    ///
+    /// Persisted as one bit rather than storing a second copy of the file's text:
+    /// a restore takes `query` as-is either way, and this is only what the modified
+    /// dot on the tab needs to come back honest. `false` lets the restore treat
+    /// the text it already has as the on-disk content; `true` leaves that unknown,
+    /// which the tab shows as modified until the next save or reload settles it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub file_dirty: bool,
 }
 
 /// The set of open tabs at last save, plus which one was active (its index).
