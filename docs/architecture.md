@@ -1534,17 +1534,37 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     through the same `CtxOpener` its `on_secondary_click_stop` calls and hands that closure to
     `with_nav_scroll`, so the right-click and the keyboard cannot offer different menus for the
     row.
-    - The **size column** (`size_badge`) puts each table's on-disk size at the right edge of its
-      row, from the same `core::stats` figures the properties modal shows. It answers the question
-      that modal cannot — *which* of these is the big one — and is off by default behind SCHEMA
-      gear → **Show table sizes** (`SchemaUi::table_sizes`, persisted as
-      `UiState::show_table_sizes`). `ConnNode::stats` holds one database's `SchemaStats` and is
+    - The **size column** (`size_badge`) puts each table's on-disk size at the right edge of the
+      *panel*, from the same `core::stats` figures the properties modal shows. It answers the
+      question that modal cannot — *which* of these is the big one — and is off by default behind
+      SCHEMA gear → **Show table sizes** (`SchemaUi::table_sizes`, persisted as
+      `UiState::show_table_sizes`). The panel and not the row, because those are not the same edge:
+      the badge started as a `flex_grow` spacer pushing the size to the end of its row, and tree
+      rows stretch to the *widest* row (the tree is deliberately not `width_full` so it can scroll
+      horizontally), so expanding any table — whose column rows are indented and carry a type —
+      widened every row and carried the whole size column past the viewport, reachable only by
+      scrolling sideways. It is now out of flow and anchored to the panel: `absolute()`,
+      `inset_left(0)`, `width(tree_row_min_w())`, `justify_end()`, the same value every row already
+      uses as its `min_width`. `inset_left` rather than `inset_right` precisely because the right
+      edge is the one that moves. The trade is that a table name long enough to reach the panel
+      edge now runs *under* the size instead of pushing it along — tolerable because sizes appear
+      on table rows only, so there is no column row beneath to collide with. What runs underneath
+      is also the chevron and the name, so `.pointer_events(|| false)` on the badge is load-bearing
+      and not decoration: without it the badge, as the row's last child, won Floem's back-to-front
+      pointer walk for the panel's full width and clicking a table stopped expanding it — with the
+      column *off* too, because the empty state is still a full-width box. Keyboard nav kept
+      working throughout, which is the tell that it was dispatch and not the toggle. The mechanism
+      is under *Floem 0.2 gotchas*. `ConnNode::stats` holds one database's `SchemaStats` and is
       both the fetch's trigger and its guard: the app's effect fetches only nodes at
       `DbStatsState::Idle` that are *expanded* with the column on, moving each to `Loading` before
       spawning, and settles a failure at `Unavailable` rather than retrying on every expand.
-      `start_fetch` resets a node to `Idle`, which is what makes Refresh both the way to get fresh
-      figures and the only thing that retries a failed one. A table with no size renders nothing —
-      a dash down a tree of views and SQLite tables is worse than a blank.
+      `start_fetch` resets a node to `Idle` **and bumps `stats_gen`**, and it is the pair that makes
+      Refresh both the way to get fresh figures and the only thing that retries a failed one. The
+      reset alone never did it: the effect reads each slot `get_untracked` (it *writes* those slots,
+      so tracking them would re-enter it mid-loop), so on both refresh paths the column simply went
+      blank until something unrelated — the toggle, an expand, a connection switch — happened to
+      re-run the effect. A table with no size renders nothing — a dash down a tree of views and
+      SQLite tables is worse than a blank.
     `completion.rs` — SQL autocomplete: the ranking + popup layer
     (`recompute_completions`/`accept_completion`/`completion_popup` + `SchemaIndex`/`fuzzy_score`)
     over `schemaic_core::intel`'s scope/context engine.
@@ -1931,8 +1951,19 @@ Re-introducing the anti-patterns these guard against is a regression:
   class wins. Nest class overrides accordingly (dropdown popup restyle nests under `ListClass`).
 - **`DoubleClick` consumes the second `PointerUp`** — clear drag/press state in the double-click
   handler too, not only in `PointerUp`.
-- **Absolute overlays** (placeholders, action bars) intercept clicks — add `.pointer_events(|| false)`
-  so clicks fall through.
+- **Absolute overlays** (placeholders, action bars, badges) intercept clicks — every one that covers
+  something clickable needs `.pointer_events(|| false)` so clicks fall through. Out of flow is not
+  out of the hit test: Floem walks a view's children back-to-front looking for a pointer target and
+  stops at the first one whose bounds contain the point, whether or not that child handles the event
+  (`floem-0.2.0/src/context.rs`, `unconditional_view_event`: the loop is
+  `for child in children.into_iter().rev()` and ends `if event.is_pointer() { break }`), and an
+  overlay is typically the last child. A view that has opted out is `continue`d past instead —
+  `EventCx::should_send` returns false on the flag and the walk reaches the sibling underneath
+  (`Decorators::pointer_events`, `floem-0.2.0/src/views/decorator.rs:175`); Floem's own inspector
+  marks its overlays the same way. It bites even when the overlay renders **nothing**, because an
+  empty box still has bounds: the schema tree's size badge, once it became a panel-wide absolute
+  box, swallowed every click on a table row's chevron and name with the size column switched *off*
+  as well — which is what made the breakage look unrelated to the feature that introduced it.
 - **And nothing bounds them.** An absolute child is out of flow, so text in one that is longer than
   the box lays out at its natural width and **paints across the border** into whatever sits beside
   it — not clipped, not ellipsized. `edit_field`'s placeholder did this for every field in the app
@@ -1943,6 +1974,21 @@ Re-introducing the anti-patterns these guard against is a regression:
   otherwise sizes to its content and overflows the box meant to bound it, `min_width(0)` because
   without it the label refuses to shrink below that content width. `placeholder_right_inset` is where
   `edit_field` decides how much room the in-flow trailing action needs.
+- **A row's right edge is not the panel's, and an absolute inset is measured from the *border* box.**
+  Two facts that only bite together. Rows inside a horizontal scroll stretch to the **widest** row,
+  not to the viewport — the SCHEMA tree is deliberately not `width_full` so it can scroll — so a
+  `flex_grow` spacer right-aligns a child to whatever the longest row happens to be. The schema
+  tree's size column was pushed out that way and disappeared off the right of the viewport the
+  moment any table was expanded, its indented column rows having widened every row in the tree.
+  The fix is to leave the flow: `absolute().inset_left(0).width(<the panel width>)` with
+  `justify_end()`, and `inset_left` rather than `inset_right` because the right edge is the moving
+  one. That works at every indent level because taffy resolves an absolute child's inset from the
+  parent's **border** box and never adds its padding (taffy 0.4.4, `compute/flexbox.rs`,
+  `perform_absolute_layout_on_absolute_children`: `offset_main = start + border.main_start`), so one
+  inset lands identically on rows carrying different per-level `padding_left` — no depth arithmetic.
+  What you give up is the flow's collision handling: the in-flow sibling now runs *under* the
+  overlay instead of pushing it along — in paint order and in the hit test both, so the overlay
+  also needs the `.pointer_events(|| false)` the absolute-overlays bullet above is about.
 - **Deferred layout**: `exec_after(Duration::ZERO, …)` runs after layout settles — so
   `scroll_to(bottom)` clamps against new content height, not stale.
 - **`.get()` clones the whole value — use `.with()` to read part of a collection.** `SignalGet::get`
@@ -1958,6 +2004,18 @@ Re-introducing the anti-patterns these guard against is a regression:
   reveals: `if !matches!(right_panel.get_untracked(), Ai) { set(Ai) }` — a redundant `set(Ai)` while
   the AI panel is open disposes its `elapsed_ms` mid-update and the rebuilt footer panics on the
   freed signal.
+- **An effect that writes the signals it reads must read them untracked — and an outside write to
+  them is then invisible, so it needs a generation counter.** The schema tree's size-column effect
+  scans every `ConnNode::stats` slot for `Idle` and writes `Loading` into each one it fetches;
+  tracking those reads would make the effect its own dependency, re-entering it mid-loop and
+  double-fetching every database it had not yet reached. `get_untracked` there is load-bearing, not
+  an optimisation. The half that is easy to miss is the other side: a refresh resetting those same
+  slots to `Idle` now changes nothing the effect watches, so the sizes went blank and only returned
+  when an unrelated dependency happened to re-run it. The answer is a bare counter beside the state
+  — `main.rs`'s `stats_gen: RwSignal<u64>`, bumped by `start_fetch` immediately after the reset and
+  `track()`ed by the effect. Don't lean on a state signal that "obviously" already changed: the
+  connection-wide refresh does `set` `db_nodes`, which the effect *does* track, but it does so
+  before `start_fetch` resets the slots, so that run still saw them `Loaded` and found nothing to do.
 - **Don't read a locally-scoped signal inside a `dyn_container` child keyed on a *parent/shared*
   signal.** The child rebuilds when the shared signal changes — and if it changes *while the
   enclosing view is disposing* (e.g. `active_db` updates as the query pane is replaced on opening a
