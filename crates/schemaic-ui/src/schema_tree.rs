@@ -1788,11 +1788,15 @@ fn size_badge(
             None => empty().into_any(),
             Some(s) => h_stack((
                 empty().style(|s| s.flex_grow(1.0_f32).min_width(6.0)),
+                // No margin of its own: the row's `padding_right` plus the 2px it
+                // stops short of the panel edge already come to `ROW_PAD`, which
+                // is the inset the chevron gets on the left. Adding to that put
+                // the size visibly further in than the tree's left margin, and
+                // the two edges are what the eye pairs up.
                 text(s).style(|s| {
                     s.font_size(theme::FONT_STATUS)
                         .color(theme::text_faint())
                         .flex_shrink(0.0_f32)
-                        .margin_right(6.0)
                 }),
             ))
             .style(|s| s.flex_grow(1.0_f32).items_center().min_width(0.0))
