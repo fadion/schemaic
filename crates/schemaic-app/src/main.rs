@@ -821,17 +821,22 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         );
     });
 
-    // Per-database identity colours (persisted, keyed by connection+database;
-    // set from the schema tree's right-click menu, shown as a dot on the DB node,
-    // the active-DB selector, and the database's query tabs).
-    let db_colors = RwSignal::new(
-        persist::load_json::<schemaic_core::db_color::DbColorsFile>("db_colors.json").rules,
-    );
+    // Identity colours, both stores out of one file (persisted; set from the schema
+    // tree's right-click menu). Per-database — keyed by connection+database, shown
+    // as a dot on the DB node, the active-DB selector and the database's query tabs
+    // — and per-table, keyed by connection+database+display name, shown as a dot on
+    // the table row and as a tint on the table's ER-diagram card header.
+    let colors = persist::load_json::<schemaic_core::db_color::DbColorsFile>("db_colors.json");
+    let db_colors = RwSignal::new(colors.rules);
+    let table_colors = RwSignal::new(colors.tables);
+    // One save for the pair — they share `db_colors.json`, so writing either half
+    // has to write both or the other is lost.
     let save_db_colors: Rc<dyn Fn()> = Rc::new(move || {
         persist::save_json(
             "db_colors.json",
             &schemaic_core::db_color::DbColorsFile {
                 rules: db_colors.get_untracked(),
+                tables: table_colors.get_untracked(),
             },
         );
     });
@@ -4901,6 +4906,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             // Persisted by an effect on change.
             search_history.update(|v| schemaic_core::search_history::clear_conn(v, id));
             db_colors.update(|v| schemaic_core::db_color::clear_conn(v, id));
+            table_colors.update(|v| schemaic_core::db_color::table_clear_conn(v, id));
+            // One save, both stores — see where `save_db_colors` is built.
             (save_db_colors)();
             db_favorites.update(|v| schemaic_core::favorite::clear_conn(v, id));
             (save_db_favorites)();
@@ -6266,6 +6273,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         formats,
         save_formats,
         db_colors,
+        table_colors,
         save_db_colors,
         db_favorites,
         save_db_favorites,

@@ -1888,6 +1888,9 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
     // which rebuilds this node anyway, so the handle captured here is always the
     // live one for the row on screen.
     let table_sizes = ctx.ui.schema.table_sizes;
+    // Read before the destructure below moves `ctx`.
+    let table_colors = ctx.ui.table_colors;
+    let row_conn = ctx.ui.conn.active_conn;
     let db_stats = ctx.ui.schema.db_nodes.with_untracked(|nodes| {
         nodes
             .iter()
@@ -1984,6 +1987,20 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
             theme::FONT_BODY,
             theme::text,
             false,
+            1.0,
+        ),
+        // Identity dot after the name (only when this table has a colour), placed
+        // and spaced exactly like the database row's — the same colour tints this
+        // table's card header in the ER diagram.
+        crate::table_color_dot(
+            table_colors,
+            {
+                let db = database.clone();
+                let tbl = source.display();
+                move || Some((row_conn.get(), db.clone(), tbl.clone()))
+            },
+            7.0,
+            0.0,
             1.0,
         ),
         size_badge(
