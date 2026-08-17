@@ -613,26 +613,23 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
                 .style(menu_item_style)
                 .style(|s| s.padding_vert(8.0));
 
-            // A toggle, so it carries its own state: the check is the only thing
-            // that says whether the column is on, since a tree of views and
-            // engines with no statistics can legitimately show no sizes at all.
-            // The menu stays open — this one is a view mode you flip and look at.
+            // **The label carries the state, the way the eye menu's rows do** —
+            // `db_toggle_on` when the column is showing. No check glyph: it would
+            // need a reserved 13px gutter that reads as an empty box on every
+            // other row of this menu, and on the off state as a missing tick.
+            //
+            // Off is plain `text()`, not the eye menu's faded `db_toggle_off`.
+            // There, dim means *this database is hidden* — a state with a
+            // consequence. Here off is just the resting state of a view mode, and
+            // dimming it would make an ordinary menu row look disabled.
             let toggle_sizes = toggle_sizes.clone();
-            let sizes_item = container(
-                h_stack((
-                    // Faded rather than hidden: `hide()` takes it out of layout,
-                    // and the label would then shift sideways as you toggle.
-                    icons::icon(icons::CHECK, 13.0).style(move |s| {
-                        s.flex_shrink(0.0_f32).width(13.0).color(if sizes_on.get() {
-                            theme::text()
-                        } else {
-                            theme::text().multiply_alpha(0.0)
-                        })
-                    }),
-                    text("Show table sizes").style(|s| s.color(theme::text())),
-                ))
-                .style(|s| s.items_center().gap(7.0)),
-            )
+            let sizes_item = container(text("Show table sizes").style(move |s| {
+                s.color(if sizes_on.get() {
+                    theme::db_toggle_on()
+                } else {
+                    theme::text()
+                })
+            }))
             .on_click_stop(move |_| (toggle_sizes)())
             .style(menu_item_style)
             .style(|s| s.padding_vert(8.0));
