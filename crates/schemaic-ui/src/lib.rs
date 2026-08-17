@@ -772,6 +772,25 @@ pub struct Tab {
     /// in-place commit splice deliberately does NOT bump it, so it still avoids a
     /// rebuild. Part of the results-view container key.
     pub load_gen: RwSignal<u64>,
+    /// The `.sql` file this tab is bound to, or `None` for a scratch tab. Set by
+    /// Open (Ctrl+O) and by Save As, and persisted with the tab. A tab with a path
+    /// takes its title from the file name and shows a modified dot when it has
+    /// drifted from what's on disk.
+    pub path: RwSignal<Option<std::path::PathBuf>>,
+    /// The file's contents as of the last open / save / reload — the thing
+    /// [`Tab::modified`] compares `query` against. `None` means "unknown", which
+    /// only happens for a session restored while dirty; it reads as modified,
+    /// which is the safe direction.
+    pub disk_sql: RwSignal<Option<String>>,
+    /// The file was CRLF, so a save writes CRLF back (see
+    /// [`schemaic_core::sqlfile`]). Meaningless without `path`.
+    pub file_crlf: RwSignal<bool>,
+    /// Bumped when the tab's text is replaced *from outside the editor* (a reload
+    /// from disk). Part of the editor pane's container key, because the Floem
+    /// editor owns its own document once mounted: writing `query` alone would
+    /// leave the visible text stale until the next keystroke overwrote the signal
+    /// back from the doc.
+    pub reload_gen: RwSignal<u64>,
 }
 
 impl Tab {
@@ -813,16 +832,45 @@ impl Tab {
             grid_query: cx.create_rw_signal(schemaic_core::filter::GridQuery::default()),
             view_err: cx.create_rw_signal(None),
             load_gen: cx.create_rw_signal(0),
+            path: cx.create_rw_signal(None),
+            disk_sql: cx.create_rw_signal(None),
+            file_crlf: cx.create_rw_signal(false),
+            reload_gen: cx.create_rw_signal(0),
         }
     }
 
-    /// The tab's display title: its user-assigned name, or the default "Query N".
-    /// Reads the `name` signal reactively, so callers in a reactive scope re-run
-    /// on rename.
+    /// The tab's display title: its user-assigned name, else its file name, else
+    /// the default "Query N". Reads the `name` and `path` signals reactively, so
+    /// callers in a reactive scope re-run on a rename or a Save As.
+    ///
+    /// A user-assigned name wins over the file name on purpose: renaming a tab is
+    /// an explicit act, and a Save As shouldn't silently undo it.
     pub fn title(&self) -> String {
-        self.name
-            .get()
-            .unwrap_or_else(|| format!("Query {}", self.label))
+        if let Some(name) = self.name.get() {
+            return name;
+        }
+        match self.path.get() {
+            Some(p) => schemaic_core::sqlfile::tab_title(&p),
+            None => format!("Query {}", self.label),
+        }
+    }
+
+    /// Has this file-backed tab drifted from the file on disk?
+    ///
+    /// Always false for a tab with no file: an ordinary query tab is persisted
+    /// with the session and has nothing to be unsaved *against*, so a modified
+    /// marker on one would mean nothing. Reactive (tracks `query`).
+    pub fn modified(&self) -> bool {
+        if self.path.with(|p| p.is_none()) {
+            return false;
+        }
+        // `None` disk text = a session restored mid-edit, which we can't verify
+        // without re-reading the file. Reads as modified; a save or a reload
+        // settles it.
+        self.disk_sql.with(|disk| match disk {
+            Some(d) => self.query.with(|q| q != d),
+            None => true,
+        })
     }
 }
 
@@ -1500,6 +1548,20 @@ pub struct TabsActions {
     pub open_table_col: Rc<dyn Fn(TableSource, String)>,
     /// Open a new query tab containing `sql` (does NOT run it).
     pub open_query: Rc<dyn Fn(String)>,
+    /// Ctrl+O — pick a `.sql` file and open it in a tab (reusing a blank one, as
+    /// every other "open something in a tab" path does). A file already open on
+    /// this connection is activated rather than opened twice.
+    pub open_sql_file: Rc<dyn Fn()>,
+    /// Ctrl+S — write the tab (by id) back to its file. A tab with no file yet
+    /// falls through to [`Self::save_sql_file_as`], so this is always the answer
+    /// to "save this".
+    pub save_sql_file: Rc<dyn Fn(usize)>,
+    /// Ctrl+Shift+S — pick a path and write the tab (by id) there, binding it to
+    /// the new file.
+    pub save_sql_file_as: Rc<dyn Fn(usize)>,
+    /// Re-read the tab's file from disk, discarding unsaved edits (confirmed
+    /// first when there are any). No-op for a tab with no file.
+    pub reload_sql_file: Rc<dyn Fn(usize)>,
     /// Reopen the most-recently-closed tab (Ctrl+Shift+T): restores its query,
     /// connection/database, source, and name from a small ring. No-op when empty.
     pub reopen_closed_tab: Rc<dyn Fn()>,
@@ -1538,7 +1600,8 @@ pub struct TabsActions {
 /// The global navigation keys — handled at BOTH the workspace root and inside the
 /// editor (which `on_event_stop`s every KeyDown, so it can't rely on bubbling).
 /// Ctrl+P Find Anywhere · Ctrl+T new tab · Ctrl+Shift+T reopen closed tab ·
-/// Ctrl+W close tab · Ctrl+Tab cycle (Shift = reverse) · Ctrl+1..9 jump to the Nth tab.
+/// Ctrl+W close tab · Ctrl+Tab cycle (Shift = reverse) · Ctrl+1..9 jump to the Nth tab ·
+/// Ctrl+O open a `.sql` file · Ctrl+S save · Ctrl+Shift+S save as.
 #[derive(Clone)]
 pub(crate) struct NavKeys {
     pub tabs: RwSignal<Vec<Tab>>,
@@ -1551,6 +1614,9 @@ pub(crate) struct NavKeys {
     pub add_tab: Rc<dyn Fn()>,
     pub close_tab: Rc<dyn Fn(usize)>,
     pub reopen_closed: Rc<dyn Fn()>,
+    pub open_file: Rc<dyn Fn()>,
+    pub save_file: Rc<dyn Fn(usize)>,
+    pub save_file_as: Rc<dyn Fn(usize)>,
 }
 
 impl NavKeys {
@@ -1577,6 +1643,11 @@ impl NavKeys {
                 (self.reopen_closed)();
                 return true;
             }
+            // Ctrl+Shift+S → Save As.
+            if ch == Some("s") {
+                (self.save_file_as)(self.active.get_untracked());
+                return true;
+            }
             // Other Ctrl+Shift+<letter/digit> belong to the panel toggles, not us.
             return false;
         }
@@ -1594,6 +1665,16 @@ impl NavKeys {
             }
             Some("w") => {
                 (self.close_tab)(self.active.get_untracked());
+                true
+            }
+            // Ctrl+O / Ctrl+S — open a `.sql` file, and save the active tab to
+            // one (Save As when it hasn't got a file yet).
+            Some("o") => {
+                (self.open_file)();
+                true
+            }
+            Some("s") => {
+                (self.save_file)(self.active.get_untracked());
                 true
             }
             // Ctrl+1..9 → jump to the 1st..9th tab (by position, not id).
@@ -2338,6 +2419,9 @@ pub fn workspace(ui: Ui) -> impl IntoView {
         add_tab: ui.tab_actions.add_tab.clone(),
         close_tab: ui.tab_actions.close_tab.clone(),
         reopen_closed: ui.tab_actions.reopen_closed_tab.clone(),
+        open_file: ui.tab_actions.open_sql_file.clone(),
+        save_file: ui.tab_actions.save_sql_file.clone(),
+        save_file_as: ui.tab_actions.save_sql_file_as.clone(),
     };
     let shell = v_stack((
         header(ui.clone()),
@@ -3563,6 +3647,9 @@ fn center(ui: Ui) -> impl IntoView {
         add_tab: ui.tab_actions.add_tab.clone(),
         close_tab: ui.tab_actions.close_tab.clone(),
         reopen_closed: ui.tab_actions.reopen_closed_tab.clone(),
+        open_file: ui.tab_actions.open_sql_file.clone(),
+        save_file: ui.tab_actions.save_sql_file.clone(),
+        save_file_as: ui.tab_actions.save_sql_file_as.clone(),
     };
 
     // Open the query-plan modal for a statement (from the editor's "Plan" menu):
@@ -3598,8 +3685,21 @@ fn center(ui: Ui) -> impl IntoView {
     // "flashing" closed, a solid placeholder of identical size, so nothing
     // below it shifts.
     let editor_area = dyn_container(
-        move || (active.get(), flashing.get() == Some(active.get())),
-        move |(id, is_flashing)| {
+        move || {
+            let id = active.get();
+            // The active tab's reload generation is part of the key: the Floem
+            // editor owns its document once mounted (edits flow doc → `query`,
+            // never back), so a reload from disk only becomes visible by
+            // remounting the pane on the new text. `with_untracked` for the
+            // lookup — tracking the whole `tabs` vector here would rebuild the
+            // editor every time any tab was opened or closed.
+            let reloads = tabs
+                .with_untracked(|v| v.iter().find(|t| t.id == id).copied())
+                .and_then(|t| t.reload_gen.try_get())
+                .unwrap_or(0);
+            (id, flashing.get() == Some(id), reloads)
+        },
+        move |(id, is_flashing, _)| {
             if is_flashing {
                 return editor_placeholder(editor_h, editor_collapsed).into_any();
             }

@@ -1593,8 +1593,27 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `completion.rs` — SQL autocomplete: the ranking + popup layer
     (`recompute_completions`/`accept_completion`/`completion_popup` + `SchemaIndex`/`fuzzy_score`)
     over `schemaic_core::intel`'s scope/context engine.
-  - `tabs.rs` — query-tab strip. `grid.rs` — the whole results grid (`GridState`/`GridCtx`;
-    `results_view`/`loaded_view` are the entry points). `editor_pane.rs` — SQL editor pane
+  - `tabs.rs` — query-tab strip, and where a **`.sql`-backed tab** shows itself. The state behind
+    that is four signals on `Tab`: `path`, `disk_sql` (the file's text as of the last open / save /
+    reload — `None` means *unknown*, which reads as modified, the safe direction), `file_crlf` and
+    `reload_gen`. `Tab::title` falls back name → file name → "Query N", the user-assigned name
+    winning on purpose, since renaming a tab is an explicit act a Save As shouldn't silently undo;
+    `Tab::modified` is `path.is_some() && query != disk_sql`, and so always false for a tab with no
+    file — an ordinary tab is session-persisted and has nothing to be unsaved *against*. The chip's
+    content is a `dyn_container` keyed on `(editing, title, pinned, modified)`: the `modified` read
+    tracks `query`, so the closure re-runs on every keystroke, but the key only *changes* when the
+    flag flips, which is the one thing that has to rebuild the row. When it is set, a 6px
+    accent-tinted dot sits between the label and the ×, tooltipped ("Unsaved changes" — a bare dot
+    says nothing on its own) and tinted rather than neutral so it doesn't read as a second close
+    affordance. Its `TAB_MODIFIED_W` (13px — the glyph plus the 7px gap the label/× pair
+    already use) comes off the title cap the way the DB-identity dot's `TAB_DOT_W` does, and for the
+    same reason: `TAB_TITLE_AVAIL` covers neither, so a full-width truncated title would push the ×
+    past the chip cap and clip it. The context menu gains Save / Save As… / Reload from disk, after
+    Duplicate and before Close — Save is offered on a tab with no file too, since it falls through
+    to Save As, which is the answer to "save this" there, while Reload is *dimmed* rather than
+    hidden, the way "Reopen last tab" is on an empty ring, so the menu keeps one shape.
+  - `grid.rs` — the whole results grid (`GridState`/`GridCtx`; `results_view`/`loaded_view` are the
+    entry points). `editor_pane.rs` — SQL editor pane
     (`query_pane` + Ctrl+K popup, statement highlight, custom scrollbars). `compute_diagnostics`
     bridges the tab's schema/active-db to `intel::diagnostics`; `syntax_view` draws severity-coloured
     squiggles (red errors / amber typo warnings) with hover tooltips.
@@ -1657,7 +1676,39 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
 - `schemaic-app` — `main.rs` wires signals + callbacks and builds the `Ui`; also the built-in MCP
   server (`--mcp-serve`) the AI panel talks to. A query tab's identity is `(conn_id, database)`;
   the app resolves `conn_id` → `Db` at run time (`db_for`), so a tab keeps its connection after a
-  switch. The MCP subprocess gets its DB endpoint as JSON in `$SCHEMAIC_MCP_ENDPOINT` via a
+  switch.
+  **Opening and saving a tab's `.sql` file** is `TabsActions::open_sql_file`/`save_sql_file`/
+  `save_sql_file_as`/`reload_sql_file` (Ctrl+O / Ctrl+S / Ctrl+Shift+S, bound in `NavKeys::handle`
+  so they work at the workspace root and inside the editor alike, and offered as Open File / Save
+  File / Save File As in the palette). They are split the way the results export is: the dialog
+  (`floem::file_action::open_file` / `floem::action::save_as`, filtered on
+  `sqlfile::SQL_EXTENSIONS`) and the tab bookkeeping run on the UI thread, while the read/write goes
+  to `handle.spawn_blocking` and comes back through `create_ext_action` — the IO is synchronous and
+  a large script would otherwise freeze the window. Every decision about bytes and names is
+  `core::sqlfile`. A tab closed mid-flight is detected with `try_get_untracked` and the callback
+  degrades to a no-op: the bytes are on disk either way, there is just no tab left to mark saved,
+  and reading a disposed signal would panic. A save snapshots the text *before* the write, so typing
+  during it correctly leaves the tab modified afterwards. Failures land in the shared error modal
+  (`error_modal_text` + `error_modal_open`), because a failed Open or Save has no grid and no error
+  bar of its own to land in and silence is the one thing it must not be. Open activates an
+  already-open tab on the same connection rather than opening one file twice — two tabs saving over
+  each other is a lost edit — and otherwise places the new tab through `place_tab`, whose blank-slate
+  predicate gained `path.is_none()`: a tab bound to a file is not a blank slate even when the file
+  is empty, since reusing it would drop the binding and the next Ctrl+S would go somewhere else.
+  Save falls through to Save As when the tab has no path, and Reload asks through the shared
+  `Confirm` channel when the tab is modified, since nothing else in the app can put those edits
+  back. None of the four is connection-gated, deliberately and like the export: a file is between
+  the editor and the disk.
+  A file tab survives both kinds of restore. `persist::SavedTab` carries `path`, `file_crlf` and
+  `file_dirty`, each `#[serde(default, skip_serializing_if = …)]` so a session file written before
+  the feature still restores its tabs; `ClosedTab` carries `path`/`disk_sql`/`file_crlf` so
+  Ctrl+Shift+T brings back a *file* tab rather than an untitled copy of its text, and its "worth
+  restoring" guard counts a path as worth restoring on its own — the binding is the thing being
+  lost, even from an empty file. The file's *contents* are deliberately not persisted: `file_dirty`
+  is one bit that lets the restore decide whether the `query` it already has **is** the on-disk copy
+  (`disk_sql = Some(query)`) or unknown (`None`, which reads as modified until the next save or
+  reload settles it).
+  The MCP subprocess gets its DB endpoint as JSON in `$SCHEMAIC_MCP_ENDPOINT` via a
   per-session temp `--mcp-config` file (removed on drop) — never argv, so credentials don't leak
   to other same-user processes. Pure clusters split out: `claude_cli.rs` (`claude` binary
   discovery — PATH/PATHEXT/override) and `ai.rs` (`AiSession`/`start_ai_session` streaming,
@@ -2397,6 +2448,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   what `statement_line_boxes_at` clamps against `vp.width()` (a zero width means "not laid out yet",
   so it clamps nothing rather than blanking the overlay). The vertical half needs no clamp — floem
   won't place an offset outside its screen lines, and `editor_points` drops what it won't place.
+- **The floem editor owns its document once mounted, and the sync is one-way — writing the `query`
+  signal from outside is not merely invisible, it is lost.** Every edit runs
+  `query.set(doc.text())` from the editor's `.update` callback (`editor_pane.rs`), and there is no
+  effect pushing `query` back into the doc, so a write from outside a mounted editor changes nothing
+  the user can see and the next keystroke overwrites the signal back from the doc. Replacing a tab's
+  text from outside — reload from disk — therefore bumps `Tab::reload_gen`, which is part of the
+  `editor_area` `dyn_container` key in `lib.rs` (`(active id, is_flashing, reload_gen)`), and the
+  pane remounts on the new text. That key reads the tab out of `tabs` with `with_untracked` and only
+  *then* tracks `reload_gen`: tracking the whole vector there would rebuild the editor every time
+  any tab was opened or closed.
 
 ## Popup menus (`menu_panel`)
 

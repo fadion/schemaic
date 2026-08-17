@@ -101,6 +101,11 @@ const TAB_TITLE_AVAIL: f64 = TAB_MAX_W - 40.0;
 // full-width truncated title pushes the × past the chip cap and clips it.
 const TAB_DOT_W: f64 = 12.0;
 
+// The modified dot on a file-backed tab sits between the label and the ×, and
+// costs the same way: its 6px glyph plus the 7px gap the label/× pair already use
+// between themselves. Shed from the title cap for the same reason as `TAB_DOT_W`.
+const TAB_MODIFIED_W: f64 = 13.0;
+
 fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
     let active = ui.tabs_ui.active;
     let close_tab = ui.tab_actions.close_tab.clone();
@@ -112,6 +117,9 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
     let close_all = ui.tab_actions.close_all_tabs.clone();
     let close_others = ui.tab_actions.close_other_tabs.clone();
     let can_close_others = ui.tab_actions.can_close_other_tabs.clone();
+    let save_file = ui.tab_actions.save_sql_file.clone();
+    let save_file_as = ui.tab_actions.save_sql_file_as.clone();
+    let reload_file = ui.tab_actions.reload_sql_file.clone();
     let overlay = ui.overlay;
 
     // Commit the inline rename: an empty/blank name reverts to the default
@@ -129,9 +137,20 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
     let close_content = close_tab.clone();
     let close_mid = close_tab.clone();
     let content = dyn_container(
-        // Keyed on pinned too, so toggling pin swaps the × for the pin indicator.
-        move || (tab.editing.get(), tab.title(), tab.pinned.get()),
-        move |(editing, title, pinned)| -> AnyView {
+        // Keyed on pinned too, so toggling pin swaps the × for the pin indicator,
+        // and on `modified` so the unsaved dot appears/disappears with it. The
+        // modified read tracks `query`, so this closure re-runs on every
+        // keystroke — but the key only *changes* when the flag flips, which is
+        // the one thing that has to rebuild the row.
+        move || {
+            (
+                tab.editing.get(),
+                tab.title(),
+                tab.pinned.get(),
+                tab.modified(),
+            )
+        },
+        move |(editing, title, pinned, modified)| -> AnyView {
             if editing {
                 // Inline rename field. `edit_field` (unlike floem's `text_input`,
                 // which swallows Escape into its own `clear_focus`) routes Escape
@@ -189,15 +208,19 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
 
             // Display: label (ellipsized past the tab width) + close ×. A title
             // that would be clipped gets a tooltip with its full text; a title
-            // that fits gets none.
-            let truncated =
-                measure_text_px(&title) > TAB_TITLE_AVAIL - if has_dot() { TAB_DOT_W } else { 0.0 };
+            // that fits gets none. Both dots eat into the width the title has.
+            let avail = move || {
+                TAB_TITLE_AVAIL
+                    - if has_dot() { TAB_DOT_W } else { 0.0 }
+                    - if modified { TAB_MODIFIED_W } else { 0.0 }
+            };
+            let truncated = measure_text_px(&title) > avail();
             let full = title.clone();
             // Left inset moved to the row's `padding_left` so the (optional) DB
             // colour dot can lead the label without shifting the text when absent.
             let label = text(title).style(move |s| {
                 s.margin_right(7.0)
-                    .max_width(TAB_TITLE_AVAIL - if has_dot() { TAB_DOT_W } else { 0.0 })
+                    .max_width(avail())
                     .text_overflow(TextOverflow::Ellipsis)
                     .font_size(theme::FONT_BODY)
             });
@@ -244,7 +267,26 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                 6.0,
                 -1.0,
             );
-            h_stack((dot, label, close))
+            // Unsaved-changes dot, between the label and the ×: this tab has a
+            // `.sql` file and has drifted from it. Zero-footprint otherwise —
+            // a tab with no file has nothing to be unsaved against, since the
+            // session persists it either way. Accent-tinted so it reads as a
+            // state and not as another close affordance, and tooltipped because
+            // a bare dot doesn't say what it means.
+            let modified_dot: AnyView = if modified {
+                icons::icon(icons::DOT, 6.0)
+                    .style(|s| {
+                        s.flex_shrink(0.0_f32)
+                            .margin_right(7.0)
+                            .margin_top(-1.0)
+                            .color(theme::accent())
+                    })
+                    .tooltip(|| text("Unsaved changes"))
+                    .into_any()
+            } else {
+                empty().into_any()
+            };
+            h_stack((dot, label, modified_dot, close))
                 .style(|s| s.flex_row().items_center().padding_left(10.0))
                 .into_any()
         },
@@ -304,6 +346,24 @@ fn tab_chip(tab: Tab, ui: Ui) -> impl IntoView {
                     let duplicate = duplicate.clone();
                     move || (duplicate)(tab.id)
                 }),
+                // The file group. Save is offered on a tab with no file too —
+                // it opens Save As, which is the answer to "save this" there.
+                MenuEntry::action("Save", {
+                    let save = save_file.clone();
+                    move || (save)(tab.id)
+                }),
+                MenuEntry::action("Save As…", {
+                    let save_as = save_file_as.clone();
+                    move || (save_as)(tab.id)
+                }),
+                // Dimmed rather than hidden on a tab with no file, the way
+                // "Reopen last tab" is when the ring is empty — the menu keeps
+                // one shape and says why an entry is unavailable by looking it.
+                MenuEntry::action("Reload from disk", {
+                    let reload = reload_file.clone();
+                    move || (reload)(tab.id)
+                })
+                .disabled(tab.path.get_untracked().is_none()),
             ];
             if !pinned {
                 let close = close_tab.clone();
