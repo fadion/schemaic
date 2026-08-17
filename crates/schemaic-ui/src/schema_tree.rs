@@ -1113,8 +1113,16 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
             "Give me a concise overview of the `{ctx_db}` database — the domain it models, \
              its key tables, and how they relate."
         );
+        // Built here rather than per render, for the reason the namespace script
+        // is: a whole database is a lot of `CREATE`s, and it is only ever needed
+        // once the menu opens. Empty until the schema has loaded — the node
+        // expands lazily, so a database nobody has opened has nothing to write.
+        let ddl = schema_sig.with_untracked(|s| match s {
+            SchemaState::Loaded(db) => db.create_ddl_script_all(dialect),
+            _ => String::new(),
+        });
         context_menu.set(Some(CtxMenu {
-            kind: CtxKind::Database,
+            kind: CtxKind::Database { ddl },
             name: ctx_db.clone(),
             ai_prompt,
             at,
@@ -1563,6 +1571,39 @@ fn object_group_node(
     let key = object_group_key(&database, scope, kind);
     let count = items.len();
 
+    // A folder's menu is about the *set* it holds, which is why it exists at all
+    // now: `Create sequence` used to live only in the database node's `Create`
+    // submenu, two levels away from the folder named after it.
+    let open_menu: CtxOpener = {
+        let (db, ns, objects) = (database.clone(), scope_ns.clone(), items.clone());
+        Rc::new(move |at| {
+            let label = object_group_label(kind);
+            let ai_prompt = format!(
+                "In the `{db}` database, explain the {} it defines — what each one is \
+                 for and where it is used.",
+                label.to_lowercase()
+            );
+            // Every object in the folder, in the order the rows are in. Built on
+            // open, as the namespace and database scripts are.
+            let ddl = objects
+                .iter()
+                .map(|o| o.create_sql(dialect))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            context_menu.set(Some(CtxMenu {
+                kind: CtxKind::ObjectGroup {
+                    database: db.clone(),
+                    schema: ns.clone(),
+                    kind,
+                    ddl,
+                },
+                name: label.to_string(),
+                ai_prompt,
+                at,
+            }));
+        })
+    };
+
     let toggle_row = on_toggle.clone();
     let key_row = key.clone();
     let header = h_stack((
@@ -1580,6 +1621,10 @@ fn object_group_node(
         capsule(count.to_string()),
     ))
     .on_double_click_stop(move |_| (toggle_row)(key_row.clone()))
+    .on_secondary_click_stop({
+        let open = open_menu.clone();
+        move |_| (open)(None)
+    })
     .style({
         let hl = key.clone();
         move |s| {
@@ -1595,9 +1640,7 @@ fn object_group_node(
             }
         }
     });
-    // No menu: a group folder is structural — right-clicking one offers nothing,
-    // so Shift+F10 on it must offer nothing too.
-    let header = with_nav_scroll(header.into_any(), nav, key.clone(), None);
+    let header = with_nav_scroll(header.into_any(), nav, key.clone(), Some(open_menu));
 
     let key_children = key.clone();
     let ns_hit_base = scope_ns.clone();

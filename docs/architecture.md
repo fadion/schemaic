@@ -396,14 +396,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     the twelve-step rebuild in disguise: a foreign key or a constraint-backed index comes off only
     by recreating the table around it. Every non-SQLite dialect answers true. It exists because the
     per-row menus were built with **no** gate at all — not this one, not even `read_only` — so a
-    column row's **Edit column** and a key row's **Edit table** opened the designer on a SQLite
+    column row's **Edit column** and a key row's edit entry opened the designer on a SQLite
     connection, ran `diff`, and reached a preview that only `Db::run_ddl` refused at the last
     moment. Those two rows now ask `overlays::field_entries`/`key_entries` (separate from the menu
     builder so the rule can be asserted without a `Ui`, the same shape as `object_entries`): Edit
-    column and Edit table are offered on every engine, since the designer is the thing that reaches
-    a rebuild, **Drop** (column) and **Drop index** stay because the engine performs them, and Drop
-    foreign key — plus Drop index when the index backs a constraint — is absent
-    (`overlays::row_menu_tests`). `ChangeSet::unsupported()` is the same
+    column and the key row's edit entry — **Edit index**, **Edit foreign key** or
+    **Edit primary key**, named for whichever the row is — are offered on every engine, since the
+    designer is the thing that reaches a rebuild, **Drop** (column) and **Drop index** stay because
+    the engine performs them, and Drop foreign key — plus Drop index when the index backs a
+    constraint — is absent (`overlays::row_menu_tests`). `ChangeSet::unsupported()` is the same
     predicate read over a whole set, returning the plain-language summaries of what the dialect
     can't express, which is what the preview shows and refuses to apply around. **Where a rebuild is
     present it withholds nothing except an index flagged `IndexInfo::lossy` that cannot be put back
@@ -464,6 +465,27 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     working around them, since any model-fidelity gap surfaces to the user as a phantom
     change. Also `key_list_text`/`parse_key_list` (the designer's `bio(20), age DESC`
     field) and `common_types`. Pure + unit-tested.
+    **`TableDraft::find_key(index, foreign_key) -> Option<DraftKey>`** says where one of a table's
+    keys sits in the draft — which of the designer's sections holds it, and which row of that
+    section — and it exists because the schema tree's sequence of keys and the draft's are **not
+    the same sequence**, so a position taken from one lands on the wrong row in the other. Three
+    ways they differ, one per `DraftKey` arm. The tree lists the primary key among the keys while
+    `TableDraft::from_table` filters `is_primary()` out of `indexes` entirely, so an index position
+    read off `TableInfo::indexes` is one row late in any table that has a primary key
+    (`DraftKey::Index`). The tree shows a foreign key under its **backing index**, whose name
+    needn't match the constraint's — classicmodels' `customerNumber` index backs `orders_ibfk_1` —
+    while the draft keeps `foreign_keys` as a collection of its own, so the lookup is by
+    *constraint* name and the index name is ignored (`DraftKey::ForeignKey`). And the primary key
+    is no row anywhere in the draft: it is the per-column tick `set_in_primary_key` writes, which
+    is what the index form's own hint — *"No index selected. The primary key lives on the
+    columns."* — tells the user, so `DraftKey::PrimaryKeyColumn` names its **first column in key
+    order** instead. The arguments are exactly what a `CtxKind::Key` tree row carries, asked
+    together because they answer one question. `None` for a key this draft doesn't hold, which is
+    the caller's cue to open on nothing in particular rather than on row 0
+    (`find_key_positions_an_index_in_the_primary_key_less_list`,
+    `find_key_sends_the_primary_key_to_its_first_column`,
+    `find_key_resolves_a_foreign_key_by_its_constraint_name`,
+    `find_key_answers_nothing_for_a_key_the_draft_does_not_hold`).
     **CHECK constraints** are `CheckDraft`/`CheckInfo` → `Change::{AddCheck, DropCheck}`,
     a drop-and-add on both engines (neither can alter one in place). Three rules are
     written down because each was a bug waiting: the predicate is normalized **on the
@@ -785,6 +807,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     nothing here — `DROP TABLE` leaves a view that selects from the table in place, SQLite resolving
     a view's references when it runs rather than when it is declared, and the table returns under
     the same name before the transaction ends.
+    **The tree's Generate DDL entries are two `DbSchema` methods, one per altitude.**
+    `create_ddl_script(schema, dialect)` emits one namespace in **dependency order** — the
+    standalone types, then base tables, then views, then the sequences that stand on their own —
+    because an omitted foreign key leaves a script that still runs while an omitted type fails on
+    the first `CREATE TABLE`; a sequence a `serial` or an identity column already creates is
+    skipped, since restating it fails on a name that exists. `create_ddl_script_all(dialect)` is
+    the database node's analogue: it walks `schemas()` in **display** order (`public` first, then
+    alphabetical), so the script reads down the tree it was raised from, and joins only the
+    namespaces that produced something rather than leaving a blank run where an empty one was.
+    Where an engine has no namespaces at all — MySQL and SQLite, whose tables carry `None` — there
+    is nothing to walk and it *is* `create_ddl_script(None, dialect)`
+    (`create_ddl_script_all_is_the_flat_script_without_namespaces` pins that equivalence, which is
+    the half a namespace-walking loop would quietly get wrong). Ordering *between* namespaces is
+    consequently display order and not dependency order: a type used by a table in another
+    namespace is emitted after it if the alphabet says so. That is the same class of gap
+    `create_ddl_script` already carries for foreign keys, and it is accepted for the same reason —
+    the script goes to the clipboard and an editor tab, is read and edited before it is run, and
+    `ddl_preview` is still the only thing that runs anything.
     **`TriggerInfo`/`TriggerAction`/`TriggerEvent`/`TriggerEnabled`/`TriggerSource` +
     `RoutineInfo`** are the trigger and PG-trigger-function half, and carry three rules the
     same "restate everything or it silently resets" logic as `ViewOptions`.
@@ -1387,6 +1427,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `table_designer::open_for_table`/`open_for_new`/`preview_draft_edit` (a shortcut whose
     edit has dependents — dropping a column takes its index and FK with it) and
     `ddl_preview::preview_change` (a lone `Change`).
+    **`open_for_table` takes a `DesignerFocus`** — `Table`, `Column(&str)` or
+    `Key { index, foreign_key }` — which is the row the designer lands on once it opens, so the
+    tree's column and key right-clicks (`Edit column`, and `Edit index` / `Edit foreign key` /
+    `Edit primary key`) put you on the row you clicked instead of on the table summary with the row
+    still to find. It is **named, not positional**: the designer's sequence is the draft's, and the
+    draft doesn't exist until the modal opens. That is also why the two cases resolve on opposite
+    sides of the open — a `Column` against the introspected `TableInfo` before it moves into the
+    `DesignerTarget`, a `Key` against `ui.ddl.draft` *after* `open_designer` returns, through
+    `ddl::TableDraft::find_key`, since the seeded draft is the sequence the Indexes and Foreign keys
+    lists actually render (and a `PrimaryKeyColumn` answer lands on the Columns tab, the key being a
+    tick there rather than a row). Landing itself is the three signal writes any selection change is:
+    `ddl.tab`, `ddl.selected`, and the `ddl.rev` bump the form is keyed on. A focus that resolves to
+    `None` — a name the draft doesn't hold — is dropped **silently** and the designer opens on the
+    `Table` tab, which is what it did before it was asked at all: the request that failed is the
+    landing, not the edit.
   - `view_editor.rs` — the **view** modal (tree "Edit" on a view, "Create view" on a database/
     schema node *and* on the editor's right-click when the statement under the caret can be a
     view body — `ddl::can_be_view_body`, which seeds the draft with it), over `core::ddl`'s
@@ -1435,10 +1490,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     is the entry point's gate: a constraint trigger's deferral settings aren't modelled, so it is
     listed and droppable but not editable, the call a materialized view gets.
   - `object_editor.rs` — the **enum / domain / sequence** modal, over `core::ddl`'s
-    `ObjectDraft`. Reached from a tree object's **Edit** and from a database or schema node's
+    `ObjectDraft`. Reached from a tree object's **Edit**, from a database or schema node's
     **Create ▸ Type / Domain / Sequence** (PostgreSQL only — on MySQL those entries don't
     exist, the same "hide what an engine can't express" call `trigger_editor`'s form makes;
-    `overlays::create_submenu` is the one builder both nodes' Create submenu comes from).
+    `overlays::create_submenu` is the one builder both nodes' Create submenu comes from), and
+    from the folder that holds the objects themselves — `Types`/`Domains`/`Sequences` each offer a
+    flat, kind-named **Create sequence** / **Create type** / **Create domain** of their own, which
+    calls `open_for_new` directly rather than through `create_submenu`: the folder has already
+    said which kind, so the submenu's other two children would be entries belonging to the folders
+    either side of it.
     One modal for three objects because the chrome, the footer, the change count and the
     ending at `ddl_preview` are identical and only the middle section differs. Same
     seed-local-signals-then-write-back rule as the other editors, and three more written down:
@@ -1465,7 +1525,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     and a namespace both survive a search that only one of their **objects** matches, or the
     match would be hidden by the row that contains it. `nav_rows` carries the folders and their
     leaves like everything else — it is the function that must stay bug-for-bug identical to
-    the render.
+    the render. **A folder now carries a menu of its own** (`CtxKind::ObjectGroup`), reversing the
+    earlier call that a structural row should offer nothing on either the pointer or `Shift+F10`:
+    it is the script for everything in the folder and `Refresh`, then the one thing you come to a
+    folder for — `Create {kind}`, flat and lower-cased to match the object row's `Edit sequence`.
+    It exists because creating a sequence was reachable only through the database node's
+    `Create ▸`, two levels away from the folder named after it. `object_group_node` stages it
+    through the same `CtxOpener` its `on_secondary_click_stop` calls and hands that closure to
+    `with_nav_scroll`, so the right-click and the keyboard cannot offer different menus for the
+    row.
     - The **size column** (`size_badge`) puts each table's on-disk size at the right edge of its
       row, from the same `core::stats` figures the properties modal shows. It answers the question
       that modal cannot — *which* of these is the big one — and is off by default behind SCHEMA
@@ -2279,6 +2347,24 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   until the Live Monitor's Export made it fifteen. The count was never reproducible — the openers
   are *logical* menus, not `popup_menu.set` sites, several of which are helper-driven — so it is
   gone rather than incremented: the sentence needs "all of them", not a number that silently rots.)
+- **Every schema-tree menu is a subsequence of one skeleton, and `Drop` is always the last entry in
+  its menu.** `overlays::context_menu_overlay`'s `build` closure matches on `CtxKind` — one arm per
+  kind of row — and each arm emits the same five groups in the same order, separated by
+  `MenuEntry::Separator`, so an action sits in the same place whatever was right-clicked:
+  **Open** (what a double-click would have done), **Read** (`Copy name`, `Copy qualified name`,
+  then what the node can *show* you — `Properties`, `Show diagram`, `Generate DDL` — closing with
+  `Refresh`), **Tree state** (`Favorite`, `Colour ▸`, `Hide`, which act on the row and not on the
+  object), **Write** (`Create`/`Edit`/`Import`/`Triggers`, with the entries that can't be taken
+  back **last** inside the group and coloured `theme::error`), and the `AI Explain` row every menu
+  ends with, appended outside the `match`. The write group's ordering is the load-bearing half: the
+  row the cursor lands on after a right-click must never be the irreversible one, and two menus
+  broke that before the skeleton was written down — the key/index menu opened straight onto
+  `Drop index`/`Drop foreign key` with its edit entry (then labelled `Edit table`, now named for
+  the row) *below* them, and the column menu's `Drop` was rendered in the same colour as the
+  `Edit column` directly above it. A new entry joins its group rather than the end of the list, and
+  a new arm reads the skeleton, which is stated as a comment
+  block immediately above the closure: an arm is written and reviewed one arm at a time, and
+  nothing else in the file says what the order is.
 - **Keyboard operation lives in `menu_key`.** The panel is a `focus_root`, so it took focus and
   answered Escape from the start — but nothing moved a cursor and no row was marked, so a menu
   opened with Enter from a ringed button could only be finished with the mouse and read as though

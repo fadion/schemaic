@@ -225,20 +225,53 @@ fn table_names(ui: &Ui, database: &str, schema: Option<&str>) -> Vec<String> {
     })
 }
 
-/// Open the designer on an existing table, optionally with one column selected
-/// (the schema tree's column right-click lands you on the column you clicked).
+/// What the designer should land on once it opens — the row the user
+/// right-clicked in the schema tree, named rather than positioned.
+///
+/// A position wouldn't survive the trip: the tree's sequence and the designer's
+/// are different sequences (see [`schemaic_core::ddl::TableDraft::find_key`]),
+/// and the designer's own is the draft's, which doesn't exist until the modal
+/// opens.
+#[derive(Clone, Copy)]
+pub(crate) enum DesignerFocus<'a> {
+    /// Nothing in particular — the `Table` tab, which is where it opens anyway.
+    Table,
+    Column(&'a str),
+    /// One of the table's keys, as the tree's key row carries it: the index the
+    /// row stands for, plus the foreign-key constraint it backs when it backs
+    /// one. Which section that lands in is the draft's answer, not the caller's.
+    Key {
+        index: &'a schemaic_core::schema::IndexInfo,
+        foreign_key: Option<&'a str>,
+    },
+}
+
+/// Open the designer on an existing table, landing on whatever `focus` names —
+/// the schema tree's column and key right-clicks put you on the row you clicked
+/// rather than on the table summary.
+///
+/// A focus that resolves to nothing (a name the draft doesn't hold) is dropped
+/// silently: the designer opens on the `Table` tab, which is what it did before
+/// it was asked at all. The modal still opens — the request that failed is the
+/// landing, not the edit.
 pub(crate) fn open_for_table(
     ui: &Ui,
     database: &str,
     schema: Option<&str>,
     table: &str,
-    focus_column: Option<&str>,
+    focus: DesignerFocus<'_>,
 ) {
     let Some(info) = loaded_table(ui, database, schema, table) else {
         return;
     };
     let ctx = edit_ctx(ui);
-    let column_at = focus_column.and_then(|c| info.columns.iter().position(|x| x.name == c));
+    // Resolved against the introspected table, before it moves into the target.
+    // The key case is resolved *after* the open instead, against the draft the
+    // open seeds — that is the sequence the Indexes and Foreign keys lists show.
+    let column_at = match focus {
+        DesignerFocus::Column(c) => info.columns.iter().position(|x| x.name == c),
+        _ => None,
+    };
     open_designer(
         ui,
         DesignerTarget {
@@ -252,8 +285,22 @@ pub(crate) fn open_for_table(
             read_only: ctx.read_only,
         },
     );
-    if let Some(i) = column_at {
-        ui.ddl.tab.set(DesignerTab::Columns);
+    let landing = match focus {
+        DesignerFocus::Table => None,
+        DesignerFocus::Column(_) => column_at.map(|i| (DesignerTab::Columns, i)),
+        DesignerFocus::Key { index, foreign_key } => ui
+            .ddl
+            .draft
+            .with_untracked(|d| d.find_key(index, foreign_key))
+            .map(|k| match k {
+                schemaic_core::ddl::DraftKey::Index(i) => (DesignerTab::Indexes, i),
+                schemaic_core::ddl::DraftKey::ForeignKey(i) => (DesignerTab::ForeignKeys, i),
+                // The primary key is a tick on a column, not a row of its own.
+                schemaic_core::ddl::DraftKey::PrimaryKeyColumn(i) => (DesignerTab::Columns, i),
+            }),
+    };
+    if let Some((tab, i)) = landing {
+        ui.ddl.tab.set(tab);
         ui.ddl.selected.set(i);
         ui.ddl.rev.update(|r| *r += 1);
     }

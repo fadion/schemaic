@@ -166,7 +166,10 @@ pub(crate) struct FieldEntries {
 /// What a **key / index** row's context menu offers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct KeyEntries {
-    /// Whether **Edit table** is offered. Same designer as [`FieldEntries::edit`].
+    /// Whether the edit entry is offered — **Edit index**, **Edit foreign key**
+    /// or **Edit primary key**, named for whichever the row is. Same designer as
+    /// [`FieldEntries::edit`], opened on the section that holds the key (see
+    /// [`schemaic_core::ddl::TableDraft::find_key`]).
     pub edit: bool,
     pub drop_foreign_key: bool,
     pub drop_index: bool,
@@ -693,8 +696,28 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
     // The entries for one target, built on demand. It is a closure rather than the
     // body of the `dyn_container` because the *placement* needs them too: how far
     // down the menu may open depends on how many rows it has, and that varies from
-    // 4 to 13 by target kind. Called twice per open (once to place, once to
+    // 4 to 14 by target kind. Called twice per open (once to place, once to
     // render), which is a dozen `Rc` clones.
+    //
+    // ── The order every arm below follows ─────────────────────────────────────
+    // One skeleton, and each menu is a subsequence of it, so the same action is
+    // in the same place whatever the row is:
+    //
+    //   1. Open        — what a double-click would have done
+    //   2. Read        — Copy name, Copy qualified name, then what the node can
+    //                    show you (Properties, Show diagram, Generate DDL),
+    //                    closing with Refresh
+    //   3. Tree state  — Favorite, Colour, Hide: the row, not the object
+    //   4. Write       — Create / Edit / Import / Triggers, with the entries
+    //                    that can't be taken back **last** inside the group and
+    //                    coloured `theme::error`
+    //   5. AI Explain  — appended to every menu, outside the `match`
+    //
+    // Group 4's rule is the load-bearing one: Drop is always the last thing in
+    // its menu, so the row the cursor lands on after a right-click is never the
+    // irreversible one. The key/index menu used to open straight onto `Drop
+    // index`, and the column menu's `Drop` was the same colour as `Edit column`
+    // above it.
     let build: Rc<dyn Fn(CtxMenu) -> Vec<MenuEntry>> = Rc::new(move |menu: CtxMenu| {
         {
             // Clipboard action for a string.
@@ -705,17 +728,49 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
             };
             let mut entries: Vec<MenuEntry> = Vec::new();
             match menu.kind.clone() {
-                CtxKind::Database => {
+                CtxKind::Database { ddl } => {
+                    // ── Open ──────────────────────────────────────────────────
+                    let ocli = open_db_cli.clone();
+                    let dbn = menu.name.clone();
+                    entries.push(MenuEntry::action("Open in CLI", move || {
+                        (ocli)(Some(dbn.clone()))
+                    }));
+                    entries.push(MenuEntry::Separator);
+                    // ── Read: clipboard, then what the node can show you, then
+                    // the two that only rearrange the tree under it ───────────
                     entries.push(MenuEntry::action("Copy name", copy(menu.name.clone())));
-                    let th = toggle_hidden.clone();
-                    let n = menu.name.clone();
-                    entries.push(MenuEntry::action("Hide", move || (th)(n.clone())));
+                    // The namespace script's database-level analog, and absent
+                    // for the same reason it is: a schema that hasn't loaded has
+                    // no script to give, and an entry that copies "" is worse
+                    // than no entry.
+                    if !ddl.is_empty() {
+                        let oq = open_query.clone();
+                        entries.push(MenuEntry::action("Generate DDL", move || {
+                            let _ = floem::Clipboard::set_contents(ddl.clone());
+                            (oq)(ddl.clone());
+                        }));
+                    }
+                    // ER diagram of the whole database (every related table).
+                    let edb = menu.name.clone();
+                    entries.push(MenuEntry::action("Show diagram", move || {
+                        erd.set(Some(crate::ErdTarget {
+                            conn_id: active_conn.get_untracked(),
+                            database: edb.clone(),
+                            seed: schemaic_core::erd::DiagramSeed::Database,
+                        }));
+                    }));
                     let rf = refresh_db.clone();
                     let dn = menu.name.clone();
                     entries.push(MenuEntry::action("Refresh", move || (rf)(dn.clone())));
                     let cd = collapse_db.clone();
                     let cn = menu.name.clone();
                     entries.push(MenuEntry::action("Collapse all", move || (cd)(cn.clone())));
+                    // ── How this database *looks* in the tree ─────────────────
+                    // Its own group: colour, favourite and hide change nothing
+                    // about the database, only about the row standing for it —
+                    // and Hide, which takes the row away, used to sit second
+                    // from the top with the harmless entries.
+                    entries.push(MenuEntry::Separator);
                     // Set colour: preset swatches + Clear, stored per (active
                     // connection, database) and shown as a dot on the DB node,
                     // active-DB selector, and this database's query tabs.
@@ -747,7 +802,6 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             (save)();
                         }));
                     }
-                    entries.push(MenuEntry::sub("Colour", swatches));
                     // Favorite / unfavorite: a favorited database gets a gold star
                     // and sorts to the top of the tree (oldest favorite highest).
                     let fav_now = schemaic_core::favorite::is_favorite(
@@ -768,20 +822,11 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             (save)();
                         }));
                     }
-                    // ER diagram of the whole database (every related table).
-                    let edb = menu.name.clone();
-                    entries.push(MenuEntry::action("Show diagram", move || {
-                        erd.set(Some(crate::ErdTarget {
-                            conn_id: active_conn.get_untracked(),
-                            database: edb.clone(),
-                            seed: schemaic_core::erd::DiagramSeed::Database,
-                        }));
-                    }));
-                    let ocli = open_db_cli.clone();
-                    let dbn = menu.name.clone();
-                    entries.push(MenuEntry::action("Open in CLI", move || {
-                        (ocli)(Some(dbn.clone()))
-                    }));
+                    entries.push(MenuEntry::sub("Colour", swatches));
+                    let th = toggle_hidden.clone();
+                    let n = menu.name.clone();
+                    entries.push(MenuEntry::action("Hide", move || (th)(n.clone())));
+                    // ── Write ─────────────────────────────────────────────────
                     // Schema editing gets its own group — it's the one entry here
                     // that writes.
                     entries.push(MenuEntry::Separator);
@@ -816,13 +861,11 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         "{database}.{}",
                         schemaic_core::schema::display_name(item.schema(), item.name())
                     );
-                    entries.push(MenuEntry::sub(
-                        "Copy",
-                        vec![
-                            MenuEntry::action("Name", copy(item.name().to_string())),
-                            MenuEntry::action("Qualified name", copy(qualified)),
-                        ],
+                    entries.push(MenuEntry::action(
+                        "Copy name",
+                        copy(item.name().to_string()),
                     ));
+                    entries.push(MenuEntry::action("Copy qualified name", copy(qualified)));
                     {
                         let oq = open_query.clone();
                         entries.push(MenuEntry::action("Generate DDL", move || {
@@ -910,16 +953,63 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             (oq)(ddl.clone());
                         }));
                     }
+                    // A namespace is introspected as part of its database, so
+                    // refreshing targets the database.
+                    let rf = refresh_db.clone();
+                    let refresh_database = database.clone();
+                    entries.push(MenuEntry::action("Refresh", move || {
+                        (rf)(refresh_database.clone())
+                    }));
+                    // The writing group, set off the way every other menu here
+                    // sets its own off. This was the one menu where `Create` sat
+                    // between two read entries with no boundary at all.
+                    entries.push(MenuEntry::Separator);
                     entries.extend(create_submenu(
                         &import_ui,
                         &database,
                         Some(&menu.name),
                         conn_read_only(&connections, active_conn),
                     ));
-                    // A namespace is introspected as part of its database, so
-                    // refreshing targets the database.
-                    let rf = refresh_db.clone();
-                    entries.push(MenuEntry::action("Refresh", move || (rf)(database.clone())));
+                }
+                // A `Types`/`Domains`/`Sequences` folder. The menu is about the
+                // set, not the row: a folder has no name worth copying and
+                // nothing to open, so it carries the read group's script and
+                // refresh, then the one thing you actually come here for —
+                // making another of what it holds.
+                CtxKind::ObjectGroup {
+                    database,
+                    schema,
+                    kind,
+                    ddl,
+                } => {
+                    if !ddl.is_empty() {
+                        let oq = open_query.clone();
+                        entries.push(MenuEntry::action("Generate DDL", move || {
+                            let _ = floem::Clipboard::set_contents(ddl.clone());
+                            (oq)(ddl.clone());
+                        }));
+                    }
+                    {
+                        let rf = refresh_db.clone();
+                        let db = database.clone();
+                        entries.push(MenuEntry::action("Refresh", move || (rf)(db.clone())));
+                    }
+                    entries.push(MenuEntry::Separator);
+                    {
+                        let ui = import_ui.clone();
+                        let (db, ns) = (database.clone(), schema.clone());
+                        // Flat and kind-named, not a `Create` submenu: the folder
+                        // has already said which kind, so a submenu would open
+                        // onto one live entry and two that belong to the folders
+                        // either side of it. Same lower-case spelling as the
+                        // object row's "Edit type".
+                        entries.push(
+                            MenuEntry::action(format!("Create {}", kind.label()), move || {
+                                crate::object_editor::open_for_new(&ui, &db, ns.as_deref(), kind);
+                            })
+                            .disabled(conn_read_only(&connections, active_conn)),
+                        );
+                    }
                 }
                 CtxKind::Table {
                     database,
@@ -955,18 +1045,13 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             (otn)(src.clone())
                         }));
                     }
-                    // Group the two copy variants into a "Copy" submenu.
-                    entries.push(MenuEntry::sub(
-                        "Copy",
-                        vec![
-                            MenuEntry::action("Name", copy(menu.name.clone())),
-                            MenuEntry::action("Qualified name", copy(qualified)),
-                        ],
-                    ));
-                    let rf = refresh_db.clone();
-                    entries.push(MenuEntry::action("Refresh", move || {
-                        (rf)(refresh_database.clone())
-                    }));
+                    // The read group opens here, and its first two entries are
+                    // the same two every menu in this tree opens with. Flat, not
+                    // a "Copy" submenu: two children behind a hover is a hover
+                    // spent on the most-used entry in the menu.
+                    entries.push(MenuEntry::Separator);
+                    entries.push(MenuEntry::action("Copy name", copy(menu.name.clone())));
+                    entries.push(MenuEntry::action("Copy qualified name", copy(qualified)));
                     // The full `TableInfo` (columns, nullability) that the
                     // schema-editing entries below map onto, and which only
                     // exists once the schema has loaded. Read here rather than
@@ -1025,9 +1110,19 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         let _ = floem::Clipboard::set_contents(ddl.clone());
                         (oq)(ddl.clone());
                     }));
+                    // Refresh closes the read group in every menu in this tree.
+                    // It used to sit between Copy and Properties, splitting the
+                    // three entries that show you something — and it doesn't act
+                    // on the table at all: a table is introspected as part of
+                    // its database, so this targets the database.
+                    let rf = refresh_db.clone();
+                    entries.push(MenuEntry::action("Refresh", move || {
+                        (rf)(refresh_database.clone())
+                    }));
                     // Its own group, just above AI Explain: everything that
                     // *writes* — import and schema editing — reads as one set
-                    // rather than trailing off the end of the read-only ones.
+                    // rather than trailing off the end of the read-only ones,
+                    // with the two that can't be taken back last inside it.
                     entries.push(MenuEntry::Separator);
                     {
                         let read_only = conn_read_only(&connections, active_conn);
@@ -1102,7 +1197,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                                 &db,
                                                 ns.as_deref(),
                                                 &tbl,
-                                                None,
+                                                crate::table_designer::DesignerFocus::Table,
                                             );
                                         }
                                     },
@@ -1248,6 +1343,18 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                 }
                 CtxKind::Field { source, column } => {
                     entries.push(MenuEntry::action("Copy name", copy(menu.name.clone())));
+                    // `database.schema.table.column` — the one qualification a
+                    // column has, and the shape you paste into a query. Built
+                    // the way the table entry builds its own.
+                    entries.push(MenuEntry::action(
+                        "Copy qualified name",
+                        copy(format!(
+                            "{}.{}.{}",
+                            source.database,
+                            source.display(),
+                            column
+                        )),
+                    ));
                     let read_only = conn_read_only(&connections, active_conn);
                     entries.push(MenuEntry::Separator);
                     let offers = field_entries(crate::table_designer::edit_ctx(&import_ui).dialect);
@@ -1260,7 +1367,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                 &src.database,
                                 src.schema.as_deref(),
                                 &src.table,
-                                Some(&col),
+                                crate::table_designer::DesignerFocus::Column(&col),
                             );
                         }));
                     }
@@ -1270,8 +1377,12 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // Through the draft, not as a lone `DropColumn`: the
                         // index over the column and any foreign key standing on
                         // it have to come off first or the server refuses it.
+                        //
+                        // Red and last, as every other Drop in this tree is —
+                        // this one used to be the same colour as Edit column
+                        // directly above it.
                         entries.push(
-                            MenuEntry::action("Drop", move || {
+                            MenuEntry::action_colored("Drop", theme::error, move || {
                                 let col = col.clone();
                                 crate::table_designer::preview_draft_edit(
                                     &ui,
@@ -1303,25 +1414,68 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         crate::table_designer::edit_ctx(&import_ui).dialect,
                         index.constraint.as_deref(),
                     );
+                    if offers.edit {
+                        let ui = import_ui.clone();
+                        let src = source.clone();
+                        let ix = index.clone();
+                        let fk = foreign_key.clone();
+                        // Named for what the row *is*, the way the object menu's
+                        // "Edit sequence" is — and it lands there: the designer
+                        // opens on the Indexes or Foreign keys section with this
+                        // entry selected, rather than on the table summary with
+                        // the user to find the row again. A PRIMARY row names
+                        // the primary key and lands on its first column, which
+                        // is where the key is actually edited (the index form's
+                        // own hint says so).
+                        let label = if fk.is_some() {
+                            "Edit foreign key"
+                        } else if ix.is_primary() {
+                            "Edit primary key"
+                        } else {
+                            "Edit index"
+                        };
+                        entries.push(MenuEntry::action(label, move || {
+                            crate::table_designer::open_for_table(
+                                &ui,
+                                &src.database,
+                                src.schema.as_deref(),
+                                &src.table,
+                                crate::table_designer::DesignerFocus::Key {
+                                    index: &ix,
+                                    foreign_key: fk.as_deref(),
+                                },
+                            );
+                        }));
+                    }
                     // A foreign key's backing index can't be dropped while the
                     // constraint stands, so the entry offers the constraint —
                     // which is what the row is really showing.
+                    //
+                    // Last in the group and red, as every other Drop in this
+                    // tree is. This menu used to put it *first* under the
+                    // separator with Edit table below it — the one place where
+                    // the row your cursor lands on after a right-click was the
+                    // irreversible one.
                     match foreign_key {
                         Some(name) if offers.drop_foreign_key => {
                             let ui = import_ui.clone();
                             let src = source.clone();
                             entries.push(
-                                MenuEntry::action("Drop foreign key", move || {
-                                    crate::ddl_preview::preview_change(
-                                        &ui,
-                                        &src.database,
-                                        &src.table,
-                                        src.schema.as_deref(),
-                                        schemaic_core::ddl::Change::DropForeignKey {
-                                            name: name.clone(),
-                                        },
-                                    );
-                                })
+                                MenuEntry::action_colored(
+                                    "Drop foreign key",
+                                    theme::error,
+                                    move || {
+                                        crate::ddl_preview::preview_change(
+                                            &ui,
+                                            &src.database,
+                                            &src.table,
+                                            src.schema.as_deref(),
+                                            schemaic_core::ddl::Change::DropForeignKey {
+                                                name: name.clone(),
+                                            },
+                                        );
+                                    },
+                                )
                                 .disabled(read_only),
                             );
                         }
@@ -1332,7 +1486,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             let src = source.clone();
                             let ix = index.clone();
                             entries.push(
-                                MenuEntry::action("Drop index", move || {
+                                MenuEntry::action_colored("Drop index", theme::error, move || {
                                     crate::ddl_preview::preview_change(
                                         &ui,
                                         &src.database,
@@ -1348,19 +1502,6 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             );
                         }
                         _ => {}
-                    }
-                    if offers.edit {
-                        let ui = import_ui.clone();
-                        let src = source.clone();
-                        entries.push(MenuEntry::action("Edit table", move || {
-                            crate::table_designer::open_for_table(
-                                &ui,
-                                &src.database,
-                                src.schema.as_deref(),
-                                &src.table,
-                                None,
-                            );
-                        }));
                     }
                 }
             }
@@ -4218,7 +4359,7 @@ mod row_menu_tests {
     fn every_engine_designs_from_a_column_or_a_key_row() {
         for d in [MySql, Postgres, Sqlite] {
             assert!(field_entries(d).edit, "Edit column {d:?}");
-            assert!(key_entries(d, None).edit, "Edit table {d:?}");
+            assert!(key_entries(d, None).edit, "Edit index {d:?}");
         }
     }
 

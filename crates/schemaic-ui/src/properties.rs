@@ -715,7 +715,7 @@ fn footer(
                     &t.database,
                     t.schema.as_deref(),
                     &t.table,
-                    None,
+                    crate::table_designer::DesignerFocus::Table,
                 );
             }
         }
