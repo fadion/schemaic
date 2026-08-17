@@ -2458,6 +2458,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   pane remounts on the new text. That key reads the tab out of `tabs` with `with_untracked` and only
   *then* tracks `reload_gen`: tracking the whole vector there would rebuild the editor every time
   any tab was opened or closed.
+  A remount is the right answer only when the *whole document* is being replaced by something the
+  user cannot have been mid-edit in. For an edit — anything that should be undoable and should keep
+  the caret — the write has to reach the mounted editor instead, and the way in is a
+  request-and-clear signal on the tab that the pane consumes (`Tab::format_req`, `Tab::jump_offset`).
+  This is the shape the palette's "Format Code" now uses. It is worth knowing what it did before,
+  because that is the failure mode: it called `sqlfmt::format_sql` itself and wrote the result into
+  `t.query`, which nothing read back, so the command silently did nothing at all — and the bug was
+  invisible in review, because the line that "applies" the format looks exactly like the line that
+  would work if the sync went both ways. It also meant two formatters, so the palette could drift
+  from Ctrl+Alt+L; `format_req` reaches the same `editor_pane::format_editor`.
 
 ## Popup menus (`menu_panel`)
 
