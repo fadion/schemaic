@@ -40,7 +40,7 @@ use schemaic_core::model::{
 use schemaic_core::rowjson::{self, ColSpec};
 use schemaic_core::schema::{DbSchema, ForeignKeyInfo, SchemaState, TableInfo, TableSource};
 use schemaic_core::summary;
-use schemaic_core::text::{hides_detail, human_count, plural};
+use schemaic_core::text::{hides_detail, plural};
 use schemaic_core::text_ops::contains_ignore_ascii_case;
 use schemaic_core::tx::{WRITE_WAIT_MS, WaitNote, write_wait_note};
 
@@ -1865,6 +1865,15 @@ pub(crate) struct GridCtx {
     /// with no usable row key passes it, and the monitor answers with "No row key
     /// for this table" rather than the button being silently absent.
     pub(crate) open_monitor: crate::MonitorFn,
+    /// Open the table-properties modal for the tab's source table. Gated exactly
+    /// as `open_monitor` is, and for the same reason — the panel answers "no
+    /// statistics for this object" itself, which is more use than a missing
+    /// button.
+    pub(crate) open_properties: crate::PropertiesFn,
+    /// Ask the app to fetch this database's table statistics if nobody has
+    /// (see [`crate::SchemaActions::db_stats`]) — called once per capped result,
+    /// which is where the `1,000 of ~4.2m` total comes from.
+    pub(crate) db_stats: Rc<dyn Fn(u64, String)>,
     /// AI-fill a single cell (sample base table → one-shot AI → stage the result).
     pub(crate) ai_fill: crate::AiFillFn,
     /// AI-generate seed rows (Insert Row / Seed Table) → stage pending rows.
@@ -2379,6 +2388,68 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         gs.edit_model.set(Arc::new(model));
     });
 
+    // ── What the capped notice compares against ──────────────────────────────
+    // `1,000 of ~4.2m` — what the result *would* have held. Only sayable when the
+    // loaded rows are a capped read of a whole table, which is the strict half:
+    // a table's row estimate is a total this query had only if the query took the
+    // table entire (`intel::full_table_source`), and `grid_query` must be empty
+    // because a spliced filter re-runs a statement that is not `base_sql`.
+    //
+    // Resolved once here, from the SQL that produced this result — a fresh run
+    // rebuilds the grid, so an untracked read is the snapshot, not a stale one.
+    let result_db = rs.database.clone();
+    let scanned: Option<(String, Option<String>, String)> =
+        if truncated && gs.grid_query.with_untracked(|q| q.is_empty()) {
+            gs.base_sql.with_untracked(|sql| {
+                let t = schemaic_core::intel::full_table_source(sql.as_deref()?, gs.dialect)?;
+                let (database, schema) = schemaic_core::stats::catalogue_key(
+                    gs.dialect,
+                    t.qualifier.as_deref(),
+                    result_db.as_deref(),
+                )?;
+                Some((database, schema, t.name))
+            })
+        } else {
+            None
+        };
+    // A capped result is the moment the total is worth a catalogue query, so ask
+    // for one — the app no-ops if this database's figures are already in hand or
+    // in flight. In an effect rather than inline so the request lands after this
+    // build, not during it (the same reason `properties_overlay` fetches from
+    // one); it reads no signal, so it runs exactly once.
+    if let Some((database, ..)) = scanned.clone() {
+        let ask = gctx.db_stats.clone();
+        let conn_id = gctx.conn_id;
+        create_effect(move |_| (ask)(conn_id.get_untracked(), database.clone()));
+    }
+    // Reactive, so the figure appears when that fetch lands. The node lookup is
+    // tracked too (unlike `crate::db_stats_slot`'s): a connection-wide refresh
+    // replaces the whole node list, and a slot captured from the old one is a
+    // disposed signal.
+    let db_nodes_stats = gctx.db_nodes;
+    let (tab_conn, active_conn_stats) = (gctx.conn_id, gctx.active_conn);
+    let row_total: Memo<Option<schemaic_core::stats::RowCount>> = create_memo(move |_| {
+        let (database, schema, table) = scanned.as_ref()?;
+        // `db_nodes` is the *active* connection's tree. A tab bound to another
+        // one names its databases in the same words and would read a different
+        // server's figures out of it.
+        if tab_conn.get() != active_conn_stats.get() {
+            return None;
+        }
+        let slot = db_nodes_stats.with(|nodes| {
+            nodes
+                .iter()
+                .find(|n| n.database == *database)
+                .map(|n| n.stats)
+        })?;
+        slot.with(|st| match st {
+            crate::DbStatsState::Loaded(set) => set
+                .find(schema.as_deref(), table)
+                .and_then(schemaic_core::stats::TableStats::row_count),
+            _ => None,
+        })
+    });
+
     // Column-highlight request from a schema-tree column double-click: select the
     // whole named column (header + every cell) and scroll it into view, then clear
     // the request. An effect — not a one-shot read — so re-requesting the highlight
@@ -2440,6 +2511,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
         capped_columns,
         sort,
         rs.database.clone(),
+        row_total,
         strip.clone(),
     );
 
@@ -4977,6 +5049,11 @@ fn grid_toolbar(
     capped_columns: Vec<String>,
     sort: RwSignal<SortState>,
     database: Option<String>,
+    // What the whole statement would have returned, when the loaded rows are a
+    // capped read of one whole table and its total is in hand — see the
+    // `row_total` memo in `grid_view`, which is where those conditions are
+    // decided. `None` means the line says only what it read.
+    row_total: Memo<Option<schemaic_core::stats::RowCount>>,
     strip: crate::widgets::FocusRing,
 ) -> impl IntoView {
     // Escape's way home. Deferred inside `refocus_grid`, which is what makes it
@@ -5048,12 +5125,19 @@ fn grid_toolbar(
     // (`ResultSet::database`). A connection with no default database says nothing
     // rather than inventing a name.
     let scope = database.map(|d| format!("{d} · ")).unwrap_or_default();
-    let stats = text(format!(
-        "{scope}{} {}{cap} · {ncols} {} · {elapsed_ms} ms",
-        human_count(nrows),
-        plural(nrows, "row", "rows"),
-        plural(ncols, "col", "cols"),
-    ))
+    // A `label` rather than `text`, for the one part of this line that isn't
+    // settled at build time: a capped result's total arrives from a catalogue
+    // query, and the line reads `1,000 of ~4.2m rows (capped)` once it does.
+    // `plural` still follows the rows actually **read** — it is the subject of
+    // the sentence, and `1 of ~4.2m row` would be the wrong noun on a 1-row page.
+    let stats = label(move || {
+        format!(
+            "{scope}{} {}{cap} · {ncols} {} · {elapsed_ms} ms",
+            schemaic_core::stats::rows_read_of(nrows, row_total.get()),
+            plural(nrows, "row", "rows"),
+            plural(ncols, "col", "cols"),
+        )
+    })
     .style(|s| s.color(theme::text_dim()).font_size(theme::FONT_LABEL));
     // A column whose 512 MiB text arena filled up renders blank from that row
     // on. Said out loud, because the alternative is the user discovering empty

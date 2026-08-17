@@ -59,8 +59,15 @@ const INDEX_FACT_GAP: f64 = 20.0;
 
 /// Open the properties modal for one object. The fetch is kicked off by the
 /// modal itself, so every entry point is this one call.
+///
+/// `conn_id` is passed rather than read from the active connection because the
+/// two can differ: a query tab keeps the connection it was opened on, so the
+/// results toolbar's entry describes a table on *that* server even while the
+/// switcher points at another one — and the fetch keys on this
+/// (`db_for(target.conn_id)`).
 pub(crate) fn open_for_table(
     ui: &Ui,
+    conn_id: u64,
     database: &str,
     schema: Option<&str>,
     table: &str,
@@ -70,7 +77,7 @@ pub(crate) fn open_for_table(
     ui.overlay.properties_counting.set(false);
     ui.overlay.properties_count_err.set(None);
     ui.overlay.properties.set(Some(PropertiesTarget {
-        conn_id: ui.conn.active_conn.get_untracked(),
+        conn_id,
         database: database.to_string(),
         schema: schema.map(str::to_string),
         table: table.to_string(),

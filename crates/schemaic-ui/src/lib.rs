@@ -1100,6 +1100,32 @@ pub enum DbStatsState {
     Unavailable,
 }
 
+/// One database's statistics slot in the schema tree's cache, found by name —
+/// `None` when this connection has no such node.
+///
+/// Handed out as the signal rather than as the figures inside it so each caller
+/// decides whether to **track** it: the results toolbar wants its row estimate to
+/// appear when a fetch lands, while a context menu is built once on the click and
+/// must not re-enter while it is open. Nothing here *asks* for a fetch — see
+/// [`DbStatsState`] for who does.
+///
+/// The **lookup** is untracked either way, which is what makes this the
+/// short-lived caller's version: replacing the node list (a connection-wide
+/// refresh) leaves a captured slot pointing at a disposed signal. Anything that
+/// keeps the slot across renders tracks the list too — `grid_view`'s `row_total`
+/// memo does.
+pub(crate) fn db_stats_slot(
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    database: &str,
+) -> Option<RwSignal<DbStatsState>> {
+    db_nodes.with_untracked(|nodes| {
+        nodes
+            .iter()
+            .find(|n| n.database == database)
+            .map(|n| n.stats)
+    })
+}
+
 /// Text-field signals backing the "Manage Connections" form. `id == None`
 /// means a new (not-yet-saved) connection. Ports are edited as text and parsed
 /// on save.
@@ -1810,6 +1836,16 @@ pub struct SchemaActions {
     /// Toggle the schema tree's size column, persisting the choice. Switching it
     /// on is what makes the app fetch statistics for the expanded databases.
     pub toggle_table_sizes: Rc<dyn Fn()>,
+    /// Fill one database's [`ConnNode::stats`] — `(conn_id, database)` — if
+    /// nobody has yet. A no-op on a node already loading, loaded, or known
+    /// unavailable, and on an engine that publishes nothing, so a caller may ask
+    /// freely; the slot is the guard (see [`DbStatsState`]).
+    ///
+    /// It exists because the size column is opt-in while the results toolbar's
+    /// `1,000 of ~4.2m` is not: a capped result is exactly the moment the total
+    /// is worth a catalogue query, and without this the line would only ever
+    /// appear for users who had already switched the tree column on.
+    pub db_stats: Rc<dyn Fn(u64, String)>,
 }
 
 /// Result of a "Test" of the Manage-Connections draft (host + credentials),
@@ -2152,6 +2188,14 @@ pub use schemaic_core::monitor::MonitorEntry;
 /// Open the Live Monitor for a table on a connection — starts polling that table
 /// and reveals the modal. Built in the app, invoked from the grid toolbar.
 pub type MonitorFn = Rc<dyn Fn(u64, TableSource)>;
+
+/// Open the table-properties modal for a table on a connection — the results
+/// toolbar's entry point, beside the schema tree's own context-menu entry.
+///
+/// Built where the whole [`Ui`] is in reach (`workspace`) rather than in the app,
+/// because everything it needs is already there: the modal fetches its own
+/// figures, and whether the object is a view comes from the loaded schema.
+pub type PropertiesFn = Rc<dyn Fn(u64, TableSource)>;
 
 /// All app state + callbacks the UI needs, bundled so views take one argument.
 /// The app (schemaic-app) owns the signals and provides the `Rc<dyn Fn>`
@@ -3641,6 +3685,28 @@ fn center(ui: Ui) -> impl IntoView {
     let apply_view = ui.tab_actions.apply_view.clone();
     let follow_fk = ui.tab_actions.open_table_filtered.clone();
     let open_monitor = ui.tab_actions.open_monitor.clone();
+    let db_stats = ui.schema_actions.db_stats.clone();
+    // Properties for a query tab's source table — the results toolbar's entry.
+    // Built here because `GridCtx` takes callbacks, not the whole `Ui` (like
+    // `create_view` below), and because only the loaded schema knows whether the
+    // object is a view; an unloaded one is described as a table, which is what
+    // the panel would show anyway.
+    let open_properties: PropertiesFn = {
+        let ui = ui.clone();
+        Rc::new(move |conn_id: u64, src: TableSource| {
+            let is_view =
+                table_designer::loaded_table(&ui, &src.database, src.schema.as_deref(), &src.table)
+                    .is_some_and(|t| t.is_view);
+            properties::open_for_table(
+                &ui,
+                conn_id,
+                &src.database,
+                src.schema.as_deref(),
+                &src.table,
+                is_view,
+            );
+        })
+    };
     let ai_fill = ui.tab_actions.ai_fill.clone();
     let ai_seed = ui.tab_actions.ai_seed.clone();
     let active_db = ui.tabs_ui.active_db;
@@ -3800,6 +3866,8 @@ fn center(ui: Ui) -> impl IntoView {
                     summarize: summarize.clone(),
                     follow_fk: follow_fk.clone(),
                     open_monitor: open_monitor.clone(),
+                    open_properties: open_properties.clone(),
+                    db_stats: db_stats.clone(),
                     ai_fill: ai_fill.clone(),
                     ai_seed: ai_seed.clone(),
                     dismiss: dismiss_menus.clone(),
@@ -3965,8 +4033,10 @@ fn results_section(
             }
         });
     }
-    // Live Monitor: watch the tab's source table. Captured before `gctx` moves.
+    // Properties + Live Monitor: both act on the tab's source table. Captured
+    // before `gctx` moves.
     let open_monitor = gctx.open_monitor.clone();
+    let open_properties = gctx.open_properties.clone();
     let (monitor_source, monitor_conn) = (gctx.source, gctx.conn_id);
     let body = dyn_container(
         move || !result_tabs.with(|v| v.is_empty()),
@@ -3986,33 +4056,51 @@ fn results_section(
             .min_width(0.0)
     });
 
-    // Title row: "RESULTS" left; a Live-Monitor button + expand/shrink toggle right
-    // (same widget + spacing as the Schema/AI title-bar icons — monitor `mr=2`,
-    // toggle `mr=7` gives the 12px inter-icon gap and 12px edge inset). The toggle
-    // swaps its glyph via `dyn_container` (a transform-transition on a small svg is
-    // unreliable — see themes gotchas).
+    // Title row: "RESULTS" left; a Properties button, a Live-Monitor button and
+    // the expand/shrink toggle right (same widget + spacing as the Schema/AI
+    // title-bar icons — `mr=2` between, `mr=7` on the last for the 12px inter-icon
+    // gap and 12px edge inset). The toggle swaps its glyph via `dyn_container` (a
+    // transform-transition on a small svg is unreliable — see themes gotchas).
+    //
+    // Properties leads, because it describes the table as it stands while the
+    // monitor watches it change — the same order the schema tree's menu puts them
+    // in. Both are gated on the tab having a source table, and both then let their
+    // own panel answer what it can't ("no statistics for a view", "no row key for
+    // this table") rather than the button being silently dead.
+    let has_source = move || monitor_source.get().is_some();
+    let properties_btn = {
+        let open_properties = open_properties.clone();
+        toolbar_icon(icons::TABLE_PROPERTIES, 5.0, 2.0, has_source, move || {
+            if let Some(src) = monitor_source.get_untracked() {
+                (open_properties)(monitor_conn.get_untracked(), src);
+            }
+        })
+        .tooltip(|| text("Table properties…").style(widgets::tooltip_style))
+    };
     let monitor_btn = {
         let open_monitor = open_monitor.clone();
-        let enabled = move || monitor_source.get().is_some();
-        toolbar_icon(icons::ACTIVITY, 5.0, 2.0, enabled, move || {
+        toolbar_icon(icons::ACTIVITY, 5.0, 2.0, has_source, move || {
             if let Some(src) = monitor_source.get_untracked() {
                 (open_monitor)(monitor_conn.get_untracked(), src);
             }
         })
+        .tooltip(|| text("Live Monitor…").style(widgets::tooltip_style))
     };
     let toggle_btn = dyn_container(
         move || editor_collapsed.get(),
         move |collapsed| {
-            let markup = if collapsed {
-                icons::SHRINK
+            let (markup, tip) = if collapsed {
+                (icons::SHRINK, "Restore the editor")
             } else {
-                icons::EXPAND
+                (icons::EXPAND, "Collapse the editor")
             };
             let t = toggle_collapse.clone();
-            toolbar_icon(markup, 5.0, 7.0, || true, move || (t)()).into_any()
+            toolbar_icon(markup, 5.0, 7.0, || true, move || (t)())
+                .tooltip(move || text(tip).style(widgets::tooltip_style))
+                .into_any()
         },
     );
-    let icons_group = h_stack((monitor_btn, toggle_btn))
+    let icons_group = h_stack((properties_btn, monitor_btn, toggle_btn))
         .style(|s| s.flex_row().items_start().flex_shrink(0.0_f32));
     let title_row = h_stack((section_title("RESULTS"), icons_group))
         .style(|s| s.width_full().flex_row().items_start().justify_between());

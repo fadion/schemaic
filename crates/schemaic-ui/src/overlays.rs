@@ -681,6 +681,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
     let active_conn = ui.conn.active_conn;
     let open_query = ui.tab_actions.open_query.clone();
     let open_db_cli = ui.tab_actions.open_db_cli.clone();
+    let open_monitor = ui.tab_actions.open_monitor.clone();
     let refresh_db = ui.schema_actions.refresh_db.clone();
     let collapse_db = ui.schema_actions.collapse_db.clone();
     let ai_send = ui.ai_actions.send.clone();
@@ -1083,11 +1084,26 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         entries.push(MenuEntry::action("Properties", move || {
                             crate::properties::open_for_table(
                                 &ui,
+                                active_conn.get_untracked(),
                                 &db,
                                 ns.as_deref(),
                                 &tbl,
                                 is_view,
                             );
+                        }));
+                    }
+                    // Watch this table for row changes — the same action the
+                    // results toolbar offers, next to Properties there and here
+                    // for the same reason: both report on the table as it is,
+                    // rather than on its structure. Offered for a view too; the
+                    // monitor says "No row key for this table" when it can't
+                    // diff one, which is a better answer than a missing entry
+                    // (see [`crate::grid::GridCtx::open_monitor`]).
+                    {
+                        let om = open_monitor.clone();
+                        let src = source.clone();
+                        entries.push(MenuEntry::action("Live monitor", move || {
+                            (om)(active_conn.get_untracked(), src.clone());
                         }));
                     }
                     // ER diagram seeded on this table's FK neighbourhood.
@@ -1255,6 +1271,24 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         //
                         // Drop applies to a view; Truncate does not — a view owns
                         // no rows to delete — so only the second is conditional.
+                        //
+                        // Both name the *scale* of what goes when a row figure is
+                        // already in hand: "Delete all ~4.2m rows in orders?" is
+                        // a different question from "delete every row", and the
+                        // difference is the one the user wants before clicking.
+                        // Read from the tree's statistics cache and never
+                        // fetched — this menu is built on the right-click, so a
+                        // round trip here would either block it or land after the
+                        // modal is already up. Whether a figure in hand is worth
+                        // naming at all is `stats::truncate_prompt`'s decision.
+                        let rows = crate::db_stats_slot(db_nodes, &database).and_then(|slot| {
+                            slot.with_untracked(|st| match st {
+                                crate::DbStatsState::Loaded(set) => set
+                                    .get(schema.as_deref(), &table)
+                                    .and_then(schemaic_core::stats::TableStats::row_count),
+                                _ => None,
+                            })
+                        });
                         if offers.truncate {
                             let ui = import_ui.clone();
                             let confirm = ui.overlay.confirm;
@@ -1266,8 +1300,8 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                         (ui.clone(), db.clone(), ns.clone(), tbl.clone());
                                     confirm.set(Some(crate::Confirm {
                                         title: "Truncate table".to_string(),
-                                        message: format!(
-                                            "Delete every row in {label}? This can't be undone."
+                                        message: schemaic_core::stats::truncate_prompt(
+                                            &label, rows,
                                         ),
                                         resolve: Rc::new(move |yes| {
                                             if yes {
@@ -1296,27 +1330,15 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                         (ui.clone(), db.clone(), ns.clone(), tbl.clone());
                                     // A view is dropped by `DROP VIEW`; asking
                                     // about "every row in it" would be asking
-                                    // about rows it doesn't own either.
-                                    let (title, message) = if is_view {
-                                        (
-                                            "Drop view",
-                                            format!(
-                                                "Drop {label}? Anything built on it goes too. \
-                                                 This can't be undone."
-                                            ),
-                                        )
-                                    } else {
-                                        (
-                                            "Drop table",
-                                            format!(
-                                                "Drop {label} and every row in it? \
-                                                 This can't be undone."
-                                            ),
-                                        )
-                                    };
+                                    // about rows it doesn't own either — which is
+                                    // also why `drop_prompt` never gives one a
+                                    // row figure.
+                                    let title = if is_view { "Drop view" } else { "Drop table" };
                                     confirm.set(Some(crate::Confirm {
                                         title: title.to_string(),
-                                        message,
+                                        message: schemaic_core::stats::drop_prompt(
+                                            &label, rows, is_view,
+                                        ),
                                         resolve: Rc::new(move |yes| {
                                             if yes {
                                                 crate::ddl_preview::preview_change(
