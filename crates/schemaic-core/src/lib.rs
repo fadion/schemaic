@@ -37,6 +37,7 @@ pub mod search_history;
 pub mod secrets;
 pub mod seed;
 pub mod sql;
+pub mod sqlfile;
 pub mod sqlfmt;
 pub mod stats;
 pub mod summary;
