@@ -4634,7 +4634,17 @@ pub fn single_source_table(sql: &str, dialect: SqlDialect) -> Option<SourceTable
     let sqlparser::ast::Statement::Query(query) = &stmts[0] else {
         return None;
     };
-    let parts = object_name_parts(simple_select_source(query)?);
+    source_table_of(simple_select_source(query)?)
+}
+
+/// An AST table name as a [`SourceTable`], or `None` when it has a shape this
+/// crate refuses to read.
+///
+/// Three parts is `db.schema.table`, which no engine here produces from its own
+/// generated SQL; reading only the last two would silently drop a qualifier that
+/// changes which table this is.
+fn source_table_of(name: &sqlparser::ast::ObjectName) -> Option<SourceTable> {
+    let parts = object_name_parts(name);
     match parts.len() {
         1 => Some(SourceTable {
             qualifier: None,
@@ -4644,11 +4654,82 @@ pub fn single_source_table(sql: &str, dialect: SqlDialect) -> Option<SourceTable
             qualifier: Some(parts[0].clone()),
             name: parts[1].clone(),
         }),
-        // Three parts is `db.schema.table`, which no engine here produces from
-        // its own generated SQL; reading only the last two would silently drop a
-        // qualifier that changes which table this is.
         _ => None,
     }
+}
+
+/// The table a statement reads **in full** — every row of it, once each — or
+/// `None` when the statement is anything else.
+///
+/// This is the question behind the results toolbar's `1,000 of ~4.2m`. A table's
+/// row estimate only describes a *result* when the result is the whole table;
+/// printed against a filtered or aggregated read it would be a total the query
+/// never had, in a line the user has no way to check. So this is deliberately
+/// stricter than [`single_source_table`], which only asks which table a row came
+/// *from*: on top of that statement shape it requires no `WHERE`, no
+/// `GROUP BY` / `HAVING` / `QUALIFY`, no `DISTINCT`, no `LIMIT` / `OFFSET` /
+/// `FETCH`, and a projection of nothing but column references and wildcards.
+///
+/// **The projection rule is about aggregates.** `SELECT COUNT(*) FROM t` passes
+/// every other test here and returns exactly one row, so a row-preserving
+/// projection has to be established rather than assumed. Plain column references
+/// and wildcards are; anything computed is refused without looking closer, which
+/// also refuses harmless arithmetic — being wrong here invents a total, being
+/// conservative only says less.
+///
+/// An `ORDER BY` is fine: it reorders rows without adding or removing any.
+pub fn full_table_source(sql: &str, dialect: SqlDialect) -> Option<SourceTable> {
+    use sqlparser::ast::{GroupByExpr, SetExpr};
+    let stmts = sqlparser::parser::Parser::parse_sql(&*dialect.parser(), sql).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    let sqlparser::ast::Statement::Query(query) = &stmts[0] else {
+        return None;
+    };
+    if query.limit_clause.is_some() || query.fetch.is_some() {
+        return None;
+    }
+    let name = simple_select_source(query)?;
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        // Unreachable: `simple_select_source` just established this is a Select.
+        return None;
+    };
+    if select.selection.is_some()
+        || select.prewhere.is_some()
+        || select.having.is_some()
+        || select.qualify.is_some()
+        || select.distinct.is_some()
+        || select.top.is_some()
+    {
+        return None;
+    }
+    // `GROUP BY ALL` and a non-empty expression list both group; only the empty
+    // expression list is "no GROUP BY at all". A `WITH ROLLUP` modifier on an
+    // empty list is not a shape any parser produces, and refusing it costs
+    // nothing.
+    match &select.group_by {
+        GroupByExpr::Expressions(exprs, modifiers) if exprs.is_empty() && modifiers.is_empty() => {}
+        _ => return None,
+    }
+    if !select.projection.iter().all(row_preserving_item) {
+        return None;
+    }
+    source_table_of(name)
+}
+
+/// Does this projected item return one value per input row rather than folding
+/// rows together? See [`full_table_source`], which is the only caller and states
+/// why the answer has to be conservative.
+fn row_preserving_item(item: &sqlparser::ast::SelectItem) -> bool {
+    use sqlparser::ast::{Expr, SelectItem};
+    let expr = match item {
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => return true,
+        SelectItem::UnnamedExpr(e)
+        | SelectItem::ExprWithAlias { expr: e, .. }
+        | SelectItem::ExprWithAliases { expr: e, .. } => e,
+    };
+    matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
 }
 
 /// What a simple single-table `SELECT` projects, in result-column order.
@@ -5002,6 +5083,75 @@ mod tests {
         ] {
             assert_eq!(t(sql), None, "{sql}");
         }
+    }
+
+    #[test]
+    fn full_table_source_reads_an_unfiltered_whole_table_select() {
+        let t = |s: &str| full_table_source(s, SqlDialect::Sqlite).map(|s| s.name);
+        assert_eq!(t("SELECT * FROM artist"), Some("artist".to_string()));
+        // Named columns are still one row out per row in.
+        assert_eq!(t("SELECT a, b FROM artist"), Some("artist".to_string()));
+        assert_eq!(
+            t("SELECT t.a AS x FROM artist t"),
+            Some("artist".to_string())
+        );
+        // An ORDER BY reorders rows; it doesn't add or remove any — and this is
+        // the shape the app's own generated browse query has, minus its LIMIT.
+        assert_eq!(
+            t("SELECT * FROM artist ORDER BY id ASC"),
+            Some("artist".to_string())
+        );
+        // The qualifier survives, because it is part of which table this is.
+        assert_eq!(
+            full_table_source("SELECT * FROM shop.orders", SqlDialect::MySql),
+            Some(SourceTable {
+                qualifier: Some("shop".into()),
+                name: "orders".into()
+            })
+        );
+    }
+
+    #[test]
+    fn full_table_source_refuses_anything_that_is_not_the_whole_table() {
+        let t = |s: &str| full_table_source(s, SqlDialect::Sqlite);
+        for sql in [
+            // Fewer rows than the table has.
+            "SELECT * FROM t WHERE a = 1",
+            "SELECT * FROM t LIMIT 10",
+            "SELECT * FROM t LIMIT 10 OFFSET 5",
+            "SELECT DISTINCT a FROM t",
+            // Folded rows: the estimate would be printed against a result of one.
+            "SELECT count(*) FROM t",
+            "SELECT a, count(*) FROM t GROUP BY a",
+            "SELECT max(a) AS m FROM t",
+            // A computed column is refused without looking closer — it may be an
+            // aggregate, and the conservative answer only says less.
+            "SELECT a * 2 FROM t",
+            // Not one plain table to begin with (`simple_select_source`).
+            "SELECT * FROM a JOIN b ON a.id = b.a_id",
+            "WITH c AS (SELECT 1) SELECT * FROM c",
+            "SELECT a FROM t UNION SELECT a FROM u",
+            "SELECT * FROM a; SELECT * FROM b",
+            "not sql at all",
+        ] {
+            assert_eq!(t(sql), None, "{sql}");
+        }
+    }
+
+    /// The generated browse query carries a `LIMIT`, so it must **not** qualify —
+    /// its result is a page, and the table's estimate is not that page's total.
+    #[test]
+    fn full_table_source_refuses_the_generated_browse_query() {
+        let sql = crate::filter::table_query(
+            SqlDialect::MySql,
+            "shop",
+            None,
+            "orders",
+            crate::filter::BrowseKey::None,
+            crate::filter::Order::Asc,
+            100,
+        );
+        assert_eq!(full_table_source(&sql, SqlDialect::MySql), None, "{sql}");
     }
 
     /// The case a name match gets wrong, and the reason the derivation is

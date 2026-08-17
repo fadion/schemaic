@@ -408,6 +408,25 @@ impl SchemaStats {
             .find(|t| t.schema.as_deref() == schema && t.table == table)
     }
 
+    /// One table's stats found by the name a **statement** wrote, with whatever
+    /// namespace it wrote — or didn't.
+    ///
+    /// The difference from [`SchemaStats::get`] is the `None` namespace, which
+    /// there means "this engine has no namespaces" and here means "the statement
+    /// didn't say". So an unqualified name matches by name alone, and matches
+    /// **only when exactly one table carries it**: an unqualified PostgreSQL name
+    /// resolves through the server's `search_path`, which the client does not
+    /// know, and picking either of two candidates would print one table's size
+    /// beside another table's rows with nothing to show that it happened.
+    pub fn find(&self, schema: Option<&str>, table: &str) -> Option<&TableStats> {
+        if schema.is_some() {
+            return self.get(schema, table);
+        }
+        let mut hits = self.tables.iter().filter(|t| t.table == table);
+        let first = hits.next()?;
+        hits.next().is_none().then_some(first)
+    }
+
     /// Every table's total added up — the "this database is N on disk" figure.
     /// `None` when no table reported a size.
     pub fn total_bytes(&self) -> Option<u64> {
@@ -465,6 +484,101 @@ pub fn count_rows_sql(schema: Option<&str>, table: &str, dialect: SqlDialect) ->
         None => crate::export::ident_sql(table, dialect),
     };
     format!("SELECT COUNT(*) FROM {name}")
+}
+
+/// Where the `qualifier.table` a statement wrote sits in the catalogue:
+/// `(database, namespace)`.
+///
+/// **The two engines that publish statistics disagree about what a qualifier
+/// is.** A MySQL connection is server-level, so `shop.orders` names a *database*
+/// and there is no level under it; a PostgreSQL connection is already bound to
+/// its database, so `sales.orders` names a *namespace* inside it. Asked here
+/// rather than at each call site because getting it backwards looks up a
+/// different table and reports its figures without anything showing that it
+/// happened.
+///
+/// `result_db` is the database the statement ran in — the qualifier it left out.
+/// `None` when that is unknown and the statement didn't say, and `None` for
+/// SQLite, which publishes no statistics to key at all
+/// ([`supports_table_stats`]).
+pub fn catalogue_key(
+    dialect: SqlDialect,
+    qualifier: Option<&str>,
+    result_db: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    match dialect {
+        SqlDialect::MySql => Some((qualifier.or(result_db)?.to_string(), None)),
+        SqlDialect::Postgres => Some((result_db?.to_string(), qualifier.map(str::to_string))),
+        SqlDialect::Sqlite => None,
+    }
+}
+
+/// The row figure the results toolbar prints: `1,000` on its own, or
+/// `1,000 of ~4.2m` when the loaded rows are a capped read of a whole table whose
+/// total is in hand.
+///
+/// **`total` is only ever the whole statement's total.** Whether it *is* one is
+/// [`crate::intel::full_table_source`]'s question, asked before this is called;
+/// all that is decided here is whether the figure adds anything. A total at or
+/// below what was already read says nothing the line doesn't — and would print
+/// `1,000 of ~400`, which reads as a bug rather than as the stale estimate it is.
+pub fn rows_read_of(loaded: usize, total: Option<RowCount>) -> String {
+    let read = human_count(loaded);
+    match total {
+        Some(t) if t.value() > loaded as u64 => format!("{read} of {}", t.label()),
+        _ => read,
+    }
+}
+
+/// Below this many rows an **estimate** is not named in a destructive
+/// confirmation.
+///
+/// The point of naming a figure there is scale: "this will delete ~4.2m rows" is
+/// worth stopping for. Below a thousand rows there is no scale to warn about, and
+/// InnoDB's sampled `TABLE_ROWS` is at its least reliable exactly there — it
+/// reports 0 for tables that hold a handful of rows. A prompt reading *"Delete
+/// all ~0 rows in orders?"* would be worse than one that says nothing, because it
+/// answers a question the user didn't ask and answers it wrongly.
+pub const CONFIRM_ROW_FLOOR: u64 = 1_000;
+
+/// Is this figure worth naming in a destructive confirmation? See
+/// [`CONFIRM_ROW_FLOOR`] for the estimate's floor; a figure the engine actually
+/// counted is named at any size above empty.
+fn worth_naming(rows: RowCount) -> bool {
+    match rows {
+        RowCount::Exact(n) => n > 0,
+        RowCount::Estimate(n) => n >= CONFIRM_ROW_FLOOR,
+    }
+}
+
+/// What the `TRUNCATE` confirmation asks about `label`, naming the scale of what
+/// goes when a row figure worth naming is already in hand.
+pub fn truncate_prompt(label: &str, rows: Option<RowCount>) -> String {
+    match rows.filter(|&r| worth_naming(r)) {
+        Some(r) => format!(
+            "Delete all {} rows in {label}? This can't be undone.",
+            r.label()
+        ),
+        None => format!("Delete every row in {label}? This can't be undone."),
+    }
+}
+
+/// What the `DROP` confirmation asks about `label`.
+///
+/// A view is dropped by `DROP VIEW` and owns no rows, so it is never given a row
+/// figure — asking about "every row in it" would be asking about rows that
+/// belong to the tables under it.
+pub fn drop_prompt(label: &str, rows: Option<RowCount>, is_view: bool) -> String {
+    if is_view {
+        return format!("Drop {label}? Anything built on it goes too. This can't be undone.");
+    }
+    match rows.filter(|&r| worth_naming(r)) {
+        Some(r) => format!(
+            "Drop {label} and all {} rows in it? This can't be undone.",
+            r.label()
+        ),
+        None => format!("Drop {label} and every row in it? This can't be undone."),
+    }
 }
 
 /// A duration in seconds as the shortest sensible unit: `30s`, `5m`, `1h`,
@@ -832,6 +946,33 @@ mod tests {
     }
 
     #[test]
+    fn an_unqualified_statement_name_matches_only_when_it_is_unambiguous() {
+        let two = SchemaStats {
+            tables: vec![
+                named(Some("sales"), "orders", 10),
+                named(Some("archive"), "orders", 20),
+            ],
+        };
+        // Two namespaces hold the name and only `search_path` decides which the
+        // statement meant, so neither figure is reported.
+        assert!(two.find(None, "orders").is_none());
+        // A namespace the statement *did* write is matched exactly, ambiguity or
+        // not.
+        assert_eq!(two.find(Some("sales"), "orders").unwrap().rows, Some(10));
+
+        let one = SchemaStats {
+            tables: vec![named(Some("public"), "orders", 30)],
+        };
+        assert_eq!(one.find(None, "orders").unwrap().rows, Some(30));
+        assert!(one.find(None, "customers").is_none());
+        // MySQL, where nothing carries a namespace at all.
+        let my = SchemaStats {
+            tables: vec![named(None, "orders", 40)],
+        };
+        assert_eq!(my.find(None, "orders").unwrap().rows, Some(40));
+    }
+
+    #[test]
     fn a_database_total_adds_up_what_reported_a_size() {
         let set = SchemaStats {
             tables: vec![
@@ -929,6 +1070,121 @@ mod tests {
         assert!(
             !supports_table_stats(SqlDialect::Sqlite),
             "SQLite keeps no per-table size; see the doc comment"
+        );
+    }
+
+    // ── Catalogue key ────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_qualifier_is_a_database_on_mysql_and_a_namespace_on_postgres() {
+        let k = catalogue_key;
+        assert_eq!(
+            k(SqlDialect::MySql, Some("shop"), Some("other")),
+            Some(("shop".into(), None)),
+            "the statement's own qualifier wins over the connection's database"
+        );
+        assert_eq!(
+            k(SqlDialect::MySql, None, Some("shop")),
+            Some(("shop".into(), None))
+        );
+        assert_eq!(
+            k(SqlDialect::Postgres, Some("sales"), Some("shop")),
+            Some(("shop".into(), Some("sales".into()))),
+            "a Postgres qualifier never changes which database this is"
+        );
+        // Unqualified on Postgres: the namespace stays unknown, and
+        // `SchemaStats::find` is what decides whether that is answerable.
+        assert_eq!(
+            k(SqlDialect::Postgres, None, Some("shop")),
+            Some(("shop".into(), None))
+        );
+    }
+
+    #[test]
+    fn a_key_needs_a_database_and_sqlite_never_has_one_to_key() {
+        assert_eq!(catalogue_key(SqlDialect::MySql, None, None), None);
+        assert_eq!(catalogue_key(SqlDialect::Postgres, None, None), None);
+        assert_eq!(
+            catalogue_key(SqlDialect::Sqlite, Some("main"), Some("main")),
+            None,
+            "SQLite publishes no statistics to look up"
+        );
+    }
+
+    // ── What the toolbar prints ──────────────────────────────────────────────
+
+    #[test]
+    fn the_total_is_added_to_the_rows_read_when_it_says_something() {
+        assert_eq!(
+            rows_read_of(1_000, Some(RowCount::Estimate(4_200_000))),
+            "1k of ~4.2m"
+        );
+        assert_eq!(
+            rows_read_of(1_000, Some(RowCount::Exact(4_213_551))),
+            "1k of 4,213,551"
+        );
+    }
+
+    #[test]
+    fn a_total_that_says_nothing_is_left_out() {
+        // Nothing in hand.
+        assert_eq!(rows_read_of(1_000, None), "1k");
+        // A stale estimate below what was already read would print
+        // `1k of ~400`, which reads as a bug rather than as a stale figure.
+        assert_eq!(rows_read_of(1_000, Some(RowCount::Estimate(400))), "1k");
+        // Equal is not more: the read already accounts for every row.
+        assert_eq!(rows_read_of(1_000, Some(RowCount::Exact(1_000))), "1k");
+    }
+
+    // ── What a destructive confirmation asks ─────────────────────────────────
+
+    #[test]
+    fn a_confirmation_names_a_figure_big_enough_to_be_the_point() {
+        assert_eq!(
+            truncate_prompt("orders", Some(RowCount::Estimate(4_200_000))),
+            "Delete all ~4.2m rows in orders? This can't be undone."
+        );
+        assert_eq!(
+            drop_prompt("orders", Some(RowCount::Estimate(4_200_000)), false),
+            "Drop orders and all ~4.2m rows in it? This can't be undone."
+        );
+        // An engine that counted is believed at any size above empty.
+        assert_eq!(
+            truncate_prompt("orders", Some(RowCount::Exact(12))),
+            "Delete all 12 rows in orders? This can't be undone."
+        );
+    }
+
+    #[test]
+    fn a_confirmation_says_nothing_it_cannot_stand_behind() {
+        let vague = "Delete every row in orders? This can't be undone.";
+        assert_eq!(truncate_prompt("orders", None), vague);
+        // The case the floor exists for: InnoDB reports 0 for a small table it
+        // hasn't sampled, and "Delete all ~0 rows" reads as "this is empty".
+        assert_eq!(
+            truncate_prompt("orders", Some(RowCount::Estimate(0))),
+            vague
+        );
+        assert_eq!(
+            truncate_prompt("orders", Some(RowCount::Estimate(CONFIRM_ROW_FLOOR - 1))),
+            vague
+        );
+        assert_ne!(
+            truncate_prompt("orders", Some(RowCount::Estimate(CONFIRM_ROW_FLOOR))),
+            vague
+        );
+        assert_eq!(truncate_prompt("orders", Some(RowCount::Exact(0))), vague);
+    }
+
+    #[test]
+    fn a_view_is_never_given_a_row_figure() {
+        // It owns none: the rows belong to the tables under it, and `DROP VIEW`
+        // deletes no data at all.
+        let expected = "Drop v? Anything built on it goes too. This can't be undone.";
+        assert_eq!(drop_prompt("v", None, true), expected);
+        assert_eq!(
+            drop_prompt("v", Some(RowCount::Estimate(4_200_000)), true),
+            expected
         );
     }
 }

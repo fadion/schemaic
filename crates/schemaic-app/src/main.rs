@@ -4366,23 +4366,84 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
 
     let toggle_table_sizes: Rc<dyn Fn()> = Rc::new(move || table_sizes.update(|on| *on = !*on));
 
+    // Fetch one database's table statistics into its node's slot, once.
+    //
+    // **`ConnNode::stats` is both the trigger and the guard.** Only a node at
+    // `Idle` is fetched, and moving it to `Loading` before the spawn is what stops
+    // a second ask — from the size-column effect below, from a capped result's
+    // toolbar, or from the two at once — becoming a second query. Nothing here
+    // retries a failure either: a column that re-queried a failing server on every
+    // expand would cost more than it is worth, so a refusal is remembered until a
+    // refresh puts the slot back to `Idle`.
+    let fetch_db_stats: Rc<dyn Fn(u64, String, RwSignal<schemaic_ui::DbStatsState>)> = {
+        let db_for = db_for.clone();
+        let handle = handle.clone();
+        Rc::new(
+            move |conn_id: u64, database: String, slot: RwSignal<schemaic_ui::DbStatsState>| {
+                if slot.get_untracked() != schemaic_ui::DbStatsState::Idle {
+                    return;
+                }
+                let Ok(db) = db_for(conn_id) else {
+                    return;
+                };
+                // An engine with nothing to publish is settled here rather than
+                // by a round trip that would come back empty and be retried on
+                // the next expand.
+                if !schemaic_core::stats::supports_table_stats(db.engine().dialect()) {
+                    slot.set(schemaic_ui::DbStatsState::Unavailable);
+                    return;
+                }
+                slot.set(schemaic_ui::DbStatsState::Loading);
+                let report =
+                    create_ext_action(cx, move |res: Option<schemaic_core::stats::SchemaStats>| {
+                        slot.set(match res {
+                            Some(set) => schemaic_ui::DbStatsState::Loaded(set),
+                            None => schemaic_ui::DbStatsState::Unavailable,
+                        });
+                    });
+                handle.spawn(async move {
+                    report(db.fetch_table_stats(&database).await.ok());
+                });
+            },
+        )
+    };
+
+    // The same fetch, asked for by name — the results toolbar's route to a row
+    // estimate for a capped result (`SchemaActions::db_stats`). It is deliberately
+    // free to ask on every capped result: the slot above answers all but the first.
+    //
+    // **The connection has to match.** `db_nodes` holds the *active* connection's
+    // databases, so filling a slot from a query tab bound to some other server
+    // would write one server's figures into another's tree. A tab of another
+    // connection is not on screen anyway (the strip shows the active connection's
+    // tabs), which makes this a guard rather than a case.
+    let db_stats: Rc<dyn Fn(u64, String)> = {
+        let fetch = fetch_db_stats.clone();
+        Rc::new(move |conn_id: u64, database: String| {
+            if conn_id != active_conn.get_untracked() {
+                return;
+            }
+            let slot = db_nodes.with_untracked(|nodes| {
+                nodes
+                    .iter()
+                    .find(|n| n.database == database)
+                    .map(|n| n.stats)
+            });
+            if let Some(slot) = slot {
+                (fetch)(conn_id, database, slot);
+            }
+        })
+    };
+
     // Fill the schema tree's size column, one database at a time and only for
     // the ones the user can actually see: sizes on, and the database expanded.
-    //
-    // `ConnNode::stats` is both the trigger and the guard — this fetches exactly
-    // the nodes at `Idle` and moves each to `Loading` before spawning, so
-    // re-running (on another expand, or a connection switch) cannot double-fetch
-    // a database already in flight. Nothing here retries a failure: a size column
-    // that re-queried a failing server every time you expanded a node would cost
-    // more than it is worth.
     //
     // Which is also why the slots are read untracked, and why a refresh has to
     // announce itself through `stats_gen` instead: tracking them would make this
     // effect its own dependency, re-entering on the first `Loading` write and
     // re-fetching every database it had not reached yet.
     {
-        let db_for = db_for.clone();
-        let handle = handle.clone();
+        let fetch = fetch_db_stats.clone();
         create_effect(move |_| {
             if !table_sizes.get() {
                 return;
@@ -4401,27 +4462,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         .collect()
                 });
             for (database, slot) in pending {
-                let Ok(db) = db_for(conn_id) else {
-                    continue;
-                };
-                // An engine with nothing to publish is settled here rather than
-                // by a round trip that would come back empty and be retried on
-                // the next expand.
-                if !schemaic_core::stats::supports_table_stats(db.engine().dialect()) {
-                    slot.set(schemaic_ui::DbStatsState::Unavailable);
-                    continue;
-                }
-                slot.set(schemaic_ui::DbStatsState::Loading);
-                let report =
-                    create_ext_action(cx, move |res: Option<schemaic_core::stats::SchemaStats>| {
-                        slot.set(match res {
-                            Some(set) => schemaic_ui::DbStatsState::Loaded(set),
-                            None => schemaic_ui::DbStatsState::Unavailable,
-                        });
-                    });
-                handle.spawn(async move {
-                    report(db.fetch_table_stats(&database).await.ok());
-                });
+                (fetch)(conn_id, database, slot);
             }
         });
     }
@@ -6063,6 +6104,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             table_stats,
             count_rows,
             toggle_table_sizes,
+            db_stats,
         }),
         // Reset on every open (`import_view::open_import`), so one bundle serves
         // every table rather than a per-open scope that would need disposing.

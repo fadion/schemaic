@@ -149,8 +149,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     statement that produced a result) and by SQLite's write-back (which needs to know which base
     table a grid row belongs to). Two predicates that agreed on the day they were written is the
     arrangement `ident_sql` exists to rule out, and a test pins that the two callers still agree.
-    `single_source_table` is its entry point for a caller holding only SQL, and
-    **`projection_of`** the derivation over it: which base column each result column reads, or
+    `single_source_table` is its entry point for a caller holding only SQL.
+    **`full_table_source` is the stricter twin of it**, and the two are not
+    interchangeable: `single_source_table` asks which table a row came *from*, while this asks
+    whether the statement returns the table **entire** — no `WHERE`, no `GROUP BY`/`HAVING`/
+    `QUALIFY`, no `DISTINCT`, no `LIMIT`/`OFFSET`/`FETCH`, and a projection of nothing but column
+    references and wildcards. Only then is a table's row estimate also an estimate of what the
+    *query* would have returned, which is what the results toolbar's `1,000 of ~4.2m` claims. The
+    projection rule is there for aggregates — `SELECT count(*) FROM t` passes every other test and
+    returns one row — and refuses anything computed without looking closer, arithmetic included:
+    being wrong invents a total, being conservative only says less. An `ORDER BY` passes, so the
+    difference between the app's own generated browse query and a qualifying one is precisely its
+    `LIMIT`, which a test pins.
+    **`projection_of`** is the derivation over `single_source_table`: which base column each result column reads, or
     `None` where it is computed. It is **positional, not name-matched**, and that is the whole
     reason it is a function rather than a lookup — `SELECT a AS b, b FROM t` produces a first
     column *named* `b` that *is* `a`, so matching by name maps it to column `b` and an edit to that
@@ -1065,8 +1076,26 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       flags an index only when the server actually counted zero scans — `scans: None` is "nobody
       was counting", never "drop this". `count_rows_sql` builds the exact-count statement here
       rather than three times in the db crate, through the one quoter (`export::ident_sql`).
-      Filled by `Db::fetch_table_stats`; rendered by `ui/properties.rs` and the schema tree's
-      size column.
+      Filled by `Db::fetch_table_stats`; rendered by `ui/properties.rs`, the schema tree's
+      size column, the results toolbar and the destructive confirmations.
+      - **Where a figure may be printed, and in what words, is decided here too** — the surfaces
+        that print one hold no rules of their own. `catalogue_key` says where a statement's
+        `qualifier.table` sits in the catalogue, because the two engines that publish statistics
+        disagree about what a qualifier *is* (a database on MySQL, a namespace on PostgreSQL) and
+        getting it backwards reports one table's figures for another with nothing to show that it
+        happened. `SchemaStats::find` then resolves the name a *statement* wrote — unlike `get`,
+        whose `None` namespace means "this engine has none", `find`'s means "the statement didn't
+        say", so it matches by name alone and **only when exactly one table carries it**: an
+        unqualified PostgreSQL name resolves through `search_path`, which the client does not know.
+      - `rows_read_of` is the toolbar's row segment (`1k` alone, or `1k of ~4.2m`), and it drops a
+        total at or below what was already read — `1k of ~400` reads as a bug rather than as the
+        stale estimate it is. `truncate_prompt`/`drop_prompt` are the destructive confirmations'
+        wording, and they name a figure only above `CONFIRM_ROW_FLOOR` (1,000) when it is an
+        *estimate*: the point of naming one is scale, and InnoDB's sampled `TABLE_ROWS` is at its
+        least reliable exactly below that — it reports 0 for a table holding a handful of rows, so
+        *"Delete all ~0 rows in orders?"* would answer a question the user didn't ask, wrongly. A
+        figure the engine actually counted is named at any size above empty; a **view** is never
+        given one, since the rows belong to the tables under it.
 - `schemaic-db` — MySQL/MariaDB (`mysql_async`) + SSH tunnels (`ssh.rs`), PostgreSQL in `pg.rs`,
   SQLite in `sqlite.rs`, and
   the pinned manual-transaction connection in `session.rs`. Populates each result column's
@@ -1375,9 +1404,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   - `diff_view.rs` — Ctrl+K diff preview. `history_panel.rs` — Query History right-column panel.
   - `plan_view.rs` — Query Plan modal (`EXPLAIN`/`EXPLAIN ANALYZE` table + warnings + "Ask AI"),
     via `TabsActions::run_plan` → `Db::explain`.
-  - `properties.rs` — the **table properties** modal (`properties_overlay`), opened from a Table or
-    View row's context menu by setting `overlay.properties`; an effect in the modal calls
-    `SchemaActions::table_stats`, whose result lands in `overlay.properties_state`. Sizes, row
+  - `properties.rs` — the **table properties** modal (`properties_overlay`), opened by setting
+    `overlay.properties` — from a Table or View row's context menu, or from the RESULTS title bar's
+    Properties icon for a tab with a source table; an effect in the modal calls
+    `SchemaActions::table_stats`, whose result lands in `overlay.properties_state`. Both entry
+    points go through `open_for_table`, which takes the **connection explicitly** rather than
+    reading the active one: a query tab keeps the connection it was opened on, and the fetch keys on
+    `db_for(target.conn_id)`. Sizes, row
     estimate, the storage-split bar, table options and the index list — deliberately **not**
     structure, which the tree, the designer and Generate DDL already show three times over. The
     column/key counts and the collation come free from the in-memory `TableInfo`
@@ -1583,9 +1616,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       column *off* too, because the empty state is still a full-width box. Keyboard nav kept
       working throughout, which is the tell that it was dispatch and not the toggle. The mechanism
       is under *Floem 0.2 gotchas*. `ConnNode::stats` holds one database's `SchemaStats` and is
-      both the fetch's trigger and its guard: the app's effect fetches only nodes at
-      `DbStatsState::Idle` that are *expanded* with the column on, moving each to `Loading` before
+      both the fetch's trigger and its guard: the app's `fetch_db_stats` fetches only nodes at
+      `DbStatsState::Idle`, moving each to `Loading` before
       spawning, and settles a failure at `Unavailable` rather than retrying on every expand.
+      **Two things ask it, and the slot is what keeps that from being two queries.** The size
+      column's effect asks for the databases that are *expanded* with the column on; a capped
+      result's toolbar asks for its own through `SchemaActions::db_stats`, which resolves the node by
+      name — that route exists because the column is opt-in while `1,000 of ~4.2m` is not, and
+      without it the line would only ever appear for users who had already switched the column on.
+      `db_stats` refuses a connection that is not the active one: `db_nodes` is the active
+      connection's tree, and another server's databases are named in the same words.
       `start_fetch` resets a node to `Idle` **and bumps `stats_gen`**, and it is the pair that makes
       Refresh both the way to get fresh figures and the only thing that retries a failed one. The
       reset alone never did it: the effect reads each slot `get_untracked` (it *writes* those slots,
@@ -2543,7 +2583,8 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   kind of row — and each arm emits the same five groups in the same order, separated by
   `MenuEntry::Separator`, so an action sits in the same place whatever was right-clicked:
   **Open** (what a double-click would have done), **Read** (`Copy name`, `Copy qualified name`,
-  then what the node can *show* you — `Properties`, `Show diagram`, `Generate DDL` — closing with
+  then what the node can *show* you — `Properties`, `Live monitor`, `Show diagram`, `Generate DDL` —
+  closing with
   `Refresh`), **Tree state** (`Favorite`, `Colour ▸`, `Hide`, which act on the row and not on the
   object), **Write** (`Create`/`Edit`/`Import`/`Triggers`, with the entries that can't be taken
   back **last** inside the group and coloured `theme::error`), and the `AI Explain` row every menu
@@ -2556,6 +2597,10 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   a new arm reads the skeleton, which is stated as a comment
   block immediately above the closure: an arm is written and reviewed one arm at a time, and
   nothing else in the file says what the order is.
+  The Table arm's `Truncate`/`Drop` name the **scale** of what they delete when a row figure is
+  already in `ConnNode::stats` (`stats::truncate_prompt`/`drop_prompt` decide the words and whether
+  a figure is worth naming). It is read, never fetched: the menu is built on the right-click, so a
+  round trip there would either block it or land after the modal is already up.
 - **Keyboard operation lives in `menu_key`.** The panel is a `focus_root`, so it took focus and
   answered Escape from the start — but nothing moved a cursor and no row was marked, so a menu
   opened with Enter from a ringed button could only be finished with the mouse and read as though
@@ -2800,6 +2845,25 @@ for keyboard nav.
   statement 2 in `sakila` and labelled it `world` — the label lying in exactly the case it exists to
   catch. `sql::use_target` reads it and is deliberately conservative: a `USE` it can't read plainly
   drops the label to `None`, which prints nothing, rather than carrying a name now certainly wrong.
+- **A capped result says what it capped, when it can say it honestly**: the stats line reads
+  `1,000 of ~4.2m rows (capped)` rather than `1,000 rows (capped)`. Three things have to line up, and
+  `grid_view`'s `row_total` memo is where they do. The read must be capped
+  (`ResultSet::truncated`); `grid_query` must be empty, because a spliced header filter re-runs a
+  statement that is *not* `base_sql`; and `base_sql` must return the table entire
+  (`intel::full_table_source`), or the table's estimate is a total this query never had. The figure
+  then comes from `ConnNode::stats` via `stats::catalogue_key` + `SchemaStats::find`, requested once
+  per capped result through `SchemaActions::db_stats` and read reactively so it appears when the
+  fetch lands — which is why the line is a `label` and not a `text`. `plural` still follows the rows
+  actually *read*: they are the subject of the sentence, and `1 of ~4.2m row` is the wrong noun.
+  The cap itself is unchanged and is still a **client-side stream cutoff**, not a `LIMIT`; this only
+  says how much of the table went past it.
+- **The RESULTS title bar carries Properties, Live Monitor and the editor-collapse toggle**, in that
+  order and all tooltipped. Properties leads because it describes the table as it stands while the
+  monitor watches it change — the same order the schema tree's Read group puts them in. Both act on
+  the tab's source table and are gated on it *existing*, which is deliberately weaker than the row
+  actions' `insert_target`: a table with no usable row key passes, and the monitor then answers "No
+  row key for this table" rather than the button being silently dead. The same reasoning covers a
+  view, whose properties panel says which figures an engine publishes for one.
 - **Find (Ctrl+F) and Go to row (Ctrl+G)** are two popups sharing one anchor at the panel's
   top-right, and both are **split in the same way**: the bar renders at the RESULTS-*panel* level
   (`grid_find_bar`/`grid_goto_bar`, mounted in `results_section`) so it can sit at the panel's edge,
