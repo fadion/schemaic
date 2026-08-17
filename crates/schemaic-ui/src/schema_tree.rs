@@ -1805,8 +1805,25 @@ fn object_row(
 /// Renders nothing at all unless the column is on **and** this table has a size,
 /// so a view, a partitioned parent, or an engine that publishes nothing leaves
 /// the row exactly as it was rather than showing a placeholder dash down the
-/// whole tree. `flex_grow` on the spacer pushes it right without giving the
-/// name a fixed width.
+/// whole tree.
+///
+/// **Absolutely positioned, and anchored to the panel rather than to the row.**
+/// A `flex_grow` spacer used to push the size to the row's right edge, which is
+/// only the panel's right edge while the tree fits: rows stretch to the widest one,
+/// so expanding a table — whose column rows are indented and carry a type —
+/// widened every row and carried the whole size column off past the viewport,
+/// reachable only by scrolling sideways. Taking it out of flow and pinning it
+/// `tree_row_min_w()` from the row's left edge puts it back where the panel ends.
+/// `inset_left`, not `inset_right`, for exactly that reason — the right edge is
+/// the one that moves. Taffy measures the inset from the row's *border* box, so
+/// the anchor ignores the per-level `padding_left` and lands identically on
+/// every row whatever its depth.
+///
+/// The cost of leaving the flow is that a table name long enough to reach the
+/// panel edge now runs under the size instead of pushing it along. Sizes sit on
+/// table rows only, which is what makes that trade a good one: there is no
+/// column row underneath to collide with, and the alternative was a column that
+/// disappeared whenever anything was open.
 fn size_badge(
     stats: Option<RwSignal<crate::DbStatsState>>,
     enabled: RwSignal<bool>,
@@ -1829,24 +1846,39 @@ fn size_badge(
         },
         move |size| match size {
             None => empty().into_any(),
-            Some(s) => h_stack((
-                empty().style(|s| s.flex_grow(1.0_f32).min_width(6.0)),
-                // No margin of its own: the row's `padding_right` plus the 2px it
-                // stops short of the panel edge already come to `ROW_PAD`, which
-                // is the inset the chevron gets on the left. Adding to that put
-                // the size visibly further in than the tree's left margin, and
-                // the two edges are what the eye pairs up.
-                text(s).style(|s| {
+            Some(s) => text(s)
+                .style(|s| {
                     s.font_size(theme::FONT_STATUS)
                         .color(theme::text_faint())
                         .flex_shrink(0.0_f32)
-                }),
-            ))
-            .style(|s| s.flex_grow(1.0_f32).items_center().min_width(0.0))
-            .into_any(),
+                })
+                .into_any(),
         },
     )
-    .style(|s| s.flex_grow(1.0_f32).min_width(0.0))
+    // Invisible to the mouse, and **not optional**. This box spans the row from
+    // its left edge, so it lies over the chevron and the name — and Floem walks a
+    // row's children back-to-front looking for a pointer target and stops at the
+    // first one whose bounds contain the point, whether or not it handles the
+    // event (`context.rs`, `unconditional_view_event`: `if event.is_pointer()
+    // { break }`). As the last child, the badge won that race for the whole row
+    // and clicking a table stopped expanding it — with the column *off* too,
+    // since the empty state is still a full-width box. Nothing here is clickable,
+    // so it opts out and the row underneath goes back to receiving everything.
+    .pointer_events(|| false)
+    // `justify_end` inside a panel-wide box does what the spacer used to. The
+    // padding is the row's own 8px plus 10 more: sitting hard against the panel
+    // edge read as too tight next to the tree's scrollbar, so the column is
+    // pulled in by eye rather than to match a constant.
+    .style(|s| {
+        s.absolute()
+            .inset_left(0.0)
+            .inset_top(0.0)
+            .width(tree_row_min_w())
+            .height_full()
+            .justify_end()
+            .items_center()
+            .padding_right(18.0)
+    })
 }
 
 fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl IntoView {

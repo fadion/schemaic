@@ -43,7 +43,7 @@ use floem::ext_event::create_ext_action;
 use floem::ext_event::create_signal_from_channel;
 use floem::kurbo::Size;
 use floem::reactive::{
-    RwSignal, Scope, SignalGet, SignalUpdate, SignalWith, create_effect, create_memo,
+    RwSignal, Scope, SignalGet, SignalTrack, SignalUpdate, SignalWith, create_effect, create_memo,
 };
 use floem::window::{Icon, WindowConfig};
 use schemaic_core::connection::{ConnStatus, Connection};
@@ -1119,6 +1119,21 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let properties_count_err: RwSignal<Option<String>> = RwSignal::new(None);
     // The schema tree's size column (persisted; see `UiState::show_table_sizes`).
     let table_sizes = RwSignal::new(ui_state.show_table_sizes);
+    // Bumped whenever a refresh puts some node's statistics back to `Idle`, and
+    // read by the size-column effect below — the *only* thing that tells it to
+    // look again.
+    //
+    // `ConnNode::stats` can't do that job itself. The effect reads each node's
+    // slot with `get_untracked`, deliberately: it writes `Loading` into those
+    // same slots, and tracking them would re-enter the effect mid-loop and
+    // double-fetch the databases it hadn't reached yet. So the reset at
+    // `start_fetch` is invisible to it, and both refresh paths used to leave the
+    // column blank until something unrelated (the toggle, an expand, a
+    // connection switch) happened to re-run it. `db_nodes` is not that
+    // something: the connection-wide refresh does `set` it, but *before*
+    // `start_fetch` resets the slots, so that run still sees them `Loaded` and
+    // finds nothing to do.
+    let stats_gen: RwSignal<u64> = RwSignal::new(0);
 
     // AI panel state. `ai_session` holds the live CLI conversation (bound to a
     // connection); the reader task streams transcript snapshots over a channel
@@ -3556,7 +3571,12 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             // alongside the schema. Refresh is the one gesture that means "these
             // figures are out of date", and it is also the only thing that ever
             // retries a database whose statistics fetch failed.
+            //
+            // The bump is what makes that true. The reset alone is a write the
+            // size-column effect does not watch (see `stats_gen`), so on its own
+            // it only *clears* the column.
             node.stats.set(schemaic_ui::DbStatsState::Idle);
+            stats_gen.update(|g| *g = g.wrapping_add(1));
             let seq = next_fetch_seq.get() + 1;
             next_fetch_seq.set(seq);
             fetch_seq.borrow_mut().insert(node.id, seq);
@@ -3977,6 +3997,11 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // a database already in flight. Nothing here retries a failure: a size column
     // that re-queried a failing server every time you expanded a node would cost
     // more than it is worth.
+    //
+    // Which is also why the slots are read untracked, and why a refresh has to
+    // announce itself through `stats_gen` instead: tracking them would make this
+    // effect its own dependency, re-entering on the first `Loading` write and
+    // re-fetching every database it had not reached yet.
     {
         let db_for = db_for.clone();
         let handle = handle.clone();
@@ -3986,6 +4011,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             }
             let open = expanded.get();
             let conn_id = active_conn.get();
+            // A refresh reset some node to `Idle`; nothing else here would see it.
+            stats_gen.track();
             let pending: Vec<(String, RwSignal<schemaic_ui::DbStatsState>)> =
                 db_nodes.with(|nodes| {
                     nodes
