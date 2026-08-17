@@ -687,6 +687,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
     let ai_send = ui.ai_actions.send.clone();
     let right_panel = ui.layout.right_panel;
     let db_colors = ui.db_colors;
+    let table_colors = ui.table_colors;
     let save_db_colors = ui.save_db_colors.clone();
     let db_favorites = ui.db_favorites;
     let save_db_favorites = ui.save_db_favorites.clone();
@@ -1135,6 +1136,57 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     entries.push(MenuEntry::action("Refresh", move || {
                         (rf)(refresh_database.clone())
                     }));
+                    // ── How this table *looks* in the tree ────────────────────
+                    // The database menu's colour group, one level down: preset
+                    // swatches + None, stored per (connection, database, display
+                    // name) and shown as a dot on this row — and, because the ER
+                    // diagram is the one surface with room for a fill, as a tint on
+                    // this table's card header there.
+                    entries.push(MenuEntry::Separator);
+                    {
+                        // The *display* name, matching what `TableColorRule` keys
+                        // on and what an ERD node id is: `sales.orders` outside
+                        // `public`, so two namespaces' `orders` colour separately.
+                        let key = source.display();
+                        let mut swatches: Vec<MenuEntry> = crate::CONN_COLOR_PRESETS
+                            .iter()
+                            .map(|(name, hex, cfn)| {
+                                let tc = table_colors;
+                                let save = save_db_colors.clone();
+                                let db = database.clone();
+                                let tbl = key.clone();
+                                let hex = hex.to_string();
+                                MenuEntry::action_icon(*name, (icons::DOT, *cfn), move || {
+                                    let cid = active_conn.get_untracked();
+                                    tc.update(|r| {
+                                        schemaic_core::db_color::table_upsert(
+                                            r,
+                                            cid,
+                                            &db,
+                                            &tbl,
+                                            Some(hex.clone()),
+                                        )
+                                    });
+                                    (save)();
+                                })
+                            })
+                            .collect();
+                        swatches.push(MenuEntry::Separator);
+                        {
+                            let tc = table_colors;
+                            let save = save_db_colors.clone();
+                            let db = database.clone();
+                            let tbl = key.clone();
+                            swatches.push(MenuEntry::action("None", move || {
+                                let cid = active_conn.get_untracked();
+                                tc.update(|r| {
+                                    schemaic_core::db_color::table_upsert(r, cid, &db, &tbl, None)
+                                });
+                                (save)();
+                            }));
+                        }
+                        entries.push(MenuEntry::sub("Colour", swatches));
+                    }
                     // Its own group, just above AI Explain: everything that
                     // *writes* — import and schema editing — reads as one set
                     // rather than trailing off the end of the read-only ones,

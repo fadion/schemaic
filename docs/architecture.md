@@ -1035,9 +1035,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     - `favorite.rs` — the `(conn_id, database)` star list. `toggle` appends newest-**last** on
       purpose: `rank` (0 = that connection's oldest) is what the schema tree sorts by, so order in
       the `Vec` *is* the sort key.
-    - `db_color.rs` — a per-`(connection, database)` identity colour. Display-only (a dot in the
-      tree, the active-DB selector and tabs) and **manual only** — never inferred, and explicitly
-      not the editor's production-red danger frame, which stays a *connection*-level signal.
+    - `db_color.rs` — identity colours: a per-`(connection, database)` one and a
+      per-`(connection, database, table)` one. Display-only — a dot in the tree, the active-DB
+      selector and tabs for a database; a dot on the table row and a tint on that table's card
+      header in the ER diagram for a table — and **manual only**, never inferred, and explicitly
+      not the editor's production-red danger frame, which stays a *connection*-level signal. The
+      two are **separate stores in one file** (`DbColorsFile { rules, tables }`, `db_colors.json`),
+      not one store with an optional table: nothing then has to remember to filter the database
+      rules out of a table lookup, and a database named `app` cannot lend its colour to a table
+      named `app` — which is what `database_and_table_colours_are_separate_stores` pins. `tables`
+      is `#[serde(default)]`, so a file written before table colours existed still loads. Sharing
+      the file is why the app builds **one** `save_db_colors` for the pair, since writing either
+      half alone would drop the other, and why deleting a connection runs both `clear_conn` and
+      `table_clear_conn`. A table's key is its **display name** (`schema::TableSource::display` —
+      the bare name on MySQL/SQLite and inside PostgreSQL's `public`, `schema.table` outside it)
+      rather than a separate `schema` field, because that spelling is already the identity an
+      ER-diagram node id carries, so the diagram looks a colour up by node id with no reparsing.
     - `tabsel.rs` — tab-selection rules for a strip that shows only the active connection's tabs, so
       every question (`pick_active`, `neighbor` after a close, `cycle`, `closing_would_empty`, `nth`
       for Ctrl+1‑9) is answered *within one connection*. `nth` especially: the Nth visible chip is
@@ -1683,6 +1696,47 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     zoom. The surface is an infinite free pan (not a scroll view) — drag/middle-drag pans, Ctrl+wheel
     zooms about the cursor, plain/Shift+wheel pans — and hit-testing maps cursor → logical space via
     `(p − pan) / z`.
+    A table carrying a `db_color` identity colour has its card **header** tinted with it: `header_bg`
+    composites the colour over `theme::erd_node_header` at `HEADER_TINT_ALPHA` (0.22) and is called
+    *inside* the header's style closure, so the themable half follows a live theme switch while the
+    identity hex arrives by value — the same split `db_color_dot` makes. **Each card's colour is
+    resolved once, untracked, before the cards are built**, and deliberately not inside that style
+    closure: it re-runs for every card on every pan and zoom, so a scan of the rule list there would
+    reintroduce the O(cards²) cost the `positions.with` borrow in `node_card` exists to avoid. The
+    lookup needs only the node id, because a diagram is scoped to one `(conn_id, database)` by its
+    `ErdTarget` and a node id *is* the display name `TableColorRule` is keyed by. The trade is that a
+    card doesn't repaint when a colour changes underneath it — a colour is settable only from the
+    schema tree's menu, which this modal covers, and reopening the diagram rebuilds every card. A
+    `NodeKind::Stub` card returns before both the header and the border and stays untinted, and the
+    *header* alpha is pinned by `contrast::tests::an_erd_header_tint_keeps_the_table_name_legible`,
+    which governs `HEADER_TINT_ALPHA` alone, since the header is the one surface where an identity
+    colour is a fill under text rather than a 6px dot.
+    The tint also carries around the **whole 1px border**, so a coloured card reads as one tinted
+    object rather than a tinted band in a neutral frame: `card_border` returns `theme::border()` for
+    a table with no colour, and otherwise the colour washed over `theme::erd_node_header()` by the
+    pure `tinted_border(tint, header, canvas)`. **The border's wash strength is its own, and is
+    picked by the canvas's measured luminance** — `border_tint_alpha` returns
+    `LIGHT_BORDER_TINT_ALPHA` (0.60) when `contrast::relative_luminance(canvas) > 0.5` and the
+    header's own 0.22 otherwise. That is the same reasoning as "ask a capability, never an engine",
+    applied to a palette: a future third theme gets sorted by the property that actually decides the
+    answer instead of by being recognised by name. Two strengths are needed because the Light
+    theme's header surface and canvas are nearly the same grey (`#EEF0F5` on `#EDEFF3`), so at the
+    header's 0.22 a tinted border came out *fainter than the plain `theme::border` it replaced* —
+    Amber at 1.09:1 against the canvas where the plain border manages 1.25:1. At 0.60 every preset
+    clears it, Amber still the floor at 1.29:1. It can't go much lower — Amber is a pale yellow
+    whose luminance sits near the canvas's, so even a full-strength rule only reaches ~1.5:1 there —
+    and raising it risks nothing, because unlike the header a border carries no text. On the dark
+    canvas 0.22 was already enough (1.67–2.16:1 against the plain border's 1.37:1, every preset
+    washing lighter than `#2E303A`), so dark keeps the header's strength and the border there lands
+    on exactly the header's colour, which is what makes the card read as one object. `tinted_border`
+    takes both surfaces as arguments rather than reading `theme` itself so the alpha choice can be
+    measured against every built-in theme and not just the loaded one:
+    `tests::a_tinted_border_is_never_fainter_than_the_plain_one` compares every `CONN_COLOR_PRESETS`
+    entry's tinted border against the plain border it replaces, in every `UiThemeKind`, and
+    `tests::the_border_alpha_follows_the_canvas_not_the_theme_name` pins both branches (both
+    strengths reachable from the two built-ins; white → light, near-black → the header's). The first
+    is a **comparison, not a WCAG floor**, which is why it lives here rather than in `contrast`'s
+    pairing table — borders are furniture, and holding one to a text floor would mean nothing.
   - `monitor_view.rs` — the **Live Monitor** modal (`monitor_overlay`), opened from the results
     title bar with the tab's `(conn_id, database, table)`. It renders `overlay.monitor_log` — built
     by the app's poll loop through `core::monitor::diff_snapshots` — as a Time·Action·ID·Data table,
@@ -1727,6 +1781,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     a listed colour in a harder role was invisible to the gate, which is how every form caption in
     the app came to be painted at 2.55:1 under a row baselined for icons. Adding a theme
     needs no work here; painting a role on a new surface means adding its row.
+    One background the table **cannot** express is composed at run time: an ER-diagram card header
+    carries the table's identity colour washed over `erd_node_header`, and the `pair!(text on
+    erd_node_header, …)` row covers only the untinted case. So
+    `an_erd_header_tint_keeps_the_table_name_legible` asserts that pairing separately — `text` on
+    every `CONN_COLOR_PRESETS` entry at `erd_view::HEADER_TINT_ALPHA` over that surface, every
+    built-in UI theme, against the `Body` floor of 4.5:1, worst case 5.0:1 (Amber on Dark).
+    `env_badge_text` is excused from the same question because no theme can promise a ratio on an
+    arbitrary connection colour; here the colour set is closed and the wash strength is ours, so the
+    promise can be kept and is measured. A failure means the alpha is too high, not that a preset is
+    wrong. That test covers the **header only** — the same card's tinted border is deliberately not
+    asserted here, because a border carries no text and a legibility floor on it would mean nothing;
+    `erd_view::tests::a_tinted_border_is_never_fainter_than_the_plain_one` holds it to the plain
+    `border` it replaces instead.
   - `lib.rs` (~5.6k lines; `grid.rs` at ~6.3k is the crate's largest) — the `Ui` struct + bundles, shared model/state
     types, `workspace`/`body`/`center`/`header`/`footer`, resize handles, `edit_field`/`FieldCfg`,
     terminal panel. The shared types living in the crate root is what stalls further splitting: the

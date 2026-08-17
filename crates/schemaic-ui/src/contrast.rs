@@ -678,6 +678,42 @@ mod tests {
         );
     }
 
+    /// The one surface where a *user-chosen* colour is a fill under text, so the
+    /// table can't express it: an ER-diagram card header carries the table's
+    /// identity colour washed over `erd_node_header`, and the table name is drawn
+    /// on the composite. `env_badge_text` is excused from this question because no
+    /// theme can promise a ratio on an arbitrary connection colour — here the
+    /// colours are a closed set (the presets) and the wash strength is ours, so the
+    /// promise *can* be kept and this measures it.
+    ///
+    /// A failure means [`crate::erd_view::HEADER_TINT_ALPHA`] is too high, not that
+    /// a preset is wrong.
+    #[test]
+    fn an_erd_header_tint_keeps_the_table_name_legible() {
+        let alpha = crate::erd_view::HEADER_TINT_ALPHA;
+        let mut bad = Vec::new();
+        for kind in UiThemeKind::ALL {
+            let t = kind.build();
+            for (name, hex, _) in crate::CONN_COLOR_PRESETS {
+                let tint = crate::theme::parse_hex(hex).expect("a preset is a valid hex");
+                let bg = over(tint.multiply_alpha(alpha), t.erd_node_header);
+                let r = contrast_ratio(t.text, bg);
+                if r < Legibility::Body.floor() {
+                    bad.push(format!(
+                        "[{}] text on {name}@{alpha} over erd_node_header = {r:.2}:1 (needs {:.1}:1)",
+                        kind.label(),
+                        Legibility::Body.floor(),
+                    ));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "the ERD header tint costs too much contrast:\n  {}",
+            bad.join("\n  ")
+        );
+    }
+
     /// The gate. Every pairing the chrome paints, in every built-in UI theme.
     #[test]
     fn every_ui_pairing_is_legible_in_every_theme() {

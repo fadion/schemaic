@@ -90,7 +90,7 @@ use floem::views::{
     Decorators, Delay, LabelClass, TextInputClass, TooltipClass, TooltipContainerClass,
 };
 use schemaic_core::connection::{ConnStatus, Connection, Environment, SshAuth};
-use schemaic_core::db_color::DbColorRule;
+use schemaic_core::db_color::{DbColorRule, TableColorRule};
 use schemaic_core::favorite::FavoriteRule;
 use schemaic_core::format::ColumnFormatRule;
 use schemaic_core::history::HistoryEntry;
@@ -2244,7 +2244,12 @@ pub struct Ui {
     /// `(conn_id, database)`; set from the schema tree, shown as a dot on the DB
     /// node, the active-DB selector, and the database's query tabs.
     pub db_colors: RwSignal<Vec<DbColorRule>>,
-    /// Persist the database-colour rules to disk (after a menu upsert).
+    /// Per-table identity colours (persisted to the same `db_colors.json`), keyed
+    /// by `(conn_id, database, display name)`; set from the schema tree, shown as
+    /// a dot on the table row and as a tint on the table's ER-diagram card header.
+    pub table_colors: RwSignal<Vec<TableColorRule>>,
+    /// Persist both colour stores to disk (after a menu upsert). One closure for
+    /// the pair, because they share one file.
     pub save_db_colors: Rc<dyn Fn()>,
     /// Favorited (bookmarked) databases (persisted to `favorites.json`), keyed by
     /// `(conn_id, database)` in favorite order (oldest first); set from the schema
@@ -3064,28 +3069,26 @@ pub(crate) fn conn_edge_border(
         .pointer_events(|| false)
 }
 
-/// A small identity dot (6px — matching the connection status dot) for a database
-/// that has an identity colour, or a zero-footprint `empty()` when it doesn't, so
-/// uncoloured databases render exactly as before. `key` yields the `(conn_id,
-/// database)` to look up reactively; `ml`/`mr`/`mt` are the dot's margins (left /
-/// right / top), applied only when a dot is drawn — `mt` fine-tunes its vertical
-/// alignment against the neighbouring text. Rebuilds when the colour or key
-/// changes. The colour is a fixed identity hex (not themable), so capturing it by
-/// value here is correct.
-pub(crate) fn db_color_dot(
-    db_colors: RwSignal<Vec<DbColorRule>>,
-    key: impl Fn() -> Option<(u64, String)> + 'static,
+/// A small identity dot (6px — matching the connection status dot) for whatever
+/// `hex` resolves to, or a zero-footprint `empty()` when it resolves to `None`, so
+/// an uncoloured row renders exactly as it did before the colour existed.
+///
+/// `hex` is read reactively, so the dot appears, changes and disappears with the
+/// rule behind it; `ml`/`mr`/`mt` are the dot's margins (left / right / top),
+/// applied only when a dot is drawn — `mt` fine-tunes its vertical alignment
+/// against the neighbouring text. The colour is a fixed identity hex (not
+/// themable), so capturing it by value in the style closure is correct.
+///
+/// The database and table stores each get a wrapper below; this is the shared
+/// half, so both dots stay the same dot.
+pub(crate) fn color_dot(
+    hex: impl Fn() -> Option<String> + 'static,
     ml: f64,
     mr: f64,
     mt: f64,
 ) -> impl IntoView {
-    dyn_container(
-        move || {
-            key().and_then(|(cid, db)| {
-                db_colors.with(|rules| schemaic_core::db_color::lookup(rules, cid, &db))
-            })
-        },
-        move |hex| match hex.as_deref().and_then(theme::parse_hex) {
+    dyn_container(hex, move |hex| {
+        match hex.as_deref().and_then(theme::parse_hex) {
             Some(color) => icons::icon(icons::DOT, 6.0)
                 .style(move |s| {
                     s.color(color)
@@ -3096,7 +3099,50 @@ pub(crate) fn db_color_dot(
                 })
                 .into_any(),
             None => empty().into_any(),
+        }
+    })
+}
+
+/// [`color_dot`] for a database: `key` yields the `(conn_id, database)` to look up.
+pub(crate) fn db_color_dot(
+    db_colors: RwSignal<Vec<DbColorRule>>,
+    key: impl Fn() -> Option<(u64, String)> + 'static,
+    ml: f64,
+    mr: f64,
+    mt: f64,
+) -> impl IntoView {
+    color_dot(
+        move || {
+            key().and_then(|(cid, db)| {
+                db_colors.with(|rules| schemaic_core::db_color::lookup(rules, cid, &db))
+            })
         },
+        ml,
+        mr,
+        mt,
+    )
+}
+
+/// [`color_dot`] for a table: `key` yields the `(conn_id, database, display name)`
+/// to look up. The third part is [`schemaic_core::schema::TableSource::display`],
+/// which is what [`TableColorRule`] is keyed by.
+pub(crate) fn table_color_dot(
+    table_colors: RwSignal<Vec<TableColorRule>>,
+    key: impl Fn() -> Option<(u64, String, String)> + 'static,
+    ml: f64,
+    mr: f64,
+    mt: f64,
+) -> impl IntoView {
+    color_dot(
+        move || {
+            key().and_then(|(cid, db, table)| {
+                table_colors
+                    .with(|rules| schemaic_core::db_color::table_lookup(rules, cid, &db, &table))
+            })
+        },
+        ml,
+        mr,
+        mt,
     )
 }
 

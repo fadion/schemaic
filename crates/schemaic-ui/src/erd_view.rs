@@ -59,6 +59,90 @@ use crate::widgets::{
 };
 use crate::{ConnNode, Ui, icons, theme};
 
+/// How strongly a table's identity colour tints its card header.
+///
+/// The header is the one place a `db_color` is a *fill* rather than a 6px dot, so
+/// it is the one place the colour can make something unreadable — the table name
+/// is drawn on it in `theme::text()`. Low enough that every
+/// [`crate::CONN_COLOR_PRESETS`] entry keeps that pairing over WCAG AA in both
+/// themes (worst case 5.0:1, Amber on Dark), and pinned there by
+/// `contrast::tests::an_erd_header_tint_keeps_the_table_name_legible` — raise it
+/// and that test says by how much it costs.
+pub(crate) const HEADER_TINT_ALPHA: f32 = 0.22;
+
+/// A card header's background: the ordinary header surface, or a table's identity
+/// colour washed over it at [`HEADER_TINT_ALPHA`].
+///
+/// Call this **inside** the style closure. The themable half
+/// (`theme::erd_node_header`) is read here so a theme switch repaints; `tint` is a
+/// fixed identity hex rather than a theme colour, which is why it is passed by
+/// value (the same reasoning as [`crate::db_color_dot`]).
+pub(crate) fn header_bg(tint: Option<floem::peniko::Color>) -> floem::peniko::Color {
+    match tint {
+        Some(c) => crate::contrast::over(
+            c.multiply_alpha(HEADER_TINT_ALPHA),
+            theme::erd_node_header(),
+        ),
+        None => theme::erd_node_header(),
+    }
+}
+
+/// The border wash for a coloured card on a **light** canvas, where
+/// [`HEADER_TINT_ALPHA`] is not enough to hold an outline.
+///
+/// The Light theme's header surface and canvas are nearly the same grey (`#EEF0F5`
+/// on `#EDEFF3`), so the header's own strength leaves the palest presets *below*
+/// the plain `theme::border` they replace — Amber reached 1.09:1 against the
+/// canvas where the plain border manages 1.25:1. 0.60 is where every preset clears
+/// it (Amber, still the floor, at 1.29:1). It can't go much lower: Amber is a pale
+/// yellow whose luminance sits close to the canvas's, so even a full-strength rule
+/// only reaches ~1.5:1 there, and the alpha buys less than it would for any other
+/// preset. Nothing is at risk in raising it — unlike the header, a 1px border
+/// carries no text.
+pub(crate) const LIGHT_BORDER_TINT_ALPHA: f32 = 0.60;
+
+/// How strongly a coloured card's border takes its tint, chosen by **the canvas it
+/// has to stand out from** rather than by which theme is loaded. A theme is light
+/// or dark here as a measured property, so a future palette is sorted by the thing
+/// that actually decides the answer instead of by being recognised by name.
+fn border_tint_alpha(canvas: floem::peniko::Color) -> f32 {
+    if crate::contrast::relative_luminance(canvas) > 0.5 {
+        LIGHT_BORDER_TINT_ALPHA
+    } else {
+        HEADER_TINT_ALPHA
+    }
+}
+
+/// A coloured card's border: its identity colour washed over the header surface,
+/// at the strength [`border_tint_alpha`] picks for this canvas.
+///
+/// The pure half of [`card_border`], taking its two surfaces as arguments so the
+/// alpha choice can be measured against every built-in theme rather than only
+/// against whichever one is loaded — see
+/// `tests::a_tinted_border_is_never_fainter_than_the_plain_one`.
+///
+/// Washing the colour rather than using the raw hex is deliberate: on a dark canvas
+/// the border comes out at exactly the header's own colour, so the card reads as one
+/// tinted object instead of a tinted band inside a neutral frame. A full-strength
+/// rule would be a louder signal than the header it belongs to.
+pub(crate) fn tinted_border(
+    tint: floem::peniko::Color,
+    header: floem::peniko::Color,
+    canvas: floem::peniko::Color,
+) -> floem::peniko::Color {
+    crate::contrast::over(tint.multiply_alpha(border_tint_alpha(canvas)), header)
+}
+
+/// A card's border: the ordinary `theme::border`, or — for a table with an identity
+/// colour — that colour washed over the header surface by [`tinted_border`]. Call
+/// it inside the style closure, for the reason [`header_bg`] gives.
+pub(crate) fn card_border(tint: Option<floem::peniko::Color>) -> floem::peniko::Color {
+    match tint {
+        Some(c) => tinted_border(c, theme::erd_node_header(), theme::erd_canvas()),
+        None => theme::border(),
+    }
+}
+
 /// The key role tint for a column, matching the schema panel / Find-Anywhere:
 /// primary-key columns gold, foreign-key columns purple, others normal text.
 fn col_tint(pk: bool, fk: bool) -> floem::peniko::Color {
@@ -597,6 +681,9 @@ fn column_rows(
 /// follows drags) and, for real tables, draggable — a drag updates `positions`
 /// and calls `persist` on release. Double-clicking a real table invokes `reveal`
 /// (opens/reveals it in the app).
+///
+/// `tint` is the table's identity colour, already resolved by the caller — see
+/// [`header_bg`] for why it arrives as a value rather than as the signal.
 #[allow(clippy::too_many_arguments)]
 fn node_card(
     p: &Placed,
@@ -609,6 +696,7 @@ fn node_card(
     graph: Rc<DiagramGraph>,
     persist: Rc<dyn Fn()>,
     reveal: Rc<dyn Fn(String)>,
+    tint: Option<floem::peniko::Color>,
 ) -> AnyView {
     let id = p.node.id.clone();
     let (ix, iy, w) = (p.x, p.y, p.w);
@@ -692,7 +780,9 @@ fn node_card(
             .height(HEADER_H * z)
             .width_full()
             .padding_horiz(10.0 * z)
-            .background(theme::erd_node_header())
+            // The table's identity colour, if it has one — the same colour the
+            // schema tree dots it with.
+            .background(header_bg(tint))
             .border_bottom(1.0)
             .border_color(theme::border())
     });
@@ -752,7 +842,8 @@ fn node_card(
             .inset_top(pany + y * z)
             .width(w * z)
             .border(1.0)
-            .border_color(theme::border())
+            // Carries the header's tint around the whole card — see `card_border`.
+            .border_color(card_border(tint))
             .border_radius(6.0 * z)
             .background(theme::erd_node_bg())
     })
@@ -911,6 +1002,7 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
     let erd_sig = ui.overlay.erd;
     let db_nodes = ui.schema.db_nodes;
     let open_table = ui.tab_actions.open_table.clone();
+    let table_colors = ui.table_colors;
     let win = window_size();
 
     dyn_container(
@@ -1125,6 +1217,29 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                     .height_full()
             });
 
+            // Each card's identity colour, resolved **once** per card. A node id is
+            // the table's display name, which is exactly how `db_color` keys a
+            // table colour, so no reparsing is needed. Untracked, and not read
+            // inside the header's style closure: that closure re-runs for every
+            // card on every pan and zoom, and a scan of the rule list there would
+            // reintroduce the O(cards²) cost the position lookup in `node_card`
+            // exists to avoid. Nothing is lost — a colour is only settable from the
+            // schema tree's menu, which this modal covers, and reopening the
+            // diagram rebuilds every card.
+            let tint_of = |id: &str| {
+                table_colors
+                    .with_untracked(|r| {
+                        schemaic_core::db_color::table_lookup(
+                            r,
+                            target.conn_id,
+                            &target.database,
+                            id,
+                        )
+                    })
+                    .as_deref()
+                    .and_then(theme::parse_hex)
+            };
+
             // Node cards over the edge layer.
             let mut children: Vec<AnyView> = vec![edge_layer.into_any()];
             for p in &placed {
@@ -1139,6 +1254,7 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                     graph.clone(),
                     persist.clone(),
                     reveal.clone(),
+                    tint_of(&p.node.id),
                 ));
             }
 
@@ -1406,6 +1522,71 @@ fn modal_frame(
 mod tests {
     use super::*;
     use schemaic_core::erd::{Cardinality, DiagramEdge, DiagramGraph, DiagramNode, NodeKind};
+
+    /// Substituting a card's identity colour for `theme::border` must never leave
+    /// the card *less* defined than it was — the outline is what separates it from
+    /// the canvas, and a colour is a decoration on top of that job, not instead of
+    /// it. Measured for every preset in every built-in theme, against the plain
+    /// border the tint replaces.
+    ///
+    /// This is what [`LIGHT_BORDER_TINT_ALPHA`] exists for: at the header's own
+    /// 0.22 the Light theme failed this for seven of the eight presets — every one
+    /// but Red. It is a
+    /// comparison and not a WCAG floor, which is why it lives here rather than in
+    /// `contrast`'s pairing table — borders are furniture, and holding one to a
+    /// text floor would mean nothing (see that module's opening).
+    #[test]
+    fn a_tinted_border_is_never_fainter_than_the_plain_one() {
+        use crate::contrast::contrast_ratio;
+        use crate::themes::UiThemeKind;
+
+        let mut bad = Vec::new();
+        for kind in UiThemeKind::ALL {
+            let t = kind.build();
+            let plain = contrast_ratio(t.border, t.erd_canvas);
+            for (name, hex, _) in crate::CONN_COLOR_PRESETS {
+                let tint = theme::parse_hex(hex).expect("a preset is a valid hex");
+                let r = contrast_ratio(
+                    tinted_border(tint, t.erd_node_header, t.erd_canvas),
+                    t.erd_canvas,
+                );
+                if r < plain {
+                    bad.push(format!(
+                        "[{}] {name} border = {r:.2}:1 vs canvas, plain border = {plain:.2}:1",
+                        kind.label(),
+                    ));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "a tinted card border is fainter than the one it replaces:\n  {}",
+            bad.join("\n  ")
+        );
+    }
+
+    /// The alpha is picked from the canvas's measured luminance, not from a theme
+    /// name, so the two built-ins have to land on the two different strengths — and
+    /// an unknown palette is sorted by the same property rather than defaulting to
+    /// whichever branch was written first.
+    #[test]
+    fn the_border_alpha_follows_the_canvas_not_the_theme_name() {
+        use crate::themes::UiThemeKind;
+
+        let alphas: Vec<f32> = UiThemeKind::ALL
+            .iter()
+            .map(|k| border_tint_alpha(k.build().erd_canvas))
+            .collect();
+        assert!(
+            alphas.contains(&HEADER_TINT_ALPHA) && alphas.contains(&LIGHT_BORDER_TINT_ALPHA),
+            "both strengths should be reachable from the built-in themes, got {alphas:?}"
+        );
+        // White is unambiguously a light canvas; near-black unambiguously dark.
+        let white = floem::peniko::Color::rgb8(0xFF, 0xFF, 0xFF);
+        let black = floem::peniko::Color::rgb8(0x08, 0x08, 0x0C);
+        assert_eq!(border_tint_alpha(white), LIGHT_BORDER_TINT_ALPHA);
+        assert_eq!(border_tint_alpha(black), HEADER_TINT_ALPHA);
+    }
 
     fn node(id: &str) -> DiagramNode {
         DiagramNode {
