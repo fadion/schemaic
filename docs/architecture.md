@@ -3446,6 +3446,18 @@ for keyboard nav.
   **View**. **Every panel-level bar is cleared when the result stops being `Loaded`**, in one
   effect in `results_section`: their only writer lives inside `grid_view`, so a failed re-run left
   the previous total and a live-looking Go-to-row popup pinned to a panel saying "Query failed."
+  Under a Run Everything strip that means the **shown** statement (`shown_panel_loaded`), not "any
+  statement in the batch": only one grid is mounted, so switching from a loaded Result 1 to a failed
+  Result 2 was the same bug one level along.
+- **A failed batch statement reports in the error bar, not in the pane.** `grid_error_bar`'s first
+  source is `batch_err`, a memo over the shown panel (`shown_panel_error`), ahead of `commit_err` —
+  a failed statement has no grid mounted, so a commit error left over from another result tab would
+  be describing something off screen. The pane keeps only a dim "Statement failed.", the way
+  `grid_view` notes `Phase::Failed` while the editor bar carries a single run's message. It used to
+  *be* the pane (`centered_msg(m, theme::error)`), and a server error is one long line: it rendered
+  unwrapped across the middle of the window and out over the schema sidebar. A batch has no editor
+  bar to fall back on — `run_all` sets the tab's `results` to `Idle` — which is why the panel bar is
+  where this goes, **View** (`text::hides_detail`) and all.
 - **A result says which database it came from, and the answer lives on the result.** The grid's
   stats line leads with `ResultSet::database` (`world · 100 rows · 15 cols · 1 ms`), stamped by the
   loader that knows the scope — `Db::fetch_query`, `Session::fetch_query` (its *pinned* database,

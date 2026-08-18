@@ -4114,6 +4114,15 @@ fn results_section(
     let (commit_err, error_open, error_text) = (gctx.commit_err, gctx.error_open, gctx.error_text);
     let (commit_wait, rollback_tx) = (gctx.commit_wait, gctx.rollback_tx.clone());
     let view_err = gctx.view_err;
+    // A Run-Everything statement's own error, which the bottom bar carries for the
+    // same reason the editor's carries a single run's: a server error is one long
+    // line, and in the pane it ran clear across the window. Derived rather than a
+    // fourth signal to keep in step — the panels *are* the state, so switching
+    // result tabs and starting a new batch both fall out of them for free.
+    let batch_err = create_memo(move |_| {
+        let ai = active_result.get();
+        result_tabs.with(|v| shown_panel_error(v, ai))
+    });
     // **The panel-level bars must not outlive the grid they describe.** All three
     // are mounted here, outside `body`, while their only writer lives inside
     // `grid_view`, which exists only under `Phase::Loaded` — so running a
@@ -4128,11 +4137,16 @@ fn results_section(
     {
         let (results, result_tabs) = (results, result_tabs);
         create_effect(move |_| {
+            let ai = active_result.get();
             let loaded = if result_tabs.with(|v| v.is_empty()) {
                 matches!(results.get(), QueryState::Loaded(_))
             } else {
-                // Run Everything: at least one statement still has a grid.
-                result_tabs.with(|v| v.iter().any(|p| matches!(p.state, QueryState::Loaded(_))))
+                // Run Everything: the statement the strip is *showing* is the one
+                // whose grid is mounted. "Any statement in the batch" was the same
+                // bug one level along — switching from a loaded Result 1 to a
+                // failed Result 2 left the selection summary and the find bar over
+                // a pane with no grid under them.
+                result_tabs.with(|v| shown_panel_loaded(v, ai))
             };
             if !loaded {
                 sel_summary.set(None);
@@ -4232,6 +4246,7 @@ fn results_section(
         ),
         grid_goto_bar(goto_open, goto_query, goto_step),
         grid_error_bar(
+            batch_err,
             commit_err,
             view_err,
             commit_wait,
@@ -4243,7 +4258,8 @@ fn results_section(
         // bar when that one is up, by the same predicate `grid_error_bar` decides
         // its own visibility with.
         grid_selection_bar(sel_summary, move || {
-            commit_err.with(Option::is_some)
+            batch_err.with(Option::is_some)
+                || commit_err.with(Option::is_some)
                 || view_err.with(Option::is_some)
                 || commit_wait.with(Option::is_some)
         }),
@@ -4257,6 +4273,41 @@ fn results_section(
     })
 }
 
+/// The statement a Run-Everything strip is **showing**: the `active`th panel, or
+/// the first when that index is stale — a click that selected Result 7 outlives a
+/// later batch of three, and the strip is regenerated on every run.
+///
+/// One function so the pane, the error bar and the bars-clearing effect can't
+/// disagree about which statement they are describing.
+fn shown_panel(panels: &[ResultPanel], active: usize) -> Option<&ResultPanel> {
+    panels.get(active).or_else(|| panels.first())
+}
+
+/// The message the RESULTS error bar carries for a batch: the shown statement's
+/// own error, or `None` for one that is idle, running, cancelled or loaded.
+///
+/// A batch statement's error used to be the pane itself
+/// (`centered_msg(m, theme::error)`), and a server error is one long line: it
+/// rendered as unwrapped text across the middle of the window, out over the schema
+/// sidebar. It now goes where a single run's does — a one-lined red bar with
+/// **View** for the full text — while the pane says only that the statement failed.
+fn shown_panel_error(panels: &[ResultPanel], active: usize) -> Option<String> {
+    match shown_panel(panels, active).map(|p| &p.state) {
+        Some(QueryState::Failed(m)) => Some(m.clone()),
+        _ => None,
+    }
+}
+
+/// Whether a grid is mounted under the strip — i.e. the **shown** statement
+/// loaded one. What the panel-level bars (find, go-to-row, the selection summary)
+/// are allowed to be up for.
+fn shown_panel_loaded(panels: &[ResultPanel], active: usize) -> bool {
+    matches!(
+        shown_panel(panels, active).map(|p| &p.state),
+        Some(QueryState::Loaded(_))
+    )
+}
+
 // Run Everything results: a result-tab strip over the active statement's grid.
 fn results_multi(
     result_tabs: RwSignal<Vec<ResultPanel>>,
@@ -4267,17 +4318,20 @@ fn results_multi(
     let body = dyn_container(
         move || {
             let ai = active_result.get();
-            result_tabs.with(|v| v.get(ai).or_else(|| v.first()).map(|p| p.state.clone()))
+            result_tabs.with(|v| shown_panel(v, ai).map(|p| p.state.clone()))
         },
         move |state| match state {
             None => empty().into_any(),
             Some(QueryState::Idle) => empty().into_any(),
             Some(QueryState::Running) => running_view(cancel.clone()).into_any(),
-            // Unlike single runs (whose error shows in the editor bar), a batch
-            // statement's error has nowhere else to go, so show it here. Free-
-            // standing text on the results background, so `error()` — see the
-            // note in `monitor_view`'s status line.
-            Some(QueryState::Failed(m)) => centered_msg(m, theme::error).into_any(),
+            // The message itself goes to the panel-level error bar (see
+            // `shown_panel_error`), exactly as a single run's goes to the editor's
+            // — so the pane only notes the failure, as `grid_view` does under
+            // `Phase::Failed`. It used to *be* the pane, and one long server error
+            // then ran across the window and out over the schema sidebar.
+            Some(QueryState::Failed(_)) => {
+                centered_msg("Statement failed.", theme::text_dim).into_any()
+            }
             Some(QueryState::Cancelled) => {
                 centered_msg("Query cancelled.", theme::text_dim).into_any()
             }
@@ -6654,6 +6708,76 @@ mod field_layout_tests {
     #[test]
     fn a_field_without_the_action_reserves_nothing_for_it() {
         assert!(placeholder_right_inset(false) < placeholder_right_inset(true));
+    }
+}
+
+#[cfg(test)]
+mod result_strip_tests {
+    use super::{ResultPanel, shown_panel_error, shown_panel_loaded};
+    use schemaic_core::model::QueryState;
+    use std::sync::Arc;
+
+    fn panel(state: QueryState) -> ResultPanel {
+        ResultPanel {
+            label: "Result 1".into(),
+            state,
+        }
+    }
+
+    fn loaded() -> ResultPanel {
+        panel(QueryState::Loaded(Arc::new(
+            schemaic_core::model::ResultSet::default(),
+        )))
+    }
+
+    #[test]
+    fn the_shown_statements_error_is_the_one_the_bar_carries() {
+        let panels = vec![
+            loaded(),
+            panel(QueryState::Failed("Server error: 1064".into())),
+        ];
+        assert_eq!(shown_panel_error(&panels, 0), None);
+        assert_eq!(
+            shown_panel_error(&panels, 1).as_deref(),
+            Some("Server error: 1064")
+        );
+    }
+
+    /// Nothing to report for a statement that is still going, was cancelled, or
+    /// hasn't been dispatched — the pane says so itself.
+    #[test]
+    fn only_a_failure_puts_anything_in_the_bar() {
+        for state in [QueryState::Idle, QueryState::Running, QueryState::Cancelled] {
+            assert_eq!(shown_panel_error(&[panel(state)], 0), None);
+        }
+    }
+
+    /// A click that selected Result 7 outlives a later batch of three, and the
+    /// body already falls back to the first panel — the bar has to agree with it,
+    /// or it would report an error for a statement nobody is looking at.
+    #[test]
+    fn a_stale_selection_reads_the_first_panel_as_the_body_does() {
+        let panels = vec![panel(QueryState::Failed("boom".into())), loaded()];
+        assert_eq!(shown_panel_error(&panels, 7).as_deref(), Some("boom"));
+        assert!(!shown_panel_loaded(&panels, 7));
+    }
+
+    #[test]
+    fn an_empty_strip_reports_nothing() {
+        assert_eq!(shown_panel_error(&[], 0), None);
+        assert!(!shown_panel_loaded(&[], 0));
+    }
+
+    /// **The panel-level bars follow the grid that is mounted**, which is the
+    /// shown statement's — not "some statement in the batch has a grid". With
+    /// `any`, switching from a loaded Result 1 to a failed Result 2 left the
+    /// selection summary and the find bar floating over a pane with no grid under
+    /// them.
+    #[test]
+    fn only_the_shown_statement_decides_whether_a_grid_is_mounted() {
+        let panels = vec![loaded(), panel(QueryState::Failed("boom".into()))];
+        assert!(shown_panel_loaded(&panels, 0));
+        assert!(!shown_panel_loaded(&panels, 1));
     }
 }
 
