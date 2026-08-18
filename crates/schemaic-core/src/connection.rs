@@ -474,6 +474,22 @@ pub fn is_sqlite(db_type: &str) -> bool {
     t.eq_ignore_ascii_case("sqlite") || t.eq_ignore_ascii_case("sqlite3")
 }
 
+/// Do two `db_type` labels name the **same engine**?
+///
+/// One engine has more than one label — `MariaDB` and `MySQL` are the same
+/// engine, `pg` and `PostgreSQL` are, and an empty label predates the field —
+/// so a string comparison is not this question. Answered through
+/// [`is_postgres`]/[`is_sqlite`] rather than by a `match` of its own, so a
+/// fourth engine cannot sort onto whichever side it happens to fall.
+///
+/// The connection form's Type picker asks it to tell *its own* change apart from
+/// a connection being loaded into the form: on a pick the stored label still
+/// names the previous engine, on a load it already names the new one. Only the
+/// first should rewrite the label or offer the new engine's default port.
+pub fn same_engine(a: &str, b: &str) -> bool {
+    is_postgres(a) == is_postgres(b) && is_sqlite(a) == is_sqlite(b)
+}
+
 /// How to name a connection's engine on screen.
 ///
 /// Normalises the PostgreSQL aliases [`is_postgres`] accepts onto the one label
@@ -1014,6 +1030,62 @@ mod tests {
                 SqlDialect::MySql
             };
             assert_eq!(SqlDialect::from_db_type(label), by_predicate, "{label}");
+        }
+    }
+
+    /// Two labels for one engine are one engine — the question the connection
+    /// form's Type picker asks to tell *its own* change apart from a load.
+    #[test]
+    fn labels_for_one_engine_name_the_same_engine() {
+        for (a, b) in [
+            ("MySQL", "MariaDB"),
+            ("MariaDB", "mysql"),
+            // Predates the field, and everything from that era was MySQL.
+            ("", "MySQL"),
+            ("something new", "MySQL"),
+            ("PostgreSQL", "pg"),
+            ("postgres", "  POSTGRESQL "),
+            ("SQLite", "sqlite3"),
+            ("  sqlite ", "SQLite"),
+        ] {
+            assert!(same_engine(a, b), "{a} vs {b}");
+            assert!(same_engine(b, a), "{b} vs {a}");
+        }
+    }
+
+    #[test]
+    fn labels_for_different_engines_do_not() {
+        for (a, b) in [
+            ("MySQL", "PostgreSQL"),
+            ("MariaDB", "SQLite"),
+            ("PostgreSQL", "sqlite3"),
+            ("", "pg"),
+            ("SQLite", ""),
+        ] {
+            assert!(!same_engine(a, b), "{a} vs {b}");
+            assert!(!same_engine(b, a), "{b} vs {a}");
+        }
+    }
+
+    /// It has to answer through the same two predicates the rest of the app
+    /// decides with, or a fourth engine would sort onto whichever side it fell.
+    #[test]
+    fn same_engine_agrees_with_the_label_predicates() {
+        let labels = [
+            "MySQL",
+            "MariaDB",
+            "",
+            "PostgreSQL",
+            "pg",
+            "SQLite",
+            "sqlite3",
+            "something else",
+        ];
+        for a in labels {
+            for b in labels {
+                let by_predicate = is_postgres(a) == is_postgres(b) && is_sqlite(a) == is_sqlite(b);
+                assert_eq!(same_engine(a, b), by_predicate, "{a} vs {b}");
+            }
         }
     }
 
