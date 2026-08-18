@@ -124,6 +124,20 @@ pub(crate) const COMPLETION_ROW_PAD: f64 = 10.0;
 pub(crate) const COMPLETION_NAME_SIZE: f32 = 14.0;
 pub(crate) const COMPLETION_ANNOT_SIZE: f32 = 12.0;
 
+/// The Ctrl+Enter run menu's width. The panel's `min_width` *and* what
+/// `run_menu_pos` finds room for — one constant, because a placement computed
+/// against a different width than the panel draws at is how the menu came to be
+/// cut off at the editor's right edge in the first place.
+pub(crate) const RUN_MENU_W: f64 = 170.0;
+/// One run-menu row: `FONT_TITLE`'s line box plus its `padding_vert(8)`.
+pub(crate) const RUN_MENU_ROW_H: f64 = 34.0;
+/// The whole menu: its two rows, the panel's `padding_vert(6)` and its 1px border.
+///
+/// An estimate, like [`COMPLETION_ROW_H`], because a style closure has no measured
+/// box to ask. Only the bottom clamp reads it, so being a few px out costs a few px
+/// of position — never a cut-off row.
+pub(crate) const RUN_MENU_H: f64 = 2.0 * RUN_MENU_ROW_H + 12.0 + 2.0;
+
 /// Height of the wavy syntax-error underline (px).
 pub(crate) const WAVE_H: f64 = 5.0;
 

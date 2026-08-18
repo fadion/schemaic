@@ -3086,6 +3086,18 @@ Re-introducing the anti-patterns these guard against is a regression:
   `COMPLETION_SLACK_W` of air and rounds up, because a box sized to exactly its widest row puts
   that row on its own ellipsis boundary, where a sub-pixel disagreement between the measurement and
   the layout is a visibly wrong string.
+  The **Ctrl+Enter run menu** is the fourth caret-anchored overlay and obeys both halves the same
+  way, through `editor_pane::run_menu_pos`: `run_menu` stores the caret's line-bottom in content
+  coords (via `content_x_of`, the gutter the highlight boxes use — `COMPLETION_GUTTER` is an
+  under-estimate the suggestion list hides behind its own padding) and the style closure subtracts
+  `ed.viewport`, then keeps the panel inside `content_x + vp.width()` — the same fold
+  `statement_line_boxes_at` clamps to, rather than `area_w`. Horizontally it **flips** left of the
+  caret, so the menu stays beside the statement it is about to run; vertically it **clamps**, since
+  flipping would need the caret line's top edge and covering a line beats a jump. The flip alone is
+  not enough: an anchor already past the fold (a caret scrolled out to the right) flips to somewhere
+  still past it. `RUN_MENU_W` is one constant for the panel's `min_width` and the placement's
+  arithmetic — comparing an unscrolled anchor against a width the panel wasn't drawn at is what cut
+  the menu off at the editor's right edge on a long line.
 - **The floem editor owns its document once mounted, and the sync is one-way — writing the `query`
   signal from outside is not merely invisible, it is lost.** Every edit runs
   `query.set(doc.text())` from the editor's `.update` callback (`editor_pane.rs`), and there is no
