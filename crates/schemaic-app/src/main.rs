@@ -240,6 +240,14 @@ fn resolve_cli<'a>(progs: &[&'a str]) -> Option<CliLauncher<'a>> {
         .then(|| CliLauncher::Wsl(progs[0]))
 }
 
+/// Find a client on `PATH` only, with **no WSL fallback** — see [`sqlite_shell`]
+/// for the one client that must not have one.
+fn resolve_native_cli(prog: &str) -> Option<CliLauncher<'_>> {
+    schemaic_term::shell::which(prog)
+        .is_some()
+        .then_some(CliLauncher::Native(prog))
+}
+
 /// Build the terminal shell that launches the MySQL/MariaDB CLI for `conn`,
 /// optionally scoped to `db`. The password rides `MYSQL_PWD` (via `WSLENV` for
 /// the WSL case) so it never appears on the command line or in shell history.
@@ -257,6 +265,20 @@ fn psql_shell(
     db: &str,
 ) -> Option<schemaic_term::ShellConfig> {
     resolve_cli(&["psql"]).map(|l| psql_shell_config(l, conn, db))
+}
+
+/// The SQLite third: `sqlite3 <file>`.
+///
+/// **Native only, deliberately** ([`resolve_native_cli`]). The other two clients
+/// take a host and a port, which mean the same thing inside WSL as outside it; this
+/// one takes a *path*, and `sqlite3 'C:\data\app.db'` under WSL does not fail — it
+/// **creates an empty database** under that literal name and hands the user a
+/// session on something that looks like theirs. Offering it would mean translating
+/// the path to `/mnt/c/…`, which nothing here does yet.
+fn sqlite_shell(
+    conn: &schemaic_core::connection::Connection,
+) -> Option<schemaic_term::ShellConfig> {
+    resolve_native_cli("sqlite3").map(|l| sqlite_shell_config(l, conn))
 }
 
 /// Which database `psql` should open.
@@ -295,7 +317,33 @@ fn mysql_shell_config(
     if let Some(d) = db {
         cli_args.push(d.to_string());
     }
-    wrap_launcher(launcher, cli_args, "MYSQL_PWD", &conn.password)
+    wrap_launcher(launcher, cli_args, Some(("MYSQL_PWD", &conn.password)))
+}
+
+/// The SQLite twin of [`mysql_shell_config`] — pure argv construction, split from
+/// the `PATH` probing in [`sqlite_shell`] so it's unit-tested.
+///
+/// One argument (the file) and **no credential env at all**: there is no server, so
+/// `host`/`port`/`user`/`password` are inert on such a connection and an env var
+/// here would be a secret invented for an engine that has none.
+///
+/// `cwd` is the file's own directory, which the server clients have no equivalent
+/// of: `sqlite3`'s dot-commands take relative paths (`.output rows.csv`,
+/// `.read seed.sql`), and resolving those against wherever the app was launched
+/// from — on a desktop launch, not a directory the user can name — would write
+/// files nobody can find. `None` when the path has no directory part, since
+/// spawning into `""` fails outright.
+fn sqlite_shell_config(
+    launcher: CliLauncher,
+    conn: &schemaic_core::connection::Connection,
+) -> schemaic_term::ShellConfig {
+    let mut cfg = wrap_launcher(launcher, vec![conn.file.clone()], None);
+    cfg.cwd = std::path::Path::new(&conn.file)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .and_then(|p| p.to_str())
+        .map(str::to_string);
+    cfg
 }
 
 /// [`mysql_shell_config`]'s PostgreSQL twin. Every parameter takes a different
@@ -317,24 +365,35 @@ fn psql_shell_config(
         "-d".into(),
         db.to_string(),
     ];
-    wrap_launcher(launcher, cli_args, "PGPASSWORD", &conn.password)
+    wrap_launcher(launcher, cli_args, Some(("PGPASSWORD", &conn.password)))
 }
 
-/// Turn a client's argv into a spawnable config, native or through WSL, with the
-/// password in `var` — the half both engines share, so neither can lose the
-/// rule that the password never reaches the command line.
+/// Turn a client's argv into a spawnable config, native or through WSL, with any
+/// password in `secret`'s variable — the half every engine shares, so none of them
+/// can lose the rule that the password never reaches the command line.
+///
+/// `secret` is `None` for a client that has no credential to pass (SQLite's), which
+/// is not the same as an empty password: it means no variable is set at all, and no
+/// `WSLENV` entry naming one.
 fn wrap_launcher(
     launcher: CliLauncher,
     cli_args: Vec<String>,
-    var: &str,
-    password: &str,
+    secret: Option<(&str, &str)>,
 ) -> schemaic_term::ShellConfig {
+    let env = |prefix: Vec<(String, String)>| match secret {
+        Some((var, password)) => {
+            let mut env = prefix;
+            env.push((var.into(), password.to_string()));
+            env
+        }
+        None => Vec::new(),
+    };
     match launcher {
         CliLauncher::Native(prog) => schemaic_term::ShellConfig {
             program: prog.into(),
             args: cli_args,
             cwd: None,
-            env: vec![(var.into(), password.to_string())],
+            env: env(Vec::new()),
         },
         CliLauncher::Wsl(prog) => {
             let mut args: Vec<String> = vec!["-e".into(), prog.into()];
@@ -345,10 +404,10 @@ fn wrap_launcher(
                 cwd: None,
                 // WSLENV is what carries the variable across the boundary; without
                 // it the password simply doesn't arrive and psql/mysql prompts.
-                env: vec![
-                    ("WSLENV".into(), format!("{var}/u")),
-                    (var.into(), password.to_string()),
-                ],
+                env: env(match secret {
+                    Some((var, _)) => vec![("WSLENV".into(), format!("{var}/u"))],
+                    None => Vec::new(),
+                }),
             }
         }
     }
@@ -6297,22 +6356,35 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             } else {
                 conn
             };
-            let built = if schemaic_core::connection::is_postgres(&conn.db_type) {
-                // The button on the terminal's toolbar passes no database, and
-                // psql needs one. Fall back to the focused tab's — but only when
-                // that tab is on this connection, or we'd name a database from
-                // another server (`scoped_database`'s whole reason for being).
-                let tab = tabs.with_untracked(|v| {
-                    v.iter()
-                        .find(|t| t.id == active.get_untracked())
-                        .map(|t| (t.conn_id.get_untracked(), t.database.get_untracked()))
-                });
-                let scoped = scoped_database(tab, active_conn.get_untracked(), None);
-                let target = psql_database(db.as_deref(), scoped.as_deref());
-                psql_shell(&conn, &target).ok_or("No psql client found (PATH or WSL).")
-            } else {
-                mysql_shell(&conn, db.as_deref())
-                    .ok_or("No mysql/mariadb client found (PATH or WSL).")
+            // **A match on the engine, not `if Postgres { … } else { mysql }`** —
+            // which is what this was, and it sent a SQLite connection to the MySQL
+            // client with the inert `127.0.0.1:3306` of a *file* connection: either
+            // "no client found" or, on a machine that has one, a session against
+            // some unrelated local server presented as this connection's. Exhaustive
+            // here, so a fourth engine is a compile error rather than a wrong guess
+            // (the same reason `dialect_of` was rewritten this way).
+            let built = match schemaic_db::Engine::from_db_type(&conn.db_type) {
+                schemaic_db::Engine::Postgres => {
+                    // The button on the terminal's toolbar passes no database, and
+                    // psql needs one. Fall back to the focused tab's — but only when
+                    // that tab is on this connection, or we'd name a database from
+                    // another server (`scoped_database`'s whole reason for being).
+                    let tab = tabs.with_untracked(|v| {
+                        v.iter()
+                            .find(|t| t.id == active.get_untracked())
+                            .map(|t| (t.conn_id.get_untracked(), t.database.get_untracked()))
+                    });
+                    let scoped = scoped_database(tab, active_conn.get_untracked(), None);
+                    let target = psql_database(db.as_deref(), scoped.as_deref());
+                    psql_shell(&conn, &target).ok_or("No psql client found (PATH or WSL).")
+                }
+                // `db` is ignored: a SQLite connection's one database is the file
+                // itself, which the config already names.
+                schemaic_db::Engine::Sqlite => {
+                    sqlite_shell(&conn).ok_or("No sqlite3 client found on PATH.")
+                }
+                schemaic_db::Engine::MySql => mysql_shell(&conn, db.as_deref())
+                    .ok_or("No mysql/mariadb client found (PATH or WSL)."),
             };
             // Badge the panel only for a session that really is a client. The
             // no-client arm spawns a message instead, which is nobody's engine.
@@ -7051,7 +7123,7 @@ fn open_url(url: &str) {
 mod app_tests {
     use super::{
         CliLauncher, inline_outcome, mysql_shell_config, psql_database, psql_shell_config,
-        unique_name,
+        resolve_native_cli, sqlite_shell_config, unique_name,
     };
     use schemaic_core::connection::Connection;
     use schemaic_ui::InlineAiState;
@@ -7338,6 +7410,85 @@ mod app_tests {
             ]
         );
         assert!(!cfg.args.iter().any(|a| a.contains("s3cr3t")));
+    }
+
+    // ── The SQLite client ─────────────────────────────────────────────────
+    // A file, not a server: no host, port, user or password to pass, and the one
+    // argument is the database file itself.
+
+    /// Forward slashes, which **both** platforms parse as separators — a
+    /// backslashed path has no directory part at all on Linux, and this suite runs
+    /// on both.
+    fn file_conn() -> Connection {
+        Connection {
+            db_type: "SQLite".to_string(),
+            file: "/data/chinook.db".to_string(),
+            ..conn()
+        }
+    }
+
+    #[test]
+    fn sqlite_shell_opens_the_file_and_carries_no_secret() {
+        let cfg = sqlite_shell_config(CliLauncher::Native("sqlite3"), &file_conn());
+        assert_eq!(cfg.program, "sqlite3");
+        assert_eq!(cfg.args, vec!["/data/chinook.db"]);
+        // Nothing to pass: the server side of a file connection is inert, and the
+        // password field of one is empty by construction (`Connection::sanitized`).
+        // An env var here would be a credential invented for an engine that has
+        // none.
+        assert!(cfg.env.is_empty(), "a file has no secret to carry");
+    }
+
+    /// **The file's own directory**, so `.output rows.csv` and `.read seed.sql`
+    /// land beside the database rather than in whatever directory the app was
+    /// started from — which on a desktop launch is not a place the user can find.
+    #[test]
+    fn sqlite_shell_starts_in_the_databases_directory() {
+        let cfg = sqlite_shell_config(CliLauncher::Native("sqlite3"), &file_conn());
+        assert_eq!(cfg.cwd.as_deref(), Some("/data"));
+    }
+
+    /// The form a Windows connection actually holds, which is where these files
+    /// live for this project's own author.
+    #[cfg(windows)]
+    #[test]
+    fn sqlite_shell_handles_a_backslashed_windows_path() {
+        let c = Connection {
+            file: r"C:\Users\me\dbs\chinook.db".to_string(),
+            ..file_conn()
+        };
+        let cfg = sqlite_shell_config(CliLauncher::Native("sqlite3"), &c);
+        assert_eq!(cfg.args, vec![r"C:\Users\me\dbs\chinook.db"]);
+        assert_eq!(cfg.cwd.as_deref(), Some(r"C:\Users\me\dbs"));
+    }
+
+    /// A file with no parent (a bare name, or a root) must not produce an empty
+    /// `cwd` — spawning into `""` fails outright on both platforms.
+    #[test]
+    fn sqlite_shell_has_no_cwd_when_the_path_has_no_directory() {
+        let c = Connection {
+            file: "scratch.db".to_string(),
+            ..file_conn()
+        };
+        let cfg = sqlite_shell_config(CliLauncher::Native("sqlite3"), &c);
+        assert_eq!(cfg.args, vec!["scratch.db"]);
+        assert_eq!(cfg.cwd, None);
+    }
+
+    /// **No WSL fallback for SQLite**, unlike the two server clients.
+    ///
+    /// Their target is a host and a port, which mean the same thing on both sides
+    /// of the boundary. A *path* does not: `sqlite3 'C:\data\chinook.db'` inside
+    /// WSL doesn't fail, it **creates an empty database** under that literal name
+    /// in the current directory, and the user gets a session on a database that
+    /// looks like theirs and is empty. Translating to `/mnt/c/...` is the only
+    /// honest way to offer it, and nothing here does that yet.
+    #[test]
+    fn sqlite_client_is_resolved_natively_only() {
+        assert!(matches!(
+            resolve_native_cli("sqlite3"),
+            None | Some(CliLauncher::Native("sqlite3"))
+        ));
     }
 
     #[test]
