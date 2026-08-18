@@ -3357,6 +3357,23 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   menu anchored to the box hugged the window edge. The indent that makes the tree a tree is the row's
   `padding_left`. Both geometry signals are read *inside* the cursor guard, so only the cursor row
   subscribes and a scroll that moves it refreshes the point.
+- **An open context menu marks the row it acts on** — `Nav::menu_row`, painted by
+  `schema_tree::menu_mark` as a 1px rule above and below in `theme::row_menu_edge`. A menu is a panel
+  floating clear of its row, and once the pointer is on the menu nothing on screen said which
+  database, table or column the Drop was about. Not the nav cursor's highlight: a right-click
+  deliberately does **not** move the cursor (`resume_cursor` — a cursor that exists is the user's), so
+  this is a second, shorter-lived mark. Set by `marking_opener`, which wraps the row's `CtxOpener`
+  where it is *built* rather than at the click, so the `Shift+F10` route marks too; cleared by an
+  effect watching `context_menu` go to `None`, which covers the closes the tree's own code never sees.
+  Two details are load-bearing. It is a **border, not an `outline`**: floem strokes a per-side border
+  *inside* the view's rect (`paint_border`: top at y = 0.5, bottom at height − 0.5), so nothing bleeds
+  onto the neighbouring rows and no `z_index` is needed to keep their hover backgrounds off it, while
+  an `outline` — which floem inflates outward — would have needed one; and taffy sizes the **border
+  box**, so `height(TREE_ROW_H)` is unchanged and the rule costs 2px of content box, not a layout
+  shift. The key/index leaf is the only row outside the nav sequence, so it carries its own
+  `key_row_menu_key` (a prefix that never reaches the persisted expansion set) and calls `menu_mark`
+  itself — a marker that skipped the one row kind with a menu but no cursor is a marker the user
+  learns not to trust. `every_row_key_family_owns_its_prefix` guards the shared key space.
 - **A menu the keyboard opened gives focus back when it closes** — `widgets::set_menu_return`, set
   by the opener and **taken** by `menu_panel` as it builds, so the slot lives only between the two
   and a later menu cannot inherit a stale return. Folded into `close`, the path Escape and every

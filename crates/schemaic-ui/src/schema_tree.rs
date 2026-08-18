@@ -69,6 +69,18 @@ struct Nav {
     /// beside `cursor_view` by the same effect, so the two always describe the
     /// same row.
     cursor_menu: RwSignal<Option<CtxOpener>>,
+    /// The key of the row whose **context menu is open**, painted by
+    /// [`with_nav_scroll`] as a rule above and below it.
+    ///
+    /// A menu is a panel floating away from the row it acts on, and once the
+    /// pointer has moved onto it there was nothing left on screen saying which
+    /// database, table or column *this* Drop is about. Not the nav cursor: a
+    /// right-click deliberately doesn't move that (see [`resume_cursor`] — a cursor
+    /// that exists is the user's), so this is a second, shorter-lived mark that
+    /// lives exactly as long as the menu.
+    ///
+    /// Set by [`marking_opener`], cleared by watching the menu itself go away.
+    menu_row: RwSignal<Option<String>>,
 }
 
 /// A row's context menu, as a function of **where** to open it: `None` at the
@@ -158,6 +170,18 @@ fn object_group_key(database: &str, scope: TableScope, kind: ObjectKind) -> Stri
         scope.name().unwrap_or_default(),
         kind.label()
     )
+}
+
+/// A key/index leaf row, **for the context-menu mark only**.
+///
+/// Its own prefix, and deliberately outside every other key's: a key row is not in
+/// the nav sequence (no cursor, no expansion, nothing persisted — see
+/// [`key_row`]), so this string is never compared against `expanded` or
+/// `Nav::selected` and cannot collide with one that is. It exists because the row
+/// still *has* a context menu, and a marker that skipped it would be a marker the
+/// user learns not to trust.
+fn key_row_menu_key(database: &str, table: &str, index: &str) -> String {
+    format!("keyrow:{database}:{table}:{index}")
 }
 
 fn object_key(database: &str, scope: TableScope, kind: ObjectKind, name: &str) -> String {
@@ -570,6 +594,47 @@ fn is_nav_selected(nav: Nav, key: &str) -> bool {
     nav.focused.get() && nav.selected.with(|s| s.as_deref() == Some(key))
 }
 
+/// The rule a row wears **while its context menu is open** — 1px above and below,
+/// in [`theme::row_menu_edge`]. The visible half of [`Nav::menu_row`]; called from
+/// a row's `.style()`, like [`is_nav_selected`].
+///
+/// Borders and not an `outline`: floem strokes a per-side border *inside* the
+/// view's own rect (`paint_border` puts the top line at y = 0.5 and the bottom at
+/// height − 0.5), so nothing bleeds into the rows on either side and no `z_index`
+/// is needed to keep their hover backgrounds off it — an outline, which floem
+/// inflates *outward*, would have needed exactly that. And since taffy sizes the
+/// **border box**, a row's `height(TREE_ROW_H)` is unchanged: the rule costs 2px of
+/// content box on a vertically centred row, and no layout shift.
+fn menu_mark(s: floem::style::Style, nav: Nav, key: &str) -> floem::style::Style {
+    if nav.menu_row.with(|k| k.as_deref() == Some(key)) {
+        s.border_top(1.0)
+            .border_bottom(1.0)
+            .border_color(theme::row_menu_edge())
+    } else {
+        s
+    }
+}
+
+/// Wrap a row's [`CtxOpener`] so that raising the menu also **marks the row it
+/// belongs to** ([`Nav::menu_row`], painted by [`with_nav_scroll`]).
+///
+/// Wrapped where the opener is *built*, not at the click, because a row has two
+/// ways to raise its menu — the pointer, and Shift+F10 through
+/// [`Nav::cursor_menu`] — and only one of them is a click. Both go through the
+/// opener, so both mark, and the keyboard route cannot quietly lose the
+/// affordance the pointer route has.
+///
+/// Give it the same `key` the row passes to [`with_nav_scroll`]: that is the key
+/// the mark is compared against, and it is the tree's one row identity (the
+/// expansion set, the nav cursor and the persisted state all use it).
+fn marking_opener(nav: Nav, key: &str, open: CtxOpener) -> CtxOpener {
+    let key = key.to_string();
+    Rc::new(move |at| {
+        nav.menu_row.set(Some(key.clone()));
+        open(at);
+    })
+}
+
 // Attach a self-scroll-into-view effect to a row's view: whenever it becomes the
 // focused nav cursor, scroll it into the tree viewport. Returns the same view.
 fn with_nav_scroll(view: AnyView, nav: Nav, key: String, menu: Option<CtxOpener>) -> AnyView {
@@ -578,7 +643,15 @@ fn with_nav_scroll(view: AnyView, nav: Nav, key: String, menu: Option<CtxOpener>
     // `on_resize`'s rect is view-local, so only its *height* is taken.
     let origin = RwSignal::new(Point::ZERO);
     let height = RwSignal::new(0.0_f64);
+    // **The row whose context menu is open wears a rule top and bottom**
+    // ([`menu_mark`]). Chained here rather than added to each row builder's own
+    // `.style()` for the reason the scroll effect is here: every navigable row in
+    // the tree comes through this one function, menu or no menu. (The key/index
+    // leaf is the one row that doesn't — it is out of the nav sequence entirely —
+    // and `key_row` therefore calls `menu_mark` itself.)
+    let marked = key.clone();
     let view = view
+        .style(move |s| menu_mark(s, nav, &marked))
         .on_move(move |p| origin.set(p))
         .on_resize(move |r| height.set(r.height()))
         .into_any();
@@ -675,7 +748,19 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
         reveal: RwSignal::new(None),
         cursor_at: RwSignal::new(None),
         cursor_menu: RwSignal::new(None),
+        menu_row: RwSignal::new(None),
     };
+    // **The mark goes away with the menu**, however it went: Escape, a click
+    // outside, an action taken from it, or a second right-click somewhere the tree
+    // doesn't own. Derived from the menu's own state rather than cleared at each of
+    // those sites, because the last of them isn't the tree's code at all. The write
+    // is guarded so a menu-less tree doesn't re-notify every row on every close
+    // (`RwSignal::set` doesn't dedup).
+    create_effect(move |_| {
+        if context_menu.with(|m| m.is_none()) && nav.menu_row.with_untracked(|k| k.is_some()) {
+            nav.menu_row.set(None);
+        }
+    });
 
     let nav_tree_id: RwSignal<Option<floem::ViewId>> = RwSignal::new(None);
 
@@ -1184,6 +1269,9 @@ fn db_node(conn: ConnNode, ctx: SchemaTreeCtx) -> impl IntoView {
             at,
         }));
     });
+    // Shadowed, so the pointer's `on_secondary_click_stop` clone below and the
+    // Shift+F10 route through `with_nav_scroll` both get the marking wrapper.
+    let open_menu = marking_opener(nav, &key, open_menu);
     let dot_db = conn.database.clone();
     let star_db = conn.database.clone();
     let icon_fav_db = conn.database.clone();
@@ -1455,6 +1543,7 @@ fn schema_node(
             }));
         })
     };
+    let open_menu = marking_opener(nav, &key, open_menu);
     let name_term = {
         let f = filter.get_untracked();
         let f = f.trim();
@@ -1659,6 +1748,7 @@ fn object_group_node(
             }));
         })
     };
+    let open_menu = marking_opener(nav, &key, open_menu);
 
     let toggle_row = on_toggle.clone();
     let key_row = key.clone();
@@ -1794,6 +1884,7 @@ fn object_row(
             }));
         })
     };
+    let open_menu = marking_opener(nav, &nav_key, open_menu);
     let row = h_stack((
         icons::icon(object_icon(kind), SCHEMA_ICON as f32).style(move |s| {
             s.color(theme::text_muted().multiply_alpha(if dim { 0.4 } else { 0.7 }))
@@ -2028,6 +2119,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
             }));
         })
     };
+    let open_menu = marking_opener(nav, &key, open_menu);
     let col_source = source.clone();
     let header = h_stack((
         chevron(expanded, key.clone(), on_toggle),
@@ -2148,7 +2240,7 @@ fn table_node(database: String, table: TableInfo, ctx: SchemaTreeCtx) -> impl In
                         fk.columns.len() == names.len() && fk.columns.iter().eq(names.iter())
                     })
                     .map(|fk| fk.name.clone());
-                key_row(ix, context_menu, key_src.clone(), fk, indent)
+                key_row(ix, context_menu, key_src.clone(), fk, nav, indent)
             }))
             .style(|s| s.flex_col());
             v_stack((counts, cols_block, keys_block))
@@ -2259,6 +2351,7 @@ fn column_row(
             at,
         }));
     });
+    let open_menu = marking_opener(nav, &nav_key, open_menu);
     // The glyph always reflects the column's *type* family — the key glyph is for
     // the key/index rows, not the columns they cover (so `id` is a numeric column,
     // and `PRIMARY(id)` is the key). Key membership only tints the row: a PK column
@@ -2317,6 +2410,9 @@ fn key_row(
     // by the caller from the table's own constraints, since the names needn't
     // match.
     fk_name: Option<String>,
+    // `nav` only for the context-menu mark — a key row takes no part in keyboard
+    // navigation (see the style at the end).
+    nav: Nav,
     indent: f64,
 ) -> impl IntoView {
     let (database, table) = (source.database.clone(), source.display());
@@ -2331,6 +2427,9 @@ fn key_row(
     };
     let kind = if ix.foreign { "foreign key" } else { "index" };
     let cols = ix.column_names().collect::<Vec<_>>().join(", ");
+    // Built before `database`/`table` are moved into the click closure below.
+    let menu_key = key_row_menu_key(&database, &table, &ix.name);
+    let mark_key = menu_key.clone();
     let ctx_name = ix.name.clone();
     let label = format!("{} ({cols})", ix.name);
     let ctx_index = ix.clone();
@@ -2352,6 +2451,9 @@ fn key_row(
     // trailing type tag stays full-strength (its own muted colour, above).
     .style(move |s| s.color(color.multiply_alpha(0.5)).items_center())
     .on_secondary_click_stop(move |_| {
+        // This row has no `CtxOpener` to wrap (`marking_opener`) because it has no
+        // keyboard route to share one with, so it marks itself.
+        nav.menu_row.set(Some(menu_key.clone()));
         let ai_prompt = format!(
             "In `{database}`.`{table}`, explain the `{ctx_name}` {kind} on ({cols}) — its \
              purpose (uniqueness, faster lookups, or a foreign-key relationship)."
@@ -2370,8 +2472,10 @@ fn key_row(
         }));
     })
     // Non-interactive: static layout (no hover), and not in the nav sequence, so
-    // it never shows a selection highlight either — it opens nowhere.
-    .style(move |s| tree_row_static(s, COL_PAD + indent))
+    // it never shows a selection highlight either — it opens nowhere. The
+    // context-menu mark is not that highlight: the row has a menu like any other,
+    // and while it is open it says so.
+    .style(move |s| menu_mark(tree_row_static(s, COL_PAD + indent), nav, &mark_key))
 }
 
 // A clickable disclosure chevron: chevron-down when expanded, chevron-right
@@ -2783,6 +2887,49 @@ mod tests {
             column_key("shop", &tbl(None, "users"), "id"),
             "col:shop:users:id"
         );
+    }
+
+    /// **Every row-key family owns its prefix, and no family's prefix is a prefix
+    /// of another's.** The keys share one string space — the expansion set, the nav
+    /// cursor, and now the context-menu mark all compare against it — so two
+    /// families that could produce the same string would mark, select or expand a
+    /// row nobody named. `keyrow:` is the newest and the only one that never
+    /// reaches the persisted set, which makes it the easiest to get wrong; note
+    /// `obj:` and `objgrp:` are the pair that already share three letters.
+    #[test]
+    fn every_row_key_family_owns_its_prefix() {
+        let keys = [
+            ("db:", db_key("shop")),
+            ("sch:", schema_key("shop", "public")),
+            ("tbl:", table_key_named("shop", "users")),
+            ("col:", column_key_named("shop", "users", "id")),
+            (
+                "objgrp:",
+                object_group_key("shop", TableScope::Flat, ObjectKind::Sequence),
+            ),
+            (
+                "obj:",
+                object_key(
+                    "shop",
+                    TableScope::Flat,
+                    ObjectKind::Sequence,
+                    "users_id_seq",
+                ),
+            ),
+            ("keyrow:", key_row_menu_key("shop", "users", "PRIMARY")),
+        ];
+        for (prefix, key) in &keys {
+            assert!(key.starts_with(prefix), "{key} is not a {prefix} key");
+            for (other, _) in &keys {
+                if other == prefix {
+                    continue;
+                }
+                assert!(
+                    !key.starts_with(other),
+                    "{key} answers to {other} as well as {prefix}"
+                );
+            }
+        }
     }
 
     #[test]
