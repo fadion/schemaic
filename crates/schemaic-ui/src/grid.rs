@@ -1824,6 +1824,10 @@ pub(crate) struct GridCtx {
     /// history, preserves `base_sql`/`grid_query` (see `TabsActions::apply_view`).
     pub(crate) apply_view: ApplyViewFn,
     pub(crate) db_nodes: RwSignal<Vec<ConnNode>>,
+    /// The refresh announcement the statistics slots don't make themselves — see
+    /// [`crate::SchemaUi::stats_gen`]. The toolbar's total is read from a slot a
+    /// Refresh clears, so the ask has to re-run when it does.
+    pub(crate) stats_gen: RwSignal<u64>,
     /// Saved connections + the active id, for the identity-colour rule drawn at
     /// the table's top edge (the "prominent colour" setting).
     pub(crate) connections: RwSignal<Vec<Connection>>,
@@ -2397,11 +2401,24 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     // for one — the app no-ops if this database's figures are already in hand or
     // in flight. In an effect rather than inline so the request lands after this
     // build, not during it (the same reason `properties_overlay` fetches from
-    // one); it reads no signal, so it runs exactly once.
+    // one).
+    //
+    // **And again whenever a refresh throws the figures away.** A schema Refresh
+    // resets every `ConnNode::stats` to `Idle`; the memo below is live on that
+    // slot and drops the total the moment it happens, so an ask that ran only at
+    // build time meant `of ~2.84m` vanished from an unchanged on-screen result and
+    // never came back — unless the opt-in size column happened to be on *and* that
+    // database expanded, which is the tree's own refetch, not this one. Tracking
+    // `stats_gen` is what makes the two halves symmetric; a repeated ask is free
+    // (the slot is the guard).
     if let Some((database, ..)) = scanned.clone() {
         let ask = gctx.db_stats.clone();
         let conn_id = gctx.conn_id;
-        create_effect(move |_| (ask)(conn_id.get_untracked(), database.clone()));
+        let stats_gen = gctx.stats_gen;
+        create_effect(move |_| {
+            stats_gen.track();
+            (ask)(conn_id.get_untracked(), database.clone());
+        });
     }
     // Reactive, so the figure appears when that fetch lands. The node lookup is
     // tracked too (unlike `crate::db_stats_slot`'s): a connection-wide refresh
@@ -2755,6 +2772,15 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                     .border_color(theme::border())
             });
             gs.focus_id.set(Some(data_body.id()));
+            // **And this is where the keyboard goes when a control disappears while
+            // focused with no modal open** — the toolbar's ✓/✗ pressed from the
+            // keyboard being the case that lost it (see
+            // `widgets::set_keyboard_home`). Registered here rather than beside the
+            // toolbar because `focus_id` is what `refocus_grid` uses and this is
+            // where it is set: the arrows, `Del`, `Ctrl+Enter` and `F6` are all
+            // listeners on this body, so it is the only place the grid's keyboard
+            // actually lives.
+            crate::widgets::set_keyboard_home(Some(std::rc::Rc::new(move || refocus_grid(gs))));
 
             let body = h_stack((frozen_body, data_body)).style(|s| {
                 s.flex_row()
@@ -3102,7 +3128,11 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
 /// past the current event so the text_input's disposal (which would otherwise
 /// grab focus back) doesn't leave the grid unable to receive arrow/Enter keys.
 fn refocus_grid(gs: GridState) {
-    if let Some(f) = gs.focus_id.get_untracked() {
+    // `try_get_untracked`: this is also the workspace's registered keyboard home
+    // (`widgets::set_keyboard_home`), which outlives the grid that registered it —
+    // a tab switch disposes the grid's scope, and a read of a freed signal is not a
+    // question with an answer. A disposed grid answers `None` and nothing moves.
+    if let Some(Some(f)) = gs.focus_id.try_get_untracked() {
         floem::action::exec_after(std::time::Duration::from_millis(0), move |_| {
             f.request_focus();
         });

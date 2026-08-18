@@ -41,6 +41,37 @@ use crate::{icons, theme};
 thread_local! {
     static FOCUS_ROOTS: std::cell::RefCell<Vec<(floem::ViewId, Option<FocusRing>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Where the keyboard goes when a focused control disappears and there is **no
+    /// overlay above it** — see [`set_keyboard_home`].
+    static KEYBOARD_HOME: std::cell::RefCell<Option<Rc<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Register the workspace's own "the keyboard lives here" action, for the case
+/// [`innermost_focus_root`] cannot answer: a control removed while focused with no
+/// modal open.
+///
+/// **The workspace is not a focus root, and making it one would not help.** A
+/// modal's root carries the key handlers for its own contents, so handing focus
+/// there restores the whole overlay's keyboard; the workspace's root carries
+/// almost none — the arrows, `Del`, `Ctrl+Enter`, `Ctrl+F` and `F6` are all
+/// listeners on the results grid's body. So the fallback has to name a *place*
+/// rather than an ancestor, and the place is whatever the grid currently focuses
+/// with (`refocus_grid`).
+///
+/// Without it, pressing the results toolbar's ✓ or ✗ **from the keyboard** left
+/// nothing focused at all: the press removes the control that was pressed (the
+/// commit block's `dyn_container` key changes), floem clears `app_state.focus`
+/// silently when a focused view is removed, and the cleanup's
+/// `hand_keyboard_back` had nowhere to hand to — from there the grid answered no
+/// key, including the `F6` that would have got back into the strip, until the user
+/// clicked a cell.
+///
+/// A closure rather than a `ViewId` because the answer has to be current at the
+/// moment it is used: a grid rebuilds on every result, and a stored id from a
+/// previous build names a view that no longer exists.
+pub(crate) fn set_keyboard_home(home: Option<Rc<dyn Fn()>>) {
+    KEYBOARD_HOME.with_borrow_mut(|h| *h = home);
 }
 
 /// Mark `view` as the overlay that owns the keyboard while it is mounted: it
@@ -98,6 +129,15 @@ pub(crate) fn hand_keyboard_back(ring: Option<(&FocusRing, floem::ViewId)>) {
     }
     if let Some(r) = innermost_focus_root() {
         r.request_focus();
+        return;
+    }
+    // No overlay above: the workspace's own home, if it has registered one. This
+    // is the half that used to be missing — see [`set_keyboard_home`] — and it is
+    // why every site that hands the keyboard back can now do so without knowing
+    // whether it is inside a modal.
+    let home = KEYBOARD_HOME.with_borrow(|h| h.clone());
+    if let Some(home) = home {
+        home();
     }
 }
 
@@ -1657,9 +1697,12 @@ thread_local! {
 ///   matters. Floem delivers a key to the focused view and then to the root's
 ///   listeners **only if nothing consumed it**, and Tab is precisely the key the
 ///   ring consumes.
-/// - The pointer half has no such problem: the root sees every press
-///   (`lib.rs`'s catch-all `PointerDown`), which is also where
-///   [`pointer_released`] is driven from.
+/// - The pointer half is nearly as awkward and in the opposite direction: the
+///   root's catch-all `PointerDown` (`lib.rs`) sees every press **nothing else
+///   consumed**, which is why this function exists at all — a trigger that stops
+///   the press has to repay the clear itself. Five sites keep a bare `|_| {}` on
+///   purpose (the menu panel, the tree's two menu bodies, the column popover, the
+///   run menu), so the flag survives a click inside an open menu.
 ///
 /// Deliberately *not* touched by [`FocusRing::focus_at`] or
 /// [`hand_keyboard_back`]. Both move focus on behalf of something the user may
@@ -4047,6 +4090,90 @@ mod ring_tests {
     #[should_panic(expected = "must stay last")]
     fn a_tabindex_past_the_title_close_is_refused() {
         FocusRing::new().register(TITLE_CLOSE_TAB + 1, floem::ViewId::new());
+    }
+
+    /// **`FocusVisible` is applied after `Focus`, so the narrower of the two
+    /// wins.** Floem gates the second on `app_state.keyboard_navigation`, which
+    /// latches globally the first time its own Tab traversal runs anywhere in the
+    /// window — one Tab in the workspace does it, and nothing but a pointer press
+    /// resets it. A ring member that sets only `.focus` and suppresses
+    /// `.focus_visible` (which every control here must, to answer floem's own 3px
+    /// magenta default) therefore shows **no focus indication at all** from that
+    /// moment on. That is what happened to the Settings switch.
+    ///
+    /// Asserted over both ring builders, as the composed `Style` floem would
+    /// resolve: the outline under `[Focus, FocusVisible]` may never be narrower
+    /// than the one under `[Focus]`.
+    #[test]
+    fn a_rings_focus_visible_outline_is_never_narrower_than_its_focus_one() {
+        use floem::style::{Outline, Style, StyleSelector};
+        // The ring is gated on the app's own flag, so the question only exists
+        // when it is set.
+        keyboard_nav().set(true);
+        let width = |s: Style, sel: &[StyleSelector]| {
+            let px = s.apply_selectors(sel).get(Outline);
+            // `PxPct` — a ring is always in px.
+            format!("{px:?}")
+        };
+        for (what, s) in [
+            (
+                "button_focus_ring",
+                button_focus_ring(Style::new(), ACTION_RADIUS),
+            ),
+            (
+                "themed_toggle",
+                crate::settings::toggle_focus_ring(
+                    Style::new().focus_visible(|s| s.outline(0.0)),
+                    theme::accent(),
+                ),
+            ),
+        ] {
+            let focus = width(s.clone(), &[StyleSelector::Focus]);
+            let visible = width(s, &[StyleSelector::Focus, StyleSelector::FocusVisible]);
+            assert_eq!(
+                focus, visible,
+                "{what}: the ring must survive floem's FocusVisible pass"
+            );
+            assert_ne!(
+                focus,
+                format!("{:?}", floem::unit::PxPct::Px(0.0)),
+                "{what}"
+            );
+        }
+    }
+
+    /// **The half that was missing: with no overlay open, there was nowhere to
+    /// hand the keyboard to.** A control removed while focused — the results
+    /// toolbar's ✓/✗ pressed from the keyboard removes itself — left
+    /// `app_state.focus` at `None` and the grid answering no key at all, including
+    /// the `F6` that would have got back into the strip.
+    ///
+    /// The ring half is asserted beside it: the tabindex has to survive the
+    /// control's removal, or the next Tab restarts at the top of the strip instead
+    /// of resuming beside where the control was.
+    #[test]
+    fn handing_the_keyboard_back_falls_back_to_the_workspaces_home() {
+        let ring = FocusRing::new();
+        let leaving = floem::ViewId::new();
+        ring.register(ACTION_TAB + 20, leaving);
+
+        let called = Rc::new(std::cell::Cell::new(0u32));
+        let n = called.clone();
+        set_keyboard_home(Some(Rc::new(move || n.set(n.get() + 1))));
+        // No `focus_root` is registered — which is the workspace, every time.
+        assert_eq!(innermost_focus_root(), None, "the premise");
+
+        hand_keyboard_back(Some((&ring, leaving)));
+        assert_eq!(called.get(), 1, "the workspace's home was asked");
+        // And the walk resumes beside the control that left, by tabindex — the id
+        // itself no longer resolves.
+        assert_eq!(ring.last.get(), Some(ACTION_TAB + 20));
+
+        // Registering nothing is the honest empty state: no home, no panic, no
+        // focus moved.
+        set_keyboard_home(None);
+        hand_keyboard_back(None);
+        assert_eq!(called.get(), 1);
     }
 
     /// **Every index the app really registers must go in without complaint**,

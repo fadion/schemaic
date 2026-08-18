@@ -2609,6 +2609,7 @@ impl ChangeSet {
                     IndexReplay::Emit | IndexReplay::Verbatim(_) | IndexReplay::Skip => None,
                 })
                 .chain(rebuild_strands_a_trigger(&r.current, &r.draft))
+                .chain(rebuild_cannot_restate(&r.current))
                 .collect();
         }
         let mut out: Vec<String> = self
@@ -3878,6 +3879,33 @@ fn pg_column_clauses(from: &ColumnInfo, to: &ColumnInfo, d: SqlDialect) -> Vec<S
     out
 }
 
+/// The column a SQLite `CREATE TABLE` writes the primary key **on**, rather than
+/// as a table constraint of its own — the rowid alias, and the only shape the
+/// engine has for `AUTOINCREMENT`.
+///
+/// Shared with [`sqlite_rebuild_sql`], which needs the same answer to know
+/// whether the table it is rebuilding has a `sqlite_sequence` counter to carry.
+fn sqlite_inline_key(d: &TableDraft) -> Option<&str> {
+    match d.primary_key.as_slice() {
+        [only] => d
+            .columns
+            .iter()
+            .find(|c| &c.info.name == only && c.info.auto_increment)
+            .map(|c| c.info.name.as_str()),
+        _ => None,
+    }
+}
+
+/// Does this draft declare the `AUTOINCREMENT` keyword — the promise that an id
+/// is never reused, as opposed to merely being assigned by the engine?
+fn declares_sqlite_autoincrement(d: &TableDraft) -> bool {
+    sqlite_inline_key(d).is_some_and(|k| {
+        d.columns
+            .iter()
+            .any(|c| c.info.name == k && c.info.sqlite_autoincrement)
+    })
+}
+
 /// `CREATE TABLE` (plus, on PostgreSQL, the statements its `CREATE TABLE` can't
 /// carry: indexes and comments).
 fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
@@ -3901,14 +3929,7 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
     // put `AUTOINCREMENT` on every plain key a rebuild touched — a change to the
     // table's semantics the user never asked for. `sqlite_autoincrement` is the
     // flag that really answers it.
-    let inline_key: Option<&str> = match d.primary_key.as_slice() {
-        [only] if sqlite => d
-            .columns
-            .iter()
-            .find(|c| &c.info.name == only && c.info.auto_increment)
-            .map(|c| c.info.name.as_str()),
-        _ => None,
-    };
+    let inline_key: Option<&str> = if sqlite { sqlite_inline_key(d) } else { None };
     let mut lines: Vec<String> = d
         .columns
         .iter()
@@ -5377,6 +5398,131 @@ fn rebuild_strands_a_trigger(current: &TableInfo, draft: &TableDraft) -> Option<
     ))
 }
 
+/// The refusal for a rebuild of a table whose declaration says more than this
+/// model can, or empty when the model can restate all of it.
+///
+/// **What introspection doesn't model, the rebuild deletes.** The plan is
+/// copy-drop-rename and the new table is written from the draft, so a clause with
+/// no field to hold it is gone the moment the plan succeeds — and because the
+/// draft is built from the same incomplete model, [`diff`] reads the untouched
+/// draft as a no-op and no round-trip check can see the loss either. Each of the
+/// three below was measured deleted on 3.46.0 by a plan that reported success,
+/// and each changes what the table *does*: a deferred foreign key starts refusing
+/// the mid-transaction insert it exists to allow, a conflict clause turns a
+/// quietly replaced row into an aborted statement, and a descending key column
+/// comes back ascending — which on a lone `INTEGER PRIMARY KEY` is the difference
+/// between the rowid itself and a table with a separate index.
+///
+/// Refusing is the honest half of the pair: the alternative is three model
+/// additions, and until they exist the preview says which clause it cannot write
+/// rather than writing a table that merely looks like the one that was there.
+fn rebuild_cannot_restate(current: &TableInfo) -> Option<String> {
+    let missing = unrestatable_sqlite_clauses(current.create_sql.as_deref()?);
+    let (last, rest) = missing.split_last()?;
+    let named = if rest.is_empty() {
+        (*last).to_string()
+    } else {
+        format!("{} and {last}", rest.join(", "))
+    };
+    Some(format!(
+        "This table's declaration carries {named}, which Schemaic's model has no \
+         field for. A rebuild writes the table back from that model, so the clause \
+         would be gone from a table that still looked right — and every write \
+         depending on it would behave differently from then on. Change this table \
+         with a script instead (Copy DDL is the start of one), or take the clause \
+         off first."
+    ))
+}
+
+/// Every clause in a SQLite table's own `CREATE` text that the model has no field
+/// for, named as a message wants them and never twice.
+///
+/// Read through the shared boundary lexer, and only within the table body: the
+/// text handed in is [`TableInfo::create_sql`], which ends with the table's
+/// `CREATE INDEX` statements, and an index key's direction **is** modelled
+/// ([`crate::schema::IndexColumn::descending`]). `DESC` is therefore the key's
+/// only when the item declaring it is a primary key; `ASC` is the default and
+/// loses nothing.
+fn unrestatable_sqlite_clauses(create_sql: &str) -> Vec<&'static str> {
+    use crate::sql::{is_word_byte, is_word_start, skip_noncode};
+    let d = SqlDialect::Sqlite;
+    let b = create_sql.as_bytes();
+    let mut out: Vec<&'static str> = Vec::new();
+    let mut add = |what: &'static str| {
+        if !out.contains(&what) {
+            out.push(what);
+        }
+    };
+
+    // Into the table body. Everything before its `(` is the header, where a
+    // quoted table name could otherwise read as content.
+    let mut i = 0usize;
+    let body = loop {
+        if i >= b.len() {
+            return out;
+        }
+        if let Some(j) = skip_noncode(b, i, d) {
+            i = j.max(i + 1);
+            continue;
+        }
+        if b[i] == b'(' {
+            break i + 1;
+        }
+        i += 1;
+    };
+
+    let mut i = body;
+    let mut depth = 1i32;
+    // Whether the item being read is a primary key — reset at each top-level
+    // comma, so a `DESC` cannot borrow the key from the item before it.
+    let mut item_is_key = false;
+    while i < b.len() && depth > 0 {
+        if let Some(j) = skip_noncode(b, i, d) {
+            i = j.max(i + 1);
+            continue;
+        }
+        match b[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+                continue;
+            }
+            b',' if depth == 1 => {
+                item_is_key = false;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if !is_word_start(b[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i + 1;
+        while end < b.len() && is_word_byte(b[end]) {
+            end += 1;
+        }
+        let word = &create_sql[start..end];
+        if word.eq_ignore_ascii_case("PRIMARY") {
+            item_is_key = true;
+        } else if word.eq_ignore_ascii_case("DEFERRABLE") {
+            add("a foreign key's DEFERRABLE clause");
+        } else if word.eq_ignore_ascii_case("CONFLICT") {
+            add("an ON CONFLICT clause");
+        } else if word.eq_ignore_ascii_case("DESC") && item_is_key {
+            add("a DESC primary-key column");
+        }
+        i = end;
+    }
+    out
+}
+
 /// The first column this plan renames or drops, named the way a message wants
 /// it — or `None` when every column of `current` is still there under its own
 /// name.
@@ -5513,6 +5659,43 @@ pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
             "INSERT INTO {shadow} ({}) SELECT {} FROM {original};",
             into.join(", "),
             from.join(", ")
+        ));
+    }
+
+    // **`AUTOINCREMENT` promises an id is never reused, and the counter that
+    // keeps that promise is a row in `sqlite_sequence`.** `DROP TABLE` takes the
+    // row with it, and the copy above re-seeded the shadow table's from the rows
+    // that *survived* — so a table whose highest rows were deleted comes back
+    // handing those ids out a second time, which is precisely what the keyword
+    // was chosen to prevent. `seq` is the highest id ever issued; `max(id)` is
+    // only the highest still there.
+    //
+    // It has to happen here, before the drop: after it the original's row is
+    // gone and there is nothing left to read. The rename then carries the
+    // shadow's row to the table's own name, as SQLite does for any
+    // `AUTOINCREMENT` table it renames. Both sides are asked — a plan that
+    // *removes* the keyword has no counter to keep, and one that adds it has
+    // none to carry.
+    if current.columns.iter().any(|c| c.sqlite_autoincrement)
+        && declares_sqlite_autoincrement(&build)
+    {
+        let seq = qualified("sqlite_sequence", current.schema.as_deref(), d);
+        // `sqlite_sequence` has no unique index on `name`, so `INSERT OR
+        // REPLACE` would leave two rows for one table rather than replacing
+        // either. The delete is what makes the insert an assignment.
+        out.push(format!(
+            "DELETE FROM {seq} WHERE {} = {};",
+            q("name"),
+            ddl_string(&build.name, d)
+        ));
+        out.push(format!(
+            "INSERT INTO {seq} ({}, {}) SELECT {}, {} FROM {seq} WHERE {} = {};",
+            q("name"),
+            q("seq"),
+            ddl_string(&build.name, d),
+            q("seq"),
+            q("name"),
+            ddl_string(&current.name, d)
         ));
     }
 
@@ -12085,6 +12268,194 @@ mod sqlite_rebuild_tests {
             columns: vec![col("a", "INTEGER"), col("b", "TEXT")],
             ..Default::default()
         }
+    }
+
+    /// The same table with a declaration to read. The clauses the model has no
+    /// field for are recorded **only** in the table's own `CREATE` text, which is
+    /// therefore where the refusal has to look.
+    fn table_declaring(sql: &str) -> TableInfo {
+        TableInfo {
+            create_sql: Some(sql.into()),
+            ..table()
+        }
+    }
+
+    /// What a plan over `t` withholds — a retype, so the plan really is the
+    /// rebuild.
+    fn withheld(t: &TableInfo) -> Vec<String> {
+        let mut d = TableDraft::from_table(t);
+        d.columns[1].info.type_name = "BLOB".into();
+        diff(t, &d, SqlDialect::Sqlite).unsupported()
+    }
+
+    /// **What the model has no field for, the rebuild deletes** — and the plan
+    /// reports success over it. A transaction that legitimately inserts a child
+    /// before its parent starts failing, and nothing said the clause was gone.
+    #[test]
+    fn a_deferrable_foreign_key_is_withheld() {
+        let t = table_declaring(
+            "CREATE TABLE \"t\" (a INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED, b TEXT);",
+        );
+        let w = withheld(&t);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("DEFERRABLE"), "{w:?}");
+    }
+
+    /// A conflict clause changes what a *write* does: rows that were quietly
+    /// replaced start aborting the statement instead.
+    #[test]
+    fn a_conflict_clause_is_withheld() {
+        let t = table_declaring(
+            "CREATE TABLE \"t\" (a TEXT NOT NULL ON CONFLICT REPLACE, b TEXT UNIQUE ON CONFLICT IGNORE);",
+        );
+        let w = withheld(&t);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("ON CONFLICT"), "{w:?}");
+    }
+
+    /// `PRIMARY KEY (a DESC)` comes back as `PRIMARY KEY ("a")`: the draft's key
+    /// is a list of names and has nowhere to put the direction. On a single
+    /// `INTEGER PRIMARY KEY` the same word is the difference between a rowid
+    /// alias and a table with a separate index.
+    #[test]
+    fn a_descending_key_column_is_withheld() {
+        let t = table_declaring("CREATE TABLE \"t\" (a INTEGER, b TEXT, PRIMARY KEY (a DESC));");
+        let w = withheld(&t);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("DESC"), "{w:?}");
+    }
+
+    /// The three words where each is **not** a clause: in a comment, inside a
+    /// string default, and as a quoted column name. The scan is the shared
+    /// boundary lexer's, so none of them is code.
+    #[test]
+    fn an_ordinary_declaration_withholds_nothing() {
+        let t = table_declaring(
+            "CREATE TABLE \"t\" ( -- DEFERRABLE, and ON CONFLICT\n  \
+             a INTEGER DEFAULT 'ON CONFLICT', b TEXT, \"desc\" TEXT, PRIMARY KEY (a));",
+        );
+        assert!(withheld(&t).is_empty(), "{:?}", withheld(&t));
+    }
+
+    /// An **index** key's direction is modelled ([`IndexColumn::descending`]) and
+    /// re-emitted, both as a statement and as a `UNIQUE (…)` line in the table
+    /// body — so a `DESC` there is restated and must not refuse the plan.
+    #[test]
+    fn an_index_direction_is_not_a_refusal() {
+        let t = table_declaring(
+            "CREATE TABLE \"t\" (a INTEGER, b TEXT, UNIQUE (b DESC));\n\
+             CREATE INDEX ix ON t (a DESC);",
+        );
+        assert!(withheld(&t).is_empty(), "{:?}", withheld(&t));
+    }
+
+    /// A table Schemaic never read a declaration for — every non-SQLite engine —
+    /// has nothing to check, and must not be refused for it.
+    #[test]
+    fn no_declaration_means_no_refusal() {
+        let t = table();
+        assert!(t.create_sql.is_none(), "the premise");
+        assert!(withheld(&t).is_empty(), "{:?}", withheld(&t));
+    }
+
+    /// `s (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)` — a table that
+    /// genuinely carries the keyword, as opposed to one a rebuild put it on.
+    fn autoincrement_table() -> TableInfo {
+        TableInfo {
+            name: "s".into(),
+            columns: vec![
+                ColumnInfo {
+                    name: "id".into(),
+                    type_name: "INTEGER".into(),
+                    nullable: false,
+                    primary_key: true,
+                    auto_increment: true,
+                    sqlite_autoincrement: true,
+                    ..Default::default()
+                },
+                col("v", "TEXT"),
+            ],
+            indexes: vec![IndexInfo {
+                name: "PRIMARY".into(),
+                columns: vec![IndexColumn::plain("id")],
+                unique: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// **`AUTOINCREMENT`'s whole promise is that an id is never reused**, and
+    /// the counter keeping it is a `sqlite_sequence` row that goes down with the
+    /// `DROP TABLE`. The copy re-seeds it from the rows that survived, so a
+    /// table whose highest rows were deleted hands those ids out a second time —
+    /// which anything outside the database holding a reference to one will
+    /// mis-resolve. The counter has to be moved to the shadow table while both
+    /// rows still exist.
+    #[test]
+    fn the_rebuild_carries_the_autoincrement_counter() {
+        let t = autoincrement_table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns[1].info.type_name = "BLOB".into();
+        let got = plan(&t, &d);
+        let drop_at = got
+            .iter()
+            .position(|s| s.starts_with("DROP TABLE"))
+            .expect("the rebuild drops the original");
+        let carry: Vec<&String> = got
+            .iter()
+            .filter(|s| s.contains("sqlite_sequence"))
+            .collect();
+        assert_eq!(carry.len(), 2, "{got:#?}");
+        // The seeding the copy left on the shadow table is worth less than the
+        // counter the original kept: `seq` is the highest id ever issued, and
+        // `max(id)` is only the highest that is still there.
+        assert!(carry[0].starts_with("DELETE FROM"), "{got:#?}");
+        assert!(carry[1].starts_with("INSERT INTO"), "{got:#?}");
+        assert!(
+            carry[1].contains("'s'"),
+            "reads the original's row: {got:#?}"
+        );
+        // Both before the drop, because the drop takes the original's row with
+        // it — after the rename there is nothing left to read.
+        for c in &carry {
+            assert!(
+                got.iter().position(|s| s == *c).unwrap() < drop_at,
+                "{got:#?}"
+            );
+        }
+    }
+
+    /// A table with no counter gets no statements about one — writing a
+    /// `sqlite_sequence` row for a table that has no `AUTOINCREMENT` key would
+    /// be junk in the catalogue, and the preview would show two statements that
+    /// do nothing.
+    #[test]
+    fn a_plain_key_gets_no_sequence_statements() {
+        let mut t = autoincrement_table();
+        t.columns[0].sqlite_autoincrement = false;
+        let mut d = TableDraft::from_table(&t);
+        d.columns[1].info.type_name = "BLOB".into();
+        let got = plan(&t, &d);
+        assert!(
+            !got.iter().any(|s| s.contains("sqlite_sequence")),
+            "{got:#?}"
+        );
+    }
+
+    /// An edit that *removes* the keyword removes the counter with it: the new
+    /// table has no `AUTOINCREMENT` key, so a row carried over would describe a
+    /// table that no longer exists in that shape.
+    #[test]
+    fn dropping_the_keyword_drops_the_counter() {
+        let t = autoincrement_table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.sqlite_autoincrement = false;
+        let got = plan(&t, &d);
+        assert!(
+            !got.iter().any(|s| s.contains("sqlite_sequence")),
+            "{got:#?}"
+        );
     }
 
     /// **A keyless table's rows are known by their rowid, so the copy has to

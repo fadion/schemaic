@@ -62,7 +62,7 @@ use rusqlite::{Connection as SqliteConn, OpenFlags};
 use schemaic_core::model::CellTag;
 use schemaic_core::model::{
     Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder,
-    ResultSet, Value, WriteStep, one_row_verdict,
+    ResultSet, Rollback, Value, WriteStep, one_row_verdict,
 };
 use schemaic_core::schema::{
     CheckInfo, ColumnInfo, DbSchema, ForeignKeyInfo, IndexColumn, IndexInfo, TableInfo,
@@ -595,7 +595,13 @@ pub(crate) async fn commit_writes(
             let affected = txn
                 .execute(&sql, rusqlite::params_from_iter(params))
                 .map_err(query_err)? as u64;
-            one_row_verdict(step, affected).map_err(DbError::Query)?;
+            // **The verdict says what the guard saw; the clause says what the
+            // rollback achieved.** `one_row_verdict` is reached before the
+            // rollback runs and so cannot know, which is why the caller appends
+            // the note — and why all three executors share one wording. Always
+            // `Complete` here: SQLite has no non-transactional table type.
+            one_row_verdict(step, affected)
+                .map_err(|m| DbError::Query(format!("{m}{}", Rollback::Complete.note())))?;
             total += affected;
         }
         txn.commit().map_err(query_err)?;
@@ -789,9 +795,15 @@ pub(crate) async fn import_rows(
                 };
                 let affected = conn.execute(&sql, []).map_err(query_err)? as u64;
                 if affected != batch.len() as u64 {
+                    // The clause comes from the shared `Rollback` rather than
+                    // being written here: it used to be inline in each executor,
+                    // with divergent wordings and no test, which is what
+                    // `Rollback::note` exists to stop happening again. Always
+                    // `Complete` — every SQLite table is transactional.
                     return Err(DbError::Query(format!(
-                        "a batch of {} rows affected {affected} — the import was rolled back",
-                        batch.len()
+                        "a batch of {} rows affected {affected}{}",
+                        batch.len(),
+                        Rollback::Complete.note()
                     )));
                 }
                 batch.clear();
@@ -903,6 +915,22 @@ pub(crate) async fn run_ddl(
         // violation the plan *added* refuses it.
         let inherited = fk_violations(&conn).unwrap_or_default();
 
+        // **Step 9 of SQLite's twelve-step procedure, which the plan has no way
+        // to perform.** A view naming a column the rebuild drops or renames is
+        // broken by it — the engine refuses the *native* `DROP COLUMN` for
+        // exactly this, and `legacy_alter_table = ON` (right for the rename, see
+        // `ddl::sqlite_rebuild_sql`) is what stops it noticing here. So the plan
+        // used to report success and the user found out the next time they opened
+        // the view.
+        //
+        // The engine is the authority on what a view resolves to, so this asks
+        // it: preparing `SELECT * FROM <view>` re-parses the definition against
+        // the schema the plan left behind. Read before `BEGIN` as well, and
+        // compared, for the same reason the foreign-key rows are — a `.db` can
+        // arrive with a view over a table that is already gone, and refusing for
+        // that would take DDL away from every other table in the file.
+        let broken_before = broken_views(&conn);
+
         conn.execute_batch("BEGIN")
             .map_err(|e| fail(0, format!("{e}")))?;
 
@@ -930,6 +958,16 @@ pub(crate) async fn run_ddl(
                     format!("the plan leaves a foreign key pointing at nothing: {row}"),
                 ));
             }
+            if let Some((view, why)) = first_newly_broken_view(&conn, &broken_before) {
+                return Err(fail(
+                    last,
+                    format!(
+                        "the plan would break the view {view}, which reads a column it \
+                         renames or drops ({why}). Nothing was changed. Edit or drop the \
+                         view first."
+                    ),
+                ));
+            }
             Ok(())
         })();
 
@@ -951,6 +989,54 @@ pub(crate) async fn run_ddl(
             }
         }
     })
+}
+
+/// Every view in the database that does not currently resolve, by name.
+///
+/// Asked by *preparing* `SELECT * FROM <view>`: SQLite re-parses the stored
+/// definition against the live schema at prepare time, which is the only complete
+/// answer to "does this view still work" — the definition text alone would need
+/// the whole resolver to interpret, and `PRAGMA integrity_check` does not look at
+/// views at all. Nothing is executed, so the cost is a parse per view and no rows
+/// are read.
+///
+/// Errors are the answer rather than a failure: a view that cannot be prepared is
+/// precisely what this is looking for. A catalogue read that fails altogether
+/// gives an empty set, which makes the comparison in [`run_ddl`] permissive rather
+/// than refusing a plan on the strength of a question that couldn't be asked.
+fn broken_views(conn: &SqliteConn) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Ok(mut stmt) = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'view'") else {
+        return out;
+    };
+    let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
+        return out;
+    };
+    for name in rows.flatten() {
+        if let Err(e) = conn.prepare(&format!("SELECT * FROM {}", ident_sqlite(&name))) {
+            out.insert(name, e.to_string());
+        }
+    }
+    out
+}
+
+/// The first view the plan broke — one that resolves no longer and did resolve
+/// before — with the engine's own reason.
+///
+/// `None` when every view that fails now was already failing, which is the
+/// inherited case: see [`run_ddl`].
+fn first_newly_broken_view(
+    conn: &SqliteConn,
+    before: &HashMap<String, String>,
+) -> Option<(String, String)> {
+    let mut now: Vec<(String, String)> = broken_views(conn)
+        .into_iter()
+        .filter(|(name, _)| !before.contains_key(name))
+        .collect();
+    // Sorted so a plan that breaks several names the same one every time — a
+    // `HashMap`'s order would make the message drift between identical runs.
+    now.sort();
+    now.into_iter().next()
 }
 
 /// Every dangling foreign-key row in the database, as identities that can be
@@ -1221,14 +1307,32 @@ pub(crate) async fn fetch_table_list(db: &Db) -> Result<DbSchema, DbError> {
 /// per-table statistics to fetch — see
 /// [`schemaic_core::stats::supports_table_stats`] — so the exact count is not a
 /// fallback here, it is the only figure there is.
-pub(crate) async fn count_rows(db: &Db, sql: &str) -> Result<u64, DbError> {
+pub(crate) async fn count_rows(
+    db: &Db,
+    sql: &str,
+    cancel: CancellationToken,
+) -> Result<u64, DbError> {
     let sql = sql.to_string();
-    with_conn(db, move |conn| {
+    let db = db.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // Not `with_conn`: a full scan has to be interruptible, and the handle has to
+    // reach the async side before the scan starts — the same shape `fetch_query`
+    // uses, and the reason `count_rows` takes a token at all.
+    let work = tokio::task::spawn_blocking(move || {
+        let conn = open(&db)?;
+        let _ = tx.send(conn.get_interrupt_handle());
         conn.query_row(&sql, [], |r| r.get::<_, i64>(0))
             .map(|n| n.max(0) as u64)
             .map_err(query_err)
-    })
-    .await
+    });
+    let interrupt = rx.await.ok();
+    tokio::select! {
+        r = work => r.map_err(|e| DbError::Query(format!("worker failed: {e}")))?,
+        _ = cancel.cancelled() => {
+            if let Some(h) = interrupt { h.interrupt(); }
+            Err(DbError::Cancelled)
+        }
+    }
 }
 
 /// Names and kinds from `sqlite_master`, tables before views, each alphabetically.
@@ -3095,8 +3199,48 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(db.count_rows(MAIN, None, "t").await.unwrap(), 3);
-        assert_eq!(db.count_rows(MAIN, None, "empty_one").await.unwrap(), 0);
+        assert_eq!(
+            db.count_rows(MAIN, None, "t", CancellationToken::new())
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            db.count_rows(MAIN, None, "empty_one", CancellationToken::new())
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// **A count that was cancelled reports as cancelled**, rather than the caller
+    /// abandoning an answer while the scan runs on. A token cancelled before the
+    /// call is the deterministic half of that: the interrupt handle reaches the
+    /// async side before the query starts, so this is the same path a mid-scan
+    /// Cancel takes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_count_stops_instead_of_answering() {
+        let (keeper, db) = shared_memory("count_rows_cancel");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY);
+                 INSERT INTO t VALUES (1), (2), (3);",
+            )
+            .unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        let err = db
+            .count_rows(MAIN, None, "t", token)
+            .await
+            .expect_err("a cancelled count must not report a figure");
+        assert!(matches!(err, DbError::Cancelled), "{err}");
+        // And the connection is not left behind: the next count answers normally.
+        assert_eq!(
+            db.count_rows(MAIN, None, "t", CancellationToken::new())
+                .await
+                .unwrap(),
+            3
+        );
     }
 
     /// The name goes through the one quoter, so a table named after a keyword —
@@ -3114,8 +3258,18 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(db.count_rows(MAIN, None, "order").await.unwrap(), 2);
-        assert_eq!(db.count_rows(MAIN, None, "we\"ird").await.unwrap(), 1);
+        assert_eq!(
+            db.count_rows(MAIN, None, "order", CancellationToken::new())
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.count_rows(MAIN, None, "we\"ird", CancellationToken::new())
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     /// SQLite publishes no per-table statistics, and the fetch says so by
@@ -3425,6 +3579,15 @@ mod tests {
         assert!(
             format!("{err}").contains("affected 0 rows"),
             "the message names what the guard saw: {err}"
+        );
+        // **And that the other edits went with it.** The verdict is reached
+        // before the rollback runs and so can't know what it achieved; the
+        // caller appends the clause once it does, in the wording all three
+        // executors share. Without it a user reads "one statement failed" and
+        // has the wrong model of what is in their table.
+        assert!(
+            format!("{err}").contains(schemaic_core::model::Rollback::Complete.note()),
+            "the message must say the batch was rolled back: {err}"
         );
 
         // The *first* update must be gone too — SQLite has no non-transactional
@@ -5253,6 +5416,128 @@ mod rebuild_fidelity_tests {
             2
         );
     }
+
+    /// **`AUTOINCREMENT`'s promise is that an id is never reused**, and the only
+    /// thing keeping it is a `sqlite_sequence` row that `DROP TABLE` takes with
+    /// it. The copy re-seeds the counter from the rows that survived, so a table
+    /// whose highest row was deleted hands that id out a second time — and
+    /// anything outside the database still holding a reference to it now resolves
+    /// to a different row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rebuild_keeps_the_autoincrement_counter() {
+        let (keeper, db) = shared_memory("fid_seq");
+        keeper
+            .execute_batch(
+                "CREATE TABLE s (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT, n INTEGER);
+                 INSERT INTO s (v, n) VALUES ('a', 1), ('b', 2), ('c', 3);
+                 DELETE FROM s WHERE id = 3;",
+            )
+            .unwrap();
+        let seq = |k: &rusqlite::Connection| {
+            k.query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 's'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(seq(&keeper), 3, "the premise: id 3 has been issued");
+
+        let before = table_of(&db, "s").await;
+        let mut draft = TableDraft::from_table(&before);
+        retype_last(&mut draft);
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e} — plan {:#?}", cs.emit()));
+
+        assert_eq!(seq(&keeper), 3, "the counter came across the rename");
+        keeper
+            .execute_batch("INSERT INTO s (v, n) VALUES ('d', 4)")
+            .unwrap();
+        assert_eq!(
+            keeper
+                .query_row("SELECT id FROM s WHERE v = 'd'", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            4,
+            "id 3 must never be issued twice"
+        );
+    }
+
+    /// **Three clauses the model has no field for, all measured deleted by a
+    /// plan that reported success.** The round-trip gate cannot see any of them —
+    /// the draft is built from the same incomplete model, so `diff` reads the
+    /// untouched draft as a no-op — which is why this asks the preview instead of
+    /// the declaration.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clauses_the_model_cannot_restate_are_withheld() {
+        let (keeper, db) = shared_memory("fid_unrestatable");
+        keeper
+            .execute_batch(
+                "CREATE TABLE p (id INTEGER PRIMARY KEY, n INTEGER);
+                 CREATE TABLE c (id INTEGER PRIMARY KEY,
+                                 pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED,
+                                 n INTEGER);
+                 CREATE TABLE q (a TEXT NOT NULL ON CONFLICT REPLACE DEFAULT 'z', n INTEGER);
+                 CREATE TABLE k (a TEXT, n INTEGER, PRIMARY KEY (a DESC));",
+            )
+            .unwrap();
+        for (table, clause) in [("c", "DEFERRABLE"), ("q", "ON CONFLICT"), ("k", "DESC")] {
+            let before = table_of(&db, table).await;
+            let mut draft = TableDraft::from_table(&before);
+            retype_last(&mut draft);
+            let cs = diff(&before, &draft, SqlDialect::Sqlite);
+            assert!(!cs.is_empty(), "{table}: the premise is a real plan");
+            let w = cs.unsupported();
+            assert_eq!(w.len(), 1, "{table}: {w:?}");
+            assert!(w[0].contains(clause), "{table}: {w:?}");
+            // And the omission travels with the copied script, which is not
+            // disabled the way Apply is.
+            assert!(cs.script().contains("INCOMPLETE"), "{table}");
+        }
+        // The gate is narrow: an ordinary table beside them is still editable.
+        let before = table_of(&db, "p").await;
+        let mut draft = TableDraft::from_table(&before);
+        retype_last(&mut draft);
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e} — plan {:#?}", cs.emit()));
+    }
+
+    /// The other side of it: a table with no counter must not come back with a
+    /// `sqlite_sequence` row, which would be a fact about the table that isn't
+    /// true.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rebuild_invents_no_counter() {
+        let (keeper, db) = shared_memory("fid_seq_none");
+        keeper
+            .execute_batch(
+                "CREATE TABLE p (id INTEGER PRIMARY KEY, v TEXT, n INTEGER);
+                 INSERT INTO p (v, n) VALUES ('a', 1);",
+            )
+            .unwrap();
+        let before = table_of(&db, "p").await;
+        let mut draft = TableDraft::from_table(&before);
+        retype_last(&mut draft);
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e} — plan {:#?}", cs.emit()));
+        assert_eq!(
+            keeper
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_sequence'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0,
+            "no AUTOINCREMENT anywhere, so the table should not exist at all"
+        );
+    }
 }
 
 /// A rebuild happens under objects that reference the table. These are the ones
@@ -5303,6 +5588,119 @@ mod rebuild_bystander_tests {
             .query_row("SELECT count(*) FROM big", [], |r| r.get(0))
             .unwrap();
         assert_eq!(seen, 1, "and the view still resolves afterwards");
+    }
+
+    /// **Step 9 of SQLite's own procedure, and the engine's answer beside it.** A
+    /// native `ALTER TABLE … DROP COLUMN` is *refused* while a view names the
+    /// column; the rebuild runs under `legacy_alter_table = ON` — right for the
+    /// rename, and what removes the last check — so the same edit reported
+    /// success and left `SELECT * FROM v` failing `no such column: doomed`, with
+    /// nothing said until the user next opened the view.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rebuild_that_breaks_a_view_is_refused_and_rolled_back() {
+        let (keeper, db) = shared_memory("rebuild_view_drop");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, keepme TEXT, doomed TEXT);
+                 CREATE VIEW v AS SELECT id, doomed FROM t;
+                 INSERT INTO t VALUES (1, 'a', 'b');",
+            )
+            .unwrap();
+        let before = table_of(&db, "t").await;
+        let mut draft = TableDraft::from_table(&before);
+        // A drop *and* a retype, so the plan is the rebuild rather than SQLite's
+        // own `DROP COLUMN` — which the engine would refuse for us.
+        draft.remove_column(2);
+        draft.columns[1].info.type_name = "BLOB".into();
+
+        let err = db
+            .run_ddl(
+                MAIN,
+                &sqlite_rebuild_sql(&before, &draft),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a plan that breaks a view must not commit");
+        assert!(format!("{err}").contains("v"), "names the view: {err}");
+        assert_eq!(err.applied, 0, "{err}");
+
+        // Rolled back whole: the column is still there and the view still reads.
+        assert_eq!(
+            keeper
+                .query_row("SELECT count(*) FROM v", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "the view must still resolve"
+        );
+    }
+
+    /// The gate is about the columns a view actually names: a view over the same
+    /// table that doesn't touch the dropped column is not affected, and the edit
+    /// goes through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_view_that_names_no_dropped_column_is_no_obstacle() {
+        let (keeper, db) = shared_memory("rebuild_view_ok");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, keepme TEXT, doomed TEXT);
+                 CREATE VIEW v AS SELECT id, keepme FROM t;
+                 INSERT INTO t VALUES (1, 'a', 'b');",
+            )
+            .unwrap();
+        let before = table_of(&db, "t").await;
+        let mut draft = TableDraft::from_table(&before);
+        draft.remove_column(2);
+        draft.columns[1].info.type_name = "BLOB".into();
+        db.run_ddl(
+            MAIN,
+            &sqlite_rebuild_sql(&before, &draft),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("nothing the view names has moved");
+        assert_eq!(
+            keeper
+                .query_row("SELECT count(*) FROM v", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    /// **What was already broken is not the plan's fault** — the same rule the
+    /// inherited-foreign-key reading follows. A `.db` can carry a view over a
+    /// table that no longer exists, and refusing for it would take the DDL
+    /// feature away from every other table in the file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_view_that_was_already_broken_does_not_refuse_the_plan() {
+        let (keeper, db) = shared_memory("rebuild_view_inherited");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER);
+                 INSERT INTO t VALUES (1, 1);",
+            )
+            .unwrap();
+        let before = table_of(&db, "t").await;
+        // Created after the read, because a view over a missing table is enough
+        // to fail `fetch_schema` itself — a separate matter from what the plan
+        // is allowed to commit.
+        keeper
+            .execute_batch("CREATE VIEW gone AS SELECT * FROM no_such_table;")
+            .unwrap();
+        assert!(
+            keeper
+                .query_row("SELECT 1 FROM gone", [], |r| r.get::<_, i64>(0))
+                .is_err(),
+            "the premise: the view is broken before the plan runs"
+        );
+        let mut draft = TableDraft::from_table(&before);
+        draft.columns[1].info.type_name = "TEXT".into();
+        db.run_ddl(
+            MAIN,
+            &sqlite_rebuild_sql(&before, &draft),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("an unrelated broken view must not refuse the edit");
     }
 }
 

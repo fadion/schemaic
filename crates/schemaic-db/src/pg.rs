@@ -686,11 +686,23 @@ fn table_stats_sql() -> String {
 /// Per-index size and scan count. The primary key's index is renamed `PRIMARY`
 /// exactly as [`index_list_sql`] does it, so the properties surface and the
 /// designer name the same index the same way.
+///
+/// **The size carries [`table_stats_sql`]'s partitioned guard, in the index's own
+/// spelling.** A partitioned index (`relkind = 'I'`) is a parent with no storage,
+/// exactly as a partitioned table (`'p'`) is: `pg_relation_size` on one returns a
+/// truthful `0` that the panel renders as `0 B` — and *Copy* exports — for an
+/// index spread over 40 GB of partitions. Null instead, which prints as `—`.
+///
+/// The scan half needs no guard and must not grow one: `pg_stat_all_indexes` is
+/// defined over `relkind IN ('r','t','m')`, so a partitioned index has no row
+/// there, `idx_scan` is NULL, and `scans: None` is the truth — "nobody counted",
+/// which is what stops [`IndexStats::is_unused`] flagging it.
 fn index_stats_sql() -> String {
     format!(
         "SELECT n.nspname, c.relname, \
                 CASE WHEN ix.indisprimary THEN 'PRIMARY' ELSE ic.relname END, \
-                pg_relation_size(ic.oid), si.idx_scan, \
+                CASE WHEN ic.relkind = 'I' THEN NULL ELSE pg_relation_size(ic.oid) END, \
+                si.idx_scan, \
                 ix.indisprimary, ix.indisunique \
          FROM pg_index ix \
          JOIN pg_class c ON c.oid = ix.indrelid \
@@ -766,15 +778,28 @@ pub(crate) async fn fetch_table_stats(db: &Db, database: &str) -> Result<SchemaS
             }
         })
         .collect();
-    Ok(SchemaStats { tables })
+    Ok(SchemaStats::new(tables))
 }
 
 /// The PostgreSQL half of [`Db::count_rows`].
-pub(crate) async fn count_rows(db: &Db, database: &str, sql: &str) -> Result<u64, DbError> {
+pub(crate) async fn count_rows(
+    db: &Db,
+    database: &str,
+    sql: &str,
+    cancel: CancellationToken,
+) -> Result<u64, DbError> {
     let client = connect_to(db, database).await?;
-    query_all(&client, sql)
-        .await?
-        .first()
+    // A full scan on a large table, so the token is what stops it *on the server*
+    // rather than only abandoning the answer — see `Db::count_rows`.
+    let token = client.cancel_token();
+    let rows = tokio::select! {
+        r = query_all(&client, sql) => r?,
+        _ = cancel.cancelled() => {
+            let _ = token.cancel_query(NoTls).await;
+            return Err(DbError::Cancelled);
+        }
+    };
+    rows.first()
         .and_then(|r| opt(r, 0))
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| DbError::Query("COUNT(*) returned no row".into()))
@@ -2952,6 +2977,80 @@ mod tests {
         assert!(!f.contains("topology"));
         // The alias is spliced everywhere, so the five queries can't diverge.
         assert_eq!(f.matches("n.nspname").count(), 4);
+    }
+
+    // ── The statistics queries ────────────────────────────────────────────
+    //
+    // The per-engine half of the properties panel is these two strings: which
+    // relkinds get a size, what a negative `reltuples` means, what the primary
+    // key's index is called. Each has a wrong answer that produces a
+    // plausible-looking panel rather than an error, and the divergence this
+    // convention exists to catch is the one that shipped — a guard present in one
+    // builder and absent from its sibling.
+
+    /// A partitioned parent has no storage of its own, so it is listed with null
+    /// sizes rather than a truthful `0` that reads as "this 40 GB table is empty".
+    #[test]
+    fn the_table_stats_query_nulls_a_partitioned_parents_sizes() {
+        let q = table_stats_sql();
+        assert!(
+            q.contains("CASE WHEN c.relkind = 'p' THEN NULL ELSE pg_table_size(c.oid) END"),
+            "{q}"
+        );
+        assert!(
+            q.contains("CASE WHEN c.relkind = 'p' THEN NULL ELSE pg_indexes_size(c.oid) END"),
+            "both sizes, or the split disagrees with the total: {q}"
+        );
+        // `reltuples` is -1 on a relation that has never been analyzed. Passed
+        // through it would say "0 rows" about a full table.
+        assert!(q.contains("CASE WHEN c.reltuples < 0 THEN NULL"), "{q}");
+        // Sized relkinds only, and the partitioned parent listed among them so it
+        // still gets its row estimate.
+        assert!(q.contains("c.relkind IN ('r','m','p')"), "{q}");
+    }
+
+    /// **The sibling guard, in the index's own spelling.** A partitioned index
+    /// (`relkind = 'I'`) is the same parent-with-no-storage as a partitioned
+    /// table, and `pg_relation_size` returns `0` for it — which the panel printed
+    /// as `0 B` and Copy exported, for an index over 40 GB of partitions.
+    #[test]
+    fn the_index_stats_query_nulls_a_partitioned_indexs_size() {
+        let q = index_stats_sql();
+        assert!(
+            q.contains("CASE WHEN ic.relkind = 'I' THEN NULL ELSE pg_relation_size(ic.oid) END"),
+            "{q}"
+        );
+        // And the scan count is left unguarded on purpose: `pg_stat_all_indexes`
+        // has no row for a partitioned index, so NULL there means "nobody
+        // counted", which is what keeps `is_unused` from flagging it.
+        assert!(q.contains("si.idx_scan"), "{q}");
+        assert!(!q.contains("THEN NULL ELSE si.idx_scan"), "{q}");
+    }
+
+    /// The primary key is named the same thing on every surface — the designer's
+    /// index list calls it `PRIMARY`, so the properties panel must too, or the two
+    /// describe the same index under two names.
+    #[test]
+    fn the_index_stats_query_names_the_primary_key_as_the_designer_does() {
+        let q = index_stats_sql();
+        assert!(
+            q.contains("CASE WHEN ix.indisprimary THEN 'PRIMARY' ELSE ic.relname END"),
+            "{q}"
+        );
+        assert!(
+            index_list_sql().contains("'PRIMARY'"),
+            "the claim is about agreeing with this one"
+        );
+    }
+
+    /// Both statistics queries filter internal schemas through the shared
+    /// builder, so a new namespace rule reaches them with the rest.
+    #[test]
+    fn both_statistics_queries_filter_internal_schemas() {
+        for q in [table_stats_sql(), index_stats_sql()] {
+            assert!(q.contains("n.nspname NOT IN"), "{q}");
+            assert!(q.contains("pg\\_toast%"), "{q}");
+        }
     }
 
     #[test]

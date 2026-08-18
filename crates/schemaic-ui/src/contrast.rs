@@ -399,6 +399,21 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     pair!(text_dim on erd_node_bg, Body, "ERD: a stub (cross-database) card's label"),
     pair!(text on erd_node_header, Body, "ERD: a card's table name"),
     pair!(text on erd_row_highlight, Body, "ERD: a row at the end of a hovered edge"),
+    // The find bar's three paintings. The fourth — a hit on a *tinted* header — is
+    // a composite the table cannot express and is measured by
+    // `an_erd_header_tint_keeps_the_table_name_legible` instead, which asks
+    // `erd_view::name_paint` what the code actually paints there.
+    pair!(match_highlight on erd_node_bg, Body, "ERD: a matched column's name"),
+    pair!(
+        match_highlight on erd_row_highlight,
+        Body,
+        "ERD: a matched column at the end of a hovered edge"
+    ),
+    pair!(
+        match_highlight on erd_node_header,
+        Body,
+        "ERD: a matched table's name on an untinted card"
+    ),
     // ── Buttons whose foreground and background are chosen together. These are
     // the shape [B16-L2-01]'s sibling bug had: the two halves live in different
     // views, so nothing but a pairing check looks at them side by side.
@@ -688,8 +703,16 @@ mod tests {
     ///
     /// A failure means [`crate::erd_view::HEADER_TINT_ALPHA`] is too high, not that
     /// a preset is wrong.
+    ///
+    /// **Asked of both states the name can be in**, and through
+    /// [`crate::erd_view::name_paint`] rather than a hard-coded foreground: the
+    /// commit that added this test measured `t.text`, the next one repainted a find
+    /// hit `match_highlight` on the same composite, and 3.11:1 shipped with the gate
+    /// still green. Asking the decision means a hit can only be marked here in a
+    /// way that clears the floor.
     #[test]
     fn an_erd_header_tint_keeps_the_table_name_legible() {
+        use crate::erd_view::{NamePaint, name_paint};
         let alpha = crate::erd_view::HEADER_TINT_ALPHA;
         let mut bad = Vec::new();
         for kind in UiThemeKind::ALL {
@@ -697,13 +720,21 @@ mod tests {
             for (name, hex, _) in crate::CONN_COLOR_PRESETS {
                 let tint = crate::theme::parse_hex(hex).expect("a preset is a valid hex");
                 let bg = over(tint.multiply_alpha(alpha), t.erd_node_header);
-                let r = contrast_ratio(t.text, bg);
-                if r < Legibility::Body.floor() {
-                    bad.push(format!(
-                        "[{}] text on {name}@{alpha} over erd_node_header = {r:.2}:1 (needs {:.1}:1)",
-                        kind.label(),
-                        Legibility::Body.floor(),
-                    ));
+                for hit in [false, true] {
+                    let (fg, what) = match name_paint(hit, true) {
+                        NamePaint::Match => (t.match_highlight, "match_highlight"),
+                        NamePaint::Plain => (t.text, "text"),
+                    };
+                    let r = contrast_ratio(fg, bg);
+                    if r < Legibility::Body.floor() {
+                        bad.push(format!(
+                            "[{}] {what} on {name}@{alpha} over erd_node_header = {r:.2}:1 \
+                             (needs {:.1}:1){}",
+                            kind.label(),
+                            Legibility::Body.floor(),
+                            if hit { " — as a find hit" } else { "" },
+                        ));
+                    }
                 }
             }
         }

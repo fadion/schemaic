@@ -29,7 +29,7 @@ that has quietly become false. Route the write through `arch-scribe` when a chan
 
 ## Delegate the reading (`.claude/agents/`)
 
-`docs/architecture.md` is ~3.2k lines and several modules are thousands each (`ui/grid.rs` ~6.3k,
+`docs/architecture.md` is ~3.4k lines and several modules are thousands each (`ui/grid.rs` ~6.3k,
 `ui/lib.rs` ~5.6k, `app/main.rs`), so paging them into the main context is what runs a session out
 of room. Three subagents exist to do that reading in their own windows:
 

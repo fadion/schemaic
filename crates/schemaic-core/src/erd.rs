@@ -675,6 +675,28 @@ pub fn fit_bounds(content: Rect, viewport: (f64, f64), zoom_min: f64) -> (f64, (
     (z, ((vw - w * z) / 2.0 - x * z, (vh - h * z) / 2.0 - y * z))
 }
 
+/// The pan that puts **one card's** centre at the centre of `viewport`, at the
+/// zoom already in force — [`fit_bounds`]' single-card case, and the thing that
+/// makes a find hit on an off-screen card useful at all.
+///
+/// The canvas draws a card at `pan + logical · zoom`, so this is that transform
+/// solved for `pan`: `pan + (x + w/2)·z == vw/2`. Deliberately *centre* rather
+/// than *make visible* — a card larger than the viewport still lands centred,
+/// which is the reading a search wants (the name is at the card's top-left, and
+/// clamping would leave the hit off screen while the readout said "1 match").
+///
+/// Here rather than in the effect that calls it because a sign slip, a `w` where
+/// `h` belongs, or `zoom` applied to the wrong term all fail *silently*: the
+/// diagram jumps somewhere useless and every readout still agrees a match was
+/// found.
+pub fn center_pan(viewport: (f64, f64), card: Rect, zoom: f64) -> (f64, f64) {
+    let (vw, vh) = viewport;
+    (
+        vw / 2.0 - (card.x + card.w / 2.0) * zoom,
+        vh / 2.0 - (card.y + card.h / 2.0) * zoom,
+    )
+}
+
 /// Does `content` `(w, h)` overflow `viewport` `(w, h)` in either dimension — i.e.
 /// would opening at 100% top-left hide part of the diagram? Gate for fit-on-open.
 pub fn view_overflows(content: (f64, f64), viewport: (f64, f64)) -> bool {
@@ -1032,6 +1054,44 @@ pub fn sole_node(matches: &[NodeMatch]) -> Option<&str> {
     }
 }
 
+/// A search's hits with a per-node index over them — what the *cards* need.
+///
+/// Every card asks the same question once per keystroke ("did this search touch
+/// me?"), and asking it by scanning the hit list is O(cards × matches): a
+/// one-character term on a 500-card diagram matches every card, so 250,000
+/// comparisons per keystroke, measured at 0.65 ms on top of the search itself and
+/// before floem does anything. Built once here instead, so a card's answer is a
+/// hash lookup.
+///
+/// It carries the hit list rather than replacing it, because the readout and the
+/// pan both want it whole and in graph order ([`match_label`], [`sole_node`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Matches {
+    hits: Vec<NodeMatch>,
+    by_node: HashMap<String, usize>,
+}
+
+impl Matches {
+    pub fn new(hits: Vec<NodeMatch>) -> Self {
+        let by_node = hits
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.node.clone(), i))
+            .collect();
+        Self { hits, by_node }
+    }
+
+    /// What this search found in `node`, if anything.
+    pub fn of(&self, node: &str) -> Option<&NodeMatch> {
+        self.by_node.get(node).map(|i| &self.hits[*i])
+    }
+
+    /// The hits, in the graph's node order.
+    pub fn hits(&self) -> &[NodeMatch] {
+        &self.hits
+    }
+}
+
 /// The find bar's readout: how much was found, and whether it is all in one card.
 ///
 /// The card span is only worth saying when there is more than one — "2 matches"
@@ -1146,6 +1206,28 @@ mod search_tests {
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].node, "archive.orders");
         assert!(m[0].name);
+    }
+
+    /// The index answers exactly what a scan of the hit list would, for every node
+    /// and for one that isn't there — and keeps the list whole, in graph order, for
+    /// the readout and the pan.
+    #[test]
+    fn the_match_index_answers_what_a_scan_would() {
+        let g = graph(vec![
+            dnode("orders", &["id", "created_at"]),
+            dnode("customers", &["id", "created_at"]),
+            dnode("items", &["sku"]),
+        ]);
+        let hits = search(&g, "created");
+        let m = Matches::new(hits.clone());
+        assert_eq!(m.hits(), hits.as_slice(), "whole, and in graph order");
+        for h in &hits {
+            assert_eq!(m.of(&h.node), Some(h));
+        }
+        assert_eq!(m.of("items"), None, "matched nothing");
+        assert_eq!(m.of("nosuch"), None);
+        // An empty search indexes nothing and answers nothing.
+        assert_eq!(Matches::new(search(&g, "")).of("orders"), None);
     }
 
     /// The pan-and-flash trigger: every hit is in one card, however many hits
@@ -1783,6 +1865,87 @@ mod tests {
         assert_eq!(z, 1.0);
         // A card at the content origin draws at pan + origin*z — dead centre.
         assert_eq!((px + shifted.x * z, py + shifted.y * z), (300.0, 250.0));
+    }
+
+    // ── centring one card ──
+    //
+    // Where the user is looking after a search. Every way of getting this wrong —
+    // a sign, a `w` for an `h`, `zoom` on the wrong term — leaves the sole match
+    // off screen while the readout still says "1 match", so each case below
+    // re-derives the transform the canvas actually draws with rather than
+    // restating the formula.
+
+    /// The card's centre lands at the viewport's centre, at zoom 1.
+    #[test]
+    fn center_pan_puts_a_cards_centre_in_the_middle() {
+        let card = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 200.0,
+            h: 100.0,
+        };
+        let (px, py) = center_pan((800.0, 600.0), card, 1.0);
+        assert_eq!((px, py), (300.0, 250.0));
+        // Re-derived: the canvas draws the card at `pan + logical · zoom`.
+        assert_eq!(px + (card.x + card.w / 2.0), 400.0);
+        assert_eq!(py + (card.y + card.h / 2.0), 300.0);
+    }
+
+    /// Zoom scales the card's position *and* its size, and both terms are on the
+    /// same side of the solve — asserted at each end of the zoom range.
+    #[test]
+    fn center_pan_centres_the_scaled_card() {
+        let card = Rect {
+            x: 640.0,
+            y: 480.0,
+            w: 240.0,
+            h: 120.0,
+        };
+        for z in [0.4_f64, 1.0, 2.0] {
+            let (px, py) = center_pan((800.0, 600.0), card, z);
+            assert!(
+                (px + (card.x + card.w / 2.0) * z - 400.0).abs() < 1e-9,
+                "z = {z}"
+            );
+            assert!(
+                (py + (card.y + card.h / 2.0) * z - 300.0).abs() < 1e-9,
+                "z = {z}"
+            );
+        }
+    }
+
+    /// The canvas allows negative logical positions (a diagram dragged up and
+    /// left), so a card there has to centre like any other.
+    #[test]
+    fn center_pan_handles_a_negative_position() {
+        let card = Rect {
+            x: -900.0,
+            y: -300.0,
+            w: 200.0,
+            h: 100.0,
+        };
+        let (px, py) = center_pan((800.0, 600.0), card, 1.0);
+        assert_eq!(
+            (px + card.x + card.w / 2.0, py + card.y + card.h / 2.0),
+            (400.0, 300.0)
+        );
+    }
+
+    /// **Centre, not clamp.** A card taller than the viewport still lands centred:
+    /// its name is at the top-left, and this is the case where "centre" and "make
+    /// visible" differ — `fit_bounds` answers it by zooming out, which a search
+    /// deliberately does not do.
+    #[test]
+    fn center_pan_centres_a_card_bigger_than_the_viewport() {
+        let card = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 300.0,
+            h: 2000.0,
+        };
+        let (px, py) = center_pan((800.0, 600.0), card, 1.0);
+        assert_eq!((px, py), (250.0, -700.0));
+        assert!(py < 0.0, "the card's top is above the viewport, centred");
     }
 
     // ── live content bounds ──

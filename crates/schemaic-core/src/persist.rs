@@ -325,6 +325,46 @@ pub struct SavedTabsFile {
     pub active: usize,
 }
 
+impl SavedTabsFile {
+    /// The tabs whose text exists **nowhere else**: a file-backed tab with
+    /// unsaved edits.
+    ///
+    /// What "restore tabs on startup" is off means is *don't bring my session
+    /// back* — and for every other tab that is a complete answer, because the text
+    /// is a query the user can retype or a table they can reopen. A file tab with
+    /// unsaved edits is the one exception: the edits are not on disk (that is what
+    /// makes it dirty) and they are not in the file (the file still holds the old
+    /// bytes), so a quit that dropped them would be the only unprompted loss of
+    /// unrecoverable text in the application — every other route to losing that
+    /// tab goes through the close guard, and a window quit cannot be vetoed on
+    /// floem 0.2.
+    ///
+    /// So this subset is what is written and what is read while the setting is
+    /// off, on both sides of the same rule: nothing else is stored against the
+    /// user's preference, and a full session left over from when the setting was
+    /// *on* is not silently restored either.
+    ///
+    /// `active` is re-pointed at the survivor nearest the one that was active, so
+    /// the index cannot outrun the shortened list.
+    pub fn unsaved_files_only(&self) -> SavedTabsFile {
+        let kept: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.path.is_some() && t.file_dirty)
+            .map(|(i, _)| i)
+            .collect();
+        let active = kept
+            .iter()
+            .position(|i| *i >= self.active)
+            .unwrap_or(kept.len().saturating_sub(1));
+        SavedTabsFile {
+            tabs: kept.iter().map(|i| self.tabs[*i].clone()).collect(),
+            active,
+        }
+    }
+}
+
 /// Saved connections plus which one is active.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ConnectionsFile {
@@ -1059,6 +1099,87 @@ mod tests {
             sibling(Path::new("connections.json"), ".corrupt"),
             Path::new("connections.json.corrupt")
         );
+    }
+
+    // ── The session's unrecoverable half ──────────────────────────────────
+
+    /// A saved tab, spelled by what this rule asks about.
+    fn saved(path: Option<&str>, dirty: bool, query: &str) -> super::SavedTab {
+        super::SavedTab {
+            query: query.into(),
+            conn_id: 1,
+            database: None,
+            source: None,
+            source_schema: None,
+            name: None,
+            pinned: false,
+            path: path.map(PathBuf::from),
+            file_crlf: false,
+            file_bom: false,
+            file_lossy: false,
+            file_dirty: dirty,
+        }
+    }
+
+    /// With the setting off, the only tab worth keeping is the one whose text is
+    /// nowhere else: a file tab with unsaved edits. A query tab is retypeable, a
+    /// clean file tab is on disk, and a quit is the one close path that cannot
+    /// ask first.
+    #[test]
+    fn only_a_dirty_file_tab_survives_the_setting_being_off() {
+        let file = super::SavedTabsFile {
+            tabs: vec![
+                saved(None, false, "select 1"),
+                saved(Some("/sql/a.sql"), false, "select 2"),
+                saved(Some("/sql/b.sql"), true, "select 3 -- edited"),
+            ],
+            active: 0,
+        };
+        let kept = file.unsaved_files_only();
+        assert_eq!(kept.tabs.len(), 1);
+        assert_eq!(kept.tabs[0].query, "select 3 -- edited");
+        assert_eq!(kept.active, 0, "the index must not outrun the list");
+    }
+
+    /// Nothing unsaved, nothing kept — and the active index still has to be one
+    /// this file can be indexed by.
+    #[test]
+    fn a_session_with_nothing_unsaved_keeps_nothing() {
+        let file = super::SavedTabsFile {
+            tabs: vec![
+                saved(None, false, "select 1"),
+                saved(None, true, "select 2"),
+            ],
+            active: 1,
+        };
+        let kept = file.unsaved_files_only();
+        assert!(
+            kept.tabs.is_empty(),
+            "a dirty tab with no file is retypeable"
+        );
+        assert_eq!(kept.active, 0);
+    }
+
+    /// The active tab follows the survivor nearest to it, from either side, so
+    /// the restored window lands on a tab that is actually there.
+    #[test]
+    fn the_active_index_follows_the_surviving_tabs() {
+        let tabs = vec![
+            saved(Some("/sql/a.sql"), true, "a"),
+            saved(None, false, "q"),
+            saved(Some("/sql/b.sql"), true, "b"),
+        ];
+        let at = |active: usize| {
+            super::SavedTabsFile {
+                tabs: tabs.clone(),
+                active,
+            }
+            .unsaved_files_only()
+            .active
+        };
+        assert_eq!(at(0), 0, "itself");
+        assert_eq!(at(1), 1, "the query tab is gone; the next survivor");
+        assert_eq!(at(2), 1, "itself, renumbered");
     }
 
     // ── File modes ────────────────────────────────────────────────────────

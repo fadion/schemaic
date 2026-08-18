@@ -1778,6 +1778,18 @@ impl NavKeys {
 #[derive(Clone, Copy)]
 pub struct SchemaUi {
     pub db_nodes: RwSignal<Vec<ConnNode>>,
+    /// Bumped by the app whenever a refresh resets the [`ConnNode::stats`] slots
+    /// back to [`DbStatsState::Idle`].
+    ///
+    /// **The reset is a write nobody watches**, deliberately: an effect that
+    /// tracked the slots it fills would re-enter on its own first `Loading` write.
+    /// So the refresh announces itself here instead, and *every* consumer that
+    /// asks for statistics has to take this as a dependency — the tree's size
+    /// column does, and the results toolbar's `of ~4.2m` didn't, which is how a
+    /// Refresh deleted that figure from an on-screen capped result for good (its
+    /// asker read nothing tracked and ran once, while the memo that *prints* the
+    /// figure was live on the slot the refresh had just cleared).
+    pub stats_gen: RwSignal<u64>,
     pub expanded: RwSignal<HashSet<String>>,
     /// The active tab's source table, highlighted in the tree.
     pub active_table: RwSignal<Option<TableSource>>,
@@ -1842,6 +1854,16 @@ pub struct SchemaActions {
     /// rows**. Separate from [`SchemaActions::table_stats`] because it is a full
     /// scan the user asked for, not part of opening the panel.
     pub count_rows: Rc<dyn Fn(PropertiesTarget)>,
+    /// Stop a `COUNT(*)` that is still running — on the **server**, not just in the
+    /// UI. A no-op when none is.
+    ///
+    /// It exists because the scan is unbounded and abandoning the answer is not the
+    /// same as stopping the work: without it a count on a 200M-row table held its
+    /// connection for minutes after the panel had gone, and reopening offered the
+    /// button again, so N opens stacked N concurrent full scans. The app also calls
+    /// it whenever the modal's target changes, which covers Escape, the ✕, the
+    /// backdrop and reopening on another table.
+    pub count_cancel: Rc<dyn Fn()>,
     /// Toggle the schema tree's size column, persisting the choice. Switching it
     /// on is what makes the app fetch statistics for the expanded databases.
     pub toggle_table_sizes: Rc<dyn Fn()>,
@@ -2774,9 +2796,19 @@ pub fn workspace(ui: Ui) -> impl IntoView {
         // The "clear" half of the app's `:focus-visible`
         // (`widgets::keyboard_nav`): from here on the focus ring stays dark until
         // the next Tab, because on a pointer gesture it marks what the user just
-        // pointed at. The root is the only place that sees *every* press — the
-        // same reason `pointer_released` is driven from its `PointerUp` twin —
-        // and `set` is guarded because it never dedups, and an unguarded write on
+        // pointed at.
+        //
+        // **The root sees every press nothing else consumed** — which is not the
+        // same as every press, and the difference is load-bearing. Floem's
+        // dispatch stops at the first descendant that processes a pointer event
+        // and runs a view's own listeners only after that walk, so every
+        // `on_event_stop(PointerDown, …)` in the app hides the press from here.
+        // That is why a press-swallowing menu trigger has to repay the clear
+        // itself, through `widgets::menu_trigger_press`, which states the rule in
+        // full — and why five sites keep a bare `|_| {}` on purpose, so the flag
+        // survives a click on a menu panel or a popover.
+        //
+        // `set` is guarded because it never dedups, and an unguarded write on
         // every click in the app would re-run every button's style closure.
         let kbd = widgets::keyboard_nav();
         if kbd.get_untracked() {
@@ -3666,6 +3698,7 @@ fn center(ui: Ui) -> impl IntoView {
     // a write up is one of the user's own.
     let rollback_tx = ui.tab_actions.rollback_tx.clone();
     let db_nodes = ui.schema.db_nodes;
+    let stats_gen = ui.schema.stats_gen;
     let inline_ai = ui.ai.inline;
     let inline_ai_run = ui.ai_actions.inline_run.clone();
     let inline_ai_cancel = ui.ai_actions.inline_cancel.clone();
@@ -3932,6 +3965,7 @@ fn center(ui: Ui) -> impl IntoView {
                     load_gen: tab.load_gen,
                     apply_view: apply_view.clone(),
                     db_nodes,
+                    stats_gen,
                     connections,
                     active_conn,
                     popup,

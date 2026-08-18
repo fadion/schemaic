@@ -301,6 +301,32 @@ struct NavRow {
     expanded: bool,
 }
 
+/// Where the nav cursor goes when the tree **gains focus**: it stays where it
+/// was, and only an unset cursor is seeded from the open table's row.
+///
+/// **A cursor that exists is the user's.** Seeding unconditionally was right while
+/// the only way the tree could gain focus was a click from outside it — but the
+/// context menu now hands focus back (`widgets::set_menu_return`), which re-fires
+/// `FocusGained` on a tree that is already focused and already has a cursor. So
+/// arrowing to `customers`, pressing Shift+F10 and pressing Escape moved the
+/// cursor to whatever table happened to be open, with no keypress asking for it —
+/// and the next Shift+F10 or Enter acted on that row instead. Its own comment
+/// described this rule ("otherwise resume wherever the cursor last was"); the code
+/// only had the first half.
+///
+/// `visible` is the key list the arrows walk: a cursor is only worth seeding to a
+/// row that is actually on screen.
+fn resume_cursor(
+    selected: Option<&str>,
+    active_key: Option<&str>,
+    visible: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if let Some(cur) = selected {
+        return Some(cur.to_string());
+    }
+    active_key.filter(|k| visible(k)).map(str::to_string)
+}
+
 // Reorder databases so favorited ones come first (oldest favorite highest); the
 // rest keep their natural order. Stable, so within each group the original order
 // is preserved. Shared by the tree render and keyboard-nav row list so the two
@@ -738,21 +764,29 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
         .keyboard_navigable()
         .on_event(EventListener::FocusGained, move |_| {
             nav.focused.set(true);
-            // Start from the active table whenever one is open and visible;
-            // otherwise resume wherever the cursor last was.
-            if let Some(src) = active_table.get_untracked() {
-                let k = table_key_named(&src.database, &src.display());
-                let rows = visible_nav_rows(
-                    db_nodes,
-                    expanded,
-                    hidden_dbs,
-                    filter,
-                    db_favorites,
-                    active_conn,
-                );
-                if rows.iter().any(|r| r.key == k) {
-                    nav.selected.set(Some(k));
-                }
+            // Start from the active table when the cursor is nowhere; otherwise
+            // resume where it was. The decision is `resume_cursor`, which states
+            // why the second half matters now that the context menu hands focus
+            // back to a tree that already has a cursor.
+            let seeded = nav.selected.with_untracked(|cur| {
+                let active = active_table
+                    .get_untracked()
+                    .map(|src| table_key_named(&src.database, &src.display()));
+                resume_cursor(cur.as_deref(), active.as_deref(), |k| {
+                    visible_nav_rows(
+                        db_nodes,
+                        expanded,
+                        hidden_dbs,
+                        filter,
+                        db_favorites,
+                        active_conn,
+                    )
+                    .iter()
+                    .any(|r| r.key == k)
+                })
+            });
+            if let Some(k) = seeded {
+                nav.selected.set(Some(k));
             }
             EventPropagation::Continue
         })
@@ -784,7 +818,29 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                 _ => false,
             };
             if menu_key {
-                if let Some(open) = nav.cursor_menu.get_untracked() {
+                // **Re-resolve the cursor first, exactly as the arrows and Enter
+                // do.** `cursor_menu`/`cursor_at` are published by the cursor row's
+                // own effect and are never cleared, so a row that has gone —
+                // collapse its parent, or refresh the database out from under it —
+                // leaves a callable opener and a stale window point behind: the menu
+                // for an invisible object, positioned over an unrelated row. The
+                // opener captures owned data rather than row signals, which is why
+                // this misbehaves instead of panicking.
+                let cursor_visible = nav.selected.with_untracked(|cur| {
+                    cur.as_deref().is_some_and(|k| {
+                        visible_nav_rows(
+                            db_nodes,
+                            expanded,
+                            hidden_dbs,
+                            filter,
+                            db_favorites,
+                            active_conn,
+                        )
+                        .iter()
+                        .any(|r| r.key == k)
+                    })
+                });
+                if let Some(open) = nav.cursor_menu.get_untracked().filter(|_| cursor_visible) {
                     let at = nav.cursor_at.get_untracked();
                     let tree_id = nav_tree_id.get_untracked();
                     crate::widgets::set_menu_return(Rc::new(move || {
@@ -3036,5 +3092,39 @@ mod tests {
             ObjectItem::Sequence(SequenceInfo::default()).detail(),
             "bigint"
         );
+    }
+
+    // ── The nav cursor on refocus ─────────────────────────────────────────
+
+    /// **A cursor that exists is the user's.** The context menu hands focus back
+    /// to a tree that is already focused and already has a cursor, so re-seeding
+    /// unconditionally moved the cursor off the row the menu was about — and the
+    /// next Shift+F10 or Enter acted on a different row, one whose menu carries
+    /// Drop and Truncate.
+    #[test]
+    fn a_live_cursor_survives_the_tree_regaining_focus() {
+        let visible = |_: &str| true;
+        assert_eq!(
+            resume_cursor(Some("tbl:shop:customers"), Some("tbl:shop:orders"), visible).as_deref(),
+            Some("tbl:shop:customers")
+        );
+    }
+
+    /// With no cursor, the open table's row is where the walk starts — the
+    /// click-in-from-outside case this was written for.
+    #[test]
+    fn an_absent_cursor_is_seeded_from_the_open_table() {
+        assert_eq!(
+            resume_cursor(None, Some("tbl:shop:orders"), |_| true).as_deref(),
+            Some("tbl:shop:orders")
+        );
+        // …but only to a row that is on screen: a collapsed database's table is
+        // not somewhere the arrows could have reached.
+        assert_eq!(
+            resume_cursor(None, Some("tbl:shop:orders"), |_| false),
+            None
+        );
+        // Nothing open, nothing to seed from.
+        assert_eq!(resume_cursor(None, None, |_| true), None);
     }
 }

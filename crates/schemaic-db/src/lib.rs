@@ -907,24 +907,39 @@ impl Db {
     /// answer to an estimate the user doesn't believe. Unbounded by nature: on a
     /// large table this is a full scan, which is why nothing calls it
     /// automatically.
+    ///
+    /// **And why it takes a token like every other unbounded operation here.** It
+    /// was the one that didn't: closing the properties modal abandoned the *result*
+    /// and left the scan running on the server for minutes, holding its connection,
+    /// with nothing anywhere able to stop it — and reopening offered the button
+    /// again, so N opens stacked N concurrent full scans on a production server.
     pub async fn count_rows(
         &self,
         database: &str,
         schema: Option<&str>,
         table: &str,
+        cancel: CancellationToken,
     ) -> Result<u64, DbError> {
         let sql = count_rows_sql(schema, table, self.engine.dialect());
         match self.engine {
-            Engine::Postgres => return pg::count_rows(self, database, &sql).await,
-            Engine::Sqlite => return sqlite::count_rows(self, &sql).await,
+            Engine::Postgres => return pg::count_rows(self, database, &sql, cancel).await,
+            Engine::Sqlite => return sqlite::count_rows(self, &sql, cancel).await,
             Engine::MySql => {}
         }
         let mut conn = self.open(Some(database), false).await?;
-        let out = conn
-            .query_first::<u64, _>(sql)
-            .await
-            .map_err(|e| DbError::Query(e.to_string()))
-            .and_then(|n| n.ok_or_else(|| DbError::Query("COUNT(*) returned no row".into())));
+        // The connection id, so a second connection can KILL the scan — the same
+        // shape `fetch_query` uses, and the only thing that actually stops work
+        // already running on the server.
+        let conn_id = conn.id();
+        let out = tokio::select! {
+            r = conn.query_first::<u64, _>(sql) => r
+                .map_err(|e| DbError::Query(e.to_string()))
+                .and_then(|n| n.ok_or_else(|| DbError::Query("COUNT(*) returned no row".into()))),
+            _ = cancel.cancelled() => {
+                self.kill_query(conn_id).await;
+                Err(DbError::Cancelled)
+            }
+        };
         let _ = conn.disconnect().await;
         out
     }
@@ -945,56 +960,64 @@ type MyStatRow = (
     Option<String>,
 );
 
+/// Sizes and estimates. `CAST(… AS CHAR)` on the timestamps because these are
+/// shown, not computed with, and the server's own rendering is the one the user
+/// would see in a client.
+const MY_TABLE_STATS_SQL: &str = "SELECT CAST(TABLE_NAME AS CHAR), TABLE_ROWS, DATA_LENGTH, \
+            INDEX_LENGTH, DATA_FREE, AUTO_INCREMENT, CAST(ROW_FORMAT AS CHAR), \
+            CAST(ENGINE AS CHAR), CAST(CREATE_TIME AS CHAR), CAST(UPDATE_TIME AS CHAR) \
+     FROM information_schema.TABLES \
+     WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME";
+
+/// Cardinality per index. `information_schema.STATISTICS` has one row per key
+/// *position*, each carrying the cardinality of the prefix ending there, so the
+/// index's own figure is the last one — `MAX` over the group. Reading a row
+/// instead would report the **first** column's distinct count as the whole
+/// index's, which on a `(status, created_at)` index is a handful against
+/// millions. `NON_UNIQUE` is constant within a group; `MIN` just picks it out.
+const MY_INDEX_CARDINALITY_SQL: &str = "SELECT CAST(TABLE_NAME AS CHAR), CAST(INDEX_NAME AS CHAR), \
+            MAX(CARDINALITY), MIN(NON_UNIQUE) \
+     FROM information_schema.STATISTICS \
+     WHERE TABLE_SCHEMA = ? \
+     GROUP BY TABLE_NAME, INDEX_NAME \
+     ORDER BY TABLE_NAME, INDEX_NAME";
+
+/// How often each index has actually been used. Performance Schema is the only
+/// place MySQL keeps this, and it is routinely off, not instrumented, or not
+/// granted — all of which must leave the scan count **absent** rather than zero,
+/// because zero is what marks an index unused. So a failure here drops the whole
+/// map and every index reports "we don't know".
+///
+/// `INDEX_NAME IS NOT NULL` because the same view carries a row for the table
+/// itself, which is not an index and would otherwise be counted as one.
+const MY_INDEX_USAGE_SQL: &str = "SELECT CAST(OBJECT_NAME AS CHAR), CAST(INDEX_NAME AS CHAR), COUNT_STAR \
+     FROM performance_schema.table_io_waits_summary_by_index_usage \
+     WHERE OBJECT_SCHEMA = ? AND INDEX_NAME IS NOT NULL";
+
 /// The MySQL/MariaDB half of [`Db::fetch_table_stats`]: three queries, only the
-/// first of which is required.
+/// first of which is required. The rows become a [`SchemaStats`] in
+/// [`map_mysql_stats`], which is where the decisions are and is therefore where
+/// the tests are.
 async fn collect_table_stats(conn: &mut Conn, database: &str) -> Result<SchemaStats, DbError> {
     let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
 
-    // Sizes and estimates. `CAST(… AS CHAR)` on the timestamps because these are
-    // shown, not computed with, and the server's own rendering is the one the
-    // user would see in a client.
     let rows: Vec<MyStatRow> = conn
-        .exec_map(
-            "SELECT CAST(TABLE_NAME AS CHAR), TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH, \
-                    DATA_FREE, AUTO_INCREMENT, CAST(ROW_FORMAT AS CHAR), \
-                    CAST(ENGINE AS CHAR), CAST(CREATE_TIME AS CHAR), \
-                    CAST(UPDATE_TIME AS CHAR) \
-             FROM information_schema.TABLES \
-             WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
-            (database,),
-            |r: MyStatRow| r,
-        )
+        .exec_map(MY_TABLE_STATS_SQL, (database,), |r: MyStatRow| r)
         .await
         .map_err(qerr)?;
 
-    // Cardinality per index. `information_schema.STATISTICS` has one row per key
-    // *position*, each carrying the cardinality of the prefix ending there, so
-    // the index's own figure is the last one — `MAX` over the group. `NON_UNIQUE`
-    // is constant within a group; `MIN` just picks it out.
     let idx_rows: Vec<(String, String, Option<u64>, Option<i64>)> = conn
         .exec_map(
-            "SELECT CAST(TABLE_NAME AS CHAR), CAST(INDEX_NAME AS CHAR), \
-                    MAX(CARDINALITY), MIN(NON_UNIQUE) \
-             FROM information_schema.STATISTICS \
-             WHERE TABLE_SCHEMA = ? \
-             GROUP BY TABLE_NAME, INDEX_NAME \
-             ORDER BY TABLE_NAME, INDEX_NAME",
+            MY_INDEX_CARDINALITY_SQL,
             (database,),
             |r: (String, String, Option<u64>, Option<i64>)| r,
         )
         .await
         .map_err(qerr)?;
 
-    // How often each index has actually been used. Performance Schema is the
-    // only place MySQL keeps this, and it is routinely off, not instrumented, or
-    // not granted — all of which must leave the scan count **absent** rather than
-    // zero, because zero is what marks an index unused. So a failure here drops
-    // the whole map and every index reports "we don't know".
     let usage: HashMap<(String, String), u64> = conn
         .exec_map(
-            "SELECT CAST(OBJECT_NAME AS CHAR), CAST(INDEX_NAME AS CHAR), COUNT_STAR \
-             FROM performance_schema.table_io_waits_summary_by_index_usage \
-             WHERE OBJECT_SCHEMA = ? AND INDEX_NAME IS NOT NULL",
+            MY_INDEX_USAGE_SQL,
             (database,),
             |(t, i, n): (String, String, u64)| ((t, i), n),
         )
@@ -1015,8 +1038,24 @@ async fn collect_table_stats(conn: &mut Conn, database: &str) -> Result<SchemaSt
         _ => Freshness::Unknown,
     };
 
+    Ok(map_mysql_stats(rows, &idx_rows, &usage, freshness))
+}
+
+/// The three MySQL statistics queries' rows, as the model the panel reads.
+///
+/// Pure, and separate from [`collect_table_stats`] because every decision in this
+/// feature's MySQL half is here rather than in the round trip: which indexes
+/// belong to which table, what makes one unique, and — the one that decides
+/// whether an index gets flagged for deletion — that a missing `usage` entry
+/// leaves `scans` **absent** rather than zero.
+fn map_mysql_stats(
+    rows: Vec<MyStatRow>,
+    idx_rows: &[(String, String, Option<u64>, Option<i64>)],
+    usage: &HashMap<(String, String), u64>,
+    freshness: Freshness,
+) -> SchemaStats {
     let mut by_table: HashMap<&str, Vec<IndexStats>> = HashMap::new();
-    for (table, index, cardinality, non_unique) in &idx_rows {
+    for (table, index, cardinality, non_unique) in idx_rows {
         let is_primary = index == "PRIMARY";
         by_table.entry(table).or_default().push(IndexStats {
             name: index.clone(),
@@ -1024,8 +1063,13 @@ async fn collect_table_stats(conn: &mut Conn, database: &str) -> Result<SchemaSt
             // breaks it down, so no index here has a size of its own.
             bytes: None,
             cardinality: *cardinality,
+            // Absent, not zero: Performance Schema is routinely off or ungranted,
+            // and zero is what `IndexStats::is_unused` reads as "drop me".
             scans: usage.get(&(table.clone(), index.clone())).copied(),
             is_primary,
+            // The primary key is unique without saying so — `NON_UNIQUE` is 0 for
+            // it too, but the flag is what the panel labels the row with, and a
+            // key that failed this test would be labelled an ordinary index.
             is_unique: is_primary || *non_unique == Some(0),
         });
     }
@@ -1055,7 +1099,7 @@ async fn collect_table_stats(conn: &mut Conn, database: &str) -> Result<SchemaSt
             },
         )
         .collect();
-    Ok(SchemaStats { tables })
+    SchemaStats::new(tables)
 }
 
 async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbError> {
@@ -3056,6 +3100,118 @@ pub(crate) fn parse_typed(s: String, type_name: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── The MySQL statistics half ─────────────────────────────────────────
+    //
+    // Three decisions with wrong answers that produce a plausible-looking panel
+    // rather than an error: reading a cardinality per key *position* instead of
+    // per index, calling the primary key an ordinary index, and turning "nobody
+    // counted the scans" into "zero scans" — which is what marks an index for
+    // deletion.
+
+    /// `information_schema.STATISTICS` has one row per key position, each with the
+    /// cardinality of the prefix ending there. The index's own figure is the last
+    /// one, so the query has to group and take `MAX`: reading a row instead would
+    /// report `(status, created_at)`'s handful of statuses as the whole index's
+    /// distinct count.
+    #[test]
+    fn the_cardinality_query_takes_the_index_and_not_one_key_position() {
+        assert!(MY_INDEX_CARDINALITY_SQL.contains("MAX(CARDINALITY)"));
+        assert!(MY_INDEX_CARDINALITY_SQL.contains("GROUP BY TABLE_NAME, INDEX_NAME"));
+        // `NON_UNIQUE` is constant within the group; `MIN` is how it survives the
+        // grouping rather than an aggregate that means anything.
+        assert!(MY_INDEX_CARDINALITY_SQL.contains("MIN(NON_UNIQUE)"));
+    }
+
+    /// The usage view carries a row for the **table** as well as its indexes, with
+    /// a NULL index name. Counted, it would appear as an index nobody can find.
+    #[test]
+    fn the_usage_query_skips_the_tables_own_row() {
+        assert!(MY_INDEX_USAGE_SQL.contains("INDEX_NAME IS NOT NULL"));
+        assert!(MY_INDEX_USAGE_SQL.contains("OBJECT_SCHEMA = ?"));
+    }
+
+    fn stat_row(name: &str) -> MyStatRow {
+        (
+            name.to_string(),
+            Some(4_213_551),
+            Some(1024),
+            Some(512),
+            None,
+            None,
+            None,
+            Some("InnoDB".to_string()),
+            None,
+            None,
+        )
+    }
+
+    /// The mapping's three rules at once: indexes land on their own table, a key
+    /// is unique because it is the key, and an index Performance Schema said
+    /// nothing about reports **no** scan count rather than zero.
+    #[test]
+    fn the_mapping_keeps_a_missing_scan_count_absent() {
+        let idx = vec![
+            ("orders".into(), "PRIMARY".into(), Some(4_000_000), Some(0)),
+            (
+                "orders".into(),
+                "idx_email".into(),
+                Some(3_996_120),
+                Some(0),
+            ),
+            ("orders".into(), "idx_status".into(), Some(7), Some(1)),
+            ("other".into(), "PRIMARY".into(), Some(1), Some(0)),
+        ];
+        let usage: HashMap<(String, String), u64> =
+            [(("orders".to_string(), "idx_email".to_string()), 12)].into();
+        let stats = map_mysql_stats(
+            vec![stat_row("orders"), stat_row("other")],
+            &idx,
+            &usage,
+            Freshness::Unknown,
+        );
+
+        let orders = stats.find(None, "orders").expect("orders");
+        assert_eq!(orders.indexes.len(), 3, "the other table's key is not here");
+        let by = |n: &str| {
+            orders
+                .indexes
+                .iter()
+                .find(|i| i.name == n)
+                .unwrap_or_else(|| panic!("{n}"))
+        };
+        assert_eq!(by("idx_email").scans, Some(12));
+        // The two nobody reported: absent, so `is_unused` cannot flag them.
+        assert_eq!(by("idx_status").scans, None);
+        assert!(!by("idx_status").is_unused(), "not counted is not unused");
+        assert!(by("PRIMARY").is_primary && by("PRIMARY").is_unique);
+        assert!(by("idx_email").is_unique, "NON_UNIQUE = 0");
+        assert!(!by("idx_status").is_unique, "NON_UNIQUE = 1");
+        // MySQL reports one `INDEX_LENGTH` for the whole table, so no index here
+        // may claim a size of its own.
+        assert!(orders.indexes.iter().all(|i| i.bytes.is_none()));
+        // And the cardinality is carried, marked as the estimate it is.
+        assert_eq!(
+            by("idx_email").cardinality_label().as_deref(),
+            Some("~4m"),
+            "printed as an estimate, not as 3,996,120"
+        );
+    }
+
+    /// A table with no rows in `STATISTICS` — a view, or a table whose grants hide
+    /// it — still gets its entry, with no indexes rather than none of it.
+    #[test]
+    fn the_mapping_keeps_a_table_with_no_indexes() {
+        let stats = map_mysql_stats(
+            vec![stat_row("v")],
+            &[],
+            &HashMap::new(),
+            Freshness::Unknown,
+        );
+        let v = stats.find(None, "v").expect("v");
+        assert!(v.indexes.is_empty());
+        assert_eq!(v.rows, Some(4_213_551));
+    }
 
     #[test]
     fn build_insert_sql_shapes() {

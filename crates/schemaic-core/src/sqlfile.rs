@@ -243,6 +243,57 @@ fn has_sql_ext(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case(SQL_EXT))
 }
 
+/// Does this platform's filesystem read two paths differing only in case as one
+/// file?
+///
+/// Windows (NTFS) and macOS (APFS, as shipped) do; Linux does not, and
+/// `Makefile` beside `makefile` really is two files there. It is a `const` rather
+/// than a runtime probe because the alternative — a case-folding answer taken
+/// from one directory — would be wrong for a path on a mounted volume with the
+/// other setting, and being wrong in *that* direction merges two files the user
+/// meant to keep apart.
+pub const PATHS_IGNORE_CASE: bool = cfg!(any(windows, target_os = "macos"));
+
+/// Do these two paths name the same file, as far as the paths themselves can
+/// say?
+///
+/// **Two tabs bound to one file is a lost edit**: each keeps its own copy of the
+/// bytes on disk, so saving the second silently discards the first, and the first
+/// tab goes on reporting itself clean because its own copy still matches what it
+/// wrote. The comparison that prevented it was `Path`'s own `==`, which is
+/// component-wise and case-**sensitive** on every platform — wrong in exactly the
+/// direction Windows and macOS need.
+///
+/// This is the path-shaped half of the question and it is deliberately not the
+/// whole of it: a hard link, a junction, an 8.3 short name or a substituted drive
+/// still reads as two names for one file. The caller canonicalises first (which
+/// resolves all four when the file exists) and asks this afterwards, because a
+/// path being saved to for the first time cannot be canonicalised at all.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    same_path(a, b, PATHS_IGNORE_CASE)
+}
+
+/// [`same_file`]'s rule with the platform's answer passed in, so both sides of it
+/// are testable on either platform.
+///
+/// Case folding is Unicode's simple lowercase, not NTFS's own upcasing table:
+/// they differ only for characters outside the Basic Multilingual Plane's common
+/// range, and the cost of a disagreement there is the second tab this exists to
+/// prevent — not a wrong file.
+pub fn same_path(a: &Path, b: &Path, ignore_case: bool) -> bool {
+    // `Components` normalises away `.` and repeated separators, which is why the
+    // comparison is over components rather than over the strings.
+    if !ignore_case {
+        return a.components().eq(b.components());
+    }
+    let folded = |p: &Path| -> Vec<String> {
+        p.components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect()
+    };
+    folded(a) == folded(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,5 +514,66 @@ mod tests {
             ensure_extension(PathBuf::from("/tmp/schema.ddl")),
             PathBuf::from("/tmp/schema.ddl")
         );
+    }
+
+    /// The same path spelled two ways is one file on both readings — a `.`
+    /// component and a doubled separator are not differences.
+    #[test]
+    fn a_path_is_the_same_file_as_itself_however_it_is_spelled() {
+        for ignore_case in [true, false] {
+            assert!(same_path(
+                Path::new("/tmp/orders.sql"),
+                Path::new("/tmp/orders.sql"),
+                ignore_case
+            ));
+            assert!(same_path(
+                Path::new("/tmp/./orders.sql"),
+                Path::new("/tmp/orders.sql"),
+                ignore_case
+            ));
+            assert!(same_path(
+                Path::new("/tmp//orders.sql"),
+                Path::new("/tmp/orders.sql"),
+                ignore_case
+            ));
+        }
+    }
+
+    /// **The case that lost the edit.** On Windows and macOS `ORDERS.SQL` is the
+    /// file `orders.sql`; on Linux it is a different file, and merging them would
+    /// be the worse mistake. Both answers are asserted here so the platform's is
+    /// a choice rather than an accident.
+    #[test]
+    fn case_is_a_difference_only_where_the_filesystem_says_so() {
+        let a = Path::new("/sql/orders.sql");
+        let b = Path::new("/sql/ORDERS.SQL");
+        assert!(same_path(a, b, true));
+        assert!(!same_path(a, b, false));
+        assert_eq!(same_file(a, b), PATHS_IGNORE_CASE);
+    }
+
+    /// Two genuinely different files stay different on either reading — the
+    /// folding must not go so far as to merge names that only look alike.
+    #[test]
+    fn different_files_are_never_the_same_file() {
+        for ignore_case in [true, false] {
+            assert!(!same_path(
+                Path::new("/sql/orders.sql"),
+                Path::new("/sql/orders2.sql"),
+                ignore_case
+            ));
+            assert!(!same_path(
+                Path::new("/sql/a/orders.sql"),
+                Path::new("/sql/b/orders.sql"),
+                ignore_case
+            ));
+            // A relative path is not the absolute one it may resolve to: this
+            // function answers about paths, and the caller canonicalises first.
+            assert!(!same_path(
+                Path::new("orders.sql"),
+                Path::new("/sql/orders.sql"),
+                ignore_case
+            ));
+        }
     }
 }

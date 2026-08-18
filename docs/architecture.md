@@ -14,7 +14,7 @@ holds the *working* rules — how to build, test and commit — and points here 
 Keep the two disjoint: an instruction to the person or agent doing the work belongs there, a fact
 about the system belongs here.
 
-**Prefer reading this through a subagent.** It is ~3.2k lines; paging it into a session wholesale
+**Prefer reading this through a subagent.** It is ~3.4k lines; paging it into a session wholesale
 is what runs that session out of context. `scout` (in `.claude/agents/`) answers "where/how"
 questions against this document *and* the code and reports back a conclusion rather than a
 transcript, and `arch-scribe` makes the edits a finished change requires. Read a section here by
@@ -160,7 +160,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     returns one row — and refuses anything computed without looking closer, arithmetic included:
     being wrong invents a total, being conservative only says less. An `ORDER BY` passes, so the
     difference between the app's own generated browse query and a qualifying one is precisely its
-    `LIMIT`, which a test pins.
+    `LIMIT`, which a test pins. It also looks **inside the table factor**, not only at the name it
+    carries: `FROM orders PARTITION (p0)` and `TABLESAMPLE SYSTEM (10)` each read a proper subset, so
+    the table's estimate is a total the statement could never have reached — and the `~` in front of
+    it says "estimate", not "of a different query". A lock hint (`FOR UPDATE`) and
+    `SQL_CALC_FOUND_ROWS` sit in the same neighbourhood, change no row count, and still qualify;
+    a test pins that too.
     **`projection_of`** is the derivation over `single_source_table`: which base column each result column reads, or
     `None` where it is computed. It is **positional, not name-matched**, and that is the whole
     reason it is a function rather than a lookup — `SELECT a AS b, b FROM t` produces a first
@@ -375,13 +380,30 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     MySQL-family repair `ddl::alter_column_disturbs_checks` gates is a different repair for a
     different statement. `db::sqlite::rebuild_fidelity_tests` reads `sqlite_master.sql` back after
     each of these and compares — the question the consequence-shaped suites beside it cannot ask.
-    **Two things the rebuild refuses rather than does.** `ChangeSet::unsupported` withholds a plan
+    **`AUTOINCREMENT`'s counter is carried too**, and it is not part of the model: it is a row in
+    `sqlite_sequence` that `DROP TABLE` takes with it, while the copy re-seeds the new table's from
+    the rows that *survived* — so a table whose highest rows had been deleted came back handing
+    those ids out a second time, which is the one thing the keyword promises never happens. Two
+    statements between the copy and the drop move the row onto the shadow table (a `DELETE` first:
+    `sqlite_sequence` has no unique index, so `INSERT OR REPLACE` would leave two rows for one
+    table), and the rename carries it back under the real name. Gated on **both** sides declaring
+    the keyword — `declares_sqlite_autoincrement`, over `sqlite_inline_key`, which is also what
+    `create_table_sql` asks, so there is one definition of SQLite's inline-key rule.
+    **Three things the rebuild refuses rather than does.** `ChangeSet::unsupported` withholds a plan
     whose replayed `dependent_ddl` would name a column the plan renames or drops
     (`rebuild_strands_a_trigger`): the text is a snapshot, `legacy_alter_table = ON` stops SQLite
     fixing it, and SQLite validates `NEW.<col>` at write time rather than at `CREATE TRIGGER` — so
     the plan used to *succeed* and the table then rejected every write. The route that does work is
     offered instead: a rename **on its own** is `ALTER TABLE … RENAME COLUMN`
     (`supports_change` + `is_rename_only`), which re-points every view and trigger for us.
+    It also withholds a rebuild of a table whose *declaration* says more than the model can restate
+    (`rebuild_cannot_restate`, over `unrestatable_sqlite_clauses`): a foreign key's `DEFERRABLE`, a
+    column's `ON CONFLICT`, a `DESC` primary-key column. What introspection doesn't model, the
+    rebuild deletes — and because the draft is built from the same incomplete model, `diff` reads
+    the untouched draft as a no-op, so no round-trip check can see the loss either. Each was
+    measured deleted by a plan that reported success, and each changes what the table *does*. The
+    scan is the shared boundary lexer's and covers the table body only, so an **index** key's `DESC`
+    — which the model does carry (`IndexColumn::descending`) and does re-emit — is not a refusal.
     `Change::RebuildTable(Box<Rebuild>)` is how it reaches a plan: `diff` inserts one at the
     **front** of the set the moment that set holds a change SQLite has no statement of its own for,
     and that one change performs the whole set. It sits *beside* the changes it performs rather than
@@ -1096,6 +1118,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     extension only: the native dialogs mostly append the filter's own but not on every platform,
     while `schema.ddl` is the user saying what they want and quietly writing `schema.ddl.sql`
     instead is worse than honouring it. Pure + unit-tested inline.
+    **Whether two paths are one file is asked here as well** (`same_file`, over `same_path` with
+    `PATHS_IGNORE_CASE`), because two tabs bound to one file is a lost edit: each keeps its own copy
+    of the bytes on disk, so saving the second discards the first — and the first goes on reporting
+    itself clean, since its own copy still matches what it wrote. The comparison that allowed it was
+    `Path`'s `==`, which is component-wise and case-**sensitive** on every platform, wrong in exactly
+    the direction Windows and macOS need. The fold is a `const` per platform rather than a probe (a
+    wrong answer merges two files the user meant to keep apart), and both readings are tested. It is
+    deliberately only the path-shaped half: the app canonicalises first — which settles case, 8.3
+    short names, junctions and a substituted drive when the file exists — and asks this afterwards,
+    for the path being saved to for the first time, which cannot be canonicalised at all. The Open
+    command searches **every** tab through it, not the active connection's: the strip being
+    per-connection is a fact about visibility and no answer to the lost edit, and a hit on another
+    connection goes through `switch_conn` so the strip shows the tab it activates.
   - **Small persisted / UI-state models**, each a flat `Vec` keyed by `conn_id` and each pure +
     tested (they share `history.rs`'s shape; a new one belongs here, not in the UI):
     - `search_history.rs` — recent Find-Anywhere targets (`MAX_PER_CONN`, newest-first, deduped).
@@ -1190,6 +1225,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
         *"Delete all ~0 rows in orders?"* would answer a question the user didn't ask, wrongly. A
         figure the engine actually counted is named at any size above empty; a **view** is never
         given one, since the rows belong to the tables under it.
+      - **`SchemaStats` carries a lookup index and its `tables` are private**, because the badge
+        lookup is per *row* of the schema tree and one landing invalidates every badge in the
+        database at once: `iter().find` cost 4.2 ms at 2,000 tables, 24.8 ms at 5,000 and 95.9 ms at
+        10,000, in a single frame on the UI thread (measured on the shipped core, release). Build one
+        with `SchemaStats::new`; the field is private so a literal cannot fill the `Vec` and leave the
+        index empty, which would answer *"no statistics for this table"* for every row, silently. The
+        index keys on the **name** alone so a lookup borrows its `&str` instead of allocating a key,
+        and the handful of same-named tables in other namespaces are separated inside the bucket.
+      - The panel and the copied Markdown are two renderings of one claim, so each rule they share
+        is one function: `RowCount::qualifier` (the word a figure is qualified with — the two had
+        drifted to "(estimated)" against "(estimate)", with only the Markdown half tested),
+        `TableStats::row_caption`, `TableStats::shows_free` (MySQL's `DATA_FREE`, and only when there
+        is some), `index_facts` + `unused_note` (an index's own line), and `count_row_state` — whose
+        `None` is the state that removes the **Count rows** row rather than leaving a blank band
+        where the control was. `IndexStats::cardinality_label` is the one reader of
+        `IndexStats::cardinality`: it is an InnoDB sample of ~20 index pages, and printed through the
+        *exact* branch it read as a measurement — `3,996,120`, on the clipboard as well as in the
+        panel, four lines under a row count carefully marked `~4.21m (estimated)`.
 - `schemaic-db` — MySQL/MariaDB (`mysql_async`) + SSH tunnels (`ssh.rs`), PostgreSQL in `pg.rs`,
   SQLite in `sqlite.rs`, and
   the pinned manual-transaction connection in `session.rs`. Populates each result column's
@@ -1262,8 +1315,37 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   (`-1` is "don't know", so it becomes `None`), `n_dead_tup` and the last analyze, through
   `query_all_optional` so a restricted `pg_stat_*` can't fail the fetch; a **partitioned parent**
   is listed with null sizes rather than the truthful `0` that would read as an empty table.
+  A partitioned **index** (`relkind = 'I'`) carries the same guard in its own spelling, and did not
+  at first: `pg_relation_size` on one returns `0`, so an index spread over 40 GB of partitions
+  printed `0 B` in the panel and exported it — the exact reading the sibling query's comment says it
+  avoids. Its *scan* count is deliberately unguarded: `pg_stat_all_indexes` has no row for such an
+  index, and NULL there is the truth ("nobody counted"), which is what stops `is_unused` flagging it.
+  Both builders are string-tested beside `user_schema_filter_excludes_only_postgres_internals` —
+  that convention exists precisely to catch a guard present in one query and absent from its sibling,
+  which is what shipped. On the MySQL side the three queries are named constants and the
+  rows-to-model step is a pure `map_mysql_stats`, so the decisions with a wrong answer that looks
+  plausible — `MAX(CARDINALITY)` per index rather than per key *position*, the usage view's NULL
+  index row, a missing usage entry leaving `scans: None` — are unit-tested without a server.
   SQLite returns an empty set — it publishes none (`stats::supports_table_stats`), and
-  `count_rows` is not a fallback there but the only figure there is. `run_ddl` is the schema-editing apply path and is **honest about
+  `count_rows` is not a fallback there but the only figure there is.
+  **One fetch per database, shared by all three surfaces.** The properties modal used to issue its
+  own, on its own connection, on every open — ten tables inspected in a row was ten whole-database
+  catalogue fetches for figures already in memory, and worse on a server with
+  `information_schema_stats_expiry = 0`, which re-reads them from the storage engine each time. It
+  now reads `ConnNode::stats` when that slot holds figures for the active connection's database, and
+  *warms* the slot when it does have to fetch, so the modal and the tree spare each other in both
+  directions. Another connection's target still fetches on its own: `db_nodes` is the active
+  connection's tree, which is why the target carries a `conn_id` at all.
+  **`count_rows` takes a `CancellationToken` like every other unbounded operation.** It was the one
+  that didn't, and the scan it starts is a full one: closing the modal abandoned the *answer* while
+  the query ran on for minutes holding a connection, and reopening offered the button again, so N
+  opens stacked N concurrent scans. Each engine cancels its own way — MySQL `KILL QUERY` from a
+  second connection, PostgreSQL `cancel_token`, SQLite the interrupt handle, which is why its count
+  no longer goes through `with_conn` (the handle has to reach the async side before the scan starts).
+  The app holds one token beside `properties_counting`, cancels it whenever the modal's target
+  changes (Escape, the ✕, the backdrop, reopening elsewhere) and offers **Cancel** beside the spinner;
+  a cancelled count is not reported as a failure, since the estimate the user already had is what the
+  panel goes back to. `run_ddl` is the schema-editing apply path and is **honest about
   atomicity**: PostgreSQL runs the whole plan in one transaction (transactional DDL), MySQL runs
   it sequentially and reports which statement failed *and how many already stuck*
   (`DdlError::applied`) — every MySQL DDL statement commits implicitly, so a transaction there
@@ -1296,6 +1378,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   `BEGIN` as well, identified by `(table, rowid, parent, fkid)`, and only what
   `FkViolations::added_since` reports as new refuses the plan (capped at 10,000 rows, past which it
   falls back to comparing counts).
+  **Step 9 is asked here too, and of the engine.** SQLite's own procedure says to deal with the views
+  a schema change affects, and a plan has no way to: `legacy_alter_table = ON` — right for the
+  rename — is exactly what stops the engine noticing, so a rebuild that dropped or renamed a column
+  a view names *reported success* and the user found out the next time they opened the view. (The
+  **native** `ALTER TABLE … DROP COLUMN` is refused by the engine for the same case, so this was a
+  divergence inside one feature.) The authority on what a view resolves to is SQLite, so
+  `broken_views` asks it: for every view in the catalogue, *prepare* `SELECT * FROM <view>` — a parse
+  against the schema the plan left behind, no rows read. Read before `BEGIN` as well and compared
+  (`first_newly_broken_view`), on the same inherited-vs-added reading as the foreign keys: a `.db`
+  can arrive with a view over a table that is already gone, and refusing for that would take DDL away
+  from every other table in the file. A plan that broke one is rolled back whole, naming the view and
+  the engine's own reason (`sqlite::rebuild_bystander_tests`).
   **`Db::trigger_source` is the fourth MySQL-vs-MariaDB text divergence** (with `mysql_column`'s
   defaults, the view `ALGORITHM` and `mysql_check_clause`) and the only one that is not an
   optimisation: `information_schema.TRIGGERS.ACTION_STATEMENT` on MySQL 8 returns the body with
@@ -1862,18 +1956,59 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     when `erd::sole_node` names a single card — a "next" button would have to invent a sequence over
     a 2-D canvas before it had anything to do. The bar also carries `on_event_stop(PointerDown)`,
     because the canvas pans on a primary drag and the popup sits on top of it, so aiming for the
-    text field would otherwise drag the whole diagram out from under the pointer.
-    One `Memo<Vec<NodeMatch>>` per diagram recomputes per keystroke and each card derives its own
+    text field would otherwise drag the whole diagram out from under the pointer. That `Stop` has a
+    cost the handler now pays: it is returned from inside floem's children loop, so no ancestor
+    reaches the default block that would have re-focused the modal root, and floem takes focus on
+    every `PointerDown` before dispatch — a press on the bar's padding therefore left
+    `app_state.focus` at `None` and the diagram answering no keys. So the handler hands the keyboard
+    to the innermost focus root when the press landed **to the right of the field**, and still does
+    nothing when it landed on the field itself, which is what its own comment was protecting.
+    `Find::dismiss` does the same, covering Escape-in-field and the ✕ together: closing the bar
+    removes the focused editor, and floem clears focus *silently* when a focused view is removed —
+    after which Escape didn't close the diagram and Ctrl+F didn't reopen the bar until the user
+    clicked something.
+    One `Memo<erd::Matches>` per diagram recomputes per keystroke and each card derives its own
     `Option<NodeMatch>` memo from it, so a card whose match didn't change doesn't re-render because
     a character was typed elsewhere — memos specifically, since `dyn_container` is built on
-    `create_updater` and does not diff, it rebuilds whenever a dependency fires. Highlighting is
+    `create_updater` and does not diff, it rebuilds whenever a dependency fires.
+    **`Matches` is indexed by node** for that per-card question: scanning the hit list made it
+    O(cards × matches), and a one-character term matches every card — 0.65 ms of pure comparison at
+    500 cards, before floem does anything. The same reasoning keeps the matched **columns** out of the
+    row stack's rebuild key: they travel into `column_row` as a per-column `Memo<bool>` read inside
+    the row's own style closure, because the highlight is a colour and an outline. Carried in the
+    `dyn_container` selector instead, a broad term rebuilt ~10,000 views per keystroke on a 500-card ×
+    20-column diagram — a memo per row costs a cached read on a pan frame, where a scan there would
+    have reintroduced the O(cards²) trap this module already documents twice. The pan and the flash
+    are **guarded writes** for the same reason: every card's style closure reads both, and `set` never
+    dedups, so typing another character that resolved to the same card was two more full restyle
+    passes over a canvas that had not moved. Highlighting is
     `theme::match_highlight` on the table name and on the matched column names, the same colour the
     schema tree marks a filter hit with, and deliberately **not** the tree's per-character
     `highlight_text`: that bakes a fixed font size into a text layout, and a card's type scales with
     the zoom, so the name would stop growing with the diagram. A find hit outranks a column's key
     tint — the gold/purple says what the column *is*, which is still true and still on the glyph
-    beside it. The pan is a `create_effect` on the matches memo: given a `sole_node` it solves the
-    cards' own `pan + logical·z` for `pan` to centre that card, reading viewport, positions, sizes
+    beside it.
+    **A hit is marked twice, and only one of the two marks survives a tinted header.** `name_paint`
+    is that decision: over the plain header the recolour measures 5.11:1 (Dark) / 5.69:1 (Light),
+    while over an identity colour washed at `HEADER_TINT_ALPHA` it measures 3.11–4.04:1 on Dark and
+    as low as 4.38:1 on Light — under the 4.5 floor the pairing table sets for this exact site, worst
+    of all on the card the search has just panned to and ringed. So a tinted header keeps
+    `theme::text()`, which *is* gated there, and wears its **bottom border** in the match colour
+    instead: a border carries no text-legibility debt, moves nothing, and is the language the matched
+    rows already use one weight down. It is a function so
+    `an_erd_header_tint_keeps_the_table_name_legible` can ask what the code paints instead of
+    restating a foreground the code has since stopped using — which is exactly how 3.11:1 shipped
+    past a test written for this surface one commit earlier. The three plain `match_highlight`
+    paintings are ordinary `PAIRINGS` rows.
+    **A stub card is a card that can be found**, so the per-card match memos are derived *above* the
+    stub branch: `erd::search` matches a stub on its name deliberately, `sole_node` returns it and the
+    canvas pans to it, and the early return used to skip both the recolour and the flash ring — a
+    search that said "1 match" and marked nothing.
+    The pan is a `create_effect` on the matches memo: given a `sole_node` it calls `erd::center_pan`,
+    which solves the cards' own `pan + logical·z` for `pan` — pure and tested beside `fit_bounds`,
+    the whole-diagram case of the same arithmetic, because a sign slip or a `w` where an `h` belongs
+    leaves the sole match off screen while every readout still agrees a match was found. It reads
+    viewport, positions, sizes
     and zoom **untracked** so panning can't re-trigger it, then flashes the card for `FIND_FLASH`
     (3s). **The flash ring is an `outline(2.0)`, not a fatter border** — a border is part of the
     box, so widening one would nudge the card's content by a pixel as the ring came and went — and
@@ -1900,7 +2035,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     title bar with the tab's `(conn_id, database, table)`. It renders `overlay.monitor_log` — built
     by the app's poll loop through `core::monitor::diff_snapshots` — as a Time·Action·ID·Data table,
     and owns *none* of the polling: closing the modal flips `overlay.monitor_open` false, and that
-    is what stops the loop. Three icon buttons sit in the sub-header between the status line and
+    is what stops the loop.
+    **The table is built once and diffed, not rebuilt per poll**, and the two halves of that are one
+    change. The body's `dyn_container` reads a **memo** of `log.is_empty()`: reading the log itself
+    subscribed to it, and `dyn_container` does not diff — so every poll that landed a single change
+    tore down and rebuilt the header, both scrolls and up to `LOG_CAP` rows, cloning the log twice on
+    the way. The list jumped to the top (a fresh scroll starts at zero, and `follow` is false exactly
+    when the reader has scrolled away to read history) and the header desynchronised from the body
+    horizontally, so reading back through a live log was impossible except by pausing. And the row
+    stack is keyed on `MonitorEntry::seq`, a number `monitor::append_changes` assigns, **not** on the
+    list index: at the cap the log slides, so `{0..999}` describes a different thousand changes after
+    every poll while the key set stays identical — floem reuses a view whose key didn't change, so
+    memoising the selector alone would have frozen the rendered list at the first thousand changes
+    while the log and its export went on moving. The unconditional rebuild was what hid that. Three icon buttons sit in the sub-header between the status line and
     the interval dropdown — Pause, Clear, Export — and they join the modal's `FocusRing` at
     tabindex 10/11/12 with the dropdown moved to 13, so a monitor is watchable with both hands off
     the mouse. **Pause holds the fetch, not the loop**: `monitor_tick` reads
@@ -2025,6 +2172,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   is one bit that lets the restore decide whether the `query` it already has **is** the on-disk copy
   (`disk_sql = Some(query)`) or unknown (`None`, which reads as modified until the next save or
   reload settles it).
+  **Quitting the window is the one close path `guard_close` never sees, so it is answered by a
+  flush rather than a question.** Floem 0.2 handles `WindowEvent::CloseRequested` by closing
+  unconditionally — there is no veto to hang a prompt off — but the close *is* observable
+  (`WindowHandle::destroy` fires `WindowClosed` before disposing the scope), so the workspace root
+  carries a `WindowClosed` listener that writes the session synchronously. Without it a quit inside
+  the 600 ms save debounce left `tabs.json` holding the **previous** save, whose `file_dirty` was
+  `false` because the tab was clean then: the tab came back with the pre-edit text, no italic and no
+  dot, reporting itself as matching disk. Confidently wrong is worse than stale. The snapshot is
+  built by one closure (`session_snapshot`) shared with the debounced effect, because the builder
+  that runs at quit is the one nobody watches.
+  **And "restore tabs off" is not a licence to drop unrecoverable text.** With the setting off, the
+  flush writes — and the restore reads — only `SavedTabsFile::unsaved_files_only`: a file-backed tab
+  with unsaved edits, whose text is neither on disk nor retypeable. Every other tab is a query the
+  user can retype or a table they can reopen, so nothing else is stored against their preference; the
+  same subset is read back so a full session left over from when the setting was *on* isn't silently
+  restored either.
   The MCP subprocess gets its DB endpoint as JSON in `$SCHEMAIC_MCP_ENDPOINT` via a
   per-session temp `--mcp-config` file (removed on drop) — never argv, so credentials don't leak
   to other same-user processes. Pure clusters split out: `claude_cli.rs` (`claude` binary
@@ -2223,7 +2386,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   back on the same connection now and reports what that achieved, `DbError::Cancelled` meaning the
   rollback completed and an incomplete one arriving as an error carrying the note.
   `one_row_verdict` states only what the guard saw — it runs *before* the rollback and can't
-  know what it achieved. `engine_is_transactional` is the predicate (unknown ⇒ not transactional,
+  know what it achieved, so **every** executor appends the clause once it does: SQLite's was the one
+  that didn't, and a user reading *"UPDATE main.t affected 2 rows (expected exactly 1)"* with nothing
+  after it had no way to know the other three staged edits went back too. Its import likewise takes
+  `Rollback::Complete.note()` rather than a third hand-written wording of the sentence `Rollback`
+  exists to unify. `engine_is_transactional` is the predicate (unknown ⇒ not transactional,
   same rule as `pg_replaceable`); the import modal warns from it before the load starts. Commits
   with inserts/deletes full-re-run the query (membership/order changed); pure-UPDATE commits splice
   in place. Both halves of that rule are **pure and tested in `core::model`**, and both engines'
@@ -2421,7 +2588,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   slots to `Idle` now changes nothing the effect watches, so the sizes went blank and only returned
   when an unrelated dependency happened to re-run it. The answer is a bare counter beside the state
   — `main.rs`'s `stats_gen: RwSignal<u64>`, bumped by `start_fetch` immediately after the reset and
-  `track()`ed by the effect. Don't lean on a state signal that "obviously" already changed: the
+  `track()`ed by the effect. **Every consumer of those slots has to take that dependency, not just
+  the one the counter was added for**: the results toolbar's asker read nothing tracked, so it ran
+  once per grid build while the memo beside it stayed live on the slot — the half that can only *lose*
+  the figure. It reaches the UI as `SchemaUi::stats_gen` and travels to the grid on `GridCtx`. Don't
+  lean on a state signal that "obviously" already changed: the
   connection-wide refresh does `set` `db_nodes`, which the effect *does* track, but it does so
   before `start_fetch` resets the slots, so that run still saw them `Loaded` and found nothing to do.
 - **Don't read a locally-scoped signal inside a `dyn_container` child keyed on a *parent/shared*
@@ -2580,6 +2751,20 @@ Re-introducing the anti-patterns these guard against is a regression:
   may already be disposed. Note floem keeps **one** cleanup slot per view, so a control needing its
   own teardown passes it to `widgets::in_focus_ring_with` rather than chaining a second
   `.on_cleanup`, which would silently replace the unregister *and* the hand-back.
+  **And there is somewhere to hand it to outside a modal**, which there was not:
+  `innermost_focus_root()` is `None` in the workspace, so a ring control that removed itself while
+  focused — the results toolbar's ✓/✗ pressed from the keyboard does exactly that, since the commit
+  block's `dyn_container` key is what they change — left *nothing* focused, and from there the grid
+  answered no key at all, F6 included, until the user clicked a cell. `hand_keyboard_back` now falls
+  back to `widgets::set_keyboard_home`: an action the workspace registers, rather than an ancestor.
+  It has to be a place and not a root — a modal's root carries the key handlers for its own contents,
+  while the workspace's carries almost none (the arrows, `Del`, `Ctrl+Enter`, `Ctrl+F` and `F6` are
+  all listeners on the results grid's body) — and a closure rather than a `ViewId`, because a grid
+  rebuilds per result and a stored id names a view that has gone. `grid_view` registers
+  `refocus_grid` where it sets `focus_id`; `refocus_grid` reads that signal with `try_get_untracked`,
+  since the home outlives the grid that registered it. This is the durable form of what
+  `set_menu_return` does for one case: fixing the sites one at a time is what produced the tree's
+  cursor regression below.
 - **A `.hide()`n control is still in the Tab order** — `hide()` is `display: none`, so the view is
   still in the tree and still registered in the ring, and Tab moves focus onto something nobody can
   see. Every engine-conditional block that was built-and-hidden is therefore now **built
@@ -2696,6 +2881,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   decorates a bare wrapper container, and floem's border/focus defaults reach widgets through
   **classes** (`ToggleButtonClass`, `ButtonClass`, `TextInputClass`), never plain containers — so a
   view sitting on a classed widget has to answer those defaults on every path, not inside a branch.
+  **And a ring must set `focus_visible` to the same outline as `focus`, or answering those defaults
+  erases it.** Floem applies the `Focus` map first and the `FocusVisible` map after
+  (`style.rs`'s `apply_interact_state`), gating the second on `app_state.keyboard_navigation` — which
+  latches **globally** the first time floem's own Tab traversal runs anywhere in the window and is
+  reset by nothing but a pointer press onto a navigable view. So a control that suppresses
+  `focus_visible` (as every one here must, to kill floem's 3px magenta) and paints its ring only under
+  `focus` shows *no focus indication at all* from the first Tab onward. `button_focus_ring` sets the
+  pair; `settings::toggle_focus_ring` — extracted for exactly this — now does too, and
+  `widgets::ring_tests` asserts over the composed `Style` that a ring's `FocusVisible` outline is
+  never narrower than its `Focus` one, for both builders.
   **The outline follows the face's corner radius, and `in_ring_button` has to be told it.** Floem
   strokes an outline at *the painting view's* `border_radius` (`view::paint_outline`), and the ring
   member is a wrapper around the face — so with no radius on the wrapper every rounded button in
@@ -2948,6 +3143,17 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   Without it the surface that raised the menu goes **keyboard-dead**: the panel is a `focus_root`
   with no other root above it in the workspace, so its teardown drops focus and the next key reaches
   nothing. Both the grid toolbar's F6 and the tree's Shift+F10 hit exactly that.
+  **Handing focus back is a focus *event*, and a handler that re-seeds state on one is a bug waiting
+  for a caller.** The tree's `FocusGained` seeded the nav cursor from the open table unconditionally
+  — correct while the only way in was a click from outside, and wrong the moment the menu started
+  returning focus to a tree that was already focused and already had a cursor: closing the menu moved
+  the highlight to whatever table happened to be open, with no keypress asking, and the next
+  Shift+F10 or Enter acted on that row. The rule is `schema_tree::resume_cursor` — a live cursor is
+  the user's, and only an unset one is seeded — which is what the handler's own comment always said.
+  Shift+F10 also **re-resolves** `nav.selected` against `visible_nav_rows` before opening, exactly as
+  the arrows and Enter do: `cursor_menu`/`cursor_at` are published by the cursor row's own effect and
+  never cleared, so a row that has gone (collapse its parent, or refresh the database) left a
+  callable opener and a stale window point — the menu for an invisible object, over an unrelated row.
   **An icon closing its own menu deliberately does not arm the slot.** The slot is consumed by the
   next `menu_panel` as it *builds*, and a toggle-shut builds no panel, so a return armed there would
   sit in the thread-local waiting for the next keyboard-opened menu anywhere in the app to collect
@@ -3106,9 +3312,14 @@ for keyboard nav.
   (`ResultSet::truncated`); `grid_query` must be empty, because a spliced header filter re-runs a
   statement that is *not* `base_sql`; and `base_sql` must return the table entire
   (`intel::full_table_source`), or the table's estimate is a total this query never had. The figure
-  then comes from `ConnNode::stats` via `stats::catalogue_key` + `SchemaStats::find`, requested once
-  per capped result through `SchemaActions::db_stats` and read reactively so it appears when the
-  fetch lands — which is why the line is a `label` and not a `text`. `plural` still follows the rows
+  then comes from `ConnNode::stats` via `stats::catalogue_key` + `SchemaStats::find`, requested
+  through `SchemaActions::db_stats` and read reactively so it appears when the fetch lands — which is
+  why the line is a `label` and not a `text`. **The ask tracks `SchemaUi::stats_gen`**, like the
+  tree's size column: a schema Refresh resets every slot to `Idle`, the memo that prints the figure is
+  live on that slot and dropped it immediately, and an ask that ran only at grid-build time meant
+  `of ~2.84m` vanished from an unchanged on-screen result and never came back — unless the *opt-in*
+  size column happened to be on and that database expanded, which is the tree's refetch and not this
+  one. A repeated ask is free: the slot is the guard. `plural` still follows the rows
   actually *read*: they are the subject of the sentence, and `1 of ~4.2m row` is the wrong noun.
   The cap itself is unchanged and is still a **client-side stream cutoff**, not a `LIMIT`; this only
   says how much of the table went past it.
