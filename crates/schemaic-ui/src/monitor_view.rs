@@ -384,11 +384,22 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                     .padding_bottom(20.0)
             });
 
+            // **A memo, not the log.** `dyn_container` does not diff — it rebuilds
+            // whenever a dependency fires — and `with` subscribes, so reading the log
+            // here meant every poll that landed a single change tore down and rebuilt
+            // the whole table: header, both scrolls and up to `LOG_CAP` rows, twice
+            // cloning the log on the way. The list jumped back to the top (the new
+            // scroll starts at zero and `follow` is false exactly when the reader has
+            // scrolled away) and the header desynchronised from the body
+            // horizontally, so reading history in a live monitor was impossible
+            // except by pausing. The memo fires only on the empty↔non-empty edge.
+            let is_empty = floem::reactive::create_memo(move |_| log.with(|l| l.is_empty()));
+
             // Body: the change table (header + rows), or a centred placeholder while
             // empty — so an empty monitor shows just "Waiting…", not a bare header.
             // Rows are content-sized (no wrap), so it scrolls both axes.
             let content = dyn_container(
-                move || log.with(|l| l.is_empty()),
+                move || is_empty.get(),
                 move |empty_log| {
                     if empty_log {
                         // `paused` is tracked *here*, inside the empty branch, not in
@@ -429,10 +440,17 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                             .border_color(theme::border())
                     });
                     let (shown, poke) = autohide_state();
+                    // **Keyed on the entry's own sequence number, not its position.**
+                    // The log is a sliding window at `LOG_CAP`, so the index set
+                    // stays `{0..999}` while the thousand changes it describes move
+                    // — and floem reuses a view whose key didn't change, which would
+                    // freeze the rendered list at the first thousand while Export
+                    // went on sliding. Nothing hid that before because the whole
+                    // table was being rebuilt per poll.
                     let list = dyn_stack(
-                        move || log.get().into_iter().enumerate().collect::<Vec<_>>(),
-                        |(i, _)| *i,
-                        move |(_, entry)| entry_row(entry, cols),
+                        move || log.get(),
+                        |entry| entry.seq,
+                        move |entry| entry_row(entry, cols),
                     )
                     .style(|s| {
                         s.flex_col()

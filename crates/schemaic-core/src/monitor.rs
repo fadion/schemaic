@@ -280,6 +280,36 @@ fn field_changes(old: &[Option<String>], new: &[Option<String>]) -> Vec<FieldCha
 pub struct MonitorEntry {
     pub at: String,
     pub change: RowChange,
+    /// A number that only ever goes up, assigned by [`append_changes`] — the log's
+    /// identity for this entry.
+    ///
+    /// **It exists so the rendered list can be keyed on the entry rather than on
+    /// its position.** The log is a sliding window: at [`LOG_CAP`] each appended
+    /// entry drops one off the front, so positions `0..999` describe a *different*
+    /// thousand changes after every poll while the index set stays identical —
+    /// and floem's keyed diff, which reuses a view whose key didn't change, would
+    /// render the first thousand changes for ever while the log and its export went
+    /// on sliding underneath.
+    pub seq: u64,
+}
+
+/// Stamp `changes` with `at`, append them to `log`, and trim it to [`LOG_CAP`] —
+/// returning how many entries the trim dropped.
+///
+/// One function because the three parts are one rule: an entry's sequence number
+/// has to be assigned where it is appended (it is `last + 1`, and the log is never
+/// reordered), and the cap has to be applied in the same breath or the caveat the
+/// status line prints could disagree with what the log holds.
+pub fn append_changes(log: &mut Vec<MonitorEntry>, at: &str, changes: Vec<RowChange>) -> usize {
+    let first = log.last().map(|e| e.seq + 1).unwrap_or(0);
+    for (seq, change) in (first..).zip(changes) {
+        log.push(MonitorEntry {
+            at: at.to_string(),
+            change,
+            seq,
+        });
+    }
+    trim_log(log)
 }
 
 /// Separates a changed column's old and new value in an exported cell
@@ -792,7 +822,41 @@ mod tests {
                 fields: Vec::new(),
                 cells: cells(cells_in),
             },
+            seq: 0,
         }
+    }
+
+    /// **The sequence number only ever goes up, across the trim.** It is what the
+    /// rendered list is keyed on, and a log at the cap slides — so if the numbers
+    /// restarted, or repeated, floem would reuse a row's view for a different
+    /// change and the list would stop matching the log it exports.
+    #[test]
+    fn appended_entries_are_numbered_monotonically_across_the_cap() {
+        let change = |k: &str| RowChange {
+            kind: ChangeKind::Insert,
+            key: vec![k.to_string()],
+            fields: Vec::new(),
+            cells: Vec::new(),
+        };
+        let mut log: Vec<MonitorEntry> = Vec::new();
+        assert_eq!(append_changes(&mut log, "0:01", vec![change("a")]), 0);
+        assert_eq!(append_changes(&mut log, "0:02", vec![change("b")]), 0);
+        assert_eq!(log.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(log[1].at, "0:02", "each carries its own observation time");
+
+        // Fill to the cap, then past it: the front is dropped and the numbers keep
+        // climbing, so no two live entries ever share one.
+        let rest: Vec<RowChange> = (0..LOG_CAP).map(|i| change(&i.to_string())).collect();
+        let dropped = append_changes(&mut log, "0:03", rest);
+        assert_eq!(dropped, 2, "the two oldest went");
+        assert_eq!(log.len(), LOG_CAP);
+        assert_eq!(log.first().unwrap().seq, 2);
+        assert_eq!(log.last().unwrap().seq, (LOG_CAP + 1) as u64);
+        let mut seqs: Vec<u64> = log.iter().map(|e| e.seq).collect();
+        let before = seqs.len();
+        seqs.dedup();
+        assert_eq!(seqs.len(), before, "no repeats");
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "and strictly rising");
     }
 
     /// Every cell of one exported row, as display text (`NULL` for a real NULL),

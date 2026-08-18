@@ -4679,7 +4679,7 @@ fn source_table_of(name: &sqlparser::ast::ObjectName) -> Option<SourceTable> {
 ///
 /// An `ORDER BY` is fine: it reorders rows without adding or removing any.
 pub fn full_table_source(sql: &str, dialect: SqlDialect) -> Option<SourceTable> {
-    use sqlparser::ast::{GroupByExpr, SetExpr};
+    use sqlparser::ast::{GroupByExpr, SetExpr, TableFactor};
     let stmts = sqlparser::parser::Parser::parse_sql(&*dialect.parser(), sql).ok()?;
     if stmts.len() != 1 {
         return None;
@@ -4713,6 +4713,21 @@ pub fn full_table_source(sql: &str, dialect: SqlDialect) -> Option<SourceTable> 
         _ => return None,
     }
     if !select.projection.iter().all(row_preserving_item) {
+        return None;
+    }
+    // **Two row-limiting clauses that hang off the table factor rather than the
+    // select**, so every test above passes over them: `FROM orders PARTITION (p0)`
+    // reads one partition of a partitioned table, and `TABLESAMPLE SYSTEM (10)` a
+    // fraction of the rows. Either way the table's estimate is a total the
+    // statement could not have reached, printed against a result that overran the
+    // cap — and the `~` in front of it says "estimate", not "of a different
+    // query". A lock hint (`FOR UPDATE`) and MySQL's `SQL_CALC_FOUND_ROWS` sit in
+    // the same neighbourhood and change no row count; they stay.
+    if let TableFactor::Table {
+        partitions, sample, ..
+    } = &select.from[0].relation
+        && (!partitions.is_empty() || sample.is_some())
+    {
         return None;
     }
     source_table_of(name)
@@ -5136,6 +5151,41 @@ mod tests {
         ] {
             assert_eq!(t(sql), None, "{sql}");
         }
+    }
+
+    /// **The row-limiting clauses that live on the table factor**, not on the
+    /// select. Both read a proper subset — `PARTITION (p0)` one partition of a
+    /// partitioned table, `TABLESAMPLE` a fraction of the rows — so the table's
+    /// own estimate is a total the statement could never have reached, and the
+    /// `~` in front of it says "estimate", not "of a different query".
+    #[test]
+    fn full_table_source_refuses_a_partition_or_a_sample() {
+        assert_eq!(
+            full_table_source("SELECT * FROM t PARTITION (p0)", SqlDialect::MySql),
+            None
+        );
+        assert_eq!(
+            full_table_source(
+                "SELECT * FROM t TABLESAMPLE SYSTEM (10)",
+                SqlDialect::Postgres
+            ),
+            None
+        );
+        // The whole table on the same dialects still qualifies, so the refusal is
+        // the modifier's and not the parser's.
+        assert!(full_table_source("SELECT * FROM t", SqlDialect::MySql).is_some());
+        assert!(full_table_source("SELECT * FROM t", SqlDialect::Postgres).is_some());
+    }
+
+    /// Two neighbours that look like modifiers and change no row count: a lock
+    /// hint and MySQL's counting hint. Both must still qualify — refusing them
+    /// would drop the figure from an ordinary browse.
+    #[test]
+    fn full_table_source_keeps_a_lock_or_counting_hint() {
+        assert!(full_table_source("SELECT * FROM t FOR UPDATE", SqlDialect::MySql).is_some());
+        assert!(
+            full_table_source("SELECT SQL_CALC_FOUND_ROWS * FROM t", SqlDialect::MySql).is_some()
+        );
     }
 
     /// The generated browse query carries a `LIMIT`, so it must **not** qualify —

@@ -29,6 +29,7 @@ use floem::prelude::*;
 use floem::reactive::create_effect;
 
 use schemaic_core::schema::TableInfo;
+use schemaic_core::stats;
 use schemaic_core::stats::{IndexStats, RowCount, TableStats, format_bytes};
 use schemaic_core::text::plural;
 
@@ -267,13 +268,12 @@ fn stats_body(
 /// it.
 fn headline(stats: &TableStats) -> AnyView {
     let rows = stats.row_count();
+    // Both halves from the model: the figure's own label, and the caption that
+    // qualifies it — the same word the copied Markdown uses, which is the point of
+    // asking rather than deciding here.
     let row_tile = tile(
         rows.map(RowCount::label).unwrap_or_else(|| "—".to_string()),
-        match rows {
-            Some(rc) if rc.is_estimate() => "rows (estimated)".to_string(),
-            Some(_) => "rows (counted)".to_string(),
-            None => "rows — not reported".to_string(),
-        },
+        stats.row_caption(),
     );
     let size_tile = tile(
         stats
@@ -317,13 +317,45 @@ fn count_row(
     ring: FocusRing,
 ) -> Option<AnyView> {
     let counted = stats.is_some_and(|s| s.exact_rows.is_some());
-    let control: Option<AnyView> = if counted {
+    // The four states are the model's (`stats::count_row_state`), including the one
+    // that removes the whole row rather than leaving a blank band where the control
+    // used to be.
+    let (offer, hint_kind) = stats::count_row_state(counted, counting, count_err.is_some())?;
+    let control: Option<AnyView> = if offer == stats::CountOffer::Done {
         // Nothing to press any more, and `None` rather than an `empty()`: the row
         // has a 10px gap, which an empty child would leave as a phantom indent
         // in front of the hint.
         None
-    } else if counting {
-        Some(loading_dots("Counting", theme::text_dim, FONT_LABEL).into_any())
+    } else if offer == stats::CountOffer::Running {
+        // **The spinner needs a way out.** The scan is unbounded and holds a
+        // connection, so "wait or close the panel" is not the only answer it should
+        // have: Cancel stops it on the server. It takes `COUNT_TAB` because the two
+        // are mutually exclusive — the ring holds whichever of them exists.
+        let stop = ui.schema_actions.count_cancel.clone();
+        let press = stop.clone();
+        let face = h_stack((
+            loading_dots("Counting", theme::text_dim, FONT_LABEL),
+            text("Cancel").style(|s| {
+                s.font_size(FONT_LABEL)
+                    .color(theme::text_dim())
+                    .padding_horiz(8.0)
+                    .padding_vert(4.0)
+                    .border(1.0)
+                    .border_color(theme::control_border())
+                    .border_radius(6.0)
+                    .hover(|s| s.color(theme::text()).background(theme::control_hover()))
+            }),
+        ))
+        .style(|s| s.items_center().gap(10.0))
+        .on_click_stop(move |_| (stop)());
+        Some(in_ring_button(
+            face,
+            ring.clone(),
+            COUNT_TAB,
+            true,
+            6.0,
+            move || (press)(),
+        ))
     } else {
         let run = ui.schema_actions.count_rows.clone();
         // **Both halves, and they are not the same one.** `in_ring_button` binds
@@ -361,23 +393,22 @@ fn count_row(
         ))
     };
 
-    let hint: Option<AnyView> = match (&count_err, counted) {
-        (Some(e), _) => Some(
-            text(e.clone())
+    let hint: Option<AnyView> = match hint_kind {
+        Some(stats::CountHint::Error) => Some(
+            text(count_err.clone().unwrap_or_default())
                 .style(|s| s.font_size(FONT_BODY).color(theme::error()))
                 .into_any(),
         ),
-        // Counted: nothing left to say. The caption under the headline already
-        // reads "rows (counted)", so a second line asserting the same thing is
-        // just a line — and with the button gone too, the whole row goes with it
-        // rather than leaving a blank band where the control used to be.
-        (None, true) => None,
         // The warning belongs *before* the press, not after.
-        (None, false) => Some(
+        Some(stats::CountHint::Slow) => Some(
             text("A full scan of the table. Slow on a large one.")
                 .style(|s| s.font_size(FONT_BODY).color(theme::text_faint()))
                 .into_any(),
         ),
+        // Counted: nothing left to say. The caption under the headline already
+        // reads "rows (counted)", so a second line asserting the same thing is
+        // just a line.
+        None => None,
     };
 
     let parts: Vec<AnyView> = control.into_iter().chain(hint).collect();
@@ -412,8 +443,9 @@ fn storage_section(stats: &TableStats) -> Option<AnyView> {
         swatch(theme::key_index, "Indexes", stats.index_bytes),
     ];
     // Free space is MySQL's `DATA_FREE`, and it is only worth a legend entry when
-    // there is some — a permanent "Free 0 B" is noise on every other engine.
-    if stats.free_bytes.is_some_and(|b| b > 0) {
+    // there is some — the threshold is the model's (`shows_free`), shared with the
+    // copied Markdown.
+    if stats.shows_free() {
         legend.push(swatch(theme::border, "Free", stats.free_bytes));
     }
 
@@ -549,27 +581,11 @@ fn index_section(stats: &TableStats) -> Option<AnyView> {
 fn index_row(idx: &IndexStats) -> AnyView {
     let unused = idx.is_unused();
     let is_primary = idx.is_primary;
-    let mut facts: Vec<String> = Vec::new();
-    if let Some(b) = idx.bytes {
-        facts.push(format_bytes(b));
-    }
-    if let Some(c) = idx.cardinality {
-        facts.push(format!("cardinality {}", RowCount::Exact(c).label()));
-    }
-    match idx.scans {
-        // "Never used" is the finding; the raw zero beside it would just repeat
-        // itself. Anything else prints the count, because the *size* of the
-        // number is the point ("9 scans" is nearly as interesting as none).
-        Some(0) => {}
-        Some(n) => facts.push(format!(
-            "{} {}",
-            RowCount::Exact(n).label(),
-            plural(n as usize, "scan", "scans")
-        )),
-        // Absent, not zero — see `IndexStats::scans`. Said out loud, because a
-        // blank here would read as "no scans".
-        None => facts.push("usage not counted".to_string()),
-    }
+    // Which figures are worth printing, and in what words, is the model's
+    // decision (`stats::index_facts`) — the counted zero that prints nothing and
+    // the absent count that says so out loud are the difference between "drop this
+    // index" and "nobody was counting", and they were rules held in this view.
+    let facts = stats::index_facts(idx);
 
     let name = h_stack((
         icons::icon(
@@ -604,9 +620,9 @@ fn index_row(idx: &IndexStats) -> AnyView {
                 .style(|s| s.flex_shrink(0.0_f32).color(theme::plan_warn())),
             // Worded as an observation with its window attached, because that is
             // all the counter can support: it resets when the server does, and a
-            // nightly job's index looks identical to a dead one.
-            text("never used since the server's counters were reset")
-                .style(|s| s.font_size(FONT_BODY).color(theme::plan_warn())),
+            // nightly job's index looks identical to a dead one. The sentence is
+            // the model's, so the exported Markdown says it too.
+            text(stats::unused_note()).style(|s| s.font_size(FONT_BODY).color(theme::plan_warn())),
         ))
         .style(|s| s.items_center().gap(5.0))
         .into_any()

@@ -453,15 +453,36 @@ fn themed_toggle(sig: RwSignal<bool>) -> impl IntoView {
             // box and costs no layout at all, so the ring can be the buttons'
             // — same colour, same width — instead of a dim border that was the
             // most this could afford.
-            if !crate::widgets::keyboard_nav().get() {
-                return s;
-            }
-            s.focus(move |s| {
-                s.outline(2.0)
-                    .outline_color(theme::accent())
-                    .hover(move |s| s.background(bg_hover))
-            })
+            toggle_focus_ring(s, bg_hover)
         })
+}
+
+/// The switch's focus ring, gated on [`crate::widgets::keyboard_nav`] — a
+/// function of its own so the selector-ordering rule below can be asserted
+/// without a window.
+///
+/// **Both selectors, set to the same outline.** Floem applies `Focus` first and
+/// then `FocusVisible` (`style.rs`'s `apply_interact_state`), so the narrower of
+/// the two wins whenever `app_state.keyboard_navigation` has latched — and it
+/// latches globally the first time floem's own Tab traversal runs anywhere in the
+/// window, which one Tab in the workspace does. With only `.focus` set, the
+/// unconditional `.focus_visible(outline(0.0))` above — which is there to answer
+/// floem's own 3px magenta default — erased this ring completely from that moment
+/// on, and the switch showed no focus indication at all. `widgets::button_focus_ring`
+/// sets the pair for exactly this reason; this site had lost its half.
+pub(crate) fn toggle_focus_ring(
+    s: floem::style::Style,
+    bg_hover: floem::peniko::Color,
+) -> floem::style::Style {
+    if !crate::widgets::keyboard_nav().get() {
+        return s;
+    }
+    let ring = move |s: floem::style::Style| {
+        s.outline(2.0)
+            .outline_color(theme::accent())
+            .hover(move |s| s.background(bg_hover))
+    };
+    s.focus(ring).focus_visible(ring)
 }
 
 /// A [`themed_toggle`] in a modal's Tab order, operable from the keyboard:

@@ -64,6 +64,11 @@ type ConnectResult = Result<
 >;
 /// Self-rescheduling cursor-blink tick — holds an `Rc` to itself so it can re-arm.
 type BlinkTick = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+/// An action declared before the closure that performs it exists, filled in once
+/// it does. `app_view` builds its actions in dependency order, and the few places
+/// where that order can't hold both ways — an early action needing a later one —
+/// read through one of these rather than being duplicated.
+type LateAction<T> = Rc<RefCell<Option<Rc<dyn Fn(T)>>>>;
 
 /// A closed tab's restorable state — plain data (no signals), so it outlives the
 /// tab's disposed scope and can rebuild the tab on Ctrl+Shift+T.
@@ -866,10 +871,20 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // still worth keeping). Each tab's database is filled in once its connection's
     // database list loads — but only while still `None`, so a restored database
     // survives (see the schema-load rebind).
-    let saved_tabs = if ui_state.restore_tabs {
-        persist::load_json::<schemaic_core::persist::SavedTabsFile>("tabs.json")
-    } else {
-        schemaic_core::persist::SavedTabsFile::default()
+    let saved_tabs = {
+        let saved = persist::load_json::<schemaic_core::persist::SavedTabsFile>("tabs.json");
+        if ui_state.restore_tabs {
+            saved
+        } else {
+            // **The setting off is not a licence to drop unrecoverable text.** A
+            // file-backed tab with unsaved edits is the one tab whose text is
+            // neither on disk nor retypeable, and a window quit is the one way of
+            // losing it that cannot ask first (floem 0.2 can't veto a close). The
+            // same subset is what the flush writes while the setting is off — read
+            // here as well so a full session left over from when it was *on* isn't
+            // silently restored either.
+            saved.unsaved_files_only()
+        }
     };
     let (initial_tabs, initial_active, first_free_id): (Vec<Tab>, usize, usize) =
         if saved_tabs.tabs.is_empty() {
@@ -3521,12 +3536,22 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         })
     };
 
+    // **A file already open on *another* connection still has to be reachable**,
+    // and the only correct way to reach it is the connection switch itself —
+    // which reloads the schema, restores that connection's remembered tab and
+    // resets the status. `switch_conn` is defined much further down (it needs
+    // `load_schema`), so the reference is filled in there and read from here.
+    // Activating a tab the strip doesn't show would leave the window contradicting
+    // itself.
+    let switch_conn_late: LateAction<u64> = Rc::new(RefCell::new(None));
+
     // Ctrl+O — pick a `.sql` file and open it in a tab, reusing a blank one the
     // way every other "open something in a tab" path does (`place_tab`).
     let open_sql_file: Rc<dyn Fn()> = {
         let next_id = next_id.clone();
         let default_tab_target = default_tab_target.clone();
         let place_tab = place_tab.clone();
+        let switch_conn_late = switch_conn_late.clone();
         let read_sql_file = read_sql_file.clone();
         let file_error = file_error.clone();
         Rc::new(move || {
@@ -3541,24 +3566,53 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             let place_tab = place_tab.clone();
             let read_sql_file = read_sql_file.clone();
             let file_error = file_error.clone();
+            let switch_conn_late = switch_conn_late.clone();
             floem::file_action::open_file(opts, move |file| {
                 let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
                     return; // cancelled
                 };
-                // Already open on this connection? Activate that tab instead of
-                // opening a second view of one file — two tabs saving over each
-                // other is a lost edit, and the strip is per-connection anyway.
-                let conn = active_conn.get_untracked();
+                // **Already open anywhere?** Activate that tab instead of opening
+                // a second view of one file: each tab keeps its own copy of the
+                // bytes on disk, so saving the second discards the first — and the
+                // first goes on showing itself clean, because its own copy still
+                // matches what *it* wrote.
+                //
+                // Asked of every tab, not just this connection's. The strip being
+                // per-connection is a fact about visibility and no answer at all to
+                // the lost edit; scoping the search to the active connection made
+                // opening the same file under a second connection produce a second
+                // tab *always*.
+                //
+                // Canonicalised first, then compared by `sqlfile::same_file`: the
+                // resolved form settles case, 8.3 short names, junctions and a
+                // substituted drive when the file exists, and the path comparison
+                // is what is left when it doesn't (a path that was typed into Save
+                // As cannot be canonicalised at all).
+                let resolve = |p: &std::path::Path| {
+                    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+                };
+                let wanted = resolve(&path);
                 let already = tabs.with_untracked(|v| {
                     v.iter()
                         .find(|t| {
-                            t.conn_id.get_untracked() == conn
-                                && t.path
-                                    .with_untracked(|p| p.as_deref() == Some(path.as_path()))
+                            t.path.with_untracked(|p| {
+                                p.as_deref().is_some_and(|q| {
+                                    schemaic_core::sqlfile::same_file(&resolve(q), &wanted)
+                                })
+                            })
                         })
-                        .map(|t| t.id)
+                        .map(|t| (t.id, t.conn_id.get_untracked()))
                 });
-                if let Some(id) = already {
+                if let Some((id, on_conn)) = already {
+                    if on_conn != active_conn.get_untracked() {
+                        // Cloned out of the cell before the call: the switch runs
+                        // arbitrary app code, and holding the borrow across it
+                        // would panic if any of it came back here.
+                        let switch = switch_conn_late.borrow().clone();
+                        if let Some(switch) = switch {
+                            switch(on_conn);
+                        }
+                    }
                     active.set(id);
                     return;
                 }
@@ -3805,6 +3859,77 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         });
     }
 
+    // The session as it stands, hoisted out of the debounced effect below so the
+    // flush on window close writes exactly the same thing — a second builder
+    // would be a second answer to "what was open", and the one that runs at quit
+    // is the one nobody watches.
+    let session_snapshot: Rc<dyn Fn() -> schemaic_core::persist::SavedTabsFile> =
+        Rc::new(move || {
+            tabs.with_untracked(|v| {
+                let active_id = active.get_untracked();
+                schemaic_core::persist::SavedTabsFile {
+                    active: v.iter().position(|t| t.id == active_id).unwrap_or(0),
+                    tabs: v
+                        .iter()
+                        .map(|t| {
+                            let src = t.source.get_untracked();
+                            schemaic_core::persist::SavedTab {
+                                query: t.query.get_untracked(),
+                                conn_id: t.conn_id.get_untracked(),
+                                database: t.database.get_untracked(),
+                                // The namespace rides alongside the pair rather
+                                // than widening it, so an older build's session
+                                // file still restores (see `SavedTab`).
+                                source: src.as_ref().map(|s| (s.database.clone(), s.table.clone())),
+                                source_schema: src.and_then(|s| s.schema),
+                                name: t.name.get_untracked(),
+                                pinned: t.pinned.get_untracked(),
+                                path: t.path.get_untracked(),
+                                file_crlf: t.file_format.get_untracked().crlf,
+                                file_bom: t.file_format.get_untracked().bom,
+                                // The warning has to survive a relaunch: the
+                                // restored tab holds the *decoded* text, so
+                                // nothing in it would show that a save destroys
+                                // the original bytes.
+                                file_lossy: t.file_format.get_untracked().lossy,
+                                // One bit instead of a second copy of the file's
+                                // text — see `SavedTab::file_dirty`.
+                                file_dirty: t.modified(),
+                            }
+                        })
+                        .collect(),
+                }
+            })
+        });
+
+    // **Write the session now, because the window is going.** Quitting is the one
+    // way of losing a tab that never reaches `guard_close`, and on floem 0.2 it
+    // cannot be vetoed (`app_handle.rs` calls `close_window` on `CloseRequested`
+    // unconditionally) — so the answer is not a prompt but a flush. Without it a
+    // quit inside the 600 ms debounce left `tabs.json` holding the *previous*
+    // save, whose `file_dirty` was `false` because the tab was clean then: the tab
+    // came back with the pre-edit text, no italic and no dot, reporting itself as
+    // matching disk. Confidently wrong is worse than stale.
+    //
+    // With the setting off, only the tabs whose text is nowhere else are written
+    // (`unsaved_files_only`), and nothing at all when there are none — a quit must
+    // not silently discard unsaved file edits, and it must not store a session the
+    // user asked not to keep either.
+    let flush_session: Rc<dyn Fn()> = {
+        let session_snapshot = session_snapshot.clone();
+        Rc::new(move || {
+            let file = session_snapshot();
+            if restore_tabs.get_untracked() {
+                persist::save_json("tabs.json", &file);
+                return;
+            }
+            let unsaved = file.unsaved_files_only();
+            if !unsaved.tabs.is_empty() {
+                persist::save_json("tabs.json", &unsaved);
+            }
+        })
+    };
+
     // Persist the open tabs (query text + connection + source) so the next launch
     // can restore the session, when the setting is on. Query edits fire on every
     // keystroke, so the write is debounced with a short trailing delay: each change
@@ -3812,6 +3937,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // setting off) supersedes the pending one, so only the last edit of a burst
     // touches disk. `tabs.json` holds ids/text only — no credentials.
     {
+        let session_snapshot = session_snapshot.clone();
         let tabs_save_gen = Rc::new(Cell::new(0u64));
         create_effect(move |_| {
             let on = restore_tabs.get();
@@ -3835,48 +3961,12 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 return; // bumping `g` above also cancels any pending save
             }
             let gen_at = tabs_save_gen.clone();
+            let session_snapshot = session_snapshot.clone();
             exec_after(Duration::from_millis(600), move |_| {
                 if gen_at.get() != g {
                     return; // superseded by a newer change
                 }
-                let file = tabs.with_untracked(|v| {
-                    let active_id = active.get_untracked();
-                    schemaic_core::persist::SavedTabsFile {
-                        active: v.iter().position(|t| t.id == active_id).unwrap_or(0),
-                        tabs: v
-                            .iter()
-                            .map(|t| {
-                                let src = t.source.get_untracked();
-                                schemaic_core::persist::SavedTab {
-                                    query: t.query.get_untracked(),
-                                    conn_id: t.conn_id.get_untracked(),
-                                    database: t.database.get_untracked(),
-                                    // The namespace rides alongside the pair rather
-                                    // than widening it, so an older build's session
-                                    // file still restores (see `SavedTab`).
-                                    source: src
-                                        .as_ref()
-                                        .map(|s| (s.database.clone(), s.table.clone())),
-                                    source_schema: src.and_then(|s| s.schema),
-                                    name: t.name.get_untracked(),
-                                    pinned: t.pinned.get_untracked(),
-                                    path: t.path.get_untracked(),
-                                    file_crlf: t.file_format.get_untracked().crlf,
-                                    file_bom: t.file_format.get_untracked().bom,
-                                    // The warning has to survive a relaunch: the
-                                    // restored tab holds the *decoded* text, so
-                                    // nothing in it would show that a save
-                                    // destroys the original bytes.
-                                    file_lossy: t.file_format.get_untracked().lossy,
-                                    // One bit instead of a second copy of the
-                                    // file's text — see `SavedTab::file_dirty`.
-                                    file_dirty: t.modified(),
-                                }
-                            })
-                            .collect(),
-                    }
-                });
-                persist::save_json("tabs.json", &file);
+                persist::save_json("tabs.json", &session_snapshot());
             });
         });
     }
@@ -4508,6 +4598,38 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 properties_state.set(schemaic_ui::PropertiesState::Unsupported);
                 return;
             }
+            // **The tree and the toolbar already have a slot for this, so ask it
+            // first.** One fetch covers a whole database — the query's cost is in
+            // making the server materialize per-table statistics for all of them —
+            // and this modal used to issue a fresh one, on a fresh connection, on
+            // every open: ten tables inspected in a row was ten full catalogue
+            // fetches for data that was in memory the whole time. Worse on a server
+            // with `information_schema_stats_expiry = 0`, which re-reads from the
+            // storage engine each time, and the one the panel prints a note for.
+            //
+            // Only for the **active** connection: `db_nodes` is its tree, and a
+            // query tab's properties may name another server (which is why the
+            // target carries `conn_id` at all). Anything else takes the fetch below.
+            let slot = (target.conn_id == active_conn.get_untracked())
+                .then(|| {
+                    db_nodes.with_untracked(|nodes| {
+                        nodes
+                            .iter()
+                            .find(|n| n.database == target.database)
+                            .map(|n| n.stats)
+                    })
+                })
+                .flatten();
+            if let Some(slot) = slot
+                && let schemaic_ui::DbStatsState::Loaded(set) = slot.get_untracked()
+            {
+                properties_state.set(schemaic_ui::PropertiesState::Loaded(Box::new(
+                    set.get(target.schema.as_deref(), &target.table)
+                        .cloned()
+                        .unwrap_or_default(),
+                )));
+                return;
+            }
             let want = target.clone();
             let report = create_ext_action(
                 cx,
@@ -4515,7 +4637,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     if properties.with_untracked(|t| t.as_ref() != Some(&want)) {
                         return;
                     }
-                    properties_state.set(match res {
+                    properties_state.set(match &res {
                         Ok(set) => schemaic_ui::PropertiesState::Loaded(Box::new(
                             set.get(want.schema.as_deref(), &want.table)
                                 .cloned()
@@ -4524,8 +4646,24 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                                 // report", not a failure.
                                 .unwrap_or_default(),
                         )),
-                        Err(e) => schemaic_ui::PropertiesState::Failed(e),
+                        Err(e) => schemaic_ui::PropertiesState::Failed(e.clone()),
                     });
+                    // **And warm the shared slot with it**, so the size column and
+                    // a capped result's total are spared the same round trip — the
+                    // two paths used to be unable to see each other in either
+                    // direction. Only into a slot that hasn't got figures already:
+                    // `Loading` means a fetch of its own is in flight and will land,
+                    // and overwriting a `Loaded` set would substitute one reading
+                    // for another with nothing to say which is newer.
+                    if let (Some(slot), Ok(set)) = (slot, res)
+                        && matches!(
+                            slot.get_untracked(),
+                            schemaic_ui::DbStatsState::Idle
+                                | schemaic_ui::DbStatsState::Unavailable
+                        )
+                    {
+                        slot.set(schemaic_ui::DbStatsState::Loaded(set));
+                    }
                 },
             );
             handle.spawn(async move {
@@ -4538,12 +4676,45 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         })
     };
 
+    // The in-flight `COUNT(*)`, if any. It is a **full scan** and the only way to
+    // stop one is to hold its token: closing the modal used to abandon the answer
+    // and leave the scan running on the server for minutes, holding a connection,
+    // while the reopened panel offered the button again — N opens, N concurrent
+    // scans.
+    let counting_token: Rc<RefCell<Option<CancellationToken>>> = Rc::new(RefCell::new(None));
+
+    // Whatever the modal is pointing at changed — closed, or reopened on another
+    // table — so a scan asked for by the *previous* target is no longer wanted.
+    // This is the close path: the modal owns its own dismissal (Escape, the ✕, the
+    // backdrop) and all three arrive here as one write.
+    {
+        let counting_token = counting_token.clone();
+        create_effect(move |_| {
+            properties.track();
+            if let Some(tok) = counting_token.borrow_mut().take() {
+                tok.cancel();
+                properties_counting.set(false);
+            }
+        });
+    }
+
+    let count_cancel: Rc<dyn Fn()> = {
+        let counting_token = counting_token.clone();
+        Rc::new(move || {
+            if let Some(tok) = counting_token.borrow_mut().take() {
+                tok.cancel();
+                properties_counting.set(false);
+            }
+        })
+    };
+
     // The exact `COUNT(*)`. Its result is folded into the loaded statistics
     // rather than kept beside them, so everything that prints a row figure —
     // the headline, the Markdown copy — reads one place and cannot disagree.
     let count_rows: Rc<dyn Fn(schemaic_ui::PropertiesTarget)> = {
         let handle = handle.clone();
         let db_for = db_for.clone();
+        let counting_token = counting_token.clone();
         Rc::new(move |target: schemaic_ui::PropertiesTarget| {
             let db = match db_for(target.conn_id) {
                 Ok(db) => db,
@@ -4554,6 +4725,13 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             };
             properties_counting.set(true);
             properties_count_err.set(None);
+            // One scan at a time, and it can be stopped. Any older token is
+            // cancelled rather than dropped: dropping one abandons the *answer*
+            // while the server keeps scanning.
+            let token = CancellationToken::new();
+            if let Some(old) = counting_token.borrow_mut().replace(token.clone()) {
+                old.cancel();
+            }
             let want = target.clone();
             let report = create_ext_action(cx, move |res: Result<u64, String>| {
                 if properties.with_untracked(|t| t.as_ref() != Some(&want)) {
@@ -4578,12 +4756,21 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                             *st = schemaic_ui::PropertiesState::Loaded(stats);
                         });
                     }
+                    // A cancelled count is not a failure to report: the user asked
+                    // for it to stop, and the estimate they already have is what
+                    // the panel goes back to showing.
+                    Err(e) if e == schemaic_db::DbError::Cancelled.to_string() => {}
                     Err(e) => properties_count_err.set(Some(e)),
                 }
             });
             handle.spawn(async move {
                 let res = db
-                    .count_rows(&target.database, target.schema.as_deref(), &target.table)
+                    .count_rows(
+                        &target.database,
+                        target.schema.as_deref(),
+                        &target.table,
+                        token,
+                    )
                     .await
                     .map_err(|e| e.to_string());
                 report(res);
@@ -4675,18 +4862,25 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             if !table_sizes.get() {
                 return;
             }
-            let open = expanded.get();
             let conn_id = active_conn.get();
             // A refresh reset some node to `Idle`; nothing else here would see it.
             stats_gen.track();
+            // `with`, not `get`: the expanded set holds one key per open database,
+            // table and folder — thousands in a working session — and `get` would
+            // clone the whole `HashSet` to answer one membership test per database.
+            // A connection-wide refresh bumps `stats_gen` once per database, so it
+            // was one full clone per database per refresh. Tracking is identical
+            // either way.
             let pending: Vec<(String, RwSignal<schemaic_ui::DbStatsState>)> =
-                db_nodes.with(|nodes| {
-                    nodes
-                        .iter()
-                        .filter(|n| open.contains(&schemaic_ui::db_key(&n.database)))
-                        .filter(|n| n.stats.get_untracked() == schemaic_ui::DbStatsState::Idle)
-                        .map(|n| (n.database.clone(), n.stats))
-                        .collect()
+                expanded.with(|open| {
+                    db_nodes.with(|nodes| {
+                        nodes
+                            .iter()
+                            .filter(|n| open.contains(&schemaic_ui::db_key(&n.database)))
+                            .filter(|n| n.stats.get_untracked() == schemaic_ui::DbStatsState::Idle)
+                            .map(|n| (n.database.clone(), n.stats))
+                            .collect()
+                    })
                 });
             for (database, slot) in pending {
                 (fetch)(conn_id, database, slot);
@@ -4877,6 +5071,9 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             check_conn();
         })
     };
+    // The forward reference declared beside `open_sql_file`, which needs this to
+    // reach a file already open under another connection.
+    *switch_conn_late.borrow_mut() = Some(switch_conn.clone());
 
     // Load an existing connection into the edit form.
     let select_conn: Rc<dyn Fn(u64)> = Rc::new(move |id: u64| {
@@ -6302,6 +6499,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         },
         schema: SchemaUi {
             db_nodes,
+            stats_gen,
             expanded,
             active_table,
             hidden_dbs,
@@ -6334,6 +6532,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             trigger_source,
             table_stats,
             count_rows,
+            count_cancel,
             toggle_table_sizes,
             db_stats,
         }),
@@ -6512,7 +6711,20 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
         error_modal_text.set(Some(recoveries.join("\n\n")));
         error_modal_open.set(true);
     }
-    schemaic_ui::workspace(ui)
+    // **The session write that has to happen even though nobody asked for it.**
+    // Quitting the window is the one way of losing a tab that never reaches
+    // `guard_close`, and floem 0.2 handles `CloseRequested` by closing
+    // unconditionally, so there is no veto to hang a prompt off. The close *is*
+    // observable, though — `WindowHandle::destroy` fires `WindowClosed` before it
+    // disposes the scope — which is enough to make the debounced save's 600 ms
+    // window stop mattering. See `flush_session`.
+    {
+        use floem::views::Decorators;
+        schemaic_ui::workspace(ui)
+            .on_event_cont(floem::event::EventListener::WindowClosed, move |_| {
+                flush_session()
+            })
+    }
 }
 
 /// Live Monitor tuning: the poll interval. The two caps — per-poll rows and
@@ -6693,15 +6905,11 @@ fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
                     let at = fmt_elapsed(ctx.started.elapsed().as_secs());
                     let mut dropped = 0usize;
                     ctx.log.update(|log| {
-                        for change in changes {
-                            log.push(MonitorEntry {
-                                at: at.clone(),
-                                change,
-                            });
-                        }
-                        // The one place the cap is applied, in core, so the
-                        // modal's caveat can't disagree with it.
-                        dropped = schemaic_core::monitor::trim_log(log);
+                        // Stamp, append and trim in one core call: the sequence
+                        // number the rendered list is keyed on is assigned there,
+                        // and the cap is applied there too, so the modal's caveat
+                        // can't disagree with what the log holds.
+                        dropped = schemaic_core::monitor::append_changes(log, &at, changes);
                     });
                     if dropped > 0 {
                         ctx.dropped.update(|n| *n += dropped);

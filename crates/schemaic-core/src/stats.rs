@@ -21,6 +21,8 @@
 //! `schemaic_db::Db::fetch_table_stats`. Pure and unit-tested here; the SQL that
 //! fills it lives in the db crate.
 
+use std::collections::HashMap;
+
 use crate::intel::SqlDialect;
 use crate::text::human_count;
 
@@ -66,6 +68,20 @@ impl RowCount {
 
     pub fn is_estimate(self) -> bool {
         matches!(self, RowCount::Estimate(_))
+    }
+
+    /// The word this figure is qualified with, wherever it is printed — the
+    /// panel's caption under it and the Markdown's suffix after it.
+    ///
+    /// One word, because the two surfaces are the same claim about the same
+    /// number and they had drifted into two vocabularies ("(estimated)" against
+    /// "(estimate)") with only the second of them tested.
+    pub fn qualifier(self) -> &'static str {
+        if self.is_estimate() {
+            "estimated"
+        } else {
+            "counted"
+        }
     }
 
     /// How the figure is printed: `4,213,551` exact, `~4.2m` estimated.
@@ -148,6 +164,11 @@ pub struct IndexStats {
     /// Estimated distinct values in the index's leading columns — MySQL's
     /// `STATISTICS.CARDINALITY`. Low cardinality on a large table is the shape of
     /// an index that can't narrow much.
+    ///
+    /// **Read it through [`IndexStats::cardinality_label`], never with
+    /// `group_digits`**: it is a sample, and the figure printed to seven digits
+    /// with thousands separators was the one place in this module where an
+    /// estimate was not marked as one.
     pub cardinality: Option<u64>,
     /// How many times the server has used this index **since its counters were
     /// last reset**.
@@ -160,7 +181,112 @@ pub struct IndexStats {
     pub is_unique: bool,
 }
 
+/// What an index says about itself after its name, in order — the one decision
+/// about which of its figures are worth printing and in what words.
+///
+/// Both surfaces call it: the properties panel joins them with `·`, the copied
+/// Markdown with `, `. The rules are small and each has a wrong answer that reads
+/// as a *different fact*, which is why they are here rather than in a view:
+///
+/// - a **counted zero** prints no scan fact at all, because
+///   [`unused_note`] beside it already says so in words and "0 scans" would only
+///   repeat it;
+/// - an **absent** count prints "usage not counted" out loud, because a blank
+///   there reads as "no scans" — and the difference between the two is the
+///   difference between "drop this index" and "nobody was counting";
+/// - any other count prints, because the *size* of the number is the point.
+pub fn index_facts(ix: &IndexStats) -> Vec<String> {
+    let mut facts: Vec<String> = Vec::new();
+    if let Some(b) = ix.bytes {
+        facts.push(format_bytes(b));
+    }
+    if let Some(c) = ix.cardinality_label() {
+        facts.push(format!("cardinality {c}"));
+    }
+    match ix.scans {
+        Some(0) => {}
+        Some(n) => facts.push(format!(
+            "{} {}",
+            RowCount::Exact(n).label(),
+            crate::text::plural(n as usize, "scan", "scans")
+        )),
+        None => facts.push("usage not counted".to_string()),
+    }
+    facts
+}
+
+/// What [`IndexStats::is_unused`] is worth saying out loud.
+///
+/// Worded as an observation with its window attached, because that is all the
+/// counter can support: it resets when the server does, and a nightly job's index
+/// looks identical to a dead one. Shared with the exported Markdown, where the
+/// window matters more still — the sentence may be read in a ticket weeks later.
+pub fn unused_note() -> &'static str {
+    "never used since the server's counters were reset"
+}
+
+/// What the **Count rows** control is, given what the last count did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CountOffer {
+    /// Offer the button: no exact count is in hand.
+    Ask,
+    /// A count is running.
+    Running,
+    /// An exact count is in hand, so there is nothing left to press — pressing
+    /// again would re-scan the table to print the number already in the headline.
+    Done,
+}
+
+/// What goes beside the control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CountHint {
+    /// The last count failed; its message is the hint.
+    Error,
+    /// The warning that belongs *before* the press: this is a full scan.
+    Slow,
+}
+
+/// The **Count rows** row of the properties panel: the control, and whatever goes
+/// beside it — or `None` when the whole row is to disappear.
+///
+/// `None` is the state worth having a function for: with an exact count in hand
+/// and no error, both halves are empty, and a row rendered anyway leaves a blank
+/// band where the control used to be.
+pub fn count_row_state(
+    counted: bool,
+    counting: bool,
+    has_error: bool,
+) -> Option<(CountOffer, Option<CountHint>)> {
+    let offer = match (counted, counting) {
+        (true, _) => CountOffer::Done,
+        (false, true) => CountOffer::Running,
+        (false, false) => CountOffer::Ask,
+    };
+    let hint = match (has_error, counted) {
+        (true, _) => Some(CountHint::Error),
+        // Counted: the caption under the headline already reads "rows (counted)",
+        // so a second line asserting it is just a line.
+        (false, true) => None,
+        (false, false) => Some(CountHint::Slow),
+    };
+    (offer != CountOffer::Done || hint.is_some()).then_some((offer, hint))
+}
+
 impl IndexStats {
+    /// How this index's cardinality is printed, or `None` when the engine didn't
+    /// report one — the one reader of [`IndexStats::cardinality`], so the panel
+    /// and the copied Markdown cannot disagree about what the figure is worth.
+    ///
+    /// **It is an estimate**, and marked as one: InnoDB derives it by sampling
+    /// `innodb_stats_persistent_sample_pages` (20 by default) index pages, so a
+    /// real `COUNT(DISTINCT …)` can differ by tens of percent. Printed as
+    /// `3,996,120` it read as a measurement — beside a row count in the same panel
+    /// scrupulously printed `~4.21m (estimate)` — and **Copy** put those seven
+    /// digits into a ticket with the qualifier stripped.
+    pub fn cardinality_label(&self) -> Option<String> {
+        self.cardinality.map(|c| RowCount::Estimate(c).label())
+    }
+
     /// Should this index be flagged as unused?
     ///
     /// Only when the server actually counted and the count is zero. `scans:
@@ -248,6 +374,25 @@ impl TableStats {
             .or(self.rows.map(RowCount::Estimate))
     }
 
+    /// The caption a row figure is printed under — including the case the
+    /// engine reported nothing at all, where the figure itself is a dash and the
+    /// caption is what says why.
+    pub fn row_caption(&self) -> String {
+        match self.row_count() {
+            Some(rc) => format!("rows ({})", rc.qualifier()),
+            None => "rows — not reported".to_string(),
+        }
+    }
+
+    /// Is free space worth showing? MySQL's `DATA_FREE`, and only when there is
+    /// some: a permanent "Free 0 B" is noise on every other engine.
+    ///
+    /// One threshold, asked by the panel's legend and by the Markdown alike —
+    /// written twice, only one of them would have failed if it changed.
+    pub fn shows_free(&self) -> bool {
+        self.free_bytes.is_some_and(|b| b > 0)
+    }
+
     /// Data plus indexes. `None` only when the engine reported neither; one
     /// present and one missing still yields a total, because a partial total is
     /// the honest sum of what is known.
@@ -310,12 +455,7 @@ impl TableStats {
             out.push_str(&format!("- {label}: {value}\n"));
         };
         if let Some(rc) = self.row_count() {
-            let kind = if rc.is_estimate() {
-                " (estimate)"
-            } else {
-                " (counted)"
-            };
-            row("Rows", format!("{}{kind}", rc.label()));
+            row("Rows", format!("{} ({})", rc.label(), rc.qualifier()));
         }
         if let Some(b) = self.data_bytes {
             row("Data", format_bytes(b));
@@ -326,7 +466,7 @@ impl TableStats {
         if let (Some(t), true) = (self.total_bytes(), self.data_bytes.is_some()) {
             row("Total", format_bytes(t));
         }
-        if let Some(b) = self.free_bytes.filter(|b| *b > 0) {
+        if let (true, Some(b)) = (self.shows_free(), self.free_bytes) {
             row("Free", format_bytes(b));
         }
         if let Some(d) = self.dead_rows {
@@ -355,21 +495,22 @@ impl TableStats {
         if !self.indexes.is_empty() {
             out.push_str("\nIndexes:\n\n");
             for i in &self.indexes {
-                let mut parts: Vec<String> = Vec::new();
-                if let Some(b) = i.bytes {
-                    parts.push(format_bytes(b));
-                }
-                if let Some(c) = i.cardinality {
-                    parts.push(format!("cardinality {}", group_digits(c)));
-                }
-                match i.scans {
-                    Some(s) => parts.push(format!("{} scans", group_digits(s))),
-                    None => parts.push("scan count unavailable".to_string()),
-                }
+                // The same facts the panel prints, in the same words — this used
+                // to be a second copy of the rules, and the two had already
+                // drifted ("scan count unavailable" against "usage not counted",
+                // and a counted zero printed as `0 scans` beside a line saying it
+                // was never used).
+                let mut parts = index_facts(i);
                 if i.is_unused() {
-                    parts.push("never used".to_string());
+                    parts.push(unused_note().to_string());
                 }
-                out.push_str(&format!("- `{}` — {}\n", i.name, parts.join(", ")));
+                // A primary key the server counted zero scans for has nothing to
+                // print — it is not flagged unused, and a counted zero is not a
+                // fact. The name alone, rather than a line ending in a dash.
+                match parts.is_empty() {
+                    true => out.push_str(&format!("- `{}`\n", i.name)),
+                    false => out.push_str(&format!("- `{}` — {}\n", i.name, parts.join(", "))),
+                }
             }
         }
 
@@ -396,16 +537,57 @@ pub const DEAD_ROW_WARN: f64 = 0.2;
 /// along with the schema fetch that runs on every connect.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SchemaStats {
-    pub tables: Vec<TableStats>,
+    tables: Vec<TableStats>,
+    /// Table name → its rows in `tables`, built once at construction.
+    ///
+    /// **The lookup is per *row* of the schema tree, so a scan here is O(n²) for
+    /// one fetch.** Every expanded table owns a badge that asks once when the
+    /// database's figures land, and a `stats` write invalidates every badge in the
+    /// database at once — so `iter().find` cost, measured on the shipped core,
+    /// 4.2 ms at 2,000 tables, 24.8 ms at 5,000 and 95.9 ms at 10,000, all in one
+    /// frame on the UI thread, and roughly double that with a PostgreSQL namespace
+    /// to compare first. Keyed on the name alone (not the pair) so a lookup
+    /// borrows its `&str` instead of allocating two `String`s to build a key;
+    /// same-named tables in different namespaces are a handful at most and are
+    /// separated by the linear step inside the bucket.
+    ///
+    /// Private, with `tables` private beside it, because the two must not be able
+    /// to disagree: a literal that filled the `Vec` and left the map empty would
+    /// answer *"no statistics for this table"* for every row, silently. Build one
+    /// through [`SchemaStats::new`].
+    by_name: HashMap<String, Vec<usize>>,
 }
 
 impl SchemaStats {
+    /// One database's statistics, with the lookup index built.
+    pub fn new(tables: Vec<TableStats>) -> Self {
+        let mut by_name: HashMap<String, Vec<usize>> = HashMap::with_capacity(tables.len());
+        for (i, t) in tables.iter().enumerate() {
+            by_name.entry(t.table.clone()).or_default().push(i);
+        }
+        Self { tables, by_name }
+    }
+
+    /// Every table's statistics, in the order the engine listed them.
+    pub fn tables(&self) -> &[TableStats] {
+        &self.tables
+    }
+
     /// Find one table's stats. Matches on namespace **and** name, because
     /// `sales.orders` and `archive.orders` are different tables.
     pub fn get(&self, schema: Option<&str>, table: &str) -> Option<&TableStats> {
-        self.tables
+        self.rows_named(table)
+            .find(|t| t.schema.as_deref() == schema)
+    }
+
+    /// The tables carrying `name`, whatever their namespace.
+    fn rows_named(&self, name: &str) -> impl Iterator<Item = &TableStats> {
+        self.by_name
+            .get(name)
+            .map(|ix| ix.as_slice())
+            .unwrap_or(&[])
             .iter()
-            .find(|t| t.schema.as_deref() == schema && t.table == table)
+            .map(|i| &self.tables[*i])
     }
 
     /// One table's stats found by the name a **statement** wrote, with whatever
@@ -422,7 +604,7 @@ impl SchemaStats {
         if schema.is_some() {
             return self.get(schema, table);
         }
-        let mut hits = self.tables.iter().filter(|t| t.table == table);
+        let mut hits = self.rows_named(table);
         let first = hits.next()?;
         hits.next().is_none().then_some(first)
     }
@@ -920,14 +1102,50 @@ mod tests {
         }
     }
 
+    /// **The index and a scan must answer identically for every row**, in both
+    /// namespace shapes and for names that aren't there. The lookup is per *row* of
+    /// the schema tree and a `stats` write invalidates every badge at once, so
+    /// `iter().find` here was 24.8 ms at 5,000 tables in a single frame — but an
+    /// index that disagrees with the scan is worse than a slow one, because what it
+    /// answers is "this table has no statistics".
+    #[test]
+    fn the_lookup_index_agrees_with_a_scan_for_every_row() {
+        let mut tables: Vec<TableStats> = Vec::new();
+        for i in 0..50 {
+            tables.push(named(None, &format!("t{i}"), i));
+            tables.push(named(Some("sales"), &format!("t{i}"), 100 + i));
+            // Same name in a second namespace, which is what makes the bucket's
+            // linear step necessary and `find`'s unqualified case ambiguous.
+            tables.push(named(Some("archive"), &format!("t{i}"), 200 + i));
+        }
+        let set = SchemaStats::new(tables.clone());
+        let scan = |schema: Option<&str>, table: &str| {
+            tables
+                .iter()
+                .find(|t| t.schema.as_deref() == schema && t.table == table)
+        };
+        for t in &tables {
+            let want = scan(t.schema.as_deref(), &t.table);
+            assert_eq!(set.get(t.schema.as_deref(), &t.table), want, "{t:?}");
+        }
+        // Absent names and absent namespaces answer `None`, not the first row that
+        // happens to share one half of the key.
+        assert_eq!(set.get(None, "nope"), None);
+        assert_eq!(set.get(Some("nope"), "t0"), None);
+        // And `find`'s unqualified case still refuses an ambiguous name while
+        // answering a unique one.
+        assert_eq!(set.find(None, "t0"), None, "three namespaces carry it");
+        let one = SchemaStats::new(vec![named(Some("public"), "solo", 1)]);
+        assert_eq!(one.find(None, "solo"), one.get(Some("public"), "solo"));
+        assert_eq!(set.tables().len(), tables.len());
+    }
+
     #[test]
     fn a_lookup_matches_name_and_namespace_together() {
-        let set = SchemaStats {
-            tables: vec![
-                named(Some("sales"), "orders", 10),
-                named(Some("archive"), "orders", 20),
-            ],
-        };
+        let set = SchemaStats::new(vec![
+            named(Some("sales"), "orders", 10),
+            named(Some("archive"), "orders", 20),
+        ]);
         assert_eq!(set.get(Some("sales"), "orders").unwrap().rows, Some(10));
         assert_eq!(set.get(Some("archive"), "orders").unwrap().rows, Some(20));
         assert!(set.get(Some("public"), "orders").is_none());
@@ -937,9 +1155,7 @@ mod tests {
     fn a_namespaceless_engine_looks_up_by_name_alone() {
         // MySQL: `schema` is `None` on both sides and must match as such — not
         // fall through to "any namespace will do".
-        let set = SchemaStats {
-            tables: vec![named(None, "orders", 10)],
-        };
+        let set = SchemaStats::new(vec![named(None, "orders", 10)]);
         assert_eq!(set.get(None, "orders").unwrap().rows, Some(10));
         assert!(set.get(Some("public"), "orders").is_none());
         assert!(set.get(None, "customers").is_none());
@@ -947,12 +1163,10 @@ mod tests {
 
     #[test]
     fn an_unqualified_statement_name_matches_only_when_it_is_unambiguous() {
-        let two = SchemaStats {
-            tables: vec![
-                named(Some("sales"), "orders", 10),
-                named(Some("archive"), "orders", 20),
-            ],
-        };
+        let two = SchemaStats::new(vec![
+            named(Some("sales"), "orders", 10),
+            named(Some("archive"), "orders", 20),
+        ]);
         // Two namespaces hold the name and only `search_path` decides which the
         // statement meant, so neither figure is reported.
         assert!(two.find(None, "orders").is_none());
@@ -960,34 +1174,28 @@ mod tests {
         // not.
         assert_eq!(two.find(Some("sales"), "orders").unwrap().rows, Some(10));
 
-        let one = SchemaStats {
-            tables: vec![named(Some("public"), "orders", 30)],
-        };
+        let one = SchemaStats::new(vec![named(Some("public"), "orders", 30)]);
         assert_eq!(one.find(None, "orders").unwrap().rows, Some(30));
         assert!(one.find(None, "customers").is_none());
         // MySQL, where nothing carries a namespace at all.
-        let my = SchemaStats {
-            tables: vec![named(None, "orders", 40)],
-        };
+        let my = SchemaStats::new(vec![named(None, "orders", 40)]);
         assert_eq!(my.find(None, "orders").unwrap().rows, Some(40));
     }
 
     #[test]
     fn a_database_total_adds_up_what_reported_a_size() {
-        let set = SchemaStats {
-            tables: vec![
-                TableStats {
-                    data_bytes: Some(1_000),
-                    index_bytes: Some(200),
-                    ..named(None, "orders", 10)
-                },
-                TableStats {
-                    data_bytes: Some(500),
-                    ..named(None, "customers", 5)
-                },
-                named(None, "sizeless", 1),
-            ],
-        };
+        let set = SchemaStats::new(vec![
+            TableStats {
+                data_bytes: Some(1_000),
+                index_bytes: Some(200),
+                ..named(None, "orders", 10)
+            },
+            TableStats {
+                data_bytes: Some(500),
+                ..named(None, "customers", 5)
+            },
+            named(None, "sizeless", 1),
+        ]);
         assert_eq!(set.total_bytes(), Some(1_700));
         assert_eq!(SchemaStats::default().total_bytes(), None);
     }
@@ -1004,17 +1212,166 @@ mod tests {
             index_bytes: Some(512 * 1_024),
             engine: Some("InnoDB".into()),
             freshness: Freshness::CachedUpTo(86_400),
-            indexes: vec![idx("idx_orders_note", Some(0))],
+            indexes: vec![IndexStats {
+                cardinality: Some(3_996_120),
+                ..idx("idx_orders_note", Some(0))
+            }],
             ..Default::default()
         };
         let md = s.to_markdown("sales.orders");
         assert!(md.contains("sales.orders"), "{md}");
         assert!(md.contains("~4.21m"), "estimate stays marked: {md}");
+        // **And the index's cardinality is an estimate too** — InnoDB samples 20
+        // index pages for it by default. Printed with thousands separators it
+        // claimed six more digits of precision than it has, on the clipboard as
+        // well as in the panel, four lines under a row count carefully marked
+        // `~4.21m (estimate)`.
+        assert!(md.contains("cardinality ~4m"), "{md}");
+        assert!(!md.contains("3,996,120"), "not to seven digits: {md}");
         assert!(md.contains("1 MiB"), "{md}");
         assert!(md.contains("1.5 MiB"), "total: {md}");
         assert!(md.contains("InnoDB"), "{md}");
         assert!(md.contains("idx_orders_note"), "{md}");
         assert!(md.contains("information_schema_stats_expiry"), "{md}");
+    }
+
+    // ── What a figure is printed as, and where that is decided ────────────
+    //
+    // The panel and the copied Markdown are two renderings of one claim. Each of
+    // these rules was written twice, in two vocabularies, with only the Markdown
+    // half tested — and the failure mode is not a wrong number but a number that
+    // reads as a *different fact*.
+
+    /// The caption and the Markdown suffix say the same word about the same
+    /// figure, and the no-figure case says why rather than showing a bare dash.
+    #[test]
+    fn a_row_figure_is_qualified_in_one_vocabulary() {
+        let est = TableStats {
+            rows: Some(4_213_551),
+            ..Default::default()
+        };
+        assert_eq!(est.row_caption(), "rows (estimated)");
+        assert!(
+            est.to_markdown("t").contains("(estimated)"),
+            "{}",
+            est.to_markdown("t")
+        );
+        let counted = TableStats {
+            rows: Some(4_213_551),
+            exact_rows: Some(4_213_100),
+            ..Default::default()
+        };
+        assert_eq!(counted.row_caption(), "rows (counted)");
+        assert!(counted.to_markdown("t").contains("(counted)"));
+        // Nothing reported: the caption is what carries the news.
+        assert_eq!(TableStats::default().row_caption(), "rows — not reported");
+    }
+
+    /// One threshold for free space, asked by both printers.
+    #[test]
+    fn free_space_is_shown_only_when_there_is_some() {
+        let none = TableStats::default();
+        assert!(!none.shows_free());
+        let zero = TableStats {
+            free_bytes: Some(0),
+            ..Default::default()
+        };
+        assert!(!zero.shows_free(), "a permanent Free 0 B is noise");
+        let some = TableStats {
+            free_bytes: Some(4096),
+            data_bytes: Some(1024),
+            ..Default::default()
+        };
+        assert!(some.shows_free());
+        assert!(some.to_markdown("t").contains("Free"));
+    }
+
+    /// **The rule that decides whether an index looks droppable.** A counted zero
+    /// says nothing (the note beside it already does), an absent count says so out
+    /// loud, and any other count prints.
+    #[test]
+    fn an_index_says_whether_nobody_used_it_or_nobody_counted() {
+        let counted_zero = idx("ix", Some(0));
+        assert!(
+            !index_facts(&counted_zero)
+                .iter()
+                .any(|f| f.contains("scan")),
+            "{:?}",
+            index_facts(&counted_zero)
+        );
+        assert!(counted_zero.is_unused(), "the note is what says it");
+
+        let uncounted = idx("ix", None);
+        assert_eq!(index_facts(&uncounted), vec!["usage not counted"]);
+        assert!(!uncounted.is_unused(), "not counted is not unused");
+
+        assert_eq!(index_facts(&idx("ix", Some(1))), vec!["1 scan"]);
+        assert_eq!(index_facts(&idx("ix", Some(9))), vec!["9 scans"]);
+    }
+
+    /// Sizes and cardinality lead, each absent when the engine didn't report it —
+    /// and the cardinality goes through its estimate label.
+    #[test]
+    fn an_index_prints_only_the_figures_it_has() {
+        assert_eq!(index_facts(&idx("ix", Some(0))), Vec::<String>::new());
+        let full = IndexStats {
+            bytes: Some(2048),
+            cardinality: Some(3_996_120),
+            ..idx("ix", Some(4))
+        };
+        assert_eq!(
+            index_facts(&full),
+            vec!["2 KiB", "cardinality ~4m", "4 scans"]
+        );
+    }
+
+    /// The note carries its own window, because that is all the counter supports.
+    #[test]
+    fn the_unused_note_says_since_when() {
+        assert!(unused_note().contains("counters were reset"));
+    }
+
+    /// An index with nothing to say — a primary key the server counted zero scans
+    /// for, which is not "unused" — is a name, not a line ending in a dash.
+    #[test]
+    fn an_index_line_with_no_facts_is_just_its_name() {
+        let s = TableStats {
+            rows: Some(1),
+            indexes: vec![IndexStats {
+                is_primary: true,
+                ..idx("PRIMARY", Some(0))
+            }],
+            ..Default::default()
+        };
+        let md = s.to_markdown("t");
+        assert!(md.contains("- `PRIMARY`\n"), "{md}");
+        assert!(!md.contains("PRIMARY` —"), "{md}");
+    }
+
+    /// The four states of the Count rows row, including the one where the row is
+    /// removed rather than left as a blank band.
+    #[test]
+    fn the_count_row_disappears_only_when_it_has_nothing_to_say() {
+        assert_eq!(
+            count_row_state(false, false, false),
+            Some((CountOffer::Ask, Some(CountHint::Slow)))
+        );
+        assert_eq!(
+            count_row_state(false, true, false),
+            Some((CountOffer::Running, Some(CountHint::Slow)))
+        );
+        // Counted and quiet: nothing to press and nothing to say.
+        assert_eq!(count_row_state(true, false, false), None);
+        // Counted but the last attempt failed: the error still has to be shown.
+        assert_eq!(
+            count_row_state(true, false, true),
+            Some((CountOffer::Done, Some(CountHint::Error)))
+        );
+        // An error before any count keeps the button offered.
+        assert_eq!(
+            count_row_state(false, false, true),
+            Some((CountOffer::Ask, Some(CountHint::Error)))
+        );
     }
 
     #[test]

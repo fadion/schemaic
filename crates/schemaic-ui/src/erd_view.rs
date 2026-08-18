@@ -70,6 +70,42 @@ use crate::{ConnNode, Ui, icons, theme};
 /// and that test says by how much it costs.
 pub(crate) const HEADER_TINT_ALPHA: f32 = 0.22;
 
+/// Which of two colours a card's table name is painted in when the find bar has
+/// hit it.
+///
+/// **A hit is marked twice, and only one of the two marks is safe over a colour
+/// the user chose.** Recolouring the name `match_highlight` reads well on the
+/// plain header (5.11:1 Dark / 5.69:1 Light) and badly on a *tinted* one: over the
+/// eight presets washed at [`HEADER_TINT_ALPHA`] it measures 3.11–4.04:1 on Dark
+/// and as low as 4.38:1 on Light, under the 4.5 floor the project's own pairing
+/// table sets for this exact site — worst of all on the card a search has just
+/// panned to and ringed. So a tinted header keeps `theme::text()`, which *is*
+/// gated there, and the mark it wears instead is its bottom border in the match
+/// colour: a border carries no text-legibility debt, it doesn't move the card's
+/// contents, and it is the same language the matched **rows** already use one
+/// weight down.
+///
+/// A function rather than an `if` in the style closure so
+/// `contrast::tests::an_erd_header_tint_keeps_the_table_name_legible` can ask what
+/// the code really paints, instead of asserting a foreground the code has since
+/// stopped using — which is exactly how the 3.11:1 shipped past a test written for
+/// this surface one commit earlier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NamePaint {
+    /// `theme::text()` — the ordinary name colour.
+    Plain,
+    /// `theme::match_highlight()` — legible only on the untinted header.
+    Match,
+}
+
+/// See [`NamePaint`].
+pub(crate) const fn name_paint(hit: bool, tinted: bool) -> NamePaint {
+    match (hit, tinted) {
+        (true, false) => NamePaint::Match,
+        _ => NamePaint::Plain,
+    }
+}
+
 /// A card header's background: the ordinary header surface, or a table's identity
 /// colour washed over it at [`HEADER_TINT_ALPHA`].
 ///
@@ -187,11 +223,29 @@ impl Find {
         self.open.set(false);
         self.query.set(String::new());
         self.flash.set(None);
+        // **Hand the keyboard back, or leaving the search box leaves the diagram
+        // keyboard-dead.** Closing removes the focused editor with it, and floem
+        // clears `app_state.focus` silently when a focused view is removed — after
+        // which the modal's own key handler receives nothing: the next Escape does
+        // not close the diagram and Ctrl+F does not reopen this bar, until the user
+        // clicks something. `edit_field`'s Escape arm does this only when it has no
+        // `on_escape` of its own, and this bar passes one, so it has to be here —
+        // which also covers the ✕, since both exits come through `dismiss`.
+        crate::widgets::hand_keyboard_back(None);
         true
     }
 
     /// Outline `id` for [`FIND_FLASH`], then clear it.
+    ///
+    /// Re-flashing the card already flashing is a no-op: every card's style closure
+    /// reads `flash`, and `set` never dedups, so typing another character that
+    /// resolves to the same card would restyle the whole canvas to say what it
+    /// already says. The timer is left alone too — the ring's three seconds run from
+    /// the search that *found* the card.
     fn flash_node(self, id: &str) {
+        if self.flash.with_untracked(|f| f.as_deref() == Some(id)) {
+            return;
+        }
         let seq = self.flash_seq.get_untracked().wrapping_add(1);
         self.flash_seq.set(seq);
         self.flash.set(Some(id.to_string()));
@@ -217,7 +271,7 @@ impl Find {
 /// answers a different question — it lights up every match at once, and moves the
 /// canvas only when there is exactly one card to move to. A "next" button would
 /// have to invent a sequence over a 2-D canvas before it had anything to do.
-fn find_bar(find: Find, matches: Memo<Vec<erd::NodeMatch>>) -> impl IntoView {
+fn find_bar(find: Find, matches: Memo<erd::Matches>) -> impl IntoView {
     dyn_container(
         move || find.open.get(),
         move |open| {
@@ -244,13 +298,16 @@ fn find_bar(find: Find, matches: Memo<Vec<erd::NodeMatch>>) -> impl IntoView {
                 },
             )
             .style(|s| s.width(190.0));
+            // Its real width, for the press test below — the field is the leftmost
+            // child, so anything to the right of it missed it.
+            let input_id = input.id();
             // Blank until something is typed, then what was found — matching the
             // grid bar's dim readout in the same slot.
             let count = dyn_container(
                 move || {
                     find.query
                         .with(|q| !q.trim().is_empty())
-                        .then(|| matches.with(|m| erd::match_label(m)))
+                        .then(|| matches.with(|m| erd::match_label(m.hits())))
                 },
                 move |label| match label {
                     Some(label) => text(label)
@@ -283,10 +340,19 @@ fn find_bar(find: Find, matches: Memo<Vec<erd::NodeMatch>>) -> impl IntoView {
                         .border_color(theme::border())
                         .border_radius(8.0)
                 })
-                // Consume the press so it stops here, and **do nothing with it**.
-                // The field focuses itself on a click; this handler sees that same
-                // press on the way up, so anything it does about focus undoes what
-                // the click just did.
+                // Consume the press so it stops here, and do nothing with it **when
+                // it landed on the field**. The field focuses itself on a click;
+                // this handler sees that same press on the way up, so anything it
+                // does about focus there undoes what the click just did.
+                //
+                // A press that *missed* the field is the opposite case, and it was
+                // silently leaving the diagram keyboard-dead: floem takes focus on
+                // every `PointerDown` before dispatch, and the `Stop` returned here
+                // is returned from inside the children loop, so no ancestor ever
+                // reaches the default block that would have re-focused the modal
+                // root. Handing the keyboard to the innermost focus root — the
+                // modal, not the field — is what keeps Escape and Ctrl+F alive
+                // after a press on the bar's 8px padding or its count readout.
                 //
                 // It grabbed focus for a while, to cover a press landing on the
                 // popup's padding rather than the field. `edit_field` returns a
@@ -297,7 +363,18 @@ fn find_bar(find: Find, matches: Memo<Vec<erd::NodeMatch>>) -> impl IntoView {
                 // still did, because reopening autofocuses through the editor's real
                 // id. Reaching that id needs a `FieldCfg` hook that doesn't exist,
                 // and the padding is 8px, so the nicety isn't worth one.
-                .on_event_stop(EventListener::PointerDown, |_| {})
+                .on_event_stop(EventListener::PointerDown, move |e| {
+                    // `pe.pos` is relative to this bar, whose left padding is 8px,
+                    // so the field's own band is `[8, 8 + width)`. Read from the
+                    // laid-out view rather than from the 190.0 above, so a change to
+                    // one doesn't leave the other describing a field that moved.
+                    if let Event::PointerDown(pe) = e {
+                        let w = input_id.get_size().map(|s| s.width).unwrap_or(190.0);
+                        if pe.pos.x > 8.0 + w {
+                            crate::widgets::hand_keyboard_back(None);
+                        }
+                    }
+                })
                 .into_any()
         },
     )
@@ -719,8 +796,10 @@ fn column_row(
     hovered: RwSignal<Option<usize>>,
     graph: Rc<DiagramGraph>,
     node_id: Rc<str>,
-    // `found`: this column's name is one the find bar matched.
-    found: bool,
+    // `found`: this column's name is one the find bar matched. A memo, not a
+    // `bool`, so a search restyles the row instead of rebuilding the card's whole
+    // column stack — see `column_rows`.
+    found: Memo<bool>,
 ) -> AnyView {
     let name = c.name.clone();
     let hl_name = c.name.clone();
@@ -742,7 +821,7 @@ fn column_row(
             // column *is*, which is still true and still on the glyph beside it,
             // while the highlight answers the question being asked right now.
             s.font_size(11.5 * zoom.get() as f32)
-                .color(if found {
+                .color(if found.get() {
                     theme::match_highlight()
                 } else {
                     col_tint(pk, fk)
@@ -781,7 +860,7 @@ fn column_row(
         // border for the same reason as there — it must not move the row's
         // contents, since every row's height feeds the card's measured size and
         // the edges routed to it.
-        if found {
+        if found.get() {
             s.outline(1.0).outline_color(theme::match_highlight())
         } else {
             s
@@ -809,7 +888,7 @@ fn column_rows(
     zoom: RwSignal<f64>,
     hovered: RwSignal<Option<usize>>,
     graph: Rc<DiagramGraph>,
-    hit_columns: Vec<String>,
+    mine: Memo<Option<erd::NodeMatch>>,
 ) -> impl IntoView {
     let (visible, collapsible, _h) = card_metrics(&node, is_collapsed);
     let node_id: Rc<str> = Rc::from(node.id.as_str());
@@ -817,14 +896,16 @@ fn column_rows(
         .iter()
         .map(|&ci| {
             let col = &node.columns[ci];
-            column_row(
-                col,
-                zoom,
-                hovered,
-                graph.clone(),
-                node_id.clone(),
-                hit_columns.contains(&col.name),
-            )
+            // One memo per row rather than a scan inside the row's style closure:
+            // that closure runs on every pan and zoom frame for every row, and the
+            // file's other O(cards²) traps all came from putting a search there. A
+            // memo recomputes only when *this card's* match changes, and reading it
+            // in the closure is a cached read.
+            let name = col.name.clone();
+            let found = create_memo(move |_| {
+                mine.with(|m| m.as_ref().is_some_and(|m| m.columns.contains(&name)))
+            });
+            column_row(col, zoom, hovered, graph.clone(), node_id.clone(), found)
         })
         .collect();
     if collapsible {
@@ -894,7 +975,7 @@ fn node_card(
     reveal: Rc<dyn Fn(String)>,
     tint: Option<floem::peniko::Color>,
     find: Find,
-    matches: Memo<Vec<erd::NodeMatch>>,
+    matches: Memo<erd::Matches>,
 ) -> AnyView {
     let id = p.node.id.clone();
     let (ix, iy, w) = (p.x, p.y, p.w);
@@ -908,18 +989,46 @@ fn node_card(
         positions.with(|m: &HashMap<String, (f64, f64)>| m.get(key).copied().unwrap_or((ix, iy)))
     };
 
+    // What the find bar found *in this card*, as a memo so a card only re-renders
+    // when its own match changes: `matches` fires on every keystroke, but a card
+    // nobody is searching for sees the same `None` each time and stays put.
+    //
+    // **Above the stub branch, because a stub is a card that can be found.**
+    // `erd::search` matches one on its name deliberately (it is a named card the
+    // user can read, and it has a core test saying so), and `sole_node` returns it,
+    // so the readout counts it and the canvas pans to it — but the branch below
+    // used to return before both this and the flash ring, and the entire visible
+    // result of a successful search was the diagram shifting slightly.
+    let mine = {
+        let id = id.clone();
+        create_memo(move |_| matches.with(|m| m.of(&id).cloned()))
+    };
+    // The name is painted in the shared match colour when the search hit it —
+    // `theme::match_highlight`, the same colour the schema tree marks a filter hit
+    // with. Not the tree's per-character `highlight_text`: that bakes a fixed font
+    // size into a text layout, and a card's type scales with the zoom, so the name
+    // would stop growing with the diagram it belongs to.
+    let name_hit = create_memo(move |_| mine.with(|m| m.as_ref().is_some_and(|m| m.name)));
+
     if p.node.kind == NodeKind::Stub {
         let id_s = id.clone();
+        let id_flash = id.clone();
         return container(text(p.node.id.clone()).style(move |s| {
             s.font_size(13.0 * zoom.get() as f32)
-                .color(theme::text_dim())
+                // A stub carries no tint, so the match colour is the gated
+                // pairing here (`match_highlight on erd_node_bg`).
+                .color(match name_paint(name_hit.get(), false) {
+                    NamePaint::Match => theme::match_highlight(),
+                    NamePaint::Plain => theme::text_dim(),
+                })
                 .padding_horiz(10.0 * zoom.get())
         }))
         .style(move |s| {
             let z = zoom.get();
             let (panx, pany) = pan.get();
             let (x, y) = at(&id_s);
-            s.absolute()
+            let s = s
+                .absolute()
                 .inset_left(panx + x * z)
                 .inset_top(pany + y * z)
                 .width(w * z)
@@ -928,24 +1037,18 @@ fn node_card(
                 .border(1.0)
                 .border_color(theme::text_muted())
                 .border_radius(6.0 * z)
-                .background(theme::erd_node_bg())
+                .background(theme::erd_node_bg());
+            // The same "here it is" ring the real card wears, for the same reason
+            // and at the same weight — a pan to a card with nothing marked on it
+            // is a search that reports a hit and shows none.
+            if find.flash.with(|f| f.as_deref() == Some(id_flash.as_str())) {
+                s.outline(2.0).outline_color(theme::match_highlight())
+            } else {
+                s
+            }
         })
         .into_any();
     }
-
-    // What the find bar found *in this card*, as a memo so a card only re-renders
-    // when its own match changes: `matches` fires on every keystroke, but a card
-    // nobody is searching for sees the same `None` each time and stays put.
-    let mine = {
-        let id = id.clone();
-        create_memo(move |_| matches.with(|v| v.iter().find(|m| m.node == id).cloned()))
-    };
-    // The name is painted in the shared match colour when the search hit it —
-    // `theme::match_highlight`, the same colour the schema tree marks a filter hit
-    // with. Not the tree's per-character `highlight_text`: that bakes a fixed font
-    // size into a text layout, and a card's type scales with the zoom, so the name
-    // would stop growing with the diagram it belongs to.
-    let name_hit = create_memo(move |_| mine.with(|m| m.as_ref().is_some_and(|m| m.name)));
 
     let name = p.node.id.clone();
     // Does the name ellipsize at this card's width? The header lays out as
@@ -979,10 +1082,9 @@ fn node_card(
         text(name).style(move |s| {
             s.font_size(13.0 * zoom.get() as f32)
                 .font_bold()
-                .color(if name_hit.get() {
-                    theme::match_highlight()
-                } else {
-                    theme::text()
+                .color(match name_paint(name_hit.get(), tint.is_some()) {
+                    NamePaint::Match => theme::match_highlight(),
+                    NamePaint::Plain => theme::text(),
                 })
                 .flex_grow(1.0_f32)
                 .min_width(0.0)
@@ -1000,7 +1102,15 @@ fn node_card(
             // schema tree dots it with.
             .background(header_bg(tint))
             .border_bottom(1.0)
-            .border_color(theme::border())
+            // **The mark that works on any header.** A hit paints this line in the
+            // match colour, whether or not the name itself could be recoloured
+            // (see `name_paint`) — so a coloured card is marked as clearly as a
+            // plain one, and the marker is the same one the matched rows wear.
+            .border_color(if name_hit.get() {
+                theme::match_highlight()
+            } else {
+                theme::border()
+            })
     });
 
     // A truncated name gets a tooltip with the full text — only on the header, and
@@ -1024,15 +1134,18 @@ fn node_card(
         let id_k = id.clone();
         dyn_container(
             // `with`: `get` would clone the whole collapse map per card (see the
-            // position read above). The find's matched columns join the key so the
-            // rows repaint when a search starts or stops touching them.
-            move || {
-                (
-                    collapsed.with(|m| m.get(&id_k).copied().unwrap_or(false)),
-                    mine.with(|m| m.as_ref().map(|m| m.columns.clone()).unwrap_or_default()),
-                )
-            },
-            move |(is_collapsed, hit_columns)| {
+            // position read above).
+            //
+            // **Only the collapse state is a rebuild key.** The find's matched
+            // columns used to be in this tuple, which made a highlight a *rebuild*:
+            // a one-character term flips most cards from no match to some match and
+            // changes most of them on every character after, so a 500-card ×
+            // 20-column diagram tore down and rebuilt ~10,000 views per keystroke.
+            // The highlight travels into the rows as a memo instead and is answered
+            // in a style closure — the same shape the card's own name highlight
+            // already had, one screen up.
+            move || collapsed.with(|m| m.get(&id_k).copied().unwrap_or(false)),
+            move |is_collapsed| {
                 column_rows(
                     node.clone(),
                     is_collapsed,
@@ -1041,7 +1154,7 @@ fn node_card(
                     zoom,
                     hovered,
                     graph.clone(),
-                    hit_columns,
+                    mine,
                 )
                 .into_any()
             },
@@ -1471,9 +1584,15 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
             // because a character was typed somewhere else in the box.
             let find = Find::new();
             let search_graph = graph.clone();
-            let matches: Memo<Vec<erd::NodeMatch>> = create_memo(move |_| {
+            // Indexed by node, because **every card asks about itself once per
+            // keystroke**: scanning the hit list made that O(cards × matches), and a
+            // one-character term matches every card on a large diagram — 0.65 ms of
+            // pure comparison at 500 cards, before floem does anything. The list
+            // itself is still carried whole and in graph order for the readout and
+            // the pan.
+            let matches: Memo<erd::Matches> = create_memo(move |_| {
                 let q = find.query.get();
-                erd::search(&search_graph, &q)
+                erd::Matches::new(erd::search(&search_graph, &q))
             });
 
             // Every hit in one card → go there and ring it. The pan is what makes
@@ -1481,7 +1600,8 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
             // highlight alone is invisible if the card is off-screen. More than one
             // card and nothing moves — see `erd::sole_node`.
             create_effect(move |_| {
-                let Some(id) = matches.with(|m| erd::sole_node(m).map(|s| s.to_string())) else {
+                let Some(id) = matches.with(|m| erd::sole_node(m.hits()).map(|s| s.to_string()))
+                else {
                     return;
                 };
                 let (vw, vh) = viewport_size.get_untracked();
@@ -1489,11 +1609,23 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                     let at = positions.with_untracked(|m| m.get(&id).copied());
                     let size = sizes.with_untracked(|m| m.get(&id).copied());
                     if let (Some((x, y)), Some((cw, ch))) = (at, size) {
-                        // Centre the card's own centre in the viewport, in the
-                        // same screen-space transform the cards lay themselves out
-                        // with (`pan + logical·z`), solved for `pan`.
-                        let z = zoom.get_untracked();
-                        pan.set((vw / 2.0 - (x + cw / 2.0) * z, vh / 2.0 - (y + ch / 2.0) * z));
+                        // The solve lives in the core beside `fit_bounds`, which is
+                        // the whole-diagram case of the same arithmetic: every way
+                        // of getting it wrong leaves the sole match off screen with
+                        // every readout still saying "1 match".
+                        // Guarded, because `set` never dedups and **every card's
+                        // style closure reads `pan`**: typing another character
+                        // that resolves to the same card would otherwise be a
+                        // full restyle-and-repaint pass over the canvas for a
+                        // screen that did not move.
+                        let to = erd::center_pan(
+                            (vw, vh),
+                            erd::Rect { x, y, w: cw, h: ch },
+                            zoom.get_untracked(),
+                        );
+                        if pan.get_untracked() != to {
+                            pan.set(to);
+                        }
                     }
                 }
                 find.flash_node(&id);
