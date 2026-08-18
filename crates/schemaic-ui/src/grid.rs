@@ -1946,13 +1946,16 @@ pub(crate) struct GridCtx {
 ///
 /// It carries two things, and they can't coincide — a write is either still
 /// waiting or has come back and failed:
-/// - an **error** (commit write-back, or a filter/sort re-run), in the red fill;
+/// - an **error** in the red fill: the shown Run-Everything statement's own
+///   failure (`batch_err` — a batch has no editor bar to put it in), else a commit
+///   write-back or a filter/sort re-run;
 /// - a **wait note** for a write that is taking long enough to need explaining
 ///   ([`arm_wait_note`]), on the ordinary chrome surface, with a one-click
 ///   `Rollback` when exactly one transaction of the user's own could be the
 ///   holder. It uses the footer's `tx_rollback` colour deliberately: it is the
 ///   same action on the same surface, and the two should never diverge.
 pub(crate) fn grid_error_bar(
+    batch_err: Memo<Option<String>>,
     commit_err: RwSignal<Option<String>>,
     view_err: RwSignal<Option<String>>,
     commit_wait: RwSignal<Option<WaitNote>>,
@@ -1960,12 +1963,16 @@ pub(crate) fn grid_error_bar(
     error_open: RwSignal<bool>,
     error_text: RwSignal<Option<String>>,
 ) -> impl IntoView {
-    // An error wins: it describes a write that is already over, while the wait
-    // note describes one still in flight (and every path clears the note before
-    // reporting a failure anyway).
+    // The batch error leads, because a failed statement has no grid mounted at
+    // all: a commit error left over from another result tab's grid would be
+    // reporting on something the user isn't looking at, and the statement's own
+    // failure would have nowhere to go. Then an error over the wait note — it
+    // describes a write that is already over, while the note describes one still in
+    // flight (and every path clears the note before reporting a failure anyway).
     let current = move || {
-        commit_err
+        batch_err
             .get()
+            .or_else(|| commit_err.get())
             .or_else(|| view_err.get())
             .map(Err)
             .or_else(|| commit_wait.get().map(Ok))
@@ -2020,7 +2027,11 @@ pub(crate) fn grid_error_bar(
         .into_any()
     })
     .style(move |s| {
-        if commit_err.get().is_some() || view_err.get().is_some() || commit_wait.get().is_some() {
+        if batch_err.get().is_some()
+            || commit_err.get().is_some()
+            || view_err.get().is_some()
+            || commit_wait.get().is_some()
+        {
             s.absolute()
                 .inset_left(5.0)
                 .inset_right(5.0)
