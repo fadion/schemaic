@@ -674,6 +674,40 @@ fn content_x_of(sql: &str) -> f64 {
     HL_GUTTER + digits.saturating_sub(1) as f64 * HL_DIGIT_W
 }
 
+/// Top-left corner for the Ctrl+Enter run menu, in `editor_area` coords.
+///
+/// `anchor` is what the key handler stored: the caret's line-bottom with the gutter
+/// added, in editor-**content** coords — so this is where rule 1 above is paid, and
+/// reactively, so the menu keeps up with a scroll under it (the suggestion list's
+/// route, for the same reason). `menu` is the panel's `(width, height)`.
+///
+/// It is then kept inside the **visible code column** — `content_x + vp.width()`,
+/// the same fold [`statement_line_boxes_at`] clamps to — because `editor_area`
+/// neither scrolls nor clips: a menu placed past that edge is drawn over the pane
+/// beside it and cut off mid-panel, which is what a caret near the end of a long
+/// line used to do. Horizontally it **flips** to the caret's left, so the menu stays
+/// beside what it is about to run; vertically it **clamps**, since a flip needs the
+/// caret line's top edge and covering a line is cheaper than a jump.
+///
+/// The clamp is not redundant with the flip: an anchor already past the fold (a
+/// caret scrolled out to the right) flips to somewhere still past it.
+///
+/// A zero-sized viewport is "not measured yet", not "no room" — it keeps the plain
+/// anchor rather than pinning the menu to the editor's top-left.
+fn run_menu_pos(anchor: Point, menu: (f64, f64), content_x: f64, vp: Rect) -> Point {
+    let (menu_w, menu_h) = menu;
+    let (x, y) = (anchor.x - vp.x0, anchor.y - vp.y0);
+    if vp.width() <= 0.0 || vp.height() <= 0.0 {
+        return Point::new(x.max(0.0), y.max(0.0));
+    }
+    let fold = content_x + vp.width();
+    let flipped = if x + menu_w > fold { x - menu_w } else { x };
+    Point::new(
+        flipped.min(fold - menu_w).max(0.0),
+        y.min(EDITOR_PAD_TOP + vp.height() - menu_h).max(0.0),
+    )
+}
+
 /// Did the editor actually place this offset?
 ///
 /// floem's "not on screen" answer is *both* points at the origin. A genuinely
@@ -1527,16 +1561,18 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     run_menu_offset.set(offset);
                     run_sel.set(0);
                     let (_, below) = e.points_of_offset(offset, CursorAffinity::Backward);
-                    // Same gutter math as the statement-highlight boxes so the menu
-                    // sits under the caret — `COMPLETION_GUTTER` (which the
-                    // completion popup hides behind its own padding) underestimates
-                    // the real gutter, so the menu drifted ~18px left (§7.4).
-                    let digits = (sql.bytes().filter(|&c| c == b'\n').count() + 1)
-                        .to_string()
-                        .len();
-                    let content_x = HL_GUTTER + digits.saturating_sub(1) as f64 * HL_DIGIT_W;
+                    // Same gutter as the statement-highlight boxes so the menu sits
+                    // under the caret — `COMPLETION_GUTTER` (which the completion
+                    // popup hides behind its own padding) underestimates the real
+                    // gutter, so the menu drifted ~18px left (§7.4). Through
+                    // `content_x_of`, which is also what `run_menu_pos` finds the
+                    // code column's right edge from.
+                    //
+                    // Stored in **content** coords, scroll included: the view
+                    // subtracts the viewport itself, so the menu keeps up with a
+                    // scroll rather than freezing where the caret was when it opened.
                     run_menu.set(Some(Point::new(
-                        content_x + below.x,
+                        content_x_of(&sql) + below.x,
                         below.y + 4.0 + EDITOR_PAD_TOP,
                     )));
                     comp.open.set(false);
@@ -2834,20 +2870,24 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 .style(|s| {
                     panel_style(s)
                         .background(theme::bg_chrome())
-                        .min_width(170.0)
+                        .min_width(RUN_MENU_W)
                         .padding_vert(6.0)
                         .font_size(theme::FONT_TITLE)
                 });
                 let positioned = container(panel).style(move |s| {
-                    // Flip leftward at the pane's right edge (same as the AI menu).
-                    const MENU_W: f64 = 170.0;
-                    let w = area_w.get();
-                    let x = if w > 0.0 && pos.x + MENU_W > w {
-                        (pos.x - MENU_W).max(0.0)
-                    } else {
-                        pos.x
-                    };
-                    s.absolute().inset_left(x).inset_top(pos.y)
+                    // `pos` is a *content* anchor, so the viewport comes off here —
+                    // a reactive read, which is also what keeps the menu on the
+                    // caret while the editor scrolls under it. `run_menu_pos` then
+                    // flips it left of the caret at the code column's right edge and
+                    // clamps it into the pane. It used to compare the unscrolled
+                    // anchor against `area_w` and got cut off at that edge.
+                    let p = run_menu_pos(
+                        pos,
+                        (RUN_MENU_W, RUN_MENU_H),
+                        content_x_of(&query.get_untracked()),
+                        ed_vp.get(),
+                    );
+                    s.absolute().inset_left(p.x).inset_top(p.y)
                 });
                 // Same for a click outside: the catcher stops propagation, so the
                 // click that dismissed the menu never reaches the editor either.
@@ -3916,5 +3956,98 @@ mod geometry_tests {
         let two_digit = content_x_of(&"x\n".repeat(20));
         assert!(two_digit > one_digit);
         assert_eq!(two_digit - one_digit, HL_DIGIT_W);
+    }
+
+    // ── The run menu's placement ──────────────────────────────────────────
+    //
+    // The fourth `editor_area` overlay, and the last one to solve neither rule
+    // above: its anchor was stored in content coords at Ctrl+Enter time and never
+    // had the viewport taken off, and its edge check compared that anchor against
+    // `area_w` — so a caret near the right of a long line put the menu past the
+    // code column, where it was cut off mid-panel.
+
+    const MENU: (f64, f64) = (170.0, 82.0);
+    /// A 500×180 visible box, unscrolled. The code column starts at `content_x_of`,
+    /// so the fold is at `content_x + 500`.
+    const SEEN: Rect = Rect::new(0.0, 0.0, 500.0, 180.0);
+
+    fn cx() -> f64 {
+        content_x_of("SELECT 1;\nSELECT 2;")
+    }
+
+    #[test]
+    fn a_menu_with_room_opens_at_the_caret() {
+        let p = run_menu_pos(Point::new(cx() + 40.0, 60.0), MENU, cx(), SEEN);
+        assert_eq!(p, Point::new(cx() + 40.0, 60.0));
+    }
+
+    /// The reported bug: the caret near the end of a long line. The menu flips to
+    /// the caret's left rather than running past the code column.
+    #[test]
+    fn a_caret_near_the_right_edge_flips_the_menu_left_of_it() {
+        let anchor_x = cx() + 480.0; // 20px short of the fold
+        let p = run_menu_pos(Point::new(anchor_x, 60.0), MENU, cx(), SEEN);
+        assert_eq!(p.x, anchor_x - MENU.0, "the menu's right edge is the caret");
+        assert!(
+            p.x + MENU.0 <= cx() + SEEN.width(),
+            "{} runs past the fold",
+            p.x
+        );
+    }
+
+    /// Rule 1 for this overlay: the anchor is a document position, so a scrolled
+    /// editor has to have the origin taken off — otherwise the menu opens where
+    /// the caret *would* be with the editor scrolled home, which is what pushed it
+    /// off the right edge on a long line.
+    #[test]
+    fn a_scrolled_editor_moves_the_menu_with_the_caret() {
+        let scrolled = Rect::new(300.0, 40.0, 800.0, 220.0);
+        let p = run_menu_pos(Point::new(cx() + 380.0, 100.0), MENU, cx(), scrolled);
+        assert_eq!(p, Point::new(cx() + 80.0, 60.0));
+    }
+
+    /// A flip is not enough on its own: an anchor already past the fold (a caret
+    /// scrolled out to the right) flips to somewhere still past it, so the result
+    /// is clamped as well.
+    #[test]
+    fn an_anchor_past_the_fold_is_clamped_inside_it() {
+        let p = run_menu_pos(Point::new(cx() + 900.0, 60.0), MENU, cx(), SEEN);
+        assert!(
+            p.x + MENU.0 <= cx() + SEEN.width(),
+            "{} runs past the fold",
+            p.x
+        );
+    }
+
+    /// A visible column narrower than the menu starts it flush rather than at a
+    /// negative x, which would hide the labels instead of the panel's right edge.
+    #[test]
+    fn a_menu_wider_than_the_column_starts_flush() {
+        let narrow = Rect::new(0.0, 0.0, 60.0, 180.0);
+        assert_eq!(
+            run_menu_pos(Point::new(20.0, 10.0), MENU, cx(), narrow).x,
+            0.0
+        );
+    }
+
+    /// Vertically it clamps rather than flipping — the menu can't hang below the
+    /// pane and across the results grid.
+    #[test]
+    fn a_caret_on_the_last_visible_line_keeps_the_menu_in_the_pane() {
+        let p = run_menu_pos(Point::new(cx() + 10.0, 175.0), MENU, cx(), SEEN);
+        assert!(
+            p.y + MENU.1 <= EDITOR_PAD_TOP + SEEN.height(),
+            "{} hangs below the pane",
+            p.y
+        );
+        assert!(p.y > 0.0, "and not pinned to the top: {}", p.y);
+    }
+
+    /// Before the first layout the viewport is zero-sized. Clamping against that
+    /// would pin every menu to the editor's top-left corner.
+    #[test]
+    fn an_unmeasured_viewport_clamps_nothing() {
+        let p = run_menu_pos(Point::new(400.0, 90.0), MENU, cx(), Rect::ZERO);
+        assert_eq!(p, Point::new(400.0, 90.0));
     }
 }
