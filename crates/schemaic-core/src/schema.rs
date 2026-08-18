@@ -499,7 +499,7 @@ fn when_group(guard: &str) -> String {
 /// built from a designer edit rather than from the pragma doesn't get a second
 /// pair.
 ///
-/// `pub(crate)` because [`crate::ddl::sqlite_constant_default`] asks the same
+/// `pub(crate)` because `ddl::sqlite_constant_default` asks the same
 /// grammar question for `ADD COLUMN` — the two used to answer it separately, and
 /// the one that guessed sent statements the engine refuses down a path with no
 /// transaction around it.

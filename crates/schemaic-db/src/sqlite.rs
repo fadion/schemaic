@@ -316,7 +316,8 @@ fn attach_origins(conn: &SqliteConn, sql: &str, columns: &mut [Column]) {
 /// at all.
 ///
 /// So it asks two questions, in the order that makes each one cheap to justify:
-/// SQLite's own [`sqlite_affinity`] rule, which covers every `…BLOB…` spelling
+/// SQLite's own [`schemaic_core::schema::sqlite_affinity`] rule, which covers
+/// every `…BLOB…` spelling
 /// and the untyped column; then the `BINARY` family, which SQLite gives NUMERIC
 /// affinity but which nobody writes meaning anything but bytes.
 ///
