@@ -294,6 +294,69 @@ pub fn same_path(a: &Path, b: &Path, ignore_case: bool) -> bool {
     folded(a) == folded(b)
 }
 
+/// A tab's binding to a file on disk: its path, the text last known to be *on*
+/// disk, and the byte shape to write back.
+///
+/// It exists as one value because the three are only ever correct together, and
+/// the places that set them are not the places that read them. Setting the path
+/// without the on-disk text leaves a tab that claims to be a saved file and
+/// can't tell whether it is modified; clearing the path without clearing the
+/// format leaves a fresh document carrying the CRLF and BOM of a file it is no
+/// longer bound to.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileBinding {
+    pub path: Option<PathBuf>,
+    /// The file's text as it was last read or written — `None` when that is not
+    /// known, which a tab shows as modified. See [`restored_binding`].
+    pub disk_sql: Option<String>,
+    pub format: SqlFormat,
+}
+
+impl FileBinding {
+    /// **No file.** What a tab holds when it has never been saved, and what the
+    /// "blank slate" left behind by closing a connection's last tab must be
+    /// reset to.
+    ///
+    /// A cleared tab that kept its path is one Ctrl+S from overwriting that file
+    /// with an empty document — the tab looks new and the keystroke does not ask.
+    /// Expressed as a value rather than three assignments because the bug is
+    /// always an assignment that was left out.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Is this tab bound to a file at all?
+    pub fn is_bound(&self) -> bool {
+        self.path.is_some()
+    }
+}
+
+/// The binding a tab comes back with when a session is restored.
+///
+/// **The file's text is not persisted**, so whether the on-disk copy is known
+/// has exactly one answer per saved tab, and it is this one: a tab saved *clean*
+/// had its editor text equal to the file, and that text *is* persisted — so the
+/// restored `query` is the on-disk copy. A tab saved *dirty* leaves it unknown,
+/// which the tab shows as modified until a save or a reload settles it. A tab
+/// with no path has no on-disk copy to know about.
+///
+/// The trap is the fourth combination: a *dirty* tab whose text is restored and
+/// whose `disk_sql` is wrongly set to it comes back looking clean, so the
+/// modified marker is gone and Ctrl+S is a no-op over the user's unsaved work.
+pub fn restored_binding(
+    path: Option<PathBuf>,
+    file_dirty: bool,
+    query: &str,
+    format: SqlFormat,
+) -> FileBinding {
+    let disk_sql = (path.is_some() && !file_dirty).then(|| query.to_string());
+    FileBinding {
+        path,
+        disk_sql,
+        format,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +364,65 @@ mod tests {
     /// The format of an ordinary LF, no-BOM, valid-UTF-8 file.
     fn plain() -> SqlFormat {
         SqlFormat::default()
+    }
+
+    // ── What a restored tab knows about its file ─────────────────────────────
+
+    #[test]
+    fn a_clean_file_tab_restores_knowing_its_on_disk_text() {
+        let b = restored_binding(Some(PathBuf::from("/w/a.sql")), false, "SELECT 1;", plain());
+        assert_eq!(b.disk_sql.as_deref(), Some("SELECT 1;"));
+        assert!(b.is_bound());
+    }
+
+    /// **The one that loses work if it goes the other way.** A tab saved with
+    /// unsaved edits must come back *not* knowing its on-disk text, or it reads
+    /// as clean: no modified marker, and Ctrl+S does nothing.
+    #[test]
+    fn a_dirty_file_tab_restores_knowing_nothing() {
+        let b = restored_binding(
+            Some(PathBuf::from("/w/a.sql")),
+            true,
+            "SELECT 2; -- edited",
+            plain(),
+        );
+        assert_eq!(b.disk_sql, None);
+        assert!(b.is_bound(), "it is still that file's tab");
+    }
+
+    #[test]
+    fn a_tab_with_no_file_has_no_on_disk_text_either_way() {
+        for dirty in [false, true] {
+            let b = restored_binding(None, dirty, "SELECT 3;", plain());
+            assert_eq!(b.disk_sql, None, "dirty = {dirty}");
+            assert!(!b.is_bound());
+        }
+    }
+
+    /// The byte shape rides along untouched — it is what the file *was*, not
+    /// something derived from the text.
+    #[test]
+    fn the_restored_binding_carries_the_byte_shape_as_it_was() {
+        let crlf_bom = SqlFormat {
+            crlf: true,
+            bom: true,
+            lossy: false,
+        };
+        let b = restored_binding(Some(PathBuf::from("/w/a.sql")), false, "x", crlf_bom);
+        assert_eq!(b.format, crlf_bom);
+    }
+
+    /// Shedding the binding must shed **all** of it: a cleared tab that kept its
+    /// path is one Ctrl+S from overwriting that file with an empty document, and
+    /// one that kept its format writes a fresh script with a BOM and CRLF it
+    /// never had.
+    #[test]
+    fn a_shed_binding_keeps_nothing() {
+        let b = FileBinding::none();
+        assert_eq!(b.path, None);
+        assert_eq!(b.disk_sql, None);
+        assert_eq!(b.format, SqlFormat::default());
+        assert!(!b.is_bound());
     }
 
     #[test]

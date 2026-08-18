@@ -124,6 +124,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `the_rejection_lists_only_this_engines_heads`). Only the head list is per dialect: the
     single-statement check and the `DENY_KEYWORDS` scan — which is what refuses a write hidden
     behind a `WITH` head — apply the same everywhere.
+    **The gate's *lexer* half is per dialect as well, and is where the real bypass was.** Whether a
+    statement has ended is a dialect question, so the same text gets different — and individually
+    correct — verdicts: `SELECT 'a\' ; DELETE FROM s; --'` is one statement on MySQL, whose
+    backslash escape swallows the rest of the literal, and two anywhere else. A SQLite connection
+    gated with `SqlDialect::MySql` therefore passed a payload that deletes a table (`c6c5dae`).
+    The tests read `EVERY_DIALECT` rather than the module's MySQL-binding helper, and three
+    (`the_gate_reads_this_engines_string_escape` / `…_comment_rule` / `…_identifier_quoting`) assert
+    that the engines' answers *differ*, so a mis-paired dialect fails instead of passing by
+    coincidence.
   - `intel.rs` — the **SQL intelligence** layer (structure-aware, dialect-pluggable). Parses a
     *complete* statement with a real per-dialect AST (`sqlparser`; `SqlDialect` seam — MySQL,
     PostgreSQL and SQLite all wired) and answers what a token stream can't: `statement_scope`
@@ -185,6 +194,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     and doesn't know why anyone wanted it. Two tests hold either side of the line —
     `projection_places_the_columns_ahead_of_a_trailing_wildcard` and
     `projection_still_refuses_a_wildcard_that_is_not_the_last_item`.
+    **The relaxation moved the safety into another crate**, which is why it is tested from both
+    ends. `SELECT a, * FROM t` used to return `None`, and no projection meant no origins meant
+    read-only by construction; now every column is attributed and two of them claim the base column
+    `a`, so the only thing still refusing the table is `edit::resolve_key`'s C1 duplicate check.
+    `db::sqlite`'s `a_column_exposed_twice_by_the_widened_projection_stays_read_only` walks the new
+    shape through `analyze_edit` end to end, `a_computed_leading_item_keys_on_the_tables_own_primary_key`
+    covers the other half (`SELECT 1, * FROM t`, editable only *because* of the relaxation), and
+    `edit::c1_holds_for_one_column_duplicated_within_a_single_table` names C1 explicitly so a
+    relaxation of the duplicate rule fails there rather than in a SQLite integration test.
     **Every SQL fragment this module generates** (`join_condition`, `join_targets`, `expand_star`)
     is quoted through `export::ident_if_needed`, which quotes only what a bare name would get wrong
     — anything that isn't a plain lower-case word that can stand unquoted as an *identifier*
@@ -331,6 +349,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     table/view menu, the editor's right-click and the Create submenu each ask the predicate for the
     object in front of them and offer **nothing** where the answer is no (absent, not dimmed — "not
     supported" rather than "not here").
+    A third narrow fact joined them: **`requires_named_checks`**, false on SQLite alone —
+    see `TableDraft::validate` below. And `supports_change` lists **`CreateTable`**, which
+    it did not: `emit_sqlite` had no arm for it either, while `create_table_sql` has had a
+    SQLite arm since the engine landed. A set holding one `CreateTable` is not empty, so
+    the designer's New-table path opened its preview and offered Apply on an empty script
+    — the plan reported success and no table existed. That shape is the reason both the
+    capability list and the emitter's dispatch are worth reading together: a change kind
+    missing from either is silent.
     **The twelve-step rebuild is `sqlite_rebuild_sql(current, draft)`**, over
     `Rebuild { current, draft }` — both sides, because which new column takes which old one's data
     can only be answered by looking at both. SQLite's `ALTER TABLE` does `RENAME TABLE`,
@@ -533,10 +559,34 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     opens clean — `int(11)` ≡ `int`, `character varying(45)` ≡ `varchar(45)`. **The
     round-trip gate is test-enforced**: `TableDraft::from_table(t)` diffed against `t`
     must be empty over captured fixtures from classicmodels/sakila/employees/world +
-    PG world/chinook (`ddl::tests::roundtrip`) — extend those fixtures rather than
-    working around them, since any model-fidelity gap surfaces to the user as a phantom
-    change. Also `key_list_text`/`parse_key_list` (the designer's `bio(20), age DESC`
+    PG world/chinook + two SQLite shapes (`ddl::tests::roundtrip`) — extend those
+    fixtures rather than working around them, since any model-fidelity gap surfaces to
+    the user as a phantom change. **On SQLite it is worse than a stray preview line**:
+    a non-empty diff is what routes an edit through the twelve-step rebuild, so an
+    invented change drops and recreates the table for an edit nobody made. The gate has
+    a second half a fixture cannot cover — `db::sqlite`'s
+    `an_introspected_table_diffs_to_nothing_against_its_own_draft` makes the same
+    assertion over **real introspection**, across a corpus declaring every fidelity
+    property the engine added; a fixture states what the reader is believed to produce,
+    and that belief is exactly what the range's findings kept disagreeing with. It found
+    three shipped bugs on its first run (`CreateTable` unhandled by `emit_sqlite`,
+    `validate` refusing an unnamed `CHECK`, and two unnamed checks pairing onto one
+    original). Also `key_list_text`/`parse_key_list` (the designer's `bio(20), age DESC`
     field) and `common_types`. Pure + unit-tested.
+    **A `CHECK` is matched to its original by name, and an unnamed one has none.**
+    SQLite keeps a constraint unnamed — a bare `CHECK (a > 0)` in the table body is the
+    ordinary spelling there and `CheckInfo::clause_sql` emits it back that way — so
+    `diff` claims by name first and then pairs the unnamed ones **by predicate**, each
+    original claimable once, with whatever is left on either side the real drop or add.
+    Matching on the shared empty name gave every unnamed draft check the *first*
+    original and produced a `DROP`+`ADD` on an untouched table.
+    **`TableDraft::validate(dialect)`** takes the dialect for one rule:
+    `ddl::requires_named_checks` is false on SQLite alone, because MySQL and PostgreSQL
+    assign a constraint name themselves and a blank one there can only be an unfinished
+    form. Demanding one everywhere made every SQLite table carrying an unnamed check
+    **uneditable** — the designer opened on an untouched table with a blocking footer
+    error and no field to fix it in. The predicate rule (`CHECK ()`) is unchanged and
+    applies to all three.
     **`TableDraft::find_key(index, foreign_key) -> Option<DraftKey>`** says where one of a table's
     keys sits in the draft — which of the designer's sections holds it, and which row of that
     section — and it exists because the schema tree's sequence of keys and the draft's are **not
@@ -1131,6 +1181,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     command searches **every** tab through it, not the active connection's: the strip being
     per-connection is a fact about visibility and no answer to the lost edit, and a hit on another
     connection goes through `switch_conn` so the strip shows the tab it activates.
+    **A tab's binding to a file is one value, not three fields.** `FileBinding { path, disk_sql,
+    format }` with `restored_binding(path, file_dirty, query, format)` and `FileBinding::none()`,
+    because both failures here are a line left out. The file's *text* is not persisted, so whether
+    a restored tab knows its on-disk copy has exactly one answer per saved tab: a tab saved clean
+    had its editor text equal to the file and that text *is* persisted, while one saved dirty leaves
+    it unknown — and getting the fourth combination wrong brings a dirty tab back looking clean, so
+    the modified marker is gone and Ctrl+S is a no-op over unsaved work. `none()` is the other side:
+    the blank slate left when a connection's last tab closes must shed the path (or the next Ctrl+S
+    overwrites that file with an empty document) *and* the format (or a fresh script is written with
+    a BOM and CRLF it never had). `app/main.rs` reads both at its two sites; the decisions
+    themselves are tested here.
   - **Small persisted / UI-state models**, each a flat `Vec` keyed by `conn_id` and each pure +
     tested (they share `history.rs`'s shape; a new one belongs here, not in the UI):
     - `search_history.rs` — recent Find-Anywhere targets (`MAX_PER_CONN`, newest-first, deduped).
@@ -2050,10 +2111,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     while the log and its export went on moving. The unconditional rebuild was what hid that. Three icon buttons sit in the sub-header between the status line and
     the interval dropdown — Pause, Clear, Export — and they join the modal's `FocusRing` at
     tabindex 10/11/12 with the dropdown moved to 13, so a monitor is watchable with both hands off
-    the mouse. **Pause holds the fetch, not the loop**: `monitor_tick` reads
-    `overlay.monitor_paused`, calls `monitor_reschedule` and returns, because a pause that unwound
-    the loop would need `open_monitor` to restart it and that resets the baseline and the log — the
-    opposite of what Pause is for. The cost is that the baseline ages, so the first poll after a
+    the mouse. **Pause holds the fetch, not the loop**: `monitor_tick` reads the three signals and
+    switches on `core::monitor::tick_action(open, superseded, paused) -> Stop | Reschedule | Fetch`,
+    which is where the decision lives so it can be tested — the arms sat inside a floem-scheduled
+    function no test could call, and swapping two statements would have turned Pause into Stop with
+    nothing failing. A paused tick **reschedules**, because a pause that unwound the loop would need
+    `open_monitor` to restart it and that resets the baseline and the log — the opposite of what
+    Pause is for. A closed modal is the only thing that ends the loop; a superseded generation stops
+    *without* re-arming, or the old target's loop polls beside the new one forever. The cost is that the baseline ages, so the first poll after a
     resume diffs against the pre-pause table and logs the *net* change stamped at the resume; that
     is the log's standing rule (an entry is stamped when a poll observed it, not when it happened),
     just coarser. **Clear empties `overlay.monitor_log` only** — the app's baseline snapshot is
@@ -3047,6 +3112,20 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   a new arm reads the skeleton, which is stated as a comment
   block immediately above the closure: an arm is written and reviewed one arm at a time, and
   nothing else in the file says what the order is.
+  **`overlays::menu_order_gate` holds the load-bearing half**, and only that half. It reads the
+  module's own source, bounded by the `let build:` binding and the `AI Explain` row that is pushed
+  outside the `match`, and asserts that nothing follows an irreversible entry inside its `CtxKind`
+  arm — which is checkable at all because every destructive entry marks itself
+  `action_colored(…, theme::error, …)`, the same fact the menu shows the user; a second test pins
+  that the marking is on exactly `Drop`, `Drop foreign key`, `Drop index` and `Truncate`, so
+  re-colouring can't weaken the first one silently. The **subsequence** claim over all five groups
+  is *not* gated, and the shipped code already deviates from it twice, harmlessly: the database arm
+  pushes `Collapse all` after `Refresh` where the skeleton closes the read group with `Refresh`,
+  and the table arm's write group is `Import` → `Edit table` → `Triggers` where the skeleton lists
+  Create/Edit/Import/Triggers. Catching those needs the ordering lifted out of the `Ui` closure —
+  a pure `menu_skeleton(kind, offers) -> Vec<MenuSlot>` returning labels and group ids, with the
+  closures attached afterwards — which rewrites every arm of a 700-line `match` and is a change to
+  make with the app running.
   The Table arm's `Truncate`/`Drop` name the **scale** of what they delete when a row figure is
   already in `ConnNode::stats` (`stats::truncate_prompt`/`drop_prompt` decide the words and whether
   a figure is worth naming). It is read, never fetched: the menu is built on the right-click, so a
@@ -3086,8 +3165,18 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   rustdoc calls that derive load-bearing rather than a convenience. It is self-invalidating **only
   because every opener overwrites the anchor as it opens**: there is no separate flag to go stale
   and nothing for the other ten to reset. An opener that fills `popup_menu` without setting
-  `popup_anchor` first therefore hands its menu to whoever opened last, silently, and the test that
-  would catch it doesn't exist.
+  `popup_anchor` first therefore hands its menu to whoever opened last, silently.
+  **`widgets::popup_anchor_gate` is what catches that**, and it reads the source, because the sites
+  are not greppable by one name — `overlay.popup_menu.set(Some(…))`, `gs.popup.set(Some(…))` and
+  `table_designer`'s local `popup`/`anchor`. Walking each file of the crate in order, every write
+  that *fills* the channel must have an anchor write between it and the previous fill: a stand-in
+  for "in the same opener, before it", which holds because openers don't interleave. `rustfmt`
+  breaks the long ones at the `.`, so the scan joins a continuation onto its owner — getting that
+  wrong reported two correct openers as offenders. Deliberately weak, like `shortcuts`' `KEY_FILES`
+  and `core/tests/doc_coverage.rs`, and it asserts a floor on how many openers it found so a rename
+  can't make it pass by seeing nothing. Folding the pair into one `open_popup(anchor, entries)`
+  constructor, so the anchor *cannot* be omitted, is still the better end state and is a change to
+  make with the app running.
   `open` (is the channel non-empty) is checked **before** the anchor, which is the reason this is a
   named function rather than an inline `&&`: closing clears `popup_menu` but leaves `popup_anchor`
   naming the last opener, so an anchor-only test reports the menu still up after Escape and the

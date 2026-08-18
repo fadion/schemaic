@@ -2145,7 +2145,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
             let status = dyn_container(
                 move || d.draft.get(),
                 move |draft| {
-                    let errs = draft.validate();
+                    let errs = draft.validate(status_target.dialect);
                     if let Some(first) = errs.first() {
                         return text(first.clone())
                             .style(|s| {
@@ -2185,7 +2185,7 @@ pub(crate) fn table_designer_overlay(ui: Ui) -> impl IntoView {
                     let target = preview_target.clone();
                     let ring = ring_actions.clone();
                     let cs = change_set(&target, &draft);
-                    let ready = draft.validate().is_empty() && !cs.is_empty();
+                    let ready = draft.validate(target.dialect).is_empty() && !cs.is_empty();
                     h_stack((
                         action_button(
                             "Cancel",

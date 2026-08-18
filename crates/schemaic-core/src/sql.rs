@@ -1420,6 +1420,12 @@ mod tests {
     use super::*;
     use crate::intel::SqlDialect;
 
+    /// Every engine this build ships. A test whose expected answer does not
+    /// depend on the dialect should loop over this rather than pick one, so a
+    /// fourth engine is added to the suite by adding it here.
+    const EVERY_DIALECT: [SqlDialect; 3] =
+        [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite];
+
     // These legacy tests predate the dialect parameter and assert MySQL boundary
     // behavior; thin MySQL-defaulting wrappers (shadowing the glob import) keep them
     // unchanged. New Postgres tests below call the real `super::` functions with an
@@ -1902,22 +1908,37 @@ mod tests {
         assert!(unsafe_reason("DELETE FROM t # WHERE id=1").is_some());
     }
 
+    /// Every dialect, because a verdict that does *not* depend on the engine must
+    /// not be proved on one: the gate is the only guard on AI-issued SQL and it
+    /// is dialect-parameterised, so a fourth engine should inherit this suite
+    /// rather than the single dialect the helper above happens to bind.
     #[test]
     fn read_only_gate_blocks_bypasses() {
-        assert!(read_only_reason("SELECT * FROM t").is_ok());
-        assert!(read_only_reason("WITH c AS (SELECT 1) SELECT * FROM c").is_ok());
-        // CTE that hides a DELETE.
-        assert!(read_only_reason("WITH c AS (SELECT 1) DELETE FROM t").is_err());
-        // EXPLAIN ANALYZE actually executes the statement.
-        assert!(read_only_reason("EXPLAIN ANALYZE DELETE FROM t").is_err());
-        // SELECT … INTO OUTFILE writes files on the DB host.
-        assert!(read_only_reason("SELECT * FROM t INTO OUTFILE '/tmp/x'").is_err());
-        // SLEEP / locks.
-        assert!(read_only_reason("SELECT SLEEP(10)").is_err());
-        // Multi-statement.
-        assert!(read_only_reason("SELECT 1; DROP TABLE t").is_err());
-        // Dangerous words inside a string / identifier are fine.
-        assert!(read_only_reason("SELECT 'delete from t'").is_ok());
+        for d in EVERY_DIALECT {
+            let gate = |s: &str| super::read_only_reason(s, d);
+            assert!(gate("SELECT * FROM t").is_ok(), "{d:?}");
+            assert!(
+                gate("WITH c AS (SELECT 1) SELECT * FROM c").is_ok(),
+                "{d:?}"
+            );
+            // CTE that hides a DELETE.
+            assert!(gate("WITH c AS (SELECT 1) DELETE FROM t").is_err(), "{d:?}");
+            // EXPLAIN ANALYZE actually executes the statement.
+            assert!(gate("EXPLAIN ANALYZE DELETE FROM t").is_err(), "{d:?}");
+            // SELECT … INTO OUTFILE writes files on the DB host.
+            assert!(
+                gate("SELECT * FROM t INTO OUTFILE '/tmp/x'").is_err(),
+                "{d:?}"
+            );
+            // SLEEP / locks.
+            assert!(gate("SELECT SLEEP(10)").is_err(), "{d:?}");
+            // Multi-statement.
+            assert!(gate("SELECT 1; DROP TABLE t").is_err(), "{d:?}");
+            // A dangerous word inside a *standard* string is inert everywhere.
+            assert!(gate("SELECT 'delete from t'").is_ok(), "{d:?}");
+        }
+        // The backtick is not standard, so this one is deliberately not in the
+        // sweep — see `the_gate_reads_this_engines_identifier_quoting`.
         assert!(read_only_reason("SELECT `update` FROM t").is_ok());
     }
 
@@ -1947,6 +1968,75 @@ mod tests {
         assert!(gate("DESC t", SqlDialect::MySql).is_ok());
         assert!(gate("DESCRIBE t", SqlDialect::Postgres).is_err());
         assert!(gate("DESCRIBE t", SqlDialect::Sqlite).is_err());
+    }
+
+    // ── The gate's lexer half, per dialect ───────────────────────────────────
+    // `c6c5dae` fixed a real bypass — a SQLite connection was gated with
+    // `SqlDialect::MySql` — and its test asserts only that `dialect_of` returns
+    // the right enum. These pin the behaviour that made the mis-pairing matter:
+    // the gate's answer changes with the dialect *before* it reaches the head
+    // list, because where a statement ends is a dialect question.
+
+    /// **The payload the bypass used.** MySQL has a backslash escape in a string
+    /// and the other two do not, so `'a\'` ends the literal everywhere except
+    /// MySQL — where the scanner runs on and the `; DELETE` is swallowed into it.
+    /// Gated as MySQL, a SQLite connection was handed a statement that runs both
+    /// halves; measured against a live SQLite, the DELETE emptied the table.
+    #[test]
+    fn the_gate_reads_this_engines_string_escape() {
+        let payload = r"SELECT 'a\' ; DELETE FROM s; --'";
+        for d in [SqlDialect::Sqlite, SqlDialect::Postgres] {
+            let err = super::read_only_reason(payload, d)
+                .expect_err("two statements, because the literal ends at its own quote");
+            assert!(err.contains("single statement"), "{d:?}: {err}");
+        }
+        // MySQL's answer is different *and correct there*: it really is one
+        // statement, because the engine reads `\'` as an escaped quote.
+        assert!(super::read_only_reason(payload, SqlDialect::MySql).is_ok());
+    }
+
+    /// `#` opens a comment on MySQL alone. Hiding a `DELETE` behind one is a read
+    /// on MySQL and a rejected write everywhere else — the same text, two honest
+    /// answers, and the wrong dialect picks the wrong one.
+    #[test]
+    fn the_gate_reads_this_engines_comment_rule() {
+        let hidden = "SELECT 1 # DELETE FROM t";
+        assert!(super::read_only_reason(hidden, SqlDialect::MySql).is_ok());
+        for d in [SqlDialect::Sqlite, SqlDialect::Postgres] {
+            let err = super::read_only_reason(hidden, d).expect_err("`#` is not a comment here");
+            assert!(err.contains("DELETE"), "{d:?}: {err}");
+        }
+        // A `--` comment is every engine's, and the newline ends it on all three,
+        // so what follows is code and the deny scan sees it.
+        for d in EVERY_DIALECT {
+            assert!(
+                super::read_only_reason("SELECT 1 -- x\n, (SELECT DROP)", d).is_err(),
+                "{d:?}"
+            );
+        }
+    }
+
+    /// Which quotings make a keyword inert is the engine's business too:
+    /// backticks are MySQL's and SQLite's, brackets are SQLite's alone, and a
+    /// `;` inside one is not a statement break where the quoting is real.
+    #[test]
+    fn the_gate_reads_this_engines_identifier_quoting() {
+        // A column literally called `update`.
+        let backticked = "SELECT `update` FROM t";
+        assert!(super::read_only_reason(backticked, SqlDialect::MySql).is_ok());
+        assert!(super::read_only_reason(backticked, SqlDialect::Sqlite).is_ok());
+        assert!(
+            super::read_only_reason(backticked, SqlDialect::Postgres).is_err(),
+            "PostgreSQL has no backtick, so the word is code"
+        );
+        // A bracketed name carrying a `;`: one statement on SQLite, two anywhere
+        // the bracket is ordinary code.
+        let bracketed = "SELECT * FROM [odd; name]";
+        assert!(super::read_only_reason(bracketed, SqlDialect::Sqlite).is_ok());
+        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+            let err = super::read_only_reason(bracketed, d).expect_err("`[` is not a quote here");
+            assert!(err.contains("single statement"), "{d:?}: {err}");
+        }
     }
 
     /// The rejection names what *this* engine allows, so the model can retry with

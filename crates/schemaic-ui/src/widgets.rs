@@ -4438,3 +4438,151 @@ mod follow_tests {
         assert_eq!(next_floor(1200.0, 1400.0, true), 1400.0);
     }
 }
+
+/// **The anchor-before-the-channel gate.**
+///
+/// [`menu_anchored_at`] decides whether a trigger owns the menu that is up by
+/// comparing `popup_anchor` against the [`crate::PopupAnchor`] the trigger would
+/// set itself. That works only because the rule holds at *every* opener: the
+/// anchor is what makes it self-invalidating, so an opener that fills the popup
+/// channel without writing the anchor first inherits the previous opener's
+/// value. The menu then opens at the previous trigger's rect, across the window
+/// from the control that raised it, and the previous trigger reports *its* menu
+/// as open — so pressing that one closes the new menu instead of opening its own.
+/// That is the exact defect `c911c69` / `0ac0d6d` / `7a1f4eb` were three commits
+/// to remove, and `docs/architecture.md` says in as many words that the test
+/// which would catch it doesn't exist.
+///
+/// The sites are not greppable by one name — that is the whole difficulty. They
+/// are `overlay.popup_menu.set(Some(…))`, `gs.popup.set(Some(…))` and a local
+/// `popup.set(Some(…))`, across seven modules. So this reads the source, in the
+/// spirit of [`crate::shortcuts`]'s `KEY_FILES` and `core/tests/doc_coverage.rs`:
+/// deliberately weak, and there to catch the one failure that recurs.
+///
+/// **What it checks.** Walking each file in order, every write that *fills* the
+/// channel must have an anchor write between it and the previous fill (or the
+/// start of the file). That is a stand-in for "in the same opener, before it" —
+/// openers don't interleave, and a thirteenth one that forgets the anchor has
+/// nothing between it and its predecessor's fill.
+#[cfg(test)]
+mod popup_anchor_gate {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    /// Openers that deliberately don't write the anchor, each with the reason.
+    /// Empty is the healthy state — a site leaves this list the moment it starts
+    /// setting one, and joins it only with a reason a reader can check.
+    const EXEMPT: &[(&str, u32, &str)] = &[];
+
+    fn src_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    /// The file with its `#[cfg(test)]` module cut off — test data is full of
+    /// `.set(Some(…))` and a gate that cries wolf gets deleted.
+    fn production_code(src: &str) -> &str {
+        match src.find("#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        }
+    }
+
+    /// The file's *logical* lines, each with the 1-based number it starts at.
+    ///
+    /// `rustfmt` breaks `gs.popup_anchor.set(Some(anchor_below(…)))` across two
+    /// lines at the `.`, so a per-line scan reads the receiver and the call
+    /// separately and sees neither. Joining a continuation onto its owner is what
+    /// makes the two spellings the same text — and getting this wrong is silent:
+    /// the gate reported two correct openers as offenders.
+    fn logical_lines(src: &str) -> Vec<(u32, String)> {
+        let mut out: Vec<(u32, String)> = Vec::new();
+        for (i, raw) in src.lines().enumerate() {
+            let t = raw.trim_start();
+            match out.last_mut() {
+                Some((_, prev)) if t.starts_with('.') => prev.push_str(t),
+                _ => out.push((i as u32 + 1, t.to_string())),
+            }
+        }
+        out
+    }
+
+    /// Does this line *fill* the popup channel? `set(None)` closes it and needs
+    /// no anchor; `popup_width.set(…)` is a different signal whose name merely
+    /// starts the same way, which is why the suffix is matched exactly.
+    fn fills_channel(line: &str) -> bool {
+        let t = line.trim_start();
+        for name in ["popup_menu", "popup"] {
+            let pat = format!("{name}.set(Some(");
+            if let Some(i) = t.find(&pat) {
+                // Nothing but a path may precede it: `overlay.popup_menu`,
+                // `gs.popup`, or the bare local.
+                let before = &t[..i];
+                let path_only = before
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '.');
+                // `gs.popup_menu` must not also count as `popup` — the longer
+                // name is tried first, and a hit on `popup` whose char before is
+                // a word byte is part of a longer name.
+                let boundary = before.chars().last().is_none_or(|c| c == '.');
+                if path_only && boundary {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Does this line write the anchor? Both spellings: the shared
+    /// `popup_anchor`, and `table_designer`'s local, which is simply `anchor`
+    /// because its popup is local too.
+    fn sets_anchor(line: &str) -> bool {
+        let t = line.trim_start();
+        ["popup_anchor.set(", "anchor.set("]
+            .iter()
+            .any(|p| t.contains(p))
+    }
+
+    #[test]
+    fn every_opener_sets_the_anchor_before_filling_the_popup_channel() {
+        let exempt: BTreeSet<(&str, u32)> = EXEMPT.iter().map(|(f, l, _)| (*f, *l)).collect();
+        let mut offenders: Vec<String> = Vec::new();
+        let mut fills = 0usize;
+
+        let mut files: Vec<PathBuf> = std::fs::read_dir(src_dir())
+            .expect("the crate's own src")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .collect();
+        files.sort();
+
+        for path in files {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let src = std::fs::read_to_string(&path).expect("readable");
+            let mut anchored = false;
+            for (lineno, line) in logical_lines(production_code(&src)) {
+                if sets_anchor(&line) {
+                    anchored = true;
+                }
+                if fills_channel(&line) {
+                    fills += 1;
+                    if !anchored && !exempt.contains(&(name.as_str(), lineno)) {
+                        offenders.push(format!(
+                            "{name}:{lineno} fills the popup channel with no \
+                             `popup_anchor.set` since the previous opener"
+                        ));
+                    }
+                    // The next fill is a different opener and needs its own.
+                    anchored = false;
+                }
+            }
+        }
+
+        assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+        // The scan has to still be finding the sites: a renamed channel would
+        // otherwise make this pass by seeing nothing at all.
+        assert!(
+            fills >= 10,
+            "the scan found only {fills} openers — has the channel been renamed?"
+        );
+    }
+}

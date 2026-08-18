@@ -4040,37 +4040,48 @@ mod object_menu_tests {
         assert!(!object_entries(true, Postgres, true).triggers);
     }
 
-    /// **A SQLite table is designable** — the engine can't alter one in place,
-    /// but the rebuild reaches everything the designer can ask for, so the entry
-    /// is offered rather than absent.
-    #[test]
-    fn sqlite_designs_a_table() {
-        let e = object_entries(false, Sqlite, false);
-        assert!(e.edit, "the rebuild is what makes this possible");
-        assert!(e.import, "unchanged");
-        assert!(e.truncate, "unchanged");
-    }
-
-    /// **A SQLite view is editable too**, now that the emitter has its own arm:
-    /// no `CREATE OR REPLACE VIEW` and no rename verb, so every edit is a drop
-    /// and a create.
-    #[test]
-    fn sqlite_edits_a_view() {
-        assert!(object_entries(true, Sqlite, false).edit, "view");
-    }
-
-    /// **And its triggers**, which needed a reader before an editor: SQLite
-    /// publishes no catalogue of a trigger's parts, so until `sqlite_trigger_info`
-    /// could parse them out of `sqlite_master`, the list was empty and the editor
-    /// would have shown a table's triggers as gone.
+    /// **The whole table of answers, in one place.** Three separate tests used
+    /// to assert `object_entries(…, Sqlite, …).edit`, `.triggers` and so on —
+    /// each of which now reduces to a literal `true`, so none of them could fail
+    /// for any dialect: delete SQLite's entire capability story and they stayed
+    /// green.
     ///
-    /// A SQLite **view** carries triggers too — `INSTEAD OF` is the only way one
-    /// is written to — so this is not `!is_view` there any more than it is on
-    /// PostgreSQL.
+    /// A matrix has content where an isolated `true` has none, because what it
+    /// pins is the **shape of the disagreement**: `triggers` is the one entry
+    /// where the engines differ (MySQL takes no trigger on a view; a
+    /// *materialized* view takes none anywhere), and `edit`/`import`/`truncate`
+    /// are asserted *and* asserted to be the same everywhere, which is the claim
+    /// that would break if a fourth engine were sorted onto the wrong side.
+    ///
+    /// The capability these constants replaced is tested where it still exists —
+    /// `core::ddl`'s `every_engine_can_express_a_column_retype` and
+    /// `a_body_change_drops_and_creates_rather_than_replacing`.
     #[test]
-    fn sqlite_edits_triggers_on_a_table_and_on_a_view() {
-        assert!(object_entries(false, Sqlite, false).triggers, "table");
-        assert!(object_entries(true, Sqlite, false).triggers, "view");
+    fn the_object_menu_matrix_is_the_same_everywhere_except_a_views_triggers() {
+        for d in [MySql, Postgres, Sqlite] {
+            // A base table: everything, on every engine.
+            let t = object_entries(false, d, false);
+            assert!(
+                t.edit && t.import && t.truncate && t.triggers,
+                "{d:?}: {t:?}"
+            );
+
+            // A view: no import, no truncate, and editable everywhere — SQLite
+            // included, where every edit is a drop and a create because there is
+            // no `CREATE OR REPLACE VIEW`.
+            let v = object_entries(true, d, false);
+            assert!(v.edit, "{d:?} view: {v:?}");
+            assert!(!v.import && !v.truncate, "{d:?} view: {v:?}");
+
+            // **The one real disagreement.** `INSTEAD OF` lives on PostgreSQL
+            // and on SQLite, where it is the only way a view is written to at
+            // all. MySQL takes no trigger on a view.
+            assert_eq!(v.triggers, d != MySql, "{d:?} view triggers: {v:?}");
+
+            // And a materialized view takes none anywhere: the server refuses
+            // outright (`relation "mv" cannot have triggers`).
+            assert!(!object_entries(true, d, true).triggers, "{d:?} matview");
+        }
     }
 }
 
@@ -4520,6 +4531,14 @@ mod row_menu_tests {
     /// reaches a retype or a constraint by rebuilding the table. They were once
     /// ungated for the wrong reason (nobody had gated them) and are ungated now
     /// for the right one.
+    ///
+    /// **This asserts a literal, and says so.** Both `edit` fields reduce to
+    /// `!is_view`, so nothing here can fail for a *dialect* — the value is in the
+    /// `is_view` half, which `a_view_offers_no_column_or_key_entry_on_any_engine`
+    /// below covers, and in the claim underneath, which is that the designer can
+    /// really express the edit on every engine. That one can fail and is tested
+    /// where it lives: `core::ddl`'s `every_engine_can_express_a_column_retype`
+    /// and `sqlite_reaches_a_retype_through_the_rebuild_and_the_others_alter_in_place`.
     #[test]
     fn every_engine_designs_from_a_column_or_a_key_row() {
         for d in [MySql, Postgres, Sqlite] {
@@ -4594,8 +4613,15 @@ mod sqlite_create_menu_tests {
 
     /// The submenu used to be empty on SQLite — there was no emitter to build a
     /// `CREATE TABLE` with, and then none to build a `CREATE VIEW` with either.
-    /// Both are there now. There is still no `CREATE TRIGGER` entry, because
-    /// nothing reads a SQLite trigger back.
+    /// Both are there now.
+    ///
+    /// **No `CREATE TRIGGER` entry, and not for the reason this comment used to
+    /// give.** It said "nothing reads a SQLite trigger back", which `2cfcf4f`
+    /// made false in the same range — `sqlite_trigger_info` parses one out of
+    /// `sqlite_master`, and the trigger *editor* is offered on SQLite (see
+    /// `object_menu_tests`). The submenu is a different list: a trigger is
+    /// created from the object it hangs off, on every engine, so it has no entry
+    /// here on any of them.
     #[test]
     fn sqlite_can_create_a_table_and_a_view() {
         let labels: Vec<&str> = create_children(Sqlite, false)
@@ -4608,5 +4634,195 @@ mod sqlite_create_menu_tests {
     #[test]
     fn a_read_only_sqlite_connection_can_create_nothing() {
         assert!(create_children(Sqlite, true).iter().all(|e| e.disabled));
+    }
+}
+
+/// **The irreversible entry is last in its group, in every context menu.**
+///
+/// `8a85fa1`'s whole subject is one menu order — Open · Read · Tree state ·
+/// Write (irreversible last, coloured `theme::error`) · AI Explain — written out
+/// above [`context_menu_overlay`]'s builder. Its commit message records that the
+/// six menus had already drifted into six orderings once, and that the key row
+/// *"opened straight onto Drop index"*: the row the cursor lands on after a
+/// right-click was the one that destroys an index. That is a rule with a
+/// production bug history and no test, because the ordering lives inside
+/// `build: Rc<dyn Fn(CtxMenu) -> Vec<MenuEntry>>`, a closure over the whole `Ui`
+/// bundle, which no unit test can call.
+///
+/// So this reads the source, like [`crate::widgets`]'s popup-anchor gate and
+/// `core/tests/doc_coverage.rs`. **It checks the load-bearing half only** — the
+/// half a mistake in is destructive rather than merely untidy — and it can do
+/// that precisely because the destructive entries mark themselves: every one is
+/// built with `MenuEntry::action_colored(…, theme::error, …)`, which is the same
+/// fact the menu shows the user.
+///
+/// Two things it deliberately does not check, recorded here so the shorter rule
+/// isn't mistaken for the whole one. The full skeleton is a *subsequence* claim
+/// over five groups, and the shipped code already deviates from it twice,
+/// harmlessly: the database arm pushes **Collapse all** after Refresh where the
+/// skeleton closes the read group with Refresh, and the table arm's write group
+/// is Import → Edit table → Triggers where the skeleton lists
+/// Create/Edit/Import/Triggers. Neither misplaces a destructive entry. Catching
+/// those needs the extraction the ledger asks for — a pure
+/// `menu_skeleton(kind, offers) -> Vec<MenuSlot>` with the closures attached
+/// afterwards — which rewrites every arm of a 700-line `match` and is a change to
+/// make with the app running.
+#[cfg(test)]
+mod menu_order_gate {
+    use std::path::{Path, PathBuf};
+
+    fn this_file() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("overlays.rs")
+    }
+
+    /// One entry construction found in the builder.
+    #[derive(Debug)]
+    struct Built {
+        arm: String,
+        line: u32,
+        label: String,
+        destructive: bool,
+    }
+
+    /// Every `MenuEntry` construction inside the context-menu builder, in source
+    /// order, tagged with the `CtxKind` arm it sits in.
+    ///
+    /// The scan is bounded by the builder's own two landmarks: it starts at the
+    /// `let build:` binding and stops at the `AI Explain` row, which is pushed
+    /// *outside* the `match` and is therefore the fixed tail of every menu — the
+    /// one entry that legitimately follows a Drop.
+    ///
+    /// A constructor's head may wrap over several lines (`rustfmt` breaks the
+    /// long ones, and two labels are `if …` expressions rather than literals), so
+    /// the label is the first string literal within the following few lines and
+    /// `theme::error` is looked for in the same span, before the closure starts.
+    /// That is approximate by design: it is an ordering gate, not a parser.
+    fn built_entries(src: &str) -> Vec<Built> {
+        let lines: Vec<&str> = src.lines().collect();
+        // Both landmarks are searched *forward*, and the second from the first:
+        // the module comment above the builder quotes "AI Explain" too, and
+        // taking that one made the range empty and the whole gate vacuous — it
+        // passed by finding nothing, which is why the counts below are asserted.
+        let find_from = |at: usize, needle: &str| {
+            lines
+                .iter()
+                .skip(at)
+                .position(|l| l.contains(needle))
+                .map(|i| i + at)
+                .unwrap_or_else(|| panic!("the builder's landmark is gone: {needle}"))
+        };
+        let start = find_from(0, "let build: Rc<dyn Fn(CtxMenu)");
+        let end = find_from(start, "\"AI Explain\"");
+
+        let mut out = Vec::new();
+        let mut arm = "(before the match)".to_string();
+        for i in start..end {
+            let t = lines[i].trim_start();
+            if let Some(rest) = t.strip_prefix("CtxKind::") {
+                arm = rest
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .find(|s| !s.is_empty())
+                    .unwrap_or("?")
+                    .to_string();
+            }
+            let is_ctor = ["action(", "action_icon(", "action_colored(", "sub("]
+                .iter()
+                .any(|c| t.contains(&format!("MenuEntry::{c}")));
+            if !is_ctor {
+                continue;
+            }
+            let head: String = lines[i..(i + 6).min(lines.len())].join(" ");
+            // The AI Explain row is pushed *outside* the `match` and is the fixed
+            // tail of every menu — the one entry that legitimately follows a
+            // Drop. Its constructor sits one line above its label, so bounding
+            // the scan by the label alone still catches it.
+            if head.contains("\"AI Explain\"") {
+                continue;
+            }
+            let label = head
+                .split_once("MenuEntry::")
+                .map(|(_, r)| r)
+                .and_then(|r| r.split_once('"'))
+                .and_then(|(_, r)| r.split_once('"'))
+                .map(|(l, _)| l.to_string())
+                .unwrap_or_default();
+            let closure_at = head.find("move ||").unwrap_or(head.len());
+            out.push(Built {
+                arm: arm.clone(),
+                line: i as u32 + 1,
+                label,
+                destructive: head[..closure_at].contains("theme::error"),
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn nothing_follows_an_irreversible_entry_in_its_own_menu() {
+        let src = std::fs::read_to_string(this_file()).expect("this file");
+        let built = built_entries(&src);
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut seen: Option<(String, u32, String)> = None;
+        let mut current_arm = String::new();
+        for b in &built {
+            if b.arm != current_arm {
+                current_arm.clone_from(&b.arm);
+                seen = None;
+            }
+            if b.destructive {
+                // A second irreversible entry beside the first is the ordinary
+                // shape — Truncate then Drop.
+                seen = Some((b.arm.clone(), b.line, b.label.clone()));
+            } else if let Some((arm, at, first)) = &seen {
+                offenders.push(format!(
+                    "{arm}: `{}` at line {} comes after the irreversible `{first}` \
+                     at line {at} — a right-click would land the cursor on the \
+                     entry that can't be taken back",
+                    b.label, b.line
+                ));
+            }
+        }
+        assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+
+        // The scan has to still be finding the menus, or it passes by seeing
+        // nothing: six irreversible entries across the seven arms.
+        let marked: Vec<(&str, &str)> = built
+            .iter()
+            .filter(|b| b.destructive)
+            .map(|b| (b.arm.as_str(), b.label.as_str()))
+            .collect();
+        assert_eq!(
+            marked.len(),
+            6,
+            "has the builder or the `theme::error` marking changed? {marked:?}"
+        );
+        assert!(
+            built.len() > 40,
+            "only {} entries found — has the builder moved?",
+            built.len()
+        );
+    }
+
+    /// The entries that mark themselves destructive are the ones that really
+    /// are: using that colour for anything else here would make the gate above
+    /// silently weaker, since it keys on exactly that.
+    #[test]
+    fn the_error_colour_marks_the_drops_and_truncate_and_nothing_else() {
+        let src = std::fs::read_to_string(this_file()).expect("this file");
+        let mut labels: Vec<String> = built_entries(&src)
+            .into_iter()
+            .filter(|b| b.destructive)
+            .map(|b| b.label)
+            .collect();
+        labels.sort();
+        labels.dedup();
+        assert_eq!(
+            labels,
+            vec!["Drop", "Drop foreign key", "Drop index", "Truncate"],
+            "an entry gained or lost the irreversible marking"
+        );
     }
 }

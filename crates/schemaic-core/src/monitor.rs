@@ -59,6 +59,48 @@ pub fn discard_needs_asking(log_len: usize, exported: bool) -> bool {
     log_len > 0 && !exported
 }
 
+/// What one poll of the monitor's timer should do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TickAction {
+    /// Let the loop end. Nothing re-arms after this, so the monitor is over.
+    Stop,
+    /// Skip this poll and arm the next one.
+    Reschedule,
+    /// Fetch the page and diff it against the baseline.
+    Fetch,
+}
+
+/// The decision one timer tick makes, given what the modal is doing.
+///
+/// **Pause is not Stop, and the difference is one arm.** The three lines this
+/// replaces were the commit's headline behaviour and sat inside a
+/// floem-scheduled function, where no test could reach them: swap the two
+/// statements and a paused monitor never re-arms, so Resume does nothing and the
+/// only way back is to close and reopen the modal — with the log gone. Nothing
+/// would have failed.
+///
+/// What the arms mean, in the order they are asked:
+///
+/// - **`open == false`** — the modal is closed (or its signal is disposed, which
+///   the caller reads as the same thing). Nothing to poll for and nothing to
+///   re-arm: the loop ends here, and this is the *only* way it ends.
+/// - **`superseded`** — a newer generation is running, because the user
+///   re-targeted the monitor. This timer belongs to the old target, so it must
+///   not fetch *and* must not re-arm, or two loops poll forever.
+/// - **`paused`** — skip the fetch and arm the next tick anyway. Resuming is
+///   then free (the loop was never broken) and the baseline deliberately ages,
+///   so the first poll after a resume reports the **net** change across the
+///   pause rather than nothing at all.
+pub fn tick_action(open: bool, superseded: bool, paused: bool) -> TickAction {
+    if !open || superseded {
+        TickAction::Stop
+    } else if paused {
+        TickAction::Reschedule
+    } else {
+        TickAction::Fetch
+    }
+}
+
 /// One captured row: its identity `key` (the key columns' values, stringified,
 /// in key order) and every column's value (`None` = NULL) in result-column order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -494,6 +536,41 @@ mod discard_tests {
 mod tests {
     use super::*;
 
+    // ── The poll lifecycle ───────────────────────────────────────────────────
+
+    /// **The one that would have caught Pause becoming Stop.** A paused tick has
+    /// to re-arm: that is what makes Resume free, and what lets the baseline age
+    /// so the first poll after a resume reports the net change across the pause.
+    /// Inverting the two statements is a one-character edit that leaves the whole
+    /// suite green without this.
+    #[test]
+    fn a_paused_tick_reschedules_rather_than_stopping() {
+        assert_eq!(tick_action(true, false, true), TickAction::Reschedule);
+        assert_ne!(tick_action(true, false, true), TickAction::Stop);
+    }
+
+    #[test]
+    fn an_open_unpaused_monitor_fetches() {
+        assert_eq!(tick_action(true, false, false), TickAction::Fetch);
+    }
+
+    /// Closing the modal is the only thing that ends the loop.
+    #[test]
+    fn a_closed_monitor_stops() {
+        assert_eq!(tick_action(false, false, false), TickAction::Stop);
+        assert_eq!(tick_action(false, false, true), TickAction::Stop);
+    }
+
+    /// A superseded generation must neither fetch nor re-arm — re-arming would
+    /// leave the old target's loop polling beside the new one, forever.
+    #[test]
+    fn a_superseded_generation_stops_even_when_open() {
+        assert_eq!(tick_action(true, true, false), TickAction::Stop);
+        // And pausing doesn't rescue it: the timer belongs to a target the user
+        // has already left.
+        assert_eq!(tick_action(true, true, true), TickAction::Stop);
+    }
+
     fn row(key: &str, cells: &[Option<&str>]) -> SnapshotRow {
         SnapshotRow {
             key: vec![key.to_string()],
@@ -577,6 +654,50 @@ mod tests {
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].kind, ChangeKind::Update);
         assert_eq!(out[0].key, vec!["2"]);
+    }
+
+    /// **What a pause costs, stated as a diff.** A paused tick keeps re-arming
+    /// and leaves the baseline alone, so the snapshot the first poll after a
+    /// resume compares against is however many intervals old the pause was. The
+    /// claim that behaviour rests on is that such a comparison still reports the
+    /// change — the *net* one, stamped at the resume — rather than nothing.
+    ///
+    /// Here the row was updated twice and another was deleted while the monitor
+    /// was paused. One update comes back, carrying the latest value and not the
+    /// intermediate one, and the delete comes back too. What is lost to a pause
+    /// is the intermediate step, and that is the documented trade rather than a
+    /// silent gap.
+    #[test]
+    fn a_stale_baseline_still_reports_the_net_change() {
+        let old = window(vec![
+            row("1", &[Some("a")]),
+            row("2", &[Some("b")]),
+            row("3", &[Some("c")]),
+        ]);
+        // Two intervals later: `1` went a → a2 → a3, and `2` is gone.
+        let new = window(vec![row("1", &[Some("a3")]), row("3", &[Some("c")])]);
+        let out = diff_snapshots(&old, &new);
+        assert_eq!(out.len(), 2, "{out:?}");
+        let upd = out
+            .iter()
+            .find(|c| c.kind == ChangeKind::Update)
+            .expect("the update survives the staleness");
+        assert_eq!(upd.key, vec!["1"]);
+        assert_eq!(
+            upd.cells[0].as_deref(),
+            Some("a3"),
+            "the net value, not the intermediate one"
+        );
+        assert_eq!(
+            upd.fields.len(),
+            1,
+            "one column changed across the pause: {upd:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|c| c.kind == ChangeKind::Delete && c.key == vec!["2"]),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -1045,5 +1166,99 @@ mod tests {
         );
         assert!(out.starts_with("Time,Action,Key,id,name"), "{out}");
         assert!(out.contains("0:07,INSERT,3,3,bob"), "{out}");
+    }
+
+    /// **The NULL rule, where it becomes bytes.** `log_result_set`'s central
+    /// promise is that a value standing alone is a *real* NULL cell — so each
+    /// format renders it its own way — while inside an `old → new` transition it
+    /// can only be the literal text `NULL`, there being no way to put a real
+    /// NULL inside a string. Every existing test asserts the first half at the
+    /// `ResultSet` level (`cell(..).is_null()`) and none checks what a renderer
+    /// writes, so nothing distinguished the intended outcome from the failure
+    /// mode the design exists to avoid: the four characters `NULL` in all four
+    /// formats, indistinguishable from a column whose value is the string
+    /// "NULL".
+    ///
+    /// Table-driven over [`LOG_FORMATS`] so a fifth format has to state its
+    /// answer rather than inherit CSV's by omission.
+    #[test]
+    fn every_log_format_renders_a_null_its_own_way() {
+        use crate::export::ExportFormat;
+        // One update: `note` went `hi` → NULL (a transition), and `extra` is a
+        // standalone NULL because this change never touched it.
+        let log = [MonitorEntry {
+            at: "0:07".into(),
+            change: RowChange {
+                kind: ChangeKind::Update,
+                key: vec!["3".into()],
+                fields: vec![FieldChange {
+                    col: 0,
+                    old: Some("hi".into()),
+                    new: None,
+                }],
+                cells: vec![None, None],
+            },
+            seq: 0,
+        }];
+        let rs = log_result_set(&log, &["note".into(), "extra".into()]);
+        let order: Vec<usize> = (0..rs.row_count()).collect();
+        let render = |f: ExportFormat| f.render(&rs, &order, None, crate::intel::SqlDialect::MySql);
+
+        for f in LOG_FORMATS {
+            let out = render(f);
+            // The transition is text in every format, and says NULL on its right.
+            assert!(
+                out.contains(&format!("hi{TRANSITION}NULL")),
+                "{f:?}: the transition lost its wording\n{out}"
+            );
+        }
+        // …and the standalone NULL is each format's own spelling of absent.
+        let csv = render(ExportFormat::Csv);
+        assert!(
+            csv.lines().nth(1).is_some_and(|l| l.ends_with(',')),
+            "CSV: an empty field, not the text NULL\n{csv}"
+        );
+        let json = render(ExportFormat::Json);
+        assert!(
+            json.contains("\"extra\": null") || json.contains("\"extra\":null"),
+            "JSON: a real null, not a string\n{json}"
+        );
+        assert!(
+            !json.contains("\"extra\": \"NULL\""),
+            "JSON: the string NULL is the failure mode\n{json}"
+        );
+    }
+
+    /// The other two decisions a change log only meets through a renderer, both
+    /// real guards in `core::export` and neither pinned from this side.
+    #[test]
+    fn the_log_projection_meets_the_renderers_own_guards() {
+        use crate::export::ExportFormat;
+        // A watched table with a column of its own called `Time` — the same name
+        // as the observation timestamp the projection puts in front of it.
+        let log = [entry("0:07", ChangeKind::Insert, "3", &[Some("14:00")])];
+        let rs = log_result_set(&log, &["Time".into()]);
+        let order: Vec<usize> = (0..rs.row_count()).collect();
+        let json = ExportFormat::Json.render(&rs, &order, None, crate::intel::SqlDialect::MySql);
+        // De-duplicated rather than merged: a JSON object can hold one `Time`,
+        // and the row's value must not overwrite the timestamp.
+        assert!(json.contains("\"Time\""), "{json}");
+        assert!(json.contains("Time_2"), "the duplicate is renamed\n{json}");
+        assert!(json.contains("0:07") && json.contains("14:00"), "{json}");
+
+        // CSV neutralises a cell a spreadsheet would read as a formula.
+        let log = [entry(
+            "0:08",
+            ChangeKind::Insert,
+            "4",
+            &[Some("=cmd|'/c calc'!A1")],
+        )];
+        let rs = log_result_set(&log, &["note".into()]);
+        let order: Vec<usize> = (0..rs.row_count()).collect();
+        let csv = ExportFormat::Csv.render(&rs, &order, None, crate::intel::SqlDialect::MySql);
+        assert!(
+            !csv.contains(",=cmd"),
+            "the leading `=` must not survive bare\n{csv}"
+        );
     }
 }
