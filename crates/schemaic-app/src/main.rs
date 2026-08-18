@@ -80,7 +80,7 @@ struct ClosedTab {
     /// — so Ctrl+Shift+T brings back a *file* tab, not an untitled copy of its text.
     path: Option<std::path::PathBuf>,
     disk_sql: Option<String>,
-    file_crlf: bool,
+    file_format: schemaic_core::sqlfile::SqlFormat,
 }
 /// Record one executed query into history: `(conn_id, database, sql, tab_name)`,
 /// returning the **run id** it was recorded under — what
@@ -440,10 +440,15 @@ fn dialect_of(db: &Db) -> SqlDialect {
     dialect_for(db.engine())
 }
 
-/// One loaded table's DDL, its primary-key column names, and the implicit row
-/// key it has if it has no key of its own
+/// One loaded table's DDL, the columns that identify one of its rows, and the
+/// implicit row key it has if it has none of its own
 /// ([`schemaic_core::schema::TableInfo::implicit_key`] — SQLite's rowid, `None`
 /// on the other two engines). Everything empty when the schema isn't loaded yet.
+///
+/// The middle value is `schema::browse_key_columns`, **not** the primary key:
+/// the same precedence `edit::resolve_key` uses, so the statement the grid runs
+/// and the key the write path resolves cannot disagree about whether the table
+/// has a key of its own.
 fn table_ddl_and_pk(
     db_nodes: RwSignal<Vec<ConnNode>>,
     source: &TableSource,
@@ -458,13 +463,11 @@ fn table_ddl_and_pk(
                     schemaic_core::schema::SchemaState::Loaded(s) => s
                         .find_table(source.schema.as_deref(), &source.table)
                         .map(|t| {
-                            let pk = t
-                                .columns
-                                .iter()
-                                .filter(|c| c.primary_key)
-                                .map(|c| c.name.clone())
-                                .collect();
-                            (t.create_ddl(dialect), pk, t.implicit_key.clone())
+                            (
+                                t.create_ddl(dialect),
+                                schemaic_core::schema::browse_key_columns(t),
+                                t.implicit_key.clone(),
+                            )
                         }),
                     _ => None,
                 })
@@ -897,7 +900,11 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         t.name.set(s.name.clone());
                         t.pinned.set(s.pinned);
                         t.path.set(s.path.clone());
-                        t.file_crlf.set(s.file_crlf);
+                        t.file_format.set(schemaic_core::sqlfile::SqlFormat {
+                            crlf: s.file_crlf,
+                            bom: s.file_bom,
+                            lossy: s.file_lossy,
+                        });
                         // The file's text isn't persisted. A tab saved *clean*
                         // therefore has its on-disk copy right here in `query`;
                         // one saved dirty leaves it unknown (`None`), which the
@@ -995,7 +1002,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             let conn = connections
                 .with_untracked(|cs| cs.iter().find(|c| c.id == conn_id).cloned())
                 .ok_or_else(|| "connection no longer exists".to_string())?;
-            let tunnel = if conn.ssh.enabled {
+            let tunnel = if conn.uses_tunnel() {
                 match tunnels.borrow().get(&conn_id).map(|h| h.port()) {
                     Some(p) => Some(p),
                     None => return Err("SSH tunnel is not established yet".to_string()),
@@ -1132,6 +1139,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     let monitor_interval: RwSignal<u64> = RwSignal::new(MONITOR_INTERVAL_SECS);
     let monitor_paused: RwSignal<bool> = RwSignal::new(false);
     let monitor_export_err: RwSignal<Option<String>> = RwSignal::new(None);
+    let monitor_exported: RwSignal<bool> = RwSignal::new(false);
+    let monitor_dropped: RwSignal<usize> = RwSignal::new(0);
     // Table-properties modal. `properties` is both the open flag and the object
     // being described, so a stale fetch can check it before writing.
     let properties: RwSignal<Option<schemaic_ui::PropertiesTarget>> = RwSignal::new(None);
@@ -1646,6 +1655,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             monitor_partial.set(false);
             monitor_paused.set(false);
             monitor_export_err.set(None);
+            monitor_exported.set(false);
+            monitor_dropped.set(0);
             monitor_title.set(Some(format!("{}.{}", source.database, source.display())));
             monitor_open.set(true);
             let ctx = MonitorCtx {
@@ -1665,6 +1676,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 target: (conn_id, source),
                 interval: monitor_interval,
                 paused: monitor_paused,
+                exported: monitor_exported,
+                dropped: monitor_dropped,
             };
             monitor_tick(ctx, g);
         })
@@ -2615,7 +2628,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                     label: tab.label,
                     path,
                     disk_sql: tab.disk_sql.get_untracked(),
-                    file_crlf: tab.file_crlf.get_untracked(),
+                    file_format: tab.file_format.get_untracked(),
                 });
             };
             // Pinned tabs aren't closable, and this is the last thing every close
@@ -2662,7 +2675,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 // reopen ring with the text (`record` above).
                 tab.path.set(None);
                 tab.disk_sql.set(None);
-                tab.file_crlf.set(false);
+                tab.file_format.set(Default::default());
                 // Also reset the results pane so the reopened tab is fully fresh
                 // (single-grid Idle state, no leftover Run-Everything tabs).
                 tab.results.set(QueryState::Idle);
@@ -3182,30 +3195,156 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // otherwise freeze the window) with `create_ext_action` bringing the outcome
     // back. Every decision about bytes and names is `core::sqlfile`.
 
-    /// Report a file operation's outcome — invoked on the UI thread.
+    /// Why a read didn't produce text.
+    ///
+    /// `TooBig` is separate because it is not an error to report but a *question
+    /// to ask*: the file is readable and the user may well want it anyway. It
+    /// carries the size so the question can name it.
+    enum FileReadError {
+        Message(String),
+        TooBig(u64),
+    }
+
+    /// Report a file operation's outcome — invoked on the UI thread. A read's
+    /// error is already a sentence: the "too large" question is asked and
+    /// resolved inside `read_sql_file`, so nothing downstream has to know it
+    /// exists.
     type FileReadDone = Rc<dyn Fn(Result<schemaic_core::sqlfile::SqlText, String>)>;
+    type SizedReadDone = Rc<dyn Fn(Result<schemaic_core::sqlfile::SqlText, FileReadError>)>;
     type FileWriteDone = Rc<dyn Fn(Result<(), String>)>;
 
-    let read_sql_file: Rc<dyn Fn(std::path::PathBuf, FileReadDone)> = {
+    // `allow_big` is the user's answer to the confirmation below, carried back in
+    // on the second attempt — a file over the warn threshold is read only once
+    // they have said so.
+    let read_sql_file_sized: Rc<dyn Fn(std::path::PathBuf, bool, SizedReadDone)> = {
         let handle = handle.clone();
+        Rc::new(
+            move |path: std::path::PathBuf, allow_big: bool, done: SizedReadDone| {
+                let report = create_ext_action(cx, move |res| (done)(res));
+                handle.spawn_blocking(move || {
+                    use schemaic_core::sqlfile::{OpenVerdict, open_verdict};
+                    // **The size is asked before the bytes are.** The read itself
+                    // is cheap; what is not is the editor's own analysis, which
+                    // runs over the whole document on the UI thread 120 ms after
+                    // every pause in typing — so a 16 MB script is an
+                    // eleven-second freeze per burst, for as long as the tab is
+                    // open. The import path already asks this question the same
+                    // way (`fs::metadata().len()`).
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    match open_verdict(size) {
+                        OpenVerdict::Open => {}
+                        OpenVerdict::Confirm(n) if !allow_big => {
+                            report(Err(FileReadError::TooBig(n)));
+                            return;
+                        }
+                        OpenVerdict::Confirm(_) => {}
+                        OpenVerdict::Refuse(n) => {
+                            report(Err(FileReadError::Message(format!(
+                                "{} is {} — too large to open in an editor tab. \
+                                 Schemaic would spend most of its time re-analysing \
+                                 it. Run it from a query tab, or use Import for a \
+                                 data file.",
+                                path.display(),
+                                schemaic_core::stats::format_bytes(n)
+                            ))));
+                            return;
+                        }
+                    }
+                    let res = std::fs::read(&path)
+                        .map(|bytes| schemaic_core::sqlfile::decode(&bytes))
+                        .map_err(|e| {
+                            FileReadError::Message(format!("Couldn't read {}: {e}", path.display()))
+                        });
+                    report(res);
+                });
+            },
+        )
+    };
+    // The same read, with the "this file is large" question asked and resolved
+    // here rather than by each caller — Open and reload both want it worded the
+    // same way, and neither wants to know the band exists otherwise.
+    let read_sql_file: Rc<dyn Fn(std::path::PathBuf, FileReadDone)> = {
+        let sized = read_sql_file_sized.clone();
         Rc::new(move |path: std::path::PathBuf, done: FileReadDone| {
-            let report = create_ext_action(cx, move |res| (done)(res));
-            handle.spawn_blocking(move || {
-                let res = std::fs::read(&path)
-                    .map(|bytes| schemaic_core::sqlfile::decode(&bytes))
-                    .map_err(|e| format!("Couldn't read {}: {e}", path.display()));
-                report(res);
-            });
+            let retry = sized.clone();
+            let again = path.clone();
+            (sized)(
+                path,
+                false,
+                Rc::new(move |res| match res {
+                    Ok(f) => (done)(Ok(f)),
+                    Err(FileReadError::Message(m)) => (done)(Err(m)),
+                    Err(FileReadError::TooBig(n)) => {
+                        let (retry, again, done) = (retry.clone(), again.clone(), done.clone());
+                        confirm.set(Some(Confirm {
+                            title: "Open a large file?".to_string(),
+                            message: format!(
+                                "“{}” is {}. Schemaic re-analyses the whole document \
+                                 shortly after every pause in typing, so a file this \
+                                 size makes the editor slow to respond for as long as \
+                                 the tab is open. Open it anyway?",
+                                schemaic_core::sqlfile::tab_title(&again),
+                                schemaic_core::stats::format_bytes(n),
+                            ),
+                            resolve: Rc::new(move |yes| {
+                                if !yes {
+                                    return;
+                                }
+                                let done = done.clone();
+                                (retry)(
+                                    again.clone(),
+                                    true,
+                                    Rc::new(move |res| {
+                                        (done)(res.map_err(|e| match e {
+                                            FileReadError::Message(m) => m,
+                                            // Unreachable: the retry allows it.
+                                            FileReadError::TooBig(_) => {
+                                                "The file is too large to open.".to_string()
+                                            }
+                                        }))
+                                    }),
+                                );
+                            }),
+                        }));
+                    }
+                }),
+            )
         })
     };
 
-    let write_sql_file: Rc<dyn Fn(std::path::PathBuf, String, FileWriteDone)> = {
+    // `expect_disk` is what the file's bytes must still be for the write to go
+    // ahead — `Some` only for a Save over a file this tab read, where somebody
+    // else's edit would otherwise be discarded without a word. `None` means
+    // "write it whatever is there", which is what a Save As the user has already
+    // confirmed the overwrite for means.
+    type FileWriteReq = (std::path::PathBuf, String, Option<Vec<u8>>);
+    let write_sql_file: Rc<dyn Fn(FileWriteReq, FileWriteDone)> = {
         let handle = handle.clone();
         Rc::new(
-            move |path: std::path::PathBuf, contents: String, done: FileWriteDone| {
+            move |(path, contents, expect_disk): FileWriteReq, done: FileWriteDone| {
                 let report = create_ext_action(cx, move |res| (done)(res));
                 handle.spawn_blocking(move || {
-                    let res = std::fs::write(&path, contents.as_bytes())
+                    // Read-then-write, on the worker, immediately before the
+                    // rename. It is not a lock — nothing here can take one — but
+                    // it closes the window that matters in practice: a file
+                    // edited in another program since this tab last read it.
+                    // Silently discarding that edit is the failure; a missing
+                    // file is not one, since Save is how it comes back.
+                    if let Some(expected) = expect_disk
+                        && let Ok(now) = std::fs::read(&path)
+                        && now != expected
+                    {
+                        report(Err(format!(
+                            "{} has changed on disk since it was opened. \
+                             Saving now would discard those changes — reload the \
+                             file (or Save As to a different name) instead.",
+                            path.display()
+                        )));
+                        return;
+                    }
+                    // Atomic: `fs::write` truncates first, and this file is the
+                    // one thing Schemaic can't regenerate.
+                    let res = schemaic_core::persist::write_file_atomic(&path, contents.as_bytes())
                         .map_err(|e| format!("Couldn't save {}: {e}", path.display()));
                     report(res);
                 });
@@ -3224,32 +3363,84 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // Write a tab's current text to `path` and, on success, bind the tab to it and
     // record what's now on disk. The snapshot is taken *before* the write, so
     // typing during it correctly leaves the tab modified afterwards.
+    //
+    // **A save that cannot be undone asks first.** `sqlfile::decode` reads bytes
+    // it can't make sense of as U+FFFD so a mis-encoded byte costs a character
+    // rather than the whole file — but writing that text back replaces every one
+    // of those bytes on disk permanently, including in lines the user never
+    // touched, and a Latin-1 `mysqldump` is the ordinary shape of it. So a lossy
+    // tab's save is confirmed, in the same modal every other irreversible action
+    // in the app uses.
     let write_tab_to: Rc<dyn Fn(Tab, std::path::PathBuf)> = {
         let write_sql_file = write_sql_file.clone();
         let file_error = file_error.clone();
         Rc::new(move |tab: Tab, path: std::path::PathBuf| {
+            let format = tab.file_format.get_untracked();
             let text = tab.query.get_untracked();
-            let contents = schemaic_core::sqlfile::encode(&text, tab.file_crlf.get_untracked());
-            let file_error = file_error.clone();
-            let landed = path.clone();
-            (write_sql_file)(
-                path,
-                contents,
-                Rc::new(move |res| match res {
-                    // The dialog and the write take a moment; a tab closed in the
-                    // meantime has had its scope disposed, and reading a freed
-                    // signal panics. Absent is the answer — the bytes are on disk
-                    // either way, there is just no tab left to mark saved.
-                    Ok(()) => {
-                        if tab.path.try_get_untracked().is_none() {
-                            return;
-                        }
-                        tab.path.set(Some(landed.clone()));
-                        tab.disk_sql.set(Some(text.clone()));
+            let contents = schemaic_core::sqlfile::encode(&text, format);
+            // What the file must still hold. Reconstructed from the text this tab
+            // read rather than kept as a second copy of the bytes — `encode` is
+            // `decode`'s inverse for exactly the files this can apply to. A lossy
+            // read has no inverse and a restored-dirty tab never read one, so
+            // both skip the check; the lossy case has its own, louder question.
+            let expect_disk = (!format.lossy)
+                .then(|| tab.disk_sql.get_untracked())
+                .flatten()
+                .map(|disk| schemaic_core::sqlfile::encode(&disk, format).into_bytes());
+            let write: Rc<dyn Fn()> = {
+                let write_sql_file = write_sql_file.clone();
+                let file_error = file_error.clone();
+                let landed = path.clone();
+                Rc::new(move || {
+                    let file_error = file_error.clone();
+                    let landed2 = landed.clone();
+                    let text = text.clone();
+                    (write_sql_file)(
+                        (landed.clone(), contents.clone(), expect_disk.clone()),
+                        Rc::new(move |res| match res {
+                            // The dialog and the write take a moment; a tab closed
+                            // in the meantime has had its scope disposed, and
+                            // reading a freed signal panics. Absent is the answer —
+                            // the bytes are on disk either way, there is just no tab
+                            // left to mark saved.
+                            Ok(()) => {
+                                if tab.path.try_get_untracked().is_none() {
+                                    return;
+                                }
+                                tab.path.set(Some(landed2.clone()));
+                                tab.disk_sql.set(Some(text.clone()));
+                                // Saved as UTF-8, so what was unreadable is gone
+                                // and the tab and the file now agree. Asking again
+                                // would be asking about a file that no longer
+                                // exists.
+                                tab.file_format.update(
+                                    |f: &mut schemaic_core::sqlfile::SqlFormat| f.lossy = false,
+                                );
+                            }
+                            Err(e) => (file_error)(e),
+                        }),
+                    );
+                })
+            };
+            if !format.lossy {
+                (write)();
+                return;
+            }
+            confirm.set(Some(Confirm {
+                title: "Save as UTF-8?".to_string(),
+                message: format!(
+                    "Schemaic couldn't read every byte of “{}” as text and showed \
+                     those bytes as “�”. Saving writes what you see, so each of \
+                     them is replaced permanently — in the whole file, not just \
+                     the lines you edited. Save anyway?",
+                    schemaic_core::sqlfile::tab_title(&path)
+                ),
+                resolve: Rc::new(move |yes| {
+                    if yes {
+                        (write)();
                     }
-                    Err(e) => (file_error)(e),
                 }),
-            );
+            }));
         })
     };
 
@@ -3279,12 +3470,37 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             let write_tab_to = write_tab_to.clone();
             // `save_as` takes an `Fn`, so everything it needs is cloned per call.
             floem::action::save_as(opts, move |file| {
-                let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
+                let Some(picked) = file.and_then(|f| f.path.first().cloned()) else {
                     return; // cancelled
                 };
                 // The native dialogs mostly append the filter's extension, but
                 // not on every platform — see `sqlfile::ensure_extension`.
-                (write_tab_to)(tab, schemaic_core::sqlfile::ensure_extension(path));
+                let path = schemaic_core::sqlfile::ensure_extension(picked.clone());
+                let write_tab_to = write_tab_to.clone();
+                // **The dialog checked the name the user typed, not this one.**
+                // Typing `orders` when `orders.sql` already exists gets no
+                // "replace?" from the native dialog, because `orders` doesn't
+                // exist — and then the extension is added and the existing file
+                // is overwritten with no prompt at all. So the extra path this
+                // step invented is confirmed here, where the dialog can't.
+                if path != picked && path.exists() {
+                    confirm.set(Some(Confirm {
+                        title: "Replace file?".to_string(),
+                        message: format!(
+                            "“{}” already exists — “{}” was saved with the .sql \
+                             extension added. Replace it?",
+                            schemaic_core::sqlfile::tab_title(&path),
+                            schemaic_core::sqlfile::tab_title(&picked),
+                        ),
+                        resolve: Rc::new(move |yes| {
+                            if yes {
+                                (write_tab_to)(tab, path.clone());
+                            }
+                        }),
+                    }));
+                    return;
+                }
+                (write_tab_to)(tab, path);
             });
         })
     };
@@ -3361,7 +3577,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                             let tab = Tab::new(cx, id, &f.text, conn_id, database);
                             tab.path.set(Some(opened.clone()));
                             tab.disk_sql.set(Some(f.text.clone()));
-                            tab.file_crlf.set(f.crlf);
+                            tab.file_format.set(f.format);
                             (place_tab)(tab);
                         }
                         Err(e) => (file_error)(e),
@@ -3400,7 +3616,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                                 }
                                 tab.query.set(f.text.clone());
                                 tab.disk_sql.set(Some(f.text.clone()));
-                                tab.file_crlf.set(f.crlf);
+                                tab.file_format.set(f.format);
                                 // The mounted editor owns its document, so the
                                 // new text only shows once the pane remounts.
                                 tab.reload_gen.update(|g| *g = g.wrapping_add(1));
@@ -3477,7 +3693,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             tab.name.set(snap.name);
             tab.path.set(snap.path);
             tab.disk_sql.set(snap.disk_sql);
-            tab.file_crlf.set(snap.file_crlf);
+            tab.file_format.set(snap.file_format);
             (place_tab)(tab);
             if restore_label {
                 // A clash only matters within the connection — that's the scope
@@ -3645,7 +3861,13 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                                     name: t.name.get_untracked(),
                                     pinned: t.pinned.get_untracked(),
                                     path: t.path.get_untracked(),
-                                    file_crlf: t.file_crlf.get_untracked(),
+                                    file_crlf: t.file_format.get_untracked().crlf,
+                                    file_bom: t.file_format.get_untracked().bom,
+                                    // The warning has to survive a relaunch: the
+                                    // restored tab holds the *decoded* text, so
+                                    // nothing in it would show that a save
+                                    // destroys the original bytes.
+                                    file_lossy: t.file_format.get_untracked().lossy,
                                     // One bit instead of a second copy of the
                                     // file's text — see `SavedTab::file_dirty`.
                                     file_dirty: t.modified(),
@@ -3724,7 +3946,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             };
             // Effective endpoint — through the tunnel for SSH connections. If the
             // tunnel isn't up yet, stay Unknown; a later tick will catch it.
-            let tunnel = if conn.ssh.enabled {
+            let tunnel = if conn.uses_tunnel() {
                 match tunnels.borrow().get(&conn.id).map(|h| h.port()) {
                     Some(port) => Some(port),
                     None => {
@@ -4128,7 +4350,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 // Establish (or reuse) the SSH tunnel, then build the `Db`. A
                 // freshly opened tunnel's handle is returned so the UI thread can
                 // cache it (and thereby own its lifetime).
-                let (tunnel_port, new_handle) = if conn_task.ssh.enabled {
+                let (tunnel_port, new_handle) = if conn_task.uses_tunnel() {
                     match cached_port {
                         Some(p) => (Some(p), None),
                         None => match schemaic_db::ssh::open_tunnel(
@@ -4732,7 +4954,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             handle.spawn(async move {
                 // Keep the tunnel handle alive for the duration of the ping; it
                 // drops (freeing the listener/port) when this task ends.
-                let tunnel = if conn.ssh.enabled {
+                let tunnel = if conn.uses_tunnel() {
                     match schemaic_db::ssh::open_tunnel(&conn.ssh, &conn.host, conn.port).await {
                         Ok(h) => Some(h),
                         Err(_) => {
@@ -5541,7 +5763,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             // case itself.
             let ssh = connections
                 .try_with_untracked(|cs| {
-                    cs.map(|cs| cs.iter().find(|c| c.id == id).map(|c| c.ssh.enabled))
+                    cs.map(|cs| cs.iter().find(|c| c.id == id).map(|c| c.uses_tunnel()))
                 })?
                 .unwrap_or(false);
             // A run already in flight against *this* connection probes it far
@@ -5836,7 +6058,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             // For an SSH connection, point the client at the local tunnel
             // (127.0.0.1:<port>), not the firewalled remote host (review H11). If
             // the tunnel isn't up yet, say so rather than silently failing.
-            let conn = if conn.ssh.enabled {
+            let conn = if conn.uses_tunnel() {
                 match tunnels.borrow().get(&conn.id).map(|h| h.port()) {
                     Some(port) => Connection {
                         host: "127.0.0.1".to_string(),
@@ -6069,6 +6291,8 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
             monitor_interval,
             monitor_paused,
             monitor_export_err,
+            monitor_exported,
+            monitor_dropped,
             erd: RwSignal::new(None),
             properties,
             properties_state,
@@ -6296,7 +6520,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
 /// has to name both: past `ROW_CAP` it is watching a page rather than a table,
 /// and past `LOG_CAP` the log it can export is missing its oldest entries.
 const MONITOR_INTERVAL_SECS: u64 = 2;
-use schemaic_core::monitor::{LOG_CAP as MONITOR_LOG_MAX, ROW_CAP as MONITOR_LIMIT};
+use schemaic_core::monitor::ROW_CAP as MONITOR_LIMIT;
 
 /// Everything a Live Monitor poll tick needs, so it can re-arm itself across ticks
 /// (all fields cheap to clone: `Copy` signals, `Rc`s, a `Handle`). See the
@@ -6325,6 +6549,14 @@ struct MonitorCtx {
     interval: RwSignal<u64>,
     /// The modal's Pause toggle. Read fresh on each tick, like `interval`.
     paused: RwSignal<bool>,
+    /// Whether the log as it stands is already on disk — cleared here the moment
+    /// a poll appends anything, so the Clear confirmation asks about a log that
+    /// really has no second copy.
+    exported: RwSignal<bool>,
+    /// How many entries the cap has dropped, accumulated from
+    /// [`schemaic_core::monitor::trim_log`] — the status line's caveat reads it
+    /// rather than guessing from the log's length.
+    dropped: RwSignal<usize>,
 }
 
 /// One Live Monitor poll: fetch the watched table (bounded), then hand the result
@@ -6459,6 +6691,7 @@ fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
                 let changes = diff_snapshots(prev, &snap);
                 if !changes.is_empty() {
                     let at = fmt_elapsed(ctx.started.elapsed().as_secs());
+                    let mut dropped = 0usize;
                     ctx.log.update(|log| {
                         for change in changes {
                             log.push(MonitorEntry {
@@ -6466,11 +6699,16 @@ fn monitor_apply(ctx: MonitorCtx, my_gen: u64, out: Result<ResultSet, String>) {
                                 change,
                             });
                         }
-                        if log.len() > MONITOR_LOG_MAX {
-                            let drop = log.len() - MONITOR_LOG_MAX;
-                            log.drain(0..drop);
-                        }
+                        // The one place the cap is applied, in core, so the
+                        // modal's caveat can't disagree with it.
+                        dropped = schemaic_core::monitor::trim_log(log);
                     });
+                    if dropped > 0 {
+                        ctx.dropped.update(|n| *n += dropped);
+                    }
+                    // The file on disk no longer holds what the log holds, so
+                    // Clear goes back to asking (`monitor::discard_needs_asking`).
+                    ctx.exported.set(false);
                 }
             }
             *ctx.prev.borrow_mut() = Some(snap);

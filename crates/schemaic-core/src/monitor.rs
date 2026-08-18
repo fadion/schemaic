@@ -27,6 +27,38 @@ pub const ROW_CAP: usize = 1000;
 /// exported, a silently truncated one is a record that looks complete and isn't.
 pub const LOG_CAP: usize = 1000;
 
+/// Trim `log` to [`LOG_CAP`], oldest first, and say how many entries went.
+///
+/// **One function for one rule, because the two halves of it lived in different
+/// crates and disagreed.** The app trimmed on `len > LOG_CAP` and the modal
+/// printed *"the oldest are dropping"* on `len >= LOG_CAP` — so a log sitting at
+/// exactly the cap with nothing dropped carried a caveat that was false, on a
+/// record whose whole value is that it can be trusted. The count is the honest
+/// signal: it is only ever non-zero when something really has been thrown away.
+pub fn trim_log<T>(log: &mut Vec<T>) -> usize {
+    let over = log.len().saturating_sub(LOG_CAP);
+    if over > 0 {
+        log.drain(0..over);
+    }
+    over
+}
+
+/// Does throwing this log away need asking first?
+///
+/// **The log is the only copy.** A `DELETE` it recorded holds values the database
+/// no longer has and no snapshot keeps — the baseline is the *current* page — and
+/// a poll never re-reports a change it has already reported. So a discard is
+/// irreversible in the way the confirm modal exists for, and it is reached by a
+/// trash icon sitting one glyph from Export.
+///
+/// Two things make it *not* worth asking: an empty log, where there is nothing to
+/// lose, and one already written to a file, where there is a second copy. Both
+/// are the ordinary case, which is why the question isn't simply "is it
+/// destructive".
+pub fn discard_needs_asking(log_len: usize, exported: bool) -> bool {
+    log_len > 0 && !exported
+}
+
 /// One captured row: its identity `key` (the key columns' values, stringified,
 /// in key order) and every column's value (`None` = NULL) in result-column order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -378,6 +410,54 @@ fn log_cell(change: &RowChange, i: usize) -> Value {
 /// expressed. Matches [`Value::display`], which is what the grid shows.
 fn null_text(v: &Option<String>) -> &str {
     v.as_deref().unwrap_or("NULL")
+}
+
+#[cfg(test)]
+mod discard_tests {
+    use super::*;
+
+    /// All four cases, because the two "no" answers are the ones that keep the
+    /// prompt from becoming noise every reader learns to dismiss.
+    #[test]
+    fn only_an_unexported_non_empty_log_is_worth_asking_about() {
+        assert!(discard_needs_asking(40, false), "the case that loses data");
+        assert!(!discard_needs_asking(40, true), "there is a copy on disk");
+        assert!(!discard_needs_asking(0, false), "nothing to lose");
+        assert!(!discard_needs_asking(0, true));
+    }
+
+    #[test]
+    fn one_change_is_still_a_change() {
+        assert!(discard_needs_asking(1, false));
+    }
+
+    /// **Exactly at the cap, nothing has been dropped.** That was the disagreement
+    /// between the two crates: the trim said `>`, the caveat said `>=`, and the
+    /// first time a log filled it claimed a loss that hadn't happened.
+    #[test]
+    fn a_full_log_has_dropped_nothing_until_it_overflows() {
+        let mut log: Vec<usize> = (0..LOG_CAP).collect();
+        assert_eq!(trim_log(&mut log), 0);
+        assert_eq!(log.len(), LOG_CAP);
+        assert_eq!(log[0], 0, "and nothing came off the front");
+    }
+
+    #[test]
+    fn an_overflowing_log_drops_the_oldest_and_says_how_many() {
+        let mut log: Vec<usize> = (0..LOG_CAP + 3).collect();
+        assert_eq!(trim_log(&mut log), 3);
+        assert_eq!(log.len(), LOG_CAP);
+        assert_eq!(log[0], 3, "the oldest three went, in order");
+    }
+
+    #[test]
+    fn a_short_log_is_untouched() {
+        let mut log: Vec<usize> = vec![1, 2, 3];
+        assert_eq!(trim_log(&mut log), 0);
+        assert_eq!(log, vec![1, 2, 3]);
+        let mut empty: Vec<usize> = Vec::new();
+        assert_eq!(trim_log(&mut empty), 0);
+    }
 }
 
 #[cfg(test)]

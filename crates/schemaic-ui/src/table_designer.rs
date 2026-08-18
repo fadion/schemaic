@@ -264,6 +264,15 @@ pub(crate) fn open_for_table(
     let Some(info) = loaded_table(ui, database, schema, table) else {
         return;
     };
+    // **A view is not a table, and this is the designer for a table.** Every
+    // menu that reaches here already asks (`overlays::object_entries`,
+    // `field_entries`, `key_entries`); this is the second lock, because the
+    // failure it prevents is a full Columns / Indexes / Foreign keys form for an
+    // object whose every edit the server refuses — and on SQLite one whose
+    // rebuild would emit `DROP TABLE` on a view.
+    if info.is_view {
+        return;
+    }
     let ctx = edit_ctx(ui);
     // Resolved against the introspected table, before it moves into the target.
     // The key case is resolved *after* the open instead, against the draft the

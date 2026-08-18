@@ -50,6 +50,27 @@ pub struct ColumnInfo {
     pub identity_always: bool,
     /// A generated/computed column's expression, without the `AS (…)` wrapper.
     pub generated: Option<String>,
+    /// **SQLite's `AUTOINCREMENT` keyword**, which is a narrower claim than
+    /// [`ColumnInfo::auto_increment`]. `false` on every other engine.
+    ///
+    /// Every `INTEGER PRIMARY KEY` in a rowid table is the rowid and is assigned
+    /// by the engine, so `auto_increment` is true for all of them. The keyword
+    /// adds one promise on top: the engine will never hand out an id it has used
+    /// before, at the cost of a `sqlite_sequence` row it maintains per table.
+    /// Reading the first as the second is how a rebuild came to add
+    /// `AUTOINCREMENT` — and a `sqlite_sequence` entry — to every plain key it
+    /// touched.
+    pub sqlite_autoincrement: bool,
+    /// The generated column is materialised (`STORED`) rather than recomputed on
+    /// every read (`VIRTUAL`). Meaningless without [`ColumnInfo::generated`].
+    ///
+    /// **SQLite's is the only one that can be either.** PostgreSQL has no virtual
+    /// form and MySQL reports its own, but SQLite defaults to `VIRTUAL` — so a
+    /// `STORED` column re-emitted without the word stops being materialised, and
+    /// the storage-versus-read trade the user chose is reversed silently. The
+    /// distinction is in the `pragma_table_xinfo.hidden` value the reader already
+    /// has (2 = VIRTUAL, 3 = STORED).
+    pub generated_stored: bool,
     /// MySQL's `ON UPDATE CURRENT_TIMESTAMP` (the expression, not the keyword).
     pub on_update: Option<String>,
     pub comment: Option<String>,
@@ -80,6 +101,14 @@ pub struct IndexColumn {
     /// [`IndexInfo::column_names`] skips it; and no table column has to exist by
     /// that name, so the designer's validation must not look for one.
     pub expression: bool,
+    /// This key column's **own** collation, when the index states one that isn't
+    /// the column's — `CREATE UNIQUE INDEX ix ON t (email COLLATE NOCASE)`.
+    ///
+    /// SQLite only. It is not decoration: the collation is what the uniqueness is
+    /// *measured in*, so an index recreated without it accepts `'a@X'` beside
+    /// `'A@x'` where the original refused the pair. `None` means "whatever the
+    /// column collates as", which is what an ordinary index says.
+    pub collation: Option<String>,
 }
 
 impl IndexColumn {
@@ -215,6 +244,12 @@ impl IndexInfo {
                 if let Some(n) = c.prefix {
                     s.push_str(&format!("({n})"));
                 }
+                // Before `DESC`, which is the order SQLite's grammar takes them
+                // in — and this is what stops a recreate measuring uniqueness in
+                // a different collation from the index it replaces.
+                if let Some(col) = c.collation.as_deref().filter(|c| !c.is_empty()) {
+                    s.push_str(&format!(" COLLATE {col}"));
+                }
                 if c.descending {
                     s.push_str(" DESC");
                 }
@@ -330,8 +365,11 @@ impl ColumnInfo {
         // A generated column carries an expression instead of a default.
         if let Some(expr) = &self.generated {
             out.push_str(&format!(" GENERATED ALWAYS AS ({expr})"));
-            if pg {
-                // PostgreSQL only has the stored form, and requires the keyword.
+            // PostgreSQL only has the stored form and requires the keyword.
+            // SQLite has both, defaults to VIRTUAL, and the difference is the
+            // storage/read trade the user chose — so a `STORED` column that came
+            // back without the word has been silently un-materialised.
+            if pg || (sqlite && self.generated_stored) {
                 out.push_str(" STORED");
             }
         }
@@ -350,7 +388,17 @@ impl ColumnInfo {
             if let Some(d) = &self.default
                 && !self.auto_increment
             {
-                out.push_str(&format!(" DEFAULT {d}"));
+                // **SQLite's grammar wants an expression default parenthesised**,
+                // and `pragma_table_xinfo.dflt_value` reports it with the
+                // parentheses already stripped — so a `DEFAULT (datetime('now'))`
+                // read and re-emitted verbatim is `near "(": syntax error`, and
+                // the table is uneditable for as long as the default exists. Only
+                // a literal and the `CURRENT_*` keywords may go bare.
+                if sqlite && !is_bare_sqlite_default(d) {
+                    out.push_str(&format!(" DEFAULT ({d})"));
+                } else {
+                    out.push_str(&format!(" DEFAULT {d}"));
+                }
             }
             if self.auto_increment && !sqlite {
                 // PostgreSQL's identity is a column attribute; MySQL's is a flag.
@@ -379,6 +427,142 @@ impl ColumnInfo {
             out.push_str(&format!(" COMMENT {}", ddl_string(c, dialect)));
         }
         out
+    }
+}
+
+/// The columns that identify a row of `t` for **browsing**, in key order —
+/// empty when the table has none of its own.
+///
+/// **It has to answer the same question `edit::resolve_key` answers**, or the
+/// grid projects a key the write path then ignores. `resolve_key` has three
+/// sources: the primary key, then a unique non-foreign index whose columns are
+/// all present and all `NOT NULL`, then the implicit key. `filter::BrowseKey`'s
+/// caller used to supply only the first, so a `CREATE TABLE u (email TEXT NOT
+/// NULL UNIQUE, name TEXT)` — a perfectly keyed table — was opened as
+/// `SELECT rowid, * FROM u ORDER BY rowid`, carrying a rowid column into the
+/// grid, every export and every copy, while the write keyed on `email` and never
+/// looked at it. That is the outcome `BrowseKey::pick`'s own doc forbids.
+///
+/// The middle arm's `NOT NULL` requirement is the whole reason it is a *unique*
+/// index and not merely a unique one: SQL lets any number of rows share a NULL
+/// in a unique column, so a nullable one identifies nothing.
+pub fn browse_key_columns(t: &TableInfo) -> Vec<String> {
+    let pk: Vec<String> = t
+        .columns
+        .iter()
+        .filter(|c| c.primary_key)
+        .map(|c| c.name.clone())
+        .collect();
+    if !pk.is_empty() {
+        return pk;
+    }
+    t.indexes
+        .iter()
+        .filter(|ix| ix.unique && !ix.foreign)
+        .find(|ix| {
+            !ix.columns.is_empty()
+                && ix.column_names().all(|c| {
+                    t.columns
+                        .iter()
+                        .find(|tc| tc.name == c)
+                        .map(|tc| !tc.nullable)
+                        .unwrap_or(false)
+                })
+        })
+        .map(|ix| ix.column_names().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// A trigger's `WHEN` clause, with the guard wrapped in parentheses that close
+/// where a parenthesis will actually close.
+///
+/// **The user's guard is arbitrary SQL and may end in a line comment.**
+/// `WHEN ({w})` then reads `WHEN (NEW.a > 0 -- only positives)` and the closing
+/// paren is inside the comment: the engine fails on whatever comes next
+/// (`near "BEGIN": syntax error`), which is not where the problem is, and the
+/// text the user typed looks fine. So the group closes on its own line, always
+/// — the same guard `ddl::create_view_sql` applies to its terminator, and
+/// unconditional because a guard is multi-line as often as not and the shape
+/// costs nothing.
+fn when_group(guard: &str) -> String {
+    format!("\nWHEN (\n{guard}\n)")
+}
+
+/// May this default text stand in a SQLite `DEFAULT` clause **without**
+/// parentheses?
+///
+/// SQLite's grammar is narrow here: a signed number, a string or blob literal,
+/// `NULL`, `TRUE`/`FALSE`, and the three `CURRENT_*` keywords. Everything else —
+/// a function call, an operator expression, a parenthesised anything — must be
+/// wrapped, and `pragma_table_xinfo` hands the text back with exactly those
+/// parentheses removed. An already-parenthesised value is left alone so a model
+/// built from a designer edit rather than from the pragma doesn't get a second
+/// pair.
+///
+/// `pub(crate)` because [`crate::ddl::sqlite_constant_default`] asks the same
+/// grammar question for `ADD COLUMN` — the two used to answer it separately, and
+/// the one that guessed sent statements the engine refuses down a path with no
+/// transaction around it.
+pub(crate) fn is_bare_sqlite_default(d: &str) -> bool {
+    let t = d.trim();
+    if t.is_empty() {
+        return true;
+    }
+    if t.starts_with('(') && t.ends_with(')') {
+        return true;
+    }
+    let upper = t.to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "NULL" | "TRUE" | "FALSE" | "CURRENT_TIME" | "CURRENT_DATE" | "CURRENT_TIMESTAMP"
+    ) {
+        return true;
+    }
+    // A string or blob literal — **the whole value**, which is what the shared
+    // boundary lexer answers: it returns the offset just past the literal that
+    // starts here, so `'a' || 'b'` correctly is *not* one (the literal ends at
+    // 3, the value doesn't).
+    let start = if upper.starts_with("X'") { 1 } else { 0 };
+    if t.as_bytes().get(start) == Some(&b'\'')
+        // Terminated, which the lexer alone can't say: an unclosed literal runs
+        // to the end of the input and so also "ends" at `t.len()`.
+        && t.len() > start + 1
+        && t.ends_with('\'')
+        && crate::sql::skip_noncode(t.as_bytes(), start, crate::intel::SqlDialect::Sqlite)
+            == Some(t.len())
+    {
+        return true;
+    }
+    // A signed number, decimal or hex — and *only* a number. `1+2` is an
+    // expression, which SQLite's grammar admits nowhere a bare default can go,
+    // and a permissive character-set test called it one.
+    is_numeric_literal(t.strip_prefix(['+', '-']).unwrap_or(t))
+}
+
+/// An unsigned SQLite numeric literal: `12`, `1.5`, `.5`, `1e-3`, `0xFF`.
+fn is_numeric_literal(n: &str) -> bool {
+    if let Some(hex) = n.strip_prefix("0x").or_else(|| n.strip_prefix("0X")) {
+        return !hex.is_empty() && hex.bytes().all(|c| c.is_ascii_hexdigit());
+    }
+    // `<digits>[.<digits>][(e|E)[+|-]<digits>]`, with at least one digit in the
+    // mantissa.
+    let (mantissa, exponent) = match n.find(['e', 'E']) {
+        Some(i) => (&n[..i], Some(&n[i + 1..])),
+        None => (n, None),
+    };
+    let mut parts = mantissa.splitn(2, '.');
+    let whole = parts.next().unwrap_or("");
+    let frac = parts.next().unwrap_or("");
+    let digits = |s: &str| s.bytes().all(|c| c.is_ascii_digit());
+    if !digits(whole) || !digits(frac) || (whole.is_empty() && frac.is_empty()) {
+        return false;
+    }
+    match exponent {
+        None => true,
+        Some(e) => {
+            let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+            !e.is_empty() && digits(e)
+        }
     }
 }
 
@@ -565,6 +749,24 @@ pub struct TableInfo {
     /// didn't survive the parse is gone from a trigger that still looks armed.
     /// Replaying the text SQLite stored cannot lose anything.
     pub dependent_ddl: Vec<String>,
+    /// **SQLite `WITHOUT ROWID`.** `false` everywhere else, which has no such
+    /// thing.
+    ///
+    /// Modelled because the rebuild writes the table back from this model, and a
+    /// clause the model doesn't carry is a clause the rebuild drops: the table
+    /// comes back as an ordinary rowid table, with a different storage layout,
+    /// different `INTEGER PRIMARY KEY` semantics, and — the part that changes
+    /// what the data is allowed to be — without the implicit `NOT NULL` a
+    /// `WITHOUT ROWID` table's primary-key columns carry. The reader has it
+    /// already: it is `pragma_table_list.wr`, the same row the implicit key asks.
+    pub without_rowid: bool,
+    /// **SQLite `STRICT`.** `false` everywhere else.
+    ///
+    /// Here for the same reason as [`TableInfo::without_rowid`]: a rebuild that
+    /// drops it turns a table whose types the engine *enforces* into one whose
+    /// declared types are advisory, and nothing in the plan or the result says
+    /// so. It is the `strict` column of the same `pragma_table_list` row.
+    pub strict: bool,
 }
 
 /// One `CHECK` constraint: a name and the predicate it enforces.
@@ -1167,8 +1369,10 @@ impl TriggerInfo {
                 .map(str::trim)
                 .filter(|w| !w.is_empty())
             {
-                // Wrapped exactly once, the guard being held bare in the model.
-                out.push_str(&format!("\nWHEN ({w})"));
+                // Wrapped exactly once, the guard being held bare in the model —
+                // and closed on a line of its own, since a guard ending in a
+                // line comment would otherwise swallow the `)`.
+                out.push_str(&when_group(w));
             }
             let body = match &self.action {
                 TriggerAction::Body(b) => b.trim().to_string(),
@@ -1249,7 +1453,7 @@ impl TriggerInfo {
             .map(str::trim)
             .filter(|w| !w.is_empty())
         {
-            out.push_str(&format!("\nWHEN ({w})"));
+            out.push_str(&when_group(w));
         }
         let call = match &self.action {
             TriggerAction::Function { name, args } => {
@@ -2545,6 +2749,52 @@ pub fn classify_column_type(type_name: &str) -> ColumnTypeClass {
     }
 }
 
+/// The five affinities SQLite assigns a column from its **declared type text**.
+///
+/// SQLite has no column types — a cell of any storage class can go in any
+/// column — but the declared text still decides which storage class the engine
+/// *prefers*, and that is the only thing a reader can ask about the column
+/// itself. Unlike MySQL and PostgreSQL, the text is arbitrary: `MEDIUMBLOB`,
+/// `VARBINARY(16)` and a column declared with **no type at all** are all things
+/// a SQLite table can say, and only the affinity rule sorts them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqliteAffinity {
+    Integer,
+    Text,
+    /// Raw bytes — also what a column with no declared type gets.
+    Blob,
+    Real,
+    Numeric,
+}
+
+/// Which affinity SQLite gives a column declared `declared`.
+///
+/// This is [the five rules of *Determination of Column
+/// Affinity*](https://sqlite.org/datatype3.html#determination_of_column_affinity),
+/// in order and case-insensitively, and the order is the whole algorithm: it is
+/// why `VARCHAR` is TEXT despite containing `CHAR` *and* nothing else, and why
+/// `POINT` — which contains neither `INT` at the start nor any other keyword —
+/// is INTEGER, not NUMERIC.
+///
+/// It lives here rather than in the backend because two separate readings of a
+/// declared type depend on it: whether a column holds bytes the grid must not
+/// let anyone type over, and what an imported CSV value should be coerced to.
+/// Both used to spell their own narrower test inline.
+pub fn sqlite_affinity(declared: &str) -> SqliteAffinity {
+    let t = declared.trim().to_ascii_uppercase();
+    if t.contains("INT") {
+        SqliteAffinity::Integer
+    } else if t.contains("CHAR") || t.contains("CLOB") || t.contains("TEXT") {
+        SqliteAffinity::Text
+    } else if t.is_empty() || t.contains("BLOB") {
+        SqliteAffinity::Blob
+    } else if t.contains("REAL") || t.contains("FLOA") || t.contains("DOUB") {
+        SqliteAffinity::Real
+    } else {
+        SqliteAffinity::Numeric
+    }
+}
+
 /// Per-connection introspection lifecycle, shared loader→UI through a signal.
 ///
 /// The loaded schema is an `Arc` because reading it out of that signal is on the
@@ -2686,8 +2936,31 @@ mod trigger_tests {
         // Held bare in the model; the emitter is the only thing that parenthesises.
         t.condition = Some("new.total > 0".into());
         let sql = t.create_sql(SqlDialect::Postgres);
-        assert!(sql.contains("\nWHEN (new.total > 0)\n"), "{sql}");
+        assert!(sql.contains("\nWHEN (\nnew.total > 0\n)\n"), "{sql}");
         assert!(!sql.contains("((new.total > 0))"), "{sql}");
+    }
+
+    /// **A guard is arbitrary SQL and may end in a line comment**, which is why
+    /// the group closes on a line of its own: `WHEN (NEW.a > 0 -- why)` puts the
+    /// closing paren inside the comment, and the engine then fails on whatever
+    /// follows — `near "BEGIN": syntax error`, which is not where the problem is.
+    #[test]
+    fn a_when_guard_ending_in_a_comment_still_closes_its_group() {
+        for dialect in [SqlDialect::Postgres, SqlDialect::Sqlite] {
+            let mut t = pg_trigger();
+            if dialect == SqlDialect::Sqlite {
+                t.schema = None;
+                t.action = TriggerAction::Body("BEGIN UPDATE t SET b = 1; END".into());
+            }
+            t.condition = Some("NEW.a > 0 -- only positives".into());
+            let sql = t.create_sql(dialect);
+            let at = sql.find("WHEN (").expect("a WHEN group") + "WHEN ".len();
+            assert_eq!(
+                crate::sql::balanced_paren_span(sql.as_bytes(), at, dialect),
+                sql[at..].find("\n)").map(|i| at + i + 1),
+                "the group must close at a code position:\n{sql}"
+            );
+        }
     }
 
     #[test]
@@ -2858,6 +3131,221 @@ mod schema_state_tests {
             SchemaState::Failed("gone".into()).begin_refresh(),
             Some(SchemaState::Loading)
         ));
+    }
+}
+
+#[cfg(test)]
+mod browse_key_tests {
+    use super::*;
+
+    fn col(name: &str, nullable: bool, pk: bool) -> ColumnInfo {
+        ColumnInfo {
+            name: name.into(),
+            type_name: "TEXT".into(),
+            nullable,
+            primary_key: pk,
+            ..Default::default()
+        }
+    }
+
+    fn table(columns: Vec<ColumnInfo>, indexes: Vec<IndexInfo>) -> TableInfo {
+        TableInfo {
+            name: "u".into(),
+            columns,
+            indexes,
+            implicit_key: Some("rowid".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_primary_key_wins() {
+        let t = table(
+            vec![col("id", false, true), col("email", false, false)],
+            vec![IndexInfo::plain("uq", vec!["email"], true)],
+        );
+        assert_eq!(browse_key_columns(&t), vec!["id".to_string()]);
+    }
+
+    /// **The arm that was missing.** `CREATE TABLE u (email TEXT NOT NULL UNIQUE,
+    /// name TEXT)` has a perfectly good row key, and the browse gate asked only
+    /// about the primary key — so the tab opened `SELECT rowid, * … ORDER BY
+    /// rowid`, carrying a rowid column into the grid, every export and every
+    /// copy, while the write path keyed on `email` and never looked at it.
+    #[test]
+    fn a_unique_not_null_index_is_a_key() {
+        let t = table(
+            vec![col("email", false, false), col("name", true, false)],
+            vec![IndexInfo::plain("uq", vec!["email"], true)],
+        );
+        assert_eq!(browse_key_columns(&t), vec!["email".to_string()]);
+    }
+
+    /// A *nullable* unique column identifies nothing: SQL lets any number of
+    /// rows share a NULL there. This is the same rule `edit::resolve_key`
+    /// applies, and the reason the two have to be one function.
+    #[test]
+    fn a_nullable_unique_index_is_not_a_key() {
+        let t = table(
+            vec![col("email", true, false), col("name", true, false)],
+            vec![IndexInfo::plain("uq", vec!["email"], true)],
+        );
+        assert!(browse_key_columns(&t).is_empty());
+    }
+
+    #[test]
+    fn a_non_unique_or_foreign_index_is_not_a_key() {
+        let plain = table(
+            vec![col("email", false, false)],
+            vec![IndexInfo::plain("ix", vec!["email"], false)],
+        );
+        assert!(browse_key_columns(&plain).is_empty());
+
+        let mut fk = IndexInfo::plain("fk", vec!["email"], true);
+        fk.foreign = true;
+        assert!(browse_key_columns(&table(vec![col("email", false, false)], vec![fk])).is_empty());
+    }
+
+    #[test]
+    fn a_table_with_neither_has_no_key_of_its_own() {
+        let t = table(vec![col("a", true, false), col("b", true, false)], vec![]);
+        assert!(browse_key_columns(&t).is_empty());
+    }
+
+    /// A composite unique index comes back whole and in key order.
+    #[test]
+    fn a_composite_unique_index_keeps_its_order() {
+        let t = table(
+            vec![col("a", false, false), col("b", false, false)],
+            vec![IndexInfo::plain("uq", vec!["b", "a"], true)],
+        );
+        assert_eq!(
+            browse_key_columns(&t),
+            vec!["b".to_string(), "a".to_string()]
+        );
+    }
+}
+
+#[cfg(test)]
+mod sqlite_default_tests {
+    use super::*;
+
+    /// Everything SQLite's grammar lets stand without parentheses.
+    #[test]
+    fn the_literals_stand_bare() {
+        for d in [
+            "NULL",
+            "null",
+            "TRUE",
+            "FALSE",
+            "CURRENT_TIME",
+            "CURRENT_DATE",
+            "CURRENT_TIMESTAMP",
+            "'hi'",
+            "''",
+            "'it''s'",
+            "X'00FF'",
+            "x'00ff'",
+            "0",
+            "3",
+            "-1",
+            "+7",
+            "1.5",
+            ".5",
+            "1e-3",
+            "1E+10",
+            "0xFF",
+            "0X1a",
+        ] {
+            assert!(is_bare_sqlite_default(d), "{d}");
+        }
+        // Already parenthesised, so nothing to add.
+        assert!(is_bare_sqlite_default("(datetime('now'))"));
+        // Nothing at all is nothing to wrap.
+        assert!(is_bare_sqlite_default(""));
+    }
+
+    /// **And everything that is an expression, which is where this went wrong.**
+    /// A character-set test called `1+2` a number and a `starts_with('\'')` test
+    /// called `'a' || 'b'` a string, so both took the `ADD COLUMN` fast path —
+    /// on which SQLite refuses the statement, and Copy / "Open in editor" then
+    /// half-applies a two-column add.
+    #[test]
+    fn an_expression_is_not_a_literal() {
+        for d in [
+            "1+2",
+            "-1*2",
+            "'a'||'b'",
+            "'a' || 'b'",
+            "datetime('now')",
+            "upper('a')",
+            "a+1",
+            "1e",
+            "1e+",
+            "0x",
+            "1.2.3",
+            "1 2",
+            "'unterminated",
+        ] {
+            assert!(!is_bare_sqlite_default(d), "{d}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod sqlite_affinity_tests {
+    use super::*;
+
+    /// The rules SQLite documents, each with the example the documentation
+    /// itself uses, plus the spellings the exact-match test this replaced let
+    /// through.
+    #[test]
+    fn the_five_rules_in_order() {
+        use SqliteAffinity::*;
+        for (declared, want) in [
+            ("INT", Integer),
+            ("INTEGER", Integer),
+            ("BIGINT", Integer),
+            ("UNSIGNED BIG INT", Integer),
+            // Rule 1 wins over rule 2 even though the text also says CHAR.
+            ("INT CHAR", Integer),
+            ("CHARACTER(20)", Text),
+            ("VARCHAR(255)", Text),
+            ("NCHAR(55)", Text),
+            ("CLOB", Text),
+            ("TEXT", Text),
+            ("BLOB", Blob),
+            ("MEDIUMBLOB", Blob),
+            ("longblob", Blob),
+            ("REAL", Real),
+            ("DOUBLE PRECISION", Real),
+            ("FLOAT", Real),
+            ("NUMERIC", Numeric),
+            ("DECIMAL(10,5)", Numeric),
+            ("BOOLEAN", Numeric),
+            ("DATE", Numeric),
+            ("DATETIME", Numeric),
+        ] {
+            assert_eq!(sqlite_affinity(declared), want, "{declared}");
+        }
+    }
+
+    /// **The case the grid gets wrong if this is an exact match.** A column
+    /// declared with no type at all is idiomatic SQLite — `CREATE TABLE t (id
+    /// INTEGER PRIMARY KEY, thumb)` — and it has BLOB affinity, so it is exactly
+    /// where raw bytes end up.
+    #[test]
+    fn no_declared_type_is_blob() {
+        assert_eq!(sqlite_affinity(""), SqliteAffinity::Blob);
+        assert_eq!(sqlite_affinity("   "), SqliteAffinity::Blob);
+    }
+
+    /// The declared text is arbitrary, and case is not part of it.
+    #[test]
+    fn the_rules_are_case_insensitive_and_ignore_the_padding() {
+        assert_eq!(sqlite_affinity(" varbinary(16) "), SqliteAffinity::Numeric);
+        assert_eq!(sqlite_affinity("VarBinary(16)"), SqliteAffinity::Numeric);
+        assert_eq!(sqlite_affinity("tinyblob"), SqliteAffinity::Blob);
     }
 }
 

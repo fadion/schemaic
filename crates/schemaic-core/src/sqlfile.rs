@@ -17,7 +17,19 @@
 //!
 //! Mixed endings resolve to the majority, and a tie to CRLF: a file that is
 //! mostly CRLF with one stray LF is a CRLF file, and normalising the stray one
-//! on save is the smaller lie.
+//! on save is the smaller lie. A UTF-8 BOM is remembered the same way, and for
+//! the same reason.
+//!
+//! # A lossy read is not a licence to write
+//!
+//! [`decode`] reads bytes it cannot make sense of as U+FFFD, because a
+//! mis-encoded byte should cost the user a replacement character rather than the
+//! whole file. That is a decision about *reading*. Writing the result back is a
+//! different act — it replaces every unreadable byte in the file permanently,
+//! including in the thousands of lines the user never touched — so the fact of
+//! the loss rides on [`SqlFormat::lossy`] and the caller has to ask first. The
+//! `.sql` file is the one artefact in this application that Schemaic cannot
+//! regenerate.
 
 use std::path::{Path, PathBuf};
 
@@ -33,13 +45,83 @@ pub const SQL_FILTER_NAME: &str = "SQL script";
 /// The suggested file name for a tab that has never been saved.
 const FALLBACK_NAME: &str = "query";
 
-/// A file's text as the editor wants it, plus what its line endings were.
+/// Everything about a file's bytes that isn't its text — what [`encode`] needs
+/// to put back, and what a caller needs to know before it overwrites the file.
+///
+/// It rides on the tab (and its saved session entry) between the read and the
+/// write, which is the only place it can live: the editor holds `\n`-only UTF-8
+/// text and has no memory of what the bytes were.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SqlFormat {
+    /// The file was CRLF-dominant, so [`encode`] should write it back that way.
+    pub crlf: bool,
+    /// The file began with a UTF-8 BOM, which [`decode`] strips and [`encode`]
+    /// therefore has to put back — a Save that dropped it would rewrite the
+    /// file's first three bytes for a one-line edit, and some Windows tools read
+    /// the file differently without it.
+    pub bom: bool,
+    /// **`decode` could not read every byte as UTF-8 and substituted U+FFFD.**
+    ///
+    /// The lossy read is deliberate — a mis-encoded byte should cost the user a
+    /// replacement character rather than the whole file — but it is a decision
+    /// about *reading*, and writing the result back is a different act: it
+    /// replaces every unreadable byte in the file permanently, including in the
+    /// thousands of lines the user never touched. A Latin-1 `mysqldump`, or
+    /// anything Notepad wrote in the ANSI codepage, is exactly this shape. So
+    /// the fact travels with the text, and the caller must ask before it saves.
+    pub lossy: bool,
+}
+
+/// A file's text as the editor wants it, plus what its bytes were.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqlText {
     /// The text with every `\r\n` collapsed to `\n`.
     pub text: String,
-    /// The file was CRLF-dominant, so [`encode`] should write it back that way.
-    pub crlf: bool,
+    pub format: SqlFormat,
+}
+
+/// Past this, opening a `.sql` file asks first. See [`open_verdict`].
+///
+/// 1 MB is where the editor's own analysis crosses half a second on an *empty*
+/// catalogue — measured at 710 ms for a 1 MB document, 2.78 s at 4 MB, 11.4 s at
+/// 16 MB — and a real catalogue is worse than that, not better.
+pub const OPEN_WARN_BYTES: u64 = 1 << 20;
+
+/// Past this, opening is refused outright.
+///
+/// 64 MB puts the same analysis at ~45 s per pause in typing, forever, which is
+/// not a slow editor but a hung window. The number is deliberately far above
+/// anything a hand-written script reaches: what lands here is a database dump,
+/// and the answer for one of those is the import path or a query tab, not a
+/// syntax-highlighted editor holding four copies of it.
+pub const OPEN_REFUSE_BYTES: u64 = 64 << 20;
+
+/// What opening a file of `bytes` should do.
+///
+/// **The editor's cost is the whole reason this exists**, not the read: `fs::read`
+/// and [`decode`] are cheap even at 256 MB. What is not cheap is
+/// `intel::diagnostics`, which runs over the *whole* document on the UI thread
+/// 120 ms after every burst of typing — so a file that opens in a moment leaves
+/// the window unresponsive for as long as the user keeps it open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenVerdict {
+    /// Open it.
+    Open,
+    /// Ask first, with this many bytes to name in the question.
+    Confirm(u64),
+    /// Refuse, with this many bytes to name in the message.
+    Refuse(u64),
+}
+
+/// Should a file this big be opened in an editor tab? See [`OpenVerdict`].
+pub fn open_verdict(bytes: u64) -> OpenVerdict {
+    if bytes > OPEN_REFUSE_BYTES {
+        OpenVerdict::Refuse(bytes)
+    } else if bytes > OPEN_WARN_BYTES {
+        OpenVerdict::Confirm(bytes)
+    } else {
+        OpenVerdict::Open
+    }
 }
 
 /// Turn a `.sql` file's bytes into editor text.
@@ -47,27 +129,40 @@ pub struct SqlText {
 /// Strips a UTF-8 BOM (Windows tools write one and it would otherwise show up as
 /// an invisible first character that breaks the first keyword), decodes lossily
 /// — a mis-encoded byte should cost the user a replacement character, not the
-/// whole file — and normalises line endings, recording what they were.
+/// whole file — and normalises line endings. **Each of those three is recorded**
+/// in the returned [`SqlFormat`], because each is something `encode` has to put
+/// back or a caller has to warn about.
 pub fn decode(bytes: &[u8]) -> SqlText {
-    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let bom = bytes.starts_with(b"\xEF\xBB\xBF");
+    let bytes = if bom { &bytes[3..] } else { bytes };
     let raw = String::from_utf8_lossy(bytes);
+    // `from_utf8_lossy` borrows when every byte was valid UTF-8 and allocates
+    // only when it had to substitute — so the fact is already in hand, free.
+    let lossy = matches!(raw, std::borrow::Cow::Owned(_));
     let crlf = is_crlf(&raw);
     SqlText {
         text: raw.replace("\r\n", "\n"),
-        crlf,
+        format: SqlFormat { crlf, bom, lossy },
     }
 }
 
-/// Turn editor text back into the bytes to write, restoring CRLF when the file
-/// had it. The inverse of [`decode`] for any text the editor can hold (which is
-/// `\n`-only, since `decode` is the only way text arrives from a file).
-pub fn encode(text: &str, crlf: bool) -> String {
-    if crlf {
+/// Turn editor text back into the bytes to write, restoring the BOM and the CRLF
+/// the file had. The inverse of [`decode`] for any text the editor can hold
+/// (which is `\n`-only, since `decode` is the only way text arrives from a file)
+/// **and any file `decode` read without loss** — a lossy read has no inverse,
+/// which is what [`SqlFormat::lossy`] is for.
+pub fn encode(text: &str, format: SqlFormat) -> String {
+    let body = if format.crlf {
         // Guard against a stray `\r\n` already in the buffer (pasted from
         // somewhere) doubling into `\r\r\n`.
         text.replace("\r\n", "\n").replace('\n', "\r\n")
     } else {
         text.to_string()
+    };
+    if format.bom {
+        format!("\u{FEFF}{body}")
+    } else {
+        body
     }
 }
 
@@ -152,18 +247,57 @@ fn has_sql_ext(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    /// The format of an ordinary LF, no-BOM, valid-UTF-8 file.
+    fn plain() -> SqlFormat {
+        SqlFormat::default()
+    }
+
+    #[test]
+    fn open_verdict_covers_the_three_bands() {
+        use OpenVerdict::*;
+        assert_eq!(open_verdict(0), Open, "an empty file");
+        assert_eq!(open_verdict(47_000), Open, "an ordinary script");
+        assert_eq!(
+            open_verdict(OPEN_WARN_BYTES),
+            Open,
+            "the bound is inclusive"
+        );
+        assert_eq!(
+            open_verdict(OPEN_WARN_BYTES + 1),
+            Confirm(OPEN_WARN_BYTES + 1)
+        );
+        assert_eq!(open_verdict(16 << 20), Confirm(16 << 20));
+        assert_eq!(
+            open_verdict(OPEN_REFUSE_BYTES),
+            Confirm(OPEN_REFUSE_BYTES),
+            "the refusal bound is inclusive too"
+        );
+        assert_eq!(
+            open_verdict(OPEN_REFUSE_BYTES + 1),
+            Refuse(OPEN_REFUSE_BYTES + 1)
+        );
+        assert_eq!(open_verdict(u64::MAX), Refuse(u64::MAX));
+    }
+
+    /// The bands have to be in order, or one of them is unreachable.
+    #[test]
+    fn the_thresholds_are_ordered() {
+        const { assert!(OPEN_WARN_BYTES < OPEN_REFUSE_BYTES) };
+    }
+
     #[test]
     fn decode_strips_a_bom_and_keeps_lf() {
         let got = decode(b"\xEF\xBB\xBFSELECT 1;\nSELECT 2;\n");
         assert_eq!(got.text, "SELECT 1;\nSELECT 2;\n");
-        assert!(!got.crlf);
+        assert!(!got.format.crlf);
+        assert!(got.format.bom, "and it remembers there was one");
     }
 
     #[test]
     fn decode_normalises_crlf_and_remembers_it() {
         let got = decode(b"SELECT 1;\r\nSELECT 2;\r\n");
         assert_eq!(got.text, "SELECT 1;\nSELECT 2;\n");
-        assert!(got.crlf);
+        assert!(got.format.crlf);
     }
 
     #[test]
@@ -172,7 +306,7 @@ mod tests {
             decode(b""),
             SqlText {
                 text: String::new(),
-                crlf: false
+                format: plain(),
             }
         );
         // A file that is nothing but a BOM is likewise empty.
@@ -186,32 +320,78 @@ mod tests {
         assert!(got.text.contains('\u{FFFD}'));
     }
 
+    /// **The fact a Save has to know.** A lossy read has no inverse: writing the
+    /// decoded text back replaces every unreadable byte in the file — including
+    /// in the lines the user never touched — permanently. A Latin-1 `mysqldump`
+    /// is the ordinary shape of this.
+    #[test]
+    fn decode_reports_whether_it_had_to_substitute() {
+        assert!(decode(b"-- caf\xE9\nSELECT 1;\n").format.lossy, "latin-1");
+        assert!(decode(b"-- don\x92t\n").format.lossy, "cp-1252 apostrophe");
+        assert!(
+            decode(b"\xFF\xFES\0E\0").format.lossy,
+            "utf-16le with a BOM"
+        );
+        assert!(!decode("-- café\nSELECT 1;\n".as_bytes()).format.lossy);
+        assert!(!decode(b"").format.lossy);
+        assert!(
+            !decode(b"\xEF\xBB\xBFSELECT 1;").format.lossy,
+            "a BOM is not loss"
+        );
+    }
+
+    /// And it really is one-way — the assertion the round-trip test below cannot
+    /// make, and the reason the flag exists rather than a wider `encode`.
+    #[test]
+    fn a_lossy_decode_does_not_round_trip() {
+        let raw = &b"-- caf\xE9\nSELECT 1;\n"[..];
+        let d = decode(raw);
+        assert!(d.format.lossy);
+        assert_ne!(
+            encode(&d.text, d.format).as_bytes(),
+            raw,
+            "if this ever passes, the flag can go"
+        );
+    }
+
     #[test]
     fn a_lone_cr_is_not_a_line_ending() {
         // An old-Mac `\r` (or a `\r` inside a string literal) is left exactly as
         // it is: it isn't `\r\n`, so nothing collapses and nothing is claimed.
         let got = decode(b"SELECT '\ra';");
         assert_eq!(got.text, "SELECT '\ra';");
-        assert!(!got.crlf);
+        assert!(!got.format.crlf);
     }
 
     #[test]
     fn mixed_endings_resolve_to_the_majority() {
-        assert!(decode(b"a\r\nb\r\nc\nd").crlf, "two CRLF against one LF");
-        assert!(!decode(b"a\nb\nc\r\nd").crlf, "two LF against one CRLF");
+        assert!(
+            decode(b"a\r\nb\r\nc\nd").format.crlf,
+            "two CRLF against one LF"
+        );
+        assert!(
+            !decode(b"a\nb\nc\r\nd").format.crlf,
+            "two LF against one CRLF"
+        );
         // A tie is CRLF: normalising the odd lone LF is the smaller change.
-        assert!(decode(b"a\r\nb\nc").crlf);
+        assert!(decode(b"a\r\nb\nc").format.crlf);
     }
 
     #[test]
-    fn encode_round_trips_both_endings() {
+    fn encode_round_trips_every_readable_shape() {
         for raw in [
             &b"SELECT 1;\r\nSELECT 2;\r\n"[..],
             &b"SELECT 1;\nSELECT 2;\n"[..],
+            // The BOM was stripped on open and never written back, so a Save of
+            // an untouched file used to shrink it by three bytes.
+            &b"\xEF\xBB\xBFSELECT 1;\n"[..],
+            &b"\xEF\xBB\xBFSELECT 1;\r\n"[..],
+            &b"\xEF\xBB\xBF"[..],
+            "-- café\nSELECT 1;\n".as_bytes(),
         ] {
             let d = decode(raw);
             assert_eq!(
-                encode(&d.text, d.crlf).as_bytes(),
+                encode(&d.text, d.format).as_bytes(),
                 raw,
                 "decode → encode must be the identity on a file we opened"
             );
@@ -220,7 +400,16 @@ mod tests {
 
     #[test]
     fn encode_does_not_double_a_crlf_already_in_the_buffer() {
-        assert_eq!(encode("a\r\nb\nc", true), "a\r\nb\r\nc");
+        assert_eq!(
+            encode(
+                "a\r\nb\nc",
+                SqlFormat {
+                    crlf: true,
+                    ..plain()
+                }
+            ),
+            "a\r\nb\r\nc"
+        );
     }
 
     #[test]

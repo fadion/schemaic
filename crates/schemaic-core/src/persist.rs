@@ -289,6 +289,22 @@ pub struct SavedTab {
     /// (see [`crate::sqlfile`]). Meaningless without `path`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub file_crlf: bool,
+    /// The file began with a UTF-8 BOM, which a save has to put back
+    /// (see [`crate::sqlfile::SqlFormat::bom`]). Meaningless without `path`.
+    ///
+    /// Its own field beside `file_crlf` rather than a nested struct, because a
+    /// `tabs.json` written by an older build has neither and must keep restoring
+    /// — `#[serde(default)]` on a flat `bool` is what makes that free.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub file_bom: bool,
+    /// Schemaic could not read every byte of the file as UTF-8 and substituted
+    /// replacement characters (see [`crate::sqlfile::SqlFormat::lossy`]).
+    ///
+    /// Persisted because the warning has to survive a relaunch: the restored tab
+    /// holds the *decoded* text, so nothing in it would show that saving would
+    /// destroy the original bytes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub file_lossy: bool,
     /// `query` differed from the file on disk when the session was saved.
     ///
     /// Persisted as one bit rather than storing a second copy of the file's text:
@@ -586,6 +602,39 @@ pub(crate) fn write_bytes(store: &dyn FileStore, path: &Path, json: &[u8]) {
         // rather than leaving only the temp file.
         let _ = store.write(path, json);
         store.remove(&tmp);
+    }
+}
+
+/// Write `bytes` over `path` **atomically**, for a file that isn't ours.
+///
+/// A `.sql` script the user opened is the one artefact in this application that
+/// Schemaic cannot regenerate, and `fs::write` truncates before it writes: a
+/// full disk, a dropped network share or a crash between the two leaves the
+/// user's file empty or half-written, with the only copy of the text still in a
+/// tab the app is about to close. Staging beside it and renaming over makes the
+/// replacement a single step.
+///
+/// Unlike [`write_bytes`] it keeps **no `.bak`** and narrows no permissions:
+/// this is the user's own file in the user's own directory, and leaving
+/// `orders.sql.bak` behind after every Ctrl+S — or changing the mode of a file
+/// checked into their repository — is not ours to do. The temp sibling is
+/// removed on any failure, so a failed save leaves the directory as it was.
+pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = sibling(path, ".schemaic-tmp");
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Cross-device, or a Windows share that refuses the replace. A
+            // direct write is what the caller asked for and is still better than
+            // failing with the text only in memory.
+            let direct = std::fs::write(path, bytes);
+            let _ = std::fs::remove_file(&tmp);
+            direct
+        }
     }
 }
 

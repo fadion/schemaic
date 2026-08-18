@@ -23,6 +23,24 @@ pub struct EditTable {
     pub schema: Option<String>,
     pub table: String,
     pub key_cols: Vec<usize>,
+    /// Result columns whose **original** values the `WHERE` must also match, on
+    /// top of `key_cols`. Empty unless the key is an implicit one.
+    ///
+    /// **A rowid is not a row identity.** SQLite hands one out per row, and it
+    /// reassigns them: the twelve-step rebuild renumbers a keyless table, a
+    /// delete frees the highest one for the next insert, `VACUUM` compacts them.
+    /// Nothing re-runs an open result tab when any of that happens, so the grid
+    /// can hold a number that now names a *different* row — and an `UPDATE`
+    /// keyed on it affects exactly 1 row, which is the number
+    /// [`crate::model::one_row_verdict`] is looking for. The safety net's whole
+    /// premise is that a stale key matches **zero** rows.
+    ///
+    /// So the rowid keeps identifying the row and these columns confirm it: the
+    /// values the grid actually read, `AND`ed onto the same `WHERE`. A
+    /// renumbered or reused rowid now matches nothing and the net fires. This is
+    /// not "match on every value" — that scheme can't tell two identical rows
+    /// apart, and this one never has to, because the rowid already did.
+    pub confirm_cols: Vec<usize>,
 }
 
 /// Which result columns are editable, and to which base table each writes.
@@ -162,11 +180,13 @@ pub fn analyze_edit(
     for ((db, schema, table), cis) in &groups {
         if let Some(key_cols) = resolve_key(&schema_for, db, schema.as_deref(), table, cis, rs) {
             let idx = tables.len();
+            let confirm_cols = confirm_columns(&key_cols, cis, rs);
             tables.push(EditTable {
                 database: db.clone(),
                 schema: schema.clone(),
                 table: table.clone(),
                 key_cols,
+                confirm_cols,
             });
             for &ci in cis {
                 // C2: binary columns can't round-trip as text → never editable,
@@ -185,6 +205,65 @@ pub fn analyze_edit(
         }
     }
     EditModel { col_table, tables }
+}
+
+/// The `WHERE` identity of data row `di` in `rs` for base table `tbl`: each key
+/// column's real name paired with the row's **original** value, followed by the
+/// table's [`EditTable::confirm_cols`] in the same shape.
+///
+/// The one builder for it. Every write the grid issues — update, delete, and the
+/// row panel's immediate save — is aimed at the row this names, so a difference
+/// between copies is a statement aimed somewhere else. It lives here rather than
+/// in the grid because the confirming columns are part of the row's identity,
+/// and identity is what this module is for.
+pub fn row_key(rs: &ResultSet, tbl: &EditTable, di: usize) -> Vec<(String, Value)> {
+    tbl.key_cols
+        .iter()
+        .chain(tbl.confirm_cols.iter())
+        .map(|&kci| {
+            let name = rs
+                .columns
+                .get(kci)
+                .and_then(|c| c.origin.as_ref())
+                .map(|o| o.column.clone())
+                .unwrap_or_default();
+            let val = rs
+                .cell(di, kci)
+                .map(|c| c.to_value())
+                .unwrap_or(Value::Null);
+            (name, val)
+        })
+        .collect()
+}
+
+/// The result columns whose original values must confirm an **implicit** key —
+/// see [`EditTable::confirm_cols`]. Empty for every real key, on every engine.
+///
+/// A binary column is left out: its cell is a placeholder, not the value, so
+/// comparing it would refuse every write to the table rather than only the
+/// misdirected ones. Everything else the grid read goes in, including a column
+/// the user is editing — the value compared is the one that was *read*, which is
+/// what the row was when its rowid was.
+fn confirm_columns(key_cols: &[usize], cis: &[usize], rs: &ResultSet) -> Vec<usize> {
+    let implicit = key_cols.iter().any(|&kci| {
+        rs.columns[kci]
+            .origin
+            .as_ref()
+            .is_some_and(|o| o.implicit_key)
+    });
+    if !implicit {
+        return Vec::new();
+    }
+    cis.iter()
+        .copied()
+        .filter(|ci| !key_cols.contains(ci))
+        .filter(|&ci| {
+            rs.columns[ci]
+                .origin
+                .as_ref()
+                .is_some_and(|o| !o.binary && !o.implicit_key)
+        })
+        .collect()
 }
 
 /// Find the result-column indices forming a usable row key for one base table,
@@ -448,6 +527,69 @@ mod tests {
         // data, and a new row has no value to offer for it.
         assert!(!m.editable(0));
         assert!(m.insert_target().is_some());
+    }
+
+    /// **The rowid identifies, the values confirm.** A rowid is reassigned — by
+    /// the twelve-step rebuild, by an insert after a delete, by `VACUUM` — and
+    /// nothing re-runs an open grid when it happens, so the number can come to
+    /// name a different row. Keyed on the number alone, the `UPDATE` lands on
+    /// that row and affects exactly 1, which is the number the safety net wants
+    /// to see. The read values ride along so a moved rowid matches **zero**.
+    #[test]
+    fn an_implicit_key_carries_the_read_values_as_confirmation() {
+        let r = rs(vec![
+            implicit_col("rowid", "notes"),
+            col("a", "TEXT", "notes", false, false),
+            col("b", "TEXT", "notes", false, false),
+        ]);
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "notes").then(|| schema_keyless("notes", &[("a", "text"), ("b", "text")]))
+        };
+        let m = analyze_edit(&r, schema);
+        let tbl = m.insert_target().expect("writable");
+        assert_eq!(tbl.key_cols, vec![0]);
+        assert_eq!(tbl.confirm_cols, vec![1, 2]);
+    }
+
+    /// A binary column's cell is a placeholder, not the value, so comparing it
+    /// would refuse every write to the table rather than only the misdirected
+    /// ones.
+    #[test]
+    fn a_binary_column_is_not_used_as_confirmation() {
+        let r = rs(vec![
+            implicit_col("rowid", "notes"),
+            col("a", "TEXT", "notes", false, false),
+            col("blob", "BLOB", "notes", false, true),
+        ]);
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "notes").then(|| schema_keyless("notes", &[("a", "text"), ("blob", "blob")]))
+        };
+        let m = analyze_edit(&r, schema);
+        assert_eq!(
+            m.insert_target().map(|t| t.confirm_cols.clone()),
+            Some(vec![1])
+        );
+    }
+
+    /// A real key needs no confirmation: it is the row's identity, it survives a
+    /// rebuild because its *values* are copied, and a deleted-then-reinserted
+    /// row does not silently inherit it. Every MySQL and PostgreSQL table is
+    /// here, and so is every SQLite table with a key of its own.
+    #[test]
+    fn a_real_key_carries_no_confirmation_columns() {
+        let r = rs(vec![
+            col("id", "INT", "users", true, false),
+            col("name", "VARCHAR", "users", false, false),
+        ]);
+        let schema = |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "users")
+                .then(|| schema_with_pk("users", &["id"], &[("id", "int"), ("name", "varchar")]))
+        };
+        let m = analyze_edit(&r, schema);
+        assert_eq!(
+            m.insert_target().map(|t| t.confirm_cols.clone()),
+            Some(vec![])
+        );
     }
 
     /// The implicit key is the last resort, never a shortcut past a real one:

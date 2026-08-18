@@ -53,7 +53,7 @@
 //! the burden of skipping it on export, copy and every aggregate. See
 //! [`implicit_row_key`] for why the *spelling* is chosen rather than fixed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use rusqlite::types::ValueRef;
@@ -96,15 +96,26 @@ fn query_err(e: rusqlite::Error) -> DbError {
 /// distance: a mistyped path would silently produce an empty database and present
 /// it as a connection that worked, and the user would go looking for their tables
 /// in a file that never had any. A missing file is an error here, and says so.
+///
+/// **`SQLITE_OPEN_URI` is absent in a release build**, and present only under
+/// `cfg(test)`, where the shared in-memory databases the suites use are reached
+/// by a `file:name?mode=memory&cache=shared` URI. Setting it in production put a
+/// second, invisible meaning on the one field the user types: a saved path
+/// beginning `file:` would be parsed as a URI, so `file:reports?x` opens
+/// `reports` and quietly discards the rest — and `?mode=memory` on a real path
+/// opens a scratch database that accepts every write and keeps none.
 fn open(db: &Db) -> Result<SqliteConn, DbError> {
     if db.file.trim().is_empty() {
         return Err(DbError::Connect("no database file is set".to_string()));
     }
-    SqliteConn::open_with_flags(
-        &db.file,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(|e| DbError::Connect(format!("{}: {e}", db.file)))
+    #[allow(unused_mut)]
+    let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE;
+    #[cfg(test)]
+    {
+        flags |= OpenFlags::SQLITE_OPEN_URI;
+    }
+    SqliteConn::open_with_flags(&db.file, flags)
+        .map_err(|e| DbError::Connect(format!("{}: {e}", db.file)))
 }
 
 /// Run `f` against a fresh connection on a blocking thread.
@@ -287,10 +298,36 @@ fn attach_origins(conn: &SqliteConn, sql: &str, columns: &mut [Column]) {
             // editing system must treat such a column as read-only — the same call
             // the other two engines make for a binary charset. It is the
             // *declared* type that decides, since that is what the column is for.
-            binary: ci.type_name.eq_ignore_ascii_case("BLOB"),
+            binary: declares_bytes(&ci.type_name),
             implicit_key: false,
         });
     }
+}
+
+/// Is a column declared `declared` one the grid must never let anyone type
+/// over — a column meant to hold raw bytes?
+///
+/// **Not an equality test against `"BLOB"`.** SQLite's declared type is
+/// arbitrary text, so the same intent is written `BLOB`, `MEDIUMBLOB`,
+/// `VARBINARY(16)`, or — idiomatically — as nothing at all. Every one of those
+/// stores raw bytes, [`value_of`] renders them all as `<N bytes>`, and a column
+/// this answers `false` for is *editable*: committing that placeholder writes
+/// the literal text over the data, and Duplicate row does it with no cell edit
+/// at all.
+///
+/// So it asks two questions, in the order that makes each one cheap to justify:
+/// SQLite's own [`sqlite_affinity`] rule, which covers every `…BLOB…` spelling
+/// and the untyped column; then the `BINARY` family, which SQLite gives NUMERIC
+/// affinity but which nobody writes meaning anything but bytes.
+///
+/// What it still cannot see is a blob stored in a column declared `TEXT` —
+/// SQLite permits that, and only a `Value` variant for bytes would catch it.
+/// Widening here is safe in the one direction that matters: a column wrongly
+/// called binary is read-only, never wrongly writable.
+fn declares_bytes(declared: &str) -> bool {
+    use schemaic_core::schema::{SqliteAffinity, sqlite_affinity};
+    sqlite_affinity(declared) == SqliteAffinity::Blob
+        || declared.to_ascii_uppercase().contains("BINARY")
 }
 
 /// The names SQLite accepts for a rowid table's implicit key, in the order a
@@ -317,6 +354,25 @@ fn has_rowid(conn: &SqliteConn, table: &str) -> bool {
     wr == Some(0)
 }
 
+/// `(without_rowid, strict)` for `table`, from the same `pragma_table_list` row
+/// [`has_rowid`] reads.
+///
+/// Both default to `false` when the row can't be read — the shape of an ordinary
+/// table, which is the conservative answer: emitting a clause a table doesn't
+/// have would change it, while omitting one it does have is the failure the
+/// caller's own emitter is now guarded against by the round-trip gate.
+///
+/// `strict` arrived in SQLite 3.37; on an older library the column is absent and
+/// the query fails, which lands on the same `false`.
+fn table_list_flags(conn: &SqliteConn, table: &str) -> (bool, bool) {
+    conn.query_row(
+        "SELECT wr, strict FROM pragma_table_list(?1) WHERE schema = ?2 AND type = 'table'",
+        rusqlite::params![table, MAIN],
+        |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)? != 0)),
+    )
+    .unwrap_or((false, false))
+}
+
 /// The spelling of `table`'s implicit row key to project, or `None` for a table
 /// that has none to reach.
 ///
@@ -339,10 +395,17 @@ fn implicit_row_key(columns: &[ColumnInfo], has_rowid: bool) -> Option<String> {
 }
 
 /// Is this name a view rather than a base table? `None` when it is neither.
+///
+/// **Matched case-insensitively**, because SQLite resolves an object name that
+/// way and every other lookup on this path already does. A case-sensitive `=`
+/// here made `SELECT * FROM ARTIST` fall to the caller's "don't attribute"
+/// answer and open read-only, while `SELECT * FROM artist` was editable — the
+/// same table, decided by how the user typed it.
 fn is_view(conn: &SqliteConn, name: &str) -> Result<bool, DbError> {
     let kind: Option<String> = conn
         .query_row(
-            "SELECT type FROM sqlite_master WHERE name = ?1 AND type IN ('table','view')",
+            "SELECT type FROM sqlite_master \
+             WHERE name = ?1 COLLATE NOCASE AND type IN ('table','view')",
             [name],
             |r| r.get(0),
         )
@@ -785,8 +848,13 @@ pub(crate) async fn run_ddl(
     stmts: &[String],
     cancel: CancellationToken,
 ) -> Result<(), crate::DdlError> {
+    // **The shadow table is ours, not the user's.** A rebuild's copy step fails
+    // with `NOT NULL constraint failed: t_schemaic_rebuild.c` — naming an object
+    // that exists between two statements of a script they may not have read. The
+    // engine's message is otherwise the most useful thing there is, so only the
+    // name is changed (`ddl::unshadow`).
     let fail = |at: usize, message: String| crate::DdlError {
-        message,
+        message: schemaic_core::ddl::unshadow(&message),
         at,
         applied: 0,
     };
@@ -816,7 +884,25 @@ pub(crate) async fn run_ddl(
         // reference dangling, which is a stricter question than the per-statement
         // one — a plan is allowed to pass through states no single statement
         // could.
+        //
+        // A rebuild plan carries the same pragma as its first and last statement
+        // (`ddl::FK_OFF`/`FK_ON`), because that list is also what the preview's
+        // Copy and "Open in editor" hand to a query tab. Both are silently
+        // ignored here — SQLite ignores the pragma inside a transaction — which
+        // is exactly why this one has to stay.
         let _ = conn.execute_batch("PRAGMA foreign_keys = OFF");
+
+        // **What was already broken is not the plan's fault.** A `.db` written by
+        // the sqlite3 CLI — where foreign keys are off by default — very commonly
+        // carries a child row whose parent is gone, and
+        // `pragma_foreign_key_check` scans the *whole database*: without this,
+        // adding a column to an unrelated third table was refused with "the plan
+        // leaves a foreign key pointing at nothing", and every DDL operation on
+        // that file failed the same way for ever. Taken before `BEGIN` so it
+        // describes the state the plan inherited, and compared below so only a
+        // violation the plan *added* refuses it.
+        let inherited = fk_violations(&conn).unwrap_or_default();
+
         conn.execute_batch("BEGIN")
             .map_err(|e| fail(0, format!("{e}")))?;
 
@@ -833,7 +919,12 @@ pub(crate) async fn run_ddl(
             // The last statement's index, so a violation is reported against the
             // plan rather than against nothing.
             let last = stmts.len() - 1;
-            if let Some(row) = first_fk_violation(&conn).map_err(|e| fail(last, format!("{e}")))? {
+            let now = fk_violations(&conn).map_err(|e| fail(last, format!("{e}")))?;
+            // Only what the plan *added*. A row that was already dangling before
+            // `BEGIN` came with the file, and refusing for it would take the whole
+            // DDL feature away from a database whose bad row has nothing to do
+            // with the edit.
+            if let Some(row) = now.added_since(&inherited) {
                 return Err(fail(
                     last,
                     format!("the plan leaves a foreign key pointing at nothing: {row}"),
@@ -862,32 +953,86 @@ pub(crate) async fn run_ddl(
     })
 }
 
-/// The first foreign-key violation in the database, described, or `None` when
-/// there is none.
+/// Every dangling foreign-key row in the database, as identities that can be
+/// compared between two readings.
 ///
 /// `PRAGMA foreign_key_check` returns one row per violation — the child table,
-/// the rowid, the parent it names, and which of that table's foreign keys it
-/// was. One is enough to refuse the plan, and naming it is what makes the
-/// refusal actionable rather than a bare "constraint failed".
-fn first_fk_violation(conn: &SqliteConn) -> Result<Option<String>, DbError> {
+/// the child's rowid, the parent it names, and which of that table's foreign keys
+/// it was. Those four *are* the identity, which is what lets `run_ddl` ask the
+/// only question worth asking: is this one the plan's doing, or was it here
+/// already?
+#[derive(Debug, Default)]
+struct FkViolations {
+    /// `(table, rowid, parent, fkid)` per violation.
+    rows: HashSet<(String, Option<i64>, Option<String>, i64)>,
+    /// The reading was truncated at [`FK_SCAN_CAP`] — see [`Self::added_since`].
+    truncated: bool,
+}
+
+/// How many violations are read back before the scan gives up.
+///
+/// A database with more than this many dangling rows is already broken in a way
+/// no DDL plan is going to make meaningfully worse, and reading all of them into
+/// memory to prove it would be the expensive half of every apply.
+const FK_SCAN_CAP: usize = 10_000;
+
+impl FkViolations {
+    /// One violation present here and not in `before`, described for the user —
+    /// or `None` when this reading adds nothing.
+    ///
+    /// When either reading was truncated the set comparison can't be trusted, so
+    /// it falls back to the count: more violations than before is still an
+    /// answer, and equal-or-fewer on an already-broken database is not something
+    /// to refuse a plan over.
+    fn added_since(&self, before: &FkViolations) -> Option<String> {
+        if self.truncated || before.truncated {
+            return (self.rows.len() > before.rows.len())
+                .then(|| self.rows.iter().next().map(describe_fk_row))
+                .flatten();
+        }
+        self.rows
+            .difference(&before.rows)
+            .next()
+            .map(describe_fk_row)
+    }
+}
+
+/// One violation row, in the words the refusal uses — naming the child table is
+/// what makes it actionable rather than a bare "constraint failed".
+fn describe_fk_row(row: &(String, Option<i64>, Option<String>, i64)) -> String {
+    match &row.2 {
+        Some(p) => format!("a row in {} refers to {p}", row.0),
+        None => format!("a row in {}", row.0),
+    }
+}
+
+/// Read the whole database's dangling foreign-key rows.
+fn fk_violations(conn: &SqliteConn) -> Result<FkViolations, DbError> {
     let mut stmt = conn
-        .prepare("SELECT \"table\", \"parent\" FROM pragma_foreign_key_check() LIMIT 1")
+        .prepare(
+            "SELECT \"table\", \"rowid\", \"parent\", \"fkid\" \
+             FROM pragma_foreign_key_check() LIMIT ?1",
+        )
         .map_err(query_err)?;
-    let mut rows = stmt
-        .query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+    let rows = stmt
+        .query_map([FK_SCAN_CAP as i64 + 1], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<i64>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
         })
         .map_err(query_err)?;
-    match rows.next() {
-        None => Ok(None),
-        Some(row) => {
-            let (child, parent) = row.map_err(query_err)?;
-            Ok(Some(match parent {
-                Some(p) => format!("a row in {child} refers to {p}"),
-                None => format!("a row in {child}"),
-            }))
+    let mut out = FkViolations::default();
+    for row in rows {
+        out.rows.insert(row.map_err(query_err)?);
+        if out.rows.len() > FK_SCAN_CAP {
+            out.truncated = true;
+            break;
         }
     }
+    Ok(out)
 }
 
 /// The databases this connection offers: the one file, under the name SQLite
@@ -976,6 +1121,15 @@ pub(crate) async fn fetch_schema(db: &Db) -> Result<DbSchema, DbError> {
             let implicit_key = (!is_view)
                 .then(|| implicit_row_key(&columns, has_rowid(conn, &name)))
                 .flatten();
+            // The two clauses that change what the table *is*. Both are in the
+            // `pragma_table_list` row `has_rowid` already reads, and both are
+            // modelled because the rebuild writes the table back from the model:
+            // one the model doesn't carry is one the edit silently drops.
+            let (without_rowid, strict) = if is_view {
+                (false, false)
+            } else {
+                table_list_flags(conn, &name)
+            };
             // One read of the catalogue, two things made from it — the model the
             // *editor* diffs, and the statements a *rebuild* replays. They are
             // not redundant: see `TableInfo::dependent_ddl` for why a rebuild
@@ -986,12 +1140,15 @@ pub(crate) async fn fetch_schema(db: &Db) -> Result<DbSchema, DbError> {
             // `INSTEAD OF` trigger is the only way a SQLite view is written to,
             // and it hangs off the view.
             let triggers = triggers_of(&trigger_sql);
-            // What a rebuild has to put back, which is a table's business only.
-            let dependent_ddl = if is_view {
-                Vec::new()
-            } else {
-                trigger_statements(&trigger_sql)
-            };
+            // What a re-create has to put back. A **table**'s rebuild drops the
+            // table and its triggers go with it; a **view**'s edit is a
+            // `DROP VIEW` + `CREATE VIEW` on this engine, because SQLite has no
+            // `CREATE OR REPLACE VIEW`, and SQLite drops a view's `INSTEAD OF`
+            // triggers with the view too. That is the only way a SQLite view is
+            // written to at all, and the text is unrecoverable once the drop has
+            // run — so it is collected here for both, and `ChangeSet` replays it
+            // in both places.
+            let dependent_ddl = trigger_statements(&trigger_sql);
             tables.push(TableInfo {
                 name,
                 schema: None,
@@ -1023,6 +1180,8 @@ pub(crate) async fn fetch_schema(db: &Db) -> Result<DbSchema, DbError> {
                 check_constraints: if is_view { Vec::new() } else { checks_of(&sql) },
                 triggers,
                 dependent_ddl,
+                without_rowid,
+                strict,
             });
         }
         Ok(DbSchema {
@@ -1106,6 +1265,14 @@ fn master_entries(conn: &SqliteConn) -> Result<Vec<(String, String, String)>, Db
 /// refuses, failing the whole transaction. `hidden = 1` is a virtual table's
 /// hidden column and is skipped: it isn't part of the table as declared.
 fn table_columns(conn: &SqliteConn, table: &str) -> Result<Vec<ColumnInfo>, DbError> {
+    // `coll` is what makes a column's `COLLATE NOCASE` survive a rebuild — the
+    // rebuild writes the table from this model, so a collation the model doesn't
+    // carry is one the edit silently drops, and `'A' = 'a'` stops being true.
+    // `pragma_table_xinfo` has no `coll`; `pragma_table_info` has none either.
+    // It comes from the table's own `CREATE` text (see `collations_of`).
+    let collations = collations_of(conn, table)?;
+    let has_rowid = has_rowid(conn, table);
+    let declared_autoincrement = table_declares_autoincrement(conn, table);
     let mut stmt = conn
         .prepare(
             "SELECT name, type, \"notnull\", dflt_value, pk, hidden FROM pragma_table_xinfo(?1)",
@@ -1124,21 +1291,36 @@ fn table_columns(conn: &SqliteConn, table: &str) -> Result<Vec<ColumnInfo>, DbEr
         })
         .map_err(query_err)?;
 
-    let mut out = Vec::new();
+    let mut rows_out = Vec::new();
     for row in rows {
-        let (name, type_name, notnull, default, pk, hidden) = row.map_err(query_err)?;
+        rows_out.push(row.map_err(query_err)?);
+    }
+    // How many columns the primary key has. An `INTEGER PRIMARY KEY` is the
+    // rowid only when it is the *whole* key: `PRIMARY KEY (a, b)` over two
+    // INTEGER columns assigns neither, and neither does a `WITHOUT ROWID`
+    // table's key. Reading each column on its own said "server-assigned" for
+    // both, and the grid then dropped those columns from its `INSERT` — so
+    // duplicating a junction row wrote `(NULL, NULL)`.
+    let key_width = rows_out.iter().filter(|r| r.4).count();
+
+    let mut out = Vec::new();
+    for (name, type_name, notnull, default, pk, hidden) in rows_out {
         if hidden == 1 {
             continue; // a virtual table's hidden column — not part of the declaration
         }
+        // 2 = VIRTUAL, 3 = STORED. The two values *are* the distinction, and
+        // collapsing them turned a materialised column back into a computed one.
         let generated = (hidden == 2 || hidden == 3)
             .then(|| generated_expr(conn, table, &name))
             .flatten();
         // `AUTOINCREMENT` is a separate keyword, but an `INTEGER PRIMARY KEY` is
         // the rowid and is server-assigned whether or not it is present — which is
-        // what this flag is asked about, so both count.
-        let auto_increment = pk && type_name.eq_ignore_ascii_case("INTEGER");
+        // what this flag is asked about, so both count. It has to be the sole key
+        // column of a rowid table, though: that is what makes it the rowid.
+        let rowid_alias =
+            pk && key_width == 1 && has_rowid && type_name.eq_ignore_ascii_case("INTEGER");
         out.push(ColumnInfo {
-            name,
+            name: name.clone(),
             type_name,
             // A PK column is NOT NULL in every SQL engine — except SQLite, where
             // an `INTEGER PRIMARY KEY` is the rowid and everything else declared
@@ -1148,15 +1330,28 @@ fn table_columns(conn: &SqliteConn, table: &str) -> Result<Vec<ColumnInfo>, DbEr
             nullable: !notnull,
             primary_key: pk,
             default,
-            auto_increment,
+            auto_increment: rowid_alias,
+            sqlite_autoincrement: rowid_alias && declared_autoincrement,
             identity_always: false,
             generated,
+            generated_stored: hidden == 3,
             on_update: None,
             comment: None,
-            collation: None,
+            collation: collations.get(&name.to_ascii_lowercase()).cloned(),
         });
     }
     Ok(out)
+}
+
+/// [`declares_autoincrement`] against the table's stored declaration.
+fn table_declares_autoincrement(conn: &SqliteConn, table: &str) -> bool {
+    conn.query_row(
+        "SELECT COALESCE(sql, '') FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |r| r.get::<_, String>(0),
+    )
+    .map(|sql| declares_autoincrement(&sql))
+    .unwrap_or(false)
 }
 
 /// The `CREATE INDEX` statements SQLite stores for `table`, each terminated and
@@ -1187,10 +1382,21 @@ fn index_sql(conn: &SqliteConn, table: &str) -> Result<Vec<(String, String)>, Db
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(query_err)
         // SQLite stores the statement without its terminator; every consumer
-        // here is stringing statements together, so it goes back on once.
+        // here is stringing statements together, so it goes back on once —
+        // through `sql::terminated`, because an index's stored text keeps the
+        // author's own trailing `-- comment` and a `;` trimmed onto the end of
+        // that is commented out, taking the *next* statement with it.
         .map(|v| {
             v.into_iter()
-                .map(|(n, s)| (n, format!("{};", s.trim().trim_end_matches(';'))))
+                .map(|(n, s)| {
+                    (
+                        n,
+                        schemaic_core::sql::terminated(
+                            &s,
+                            schemaic_core::intel::SqlDialect::Sqlite,
+                        ),
+                    )
+                })
                 .collect()
         })
 }
@@ -1208,8 +1414,11 @@ fn trigger_statements(raw: &[String]) -> Vec<String> {
     raw.iter()
         // SQLite stores the statement without its terminator, and a trigger body
         // is full of internal `;` — so the one that ends it has to be added back
-        // or the replay runs into whatever follows.
-        .map(|s| format!("{};", s.trim().trim_end_matches(';')))
+        // or the replay runs into whatever follows. Through `sql::terminated`,
+        // the same guard `index_sql` needs: a trigger's stored text is truncated
+        // at its last token today, but that is the engine's choice and not a
+        // property of this code, and getting it wrong here fails a *rebuild*.
+        .map(|s| schemaic_core::sql::terminated(s, schemaic_core::intel::SqlDialect::Sqlite))
         .collect()
 }
 
@@ -1474,6 +1683,151 @@ fn generated_expr_of(create_sql: &str, column: &str) -> Option<String> {
     None
 }
 
+/// Each column's explicit `COLLATE`, keyed by lower-cased column name.
+///
+/// **No pragma reports it.** `table_xinfo` has no `coll` column and
+/// `index_xinfo`'s is the index's, not the column's — so, exactly as with
+/// [`checks_of`] and [`generated_expr_of`], the table's own `CREATE` text is the
+/// only source. The cost of not reading it is that the rebuild writes the table
+/// back without the clause: a `COLLATE NOCASE` column silently becomes
+/// case-sensitive, and every comparison the user relies on changes meaning.
+///
+/// Read at the item's own paren depth only, so a `COLLATE` inside a `CHECK`
+/// predicate or an index expression can't be mistaken for a column's.
+fn collations_of(conn: &SqliteConn, table: &str) -> Result<HashMap<String, String>, DbError> {
+    let sql: String = conn
+        .query_row(
+            "SELECT COALESCE(sql, '') FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    Ok(collations_of_text(&sql))
+}
+
+/// The pure reader behind [`collations_of`].
+fn collations_of_text(create_sql: &str) -> HashMap<String, String> {
+    use schemaic_core::intel::SqlDialect;
+    use schemaic_core::sql::{is_word_byte, is_word_start, skip_noncode};
+
+    let b = create_sql.as_bytes();
+    let mut out = HashMap::new();
+    let mut i = 0usize;
+    let body = loop {
+        if i >= b.len() {
+            return out;
+        }
+        if let Some(j) = skip_noncode(b, i, SqlDialect::Sqlite) {
+            i = j.max(i + 1);
+            continue;
+        }
+        if b[i] == b'(' {
+            break i + 1;
+        }
+        i += 1;
+    };
+
+    let mut i = body;
+    let mut depth = 1i32;
+    // The first identifier of the current item, which for a column declaration
+    // is its name. Reset at every top-level comma, so a table constraint's
+    // keyword can't be filed as a column.
+    let mut column: Option<String> = None;
+    let mut first = true;
+    while i < b.len() && depth > 0 {
+        if let Some(j) = skip_noncode(b, i, SqlDialect::Sqlite) {
+            i = j.max(i + 1);
+            continue;
+        }
+        match b[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+                continue;
+            }
+            b',' if depth == 1 => {
+                column = None;
+                first = true;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if depth == 1 && first {
+            let (name, next) = ident_at(create_sql, i);
+            if let Some(n) = name {
+                column = Some(n);
+                first = false;
+                i = next;
+                continue;
+            }
+        }
+        if !is_word_start(b[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i + 1;
+        while end < b.len() && is_word_byte(b[end]) {
+            end += 1;
+        }
+        if depth == 1
+            && create_sql[start..end].eq_ignore_ascii_case("COLLATE")
+            && let Some(col) = column.as_deref()
+        {
+            let (name, next) = ident_at(create_sql, end);
+            if let Some(n) = name {
+                out.insert(col.to_ascii_lowercase(), n);
+                i = next;
+                continue;
+            }
+        }
+        i = end;
+    }
+    out
+}
+
+/// Does this table's declaration carry the `AUTOINCREMENT` keyword?
+///
+/// SQLite publishes no pragma for it, and `sqlite_sequence` is not the answer
+/// either: the engine writes a row there only once a row has been inserted, so
+/// an empty `AUTOINCREMENT` table would read as an ordinary one and lose the
+/// keyword on the first rebuild. The declaration is the authority, read through
+/// the shared boundary lexer as a whole word so a column named
+/// `autoincrement_note` — or the word inside a string or a comment — can't match.
+fn declares_autoincrement(create_sql: &str) -> bool {
+    use schemaic_core::intel::SqlDialect;
+    use schemaic_core::sql::{is_word_byte, is_word_start, skip_noncode};
+
+    let b = create_sql.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, SqlDialect::Sqlite) {
+            i = j.max(i + 1);
+            continue;
+        }
+        if !is_word_start(b[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i + 1;
+        while end < b.len() && is_word_byte(b[end]) {
+            end += 1;
+        }
+        if create_sql[start..end].eq_ignore_ascii_case("AUTOINCREMENT") {
+            return true;
+        }
+        i = end;
+    }
+    false
+}
+
 /// Every `CHECK` constraint a table declares, in declaration order.
 ///
 /// **No pragma exposes these**, so the table's own `CREATE TABLE` text is the
@@ -1559,6 +1913,30 @@ fn checks_of(create_sql: &str) -> Vec<CheckInfo> {
             i = next;
             continue;
         }
+        // **A name belongs to the constraint it introduces, and to no other.**
+        // `a TEXT CONSTRAINT nn_a NOT NULL CHECK (a <> '')` names the *NOT NULL*;
+        // clearing `pending` only at the comma let the bare `CHECK` beside it
+        // inherit `nn_a`, so a rebuild wrote `CONSTRAINT "nn_a" CHECK (…)` and
+        // gave the table a name it never gave itself — silently and permanently,
+        // since SQLite accepts it. Any constraint keyword that isn't `CHECK`
+        // consumes the pending name.
+        if depth == 1
+            && matches!(
+                word.to_ascii_uppercase().as_str(),
+                "NOT"
+                    | "NULL"
+                    | "UNIQUE"
+                    | "PRIMARY"
+                    | "REFERENCES"
+                    | "DEFAULT"
+                    | "COLLATE"
+                    | "GENERATED"
+            )
+        {
+            pending = None;
+            i = end;
+            continue;
+        }
         if depth == 1 && word.eq_ignore_ascii_case("CHECK") {
             let mut k = end;
             while k < b.len() && b[k].is_ascii_whitespace() {
@@ -1585,52 +1963,15 @@ fn checks_of(create_sql: &str) -> Vec<CheckInfo> {
 }
 
 /// The identifier starting at or after `at`, unquoted, and the offset just past
-/// it. SQLite accepts four spellings of a quoted name (`"x"`, `` `x` ``, `[x]`
-/// and `'x'`), and a doubled quote inside one is a literal quote.
+/// it.
+///
+/// A thin alias for [`schemaic_core::sql::ident_at`], which owns the rule. It
+/// used to be a second copy — its own quote table, its own doubling rule, its own
+/// `]`-has-no-escape exception — and the copy had already drifted: its bare arm
+/// looped on `is_word_byte` alone, so `CONSTRAINT 3way` read back a constraint
+/// named `3way`, a name no engine would accept.
 fn ident_at(sql: &str, at: usize) -> (Option<String>, usize) {
-    let b = sql.as_bytes();
-    let mut i = at;
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i >= b.len() {
-        return (None, i);
-    }
-    let close = match b[i] {
-        b'"' => b'"',
-        b'`' => b'`',
-        b'\'' => b'\'',
-        b'[' => b']',
-        _ => {
-            let start = i;
-            while i < b.len() && schemaic_core::sql::is_word_byte(b[i]) {
-                i += 1;
-            }
-            return if i > start {
-                (Some(sql[start..i].to_string()), i)
-            } else {
-                (None, i)
-            };
-        }
-    };
-    let mut name = String::new();
-    i += 1;
-    while i < b.len() {
-        if b[i] == close {
-            // A doubled closing quote is one literal character — `[x]` has no
-            // such rule, its content simply runs to the first `]`.
-            if close != b']' && b.get(i + 1) == Some(&close) {
-                name.push(close as char);
-                i += 2;
-                continue;
-            }
-            return (Some(name), i + 1);
-        }
-        let ch_len = sql[i..].chars().next().map_or(1, char::len_utf8);
-        name.push_str(&sql[i..i + ch_len]);
-        i += ch_len;
-    }
-    (Some(name), i)
+    schemaic_core::sql::ident_at(sql, at, schemaic_core::intel::SqlDialect::Sqlite)
 }
 
 /// From `at`, scan forward for `AS (` at a code position and return the text
@@ -1698,6 +2039,7 @@ fn as_expression(sql: &str, at: usize) -> Option<String> {
 /// is the only complete record of the ones the pragmas read `lossy`.
 fn table_indexes(conn: &SqliteConn, table: &str) -> Result<Vec<IndexInfo>, DbError> {
     let declared: HashMap<String, String> = index_sql(conn, table)?.into_iter().collect();
+    let column_collations = collations_of(conn, table)?;
     let mut stmt = conn
         .prepare("SELECT name, \"unique\", origin, partial FROM pragma_index_list(?1)")
         .map_err(query_err)?;
@@ -1716,7 +2058,7 @@ fn table_indexes(conn: &SqliteConn, table: &str) -> Result<Vec<IndexInfo>, DbErr
 
     let mut out = Vec::new();
     for (name, unique, origin, partial) in rows {
-        let (columns, dropped_expression) = index_columns(conn, &name)?;
+        let (columns, dropped_expression) = index_columns(conn, &name, &column_collations)?;
         let is_pk = origin == "pk";
         out.push(IndexInfo {
             name: if is_pk {
@@ -1751,9 +2093,19 @@ fn table_indexes(conn: &SqliteConn, table: &str) -> Result<Vec<IndexInfo>, DbErr
 /// One index's key columns, in key order, plus whether an **expression** key was
 /// dropped — which the caller records as `lossy`, since recreating the index
 /// without it would silently change what it indexes.
-fn index_columns(conn: &SqliteConn, index: &str) -> Result<(Vec<IndexColumn>, bool), DbError> {
+/// `column_collations` is the table's own per-column `COLLATE` (see
+/// [`collations_of`]), which is what makes the index's `coll` readable: the
+/// pragma reports the *effective* collation of each key, so it says `NOCASE` both
+/// for `CREATE INDEX … (email COLLATE NOCASE)` and for a plain index over a
+/// column already declared `COLLATE NOCASE`. Only the first is the index's own,
+/// and only the first has to be restated.
+fn index_columns(
+    conn: &SqliteConn,
+    index: &str,
+    column_collations: &HashMap<String, String>,
+) -> Result<(Vec<IndexColumn>, bool), DbError> {
     let mut stmt = conn
-        .prepare("SELECT name, desc, key FROM pragma_index_xinfo(?1) ORDER BY seqno")
+        .prepare("SELECT name, desc, key, coll FROM pragma_index_xinfo(?1) ORDER BY seqno")
         .map_err(query_err)?;
     let rows = stmt
         .query_map([index], |r| {
@@ -1761,6 +2113,7 @@ fn index_columns(conn: &SqliteConn, index: &str) -> Result<(Vec<IndexColumn>, bo
                 r.get::<_, Option<String>>(0)?,
                 r.get::<_, i64>(1)? != 0,
                 r.get::<_, i64>(2)? != 0,
+                r.get::<_, Option<String>>(3)?,
             ))
         })
         .map_err(query_err)?;
@@ -1768,7 +2121,7 @@ fn index_columns(conn: &SqliteConn, index: &str) -> Result<(Vec<IndexColumn>, bo
     let mut out = Vec::new();
     let mut dropped_expression = false;
     for row in rows {
-        let (name, descending, key) = row.map_err(query_err)?;
+        let (name, descending, key, coll) = row.map_err(query_err)?;
         if !key {
             continue; // an implicitly carried rowid, not a declared key column
         }
@@ -1779,11 +2132,21 @@ fn index_columns(conn: &SqliteConn, index: &str) -> Result<(Vec<IndexColumn>, bo
             dropped_expression = true;
             continue;
         };
+        // What the column would collate as on its own — `BINARY` unless the
+        // table declares otherwise. Anything else is the index's own clause, and
+        // dropping it is what turns a case-insensitive UNIQUE index into a
+        // case-sensitive one without a word.
+        let column_default = column_collations
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
+            .unwrap_or("BINARY");
+        let collation = coll.filter(|c| !c.eq_ignore_ascii_case(column_default));
         out.push(IndexColumn {
             name,
             prefix: None,
             descending,
             expression: false,
+            collation,
         });
     }
     Ok((out, dropped_expression))
@@ -1949,6 +2312,156 @@ mod tests {
             .unwrap();
         let rs = run_query(&conn, "SELECT b FROM t", 10).unwrap();
         assert_eq!(rs.cell(0, 0).expect("cell").display(), "<3 bytes>");
+    }
+
+    /// **`auto_increment` means "the engine fills this in", and only a rowid
+    /// alias does.** A single `INTEGER PRIMARY KEY` in a rowid table is one;
+    /// each column of a composite `INTEGER` key is not, and neither is a
+    /// `WITHOUT ROWID` table's key. The grid leaves a server-assigned column out
+    /// of its `INSERT`, so calling both columns of a junction table
+    /// auto-increment made Duplicate row write `(NULL, NULL)`.
+    #[test]
+    fn only_a_rowid_alias_is_server_assigned() {
+        let conn = SqliteConn::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE solo (id INTEGER PRIMARY KEY, n TEXT);
+             CREATE TABLE pair (a INTEGER, b INTEGER, PRIMARY KEY (a, b));
+             CREATE TABLE wr (k INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID;
+             CREATE TABLE texty (k TEXT PRIMARY KEY);",
+        )
+        .unwrap();
+        let flags = |t: &str| -> Vec<(String, bool)> {
+            table_columns(&conn, t)
+                .unwrap()
+                .into_iter()
+                .map(|c| (c.name, c.auto_increment))
+                .collect()
+        };
+        assert_eq!(
+            flags("solo"),
+            vec![("id".to_string(), true), ("n".to_string(), false)]
+        );
+        assert_eq!(
+            flags("pair"),
+            vec![("a".to_string(), false), ("b".to_string(), false)],
+            "neither column of a composite key is assigned"
+        );
+        assert_eq!(
+            flags("wr"),
+            vec![("k".to_string(), false), ("v".to_string(), false)],
+            "a WITHOUT ROWID key is the user's to supply"
+        );
+        assert_eq!(flags("texty"), vec![("k".to_string(), false)]);
+    }
+
+    /// The keyword is a narrower claim than "server-assigned", and it is read
+    /// from the declaration — `sqlite_sequence` has no row until something has
+    /// been inserted, so an empty table would have lost it.
+    #[test]
+    fn autoincrement_is_read_from_the_declaration() {
+        let conn = SqliteConn::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE plain (id INTEGER PRIMARY KEY);
+             CREATE TABLE keyed (id INTEGER PRIMARY KEY AUTOINCREMENT);
+             CREATE TABLE decoy (id INTEGER PRIMARY KEY, autoincrement_note TEXT);",
+        )
+        .unwrap();
+        let keyword = |t: &str| table_columns(&conn, t).unwrap()[0].sqlite_autoincrement;
+        assert!(!keyword("plain"));
+        assert!(keyword("keyed"), "and no row exists in sqlite_sequence yet");
+        assert!(!keyword("decoy"), "a column name is not the keyword");
+    }
+
+    /// The two `pragma_table_xinfo.hidden` values *are* the VIRTUAL/STORED
+    /// distinction, and collapsing them un-materialises a stored column.
+    #[test]
+    fn a_generated_column_reports_which_kind_it_is() {
+        let conn = SqliteConn::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE g (a INTEGER,
+                             s INTEGER GENERATED ALWAYS AS (a*2) STORED,
+                             v INTEGER GENERATED ALWAYS AS (a+1) VIRTUAL);",
+        )
+        .unwrap();
+        let cols = table_columns(&conn, "g").unwrap();
+        let of = |n: &str| cols.iter().find(|c| c.name == n).unwrap().generated_stored;
+        assert!(!of("a"), "not generated at all");
+        assert!(of("s"));
+        assert!(!of("v"));
+    }
+
+    /// No pragma reports a column's `COLLATE`, so it comes out of the table's own
+    /// declaration — and a rebuild that didn't carry it made every comparison on
+    /// the column case-sensitive again.
+    #[test]
+    fn a_columns_collation_is_read_from_the_declaration() {
+        let conn = SqliteConn::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE c (email TEXT COLLATE NOCASE,
+                             plain TEXT,
+                             note  TEXT DEFAULT 'collate rtrim',
+                             ck    TEXT CHECK (ck COLLATE NOCASE <> 'x'));",
+        )
+        .unwrap();
+        let cols = table_columns(&conn, "c").unwrap();
+        let of = |n: &str| cols.iter().find(|c| c.name == n).unwrap().collation.clone();
+        assert_eq!(of("email").as_deref(), Some("NOCASE"));
+        assert_eq!(of("plain"), None);
+        assert_eq!(of("note"), None, "the word inside a string literal");
+        assert_eq!(
+            of("ck"),
+            None,
+            "a COLLATE inside a CHECK is not the column's"
+        );
+    }
+
+    /// The two clauses that change what the table *is*, from the pragma row the
+    /// implicit key already reads.
+    #[test]
+    fn table_list_flags_reports_without_rowid_and_strict() {
+        let conn = SqliteConn::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE plain (a INTEGER);
+             CREATE TABLE wr (a TEXT PRIMARY KEY) WITHOUT ROWID;
+             CREATE TABLE st (a INTEGER) STRICT;
+             CREATE TABLE both (a TEXT PRIMARY KEY) WITHOUT ROWID, STRICT;",
+        )
+        .unwrap();
+        assert_eq!(table_list_flags(&conn, "plain"), (false, false));
+        assert_eq!(table_list_flags(&conn, "wr"), (true, false));
+        assert_eq!(table_list_flags(&conn, "st"), (false, true));
+        assert_eq!(table_list_flags(&conn, "both"), (true, true));
+        assert_eq!(table_list_flags(&conn, "gone"), (false, false));
+    }
+
+    /// An index's `COLLATE` is its own only when it differs from the column's —
+    /// the pragma reports the *effective* collation either way.
+    #[test]
+    fn an_index_reports_only_the_collation_it_states_itself() {
+        let conn = SqliteConn::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE m (email TEXT, ci TEXT COLLATE NOCASE);
+             CREATE INDEX ix_own    ON m (email COLLATE NOCASE);
+             CREATE INDEX ix_plain  ON m (email);
+             CREATE INDEX ix_column ON m (ci);",
+        )
+        .unwrap();
+        let ixs = table_indexes(&conn, "m").unwrap();
+        let coll = |n: &str| {
+            ixs.iter()
+                .find(|i| i.name == n)
+                .unwrap_or_else(|| panic!("{n}"))
+                .columns[0]
+                .collation
+                .clone()
+        };
+        assert_eq!(coll("ix_own").as_deref(), Some("NOCASE"));
+        assert_eq!(coll("ix_plain"), None);
+        assert_eq!(
+            coll("ix_column"),
+            None,
+            "the column already collates that way — restating it would be noise"
+        );
     }
 
     #[test]
@@ -2161,16 +2674,84 @@ mod tests {
         assert!(o.iter().all(|x| x.is_none()));
     }
 
+    /// **How the user typed the name is not part of what the table is.** SQLite
+    /// resolves an object name case-insensitively and every other lookup on this
+    /// path already does — a case-sensitive `is_view` made `SELECT * FROM ARTIST`
+    /// fall to "don't attribute" and open read-only, while `SELECT * FROM artist`
+    /// was editable.
+    #[test]
+    fn a_tables_provenance_does_not_depend_on_how_its_name_was_typed() {
+        let conn = seeded();
+        for sql in [
+            "SELECT id, name FROM artist",
+            "SELECT id, name FROM ARTIST",
+            "SELECT id, name FROM Artist",
+            r#"SELECT id, name FROM "ArTiSt""#,
+        ] {
+            let o = origins_for(&conn, sql);
+            assert!(
+                o.iter().all(|x| x.is_some()),
+                "{sql} should be editable: {o:?}"
+            );
+        }
+        // And a view stays read-only however it is typed.
+        for sql in ["SELECT id, title FROM big", "SELECT id, title FROM BIG"] {
+            assert!(origins_for(&conn, sql).iter().all(|x| x.is_none()), "{sql}");
+        }
+    }
+
     /// A BLOB cell renders as its size and cannot round-trip, so its column is
     /// marked binary — the call the other two engines make for a binary charset.
+    ///
+    /// **Every spelling of it.** SQLite's declared type is arbitrary text, so
+    /// asking `== "BLOB"` leaves `MEDIUMBLOB`, `VARBINARY(16)` and the untyped
+    /// column — all of which hold raw bytes — *editable*, and committing the
+    /// rendered `<N bytes>` writes that text over the data. Duplicate row does
+    /// it with no cell edit at all.
     #[test]
     fn a_blob_column_is_marked_binary_and_so_read_only() {
         let conn = SqliteConn::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB);")
+        conn.execute_batch(
+            "CREATE TABLE t (
+                 id    INTEGER PRIMARY KEY,
+                 b     BLOB,
+                 med   MEDIUMBLOB,
+                 vb    VARBINARY(16),
+                 bin   BINARY(8),
+                 bare,
+                 label TEXT,
+                 n     REAL
+             );",
+        )
+        .unwrap();
+        let o = origins_for(&conn, "SELECT id, b, med, vb, bin, bare, label, n FROM t");
+        let binary: Vec<bool> = o.iter().map(|x| x.as_ref().unwrap().binary).collect();
+        assert_eq!(
+            binary,
+            vec![false, true, true, true, true, true, false, false]
+        );
+    }
+
+    /// The value really is a blob in each of those columns — the premise the
+    /// test above rests on, asked of SQLite rather than assumed.
+    #[test]
+    fn every_one_of_those_spellings_really_stores_bytes() {
+        let conn = SqliteConn::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (b BLOB, med MEDIUMBLOB, vb VARBINARY(16), bin BINARY(8), bare);
+             INSERT INTO t VALUES (x'00ff00ff', x'00ff00ff', x'00ff00ff', x'00ff00ff', x'00ff00ff');",
+        )
+        .unwrap();
+        let kinds: Vec<String> = conn
+            .prepare("SELECT typeof(b), typeof(med), typeof(vb), typeof(bin), typeof(bare) FROM t")
+            .unwrap()
+            .query_row([], |r| {
+                Ok((0..5)
+                    .map(|i| r.get::<_, String>(i).unwrap())
+                    .collect::<Vec<_>>())
+            })
             .unwrap();
-        let o = origins_for(&conn, "SELECT id, b FROM t");
-        assert!(!o[0].as_ref().unwrap().binary);
-        assert!(o[1].as_ref().unwrap().binary);
+        assert_eq!(kinds, vec!["blob"; 5]);
     }
 
     // ── the reserved-word lists, checked against SQLite itself ────────────
@@ -2612,19 +3193,13 @@ mod tests {
             )
             .unwrap();
 
-        // The key is resolved the way the app resolves it, not hand-written.
+        // The key is resolved and built the way the app does it, not hand-written.
         let rs = run_query(&keeper, "SELECT rowid, * FROM t", 100).unwrap();
         let m =
             schemaic_core::edit::analyze_edit(&rs, |_, _, name| Some(table_info_of(&keeper, name)));
         let tbl = m.insert_target().expect("a single writable table");
         assert_eq!(tbl.key_cols, vec![0]);
-        let key_of = |row: usize| {
-            let ci = tbl.key_cols[0];
-            vec![(
-                rs.columns[ci].origin.as_ref().unwrap().column.clone(),
-                rs.cell(row, ci).unwrap().to_value(),
-            )]
-        };
+        let key_of = |row: usize| schemaic_core::edit::row_key(&rs, tbl, row);
 
         let write = GridWrite {
             updates: vec![RowEdit {
@@ -2661,6 +3236,166 @@ mod tests {
                 (1, "same".to_string(), "same".to_string()),
                 (2, "same".to_string(), "edited".to_string()),
             ]
+        );
+    }
+
+    /// **A rowid is not a row identity, and the 1-row net cannot see that on its
+    /// own.** The designer's rebuild renumbers a keyless table; nothing re-runs
+    /// an open result tab, so the grid still holds the old numbers. Keyed on the
+    /// number alone the `UPDATE` lands on a *neighbour* and affects exactly 1 —
+    /// the number [`one_row_verdict`] is looking for — so it commits and the
+    /// report says it worked. The read values ride in the `WHERE` so a
+    /// renumbered rowid matches zero and the net fires.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_renumbered_rowid_fails_the_write_instead_of_hitting_a_neighbour() {
+        use schemaic_core::ddl::{TableDraft, sqlite_rebuild_sql};
+        let (keeper, db) = shared_memory("rowid_stale_rebuild");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (a TEXT, b TEXT);
+                 INSERT INTO t VALUES ('alice','x'), ('bob','x'), ('carol','x'), ('dave','x');
+                 DELETE FROM t WHERE a = 'alice';",
+            )
+            .unwrap();
+
+        // What the grid read: rowids 2, 3, 4.
+        let rs = run_query(&keeper, "SELECT rowid, * FROM t", 100).unwrap();
+        let m =
+            schemaic_core::edit::analyze_edit(&rs, |_, _, name| Some(table_info_of(&keeper, name)));
+        let tbl = m.insert_target().expect("writable");
+
+        // A designer edit on the same table, through the real path.
+        let before = fetch_schema(&db)
+            .await
+            .expect("introspect")
+            .tables
+            .into_iter()
+            .find(|t| t.name == "t")
+            .expect("t");
+        let mut draft = TableDraft::from_table(&before);
+        draft.columns.push(schemaic_core::ddl::ColumnDraft::new(
+            schemaic_core::schema::ColumnInfo {
+                name: "note".into(),
+                type_name: "TEXT".into(),
+                nullable: true,
+                ..Default::default()
+            },
+        ));
+        db.run_ddl(
+            MAIN,
+            &sqlite_rebuild_sql(&before, &draft),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("rebuild");
+
+        // The grid now holds a key for row `bob` (rowid 2 as read). Whether the
+        // rebuild kept the numbering or not, the write must land on `bob` or on
+        // nothing — never on `carol`.
+        let write = GridWrite {
+            updates: vec![RowEdit {
+                database: MAIN.to_string(),
+                schema: None,
+                table: "t".to_string(),
+                set: vec![("b".to_string(), Some("BOBS-EDIT".to_string()))],
+                key: schemaic_core::edit::row_key(&rs, tbl, 0),
+            }],
+            ..Default::default()
+        };
+        let outcome = commit_writes(&db, &write, CancellationToken::new()).await;
+
+        let rows: Vec<(String, String)> = keeper
+            .prepare("SELECT a, b FROM t ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let edited: Vec<&str> = rows
+            .iter()
+            .filter(|(_, b)| b == "BOBS-EDIT")
+            .map(|(a, _)| a.as_str())
+            .collect();
+        assert!(
+            edited.is_empty() || edited == ["bob"],
+            "the edit landed on {edited:?}, outcome {outcome:?}, rows {rows:?}"
+        );
+    }
+
+    /// **Rowid reuse.** Nothing renumbers here — anything else on the connection
+    /// deletes the highest row and inserts a new one, which takes the freed
+    /// number. The stale tab's update and its delete both hit the new row, both
+    /// affect exactly 1, and both commit.
+    #[tokio::test]
+    async fn a_reused_rowid_fails_the_write_instead_of_hitting_the_new_row() {
+        let (keeper, db) = shared_memory("rowid_reuse");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (a TEXT, b TEXT);
+                 INSERT INTO t VALUES ('r1','one'), ('r2','two'), ('r3','three');",
+            )
+            .unwrap();
+
+        let rs = run_query(&keeper, "SELECT rowid, * FROM t", 100).unwrap();
+        let m =
+            schemaic_core::edit::analyze_edit(&rs, |_, _, name| Some(table_info_of(&keeper, name)));
+        let tbl = m.insert_target().expect("writable");
+        let stale = schemaic_core::edit::row_key(&rs, tbl, 2); // rowid 3 = 'r3'
+
+        keeper
+            .execute_batch(
+                "DELETE FROM t WHERE a = 'r3';
+                 INSERT INTO t VALUES ('BRAND-NEW','payroll');",
+            )
+            .unwrap();
+        let took: i64 = keeper
+            .query_row("SELECT rowid FROM t WHERE a = 'BRAND-NEW'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(took, 3, "the premise: SQLite reused the freed rowid");
+
+        for write in [
+            GridWrite {
+                updates: vec![RowEdit {
+                    database: MAIN.to_string(),
+                    schema: None,
+                    table: "t".to_string(),
+                    set: vec![("b".to_string(), Some("edited-by-user".to_string()))],
+                    key: stale.clone(),
+                }],
+                ..Default::default()
+            },
+            GridWrite {
+                deletes: vec![RowDelete {
+                    database: MAIN.to_string(),
+                    schema: None,
+                    table: "t".to_string(),
+                    key: stale.clone(),
+                }],
+                ..Default::default()
+            },
+        ] {
+            commit_writes(&db, &write, CancellationToken::new())
+                .await
+                .expect_err("a stale rowid must match nothing, not the new row");
+        }
+
+        let rows: Vec<(String, String)> = keeper
+            .prepare("SELECT a, b FROM t ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("r1".to_string(), "one".to_string()),
+                ("r2".to_string(), "two".to_string()),
+                ("BRAND-NEW".to_string(), "payroll".to_string()),
+            ],
+            "the new row is untouched"
         );
     }
 
@@ -2845,6 +3580,84 @@ mod tests {
             .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, n as i64);
+    }
+
+    /// **What the import actually *wrote*, not how many rows it wrote.** Nothing
+    /// read a value back before this, so `coerce`'s per-dialect literal could be
+    /// wrong for a whole engine and every test still passed.
+    ///
+    /// The boolean is the case that was wrong: SQLite fell into the arm written
+    /// for PostgreSQL and got `'true'`, which a NUMERIC-affinity column stores as
+    /// **TEXT** — and a TEXT value in a boolean context converts to 0, so every
+    /// row imported as true was invisible to `WHERE flag` and came back from
+    /// `WHERE NOT flag`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_import_writes_values_sqlite_reads_back_as_it_meant_them() {
+        use schemaic_core::import::{ColKind, NullRule, coerce};
+        use schemaic_core::intel::SqlDialect;
+
+        let (keeper, db) = shared_memory("import_values");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, flag BOOLEAN, n INTEGER, s TEXT);",
+            )
+            .unwrap();
+        let null = NullRule::default();
+        let cell = |text: &str, kind: ColKind| {
+            coerce(text, kind, true, &null, SqlDialect::Sqlite).expect(text)
+        };
+        let mut rows = [
+            Ok(vec![
+                Value::Int(1),
+                cell("true", ColKind::Bool),
+                cell("42", ColKind::Int),
+                cell("hi", ColKind::Other),
+            ]),
+            Ok(vec![
+                Value::Int(2),
+                cell("false", ColKind::Bool),
+                cell("-7", ColKind::Int),
+                cell("", ColKind::Other),
+            ]),
+        ]
+        .into_iter();
+        let cols = ["id", "flag", "n", "s"].map(String::from).to_vec();
+        let target = crate::ImportTarget {
+            database: MAIN,
+            schema: None,
+            table: "t",
+            columns: &cols,
+        };
+        import_rows(&db, target, &mut rows, CancellationToken::new())
+            .await
+            .expect("import");
+
+        // Stored as the engine's own booleans, not as text.
+        let kinds: Vec<String> = keeper
+            .prepare("SELECT typeof(flag) FROM t ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(kinds, vec!["integer", "integer"], "not TEXT");
+
+        // And the queries a user would write agree with what they imported.
+        let ids = |sql: &str| -> Vec<i64> {
+            keeper
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |r| r.get::<_, i64>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(ids("SELECT id FROM t WHERE flag ORDER BY id"), vec![1]);
+        assert_eq!(ids("SELECT id FROM t WHERE flag = 1 ORDER BY id"), vec![1]);
+        assert_eq!(ids("SELECT id FROM t WHERE NOT flag ORDER BY id"), vec![2]);
+        assert_eq!(ids("SELECT id FROM t WHERE n = 42 ORDER BY id"), vec![1]);
+        assert_eq!(ids("SELECT id FROM t WHERE n = -7 ORDER BY id"), vec![2]);
+        assert_eq!(ids("SELECT id FROM t WHERE s = 'hi' ORDER BY id"), vec![1]);
     }
 
     /// All-or-nothing: a reader error partway through leaves nothing behind, and
@@ -3315,6 +4128,54 @@ mod ddl_tests {
         }
     }
 
+    /// **The other half of the same gate: what must *not* take the fast path.**
+    /// SQLite's `DEFAULT` in an `ADD COLUMN` admits a literal, a signed number
+    /// and nothing else — every operator expression without parentheses is
+    /// refused. Calling those constants sent them down the one path with no
+    /// transaction around it: through Copy / "Open in editor" a two-column add
+    /// then half-applies, which is the exact failure `sqlite_native_add` exists
+    /// to prevent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expression_default_is_not_a_constant_and_takes_the_rebuild() {
+        use schemaic_core::ddl::{self, ColumnDraft, TableDraft};
+        use schemaic_core::intel::SqlDialect::Sqlite;
+        use schemaic_core::schema::ColumnInfo;
+
+        for (i, default) in ["1+2", "'a'||'b'", "-1*2", "datetime('now')"]
+            .into_iter()
+            .enumerate()
+        {
+            let (keeper, db) = shared_memory(&format!("add_col_expr_{i}"));
+            keeper
+                .execute_batch("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (7);")
+                .unwrap();
+            let schema = fetch_schema(&db).await.expect("schema");
+            let table = schema.tables.iter().find(|t| t.name == "t").expect("t");
+
+            let mut draft = TableDraft::from_table(table);
+            draft.columns.push(ColumnDraft::new(ColumnInfo {
+                name: "c".into(),
+                type_name: "TEXT".into(),
+                nullable: true,
+                default: Some(default.into()),
+                ..Default::default()
+            }));
+            let sql = ddl::diff(table, &draft, Sqlite).emit();
+            assert!(
+                !sql.iter().any(|s| s.contains("ADD COLUMN")),
+                "DEFAULT {default} must not take the fast path: {sql:?}"
+            );
+            // And the rebuild it takes instead really does apply.
+            db.run_ddl(MAIN, &sql, CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("DEFAULT {default}: {e}\n{sql:?}"));
+            let a: i64 = keeper
+                .query_row("SELECT a FROM t", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(a, 7, "DEFAULT {default} lost the existing row");
+        }
+    }
+
     /// Editing a view, end to end through the real `fetch_schema`, the real
     /// differ, the real emitter and real SQLite — because every part of this is
     /// a *different shape* from the other two engines, and each one is only
@@ -3684,6 +4545,36 @@ mod check_text_tests {
         assert!(checks_of(r#"CREATE TABLE t (a INT PRIMARY KEY, b TEXT NOT NULL)"#).is_empty());
         assert!(checks_of("").is_empty());
     }
+
+    /// **A name belongs to the constraint it introduces.** `CONSTRAINT nn_a NOT
+    /// NULL` names the *NOT NULL*; the bare `CHECK` beside it in the same column
+    /// used to inherit it, so a rebuild wrote `CONSTRAINT "nn_a" CHECK (…)` and
+    /// gave the table a name the user deliberately left off — accepted by SQLite,
+    /// so silent and permanent.
+    #[test]
+    fn a_name_does_not_leak_from_one_constraint_to_the_next() {
+        assert_eq!(
+            one(r#"CREATE TABLE c (a TEXT CONSTRAINT nn_a NOT NULL CHECK (a <> ''))"#),
+            (String::new(), "a <> ''".to_string())
+        );
+        // Each keyword that can carry a name of its own consumes it.
+        for keyword in [
+            "NOT NULL",
+            "UNIQUE",
+            "PRIMARY KEY",
+            "REFERENCES other(id)",
+            "DEFAULT 'x'",
+            "COLLATE NOCASE",
+        ] {
+            let sql = format!("CREATE TABLE c (a TEXT CONSTRAINT n1 {keyword} CHECK (a <> ''))");
+            assert_eq!(one(&sql).0, "", "{keyword}");
+        }
+        // And a name that really does introduce the check still lands on it.
+        assert_eq!(
+            one(r#"CREATE TABLE c (a TEXT NOT NULL CONSTRAINT ck_a CHECK (a <> ''))"#),
+            ("ck_a".to_string(), "a <> ''".to_string())
+        );
+    }
 }
 
 /// Introspection carrying the checks it reads — the wiring behind
@@ -3965,6 +4856,405 @@ mod rebuild_roundtrip_tests {
     }
 }
 
+/// **Does the rebuilt table declare what the original declared?**
+///
+/// The suites above assert *consequences* — the rows came across, the CHECK
+/// bites, the trigger still fires — and every one of them passes for a table
+/// that came back missing `WITHOUT ROWID`, `STRICT`, a column's `COLLATE`, a
+/// `STORED` generated column's storage, an expression `DEFAULT`, or with an
+/// `AUTOINCREMENT` nobody asked for. This one reads `sqlite_master.sql` back and
+/// compares it to what was there, which is the only question that catches those.
+#[cfg(test)]
+mod rebuild_fidelity_tests {
+    use super::tests::shared_memory;
+    use super::*;
+    use schemaic_core::ddl::{TableDraft, diff};
+    use schemaic_core::intel::SqlDialect;
+    use tokio_util::sync::CancellationToken;
+
+    async fn table_of(db: &Db, name: &str) -> TableInfo {
+        fetch_schema(db)
+            .await
+            .expect("introspect")
+            .tables
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} is gone"))
+    }
+
+    /// Create `ddl`, make the smallest edit that forces a rebuild (retype the
+    /// last column to itself is not an edit, so a comment-free retype is used),
+    /// apply it through `diff` → `emit` → `run_ddl`, and hand back the table's
+    /// declaration afterwards.
+    async fn rebuilt(name: &str, table: &str, ddl: &str, edit: fn(&mut TableDraft)) -> String {
+        let (keeper, db) = shared_memory(name);
+        keeper.execute_batch(ddl).unwrap();
+        let before = table_of(&db, table).await;
+        let mut draft = TableDraft::from_table(&before);
+        edit(&mut draft);
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        assert!(
+            cs.unsupported().is_empty(),
+            "withheld: {:?}",
+            cs.unsupported()
+        );
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e} — plan {:#?}", cs.emit()));
+        keeper
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+    }
+
+    /// Retype the *last* column — an edit no `ALTER TABLE` can do, so every case
+    /// below really does go through the twelve steps.
+    fn retype_last(d: &mut TableDraft) {
+        let i = d.columns.len() - 1;
+        d.columns[i].info.type_name = "TEXT".into();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_rowid_survives() {
+        let sql = rebuilt(
+            "fid_wr",
+            "w",
+            "CREATE TABLE w (a TEXT NOT NULL, b TEXT, PRIMARY KEY (a)) WITHOUT ROWID;",
+            retype_last,
+        )
+        .await;
+        assert!(sql.to_uppercase().contains("WITHOUT ROWID"), "{sql}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn strict_survives() {
+        let sql = rebuilt(
+            "fid_strict",
+            "s",
+            "CREATE TABLE s (a INTEGER, b TEXT) STRICT;",
+            retype_last,
+        )
+        .await;
+        assert!(sql.to_uppercase().contains("STRICT"), "{sql}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_columns_collation_survives() {
+        let sql = rebuilt(
+            "fid_coll",
+            "c",
+            "CREATE TABLE c (email TEXT COLLATE NOCASE, n INTEGER);",
+            retype_last,
+        )
+        .await;
+        assert!(sql.to_uppercase().contains("COLLATE NOCASE"), "{sql}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stored_generated_column_stays_stored() {
+        let sql = rebuilt(
+            "fid_stored",
+            "g",
+            "CREATE TABLE g (a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2) STORED, c INTEGER);",
+            retype_last,
+        )
+        .await;
+        assert!(sql.to_uppercase().contains("STORED"), "{sql}");
+    }
+
+    /// The one that used to kill the plan outright: `pragma_table_xinfo` strips
+    /// the parentheses SQLite's grammar requires, so the re-emitted default was
+    /// `near "(": syntax error` and the table could never be edited again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expression_default_survives() {
+        let sql = rebuilt(
+            "fid_default",
+            "e",
+            "CREATE TABLE e (id INTEGER PRIMARY KEY, made TEXT DEFAULT (datetime('now')), n INTEGER);",
+            retype_last,
+        )
+        .await;
+        assert!(sql.contains("datetime('now')"), "{sql}");
+        assert!(sql.contains("DEFAULT (datetime"), "parenthesised: {sql}");
+    }
+
+    /// A literal default must *not* grow a pair of parentheses it never had.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_literal_default_is_left_bare() {
+        let sql = rebuilt(
+            "fid_default_lit",
+            "l",
+            "CREATE TABLE l (a TEXT DEFAULT 'hi', n INTEGER DEFAULT 3, t TEXT DEFAULT CURRENT_TIMESTAMP, z INTEGER);",
+            retype_last,
+        )
+        .await;
+        assert!(sql.contains("DEFAULT 'hi'"), "{sql}");
+        assert!(sql.contains("DEFAULT 3"), "{sql}");
+        assert!(sql.contains("DEFAULT CURRENT_TIMESTAMP"), "{sql}");
+    }
+
+    /// A plain `INTEGER PRIMARY KEY` is server-assigned but is **not**
+    /// `AUTOINCREMENT`; adding the keyword changes what the key promises and
+    /// creates a `sqlite_sequence` row for a table that had none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plain_key_does_not_grow_autoincrement() {
+        let sql = rebuilt(
+            "fid_plainkey",
+            "p",
+            "CREATE TABLE p (id INTEGER PRIMARY KEY, n INTEGER);",
+            retype_last,
+        )
+        .await;
+        assert!(!sql.to_uppercase().contains("AUTOINCREMENT"), "{sql}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_declared_autoincrement_key_keeps_it() {
+        let sql = rebuilt(
+            "fid_autoinc",
+            "a",
+            "CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT, n INTEGER);",
+            retype_last,
+        )
+        .await;
+        assert!(sql.to_uppercase().contains("AUTOINCREMENT"), "{sql}");
+    }
+
+    /// **The one that refused every edit.** SQLite backs a `UNIQUE` constraint
+    /// with `sqlite_autoindex_*`, a name it will not accept in a `CREATE INDEX` —
+    /// so replaying it as an index failed the whole plan, and skipping it would
+    /// have dropped the constraint instead. It belongs in the table body.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_unique_constraint_comes_back_as_a_constraint() {
+        let (keeper, db) = shared_memory("fid_unique");
+        keeper
+            .execute_batch(
+                "CREATE TABLE u (id INTEGER PRIMARY KEY, email TEXT UNIQUE, n INTEGER);
+                 INSERT INTO u VALUES (1, 'a@b', 1);",
+            )
+            .unwrap();
+        let before = table_of(&db, "u").await;
+        let mut draft = TableDraft::from_table(&before);
+        retype_last(&mut draft);
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e} — plan {:#?}", cs.emit()));
+
+        // The constraint is still enforced, which is the assertion that matters.
+        assert!(
+            keeper
+                .execute_batch("INSERT INTO u VALUES (2, 'a@b', 2)")
+                .is_err(),
+            "the UNIQUE constraint must survive"
+        );
+        // And there is no `CREATE UNIQUE INDEX` claiming a reserved name.
+        let sql: String = keeper
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'u'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sql.to_uppercase().contains("UNIQUE"), "{sql}");
+    }
+
+    /// The same constraint across a **rename**: the body is rebuilt from the
+    /// draft's names, so it follows the column. Replaying the engine's index
+    /// would have named the old one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_unique_constraint_follows_a_renamed_column() {
+        let (keeper, db) = shared_memory("fid_unique_rename");
+        keeper
+            .execute_batch("CREATE TABLE o (id INTEGER PRIMARY KEY, email TEXT UNIQUE);")
+            .unwrap();
+        let before = table_of(&db, "o").await;
+        let mut draft = TableDraft::from_table(&before);
+        draft.rename_column(1, "mail");
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e} — plan {:#?}", cs.emit()));
+
+        keeper
+            .execute_batch("INSERT INTO o VALUES (1, 'a@b')")
+            .unwrap();
+        assert!(
+            keeper
+                .execute_batch("INSERT INTO o VALUES (2, 'a@b')")
+                .is_err(),
+            "the constraint moved with the column"
+        );
+    }
+
+    /// **An index's own `COLLATE` is what its uniqueness is measured in.** Read
+    /// back without it, a case-insensitive UNIQUE index comes back
+    /// case-sensitive and accepts the pair it used to refuse.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_index_collation_survives() {
+        let (keeper, db) = shared_memory("fid_index_coll");
+        keeper
+            .execute_batch(
+                "CREATE TABLE m (id INTEGER PRIMARY KEY, email TEXT, n INTEGER);
+                 CREATE UNIQUE INDEX ix_mail ON m (email COLLATE NOCASE);
+                 INSERT INTO m VALUES (1, 'a@X', 1);",
+            )
+            .unwrap();
+        let before = table_of(&db, "m").await;
+        let mut draft = TableDraft::from_table(&before);
+        retype_last(&mut draft);
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e} — plan {:#?}", cs.emit()));
+
+        assert!(
+            keeper
+                .execute_batch("INSERT INTO m VALUES (2, 'A@x', 2)")
+                .is_err(),
+            "the index must still compare case-insensitively"
+        );
+    }
+
+    /// **A rebuild that renames a column must re-point the checks standing on
+    /// it.** SQLite resolves a `CHECK`'s column references at `CREATE TABLE`
+    /// time and refuses a predicate naming a column the shadow table doesn't
+    /// have — named or unnamed, in a transaction or not — so the very first
+    /// statement of the twelve steps failed and there was no route to the edit at
+    /// all on that engine.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rename_re_points_the_checks_the_rebuild_restates() {
+        let (keeper, db) = shared_memory("fid_check_rename");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (q INTEGER, n INTEGER,
+                                 CONSTRAINT ck_q CHECK (q > 0),
+                                 CHECK (n <> q));",
+            )
+            .unwrap();
+        let before = table_of(&db, "t").await;
+        assert_eq!(before.check_constraints.len(), 2, "the premise");
+        let mut draft = TableDraft::from_table(&before);
+        draft.rename_column(0, "qty");
+        // A retype beside it, so the plan really is the rebuild rather than
+        // SQLite's own `RENAME COLUMN`.
+        draft.columns[1].info.type_name = "TEXT".into();
+
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e} — plan {:#?}", cs.emit()));
+
+        let sql: String = keeper
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 't'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("qty"), "{sql}");
+        // And the constraints are real, not just spelled: the named one refuses a
+        // non-positive value, the unnamed one refuses an equal pair.
+        assert!(
+            keeper
+                .execute_batch("INSERT INTO t VALUES (0, '1')")
+                .is_err(),
+            "the named check still bites"
+        );
+        assert!(
+            keeper
+                .execute_batch("INSERT INTO t VALUES (5, '5')")
+                .is_err(),
+            "the unnamed check still bites"
+        );
+        keeper
+            .execute_batch("INSERT INTO t VALUES (5, '6')")
+            .unwrap();
+    }
+
+    /// **A trigger's replayed text is a snapshot, so a rebuild must not carry a
+    /// rename.** The trigger would go back naming a column that no longer
+    /// exists — SQLite accepts such a trigger and then refuses every write to
+    /// the table, after a plan that reported success.
+    ///
+    /// Two halves, and both matter. A rename **on its own** takes SQLite's own
+    /// `ALTER TABLE … RENAME COLUMN`, which re-points the trigger for us; a
+    /// rename arriving *with* something only a rebuild can do is withheld in the
+    /// preview, because there the verbatim replay is the only route and it
+    /// cannot work.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rename_under_a_trigger_takes_the_native_route_or_is_withheld() {
+        let (keeper, db) = shared_memory("fid_trigger_rename");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, scratch INTEGER);
+                 CREATE TABLE log (n INTEGER);
+                 CREATE TRIGGER t_ai AFTER INSERT ON t
+                   BEGIN INSERT INTO log VALUES (NEW.n); END;",
+            )
+            .unwrap();
+        let before = table_of(&db, "t").await;
+
+        // A rename beside a retype — only the rebuild can do both.
+        let mut draft = TableDraft::from_table(&before);
+        draft.rename_column(1, "amount");
+        retype_last(&mut draft);
+        let withheld = diff(&before, &draft, SqlDialect::Sqlite).unsupported();
+        assert_eq!(withheld.len(), 1, "{withheld:?}");
+        assert!(withheld[0].contains("trigger"), "{withheld:?}");
+
+        // The rename alone: native, and the trigger comes with it.
+        let mut draft = TableDraft::from_table(&before);
+        draft.rename_column(1, "amount");
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        assert!(
+            cs.emit().iter().any(|s| s.contains("RENAME COLUMN")),
+            "the engine's own statement: {:#?}",
+            cs.emit()
+        );
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .expect("a bare rename must apply");
+        keeper
+            .execute_batch("INSERT INTO t (amount) VALUES (5);")
+            .unwrap();
+        assert_eq!(
+            keeper
+                .query_row("SELECT n FROM log", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            5,
+            "SQLite re-pointed the trigger at the new name"
+        );
+
+        // And a retype under the same trigger is still fine — nothing moved.
+        let before = table_of(&db, "t").await;
+        let mut draft = TableDraft::from_table(&before);
+        retype_last(&mut draft);
+        let cs = diff(&before, &draft, SqlDialect::Sqlite);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .expect("a retype is still allowed");
+        keeper
+            .execute_batch("INSERT INTO t (amount) VALUES (6);")
+            .unwrap();
+        assert_eq!(
+            keeper
+                .query_row("SELECT count(*) FROM log", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+}
+
 /// A rebuild happens under objects that reference the table. These are the ones
 /// that bite.
 #[cfg(test)]
@@ -4017,7 +5307,9 @@ mod rebuild_bystander_tests {
 }
 
 /// Foreign keys around a rebuild — the part of the twelve steps that is about
-/// the *other* tables.
+/// the *other* tables — and, beside them, the three things a plan owes the user
+/// whatever it does: a script that replays, a message that names their table,
+/// and a Truncate that truncates.
 #[cfg(test)]
 mod rebuild_fk_tests {
     use super::tests::shared_memory;
@@ -4111,6 +5403,245 @@ mod rebuild_fk_tests {
             .unwrap();
         assert_eq!(artists, 1, "and the drop rolled back");
     }
+
+    /// **Truncate on SQLite is an unqualified `DELETE`, and it has to work.**
+    /// The menu offered it, asked "Delete all ~N rows?" and then opened an empty
+    /// preview — a destructive question for something the emitter had no arm
+    /// for. This is the arm, run against the engine.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_empties_the_table_and_leaves_it_there() {
+        use schemaic_core::ddl::{Change, ChangeSet};
+        use schemaic_core::intel::SqlDialect;
+        use schemaic_core::schema::ServerFlavour;
+
+        let (keeper, db) = shared_memory("truncate_sqlite");
+        keeper
+            .execute_batch(
+                "CREATE TABLE orders (id INTEGER PRIMARY KEY, n TEXT);
+                 CREATE INDEX ix_n ON orders (n);
+                 INSERT INTO orders VALUES (1, 'a'), (2, 'b');",
+            )
+            .unwrap();
+        let cs = ChangeSet {
+            table: "orders".into(),
+            schema: None,
+            dialect: SqlDialect::Sqlite,
+            flavour: ServerFlavour::Unknown,
+            changes: vec![Change::TruncateTable],
+        };
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e} — plan {:#?}", cs.emit()));
+
+        let rows: i64 = keeper
+            .query_row("SELECT count(*) FROM orders", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "every row went");
+        // The *table* is still there, with its index — that is the whole
+        // difference between Truncate and Drop.
+        let objects: i64 = keeper
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name IN ('orders', 'ix_n')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(objects, 2);
+    }
+
+    /// **A failed rebuild must name the user's table, not ours.** Adding a
+    /// `NOT NULL` column with no default to a table that *has rows* fails the
+    /// copy step — the new column is in neither list, so every copied row
+    /// supplies NULL — and the engine names the shadow table it failed on. An
+    /// empty table succeeds, which is why a fixture without rows misses it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_rebuild_names_the_real_table() {
+        use schemaic_core::ddl::{self, ColumnDraft, TableDraft};
+        use schemaic_core::intel::SqlDialect;
+        use schemaic_core::schema::ColumnInfo;
+
+        let (_keeper, db) = shared_memory("rebuild_shadow_name");
+        _keeper
+            .execute_batch("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (7);")
+            .unwrap();
+        let before = fetch_schema(&db)
+            .await
+            .expect("introspect")
+            .tables
+            .into_iter()
+            .find(|t| t.name == "t")
+            .expect("t");
+        let mut draft = TableDraft::from_table(&before);
+        draft.columns.push(ColumnDraft::new(ColumnInfo {
+            name: "c".into(),
+            type_name: "TEXT".into(),
+            nullable: false,
+            ..Default::default()
+        }));
+        let sql = ddl::diff(&before, &draft, SqlDialect::Sqlite).emit();
+        let err = db
+            .run_ddl(MAIN, &sql, CancellationToken::new())
+            .await
+            .expect_err("a NOT NULL column with no default cannot be copied in");
+        let text = format!("{err}");
+        assert!(
+            !text.contains(ddl::REBUILD_SUFFIX),
+            "the shadow table is ours, not theirs: {text}"
+        );
+        assert!(
+            text.contains("t.c"),
+            "and it still names what failed: {text}"
+        );
+    }
+
+    /// **Copy DDL has to hand back a script the engine will run.** SQLite keeps
+    /// the author's own trailing comment in `sqlite_master.sql`, so trimming and
+    /// appending a `;` put the terminator *inside* the comment — and the
+    /// statement that followed joined it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tables_ddl_replays_even_with_a_comment_on_an_index() {
+        let (keeper, db) = shared_memory("ddl_index_comment");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (a INT, b INT);
+                 CREATE INDEX ia ON t(a) -- why this index exists
+                 ;
+                 CREATE INDEX ib ON t(b);",
+            )
+            .unwrap();
+        let ddl = fetch_schema(&db)
+            .await
+            .expect("introspect")
+            .tables
+            .into_iter()
+            .find(|t| t.name == "t")
+            .expect("t")
+            .create_sql
+            .expect("SQLite keeps its own text");
+        assert!(ddl.contains("why this index exists"), "{ddl}");
+
+        // The whole point: it replays into a fresh database.
+        let fresh = SqliteConn::open_in_memory().unwrap();
+        fresh
+            .execute_batch(&ddl)
+            .unwrap_or_else(|e| panic!("{e}\n{ddl}"));
+        let indexes: i64 = fresh
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 2, "both indexes came across:\n{ddl}");
+    }
+
+    /// **What was already broken is not the plan's fault.** A `.db` written by
+    /// the sqlite3 CLI — foreign keys off by default — very commonly carries a
+    /// child row whose parent is gone, and the check scans the whole database.
+    /// Without a before-reading, adding a column to an unrelated third table was
+    /// refused with "the plan leaves a foreign key pointing at nothing", and
+    /// *every* DDL operation on that file failed the same way for ever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pre_existing_dangling_row_does_not_refuse_an_unrelated_plan() {
+        let (keeper, db) = shared_memory("rebuild_fk_inherited");
+        keeper
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 CREATE TABLE artist (id INTEGER PRIMARY KEY);
+                 CREATE TABLE album (
+                     id        INTEGER PRIMARY KEY,
+                     artist_id INTEGER REFERENCES artist (id)
+                 );
+                 CREATE TABLE unrelated (a INTEGER);
+                 INSERT INTO artist VALUES (1);
+                 INSERT INTO album  VALUES (1, 999);  -- dangling before we arrive
+                 INSERT INTO album  VALUES (2, 1);    -- perfectly fine",
+            )
+            .unwrap();
+        // The premise: the file arrives inconsistent.
+        let conn = open(&db).expect("open");
+        assert!(
+            !fk_violations(&conn).unwrap().rows.is_empty(),
+            "the fixture must be broken to begin with"
+        );
+
+        db.run_ddl(
+            MAIN,
+            &[r#"ALTER TABLE "unrelated" ADD COLUMN "b" TEXT;"#.to_string()],
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a plan that touches nothing related must still apply");
+
+        // And a plan that dangles a reference **of its own** is still refused,
+        // on the same already-inconsistent database — the row it strands is a
+        // different row from the one that was there.
+        let err = db
+            .run_ddl(
+                MAIN,
+                &[r#"DELETE FROM "artist" WHERE "id" = 1;"#.to_string()],
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("the plan's own violation still refuses");
+        assert!(
+            format!("{err}").to_lowercase().contains("foreign key"),
+            "{err}"
+        );
+        let artists: i64 = keeper
+            .query_row("SELECT count(*) FROM artist", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(artists, 1, "and it rolled back");
+    }
+
+    /// **The same cascade, on the path that has no `run_ddl` around it.** The
+    /// preview's Copy and "Open in editor" hand the user this exact statement
+    /// list to run in a query tab, whose connection enforces foreign keys and
+    /// opens no transaction. So the guard has to be *in* the list; a plan that
+    /// relies on the backend setting it out of band empties the child table the
+    /// moment it leaves the modal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_script_guards_itself_when_run_outside_run_ddl() {
+        let (keeper, db) = shared_memory("rebuild_cascade_script");
+        keeper
+            .execute_batch(
+                "CREATE TABLE artist (id INTEGER PRIMARY KEY, name TEXT);
+                 CREATE TABLE album (
+                     id        INTEGER PRIMARY KEY,
+                     artist_id INTEGER REFERENCES artist (id) ON DELETE CASCADE
+                 );
+                 INSERT INTO artist VALUES (1, 'a');
+                 INSERT INTO album  VALUES (1, 1), (2, 1);",
+            )
+            .unwrap();
+
+        let before = table_of(&db, "artist").await;
+        let mut draft = TableDraft::from_table(&before);
+        draft.columns[1].info.type_name = "BLOB".into();
+        let stmts = sqlite_rebuild_sql(&before, &draft);
+
+        // The query tab's connection, opened the way production opens one.
+        let conn = open(&db).expect("open");
+        let enforcing: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(enforcing, 1, "the premise: an editor connection enforces");
+        for sql in &stmts {
+            conn.execute_batch(sql)
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+
+        let albums: i64 = keeper
+            .query_row("SELECT count(*) FROM album", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(albums, 2, "the children must not have been cascaded away");
+        // And the script left enforcement as it found it.
+        let after: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 1, "the guard closes behind itself");
+    }
 }
 
 /// The designer's own path, end to end: `diff` → `emit` → `run_ddl`. The
@@ -4171,5 +5702,122 @@ mod designer_path_tests {
             .query_row("SELECT name FROM people WHERE id = '1'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(name, "ada", "the row came across and the id retyped");
+    }
+
+    /// **Editing a view must not cost it its `INSTEAD OF` triggers.** SQLite has
+    /// no `CREATE OR REPLACE VIEW`, so every edit is a `DROP` + `CREATE`, and
+    /// the engine drops the view's triggers with it. They are the only way a
+    /// SQLite view is written to, and their text lives nowhere else once the
+    /// drop has run — so the plan replays them, or the edit silently turns a
+    /// writable view into a read-only one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn editing_a_view_keeps_its_instead_of_triggers() {
+        use schemaic_core::ddl::{ViewDraft, diff_view};
+        let (keeper, db) = shared_memory("view_trigger_replay");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (a INTEGER);
+                 CREATE VIEW v AS SELECT a FROM t;
+                 CREATE TRIGGER vi INSTEAD OF INSERT ON v
+                   BEGIN INSERT INTO t(a) VALUES (NEW.a); END;
+                 INSERT INTO v(a) VALUES (1);",
+            )
+            .unwrap();
+        assert_eq!(
+            keeper
+                .query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "the premise: the view is writable through its trigger"
+        );
+
+        let before = table_of(&db, "v").await;
+        assert!(before.is_view);
+        assert_eq!(
+            before.dependent_ddl.len(),
+            1,
+            "introspection has to collect it: {:?}",
+            before.dependent_ddl
+        );
+        let mut draft = ViewDraft::from_table(&before).expect("a view drafts");
+        draft.select = "SELECT a FROM t WHERE a > 0".into();
+
+        let cs = diff_view(&before, &draft, SqlDialect::Sqlite);
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .expect("the view edit must apply");
+
+        let triggers: i64 = keeper
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'v'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(triggers, 1, "the trigger is still there");
+        // And it still fires — the assertion the catalogue count can't make.
+        keeper
+            .execute_batch("INSERT INTO v(a) VALUES (2);")
+            .unwrap();
+        assert_eq!(
+            keeper
+                .query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2,
+            "the view is still writable"
+        );
+    }
+
+    /// A **rename** takes the same route, and its replay cannot work: the
+    /// trigger's own SQL names the old view. Rather than fail after the drop has
+    /// run — or quietly rewrite text the user wrote — the plan refuses in the
+    /// preview. A view with nothing hanging off it renames as it always did.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn renaming_a_view_with_triggers_is_refused_rather_than_stranded() {
+        use schemaic_core::ddl::{ViewDraft, diff_view};
+        let (keeper, db) = shared_memory("view_trigger_rename");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (a INTEGER);
+                 CREATE VIEW v AS SELECT a FROM t;
+                 CREATE TRIGGER vi INSTEAD OF INSERT ON v
+                   BEGIN INSERT INTO t(a) VALUES (NEW.a); END;
+                 CREATE VIEW plain AS SELECT a FROM t;",
+            )
+            .unwrap();
+
+        let before = table_of(&db, "v").await;
+        let mut draft = ViewDraft::from_table(&before).expect("a view drafts");
+        draft.name = "w".into();
+        let withheld = diff_view(&before, &draft, SqlDialect::Sqlite).unsupported();
+        assert_eq!(withheld.len(), 1, "{withheld:?}");
+        assert!(withheld[0].contains("trigger"), "{withheld:?}");
+        // Nothing applied, so the view and its trigger are both still there.
+        assert_eq!(
+            keeper
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name IN ('v', 'vi')",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+
+        // The same rename on a view with no dependents still works.
+        let plain = table_of(&db, "plain").await;
+        let mut draft = ViewDraft::from_table(&plain).expect("a view drafts");
+        draft.name = "renamed".into();
+        let cs = diff_view(&plain, &draft, SqlDialect::Sqlite);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .expect("the rename must apply");
+        assert_eq!(
+            keeper
+                .query_row("SELECT count(*) FROM renamed", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 }

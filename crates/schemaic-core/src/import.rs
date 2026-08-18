@@ -600,16 +600,33 @@ pub fn coerce(
                 "0" | "f" | "false" | "n" | "no" | "off" => false,
                 _ => return Err(IssueKind::NotABoolean),
             };
-            Ok(match dialect {
-                // MySQL's BOOLEAN is a TINYINT: `'true'` stores as 0, silently.
-                SqlDialect::MySql => Value::Int(b as i64),
-                // PostgreSQL rejects the integer 1 for a boolean column, but
-                // takes the quoted literal.
-                _ => Value::Str(if b { "true".into() } else { "false".into() }),
+            Ok(if bool_literal_is_integer(dialect) {
+                Value::Int(b as i64)
+            } else {
+                Value::Str(if b { "true".into() } else { "false".into() })
             })
         }
         ColKind::Other => Ok(Value::Str(text.to_string())),
     }
+}
+
+/// Does a boolean go into this engine as the **integer** `1`/`0` rather than the
+/// quoted literal `'true'`/`'false'`?
+///
+/// **A capability, because the engine test got a third engine wrong.** It was
+/// `MySql => integer, _ => quoted`, written when there were two engines and the
+/// default arm meant PostgreSQL:
+///
+/// - **MySQL**'s `BOOLEAN` is a `TINYINT`. `'true'` stores as 0, silently.
+/// - **SQLite**'s is a declared type with NUMERIC affinity, so `'true'` is kept
+///   as **TEXT** — and a TEXT value in a boolean context converts to 0. Every row
+///   imported as true became invisible to `WHERE flag` and was returned by
+///   `WHERE NOT flag`, on the spelling SQLAlchemy, Django, Rails and EF Core all
+///   emit. The integer is what SQLite's own `TRUE`/`FALSE` keywords produce.
+/// - **PostgreSQL** has a real boolean type and *rejects* the integer 1 for it,
+///   but takes the quoted literal. It is the exception, not the default.
+fn bool_literal_is_integer(dialect: SqlDialect) -> bool {
+    !matches!(dialect, SqlDialect::Postgres)
 }
 
 /// Everything needed to turn a file's bytes into fields — the dialect plus what
@@ -1781,7 +1798,7 @@ mod tests {
 
     // ── coercion ────────────────────────────────────────────────────────────
 
-    use crate::intel::SqlDialect::{MySql, Postgres};
+    use crate::intel::SqlDialect::{MySql, Postgres, Sqlite};
 
     #[test]
     fn classify_recognizes_the_families_we_validate() {
@@ -1866,8 +1883,16 @@ mod tests {
     #[test]
     fn coerce_normalizes_booleans_per_dialect() {
         let n = NullRule::default();
+        // **All three engines**, because the rule used to be "MySQL, or else",
+        // and SQLite falling into the `or else` stored the *text* `'true'` in a
+        // NUMERIC-affinity column — where every boolean context then reads it
+        // as false.
         for t in ["true", "TRUE", "t", "yes", "1"] {
             assert_eq!(coerce(t, ColKind::Bool, true, &n, MySql), Ok(Value::Int(1)));
+            assert_eq!(
+                coerce(t, ColKind::Bool, true, &n, Sqlite),
+                Ok(Value::Int(1))
+            );
             assert_eq!(
                 coerce(t, ColKind::Bool, true, &n, Postgres),
                 Ok(Value::Str("true".into()))
@@ -1876,14 +1901,21 @@ mod tests {
         for f in ["false", "F", "no", "0"] {
             assert_eq!(coerce(f, ColKind::Bool, true, &n, MySql), Ok(Value::Int(0)));
             assert_eq!(
+                coerce(f, ColKind::Bool, true, &n, Sqlite),
+                Ok(Value::Int(0))
+            );
+            assert_eq!(
                 coerce(f, ColKind::Bool, true, &n, Postgres),
                 Ok(Value::Str("false".into()))
             );
         }
-        assert_eq!(
-            coerce("maybe", ColKind::Bool, true, &n, MySql),
-            Err(IssueKind::NotABoolean)
-        );
+        for d in [MySql, Postgres, Sqlite] {
+            assert_eq!(
+                coerce("maybe", ColKind::Bool, true, &n, d),
+                Err(IssueKind::NotABoolean),
+                "{d:?}"
+            );
+        }
     }
 
     /// Anything we can't be certain about goes to the server verbatim — it parses

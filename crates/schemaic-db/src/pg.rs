@@ -932,6 +932,11 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
             comment: r.get(8).cloned().flatten(),
             collation: r.get(9).cloned().flatten(),
             on_update: None,
+            // PostgreSQL has only the stored form of a generated column, and no
+            // `AUTOINCREMENT` keyword at all — its counter is an identity
+            // column, which `auto_increment`/`identity_always` above carry.
+            generated_stored: true,
+            sqlite_autoincrement: false,
         };
         (ns, ColRow { table: t, column })
     })

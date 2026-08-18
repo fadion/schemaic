@@ -3,7 +3,7 @@
 A native SQL editor (Rust + [Floem](https://github.com/lapce/floem) 0.2.0), MySQL/MariaDB-first,
 Zed-inspired, aiming to replace DataGrip. PostgreSQL and SQLite are wired too; SQLite is
 read/write and edits **tables** (through the twelve-step rebuild), **views** and **triggers**, but
-has no manual-transaction mode — see `db::sqlite`'s `Session::open` for what that one is a
+has no manual-transaction mode — see `db::session`'s `Session::open` for what that one is a
 statement about. All three engines now edit all three of those objects, and they get there
 differently, so ask the *narrow* capability (`ddl::supports_or_replace_view`,
 `ddl::supports_view_rename`) rather than the engine.
@@ -14,7 +14,7 @@ holds the *working* rules — how to build, test and commit — and points here 
 Keep the two disjoint: an instruction to the person or agent doing the work belongs there, a fact
 about the system belongs here.
 
-**Prefer reading this through a subagent.** It is ~1650 lines; paging it into a session wholesale
+**Prefer reading this through a subagent.** It is ~3.2k lines; paging it into a session wholesale
 is what runs that session out of context. `scout` (in `.claude/agents/`) answers "where/how"
 questions against this document *and* the code and reports back a conclusion rather than a
 transcript, and `arch-scribe` makes the edits a finished change requires. Read a section here by
@@ -352,6 +352,36 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     these statements and not of the connection — and so the preview shows the whole procedure, which
     is the honest thing to put in front of someone about to approve it
     (`ddl::sqlite_rebuild_tests`).
+    **The foreign-key guard rides in the plan for the same reason and one more.** The list opens
+    with `ddl::FK_OFF` and closes with `ddl::FK_ON`, which is step 1 and step 12 of SQLite's own
+    procedure: with enforcement on, the `DROP TABLE` is an implicit `DELETE FROM` the table and
+    fires every `ON DELETE CASCADE` pointing at it — the table comes back exactly as drawn and
+    another table has quietly lost every row. `sqlite::run_ddl` still sets the pragma out of band
+    for its *own* execution, because SQLite ignores it inside a transaction; the copy in the plan is
+    for the other consumer, since the same list is what the preview's **Copy** and **Open in
+    editor** hand to a query tab, whose connection enforces foreign keys with nothing around it
+    (`the_script_guards_itself_when_run_outside_run_ddl`). A table rename is inserted *before* the
+    closing pragma so the whole procedure stays inside the guard.
+    **What the rebuild writes is the model, so the model has to be the table.** Everything the
+    declaration says and the pragmas don't report is read out of `sqlite_master.sql` through the
+    shared boundary lexer — each column's `COLLATE` (`sqlite::collations_of`), the `AUTOINCREMENT`
+    keyword (`declares_autoincrement`, not `sqlite_sequence`, which has no row until the first
+    insert) — and `WITHOUT ROWID`/`STRICT` come from the `pragma_table_list` row `has_rowid`
+    already reads. A `UNIQUE` constraint's `sqlite_autoindex_*` is **not** an index statement: it is
+    re-declared as a `UNIQUE (…)` line inside the rebuilt body, from the *draft's* column names, so
+    it follows a rename — `sqlite_index_replay` answers `Skip` for it, since the engine refuses
+    `CREATE UNIQUE INDEX "sqlite_autoindex_u_1"` by name. And the draft's `CHECK` predicates are
+    re-pointed across a rename here, because here is where the declaration is written; the
+    MySQL-family repair `ddl::alter_column_disturbs_checks` gates is a different repair for a
+    different statement. `db::sqlite::rebuild_fidelity_tests` reads `sqlite_master.sql` back after
+    each of these and compares — the question the consequence-shaped suites beside it cannot ask.
+    **Two things the rebuild refuses rather than does.** `ChangeSet::unsupported` withholds a plan
+    whose replayed `dependent_ddl` would name a column the plan renames or drops
+    (`rebuild_strands_a_trigger`): the text is a snapshot, `legacy_alter_table = ON` stops SQLite
+    fixing it, and SQLite validates `NEW.<col>` at write time rather than at `CREATE TRIGGER` — so
+    the plan used to *succeed* and the table then rejected every write. The route that does work is
+    offered instead: a rename **on its own** is `ALTER TABLE … RENAME COLUMN`
+    (`supports_change` + `is_rename_only`), which re-points every view and trigger for us.
     `Change::RebuildTable(Box<Rebuild>)` is how it reaches a plan: `diff` inserts one at the
     **front** of the set the moment that set holds a change SQLite has no statement of its own for,
     and that one change performs the whole set. It sits *beside* the changes it performs rather than
@@ -461,12 +491,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     PostgreSQL and give everything else MySQL's shape, which for SQLite is not unidiomatic but
     invalid — inline `KEY`/`UNIQUE KEY`, `ENGINE=`, `COLLATE=` and `COMMENT=` are each a syntax
     error there. It now sides with PostgreSQL on indexes (statements of their own) and has no table
-    options at all. Its one real divergence is `AUTOINCREMENT`, which is legal *only* inline as
-    `INTEGER PRIMARY KEY AUTOINCREMENT` on a single column: that column takes the whole declaration
-    and the table-level `PRIMARY KEY (…)` clause stands down rather than declaring a second key (a
-    composite key is unaffected). `ColumnInfo::definition_sql` makes the same distinction — SQLite
-    keeps `COLLATE`, the generated expression, `NOT NULL` and `DEFAULT`, and drops `AUTO_INCREMENT`,
-    `ON UPDATE` and the column comment (`ddl::sqlite_create_tests`). Ordering
+    options at all — except the two suffixes that change what the table *is*, `WITHOUT ROWID` and
+    `STRICT`, which the draft carries and a rebuild that didn't restate them silently dropped. Its
+    one real divergence is the **inline single-column key**, which is legal only as
+    `INTEGER PRIMARY KEY [AUTOINCREMENT]`: that column takes the whole declaration and the
+    table-level `PRIMARY KEY (…)` clause stands down rather than declaring a second key (a composite
+    key is unaffected). **`AUTOINCREMENT` is a narrower question than "server-assigned"** and has
+    its own flag, `ColumnInfo::sqlite_autoincrement`: every `INTEGER PRIMARY KEY` is the rowid and
+    is filled in for you, which is what `auto_increment` says, while the keyword adds the promise
+    never to reuse an id and a `sqlite_sequence` row to keep it — so reading the first as the second
+    put `AUTOINCREMENT` on every plain key a rebuild touched. `ColumnInfo::definition_sql` makes the
+    same distinctions — SQLite keeps `COLLATE`, the generated expression (with `STORED` when
+    `generated_stored`, since its default is `VIRTUAL`), `NOT NULL` and `DEFAULT`, parenthesising an
+    expression default because `pragma_table_xinfo` strips the parentheses the grammar requires
+    (`schema::is_bare_sqlite_default`), and drops `AUTO_INCREMENT`, `ON UPDATE` and the column
+    comment (`ddl::sqlite_create_tests`). Ordering
     is dependency-first (FKs and indexes off before the columns under them; keys back on
     after). `normalize_type`/`types_equal` + `defaults_equal` are the reason a designer
     opens clean — `int(11)` ≡ `int`, `character varying(45)` ≡ `varchar(45)`. **The
@@ -686,7 +725,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     are here for one reason, that the modal has to be able to *name* them: `ROW_CAP` (rows per poll,
     past which the monitor watches a page rather than a table) and `LOG_CAP` (changes kept, oldest
     dropping — the app's old private `MONITOR_LOG_MAX`, moved once the log became exportable, since
-    a silently truncated record looks complete and isn't).
+    a silently truncated record looks complete and isn't). **`trim_log` is the one place `LOG_CAP`
+    is applied**, and it returns how many entries went, because the app trimming on `> LOG_CAP`
+    while the modal's caveat printed on `>= LOG_CAP` meant a log resting exactly at the cap claimed
+    a loss it hadn't had — on a record whose only value is that it can be trusted. The status line
+    reads the count. `discard_needs_asking(len, exported)` is the other decision that belongs here
+    rather than in a modal: the log is the only record of what a deleted row held and no poll
+    re-reports a change, so throwing it away is irreversible — unless it is empty, or already on
+    disk, which is why the confirmation isn't unconditional.
   - `diff.rs` — `line_diff`/`build_diff_rows` (Ctrl+K preview).
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
     persisted to `history.json`. An entry is written in **two passes** — `push` when the run
@@ -1022,8 +1068,26 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     majority and a tie to CRLF, because normalising the odd stray LF is the smaller lie; a lone `\r`
     is not a line ending at all and is left exactly as it is, since that is what a string literal
     may legitimately hold. `decode` also strips a UTF-8 BOM — a Windows tool writes one and it
-    arrives as an invisible character in front of the first keyword — and decodes lossily, because a
-    mis-encoded byte should cost a replacement character rather than the whole file.
+    arrives as an invisible character in front of the first keyword — and `encode` puts that back
+    too, on the same argument: dropping it rewrites the file's first three bytes for a one-line
+    edit. Both flags, and one more, ride on `SqlFormat`, which is what the tab and its `SavedTab`
+    carry.
+    **A lossy read is not a licence to write.** `decode` reads bytes it cannot make sense of as
+    U+FFFD, because a mis-encoded byte should cost a replacement character rather than the whole
+    file — and that is a decision about *reading*. Writing the result back is a different act: it
+    replaces every unreadable byte in the file permanently, including in the thousands of lines
+    nobody touched, and a Latin-1 `mysqldump` is the ordinary shape of it. So `SqlFormat::lossy`
+    records that it happened (free — `from_utf8_lossy` already allocates only when it substituted),
+    persists across a relaunch, and the app confirms before such a save. The `.sql` file is the one
+    artefact in this application Schemaic cannot regenerate, which is also why the write is
+    `persist::write_file_atomic` (stage beside, rename over — no `.bak` and no mode change, since it
+    is the user's own file) and why the save re-reads the bytes immediately before the rename and
+    refuses when they are not what the tab read.
+    **Size is asked before the bytes are.** `open_verdict` confirms past 1 MB and refuses past 64
+    MB, and the reason is the editor rather than the read: `fs::read` and `decode` are cheap even at
+    256 MB, while `intel::diagnostics` runs over the whole document on the UI thread 120 ms after
+    every pause in typing — measured 710 ms at 1 MB, 11.4 s at 16 MB, 44.8 s at 64 MB, on an *empty*
+    catalogue.
     The naming half is entirely about what a file system will refuse: `suggested_name` maps the
     characters Windows forbids to `-`, trims the trailing dots and spaces it also refuses, appends
     `.sql` only when it isn't already there (a tab opened from `orders.sql` must not suggest
@@ -1217,11 +1281,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   `ON DELETE CASCADE` and empties the child tables — the table comes back exactly as the user drew
   it and another one has quietly lost every row (`sqlite::rebuild_fk_tests` rebuilds a one-row
   `artist` and watches both `album` rows behind an `ON DELETE CASCADE` vanish). That is why step 1
-  of SQLite's own twelve-step procedure turns them off. Nothing is given up by it: `PRAGMA
-  foreign_key_check` runs against the *finished* state before the commit and refuses the plan if a
-  reference dangles, naming the child table and the parent so the refusal is actionable — a stricter
-  question than the per-statement one, since a plan is allowed to pass through states no single
-  statement could.
+  of SQLite's own twelve-step procedure turns them off. (The rebuild's statement list carries its
+  own `ddl::FK_OFF`/`FK_ON` pair for the *other* consumer — see the twelve-step rebuild above; both
+  are no-ops inside this transaction, which is exactly why this one has to stay.) Nothing is given
+  up by it: `PRAGMA foreign_key_check` runs against the *finished* state before the commit and
+  refuses the plan if a reference dangles, naming the child table and the parent so the refusal is
+  actionable — a stricter question than the per-statement one, since a plan is allowed to pass
+  through states no single statement could.
+  **What it must not refuse is what the file arrived with.** That pragma scans the whole database,
+  and a `.db` written by the sqlite3 CLI — where foreign keys are off by default — very commonly
+  carries a child row whose parent is gone. Read as the plan's doing, it made adding a column to an
+  unrelated third table fail with *"the plan leaves a foreign key pointing at nothing"*, and every
+  DDL operation on that file fail the same way for ever. So the violations are read **before**
+  `BEGIN` as well, identified by `(table, rowid, parent, fkid)`, and only what
+  `FkViolations::added_since` reports as new refuses the plan (capped at 10,000 rows, past which it
+  falls back to comparing counts).
   **`Db::trigger_source` is the fourth MySQL-vs-MariaDB text divergence** (with `mysql_column`'s
   defaults, the view `ALGORITHM` and `mysql_check_clause`) and the only one that is not an
   optimisation: `information_schema.TRIGGERS.ACTION_STATEMENT` on MySQL 8 returns the body with
@@ -1242,7 +1316,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   third set of catalogue queries. **There is no server**: a connection is a *file*
   (`Connection::file`), so host/port/user/password/SSH are all inert, `fetch_databases` answers
   without opening anything (the one database SQLite calls `main`), and `Db::connect` refuses to let
-  a tunnel port repoint the file. **The driver is blocking**, so every call runs in
+  a tunnel port repoint the file. **"Inert" has to be enforced twice, because the engine picker is
+  editable on a saved connection and the SQLite form renders no SSH block** — so a connection
+  switched over from a tunnelled MySQL one kept `ssh.enabled` set with no control anywhere that
+  could unset it, and every operation on a local file dialled a bastion with a stored credential and
+  failed outright when that host was down. `Connection::uses_tunnel()` is the one answer every
+  tunnel site asks (there are six), and `Connection::sanitized()` — which `DraftSignals::to_connection`
+  returns through — drops the server side on save so the state cannot exist. `is_networked` likewise
+  has a single definition in `core::connection`, which `db::Engine` and the form's `DbKind` both
+  delegate to; it had two, and the third consumer not asking at all is what this cost. **The driver is blocking**, so every call runs in
   `spawn_blocking` and opens its own connection there — which is not a compromise but exactly the
   one-connection-per-operation invariant, at microsecond cost on a local file; cancellation goes
   through `Connection::get_interrupt_handle`, the analogue of `KILL QUERY` that needs no second
@@ -1269,12 +1351,27 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   way left to name its rowid and stays read-only. And `attach_origins` looks a declared column up
   **first**, synthesising an implicit-key origin (`not_null`, `auto_increment`, not `primary_key`)
   only for an unshadowed alias on a table that has a rowid, recording the name **as written** so the
-  `WHERE` the write-back builds resolves to the same value the `SELECT` read. **Nothing in the write
-  path changed**: `GridWrite::plan`, the delete → update → insert order, the 1-row safety net and
-  `one_row_verdict` are untouched — the key simply names a column the table doesn't have, and SQLite
-  resolves `rowid` in a projection and in a `WHERE` alike, which is also why the in-place splice
-  re-fetch works (`a_keyless_table_writes_back_through_its_rowid`,
-  `a_refetch_reads_a_keyless_row_back_by_its_rowid`). A `WITHOUT ROWID` table is unchanged in every
+  `WHERE` the write-back builds resolves to the same value the `SELECT` read. `GridWrite::plan`, the
+  delete → update → insert order, the 1-row safety net and `one_row_verdict` are untouched — the key
+  simply names a column the table doesn't have, and SQLite resolves `rowid` in a projection and in a
+  `WHERE` alike, which is also why the in-place splice re-fetch works
+  (`a_keyless_table_writes_back_through_its_rowid`,
+  `a_refetch_reads_a_keyless_row_back_by_its_rowid`).
+  **But a rowid is not a row identity, and the safety net alone cannot see that.** SQLite reassigns
+  them: the twelve-step rebuild used to renumber a keyless table, an insert after a delete takes the
+  freed number, `VACUUM` compacts them — and nothing re-runs an open result tab when any of that
+  happens, so the grid can hold a number that now names a *different* row. Keyed on the number
+  alone the `UPDATE` lands on that row and affects exactly 1, which is the number `one_row_verdict`
+  is looking for; the net's whole premise is that a stale key matches **zero**. Two things restore
+  it. `EditTable::confirm_cols` carries the values the grid read into the same `WHERE` — the rowid
+  still does the identifying and the values only *confirm* it, which is why this is not the
+  match-on-all-values scheme a keyless table makes unsafe (duplicate rows are legal there, and the
+  rowid tells them apart). It is populated only for an implicit key, excludes binary columns whose
+  cell is a placeholder rather than a value, and `edit::row_key` is the one builder that appends it,
+  so update, delete and the row panel's immediate save cannot disagree about what a row is. And
+  `sqlite_rebuild_sql`'s copy now names `rowid` explicitly — gated on `TableInfo::implicit_key`
+  being reachable and on no draft column shadowing any of the three spellings — which stops the
+  renumbering at source and preserves the gaps a delete left. A `WITHOUT ROWID` table is unchanged in every
   respect — SQLite will not even prepare the statement against one — and a view gets
   `implicit_key: None`. Verified end to end against a copy of the EdgeCases file: `keyless` opens as
   `SELECT rowid, * FROM keyless ORDER BY rowid ASC LIMIT 100`, reports `editable = [false, true,
@@ -1379,7 +1476,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     And the **keyboard-navigation cluster**, which is the subject of the Tab gotchas below:
     `FocusRing` (a modal's Tab order — `register`/`unregister`/`step_from`/`remember`/`focus_at`,
     plus the `ring_step` wrap rule and its deliberate opposite `list_step`, which clamps),
-    `focus_root_with_ring`/`innermost_focus_ring` (how the modal root and the *window* root enter
+    `focus_root_with_ring`/`innermost_ring_root` (how the modal root and the *window* root enter
     it), `in_focus_ring`/`in_focus_ring_with` (how a non-field control joins, the second for one
     with teardown of its own — floem keeps a single cleanup slot), `VALUE_TAB` (where a growing
     block of stops starts), and the `PopupToken`-tagged `set_open_popup`/`clear_open_popup`/
@@ -1668,8 +1765,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     over `schemaic_core::intel`'s scope/context engine.
   - `tabs.rs` — query-tab strip, and where a **`.sql`-backed tab** shows itself. The state behind
     that is four signals on `Tab`: `path`, `disk_sql` (the file's text as of the last open / save /
-    reload — `None` means *unknown*, which reads as modified, the safe direction), `file_crlf` and
-    `reload_gen`. `Tab::title` falls back name → file name → "Query N", the user-assigned name
+    reload — `None` means *unknown*, which reads as modified, the safe direction), `file_format`
+    (the `SqlFormat` a save has to put back, and whether the read was lossy) and `reload_gen`. `Tab::title` falls back name → file name → "Query N", the user-assigned name
     winning on purpose, since renaming a tab is an explicit act a Save As shouldn't silently undo;
     `Tab::modified` is `path.is_some() && query != disk_sql`, and so always false for a tab with no
     file — an ordinary tab is session-persisted and has nothing to be unsaved *against*.
@@ -1814,7 +1911,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     is the log's standing rule (an entry is stamped when a poll observed it, not when it happened),
     just coarser. **Clear empties `overlay.monitor_log` only** — the app's baseline snapshot is
     deliberately untouched, so clearing loses history you have already read and never a change that
-    hasn't been reported yet. **Export** raises the shared `overlay.popup_menu` over
+    hasn't been reported yet — **and it asks first**, through the shared `overlay.confirm`, when
+    `monitor::discard_needs_asking` says the log has something to lose and no copy on disk. The
+    button is one glyph from Export, at the same metric, dimmed by the same predicate. **Closing the
+    modal no longer empties the log at all.** It used to, "for tidiness / no stale flash", which was
+    harmless while the log could only be watched and became a total unprompted loss the moment the
+    same commit made it an exportable record — on Escape, the most reflexive key in the app.
+    `open_monitor` resets every monitor signal on the way in, so there was never a stale flash to
+    avoid. **Export** raises the shared `overlay.popup_menu` over
     `core::monitor::LOG_FORMATS`, anchored `PopupAnchor::BelowIcon` from the ring wrapper's
     `layout_rect()` exactly as `table_designer::suggest_chevron` does (it paints above the modal
     because `popup_menu_overlay` is mounted last in the workspace stack); choosing a format runs
@@ -1826,8 +1930,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     an error takes the line outright, worst-to-mislead first (a failed export beats a poll error,
     because the user believes they have a file and doesn't), and otherwise it is a lead — `Watching`
     or `Paused` — plus **every** caveat that applies, joined. `partial` (only the first `ROW_CAP`
-    rows are watched) and `capped` (the log is at `LOG_CAP`, oldest dropping) co-occur and neither
-    replaces the other. `Tone` resolves to a `fn() -> Color`, per the themable-colour invariant.
+    rows are watched) and `capped` co-occur and neither replaces the other. `capped` is
+    `overlay.monitor_dropped > 0`, accumulated from `monitor::trim_log`'s return, **not** the log's
+    length: at exactly `LOG_CAP` nothing has been dropped yet, and the caveat used to be printed
+    there anyway. An export failure that lands after the modal has closed goes to the shared error
+    modal rather than to `monitor_export_err`, which nothing renders once it is shut, and the
+    message is passed through as the pipeline wrote it — a second `Export failed —` in front of it
+    read "Export failed — Export failed: Access is denied". `Tone` resolves to a `fn() -> Color`, per the themable-colour invariant.
     It is pure and tested inline, which is what keeps the copy honest: the two caveats co-occurring
     is precisely the case a per-state `match` got wrong.
   - `theme.rs`/`themes.rs`/`icons.rs`/`fonts.rs`/`sql_highlight.rs`.
@@ -1903,11 +2012,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   backstop every close path passes through, but by then the damage is done. The file question is
   raised only on a file-backed tab, since `Tab::modified` is false for an ordinary one.
   `close_tab_now`'s keep-≥1 branch clears `path`/`disk_sql`/
-  `file_crlf` along with the text: the blank slate it leaves behind must not still point at a file,
-  or the next Ctrl+S would overwrite that file with an empty document.
-  A file tab survives both kinds of restore. `persist::SavedTab` carries `path`, `file_crlf` and
+  `file_format` along with the text: the blank slate it leaves behind must not still point at a
+  file, or the next Ctrl+S would overwrite that file with an empty document.
+  A file tab survives both kinds of restore. `persist::SavedTab` carries `path`, `file_crlf`,
+  `file_bom`, `file_lossy` and
   `file_dirty`, each `#[serde(default, skip_serializing_if = …)]` so a session file written before
-  the feature still restores its tabs; `ClosedTab` carries `path`/`disk_sql`/`file_crlf` so
+  the feature still restores its tabs — flat bools rather than a nested struct for exactly that
+  reason; `ClosedTab` carries `path`/`disk_sql`/`file_format` so
   Ctrl+Shift+T brings back a *file* tab rather than an untitled copy of its text, and its "worth
   restoring" guard counts a path as worth restoring on its own — the binding is the thing being
   lost, even from an empty file. The file's *contents* are deliberately not persisted: `file_dirty`
@@ -2072,7 +2183,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   they are per-object questions the menus ask per object, and what differs between engines has
   moved down to the narrower predicates that decide how an edit is *performed* rather than whether
   it is offered — `supports_or_replace_view` and `supports_view_rename`, both false on SQLite and
-  only there. Gate the menu entry on the right
+  only there. **What a per-object capability must not do is answer for an object it wasn't asked
+  about**: `field_entries` and `key_entries` take `is_view` because the tree renders a column row
+  under a view exactly as under a table, and a constant `true` there offered Edit column and a red
+  Drop for something that has neither — opening the *table* designer on a view, whose every edit all
+  three engines refuse. `table_designer::open_for_table` refuses a view outright as the second lock.
+  Gate the menu entry on the right
   one rather than leaving the refusal to `Db::run_ddl`, which sees only strings. A
   new engine is a `SqlDialect` arm in `ddl.rs`'s emitter, not a parallel emitter. The
   round-trip gate (a draft built from a table must diff to *nothing*) is the test that keeps
@@ -2089,7 +2205,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   (a keyless table opened through its rowid) analysable — and by nothing else. The guard did not
   move with it: an implicit key is an ordinary key column to `commit_writes`, so the ordering and
   the 1-row net apply to it unchanged, and widening the analysis further is still the way this
-  invariant gets regressed. Its rollback, by contrast, is the one that needs no
+  invariant gets regressed. **The net's premise is that a stale key matches zero rows, and an
+  implicit key breaks it** — SQLite reassigns rowids, so a number the grid still holds can name a
+  different row, and an `UPDATE` on it affects exactly the 1 the guard wants to see. That is
+  repaired where the key is built rather than where it is checked: `EditTable::confirm_cols` puts
+  the values the grid read into the same `WHERE` for an implicit key only, and `edit::row_key` is
+  the one builder that appends them. Restoring the premise is the shape any future key of this kind
+  has to take; loosening the guard is not. Its rollback, by contrast, is the one that needs no
   hedging — there is no non-transactional table type. That
   promise is MySQL-engine-dependent: `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV` ignore `BEGIN`/`ROLLBACK`,
   and `ROLLBACK` *succeeds* there while raising warning 1196. So no write path may discard a
@@ -2224,8 +2346,6 @@ Re-introducing the anti-patterns these guard against is a regression:
     captured *by value* freezes at build time. Prefer `fn() -> Color` for anything themable (see
     `FieldCfg::background`).
 - **Reactive text**: use `dyn_container` (no `floem::views::label`).
-- Small visual tweaks: build only, let the user verify. Screenshot harness for new features /
-  behavior debugging, or when asked.
 
 ## Floem 0.2 gotchas (learned the hard way)
 
@@ -2450,7 +2570,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   Tab reaches it only when nothing in the overlay consumed the key — focus is on a dropdown's popup
   list, or on *nothing*, which is what floem leaves behind whenever a focused view is removed or an
   unfocusable row is clicked — and floem's own fallback then walks the whole window tree. So the
-  root steps `widgets::innermost_focus_ring()` instead, which is why `FOCUS_ROOTS` carries
+  root steps `widgets::innermost_ring_root()` instead, which is why `FOCUS_ROOTS` carries
   `(ViewId, Option<FocusRing>)` rather than a bare id.
   **Every cleanup that can run while focused hands the keyboard back** — `focus_root`,
   `in_focus_ring` and `edit_field` all do, because floem clears `app_state.focus` *silently* on
