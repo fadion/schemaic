@@ -628,6 +628,10 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
     let collapse_all = ui.schema_actions.collapse_all.clone();
     let toggle_sizes = ui.schema_actions.toggle_table_sizes.clone();
     let sizes_on = ui.schema.table_sizes;
+    // Kept whole for the capability check below: which rows this menu has depends
+    // on the active connection, and the menu is rebuilt on each open, so it is read
+    // there rather than captured here.
+    let menu_ui = ui.clone();
 
     dyn_container(
         move || open.get(),
@@ -635,6 +639,7 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
             if !is_open {
                 return empty().into_any();
             }
+            let ui = menu_ui.clone();
             let refresh = refresh.clone();
             let collapse_all = collapse_all.clone();
             let refresh_item = container(text("Refresh").style(|s| s.color(theme::text())))
@@ -661,19 +666,38 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
             // There, dim means *this database is hidden* — a state with a
             // consequence. Here off is just the resting state of a view mode, and
             // dimming it would make an ordinary menu row look disabled.
-            let toggle_sizes = toggle_sizes.clone();
-            let sizes_item = container(text("Show table sizes").style(move |s| {
-                s.color(if sizes_on.get() {
-                    theme::db_toggle_on()
-                } else {
-                    theme::text()
-                })
-            }))
-            .on_click_stop(move |_| (toggle_sizes)())
-            .style(menu_item_style)
-            .style(|s| s.padding_vert(8.0));
+            //
+            // **And it is offered only where the engine has sizes to show**
+            // (`stats::supports_table_stats`, the capability the fetch itself is
+            // guarded by). SQLite has none — no per-table row estimate outside an
+            // `ANALYZE` sample, and per-table bytes need the `dbstat` module this
+            // build omits — so the column stays empty whichever way the row is set,
+            // and a row that visibly toggles while nothing changes is worse than no
+            // row. Absent rather than disabled: there is nothing here for another
+            // connection to enable. The *setting* is untouched — it is global and
+            // persisted, so a MySQL connection comes back to whatever it was left at.
+            let mut items: Vec<floem::AnyView> =
+                vec![refresh_item.into_any(), collapse_item.into_any()];
+            if schemaic_core::stats::supports_table_stats(
+                crate::table_designer::edit_ctx(&ui).dialect,
+            ) {
+                let toggle_sizes = toggle_sizes.clone();
+                items.push(
+                    container(text("Show table sizes").style(move |s| {
+                        s.color(if sizes_on.get() {
+                            theme::db_toggle_on()
+                        } else {
+                            theme::text()
+                        })
+                    }))
+                    .on_click_stop(move |_| (toggle_sizes)())
+                    .style(menu_item_style)
+                    .style(|s| s.padding_vert(8.0))
+                    .into_any(),
+                );
+            }
 
-            focus_root(v_stack((refresh_item, collapse_item, sizes_item)))
+            focus_root(v_stack_from_iter(items))
                 .on_key_down(
                     Key::Named(NamedKey::Escape),
                     |_| true,

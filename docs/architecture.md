@@ -1893,7 +1893,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       *panel*, from the same `core::stats` figures the properties modal shows. It answers the
       question that modal cannot — *which* of these is the big one — and is off by default behind
       SCHEMA gear → **Show table sizes** (`SchemaUi::table_sizes`, persisted as
-      `UiState::show_table_sizes`). The panel and not the row, because those are not the same edge:
+      `UiState::show_table_sizes`). **That row is absent on an engine with no sizes to show**
+      (`schema_settings_overlay` asks `stats::supports_table_stats`, the same capability guarding the
+      fetch): on SQLite the column stays empty whichever way the setting is left, so a row that
+      visibly toggles while nothing changes is worse than no row. Absent rather than disabled, since
+      there is nothing here for another connection to enable — and the setting itself is untouched,
+      being global and persisted, so a MySQL connection comes back to whatever it was left at. The panel and not the row, because those are not the same edge:
       the badge started as a `flex_grow` spacer pushing the size to the end of its row, and tree
       rows stretch to the *widest* row (the tree is deliberately not `width_full` so it can scroll
       horizontally), so expanding any table — whose column rows are indented and carry a type —
