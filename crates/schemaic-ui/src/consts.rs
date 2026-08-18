@@ -78,6 +78,51 @@ pub(crate) const COMPLETION_GUTTER: f64 = 38.0;
 /// Gap below the caret's line-bottom (`points_of_offset().1.y`) at which the
 /// completion popup opens.
 pub(crate) const COMPLETION_LINE_H: f64 = 3.0;
+/// Height of one suggestion row — measured: `font_size(14)` + `padding_vert(5)`.
+/// The popup is positioned by a style closure, which has no measured height to
+/// read, so the flip-above decision predicts the list's height from its row count.
+pub(crate) const COMPLETION_ROW_H: f64 = 24.0;
+/// Tallest the suggestion list may grow before it scrolls internally.
+pub(crate) const COMPLETION_MAX_H: f64 = 260.0;
+/// The popup's 1px border, on both axes: the difference between the box its
+/// content gets and the box a caller has to find room for.
+pub(crate) const COMPLETION_BORDER: f64 = 2.0;
+/// Breathing room kept between the popup and the editor pane's edges.
+pub(crate) const COMPLETION_EDGE_PAD: f64 = 4.0;
+/// Shortest a squeezed list is shrunk to (two rows) before it stops giving way —
+/// below this it shows nothing worth reading, so it keeps the height instead.
+pub(crate) const COMPLETION_MIN_H: f64 = 48.0;
+/// Narrowest the popup is drawn, so a list of one-letter column names doesn't come
+/// up as a sliver that jitters wider on the next keystroke.
+pub(crate) const COMPLETION_MIN_W: f64 = 270.0;
+/// Widest, past which a long detail (a function signature) ellipsizes rather than
+/// dragging the whole box out and leaving every short row full of whitespace.
+pub(crate) const COMPLETION_MAX_W: f64 = 520.0;
+/// Slack added to each row's predicted width. Sizing the box to *exactly* the
+/// widest row leaves that row sitting on its own ellipsis boundary, where a
+/// sub-pixel disagreement between the measurement and the layout truncates the
+/// detail (`main` → `m…`) while every shorter row renders clean. Cheap insurance:
+/// the alternative to a few px of air is a visibly wrong string.
+pub(crate) const COMPLETION_SLACK_W: f64 = 6.0;
+/// A suggestion row's fixed chrome. Summed with the measured text these give the
+/// width the popup wants, which a style closure has no measured value for — so
+/// `completion_popup` builds its rows out of these same constants rather than
+/// repeating the numbers, since a layout tweak that skipped the measurement would
+/// silently mis-size the box.
+///
+/// The leading glyph plus its `margin_right`:
+pub(crate) const COMPLETION_ICON_W: f64 = COMPLETION_ICON_SIZE + 7.0;
+pub(crate) const COMPLETION_ICON_SIZE: f64 = 13.0;
+/// The least the flex spacer holds between the name and the annotations:
+pub(crate) const COMPLETION_GAP_W: f64 = 24.0;
+/// The detail's `margin_left` — charged even for an empty detail, since the margin
+/// is on the node rather than the text:
+pub(crate) const COMPLETION_DETAIL_GAP: f64 = 18.0;
+/// The row's `padding_horiz`, per side:
+pub(crate) const COMPLETION_ROW_PAD: f64 = 10.0;
+/// Suggestion name size (matches the editor) and annotation size.
+pub(crate) const COMPLETION_NAME_SIZE: f32 = 14.0;
+pub(crate) const COMPLETION_ANNOT_SIZE: f32 = 12.0;
 
 /// Height of the wavy syntax-error underline (px).
 pub(crate) const WAVE_H: f64 = 5.0;

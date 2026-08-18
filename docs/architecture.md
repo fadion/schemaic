@@ -3052,11 +3052,40 @@ Re-introducing the anti-patterns these guard against is a regression:
   the absolute document y; the gutter view subtracts `viewport.y0` itself). Overlays pinned in
   `editor_area` must subtract `ed.viewport.get()` `x0`/`y0` to follow scroll — see `char_box`
   (bracket matching), `underline_seg_at`, `statement_line_boxes_at`, all tested against a scrolled
-  viewport. **`editor_area` also doesn't clip**, so an overlay must bound itself: a box wider than
-  the visible code column paints straight out of the editor and over the panel beside it, which is
-  what `statement_line_boxes_at` clamps against `vp.width()` (a zero width means "not laid out yet",
-  so it clamps nothing rather than blanking the overlay). The vertical half needs no clamp — floem
-  won't place an offset outside its screen lines, and `editor_points` drops what it won't place.
+  viewport. The caret-anchored popups do it one step later: `completion::set_anchor` stores the
+  caret line in content coords and `completion_popup`/`signature_popup` subtract the viewport
+  *inside their style closures*, because those are placed once per edit and would otherwise stay
+  pinned to the scroll position the popup opened at. **`editor_area` also doesn't clip**, so an
+  overlay must bound itself: a box wider than the visible code column paints straight out of the
+  editor and over the panel beside it, which is what `statement_line_boxes_at` clamps against
+  `vp.width()` (a zero width means "not laid out yet", so it clamps nothing rather than blanking the
+  overlay). For the *text* overlays the vertical half needs no clamp — floem won't place an offset
+  outside its screen lines, and `editor_points` drops what it won't place. The suggestion list is
+  the exception on **both** axes, since it occupies space no line does, and it bounds itself against
+  `editor_area`'s tracked size (`area_h`/`area_w`) rather than against the text. Vertically,
+  `completion::popup_placement` hangs it below the caret when it fits, flips it above the caret line
+  when it doesn't, and shortens it to the roomier side when neither holds; left to hang below
+  unconditionally it drew itself down across the results grid. Horizontally, `completion::popup_w`
+  sizes it and `completion::popup_x` slides it left to keep the right edge inside the pane — a flat
+  `COMPLETION_GUTTER + caret.x` ran a completion near the right edge off the pane, where `.clip()`
+  cut every row's annotations off mid-word (worst with the AI panel hidden, where the editor's right
+  edge *is* the window's). Both predict rather than measure, because a style closure gets neither a
+  laid-out height nor width: the height from `COMPLETION_ROW_H × rows`, pinned when flipped so an
+  under-estimate costs a scrolled pixel rather than an overlap; the width from
+  `completion::natural_width`, which sums the row chrome (the `COMPLETION_*_W` consts, which
+  `completion_popup` builds its rows from so the two can't drift) with `widgets::measure_text_px_at`
+  over the row text. That measurement runs in `completion::set_items` — once per recompute, not per
+  style pass — and its result lives on `Completion::width`. It replaced a flat `min_width(320)`,
+  which left a list of one-letter column names three-quarters empty; a row too wide for the box now
+  ellipsizes its two dim annotation columns, and never the name being picked. Two details of that
+  are load-bearing, both learned from the same symptom (`main` truncating to `m…` on the *widest*
+  row of a table list while every shorter row rendered clean). The row list takes an **explicit**
+  width, not `width_full()`: a percentage resolves against a definite parent width, and a `scroll`
+  lays its child out against max-content available space, so the percentage quietly became "as wide
+  as the widest row" and the rows never stretched to the box at all. And `row_width` carries
+  `COMPLETION_SLACK_W` of air and rounds up, because a box sized to exactly its widest row puts
+  that row on its own ellipsis boundary, where a sub-pixel disagreement between the measurement and
+  the layout is a visibly wrong string.
 - **The floem editor owns its document once mounted, and the sync is one-way — writing the `query`
   signal from outside is not merely invisible, it is lost.** Every edit runs
   `query.set(doc.text())` from the editor's `.update` callback (`editor_pane.rs`), and there is no
