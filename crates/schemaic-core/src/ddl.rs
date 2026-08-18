@@ -4883,8 +4883,27 @@ pub fn checks_equal(a: &CheckInfo, b: &CheckInfo, dialect: SqlDialect) -> bool {
 /// SQLite has neither `CREATE OR REPLACE VIEW` nor a verb that renames a view,
 /// so every edit is a drop and a create; the other two replace in place and
 /// rename with a statement.
-pub fn supports_view_editing(_dialect: SqlDialect) -> bool {
-    true
+///
+/// **The answer is computed, not stated.** This took a `SqlDialect` it discarded
+/// and returned `true`, which is the failure the *"ask a capability, never an
+/// engine"* rule exists to prevent wearing the name of the fix for it: a literal
+/// answers for a fourth engine too, and leaves no comparison to grep for. It now
+/// asks [`supports_change`] for the two statements an editor cannot do without —
+/// a `CREATE` for a new view, and a redefinition of one that exists — so an
+/// engine whose emitter has no arm for them loses the entry instead of being
+/// handed a modal that ends at a statement nothing can write.
+pub fn supports_view_editing(dialect: SqlDialect) -> bool {
+    supports_change(dialect, &Change::CreateView(Box::default()))
+        && supports_change(
+            dialect,
+            &Change::ReplaceView {
+                draft: Box::default(),
+                // The route this engine would really be handed, so the probe is
+                // the change the editor builds rather than a shape of it.
+                recreate: !supports_or_replace_view(dialect),
+                replay: Vec::new(),
+            },
+        )
 }
 
 /// Can `dialect` redefine a view **in place**, with `CREATE OR REPLACE VIEW`?
@@ -4922,8 +4941,90 @@ pub fn supports_view_rename(dialect: SqlDialect) -> bool {
 /// verbatim, and still is what a rebuild replays. The two are not redundant: the
 /// model is what the *editor* diffs, and the text is what a table rebuild puts
 /// back without depending on the parse being perfect.
-pub fn supports_trigger_editing(_dialect: SqlDialect) -> bool {
-    true
+///
+/// Computed from [`supports_change`] for the reason [`supports_view_editing`]
+/// gives, and over all three statements: an editor that can add a trigger but
+/// not remove one is not an editor, and the drop is the half SQLite's own
+/// re-create depends on.
+pub fn supports_trigger_editing(dialect: SqlDialect) -> bool {
+    supports_change(dialect, &Change::CreateTrigger(Box::default()))
+        && supports_change(
+            dialect,
+            &Change::ReplaceTrigger {
+                draft: Box::default(),
+            },
+        )
+        && supports_change(
+            dialect,
+            &Change::DropTrigger {
+                name: String::new(),
+            },
+        )
+}
+
+/// Can a table be **designed** on `dialect` — the question every entry that
+/// opens the table designer is really asking?
+///
+/// The probe is a column **retype**, because it is the designer's own edit: the
+/// one change with no shortcut anywhere else in the app, and the one an engine is
+/// likeliest to have no statement for. Two routes count, because both end at the
+/// same table — `ALTER`ing the column in place (MySQL, PostgreSQL) or rebuilding
+/// the table around it (SQLite, which has no `ALTER` for it and reaches every
+/// such change through [`sqlite_rebuild_sql`]).
+///
+/// This exists because three menu entries that read as capability questions —
+/// **Edit table**, **Edit column**, **Edit index** — were literal `true`s, left
+/// behind when the predicate they used to ask was deleted. The literal is not
+/// wrong today and is unfalsifiable, which is the problem: it answers for
+/// whatever lands next as well.
+pub fn supports_table_design(dialect: SqlDialect) -> bool {
+    let from = ColumnInfo {
+        name: "c".into(),
+        type_name: "int".into(),
+        nullable: true,
+        ..Default::default()
+    };
+    let to = ColumnInfo {
+        type_name: "text".into(),
+        ..from.clone()
+    };
+    supports_change(
+        dialect,
+        &Change::AlterColumn {
+            from: Box::new(from),
+            to: Box::new(to),
+            position: None,
+            inline_check: None,
+        },
+    ) || supports_change(
+        dialect,
+        &Change::RebuildTable(Box::new(Rebuild {
+            current: TableInfo::default(),
+            draft: TableDraft::default(),
+        })),
+    )
+}
+
+/// Can `dialect` **place** a column — put one anywhere but at the end?
+///
+/// MySQL says `AFTER`/`FIRST` on the `MODIFY` it is already writing. SQLite has
+/// no such clause and needs none: a move is a change with no `ALTER` behind it,
+/// so it falls through to the rebuild, and the shadow table is created in the
+/// draft's column order — the move costs nothing beyond the rebuild already under
+/// way. PostgreSQL has neither: column order there is physical and no statement
+/// moves one, so a reordered draft is a preference the server has no way to
+/// honour, and arrows in the designer would promise an edit no statement can
+/// carry out.
+///
+/// An exhaustive `match` rather than a `!= Postgres` — which is how this was
+/// spelled at **both** its sites, in [`diff`] and again on the designer's arrow
+/// buttons. That spelling hands a fourth engine MySQL's answer silently; this
+/// one doesn't compile until someone has answered for it.
+pub fn supports_column_reorder(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Sqlite => true,
+        SqlDialect::Postgres => false,
+    }
 }
 
 /// Is this the change that performs a whole set by rebuilding the table?
@@ -5930,10 +6031,11 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
         }
     }
 
-    // Column order — MySQL only. PostgreSQL can't move a column, so a reordered
-    // draft there is a preference the server has no way to honor, and pretending
-    // otherwise would emit statements that fail.
-    if dialect != SqlDialect::Postgres {
+    // Column order, where the engine can place a column at all
+    // ([`supports_column_reorder`] carries which can and why). PostgreSQL can't,
+    // so a reordered draft there is a preference the server has no way to honor,
+    // and pretending otherwise would emit statements that fail.
+    if supports_column_reorder(dialect) {
         apply_positions(current, draft, &renamed, &alter_at, &add_at, &mut changes);
     }
 
@@ -8246,11 +8348,11 @@ mod tests {
     }
 
     /// **What "every engine designs from a column row" actually claims.** The
-    /// menu entry that used to be capability-gated is now a literal `true`, so
-    /// the test that reads it can no longer fail for any dialect — but the claim
-    /// underneath it is real and *did* fail on SQLite before the rebuild existed:
-    /// retyping a column has to produce a plan the engine can carry out, with
-    /// nothing withheld and something to run.
+    /// menu entry reading it asks [`supports_table_design`], which is this claim
+    /// as a predicate — and the claim is real, and *did* fail on SQLite before the
+    /// rebuild existed: retyping a column has to produce a plan the engine can
+    /// carry out, with nothing withheld and something to run. Asserting the entry
+    /// proves none of that, which is why the assertion is here and not there.
     ///
     /// The route differs and that is the point: MySQL and PostgreSQL alter the
     /// column in place, SQLite reaches the same edit through the twelve-step
@@ -8307,6 +8409,153 @@ mod tests {
                     .iter()
                     .any(|c| matches!(c, Change::RebuildTable(_))),
                 "{dialect:?} must not rebuild"
+            );
+        }
+    }
+
+    /// **A capability that ignores its dialect is a constant with a function's
+    /// name on it.** `supports_view_editing`, `supports_trigger_editing` and
+    /// `supports_table_design` all answer `true` for all three shipping engines,
+    /// which is exactly why the answer has to be *computed*: a literal answers
+    /// for the fourth engine too, and there is no comparison left to grep for.
+    ///
+    /// Each of the three now derives from [`supports_change`] — the same table
+    /// the emitter consults — so what these tests pin is that the predicate and
+    /// the emitter agree: an entry is offered when, and only when, the edit behind
+    /// it produces a plan this engine can carry out with nothing withheld. They
+    /// fail on a broken emitter and on an engine that answers `true` without one.
+    ///
+    /// **What they cannot catch, stated so the coverage isn't overread:** with
+    /// three engines that all answer yes, no runtime assertion distinguishes the
+    /// computation from a literal `true`. What rules the literal out is that the
+    /// bodies have none to return — each forwards to [`supports_change`], where
+    /// the per-engine answers live and where a fourth engine's arrival is a
+    /// change to one table rather than to every call site.
+    #[test]
+    fn view_editing_is_offered_exactly_where_a_view_edit_emits() {
+        for dialect in [MySql, Postgres, Sqlite] {
+            let cur = TableInfo {
+                name: "v".into(),
+                columns: vec![col("a", "int")],
+                is_view: true,
+                view_definition: Some("SELECT a FROM t".into()),
+                view_options: Some(ViewOptions::default()),
+                ..Default::default()
+            };
+            let mut d = ViewDraft::from_table(&cur).expect("a view drafts");
+            d.select = "SELECT a FROM t WHERE a > 1".into();
+            let cs = diff_view(&cur, &d, dialect);
+            let emits = !cs.emit().is_empty() && cs.unsupported().is_empty();
+            assert_eq!(
+                supports_view_editing(dialect),
+                emits,
+                "{dialect:?}: the entry and the emitter disagree — withheld {:?}",
+                cs.unsupported()
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_editing_is_offered_exactly_where_a_trigger_edit_emits() {
+        for dialect in [MySql, Postgres, Sqlite] {
+            let cur = TriggerInfo {
+                name: "t_ins".into(),
+                table: "orders".into(),
+                timing: TriggerTiming::Before,
+                events: vec![TriggerEvent::Insert],
+                level: TriggerLevel::Row,
+                action: TriggerAction::Body("SELECT 1".into()),
+                ..Default::default()
+            };
+            let mut d = TriggerDraft::from_info(&cur);
+            d.info.action = TriggerAction::Body("SELECT 2".into());
+            let cs = diff_trigger(&cur, &d, dialect);
+            let emits = !cs.emit().is_empty() && cs.unsupported().is_empty();
+            assert_eq!(
+                supports_trigger_editing(dialect),
+                emits,
+                "{dialect:?}: the entry and the emitter disagree — withheld {:?}",
+                cs.unsupported()
+            );
+        }
+    }
+
+    /// The designer's own edit, and the one the three literal `edit` fields in
+    /// the schema tree's menus were standing in for.
+    #[test]
+    fn table_design_is_offered_exactly_where_a_retype_emits() {
+        for dialect in [MySql, Postgres, Sqlite] {
+            let t = users();
+            let mut d = TableDraft::from_table(&t);
+            d.columns[2].info.type_name = "text".into();
+            let cs = diff(&t, &d, dialect);
+            let emits = !cs.emit().is_empty() && cs.unsupported().is_empty();
+            assert_eq!(
+                supports_table_design(dialect),
+                emits,
+                "{dialect:?}: the entry and the emitter disagree — withheld {:?}",
+                cs.unsupported()
+            );
+        }
+    }
+
+    /// **The engines really do disagree about placing a column**, which is what
+    /// makes this a capability rather than a third `!= Postgres`: asserting one
+    /// answer for all three would pass on a constant.
+    #[test]
+    fn only_postgres_cannot_place_a_column() {
+        assert!(supports_column_reorder(MySql), "MySQL says `AFTER`");
+        assert!(
+            supports_column_reorder(Sqlite),
+            "SQLite rebuilds in the draft's order"
+        );
+        assert!(
+            !supports_column_reorder(Postgres),
+            "PostgreSQL has no statement that moves a column"
+        );
+    }
+
+    /// And the predicate is the one `diff` asks, by the route each engine takes:
+    /// MySQL attaches a position to the `MODIFY` it is already writing, SQLite
+    /// has no clause for it and falls through to the rebuild, and PostgreSQL must
+    /// raise **nothing at all** — a reordered draft there is a preference the
+    /// server has no way to honour, and a plan for it would be a statement that
+    /// fails.
+    #[test]
+    fn a_reordered_draft_moves_on_mysql_rebuilds_on_sqlite_and_is_not_raised_on_postgres() {
+        let t = users();
+        let mut d = TableDraft::from_table(&t);
+        let moved = d.columns.remove(2);
+        d.columns.insert(0, moved);
+
+        let my = diff(&t, &d, MySql);
+        assert!(
+            my.changes.iter().any(|c| matches!(
+                c,
+                Change::AlterColumn {
+                    position: Some(_),
+                    ..
+                }
+            )),
+            "{:#?}",
+            my.changes
+        );
+        let lite = diff(&t, &d, Sqlite);
+        assert!(
+            lite.changes
+                .iter()
+                .any(|c| matches!(c, Change::RebuildTable(_))),
+            "{:#?}",
+            lite.changes
+        );
+        let pg = diff(&t, &d, Postgres);
+        assert!(pg.is_empty(), "{:#?}", pg.changes);
+
+        for dialect in [MySql, Postgres, Sqlite] {
+            assert_eq!(
+                supports_column_reorder(dialect),
+                !diff(&t, &d, dialect).is_empty(),
+                "{dialect:?}: the arrows and the plan disagree"
             );
         }
     }

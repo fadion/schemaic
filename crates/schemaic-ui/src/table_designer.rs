@@ -1139,7 +1139,7 @@ fn columns_list(ui: Ui, ring: FocusRing) -> AnyView {
     let can_reorder = d
         .designer
         .get_untracked()
-        .is_some_and(|t| t.dialect != SqlDialect::Postgres);
+        .is_some_and(|t| schemaic_core::ddl::supports_column_reorder(t.dialect));
     list_pane(
         rows,
         list_actions(
@@ -1163,11 +1163,10 @@ fn columns_list(ui: Ui, ring: FocusRing) -> AnyView {
                 ui.ddl.draft.update(|d| d.remove_column(i));
                 clamp_selection(&ui, |d| d.columns.len());
             },
-            // MySQL moves a column with `AFTER`, and SQLite gets there by
-            // rebuilding — the new table is created in the draft's column order,
-            // so a move costs nothing beyond the rebuild already under way.
-            // PostgreSQL has neither, and arrows there would promise an edit no
-            // statement can carry out.
+            // Which engines can place a column, and why each can or can't, is
+            // `ddl::supports_column_reorder` — the same predicate `ddl::diff`
+            // asks before it raises the move, so the arrows and the plan cannot
+            // drift apart. It was a `!= SqlDialect::Postgres` at both sites.
             can_reorder.then(|| Rc::new(move || swap_selected(&up_ui, -1)) as Rc<dyn Fn()>),
             can_reorder.then(|| Rc::new(move || swap_selected(&down_ui, 1)) as Rc<dyn Fn()>),
             ring.clone(),

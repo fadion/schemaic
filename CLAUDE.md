@@ -11,11 +11,14 @@ writes, imports and edits **tables** (through the twelve-step rebuild — `ddl::
 **views** and **triggers**, but has **no manual-transaction mode** — a statement about SQLite
 rather than unfinished work (`db::session::Session::open` carries the reason). What differs between the
 engines now lives in the *narrow* predicates that decide how an edit is performed rather than
-whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`, `supports_change`,
-`alter_column_disturbs_checks`, `stats::supports_table_stats`. Ask a **capability**, never an
-engine: a `dialect == Postgres` or `!= MySql` compiles cleanly while silently sorting a third
-engine onto whichever side it happens to fall — and a *constant* in place of a capability is the
-same failure with no comparison to grep for.
+whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,
+`supports_column_reorder`, `supports_change`, `alter_column_disturbs_checks`,
+`stats::supports_table_stats`. Ask a **capability**, never an engine: a `dialect == Postgres` or
+`!= MySql` compiles cleanly while silently sorting a third engine onto whichever side it happens to
+fall — and a *constant* in place of a capability is the same failure with no comparison to grep for,
+which is why the predicates that do answer the same for all three engines today
+(`supports_view_editing`, `supports_trigger_editing`, `supports_table_design`) *compute* that answer
+from `supports_change` rather than returning `true`.
 
 **`docs/architecture.md` is the reference document** — the module map (one entry per source file),
 the architecture invariants, the UI conventions, the Floem hazards, and the data grid end to end.

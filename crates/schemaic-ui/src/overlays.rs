@@ -159,8 +159,15 @@ pub(crate) fn object_entries(
         triggers: edits_triggers
             && (!is_view || (dialect != schemaic_core::intel::SqlDialect::MySql && !materialized)),
         // A table's designer, or a view's editor — the entry reads "Edit table"
-        // or "Edit view" and they are not the same capability.
-        edit: if is_view { edits_views } else { true },
+        // or "Edit view" and they are not the same capability. The table half was
+        // a literal `true`, left behind when the predicate it used to ask was
+        // deleted; `supports_table_design` is that question restated as the one
+        // the designer actually needs answered.
+        edit: if is_view {
+            edits_views
+        } else {
+            schemaic_core::ddl::supports_table_design(dialect)
+        },
     }
 }
 
@@ -189,9 +196,10 @@ pub(crate) struct KeyEntries {
 /// [`object_entries`] is: so the rule can be asserted without a `Ui`.
 ///
 /// The two questions really are different, which is why this asks twice.
-/// **Edit** opens the designer, which every engine now has — SQLite reaches a
-/// retype or a constraint by rebuilding the table. **Drop** is a shortcut with
-/// no draft behind it, so it needs a statement for that one change, which is a
+/// **Edit** opens the designer, so it asks whether this engine can design a table
+/// at all (`ddl::supports_table_design` — every engine can, SQLite by rebuilding
+/// the table around a retype or a constraint). **Drop** is a shortcut with no
+/// draft behind it, so it needs a statement for that one change, which is a
 /// narrower thing to ask (`ddl::supports_change`).
 /// `is_view` because **a view's columns are not the view's to edit.** The tree
 /// renders a column row under a view exactly as it does under a table — the flag
@@ -205,7 +213,7 @@ pub(crate) fn field_entries(
     is_view: bool,
 ) -> FieldEntries {
     FieldEntries {
-        edit: !is_view,
+        edit: !is_view && schemaic_core::ddl::supports_table_design(dialect),
         // The predicate reads the *shape* of the change, not its names — a
         // dropped column is expressible or not whatever it is called.
         drop: !is_view
@@ -231,11 +239,11 @@ pub(crate) fn key_entries(
     constraint: Option<&str>,
     is_view: bool,
 ) -> KeyEntries {
-    use schemaic_core::ddl::{Change, supports_change};
+    use schemaic_core::ddl::{Change, supports_change, supports_table_design};
     KeyEntries {
         // The designer, which reaches what these shortcuts can't: dropping a
         // foreign key on SQLite is a rebuild, and the draft is what has one.
-        edit: !is_view,
+        edit: !is_view && supports_table_design(dialect),
         drop_foreign_key: !is_view
             && supports_change(
                 dialect,
@@ -1265,10 +1273,12 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
 
                         // ── Schema editing ────────────────────────────────────
                         // Everything here ends at the DDL preview; nothing runs
-                        // a statement from the menu. Absent entirely on an engine
-                        // with no emitter (see `object_entries`), rather than
-                        // dimmed: "not supported" is what is true of SQLite here,
-                        // and dimming would say "not here".
+                        // a statement from the menu. Absent entirely where the
+                        // engine can't express the edit (`object_entries`, which
+                        // asks `ddl::supports_table_design` and its siblings)
+                        // rather than dimmed: "not supported" and "not here" are
+                        // different answers, and dimming gives the second one.
+                        // All three engines can, SQLite by rebuilding the table.
                         if offers.edit {
                             let ui = import_ui.clone();
                             let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
@@ -4042,9 +4052,9 @@ mod object_menu_tests {
 
     /// **The whole table of answers, in one place.** Three separate tests used
     /// to assert `object_entries(…, Sqlite, …).edit`, `.triggers` and so on —
-    /// each of which now reduces to a literal `true`, so none of them could fail
-    /// for any dialect: delete SQLite's entire capability story and they stayed
-    /// green.
+    /// each of which answers the same for every shipping engine, so none of them
+    /// could fail for a dialect: delete SQLite's entire capability story and they
+    /// stayed green.
     ///
     /// A matrix has content where an isolated `true` has none, because what it
     /// pins is the **shape of the disagreement**: `triggers` is the one entry
@@ -4053,9 +4063,13 @@ mod object_menu_tests {
     /// are asserted *and* asserted to be the same everywhere, which is the claim
     /// that would break if a fourth engine were sorted onto the wrong side.
     ///
-    /// The capability these constants replaced is tested where it still exists —
-    /// `core::ddl`'s `every_engine_can_express_a_column_retype` and
-    /// `a_body_change_drops_and_creates_rather_than_replacing`.
+    /// Every answer here is now computed from a capability rather than stated —
+    /// `edit` from `ddl::supports_table_design` or `supports_view_editing`,
+    /// `triggers` from `supports_trigger_editing`, `truncate` from
+    /// `supports_change` — and each of those is pinned against the emitter in
+    /// `core::ddl` (`table_design_is_offered_exactly_where_a_retype_emits` and its
+    /// two siblings). This test is what pins the *menu's* half: which question
+    /// each entry asks, and about which object.
     #[test]
     fn the_object_menu_matrix_is_the_same_everywhere_except_a_views_triggers() {
         for d in [MySql, Postgres, Sqlite] {
@@ -4529,16 +4543,19 @@ mod row_menu_tests {
 
     /// These two rows open the designer, which every engine now has — SQLite
     /// reaches a retype or a constraint by rebuilding the table. They were once
-    /// ungated for the wrong reason (nobody had gated them) and are ungated now
-    /// for the right one.
+    /// ungated for the wrong reason (nobody had gated them, so the answer was a
+    /// literal `true`) and are gated now on the question they were standing in
+    /// for, `ddl::supports_table_design`.
     ///
-    /// **This asserts a literal, and says so.** Both `edit` fields reduce to
-    /// `!is_view`, so nothing here can fail for a *dialect* — the value is in the
-    /// `is_view` half, which `a_view_offers_no_column_or_key_entry_on_any_engine`
-    /// below covers, and in the claim underneath, which is that the designer can
-    /// really express the edit on every engine. That one can fail and is tested
-    /// where it lives: `core::ddl`'s `every_engine_can_express_a_column_retype`
-    /// and `sqlite_reaches_a_retype_through_the_rebuild_and_the_others_alter_in_place`.
+    /// **What can fail here and what can't.** All three shipping engines answer
+    /// yes, so no assertion over these three can fail on a *dialect* today; the
+    /// value is in the `is_view` half, which
+    /// `a_view_offers_no_column_or_key_entry_on_any_engine` below covers, and in
+    /// the claim underneath — that the designer can really express the edit on
+    /// every engine — which is tested where it lives, against the emitter:
+    /// `core::ddl`'s `table_design_is_offered_exactly_where_a_retype_emits`,
+    /// `every_engine_can_express_a_column_retype` and
+    /// `sqlite_reaches_a_retype_through_the_rebuild_and_the_others_alter_in_place`.
     #[test]
     fn every_engine_designs_from_a_column_or_a_key_row() {
         for d in [MySql, Postgres, Sqlite] {
@@ -4684,6 +4701,10 @@ mod menu_order_gate {
         line: u32,
         label: String,
         destructive: bool,
+        /// Whether this entry lands in the menu itself (`entries`) rather than in
+        /// a submenu's own vector — the colour swatches are `MenuEntry`s too, and
+        /// they are not rows of the menu whose order is under test.
+        top_level: bool,
     }
 
     /// Every `MenuEntry` construction inside the context-menu builder, in source
@@ -4727,13 +4748,43 @@ mod menu_order_gate {
                     .unwrap_or("?")
                     .to_string();
             }
+            // The two arms whose write group is a helper's output rather than a
+            // constructor here (`create_submenu` builds the Create ▸ entry). The
+            // gate has to see it or those arms look as though they stop at the
+            // read group.
+            if t.starts_with("entries.extend(create_submenu(") {
+                out.push(Built {
+                    arm: arm.clone(),
+                    line: i as u32 + 1,
+                    label: CREATE_SUBMENU.to_string(),
+                    destructive: false,
+                    top_level: true,
+                });
+                continue;
+            }
             let is_ctor = ["action(", "action_icon(", "action_colored(", "sub("]
                 .iter()
                 .any(|c| t.contains(&format!("MenuEntry::{c}")));
             if !is_ctor {
                 continue;
             }
-            let head: String = lines[i..(i + 6).min(lines.len())].join(" ");
+            // Comments are cut out of the span first: one entry explains its own
+            // label with `"(0)" reads as a broken count` two lines above the label
+            // itself, and the scan read the comment's string as the entry's name.
+            let span = |from: usize, len: usize| -> String {
+                lines[from..(from + len).min(lines.len())]
+                    .iter()
+                    .map(|l| l.split_once("//").map_or(*l, |(code, _)| code))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            // Twelve lines, and the label is read only from the part *before* the
+            // action closure: one entry's label is an `if` whose arms are four
+            // comment lines below the constructor, and a window narrow enough to
+            // miss it read the entry as nameless. Cutting at `move ||` is what
+            // makes the wider window safe — a literal in a closure body is not a
+            // label, and mistaking one for a label is how this would pass.
+            let head: String = span(i, 12);
             // The AI Explain row is pushed *outside* the `match` and is the fixed
             // tail of every menu — the one entry that legitimately follows a
             // Drop. Its constructor sits one line above its label, so bounding
@@ -4741,22 +4792,231 @@ mod menu_order_gate {
             if head.contains("\"AI Explain\"") {
                 continue;
             }
-            let label = head
-                .split_once("MenuEntry::")
-                .map(|(_, r)| r)
-                .and_then(|r| r.split_once('"'))
-                .and_then(|(_, r)| r.split_once('"'))
-                .map(|(l, _)| l.to_string())
-                .unwrap_or_default();
+            let first_literal = |span: &str| {
+                span.split_once('"')
+                    .and_then(|(_, r)| r.split_once('"'))
+                    .map(|(l, _)| l.to_string())
+            };
             let closure_at = head.find("move ||").unwrap_or(head.len());
+            let mut label = head[..closure_at]
+                .split_once("MenuEntry::")
+                .and_then(|(_, r)| first_literal(r))
+                .unwrap_or_default();
+            // Two entries name themselves through a `let label = if … { "A" }
+            // else { "B" }` above the constructor (Favorite/Unfavorite, and the
+            // key row's Edit, which is named for what the row *is*). The binding
+            // holds every alternative and they all belong to the same group, so
+            // the first is enough to place the entry — and leaving the label empty
+            // would have silently excused both from the group check below.
+            if label.is_empty() {
+                label = (i.saturating_sub(12)..i)
+                    .rev()
+                    .find(|&j| lines[j].contains("let label = "))
+                    .and_then(|j| first_literal(&span(j, 6)))
+                    .unwrap_or_default();
+            }
+            // In `entries` itself, or in a submenu's own vector? The statement the
+            // constructor belongs to opens at most a line or two above it.
+            let top_level = (i.saturating_sub(3)..=i)
+                .rev()
+                .find_map(|j| {
+                    let s = lines[j].trim_start();
+                    s.split_once(".push(")
+                        .or_else(|| s.split_once(".extend("))
+                        .map(|(recv, _)| recv)
+                })
+                .is_some_and(|recv| recv == "entries");
             out.push(Built {
                 arm: arm.clone(),
                 line: i as u32 + 1,
                 label,
                 destructive: head[..closure_at].contains("theme::error"),
+                top_level,
             });
         }
         out
+    }
+
+    /// The Create ▸ entry, which two arms contribute through `create_submenu`
+    /// rather than by constructing it here.
+    const CREATE_SUBMENU: &str = "Create ▸";
+
+    /// **The skeleton as data.** Which group of the ordering comment above `build`
+    /// each entry belongs to — 1 Open, 2 Read, 3 Tree state, 4 Write — so "every
+    /// menu is a subsequence of one skeleton" becomes an assertion instead of a
+    /// paragraph. `AI Explain` is group 5 and is pushed outside the `match`, so it
+    /// never reaches this table.
+    ///
+    /// An unknown label **fails** the gate rather than being skipped, and that is
+    /// the load-bearing half: a thirteenth entry cannot be added to any menu
+    /// without placing it in the skeleton first, which is the drift the comment was
+    /// written to stop and could not.
+    fn group(label: &str) -> Option<u8> {
+        Some(match label {
+            // 1. Open — what a double-click would have done.
+            "Open in CLI" | "Open" | "Open in new tab" => 1,
+            // 2. Read — the clipboard, then what the node can show you, closing
+            //    with Refresh. `Collapse all` only rearranges the tree under the
+            //    row and sits *after* Refresh in the database arm; the skeleton's
+            //    wording says the group closes with Refresh, so that is a real
+            //    deviation — one this gate tolerates because it stays inside the
+            //    group and misplaces nothing irreversible. Recorded, not hidden.
+            "Copy name"
+            | "Copy qualified name"
+            | "Properties"
+            | "Live monitor"
+            | "Show diagram"
+            | "Generate DDL"
+            | "Refresh"
+            | "Collapse all" => 2,
+            // 3. Tree state — the row, not the object.
+            "Favorite" | "Unfavorite" | "Colour" | "Hide" => 3,
+            // 4. Write, with the irreversible entries last inside it. The order
+            //    *within* the group is not checked: the table arm ships
+            //    Import → Edit table → Triggers where the skeleton lists
+            //    Create/Edit/Import/Triggers, the second recorded deviation.
+            //    `drop_is_the_last_entry_before_ai_explain` is what pins the part
+            //    of the group order that matters.
+            CREATE_SUBMENU | "Create {}" | "Import" | "Edit table" | "Edit view"
+            | "Edit column" | "Edit index" | "Edit primary key" | "Edit foreign key"
+            | "Edit {}" | "Triggers" | "Truncate" | "Drop" | "Drop index" | "Drop foreign key" => 4,
+            _ => return None,
+        })
+    }
+
+    /// `8a85fa1`'s whole subject: one skeleton, and each menu a subsequence of it,
+    /// so the same action is in the same place whatever the row is. The commit
+    /// records that the six menus had already drifted into six orderings once —
+    /// with the key row opening straight onto `Drop index` — and it added no test.
+    ///
+    /// The scan is over the source rather than over a built menu because the order
+    /// is a property of the *source*: a dialect or a read-only connection can only
+    /// omit an entry, never move one, so one pass covers every engine and every
+    /// permission state at once. That is also why the ordering was untestable
+    /// through `build` — it closes over a `Ui`.
+    #[test]
+    fn every_menu_is_a_subsequence_of_the_skeleton() {
+        let src = std::fs::read_to_string(this_file()).expect("this file");
+        let built: Vec<Built> = built_entries(&src)
+            .into_iter()
+            .filter(|b| b.top_level)
+            .collect();
+
+        let mut unplaced: Vec<String> = Vec::new();
+        let mut out_of_order: Vec<String> = Vec::new();
+        let mut arms: Vec<String> = Vec::new();
+        let mut highest: (u8, String) = (0, String::new());
+        for b in &built {
+            if arms.last() != Some(&b.arm) {
+                arms.push(b.arm.clone());
+                highest = (0, String::new());
+            }
+            let Some(g) = group(&b.label) else {
+                unplaced.push(format!("{}: `{}` at line {}", b.arm, b.label, b.line));
+                continue;
+            };
+            if g < highest.0 {
+                out_of_order.push(format!(
+                    "{}: `{}` (group {g}) at line {} comes after `{}` (group {}) — \
+                     the menu is no longer a subsequence of the skeleton",
+                    b.arm, b.label, b.line, highest.1, highest.0
+                ));
+            } else {
+                highest = (g, b.label.clone());
+            }
+        }
+        assert!(
+            unplaced.is_empty(),
+            "entries with no place in the skeleton — add them to `group`, in the \
+             group they belong to:\n{}",
+            unplaced.join("\n")
+        );
+        assert!(out_of_order.is_empty(), "{}", out_of_order.join("\n"));
+
+        // And the scan is still finding the menus, or it passes by seeing nothing.
+        assert_eq!(
+            arms.len(),
+            7,
+            "seven `CtxKind` arms are expected, found {arms:?}"
+        );
+        assert!(
+            built.len() >= 35,
+            "only {} rows found across the seven menus — has the builder moved?",
+            built.len()
+        );
+    }
+
+    /// The one position in the skeleton that is not a matter of taste: the row the
+    /// cursor lands on after a right-click must never be the irreversible one, so
+    /// every Drop is the **last** entry its own menu contributes, and the only
+    /// thing that follows it is the `AI Explain` row pushed outside the `match`.
+    #[test]
+    fn drop_is_the_last_entry_before_ai_explain() {
+        let src = std::fs::read_to_string(this_file()).expect("this file");
+        let built: Vec<Built> = built_entries(&src)
+            .into_iter()
+            .filter(|b| b.top_level)
+            .collect();
+
+        let mut arms: Vec<String> = Vec::new();
+        for b in &built {
+            if !arms.contains(&b.arm) {
+                arms.push(b.arm.clone());
+            }
+        }
+        let mut dropless: Vec<&str> = Vec::new();
+        for arm in &arms {
+            let rows: Vec<&Built> = built.iter().filter(|b| &b.arm == arm).collect();
+            let drops: Vec<&&Built> = rows
+                .iter()
+                .filter(|b| b.label.starts_with("Drop"))
+                .collect();
+            if drops.is_empty() {
+                dropless.push(arm);
+                continue;
+            }
+            let last = rows.last().expect("a non-empty arm");
+            assert!(
+                last.label.starts_with("Drop"),
+                "{arm}: the menu ends on `{}` at line {}, after the irreversible \
+                 `{}` at line {}",
+                last.label,
+                last.line,
+                drops.last().expect("a drop").label,
+                drops.last().expect("a drop").line
+            );
+        }
+        // The three read-only menus have nothing to drop; every menu that writes
+        // ends on its Drop.
+        assert_eq!(
+            dropless,
+            vec!["Database", "Schema", "ObjectGroup"],
+            "which menus carry a Drop has changed"
+        );
+
+        // Nothing but `AI Explain` follows the `match` — the tail every menu
+        // shares, and the reason a Drop being last in its arm is a Drop being last
+        // in the menu.
+        let lines: Vec<&str> = src.lines().collect();
+        let build_at = lines
+            .iter()
+            .position(|l| l.contains("let build: Rc<dyn Fn(CtxMenu)"))
+            .expect("the builder");
+        let ai_at = (build_at..lines.len())
+            .find(|&i| lines[i].contains("\"AI Explain\""))
+            .expect("the AI Explain row");
+        let close_at = (ai_at..lines.len())
+            .find(|&i| lines[i].trim() == "});")
+            .expect("the builder's close");
+        let after: Vec<String> = (ai_at + 1..close_at)
+            .filter(|&i| lines[i].contains("MenuEntry::"))
+            .map(|i| format!("line {}: {}", i + 1, lines[i].trim()))
+            .collect();
+        assert!(
+            after.is_empty(),
+            "an entry was added after `AI Explain`, which every menu ends on:\n{}",
+            after.join("\n")
+        );
     }
 
     #[test]
