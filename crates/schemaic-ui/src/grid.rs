@@ -3138,16 +3138,97 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
 /// Return keyboard focus to the grid body after an in-cell edit ends. Deferred
 /// past the current event so the text_input's disposal (which would otherwise
 /// grab focus back) doesn't leave the grid unable to receive arrow/Enter keys.
+///
+/// **The body's id is read inside the tick, never before it.** Floem's focus
+/// request has no existence check — `UpdateMessage::Focus` assigns
+/// `app_state.focus` whether or not the id still resolves — so a captured id
+/// parks the keyboard on a removed view and *every* key is then dropped until a
+/// click. The action that hands the keyboard back here is very often the same one
+/// that rebuilt the body: the toolbar's ✗ discards, `discard_edits` clears
+/// `new_rows`, and the body's `dyn_container` is keyed on its length, so the id
+/// this held one line earlier was already gone by the time the tick landed. The
+/// grid then answered no key at all — no arrows, and not the `F6` that would have
+/// got back into the strip. `grid_toolbar`'s `focus_icon` states the same rule for
+/// the menus, and resolves by tabindex for it.
 fn refocus_grid(gs: GridState) {
-    // `try_get_untracked`: this is also the workspace's registered keyboard home
-    // (`widgets::set_keyboard_home`), which outlives the grid that registered it —
-    // a tab switch disposes the grid's scope, and a read of a freed signal is not a
-    // question with an answer. A disposed grid answers `None` and nothing moves.
-    if let Some(Some(f)) = gs.focus_id.try_get_untracked() {
-        floem::action::exec_after(std::time::Duration::from_millis(0), move |_| {
+    floem::action::exec_after(std::time::Duration::from_millis(0), move |_| {
+        // `try_get_untracked`: this is also the workspace's registered keyboard
+        // home (`widgets::set_keyboard_home`), which outlives the grid that
+        // registered it — a tab switch disposes the grid's scope, and a read of a
+        // freed signal is not a question with an answer. A disposed grid answers
+        // `None` and nothing moves.
+        if let Some(Some(f)) = gs.focus_id.try_get_untracked() {
             f.request_focus();
-        });
+        }
+    });
+}
+
+/// Anything [`clear_if_any`] can ask whether it is already empty.
+///
+/// A trait rather than three call-site guards so the question is asked the same
+/// way of every staging collection, `Option` included — an editor that is already
+/// closed and a set that is already empty are the same case.
+///
+/// The bodies below read as infinite recursion and are not: an **inherent** method
+/// wins name resolution over a trait method, so `self.is_empty()` in
+/// `impl Clearable for Vec<T>` is `Vec::is_empty`. `clear_tests` calls all three,
+/// which is what says so rather than the reader having to trust it.
+trait Clearable {
+    fn is_empty(&self) -> bool;
+    fn clear(&mut self);
+}
+
+impl<T> Clearable for Option<T> {
+    fn is_empty(&self) -> bool {
+        self.is_none()
     }
+    fn clear(&mut self) {
+        *self = None;
+    }
+}
+
+impl<T> Clearable for Vec<T> {
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+    fn clear(&mut self) {
+        self.clear();
+    }
+}
+
+impl<K: Eq + std::hash::Hash, V> Clearable for HashMap<K, V> {
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+    fn clear(&mut self) {
+        self.clear();
+    }
+}
+
+impl<T: Eq + std::hash::Hash> Clearable for HashSet<T> {
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+    fn clear(&mut self) {
+        self.clear();
+    }
+}
+
+/// Empty a signal's collection, **notifying only if it held anything**.
+///
+/// `RwSignal::update` runs its subscribers unconditionally — floem_reactive's
+/// `update_value` calls `run_effects()` with no equality check — so clearing what
+/// is already empty is not the no-op it reads as: it rebuilds every
+/// `dyn_container` keyed on the signal. `discard_edits` clears three collections
+/// and the grid body is keyed on one of them, so discarding a single cell edit
+/// tore the body down, recomputed the sort order over every row and built it
+/// again, to arrive at the same `0` — and took the keyboard with it (see
+/// [`refocus_grid`]). Unit-tested in `clear_tests`, including the floem fact.
+fn clear_if_any<C: Clearable + 'static>(sig: RwSignal<C>) {
+    if sig.with_untracked(|c| c.is_empty()) {
+        return;
+    }
+    sig.update(|c| c.clear());
 }
 
 /// The result's source table, qualified, for an AI prompt's context — `None`
@@ -4682,13 +4763,21 @@ fn edit_row_panel(gs: GridState, max_rows: RwSignal<usize>) -> impl IntoView {
 /// Discard all staged changes — cell edits, pending new rows, and pending row
 /// deletions (the toolbar ✗) — closing any open in-cell editor.
 fn discard_edits(gs: GridState) {
-    gs.edit_cell.set(None);
-    gs.dirty.update(|d| d.clear());
-    gs.new_rows.update(|r| r.clear());
-    // The pending-row indices are about to be handed out again from zero.
-    gs.new_rows_gen.update(|g| *g = g.wrapping_add(1));
-    gs.del_rows.update(|d| d.clear());
-    gs.commit_err.set(None);
+    // Every one of these is guarded, because a discard mostly throws away *one*
+    // kind of staged change and announcing the other two anyway is what rebuilt
+    // the grid body under the keyboard — see [`clear_if_any`].
+    clear_if_any(gs.edit_cell);
+    clear_if_any(gs.dirty);
+    if gs.new_rows.with_untracked(|r| !r.is_empty()) {
+        clear_if_any(gs.new_rows);
+        // The pending-row indices are about to be handed out again from zero, so an
+        // in-flight AI seed must be told the ones it captured no longer mean what
+        // they meant. Only when rows were actually thrown away: with none staged
+        // there is nothing whose indices could have moved.
+        gs.new_rows_gen.update(|g| *g = g.wrapping_add(1));
+    }
+    clear_if_any(gs.del_rows);
+    clear_if_any(gs.commit_err);
 }
 
 /// Move the grid selection to the next (`forward`) / previous cell whose
@@ -7447,5 +7536,86 @@ mod find_hits_tests {
         assert_eq!(hits.len(), 2, "both epochs render as 1970 dates");
         // And the raw value is not what was searched.
         assert!(find_hits(&rs, &[0, 1], &formats, "86400").0.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod clear_tests {
+    use super::*;
+
+    /// **`RwSignal::update` notifies whether or not the value changed** —
+    /// floem_reactive's `update_value` calls `run_effects()` with no equality check
+    /// — so clearing an already-empty staging collection is not the no-op it reads
+    /// as. It re-runs every `dyn_container` keyed on the signal, and the grid body
+    /// is keyed on `new_rows.len()`: discarding a single cell edit rebuilt the whole
+    /// body, recomputed the sort order, and replaced `focus_id` — out from under the
+    /// keyboard hand-back the same discard had already put in flight. From there the
+    /// grid answered no key at all. See `discard_edits` and `refocus_grid`.
+    #[test]
+    fn clearing_what_is_already_empty_notifies_nobody() {
+        let sig: RwSignal<Vec<u32>> = RwSignal::new(Vec::new());
+        let runs = Rc::new(std::cell::Cell::new(0u32));
+        let r = runs.clone();
+        create_effect(move |_| {
+            sig.with(|v| v.len());
+            r.set(r.get() + 1);
+        });
+        assert_eq!(runs.get(), 1, "the effect's first run");
+
+        clear_if_any(sig);
+        assert_eq!(runs.get(), 1, "nothing to clear, so nothing was rebuilt");
+
+        sig.update(|v| v.push(7));
+        assert_eq!(runs.get(), 2, "a real change notifies");
+        clear_if_any(sig);
+        assert_eq!(runs.get(), 3, "and so does a real clear");
+        assert!(sig.get_untracked().is_empty(), "which actually cleared it");
+
+        // The unguarded spelling, for contrast — this is the floem fact the guard
+        // exists for, and it is the whole bug.
+        sig.update(|v| v.clear());
+        assert_eq!(runs.get(), 4, "`update` notifies with nothing to do");
+    }
+
+    /// The same for the `Option` signals a discard resets: an editor that is
+    /// already closed shouldn't announce closing again.
+    #[test]
+    fn clearing_a_none_option_notifies_nobody() {
+        let sig: RwSignal<Option<(usize, usize)>> = RwSignal::new(None);
+        let runs = Rc::new(std::cell::Cell::new(0u32));
+        let r = runs.clone();
+        create_effect(move |_| {
+            sig.get();
+            r.set(r.get() + 1);
+        });
+        assert_eq!(runs.get(), 1);
+
+        clear_if_any(sig);
+        assert_eq!(runs.get(), 1, "already None");
+
+        sig.set(Some((1, 2)));
+        assert_eq!(runs.get(), 2);
+        clear_if_any(sig);
+        assert_eq!(runs.get(), 3);
+        assert_eq!(sig.get_untracked(), None);
+    }
+
+    /// Every collection a discard clears has to be askable, or the guard is only
+    /// applied where someone remembered to write an impl.
+    #[test]
+    fn every_staging_collection_answers_the_question() {
+        let dirty: RwSignal<HashMap<(usize, usize), Option<String>>> =
+            RwSignal::new(HashMap::from([((0, 0), None)]));
+        let rows: RwSignal<Vec<HashMap<usize, Option<String>>>> =
+            RwSignal::new(vec![HashMap::new()]);
+        let del: RwSignal<HashSet<usize>> = RwSignal::new(HashSet::from([3]));
+
+        clear_if_any(dirty);
+        clear_if_any(rows);
+        clear_if_any(del);
+
+        assert!(dirty.get_untracked().is_empty());
+        assert!(rows.get_untracked().is_empty());
+        assert!(del.get_untracked().is_empty());
     }
 }

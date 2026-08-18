@@ -2693,6 +2693,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   reveals: `if !matches!(right_panel.get_untracked(), Ai) { set(Ai) }` — a redundant `set(Ai)` while
   the AI panel is open disposes its `elapsed_ms` mid-update and the rebuilt footer panics on the
   freed signal.
+  **`update` doesn't dedup either, and can't** — `floem_reactive`'s `update_value` calls
+  `run_effects()` with no equality check, so `sig.update(|c| c.clear())` on an *already empty*
+  collection is not the no-op it reads as. `discard_edits` cleared all three staging collections
+  unconditionally, and the grid body's `dyn_container` key holds `new_rows.len()`: discarding one
+  cell edit tore the body down, recomputed the sort order over every row and built a new one to
+  arrive at the same `0` — and moved `focus_id` out from under the keyboard hand-back that the same
+  discard had already put in flight. `grid::clear_if_any` is the guard (`Clearable`, over `Option`
+  as well as the collections, so "the editor is already closed" is the same case), and
+  `grid::clear_tests` pins the floem fact itself by counting effect runs.
 - **An effect that writes the signals it reads must read them untracked — and an outside write to
   them is then invisible, so it needs a generation counter.** The schema tree's size-column effect
   scans every `ConnNode::stats` slot for `Idle` and writes `Loading` into each one it fetches;
@@ -2876,7 +2885,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   all listeners on the results grid's body) — and a closure rather than a `ViewId`, because a grid
   rebuilds per result and a stored id names a view that has gone. `grid_view` registers
   `refocus_grid` where it sets `focus_id`; `refocus_grid` reads that signal with `try_get_untracked`,
-  since the home outlives the grid that registered it. This is the durable form of what
+  since the home outlives the grid that registered it.
+  **And it reads it *inside* its deferred tick**, which is the other half of the same rule and was
+  missing for a release: the read was hoisted out and the id captured, so the hand-back landed one
+  tick later on whatever had been there when it was *scheduled*. That is exactly the window the ✗
+  opens — `discard_edits` notifies `new_rows`, the body's `dyn_container` key, so the body the id
+  named was already gone — and floem's focus request has no existence check
+  (`UpdateMessage::Focus` assigns `app_state.focus` whether or not the id resolves), so the keyboard
+  was parked on a removed view and **every** key was dropped until a click. The ✓ escaped it only
+  because `commit_busy` isn't in the body's key. Defer the *resolution*, not just the request —
+  `grid_toolbar`'s `focus_icon` says the same thing and resolves by tabindex.
+  This is the durable form of what
   `set_menu_return` does for one case: fixing the sites one at a time is what produced the tree's
   cursor regression below.
 - **A `.hide()`n control is still in the Tab order** — `hide()` is `display: none`, so the view is
