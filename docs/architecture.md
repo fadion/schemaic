@@ -334,8 +334,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     a vacuous predicate invites deletion for the wrong reason. The capabilities it used to answer
     for came apart into `supports_view_editing` and `supports_trigger_editing` — and both of those
     have since gone true everywhere too. They stay because the question is per *object* and the
-    menus ask it per object; what actually varies moved down a level, into two narrower facts that
-    are false on SQLite and only there. `supports_or_replace_view` — SQLite has no
+    menus ask it per object, and each **computes** its answer out of `supports_change` instead of
+    stating it: a predicate that discards its `SqlDialect` and returns `true` is the constant the
+    *"ask a capability"* rule exists to prevent, wearing the name of the fix for it, and it answers
+    for a fourth engine as confidently as for these three. Two more join them.
+    `supports_table_design` is what the tree's **Edit table**, **Edit column** and **Edit index**
+    entries ask — three literal `true`s until it existed — and its probe is a column retype, since
+    that is the designer's own edit: expressible in place on MySQL and PostgreSQL, reached through
+    the rebuild on SQLite, and either route counts. `supports_column_reorder` is the one where the
+    engines genuinely disagree: MySQL places a column with `AFTER`, SQLite is created in the draft's
+    order by the rebuild it is already doing, and PostgreSQL cannot move one at all. It is an
+    exhaustive `match` rather than the `!= Postgres` it was spelled as at *both* its sites — in
+    `diff`, which must not raise a move PostgreSQL has no statement for, and again on the designer's
+    arrow buttons, which must not offer one. What actually varies for views moved down a level, into
+    two narrower facts that are false on SQLite and only there. `supports_or_replace_view` — SQLite has no
     `CREATE OR REPLACE VIEW` in any form, so a redefinition there is a `DROP` plus a `CREATE`, the
     arm PostgreSQL already takes when `pg_replaceable` says no, reached unconditionally rather than
     on a body test. And `supports_view_rename` — SQLite has no verb that renames a view at all:
@@ -2405,9 +2417,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   the preview names each one and Apply refuses while it does — on the action, not only on the
   disabled button. Which gate to ask depends on the question: `supports_change` for a single change
   with no draft behind it, and for an editor the capability for *that object* —
-  `supports_view_editing` or `supports_trigger_editing`. Both of those now answer true for every
-  engine, as does the table designer — which is why it has no predicate at all any more (SQLite
-  reaches one by rebuilding, `Change::RebuildTable`). **Keep asking them, and keep them apart**:
+  `supports_view_editing`, `supports_trigger_editing` or `supports_table_design`. All three answer
+  true for every engine today (SQLite reaches a table edit by rebuilding, `Change::RebuildTable`),
+  and all three **derive** that from `supports_change` rather than returning a literal, which is the
+  only form of "always true" that isn't a constant with a function's name on it: the answer changes
+  when the emitter's does, and a fourth engine gets whatever the change table says about it. A menu
+  entry with **no** predicate is the same failure with nothing to grep for — the designer's three
+  entries were exactly that until `supports_table_design` existed. **Keep asking them, and keep them
+  apart**:
   they are per-object questions the menus ask per object, and what differs between engines has
   moved down to the narrower predicates that decide how an edit is *performed* rather than whether
   it is offered — `supports_or_replace_view` and `supports_view_rename`, both false on SQLite and
@@ -3112,20 +3129,37 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   a new arm reads the skeleton, which is stated as a comment
   block immediately above the closure: an arm is written and reviewed one arm at a time, and
   nothing else in the file says what the order is.
-  **`overlays::menu_order_gate` holds the load-bearing half**, and only that half. It reads the
-  module's own source, bounded by the `let build:` binding and the `AI Explain` row that is pushed
-  outside the `match`, and asserts that nothing follows an irreversible entry inside its `CtxKind`
-  arm — which is checkable at all because every destructive entry marks itself
-  `action_colored(…, theme::error, …)`, the same fact the menu shows the user; a second test pins
-  that the marking is on exactly `Drop`, `Drop foreign key`, `Drop index` and `Truncate`, so
-  re-colouring can't weaken the first one silently. The **subsequence** claim over all five groups
-  is *not* gated, and the shipped code already deviates from it twice, harmlessly: the database arm
-  pushes `Collapse all` after `Refresh` where the skeleton closes the read group with `Refresh`,
+  **`overlays::menu_order_gate` holds the whole claim**, in four tests over the module's own source,
+  bounded by the `let build:` binding and the `AI Explain` row pushed outside the `match`. The
+  ordering can't be reached through `build` — it closes over a `Ui` — and it doesn't need to be: the
+  order is a property of the *source*, because a dialect or a read-only connection can only **omit**
+  an entry, never move one, so one pass covers every engine and every permission state at once,
+  including engines that don't exist yet. `nothing_follows_an_irreversible_entry_in_its_own_menu` is
+  checkable at all because every destructive entry marks itself
+  `action_colored(…, theme::error, …)`, the same fact the menu shows the user, and
+  `the_error_colour_marks_the_drops_and_truncate_and_nothing_else` pins that the marking is on
+  exactly `Drop`, `Drop foreign key`, `Drop index` and `Truncate` so re-colouring can't weaken it
+  silently. `every_menu_is_a_subsequence_of_the_skeleton` carries the five-group claim: `group(label)`
+  is the skeleton as data, and an **unknown label fails** rather than being skipped, which is the
+  load-bearing part — a thirteenth entry can't be added to any menu without placing it in a group
+  first, which is the drift the comment was written to stop and could not.
+  `drop_is_the_last_entry_before_ai_explain` pins the one position that isn't a matter of taste, in
+  both halves: every menu that writes ends on its `Drop` (`Database`, `Schema` and `ObjectGroup` have
+  nothing to drop, asserted by name), and nothing but `AI Explain` follows the `match`.
+  The two deviations the shipped code already had stand, and the gate tolerates them **because they
+  stay inside their group**, which is recorded at `group` rather than quietly excused: the database
+  arm pushes `Collapse all` after `Refresh` where the skeleton closes the read group with `Refresh`,
   and the table arm's write group is `Import` → `Edit table` → `Triggers` where the skeleton lists
-  Create/Edit/Import/Triggers. Catching those needs the ordering lifted out of the `Ui` closure —
-  a pure `menu_skeleton(kind, offers) -> Vec<MenuSlot>` returning labels and group ids, with the
-  closures attached afterwards — which rewrites every arm of a 700-line `match` and is a change to
-  make with the app running.
+  Create/Edit/Import/Triggers. Order *within* group 4 is not checked; `Drop` being last is.
+  Four things the scan has to get right, each of which made it wrong first: comments are cut out of a
+  constructor's span (one entry explains its own label with `"(0)" reads as a broken count` two lines
+  above the label, and the scan read the comment as the name); a label is read only from the span
+  *before* `move ||`, which is what makes a twelve-line window safe; `let label = if … {"A"} else
+  {"B"}` above a constructor is resolved backwards, since an empty label would have excused
+  `Favorite` and the key row's `Edit` from the group check; and only entries pushed into `entries`
+  count, because the colour swatches are `MenuEntry`s too — with `entries.extend(create_submenu(…))`
+  counted as the `Create ▸` entry it is, or the two arms that write through it would look as though
+  they stop at the read group.
   The Table arm's `Truncate`/`Drop` name the **scale** of what they delete when a row figure is
   already in `ConnNode::stats` (`stats::truncate_prompt`/`drop_prompt` decide the words and whether
   a figure is worth naming). It is read, never fetched: the menu is built on the right-click, so a
