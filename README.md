@@ -1,7 +1,7 @@
 # Schemaic
 
-A fast, native SQL editor for MySQL, MariaDB, and PostgreSQL — written in Rust,
-with an editable results grid, visual schema editing, and schema-aware
+A fast, native SQL editor for MySQL, MariaDB, PostgreSQL, and SQLite — written in
+Rust, with an editable results grid, visual schema editing, and schema-aware
 intelligence, built to feel instant.
 
 <p align="center">
@@ -29,9 +29,13 @@ production data, or any data you care about.
   the prompts you send through your own `claude` CLI. Credentials go to the OS
   keyring — never a URL, never a command line — falling back to the config file
   only on a machine with no keyring at all.
-- **Both engines, properly** — MySQL/MariaDB and PostgreSQL are separate dialects
-  all the way down: quoting, DDL, completion and diagnostics follow the server
-  you're actually connected to, not a shared lowest common denominator.
+- **Every engine, properly** — MySQL/MariaDB, PostgreSQL and SQLite are separate
+  dialects all the way down: quoting, DDL, completion and diagnostics follow what
+  you're actually connected to, not a shared lowest common denominator. Where an
+  engine can't do something, the app doesn't offer it rather than failing at it —
+  and where it can do it differently, the app does the work: editing a SQLite
+  table means the twelve-step rebuild SQLite's own docs prescribe, generated,
+  checked and run in one transaction that either lands or rolls back.
 
 ## Features
 
@@ -45,11 +49,15 @@ production data, or any data you care about.
   CSV / JSON / SQL / Markdown / HTML.
 - **Transactions** — a per-tab manual mode that pins one connection and waits for
   an explicit commit or rollback, with a status pill saying what is open and how
-  many statements are in it.
+  many statements are in it. MySQL/MariaDB and PostgreSQL; on SQLite the control
+  isn't shown, because there is no manual mode there yet.
 - **Schema editing** — a visual table designer (columns, indexes, foreign keys,
   CHECK constraints) plus editors for views, triggers, and PostgreSQL functions,
   types, domains and sequences. Every change is shown as the SQL it will run,
-  with anything destructive spelled out in plain language, before it runs.
+  with anything destructive spelled out in plain language, before it runs. Tables,
+  views and triggers on all three engines — including SQLite, where a column
+  change is a table rebuild and the app generates, verifies and runs the whole
+  script for you.
 - **Live Monitor** — watch a table and see inserts, updates and deletes as they
   land, down to which column changed.
 - **Import** — load CSV / TSV / JSON (array or JSON Lines) into a table, with
@@ -58,12 +66,15 @@ production data, or any data you care about.
 - **Navigate** — schema browser with favorites, query history, `EXPLAIN` query
   plans, an ER diagram of a whole database or one table's neighbourhood, and a
   global "find anywhere" for schema objects.
-- **Connect** — MySQL / MariaDB / PostgreSQL, direct or over SSH tunnels, with
-  per-connection colors, environment badges, and a read-only guard-rail.
-- **Terminal** — an embedded shell, and a one-click `mysql` / `mariadb` / `psql`
-  session against the active connection — through the SSH tunnel when there is
-  one, and with the password passed by environment rather than on the command
-  line.
+- **Connect** — MySQL / MariaDB / PostgreSQL, direct or over SSH tunnels, and
+  SQLite by picking a file (no server, so no host, credentials or tunnel to fill
+  in). Per-connection colors, environment badges, and a read-only guard-rail on
+  all of them.
+- **Terminal** — an embedded shell, and a one-click `mysql` / `mariadb` / `psql` /
+  `sqlite3` session against the active connection — through the SSH tunnel when
+  there is one, with the password passed by environment rather than on the command
+  line, and for SQLite starting in the database file's own directory so `.output`
+  and `.read` land where you'd expect.
 - **AI assistant** — a `claude` CLI session wired into the app rather than bolted
   beside it: **AI Fix** on a failed query, which hands it the error and the query
   and offers you the corrected SQL as a diff; rewrite the statement
@@ -82,6 +93,10 @@ Requires a recent Rust toolchain (edition 2024). On any platform:
 ```sh
 cargo run -p schemaic-app
 ```
+
+No database client libraries to install for any of the three engines — SQLite is
+compiled in from source, so building needs a working C compiler (the MSVC tools on
+Windows, `build-essential` / `gcc` on Linux) alongside the GUI libraries below.
 
 ### Windows
 
