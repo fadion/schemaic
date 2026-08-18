@@ -143,7 +143,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     with correlation — reserved-keyword-alias errors, syntax errors on completed statements, and
     keyword-typo warnings). **AST for classification, `skip_noncode` for byte positions by default** —
     except `colres`, which uses sqlparser 0.62's now-accurate per-identifier *spans* (verified) so the
-    same column name in an inner vs outer scope is placed independently. `Catalog` is the case-folded view over
+    same column name in an inner vs outer scope is placed independently. **A base table exposes more than
+    its introspected columns**, so both column checks add `SqlDialect::implicit_columns` — SQLite's
+    `rowid`/`_rowid_`/`oid`, PostgreSQL's `ctid`/`tableoid`/`xmin`/`xmax`/`cmin`/`cmax`, none on MySQL — to
+    each base-table source (not to a derived table or CTE, which expose only what they project). Schemaic
+    *writes* the SQLite one itself: a keyless table's browse statement is `SELECT rowid, * FROM notes ORDER
+    BY rowid ASC`, and the editor squiggled `rowid` twice, calling its own generated SQL broken. They join
+    the known set rather than short-circuiting the check, so `rowid` over two tables is still the ambiguity
+    SQLite itself reports; and the list is per dialect, so `rowid` on MySQL stays the error it is. Two
+    accepted imprecisions, both erring the way this module always errs (a false "unknown column" is worse
+    than a missed one): a `WITHOUT ROWID` table genuinely has no `rowid` and the model doesn't record which
+    tables those are, and PostgreSQL's `oid` is deliberately absent from its list since it belongs to the
+    system catalogues only. `Catalog` is the case-folded view over
     the introspected `DbSchema`s (columns + FK edges); building one is O(tables × columns) and a keystroke asks
     for it up to four times, so the UI goes through `CatalogCache` — a memo keyed on the **`Arc<DbSchema>`
     identity** of the schemas it was built from rather than a hand-bumped generation, so a re-introspection
