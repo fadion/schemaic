@@ -701,6 +701,30 @@ mod tests {
         assert!(!m.editable(1));
     }
 
+    /// C1's **other** shape, and the one it now carries the safety of. A
+    /// `SELECT a, * FROM t` is one table, not a self-join: it exposes `a` twice
+    /// and everything else once. Before `ed7e60c` widened `projection_of` such a
+    /// statement had no origins at all and was read-only by construction; now
+    /// every column is attributed and this check is the only thing left refusing
+    /// it. Relax the rule to "a duplicate across two tables" and an `UPDATE t SET
+    /// a = ?, a = ?` becomes reachable, with nothing else failing.
+    #[test]
+    fn c1_holds_for_one_column_duplicated_within_a_single_table() {
+        let r = rs(vec![
+            col("a", "TEXT", "t", false, false), // the leading item
+            col("id", "INT", "t", true, false),  // …and the wildcard behind it
+            col("a", "TEXT", "t", false, false),
+        ]);
+        let schema = |_db: &str, _s: Option<&str>, tbl: &str| {
+            (tbl == "t").then(|| schema_with_pk("t", &["id"], &[("id", "int"), ("a", "text")]))
+        };
+        let m = analyze_edit(&r, schema);
+        assert!(m.insert_target().is_none(), "no row can be identified");
+        for ci in 0..3 {
+            assert!(!m.editable(ci), "column {ci}");
+        }
+    }
+
     #[test]
     fn c2_binary_column_not_editable_binary_key_readonly() {
         // A binary (BLOB) non-key column: read-only, but the INT PK stays editable.

@@ -50,7 +50,7 @@ use schemaic_core::connection::{ConnStatus, Connection};
 use schemaic_core::edit::analyze_edit;
 use schemaic_core::health;
 use schemaic_core::model::{CommitDone, GridWrite, QueryState, RefetchRequest, ResultSet};
-use schemaic_core::monitor::{Snapshot, diff_snapshots};
+use schemaic_core::monitor::{Snapshot, TickAction, diff_snapshots};
 
 /// Outcome of a background connect + schema-load task: `(tunnel port, tunnel
 /// handle, database names)` on success, or an error message.
@@ -914,18 +914,25 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                         }));
                         t.name.set(s.name.clone());
                         t.pinned.set(s.pinned);
-                        t.path.set(s.path.clone());
-                        t.file_format.set(schemaic_core::sqlfile::SqlFormat {
-                            crlf: s.file_crlf,
-                            bom: s.file_bom,
-                            lossy: s.file_lossy,
-                        });
-                        // The file's text isn't persisted. A tab saved *clean*
-                        // therefore has its on-disk copy right here in `query`;
-                        // one saved dirty leaves it unknown (`None`), which the
-                        // tab shows as modified until a save or reload settles it.
-                        t.disk_sql
-                            .set((s.path.is_some() && !s.file_dirty).then(|| s.query.clone()));
+                        // What a restored tab knows about its file is one
+                        // decision with four inputs, and it lives in
+                        // `sqlfile::restored_binding` where it is tested — the
+                        // combination that goes wrong (dirty, restored as clean)
+                        // silently drops the modified marker and makes Ctrl+S a
+                        // no-op over the user's unsaved work.
+                        let binding = schemaic_core::sqlfile::restored_binding(
+                            s.path.clone(),
+                            s.file_dirty,
+                            &s.query,
+                            schemaic_core::sqlfile::SqlFormat {
+                                crlf: s.file_crlf,
+                                bom: s.file_bom,
+                                lossy: s.file_lossy,
+                            },
+                        );
+                        t.path.set(binding.path);
+                        t.file_format.set(binding.format);
+                        t.disk_sql.set(binding.disk_sql);
                         t
                     })
                     .collect();
@@ -2688,9 +2695,14 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                 // still points at a file — and the next Ctrl+S would overwrite
                 // that file with the empty document. The path went into the
                 // reopen ring with the text (`record` above).
-                tab.path.set(None);
-                tab.disk_sql.set(None);
-                tab.file_format.set(Default::default());
+                //
+                // Taken as one value (`FileBinding::none`), because the failure
+                // here is always a line left out: a kept path overwrites a file,
+                // a kept format writes a BOM and CRLF the new document never had.
+                let shed = schemaic_core::sqlfile::FileBinding::none();
+                tab.path.set(shed.path);
+                tab.disk_sql.set(shed.disk_sql);
+                tab.file_format.set(shed.format);
                 // Also reset the results pane so the reopened tab is fully fresh
                 // (single-grid Idle state, no leftover Run-Everything tabs).
                 tab.results.set(QueryState::Idle);
@@ -3893,7 +3905,11 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
                                 // the original bytes.
                                 file_lossy: t.file_format.get_untracked().lossy,
                                 // One bit instead of a second copy of the file's
-                                // text — see `SavedTab::file_dirty`.
+                                // text — see `SavedTab::file_dirty`. It is the
+                                // input `sqlfile::restored_binding` reads on the
+                                // way back, and the whole reason the restore can
+                                // tell "this text is what's on disk" from "this
+                                // text is unsaved work".
                                 file_dirty: t.modified(),
                             }
                         })
@@ -6783,12 +6799,20 @@ struct MonitorCtx {
 /// table and logs the *net* change at the resume timestamp. That is the log's
 /// standing rule (an entry is stamped when a poll observed it), just coarser.
 fn monitor_tick(ctx: MonitorCtx, my_gen: u64) {
-    if ctx.open.try_get_untracked() != Some(true) || ctx.generation.get() != my_gen {
-        return;
-    }
-    if ctx.paused.try_get_untracked() == Some(true) {
-        monitor_reschedule(ctx, my_gen);
-        return;
+    // The decision itself is `monitor::tick_action`, where it can be tested —
+    // this reads the signals and does what it says. A disposed `open` reads as
+    // closed, which it is.
+    match schemaic_core::monitor::tick_action(
+        ctx.open.try_get_untracked() == Some(true),
+        ctx.generation.get() != my_gen,
+        ctx.paused.try_get_untracked() == Some(true),
+    ) {
+        TickAction::Stop => return,
+        TickAction::Reschedule => {
+            monitor_reschedule(ctx, my_gen);
+            return;
+        }
+        TickAction::Fetch => {}
     }
     let (conn_id, source) = ctx.target.clone();
     let db = match (ctx.db_for)(conn_id) {

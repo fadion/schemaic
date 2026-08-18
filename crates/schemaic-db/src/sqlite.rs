@@ -3028,8 +3028,10 @@ mod tests {
              CREATE TABLE owns_two (RowId TEXT, _ROWID_ TEXT);
              CREATE TABLE owns_all (rowid TEXT, _rowid_ TEXT, oid TEXT);
              CREATE TABLE wr (a TEXT, b TEXT, PRIMARY KEY (a)) WITHOUT ROWID;
+             CREATE TABLE keyed (id INTEGER PRIMARY KEY, a TEXT);
              CREATE VIEW v AS SELECT a FROM plain;
-             INSERT INTO plain VALUES ('no', 'key');",
+             INSERT INTO plain VALUES ('no', 'key');
+             INSERT INTO keyed VALUES (1, 'x');",
         )
         .unwrap();
         conn
@@ -3127,6 +3129,53 @@ mod tests {
         assert_eq!(first.column, "rowid");
         // `rowid` is now exposed twice — once named, once through the wildcard.
         assert_eq!(o[1].as_ref().unwrap().column, "rowid");
+    }
+
+    /// **What keeps the widened projection safe.** `ed7e60c` made
+    /// `SELECT a, * FROM t` resolve where it used to return `None`, and a `None`
+    /// projection was read-only *by construction* — no origin, no edit. Now every
+    /// column gets one, and two of them claim the base column `a`. The only thing
+    /// left refusing the table is `resolve_key`'s duplicate check (C1), in
+    /// another crate: this walks the new shape through it end to end, so a
+    /// relaxation there can't quietly make a self-ambiguous result writable.
+    #[test]
+    fn a_column_exposed_twice_by_the_widened_projection_stays_read_only() {
+        let conn = shadowing();
+        // The projection really does attribute all three now — that is the half
+        // this test exists to hold the other end of.
+        let o = origins_for(&conn, "SELECT a, * FROM keyed");
+        assert_eq!(o.len(), 3);
+        assert!(o.iter().all(|x| x.is_some()), "every column is attributed");
+        assert_eq!(o[0].as_ref().unwrap().column, "a");
+        assert_eq!(o[2].as_ref().unwrap().column, "a", "`a` twice");
+
+        let rs = run_query(&conn, "SELECT a, * FROM keyed", 100).unwrap();
+        let m = schemaic_core::edit::analyze_edit(&rs, |_, _, t| Some(table_info_of(&conn, t)));
+        assert!(m.insert_target().is_none(), "no row can be identified");
+        for ci in 0..3 {
+            assert!(!m.editable(ci), "column {ci} must stay read-only");
+        }
+    }
+
+    /// The other half of the same widening: a **computed** leading item is not a
+    /// duplicate of anything, so `SELECT 1, * FROM t` — which was unattributable
+    /// before `ed7e60c` and is editable after it — must key on the table's real
+    /// primary key, with the computed column read-only rather than shifting the
+    /// wildcard's expansion by one.
+    #[test]
+    fn a_computed_leading_item_keys_on_the_tables_own_primary_key() {
+        let conn = shadowing();
+        let rs = run_query(&conn, "SELECT 1, * FROM keyed", 100).unwrap();
+        let m = schemaic_core::edit::analyze_edit(&rs, |_, _, t| Some(table_info_of(&conn, t)));
+        assert_eq!(
+            m.table(0).map(|t| t.key_cols.clone()),
+            Some(vec![1]),
+            "the key is `id`, at result position 1"
+        );
+        assert!(!m.editable(0), "a literal is no column of the table");
+        // `id` is a *declared* column, so unlike the implicit rowid it is the
+        // table's own data and stays writable through the key it also forms.
+        assert!(m.editable(1) && m.editable(2));
     }
 
     /// A `WITHOUT ROWID` table has no rowid to name, and SQLite will not even
@@ -5078,6 +5127,118 @@ mod rebuild_fidelity_tests {
     fn retype_last(d: &mut TableDraft) {
         let i = d.columns.len() - 1;
         d.columns[i].info.type_name = "TEXT".into();
+    }
+
+    /// **Create table, on SQLite, end to end.** `ddl::create` is the designer's
+    /// whole New-table path (`table_designer.rs`), and its change set has to
+    /// reach the engine as a statement: a plan holding one `CreateTable` is not
+    /// empty, so the preview opens and Run is offered whatever the emitter
+    /// produced. An emitter with no arm for it therefore reports success and
+    /// creates nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_table_is_created_from_the_designers_draft() {
+        let (keeper, db) = shared_memory("fid_create");
+        // The shape the designer produces: a fresh draft, no original.
+        let mut draft = TableDraft::from_table(&TableInfo {
+            name: "made".into(),
+            columns: vec![
+                schemaic_core::schema::ColumnInfo {
+                    name: "id".into(),
+                    type_name: "INTEGER".into(),
+                    nullable: false,
+                    primary_key: true,
+                    auto_increment: true,
+                    ..Default::default()
+                },
+                schemaic_core::schema::ColumnInfo {
+                    name: "label".into(),
+                    type_name: "TEXT".into(),
+                    nullable: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        draft.original = None;
+
+        let cs = schemaic_core::ddl::create(&draft, SqlDialect::Sqlite);
+        assert!(!cs.is_empty(), "the preview opens on this");
+        assert!(
+            !cs.emit().is_empty(),
+            "…so it must emit something: {:#?}",
+            cs.changes
+        );
+        db.run_ddl(MAIN, &cs.emit(), CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e} — plan {:#?}", cs.emit()));
+
+        keeper
+            .execute_batch("INSERT INTO made (label) VALUES ('x')")
+            .expect("the table is really there");
+    }
+
+    /// **The round-trip gate, on SQLite.** `docs/architecture.md` states the rule
+    /// — a table drafted and diffed against *itself* must produce no changes,
+    /// "since any model-fidelity gap surfaces to the user as a phantom change" —
+    /// and `ddl::roundtrip` enforces it from hand-built fixtures. This is the
+    /// same assertion made against **real introspection**, which is the half a
+    /// fixture cannot cover: a fixture states what the reader is believed to
+    /// produce, and every gap this range's findings named was a disagreement
+    /// between that belief and the pragmas.
+    ///
+    /// Its user-visible failure is worse here than on the other two engines,
+    /// because a phantom change on SQLite is not a stray line in a preview: the
+    /// diff being non-empty is what routes an edit through the twelve-step
+    /// rebuild, so an invented change means the table is dropped and recreated
+    /// for an edit nobody made.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_introspected_table_diffs_to_nothing_against_its_own_draft() {
+        // Every fidelity property the range added, as declarations rather than as
+        // a model — the corpus of the suite above, in one database.
+        let ddl = "
+            CREATE TABLE plain   (id INTEGER PRIMARY KEY, a TEXT NOT NULL, b TEXT);
+            CREATE TABLE autoinc (id INTEGER PRIMARY KEY AUTOINCREMENT, n INTEGER);
+            CREATE TABLE wr      (a TEXT NOT NULL, b TEXT, PRIMARY KEY (a)) WITHOUT ROWID;
+            CREATE TABLE strictt (a INTEGER, b TEXT) STRICT;
+            CREATE TABLE coll    (email TEXT COLLATE NOCASE, n INTEGER);
+            CREATE TABLE gen     (a INTEGER, v INTEGER GENERATED ALWAYS AS (a*2) VIRTUAL,
+                                  s INTEGER GENERATED ALWAYS AS (a*3) STORED);
+            CREATE TABLE defs    (a TEXT DEFAULT 'hi', n INTEGER DEFAULT 3,
+                                  t TEXT DEFAULT CURRENT_TIMESTAMP,
+                                  e TEXT DEFAULT (datetime('now')));
+            CREATE TABLE checks  (q INTEGER, n INTEGER,
+                                  CONSTRAINT ck_q CHECK (q > 0), CHECK (n <> q));
+            CREATE TABLE checks2 (a INTEGER, b INTEGER, CHECK (a > 0), CHECK (b > 0));
+            CREATE TABLE uniq    (id INTEGER PRIMARY KEY, email TEXT UNIQUE);
+            CREATE TABLE parent  (id INTEGER PRIMARY KEY);
+            CREATE TABLE child   (id INTEGER PRIMARY KEY, pid INTEGER,
+                                  FOREIGN KEY (pid) REFERENCES parent(id) ON DELETE CASCADE);
+            CREATE TABLE idx     (id INTEGER PRIMARY KEY, email TEXT, low TEXT, n INTEGER);
+            CREATE UNIQUE INDEX ix_mail ON idx (email COLLATE NOCASE);
+            CREATE INDEX ix_partial ON idx (n) WHERE n > 0;
+            CREATE INDEX ix_expr ON idx (lower(low));
+            CREATE INDEX ix_desc ON idx (n DESC);
+            CREATE TABLE trg     (id INTEGER PRIMARY KEY, n INTEGER);
+            CREATE TRIGGER trg_ai AFTER INSERT ON trg BEGIN UPDATE trg SET n = 1; END;
+        ";
+        let (keeper, db) = shared_memory("fid_phantom");
+        keeper.execute_batch(ddl).unwrap();
+
+        let schema = fetch_schema(&db).await.expect("introspect");
+        assert!(
+            schema.tables.len() >= 13,
+            "the premise: {}",
+            schema.tables.len()
+        );
+        for t in &schema.tables {
+            let cs = diff(t, &TableDraft::from_table(t), SqlDialect::Sqlite);
+            assert!(
+                cs.is_empty(),
+                "{} shows a phantom change: {:#?}",
+                t.name,
+                cs.changes
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

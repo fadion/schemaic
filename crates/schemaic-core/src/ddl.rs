@@ -482,7 +482,11 @@ impl TableDraft {
     /// what the designer refuses to hand to the preview. Empty means "emittable",
     /// **not** "the server will accept it": type names, expressions and defaults
     /// are the server's to judge, exactly as with import's coercion.
-    pub fn validate(&self) -> Vec<String> {
+    ///
+    /// Takes the dialect because one of its rules is not the same on all three —
+    /// see [`requires_named_checks`], and [`TriggerDraft::validate`] for the
+    /// precedent.
+    pub fn validate(&self, dialect: SqlDialect) -> Vec<String> {
         let mut out = Vec::new();
         if self.name.trim().is_empty() {
             out.push("The table needs a name.".to_string());
@@ -564,7 +568,9 @@ impl TableDraft {
         for ck in &self.check_constraints {
             let name = ck.info.name.trim();
             if name.is_empty() {
-                out.push("Every check constraint needs a name.".to_string());
+                if requires_named_checks(dialect) {
+                    out.push("Every check constraint needs a name.".to_string());
+                }
             } else if !check_names.insert(name.to_ascii_lowercase()) {
                 out.push(format!("Two check constraints are both called {name}."));
             }
@@ -3106,6 +3112,13 @@ impl ChangeSet {
         let mut out = self.view_statements();
         out.extend(self.trigger_statements());
         for c in supported() {
+            // Whole-table statements stand alone, as they do in the other two
+            // emitters; `create_table_sql` writes SQLite's own shape (the inline
+            // `INTEGER PRIMARY KEY`, indexes as separate statements, no table
+            // options).
+            if let Change::CreateTable(draft) = c {
+                out.extend(create_table_sql(draft, self.dialect));
+            }
             if matches!(c, Change::DropTable) {
                 out.push(format!("DROP TABLE {};", self.qname()));
             }
@@ -5347,6 +5360,28 @@ pub fn alter_column_disturbs_checks(dialect: SqlDialect) -> bool {
     matches!(dialect, SqlDialect::MySql)
 }
 
+/// Must every `CHECK` constraint this engine holds carry a name?
+///
+/// **MySQL and PostgreSQL: yes, in effect** — write `ADD CHECK (…)` and the
+/// server assigns one (`t_chk_1`, `t_a_check`), so a constraint introspected
+/// from either always has a name and the designer's blank field can only be a
+/// half-filled form. Refusing it there is the useful answer.
+///
+/// **SQLite: no.** A bare `CHECK (a > 0)` inside the table body is the ordinary
+/// spelling and the engine records no name for it, which is why
+/// [`CheckInfo::clause_sql`] emits an unnamed check unnamed rather than
+/// inventing a label. Asking for one anyway made every SQLite table carrying one
+/// **uneditable**: the designer opens, reports "Every check constraint needs a
+/// name" against a table the user has not touched, and leaves Preview SQL
+/// disabled with no field to fix.
+///
+/// A capability rather than an engine test, per the house rule — the question is
+/// whether the engine names a constraint for you, and a fourth engine answers it
+/// for itself.
+pub fn requires_named_checks(dialect: SqlDialect) -> bool {
+    !matches!(dialect, SqlDialect::Sqlite)
+}
+
 /// Does this `AlterColumn` change the column's **name and nothing else**?
 ///
 /// The question SQLite's `RENAME COLUMN` answers exactly: it moves the name and
@@ -5791,7 +5826,14 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     }
     matches!(
         change,
-        Change::DropTable
+        // `CREATE TABLE` is the one whole-table statement all three engines
+        // spell the same way, and `create_table_sql` has had a SQLite arm since
+        // the engine landed. It was missing from this list and from
+        // `emit_sqlite`, so the designer's New-table path built a change set that
+        // is not empty — the preview opens on it and Run is offered — and emitted
+        // nothing: the plan reported success and no table existed afterwards.
+        Change::CreateTable(_)
+            | Change::DropTable
             // **SQLite has no `TRUNCATE`, and it does have the thing it means.**
             // `DELETE FROM t` with no `WHERE` is the documented spelling, and the
             // engine's own truncate optimisation makes it the same operation. It
@@ -6013,30 +6055,66 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
     // references it and the next introspection reads the new name; MySQL stores
     // the text and *refuses* to rename a column a check depends on. So a rewrite
     // here would be either redundant or a way to emit SQL the server rejects.
-    let ck_claimed: HashSet<&str> = draft
-        .check_constraints
-        .iter()
-        .filter_map(|c| c.original.as_deref())
-        .collect();
+    // **A check is matched to its original by name, and an unnamed one has no
+    // name to match on.** SQLite keeps a constraint unnamed — `CHECK (a > 0)`
+    // without a `CONSTRAINT` label is the ordinary spelling there, and
+    // `CheckInfo::clause_sql` emits it back that way — so a table with two of
+    // them gave every draft check the *first* one as its original. The second
+    // then compared unequal against a predicate that wasn't its own and produced
+    // a `DROP` + `ADD` for an edit nobody made, on a table nobody touched. On
+    // SQLite that is not a stray preview line: a non-empty diff is what routes an
+    // edit through the twelve-step rebuild, so the phantom dropped and recreated
+    // the table.
+    //
+    // So: claim by name where there is one, then pair the unnamed ones by their
+    // predicate, each current check claimable once. Whatever is left on the
+    // current side is a real drop and whatever is left on the draft side is a
+    // real add, which is the same answer the named path gives.
+    let mut claimed: Vec<bool> = vec![false; current.check_constraints.len()];
     let mut dropped_ck: Vec<String> = Vec::new();
     let mut added_ck: Vec<CheckInfo> = Vec::new();
-    for ck in &current.check_constraints {
-        if !ck_claimed.contains(ck.name.as_str()) {
-            dropped_ck.push(ck.name.clone());
+    // Pass 1 — a draft check that names its original claims it by that name.
+    let mut unnamed_drafts: Vec<&CheckDraft> = Vec::new();
+    for d in &draft.check_constraints {
+        match d.original.as_deref() {
+            Some(n) if !n.is_empty() => {
+                match current.check_constraints.iter().position(|c| c.name == n) {
+                    Some(i) => {
+                        claimed[i] = true;
+                        if !checks_equal(&current.check_constraints[i], &d.info, dialect) {
+                            dropped_ck.push(current.check_constraints[i].name.clone());
+                            added_ck.push(d.info.clone());
+                        }
+                    }
+                    // Its original is gone — the draft states it, so add it.
+                    None => added_ck.push(d.info.clone()),
+                }
+            }
+            // An *unnamed* original: nothing to match on until pass 2.
+            Some(_) => unnamed_drafts.push(d),
+            // No original at all: a check the user added.
+            None => added_ck.push(d.info.clone()),
         }
     }
-    for d in &draft.check_constraints {
-        let cur = d
-            .original
-            .as_deref()
-            .and_then(|n| current.check_constraints.iter().find(|c| c.name == n));
-        match cur {
-            Some(ck) if checks_equal(ck, &d.info, dialect) => {}
-            Some(ck) => {
-                dropped_ck.push(ck.name.clone());
-                added_ck.push(d.info.clone());
-            }
+    // Pass 2 — each unnamed draft check claims one unclaimed unnamed original
+    // stating the same predicate. A check whose predicate the user edited finds
+    // none and falls through to an add, leaving its original to be dropped,
+    // which is the answer the named path gives for the same edit.
+    for d in unnamed_drafts {
+        let hit = current
+            .check_constraints
+            .iter()
+            .enumerate()
+            .find(|(i, c)| !claimed[*i] && c.name.is_empty() && checks_equal(c, &d.info, dialect))
+            .map(|(i, _)| i);
+        match hit {
+            Some(i) => claimed[i] = true,
             None => added_ck.push(d.info.clone()),
+        }
+    }
+    for (i, ck) in current.check_constraints.iter().enumerate() {
+        if !claimed[i] {
+            dropped_ck.push(ck.name.clone());
         }
     }
     for name in dropped_ck {
@@ -6989,7 +7067,7 @@ pub fn single(table: &str, schema: Option<&str>, dialect: SqlDialect, change: Ch
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intel::SqlDialect::{MySql, Postgres};
+    use crate::intel::SqlDialect::{MySql, Postgres, Sqlite};
     use crate::schema::{IndexColumn, TriggerEnabled};
 
     fn col(name: &str, ty: &str) -> ColumnInfo {
@@ -7621,7 +7699,7 @@ mod tests {
         // `from_table` lifts PRIMARY into `primary_key`, so `indexes` is b_ix alone.
         assert_eq!(d.indexes[0].info.columns[0].name, "ab");
         assert_eq!(d.foreign_keys[0].info.columns, vec!["ab"]);
-        assert!(d.validate().is_empty(), "{:?}", d.validate());
+        assert!(d.validate(MySql).is_empty(), "{:?}", d.validate(MySql));
     }
 
     #[test]
@@ -7649,7 +7727,7 @@ mod tests {
         assert_eq!(d.column_names(), vec!["z", "a"]);
         assert_eq!(d.primary_key, vec!["z", "a"]);
         assert_eq!(d.foreign_keys[0].info.columns, vec!["a"]);
-        assert!(d.validate().is_empty(), "{:?}", d.validate());
+        assert!(d.validate(MySql).is_empty(), "{:?}", d.validate(MySql));
     }
 
     #[test]
@@ -7660,7 +7738,7 @@ mod tests {
         assert_eq!(d.column_names(), vec!["a"]);
         assert_eq!(d.primary_key, vec!["a"]);
         assert_eq!(d.foreign_keys[0].info.columns, vec!["a"]);
-        assert!(d.validate().is_empty(), "{:?}", d.validate());
+        assert!(d.validate(MySql).is_empty(), "{:?}", d.validate(MySql));
     }
 
     /// The schema tree's key rows and the designer's Indexes list are **not**
@@ -7778,9 +7856,11 @@ mod tests {
         let mut d = TableDraft::from_table(&ab_table());
         d.rename_column(1, "a");
         assert!(
-            d.validate().iter().any(|m| m.contains("both called a")),
+            d.validate(MySql)
+                .iter()
+                .any(|m| m.contains("both called a")),
             "{:?}",
-            d.validate()
+            d.validate(MySql)
         );
     }
 
@@ -8112,9 +8192,11 @@ mod tests {
             ..Default::default()
         })];
         assert!(
-            !d.validate().iter().any(|e| e.contains("isn't a column")),
+            !d.validate(Postgres)
+                .iter()
+                .any(|e| e.contains("isn't a column")),
             "{:?}",
-            d.validate()
+            d.validate(Postgres)
         );
     }
 
@@ -8132,7 +8214,7 @@ mod tests {
     #[test]
     fn validate_catches_what_would_emit_nonsense() {
         let mut d = TableDraft::blank("", None);
-        let errs = d.validate();
+        let errs = d.validate(MySql);
         assert!(errs.iter().any(|e| e.contains("needs a name")), "{errs:?}");
         assert!(
             errs.iter().any(|e| e.contains("at least one column")),
@@ -8151,7 +8233,7 @@ mod tests {
             columns: vec![IndexColumn::plain("nope")],
             ..Default::default()
         })];
-        let errs = d.validate();
+        let errs = d.validate(MySql);
         assert!(errs.iter().any(|e| e.contains("both called A")), "{errs:?}");
         assert!(
             errs.iter().any(|e| e.contains("b needs a type")),
@@ -8163,10 +8245,181 @@ mod tests {
         );
     }
 
+    /// **What "every engine designs from a column row" actually claims.** The
+    /// menu entry that used to be capability-gated is now a literal `true`, so
+    /// the test that reads it can no longer fail for any dialect — but the claim
+    /// underneath it is real and *did* fail on SQLite before the rebuild existed:
+    /// retyping a column has to produce a plan the engine can carry out, with
+    /// nothing withheld and something to run.
+    ///
+    /// The route differs and that is the point: MySQL and PostgreSQL alter the
+    /// column in place, SQLite reaches the same edit through the twelve-step
+    /// rebuild. Asserting the *entry* proves neither.
+    #[test]
+    fn every_engine_can_express_a_column_retype() {
+        for dialect in [MySql, Postgres, Sqlite] {
+            let t = users();
+            let mut d = TableDraft::from_table(&t);
+            d.columns[2].info.type_name = "text".into();
+            let cs = diff(&t, &d, dialect);
+            assert!(!cs.is_empty(), "{dialect:?}: no plan at all");
+            assert!(
+                cs.unsupported().is_empty(),
+                "{dialect:?} withheld: {:?}",
+                cs.unsupported()
+            );
+            assert!(
+                !cs.emit().is_empty(),
+                "{dialect:?}: a plan that emits nothing"
+            );
+        }
+    }
+
+    /// The other half: SQLite gets there by a different statement, so a test
+    /// that only checked "a plan came back" would pass on an emitter that
+    /// silently produced the wrong shape.
+    #[test]
+    fn sqlite_reaches_a_retype_through_the_rebuild_and_the_others_alter_in_place() {
+        let t = users();
+        let mut d = TableDraft::from_table(&t);
+        d.columns[2].info.type_name = "text".into();
+
+        let sqlite = diff(&t, &d, Sqlite);
+        assert!(
+            sqlite
+                .changes
+                .iter()
+                .any(|c| matches!(c, Change::RebuildTable(_))),
+            "{:#?}",
+            sqlite.changes
+        );
+        for dialect in [MySql, Postgres] {
+            let cs = diff(&t, &d, dialect);
+            assert!(
+                cs.changes
+                    .iter()
+                    .any(|c| matches!(c, Change::AlterColumn { .. })),
+                "{dialect:?}: {:#?}",
+                cs.changes
+            );
+            assert!(
+                !cs.changes
+                    .iter()
+                    .any(|c| matches!(c, Change::RebuildTable(_))),
+                "{dialect:?} must not rebuild"
+            );
+        }
+    }
+
+    /// **An unnamed `CHECK` is ordinary on SQLite and a half-filled form
+    /// elsewhere.** Demanding a name on every engine made a table carrying one
+    /// uneditable: the designer opened on a table nobody had touched, showed
+    /// "Every check constraint needs a name" in the footer, and left Preview SQL
+    /// disabled with no field to fill in. MySQL and PostgreSQL assign a name
+    /// themselves, so a blank one there really is unfinished, and the message
+    /// stays.
+    #[test]
+    fn an_unnamed_check_is_valid_only_where_the_engine_leaves_it_unnamed() {
+        let mut d = TableDraft::blank("t", None);
+        d.columns.push(ColumnDraft::new(col("a", "int")));
+        d.check_constraints.push(CheckDraft::new(CheckInfo {
+            name: String::new(),
+            expression: "a > 0".into(),
+            enforced: true,
+            validated: true,
+            inherited: true,
+            column_level: false,
+        }));
+        assert!(d.validate(Sqlite).is_empty(), "{:?}", d.validate(Sqlite));
+        for engine in [MySql, Postgres] {
+            assert!(
+                d.validate(engine)
+                    .iter()
+                    .any(|e| e.contains("needs a name")),
+                "{engine:?}: {:?}",
+                d.validate(engine)
+            );
+        }
+        // The predicate is still everyone's business — that half of the rule was
+        // never about the name.
+        d.check_constraints[0].info.expression = "  ".into();
+        assert!(
+            d.validate(Sqlite)
+                .iter()
+                .any(|e| e.contains("no predicate")),
+            "{:?}",
+            d.validate(Sqlite)
+        );
+    }
+
+    /// **Two unnamed checks are two checks.** They are matched to their originals
+    /// by name, and an unnamed one has none — so each draft check found the
+    /// *first* original, the second compared unequal against a predicate that
+    /// wasn't its own, and an untouched table produced a `DROP` + `ADD`. On
+    /// SQLite a non-empty diff is what routes an edit through the twelve-step
+    /// rebuild, so the phantom dropped and recreated the table.
+    #[test]
+    fn unnamed_checks_are_paired_by_predicate_not_by_their_shared_empty_name() {
+        let unnamed = |expr: &str| CheckInfo {
+            name: String::new(),
+            expression: expr.into(),
+            enforced: true,
+            validated: true,
+            inherited: true,
+            column_level: false,
+        };
+        let t = TableInfo {
+            name: "t".into(),
+            columns: vec![col("a", "int"), col("b", "int")],
+            check_constraints: vec![unnamed("a > 0"), unnamed("b > 0")],
+            ..Default::default()
+        };
+        // Untouched: nothing at all, on every engine. This is the assertion the
+        // phantom failed, and the one the round-trip gate makes generally.
+        for engine in [Sqlite, MySql, Postgres] {
+            let cs = diff(&t, &TableDraft::from_table(&t), engine);
+            assert!(cs.is_empty(), "{engine:?}: {:#?}", cs.changes);
+        }
+
+        // What the pairing produces when there *is* an edit, read on MySQL —
+        // SQLite collapses every table change into one `RebuildTable`, so the
+        // individual drops and adds aren't visible there. The pairing itself is
+        // the same code on all three.
+        //
+        // Edit one predicate: exactly that one is replaced, and the other is left
+        // alone rather than dragged along by the pairing.
+        let mut d = TableDraft::from_table(&t);
+        d.check_constraints[0].info.expression = "a > 10".into();
+        let cs = diff(&t, &d, MySql);
+        assert_eq!(cs.len(), 2, "{:#?}", cs.changes);
+        assert!(
+            cs.changes
+                .iter()
+                .any(|c| matches!(c, Change::AddCheck(ck) if ck.expression == "a > 10")),
+            "{:#?}",
+            cs.changes
+        );
+
+        // Remove one: a drop, and no add — the survivor still claims its own.
+        let mut d = TableDraft::from_table(&t);
+        d.check_constraints.remove(1);
+        let cs = diff(&t, &d, MySql);
+        assert_eq!(cs.len(), 1, "{:#?}", cs.changes);
+        assert!(
+            matches!(cs.changes[0], Change::DropCheck { .. }),
+            "{:#?}",
+            cs.changes
+        );
+    }
+
     #[test]
     fn a_valid_draft_has_nothing_to_say() {
         let draft = TableDraft::from_table(&users());
-        assert!(draft.validate().is_empty(), "{:?}", draft.validate());
+        assert!(
+            draft.validate(MySql).is_empty(),
+            "{:?}",
+            draft.validate(MySql)
+        );
     }
 
     /// The round-trip gate.
@@ -9805,7 +10058,103 @@ mod tests {
                 (MySql, backslashes(MySql)),
                 (Postgres, backslashes(Postgres)),
                 (Postgres, pg_expression_index()),
+                (Sqlite, sqlite_table()),
+                (Sqlite, sqlite_lossy_index()),
             ]
+        }
+
+        /// **The third engine's table.** The gate had SQLite in its *view*
+        /// fixtures and not its table ones, so every fidelity field this engine
+        /// added — `WITHOUT ROWID`, `STRICT`, `AUTOINCREMENT` as distinct from
+        /// server-assigned, `STORED` vs `VIRTUAL`, a column collation, an
+        /// implicit key, a `CHECK` — was outside the gate that exists to catch a
+        /// phantom change.
+        ///
+        /// A phantom change costs more here than on the other two: on SQLite a
+        /// non-empty diff is what routes an edit through the twelve-step rebuild,
+        /// so an invented change drops and recreates the table for an edit nobody
+        /// made. The live counterpart, over real introspection rather than this
+        /// belief about it, is `db::sqlite`'s
+        /// `an_introspected_table_diffs_to_nothing_against_its_own_draft`.
+        fn sqlite_table() -> TableInfo {
+            let mut key = auto(pk(c("id", "INTEGER", false)));
+            key.sqlite_autoincrement = true;
+            let mut email = c("email", "TEXT", true);
+            email.collation = Some("NOCASE".into());
+            let mut doubled = c("doubled", "INTEGER", true);
+            doubled.generated = Some("qty * 2".into());
+            doubled.generated_stored = true;
+            TableInfo {
+                name: "orders".into(),
+                columns: vec![key, email, c("qty", "INTEGER", true), doubled],
+                indexes: vec![ix("ix_orders_qty", vec!["qty"], false)],
+                check_constraints: vec![
+                    CheckInfo {
+                        name: "ck_qty".into(),
+                        expression: "qty > 0".into(),
+                        enforced: true,
+                        validated: true,
+                        inherited: true,
+                        column_level: false,
+                    },
+                    // SQLite keeps an unnamed check unnamed; the reader gives it
+                    // the empty name rather than inventing one.
+                    CheckInfo {
+                        name: String::new(),
+                        expression: "qty <> 13".into(),
+                        enforced: true,
+                        validated: true,
+                        inherited: true,
+                        column_level: false,
+                    },
+                ],
+                implicit_key: Some("rowid".into()),
+                create_sql: Some(
+                    "CREATE TABLE orders (id INTEGER PRIMARY KEY AUTOINCREMENT)".into(),
+                ),
+                ..Default::default()
+            }
+        }
+
+        /// A `WITHOUT ROWID` + `STRICT` table carrying the index shape only
+        /// SQLite's reader marks: one it could not fully read (`lossy`) and so
+        /// keeps the engine's own `CREATE INDEX` text for, and one whose key
+        /// column states its own `COLLATE`. Both must survive `from_table` →
+        /// `diff` untouched, because the rebuild replays them.
+        fn sqlite_lossy_index() -> TableInfo {
+            TableInfo {
+                name: "audit".into(),
+                columns: vec![pk(c("sku", "TEXT", false)), c("note", "TEXT", true)],
+                indexes: vec![
+                    IndexInfo {
+                        name: "ix_audit_expr".into(),
+                        columns: vec![IndexColumn::expr("lower(note)")],
+                        lossy: true,
+                        create_sql: Some(
+                            "CREATE INDEX ix_audit_expr ON audit (lower(note));".into(),
+                        ),
+                        ..Default::default()
+                    },
+                    IndexInfo {
+                        name: "ix_audit_note".into(),
+                        columns: vec![IndexColumn {
+                            name: "note".into(),
+                            collation: Some("NOCASE".into()),
+                            descending: true,
+                            ..Default::default()
+                        }],
+                        unique: true,
+                        create_sql: Some(
+                            "CREATE UNIQUE INDEX ix_audit_note ON audit (note COLLATE NOCASE DESC);"
+                                .into(),
+                        ),
+                        ..Default::default()
+                    },
+                ],
+                without_rowid: true,
+                strict: true,
+                ..Default::default()
+            }
         }
 
         /// A PostgreSQL table with the two index shapes the model only learned to
@@ -9947,9 +10296,14 @@ mod tests {
 
         #[test]
         fn every_fixture_is_a_valid_draft() {
-            for (_, t) in fixtures() {
+            for (dialect, t) in fixtures() {
                 let d = TableDraft::from_table(&t);
-                assert!(d.validate().is_empty(), "{}: {:?}", t.name, d.validate());
+                assert!(
+                    d.validate(dialect).is_empty(),
+                    "{}: {:?}",
+                    t.name,
+                    d.validate(dialect)
+                );
             }
         }
 
@@ -10076,7 +10430,17 @@ mod tests {
                     );
                 }
                 if !primary_key_of(&t).is_empty() {
-                    assert!(sql.contains("PRIMARY KEY ("), "{}: {sql}", t.name);
+                    // **The key has to be there; the spelling is the engine's.**
+                    // SQLite writes a single server-assigned key *inline* on the
+                    // column (`"id" INTEGER PRIMARY KEY`) because a
+                    // `PRIMARY KEY (…)` clause beside it would declare a second
+                    // key — see `sqlite_inline_key`.
+                    let inline = sqlite_inline_key(&draft).is_some();
+                    assert!(
+                        sql.contains("PRIMARY KEY (") || (inline && sql.contains("PRIMARY KEY")),
+                        "{}: {sql}",
+                        t.name
+                    );
                 }
                 for fk in &t.foreign_keys {
                     assert!(sql.contains(&fk.name), "{}: {sql}", t.name);
@@ -11690,7 +12054,7 @@ mod object_tests {
             expression: "  ".into(),
             ..Default::default()
         }));
-        let msgs = t.validate().join(" | ");
+        let msgs = t.validate(Postgres).join(" | ");
         assert!(msgs.contains("no predicate"), "{msgs}");
 
         // Two checks sharing a name — the shape the domain editor's suffix
@@ -11708,7 +12072,11 @@ mod object_tests {
                 ..Default::default()
             }));
         }
-        assert!(t2.validate().join(" | ").contains("both called dup"));
+        assert!(
+            t2.validate(Postgres)
+                .join(" | ")
+                .contains("both called dup")
+        );
 
         // An empty enum label.
         let mut e = EnumDraft::from_info(&mood());
