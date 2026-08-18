@@ -3114,6 +3114,14 @@ theme). `menu_panel(entries: Vec<MenuEntry>, close)` takes `Action`/`Sub`/`Separ
 renders the themed panel; the caller positions it absolutely. Used by the schema right-click menu
 (`context_menu_overlay`).
 
+- **Separators are tidied by the panel, not the builder** (`tidy_separators`, applied first thing in
+  `menu_panel` and by `menu_panel_height` so the measured panel matches the drawn one): leading and
+  trailing separators are dropped, a run collapses to one rule, and each submenu's own children get
+  the same treatment. A builder pushes a group's separator *before* it knows whether the group has
+  any entries — the column menu pushes one and then asks `field_entries` whether Edit column and
+  Drop are offered, and on a **view's** column neither is — so the alternative is every conditional
+  arm remembering to push its rule afterwards. It shipped as a rule with nothing under it: an empty
+  section between "Copy qualified name" and AI Explain.
 - **Nested submenus**: a `Sub` entry hover-expands a child `menu_stack` anchored to the parent row's
   right edge (`inset_left_pct(100.0)` + `inset_top(-6.0)`). Recursive for the *pointer* — each level
   owns its `open_sub` signal — while the **keyboard** stops at one level (`MenuLevel`/`MenuSub`),

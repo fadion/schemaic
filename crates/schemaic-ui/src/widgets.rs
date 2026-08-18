@@ -2098,15 +2098,87 @@ pub(crate) const CURSOR_MENU_GAP: f64 = 3.0;
 /// It is an estimate on purpose: it decides *placement*, not whether to flip, and
 /// measuring for real would mean laying the panel out first — which is what
 /// produces an open-then-flip flicker.
+///
+/// Measured over [`tidy_separators`]'s output, not the list as given: the panel
+/// drops the separators that divide nothing, and a height that counted them would
+/// flip an upward-opening menu a rule too high.
 pub(crate) fn menu_panel_height(entries: &[MenuEntry]) -> f64 {
-    entries
-        .iter()
-        .map(|e| match e {
+    separator_keep(entries)
+        .into_iter()
+        .zip(entries)
+        .filter(|(keep, _)| *keep)
+        .map(|(_, e)| match e {
             MenuEntry::Separator => 9.0,
             _ => 30.5,
         })
         .sum::<f64>()
         + 14.0
+}
+
+/// `entries` with its separators tidied: leading and trailing ones dropped, runs
+/// of two or more collapsed to one, and the same applied inside every submenu.
+///
+/// Applied by [`menu_panel`] itself (and by [`menu_panel_height`], so placement
+/// measures what is drawn) rather than by each caller, because a builder pushes a
+/// group's separator *before* it knows whether the group has any entries. The
+/// schema tree's column menu pushes one and then asks
+/// `overlays::field_entries` whether Edit column and Drop are offered at all — on a
+/// view's column neither is, and what shipped was a rule with nothing under it: an
+/// empty section between "Copy qualified name" and AI Explain. Every conditional
+/// group in that tree can reach the same shape, so this is the one place it is
+/// fixed.
+pub(crate) fn tidy_separators(entries: Vec<MenuEntry>) -> Vec<MenuEntry> {
+    let keep = separator_keep(&entries);
+    entries
+        .into_iter()
+        .zip(keep)
+        .filter(|(_, keep)| *keep)
+        .map(|(e, _)| match e {
+            MenuEntry::Sub {
+                label,
+                icon,
+                children,
+            } => MenuEntry::Sub {
+                label,
+                icon,
+                children: tidy_separators(children),
+            },
+            other => other,
+        })
+        .collect()
+}
+
+/// Which of `entries` survive [`tidy_separators`], one flag per entry. Shared with
+/// [`menu_panel_height`] so the panel that is measured and the panel that is drawn
+/// cannot disagree about how many rules they have.
+///
+/// Two passes, because "is there anything after this separator" needs the whole
+/// list: the first keeps a separator only when the last kept entry was a row, which
+/// drops leading ones and collapses runs; the second walks back from the end and
+/// drops the one trailing separator the first pass can leave.
+fn separator_keep(entries: &[MenuEntry]) -> Vec<bool> {
+    let mut keep = Vec::with_capacity(entries.len());
+    // Whether the last kept entry was a separator. `None` = nothing kept yet, so a
+    // separator here would be the panel's first row.
+    let mut last_kept_is_separator: Option<bool> = None;
+    for e in entries {
+        let is_separator = matches!(e, MenuEntry::Separator);
+        let k = !is_separator || last_kept_is_separator == Some(false);
+        if k {
+            last_kept_is_separator = Some(is_separator);
+        }
+        keep.push(k);
+    }
+    for i in (0..entries.len()).rev() {
+        if !keep[i] {
+            continue;
+        }
+        if matches!(entries[i], MenuEntry::Separator) {
+            keep[i] = false;
+        }
+        break;
+    }
+    keep
 }
 
 /// Top-left corner for a panel opened **at the cursor**: `gap` px down and right
@@ -2272,6 +2344,11 @@ pub(crate) fn menu_panel(
     close: Rc<dyn Fn()>,
     width: f64,
 ) -> impl IntoView {
+    // First, before anything indexes into the list: a builder pushes a group's
+    // separator before it knows whether the group has any entries, and a rule with
+    // nothing under it is a visible empty section. Done here so `menu_stops` and the
+    // rows below agree on what position each entry is at.
+    let entries = tidy_separators(entries);
     let level = MenuLevel::new();
     // Taken at build, so the slot is empty again the moment this panel owns it.
     // Folded into `close`, which is what Escape and every action call — the one
@@ -3808,6 +3885,129 @@ mod menu_placement_tests {
         assert_eq!(
             menu_panel_height(std::slice::from_ref(&sub)),
             menu_panel_height(&[MenuEntry::action("Copy", || {})])
+        );
+    }
+}
+
+/// Separators are pushed by a menu builder *before* it knows whether the group
+/// they open has any entries — the schema tree's column menu pushes one and then
+/// asks `field_entries` whether Edit column and Drop are offered at all, and on a
+/// view's column neither is. What shipped was a rule with nothing under it: an
+/// empty section between "Copy qualified name" and AI Explain. Every conditional
+/// group in that tree can reach the same shape, so the tidying belongs where rows
+/// become a panel rather than in each arm that might need it.
+#[cfg(test)]
+mod menu_separator_tests {
+    use super::*;
+
+    /// Labels of the kept entries, with `"—"` standing for a separator, so a
+    /// whole menu shape reads as one line.
+    fn shape(entries: Vec<MenuEntry>) -> Vec<String> {
+        tidy_separators(entries)
+            .iter()
+            .map(|e| match e {
+                MenuEntry::Separator => "—".to_string(),
+                MenuEntry::Action { label, .. } | MenuEntry::Sub { label, .. } => label.clone(),
+            })
+            .collect()
+    }
+
+    fn act(label: &str) -> MenuEntry {
+        MenuEntry::action(label, || {})
+    }
+
+    /// The reported bug: a view's column menu, with both write entries absent.
+    #[test]
+    fn a_group_whose_entries_were_all_withheld_leaves_no_empty_section() {
+        assert_eq!(
+            shape(vec![
+                act("Copy name"),
+                act("Copy qualified name"),
+                MenuEntry::Separator, // the write group — nothing was offered
+                MenuEntry::Separator, // AI Explain's group
+                act("AI Explain"),
+            ]),
+            vec!["Copy name", "Copy qualified name", "—", "AI Explain"]
+        );
+    }
+
+    #[test]
+    fn a_group_with_entries_keeps_its_separator() {
+        assert_eq!(
+            shape(vec![
+                act("Copy name"),
+                MenuEntry::Separator,
+                act("Edit column"),
+                MenuEntry::Separator,
+                act("AI Explain"),
+            ]),
+            vec!["Copy name", "—", "Edit column", "—", "AI Explain"]
+        );
+    }
+
+    /// A leading separator is a rule above the first row, and a trailing one a
+    /// rule under the last — both are visible, and neither divides anything.
+    #[test]
+    fn separators_at_either_end_are_dropped() {
+        assert_eq!(
+            shape(vec![
+                MenuEntry::Separator,
+                act("Open"),
+                MenuEntry::Separator
+            ]),
+            vec!["Open"]
+        );
+    }
+
+    #[test]
+    fn a_menu_of_nothing_but_separators_renders_nothing() {
+        assert!(shape(vec![MenuEntry::Separator, MenuEntry::Separator]).is_empty());
+    }
+
+    /// Three withheld groups in a row collapse to one rule, not three.
+    #[test]
+    fn a_long_run_collapses_to_a_single_rule() {
+        assert_eq!(
+            shape(vec![
+                act("a"),
+                MenuEntry::Separator,
+                MenuEntry::Separator,
+                MenuEntry::Separator,
+                act("b"),
+            ]),
+            vec!["a", "—", "b"]
+        );
+    }
+
+    /// A submenu is built the same conditional way (the object menu's `Create`
+    /// children vary by engine), and is its own panel.
+    #[test]
+    fn a_submenus_own_separators_are_tidied_too() {
+        let tidied = tidy_separators(vec![MenuEntry::Sub {
+            label: "Create".into(),
+            icon: None,
+            children: vec![MenuEntry::Separator, act("Table"), MenuEntry::Separator],
+        }]);
+        let MenuEntry::Sub { children, .. } = &tidied[0] else {
+            panic!("the submenu row itself survived");
+        };
+        assert_eq!(children.len(), 1);
+    }
+
+    /// The panel is placed by its measured height, so measuring must count the
+    /// rows that will actually be drawn — otherwise a menu with a withheld group
+    /// flips at the window edge as though it were a separator taller.
+    #[test]
+    fn the_measured_height_ignores_a_separator_that_wont_be_drawn() {
+        let untidy = vec![
+            act("Copy name"),
+            MenuEntry::Separator,
+            MenuEntry::Separator,
+            act("AI Explain"),
+        ];
+        assert_eq!(
+            menu_panel_height(&untidy),
+            menu_panel_height(&tidy_separators(untidy.clone()))
         );
     }
 }
