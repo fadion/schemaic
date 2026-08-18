@@ -910,6 +910,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     is reached the same way a repointed host is. `is_sqlite`/`is_postgres` are the one answer to
     which engine a label names — `schemaic_db::Engine::from_db_type`, the form's picker and
     `SqlDialect::from_db_type` all delegate, the last of which used to re-spell the aliases itself.
+    `same_engine` is that pair asked of *two* labels — `MariaDB` and `MySQL` name one engine, as do
+    `pg` and `PostgreSQL`, and as do `MySQL` and the empty label that predates the field — so the
+    question is not a string comparison. It is what the connection form's Type picker tells its own
+    change apart from a load with.
     `SshTunnel`/`SshAuth` cover the tunnel's own
     auth, including `Agent` (delegates to the running SSH agent, storing no secret at all).
     `ConnStatus::is_down` treats `Unknown` (not yet checked, or a tunnel still coming up) as
@@ -1705,7 +1709,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     other half — that each name still names a live command — can only be checked against a built
     registry, so it rides `overlays::assert_names_match_labels`' `debug_assert`, without which a
     renamed command would drop its keycap in silence.
-  - `connection_form.rs` — Manage Connections modal + password-mask (+ tests).
+  - `connection_form.rs` — Manage Connections modal + password-mask (+ tests). The form is built
+    **once per open** while the list on its left keeps loading a different connection into the same
+    `DraftSignals` — so every control the form owns a *separate* signal for has to be synced back
+    down from the draft, not merely seeded from it. The password fields' `mirror_real` does that;
+    the **Type** picker's `DbKind` did not, and reported the engine of whichever connection was
+    active when the modal opened for every row the user then clicked — including which half of the
+    form (`server_fields` vs `sqlite_fields`) got built, so a MySQL connection could be shown a
+    *Database file* field and no host. Both directions now have an effect, and the write-back one
+    tells a **pick** from a **load** by asking `connection::same_engine` whether the stored label
+    still names the previous engine: on a pick it does, on a load it already names the new one.
+    That is also what stopped opening the form from rewriting a `MariaDB` label to `MySQL` — the
+    write used to be unconditional, and the picker has one name per engine where `db_type` has
+    several.
   - `diff_view.rs` — Ctrl+K diff preview. `history_panel.rs` — Query History right-column panel.
   - `plan_view.rs` — Query Plan modal (`EXPLAIN`/`EXPLAIN ANALYZE` table + warnings + "Ask AI"),
     via `TabsActions::run_plan` → `Db::explain`.

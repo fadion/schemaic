@@ -956,14 +956,44 @@ fn conn_form(
         conn_test.set(crate::TestState::Idle);
     });
 
-    // Type: engine picker. The selection drives `draft.db_type`; switching engine
-    // also swaps in that engine's default port — but only when the port is still
-    // the *other* engine's default (or empty), so a port the user typed is never
-    // clobbered. `create_effect`'s `prev` is `None` on the first (load) run, so
-    // opening an existing connection never rewrites its saved port.
+    // Type: engine picker. The picker needs its own signal (that is what
+    // `focusable_dropdown` binds to), so `draft.db_type` and this are a mirrored
+    // pair, kept in step in both directions — the same shape as the password
+    // field's mirror above, and for the same reason.
     let engine = RwSignal::new(DbKind::from_db_type(&draft.db_type.get_untracked()));
+
+    // Down: a connection loaded into the form moves the picker onto its engine.
+    //
+    // **The form is built once, when the modal opens, and the list on the left
+    // then loads a different connection into the same draft** — so without this
+    // the picker kept showing the engine of whichever connection was active when
+    // the modal opened, and every other row reported that one. It also decides
+    // which half of the form is built, so a MySQL connection could be shown with
+    // a *Database file* field and no host at all.
+    create_effect(move |_| {
+        let k = DbKind::from_db_type(&draft.db_type.get());
+        if engine.get_untracked() != k {
+            engine.set(k);
+        }
+    });
+
+    // Up: the selection drives `draft.db_type`; switching engine also swaps in
+    // that engine's default port — but only when the port is still the *other*
+    // engine's default (or empty), so a port the user typed is never clobbered.
     create_effect(move |prev: Option<DbKind>| {
         let k = engine.get();
+        // Was this the *picker* moving, or the effect above following a load? On
+        // a pick the stored label still names the previous engine; on a load it
+        // already names the new one — and then there is nothing to write back and
+        // no port to offer, because the connection brought its own.
+        let picked =
+            !schemaic_core::connection::same_engine(&draft.db_type.get_untracked(), k.label());
+        if !picked {
+            return k;
+        }
+        // Only when the engine really changed: this preserves `MariaDB` (and any
+        // other label for an engine the picker has one name for), which an
+        // unconditional write turned into `MySQL` merely by opening the form.
         draft.db_type.set(k.label().to_string());
         if let Some(prev) = prev
             && prev != k
