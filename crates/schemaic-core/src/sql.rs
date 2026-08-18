@@ -275,6 +275,124 @@ pub fn skip_noncode(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
     }
 }
 
+/// The identifier at or after `at`, **unquoted**, and the offset just past it —
+/// or `(None, offset)` when there isn't one.
+///
+/// **The one reader for a name in raw SQL text.** A backend that scans a stored
+/// `CREATE` statement needs this constantly (SQLite's `CONSTRAINT <name>`,
+/// `COLLATE <name>`) and re-spelling it is how the four-quoting rule drifts:
+/// which bytes quote a name is [`crate::intel::ident_quote`]'s answer, per
+/// dialect and **per byte**, because SQLite's `[x]` does not close with the byte
+/// it opened with and only two of its three quotings double to escape.
+///
+/// The bare arm asks [`is_word_start`] as well as [`is_word_byte`], which the
+/// hand-rolled copy this replaces did not: a digit cannot begin a name, so
+/// `CONSTRAINT 3way` there read back a constraint called `3way`.
+///
+/// A quoted name that is never closed runs to the end of the input, matching
+/// [`skip_noncode`]'s policy — a truncated statement should not silently produce
+/// a shorter name.
+pub fn ident_at(sql: &str, at: usize, dialect: SqlDialect) -> (Option<String>, usize) {
+    let b = sql.as_bytes();
+    let mut i = at;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let Some(&open) = b.get(i) else {
+        return (None, i);
+    };
+    let Some((close, doubled)) = crate::intel::ident_quote(dialect, open) else {
+        // A **string** literal is accepted as a name too, because SQLite does:
+        // `CONSTRAINT 'x'` is legal there and means the identifier `x`.
+        if open == b'\'' && dialect == SqlDialect::Sqlite {
+            return quoted_ident(sql, i, b'\'', true);
+        }
+        if !is_word_start(open) {
+            return (None, i);
+        }
+        let start = i;
+        while i < b.len() && is_word_byte(b[i]) {
+            i += 1;
+        }
+        return (Some(sql[start..i].to_string()), i);
+    };
+    quoted_ident(sql, i, close, doubled)
+}
+
+/// The body of a quoted identifier opening at `i`, with `close` doubled to
+/// escape when `doubled`.
+fn quoted_ident(sql: &str, i: usize, close: u8, doubled: bool) -> (Option<String>, usize) {
+    let b = sql.as_bytes();
+    let mut name = String::new();
+    let mut i = i + 1;
+    while i < b.len() {
+        if b[i] == close {
+            if doubled && b.get(i + 1) == Some(&close) {
+                name.push(close as char);
+                i += 2;
+                continue;
+            }
+            return (Some(name), i + 1);
+        }
+        let ch = sql[i..].chars().next().map_or(1, char::len_utf8);
+        name.push_str(&sql[i..i + ch]);
+        i += ch;
+    }
+    (Some(name), i)
+}
+
+/// `sql` with a statement terminator on the end — put where a terminator will
+/// actually terminate.
+///
+/// **A `;` appended to trimmed text can land inside a comment.** SQLite stores a
+/// statement without its terminator and keeps the author's own trailing comment
+/// with it, so `CREATE INDEX ia ON t(a) -- why this index exists` trims to end
+/// *inside* the comment and `…exists;` is a script the engine rejects at the
+/// next statement. The same is true of an unclosed `/*`. So the tail is walked
+/// through [`skip_noncode`], and a `;` that would be swallowed goes on a line of
+/// its own instead.
+///
+/// A statement that already ends in a `;` at a code position is returned as it
+/// is, so this is idempotent.
+pub fn terminated(sql: &str, dialect: SqlDialect) -> String {
+    let t = sql.trim_end();
+    let b = t.as_bytes();
+    // Walk to the end, recording whether the last thing the lexer skipped ran
+    // off the end of the input — which is what an unclosed comment does.
+    let mut i = 0usize;
+    let mut open_comment = false;
+    let mut last_code: Option<u8> = None;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            // Would a `;` written after this text land inside the region? Only
+            // for a comment, and only one that is still open at the end: a line
+            // comment nothing terminated, or a `/*` with no `*/`. A closed block
+            // comment that happens to sit last is not a hazard.
+            open_comment = skip_comment(b, i, dialect).is_some()
+                && j >= b.len()
+                && !(b[i] == b'/' && j >= i + 4 && b[j - 2] == b'*' && b[j - 1] == b'/');
+            if j < b.len() {
+                last_code = None;
+            }
+            i = j.max(i + 1);
+            continue;
+        }
+        if !b[i].is_ascii_whitespace() {
+            last_code = Some(b[i]);
+        }
+        open_comment = false;
+        i += 1;
+    }
+    if open_comment {
+        // The `;` cannot follow on this line — the comment runs to the end.
+        return format!("{t}\n;");
+    }
+    match last_code {
+        Some(b';') => t.to_string(),
+        _ => format!("{t};"),
+    }
+}
+
 /// The index of the `)` that closes the `(` at `start`, or `None` when it is
 /// never closed (or `start` isn't an open paren at all).
 ///
@@ -1163,6 +1281,138 @@ pub fn carries_credential(sql: &str, dialect: SqlDialect) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod ident_at_tests {
+    use super::ident_at;
+    use crate::intel::SqlDialect::{MySql, Postgres, Sqlite};
+
+    fn name(sql: &str) -> Option<String> {
+        ident_at(sql, 0, Sqlite).0
+    }
+
+    /// All four spellings SQLite accepts, and the doubling rule for the three
+    /// that have one.
+    #[test]
+    fn every_sqlite_quoting_reads_back_unquoted() {
+        assert_eq!(name(r#""x""#).as_deref(), Some("x"));
+        assert_eq!(name("`x`").as_deref(), Some("x"));
+        assert_eq!(name("[x]").as_deref(), Some("x"));
+        assert_eq!(name("'x'").as_deref(), Some("x"));
+        assert_eq!(name(r#""a""b""#).as_deref(), Some("a\"b"));
+        assert_eq!(name("`a``b`").as_deref(), Some("a`b"));
+        assert_eq!(name("'a''b'").as_deref(), Some("a'b"));
+        // `[…]` has no escape at all: the content runs to the first `]`.
+        assert_eq!(name("[a]]b]").as_deref(), Some("a"));
+    }
+
+    /// **A digit cannot begin a name**, which the copy this replaced did not
+    /// check: `CONSTRAINT 3way` read back a constraint called `3way`.
+    #[test]
+    fn a_bare_name_cannot_start_with_a_digit() {
+        assert_eq!(name("3way"), None);
+        assert_eq!(name("way3").as_deref(), Some("way3"));
+        assert_eq!(name("_x").as_deref(), Some("_x"));
+        // A byte >= 0x80 is a word byte and a word start — the identifier rule
+        // this project states.
+        assert_eq!(name("é").as_deref(), Some("é"));
+    }
+
+    #[test]
+    fn leading_space_is_skipped_and_nothing_is_nothing() {
+        assert_eq!(ident_at("   x", 0, Sqlite).0.as_deref(), Some("x"));
+        assert_eq!(ident_at("", 0, Sqlite), (None, 0));
+        assert_eq!(ident_at("   ", 0, Sqlite).0, None);
+        assert_eq!(name("("), None);
+    }
+
+    /// The offset is just past the name, so a scanner can carry on from it.
+    #[test]
+    fn the_offset_lands_past_the_name() {
+        assert_eq!(ident_at("CONSTRAINT ck CHECK", 10, Sqlite).1, 13);
+        assert_eq!(ident_at(r#" "ck" CHECK"#, 0, Sqlite).1, 5);
+    }
+
+    /// **Which byte quotes a name is the dialect's answer, not this function's.**
+    /// MySQL reads `"` as a *string* and PostgreSQL has no backtick, so neither
+    /// may take the other's quoting as a name.
+    #[test]
+    fn the_quoting_is_the_dialects() {
+        assert_eq!(ident_at("`x`", 0, MySql).0.as_deref(), Some("x"));
+        assert_eq!(ident_at(r#""x""#, 0, MySql).0, None, "a string on MySQL");
+        assert_eq!(ident_at(r#""x""#, 0, Postgres).0.as_deref(), Some("x"));
+        assert_eq!(ident_at("`x`", 0, Postgres).0, None);
+        assert_eq!(ident_at("[x]", 0, Postgres).0, None);
+    }
+}
+
+#[cfg(test)]
+mod terminated_tests {
+    use super::terminated;
+    use crate::intel::SqlDialect::{MySql, Sqlite};
+
+    #[test]
+    fn an_ordinary_statement_gets_one_semicolon() {
+        assert_eq!(terminated("SELECT 1", Sqlite), "SELECT 1;");
+        assert_eq!(terminated("SELECT 1  \n", Sqlite), "SELECT 1;");
+        assert_eq!(terminated("", Sqlite), ";");
+    }
+
+    /// Idempotent, because callers string statements together and a double `;`
+    /// is an empty statement some clients refuse.
+    #[test]
+    fn a_terminated_statement_is_returned_as_it_is() {
+        assert_eq!(terminated("SELECT 1;", Sqlite), "SELECT 1;");
+        assert_eq!(terminated("SELECT 1; \n", Sqlite), "SELECT 1;");
+        assert_eq!(
+            terminated(&terminated("SELECT 1", Sqlite), Sqlite),
+            "SELECT 1;"
+        );
+    }
+
+    /// **The one this exists for.** SQLite keeps the author's own trailing
+    /// comment in `sqlite_master.sql`, so trimming and appending put the `;`
+    /// *inside* it — and the next statement in the script joined the comment.
+    #[test]
+    fn a_semicolon_never_lands_inside_a_trailing_comment() {
+        assert_eq!(
+            terminated("CREATE INDEX ia ON t(a) -- why this index exists", Sqlite),
+            "CREATE INDEX ia ON t(a) -- why this index exists\n;"
+        );
+        // An unclosed block comment behaves the same way and used to be missed
+        // by a `--`-only fix.
+        assert_eq!(
+            terminated("CREATE INDEX ia ON t(a) /* unclosed", Sqlite),
+            "CREATE INDEX ia ON t(a) /* unclosed\n;"
+        );
+        // A *closed* comment is not a hazard: code follows it, or nothing does.
+        assert_eq!(
+            terminated("CREATE INDEX ia ON t(a) /* why */", Sqlite),
+            "CREATE INDEX ia ON t(a) /* why */;"
+        );
+        // A comment that already had its terminator after it is untouched.
+        assert_eq!(
+            terminated("CREATE INDEX ia ON t(a) -- why\n;", Sqlite),
+            "CREATE INDEX ia ON t(a) -- why\n;"
+        );
+    }
+
+    /// The `;` and the comment marker have to be read as *code*, not as bytes:
+    /// both can sit inside a literal.
+    #[test]
+    fn a_semicolon_or_a_dash_inside_a_literal_is_data() {
+        assert_eq!(
+            terminated("INSERT INTO t VALUES ('a;')", Sqlite),
+            "INSERT INTO t VALUES ('a;');"
+        );
+        assert_eq!(
+            terminated("INSERT INTO t VALUES ('-- not a comment')", Sqlite),
+            "INSERT INTO t VALUES ('-- not a comment');"
+        );
+        // MySQL's `#` comment is the dialect's business, not this function's.
+        assert_eq!(terminated("SELECT 1 # why", MySql), "SELECT 1 # why\n;");
+    }
 }
 
 #[cfg(test)]

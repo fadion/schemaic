@@ -348,8 +348,20 @@ impl<'a> BrowseKey<'a> {
     /// statement projecting a rowid the write path then ignored would carry a
     /// column for no reason; one projecting nothing the write path needed would
     /// be read-only for no reason.
+    /// `key_cols` is [`crate::schema::browse_key_columns`]'s answer, not the
+    /// primary key alone — the middle arm (a unique, non-foreign, all-`NOT NULL`
+    /// index) is exactly what `analyze_edit` reaches for second, and leaving it
+    /// out made a `(email TEXT NOT NULL UNIQUE, name TEXT)` table browse by
+    /// rowid while the write path keyed on `email`.
     pub fn pick(key_cols: &'a [String], implicit: Option<&'a str>) -> Self {
-        match (key_cols.is_empty(), implicit) {
+        // An empty name is not a key. `pick` is the only constructor callers are
+        // supposed to use, and this is where the two illegal states — a `Columns`
+        // with nothing in it, an `Implicit` spelled `""` — are turned into the
+        // `None` they mean, so nothing downstream has to re-check.
+        match (
+            key_cols.is_empty(),
+            implicit.filter(|k| !k.trim().is_empty()),
+        ) {
             (false, _) => Self::Columns(key_cols),
             (true, Some(k)) => Self::Implicit(k),
             (true, None) => Self::None,

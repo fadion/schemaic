@@ -218,6 +218,12 @@ pub struct TableDraft {
     /// MySQL table collation. Always `None` on PostgreSQL.
     pub collation: Option<String>,
     pub comment: Option<String>,
+    /// SQLite `WITHOUT ROWID` — see [`TableInfo::without_rowid`]. The rebuild
+    /// writes the table from *this*, so a clause missing here is a clause the
+    /// edit silently drops.
+    pub without_rowid: bool,
+    /// SQLite `STRICT` — see [`TableInfo::strict`], and the note above.
+    pub strict: bool,
 }
 
 impl TableDraft {
@@ -258,6 +264,8 @@ impl TableDraft {
             engine: t.engine.clone(),
             collation: t.collation.clone(),
             comment: t.comment.clone(),
+            without_rowid: t.without_rowid,
+            strict: t.strict,
         }
     }
 
@@ -951,7 +959,9 @@ fn is_begin_end_block(body: &str) -> bool {
         }
         if !sql::is_word_start(b[i]) {
             if !b[i].is_ascii_whitespace() {
-                words.push("");
+                // A `;` is recorded as itself, because a *trailing* one is the
+                // statement's terminator rather than the block's content.
+                words.push(if b[i] == b';' { ";" } else { "" });
             }
             i += 1;
             continue;
@@ -964,6 +974,15 @@ fn is_begin_end_block(body: &str) -> bool {
         words.push(&body[start..end]);
         i = end;
     }
+    // **`BEGIN … END;` is a body, and it is the one this crate's own emitter
+    // writes.** Counting the terminator as content made `words.last()` a `;`,
+    // so Preview was blocked with a message stating the very rule the body
+    // satisfied — on text the user got from Copy DDL.
+    let mut n = words.len();
+    while n > 0 && words[n - 1] == ";" {
+        n -= 1;
+    }
+    let words = &words[..n];
     matches!(words.first(), Some(w) if w.eq_ignore_ascii_case("BEGIN"))
         && matches!(words.last(), Some(w) if w.eq_ignore_ascii_case("END"))
         && words.len() > 2
@@ -1712,6 +1731,16 @@ pub enum Change {
     ReplaceView {
         draft: Box<ViewDraft>,
         recreate: bool,
+        /// Statements the `DROP` takes down with the view, to be re-run after
+        /// the `CREATE` — the server's own text, not a re-emission from a parse.
+        ///
+        /// **A SQLite view's `INSTEAD OF` triggers.** They hang off the view, the
+        /// engine drops them with it, and they are the only way a SQLite view is
+        /// written to at all; their SQL exists nowhere else once the drop has
+        /// run, so an edit that didn't replay them would take a writable view
+        /// and leave a read-only one, unrecoverably. Empty when `recreate` is
+        /// false, and empty on the engines that replace a view in place.
+        replay: Vec<String>,
     },
     RenameView {
         to: String,
@@ -1829,10 +1858,58 @@ pub enum Change {
     },
 }
 
-/// What a view loses when it's dropped — the sentence behind both the plain
-/// `DROP VIEW` and the recreate that has to drop first.
-const VIEW_DROP_COST: &str =
-    "Dependent views, rules and grants on it are dropped with it and aren't restored.";
+/// The refusal for a view **rename** that would strand its dependents, or
+/// `None` when the change is fine.
+///
+/// A re-create's replay is the server's own text, and that text names the object
+/// it hangs off — `CREATE TRIGGER vi INSTEAD OF INSERT ON v`. Renaming the view
+/// makes that name resolve to nothing, so replaying it verbatim fails on the
+/// statement after the `CREATE VIEW` and takes the whole plan down with it. The
+/// alternative — re-emitting the trigger from the parsed model against the new
+/// name — would quietly rewrite text the user wrote, which is the silent
+/// unfaithfulness [`IndexReplay::Refuse`] exists to refuse elsewhere. So the
+/// plan says what it can't do and the preview blocks Apply, rather than the
+/// engine saying `no such table` after the drop has already run.
+fn unreplayable_rename(c: &Change) -> Option<String> {
+    let Change::ReplaceView {
+        draft,
+        recreate: true,
+        replay,
+    } = c
+    else {
+        return None;
+    };
+    let was = draft.original.as_deref()?;
+    if replay.is_empty() || was == draft.name {
+        return None;
+    }
+    Some(format!(
+        "Renaming {was} to {} can't carry its {} trigger{} across: their SQL names \
+         {was}, and re-writing it here would change what you wrote. Rename the view \
+         on its own after re-creating the triggers against the new name.",
+        draft.name,
+        replay.len(),
+        if replay.len() == 1 { "" } else { "s" },
+    ))
+}
+
+/// What a view loses when it's dropped, on `dialect` — the sentence behind both
+/// the plain `DROP VIEW` and the recreate that has to drop first.
+///
+/// **It has to ask.** The list was written for PostgreSQL and read as universal:
+/// on SQLite, *rules* and *grants* do not exist, so naming them told a user the
+/// warning was about someone else's engine. What SQLite really drops with a view
+/// is its `INSTEAD OF` triggers — the only way a view there is written to — and
+/// that was the one thing the sentence left out.
+fn view_drop_cost(dialect: SqlDialect) -> &'static str {
+    match dialect {
+        SqlDialect::Sqlite => {
+            "Views that select from it stop resolving until it is back, and its \
+             INSTEAD OF triggers are dropped with it."
+        }
+        _ => "Dependent views, rules and grants on it are dropped with it and aren't restored.",
+    }
+}
 
 impl Change {
     /// One line of plain language for the preview's change list.
@@ -1929,7 +2006,9 @@ impl Change {
                 format!("Set the table's {}", parts.join(", "))
             }
             Change::CreateView(d) => format!("Create view {}", d.name),
-            Change::ReplaceView { draft, recreate } => {
+            Change::ReplaceView {
+                draft, recreate, ..
+            } => {
                 if *recreate {
                     format!("Drop and re-create view {}", draft.name)
                 } else {
@@ -2031,7 +2110,13 @@ impl Change {
     /// than one risk: an `AlterColumn` that narrows a column *and* makes it
     /// NOT NULL used to disclose only the second, and that sentence says the
     /// statement will fail — which reads as a promise that nothing can be lost.
-    pub fn risks(&self) -> Vec<String> {
+    ///
+    /// It takes the `dialect` because a consequence is a property of the engine,
+    /// not of the change: dropping a view costs a PostgreSQL user their grants
+    /// and a SQLite user their `INSTEAD OF` triggers, and stating one list to
+    /// both told half the users the warning wasn't about them.
+    pub fn risks(&self, dialect: SqlDialect) -> Vec<String> {
+        let view_drop_cost = view_drop_cost(dialect);
         match self {
             // The table really is dropped in the middle of this, so it belongs
             // in the destructive block even though the plan puts it back. What
@@ -2053,22 +2138,68 @@ impl Change {
                 vec!["Leaves the table without a primary key — rows can no longer be edited from the grid.".to_string()]
             }
             Change::DropView { materialized } => vec![format!(
-                "Drops the {}view. {VIEW_DROP_COST}",
+                "Drops the {}view. {view_drop_cost}",
                 if *materialized { "materialized " } else { "" }
             )],
-            // The one place a *redefinition* is destructive: PostgreSQL can only
-            // append columns to a view, so an edit that renames, retypes or
-            // reorders one can't be applied in place at all. Saying that here is
-            // the whole reason the recreate isn't done quietly.
+            // The one place a *redefinition* is destructive: neither SQLite nor
+            // PostgreSQL can always replace a view in place, so the edit costs a
+            // drop. Saying that here is the whole reason the recreate isn't done
+            // quietly — and the second sentence has to name the engine's own
+            // reason, or it reads as being about a database the user isn't on.
             Change::ReplaceView {
                 draft,
                 recreate: true,
-            } => vec![format!(
-                "Re-creating {} drops it first. {VIEW_DROP_COST} PostgreSQL can't \
-                 replace a view whose columns changed name, type or order, so this \
-                 is the only way to apply the edit.",
-                draft.name
-            )],
+                replay,
+            } => {
+                let why = match dialect {
+                    SqlDialect::Sqlite => {
+                        "SQLite has no way to replace a view in place, so every edit \
+                         to one — a rename included — takes this route."
+                    }
+                    _ => {
+                        "PostgreSQL can't replace a view whose columns changed name, \
+                         type or order, so this is the only way to apply the edit."
+                    }
+                };
+                let mut out = vec![format!(
+                    "Re-creating {} drops it first. {view_drop_cost} {why}",
+                    draft.name
+                )];
+                // The reassurance is worth as much as the warning: the triggers
+                // are named as coming back, so the sentence above doesn't read
+                // as an unqualified loss.
+                if !replay.is_empty() {
+                    out.push(format!(
+                        "{} statement{} dropped with it {} put back afterwards, in the \
+                         same transaction.",
+                        replay.len(),
+                        if replay.len() == 1 { "" } else { "s" },
+                        if replay.len() == 1 { "is" } else { "are" },
+                    ));
+                }
+                out
+            }
+            // **Nothing is lost and the plan may simply fail** — which is worth
+            // a sentence for the same reason `KeepLossyIndex` is: the preview is
+            // where the plan says what it won't do for you. Every existing row
+            // needs a value for the new column and there is none to give it, so
+            // the engine refuses; on SQLite the refusal arrives from the middle
+            // of the twelve-step rebuild, naming the copy that failed. An empty
+            // table is fine, which is exactly why this is a warning rather than
+            // a refusal — the plan cannot know the row count.
+            Change::AddColumn { column, .. }
+                if !column.nullable
+                    && column.default.is_none()
+                    && column.generated.is_none()
+                    && !column.auto_increment =>
+            {
+                vec![format!(
+                    "Column {} is NOT NULL with no default. If the table already \
+                     has rows there is no value to give them, and the engine will \
+                     refuse the whole plan.",
+                    column.name
+                )]
+            }
             // No data is lost, which is exactly why it's worth a sentence: the
             // table stops guaranteeing something it guaranteed a moment ago, and
             // nothing about the statement or the grid afterwards shows it.
@@ -2199,8 +2330,8 @@ impl Change {
     }
 
     /// Whether this change destroys anything at all.
-    pub fn is_destructive(&self) -> bool {
-        !self.risks().is_empty()
+    pub fn is_destructive(&self, dialect: SqlDialect) -> bool {
+        !self.risks(dialect).is_empty()
     }
 }
 
@@ -2438,7 +2569,7 @@ impl ChangeSet {
             .filter(
                 |c| !matches!(c, Change::DropCheck { name } if re_added.contains(name.as_str())),
             )
-            .flat_map(Change::risks)
+            .flat_map(|c| c.risks(self.dialect))
             .collect()
     }
 
@@ -2475,15 +2606,19 @@ impl ChangeSet {
                 .iter()
                 .filter_map(|ix| match sqlite_index_replay(&r.current, &r.draft, ix) {
                     IndexReplay::Refuse(why) => Some(why),
-                    IndexReplay::Emit | IndexReplay::Verbatim(_) => None,
+                    IndexReplay::Emit | IndexReplay::Verbatim(_) | IndexReplay::Skip => None,
                 })
+                .chain(rebuild_strands_a_trigger(&r.current, &r.draft))
                 .collect();
         }
-        self.changes
+        let mut out: Vec<String> = self
+            .changes
             .iter()
             .filter(|c| !supports_change(self.dialect, c))
             .map(Change::summary)
-            .collect()
+            .collect();
+        out.extend(self.changes.iter().filter_map(unreplayable_rename));
+        out
     }
 
     /// The statements, in the order they must run. Ready to hand to the preview
@@ -2502,7 +2637,39 @@ impl ChangeSet {
     /// The statements as one script, blank-line separated — what "Copy" and
     /// "Open in editor" hand over.
     pub fn script(&self) -> String {
-        self.emit().join("\n\n")
+        format!("{}{}", self.withheld_header(), self.emit().join("\n\n"))
+    }
+
+    /// What [`unsupported`](Self::unsupported) refused, as a `--` comment block
+    /// above the script — empty when nothing was refused.
+    ///
+    /// **A copied script must not look complete.** [`emit`](Self::emit) leaves
+    /// out what this engine cannot express faithfully — a lossy index the
+    /// rebuild can't replay is the case that exists today — and Apply is
+    /// disabled while it does. Copy and "Open in editor" are not disabled,
+    /// because the escape hatch is worth keeping: the whole point of it is that
+    /// the text can be read, edited and run. So the omission travels *with* the
+    /// text rather than the button being taken away, and a six-statement rebuild
+    /// that quietly has no `UNIQUE` index in it says so at the top.
+    fn withheld_header(&self) -> String {
+        let withheld = self.unsupported();
+        if withheld.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from(
+            "-- INCOMPLETE. Schemaic could not express part of this plan, and refuses\n\
+             -- to apply it while that is true. Running the statements below anyway\n\
+             -- would leave out:\n",
+        );
+        for w in &withheld {
+            for (i, line) in w.lines().enumerate() {
+                out.push_str(if i == 0 { "--   - " } else { "--     " });
+                out.push_str(line.trim());
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+        out
     }
 
     /// The same script, but runnable by a **client** that splits on `;`.
@@ -2522,6 +2689,7 @@ impl ChangeSet {
     /// already sees through.
     pub fn editor_script(&self) -> String {
         let stmts = self.emit();
+        let head = self.withheld_header();
         // `DELIMITER` is **MySQL's client directive**, so this is asked as
         // `!= MySql` rather than `!= Postgres`: SQLite would be handed a word it
         // has no idea about, at the top of the very script the escape hatch
@@ -2530,9 +2698,9 @@ impl ChangeSet {
         if self.dialect != SqlDialect::MySql
             || !stmts.iter().any(|s| needs_delimiter(s, self.dialect))
         {
-            return stmts.join("\n\n");
+            return format!("{head}{}", stmts.join("\n\n"));
         }
-        let mut out = String::from("DELIMITER $$\n\n");
+        let mut out = format!("{head}DELIMITER $$\n\n");
         out.push_str(
             &stmts
                 .iter()
@@ -2911,14 +3079,16 @@ impl ChangeSet {
             let mut out = sqlite_rebuild_sql(&r.current, &r.draft);
             // The one thing the rebuild leaves out. It comes after, as a native
             // statement, so SQLite repoints the references other objects hold —
-            // which is exactly what the rebuild's own rename must *not* do.
+            // which is exactly what the rebuild's own rename must *not* do. It
+            // goes *before* the closing `PRAGMA foreign_keys = ON`, so the whole
+            // procedure stays inside the guard the rebuild opened.
+            let tail = out.len().saturating_sub(1);
             for c in &self.changes {
                 if let Change::RenameTable { to } = c {
-                    out.push(format!(
-                        "ALTER TABLE {} RENAME TO {};",
-                        self.qname(),
-                        self.q(to)
-                    ));
+                    out.insert(
+                        tail,
+                        format!("ALTER TABLE {} RENAME TO {};", self.qname(), self.q(to)),
+                    );
                 }
             }
             return out;
@@ -2937,6 +3107,14 @@ impl ChangeSet {
         for c in supported() {
             if matches!(c, Change::DropTable) {
                 out.push(format!("DROP TABLE {};", self.qname()));
+            }
+            // SQLite's spelling of `TRUNCATE`: an unqualified `DELETE`, which the
+            // engine's truncate optimisation turns into the same operation. The
+            // one visible difference from the other engines is that it does not
+            // reset a `sqlite_sequence` counter, which is SQLite's own behaviour
+            // for the statement and not something to paper over.
+            if matches!(c, Change::TruncateTable) {
+                out.push(format!("DELETE FROM {};", self.qname()));
             }
         }
         // Indexes before columns: SQLite refuses to drop a column an index still
@@ -2971,6 +3149,30 @@ impl ChangeSet {
                 ));
             }
         }
+        // A rename on its own — `supports_change` lets exactly that one shape of
+        // `AlterColumn` through here, and the engine's own statement is what
+        // re-points the views and triggers that name the column.
+        for c in supported() {
+            if let Change::AlterColumn { from, to, .. } = c {
+                out.push(format!(
+                    "ALTER TABLE {} RENAME COLUMN {} TO {};",
+                    self.qname(),
+                    self.q(&from.name),
+                    self.q(&to.name)
+                ));
+            }
+        }
+        // A table rename is the same statement on every engine and has no
+        // rebuild to ride inside here.
+        for c in &self.changes {
+            if let Change::RenameTable { to } = c {
+                out.push(format!(
+                    "ALTER TABLE {} RENAME TO {};",
+                    self.qname(),
+                    self.q(to)
+                ));
+            }
+        }
         out
     }
 
@@ -2999,7 +3201,11 @@ impl ChangeSet {
                 Change::CreateView(draft) => {
                     out.push(create_view_sql(draft, &draft.name, d, false))
                 }
-                Change::ReplaceView { draft, recreate } => {
+                Change::ReplaceView {
+                    draft,
+                    recreate,
+                    replay,
+                } => {
                     // A replace addresses the view under the name the server
                     // knows; a re-create drops that one and builds the draft's,
                     // which is how a rename comes along for free.
@@ -3010,6 +3216,10 @@ impl ChangeSet {
                             draft.options.materialized,
                         ));
                         out.push(create_view_sql(draft, &draft.name, d, false));
+                        // What the drop took with it, verbatim, after the view is
+                        // back — the same replay a table rebuild does with
+                        // `dependent_ddl`, for the same reason.
+                        out.extend(replay.iter().cloned());
                     } else {
                         out.push(create_view_sql(draft, server_name, d, true));
                     }
@@ -3678,11 +3888,19 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
     let separate_indexes = pg || sqlite;
     let q = |s: &str| ddl_ident_in(s, dialect);
     let qname = qualified(&d.name, d.schema.as_deref(), dialect);
-    // **SQLite's `AUTOINCREMENT` exists only inline**, as `INTEGER PRIMARY KEY
-    // AUTOINCREMENT` on one column — there is no table-level spelling of it, and
-    // a `PRIMARY KEY (…)` clause alongside would declare a second key. So the
-    // one column it can apply to takes the whole declaration, and the table
-    // constraint below stands down.
+    // **SQLite's single-column primary key is spelled inline**, as `INTEGER
+    // PRIMARY KEY [AUTOINCREMENT]` on the column — a `PRIMARY KEY (…)` clause
+    // alongside would declare a second key. So the one column it can apply to
+    // takes the whole declaration, and the table constraint below stands down.
+    //
+    // **`AUTOINCREMENT` is a different question from "server-assigned".** Every
+    // `INTEGER PRIMARY KEY` is the rowid and is filled in for you, so
+    // `auto_increment` is true for all of them; the keyword additionally
+    // promises the engine will never *reuse* an id, and costs a
+    // `sqlite_sequence` row per table for it. Reading the first as the second
+    // put `AUTOINCREMENT` on every plain key a rebuild touched — a change to the
+    // table's semantics the user never asked for. `sqlite_autoincrement` is the
+    // flag that really answers it.
     let inline_key: Option<&str> = match d.primary_key.as_slice() {
         [only] if sqlite => d
             .columns
@@ -3700,9 +3918,14 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
                 // implied by the rowid alias, and this is the form SQLite itself
                 // writes back when asked for the table's DDL.
                 return format!(
-                    "  {} {} PRIMARY KEY AUTOINCREMENT",
+                    "  {} {} PRIMARY KEY{}",
                     q(&c.info.name),
-                    c.info.type_name
+                    c.info.type_name,
+                    if c.info.sqlite_autoincrement {
+                        " AUTOINCREMENT"
+                    } else {
+                        ""
+                    }
                 );
             }
             format!("  {}", c.info.definition_sql(dialect))
@@ -3729,6 +3952,22 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
             ));
         }
     }
+    // **A SQLite `UNIQUE` constraint is part of the table's declaration**, not an
+    // index statement. The engine backs it with an index of its own —
+    // `sqlite_autoindex_<table>_<n>` — which introspection reads back like any
+    // other, and which cannot be created by name: `CREATE UNIQUE INDEX
+    // "sqlite_autoindex_u_1"` is refused with *object name reserved for internal
+    // use*, so every edit of such a table failed outright. Re-declaring it here,
+    // from the **draft's** column names, is also what carries it across a rename;
+    // `sqlite_index_replay` leaves these out of the statement list.
+    if sqlite {
+        for ix in &d.indexes {
+            if !is_sqlite_constraint_index(&ix.info) {
+                continue;
+            }
+            lines.push(format!("  UNIQUE ({})", ix.info.key_sql(dialect)));
+        }
+    }
     for fk in &d.foreign_keys {
         lines.push(format!("  {}", fk_clause(&fk.info, dialect)));
     }
@@ -3752,10 +3991,31 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
             head.push_str(&format!(" COMMENT={}", ddl_string(c, dialect)));
         }
     }
+    // The two SQLite clauses that change what the table *is*, not what is in it.
+    // Both come after the closing bracket, `WITHOUT ROWID` first, and both are
+    // silently dropped by a rebuild that doesn't restate them: the table's
+    // storage layout and its key's implicit `NOT NULL` go with the first, and
+    // type enforcement with the second.
+    if sqlite {
+        if d.without_rowid {
+            head.push_str(" WITHOUT ROWID");
+        }
+        if d.strict {
+            head.push_str(if d.without_rowid {
+                ", STRICT"
+            } else {
+                " STRICT"
+            });
+        }
+    }
     head.push(';');
     let mut out = vec![head];
     if separate_indexes {
         for ix in &d.indexes {
+            // A SQLite constraint-backed index went into the table body above.
+            if sqlite && is_sqlite_constraint_index(&ix.info) {
+                continue;
+            }
             out.push(create_index_sql(&ix.info, &qname, dialect));
         }
     }
@@ -3797,6 +4057,12 @@ pub fn key_list_text(cols: &[crate::schema::IndexColumn]) -> String {
             if let Some(n) = c.prefix {
                 s.push_str(&format!("({n})"));
             }
+            // Before `DESC`, matching `IndexInfo::key_sql` and SQLite's grammar —
+            // and shown at all so the round trip through `parse_key_list` doesn't
+            // silently drop the clause the uniqueness is measured in.
+            if let Some(col) = c.collation.as_deref().filter(|c| !c.is_empty()) {
+                s.push_str(&format!(" COLLATE {col}"));
+            }
             if c.descending {
                 s.push_str(" DESC");
             }
@@ -3815,11 +4081,26 @@ pub fn parse_key_list(s: &str) -> Vec<crate::schema::IndexColumn> {
         .map(|p| p.trim())
         .filter(|p| !p.is_empty())
         .map(|p| {
-            // ` DESC` / ` ASC` suffix first, then a `(n)` prefix length.
+            // ` DESC` / ` ASC` suffix first, then a `COLLATE x` clause, then a
+            // `(n)` prefix length — the reverse of the order `key_list_text`
+            // wrote them in.
             let (head, descending) = match p.rsplit_once(char::is_whitespace) {
                 Some((h, tail)) if tail.eq_ignore_ascii_case("desc") => (h.trim(), true),
                 Some((h, tail)) if tail.eq_ignore_ascii_case("asc") => (h.trim(), false),
                 _ => (p, false),
+            };
+            let (head, collation) = match head.rsplit_once(char::is_whitespace) {
+                Some((h, name))
+                    if h.trim_end()
+                        .rsplit_once(char::is_whitespace)
+                        .map(|(_, kw)| kw.eq_ignore_ascii_case("collate"))
+                        .unwrap_or_else(|| h.trim_end().eq_ignore_ascii_case("collate")) =>
+                {
+                    let h = h.trim_end();
+                    let cut = h.len() - "collate".len();
+                    (h[..cut].trim_end(), Some(name.to_string()))
+                }
+                _ => (head, None),
             };
             // A piece wrapped in its own parentheses is an expression key —
             // `(lower(email))`. Checked before the prefix rule below, which reads
@@ -3827,6 +4108,7 @@ pub fn parse_key_list(s: &str) -> Vec<crate::schema::IndexColumn> {
             if let Some(inner) = unwrap_parens(head) {
                 return crate::schema::IndexColumn {
                     descending,
+                    collation: collation.clone(),
                     ..crate::schema::IndexColumn::expr(inner)
                 };
             }
@@ -3846,6 +4128,7 @@ pub fn parse_key_list(s: &str) -> Vec<crate::schema::IndexColumn> {
                 prefix,
                 descending,
                 expression: false,
+                collation,
             }
         })
         .collect()
@@ -4676,16 +4959,20 @@ fn sqlite_native_add(column: &ColumnInfo, position: Option<&Position>) -> bool {
 /// Is `default` a *constant* in SQLite's sense — something `ADD COLUMN` will
 /// take?
 ///
-/// Two forms are not: the `CURRENT_*` keywords, and anything parenthesised
-/// (which covers a bare `now()` too — not a legal `DEFAULT` there at all).
-/// Everything else a column can carry is a literal and is accepted, which the
-/// engine confirms for signed numbers, blob literals, `TRUE`/`FALSE` and even a
-/// bare word.
+/// **It answers what SQLite's grammar accepts, not what it obviously refuses.**
+/// It used to reject the `CURRENT_*` keywords and anything parenthesised, and
+/// call everything else constant — so `1+2`, `'a'||'b'` and `-1*2` all took the
+/// fast path and the engine then refused the statement. Through `run_ddl` that
+/// is a confusing error; through Copy / "Open in editor" there is no transaction
+/// and a two-column add half-applies, which is precisely the *"a wrong fast path
+/// is a lie"* this predicate exists to prevent.
 ///
-/// The parenthesis is looked for at a **code** position through the shared
-/// lexer, not with a `contains('(')`: a default of `'a (b)'` is a string whose
-/// parens are data, and rejecting it would send an ordinary edit the long way
-/// round.
+/// So the question is delegated to [`crate::schema::is_bare_sqlite_default`],
+/// which states the grammar positively — a literal, a signed number,
+/// `NULL`/`TRUE`/`FALSE`, or one of the `CURRENT_*` keywords — with the
+/// `CURRENT_*` three excluded here, since `ADD COLUMN` does not take those even
+/// though a `CREATE TABLE` does. Anything already parenthesised is likewise not
+/// a constant: it is legal in a table declaration and not in an `ADD COLUMN`.
 fn sqlite_constant_default(default: &str) -> bool {
     let d = default.trim();
     if ["CURRENT_TIME", "CURRENT_DATE", "CURRENT_TIMESTAMP"]
@@ -4694,19 +4981,10 @@ fn sqlite_constant_default(default: &str) -> bool {
     {
         return false;
     }
-    let b = d.as_bytes();
-    let mut i = 0usize;
-    while i < b.len() {
-        if let Some(j) = sql::skip_noncode(b, i, SqlDialect::Sqlite) {
-            i = j.max(i + 1);
-            continue;
-        }
-        if b[i] == b'(' {
-            return false;
-        }
-        i += 1;
+    if d.starts_with('(') {
+        return false;
     }
-    true
+    crate::schema::is_bare_sqlite_default(d)
 }
 
 /// What a rebuild needs: the table as it is, and as it should be.
@@ -4725,7 +5003,19 @@ pub struct Rebuild {
 /// nothing ever sees it — but a name that collided with a real table would fail
 /// the whole plan, so it is deliberately not the `new_X` the SQLite manual uses
 /// in its example.
-const REBUILD_SUFFIX: &str = "_schemaic_rebuild";
+pub const REBUILD_SUFFIX: &str = "_schemaic_rebuild";
+
+/// `message` with the shadow table's name mapped back onto the real one.
+///
+/// **"Nothing ever sees it" is true right up until the plan fails.** A
+/// `NOT NULL` column with no default added to a table that has rows fails the
+/// copy step with `NOT NULL constraint failed: t_schemaic_rebuild.c` — an object
+/// that exists between two statements of a script the user may not have read,
+/// named at them as though it were theirs. The engine's own message is otherwise
+/// the most useful thing there is, so this changes the name and nothing else.
+pub fn unshadow(message: &str) -> String {
+    message.replace(REBUILD_SUFFIX, "")
+}
 
 /// The twelve-step rebuild, as statements: the only way to change most of a
 /// SQLite table.
@@ -4917,8 +5207,29 @@ enum IndexReplay<'a> {
     /// argument [`TableInfo::dependent_ddl`] makes for triggers: replaying the
     /// text cannot lose what the parse never saw.
     Verbatim(&'a str),
+    /// Nothing here, because the table body already carries it: a SQLite
+    /// `UNIQUE` constraint's `sqlite_autoindex_*`, which `create_table_sql`
+    /// re-declares as a `UNIQUE (…)` line. Distinct from [`IndexReplay::Refuse`]
+    /// — nothing is lost and nothing is withheld.
+    Skip,
     /// Neither is faithful, so the plan is refused — the string says why.
     Refuse(String),
+}
+
+/// Is this index the one SQLite makes for a `UNIQUE` (or `PRIMARY KEY`)
+/// constraint, rather than one the user created?
+///
+/// Two independent tells, and both are checked because either alone has a hole:
+/// the engine names them `sqlite_autoindex_<table>_<n>`, a prefix it reserves and
+/// refuses in a `CREATE INDEX`; and introspection records the constraint it backs
+/// in [`IndexInfo::constraint`]. Such an index is part of the table's
+/// *declaration*, so it belongs in the `CREATE TABLE` body and not in a statement
+/// of its own.
+fn is_sqlite_constraint_index(ix: &IndexInfo) -> bool {
+    ix.name
+        .to_ascii_lowercase()
+        .starts_with("sqlite_autoindex_")
+        || ix.constraint.is_some()
 }
 
 /// How this draft index gets back onto the rebuilt table.
@@ -4937,6 +5248,13 @@ fn sqlite_index_replay<'a>(
     draft: &TableDraft,
     ix: &IndexDraft,
 ) -> IndexReplay<'a> {
+    // A `UNIQUE` constraint's index is not a statement at all — `create_table_sql`
+    // re-declares it inside the table body, from the draft's own column names, so
+    // it follows a rename and needs nothing here. Emitting it *as an index* is
+    // what SQLite refuses by name (`object name reserved for internal use`).
+    if is_sqlite_constraint_index(&ix.info) {
+        return IndexReplay::Skip;
+    }
     if !ix.info.lossy {
         return IndexReplay::Emit;
     }
@@ -4982,6 +5300,83 @@ fn sqlite_index_replay<'a>(
     }
 }
 
+/// Does changing a column on this engine disturb the `CHECK` constraints
+/// standing on it, so that the plan has to repair them itself?
+///
+/// **A capability, deliberately, and this is the site the rule was written for.**
+/// It used to be spelled `dialect != Postgres`, which is true of two engines and
+/// right about one:
+///
+/// - **MySQL 8** stores a check's *text*, and refuses to rename a column a check
+///   names — so a rename has to drop the check and add it back re-pointed. That
+///   is the block this gates.
+/// - **MariaDB** attaches a column-level check to the column definition, so a
+///   `MODIFY`/`CHANGE COLUMN` deletes it unless the clause restates it. Same
+///   block, other arm, chosen by `flavour`.
+/// - **PostgreSQL** stores the parse tree and rewrites every check itself.
+///   Nothing to do.
+/// - **SQLite** has no column clause at all: every such edit is the twelve-step
+///   rebuild, which writes the table from the *draft*. The repair belongs there
+///   — `sqlite_rebuild_sql` re-points the draft's predicates — and the drop/add
+///   pair this block produces is discarded by `emit_sqlite`. Entering it bought
+///   two preview entries that emit nothing and no repair at all, and the rebuild
+///   then emitted a `CHECK` naming the column the plan had just renamed away,
+///   which SQLite refuses outright (`no such column: q`).
+pub fn alter_column_disturbs_checks(dialect: SqlDialect) -> bool {
+    matches!(dialect, SqlDialect::MySql)
+}
+
+/// Does this `AlterColumn` change the column's **name and nothing else**?
+///
+/// The question SQLite's `RENAME COLUMN` answers exactly: it moves the name and
+/// leaves the declaration alone, so anything else in the diff needs a different
+/// statement (or, there, the whole rebuild).
+fn is_rename_only(from: &ColumnInfo, to: &ColumnInfo) -> bool {
+    from.name != to.name
+        && *to
+            == ColumnInfo {
+                name: to.name.clone(),
+                ..from.clone()
+            }
+}
+
+/// The refusal for a rebuild whose replayed triggers would name a column the
+/// plan moved, or empty when there is nothing to strand.
+///
+/// **A replayed trigger is a snapshot, and `legacy_alter_table = ON` stops the
+/// engine fixing it.** `dependent_ddl` is captured before the edit and put back
+/// verbatim — which is right for the table's own name, since it comes back under
+/// it, and wrong for a column the plan renamed or dropped. SQLite does not
+/// validate `NEW.<col>` when a trigger is created, so the plan *succeeds*, the
+/// report says it applied, and the next `INSERT` fails `no such column: NEW.n` —
+/// the table now rejects every write and nothing said so. The engine's own
+/// `ALTER TABLE … RENAME COLUMN` rewrites the trigger; the rebuild is strictly
+/// worse, which is why this refuses rather than trying to compete with it.
+///
+/// Rewriting the text would mean re-parsing SQL Schemaic doesn't round-trip
+/// faithfully for triggers — the same argument [`TableInfo::dependent_ddl`]
+/// makes for keeping the text verbatim in the first place — so the honest answer
+/// is to say what can't be done, in the preview, before anything runs.
+fn rebuild_strands_a_trigger(current: &TableInfo, draft: &TableDraft) -> Option<String> {
+    if current.dependent_ddl.is_empty() {
+        return None;
+    }
+    let moved = column_moved(current, draft)?;
+    Some(format!(
+        "This table has {} trigger{} on it, and their SQL is replayed exactly as \
+         SQLite stored it — which would still name {moved}. SQLite accepts such a \
+         trigger and then refuses every write to the table. Drop or edit the \
+         trigger first, or rename the column with no other change so SQLite's own \
+         ALTER TABLE can rewrite it.",
+        current.dependent_ddl.len(),
+        if current.dependent_ddl.len() == 1 {
+            ""
+        } else {
+            "s"
+        },
+    ))
+}
+
 /// The first column this plan renames or drops, named the way a message wants
 /// it — or `None` when every column of `current` is still there under its own
 /// name.
@@ -5010,6 +5405,19 @@ fn column_moved(current: &TableInfo, draft: &TableDraft) -> Option<String> {
         .map(|c| format!("{}, which this plan drops", c.name))
 }
 
+/// Step 1 of SQLite's twelve-step procedure, as a statement rather than as a
+/// property of the connection — see [`sqlite_rebuild_sql`] for why it rides in
+/// the plan.
+pub const FK_OFF: &str = "PRAGMA foreign_keys = OFF;";
+
+/// Step 12: enforcement back on, whatever the connection was doing before.
+pub const FK_ON: &str = "PRAGMA foreign_keys = ON;";
+
+/// Every name that reaches a SQLite table's rowid. A declared column taking any
+/// of them shadows it, which is why the rebuild's rowid carry checks all three
+/// rather than only the one it writes.
+const ROWID_SPELLINGS: [&str; 3] = ["rowid", "_rowid_", "oid"];
+
 pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> {
     let d = SqlDialect::Sqlite;
     let q = |s: &str| ddl_ident_in(s, d);
@@ -5017,19 +5425,55 @@ pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
     let shadow_name = format!("{}{REBUILD_SUFFIX}", current.name);
     let shadow = qualified(&shadow_name, current.schema.as_deref(), d);
 
-    // The table to build: the draft, under the shadow name and without its
-    // indexes, which are created against the real table further down.
+    // **Step 1, and it has to be here rather than only in the backend.** With
+    // foreign keys enforced, the `DROP TABLE` below is an implicit
+    // `DELETE FROM` the table, which fires every `ON DELETE CASCADE` pointing at
+    // it — the table comes back exactly as the user drew it and another table
+    // has quietly lost every row. `sqlite::run_ddl` sets the pragma out of band
+    // for its own execution because SQLite ignores it inside a transaction, but
+    // this list is *also* what Copy and "Open in editor" hand over, and a query
+    // tab's connection enforces foreign keys with nothing around it. So the
+    // guard travels with the statements it guards, exactly as
+    // `legacy_alter_table` does below, and the preview shows the whole
+    // procedure.
+    let mut out = vec![FK_OFF.to_string()];
+
+    // The table to build: the draft, under the shadow name and without the
+    // indexes that are *statements*, which are created against the real table
+    // further down. A `UNIQUE` constraint's index stays, because it is part of
+    // the declaration — `create_table_sql` writes it as a `UNIQUE (…)` line and
+    // `sqlite_index_replay` skips it below.
     let mut build = draft.clone();
     build.name = shadow_name;
-    build.indexes.clear();
-    let mut out = create_table_sql(&build, d);
+    build
+        .indexes
+        .retain(|ix| is_sqlite_constraint_index(&ix.info));
+    // **The checks have to follow a renamed column, and only here.** The draft's
+    // predicates are the text SQLite last stored, naming the columns as they were
+    // — and this shadow table has them as they *will be*, so a `CHECK (q > 0)`
+    // beside a column now called `qty` is `no such column: q` on the very first
+    // statement of the twelve steps, with the whole plan rolled back and no route
+    // to the edit at all. The other two engines repair this differently or not at
+    // all ([`alter_column_disturbs_checks`]); SQLite's repair is the rebuild's,
+    // because the rebuild is what writes the declaration.
+    for c in &draft.columns {
+        let Some(was) = c.original.as_deref().filter(|o| **o != c.info.name) else {
+            continue;
+        };
+        for ck in &mut build.check_constraints {
+            if let Some(e) = repoint_check_column(&ck.info.expression, was, &c.info.name, d) {
+                ck.info.expression = e;
+            }
+        }
+    }
+    out.extend(create_table_sql(&build, d));
 
     // Which new column takes which old one's data. A column the user added has
     // no `original` and is left out of both lists so its default applies, and a
     // generated column is left out because it cannot be inserted into — it is
     // computed from the rows this statement moves.
     let live: HashSet<&str> = current.columns.iter().map(|c| c.name.as_str()).collect();
-    let (into, from): (Vec<String>, Vec<String>) = draft
+    let (mut into, mut from): (Vec<String>, Vec<String>) = draft
         .columns
         .iter()
         .filter(|c| c.info.generated.is_none())
@@ -5038,6 +5482,32 @@ pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
             Some((q(&c.info.name), q(was)))
         })
         .unzip();
+
+    // **Carry the rowid when there is one to carry.** A keyless table's rows are
+    // identified to the grid by their rowid, and a copy that doesn't name it
+    // renumbers every row — an open result tab then holds numbers that name
+    // *different* rows, and nothing re-runs it. Naming it is legal, preserves
+    // the gaps a delete left, does not disturb an `INTEGER PRIMARY KEY` (which
+    // *is* the rowid, and is copied by its own name in that case), and leaves
+    // generated columns alone.
+    //
+    // `implicit_key` is already the whole question on the source side: it is
+    // `None` for a `WITHOUT ROWID` table and `None` when every one of the three
+    // spellings has been taken by a declared column. What it cannot see is the
+    // *draft* taking one of those names — a new column called `rowid` shadows
+    // the real one, so `SELECT rowid` would copy that column's value instead.
+    if let Some(alias) = current.implicit_key.as_deref()
+        && !draft.columns.iter().any(|c| {
+            ROWID_SPELLINGS
+                .iter()
+                .any(|s| c.info.name.eq_ignore_ascii_case(s))
+        })
+        && !into.is_empty()
+    {
+        into.insert(0, q("rowid"));
+        from.insert(0, q(alias));
+    }
+
     if !into.is_empty() {
         out.push(format!(
             "INSERT INTO {shadow} ({}) SELECT {} FROM {original};",
@@ -5070,6 +5540,8 @@ pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
         match sqlite_index_replay(current, draft, ix) {
             IndexReplay::Emit => out.push(create_index_sql(&ix.info, &original, d)),
             IndexReplay::Verbatim(sql) => out.push(sql.to_string()),
+            // Already in the table body, as a `UNIQUE (…)` constraint line.
+            IndexReplay::Skip => {}
             // Nothing, and the index is therefore gone from the rebuilt table —
             // which is why this arm is unreachable in the application:
             // [`ChangeSet::unsupported`] reports the same refusal and the preview
@@ -5081,6 +5553,7 @@ pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
         }
     }
     out.extend(current.dependent_ddl.iter().cloned());
+    out.push(FK_ON.to_string());
     out
 }
 
@@ -5116,9 +5589,35 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     if let Change::AddColumn { column, position } = change {
         return sqlite_native_add(column, position.as_ref());
     }
+    // **A rename on its own is `ALTER TABLE … RENAME COLUMN`, which SQLite has
+    // had since 3.25 — and taking it matters for more than the cost.** The
+    // engine's own statement re-points every view and trigger that names the
+    // column; the rebuild replays their text verbatim under
+    // `legacy_alter_table = ON`, which is precisely the case
+    // [`rebuild_strands_a_trigger`] has to refuse. So the route that works is the
+    // one offered, and the refusal is left for a rename that arrives alongside
+    // something only a rebuild can do.
+    if let Change::AlterColumn {
+        from,
+        to,
+        position,
+        inline_check,
+    } = change
+    {
+        return position.is_none() && inline_check.is_none() && is_rename_only(from, to);
+    }
     matches!(
         change,
         Change::DropTable
+            // **SQLite has no `TRUNCATE`, and it does have the thing it means.**
+            // `DELETE FROM t` with no `WHERE` is the documented spelling, and the
+            // engine's own truncate optimisation makes it the same operation. It
+            // is listed here rather than left out because the menu reads this
+            // predicate: without it, Truncate was offered, red and enabled, asked
+            // "Delete all ~4.2m rows in orders?", and then opened a preview with
+            // an empty script and an inert Apply — a destructive question for an
+            // action the engine was never going to perform.
+            | Change::TruncateTable
             | Change::DropView {
                 materialized: false
             }
@@ -5372,7 +5871,7 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
     // A constraint the draft already changed is left alone in both arms. The
     // user's edit is the authority there, and touching it twice would either
     // duplicate the statement or overwrite what they typed.
-    if dialect != SqlDialect::Postgres {
+    if alter_column_disturbs_checks(dialect) {
         let touched: HashSet<String> = changes
             .iter()
             .filter_map(|c| match c {
@@ -5732,6 +6231,15 @@ pub fn diff_view(current: &TableInfo, draft: &ViewDraft, dialect: SqlDialect) ->
         changes.push(Change::ReplaceView {
             draft: Box::new(draft.clone()),
             recreate,
+            // Only a re-create drops anything, so only a re-create has anything
+            // to put back. `dependent_ddl` is the server's own text for the
+            // objects that go down with this one — on SQLite, the view's
+            // `INSTEAD OF` triggers.
+            replay: if recreate {
+                current.dependent_ddl.clone()
+            } else {
+                Vec::new()
+            },
         });
         // A re-create already builds the view under its new name; renaming
         // after it would address a name nothing answers to.
@@ -7358,14 +7866,12 @@ mod tests {
                 IndexColumn {
                     name: "bio".into(),
                     prefix: Some(20),
-                    descending: false,
-                    expression: false,
+                    ..Default::default()
                 },
                 IndexColumn {
                     name: "age".into(),
-                    prefix: None,
                     descending: true,
-                    expression: false,
+                    ..Default::default()
                 },
                 IndexColumn::plain("id"),
             ]
@@ -8649,10 +9155,10 @@ mod tests {
             d.check_constraints.clear();
             let cs = diff(&t, &d, MySql);
             assert!(matches!(cs.changes.as_slice(), [Change::DropCheck { .. }]));
-            let risks = cs.changes[0].risks();
+            let risks = cs.changes[0].risks(MySql);
             assert_eq!(risks.len(), 1, "{risks:?}");
             assert!(risks[0].contains("qty_pos"), "{risks:?}");
-            assert!(cs.changes[0].is_destructive());
+            assert!(cs.changes[0].is_destructive(MySql));
         }
 
         /// PostgreSQL drops every constraint by name through one spelling, and
@@ -9921,7 +10427,7 @@ mod tests {
             position: None,
             inline_check: None,
         }
-        .risks()
+        .risks(MySql)
     }
 
     /// The same, flattened — for the cases that assert on wording rather than count.
@@ -9944,7 +10450,7 @@ mod tests {
             position: None,
             inline_check: None,
         }
-        .risks();
+        .risks(MySql);
         assert_eq!(got.len(), 2, "{got:?}");
         assert!(got.iter().any(|r| r.contains("NOT NULL")), "{got:?}");
         assert!(got.iter().any(|r| r.contains("truncates")), "{got:?}");
@@ -9964,7 +10470,7 @@ mod tests {
             position: None,
             inline_check: None,
         }
-        .risks();
+        .risks(MySql);
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(got[0].contains("NOT NULL"));
     }
@@ -9972,6 +10478,38 @@ mod tests {
     #[test]
     fn a_harmless_alter_yields_no_risk_at_all() {
         assert!(risks("varchar(10)", "varchar(255)").is_empty());
+    }
+
+    /// **A NOT NULL column with no default is a plan that may simply fail**, and
+    /// the preview is where a plan says what it won't do for you. It cannot know
+    /// the row count, so it warns rather than refuses — and on SQLite the
+    /// refusal otherwise arrives from the middle of the rebuild.
+    #[test]
+    fn a_not_null_column_with_no_default_is_flagged() {
+        let mut c = col("c", "varchar(20)");
+        c.nullable = false;
+        let add = |column: ColumnInfo| Change::AddColumn {
+            column: Box::new(column),
+            position: None,
+        };
+        for d in [MySql, Postgres, SqlDialect::Sqlite] {
+            let got = add(c.clone()).risks(d);
+            assert_eq!(got.len(), 1, "{d:?}: {got:?}");
+            assert!(got[0].contains("NOT NULL"), "{got:?}");
+            assert!(got[0].contains('c'), "it names the column: {got:?}");
+        }
+        // Every way of supplying a value takes the warning away.
+        let mut with_default = c.clone();
+        with_default.default = Some("'x'".into());
+        assert!(add(with_default).risks(MySql).is_empty());
+        let mut generated = c.clone();
+        generated.generated = Some("1".into());
+        assert!(add(generated).risks(MySql).is_empty());
+        let mut auto = c.clone();
+        auto.auto_increment = true;
+        assert!(add(auto).risks(MySql).is_empty());
+        // And a nullable column was never a problem.
+        assert!(add(col("c", "varchar(20)")).risks(MySql).is_empty());
     }
 
     #[test]
@@ -10132,7 +10670,7 @@ mod lossy_index_tests {
             .expect("the refusal is a change the preview can render");
         assert!(kept.summary().contains("idx_person"));
         assert!(
-            !kept.risks().is_empty(),
+            !kept.risks(Postgres).is_empty(),
             "it belongs in the destructive block — the user's edit is not being applied"
         );
         // And it emits no SQL.
@@ -11174,7 +11712,6 @@ mod sqlite_drop_tests {
     fn sqlite_expresses_no_designer_change() {
         for c in [
             Change::RenameTable { to: "t2".into() },
-            Change::TruncateTable,
             Change::PrimaryKey {
                 from: vec!["id".into()],
                 to: vec![],
@@ -11183,6 +11720,28 @@ mod sqlite_drop_tests {
         ] {
             assert!(!supports_change(Sqlite, &c), "{c:?}");
         }
+    }
+
+    /// **Truncate is a shortcut, not a designer change, and SQLite has it.**
+    /// It has no `TRUNCATE` keyword and does have the operation: an unqualified
+    /// `DELETE`, which the engine's truncate optimisation makes the same thing.
+    /// The menu reads this predicate, so answering `false` offered a red,
+    /// enabled entry that asked "Delete all ~4.2m rows?" and then opened a
+    /// preview with an empty script and an inert Apply.
+    #[test]
+    fn sqlite_truncates_with_an_unqualified_delete() {
+        assert!(supports_change(Sqlite, &Change::TruncateTable));
+        let cs = ChangeSet {
+            table: "orders".into(),
+            schema: None,
+            dialect: Sqlite,
+            flavour: ServerFlavour::Unknown,
+            changes: vec![Change::TruncateTable],
+        };
+        assert_eq!(cs.emit(), vec![r#"DELETE FROM "orders";"#]);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        // And it is still a destructive plan, so the preview says so.
+        assert!(!cs.destructive().is_empty());
     }
 
     /// The predicate is about SQLite. The two engines with a full emitter
@@ -11342,6 +11901,7 @@ mod sqlite_create_tests {
                     nullable: false,
                     primary_key: true,
                     auto_increment: true,
+                    sqlite_autoincrement: true,
                     ..Default::default()
                 },
                 col("email", "TEXT"),
@@ -11367,6 +11927,24 @@ mod sqlite_create_tests {
         assert!(
             !sql.contains("PRIMARY KEY (\"id\")"),
             "the table-level clause would be a second key: {sql}"
+        );
+    }
+
+    /// **`AUTOINCREMENT` is not the same question as "the engine fills it in".**
+    /// Every `INTEGER PRIMARY KEY` is the rowid and is assigned for you; the
+    /// keyword additionally promises never to reuse an id and costs a
+    /// `sqlite_sequence` row. A rebuild that added it to every plain key changed
+    /// the table's semantics without being asked.
+    #[test]
+    fn a_plain_integer_key_is_inlined_without_the_keyword() {
+        let mut t = autoinc();
+        t.columns[0].sqlite_autoincrement = false;
+        let sql = one(&t);
+        assert!(sql.contains(r#""id" INTEGER PRIMARY KEY"#), "{sql}");
+        assert!(!sql.contains("AUTOINCREMENT"), "{sql}");
+        assert!(
+            !sql.contains("PRIMARY KEY (\"id\")"),
+            "still inline, so there is only one key: {sql}"
         );
     }
 
@@ -11509,8 +12087,140 @@ mod sqlite_rebuild_tests {
         }
     }
 
+    /// **A keyless table's rows are known by their rowid, so the copy has to
+    /// carry it.** Without this the rebuild renumbers every row, and an open
+    /// grid — which nothing re-runs — holds numbers that name different rows.
+    #[test]
+    fn the_copy_carries_the_rowid_when_the_table_has_a_reachable_one() {
+        let mut t = table();
+        t.implicit_key = Some("rowid".into());
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.type_name = "TEXT".into();
+        let got = plan(&t, &d);
+        assert_eq!(
+            got[1],
+            r#"INSERT INTO "t_schemaic_rebuild" ("rowid", "a", "b") SELECT "rowid", "a", "b" FROM "t";"#,
+            "{got:#?}"
+        );
+    }
+
+    /// The spelling the source's rowid actually answers to is what gets read —
+    /// a table with its own `rowid` column reaches the real one as `_rowid_`.
+    #[test]
+    fn the_carry_reads_the_spelling_the_source_reports() {
+        let mut t = table();
+        t.implicit_key = Some("_rowid_".into());
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.type_name = "TEXT".into();
+        assert!(
+            plan(&t, &d)[1].contains(r#"SELECT "_rowid_", "a", "b""#),
+            "{:#?}",
+            plan(&t, &d)
+        );
+    }
+
+    /// No reachable rowid — a `WITHOUT ROWID` table, or one that has taken all
+    /// three names — and there is nothing to carry.
+    #[test]
+    fn nothing_is_carried_when_the_table_has_no_reachable_rowid() {
+        let t = table();
+        assert!(t.implicit_key.is_none(), "the premise");
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.type_name = "TEXT".into();
+        assert!(!plan(&t, &d)[1].contains("rowid"), "{:#?}", plan(&t, &d));
+    }
+
+    /// **The case that would copy the wrong value.** A draft column named
+    /// `rowid` shadows the real one in the shadow table, so `SELECT rowid` would
+    /// read that column instead. The carry stands down.
+    #[test]
+    fn a_draft_column_shadowing_the_rowid_stops_the_carry() {
+        for shadow in ["rowid", "_ROWID_", "oid"] {
+            let mut t = table();
+            t.implicit_key = Some("rowid".into());
+            let mut d = TableDraft::from_table(&t);
+            d.columns.push(ColumnDraft::new(col(shadow, "INTEGER")));
+            let got = plan(&t, &d);
+            assert_eq!(
+                got[1], r#"INSERT INTO "t_schemaic_rebuild" ("a", "b") SELECT "a", "b" FROM "t";"#,
+                "{shadow}: {got:#?}"
+            );
+        }
+    }
+
+    /// **What the plan withheld has to be in the text the plan is copied as.**
+    /// A lossy index the rebuild cannot replay is left out of `emit()`, Apply is
+    /// disabled for it — and Copy / "Open in editor" hand over the same
+    /// statements with no mention of it at all, so the user runs a
+    /// complete-looking rebuild that silently has no `UNIQUE` index in it.
+    #[test]
+    fn a_withheld_index_is_named_in_the_script_the_hatch_hands_over() {
+        use crate::schema::{IndexColumn, IndexInfo};
+        let mut t = table();
+        t.indexes.push(IndexInfo {
+            name: "ix_mail".into(),
+            columns: vec![IndexColumn::plain("b")],
+            unique: true,
+            // The model only partly read it, and the plan moves a column its
+            // unread half may name — the one case with no faithful statement.
+            lossy: true,
+            create_sql: Some("CREATE UNIQUE INDEX \"ix_mail\" ON \"t\" (lower(\"b\"))".into()),
+            ..Default::default()
+        });
+        let mut d = TableDraft::from_table(&t);
+        // A rename *and* a retype: a rename on its own takes SQLite's native
+        // `RENAME COLUMN` and never reaches the rebuild at all.
+        d.rename_column(0, "z");
+        d.columns[1].info.type_name = "BLOB".into();
+        let cs = diff(&t, &d, SqlDialect::Sqlite);
+        assert!(!cs.unsupported().is_empty(), "the premise");
+
+        for script in [cs.script(), cs.editor_script()] {
+            assert!(script.contains("ix_mail"), "{script}");
+            assert!(script.contains("INCOMPLETE"), "{script}");
+            // The header is comment-only, so the script still runs as far as it
+            // goes rather than becoming a syntax error.
+            assert!(
+                script.lines().take_while(|l| l.starts_with("--")).count() >= 4,
+                "{script}"
+            );
+        }
+    }
+
+    /// Nothing withheld, nothing prepended — the ordinary script is untouched.
+    #[test]
+    fn a_complete_plan_gets_no_header() {
+        let t = table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.type_name = "TEXT".into();
+        let cs = diff(&t, &d, SqlDialect::Sqlite);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        assert!(!cs.script().starts_with("--"), "{}", cs.script());
+        assert_eq!(cs.script(), cs.editor_script());
+    }
+
+    /// The rebuild's body — everything between the foreign-key guard, which
+    /// [`the_plan_is_wrapped_in_the_foreign_key_guard`] pins on its own so the
+    /// tests below can keep talking about statement positions.
     fn plan(current: &TableInfo, draft: &TableDraft) -> Vec<String> {
-        sqlite_rebuild_sql(current, draft)
+        let full = sqlite_rebuild_sql(current, draft);
+        assert_eq!(full.first().map(String::as_str), Some(FK_OFF), "{full:#?}");
+        assert_eq!(full.last().map(String::as_str), Some(FK_ON), "{full:#?}");
+        full[1..full.len() - 1].to_vec()
+    }
+
+    /// **Step 1 and step 12 of SQLite's own procedure.** The guard has to be in
+    /// the statement list, because the list is also what Copy and "Open in
+    /// editor" hand the user — and a query tab's connection enforces foreign
+    /// keys, which turns the `DROP TABLE` into a cascading delete.
+    #[test]
+    fn the_plan_is_wrapped_in_the_foreign_key_guard() {
+        let t = table();
+        let mut d = TableDraft::from_table(&t);
+        d.columns[0].info.type_name = "TEXT".into();
+        let got = sqlite_rebuild_sql(&t, &d);
+        assert_eq!(got.first().map(String::as_str), Some(FK_OFF), "{got:#?}");
+        assert_eq!(got.last().map(String::as_str), Some(FK_ON), "{got:#?}");
     }
 
     /// The shape of the whole thing, on the simplest edit there is: a retype,
@@ -11628,7 +12338,7 @@ mod sqlite_rebuild_tests {
         let mut t = table();
         t.dependent_ddl = vec![trg.to_string()];
         let d = TableDraft::from_table(&t);
-        let got = sqlite_rebuild_sql(&t, &d);
+        let got = plan(&t, &d);
         assert_eq!(got.last().map(String::as_str), Some(trg), "{got:#?}");
     }
 
@@ -11864,7 +12574,15 @@ mod sqlite_trigger_rule_tests {
     /// syntax error too — both refused before Apply rather than after the drop.
     #[test]
     fn the_body_has_to_be_a_begin_end_block() {
-        for body in ["", "SELECT 1;", "BEGIN END", "BEGIN  END", "-- nothing"] {
+        for body in [
+            "",
+            "SELECT 1;",
+            "BEGIN END",
+            "BEGIN  END",
+            "-- nothing",
+            // A terminator does not make an empty block a body.
+            "BEGIN END;",
+        ] {
             let mut d = draft();
             d.info.action = TriggerAction::Body(body.into());
             assert!(!errs(&d, TriggerHost::Table).is_empty(), "{body:?}");
@@ -11873,6 +12591,12 @@ mod sqlite_trigger_rule_tests {
             "BEGIN SELECT 1; END",
             "  begin\n select 'END'; \nend  ",
             "BEGIN /* c */ SELECT 1; END",
+            // **The form this crate's own emitter writes**, and the one Copy DDL
+            // hands the user. Refusing it stated the rule the body satisfied.
+            "BEGIN SELECT 1; END;",
+            "BEGIN SELECT 1; END ;",
+            "BEGIN SELECT 1; END;;",
+            "BEGIN SELECT 1; END;\n",
         ] {
             let mut d = draft();
             d.info.action = TriggerAction::Body(body.into());
@@ -11996,6 +12720,91 @@ mod sqlite_view_tests {
         let drop_at = sql.find("DROP VIEW").expect("drops the old view");
         let create_at = sql.find("CREATE VIEW").expect("creates the new one");
         assert!(drop_at < create_at, "the drop has to come first: {sql}");
+    }
+
+    /// **SQLite drops a view's `INSTEAD OF` triggers with the view**, and they
+    /// are the only way a view there is written to at all. Nothing else holds
+    /// their text once the drop has run, so an edit that didn't replay them
+    /// would turn a writable view into a read-only one, unrecoverably.
+    #[test]
+    fn a_recreated_view_puts_its_instead_of_triggers_back() {
+        let trg = r#"CREATE TRIGGER "vi" INSTEAD OF INSERT ON "v" BEGIN INSERT INTO t(a) VALUES (NEW.a); END;"#;
+        let mut cur = view();
+        cur.dependent_ddl = vec![trg.to_string()];
+        let mut d = ViewDraft::from_table(&cur).unwrap();
+        d.select = "SELECT a, b FROM t WHERE a > 1".into();
+        let stmts = diff_view(&cur, &d, Sqlite).emit();
+        assert_eq!(stmts.last().map(String::as_str), Some(trg), "{stmts:#?}");
+        let create = stmts
+            .iter()
+            .position(|s| s.contains("CREATE VIEW"))
+            .expect("creates the view");
+        assert!(
+            create < stmts.len() - 1,
+            "the replay comes after: {stmts:#?}"
+        );
+    }
+
+    /// A rename takes the same route on SQLite — there is no `ALTER VIEW …
+    /// RENAME` — but the replay can't come with it: the trigger's own SQL names
+    /// the old view, so replaying it verbatim fails after the drop and
+    /// re-emitting it from the model would rewrite what the user wrote. The plan
+    /// refuses instead, in the preview, before anything runs.
+    #[test]
+    fn a_rename_that_would_strand_a_trigger_is_withheld() {
+        let trg = r#"CREATE TRIGGER "vi" INSTEAD OF INSERT ON "v" BEGIN SELECT 1; END;"#;
+        let mut cur = view();
+        cur.dependent_ddl = vec![trg.to_string()];
+        let mut d = ViewDraft::from_table(&cur).unwrap();
+        d.name = "w".into();
+        let withheld = diff_view(&cur, &d, Sqlite).unsupported();
+        assert_eq!(withheld.len(), 1, "{withheld:?}");
+        assert!(withheld[0].contains('v'), "{withheld:?}");
+        assert!(withheld[0].contains("trigger"), "{withheld:?}");
+    }
+
+    /// Nothing hanging off it, nothing to strand — the rename is unaffected.
+    #[test]
+    fn a_rename_with_no_dependents_is_not_withheld() {
+        let cur = view();
+        let mut d = ViewDraft::from_table(&cur).unwrap();
+        d.name = "w".into();
+        assert!(diff_view(&cur, &d, Sqlite).unsupported().is_empty());
+    }
+
+    /// **The warning has to be about the engine the user is on.** SQLite has no
+    /// rules and no grants; what it does have, and what the sentence used to
+    /// omit, is the triggers.
+    #[test]
+    fn the_recreate_warning_names_what_sqlite_actually_loses() {
+        let trg = r#"CREATE TRIGGER "vi" INSTEAD OF INSERT ON "v" BEGIN SELECT 1; END;"#;
+        let mut cur = view();
+        cur.dependent_ddl = vec![trg.to_string()];
+        let mut d = ViewDraft::from_table(&cur).unwrap();
+        d.select = "SELECT a, b FROM t WHERE a > 1".into();
+        let risks = diff_view(&cur, &d, Sqlite).destructive().join(" ");
+        assert!(risks.contains("INSTEAD OF"), "{risks}");
+        assert!(!risks.contains("grants"), "{risks}");
+        assert!(!risks.contains("rules"), "{risks}");
+        assert!(!risks.contains("PostgreSQL"), "{risks}");
+        // And it says they come back, so the warning isn't read as a loss.
+        assert!(risks.contains("put back afterwards"), "{risks}");
+    }
+
+    /// PostgreSQL's own wording is untouched: its recreate really does lose the
+    /// grants and the dependent views, and nothing puts them back.
+    #[test]
+    fn postgres_keeps_its_own_wording() {
+        let mut cur = view();
+        cur.schema = Some("public".into());
+        let mut d = ViewDraft::from_table(&cur).unwrap();
+        d.select = "SELECT a, b FROM t WHERE a > 1".into();
+        d.force_recreate = true;
+        let risks = diff_view(&cur, &d, SqlDialect::Postgres)
+            .destructive()
+            .join(" ");
+        assert!(risks.contains("grants"), "{risks}");
+        assert!(risks.contains("PostgreSQL"), "{risks}");
     }
 
     #[test]
@@ -12391,7 +13200,8 @@ mod sqlite_designer_tests {
     }
 
     /// A rename is left to SQLite's own statement, after the rebuild, so the
-    /// engine repoints the references other objects hold.
+    /// engine repoints the references other objects hold — and still inside the
+    /// foreign-key guard the rebuild opened, which is what closes the plan.
     #[test]
     fn a_rename_rides_after_the_rebuild_as_a_native_statement() {
         let t = table();
@@ -12399,9 +13209,10 @@ mod sqlite_designer_tests {
         d.columns[0].info.type_name = "TEXT".into();
         d.name = "t2".into();
         let sql = diff(&t, &d, Sqlite).emit();
+        assert_eq!(sql.last().map(String::as_str), Some(FK_ON), "{sql:#?}");
         assert_eq!(
-            sql.last().map(String::as_str),
-            Some(r#"ALTER TABLE "t" RENAME TO "t2";"#),
+            sql[sql.len() - 2].as_str(),
+            r#"ALTER TABLE "t" RENAME TO "t2";"#,
             "{sql:#?}"
         );
     }

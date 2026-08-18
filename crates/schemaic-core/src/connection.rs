@@ -288,6 +288,48 @@ impl Connection {
         format!("{}:{}", self.host, self.port)
     }
 
+    /// This connection as it should be **stored**: a file connection carries no
+    /// server coordinates.
+    ///
+    /// **The engine picker can be changed on a saved connection**, and the SQLite
+    /// form renders no host, user, password or SSH block — so a connection
+    /// switched over from a tunnelled MySQL one kept the whole server side, with
+    /// no control anywhere that could unset any of it. [`Self::uses_tunnel`]
+    /// makes the leftover SSH toggle harmless; this is what stops it being there
+    /// at all, and what makes this module's opening claim — "there is no server,
+    /// so `host`/`port`/`user`/`password`/`ssh` are inert … it has no secret to
+    /// keep" — true of what actually reaches `connections.json` and the keyring.
+    ///
+    /// A no-op on every other engine.
+    pub fn sanitized(mut self) -> Connection {
+        if is_sqlite(&self.db_type) {
+            self.host = String::new();
+            self.port = 0;
+            self.user = String::new();
+            self.password = String::new();
+            self.ssh = SshTunnel::default();
+        }
+        self
+    }
+
+    /// Should opening this connection open an SSH tunnel first?
+    ///
+    /// **Not `ssh.enabled` on its own.** The engine picker can be changed on a
+    /// saved connection, and the SQLite form renders no SSH block at all — so a
+    /// connection switched over from a tunnelled MySQL one keeps `ssh.enabled`
+    /// set with no control anywhere that can unset it. Asking the flag alone
+    /// then made every operation on a purely local file dial a third-party
+    /// bastion with a stored credential, forward it to the file connection's
+    /// inert `"":0`, and fail the whole connection if that host was down. The
+    /// form meanwhile tells the user in as many words that there is "no server
+    /// to reach — no host, user, password or tunnel".
+    ///
+    /// One answer, asked everywhere: [`crate::connection`]'s five tunnel sites,
+    /// rather than a sixth spelling of it at each.
+    pub fn uses_tunnel(&self) -> bool {
+        self.ssh.enabled && !is_sqlite(&self.db_type)
+    }
+
     /// The whole path of a SQLite connection's file, empty for any other engine.
     /// For a tooltip or a form, where [`Self::endpoint`]'s short name isn't enough
     /// to tell two files of the same name apart.
@@ -449,6 +491,22 @@ pub fn engine_label(db_type: &str) -> String {
         "" => "MySQL".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Is this engine reached **over the network** — i.e. does a host, a port, a
+/// user, a password or an SSH tunnel mean anything for it?
+///
+/// SQLite is the one that answers `false`, and it is a predicate rather than an
+/// `is_sqlite(…)` at each site because the *question* is what the callers
+/// actually have: whether to open a tunnel, whether to show a port field,
+/// whether a credential is worth keyring space.
+///
+/// **It lives here so there is one answer.** There were two — `Engine::is_networked`
+/// in `schemaic-db` and a `DbKind::is_networked` in the connection form — and
+/// while the two agreed, having two is what let the *third* consumer, the tunnel
+/// decision, quietly not ask at all. Both now delegate here.
+pub fn is_networked(db_type: &str) -> bool {
+    !is_sqlite(db_type)
 }
 
 /// The default TCP port for a `db_type` label.
@@ -716,6 +774,66 @@ mod tests {
         assert!(moved(|c| c.ssh.host = "bastion".into()), "ssh host");
         assert!(moved(|c| c.ssh.port = 2222), "ssh port");
         assert!(moved(|c| c.ssh.user = "deploy".into()), "ssh user");
+    }
+
+    /// **A SQLite connection opens no tunnel, whatever the flag says.**
+    ///
+    /// The state is reachable and not exotic: change a saved MySQL connection's
+    /// engine to SQLite, browse to a file, save. `ssh.enabled` comes across
+    /// unchanged and the SQLite form renders no SSH block, so no control in the
+    /// app can unset it. Asking the flag alone made every operation on a local
+    /// file authenticate to a bastion with a stored credential, and fail
+    /// outright when that host was down.
+    #[test]
+    fn a_sqlite_connection_never_uses_a_tunnel() {
+        let mut c = conn();
+        c.ssh.enabled = true;
+        assert!(c.uses_tunnel(), "the premise: MySQL with SSH on");
+
+        for label in ["SQLite", "sqlite", "SQLite3", " sqlite3 "] {
+            let mut file = c.clone();
+            file.db_type = label.into();
+            assert!(
+                !file.uses_tunnel(),
+                "{label} has no server to tunnel to, and the form can't turn this off"
+            );
+        }
+        // And the ordinary "no SSH configured" answer is unchanged on every
+        // engine.
+        for label in ["MySQL", "PostgreSQL", "SQLite"] {
+            let mut off = c.clone();
+            off.db_type = label.into();
+            off.ssh.enabled = false;
+            assert!(!off.uses_tunnel(), "{label}");
+        }
+    }
+
+    /// **What this module's opening paragraph claims, asserted.** A SQLite
+    /// connection has "no secret to keep … no tunnel to open", and switching a
+    /// saved MySQL connection's engine to SQLite is what used to make that false:
+    /// the form renders no SSH block, so nothing could unset what came across.
+    #[test]
+    fn saving_a_sqlite_connection_drops_the_server_side() {
+        let mut switched = tunnelled();
+        switched.db_type = "SQLite".into();
+        switched.file = r"C:\data\app.db".into();
+        let saved = switched.clone().sanitized();
+
+        assert_eq!(saved.file, r"C:\data\app.db", "the target is kept");
+        assert!(saved.host.is_empty());
+        assert_eq!(saved.port, 0);
+        assert!(saved.user.is_empty());
+        assert!(saved.password.is_empty(), "nothing reaches the keyring");
+        assert_eq!(saved.ssh, SshTunnel::default());
+        assert!(!saved.uses_tunnel());
+    }
+
+    /// And a real server connection is returned exactly as it was — the whole
+    /// point of the `sanitized` name is that it is a no-op on every other engine.
+    #[test]
+    fn sanitizing_a_server_connection_changes_nothing() {
+        let c = tunnelled();
+        assert_eq!(c.clone().sanitized(), c);
     }
 
     /// **The exclusion the doc spends a paragraph defending**, and which nothing

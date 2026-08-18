@@ -80,6 +80,12 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
     let interval = ui.overlay.monitor_interval;
     let paused = ui.overlay.monitor_paused;
     let export_err = ui.overlay.monitor_export_err;
+    let exported = ui.overlay.monitor_exported;
+    let dropped = ui.overlay.monitor_dropped;
+    let confirm = ui.overlay.confirm;
+    // Where an export failure lands when the modal has already closed.
+    let error_modal_text = ui.overlay.error_modal_text;
+    let error_modal_open = ui.overlay.error_modal_open;
     // The shared popup channel — `popup_menu_overlay` is mounted last in the
     // workspace stack, so a menu raised from in here paints above this modal and
     // its backdrop rather than behind them.
@@ -95,9 +101,13 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
             }
             let close: Rc<dyn Fn()> = Rc::new(move || {
                 open.set(false);
-                // Free the log + reset state so a reopen starts clean (the app also
-                // resets on open, so this is just tidiness / no stale flash).
-                log.set(Vec::new());
+                // **The log is deliberately left alone.** It used to be emptied
+                // here "for tidiness / no stale flash", which was harmless while
+                // it could only be watched — and became a total, unprompted loss
+                // the moment the same commit made it an exportable record: the
+                // only copy of a deleted row's values, thrown away by Escape.
+                // `open_monitor` resets every one of these signals on the way in,
+                // so nothing stale can flash anyway.
                 error.set(None);
                 title.set(None);
                 cols.set(Vec::new());
@@ -178,10 +188,9 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                         error.get(),
                         paused.get(),
                         partial.get(),
-                        // `>=`, not `==`: the app trims *after* appending, so a
-                        // poll landing several changes at once passes through the
-                        // cap rather than resting on it.
-                        log.with(|l| l.len() >= schemaic_core::monitor::LOG_CAP),
+                        // What was actually dropped, not what the length implies:
+                        // a log resting *at* the cap has lost nothing yet.
+                        dropped.get() > 0,
                     )
                 },
                 move |(msg, tone)| {
@@ -237,27 +246,61 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
             // at build); each guards itself instead, so Enter on a dimmed button
             // does nothing.
             let has_log = move || log.with_untracked(|l| !l.is_empty());
+            // **Clear asks, because the log is the only copy.** A `DELETE` it
+            // recorded holds values the database no longer has, and a poll never
+            // re-reports a change it has already reported — so this is
+            // irreversible, and the button sits one glyph from Export with the
+            // same metric and the same enabled/dimmed rule. The confirmation is
+            // skipped exactly where it would be noise: an empty log, or one
+            // already written to a file
+            // ([`schemaic_core::monitor::discard_needs_asking`]).
+            let clear: Rc<dyn Fn()> = Rc::new(move || {
+                if !has_log() {
+                    return;
+                }
+                let n = log.with_untracked(Vec::len);
+                if !schemaic_core::monitor::discard_needs_asking(n, exported.get_untracked()) {
+                    // Only the log — the baseline snapshot lives in the app and
+                    // is deliberately untouched, so clearing loses the history
+                    // you already read, never a change not yet reported.
+                    log.set(Vec::new());
+                    dropped.set(0);
+                    return;
+                }
+                confirm.set(Some(crate::Confirm {
+                    title: "Clear the log?".to_string(),
+                    message: format!(
+                        "{n} change{} would be discarded. The log is the only record \
+                         of what a deleted row held — the poll will not report a \
+                         change again — and this can't be undone. Export it first if \
+                         you want to keep it.",
+                        if n == 1 { "" } else { "s" }
+                    ),
+                    resolve: Rc::new(move |yes| {
+                        if yes {
+                            log.set(Vec::new());
+                            exported.set(false);
+                            dropped.set(0);
+                        }
+                    }),
+                }));
+            });
+            let clear_click = clear.clone();
+            let clear_key = clear.clone();
             let clear_btn = crate::widgets::in_ring_button(
                 crate::widgets::toolbar_icon(
                     icons::TRASH_2,
                     0.0,
                     0.0,
                     move || log.with(|l| !l.is_empty()),
-                    // Only the log — the baseline snapshot lives in the app and is
-                    // deliberately untouched, so clearing loses the history you
-                    // already read, never a change that hasn't been reported yet.
-                    move || log.set(Vec::new()),
+                    move || (clear_click)(),
                 )
                 .tooltip(|| text("Clear the log").style(crate::widgets::tooltip_style)),
                 ring.clone(),
                 11,
                 true,
                 0.0,
-                move || {
-                    if has_log() {
-                        log.set(Vec::new());
-                    }
-                },
+                move || (clear_key)(),
             );
             let export_file = export_file.clone();
             let export_menu: Rc<dyn Fn()> = {
@@ -276,7 +319,18 @@ pub(crate) fn monitor_overlay(ui: Ui) -> impl IntoView {
                             .map(|&f| {
                                 let export_file = export_file.clone();
                                 MenuEntry::action(f.label(), move || {
-                                    save_log(log, cols, title, export_err, export_file.clone(), f);
+                                    save_log(
+                                        log,
+                                        cols,
+                                        title,
+                                        export_err,
+                                        exported,
+                                        open,
+                                        error_modal_text,
+                                        error_modal_open,
+                                        export_file.clone(),
+                                        f,
+                                    );
                                 })
                             })
                             .collect(),
@@ -673,11 +727,16 @@ fn status_line(
 /// never saw. The rendering itself is the ordinary [`schemaic_core::export`]
 /// path over [`log_result_set`]'s projection — the app owns the worker thread
 /// that actually writes, exactly as it does for a results export.
+#[allow(clippy::too_many_arguments)]
 fn save_log(
     log: RwSignal<Vec<crate::MonitorEntry>>,
     cols: RwSignal<Vec<String>>,
     title: RwSignal<Option<String>>,
     export_err: RwSignal<Option<String>>,
+    exported: RwSignal<bool>,
+    open: RwSignal<bool>,
+    fallback_err: RwSignal<Option<String>>,
+    fallback_open: RwSignal<bool>,
     export_file: crate::ExportFn,
     format: ExportFormat,
 ) {
@@ -718,9 +777,29 @@ fn save_log(
             },
             // `try_update`: the modal may have closed while the dialog was open
             // or the write ran, and a plain `set` would panic on a freed signal.
-            Rc::new(move |res| {
-                if let Err(e) = res {
-                    export_err.try_update(|v| *v = Some(format!("Export failed — {e}")));
+            Rc::new(move |res| match res {
+                // The log on screen now has a copy on disk, which is what lets
+                // Clear stop asking (`monitor::discard_needs_asking`).
+                Ok(()) => {
+                    exported.try_update(|v| *v = true);
+                }
+                // **A failure that lands after the modal closed has to go
+                // somewhere.** `monitor_export_err` is only visible inside the
+                // modal, so reporting there and nowhere else left the user with
+                // the truncated file `render_to` warns about and no idea it had
+                // happened. The shared error modal is where every other failure
+                // with no surface of its own goes.
+                //
+                // The message is used as the pipeline produced it: it already
+                // begins "Export failed: …", and a second prefix here read
+                // "Export failed — Export failed: Access is denied".
+                Err(e) => {
+                    if open.try_get_untracked() == Some(true) {
+                        export_err.try_update(|v| *v = Some(e));
+                    } else {
+                        fallback_err.try_update(|v| *v = Some(e));
+                        fallback_open.try_update(|v| *v = true);
+                    }
                 }
             }),
         );
@@ -767,15 +846,27 @@ mod tests {
     fn a_failed_export_outranks_everything_else() {
         // The user believes they have a file. Nothing else on this line matters
         // as much, and a poll error two seconds later must not bury it.
+        //
+        // **The message is the one the pipeline really produces** — `export_file`
+        // formats `Export failed: {e}` and `save_log` passes it through. The
+        // earlier fixture said "Export failed — access denied", which no code
+        // path could make, and it pinned a wording that was in fact rendered
+        // "Export failed — Export failed: Access is denied" on screen.
+        let real = "Export failed: Access is denied. (os error 5)";
         let (msg, tone) = status_line(
-            Some("Export failed — access denied".into()),
+            Some(real.into()),
             Some("connection lost".into()),
             true,
             true,
             true,
         );
         assert_eq!(tone, Tone::Error);
-        assert_eq!(msg, "Export failed — access denied");
+        assert_eq!(msg, real);
+        assert_eq!(
+            msg.matches("Export failed").count(),
+            1,
+            "the prefix must not be doubled: {msg}"
+        );
     }
 
     #[test]

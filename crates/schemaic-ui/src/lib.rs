@@ -793,9 +793,12 @@ pub struct Tab {
     /// only happens for a session restored while dirty; it reads as modified,
     /// which is the safe direction.
     pub disk_sql: RwSignal<Option<String>>,
-    /// The file was CRLF, so a save writes CRLF back (see
-    /// [`schemaic_core::sqlfile`]). Meaningless without `path`.
-    pub file_crlf: RwSignal<bool>,
+    /// Everything about the file's bytes that isn't its text — the line endings
+    /// and BOM a save has to put back, and whether the read was **lossy**, which
+    /// is what stops a save silently destroying every byte Schemaic couldn't
+    /// read as UTF-8 (see [`schemaic_core::sqlfile`]). Meaningless without
+    /// `path`.
+    pub file_format: RwSignal<schemaic_core::sqlfile::SqlFormat>,
     /// Bumped when the tab's text is replaced *from outside the editor* (a reload
     /// from disk). Part of the editor pane's container key, because the Floem
     /// editor owns its own document once mounted: writing `query` alone would
@@ -846,7 +849,7 @@ impl Tab {
             load_gen: cx.create_rw_signal(0),
             path: cx.create_rw_signal(None),
             disk_sql: cx.create_rw_signal(None),
-            file_crlf: cx.create_rw_signal(false),
+            file_format: cx.create_rw_signal(schemaic_core::sqlfile::SqlFormat::default()),
             reload_gen: cx.create_rw_signal(0),
         }
     }
@@ -1237,6 +1240,11 @@ impl DraftSignals {
     }
 
     /// Build a `Connection` from the current form values (with the given id).
+    ///
+    /// **A SQLite connection is saved without server coordinates at all** — see
+    /// [`Connection::sanitized`], which this returns through. The form's own
+    /// signals are untouched, so switching the picker back before saving restores
+    /// what was typed.
     pub fn to_connection(&self, id: u64) -> Connection {
         let db_type = self.db_type.get_untracked();
         Connection {
@@ -1273,6 +1281,7 @@ impl DraftSignals {
             read_only: self.read_only.get_untracked(),
             environment: self.environment.get_untracked(),
         }
+        .sanitized()
     }
 }
 
@@ -2133,6 +2142,25 @@ pub struct OverlayUi {
     /// interval — on the one action whose whole point is that the log outlives
     /// the modal.
     pub monitor_export_err: RwSignal<Option<String>>,
+    /// **The log as it now stands has been written to a file.** Set by a
+    /// successful export, cleared the moment the poll appends anything, and reset
+    /// by `open_monitor`.
+    ///
+    /// It is what makes the Clear confirmation worth reading rather than a
+    /// reflex: the log is the only record of a deleted row's values, so throwing
+    /// it away is irreversible — unless there is a copy on disk, which is the
+    /// ordinary case after an export
+    /// ([`schemaic_core::monitor::discard_needs_asking`]).
+    pub monitor_exported: RwSignal<bool>,
+    /// How many entries the log has dropped off the top to stay within
+    /// [`schemaic_core::monitor::LOG_CAP`].
+    ///
+    /// The status line's "the oldest are dropping" caveat reads this rather than
+    /// the log's length: at exactly the cap nothing has been dropped yet, and a
+    /// record that claims a loss it hasn't had is the same failure as one that
+    /// hides a loss it has. Set from
+    /// [`schemaic_core::monitor::trim_log`]'s return.
+    pub monitor_dropped: RwSignal<usize>,
     /// ER-diagram modal: `Some(target)` opens it for that database/seed.
     pub erd: RwSignal<Option<ErdTarget>>,
     /// Table-properties modal: `Some(target)` opens it for that object, and the

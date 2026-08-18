@@ -138,7 +138,17 @@ pub(crate) fn object_entries(
     ObjectEntries {
         // A view is not insertable, and owns no rows to delete.
         import: !is_view,
-        truncate: !is_view,
+        // **Gated on the capability, like every sibling here.** It was the one
+        // entry in this struct that wasn't, and Truncate is the entry that can
+        // least afford it: on an engine with no arm for it, the menu offered a
+        // red enabled item, asked "Delete all ~4.2m rows in orders?", and then
+        // opened a preview whose script was empty and whose Apply was inert —
+        // an irreversible question for something that was never going to happen.
+        truncate: !is_view
+            && schemaic_core::ddl::supports_change(
+                dialect,
+                &schemaic_core::ddl::Change::TruncateTable,
+            ),
         // **A view really does carry triggers on two of the three engines** —
         // `INSTEAD OF` lives on PostgreSQL and on SQLite, where it is the only
         // way a view is written to at all — so this is not simply `!is_view`.
@@ -183,46 +193,64 @@ pub(crate) struct KeyEntries {
 /// retype or a constraint by rebuilding the table. **Drop** is a shortcut with
 /// no draft behind it, so it needs a statement for that one change, which is a
 /// narrower thing to ask (`ddl::supports_change`).
-pub(crate) fn field_entries(dialect: schemaic_core::intel::SqlDialect) -> FieldEntries {
+/// `is_view` because **a view's columns are not the view's to edit.** The tree
+/// renders a column row under a view exactly as it does under a table — the flag
+/// only picks a different glyph — so without this the menu offers Edit column
+/// and a red Drop for something that has neither, opens the *table* designer on
+/// the view, and the refusal arrives from the server (`… is not BASE TABLE`, and
+/// on SQLite a `DROP TABLE` on a view) rather than from the menu. It is the same
+/// question [`object_entries`] one level up already asks.
+pub(crate) fn field_entries(
+    dialect: schemaic_core::intel::SqlDialect,
+    is_view: bool,
+) -> FieldEntries {
     FieldEntries {
-        edit: true,
+        edit: !is_view,
         // The predicate reads the *shape* of the change, not its names — a
         // dropped column is expressible or not whatever it is called.
-        drop: schemaic_core::ddl::supports_change(
-            dialect,
-            &schemaic_core::ddl::Change::DropColumn {
-                name: String::new(),
-                type_name: String::new(),
-            },
-        ),
+        drop: !is_view
+            && schemaic_core::ddl::supports_change(
+                dialect,
+                &schemaic_core::ddl::Change::DropColumn {
+                    name: String::new(),
+                    type_name: String::new(),
+                },
+            ),
     }
 }
 
 /// See [`KeyEntries`]. `constraint` is the constraint an index backs, when it
 /// backs one — SQLite can't drop those, because they are part of the table
 /// definition rather than objects of their own.
+///
+/// `is_view` for the reason [`field_entries`] takes it: a view has no keys and
+/// no indexes of its own, and every route out of these entries is the table
+/// designer.
 pub(crate) fn key_entries(
     dialect: schemaic_core::intel::SqlDialect,
     constraint: Option<&str>,
+    is_view: bool,
 ) -> KeyEntries {
     use schemaic_core::ddl::{Change, supports_change};
     KeyEntries {
         // The designer, which reaches what these shortcuts can't: dropping a
         // foreign key on SQLite is a rebuild, and the draft is what has one.
-        edit: true,
-        drop_foreign_key: supports_change(
-            dialect,
-            &Change::DropForeignKey {
-                name: String::new(),
-            },
-        ),
-        drop_index: supports_change(
-            dialect,
-            &Change::DropIndex {
-                name: String::new(),
-                constraint: constraint.map(str::to_string),
-            },
-        ),
+        edit: !is_view,
+        drop_foreign_key: !is_view
+            && supports_change(
+                dialect,
+                &Change::DropForeignKey {
+                    name: String::new(),
+                },
+            ),
+        drop_index: !is_view
+            && supports_change(
+                dialect,
+                &Change::DropIndex {
+                    name: String::new(),
+                    constraint: constraint.map(str::to_string),
+                },
+            ),
     }
 }
 
@@ -1431,7 +1459,10 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     ));
                     let read_only = conn_read_only(&connections, active_conn);
                     entries.push(MenuEntry::Separator);
-                    let offers = field_entries(crate::table_designer::edit_ctx(&import_ui).dialect);
+                    let offers = field_entries(
+                        crate::table_designer::edit_ctx(&import_ui).dialect,
+                        source_is_view(db_nodes, &source),
+                    );
                     if offers.edit {
                         let ui = import_ui.clone();
                         let (src, col) = (source.clone(), column.clone());
@@ -1487,6 +1518,7 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     let offers = key_entries(
                         crate::table_designer::edit_ctx(&import_ui).dialect,
                         index.constraint.as_deref(),
+                        source_is_view(db_nodes, &source),
                     );
                     if offers.edit {
                         let ui = import_ui.clone();
@@ -1855,6 +1887,33 @@ fn column_result_icon(
 /// only irreversible action the server refuses.
 fn is_palette_target(o: &schemaic_core::schema::ObjectItem) -> bool {
     crate::object_editor::is_editable_object(o)
+}
+
+/// Is the object a **view**, as far as the loaded schema knows?
+///
+/// `false` when the schema hasn't loaded, which is the same answer the table
+/// arm's own `is_view` gives in that state: nothing is known to be a view, and
+/// the entries that follow are already disabled for want of columns.
+fn source_is_view(
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    source: &schemaic_core::schema::TableSource,
+) -> bool {
+    db_nodes.with_untracked(|nodes| {
+        nodes
+            .iter()
+            .find(|n| n.database == source.database)
+            .and_then(|n| match n.schema.get_untracked() {
+                SchemaState::Loaded(db) => db
+                    .tables
+                    .iter()
+                    .find(|t| {
+                        t.name == source.table && t.schema.as_deref() == source.schema.as_deref()
+                    })
+                    .map(|t| t.is_view),
+                _ => None,
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// Resolve a remembered object (a search-history entry) against the live schema.
@@ -4464,8 +4523,30 @@ mod row_menu_tests {
     #[test]
     fn every_engine_designs_from_a_column_or_a_key_row() {
         for d in [MySql, Postgres, Sqlite] {
-            assert!(field_entries(d).edit, "Edit column {d:?}");
-            assert!(key_entries(d, None).edit, "Edit index {d:?}");
+            assert!(field_entries(d, false).edit, "Edit column {d:?}");
+            assert!(key_entries(d, None, false).edit, "Edit index {d:?}");
+        }
+    }
+
+    /// **A view's column row is not a table's.** The tree renders one under a
+    /// view exactly as under a table — `is_view` only picks a different glyph —
+    /// so an ungated menu offers Edit column and a red Drop for something that
+    /// has neither, opens the *table* designer on the view, and lets the refusal
+    /// arrive from the server instead of from the menu. Every engine refuses:
+    /// MySQL `… is not BASE TABLE`, PostgreSQL in kind, and SQLite's rebuild
+    /// route emits `DROP TABLE` on a view.
+    #[test]
+    fn a_view_offers_no_column_or_key_entry_on_any_engine() {
+        for d in [MySql, Postgres, Sqlite] {
+            let f = field_entries(d, true);
+            assert!(!f.edit && !f.drop, "{d:?} column on a view: {f:?}");
+            for constraint in [None, Some("uq_email")] {
+                let k = key_entries(d, constraint, true);
+                assert!(
+                    !k.edit && !k.drop_foreign_key && !k.drop_index,
+                    "{d:?} key {constraint:?} on a view: {k:?}"
+                );
+            }
         }
     }
 
@@ -4473,19 +4554,19 @@ mod row_menu_tests {
     /// engine performs — it has `ALTER TABLE … DROP COLUMN` and `DROP INDEX`.
     #[test]
     fn sqlite_still_drops_a_column_and_a_plain_index() {
-        assert!(field_entries(Sqlite).drop);
-        assert!(key_entries(Sqlite, None).drop_index);
+        assert!(field_entries(Sqlite, false).drop);
+        assert!(key_entries(Sqlite, None, false).drop_index);
     }
 
     /// The two that really do need the twelve-step rebuild.
     #[test]
     fn sqlite_drops_no_constraint() {
         assert!(
-            !key_entries(Sqlite, None).drop_foreign_key,
+            !key_entries(Sqlite, None, false).drop_foreign_key,
             "no ALTER TABLE … DROP CONSTRAINT"
         );
         assert!(
-            !key_entries(Sqlite, Some("uq_email")).drop_index,
+            !key_entries(Sqlite, Some("uq_email"), false).drop_index,
             "a UNIQUE index is part of the table definition"
         );
     }
@@ -4493,10 +4574,10 @@ mod row_menu_tests {
     #[test]
     fn the_full_engines_offer_every_row_entry() {
         for d in [MySql, Postgres] {
-            let f = field_entries(d);
+            let f = field_entries(d, false);
             assert!(f.edit && f.drop, "{d:?} column");
             for constraint in [None, Some("uq_email")] {
-                let k = key_entries(d, constraint);
+                let k = key_entries(d, constraint, false);
                 assert!(
                     k.edit && k.drop_foreign_key && k.drop_index,
                     "{d:?} key {constraint:?}"

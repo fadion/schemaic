@@ -1034,7 +1034,7 @@ fn object_name_parts(name: &sqlparser::ast::ObjectName) -> Vec<String> {
 /// byte it opened with. A single-byte answer silently picked one of the three and
 /// tokenized names written the other two ways as opaque non-code, which is a
 /// completion popup that goes blank on a name the user quoted.
-fn ident_quote(dialect: SqlDialect, open: u8) -> Option<(u8, bool)> {
+pub(crate) fn ident_quote(dialect: SqlDialect, open: u8) -> Option<(u8, bool)> {
     match (dialect, open) {
         (SqlDialect::MySql, b'`') => Some((b'`', true)),
         (SqlDialect::Postgres, b'"') => Some((b'"', true)),

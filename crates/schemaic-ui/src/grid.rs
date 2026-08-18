@@ -27,7 +27,7 @@ use floem::action::save_as;
 use floem::file::{FileDialogOptions, FileSpec};
 
 use schemaic_core::connection::Connection;
-use schemaic_core::edit::{EditModel, analyze_edit, refetch_key, refetch_template};
+use schemaic_core::edit::{EditModel, analyze_edit, refetch_key, refetch_template, row_key};
 use schemaic_core::export::{ExportFormat, suggested_filename};
 use schemaic_core::filter::{FilterError, build_query, eq_condition};
 use schemaic_core::format::{self, ColumnFormat, ColumnFormatRule};
@@ -428,25 +428,6 @@ fn origin_column(rs: &ResultSet, ci: usize) -> String {
         .and_then(|c| c.origin.as_ref())
         .map(|o| o.column.clone())
         .unwrap_or_default()
-}
-
-/// The `WHERE` identity of data row `di`: each key column's real name paired
-/// with the row's **original** value.
-///
-/// The one builder for it. Every write this grid issues — update, delete, and
-/// the row panel's immediate save — is aimed at the row this names, so a
-/// difference between copies is a statement aimed somewhere else.
-fn row_key(rs: &ResultSet, key_cols: &[usize], di: usize) -> Vec<(String, Value)> {
-    key_cols
-        .iter()
-        .map(|&kci| {
-            let val = rs
-                .cell(di, kci)
-                .map(|c| c.to_value())
-                .unwrap_or(Value::Null);
-            (origin_column(rs, kci), val)
-        })
-        .collect()
 }
 
 impl GridState {
@@ -860,7 +841,7 @@ impl GridState {
             schema: tbl.schema.clone(),
             table: tbl.table.clone(),
             set,
-            key: row_key(rs, &tbl.key_cols, di),
+            key: row_key(rs, tbl, di),
         })
     }
 
@@ -993,7 +974,7 @@ impl GridState {
                     database: tbl.database.clone(),
                     schema: tbl.schema.clone(),
                     table: tbl.table.clone(),
-                    key: row_key(&rs, &tbl.key_cols, di),
+                    key: row_key(&rs, tbl, di),
                 })
             })
             .collect()

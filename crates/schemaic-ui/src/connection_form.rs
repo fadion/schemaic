@@ -71,8 +71,13 @@ impl DbKind {
     ///
     /// SQLite doesn't, which is why the form builds a different block for it
     /// rather than showing empty coordinates.
+    ///
+    /// Delegated to [`schemaic_core::connection::is_networked`] rather than
+    /// re-answered here: this used to be a second, independent `matches!` for the
+    /// same question, and while it happened to agree, a duplicate answer is what
+    /// let the *tunnel* decision drift from it unnoticed for a whole release.
     fn is_networked(self) -> bool {
-        !matches!(self, DbKind::Sqlite)
+        schemaic_core::connection::is_networked(self.label())
     }
 
     /// Map a persisted `db_type` label back to a picker value (anything not

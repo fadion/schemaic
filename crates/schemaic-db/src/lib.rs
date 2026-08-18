@@ -92,8 +92,11 @@ impl Engine {
     /// than an `== Engine::Sqlite` at each site because the *question* is what the
     /// callers actually have: whether to open a tunnel, whether to show a port
     /// field, whether a credential is worth keyring space.
+    ///
+    /// Delegated to [`schemaic_core::connection::is_networked`], which the
+    /// connection form can also reach — the two used to answer separately.
     pub fn is_networked(self) -> bool {
-        !matches!(self, Engine::Sqlite)
+        schemaic_core::connection::is_networked(self.as_str())
     }
 
     /// Map a saved connection's `db_type` label to an engine. Anything that isn't
@@ -1187,6 +1190,8 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
                 // expression, so nothing here can read one back — it stays a
                 // column, as it was before this field existed.
                 expression: false,
+                // MySQL collates per column, not per index key.
+                collation: None,
             },
             // MySQL's index type is only worth restating when it isn't the
             // default; BTREE is, so emitting `USING BTREE` everywhere would be
@@ -1814,6 +1819,14 @@ pub(crate) fn mysql_column(r: MyColRow, mariadb: bool) -> ColRow {
                 .then(|| "CURRENT_TIMESTAMP".to_string()),
             comment: comment.filter(|c| !c.is_empty()),
             collation,
+            // MySQL reports `VIRTUAL GENERATED` / `STORED GENERATED` in `EXTRA`,
+            // and its emitter restates neither — the flag is SQLite's, where the
+            // rebuild has to write the word back or the column stops being
+            // materialised.
+            generated_stored: extra_lc.contains("stored generated"),
+            // No such keyword on MySQL: `AUTO_INCREMENT` above is the whole
+            // answer, and it already promises not to reuse a value.
+            sqlite_autoincrement: false,
         },
     }
 }

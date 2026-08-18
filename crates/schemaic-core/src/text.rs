@@ -23,11 +23,19 @@ pub fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
 /// which buckets differently on purpose (`1.2k`, `12k`) and answers to nothing.
 pub fn human_count(n: usize) -> String {
     let f = n as f64;
-    let (val, suffix) = if f >= 1e9 {
+    // **Rounded first, then given a unit.** Picking the unit from the unrounded
+    // value and rounding afterwards printed `999,999` as `1000k` — a unit that
+    // tops out below 1000 showing 1000 of itself, and doing it in the
+    // "Delete all ~1000k rows in orders?" confirmation, whose only job is to
+    // convey scale before something irreversible. The threshold is the value at
+    // which two decimals round up to 1000.
+    const PROMOTE: f64 = 999.995;
+    let (val, suffix) = if f >= 1e9 || f / 1e6 >= PROMOTE {
+        // `b` is the largest unit there is, so past a trillion it keeps counting.
         (f / 1e9, "b")
-    } else if f >= 1e6 {
+    } else if f >= 1e6 || f / 1e3 >= PROMOTE {
         (f / 1e6, "m")
-    } else if f >= 1e3 {
+    } else if f >= 1e3 || f >= PROMOTE {
         (f / 1e3, "k")
     } else {
         return n.to_string();
@@ -123,6 +131,24 @@ mod tests {
         assert_eq!(human_count(1_000_000_000), "1b");
     }
 
+    /// **A unit that tops out below 1000 must never print 1000 of itself.**
+    /// Picking the unit from the unrounded value and rounding afterwards made
+    /// `999,999` read `1000k` — and this string reaches
+    /// *"Delete all ~1000k rows in orders? This can't be undone."*, a dialog
+    /// whose only job is to convey scale before something irreversible.
+    #[test]
+    fn a_count_is_promoted_rather_than_rounded_past_its_unit() {
+        assert_eq!(human_count(999_999), "1m");
+        assert_eq!(human_count(999_995), "1m", "the first value that rounds up");
+        assert_eq!(human_count(999_994), "999.99k", "and the last that doesn't");
+        assert_eq!(human_count(999_999_999), "1b");
+        assert_eq!(human_count(999_995_000), "1b");
+        assert_eq!(human_count(999_994_999), "999.99m");
+        // The bottom boundary is the same rule seen from below.
+        assert_eq!(human_count(999), "999");
+        assert_eq!(human_count(1_000), "1k");
+    }
+
     /// Every shape the printer can emit round-trips through the go-to-row box,
     /// which is the property the two functions have to hold together: the count
     /// on screen is the one a user types back.
@@ -134,6 +160,40 @@ mod tests {
                 crate::model::goto_row_index(&printed, n),
                 Some(n - 1),
                 "{printed:?} came from {n}"
+            );
+        }
+    }
+
+    /// The round trip **without the clamp**. `goto_row_index` clamps to the row
+    /// count, so passing `n` as the count let a printed string that parses to
+    /// something else pass this property by accident — which is exactly what
+    /// `1000k` did.
+    #[test]
+    fn a_printed_count_parses_back_to_within_rounding_of_itself() {
+        for n in [
+            1usize,
+            999,
+            1_000,
+            1_250,
+            200_000,
+            999_994,
+            999_995,
+            999_999,
+            1_000_000,
+            1_500_000,
+            999_999_999,
+        ] {
+            let printed = human_count(n);
+            let parsed = crate::model::goto_row_index(&printed, usize::MAX)
+                .unwrap_or_else(|| panic!("{printed:?} is unreadable"))
+                + 1;
+            // Two decimals of the printed unit is the resolution the string has,
+            // i.e. 0.001 of the value — never a whole unit out, which is what
+            // `1000k` was.
+            let slack = (n as f64 * 0.001).max(1.0);
+            assert!(
+                (parsed as f64 - n as f64).abs() <= slack,
+                "{printed:?} came from {n} and reads back as {parsed}"
             );
         }
     }

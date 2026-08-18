@@ -8,11 +8,14 @@ wiring, the built-in MCP server).
 
 **Three engines, and they are not equal.** MySQL/MariaDB and PostgreSQL are full; SQLite reads,
 writes, imports and edits **tables** (through the twelve-step rebuild — `ddl::sqlite_rebuild_sql`),
-but has **no view or trigger editing** and **no manual-transaction mode**, all of which are
-statements about SQLite rather than unfinished work (`ddl::supports_view_editing`,
-`ddl::supports_trigger_editing` and `session::Session::open` carry the reasons). Ask a
-**capability**, never an engine: a `dialect == Postgres` or `!= MySql` compiles cleanly while
-silently sorting a third engine onto whichever side it happens to fall.
+**views** and **triggers**, but has **no manual-transaction mode** — a statement about SQLite
+rather than unfinished work (`db::session::Session::open` carries the reason). What differs between the
+engines now lives in the *narrow* predicates that decide how an edit is performed rather than
+whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`, `supports_change`,
+`alter_column_disturbs_checks`, `stats::supports_table_stats`. Ask a **capability**, never an
+engine: a `dialect == Postgres` or `!= MySql` compiles cleanly while silently sorting a third
+engine onto whichever side it happens to fall — and a *constant* in place of a capability is the
+same failure with no comparison to grep for.
 
 **`docs/architecture.md` is the reference document** — the module map (one entry per source file),
 the architecture invariants, the UI conventions, the Floem hazards, and the data grid end to end.
@@ -26,7 +29,7 @@ that has quietly become false. Route the write through `arch-scribe` when a chan
 
 ## Delegate the reading (`.claude/agents/`)
 
-`docs/architecture.md` is ~1650 lines and several modules are thousands each (`ui/grid.rs` ~6.3k,
+`docs/architecture.md` is ~3.2k lines and several modules are thousands each (`ui/grid.rs` ~6.3k,
 `ui/lib.rs` ~5.6k, `app/main.rs`), so paging them into the main context is what runs a session out
 of room. Three subagents exist to do that reading in their own windows:
 
@@ -118,8 +121,12 @@ start with a failing test, then the code that makes it pass.
 - `cargo build` / `cargo run -p schemaic-app`.
 - **Windows:** if the app is running, the linker can't overwrite `target/debug/schemaic.exe`
   ("Access is denied"). Stop it first (`Get-Process schemaic | Stop-Process -Force`).
-- Small visual tweaks: build only, let the user verify. Screenshot harness for new features /
-  behavior debugging, or when asked.
+- Visual and interaction changes: **build only, and let the user verify.** There is no screenshot
+  harness in this repository, and launching the app from a session is worse than useless — it
+  writes the user's real `%APPDATA%\Roaming\schemaic` (tabs, expansion set, active connection) and
+  the `.bak` sibling is rewritten in the same save, so there is no pre-agent restore point. Write
+  the hand checks down instead, in the shape `review/user-verify-fix.md` uses: setup, the exact
+  action, what should happen, and what would mean the fix is wrong.
 
 ## Never bulk-rewrite source with a script
 

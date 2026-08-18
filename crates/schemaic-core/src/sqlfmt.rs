@@ -20,11 +20,23 @@ use crate::sql::skip_noncode;
 /// `"\t"`). Token text is preserved verbatim; only whitespace/layout changes.
 /// `dialect` selects the boundary rules (comments/quotes/dollar-quotes) so
 /// PostgreSQL `#`-operators and `$tag$` bodies aren't mistaken for comments.
+///
+/// **A trailing newline is layout too, and is kept if the input had one.** Since
+/// Format Code reaches a `.sql` file on disk, trimming it turned a reformat into
+/// a reformat *plus* `\ No newline at end of file` in the diff — a change to a
+/// line the user did not touch, on the one artefact Schemaic cannot regenerate.
+/// One newline either way: the trailing blank lines a document collects are
+/// still whitespace to re-flow.
 pub fn format_sql(sql: &str, indent_unit: &str, dialect: SqlDialect) -> String {
     let toks = tokenize(sql, dialect);
     let mut f = Fmt::new(indent_unit);
     f.run(&toks);
-    f.out.trim_end().to_string()
+    let out = f.out.trim_end();
+    if sql.ends_with('\n') {
+        format!("{out}\n")
+    } else {
+        out.to_string()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -500,6 +512,35 @@ mod tests {
     }
 
     const IND: &str = "  ";
+
+    /// **A trailing newline is part of the file, and Format Code now reaches
+    /// files.** Trimming it made a reformat also produce
+    /// `\ No newline at end of file` in the diff — a change to a line nobody
+    /// touched. Asserted as a *property* over the corpus the other tests use,
+    /// since the failure is one character and easy to reintroduce.
+    #[test]
+    fn a_trailing_newline_survives_exactly_as_it_arrived() {
+        for src in [
+            "select a, b from t where a=1",
+            "SELECT 1;",
+            "-- just a comment",
+            "insert into t (a) values (1), (2);",
+            "select * from t /* block */ where a in (1,2)",
+            "",
+        ] {
+            for suffix in ["", "\n", "\n\n", "  \n"] {
+                let input = format!("{src}{suffix}");
+                let got = format_sql(&input, IND);
+                assert_eq!(
+                    got.ends_with('\n'),
+                    input.ends_with('\n'),
+                    "{input:?} → {got:?}"
+                );
+                // And never more than one, whatever the input collected.
+                assert!(!got.ends_with("\n\n"), "{input:?} → {got:?}");
+            }
+        }
+    }
 
     #[test]
     fn simple_select_preserves_case() {
