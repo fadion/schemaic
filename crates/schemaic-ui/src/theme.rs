@@ -272,6 +272,25 @@ pub fn row_active() -> Color {
 pub fn row_selected() -> Color {
     ui().row_selected
 }
+/// The 1px rule drawn above and below the schema-tree row whose **context menu is
+/// open**, so a menu the pointer has walked away from still says what it applies
+/// to.
+///
+/// A rule and not a background, because the row underneath may already be
+/// carrying one — the active database's, or the nav cursor's — and a marker that
+/// replaced those would say less than it added.
+///
+/// `text_muted` rather than a field of its own in both palettes: the brief is
+/// "quiet but legible on the panel and on a hovered row", which is the role that
+/// token already fills, and it is the *right direction* in each palette rather
+/// than one hex that happens to suit the dark one — darker than `text_dim` on dark
+/// (`#585C6A` under `#7E8294`), lighter than it on light (`#8A8F9E` over
+/// `#5C6270`). It began as `text_dim` and read as too bright for a 1px line, which
+/// makes sense: `text_dim` is tuned to be *read* as text. Retune here if it ever
+/// needs a hue of its own.
+pub fn row_menu_edge() -> Color {
+    ui().text_muted
+}
 // Pill tabs (the table designer's section tabs): the active pill's fill and
 // label, and the hover fill of an inactive one.
 pub fn pill_active_bg() -> Color {
