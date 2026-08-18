@@ -654,6 +654,15 @@ fn single_char(s: &str) -> Option<char> {
 // closure and the viewport origin as a pair. That makes them pure and testable
 // without an `Editor`, which is the whole reason the rules above were never
 // pinned before. The `ed`-taking wrappers below are the adapters.
+//
+// The caret-anchored popups (`completion_popup`, `signature_popup`) obey rule 1 by
+// a different route, because they are positioned once per *edit* rather than
+// repainted every frame: `completion::set_anchor` stores the caret line in content
+// coords and the popup's style closure subtracts `ed.viewport` reactively, so the
+// popup keeps up with a scroll that happens while it is open. Baking the
+// subtraction into the stored anchor would freeze it at the scroll position it
+// opened at — which is the bug that walked the suggestion list down over the
+// results grid. Rule 2 doesn't reach them: the caret is on screen by definition.
 
 /// The x origin of the code column in `editor_area` coords: the gutter widens
 /// with the line-number digit count, since it sizes to the last line number.
@@ -950,9 +959,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     } = p;
     let comp = Completion {
         items: RwSignal::new(Vec::new()),
+        width: RwSignal::new(0.0),
         sel: RwSignal::new(0),
         open: RwSignal::new(false),
         point: RwSignal::new(Point::ZERO),
+        line_top: RwSignal::new(0.0),
         suppress: RwSignal::new(false),
         sig: RwSignal::new(None),
         sig_point: RwSignal::new(Point::ZERO),
@@ -1957,10 +1968,16 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         );
     }
 
-    // Editor-area height, tracked so the Ctrl+K expand animation fills it exactly.
+    // Editor-area height, tracked so the Ctrl+K expand animation fills it exactly,
+    // and so the completion popup knows whether its list fits below the caret.
     let area_h: RwSignal<f64> = RwSignal::new(EDITOR_H);
-    // Editor-area width, tracked so right-click / run menus flip leftward instead
-    // of being clipped by the pane edge (they live in editor-area coords).
+    // The editor's scroll rect, lifted out of `ed` before the closures below consume
+    // it. The caret-anchored popups subtract its origin to turn `points_of_offset`'s
+    // document coordinates into `editor_area` ones (see the "Overlay geometry" note).
+    let ed_vp = ed.viewport;
+    // Editor-area width, tracked so right-click / run menus flip leftward and the
+    // completion popup slides left instead of being clipped by the pane edge (they
+    // all live in editor-area coords).
     let area_w: RwSignal<f64> = RwSignal::new(0.0);
 
     // Hide the editor's blinking caret AND the current-line highlight whenever the
@@ -3558,8 +3575,8 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         bracket_match_view,
         occurrences_view,
         run_overlay,
-        completion_popup(comp),
-        signature_popup(comp),
+        completion_popup(comp, area_h, area_w, ed_vp),
+        signature_popup(comp, ed_vp),
         error_bar,
         guard_bar,
         cmdk_view,

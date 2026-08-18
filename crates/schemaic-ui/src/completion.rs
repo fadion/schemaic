@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use floem::kurbo::Point;
+use floem::kurbo::{Point, Rect};
 use floem::prelude::*;
 use floem::views::editor::Editor;
 use floem::views::editor::core::cursor::CursorAffinity;
@@ -36,7 +36,7 @@ use schemaic_core::intel::{FUNCTIONS, SQL_KEYWORDS, STMT_KEYWORDS};
 use floem::AnyView;
 
 use crate::consts::*;
-use crate::widgets::autohide;
+use crate::widgets::{autohide, measure_text_px_at};
 use crate::{ConnNode, icons, theme};
 
 // ===== moved from lib.rs (autocomplete) =====
@@ -47,10 +47,20 @@ use crate::{ConnNode, icons, theme};
 #[derive(Clone, Copy)]
 pub(crate) struct Completion {
     pub(crate) items: RwSignal<Vec<Suggestion>>,
+    /// Width the current `items` want, measured when they are set (`set_items`) —
+    /// the popup's style closures re-run on every scroll and resize, and a font-system
+    /// measurement per row is not a thing to do there.
+    pub(crate) width: RwSignal<f64>,
     pub(crate) sel: RwSignal<usize>,
     pub(crate) open: RwSignal<bool>,
-    /// Caret position in editor-content coordinates (drives popup placement).
+    /// Bottom of the caret's line, in editor-*content* coordinates — the anchor the
+    /// popup hangs under. Content, not editor-area: the view subtracts the live
+    /// viewport origin itself, so the popup keeps up with scrolling.
     pub(crate) point: RwSignal<Point>,
+    /// Top of the caret's line, same coordinate space as `point`. A popup that
+    /// doesn't fit below the caret flips *above* it, and needs the line's top edge
+    /// to hang its bottom from.
+    pub(crate) line_top: RwSignal<f64>,
     /// Set right after accepting, so the edit that follows doesn't re-open the
     /// popup on the just-inserted word.
     pub(crate) suppress: RwSignal<bool>,
@@ -59,6 +69,7 @@ pub(crate) struct Completion {
     pub(crate) sig: RwSignal<Option<intel::SignatureHelp>>,
     /// Caret-anchored point for the signature-help popup (its bottom-left; the popup
     /// sits just *above* the caret so it doesn't collide with the suggestion list).
+    /// Editor-*content* coordinates, like `point`.
     pub(crate) sig_point: RwSignal<Point>,
 }
 
@@ -390,6 +401,172 @@ struct Cand {
     replace: Option<(usize, usize)>,
 }
 
+/// Pin the suggestion popup to the caret's line: the line's top and bottom edges,
+/// each plus the editor's top padding (which `points_of_offset` doesn't count).
+///
+/// These stay in editor-**content** coordinates. `points_of_offset` answers an
+/// absolute document y, so an overlay pinned in the (unscrolling) `editor_area` has
+/// to subtract the viewport origin — and the popup's style closure is the only place
+/// that can, because it re-runs when the editor scrolls and this doesn't. Baking the
+/// subtraction in here would freeze the popup at the scroll position it opened at.
+fn set_anchor(ed: &Editor, comp: Completion, offset: usize) {
+    let (top, bot) = ed.points_of_offset(offset, CursorAffinity::Backward);
+    comp.point.set(Point::new(bot.x, bot.y + EDITOR_PAD_TOP));
+    comp.line_top.set(top.y + EDITOR_PAD_TOP);
+}
+
+/// Where the suggestion list goes: its top y in `editor_area` coordinates, and the
+/// height cap its scroll area takes.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Placement {
+    top: f64,
+    max_h: f64,
+}
+
+/// Fit `rows` suggestions against the caret line `[line_top, line_bottom]` (already
+/// viewport-relative) inside an `area_h`-tall editor pane.
+///
+/// Below the caret when the list fits there, else flipped above it, else on the
+/// roomier side with the list shortened. The popup used to do none of that — it hung
+/// unconditionally below the caret, so completing on one of the last lines of the
+/// editor drew the list down across the results grid.
+fn popup_placement(line_top: f64, line_bottom: f64, rows: usize, area_h: f64) -> Placement {
+    let want = (rows as f64 * COMPLETION_ROW_H).min(COMPLETION_MAX_H) + COMPLETION_BORDER;
+    let below_top = line_bottom + COMPLETION_LINE_H;
+    let room_below = (area_h - COMPLETION_EDGE_PAD - below_top).max(0.0);
+    let room_above = (line_top - COMPLETION_LINE_H - COMPLETION_EDGE_PAD).max(0.0);
+    // A flipped popup hangs from its *bottom*, so its height has to be pinned rather
+    // than left to the content: `COMPLETION_ROW_H` is a measurement, and if the real
+    // rows come out a hair taller the box would grow back down over the caret line.
+    // Capping it means an under-estimate costs a few scrolled pixels in a list that
+    // already scrolls, which is the cheaper way to be wrong.
+    let above = |h: f64| Placement {
+        top: (line_top - COMPLETION_LINE_H - h).max(0.0),
+        max_h: h - COMPLETION_BORDER,
+    };
+    // An unmeasured pane (height 0 until the first layout) keeps the plain
+    // below-the-caret placement rather than flipping on a height that isn't real.
+    if area_h <= 0.0 || want <= room_below {
+        return Placement {
+            top: below_top,
+            max_h: COMPLETION_MAX_H,
+        };
+    }
+    if want <= room_above {
+        return above(want);
+    }
+    // Neither side fits the whole list: take the roomier one and shorten to it.
+    if room_below >= room_above {
+        Placement {
+            top: below_top,
+            max_h: (room_below - COMPLETION_BORDER).max(COMPLETION_MIN_H),
+        }
+    } else {
+        above(room_above.max(COMPLETION_MIN_H + COMPLETION_BORDER))
+    }
+}
+
+/// Width one suggestion row wants, from its already-measured text widths, rounded
+/// up and with `COMPLETION_SLACK_W` of air. The annotation columns are optional; the
+/// chrome around them isn't (see the `COMPLETION_*_W` consts for what each term is).
+fn row_width(name_w: f64, table_w: f64, detail_w: f64) -> f64 {
+    (COMPLETION_ICON_W
+        + name_w
+        + COMPLETION_GAP_W
+        + table_w
+        + COMPLETION_DETAIL_GAP
+        + detail_w
+        + 2.0 * COMPLETION_ROW_PAD
+        + COMPLETION_SLACK_W)
+        .ceil()
+}
+
+/// The list's natural width: its widest row, measured through the same font system
+/// the rows paint with (`measure_text_px_at`), so the box is sized to what is
+/// actually in it. Before this the popup was a flat `min_width(320)`, which left a
+/// list of one-letter column names three-quarters empty.
+fn natural_width(items: &[Suggestion]) -> f64 {
+    // Each measurement builds a `TextLayout`, and this runs over the whole list on
+    // every keystroke — most keyword rows carry no table and no detail at all, so
+    // short-circuit the empty ones rather than laying out an empty string 80 times.
+    fn text_w(s: &str, size: f32) -> f64 {
+        if s.is_empty() {
+            0.0
+        } else {
+            measure_text_px_at(s, size)
+        }
+    }
+    items
+        .iter()
+        .map(|it| {
+            row_width(
+                text_w(&it.text, COMPLETION_NAME_SIZE),
+                text_w(
+                    &annotation_label(&it.table, &it.alias),
+                    COMPLETION_ANNOT_SIZE,
+                ),
+                text_w(&it.detail, COMPLETION_ANNOT_SIZE),
+            )
+        })
+        .fold(0.0_f64, f64::max)
+        + COMPLETION_BORDER
+}
+
+/// Set the suggestion list and the width it wants in one step, so the two can't get
+/// out of step. Every path that fills `comp.items` goes through here.
+fn set_items(comp: Completion, items: Vec<Suggestion>) {
+    comp.width.set(natural_width(&items));
+    comp.items.set(items);
+}
+
+/// A column row's mid annotation: its owning table, plus the in-scope alias when it
+/// has one. Shared with the row builder so the measurement can't drift from what is
+/// drawn.
+fn annotation_label(table: &str, alias: &str) -> String {
+    // No table means no annotation — the row builder omits the node entirely, and an
+    // orphan alias would measure width the row never draws.
+    if table.is_empty() {
+        String::new()
+    } else if alias.is_empty() {
+        table.to_string()
+    } else {
+        format!("{table} {alias}")
+    }
+}
+
+/// The width the popup is drawn at: its `natural` width, floored so a short list
+/// isn't a sliver, capped so one long function signature ellipsizes instead of
+/// dragging every row out with it, then capped again by the pane it has to fit in.
+fn popup_w(natural: f64, area_w: f64) -> f64 {
+    let want = natural.clamp(COMPLETION_MIN_W, COMPLETION_MAX_W);
+    // Width 0 until the pane is first laid out — no cap to apply yet.
+    if area_w <= 0.0 {
+        return want;
+    }
+    // A pane narrower than the floor wins over the floor: better a cramped list
+    // than one that starts outside the editor.
+    want.min((area_w - 2.0 * COMPLETION_EDGE_PAD).max(0.0))
+}
+
+/// Left edge of a popup `w` wide against a caret at `caret_x` (viewport-relative)
+/// in an `area_w`-wide pane.
+///
+/// Under the caret, slid left as far as it takes to keep the right edge inside the
+/// pane. It used to be `COMPLETION_GUTTER + caret_x` flat, so completing near the
+/// right edge ran the list off the pane and `.clip()` cut every row's annotations
+/// off mid-word — worse still with the AI panel hidden, where the editor's right
+/// edge is the window's.
+fn popup_x(caret_x: f64, w: f64, area_w: f64) -> f64 {
+    let want = COMPLETION_GUTTER + caret_x;
+    if area_w <= 0.0 {
+        return want.max(0.0);
+    }
+    // Right edge first, then left: a popup wider than the pane starts flush at 0
+    // rather than at a negative x, which would hide the names rather than the
+    // details and defeat the whole point.
+    want.min(area_w - COMPLETION_EDGE_PAD - w).max(0.0)
+}
+
 /// Update the signature-help state for the caret. Independent of the suggestion
 /// list — runs on every edit so it appears the moment the caret enters a builtin's
 /// parentheses (including right after accepting `func()`), and clears when it leaves.
@@ -431,7 +608,7 @@ pub(crate) fn recompute_completions(
         comp.suppress.set(false);
         if !force && !after_dot {
             comp.open.set(false);
-            comp.items.set(Vec::new());
+            set_items(comp, Vec::new());
             return;
         }
     }
@@ -456,21 +633,22 @@ pub(crate) fn recompute_completions(
     if prefix.is_empty() && matches!(ctx, ClauseCtx::Column) {
         let catalog = build_catalog(db_nodes, active_db);
         if let Some(pred) = intel::join_condition(&text, lo, hi, offset, &catalog, dialect) {
-            let mut cpoint = ed.points_of_offset(offset, CursorAffinity::Backward).1;
-            cpoint.y += EDITOR_PAD_TOP;
-            comp.point.set(cpoint);
-            comp.items.set(vec![Suggestion {
-                text: pred,
-                kind: SuggestKind::Column,
-                detail: "foreign key".to_string(),
-                table: String::new(),
-                alias: String::new(),
-                // A purple key-square marks the ready-to-insert FK join predicate.
-                icon: icons::KEY_SQUARE,
-                key: KeyKind::Foreign,
-                insert: None,
-                replace: None,
-            }]);
+            set_anchor(ed, comp, offset);
+            set_items(
+                comp,
+                vec![Suggestion {
+                    text: pred,
+                    kind: SuggestKind::Column,
+                    detail: "foreign key".to_string(),
+                    table: String::new(),
+                    alias: String::new(),
+                    // A purple key-square marks the ready-to-insert FK join predicate.
+                    icon: icons::KEY_SQUARE,
+                    key: KeyKind::Foreign,
+                    insert: None,
+                    replace: None,
+                }],
+            );
             comp.sel.set(0);
             comp.open.set(true);
             return;
@@ -483,7 +661,7 @@ pub(crate) fn recompute_completions(
     // explicitly requested (Ctrl+Space).
     if prefix.is_empty() && !qualified && !force && !cont.auto_show {
         comp.open.set(false);
-        comp.items.set(Vec::new());
+        set_items(comp, Vec::new());
         return;
     }
 
@@ -876,13 +1054,9 @@ pub(crate) fn recompute_completions(
         })
         .collect();
 
-    // `.1` = the point BELOW the caret (line bottom) in editor-area coords, +the
-    // editor's top padding (which `points_of_offset` doesn't count).
-    let mut cpoint = ed.points_of_offset(offset, CursorAffinity::Backward).1;
-    cpoint.y += EDITOR_PAD_TOP;
-    comp.point.set(cpoint);
+    set_anchor(ed, comp, offset);
     let open = !items.is_empty();
-    comp.items.set(items);
+    set_items(comp, items);
     comp.sel.set(0);
     comp.open.set(open);
 }
@@ -922,7 +1096,7 @@ pub(crate) fn accept_completion(ed: &Editor, comp: Completion) {
             .update(|c| c.set_offset(from + caret, false, false));
     }
     comp.open.set(false);
-    comp.items.set(Vec::new());
+    set_items(comp, Vec::new());
 }
 
 /// `SELECT *` expansion for the candidate at the caret, or `None`. Cheap-guards on
@@ -1014,8 +1188,26 @@ fn suggest_icon_color(kind: SuggestKind, key: KeyKind) -> floem::peniko::Color {
     }
 }
 
-// Floating suggestion list, positioned just below the caret.
-pub(crate) fn completion_popup(comp: Completion) -> impl IntoView {
+/// Floating suggestion list, anchored to the caret and kept inside the editor pane.
+///
+/// `area_h`/`area_w` are `editor_area`'s measured size and `viewport` the editor's
+/// live scroll rect. Between them the popup follows the caret while it scrolls,
+/// flips above the line rather than spilling over the results grid, and slides left
+/// rather than off the pane's right edge.
+pub(crate) fn completion_popup(
+    comp: Completion,
+    area_h: RwSignal<f64>,
+    area_w: RwSignal<f64>,
+    viewport: RwSignal<Rect>,
+) -> impl IntoView {
+    // The anchor is in content coords, so the viewport origin comes off here — in a
+    // reactive read, which is what keeps the popup pinned to the caret while the
+    // editor scrolls under it. Returns the caret line's (top, bottom) and x.
+    let anchor = move || {
+        let vp = viewport.get();
+        let p = comp.point.get();
+        (comp.line_top.get() - vp.y0, p.y - vp.y0, p.x - vp.x0)
+    };
     dyn_container(
         // Keyed on open/items only — NOT `sel`. The selection highlight reads
         // `comp.sel` reactively per row (below), so moving the selection repaints in
@@ -1025,6 +1217,7 @@ pub(crate) fn completion_popup(comp: Completion) -> impl IntoView {
             if !open || items.is_empty() {
                 return empty().into_any();
             }
+            let rows_n = items.len();
             let rows: Vec<AnyView> = items
                 .into_iter()
                 .enumerate()
@@ -1045,10 +1238,10 @@ pub(crate) fn completion_popup(comp: Completion) -> impl IntoView {
                     // `suggest_icon_color`): a column's type family tinted gold (PK) /
                     // purple (FK), a table/db icon, or the muted `square-function`
                     // mark for keywords/functions.
-                    let lead: AnyView = icons::icon(icon, 13.0)
+                    let lead: AnyView = icons::icon(icon, COMPLETION_ICON_SIZE as f32)
                         .style(move |s| {
                             s.color(suggest_icon_color(kind, key))
-                                .margin_right(7.0)
+                                .margin_right(COMPLETION_ICON_W - COMPLETION_ICON_SIZE)
                                 .flex_shrink(0.0_f32)
                         })
                         .into_any();
@@ -1060,27 +1253,37 @@ pub(crate) fn completion_popup(comp: Completion) -> impl IntoView {
                     let table_ref = if table.is_empty() {
                         empty().into_any()
                     } else {
-                        let label = if alias.is_empty() {
-                            table
-                        } else {
-                            format!("{table} {alias}")
-                        };
-                        text(label)
-                            .style(|s| s.font_size(12.0).color(theme::text_dim()))
+                        text(annotation_label(&table, &alias))
+                            .style(|s| {
+                                s.font_size(COMPLETION_ANNOT_SIZE)
+                                    .color(theme::text_dim())
+                                    .min_width(0.0)
+                                    .text_ellipsis()
+                            })
                             .into_any()
                     };
                     // Name (kind-tinted) on the left; annotations right-aligned. The
-                    // selected/hovered background spans the full row width. 14px
-                    // matches the editor.
+                    // selected/hovered background spans the full row width.
+                    //
+                    // Give way in annotation-first order when the box is narrower than
+                    // the row wants (a caret near the pane's right edge, or a pane too
+                    // narrow for `COMPLETION_MAX_W`): the name never shrinks — it's the
+                    // thing being picked — and the two dim columns ellipsize.
                     h_stack((
                         lead,
-                        text(name).style(move |s| s.font_size(14.0).color(color)),
-                        empty().style(|s| s.flex_grow(1.0_f32).min_width(24.0)),
+                        text(name).style(move |s| {
+                            s.font_size(COMPLETION_NAME_SIZE)
+                                .color(color)
+                                .flex_shrink(0.0_f32)
+                        }),
+                        empty().style(|s| s.flex_grow(1.0_f32).min_width(COMPLETION_GAP_W)),
                         table_ref,
                         text(detail).style(|s| {
-                            s.font_size(12.0)
+                            s.font_size(COMPLETION_ANNOT_SIZE)
                                 .color(theme::text_muted())
-                                .margin_left(18.0)
+                                .margin_left(COMPLETION_DETAIL_GAP)
+                                .min_width(0.0)
+                                .text_ellipsis()
                         }),
                     ))
                     .style(move |s| {
@@ -1088,7 +1291,7 @@ pub(crate) fn completion_popup(comp: Completion) -> impl IntoView {
                             .flex_row()
                             .items_center()
                             .width_full()
-                            .padding_horiz(10.0)
+                            .padding_horiz(COMPLETION_ROW_PAD)
                             .padding_vert(5.0)
                             .hover(|s| s.background(theme::completion_active()));
                         // Selection highlight, read reactively so keyboard nav
@@ -1104,16 +1307,34 @@ pub(crate) fn completion_popup(comp: Completion) -> impl IntoView {
                 .collect();
             // Each row's id, so the scroll can follow the keyboard selection.
             let row_ids: Vec<floem::ViewId> = rows.iter().map(|v| v.id()).collect();
-            let list = v_stack_from_iter(rows).style(|s| s.flex_col().width_full());
+            // An explicit width, NOT `width_full()`. A percentage resolves against the
+            // parent's *definite* width, and a `scroll` lays its child out against
+            // max-content available space instead — so `width_full()` here silently
+            // became "as wide as the widest row", the rows never stretched to the box,
+            // and that widest row then sat exactly on its own ellipsis boundary (its
+            // `main` truncated to `m…` while every shorter row rendered clean). The
+            // rows have to span the popup, so the popup's width is what they get: the
+            // outer box minus its border, from the same `popup_w` the box uses.
+            let list = v_stack_from_iter(rows).style(move |s| {
+                let w = popup_w(comp.width.get(), area_w.get());
+                s.flex_col().width(w - COMPLETION_BORDER)
+            });
             // The scroll makes an overflowing list navigable by wheel; `scroll_to_view`
             // keeps the keyboard-selected row visible. `autohide` gives it the shared
             // thin, auto-hiding scrollbar (same as the schema tree / history / etc.).
             // The surface (bg #14151A, #373942 outline, rounded) + `.clip()` live on
             // the wrapping container so the full-width row highlights round to the
             // corners.
+            // The height cap comes from the same placement the outer style uses, so a
+            // list squeezed against the top or bottom of the pane shortens instead of
+            // overhanging it.
             container(
                 autohide(scroll(list).scroll_to_view(move || row_ids.get(comp.sel.get()).copied()))
-                    .style(|s| s.width_full().max_height(260.0)),
+                    .style(move |s| {
+                        let (line_top, line_bot, _) = anchor();
+                        let place = popup_placement(line_top, line_bot, rows_n, area_h.get());
+                        s.width_full().max_height(place.max_h)
+                    }),
             )
             .style(|s| {
                 s.width_full()
@@ -1127,19 +1348,24 @@ pub(crate) fn completion_popup(comp: Completion) -> impl IntoView {
         },
     )
     .style(move |s| {
-        // A high z-index lifts the popup above the results pane below it: the popup
-        // overflows the (unclipped) editor pane and, without this, the later-painted
-        // results grid draws over it (paint order = tree order). z-index gives the
-        // vger renderer a global ordering so the popup composites last. Set
-        // unconditionally so it applies whenever the popup is shown.
+        // A high z-index lifts the popup above the results pane below it: a list that
+        // can't fit inside the editor pane still overhangs the (unclipped) pane, and
+        // without this the later-painted results grid draws over it (paint order =
+        // tree order). z-index gives the vger renderer a global ordering so the popup
+        // composites last. Set unconditionally so it applies whenever it's shown.
         let s = s.z_index(1000);
         if comp.open.get() {
-            let p = comp.point.get();
+            let (line_top, line_bot, caret_x) = anchor();
+            let rows = comp.items.with(Vec::len);
+            let place = popup_placement(line_top, line_bot, rows, area_h.get());
+            // An explicit width, not `min_width`/`max_width`: the left edge has to be
+            // computed against the width to slide the box back inside the pane, and a
+            // flex-resolved width isn't knowable here.
+            let w = popup_w(comp.width.get(), area_w.get());
             s.absolute()
-                .inset_left(COMPLETION_GUTTER + p.x)
-                .inset_top(p.y + COMPLETION_LINE_H)
-                .min_width(320.0)
-                .max_width(640.0)
+                .inset_left(popup_x(caret_x, w, area_w.get()))
+                .inset_top(place.top)
+                .width(w)
         } else {
             s
         }
@@ -1151,7 +1377,7 @@ pub(crate) fn completion_popup(comp: Completion) -> impl IntoView {
 /// right of the caret. Hidden while the suggestion list is open so the two never
 /// stack — the hint returns the moment the list closes (empty arg slot, a literal,
 /// or nothing left to complete). The suggestion list stays useful for column args.
-pub(crate) fn signature_popup(comp: Completion) -> impl IntoView {
+pub(crate) fn signature_popup(comp: Completion, viewport: RwSignal<Rect>) -> impl IntoView {
     const SIG_HELP_H: f64 = 48.0;
     // Nudged right of the caret so it doesn't sit on top of the cursor.
     const SIG_HELP_DX: f64 = 30.0;
@@ -1194,15 +1420,19 @@ pub(crate) fn signature_popup(comp: Completion) -> impl IntoView {
     .style(move |s| {
         let s = s.z_index(1001);
         if comp.sig.get().is_some() && !comp.open.get() {
+            // `sig_point` is in content coords; the viewport origin comes off here so
+            // the hint tracks the caret as the editor scrolls (see `set_anchor`).
+            let vp = viewport.get();
             let p = comp.sig_point.get();
+            let (px, py) = (p.x - vp.x0, p.y - vp.y0);
             // Above the caret when there's room; otherwise below the line (near line 1).
-            let top = if p.y >= SIG_HELP_H {
-                p.y - SIG_HELP_H
+            let top = if py >= SIG_HELP_H {
+                py - SIG_HELP_H
             } else {
-                p.y + COMPLETION_LINE_H
+                py + COMPLETION_LINE_H
             };
             s.absolute()
-                .inset_left(COMPLETION_GUTTER + p.x + SIG_HELP_DX)
+                .inset_left(COMPLETION_GUTTER + px + SIG_HELP_DX)
                 .inset_top(top)
                 .max_width(560.0)
         } else {
@@ -1214,8 +1444,15 @@ pub(crate) fn signature_popup(comp: Completion) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::{
-        SuggestKind, call_parens_follow, completion_insertion, database_suggestion_visible,
-        recency_bonus, statement_identifiers,
+        KeyKind, SuggestKind, Suggestion, call_parens_follow, completion_insertion,
+        database_suggestion_visible, natural_width, popup_placement, popup_w, popup_x,
+        recency_bonus, row_width, statement_identifiers,
+    };
+    use crate::consts::{
+        COMPLETION_BORDER, COMPLETION_DETAIL_GAP, COMPLETION_EDGE_PAD, COMPLETION_GAP_W,
+        COMPLETION_GUTTER, COMPLETION_ICON_W, COMPLETION_LINE_H, COMPLETION_MAX_H,
+        COMPLETION_MAX_W, COMPLETION_MIN_H, COMPLETION_MIN_W, COMPLETION_ROW_H, COMPLETION_ROW_PAD,
+        COMPLETION_SLACK_W,
     };
     use std::collections::HashSet;
 
@@ -1301,5 +1538,172 @@ mod tests {
         let (s, c) = completion_insertion("orders", false, false);
         assert_eq!(s, "orders");
         assert_eq!(c, 6);
+    }
+
+    // ── Popup placement ─────────────────────────────────────────────────────
+    // The caret line is 24px tall in these; `area_h` is the editor pane's height.
+
+    /// Box height for `rows` suggestions, i.e. what `popup_placement` has to fit.
+    fn want(rows: usize) -> f64 {
+        (rows as f64 * COMPLETION_ROW_H).min(COMPLETION_MAX_H) + COMPLETION_BORDER
+    }
+
+    #[test]
+    fn popup_hangs_below_the_caret_when_the_list_fits_there() {
+        // Line 2 of a 248px pane: 5 rows (122px) fit under it with room to spare.
+        let p = popup_placement(29.0, 53.0, 5, 248.0);
+        assert_eq!(p.top, 53.0 + COMPLETION_LINE_H);
+        assert_eq!(p.max_h, COMPLETION_MAX_H);
+    }
+
+    #[test]
+    fn popup_flips_above_the_caret_when_the_list_would_overhang() {
+        // The reported bug: completing on the last line drew the list down over the
+        // results grid. The same list now hangs above the caret line instead.
+        let (line_top, line_bot, area_h) = (197.0, 221.0, 248.0);
+        let p = popup_placement(line_top, line_bot, 5, area_h);
+        assert_eq!(p.top, line_top - COMPLETION_LINE_H - want(5));
+        // Pinned to the predicted height, not the cap — a flipped popup grows
+        // downwards over the caret line otherwise.
+        assert_eq!(p.max_h, want(5) - COMPLETION_BORDER);
+        // …and the whole box now lands inside the pane, which is the point.
+        assert!(p.top >= 0.0);
+        assert!(p.top + want(5) <= area_h);
+    }
+
+    #[test]
+    fn a_full_length_list_is_capped_and_still_fits_above() {
+        // 40 rows clamp to COMPLETION_MAX_H, so a tall pane can still flip it whole.
+        let p = popup_placement(400.0, 424.0, 40, 500.0);
+        assert_eq!(want(40), COMPLETION_MAX_H + COMPLETION_BORDER);
+        assert_eq!(p.top, 400.0 - COMPLETION_LINE_H - want(40));
+        assert_eq!(p.max_h, COMPLETION_MAX_H);
+    }
+
+    #[test]
+    fn a_list_too_tall_for_either_side_shortens_to_the_roomier_one() {
+        // Caret past the middle of a short pane: below has 130 − 4 − 93 = 33px,
+        // above has 86 − 3 − 4 = 79px, so it goes above, shortened to 79.
+        let p = popup_placement(86.0, 90.0, 20, 130.0);
+        assert_eq!(p.max_h, 79.0 - COMPLETION_BORDER);
+        assert_eq!(p.top, 86.0 - COMPLETION_LINE_H - 79.0);
+        assert!(p.top >= 0.0);
+        // Mirrored: a caret near the top leaves more room below, so it stays below.
+        let q = popup_placement(10.0, 34.0, 20, 100.0);
+        assert_eq!(q.top, 34.0 + COMPLETION_LINE_H);
+        assert_eq!(
+            q.max_h,
+            100.0 - COMPLETION_EDGE_PAD - (34.0 + COMPLETION_LINE_H) - COMPLETION_BORDER
+        );
+    }
+
+    #[test]
+    fn a_squeezed_list_stops_shrinking_at_the_minimum() {
+        // Both sides are hopeless (a 40px pane). It keeps two readable rows and
+        // overhangs rather than collapsing to a sliver — but never above y=0.
+        let p = popup_placement(30.0, 34.0, 20, 40.0);
+        assert!(p.max_h >= COMPLETION_MIN_H);
+        assert!(p.top >= 0.0);
+    }
+
+    // ── Popup width and horizontal placement ────────────────────────────────
+
+    /// A suggestion with the given name/table/detail; the rest doesn't affect width.
+    fn sugg(name: &str, table: &str, detail: &str) -> Suggestion {
+        Suggestion {
+            text: name.to_string(),
+            kind: SuggestKind::Column,
+            detail: detail.to_string(),
+            table: table.to_string(),
+            alias: String::new(),
+            icon: "",
+            key: KeyKind::None,
+            insert: None,
+            replace: None,
+        }
+    }
+
+    #[test]
+    fn the_natural_width_is_the_widest_row_not_the_last_one() {
+        let narrow = natural_width(&[sugg("id", "", "")]);
+        let wide = natural_width(&[
+            sugg("id", "", ""),
+            sugg("customer_reference_number", "orders", "varchar(255)"),
+            sugg("n", "", ""),
+        ]);
+        assert!(wide > narrow, "{wide} should exceed {narrow}");
+        // Chrome alone is the floor for an empty-ish row: nothing measures negative.
+        assert!(narrow >= row_width(0.0, 0.0, 0.0) + COMPLETION_BORDER);
+        // An empty list has no rows to measure, so it wants nothing.
+        assert_eq!(natural_width(&[]), COMPLETION_BORDER);
+    }
+
+    #[test]
+    fn a_row_is_never_sized_to_exactly_its_own_content() {
+        // The `main` → `m…` regression: a box sized to the widest row's exact content
+        // puts that row on its ellipsis boundary. Every prediction carries slack.
+        let bare = COMPLETION_ICON_W
+            + 40.0
+            + COMPLETION_GAP_W
+            + 0.0
+            + COMPLETION_DETAIL_GAP
+            + 26.0
+            + 2.0 * COMPLETION_ROW_PAD;
+        assert!(
+            row_width(40.0, 0.0, 26.0) >= bare + COMPLETION_SLACK_W,
+            "a row must ask for more than it strictly needs"
+        );
+        // And the list inherits it, so the widest row has room in the box.
+        let items = [sugg("parent", "", "main"), sugg("v", "", "main")];
+        assert!(natural_width(&items) > row_width(40.21, 0.0, 26.14) - COMPLETION_SLACK_W);
+    }
+
+    #[test]
+    fn a_narrow_list_gets_a_narrow_box_and_a_wide_one_is_capped() {
+        // The floor stops a list of one-letter column names coming up as a sliver.
+        assert_eq!(popup_w(80.0, 1000.0), COMPLETION_MIN_W);
+        // Between the two it's sized to its content — this is what replaced the flat
+        // `min_width(320)` that left short rows three-quarters empty.
+        assert_eq!(popup_w(300.0, 1000.0), 300.0);
+        // And a long function signature ellipsizes rather than dragging the box out.
+        assert_eq!(popup_w(2000.0, 5000.0), COMPLETION_MAX_W);
+    }
+
+    #[test]
+    fn the_pane_caps_the_width_even_below_the_floor() {
+        // A 200px pane beats the 230px floor: cramped beats starting off the edge.
+        assert_eq!(popup_w(400.0, 200.0), 200.0 - 2.0 * COMPLETION_EDGE_PAD);
+        // Unmeasured pane — nothing to cap against yet.
+        assert_eq!(popup_w(300.0, 0.0), 300.0);
+    }
+
+    #[test]
+    fn the_popup_slides_left_to_keep_its_right_edge_in_the_pane() {
+        // Caret comfortably inside: straight under it, as before.
+        assert_eq!(popup_x(100.0, 300.0, 900.0), COMPLETION_GUTTER + 100.0);
+        // The reported bug — caret near the right edge, so the box shifts left far
+        // enough to land inside instead of being clipped mid-row.
+        let x = popup_x(500.0, 300.0, 600.0);
+        assert_eq!(x, 600.0 - COMPLETION_EDGE_PAD - 300.0);
+        assert!(x + 300.0 <= 600.0);
+        assert!(x < COMPLETION_GUTTER + 500.0, "it must have moved left");
+    }
+
+    #[test]
+    fn a_popup_wider_than_the_pane_starts_flush_rather_than_off_the_left() {
+        // Names matter more than details, so the left edge wins the tie.
+        assert_eq!(popup_x(200.0, 700.0, 400.0), 0.0);
+        // Unmeasured pane: the plain under-the-caret x, never negative.
+        assert_eq!(popup_x(50.0, 300.0, 0.0), COMPLETION_GUTTER + 50.0);
+        assert_eq!(popup_x(-500.0, 300.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn an_unmeasured_pane_keeps_the_plain_below_the_caret_placement() {
+        // Height is 0 until the first layout; flipping on that would put the popup
+        // above the editor entirely.
+        let p = popup_placement(197.0, 221.0, 5, 0.0);
+        assert_eq!(p.top, 221.0 + COMPLETION_LINE_H);
+        assert_eq!(p.max_h, COMPLETION_MAX_H);
     }
 }
