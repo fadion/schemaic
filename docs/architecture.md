@@ -2376,7 +2376,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   capability. **Deriving the dialect is the same question**: `Engine::dialect()` is the one
   exhaustive answer, and the hand-written `if engine == Postgres { Postgres } else { MySql }` that
   stood in for it in `app::mcp` and `app::main` is exactly how SQLite came to be lexed by MySQL's
-  rules on the AI path (see `schemaic-app` below). **No exceptions** —
+  rules on the AI path (see `schemaic-app` below). The **terminal's DB-client button** was the last
+  of that shape to fall (`open_db_cli`): `if is_postgres { psql } else { mysql }` handed a SQLite
+  connection to the MySQL client along with the inert `127.0.0.1:3306` a *file* connection carries,
+  so the button either reported no client or opened a session against an unrelated local server and
+  badged it with this connection's name. It is a `match` on `Engine` now, with `sqlite_shell` as the
+  third arm — **native `PATH` only, no WSL fallback**, because a host and port mean the same thing on
+  both sides of that boundary and a *path* does not: `sqlite3 'C:\data\app.db'` inside WSL doesn't
+  fail, it creates an empty database under that literal name. The same arm is why `wrap_launcher`
+  takes `Option<(var, password)>` — a client with no credential sets no variable and names none in
+  `WSLENV`, which is not the same as passing an empty password. **No exceptions** —
   `intel::tokenize_range` (the mid-edit byte-position *fallback*) is dialect-aware too, and so are the
   `intel` entry points that reach it (`clause_context`/`clause_continuation`/`join_targets`/
   `expand_star`/`signature_help` all take a `SqlDialect`). It additionally lifts a **quoted identifier**
