@@ -77,6 +77,43 @@ impl SqlDialect {
             SqlDialect::MySql
         }
     }
+
+    /// The columns every base table exposes **without declaring them**, lower-case.
+    ///
+    /// A table's introspected column list is not everything a statement may name.
+    /// SQLite gives every rowid table `rowid` and its two aliases `_rowid_` and
+    /// `oid`; PostgreSQL gives every table the system columns of its §5.5 (`ctid`,
+    /// `tableoid` and the four transaction ids). MySQL has none. So this is the
+    /// answer to "is this name a column of that table" that the catalogue cannot
+    /// give, and the diagnostics ask it before flagging a name as unknown.
+    ///
+    /// **Schemaic writes the SQLite one itself**, which is how the omission showed:
+    /// a keyless table's browse statement is `SELECT rowid, * FROM notes ORDER BY
+    /// rowid ASC`, and the editor squiggled `rowid` twice — the app calling the SQL
+    /// it had just generated broken.
+    ///
+    /// Two deliberate imprecisions, both erring the way this module always errs (a
+    /// false "unknown column" is worse than a missed one):
+    /// - a `WITHOUT ROWID` table really has no `rowid`, and the model doesn't record
+    ///   which tables those are, so the name is accepted for all of them;
+    /// - PostgreSQL's `oid` is a column of the system catalogues only, so it is
+    ///   **not** in the Postgres list — a plain `SELECT oid FROM my_table` there is
+    ///   the error it looks like.
+    pub fn implicit_columns(self) -> &'static [&'static str] {
+        match self {
+            SqlDialect::MySql => &[],
+            SqlDialect::Postgres => &["ctid", "tableoid", "xmin", "xmax", "cmin", "cmax"],
+            SqlDialect::Sqlite => &["rowid", "_rowid_", "oid"],
+        }
+    }
+
+    /// Is `name` one of [`SqlDialect::implicit_columns`]? Case-insensitive, as
+    /// column names are on every engine Schemaic speaks to.
+    pub fn is_implicit_column(self, name: &str) -> bool {
+        self.implicit_columns()
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(name))
+    }
 }
 
 // ── Keyword data ─────────────────────────────────────────────────────────────
@@ -2411,7 +2448,7 @@ pub fn diagnostics(sql: &str, catalog: &Catalog, dialect: SqlDialect) -> Vec<Dia
                     // A single SELECT/query → per-scope column resolution (aware of
                     // subqueries / derived tables / CTEs; qualified + unqualified).
                     [ast @ sqlparser::ast::Statement::Query(_)] => {
-                        colres::check(sql, lo, hi, catalog, ast, &mut out)
+                        colres::check(sql, lo, hi, catalog, dialect, ast, &mut out)
                     }
                     // Other statements (UPDATE/DELETE/…) → the flat qualified scan.
                     _ => qualified_column_checks(sql, lo, hi, catalog, dialect, &mut out),
@@ -3192,6 +3229,8 @@ fn qualified_column_checks(
         };
         if let Some(cols) = catalog.columns_of(&table)
             && !cols.iter().any(|c| c.eq_ignore_ascii_case(col))
+            // The engine's own undeclared columns are in no catalogue.
+            && !dialect.is_implicit_column(col)
         {
             out.push(Diagnostic {
                 range: (w[2].at, w[2].end),
@@ -3277,6 +3316,7 @@ mod colres {
         lo: usize,
         hi: usize,
         catalog: &Catalog,
+        dialect: super::SqlDialect,
         ast: &Statement,
         out: &mut Vec<Diagnostic>,
     ) {
@@ -3285,6 +3325,10 @@ mod colres {
             stmt,
             lo,
             catalog,
+            // Resolved once here rather than carried as a dialect: what the deeper
+            // walk needs is the *names* a base table exposes undeclared, and that
+            // keeps the engine question at this boundary.
+            implicit: dialect.implicit_columns(),
             ctes: HashMap::new(),
             scopes: Vec::new(),
             refs: Vec::new(),
@@ -3303,6 +3347,10 @@ mod colres {
         stmt: &'a str,
         lo: usize,
         catalog: &'a Catalog,
+        /// The engine's undeclared columns ([`super::SqlDialect::implicit_columns`]),
+        /// added to every **base table** source — not to a derived table or a CTE,
+        /// which expose only what their projection selects.
+        implicit: &'static [&'static str],
         /// CTE name (lower) → its output columns. Populated as queries are visited.
         ctes: HashMap<String, Cols>,
         scopes: Vec<Scope>,
@@ -3400,7 +3448,8 @@ mod colres {
         /// Record a scope for `sel` covering byte `range`, resolving its FROM sources
         /// against the catalog + the CTEs registered so far.
         fn push_scope(&mut self, range: (usize, usize), sel: &Select) {
-            let (sources, proj_aliases) = build_sources(sel, self.catalog, &self.ctes);
+            let (sources, proj_aliases) =
+                build_sources(sel, self.catalog, self.implicit, &self.ctes);
             let (coalesced, natural) = coalesced_cols(sel);
             group_by_check(
                 sel,
@@ -3539,13 +3588,14 @@ mod colres {
     fn build_sources(
         sel: &Select,
         catalog: &Catalog,
+        implicit: &'static [&'static str],
         ctes: &HashMap<String, Cols>,
     ) -> (Vec<Src>, HashSet<String>) {
         let mut sources = Vec::new();
         for twj in &sel.from {
-            add_source(&twj.relation, &mut sources, catalog, ctes);
+            add_source(&twj.relation, &mut sources, catalog, implicit, ctes);
             for join in &twj.joins {
-                add_source(&join.relation, &mut sources, catalog, ctes);
+                add_source(&join.relation, &mut sources, catalog, implicit, ctes);
             }
         }
         (sources, proj_aliases(sel))
@@ -3731,6 +3781,7 @@ mod colres {
         factor: &TableFactor,
         sources: &mut Vec<Src>,
         catalog: &Catalog,
+        implicit: &'static [&'static str],
         ctes: &HashMap<String, Cols>,
     ) {
         match factor {
@@ -3770,9 +3821,20 @@ mod colres {
                     db,
                 };
                 let cols = match catalog.table_status(&tref) {
+                    // The engine's undeclared columns join the introspected ones, so
+                    // `rowid` on SQLite resolves through the same scope walk as a real
+                    // column — including the ambiguity count, which is what SQLite
+                    // itself reports for `rowid` over two tables.
                     TableStatus::Found => catalog
                         .columns_of(&tref)
-                        .map(|c| Cols::Known(c.iter().map(|s| s.to_ascii_lowercase()).collect()))
+                        .map(|c| {
+                            Cols::Known(
+                                c.iter()
+                                    .map(|s| s.to_ascii_lowercase())
+                                    .chain(implicit.iter().map(|s| s.to_string()))
+                                    .collect(),
+                            )
+                        })
                         .unwrap_or(Cols::Open),
                     _ => Cols::Open, // not loaded / not found → can't judge its columns
                 };
@@ -3798,9 +3860,9 @@ mod colres {
             TableFactor::NestedJoin {
                 table_with_joins, ..
             } => {
-                add_source(&table_with_joins.relation, sources, catalog, ctes);
+                add_source(&table_with_joins.relation, sources, catalog, implicit, ctes);
                 for join in &table_with_joins.joins {
-                    add_source(&join.relation, sources, catalog, ctes);
+                    add_source(&join.relation, sources, catalog, implicit, ctes);
                 }
             }
             _ => sources.push(open_src()),
@@ -5997,6 +6059,130 @@ mod tests {
             .filter(|d| d.message.starts_with("Column "))
             .map(|d| d.message)
             .collect()
+    }
+
+    // ── the columns a table has without declaring them ─────────────────────────
+    //
+    // **A table's introspected column list is not everything it exposes.** SQLite
+    // gives every rowid table `rowid`/`_rowid_`/`oid`, and Schemaic *writes* the
+    // first one itself: a keyless table's browse statement is
+    // `SELECT rowid, * FROM notes ORDER BY rowid ASC`, which the editor then
+    // squiggled twice as an unknown column — the app telling the user the SQL it had
+    // just generated was broken.
+
+    fn col_errors_d(sql: &str, dialect: SqlDialect) -> Vec<String> {
+        diag_d(sql, dialect)
+            .into_iter()
+            .filter(|d| d.message.starts_with("Column "))
+            .map(|d| d.message)
+            .collect()
+    }
+
+    /// The statement the app generates for a keyless SQLite table, verbatim.
+    #[test]
+    fn diag_sqlite_rowid_is_not_an_unknown_column() {
+        let e = col_errors_d(
+            r#"SELECT rowid, * FROM employees ORDER BY rowid ASC LIMIT 100"#,
+            SqlDialect::Sqlite,
+        );
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn diag_sqlite_rowid_aliases_and_case_are_all_clean() {
+        for sql in [
+            "SELECT rowid FROM employees",
+            "SELECT _rowid_ FROM employees",
+            "SELECT oid FROM employees",
+            "SELECT ROWID FROM employees",
+            // Qualified, through the per-scope resolver…
+            "SELECT e.rowid FROM employees e",
+            "SELECT employees.rowid FROM employees",
+            // …and through the flat scan a non-SELECT takes.
+            "UPDATE employees SET name = 'x' WHERE employees.rowid = 2",
+            "DELETE FROM employees WHERE employees.rowid = 2",
+        ] {
+            let e = col_errors_d(sql, SqlDialect::Sqlite);
+            assert!(e.is_empty(), "{sql}: {e:?}");
+        }
+    }
+
+    /// PostgreSQL's system columns are the same case: always present, never in the
+    /// introspected list.
+    #[test]
+    fn diag_postgres_system_columns_are_not_unknown_columns() {
+        for sql in [
+            "SELECT ctid FROM employees",
+            "SELECT xmin, xmax FROM employees",
+            "SELECT employees.tableoid FROM employees",
+        ] {
+            let e = col_errors_d(sql, SqlDialect::Postgres);
+            assert!(e.is_empty(), "{sql}: {e:?}");
+        }
+    }
+
+    /// **The exemption is per engine, which is the half that makes it a fix rather
+    /// than a blanket silence.** MySQL has no such column, so the same text there is
+    /// the error it always was — as is `ctid` on SQLite and `rowid` on PostgreSQL.
+    #[test]
+    fn diag_an_implicit_column_of_another_engine_is_still_flagged() {
+        for (sql, dialect) in [
+            ("SELECT rowid FROM employees", SqlDialect::MySql),
+            ("SELECT rowid FROM employees", SqlDialect::Postgres),
+            ("SELECT e.rowid FROM employees e", SqlDialect::MySql),
+            ("SELECT ctid FROM employees", SqlDialect::Sqlite),
+            ("SELECT _rowid_ FROM employees", SqlDialect::MySql),
+        ] {
+            let e = col_errors_d(sql, dialect);
+            assert_eq!(e.len(), 1, "{sql} on {dialect:?}: {e:?}");
+        }
+    }
+
+    /// And a column that really isn't there is still flagged on SQLite — the
+    /// exemption is the implicit names, not "SQLite columns aren't checked".
+    #[test]
+    fn diag_sqlite_still_flags_a_real_unknown_column() {
+        let e = col_errors_d("SELECT salery FROM employees", SqlDialect::Sqlite);
+        assert_eq!(e.len(), 1, "{e:?}");
+        let e = col_errors_d("SELECT e.salery FROM employees e", SqlDialect::Sqlite);
+        assert_eq!(e.len(), 1, "{e:?}");
+    }
+
+    /// Two sources both carrying `rowid` is genuinely ambiguous — SQLite says
+    /// `ambiguous column name: rowid` — so the implicit names go through the same
+    /// resolution as declared ones rather than round the side of it.
+    #[test]
+    fn diag_sqlite_rowid_from_two_tables_is_ambiguous() {
+        let e = col_errors_d(
+            "SELECT rowid FROM employees, departments",
+            SqlDialect::Sqlite,
+        );
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("ambiguous"), "{e:?}");
+    }
+
+    /// Being a real column of the table also means the `GROUP BY` check treats it as
+    /// one: it warns about a bare `rowid` exactly as it warns about a bare `name`,
+    /// where before it skipped it as "not a column here". Asserted as the two being
+    /// *the same*, since what matters is that an implicit column isn't a special case
+    /// downstream of the resolver.
+    #[test]
+    fn diag_an_implicit_column_is_grouped_like_a_declared_one() {
+        let implicit = diag_d(
+            "SELECT rowid FROM employees GROUP BY name",
+            SqlDialect::Sqlite,
+        );
+        let declared = diag_d(
+            "SELECT salary FROM employees GROUP BY name",
+            SqlDialect::Sqlite,
+        );
+        assert_eq!(implicit.len(), declared.len(), "{implicit:?} {declared:?}");
+        assert!(
+            implicit
+                .iter()
+                .all(|d| d.severity == Severity::Warning && d.message.contains("GROUP BY")),
+            "{implicit:?}"
+        );
     }
 
     #[test]
