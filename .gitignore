@@ -2,6 +2,14 @@
 /target
 **/*.rs.bk
 
+# Velopack packaging output. `dist/` is the staged pack directory and `Releases/`
+# is what `vpk pack` writes into — both are produced by `release.yml`, and both
+# get recreated locally when rehearsing a release by hand
+# (`review/user-verify-autoupdate.md`, §2). Around 105 MB of binaries between
+# them, and a stray `git add -A` would happily commit the lot.
+/dist/
+/Releases/
+
 # Generated third-party license manifest (regenerate with cargo-about)
 /THIRD-PARTY-LICENSES.html
 
