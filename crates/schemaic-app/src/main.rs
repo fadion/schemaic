@@ -187,6 +187,15 @@ fn main() {
     //
     // With no hook args present (the normal user launch) `run()` returns
     // immediately, so this costs nothing on a cold start.
+    //
+    // It does one more thing worth knowing, and we rely on the default: Velopack's
+    // `auto_apply_on_startup` is **on**, so if a previous session downloaded an
+    // update and the user never took the restart, `run()` finds the staged package
+    // here and applies it — exiting and relaunching before anything below has run.
+    // That is safe *because* of where this sits: no session state has been read or
+    // written yet, so there is nothing to lose. Placed after the tab restore it
+    // would be a data-loss bug. Turn it off with `.set_auto_apply_on_startup(false)`
+    // if the surprise restart ever proves more annoying than the updates are worth.
     velopack::VelopackApp::build().run();
 
     tracing_subscriber::fmt()
