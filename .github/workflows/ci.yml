@@ -21,10 +21,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      # `apt-get update` has hung on GitHub's runners twice now — an hour on the
+      # v0.16.0 release build, forty minutes on a v0.16.2 CI run — while other
+      # jobs in the *same run* sailed through the identical step. A stalled mirror
+      # or a held dpkg lock doesn't fail, it just sits, and a job's default
+      # timeout is six hours, so nothing rescues it: the run has to be noticed by
+      # a human and cancelled.
+      #
+      # So bound it twice. `timeout` caps each individual attempt, which turns a
+      # stall into a quick non-zero exit the loop can retry — that is the part
+      # that actually recovers, since retrying is exactly what worked by hand
+      # both times. `timeout-minutes` is the backstop for the case where every
+      # attempt stalls: the job then fails in minutes instead of burning an
+      # afternoon. Failing all three attempts still falls through to the install,
+      # which may well succeed against the image's existing package lists.
       - name: Install Linux GUI build dependencies
+        timeout-minutes: 8
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev pkg-config
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get update -o Acquire::Retries=3; then
+              break
+            fi
+            echo "::warning::apt-get update stalled or failed (attempt $attempt of 3), retrying"
+            sleep 5
+          done
+          sudo timeout 300 apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -59,11 +81,21 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
+      # Bounded and retried for the reason spelled out on the lint job's copy of
+      # this step above.
       - name: Install Linux GUI build dependencies
         if: runner.os == 'Linux'
+        timeout-minutes: 8
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev pkg-config
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get update -o Acquire::Retries=3; then
+              break
+            fi
+            echo "::warning::apt-get update stalled or failed (attempt $attempt of 3), retrying"
+            sleep 5
+          done
+          sudo timeout 300 apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
