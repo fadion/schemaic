@@ -438,12 +438,34 @@ fn single_column_unique_indexes(conn: &SqliteConn, table: &str) -> Result<Vec<St
 /// fires. SQLite then returns `SQLITE_INTERRUPT` from the step in flight, which
 /// arrives here as an ordinary error and is reported as [`DbError::Cancelled`]
 /// rather than as a failure — the user asked for this one.
+/// Refuse work whose token was already cancelled when the call was made.
+///
+/// Every cancellable path below ends in a `tokio::select!` between the blocking
+/// task and `cancel.cancelled()`, and **`select!` polls its ready branches in
+/// random order**. On a small table the blocking task finishes almost at once,
+/// so with an already-cancelled token *both* branches are ready and the answer
+/// came back roughly half the time — which is exactly how
+/// `a_cancelled_count_stops_instead_of_answering` failed on CI while passing
+/// locally for weeks.
+///
+/// Checking first makes that case deterministic rather than a coin flip, and it
+/// is the honest answer besides: nothing has run yet, so there is nothing to
+/// report but the cancellation. It says nothing about a token cancelled *during*
+/// a scan, which is a real race and is still resolved by the `select!`.
+fn refuse_if_cancelled(cancel: &CancellationToken) -> Result<(), DbError> {
+    if cancel.is_cancelled() {
+        return Err(DbError::Cancelled);
+    }
+    Ok(())
+}
+
 pub(crate) async fn fetch_query(
     db: &Db,
     sql: &str,
     row_cap: usize,
     cancel: CancellationToken,
 ) -> Result<ResultSet, DbError> {
+    refuse_if_cancelled(&cancel)?;
     let sql = sql.to_string();
     let db = db.clone();
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -576,6 +598,7 @@ pub(crate) async fn commit_writes(
     write: &GridWrite,
     cancel: CancellationToken,
 ) -> Result<u64, DbError> {
+    refuse_if_cancelled(&cancel)?;
     if write.is_empty() {
         return Ok(0);
     }
@@ -686,6 +709,7 @@ pub(crate) async fn refetch_rows(
     rows: &[RefetchRow],
     cancel: CancellationToken,
 ) -> Result<Vec<(usize, Vec<Value>)>, DbError> {
+    refuse_if_cancelled(&cancel)?;
     if rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -1313,6 +1337,7 @@ pub(crate) async fn count_rows(
     sql: &str,
     cancel: CancellationToken,
 ) -> Result<u64, DbError> {
+    refuse_if_cancelled(&cancel)?;
     let sql = sql.to_string();
     let db = db.clone();
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3334,6 +3359,45 @@ mod tests {
         let stats = db.fetch_table_stats(MAIN).await.expect("no error");
         assert!(stats.is_empty());
         assert!(stats.get(None, "t").is_none());
+    }
+
+    /// **A write cancelled before it starts writes nothing**, and says so.
+    ///
+    /// The count path had this same bug and only a coin flip revealed it (see
+    /// `refuse_if_cancelled`): with the token already cancelled, `select!` found
+    /// both the finished work and the cancellation ready and picked at random. On
+    /// a *write* that coin flip is worse than a wrong number — the losing side
+    /// tells the user "cancelled" over a transaction that committed, or commits
+    /// one they cancelled. This pins the deterministic half: nothing ran, so
+    /// nothing changed, and the error says exactly that.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_cancelled_before_it_starts_changes_nothing() {
+        let (keeper, db) = shared_memory("commit_cancelled");
+        keeper
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO t VALUES (1, 'a');",
+            )
+            .unwrap();
+        let write = GridWrite {
+            updates: vec![edit("t", &[("v", Some("B"))], &[("id", Value::Int(1))])],
+            inserts: Vec::new(),
+            deletes: Vec::new(),
+        };
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let err = commit_writes(&db, &write, token)
+            .await
+            .expect_err("a cancelled write must not report a row count");
+        assert!(matches!(err, DbError::Cancelled), "{err}");
+
+        // The row is untouched — the whole point, and the half a "cancelled"
+        // report would be lying about.
+        let v: String = keeper
+            .query_row("SELECT v FROM t WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, "a");
     }
 
     #[tokio::test]
