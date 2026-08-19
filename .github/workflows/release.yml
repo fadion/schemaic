@@ -81,7 +81,70 @@ jobs:
           Copy-Item licenses/Lucide-LICENSE.txt dist/
           Compress-Archive -Path dist/* -DestinationPath "schemaic-${{ github.ref_name }}-${{ matrix.target }}.zip"
 
+      # ── Velopack: the auto-updating Windows installer ────────────────────
+      # The .zip above stays as the *portable* artifact (no auto-update, no
+      # install); everything below produces the primary one — a per-user
+      # Setup.exe that installs to %LocalAppData% with no UAC prompt, and the
+      # packages the installed app polls this same Release for.
+      #
+      # **These are unsigned, deliberately** — see the packaging section of the
+      # private todo.md. A self-signed certificate would buy nothing here (it
+      # chains to no trusted root, so SmartScreen still says "Unknown publisher"
+      # and no reputation accrues), so this ships honestly unsigned until a real
+      # cert exists. Adding one later is a `--signParams` argument on `vpk pack`,
+      # not a rework of any of this.
+      - name: Install the Velopack CLI (Windows)
+        if: runner.os == 'Windows'
+        run: dotnet tool install -g vpk
+
+      # The previous release's packages, so `vpk pack` can compute a delta against
+      # them — an update then downloads only what changed instead of the whole
+      # app. Non-fatal by design: the first tagged release has no predecessor to
+      # fetch, and a missing delta only costs bandwidth, never correctness.
+      - name: Fetch the previous release for delta computation (Windows)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: vpk download github --repoUrl https://github.com/${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }}
+
+      # Packs the same `dist/` the portable .zip was built from, so the installed
+      # app carries the licence notices too. `--noPortable` because we already
+      # publish our own portable .zip and two of them would just be confusing.
+      # `--packId` is the app's permanent identity: an installed app only accepts
+      # updates carrying the *same* id, so changing it later orphans every
+      # existing install.
+      - name: Package with Velopack (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          vpk pack `
+            --packId Schemaic `
+            --packVersion $version `
+            --packDir dist `
+            --mainExe schemaic.exe `
+            --packTitle Schemaic `
+            --packAuthors "Schemaic contributors" `
+            --icon assets/icon.ico `
+            --noPortable
+          "VPK_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Publish to the GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: schemaic-${{ github.ref_name }}-${{ matrix.target }}.*
+
+      # Uploaded separately from the archives above, and scoped to *this*
+      # version's file names on purpose: the delta step above leaves the previous
+      # release's .nupkg files sitting in `Releases/` too, and a bare `Releases/*`
+      # glob would re-attach those to the new Release. `releases.win.json` is the
+      # manifest installed apps poll, so it must be here for auto-update to work
+      # at all.
+      - name: Publish the Velopack artifacts (Windows)
+        if: runner.os == 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Releases/*Setup.exe
+            Releases/Schemaic-${{ env.VPK_VERSION }}-full.nupkg
+            Releases/Schemaic-${{ env.VPK_VERSION }}-delta.nupkg
+            Releases/releases.win.json
+          fail_on_unmatched_files: false

@@ -16,6 +16,7 @@ mod claude_cli;
 mod heap;
 mod mcp;
 mod secrets;
+mod update;
 
 /// Process-wide heap accounting (live/peak bytes), for leak-vs-retention
 /// diagnosis. Delegates to the system allocator; only adds two atomics per
@@ -167,6 +168,26 @@ fn main() {
         rt.block_on(mcp::serve(endpoint));
         return;
     }
+
+    // Velopack's startup hook, and it has to run before *everything* below —
+    // before tracing, the font registration, the tokio runtime and any Floem
+    // signal or `Scope`. The installer and the updater re-invoke this exe with
+    // `--veloapp-install` / `--veloapp-updated` / `--veloapp-obsolete` /
+    // `--veloapp-uninstall` / `--veloapp-firstrun` to run lifecycle work, and
+    // `run()` services those and then **terminates the process**. Anything set up
+    // ahead of it is built only to be thrown away — or worse, half-initialised
+    // when the process dies mid-hook.
+    //
+    // The one thing it deliberately sits *after* is the `--mcp-serve` early exit
+    // above, which is a different program: a stdio JSON-RPC server whose stdout is
+    // the protocol stream, so nothing may write to stdout ahead of it. The two
+    // never collide — the `--veloapp-*` args come from the installer, `--mcp-serve`
+    // from the `claude` CLI, and neither invocation passes the other's flag — so
+    // ordering between them is free, and this way the protocol stream stays clean.
+    //
+    // With no hook args present (the normal user launch) `run()` returns
+    // immediately, so this costs nothing on a cold start.
+    velopack::VelopackApp::build().run();
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -6483,6 +6504,12 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let resources = RwSignal::new(schemaic_core::resource::ResourceSample::default());
     start_resource_monitor(resources);
 
+    // One background update check per launch. Returns the "Restart to update"
+    // action; both are inert (and the check never reaches the network) unless this
+    // is a Velopack-installed build — see `update::start`.
+    let update_state = RwSignal::new(schemaic_core::update::UpdateState::default());
+    let apply_update = update::start(cx, &handle, window, update_state);
+
     let ui = Ui {
         tabs_ui: TabsUi {
             tabs,
@@ -6804,6 +6831,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         db_favorites,
         save_db_favorites,
         resources,
+        update_state,
+        apply_update,
     };
     // Every config file has been loaded by now. If any of them was unreadable it
     // was preserved as `.corrupt` and recovered from the backup or defaults —

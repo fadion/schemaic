@@ -100,6 +100,7 @@ use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{CommitDone, GridWrite, QueryState, RefetchRequest};
 use schemaic_core::resource::ResourceSample;
 use schemaic_core::tx::{TabTx, TxMode, TxState, write_blocking_tabs};
+use schemaic_core::update::UpdateState;
 
 /// The grid-commit completion callback, invoked on the UI thread with the outcome.
 pub type CommitDoneFn = Rc<dyn Fn(CommitDone)>;
@@ -2312,6 +2313,15 @@ pub struct Ui {
     /// The app process's own CPU/RAM usage, sampled on a timer at the app
     /// boundary and shown in the status bar. Transient (never persisted).
     pub resources: RwSignal<ResourceSample>,
+    /// How far the background auto-updater has got. Driven at the app boundary
+    /// (Velopack talks to the GitHub Releases feed on a worker thread); the footer
+    /// renders whatever [`UpdateState::label`] returns, which for most of the
+    /// life of most sessions is nothing at all. Transient (never persisted).
+    pub update_state: RwSignal<UpdateState>,
+    /// Restart into the staged update. Only ever called while
+    /// [`UpdateState::is_actionable`] holds — the footer segment is inert
+    /// otherwise — because Velopack exits the process to hand over to the updater.
+    pub apply_update: Rc<dyn Fn()>,
 }
 
 /// Which panel occupies the right column. AI and Terminal are mutually
@@ -6188,6 +6198,8 @@ fn footer(ui: Ui) -> impl IntoView {
     let popup_width = ui.overlay.popup_width;
     let toggle_read_only = ui.conn_actions.toggle_read_only.clone();
     let resources = ui.resources;
+    let update_state = ui.update_state;
+    let apply_update = ui.apply_update.clone();
     let ai_model = ui.ai.model;
     let ai_effort = ui.ai.effort;
 
@@ -6662,10 +6674,48 @@ fn footer(ui: Ui) -> impl IntoView {
     )
     .style(|s| s.margin_left(15.0));
 
+    // Auto-update notice. Absent — a genuinely zero-footprint `empty()` — for all
+    // of a normal session: `label()` returns `None` while idle, while the check is
+    // in flight, and when it fails, so the bar looks exactly as it did before this
+    // feature existed unless there is something to say.
+    //
+    // Placed first in the left group and **not** wrapped in `collapsing_seg`,
+    // unlike every other segment. That is the whole point of putting it here: the
+    // collapsing segments hide right-to-left as the window narrows, so anywhere
+    // among them the one message the user must not miss would be among the first
+    // to go. Sitting ahead of them uncollapsed, it instead pushes their edges
+    // right and makes *them* collapse sooner — the priority the right way round —
+    // and it costs no layout at all in the overwhelmingly common empty case.
+    let update_seg = dyn_container(
+        move || update_state.get(),
+        move |st| {
+            let Some(label) = st.label() else {
+                return empty().into_any();
+            };
+            // Only the staged state is clickable; "Updating… 40%" is a progress
+            // readout, and a click on it mid-download has nothing to apply.
+            if !st.is_actionable() {
+                return footer_text(label);
+            }
+            let apply = apply_update.clone();
+            text(label)
+                .style(|s| s.font_size(theme::FONT_STATUS))
+                .on_click_stop(move |_| apply())
+                .style(|s| {
+                    s.items_center()
+                        .color(theme::chip_active())
+                        .hover(|s| s.color(theme::text()))
+                })
+                .into_any()
+        },
+    )
+    .style(|s| s.items_center().margin_left(15.0));
+
     // The schema toggle always stays (it's a control, and leftmost); every status
     // segment after it collapses right-to-left as the AI icon nears it.
     let left_group = h_stack((
         schema_icon,
+        update_seg,
         collapsing_seg(cursor_seg, ai_x),
         collapsing_seg(tabs_seg, ai_x),
         collapsing_seg(wrap_seg, ai_x),

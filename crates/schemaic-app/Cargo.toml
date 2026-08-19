@@ -19,6 +19,7 @@ tokio = { workspace = true, features = ["process", "io-util", "io-std"] }
 tokio-util = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = { workspace = true }
+velopack = { workspace = true }
 crossbeam-channel = "0.5"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

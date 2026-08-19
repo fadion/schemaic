@@ -1288,6 +1288,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     - `resource.rs` — the status bar's CPU/RAM model. `ResourceSample::new` divides `sysinfo`'s
       per-process CPU% (single-core-relative, so it exceeds 100 on a multi-core box) across the
       logical core count to give a whole-machine 0..=100. Sampling itself stays at the app boundary.
+    - `update.rs` — the auto-update state model: `resource.rs`'s neighbour in the status bar and in
+      spirit, and the pure half of the Velopack plumbing in `schemaic-app`'s `update.rs`.
+      `check_gate(opt_out, installed)` answers whether a launch may check at all, and both of its
+      refusals are ordinary outcomes rather than errors, so neither is shown to anyone: `OptedOut`
+      (`SCHEMAIC_NO_UPDATE_CHECK`, read through `opt_out_requested`, which accepts `1`/`true`/`yes`/
+      `on` case-insensitively and nothing else — a `=0` left in a shell profile means what it says,
+      and the empty string a bare `set VAR=` leaves behind is not an opt-out) and `NotInstalled` (a
+      portable-zip extraction, a `cargo run` dev build, a distro package). `UpdateState` is what the
+      footer renders, and two of its rules are why it is a type rather than a pair of signals.
+      **`label()` returns `None` for `Idle`, `Checking` *and* `Failed`** — a background check that
+      finds nothing, or that cannot reach GitHub, is completely invisible, so the bar looks exactly
+      as it did before the feature existed for most of most sessions; the failure is logged, not
+      surfaced, and the next launch retries. And **`with_progress` only mutates `Downloading`**:
+      Velopack's progress channel can still deliver a tick queued behind the end of the download, and
+      folding it in blindly would replace "Restart to update" with "Updating… 100%" — a dead segment
+      where the offer the user was about to click had been
+      (`a_late_tick_cannot_rewind_a_staged_update`). `clamp_pct` is there because that channel
+      carries a plain `i16`, so nothing at the type level stops a `-1` sentinel or a `101`.
     - `text.rs` — `plural(n, one, many)`, returning only the noun form so a humanized count
       (`"1.2k"`) can be displayed while the singular/plural decision still follows the true `n`;
       `human_count` (`1250` → `1.25k`), the **row-count** printer, shared by the grid's stats line
@@ -1861,7 +1879,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     double-click are decided in **one** handler off `PointerDown`'s multi-click `count`, since
     starting an OS move loop on press can eat the second press before `DoubleClick` fires; and
     close calls `close_window`, **not `quit_app`**, because only the former runs
-    `WindowHandle::destroy` → `WindowClosed` → `flush_session`, the write that saves open tabs.
+    `WindowHandle::destroy` → `WindowClosed` → `flush_session`, the write that saves open tabs — the
+    same reason the auto-updater hands over with `close_window` rather than Velopack's
+    `apply_updates_and_restart` (`app/update.rs`).
     The eight zones are spread into the stack that wraps the app root as **loose siblings** —
     never under a full-window parent, which would swallow every press in the app (see *Floem 0.2
     gotchas*, "a full-window sibling ends the pointer walk"); they wrap the root rather than
@@ -2254,6 +2274,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     terminal panel. The shared types living in the crate root is what stalls further splitting: the
     root depends on the leaves (`mod`) and the leaves depend on the root (types), so a view builder
     can't move out until the types do.
+    The footer's **update segment** (`update_state` + `apply_update` on `Ui`, alongside `resources`)
+    is placed first in the left group, right after the schema-tree toggle icon, and is the one status
+    segment deliberately **not** wrapped in `collapsing_seg`. Those hide right-to-left as the window
+    narrows, so anywhere among them the update notice would be among the first to disappear;
+    uncollapsed and ahead of them it instead pushes their edges right and makes *them* collapse
+    sooner. It renders a zero-footprint `empty()` whenever `UpdateState::label()` is `None`, which is
+    most of most sessions, and is clickable only while `is_actionable()` holds — "Updating… 40%" is a
+    progress readout, and a click on it mid-download would have nothing to apply.
 - `schemaic-app` — `main.rs` wires signals + callbacks and builds the `Ui`; also the built-in MCP
   server (`--mcp-serve`) the AI panel talks to. A query tab's identity is `(conn_id, database)`;
   the app resolves `conn_id` → `Db` at run time (`db_for`), so a tab keeps its connection after a
@@ -2357,6 +2385,37 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     real leak or benign allocator/OS retention. Live returning to its baseline after a table closes
     while the working set stays high is the allocator holding freed pages for reuse; live *not*
     returning is the leak.
+  - `update.rs` — the Velopack half of `core::update`: one background check per launch, and the
+    "Restart to update" action `start` hands back for the footer. **Velopack's API is synchronous and
+    does network + file I/O**, so every call into it runs under `handle.spawn_blocking` and comes back
+    through Floem's async→UI seam — `create_ext_action` for the start-of-download and settle hops,
+    `create_signal_from_channel` for progress. The forwarding thread between the two channels is not
+    ceremony: Velopack reports progress on a `std::sync::mpsc::Sender<i16>` while
+    `create_signal_from_channel` wants a crossbeam receiver and must be called on the UI thread, and
+    `download_updates` blocks the worker for the whole download, so nothing on that thread is free to
+    drain the ticks. The feed is a `GithubSource` on `https://github.com/fadion/schemaic`, read
+    anonymously — 60 requests/hour per IP, which one check per launch is nowhere near.
+    `UpdateManager::new` *failing* is how "not a Velopack install" is detected, and is what feeds
+    `check_gate`; a downgrade (`UpdateInfo::IsDowngrade` — a yanked release, or a dev build ahead of
+    the tag) is skipped rather than walking the user backwards silently. The apply action builds its
+    `create_ext_action` per click because that returns an `FnOnce` and the segment stays on screen
+    until the window actually goes.
+    **The apply action calls `wait_exit_then_apply_updates` and then `floem::close_window`, never
+    `apply_updates_and_restart`.** The restart-now call exits this process on the spot, which would
+    skip the `WindowClosed` handler `flush_session` hangs off and lose up to one debounce interval of
+    unsaved tab text — the same reasoning the caption bar's close button carries in
+    `ui::window_chrome`. Closing the window runs the normal shutdown, and the updater we just handed
+    off to is already sitting there waiting for this process to go away.
+    **`main.rs` runs `velopack::VelopackApp::build().run()` near the top of `main`**, before tracing,
+    the font registration, the tokio runtime and any Floem signal or `Scope`: the installer and the
+    updater re-invoke the exe with `--veloapp-*` args, and `run()` services those and then
+    *terminates the process*, so anything set up ahead of it is either built to be thrown away or
+    half-initialised when the process dies mid-hook. With no hook args it returns immediately, so a
+    normal launch pays nothing. It sits deliberately *after* the `--mcp-serve` early exit, which is a
+    different program — a stdio JSON-RPC server whose stdout is the protocol stream, so nothing may
+    write to stdout ahead of it. The two flag sets never co-occur (one comes from the installer, the
+    other from the `claude` CLI), so the ordering between them is free, and this way the protocol
+    stream stays clean.
 
 ## Architecture invariants (don't regress these)
 
