@@ -1,9 +1,9 @@
 //! Auto-update plumbing — the Velopack half of [`schemaic_core::update`].
 //!
 //! One background check per launch: ask the GitHub Releases feed, download the
-//! update (delta when Velopack can compute one), stage it, and let the footer
-//! offer a restart. The decisions worth testing — whether to check, what the
-//! footer says, which progress ticks may move the state — live in the core module
+//! update (delta when Velopack can compute one), stage it, and let the header's
+//! update chip offer a restart. The decisions worth testing — whether to check,
+//! what the chip says, which progress ticks may move the state — live in the core
 //! and are unit-tested there; what's here is the I/O and the thread hops.
 //!
 //! **Velopack's API is synchronous and does network + file I/O**, so every call
@@ -29,6 +29,25 @@ const RELEASE_REPO: &str = "https://github.com/fadion/schemaic";
 /// Set this to `1`/`true`/`yes`/`on` to stop the app contacting GitHub at all.
 const OPT_OUT_VAR: &str = "SCHEMAIC_NO_UPDATE_CHECK";
 
+/// A development switch, and it **must stay `false` in anything committed**.
+///
+/// Flip it to `true` to pin the state at [`UpdateState::Ready`] on startup and
+/// skip the real check, which is the only way to look at the header's
+/// "Restart to update" chip: every other route to that state needs two tagged
+/// releases and a genuine update in flight, so the one piece of UI the feature
+/// exists to show is otherwise unreachable while working on it.
+///
+/// The real check has to be *skipped* rather than merely pre-empted — on a dev
+/// build it settles to `NotInstalled` → `Idle` within milliseconds and would wipe
+/// the pinned state before it was ever drawn.
+///
+/// Harmless while on: nothing is staged, so the chip is inert and clicking it
+/// does nothing (see [`apply_action`], which returns early on an empty `staged`).
+/// Shipped as `true` it would show every user a permanent restart offer that
+/// silently does nothing, which is why it is called out here rather than left as
+/// a quiet constant.
+const FORCE_UPDATE_BADGE: bool = false;
+
 /// Build an `UpdateManager` for the release feed.
 ///
 /// Fails when this isn't a Velopack-managed install — a portable-zip extraction,
@@ -42,7 +61,7 @@ fn manager() -> Result<UpdateManager, velopack::Error> {
 /// Start the one-shot background update check and return the action that applies
 /// what it staged.
 ///
-/// The returned closure is what the footer's "Restart to update" segment calls.
+/// The returned closure is what the header's "Restart to update" chip calls.
 /// It is a no-op until something is staged, so it's safe to wire unconditionally.
 pub fn start(
     cx: Scope,
@@ -55,6 +74,14 @@ pub fn start(
     // callback and the apply action) run on the UI thread, so a `RefCell` is the
     // whole of the synchronisation needed.
     let staged: Rc<RefCell<Option<VelopackAsset>>> = Rc::new(RefCell::new(None));
+
+    // Off in anything committed — see `FORCE_UPDATE_BADGE`.
+    if FORCE_UPDATE_BADGE {
+        state.set(UpdateState::Ready {
+            version: "0.16.0".to_string(),
+        });
+        return apply_action(cx, handle.clone(), window, state, staged);
+    }
 
     spawn_check(cx, handle, state, staged.clone());
     apply_action(cx, handle.clone(), window, state, staged)
@@ -92,7 +119,7 @@ fn spawn_check(
         }
     });
 
-    // Two hops back to the UI thread: one when the download starts (so the footer
+    // Two hops back to the UI thread: one when the download starts (so the chip
     // can show progress at all — `with_progress` only moves an in-flight
     // download), one when the whole thing settles.
     let begin = create_ext_action(cx, move |version: String| {
@@ -183,7 +210,7 @@ fn apply_action(
         };
         // Built per click rather than once up front: `create_ext_action` hands
         // back an `FnOnce`, and this closure has to survive being called again —
-        // the segment stays on screen until the window actually goes. We're on the
+        // the chip stays on screen until the window actually goes. We're on the
         // UI thread here (it's a click handler), which is where `create_ext_action`
         // must be called from anyway.
         let handover = create_ext_action(cx, move |launched: Result<(), String>| match launched {

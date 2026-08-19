@@ -4,7 +4,7 @@
 //! and a *synchronous* API, so it runs on a worker thread), and feeds what it
 //! learns through [`CheckGate`] and [`UpdateState`]. Nothing here talks to
 //! Velopack, so the decisions worth getting right — whether to check at all, what
-//! the footer shows, and which ticks are allowed to move the state backwards —
+//! the header chip shows, and which ticks are allowed to move the state back —
 //! are testable without an installed app or a release feed.
 
 /// Whether a background update check may run, and if not, why.
@@ -78,11 +78,11 @@ pub enum UpdateState {
 }
 
 impl UpdateState {
-    /// The footer text, or `None` when this state shows nothing at all.
+    /// The chip's text, or `None` when this state shows nothing at all.
     ///
     /// Only the two states the user can act on or is waiting for produce text.
     /// A silent background check that finds nothing — or fails — leaves the
-    /// footer exactly as it was.
+    /// header exactly as it was.
     pub fn label(&self) -> Option<String> {
         match self {
             Self::Downloading { pct, .. } => Some(format!("Updating… {pct}%")),
@@ -91,7 +91,7 @@ impl UpdateState {
         }
     }
 
-    /// Whether clicking the footer segment should do something — true only once
+    /// Whether clicking the chip should do something — true only once
     /// an update is staged and the click means "restart and apply".
     pub fn is_actionable(&self) -> bool {
         matches!(self, Self::Ready { .. })
@@ -109,7 +109,7 @@ impl UpdateState {
     ///
     /// Ticks are ignored unless a download is actually in flight. That matters
     /// because the channel outlives the download: a tick that arrives after
-    /// [`Ready`](Self::Ready) must not drag the footer back to "Updating… 100%"
+    /// [`Ready`](Self::Ready) must not drag the chip back to "Updating… 100%"
     /// and lose the restart affordance the user was about to click.
     pub fn with_progress(&self, raw_pct: i16) -> Self {
         match self {
@@ -268,7 +268,7 @@ mod tests {
     /// The regression this method exists for: Velopack's progress channel can
     /// still deliver a queued tick after `download_updates` returns, and folding
     /// it in blindly would replace the "Restart to update" affordance with
-    /// "Updating… 100%" — a dead footer segment the user can't click.
+    /// "Updating… 100%" — a dead chip the user can't click.
     #[test]
     fn a_late_tick_cannot_rewind_a_staged_update() {
         let ready = UpdateState::Ready {
