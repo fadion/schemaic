@@ -46,6 +46,7 @@ pub mod text;
 pub mod text_ops;
 pub mod transcript;
 pub mod tx;
+pub mod window_chrome;
 
 /// Product name, shown in the window title and about screen.
 pub const APP_NAME: &str = "Schemaic";

@@ -866,6 +866,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     ping-or-skip + the delay until the next tick (exponential `backoff` on consecutive failures,
     longer interval for SSH-tunnelled connections, skip while the window is unfocused / a query is
     already in flight / the tunnel isn't up). The app owns only the timer + `Db::ping`.
+  - `window_chrome.rs` — which half of the window frame the app draws itself, now that it launches
+    with `WindowConfig::show_titlebar(false)`. `Chrome::current()` answers per `Host`
+    (Windows/Linux/macOS): `draws_own_controls`, `draws_own_resize_border`, `wants_drop_shadow`,
+    `leading_inset`. **Ask the capability, never `cfg!(target_os = …)` at the use site** — the same
+    rule the engines follow, for the same reason. The split is not cosmetic: floem reads that one
+    flag as *undecorated* on Windows/Linux but as a *transparent* title bar over a full-size content
+    view on macOS, so the traffic lights, the native resize border and the move behaviour all
+    survive there. What macOS costs us instead is space — the lights are drawn over our header, so
+    `leading_inset` reserves it. The Windows half is the one with teeth: winit strips
+    `WS_CAPTION | WS_SIZEBOX` from an undecorated window, so without our own edge zones the window
+    cannot be resized at all. `ui::window_chrome` draws what this module decides.
   - `tx.rs` — the **manual-transaction** state machine behind `TxMode::Manual` (no DB, no UI).
     Two engines only: **SQLite has no manual mode**, so the status-bar segment offering it is
     hidden on such a connection and `Session::open` refuses one — not because SQLite lacks
@@ -1838,6 +1849,23 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     for `ViewOptions::column_list`. `needs_algorithm` asked `!= Postgres`, which sent a SQLite
     connection off to fetch a `SHOW CREATE VIEW` algorithm; it asks `== MySql`.
     `is_editable_view` is the entry point's gate — a materialized view is drop-only.
+  - `window_chrome.rs` — the client-side window decorations: the caption buttons (minimize /
+    maximize-restore / close), the drag strip, and the eight resize zones. Draws what
+    `core::window_chrome::Chrome` decides, and contains no `cfg!(target_os = …)` of its own.
+    `WindowChrome` holds the `WindowId` plus a `maximized` mirror — `is_maximized()` is a query, not
+    a signal — which the root's `on_resize` re-`sync`s, so the glyph follows *every* route to
+    maximizing (the button, a drag to the screen edge, Win+Up). Three shapes are load-bearing:
+    the drag strip is **its own view between the header's clusters**, because Floem dispatches
+    `PointerDown` to the deepest view first and `on_click_stop` stops `Click`, never `PointerDown` —
+    a drag handler on the header itself would fire on the connection switcher; drag and
+    double-click are decided in **one** handler off `PointerDown`'s multi-click `count`, since
+    starting an OS move loop on press can eat the second press before `DoubleClick` fires; and
+    close calls `close_window`, **not `quit_app`**, because only the former runs
+    `WindowHandle::destroy` → `WindowClosed` → `flush_session`, the write that saves open tabs.
+    The eight zones are spread into the stack that wraps the app root as **loose siblings** —
+    never under a full-window parent, which would swallow every press in the app (see *Floem 0.2
+    gotchas*, "a full-window sibling ends the pointer walk"); they wrap the root rather than
+    joining its tuple because that one is at Floem's 16-arity limit.
   - `trigger_editor.rs` — the **trigger** modal *and* the **function** modal, over `core::ddl`'s
     `TriggerSetDraft`/`FunctionDraft`. Reached from the schema context menu's per-table
     **Triggers…** entry — and from a **view's**, on every engine but MySQL, since `INSTEAD OF`
@@ -2662,6 +2690,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   empty box still has bounds: the schema tree's size badge, once it became a panel-wide absolute
   box, swallowed every click on a table row's chevron and name with the size column switched *off*
   as well — which is what made the breakage look unrelated to the feature that introduced it.
+  **The opt-out is not inheritable, so it is no help to an overlay that has its own hit targets.**
+  `should_send` is asked about the *child*, and answering no `continue`s past that whole subtree —
+  the flagged view's descendants are never offered the event, however much they want it. So an
+  overlay that both covers the window and contains something clickable cannot be one view: it has
+  to be spread as loose siblings, each small enough to be skipped on a miss. The window's eight
+  resize zones (`ui::window_chrome::resize_zones`) are exactly that shape, and they were a
+  full-window wrapper first — one holding no handler at all, on the theory that a view returning
+  `Continue` passes the press on. It does not; the walk had already ended at it, and **nothing in
+  the app was clickable**.
 - **And nothing bounds them.** An absolute child is out of flow, so text in one that is longer than
   the box lays out at its natural width and **paints across the border** into whatever sits beside
   it — not clipped, not ellipsized. `edit_field`'s placeholder did this for every field in the app

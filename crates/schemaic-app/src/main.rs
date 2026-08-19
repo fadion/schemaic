@@ -192,15 +192,30 @@ fn main() {
         .expect("build tokio runtime");
     let handle = rt.handle().clone();
 
+    // **No system title bar** — the app draws its own (`ui::window_chrome`), so
+    // the header carries the connection switcher on the left and the caption
+    // buttons on the right, in one strip.
+    //
+    // `show_titlebar(false)` rather than `undecorated(true)`, and the difference
+    // is per-platform: floem turns the former into a genuinely undecorated
+    // window on Windows/Linux, but on macOS into a *transparent* title bar over
+    // a full-size content view, which keeps the traffic lights and the native
+    // resize behaviour. `undecorated` would throw those away too, on the one
+    // platform where they still work.
+    let chrome = schemaic_core::window_chrome::Chrome::current();
     let mut config = WindowConfig::default()
         .size(Size::new(1280.0, 820.0))
+        .show_titlebar(false)
+        // Windows only, and a no-op elsewhere: keeps the DWM drop shadow (and
+        // with it the window's visual edge) behind a frameless window.
+        .undecorated_shadow(chrome.wants_drop_shadow())
         .title(schemaic_core::APP_NAME);
     if let Some(icon) = app_icon() {
         config = config.window_icon(icon);
     }
 
     Application::new()
-        .window(move |_id| app_view(handle.clone()), Some(config))
+        .window(move |id| app_view(handle.clone(), id), Some(config))
         .run();
 
     drop(rt);
@@ -810,7 +825,7 @@ fn tx_engine(db: &Db) -> TxEngine {
     }
 }
 
-fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
+fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> impl IntoView {
     let cx = Scope::current();
 
     // Load (or seed) saved connections. Secrets are hydrated from the OS keyring
@@ -6808,7 +6823,7 @@ fn app_view(handle: tokio::runtime::Handle) -> impl IntoView {
     // window stop mattering. See `flush_session`.
     {
         use floem::views::Decorators;
-        schemaic_ui::workspace(ui)
+        schemaic_ui::workspace(ui, window)
             .on_event_cont(floem::event::EventListener::WindowClosed, move |_| {
                 flush_session()
             })

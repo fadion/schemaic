@@ -40,6 +40,21 @@ pub fn bg_panel() -> Color {
 pub fn bg_editor() -> Color {
     ui().bg_editor
 }
+
+// Window caption buttons (`ui::window_chrome`) — the app draws its own now that
+// the window has no system title bar.
+pub fn caption_hover() -> Color {
+    ui().caption_hover
+} // minimize / maximize
+pub fn caption_close_hover() -> Color {
+    ui().caption_close_hover
+}
+/// The close glyph while its red hover is showing. Fixed white, like
+/// [`env_badge_text`] and for the same reason: the fill underneath is a
+/// saturated colour in every theme, so the mark on it doesn't vary with one.
+pub fn caption_close_glyph() -> Color {
+    Color::rgb8(0xFF, 0xFF, 0xFF)
+}
 // Code-editor surface — driven by the active *editor* theme.
 pub fn code_bg() -> Color {
     editor().bg

@@ -78,6 +78,17 @@ pub struct UiTheme {
     pub bg_chrome: Color,
     pub bg_panel: Color,
     pub bg_editor: Color,
+    /// Hover fill behind the window's minimize / maximize buttons. A role of its
+    /// own rather than `bg_panel`, which is what it used to borrow: one step off
+    /// `bg_chrome` is a legible lift for a *panel* filling half the window, and
+    /// almost invisible under a 46px button.
+    pub caption_hover: Color,
+    /// Hover fill behind the window's close button — a saturated red in every
+    /// theme, because it means the same thing in every theme, with a white glyph
+    /// over it (`theme::caption_close_glyph`). Not `btn_danger_hover`: that is a
+    /// *button* surface and the light theme's is a pale pink, which as a caption
+    /// close reads as a highlight rather than a warning.
+    pub caption_close_hover: Color,
     pub completion_border: Color,
     pub completion_active: Color,
     /// Outline of elevated modal panels (Find, error modal).
@@ -291,6 +302,10 @@ impl UiTheme {
             bg_chrome: c("#18191F"),
             bg_panel: c("#1B1C23"),
             bg_editor: c("#1E1F26"),
+            // Two steps above `bg_chrome` (#18191F) rather than one — enough to
+            // read as a hover without turning the caption into a lit strip.
+            caption_hover: c("#272935"),
+            caption_close_hover: c("#C42B1C"),
             completion_border: c("#373942"),
             completion_active: c("#31384C"),
             modal_border: c("#2D2F39"),
@@ -432,6 +447,12 @@ impl UiTheme {
             bg_chrome: c("#E9EBF0"),
             bg_panel: c("#F1F2F6"),
             bg_editor: c("#F6F7F9"),
+            // *Down* from `bg_chrome` (#E9EBF0), not up: on a light chrome a
+            // hover reads by getting darker, the mirror of the dark theme's lift.
+            caption_hover: c("#D6D9E2"),
+            // The same red as the dark theme. The close button's meaning doesn't
+            // change with the theme, and white-on-#C42B1C clears contrast on both.
+            caption_close_hover: c("#C42B1C"),
             completion_border: c("#D4D7E0"),
             completion_active: c("#DCE4FB"),
             modal_border: c("#D4D7E0"),

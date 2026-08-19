@@ -42,6 +42,7 @@ pub mod themes;
 mod trigger_editor;
 mod view_editor;
 mod widgets;
+mod window_chrome;
 
 use ai_panel::ai_panel;
 use connection_form::manage_modal;
@@ -89,6 +90,7 @@ use floem::views::scroll::{Handle, Rounded, Thickness, Track};
 use floem::views::{
     Decorators, Delay, LabelClass, TextInputClass, TooltipClass, TooltipContainerClass,
 };
+use floem::window::WindowId;
 use schemaic_core::connection::{ConnStatus, Connection, Environment, SshAuth};
 use schemaic_core::db_color::{DbColorRule, TableColorRule};
 use schemaic_core::favorite::FavoriteRule;
@@ -2497,8 +2499,15 @@ fn term_cell_wh(font: u16) -> (f64, f64) {
 }
 
 /// Root view: the app shell (header / body / footer) with any open overlays
-/// (connection menu, Find Anywhere, Manage Connections) stacked on top.
-pub fn workspace(ui: Ui) -> impl IntoView {
+/// (connection menu, Find Anywhere, Manage Connections) stacked on top, and the
+/// window's own resize border over all of it.
+///
+/// Takes the `WindowId` because the window has no title bar of its own any more
+/// (`WindowConfig::show_titlebar(false)`): the caption buttons in the header are
+/// ours, and they need the window to minimize, maximize and close it. See
+/// `window_chrome`.
+pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
+    let chrome = window_chrome::WindowChrome::new(window);
     let last_mouse = ui.overlay.last_mouse;
     let context_menu = ui.overlay.context_menu;
     let popup_menu = ui.overlay.popup_menu;
@@ -2535,7 +2544,7 @@ pub fn workspace(ui: Ui) -> impl IntoView {
         save_file_as: ui.tab_actions.save_sql_file_as.clone(),
     };
     let shell = v_stack((
-        header(ui.clone()),
+        header(ui.clone(), chrome),
         body(ui.clone(), schema_visible, right_panel),
         footer(ui.clone()),
     ))
@@ -2547,7 +2556,7 @@ pub fn workspace(ui: Ui) -> impl IntoView {
             .font_size(theme::FONT_TITLE)
     });
 
-    stack((
+    let root = stack((
         shell,
         conn_menu_overlay(ui.clone()),
         active_db_menu_overlay(ui.clone()),
@@ -2683,8 +2692,14 @@ pub fn workspace(ui: Ui) -> impl IntoView {
     .on_event_cont(EventListener::PointerUp, |_| {
         widgets::pointer_released().update(|n| *n = n.wrapping_add(1));
     })
-    // Publish the window size (for menu edge-flipping).
-    .on_resize(|r| window_size().set((r.width(), r.height())))
+    // Publish the window size (for menu edge-flipping), and re-read the window's
+    // maximized state — the caption glyph is a mirror of it, and this is the one
+    // event every route to maximizing (our button, a drag to the screen edge,
+    // Win+Up, the OS restoring a snapped window) has in common.
+    .on_resize(move |r| {
+        window_size().set((r.width(), r.height()));
+        chrome.sync();
+    })
     // Publish window focus (for the connection health poll). These two events
     // don't need keyboard focus, so they reach the root regardless of which
     // widget is active.
@@ -2876,11 +2891,28 @@ pub fn workspace(ui: Ui) -> impl IntoView {
             .class(TooltipContainerClass, |s| {
                 s.set(Delay, std::time::Duration::from_millis(300))
             })
-    })
+    });
+
+    // **The resize zones are spread here as eight siblings, not handed over as
+    // one view.** They have to be hit before the app, and siblings are hit in
+    // reverse tuple order, so they go after `root` — corners after edges, so a
+    // corner wins the overlap. What they must *not* do is share a full-window
+    // parent: Floem ends its pointer walk at the first child the point lands in,
+    // so such a parent eats every press in the app rather than passing the misses
+    // through (`window_chrome::WindowChrome::resize_zones` states it in full —
+    // it cost a build where nothing was clickable). Eight small siblings are each
+    // skipped on a miss, and the walk reaches `root`.
+    //
+    // They also can't join `root`'s own tuple: that one is already at Floem's
+    // 16-arity `ViewTuple` limit (see the trigger/function editors sharing an
+    // element). An outer stack is the honest shape anyway — the frame is not one
+    // more overlay in the app, it is the window around all of them.
+    let [n, s, w, e, nw, ne, sw, se] = chrome.resize_zones();
+    stack((root, n, s, w, e, nw, ne, sw, se)).style(|s| s.size_full())
 }
 
 // ── Header ────────────────────────────────────────────────────────────────
-fn header(ui: Ui) -> impl IntoView {
+fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
     let connections = ui.conn.connections;
     let active_conn = ui.conn.active_conn;
     let conn_menu_open = ui.conn.conn_menu_open;
@@ -2956,7 +2988,13 @@ fn header(ui: Ui) -> impl IntoView {
                 .color(theme::text_muted())
                 .hover(|s| s.color(theme::text()))
         });
-    let right = h_stack((search, help, settings)).style(|s| s.items_center());
+    // The glyph cluster, then the window's caption buttons hard against the right
+    // edge — the header *is* the title bar now. `settings` keeps its 20px right
+    // margin, which becomes the gap between the app's glyphs and the OS-ish
+    // controls; the buttons themselves take no outer margin, because a caption
+    // button that stops short of the corner misses the pointer thrown at it.
+    let right = h_stack((search, help, settings, chrome.controls()))
+        .style(|s| s.items_center().height_full());
 
     // Environment badge: a capsule filled with the active connection's identity
     // colour, sitting 20px right of the switcher and shown only when that
@@ -2994,8 +3032,22 @@ fn header(ui: Ui) -> impl IntoView {
         badge,
         disconnected_notice(conn_status, ui.conn_actions.recheck_conn.clone()),
     ))
-    .style(|s| s.flex_row().items_center());
-    h_stack((left, right)).style(|s| {
+    .style(move |s| {
+        // Leading space for window controls the *OS* draws over our content —
+        // macOS's traffic lights, which survive a hidden title bar and would
+        // otherwise land on top of the connection switcher. Zero elsewhere,
+        // where the controls are ours and live in `right`.
+        s.flex_row()
+            .items_center()
+            .padding_left(chrome.leading_inset())
+    });
+    // The gap between the clusters is the drag region — pressing it moves the
+    // window, double-clicking it maximizes. It has to be a view of its own: a
+    // drag handler on the header would also fire on the switcher and the glyphs,
+    // because `on_click_stop` stops `Click` and never sees `PointerDown`.
+    // `justify_between` stays as the belt to the strip's braces — it pins both
+    // clusters whatever the strip claims.
+    h_stack((left, chrome.drag_strip(), right)).style(|s| {
         s.width_full()
             .height(theme::HEADER_H)
             .min_height(theme::HEADER_H)
