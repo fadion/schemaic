@@ -124,9 +124,16 @@ jobs:
       # fetch, and a missing delta only costs bandwidth, never correctness. The
       # channel must match the one we pack with, or it fetches the *other*
       # platform's history and computes a delta against nonsense.
+      #
+      # `--timeout` is in **minutes** and defaults to **30**, which pairs badly
+      # with `continue-on-error`: the two together turn an unreachable or slow
+      # feed into half an hour of a runner sitting still, per leg, before
+      # shrugging and carrying on. 5 is roughly sixty times what the real work
+      # needs (~25 MB from GitHub's CDN, seconds on a runner), so it never binds
+      # in the good case and caps the bad one at something survivable.
       - name: Fetch the previous release for delta computation
         continue-on-error: true
-        run: vpk download github --repoUrl https://github.com/${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }} --channel ${{ matrix.channel }}
+        run: vpk download github --repoUrl https://github.com/${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }} --channel ${{ matrix.channel }} --timeout 5
 
       # Both pack steps run over the same `dist/` the portable archive was built
       # from, so the installed app carries the licence notices too. `--packId` is
