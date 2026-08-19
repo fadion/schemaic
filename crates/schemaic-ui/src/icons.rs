@@ -206,6 +206,26 @@ pub fn icon(markup: &'static str, size: f32) -> Svg {
     svg(markup.to_string()).style(move |s| s.width(size).height(size))
 }
 
+// ── Window controls ─────────────────────────────────────────────────────────
+//
+// The caption buttons for the frameless window (`window_chrome`). Not Lucide:
+// these are the platform caption glyphs, which are drawn on a 10×10 box with a
+// 1px stroke and no round caps — a Lucide `minus`/`square`/`x` at this size
+// reads as a chunky toolbar icon rather than a title-bar control. Half-pixel
+// coordinates put the 1px stroke on the pixel grid instead of straddling it.
+
+/// Minimize — the caption bar's single rule.
+pub const WINDOW_MINIMIZE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><path d="M0 5.5h10"/></svg>"#;
+
+/// Maximize — the empty frame, shown while the window is restored.
+pub const WINDOW_MAXIMIZE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="0.5" y="0.5" width="9" height="9"/></svg>"#;
+
+/// Restore — the offset double frame, shown while the window is maximized.
+pub const WINDOW_RESTORE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><path d="M2.5 2.5v-2h7v7h-2"/><rect x="0.5" y="2.5" width="7" height="7"/></svg>"#;
+
+/// Close — the caption cross (thinner and squarer than Lucide's [`X`]).
+pub const WINDOW_CLOSE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><path d="M0.5 0.5l9 9"/><path d="M9.5 0.5l-9 9"/></svg>"#;
+
 /// A non-square icon view sized `w`×`h` (logical px), for glyphs whose viewBox
 /// isn't 1:1 (e.g. the footer AI wordmark). Tint via `.style(|s| s.color(...))`.
 pub fn icon_wh(markup: &'static str, w: f32, h: f32) -> Svg {
