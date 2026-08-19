@@ -14,6 +14,7 @@
 mod ai;
 mod claude_cli;
 mod heap;
+mod logging;
 mod mcp;
 mod secrets;
 mod update;
@@ -152,7 +153,6 @@ use schemaic_ui::{
 };
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
 
 fn main() {
     // MCP stdio server mode (launched by the `claude` CLI for the AI panel).
@@ -198,11 +198,7 @@ fn main() {
     // if the surprise restart ever proves more annoying than the updates are worth.
     velopack::VelopackApp::build().run();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("schemaic=info")),
-        )
-        .init();
+    logging::init();
 
     tracing::info!(
         "{} v{} starting",

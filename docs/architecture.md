@@ -1301,7 +1301,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       **`label()` returns `None` for `Idle`, `Checking` *and* `Failed`** — a background check that
       finds nothing, or that cannot reach GitHub, is completely invisible, so the header looks
       exactly as it did before the feature existed for most of most sessions; the failure is logged,
-      not surfaced, and the next round retries. And **`with_progress` only mutates `Downloading`**:
+      not surfaced, and the next round retries — which is only worth anything because `app::logging`
+      writes that line to a file, since on an installed build it used to go to a console that does
+      not exist. And **`with_progress` only mutates `Downloading`**:
       Velopack's progress channel can still deliver a tick queued behind the end of the download, and
       folding it in blindly would replace "Restart to update" with "Updating… 100%" — a dead chip
       where the offer the user was about to click had been
@@ -2417,6 +2419,34 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     real leak or benign allocator/OS retention. Live returning to its baseline after a table closes
     while the working set stays high is the allocator holding freed pages for reuse; live *not*
     returning is the leak.
+  - `logging.rs` — the tracing subscriber, and the log file the shipped app writes to. **The
+    installed app used to log nowhere at all.** Release builds are GUI-subsystem on Windows
+    (`windows_subsystem = "windows"`, in `main.rs`), so `tracing_subscriber`'s default stdout writer
+    hands every line to a console that does not exist; when the first auto-update failure happened
+    in the field — the header chip flashing "Updating…" and then vanishing, which is the
+    deliberately-silent `UpdateState::Failed` — the error string was dropped on the floor and
+    nothing on the machine recorded why. It was diagnosable at all only because Velopack keeps a
+    separate log for its out-of-process `Update.exe`. So `init()` installs a **file** writer always,
+    at `log_path()` — `%APPDATA%/schemaic/schemaic.log`, or the platform equivalent — in the config
+    directory beside `tabs.json` and the rest of the state, so there is one directory to point a
+    user at; that is what `core::persist::config_dir` is `pub` for. Debug builds tee to stdout on
+    top of it (`MakeWriterExt::and`). ANSI is off, because escape codes are noise in a file and the
+    file is the writer that always exists — a debug console losing its colour is the price of the
+    two agreeing. **`DEFAULT_FILTER` is `"schemaic=info,velopack=info"`, and the `velopack` half is
+    load-bearing rather than decoration.** Velopack's *in-process* half (`UpdateManager`) logs
+    through the `log` crate, which `tracing-subscriber` already bridges into `tracing`, but the old
+    `schemaic=info` filter discarded every one of those records because they carry a `velopack`
+    target — that was the other half of why the field failure was undiagnosable
+    (`the_default_filter_admits_velopack` pins it); `RUST_LOG` still overrides the pair where it is
+    set. Rotation is a size check **once per launch**, not per write: `MAX_LOG_BYTES` is 4 MB and
+    one generation is kept as `schemaic.log.1`, so the worst case on disk is twice that, and a
+    `stat` stays out of the path of every trace call. Failing to open the log is not fatal — it
+    degrades to the old stdout-only behaviour rather than refusing to start, since a read-only or
+    missing config directory is a reason to lose logs, not the app. `FileWriter`/`FileHandle` are a
+    hand-rolled `MakeWriter` over one `Arc<Mutex<File>>` rather than a dependency on
+    `tracing-appender`: the whole requirement is "append to one file", and the rotation it needs is
+    a startup size check rather than the time-based scheme that crate exists for. A poisoned lock
+    drops the line instead of panicking a second time from inside the logger.
   - `update.rs` — the Velopack half of `core::update`: a background check at startup and every three
     hours after (`RECHECK_INTERVAL`), and the "Restart to update" action `start` hands back for the
     header chip. **Velopack's API is synchronous and does network + file I/O**, so every call into it
@@ -2460,6 +2490,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     unsaved tab text — the same reasoning the caption bar's close button carries in
     `ui::window_chrome`. Closing the window runs the normal shutdown, and the updater we just handed
     off to is already sitting there waiting for this process to go away.
+    **Releases carry full packages only — `release.yml` passes `--delta None` on both platforms —
+    and that is a correctness choice, not a bandwidth one.** Deltas broke the *second* consecutive
+    update. A client that reaches version N by applying a delta ends up holding a **locally
+    reassembled** package for N rather than the one CI built: v0.16.1's package was 23,606,057 bytes
+    on the release and 23,605,881 on disk after reassembly, with a different SHA1. The delta for
+    N+1 is computed against CI's copy, so it is applied to a base the build never saw. v0.16.0 →
+    v0.16.1 worked only because that base had arrived whole from `Setup.exe`; v0.16.1 → v0.16.2
+    failed in the field, and failed *silently*, because that is what `UpdateState::Failed` does. A
+    full package always verifies against the manifest whatever route the client took to get where it
+    is. The cost is roughly 15 MB per update on Windows, and next to nothing on Linux, where the
+    delta was saving 16% against an already-compressed AppImage.
     **`main.rs` runs `velopack::VelopackApp::build().run()` near the top of `main`**, before tracing,
     the font registration, the tokio runtime and any Floem signal or `Scope`: the installer and the
     updater re-invoke the exe with `--veloapp-*` args, and `run()` services those and then
