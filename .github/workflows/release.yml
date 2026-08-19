@@ -135,12 +135,13 @@ jobs:
       - name: Install the Velopack CLI
         run: dotnet tool install -g vpk
 
-      # The previous release's packages, so `vpk pack` can compute a delta against
-      # them — an update then downloads only what changed instead of the whole
-      # app. Non-fatal by design: the first tagged release has no predecessor to
-      # fetch, and a missing delta only costs bandwidth, never correctness. The
-      # channel must match the one we pack with, or it fetches the *other*
-      # platform's history and computes a delta against nonsense.
+      # Still fetched even though `--delta None` means nothing is diffed against
+      # it: `vpk pack` reads the previous release to carry its entry forward into
+      # `releases.<channel>.json`, and a feed that lists only the newest version
+      # is a feed with no history. The channel must match the one we pack with,
+      # or it fetches the *other* platform's history.
+      #
+      # Non-fatal by design: the first tagged release has no predecessor.
       #
       # `--timeout` is in **minutes** and defaults to **30**, which pairs badly
       # with `continue-on-error`: the two together turn an unreachable or slow
@@ -148,7 +149,7 @@ jobs:
       # shrugging and carrying on. 5 is roughly sixty times what the real work
       # needs (~25 MB from GitHub's CDN, seconds on a runner), so it never binds
       # in the good case and caps the bad one at something survivable.
-      - name: Fetch the previous release for delta computation
+      - name: Fetch the previous release for the feed's history
         continue-on-error: true
         run: vpk download github --repoUrl https://github.com/${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }} --channel ${{ matrix.channel }} --timeout 5
 
@@ -161,6 +162,20 @@ jobs:
       # .zip and two of them would just be confusing. There is no such flag in
       # play on Linux — there the AppImage *is* the portable artifact, and it is
       # the thing that self-updates.
+      #
+      # **`--delta None` is not a performance choice, it is a correctness one, and
+      # it should not be reverted without understanding this.** Deltas broke the
+      # second consecutive update. A client that reaches version N by applying a
+      # delta ends up with a *locally reassembled* package for N, not the one CI
+      # built: v0.16.1's package was 23,606,057 bytes on the release and
+      # 23,605,881 on disk after reassembly, with a different SHA1. The delta for
+      # N+1 is computed against CI's copy, so it is being applied to a base the
+      # build never saw. v0.16.0 → v0.16.1 worked only because that base arrived
+      # whole from Setup.exe; v0.16.1 → v0.16.2 failed silently in the field.
+      # Full packages always verify against the manifest, whatever route the
+      # client took to get where it is. The cost is roughly 15 MB per update on
+      # Windows — and next to nothing on Linux, where the delta was saving 16%
+      # against a compressed AppImage anyway.
       - name: Package with Velopack (Windows)
         if: runner.os == 'Windows'
         run: |
@@ -174,6 +189,7 @@ jobs:
             --packAuthors "Schemaic contributors" `
             --icon assets/icon.ico `
             --channel ${{ matrix.channel }} `
+            --delta None `
             --noPortable
           "VPK_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
@@ -195,7 +211,8 @@ jobs:
             --packAuthors "Schemaic contributors" \
             --icon assets/icon.png \
             --categories Development \
-            --channel ${{ matrix.channel }}
+            --channel ${{ matrix.channel }} \
+            --delta None
           echo "VPK_VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Publish to the GitHub Release
@@ -204,14 +221,20 @@ jobs:
           files: schemaic-${{ github.ref_name }}-${{ matrix.target }}.*
 
       # Uploaded separately from the archives above, and scoped to *this* version
-      # and channel on purpose: the delta step leaves the previous release's
-      # .nupkg files sitting in `Releases/` too, and a bare `Releases/*` glob
-      # would re-attach those to the new Release. `releases.<channel>.json` is
-      # the manifest installed apps poll, so it must be here for auto-update to
-      # work at all. `fail_on_unmatched_files: false` is load-bearing three times
-      # over: the delta doesn't exist on a first release, and each job names both
-      # platforms' primary artifacts while only ever producing its own — one step
-      # covering both beats two nearly identical OS-gated ones.
+      # and channel on purpose: the fetch step above leaves the previous
+      # release's .nupkg sitting in `Releases/` too, and a bare `Releases/*` glob
+      # would re-attach it to the new Release. `releases.<channel>.json` is the
+      # manifest installed apps poll, so it must be here for auto-update to work
+      # at all.
+      #
+      # **No delta package is listed, and that is deliberate** — see `--delta
+      # None` above. A `*-delta.nupkg` appearing here would mean deltas had been
+      # switched back on, so leaving the glob out keeps this list an accurate
+      # statement of what a release contains rather than a wish.
+      #
+      # `fail_on_unmatched_files: false` because each job names both platforms'
+      # primary artifacts while only ever producing its own — one step covering
+      # both beats two nearly identical OS-gated ones.
       - name: Publish the Velopack artifacts
         uses: softprops/action-gh-release@v2
         with:
@@ -219,6 +242,5 @@ jobs:
             Releases/Schemaic-${{ matrix.channel }}-Setup.exe
             Releases/Schemaic-${{ matrix.channel }}.AppImage
             Releases/Schemaic-${{ env.VPK_VERSION }}-${{ matrix.channel }}-full.nupkg
-            Releases/Schemaic-${{ env.VPK_VERSION }}-${{ matrix.channel }}-delta.nupkg
             Releases/releases.${{ matrix.channel }}.json
           fail_on_unmatched_files: false

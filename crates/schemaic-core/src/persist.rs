@@ -375,7 +375,10 @@ pub struct ConnectionsFile {
 }
 
 /// Our config directory (`%APPDATA%/schemaic`, or XDG/`~/.config` elsewhere).
-fn config_dir() -> Option<PathBuf> {
+///
+/// Public because the app's log file lives here too, beside the state files —
+/// one directory a user can be pointed at when something needs diagnosing.
+pub fn config_dir() -> Option<PathBuf> {
     let dir = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
