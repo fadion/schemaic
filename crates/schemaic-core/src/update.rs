@@ -9,9 +9,11 @@
 
 /// Whether a background update check may run, and if not, why.
 ///
-/// The app asks this once at startup. `Allowed` is the only variant that leads to
-/// a check; the other two are ordinary, expected outcomes rather than errors, so
-/// neither is surfaced to the user.
+/// The app asks this at the start of every check round. `Allowed` is the only
+/// variant that leads to a check; the other two are ordinary, expected outcomes
+/// rather than errors, so neither is surfaced to the user — and per
+/// [`should_recheck`] either of them also ends the polling, since neither can
+/// turn into `Allowed` while the process is running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CheckGate {
     /// Check away.
@@ -24,7 +26,7 @@ pub enum CheckGate {
     NotInstalled,
 }
 
-/// Decide whether the startup update check runs.
+/// Decide whether a check round runs.
 ///
 /// `opt_out` is the raw `SCHEMAIC_NO_UPDATE_CHECK` value (`None` when unset);
 /// `installed` is Velopack's own verdict on whether this is a managed install.
@@ -73,7 +75,9 @@ pub enum UpdateState {
     Ready { version: String },
     /// The check or download failed. Deliberately invisible in the UI — a
     /// background poll that couldn't reach GitHub is not the user's problem, and
-    /// the next launch retries. Kept as a state so it can be logged and tested.
+    /// the next round retries (see [`should_recheck`], for which a failure is the
+    /// one negative outcome that re-arms). Kept as a state so it can be logged
+    /// and tested.
     Failed { message: String },
 }
 
@@ -120,6 +124,28 @@ impl UpdateState {
             other => other.clone(),
         }
     }
+}
+
+/// Whether another background check is worth arming after one has settled.
+///
+/// The check used to run once per launch, which quietly meant a session left open
+/// never learned about anything: a release published two hours into a working day
+/// went unnoticed until the app happened to be restarted, which for a database
+/// client can be days. So checks repeat — but only while repeating can still
+/// change the answer.
+///
+/// Two outcomes end the polling for good. A **staged** update is the obvious one:
+/// there is nothing better to find until the user restarts, and re-checking would
+/// only risk replacing the offer they are looking at. A **refused gate** is the
+/// less obvious one — neither `OptedOut` nor `NotInstalled` can become `Allowed`
+/// inside a running process, so re-asking is pure waste, and on a dev build it
+/// would be a timer that can never do anything.
+///
+/// A *failed* check does re-arm. It is the one negative outcome that is expected
+/// to be temporary — the network comes back — and the failure is invisible
+/// anyway, so retrying costs the user nothing.
+pub fn should_recheck(gate: CheckGate, settled: &UpdateState) -> bool {
+    gate == CheckGate::Allowed && matches!(settled, UpdateState::Idle | UpdateState::Failed { .. })
 }
 
 /// Clamp Velopack's `i16` progress into a percentage.
@@ -224,6 +250,58 @@ mod tests {
             .version(),
             None
         );
+    }
+
+    #[test]
+    fn recheck_continues_while_nothing_has_been_found() {
+        assert!(should_recheck(CheckGate::Allowed, &UpdateState::Idle));
+    }
+
+    /// The reason polling exists at all: a session left open for hours found
+    /// nothing on launch, and the next release must still reach it.
+    #[test]
+    fn recheck_retries_after_a_failure() {
+        let failed = UpdateState::Failed {
+            message: "dns error".into(),
+        };
+        assert!(should_recheck(CheckGate::Allowed, &failed));
+    }
+
+    /// Once an update is staged there is nothing better to find until the user
+    /// restarts, and a further round could only disturb the offer on screen.
+    #[test]
+    fn recheck_stops_once_something_is_staged() {
+        let ready = UpdateState::Ready {
+            version: "0.16.1".into(),
+        };
+        assert!(!should_recheck(CheckGate::Allowed, &ready));
+    }
+
+    #[test]
+    fn recheck_stops_while_a_download_is_in_flight() {
+        let busy = UpdateState::Downloading {
+            version: "0.16.1".into(),
+            pct: 40,
+        };
+        assert!(!should_recheck(CheckGate::Allowed, &busy));
+    }
+
+    /// Neither refusal can change inside a running process, so a timer that
+    /// re-asks is one that can never do anything — on a dev build, forever.
+    #[test]
+    fn a_refused_gate_never_re_arms() {
+        for gate in [CheckGate::OptedOut, CheckGate::NotInstalled] {
+            assert!(!should_recheck(gate, &UpdateState::Idle), "{gate:?}");
+            assert!(
+                !should_recheck(
+                    gate,
+                    &UpdateState::Failed {
+                        message: "x".into()
+                    }
+                ),
+                "{gate:?}"
+            );
+        }
     }
 
     #[test]
