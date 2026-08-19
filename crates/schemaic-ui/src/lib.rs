@@ -2314,13 +2314,14 @@ pub struct Ui {
     /// boundary and shown in the status bar. Transient (never persisted).
     pub resources: RwSignal<ResourceSample>,
     /// How far the background auto-updater has got. Driven at the app boundary
-    /// (Velopack talks to the GitHub Releases feed on a worker thread); the footer
-    /// renders whatever [`UpdateState::label`] returns, which for most of the
-    /// life of most sessions is nothing at all. Transient (never persisted).
+    /// (Velopack talks to the GitHub Releases feed on a worker thread); the
+    /// header's update chip renders whatever [`UpdateState::label`] returns, which
+    /// for most of the life of most sessions is nothing at all. Transient (never
+    /// persisted).
     pub update_state: RwSignal<UpdateState>,
     /// Restart into the staged update. Only ever called while
-    /// [`UpdateState::is_actionable`] holds — the footer segment is inert
-    /// otherwise — because Velopack exits the process to hand over to the updater.
+    /// [`UpdateState::is_actionable`] holds — the header chip is inert otherwise
+    /// — because Velopack exits the process to hand over to the updater.
     pub apply_update: Rc<dyn Fn()>,
 }
 
@@ -2967,6 +2968,64 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
             .hover(|s| s.background(theme::bg_panel()))
     });
 
+    // Auto-update offer — the one member of this cluster that isn't always there.
+    // `UpdateState::label()` is `None` while idle, while a check is in flight and
+    // when one fails, and this renders a zero-footprint `empty()` for all of them,
+    // so for most of most sessions the header looks exactly as it did before the
+    // feature existed. It only ever appears with something to say.
+    //
+    // Shaped as the connection switcher on the other side of the header — 1px
+    // border, 5px radius, opaque header-coloured fill so the border renders crisp
+    // — at the database selector's font size, and tinted like the glyphs it sits
+    // beside (`text_muted`, brightening to `text` on hover). The colour is set on
+    // the container so the label *and* the `currentColor` icon inherit it, and the
+    // border brightens with them so the chip reads as one object.
+    let update_state = ui.update_state;
+    let apply_update = ui.apply_update.clone();
+    let update_chip = dyn_container(
+        move || update_state.get(),
+        move |st| {
+            let Some(caption) = st.label() else {
+                return empty().into_any();
+            };
+            let chip = container(
+                h_stack((
+                    // A touch under the 16px the switcher's chevron uses: this
+                    // glyph has four strokes to the chevron's one, so at a
+                    // matching size it reads heavier than the label beside it.
+                    icons::icon(icons::REFRESH_CW, 14.0),
+                    text(caption).style(|s| s.font_size(theme::FONT_TITLE)),
+                ))
+                .style(|s| s.flex_row().items_center().gap(6.0)),
+            )
+            .style(|s| {
+                s.flex_shrink(0.0_f32)
+                    .padding_horiz(9.0)
+                    .padding_vert(3.0)
+                    // 10px more than the 16px the glyphs keep between themselves,
+                    // so the chip reads as its own thing rather than as a fourth
+                    // member of the search/help/settings run.
+                    .margin_right(26.0)
+                    .items_center()
+                    .background(theme::bg_chrome())
+                    .border(1.0)
+                    .border_color(theme::text_muted())
+                    .border_radius(5.0)
+                    .color(theme::text_muted())
+                    .hover(|s| s.color(theme::text()).border_color(theme::text()))
+            });
+            // Clickable only once an update is staged: "Updating… 40%" wears the
+            // same chip but is a progress readout, and a click on it mid-download
+            // would have nothing to apply.
+            if st.is_actionable() {
+                let apply = apply_update.clone();
+                chip.on_click_stop(move |_| apply()).into_any()
+            } else {
+                chip.into_any()
+            }
+        },
+    );
+
     // Find-anywhere trigger: a plain Lucide search glyph, 24px, 20px from the
     // header's right edge (brightens on hover like the schema-panel icons).
     let search = icons::icon(icons::SEARCH, 20.0)
@@ -3003,7 +3062,7 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
     // margin, which becomes the gap between the app's glyphs and the OS-ish
     // controls; the buttons themselves take no outer margin, because a caption
     // button that stops short of the corner misses the pointer thrown at it.
-    let right = h_stack((search, help, settings, chrome.controls()))
+    let right = h_stack((update_chip, search, help, settings, chrome.controls()))
         .style(|s| s.items_center().height_full());
 
     // Environment badge: a capsule filled with the active connection's identity
@@ -6198,8 +6257,6 @@ fn footer(ui: Ui) -> impl IntoView {
     let popup_width = ui.overlay.popup_width;
     let toggle_read_only = ui.conn_actions.toggle_read_only.clone();
     let resources = ui.resources;
-    let update_state = ui.update_state;
-    let apply_update = ui.apply_update.clone();
     let ai_model = ui.ai.model;
     let ai_effort = ui.ai.effort;
 
@@ -6674,48 +6731,10 @@ fn footer(ui: Ui) -> impl IntoView {
     )
     .style(|s| s.margin_left(15.0));
 
-    // Auto-update notice. Absent — a genuinely zero-footprint `empty()` — for all
-    // of a normal session: `label()` returns `None` while idle, while the check is
-    // in flight, and when it fails, so the bar looks exactly as it did before this
-    // feature existed unless there is something to say.
-    //
-    // Placed first in the left group and **not** wrapped in `collapsing_seg`,
-    // unlike every other segment. That is the whole point of putting it here: the
-    // collapsing segments hide right-to-left as the window narrows, so anywhere
-    // among them the one message the user must not miss would be among the first
-    // to go. Sitting ahead of them uncollapsed, it instead pushes their edges
-    // right and makes *them* collapse sooner — the priority the right way round —
-    // and it costs no layout at all in the overwhelmingly common empty case.
-    let update_seg = dyn_container(
-        move || update_state.get(),
-        move |st| {
-            let Some(label) = st.label() else {
-                return empty().into_any();
-            };
-            // Only the staged state is clickable; "Updating… 40%" is a progress
-            // readout, and a click on it mid-download has nothing to apply.
-            if !st.is_actionable() {
-                return footer_text(label);
-            }
-            let apply = apply_update.clone();
-            text(label)
-                .style(|s| s.font_size(theme::FONT_STATUS))
-                .on_click_stop(move |_| apply())
-                .style(|s| {
-                    s.items_center()
-                        .color(theme::chip_active())
-                        .hover(|s| s.color(theme::text()))
-                })
-                .into_any()
-        },
-    )
-    .style(|s| s.items_center().margin_left(15.0));
-
     // The schema toggle always stays (it's a control, and leftmost); every status
     // segment after it collapses right-to-left as the AI icon nears it.
     let left_group = h_stack((
         schema_icon,
-        update_seg,
         collapsing_seg(cursor_seg, ai_x),
         collapsing_seg(tabs_seg, ai_x),
         collapsing_seg(wrap_seg, ai_x),
