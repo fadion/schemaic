@@ -67,6 +67,14 @@ russh = { version = "0.62", default-features = false, features = ["ring", "flate
 # Version pinned to match russh's transitive dependency (for `ssh_key::PublicKey`).
 ssh-key = "=0.7.0-rc.11"
 
+# Installer + auto-update framework. The `vpk` CLI builds the Setup.exe / delta
+# packages in `release.yml`; this crate is the in-process half — the startup hook
+# that services the installer's `--veloapp-*` re-invocations, and the
+# `UpdateManager` that polls the GitHub Releases feed. The API is **synchronous**
+# and does network + file IO, so every call of it runs on a worker thread and comes
+# back through Floem's async→UI seam, never on the UI thread.
+velopack = "1.2"
+
 # Process resource sampling for the status-bar CPU/RAM readout (cross-platform:
 # Windows/macOS/Linux). `default-features = false` + `system` = just the
 # CPU/memory/process reader, no disk/network/component/user probes.

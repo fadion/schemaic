@@ -39,6 +39,11 @@ permissive or permissively-electable:
 
 - MIT, Apache-2.0 (incl. `WITH LLVM-exception`), BSD-2-Clause, BSD-3-Clause,
   ISC, Zlib, 0BSD, Unlicense, BSL-1.0, Unicode-3.0, CC0-1.0.
+- `webpki-roots` — Mozilla's CA root certificate set, reached through the
+  auto-updater's HTTPS stack (`velopack` → `ureq` → `rustls`) — is licensed
+  `CDLA-Permissive-2.0`. That is a *data* license covering the certificate
+  bundle, and a permissive one: it allows use and redistribution with no
+  copyleft and no obligation beyond the disclaimer.
 - Dual/multi-licensed crates are used under a permissive option — notably
   `self_cell` (`Apache-2.0 OR GPL-2.0-only`) is used under **Apache-2.0**, and
   `r-efi` (`… OR LGPL-2.1-or-later`) under MIT/Apache-2.0. No GPL/LGPL terms apply.

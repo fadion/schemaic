@@ -27,6 +27,13 @@ allow = [
     "Unicode-3.0",
     "CC0-1.0",
     "MPL-2.0",
+    # `webpki-roots` — Mozilla's CA root certificate set, reached through
+    # velopack → ureq → rustls, which is how the updater verifies HTTPS to the
+    # GitHub release feed. CDLA-Permissive-2.0 is a *data* license, and a
+    # permissive one: use and redistribute freely, no copyleft and no obligation
+    # beyond the disclaimer. It's the license the Mozilla bundle ships under, so
+    # every Rust TLS stack that trusts public CAs lands here.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 
