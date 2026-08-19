@@ -1,10 +1,12 @@
 //! Auto-update plumbing — the Velopack half of [`schemaic_core::update`].
 //!
-//! One background check per launch: ask the GitHub Releases feed, download the
-//! update (delta when Velopack can compute one), stage it, and let the header's
-//! update chip offer a restart. The decisions worth testing — whether to check,
-//! what the chip says, which progress ticks may move the state — live in the core
-//! and are unit-tested there; what's here is the I/O and the thread hops.
+//! A background check at startup, and again every [`RECHECK_INTERVAL`] while the
+//! app stays open: ask the GitHub Releases feed, download the update (delta when
+//! Velopack can compute one), stage it, and let the header's update chip offer a
+//! restart. The decisions worth testing — whether to check, whether to check
+//! *again*, what the chip says, which progress ticks may move the state — live in
+//! the core module and are unit-tested there; what's here is the I/O and the
+//! thread hops.
 //!
 //! **Velopack's API is synchronous and does network + file I/O**, so every call
 //! into it runs on `spawn_blocking` and comes back through Floem's async→UI seam
@@ -13,11 +15,13 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 
+use floem::action::exec_after;
 use floem::ext_event::{create_ext_action, create_signal_from_channel};
 use floem::reactive::{RwSignal, Scope, SignalGet, SignalUpdate, create_effect};
 use floem::window::WindowId;
-use schemaic_core::update::{CheckGate, UpdateState, check_gate};
+use schemaic_core::update::{CheckGate, UpdateState, check_gate, should_recheck};
 use velopack::sources::GithubSource;
 use velopack::{UpdateCheck, UpdateManager, VelopackAsset};
 
@@ -58,8 +62,8 @@ fn manager() -> Result<UpdateManager, velopack::Error> {
     UpdateManager::new(GithubSource::new(RELEASE_REPO, None, false), None, None)
 }
 
-/// Start the one-shot background update check and return the action that applies
-/// what it staged.
+/// Start the background update checks and return the action that applies what
+/// they staged.
 ///
 /// The returned closure is what the header's "Restart to update" chip calls.
 /// It is a no-op until something is staged, so it's safe to wire unconditionally.
@@ -83,24 +87,18 @@ pub fn start(
         return apply_action(cx, handle.clone(), window, state, staged);
     }
 
-    spawn_check(cx, handle, state, staged.clone());
-    apply_action(cx, handle.clone(), window, state, staged)
-}
-
-/// Run the check + download on a worker thread, reporting into `state`.
-fn spawn_check(
-    cx: Scope,
-    handle: &tokio::runtime::Handle,
-    state: RwSignal<UpdateState>,
-    staged: Rc<RefCell<Option<VelopackAsset>>>,
-) {
     // Velopack reports download progress over a `std::sync::mpsc::Sender<i16>`,
     // and Floem's `create_signal_from_channel` wants a crossbeam receiver — and
-    // has to be called here, on the UI thread. Hence the pair plus a forwarding
-    // thread: `download_updates` blocks the worker for the whole download, so
-    // nothing on that thread is free to drain the ticks. The forwarder ends when
-    // the worker drops its sender, which is to say when the download finishes,
-    // fails, or is never started.
+    // has to be called on the UI thread. Hence the pair plus a forwarding thread:
+    // `download_updates` blocks its worker for the whole download, so nothing on
+    // that thread is free to drain the ticks.
+    //
+    // Built **once for the process**, not per check, even though checks now
+    // repeat: `Sender` is `Clone`, so each round hands Velopack its own handle
+    // while the signal, the effect and the forwarder stay single. Per-round would
+    // leak a signal and an effect every interval for as long as the app is open.
+    // The forwarder parks on `recv` for the app's lifetime, which is what keeping
+    // `velo_tx` alive here buys.
     let (velo_tx, velo_rx) = std::sync::mpsc::channel::<i16>();
     let (ui_tx, ui_rx) = crossbeam_channel::unbounded::<i16>();
     std::thread::spawn(move || {
@@ -119,30 +117,106 @@ fn spawn_check(
         }
     });
 
+    // A self-holding closure, so each settled check can schedule the next one —
+    // the same shape `main`'s resource sampler and the terminal cursor-blink tick
+    // use (`BlinkTick`), not the plain recursive `fn` the health poll uses. It has
+    // to be filled in after construction because the closure has to be able to
+    // reach itself.
+    let again: Recheck = Rc::new(RefCell::new(None));
+    {
+        let handle = handle.clone();
+        let staged = staged.clone();
+        let velo_tx = velo_tx.clone();
+        let again_inner = again.clone();
+        *again.borrow_mut() = Some(Rc::new(move || {
+            spawn_check(
+                cx,
+                &handle,
+                state,
+                staged.clone(),
+                velo_tx.clone(),
+                again_inner.clone(),
+            );
+        }));
+    }
+    // Clone out of the `RefCell` before calling, rather than calling under a live
+    // `borrow()` — the first check re-arms through this same cell.
+    let first = again.borrow().clone();
+    if let Some(run) = first {
+        run();
+    }
+
+    apply_action(cx, handle.clone(), window, state, staged)
+}
+
+/// Re-arm one more background check. `None` until [`start`] fills it in, because
+/// the closure inside has to be able to schedule itself.
+type Recheck = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+
+/// How long to wait before asking the feed again.
+///
+/// The cost of a round is two requests — a releases listing and a ~760-byte
+/// manifest — against GitHub's anonymous limit of 60 per hour per IP, so this is
+/// three orders of magnitude clear of it and could be far shorter without
+/// trouble. It is not shorter because nothing is gained: the thing being waited
+/// for is a human tagging a release.
+const RECHECK_INTERVAL: Duration = Duration::from_secs(3 * 60 * 60);
+
+/// Run one check + download on a worker thread, reporting into `state`, and
+/// schedule the next round through `again` if one could still change the answer.
+fn spawn_check(
+    cx: Scope,
+    handle: &tokio::runtime::Handle,
+    state: RwSignal<UpdateState>,
+    staged: Rc<RefCell<Option<VelopackAsset>>>,
+    velo_tx: std::sync::mpsc::Sender<i16>,
+    again: Recheck,
+) {
     // Two hops back to the UI thread: one when the download starts (so the chip
     // can show progress at all — `with_progress` only moves an in-flight
-    // download), one when the whole thing settles.
+    // download), one when the whole thing settles. Both are built per round
+    // because `create_ext_action` hands back an `FnOnce`.
     let begin = create_ext_action(cx, move |version: String| {
         state.set(UpdateState::Downloading { version, pct: 0 });
     });
-    let finish = create_ext_action(cx, move |res: Result<Option<VelopackAsset>, String>| {
-        match res {
-            Ok(Some(asset)) => {
-                let version = asset.Version.clone();
-                tracing::info!("update {version} staged; waiting for a restart");
-                *staged.borrow_mut() = Some(asset);
-                state.set(UpdateState::Ready { version });
+    let finish = create_ext_action(
+        cx,
+        move |(gate, res): (CheckGate, Result<Option<VelopackAsset>, String>)| {
+            let settled = match res {
+                Ok(Some(asset)) => {
+                    let version = asset.Version.clone();
+                    tracing::info!("update {version} staged; waiting for a restart");
+                    *staged.borrow_mut() = Some(asset);
+                    UpdateState::Ready { version }
+                }
+                Ok(None) => UpdateState::Idle,
+                // Deliberately not surfaced: a background poll that couldn't reach
+                // GitHub is not something to interrupt the user over, and the next
+                // round retries. The log is where this is answerable from.
+                Err(e) => {
+                    tracing::warn!("update check failed: {e}");
+                    UpdateState::Failed { message: e }
+                }
+            };
+            state.set(settled.clone());
+
+            if !should_recheck(gate, &settled) {
+                return;
             }
-            Ok(None) => state.set(UpdateState::Idle),
-            // Deliberately not surfaced: a background poll that couldn't reach
-            // GitHub is not something to interrupt the user over, and the next
-            // launch retries. The log is where this is answerable from.
-            Err(e) => {
-                tracing::warn!("update check failed: {e}");
-                state.set(UpdateState::Failed { message: e });
-            }
-        }
-    });
+            exec_after(RECHECK_INTERVAL, move |_| {
+                // The signal is disposed at shutdown, and a timer that outlives it
+                // would read freed memory — the same rule the cursor-blink and
+                // resource-sampler ticks follow.
+                if state.try_get_untracked().is_none() {
+                    return;
+                }
+                let run = again.borrow().clone();
+                if let Some(run) = run {
+                    run();
+                }
+            });
+        },
+    );
 
     let opt_out = std::env::var(OPT_OUT_VAR).ok();
     // Invisible (`Checking` has no label), but it keeps the state machine honest:
@@ -151,15 +225,16 @@ fn spawn_check(
     state.set(UpdateState::Checking);
     handle.spawn_blocking(move || {
         let um = manager();
-        match check_gate(opt_out.as_deref(), um.is_ok()) {
+        let gate = check_gate(opt_out.as_deref(), um.is_ok());
+        match gate {
             CheckGate::OptedOut => {
                 tracing::info!("update check disabled by {OPT_OUT_VAR}");
-                finish(Ok(None));
+                finish((gate, Ok(None)));
                 return;
             }
             CheckGate::NotInstalled => {
                 tracing::debug!("not a Velopack install — no update check");
-                finish(Ok(None));
+                finish((gate, Ok(None)));
                 return;
             }
             CheckGate::Allowed => {}
@@ -170,11 +245,11 @@ fn spawn_check(
         let info = match um.check_for_updates() {
             Ok(UpdateCheck::UpdateAvailable(info)) => info,
             Ok(UpdateCheck::NoUpdateAvailable | UpdateCheck::RemoteIsEmpty) => {
-                finish(Ok(None));
+                finish((gate, Ok(None)));
                 return;
             }
             Err(e) => {
-                finish(Err(e.to_string()));
+                finish((gate, Err(e.to_string())));
                 return;
             }
         };
@@ -183,15 +258,15 @@ fn spawn_check(
         // it would silently walk the user backwards, so leave it alone.
         if info.IsDowngrade {
             tracing::info!("remote release is older than the running build — skipping");
-            finish(Ok(None));
+            finish((gate, Ok(None)));
             return;
         }
 
         let asset = info.TargetFullRelease.clone();
         begin(asset.Version.clone());
         match um.download_updates(&info, Some(velo_tx)) {
-            Ok(()) => finish(Ok(Some(asset))),
-            Err(e) => finish(Err(e.to_string())),
+            Ok(()) => finish((gate, Ok(Some(asset)))),
+            Err(e) => finish((gate, Err(e.to_string()))),
         }
     });
 }

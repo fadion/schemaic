@@ -1290,7 +1290,7 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       logical core count to give a whole-machine 0..=100. Sampling itself stays at the app boundary.
     - `update.rs` — the auto-update state model: `resource.rs`'s neighbour in spirit, and the pure
       half of the Velopack plumbing in `schemaic-app`'s `update.rs`.
-      `check_gate(opt_out, installed)` answers whether a launch may check at all, and both of its
+      `check_gate(opt_out, installed)` answers whether a check round may run at all, and both of its
       refusals are ordinary outcomes rather than errors, so neither is shown to anyone: `OptedOut`
       (`SCHEMAIC_NO_UPDATE_CHECK`, read through `opt_out_requested`, which accepts `1`/`true`/`yes`/
       `on` case-insensitively and nothing else — a `=0` left in a shell profile means what it says,
@@ -1301,12 +1301,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       **`label()` returns `None` for `Idle`, `Checking` *and* `Failed`** — a background check that
       finds nothing, or that cannot reach GitHub, is completely invisible, so the header looks
       exactly as it did before the feature existed for most of most sessions; the failure is logged,
-      not surfaced, and the next launch retries. And **`with_progress` only mutates `Downloading`**:
+      not surfaced, and the next round retries. And **`with_progress` only mutates `Downloading`**:
       Velopack's progress channel can still deliver a tick queued behind the end of the download, and
       folding it in blindly would replace "Restart to update" with "Updating… 100%" — a dead chip
       where the offer the user was about to click had been
       (`a_late_tick_cannot_rewind_a_staged_update`). `clamp_pct` is there because that channel
       carries a plain `i16`, so nothing at the type level stops a `-1` sentinel or a `101`.
+      `should_recheck(gate, settled)` is the pure half of the *periodic* check, and is true only when
+      the gate was `Allowed` and the round settled to `Idle` or `Failed`. Checking used to happen
+      once per launch: v0.16.0 was left running while v0.16.1 was published and still showed nothing
+      two hours later, and restarting found the update immediately — for a database client people
+      leave open for days, launch-only checking undercuts the point of shipping auto-update at all.
+      Two outcomes end the polling permanently. A **staged** update, because there is nothing better
+      to find until the user restarts and another round could only disturb the offer already on
+      screen; and a **refused gate**, because neither `OptedOut` nor `NotInstalled` can become
+      `Allowed` inside a running process, so on a dev build it would otherwise be a timer that can
+      never do anything (`recheck_stops_once_something_is_staged`, `a_refused_gate_never_re_arms`). A
+      *failed* check does re-arm — it is the one negative outcome expected to be temporary, and it is
+      invisible anyway, so retrying costs the user nothing.
     - `text.rs` — `plural(n, one, many)`, returning only the noun form so a humanized count
       (`"1.2k"`) can be displayed while the singular/plural decision still follows the true `n`;
       `human_count` (`1250` → `1.25k`), the **row-count** printer, shared by the grid's stats line
@@ -2397,16 +2409,38 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     real leak or benign allocator/OS retention. Live returning to its baseline after a table closes
     while the working set stays high is the allocator holding freed pages for reuse; live *not*
     returning is the leak.
-  - `update.rs` — the Velopack half of `core::update`: one background check per launch, and the
-    "Restart to update" action `start` hands back for the header chip. **Velopack's API is synchronous and
-    does network + file I/O**, so every call into it runs under `handle.spawn_blocking` and comes back
-    through Floem's async→UI seam — `create_ext_action` for the start-of-download and settle hops,
-    `create_signal_from_channel` for progress. The forwarding thread between the two channels is not
+  - `update.rs` — the Velopack half of `core::update`: a background check at startup and every three
+    hours after (`RECHECK_INTERVAL`), and the "Restart to update" action `start` hands back for the
+    header chip. **Velopack's API is synchronous and does network + file I/O**, so every call into it
+    runs under `handle.spawn_blocking` and comes back through Floem's async→UI seam —
+    `create_ext_action` for the start-of-download and settle hops, `create_signal_from_channel` for
+    progress. The forwarding thread between the two channels is not
     ceremony: Velopack reports progress on a `std::sync::mpsc::Sender<i16>` while
     `create_signal_from_channel` wants a crossbeam receiver and must be called on the UI thread, and
     `download_updates` blocks the worker for the whole download, so nothing on that thread is free to
-    drain the ticks. The feed is a `GithubSource` on `https://github.com/fadion/schemaic`, read
-    anonymously — 60 requests/hour per IP, which one check per launch is nowhere near.
+    drain the ticks. **That whole progress path — the channel pair, the forwarding thread,
+    `create_signal_from_channel` and the effect folding ticks in through `with_progress` — is built
+    once per process in `start`, not per round.** `mpsc::Sender` is `Clone`, so each round hands
+    Velopack its own handle; building it per round would leak a signal and an effect every interval
+    for as long as the app stayed open, which is precisely the sort of thing an app left running for
+    days would accumulate. The forwarder thread therefore parks on `recv` for the process lifetime,
+    which is what keeping `velo_tx` alive in `start` buys.
+    **Each settled round arms the next**, through `exec_after(RECHECK_INTERVAL, …)` and only when
+    `core::update`'s `should_recheck` says another round could still change the answer — which is why
+    `spawn_check`'s `finish` payload is `(CheckGate, Result<Option<VelopackAsset>, String>)` rather
+    than the result alone: the settle handler has to know whether the gate allowed the round. The
+    re-arm goes through a `Recheck` handle (`Rc<RefCell<Option<Rc<dyn Fn()>>>>`), the same
+    self-holding-closure shape the terminal cursor-blink tick and `main.rs`'s
+    `start_resource_monitor` use, because the closure has to be able to schedule *itself*; `start`
+    clones the closure out of the cell before calling it, since that first call re-arms through the
+    same cell and would otherwise run under a live `borrow()`. The timer bails when
+    `state.try_get_untracked()` is `None`, following the *Floem 0.2 gotchas* rule for perpetual
+    self-rescheduling ticks: the signal is disposed at shutdown and a surviving timer would read
+    freed memory. The feed is a `GithubSource` on `https://github.com/fadion/schemaic`, read
+    anonymously — 60 requests/hour per IP, and a round costs two requests (a releases listing and a
+    ~760-byte manifest), so three-hourly polling stays three orders of magnitude clear of the limit.
+    It is not shorter because nothing would be gained: the thing being waited for is a human tagging
+    a release.
     `UpdateManager::new` *failing* is how "not a Velopack install" is detected, and is what feeds
     `check_gate`; a downgrade (`UpdateInfo::IsDowngrade` — a yanked release, or a dev build ahead of
     the tag) is skipped rather than walking the user backwards silently. The apply action builds its
