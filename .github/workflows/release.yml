@@ -44,11 +44,28 @@ jobs:
             channel: win-x64
     steps:
       - uses: actions/checkout@v5
+      # Bounded and retried: `apt-get update` hung here for an hour on the v0.16.0
+      # release and had to be cancelled and re-run by hand, and again on a CI run
+      # a release later. A stalled mirror or held lock never fails on its own, and
+      # a job runs six hours before GitHub intervenes. `timeout` turns each stall
+      # into a fast failure the loop retries — which is what the manual re-run was
+      # doing — and `timeout-minutes` bounds the whole step. Matters more here than
+      # in CI: this one runs after a tag is already pushed, where a wedged job
+      # holds up a release that is halfway out the door. See `ci.yml` for the
+      # fuller note.
       - name: Install Linux GUI build dependencies
         if: runner.os == 'Linux'
+        timeout-minutes: 8
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev pkg-config
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get update -o Acquire::Retries=3; then
+              break
+            fi
+            echo "::warning::apt-get update stalled or failed (attempt $attempt of 3), retrying"
+            sleep 5
+          done
+          sudo timeout 300 apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
