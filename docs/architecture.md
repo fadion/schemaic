@@ -2296,10 +2296,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     switcher documents — an outline over a transparent interior anti-aliases on both edges and looks
     blurry. Then `padding_horiz(9.0)`/`padding_vert(3.0)`, `margin_right(26.0)` — 10px more than the
     16px the glyphs keep between themselves, so the chip reads as its own thing rather than a fourth
-    member of the search/help/settings run — and `gap(6.0)` between a **14px** `icons::REFRESH_CW`
-    and a label at `theme::FONT_TITLE`, the query toolbar's database-selector size. The glyph is
-    deliberately under the 16px the switcher's chevron uses: it has four strokes to the chevron's
-    one, so at a matching size it reads heavier than the label beside it. It is tinted like the glyphs beside it — `theme::text_muted()` resting, `theme::text()` on
+    member of the search/help/settings run — and `gap(6.0)` between a **13px** `icons::REFRESH_CW`
+    and an **upper-cased label at 11px**. The caption is upper-cased because that is what squares the
+    chip up: in mixed case the lone capital `R` of "Restart to update" stood against a run of
+    x-height letters, so the glyph block was taller on its left than its right and no *symmetric*
+    padding could centre an asymmetric shape — the text read as sitting high whatever the numbers
+    were. All caps is one uniform band, which centres against equal padding. The glyph is sized
+    against that band rather than against its neighbours: four strokes in a circle read heavier than
+    the switcher's single-stroke chevron, so matching the chevron's 16px would leave it shouting over
+    an 11px caption. The design also called for 0.06em tracking, which **Floem 0.2 cannot express** —
+    neither its `Style` nor the cosmic-text `Attrs` beneath it has a letter-spacing property, and
+    padding the string to fake it would wreck the metrics the upper-casing exists to fix. It is
+    tinted like the glyphs beside it — `theme::text_muted()` resting, `theme::text()` on
     hover — and **the colour is set on the container**, so the label and the `currentColor` SVG both
     inherit one value; `border_color` brightens with them, so the chip reads as one object rather
     than a box with a lit label inside it.

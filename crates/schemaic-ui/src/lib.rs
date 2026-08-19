@@ -2990,11 +2990,25 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
             };
             let chip = container(
                 h_stack((
-                    // A touch under the 16px the switcher's chevron uses: this
-                    // glyph has four strokes to the chevron's one, so at a
-                    // matching size it reads heavier than the label beside it.
-                    icons::icon(icons::REFRESH_CW, 14.0),
-                    text(caption).style(|s| s.font_size(theme::FONT_TITLE)),
+                    // Sized against the label rather than against the other
+                    // header glyphs: four strokes in a circle read heavier than
+                    // the single-stroke chevron next door, so matching their 16px
+                    // would leave the icon shouting over an 11px caption.
+                    icons::icon(icons::REFRESH_CW, 13.0),
+                    // **Upper-cased, and that is what squares the chip up.** In
+                    // mixed case the lone capital R sat against a run of x-height
+                    // letters, so the glyph block was taller on its left than its
+                    // right and no symmetric padding could centre it — the text
+                    // read as sitting high however the numbers were tuned. All
+                    // caps is one uniform band, which centres against equal
+                    // padding, and 11px keeps that band from dominating a chip
+                    // whose neighbours are bare glyphs.
+                    //
+                    // The design also called for 0.06em tracking, which Floem 0.2
+                    // cannot do: neither its `Style` nor the cosmic-text `Attrs`
+                    // beneath it exposes letter spacing, and faking it by padding
+                    // the string would wreck the metrics this is trying to fix.
+                    text(caption.to_uppercase()).style(|s| s.font_size(11.0)),
                 ))
                 .style(|s| s.flex_row().items_center().gap(6.0)),
             )
