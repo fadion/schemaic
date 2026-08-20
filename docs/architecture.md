@@ -2878,6 +2878,27 @@ Re-introducing the anti-patterns these guard against is a regression:
   runs. Don't inline the predicate at a new scanner — there were four copies of each, no test
   comparing them, and the rule had already been regressed and repaired once. `sql.rs` tests both over
   all 256 byte values and asserts they differ on exactly the digits.
+- **A Velopack channel name is app identity, like `--packId`: add a name, never rename one.** The
+  three `release.yml` packs with — `win-x64`, `linux-x64`, `osx-arm64` — are explicit because a
+  *default* channel (`win`, `linux`) reaches only the manifest name, so both platforms emit one
+  `Schemaic-<version>-full.nupkg`, and `GithubSource::download_release_entry` resolves a package by
+  matching `FileName` across the release's assets: a Linux client following its own manifest can be
+  handed the Windows build. Renaming one afterwards is the worse half, because an installed app asks
+  for the channel baked into the manifest it was packed from — a rename orphans every install
+  carrying the old name, silently, and there is no route back to those users to tell them. So a
+  fourth platform gets a fourth name (`osx-x64` beside `osx-arm64`), never a widening of an existing
+  one. **The guard is a CI step rather than a unit test**, which is this section's one standing
+  exception to *test-enforced where possible*: no crate names a channel — `update.rs` passes `None`
+  for the whole `UpdateOptions`, so not even `ExplicitChannel` mentions one — and `cargo test
+  --workspace` therefore cannot see these strings at all. `release.yml`'s second step, right after
+  `checkout` and ahead of the build so a bad name costs seconds instead of a compile, fails the job
+  unless `matrix.channel` is one of the three. That catches the realistic mistake — a typo, or a
+  rename of a shipped channel in the matrix — in seconds and in the same file as the mistake. It
+  **cannot** catch someone editing the matrix and the step's allowlist together, and nothing inside
+  the repository could: the guard pins the workflow to its own list, not to what has actually
+  shipped on GitHub. The friction is the value — a rename has to be deliberate in two places, one of
+  which is a comment explaining why it must not happen. Adding a platform is expected and safe: add
+  the name in both places. See `app::update` for the packed file names this was measured against.
 - **Splitting `lib.rs` / `main.rs`:** grep the line range for interleaved unrelated `fn`s first; a
   helper still used by code that stays goes to `widgets.rs` (glob-imported), not the new leaf
   module; mark cross-called items `pub(crate)`; build + `cargo fmt` + smoke-launch each step.

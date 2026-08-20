@@ -59,6 +59,38 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # A channel name is app identity, like `--packId`: an installed app polls
+      # the manifest of the channel it was packed from, so renaming one orphans
+      # every install carrying the old name — silently, and with no route back
+      # to those users to tell them. This step is the only guard that exists.
+      # Nothing in the Rust tree names a channel (`update.rs` passes `None` for
+      # the whole `UpdateOptions`, so not even `ExplicitChannel` mentions one),
+      # which means `cargo test` never sees these strings and CI is the only
+      # place the rule can be enforced at all. It runs before the build rather
+      # than before `vpk pack` so a bad name costs seconds, not a compile.
+      #
+      # Be clear about what it catches: a typo, or a rename of a shipped channel
+      # in the matrix above — the realistic mistake. It cannot catch someone
+      # editing the matrix and this list together, and nothing inside the
+      # repository could. The friction is the point: a rename has to be
+      # deliberate in two places, one of which is this comment.
+      #
+      # Adding a platform is safe and expected — add the new name in both places.
+      # `osx-x64` for Intel Macs is the one already anticipated.
+      - name: Check the Velopack channel is a known name
+        shell: bash
+        env:
+          CHANNEL: ${{ matrix.channel }}
+        run: |
+          set -euo pipefail
+          case "$CHANNEL" in
+            win-x64 | linux-x64 | osx-arm64) ;;
+            *)
+              echo "::error::Unknown Velopack channel '$CHANNEL'. Renaming a shipped channel orphans every install on it. Add a name for a new platform; never rename an existing one — and if this *is* a new platform, add it to the allowlist in this step."
+              exit 1
+              ;;
+          esac
+
       # The version every leg packs with, resolved in one place because the
       # three `vpk pack` steps used to each derive it their own way — and
       # because on a `workflow_dispatch` there is no tag to derive it from.
