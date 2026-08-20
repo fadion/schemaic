@@ -2521,7 +2521,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     for us.** `release.yml` hands `vpk pack` a staged `dist/` and it produces `Schemaic.app`, a
     `Schemaic-osx-arm64-Setup.pkg` and a ditto-zipped `-Portable.zip` of the bundle — which is why
     macOS is the one leg that publishes no archive of its own, and why the `--noPortable` Windows
-    passes is absent there. The `.icns` `vpk` insists on (it validates the extension) is generated on
+    passes is absent there. **That zip is built but not published**: it is the only predictable
+    handle on the finished bundle, and a `hdiutil` step unpacks it into the `.dmg` that *is*
+    published, because the zip and the `.dmg` are the same route and only one of them is the one
+    Mac users recognise. **A `.app` dragged from that `.dmg` self-updates exactly as the `.pkg`'s
+    does** — Velopack's `OsxVelopackLocator` works from "am I inside a `.app`" and finds `UpdateMac`
+    in `Contents/MacOS`, caring nothing for how the bundle arrived. The `.icns` `vpk` insists on (it validates the extension) is generated on
     the runner from `assets/icon-1024.png` with `sips` and `iconutil`, so the PNG stays the single
     icon source. Unlike a `.deb`, a `.pkg` install **is** a Velopack install, so the in-app update
     check runs there exactly as it does on Windows. It is unsigned and un-notarized by the same

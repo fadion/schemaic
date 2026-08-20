@@ -114,13 +114,13 @@ portable folder. It does not auto-update.
 curl -fsSL https://raw.githubusercontent.com/fadion/schemaic/main/install.sh | bash
 ```
 
-Installs the `.pkg` into `/Applications`, and the app updates itself from then
-on.
+Installs the `.pkg` into `/Applications`. The app updates itself from then on.
 
-**Prefer to download it by hand?** Take `Schemaic-osx-arm64-Setup.pkg`, or
-`Schemaic-osx-arm64-Portable.zip` if you would rather drag `Schemaic.app`
-into `/Applications` yourself. Either way macOS will refuse to open it the
-first time — the app is not signed with an Apple Developer ID, which is a
+**Prefer to download it by hand?** Take **`Schemaic-osx-arm64.dmg`** and drag
+Schemaic into `/Applications` — the familiar route, and the app still updates
+itself afterwards; `Schemaic-osx-arm64-Setup.pkg` is the same app with an
+installer in front of it. Either way macOS will refuse to open it the first
+time — the app is not signed with an Apple Developer ID, which is a
 paid, ongoing thing and not yet warranted. To get past it: open the app once
 and let it be blocked, then **System Settings → Privacy & Security**, scroll
 to the message naming Schemaic, and click **Open Anyway**.
