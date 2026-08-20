@@ -1547,9 +1547,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   enum labels follow, and for the same reason.
   **`sqlite.rs` is the third engine**, and five things make it unlike the other two rather than a
   third set of catalogue queries. **There is no server**: a connection is a *file*
-  (`Connection::file`), so host/port/user/password/SSH are all inert, `fetch_databases` answers
-  without opening anything (the one database SQLite calls `main`), and `Db::connect` refuses to let
-  a tunnel port repoint the file. **"Inert" has to be enforced twice, because the engine picker is
+  (`Connection::file`), so host/port/user/password/SSH are all inert, `fetch_databases` has nothing
+  to enumerate (it reports the one database SQLite calls `main`), and `Db::connect` refuses to let
+  a tunnel port repoint the file. **It still opens the file to answer**, through `ping` — the schema
+  sidebar empties the tree when a listing fails, which the other two engines get for free because
+  their listing is a query; answering `main` without touching the file gave a missing or locked one
+  a node in the tree whose every child fetch then printed the connect error *inside* it, under a
+  database that isn't there and beside a header already saying "Disconnected". **"Inert" has to be enforced twice, because the engine picker is
   editable on a saved connection and the SQLite form renders no SSH block** — so a connection
   switched over from a tunnelled MySQL one kept `ssh.enabled` set with no control anywhere that
   could unset it, and every operation on a local file dialled a bastion with a stored credential and

@@ -6,10 +6,12 @@
 //!
 //! **There is no server.** A connection is a *file* ([`crate::Db::file`]), so
 //! there is no host, no port, no user, no password and nothing for an SSH tunnel
-//! to reach. `fetch_databases` therefore doesn't query anything: it reports the
+//! to reach. `fetch_databases` therefore has nothing to enumerate: it reports the
 //! one database SQLite calls `main`. That is not a placeholder — `main` is the
 //! name SQLite itself uses for the file you opened, and the name any qualified
-//! reference to it must use.
+//! reference to it must use. It still *opens* the file to say so, because a list
+//! the app can produce for a connection that is down is a list the schema tree
+//! will draw for one.
 //!
 //! **The driver is blocking**, so every call runs inside
 //! [`tokio::task::spawn_blocking`] and opens its own [`rusqlite::Connection`]
@@ -1149,13 +1151,26 @@ fn fk_violations(conn: &SqliteConn) -> Result<FkViolations, DbError> {
 /// The databases this connection offers: the one file, under the name SQLite
 /// gives it.
 ///
-/// It answers without opening anything, and that is a decision rather than an
-/// optimisation. The schema sidebar lists a connection's databases on selection,
-/// long before the user has asked for anything; a SQLite connection pointed at a
-/// path that is missing, locked, or on a disconnected network share would
-/// otherwise fail there, in a place with nowhere good to put the error. Failing
-/// when the user actually reads something is both later and clearer.
-pub(crate) async fn fetch_databases(_db: &Db) -> Result<Vec<String>, DbError> {
+/// There is nothing to enumerate — `main` is the name SQLite itself gives the
+/// file you opened — so the work here is the *opening*: this is the one engine
+/// whose database list could be answered without touching the connection at all,
+/// and answering it that way is what made a dead connection look alive.
+///
+/// The schema sidebar lists a connection's databases on selection, long before
+/// the user has asked to read anything, and it treats a failed listing as "this
+/// connection has nothing to show" — the tree is emptied. MySQL and PostgreSQL
+/// get that for free, since their listing is a query and a query needs a server.
+/// A SQLite connection pointed at a path that is missing, locked, or on a
+/// disconnected share used to answer `main` anyway, so the tree grew a node for
+/// a database that isn't there, and the connect error surfaced one level down as
+/// red text *inside* the tree — beneath a header already saying "Disconnected",
+/// which is the affordance that belongs to this.
+///
+/// [`ping`] is the check, so "can this connection be listed" and "is this
+/// connection up" cannot drift apart: both are `PRAGMA schema_version` against a
+/// freshly opened file. It costs one local `open` per selection.
+pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
+    ping(db).await?;
     Ok(vec![MAIN.to_string()])
 }
 
@@ -3259,6 +3274,41 @@ mod tests {
                 .map(|(c, v)| (c.to_string(), v.clone()))
                 .collect(),
         }
+    }
+
+    #[tokio::test]
+    async fn an_openable_file_lists_the_one_database_sqlite_calls_main() {
+        let (_keeper, db) = shared_memory("fetch_databases_ok");
+        assert_eq!(db.fetch_databases().await.unwrap(), vec![MAIN.to_string()]);
+    }
+
+    /// A file that cannot be opened has **no** databases, rather than one called
+    /// `main` that nothing can be read from.
+    ///
+    /// This is what the schema tree shows a dead connection: the other two
+    /// engines fail their `fetch_databases` and the app empties the tree, so a
+    /// SQLite connection reporting `main` regardless left a phantom node whose
+    /// every child fetch failed — the connect error printed *inside* the tree,
+    /// under a database that isn't there, next to a header already saying
+    /// "Disconnected".
+    ///
+    /// Opening creates nothing (there is no `SQLITE_OPEN_CREATE`), so the path
+    /// below is never written and the suite stays as pure as the rest.
+    #[tokio::test]
+    async fn a_file_that_cannot_be_opened_lists_no_databases_at_all() {
+        let db = Db::from_parts(
+            crate::Engine::Sqlite,
+            String::new(),
+            0,
+            String::new(),
+            String::new(),
+            "no-such-file-9c1f2a7b.sqlite".to_string(),
+        );
+        let err = db.fetch_databases().await.expect_err("the file is missing");
+        assert!(
+            matches!(err, DbError::Connect(_)),
+            "a missing file is a connect failure, not a query one: {err:?}"
+        );
     }
 
     /// The exact count is the properties surface's whole answer on SQLite, so it
