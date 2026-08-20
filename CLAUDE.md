@@ -30,6 +30,16 @@ reads, so silent drift from the code is the most damaging kind of bug there —
 `core/tests/doc_coverage.rs` catches a module nobody wrote down, and nothing catches a paragraph
 that has quietly become false. Route the write through `arch-scribe` when a change lands.
 
+**`TODO.md` is the user's scratchpad — a plain list of things to be done, and the place to park an
+idea for a future release.** It is gitignored, so it is also the one file here with no git history
+to recover from: back it up before a large rewrite, and never edit it with a script. Entries are
+short and imperative; delete them as they land rather than checking them off. **It is not a
+decision board.** The moment an entry starts explaining *why* something was chosen or rejected, that
+paragraph belongs in `docs/architecture.md` (or the commit that supersedes it) and the entry here
+shrinks back to the work that is left. Keep the three disjoint: a fact about the system goes in
+`docs/architecture.md`, an instruction about how to work goes in this file, an open piece of work
+goes in `TODO.md`.
+
 ## Delegate the reading (`.claude/agents/`)
 
 `docs/architecture.md` is ~3.4k lines and several modules are thousands each (`ui/grid.rs` ~6.3k,
