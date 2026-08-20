@@ -2501,6 +2501,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     full package always verifies against the manifest whatever route the client took to get where it
     is. The cost is roughly 15 MB per update on Windows, and next to nothing on Linux, where the
     delta was saving 16% against an already-compressed AppImage.
+    **The Linux `.deb` and `.rpm` sit deliberately outside all of the above.** `release.yml` wraps
+    the same zigbuild binary the tarball carries with `packaging/linux/` — `stage-payload.sh` lays
+    out the payload once so the two formats cannot drift, `build-deb.sh` and `build-rpm.sh` +
+    `schemaic.spec` add each format's metadata, and `install.sh` at the repo root picks between
+    them and the AppImage. Those installs land in `/usr/bin`, which is *not* a Velopack install, so
+    `UpdateManager::new` fails, `check_gate` answers `NotInstalled` and `should_recheck` ends the
+    poll loop for good — the correct outcome (a distribution package is the package manager's to
+    update), and the reason the AppImage stays the recommended Linux artifact.
+    **Both packages hand-write their dependency lists, and no scanner can replace them**: `readelf
+    -d` on the binary lists glibc and nothing else, because winit reaches X11, Wayland and xkbcommon
+    through `libloading` and wgpu reaches Vulkan and EGL the same way. An automatically derived list
+    therefore produces a package that installs cleanly and then cannot open a window. The two spell
+    the same set differently — the `.deb` names Debian *packages* because dpkg has no soname
+    provides, the spec names *sonames* because every rpm distribution auto-provides them, which is
+    what lets one spec serve Fedora, RHEL and openSUSE despite their disagreeing on nearly every
+    package name.
     **`main.rs` runs `velopack::VelopackApp::build().run()` near the top of `main`**, before tracing,
     the font registration, the tokio runtime and any Floem signal or `Scope`: the installer and the
     updater re-invoke the exe with `--veloapp-*` args, and `run()` services those and then
