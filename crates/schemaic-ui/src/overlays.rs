@@ -466,9 +466,30 @@ pub(crate) fn active_db_menu_overlay(ui: Ui) -> impl IntoView {
     let set_db = ui.tab_actions.set_active_db.clone();
     let anchor = ui.tabs_ui.active_db_anchor;
 
+    // **One predicate, read by the panel and by the layer it sits on.** Two
+    // spellings of "is this menu showing" is what froze the app: the content said
+    // `open && databases`, the style below said `open` alone, so clicking the
+    // selector on a connection with nothing to list built no panel and no
+    // dismiss layer — and still stretched this container over the whole window
+    // (`inset(0.0)`). An absolute, transparent, handler-less sheet on top of
+    // everything swallows every click, including the one on the selector that
+    // would close it and the Escape handler that never mounted. The window
+    // renders perfectly and answers nothing; the only way out is killing the
+    // process, which is what a user had to do.
+    let showing = move || open.get() && !db_nodes.with(|n| n.is_empty());
+    // A flag no panel answers is also a flag nothing can clear, so it must not
+    // survive: the databases can go away *while* the menu is open (a switch, a
+    // failed reload) and `open` would sit `true` until some later load repopulated
+    // the list and popped a menu nobody asked for.
+    create_effect(move |_| {
+        if db_nodes.with(|n| n.is_empty()) && open.get_untracked() {
+            open.set(false);
+        }
+    });
+
     dyn_container(
         // Same rule as the schema eye: no databases, no dropdown.
-        move || open.get() && !db_nodes.with(|n| n.is_empty()),
+        showing,
         move |is_open| {
             if !is_open {
                 return empty().into_any();
@@ -528,8 +549,10 @@ pub(crate) fn active_db_menu_overlay(ui: Ui) -> impl IntoView {
             .into_any()
         },
     )
+    // `showing`, not `open` — see above. The window-wide sheet exists only when
+    // there is a panel on it to dismiss.
     .style(move |s| {
-        if open.get() {
+        if showing() {
             s.absolute().inset(0.0)
         } else {
             s
@@ -547,6 +570,16 @@ pub(crate) fn db_visibility_overlay(ui: Ui) -> impl IntoView {
     let db_nodes = ui.schema.db_nodes;
     let hidden = ui.schema.hidden_dbs;
     let toggle = ui.schema_actions.toggle_db_hidden.clone();
+
+    // Same flag hygiene as the active-database menu: a panel that cannot render
+    // must not leave its flag set, or a later load pops a menu nobody asked for.
+    // (This one is anchored to the eye rather than stretched over the window, so
+    // it never swallowed the app the way that one did.)
+    create_effect(move |_| {
+        if db_nodes.with(|n| n.is_empty()) && open.get_untracked() {
+            open.set(false);
+        }
+    });
 
     dyn_container(
         // Nothing to list → no panel. An empty dropdown is worse than none: it

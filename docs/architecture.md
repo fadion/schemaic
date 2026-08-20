@@ -3289,6 +3289,26 @@ Re-introducing the anti-patterns these guard against is a regression:
   The layer is an absolutely-positioned sibling built *before* the panel, so the panel stays on top
   of it. The transaction prompt deliberately has none: clicking away from a question about
   uncommitted writes is not an answer.
+- **An overlay's `inset(0.0)` style and its content must read the *same* predicate** — one closure,
+  used twice, never two spellings of "is this showing". A dropdown whose content is conditional on
+  more than its open flag (`open && !db_nodes.is_empty()`, the rule that keeps an empty menu off
+  the screen) but whose style still tests `open` alone stretches a transparent, handler-less
+  container over the whole window with **no panel and no `dismiss_layer` on it**. It swallows every
+  click in the app — including the one on the trigger that would close it — and the Escape handler
+  it would need lives inside the content that never mounted. The window repaints perfectly and
+  answers nothing, so it reads as a hang and ends in a killed process; the active-database menu
+  shipped exactly that, reachable from any connection with no databases. The trigger **guards its
+  own launch** in the same step (the `widgets::accept_launch` rule, applied to a menu), and the
+  overlay clears a flag whose panel can't render, so a later load can't pop a menu nobody asked for.
+- **The QUERY toolbar's database selector names a database only while the connection has loaded
+  it** (`core::schema::shown_database`), and reads "No database" otherwise. A tab's `database` is
+  *saved state* that outlives the connection being reachable — it has to, or a server coming back
+  would leave every tab pointing somewhere new — but a connection that loaded nothing shows an
+  empty tree and a "Disconnected" header, and a toolbar still naming a database is the one surface
+  claiming otherwise, when that name can't be listed, selected or read. So the rule decides the
+  **label**, and the binding is left alone for a recovered connection to restore from. Membership
+  rather than "the list is empty", so a database dropped server-side stops being named the moment a
+  reload no longer carries it — the same test `set_active_db` already applies before selecting one.
   A **button's** focus signal is an outline, painted in `.focus`, *not* `.focus_visible` — floem
   gates `FocusVisible` on `app_state.keyboard_navigation`, which only its own `view_tab_navigation`
   ever sets, so a `focus_visible` rule on a ring member usually never fires at all. A **group**

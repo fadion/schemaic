@@ -3682,24 +3682,44 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             theme::bubble_claude_text()
         }
     };
+    // The label is the tab's database *only while this connection has actually
+    // loaded it* (`schema::shown_database`). The binding itself is left alone —
+    // it is what a recovered connection restores the tab from — but a connection
+    // that loaded nothing shows an empty tree and a "Disconnected" header, and a
+    // toolbar naming a database nobody can list, select or read would be the one
+    // surface still claiming the connection is fine.
+    let shown_db = move || {
+        let db = active_db.get();
+        db_nodes.with(|ns| {
+            let loaded: Vec<String> = ns.iter().map(|n| n.database.clone()).collect();
+            schemaic_core::schema::shown_database(db.as_deref(), &loaded).map(str::to_string)
+        })
+    };
     let db_selector = h_stack((
-        dyn_container(
-            move || active_db.get(),
-            move |db| {
-                let name = db.unwrap_or_else(|| "No database".to_string());
-                // No `.color(...)` — inherits the h_stack's (hover-reactive) colour.
-                text(name)
-                    .style(|s| s.font_size(theme::FONT_TITLE))
-                    .into_any()
-            },
-        ),
+        dyn_container(shown_db, move |db| {
+            let name = db.unwrap_or_else(|| "No database".to_string());
+            // No `.color(...)` — inherits the h_stack's (hover-reactive) colour.
+            text(name)
+                .style(|s| s.font_size(theme::FONT_TITLE))
+                .into_any()
+        }),
         icons::icon(icons::CHEVRON_DOWN, 16.0)
             // Nudge the chevron 1px down relative to its centered baseline.
             .style(move |s| s.color(db_color()).flex_shrink(0.0_f32).margin_top(1.0)),
     ))
     .on_move(move |p| trig_origin.set(p))
     .on_resize(move |r| trig_size.set((r.width(), r.height())))
-    .on_click_stop(move |_| active_db_menu_open.update(|o| *o = !*o))
+    // **Guards its own launch**, in the same step that launches it: with no
+    // databases the menu renders no panel, so setting the flag would leave one
+    // nothing can clear — and the overlay used to stretch a transparent,
+    // handler-less sheet over the whole window for it, which swallowed every
+    // click in the app until the process was killed.
+    .on_click_stop(move |_| {
+        if db_nodes.with_untracked(|ns| ns.is_empty()) {
+            return;
+        }
+        active_db_menu_open.update(|o| *o = !*o)
+    })
     .on_event_cont(EventListener::PointerEnter, move |_| db_hov.set(true))
     .on_event_cont(EventListener::PointerLeave, move |_| db_hov.set(false))
     .style(move |s| {
