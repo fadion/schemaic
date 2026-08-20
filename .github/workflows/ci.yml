@@ -78,7 +78,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # `macos-latest` is Apple Silicon, which is the only macOS target
+        # Schemaic ships. It earns its place here more than the other two do:
+        # nobody developing this has a Mac, so this job *is* the macOS
+        # compiler — without it, breakage on that platform would surface for
+        # the first time during a tagged release, after the tag is already
+        # pushed. `fail-fast: false` above keeps a macOS failure from
+        # cancelling the legs that do have someone watching them.
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
       # Bounded and retried for the reason spelled out on the lint job's copy of
