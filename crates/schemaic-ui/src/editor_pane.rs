@@ -44,7 +44,7 @@ use schemaic_core::text_ops::{
 
 use crate::completion::{
     Completion, accept_completion, completion_popup, recompute_completions, signature_popup,
-    update_signature_help,
+    types_a_character, update_signature_help,
 };
 use crate::consts::*;
 use crate::diff_view::diff_view;
@@ -999,6 +999,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         point: RwSignal::new(Point::ZERO),
         line_top: RwSignal::new(0.0),
         suppress: RwSignal::new(false),
+        typed: RwSignal::new(false),
         sig: RwSignal::new(None),
         sig_point: RwSignal::new(Point::ZERO),
     };
@@ -1162,6 +1163,15 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // custom key handler drives autocomplete (nav/accept/dismiss) and the
     // existing Ctrl+Enter / Shift+Tab shortcuts; everything else falls through.
     let editor = text_editor_keys(query.get_untracked(), move |editor_sig, kp, mods| {
+        // **Before any branch below can return.** Every key is classified as
+        // typing or not, because the recompute that a resulting edit schedules
+        // runs a tick later with nothing but the document to go on — and a
+        // document cannot tell a typed `x` from Ctrl+X. Only typing (or
+        // Ctrl+Space) may open a closed popup; see `completion::popup_may_open`.
+        comp.typed.set(match &kp.key {
+            KeyInput::Keyboard(key, _) => types_a_character(key, mods.control(), mods.alt()),
+            _ => false,
+        });
         // Any keypress dismisses the unsafe-run notice (and doesn't execute). The
         // Ctrl+Enter branch below may re-raise it if the run is still unsafe.
         if guard.get_untracked().is_some() {

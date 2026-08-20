@@ -3443,6 +3443,18 @@ Re-introducing the anti-patterns these guard against is a regression:
   `exec_after(ZERO)` — `receive_char` early-returns on `read_only`, nothing else reads it, and the
   handler→`receive_char` step is synchronous so there's no race/flicker (see the auto-pair block in
   `editor_pane`). Named keys (Backspace) never hit `receive_char`, so returning `Yes` is enough there.
+- **Only *typing* may open the suggestion popup** (`completion::popup_may_open`), and what counts as
+  typing is decided in the key handler (`completion::types_a_character`) because it cannot be
+  decided anywhere else. Every document change schedules a recompute a tick later, and the recompute
+  sees only the document — where a typed `x` and Ctrl+X are indistinguishable. So Ctrl+X (delete
+  line) and Ctrl+Z opened a list wherever the caret happened to land, and Enter opened the
+  `auto_show` list on the new blank line: three basic edits that never asked for a suggestion.
+  `Ctrl`/`Alt` mean command, never text — the same test the auto-pair block applies, with the same
+  AltGr cost — while Space is typing however the platform reports it (`Named(Space)` or `" "`),
+  because the empty-prefix list after `WHERE ` hangs off it. A list already open keeps recomputing
+  on any edit, so Backspace still refines it and closes it when the prefix goes; the rule governs
+  what may **start** showing one. `Completion::suppress` is the other half and a different thing: a
+  one-shot that closes an open list after an edit the app itself made (`edit_untyped`, accept).
 - **`Editor::points_of_offset` returns *content* coords, not viewport-relative** (`.y` is `vline_y`,
   the absolute document y; the gutter view subtracts `viewport.y0` itself). Overlays pinned in
   `editor_area` must subtract `ed.viewport.get()` `x0`/`y0` to follow scroll — see `char_box`
