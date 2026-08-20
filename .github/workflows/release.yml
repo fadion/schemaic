@@ -65,7 +65,11 @@ jobs:
             echo "::warning::apt-get update stalled or failed (attempt $attempt of 3), retrying"
             sleep 5
           done
-          sudo timeout 300 apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev pkg-config
+          # `rpm` is here rather than in an apt call of its own so there is one
+          # bounded, retried install on this runner instead of two. It provides
+          # rpmbuild, which packaging/linux/build-rpm.sh drives; the spec compiles
+          # nothing, so a Debian-hosted rpmbuild is enough.
+          sudo timeout 300 apt-get install -y libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev pkg-config rpm
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -101,6 +105,28 @@ jobs:
           cp crates/schemaic-ui/fonts/LICENSE.txt dist/IBMPlex-OFL.txt
           cp licenses/Lucide-LICENSE.txt dist/
           tar czf "schemaic-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" -C dist .
+
+      # ── Distribution packages ────────────────────────────────────────────
+      # A .deb and an .rpm around the same binary the archive above wraps.
+      # These are *convenience* packaging, not an update channel: an install
+      # under /usr/bin is not a Velopack install, so `UpdateManager::new` fails
+      # there, `check_gate` returns `NotInstalled` and the in-app update check
+      # correctly never runs. What they buy is a desktop entry, an icon,
+      # AppStream metadata for the software centres, dependency resolution and
+      # a clean uninstall. Updates come from re-running install.sh until there
+      # is an apt/dnf repository to point at.
+      #
+      # Both wrap the *same* staged payload (packaging/linux/stage-payload.sh),
+      # so the two formats cannot drift into shipping different files.
+      - name: Build the .deb and .rpm (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          binary=target/x86_64-unknown-linux-gnu/release/schemaic
+          bash packaging/linux/build-deb.sh "$version" "$binary" dist-packages
+          bash packaging/linux/build-rpm.sh "$version" "$binary" dist-packages
+          ls -l dist-packages
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -244,3 +270,15 @@ jobs:
             Releases/Schemaic-${{ env.VPK_VERSION }}-${{ matrix.channel }}-full.nupkg
             Releases/releases.${{ matrix.channel }}.json
           fail_on_unmatched_files: false
+
+      # Separate from the two publish steps above because the file names carry
+      # each format's own version convention (`schemaic_0.16.3_amd64.deb`,
+      # `schemaic-0.16.3-1.x86_64.rpm`) and match neither the archive glob nor
+      # the Velopack one.
+      - name: Publish the distribution packages
+        if: runner.os == 'Linux'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-packages/*.deb
+            dist-packages/*.rpm

@@ -1,0 +1,28 @@
+[Desktop Entry]
+Type=Application
+Name=Schemaic
+GenericName=SQL Editor
+Comment=A fast, native SQL editor for MySQL, MariaDB, PostgreSQL and SQLite
+Exec=schemaic
+Icon=io.github.fadion.Schemaic
+Terminal=false
+Categories=Development;Database;
+Keywords=SQL;MySQL;MariaDB;PostgreSQL;SQLite;database;query;editor;
+# False on purpose: startup notification is a handshake, and the app has to
+# announce that it has finished launching. floem never consumes
+# DESKTOP_STARTUP_ID or calls winit's activation-token API, so declaring true
+# earns a busy cursor that spins until the desktop times it out - worse than no
+# feedback at all.
+StartupNotify=false
+# X11 only, and it is why this file works at all under a desktop that draws
+# per-window icons. floem 0.2 exposes no way to set a window's application id,
+# so winit falls back to argv[0] for WM_CLASS - `schemaic`, not the reverse-DNS
+# id this file is named after. Without this line the two never match and the
+# window gets a generic icon.
+#
+# On Wayland there is no equivalent: winit sets `app_id` only when a name is
+# passed through its platform attributes (floem-winit's wayland window/mod.rs
+# line 134), floem never passes one, and compositors match on `app_id` alone.
+# So a Wayland session shows a fallback icon in the dock and overview until
+# floem grows an app-id setter. Nothing in this file can fix that.
+StartupWMClass=schemaic

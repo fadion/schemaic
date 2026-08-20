@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metadata: what GNOME Software and KDE Discover render for an
+  installed .deb or .rpm. Without it Schemaic appears in a software centre as a
+  bare package name, with no icon, summary or screenshot.
+
+  The reverse-DNS id follows the convention for a project with no domain of its
+  own: io.github.<owner>.<App>. It is also what Flathub would require, so
+  choosing it now costs nothing and keeps that door open. It must stay in step
+  with the .desktop file's name and the installed icon's name; the <launchable>
+  below is the link between the two.
+
+  The <release> line is rewritten at package time by build-deb.sh and by the
+  spec's %prep, so the version here only has to be valid, not current.
+-->
+<component type="desktop-application">
+  <id>io.github.fadion.Schemaic</id>
+
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>Schemaic</name>
+  <summary>Fast, native SQL editor for MySQL, MariaDB, PostgreSQL and SQLite</summary>
+
+  <developer id="io.github.fadion">
+    <name>Schemaic contributors</name>
+  </developer>
+
+  <description>
+    <p>
+      Schemaic is a native SQL editor built to feel instant: a GPU-rendered
+      interface that scrolls 200k-row result sets smoothly, an editable results
+      grid, visual schema editing, and completion and diagnostics that follow
+      the dialect you are actually connected to.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>MySQL, MariaDB, PostgreSQL and SQLite, direct or over an SSH tunnel</li>
+      <li>Editable results grid, with writes wrapped in a transaction that rolls back unless exactly one row changed</li>
+      <li>Visual schema editing, with the generated ALTER or DROP always shown as SQL before it runs</li>
+      <li>Schema browser, ER diagrams, query history, EXPLAIN plans and a global schema search</li>
+      <li>CSV, TSV and JSON import with a full validation pass before a single row is written</li>
+      <li>An embedded terminal, and a one-click client session against the active connection</li>
+      <li>No account, no telemetry, no cloud service; credentials go to the OS keyring</li>
+    </ul>
+    <p>
+      Schemaic is in active development and should not be trusted with
+      production data, or any data you care about.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.fadion.Schemaic.desktop</launchable>
+
+  <url type="homepage">https://github.com/fadion/schemaic</url>
+  <url type="bugtracker">https://github.com/fadion/schemaic/issues</url>
+  <url type="vcs-browser">https://github.com/fadion/schemaic</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>The SQL editor and results grid</caption>
+      <image>https://raw.githubusercontent.com/fadion/schemaic/main/assets/screenshot.png</image>
+    </screenshot>
+  </screenshots>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.16.3" date="2026-08-19"/>
+  </releases>
+</component>

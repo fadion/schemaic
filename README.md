@@ -86,6 +86,60 @@ production data, or any data you care about.
   rather than a generic guess.
 - **Themeable** — dark / light UI themes and multiple editor color schemes.
 
+## Install
+
+Prebuilt binaries for every release are on the
+[Releases page](https://github.com/fadion/schemaic/releases/latest). Schemaic
+runs on **Windows and Linux, x86_64**; there is no macOS build.
+
+### Windows
+
+Download **`Schemaic-win-x64-Setup.exe`** and run it. It installs per-user into
+`%LocalAppData%`, so there is no admin prompt, and it updates itself: the app
+checks for new releases in the background and offers a **Restart to update**
+button in the header when one is staged.
+
+The installer is not code-signed, so SmartScreen shows an "unknown publisher"
+warning the first time — *More info* then *Run anyway*. That is a deliberate
+choice rather than an oversight; a self-signed certificate chains to no trusted
+root and would change nothing.
+
+Prefer no installer? `schemaic-vX.Y.Z-windows-x86_64.zip` is the same build as a
+portable folder. It does not auto-update.
+
+### Linux
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/fadion/schemaic/main/install.sh | bash
+```
+
+The script picks the artifact that fits the system — a `.deb` on Debian and
+Ubuntu, an `.rpm` on Fedora, RHEL and openSUSE, the AppImage everywhere
+else — and tells you at the end how that build updates itself. Override the choice
+with `SCHEMAIC_PKG_FAMILY=debian|rpm|appimage`. Read it first if you would
+rather not pipe a script into a shell; it is
+[install.sh](install.sh) in this repository, and it uses `sudo` only for the
+package-manager step.
+
+To do it by hand instead, from the
+[latest release](https://github.com/fadion/schemaic/releases/latest):
+
+| Artifact | Install | Updates |
+| --- | --- | --- |
+| `Schemaic-linux-x64.AppImage` | `chmod +x` and run | **Yes**, in-app |
+| `schemaic_X.Y.Z_amd64.deb` | `sudo apt-get install ./schemaic_*.deb` | No |
+| `schemaic-X.Y.Z-1.x86_64.rpm` | `sudo dnf install --nogpgcheck ./schemaic-*.rpm` | No |
+| `schemaic-vX.Y.Z-linux-x86_64.tar.gz` | Extract anywhere | No |
+
+The AppImage is the only Linux artifact that updates itself. A `.deb` or `.rpm`
+installs to `/usr/bin`, which the updater correctly refuses to touch, so those
+are updated by re-running the script above. The packages are not GPG-signed,
+which is why the `.rpm` line above waives the check.
+
+The binary needs a GPU stack and the usual desktop libraries at runtime
+(`libxkbcommon`, Wayland or X11, Vulkan or EGL). The `.deb` and `.rpm` declare
+them; the AppImage and the tarball assume a working desktop session.
+
 ## Build & run
 
 Requires a recent Rust toolchain (edition 2024). On any platform:
@@ -98,11 +152,11 @@ No database client libraries to install for any of the three engines — SQLite 
 compiled in from source, so building needs a working C compiler (the MSVC tools on
 Windows, `build-essential` / `gcc` on Linux) alongside the GUI libraries below.
 
-### Windows
+### On Windows
 
 Nothing else to install.
 
-### Linux
+### On Linux
 
 The renderer needs a few GUI system libraries first — the package names differ by
 distribution, the set doesn't.
