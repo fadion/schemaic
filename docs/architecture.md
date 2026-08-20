@@ -2490,6 +2490,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     unsaved tab text — the same reasoning the caption bar's close button carries in
     `ui::window_chrome`. Closing the window runs the normal shutdown, and the updater we just handed
     off to is already sitting there waiting for this process to go away.
+    **Every leg packs on an explicit, non-default Velopack channel — `win-x64`, `linux-x64`,
+    `osx-arm64` — and those three strings are effectively permanent.** Left to default the channel
+    would be plain `win` and `linux`, and a *default* channel reaches only the manifest name: both
+    platforms would then emit a package called `Schemaic-<version>-full.nupkg`, which two jobs
+    cannot both upload to one GitHub Release. The rejected upload is the mild failure.
+    `GithubSource::download_release_entry` resolves a package by matching its `FileName` across the
+    release's assets, so a Linux client following `releases.linux.json` would be handed whichever
+    asset won that name — plausibly the Windows build. Naming a non-default channel puts it into
+    every file name instead, which is what keeps the two sets apart: measured on 2026-08-19,
+    `--channel win-x64` produced `Schemaic-0.16.0-win-x64-full.nupkg`, `Schemaic-win-x64-Setup.exe`
+    and `releases.win-x64.json`, against `Schemaic-0.16.0-linux-x64-full.nupkg`,
+    `Schemaic-linux-x64.AppImage` and `releases.linux-x64.json` for `--channel linux-x64`.
+    **There is no app-side counterpart and none is needed**: the channel is baked into the manifest
+    of the release an app was packed from, so an installed app already asks for the channel it came
+    from. `update.rs` passes `None` for `UpdateManager::new`'s whole `UpdateOptions`, which leaves
+    `ExplicitChannel` unset — that field is for *switching* channels, not for declaring the one you
+    were built on. That is also what makes the names unchangeable afterwards, which is stated as an
+    invariant below.
     **Releases carry full packages only — `release.yml` passes `--delta None` on both platforms —
     and that is a correctness choice, not a bandwidth one.** Deltas broke the *second* consecutive
     update. A client that reaches version N by applying a delta ends up holding a **locally
@@ -2517,11 +2535,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     provides, the spec names *sonames* because every rpm distribution auto-provides them, which is
     what lets one spec serve Fedora, RHEL and openSUSE despite their disagreeing on nearly every
     package name.
-    **macOS is a third leg on its own permanent `osx-arm64` channel, and Velopack builds its bundle
-    for us.** `release.yml` hands `vpk pack` a staged `dist/` and it produces `Schemaic.app`, a
-    `Schemaic-osx-arm64-Setup.pkg` and a ditto-zipped `-Portable.zip` of the bundle — which is why
-    macOS is the one leg that publishes no archive of its own, and why the `--noPortable` Windows
-    passes is absent there. **That zip is built but not published**: it is the only predictable
+    **macOS is a third leg on its own `osx-arm64` channel — permanent for the reason above, and
+    named `arm64` rather than a bare `osx` so that an Intel leg can be added later without renaming
+    this one — and Velopack builds its bundle for us.** `release.yml` hands `vpk pack` a staged
+    `dist/` and it produces `Schemaic.app`, a `Schemaic-osx-arm64-Setup.pkg` and a ditto-zipped
+    `-Portable.zip` of the bundle — which is why macOS is the one leg that publishes no archive of
+    its own, and why the `--noPortable` Windows passes is absent there. **That zip is built but not published**: it is the only predictable
     handle on the finished bundle, and a `hdiutil` step unpacks it into the `.dmg` that *is*
     published, because the zip and the `.dmg` are the same route and only one of them is the one
     Mac users recognise. **A `.app` dragged from that `.dmg` self-updates exactly as the `.pkg`'s
@@ -2531,6 +2550,43 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     icon source. Unlike a `.deb`, a `.pkg` install **is** a Velopack install, so the in-app update
     check runs there exactly as it does on Windows. It is unsigned and un-notarized by the same
     decision the Windows installer carries.
+    **That decision is to ship unsigned, and deliberately *not* self-signed** (taken 2026-08-19).
+    The app is open source with no audience yet, so neither an application to the SignPath
+    Foundation nor a paid certificate earns its cost today — but the part worth writing down is that
+    self-signing is not the cheap fallback it looks like. A self-signed Authenticode certificate
+    chains to no root any user trusts, so SmartScreen and "Windows protected your PC" say *Unknown
+    publisher* exactly as they do for an unsigned binary, and no reputation accrues: SmartScreen
+    reputation attaches to a certificate chaining to a *trusted* root, plus the file hash. Some AV
+    heuristics score an untrusted signature worse than none. On Linux the question does not arise in
+    that form at all — there is no CA-based code signing, only GPG with your own key, self-signed by
+    construction, and nothing on the path we ship verifies it: no runtime or desktop checks an
+    AppImage's embedded signature by default, and Velopack does not sign AppImages at all. GPG
+    becomes mandatory only if we ever run our own apt repository, since apt refuses an unsigned
+    `Release`.
+    **Signing is not a prerequisite for auto-update**, and an earlier version of this reasoning
+    wrongly made it one, on the grounds that auto-update pushes executables. Velopack's update
+    integrity comes from HTTPS plus a size/hash check against `releases.<channel>.json`
+    (`ChecksumFailedException`); nothing in its documented flow verifies an Authenticode signature on
+    a downloaded package. Authenticode's real value here is the *first-install* SmartScreen
+    experience and detecting a locally tampered file — polish, not correctness. What we eat for it:
+    `Setup.exe` shows the unknown-publisher warning on first download, identical to the raw `.zip` it
+    replaced and so not a regression, and Squirrel-family installer stubs have a history of AV false
+    positives that being unsigned makes likelier — which lands on `Update.exe`, the one that runs on
+    every update. Worth watching once there are real users.
+    **When we do sign, the hook is one `vpk pack` argument, not a redesign** — `--signParams` (short
+    `-n`) or `--signTemplate`, which signs the app *and* Velopack's `Update.exe`/`Setup.exe` stubs —
+    which is why this decision blocks nothing. The options on file: signpath.org, the Foundation, is
+    free for open source (not signpath.io, the paid enterprise product it runs on), and a licence
+    check on 2026-07-26 found us eligible — MIT, OSI-approved, no proprietary components — at the
+    cost of an application, staying actively maintained, and a publisher string reading "SignPath
+    Foundation" rather than ours; the flow would be `signpath/github-action-submit-signing-request`,
+    packing first, then submitting, then attaching the signed result to the Release, with the key
+    never touching our runner. Certum's Open Source Code Signing certificate (~€70–100/yr,
+    cloud-signable in CI, in *our* name) is the paid alternative. Azure Trusted Signing (~$120/yr) is
+    out regardless: since 2025-04-02 its onboarding admits only US/Canada organisations with three
+    years of history, no individuals and no EU enrolment. All of these are OV, and **no OV
+    certificate grants instant SmartScreen trust** — reputation still builds with download volume, so
+    signing buys a better first-run dialog rather than a silent one.
     **`release.yml` also answers to `workflow_dispatch`, with every publish step gated on
     `github.ref_type == 'tag'`.** A tag used to be the only way to run the file, which made a
     packaging mistake discoverable only once the tag existed and was awkward to retract — the macOS

@@ -215,12 +215,12 @@ jobs:
       # a self-updating .AppImage on Linux, and the packages each installed app
       # polls this same Release for.
       #
-      # **These are unsigned, deliberately** — see the packaging section of the
-      # private todo.md. A self-signed certificate would buy nothing here (it
-      # chains to no trusted root, so SmartScreen still says "Unknown publisher"
-      # and no reputation accrues), so this ships honestly unsigned until a real
-      # cert exists. Adding one later is a `--signParams` argument on `vpk pack`,
-      # not a rework of any of this.
+      # **These are unsigned, deliberately** — see the packaging prose under
+      # `update.rs` in docs/architecture.md. A self-signed certificate would
+      # buy nothing here (it chains to no trusted root, so SmartScreen still
+      # says "Unknown publisher" and no reputation accrues), so this ships
+      # honestly unsigned until a real cert exists. Adding one later is a
+      # `--signParams` argument on `vpk pack`, not a rework of any of this.
       #
       # Pinned rather than relying on whatever SDK the runner image ships, since
       # `vpk` is a .NET global tool and the runner's default has moved before.
