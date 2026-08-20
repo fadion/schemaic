@@ -324,10 +324,11 @@ jobs:
       # AppStream metadata use, so one identity covers every platform. It is
       # mutually exclusive with `--plist`; pass one or the other, never both.
       #
-      # No `--noPortable` here, unlike Windows: on macOS the portable artifact
-      # is a ditto zip of the .app, which is exactly what someone dragging it
-      # to /Applications wants. On Windows it would be a second, redundant
-      # portable next to the .zip we build ourselves.
+      # No `--noPortable` here, unlike Windows, even though that zip is not
+      # published: it is a ditto zip of the finished .app and therefore the only
+      # predictable way to get hold of the bundle, which the .dmg step below
+      # unpacks. On Windows the flag stays because the portable there would be a
+      # second, redundant .zip beside the one we build ourselves.
       - name: Package with Velopack (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -345,6 +346,30 @@ jobs:
           # Named, not globbed, in the publish step below, and that step
           # tolerates unmatched files - so a name vpk changes would drop the
           # macOS artifacts from a release silently. This is where that shows.
+          ls -l Releases
+
+      # Velopack builds no .dmg, and a .dmg is what a Mac user expects from a
+      # direct download: a window holding the app beside a link to /Applications
+      # to drag it onto. Built from vpk's portable zip because that is the only
+      # predictable location of the finished bundle - the .app vpk assembles
+      # lives in a temp directory it names at random - and ditto's --keepParent
+      # means that zip holds `Schemaic.app` at its root.
+      #
+      # **The dragged .app self-updates exactly as the .pkg's does.** Velopack's
+      # macOS locator works from "am I inside a .app" and finds UpdateMac in
+      # Contents/MacOS; it does not care how the bundle arrived. So the two
+      # published macOS downloads differ in install ceremony and nothing else,
+      # which is why the zip is no longer published - it and the .dmg are the
+      # same route, and the .dmg is the one people recognise.
+      - name: Build the .dmg (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          rm -rf dmg-root && mkdir -p dmg-root
+          ditto -x -k "Releases/Schemaic-${{ matrix.channel }}-Portable.zip" dmg-root
+          ln -s /Applications dmg-root/Applications
+          hdiutil create -volname Schemaic -srcfolder dmg-root -ov -format UDZO \
+            "Releases/Schemaic-${{ matrix.channel }}.dmg"
           ls -l Releases
 
       # `ref_type` rather than `event_name`: a dispatch has no tag to publish
@@ -382,7 +407,7 @@ jobs:
             Releases/Schemaic-${{ matrix.channel }}-Setup.exe
             Releases/Schemaic-${{ matrix.channel }}.AppImage
             Releases/Schemaic-${{ matrix.channel }}-Setup.pkg
-            Releases/Schemaic-${{ matrix.channel }}-Portable.zip
+            Releases/Schemaic-${{ matrix.channel }}.dmg
             Releases/Schemaic-${{ env.VPK_VERSION }}-${{ matrix.channel }}-full.nupkg
             Releases/releases.${{ matrix.channel }}.json
           fail_on_unmatched_files: false
