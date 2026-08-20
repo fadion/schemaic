@@ -603,6 +603,29 @@ pub fn display_name(schema: Option<&str>, table: &str) -> String {
     }
 }
 
+/// The database name the QUERY toolbar's selector may show, given the databases
+/// the active connection actually loaded.
+///
+/// A tab's `database` is *saved state* — it outlives the connection being
+/// reachable, and it has to, or a server coming back would leave every tab
+/// pointing somewhere new. What it must not do is get **drawn** as though it
+/// were confirmed: a connection that failed to load shows an empty schema tree
+/// and a "Disconnected" header, and a toolbar still naming a database is the one
+/// surface claiming otherwise. The selector's own list would be empty, and
+/// picking that name back is already refused (`set_active_db` checks the same
+/// membership), so what it names cannot be chosen, listed or read.
+///
+/// Membership, not "is the list empty", so the rule holds on a live connection
+/// too: a database dropped or renamed server-side stops being shown the moment a
+/// reload no longer carries it.
+///
+/// The caller keeps the binding either way — this decides the *label*, and the
+/// tab is left bound so a recovered connection restores it untouched.
+pub fn shown_database<'a>(database: Option<&'a str>, loaded: &[String]) -> Option<&'a str> {
+    let db = database?;
+    loaded.iter().any(|name| name == db).then_some(db)
+}
+
 /// The SQL form of the same thing: a quoted, namespace-qualified object name.
 ///
 /// The counterpart to [`display_name`] — one is what a person reads, this is what
@@ -3807,6 +3830,31 @@ mod tests {
         assert_eq!(display_name(None, "orders"), "orders");
         assert_eq!(display_name(Some("public"), "orders"), "orders");
         assert_eq!(display_name(Some("sales"), "orders"), "sales.orders");
+    }
+
+    #[test]
+    fn a_database_the_connection_loaded_is_shown() {
+        let loaded = vec!["main".to_string(), "sales".to_string()];
+        assert_eq!(shown_database(Some("sales"), &loaded), Some("sales"));
+    }
+
+    #[test]
+    fn a_database_nothing_loaded_is_not_shown() {
+        // The reported case: a SQLite connection whose file is missing loads no
+        // databases at all, and the tab's saved `main` is a name nothing can
+        // confirm. The tree is empty beside it and the header says Disconnected.
+        assert_eq!(shown_database(Some("main"), &[]), None);
+        // Same rule when the connection is up but that particular database is
+        // gone (dropped or renamed server-side) — it isn't selectable either.
+        let loaded = vec!["sales".to_string()];
+        assert_eq!(shown_database(Some("archive"), &loaded), None);
+    }
+
+    #[test]
+    fn a_tab_bound_to_nothing_shows_nothing() {
+        let loaded = vec!["sales".to_string()];
+        assert_eq!(shown_database(None, &loaded), None);
+        assert_eq!(shown_database(None, &[]), None);
     }
 
     #[test]
