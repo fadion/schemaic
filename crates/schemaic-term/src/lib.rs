@@ -405,10 +405,13 @@ fn read_loop(
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 {
+                    // The whole read at once: vte 0.15's `advance` takes the
+                    // slice, where 0.14's took a byte at a time. Handing it the
+                    // buffer is not just tidier — it is what lets the parser
+                    // scan runs of printable bytes without re-entering its state
+                    // machine per character.
                     let mut term = term.lock();
-                    for &b in &buf[..n] {
-                        parser.advance(&mut *term, b);
-                    }
+                    parser.advance(&mut *term, &buf[..n]);
                 }
                 notify();
             }
