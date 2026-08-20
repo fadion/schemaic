@@ -708,6 +708,35 @@ fn load_landing(started: (u64, u64), current: (u64, u64)) -> LoadLanding {
     }
 }
 
+/// May a landed **health check** write the connection status it found?
+///
+/// The health leg of the same question [`load_landing`] asks of a schema load,
+/// and for the same reason: a ping is up to five seconds of waiting, and the
+/// user can switch connection or press Retry again inside it. `started` is the
+/// `(connection id, generation)` the check stamped itself with; `current` is
+/// what those are now.
+///
+/// The connection id is the reported bug — the header's "Disconnected · Retry"
+/// still on screen after switching *to* a healthy connection. Leaving a dead
+/// server means the ping fired at it is still outstanding; it lands after the
+/// switch has reset the status to `Unknown` and after the new connection's own
+/// check has answered `Connected`, and repaints the banner over a server that
+/// is answering. Nothing clears it but the next poll, which the same stale
+/// result has just told to back off (`health::record` counts every check).
+///
+/// The generation is the case an id check alone misses: two checks of the *same*
+/// connection, out of order. Retry against a host that comes back in between
+/// lands `Connected` from the second and then the first's five-second-old
+/// failure on top.
+///
+/// A dropped check writes nothing at all — not the status, not the failure
+/// count, and not the `with_conn` continuation it may be carrying, which would
+/// otherwise run an action gated on a connection the user has left (or report
+/// the *old* connection unreachable in a modal).
+fn check_landing(started: (u64, u64), current: (u64, u64)) -> bool {
+    started == current
+}
+
 /// What one database of a landed connection load becomes: an existing node kept,
 /// or a fresh node at this id. Both carry the node id, because the schema tree's
 /// `dyn_stack` is keyed on it.
@@ -1236,6 +1265,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // check (polled or manual). Drives the health poll's backoff so a server
     // that's been down for a while isn't probed every 10s; reset on switch.
     let health_failures = RwSignal::new(0u32);
+    // Bumped by every health check that actually pings, so a check that lands
+    // after a newer one (or after a connection switch) can tell and drop its
+    // result — see `check_landing`.
+    let health_gen = RwSignal::new(0u64);
     // OS window focus, set from the workspace root. Starts `true`: the window is
     // focused on launch and winit only reports the *changes*.
     let window_focused = RwSignal::new(true);
@@ -4164,7 +4197,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 None
             };
             let db = Db::connect(&conn, tunnel);
+            // Stamped before the ping, checked when it lands: up to five seconds
+            // pass in between, and the connection the user is on can change
+            // inside them.
+            let stamp = (id, health_gen.get_untracked() + 1);
+            health_gen.set(stamp.1);
             let send = create_ext_action(cx, move |ok: bool| {
+                if !check_landing(
+                    stamp,
+                    (active_conn.get_untracked(), health_gen.get_untracked()),
+                ) {
+                    return;
+                }
                 conn_status.set(if ok {
                     ConnStatus::Connected
                 } else {
@@ -7221,6 +7265,34 @@ mod app_tests {
         // and the first to land is not the one the tree should show — it would
         // also dispose the *newer* node scope.
         assert_eq!(load_landing((7, 3), (7, 4)), LoadLanding::KeepTunnelOnly);
+    }
+
+    #[test]
+    fn a_health_check_of_the_connection_still_active_lands() {
+        use super::check_landing;
+        assert!(check_landing((7, 3), (7, 3)));
+    }
+
+    #[test]
+    fn a_health_check_of_a_connection_the_user_left_is_dropped() {
+        use super::check_landing;
+        // The reported bug: a dead connection's ping is still in flight when the
+        // user switches to a live one. It lands seconds later and repaints the
+        // header's "Disconnected · Retry" over a connection that is answering.
+        assert!(
+            !check_landing((7, 3), (8, 4)),
+            "another connection is active now"
+        );
+    }
+
+    #[test]
+    fn an_older_check_of_the_same_connection_is_dropped_too() {
+        use super::check_landing;
+        // Retry pressed twice against a host that came back in between: the
+        // second lands `Connected` first, then the first lands its five-second-
+        // old failure on top, and the banner is back until a poll that has just
+        // been told to back off.
+        assert!(!check_landing((7, 3), (7, 4)));
     }
 
     /// The level `load_landing` doesn't reach. `try_update` guards a *disposed*
