@@ -865,7 +865,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   - `health.rs` — connection health-poll policy: `tick(HealthCfg, TickCtx) -> Tick` decides
     ping-or-skip + the delay until the next tick (exponential `backoff` on consecutive failures,
     longer interval for SSH-tunnelled connections, skip while the window is unfocused / a query is
-    already in flight / the tunnel isn't up). The app owns only the timer + `Db::ping`.
+    already in flight / the tunnel isn't up). The app owns only the timer, `Db::ping` and the
+    landing guard: a ping is up to five seconds of waiting, so `main.rs`'s `check_landing` stamps
+    each check with `(connection id, generation)` and a check that lands after a switch — or after
+    a newer check of the same connection — writes **nothing**: not `ConnStatus`, not the failure
+    count `health::record` folds, and not the `with_conn` continuation it may be carrying. Without
+    it, leaving a dead connection for a healthy one repainted the header's "Disconnected · Retry"
+    over a server that was answering, and only the next poll could clear it — the poll the same
+    stale failure had just told to back off.
   - `window_chrome.rs` — which half of the window frame the app draws itself, now that it launches
     with `WindowConfig::show_titlebar(false)`. `Chrome::current()` answers per `Host`
     (Windows/Linux/macOS): `draws_own_controls`, `draws_own_resize_border`, `wants_drop_shadow`,
