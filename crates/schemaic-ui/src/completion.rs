@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use floem::keyboard::{Key, NamedKey};
 use floem::kurbo::{Point, Rect};
 use floem::prelude::*;
 use floem::views::editor::Editor;
@@ -64,6 +65,11 @@ pub(crate) struct Completion {
     /// Set right after accepting, so the edit that follows doesn't re-open the
     /// popup on the just-inserted word.
     pub(crate) suppress: RwSignal<bool>,
+    /// Did the last key the editor saw *type a character*? Written by the key
+    /// handler for every keypress, read by the recompute the resulting edit
+    /// schedules — see [`types_a_character`] for why the question cannot be
+    /// answered later, and [`popup_may_open`] for what it decides.
+    pub(crate) typed: RwSignal<bool>,
     /// Signature help for the function call enclosing the caret (independent of the
     /// suggestion list — shown whenever the caret is inside a builtin's parens).
     pub(crate) sig: RwSignal<Option<intel::SignatureHelp>>,
@@ -584,6 +590,52 @@ pub(crate) fn update_signature_help(ed: &Editor, comp: Completion, dialect: SqlD
     comp.sig.set(help);
 }
 
+/// Did this keypress **type a character** into the document?
+///
+/// Asked by the editor's key handler of every key, and recorded on
+/// [`Completion::typed`] for the recompute that the resulting edit schedules.
+///
+/// Floem inserts a plain character *after* the key handler returns, and the
+/// recompute runs a tick after that — by which time the only thing left to say
+/// what happened is the document, and a document cannot tell a typed `x` from
+/// Ctrl+X. So the question is answered here, while the key is still in hand.
+///
+/// `Ctrl`/`Alt` mean *command*, never text: Ctrl+X deletes a line and Ctrl+Z
+/// undoes, and both arrive as `Character` — which is precisely how they used to
+/// pop a suggestion list wherever the caret landed. This matches the auto-pair
+/// handler's own test one screen down, including its cost: AltGr (`Ctrl+Alt` on
+/// Windows) is excluded, so a character typed that way opens nothing on its own
+/// and needs Ctrl+Space. Space is deliberately *in* — it arrives named on some
+/// platforms and as `" "` on others, and the empty-prefix list after `WHERE `
+/// (`clause_continuation`'s `auto_show`) is typed input like any other.
+pub(crate) fn types_a_character(key: &Key, ctrl: bool, alt: bool) -> bool {
+    if ctrl || alt {
+        return false;
+    }
+    matches!(key, Key::Character(_) | Key::Named(NamedKey::Space))
+}
+
+/// May a recompute that finds the popup **closed** open it?
+///
+/// Every document change re-runs the recompute, and the recompute is what
+/// decides to show a list — so before this rule existed, *any* edit could summon
+/// one: Ctrl+X landed the caret mid-word on the following line and the list
+/// appeared for a word nobody was typing, undo did the same, and Enter after a
+/// clause keyword opened the `auto_show` list on the new blank line. None of
+/// those asked for a suggestion.
+///
+/// Typing is the only thing that opens the popup by itself; Ctrl+Space is the
+/// explicit request. A list that is *already* open keeps recomputing whatever
+/// the edit was, so Backspace still refines it and closes it when the prefix is
+/// gone — this rule is about what may **start** showing one, not about what may
+/// change one.
+///
+/// [`Completion::suppress`] is the other half and is not this: it is a one-shot
+/// that closes an open list after an edit the app itself made.
+pub(crate) fn popup_may_open(force: bool, already_open: bool, typed: bool) -> bool {
+    force || already_open || typed
+}
+
 /// Recompute context-aware suggestions for the word at the caret. Ranks the most
 /// relevant kind first (columns of the in-scope tables after SELECT/WHERE, tables
 /// after FROM, a qualifier's columns after `x.`, statement keywords at the
@@ -611,6 +663,13 @@ pub(crate) fn recompute_completions(
             set_items(comp, Vec::new());
             return;
         }
+    }
+    // Nothing below this line may *start* showing a list, so a closed popup that
+    // isn't wanted stops here — after the `suppress` one-shot above, which has to
+    // be consumed by the next recompute either way or it would swallow a later
+    // keystroke instead of the edit it was set for.
+    if !popup_may_open(force, comp.open.get_untracked(), comp.typed.get_untracked()) {
+        return;
     }
     let word_lo = word_start(&text, offset);
     let prefix = text.get(word_lo..offset).unwrap_or("").to_string();
@@ -1445,8 +1504,8 @@ pub(crate) fn signature_popup(comp: Completion, viewport: RwSignal<Rect>) -> imp
 mod tests {
     use super::{
         KeyKind, SuggestKind, Suggestion, call_parens_follow, completion_insertion,
-        database_suggestion_visible, natural_width, popup_placement, popup_w, popup_x,
-        recency_bonus, row_width, statement_identifiers,
+        database_suggestion_visible, natural_width, popup_may_open, popup_placement, popup_w,
+        popup_x, recency_bonus, row_width, statement_identifiers, types_a_character,
     };
     use crate::consts::{
         COMPLETION_BORDER, COMPLETION_DETAIL_GAP, COMPLETION_EDGE_PAD, COMPLETION_GAP_W,
@@ -1454,7 +1513,72 @@ mod tests {
         COMPLETION_MAX_W, COMPLETION_MIN_H, COMPLETION_MIN_W, COMPLETION_ROW_H, COMPLETION_ROW_PAD,
         COMPLETION_SLACK_W,
     };
+    use floem::keyboard::{Key, NamedKey};
     use std::collections::HashSet;
+
+    // ── What is allowed to summon the popup ───────────────────────────────
+
+    #[test]
+    fn a_typed_letter_is_typing() {
+        assert!(types_a_character(&Key::Character("a".into()), false, false));
+        // Shift is still typing — it is how a capital arrives.
+        assert!(types_a_character(&Key::Character("A".into()), false, false));
+    }
+
+    #[test]
+    fn space_is_typing_however_it_arrives() {
+        // Reported as a named key on some platforms and as `" "` on others, and
+        // the `auto_show` list after `WHERE ` hangs off it either way.
+        assert!(types_a_character(
+            &Key::Named(NamedKey::Space),
+            false,
+            false
+        ));
+        assert!(types_a_character(&Key::Character(" ".into()), false, false));
+    }
+
+    #[test]
+    fn enter_and_tab_are_not_typing() {
+        // The reported case: adding a line should not summon a suggestion list.
+        assert!(!types_a_character(
+            &Key::Named(NamedKey::Enter),
+            false,
+            false
+        ));
+        assert!(!types_a_character(&Key::Named(NamedKey::Tab), false, false));
+        assert!(!types_a_character(
+            &Key::Named(NamedKey::Backspace),
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_command_is_not_typing_even_though_it_carries_a_letter() {
+        // Ctrl+X (delete line) and Ctrl+Z (undo) arrive as `Character`, which is
+        // why they used to reopen the popup wherever the caret landed.
+        assert!(!types_a_character(&Key::Character("x".into()), true, false));
+        assert!(!types_a_character(&Key::Character("z".into()), true, false));
+        assert!(!types_a_character(&Key::Character("v".into()), true, false));
+        // Alt combos likewise (`Alt+↑` moves a line; `Ctrl+Alt+L` reformats).
+        assert!(!types_a_character(&Key::Character("l".into()), true, true));
+    }
+
+    #[test]
+    fn a_closed_popup_opens_only_for_typing_or_a_request() {
+        // Typing opens it; a document change that wasn't typed does not.
+        assert!(popup_may_open(false, false, true));
+        assert!(!popup_may_open(false, false, false));
+        // Ctrl+Space asks for it explicitly, whatever the last key was.
+        assert!(popup_may_open(true, false, false));
+    }
+
+    #[test]
+    fn an_open_popup_keeps_recomputing_whatever_the_edit_was() {
+        // Backspace isn't typing, but a list already on screen must still refine
+        // (and close itself once the prefix is gone) rather than freeze.
+        assert!(popup_may_open(false, true, false));
+    }
 
     #[test]
     fn databases_hidden_until_prefix_and_never_the_active_one() {
