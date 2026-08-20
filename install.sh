@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 #
-# Install Schemaic on Linux.
+# Install Schemaic on Linux or macOS.
 #
 #     curl -fsSL https://raw.githubusercontent.com/fadion/schemaic/main/install.sh | bash
 #
-# Picks the right artifact from the latest GitHub Release for this machine: a
-# .deb on Debian and Ubuntu, an .rpm on Fedora, RHEL and openSUSE, and the
-# self-updating AppImage everywhere else.
+# Picks the right artifact from the latest GitHub Release for this machine: the
+# .pkg on macOS, a .deb on Debian and Ubuntu, an .rpm on Fedora, RHEL and
+# openSUSE, and the self-updating AppImage on every other Linux.
 #
-# **The three are not equivalent, and the script says so at the end.** The
-# AppImage is a Velopack install and checks for updates on its own. A .deb or
-# .rpm lands in /usr/bin, which is not a Velopack install, so the in-app check
-# correctly never runs - those are updated by re-running this script, until
-# there is an apt/dnf repository to point at.
+# **They are not equivalent, and the script says which is which at the end.**
+# The .pkg and the AppImage are Velopack installs and check for updates on
+# their own. A .deb or .rpm lands in /usr/bin, which is not a Velopack install,
+# so the in-app check correctly never runs - those are updated by re-running
+# this script, until there is an apt/dnf repository to point at.
+#
+# On macOS this script is also the way past Gatekeeper, and not by defeating
+# it: the quarantine flag is set by whatever downloads a file, and curl does
+# not set it. Nothing here disables a security check.
 #
 set -euo pipefail
 
@@ -66,12 +70,23 @@ run_privileged() {
     fi
 }
 
-# Only x86_64 is published. Checking is the whole point: without it an arm64
-# machine downloads an amd64 package and finds out at install time - or worse,
+# The two platforms ship opposite architectures - Linux x86_64, macOS Apple
+# Silicon - so the check has to know which one it is on. Without it a machine
+# downloads the build for the other ISA and finds out at install time, or worse
 # at launch.
+os="$(uname -s)"
 arch="$(uname -m)"
-if [ "$arch" != "x86_64" ]; then
-    err "Schemaic publishes x86_64 Linux builds only, and this machine is ${arch}."
+case "$os" in
+    Linux) want_arch=x86_64 ;;
+    Darwin) want_arch=arm64 ;;
+    *)
+        err "Schemaic has no build for ${os}. Windows users want the installer"
+        err "from https://github.com/${REPO}/releases/latest"
+        exit 1
+        ;;
+esac
+if [ "$arch" != "$want_arch" ]; then
+    err "Schemaic publishes ${want_arch} builds for ${os}, and this machine is ${arch}."
     err "Building from source is documented at https://github.com/${REPO}#build--run"
     exit 1
 fi
@@ -210,9 +225,40 @@ install_appimage() {
     esac
 }
 
-family="${SCHEMAIC_PKG_FAMILY:-$(detect_family)}"
+# macOS has exactly one route, so it never consults SCHEMAIC_PKG_FAMILY or the
+# package-manager sniffing below - a Mac with Homebrew's `rpm` on it is still a
+# Mac.
+install_macos() {
+    local url tmp
+    url="$(asset_url '\.pkg')"
+    tmp="$(mktemp -d)/Schemaic.pkg"
+    info "Downloading ${url##*/}"
+    download_to "$url" "$tmp"
+    if ! pkgutil --check-signature "$tmp" >/dev/null 2>&1; then
+        # Expected: the package is unsigned. Worth saying out loud rather than
+        # discovering later, because it is the same trust posture as the
+        # Windows installer - you are trusting where this came from, and
+        # nothing else is vouching for it.
+        warn "This package is not signed by an Apple Developer ID."
+    fi
+    info "Installing to /Applications (this needs root)"
+    run_privileged installer -pkg "$tmp" -target /
+    rm -f "$tmp"
+    ok "Installed"
+    # Only true for this path, and it is the reason this script is the pleasant
+    # way in on macOS: the quarantine flag is set by whatever downloads a file,
+    # and curl does not set it. A browser download of the same .pkg would need
+    # a trip through System Settings before it would open.
+    info "Downloaded with curl, so Gatekeeper's quarantine flag was never set."
+}
+
+if [ "$os" = Darwin ]; then
+    family=macos
+else
+    family="${SCHEMAIC_PKG_FAMILY:-$(detect_family)}"
+fi
 case "$family" in
-    debian | rpm | appimage) ;;
+    debian | rpm | appimage | macos) ;;
     unknown)
         warn "No supported package manager found; the AppImage is the way in on this system."
         family=appimage
@@ -228,6 +274,7 @@ case "$family" in
     debian) install_deb ;;
     rpm) install_rpm ;;
     appimage) install_appimage ;;
+    macos) install_macos ;;
 esac
 
 echo
@@ -247,6 +294,10 @@ case "$family" in
         info "Updates:   checked automatically; the app offers a restart when one is staged."
         info "Uninstall: rm ~/.local/bin/Schemaic.AppImage \\"
         info "              ~/.local/share/applications/${APP_ID}.desktop"
+        ;;
+    macos)
+        info "Updates:   checked automatically; the app offers a restart when one is staged."
+        info "Uninstall: rm -rf /Applications/Schemaic.app"
         ;;
 esac
 printf '%sSchemaic is in active development - do not trust it with data you care about.%s\n' "$YELLOW" "$RESET"

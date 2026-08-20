@@ -19,7 +19,7 @@ production data, or any data you care about.
   200k-row result sets smoothly and searches them without lag.
 - **Lightweight** — a single native binary. No runtime to install, no embedded
   browser.
-- **Native** — real desktop app on Windows and Linux.
+- **Native** — real desktop app on Windows, Linux and macOS.
 - **Guard-rails** — writes go through a missing-`WHERE` check, grid edits commit
   in a transaction that rolls back unless exactly one row changed, and generated
   `ALTER` / `DROP` is always shown as SQL — with what it destroys named in plain
@@ -90,7 +90,8 @@ production data, or any data you care about.
 
 Prebuilt binaries for every release are on the
 [Releases page](https://github.com/fadion/schemaic/releases/latest). Schemaic
-runs on **Windows and Linux, x86_64**; there is no macOS build.
+runs on **Windows and Linux (x86_64)** and **macOS (Apple Silicon)**. There is
+no Intel Mac build.
 
 ### Windows
 
@@ -106,6 +107,31 @@ root and would change nothing.
 
 Prefer no installer? `schemaic-vX.Y.Z-windows-x86_64.zip` is the same build as a
 portable folder. It does not auto-update.
+
+### macOS
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/fadion/schemaic/main/install.sh | bash
+```
+
+Installs the `.pkg` into `/Applications`, and the app updates itself from then
+on.
+
+**Prefer to download it by hand?** Take `Schemaic-osx-arm64-Setup.pkg`, or
+`Schemaic-osx-arm64-Portable.zip` if you would rather drag `Schemaic.app`
+into `/Applications` yourself. Either way macOS will refuse to open it the
+first time — the app is not signed with an Apple Developer ID, which is a
+paid, ongoing thing and not yet warranted. To get past it: open the app once
+and let it be blocked, then **System Settings → Privacy & Security**, scroll
+to the message naming Schemaic, and click **Open Anyway**.
+
+Right-click → Open, which you will find in older advice, no longer works for
+unsigned apps on macOS Sequoia and later. The command-line equivalent is
+`xattr -dr com.apple.quarantine /Applications/Schemaic.app`.
+
+The script above avoids all of that, and not by weakening anything: the
+quarantine flag is set by whatever downloads the file, and `curl` doesn't set
+it.
 
 ### Linux
 
@@ -150,11 +176,17 @@ cargo run -p schemaic-app
 
 No database client libraries to install for any of the three engines — SQLite is
 compiled in from source, so building needs a working C compiler (the MSVC tools on
-Windows, `build-essential` / `gcc` on Linux) alongside the GUI libraries below.
+Windows, `build-essential` / `gcc` on Linux, the Xcode command line tools on
+macOS) alongside the GUI libraries below.
 
 ### On Windows
 
 Nothing else to install.
+
+### On macOS
+
+`xcode-select --install`, if you haven't already. Everything the renderer needs
+ships with the OS.
 
 ### On Linux
 

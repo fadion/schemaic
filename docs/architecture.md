@@ -2517,6 +2517,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     provides, the spec names *sonames* because every rpm distribution auto-provides them, which is
     what lets one spec serve Fedora, RHEL and openSUSE despite their disagreeing on nearly every
     package name.
+    **macOS is a third leg on its own permanent `osx-arm64` channel, and Velopack builds its bundle
+    for us.** `release.yml` hands `vpk pack` a staged `dist/` and it produces `Schemaic.app`, a
+    `Schemaic-osx-arm64-Setup.pkg` and a ditto-zipped `-Portable.zip` of the bundle — which is why
+    macOS is the one leg that publishes no archive of its own, and why the `--noPortable` Windows
+    passes is absent there. The `.icns` `vpk` insists on (it validates the extension) is generated on
+    the runner from `assets/icon-1024.png` with `sips` and `iconutil`, so the PNG stays the single
+    icon source. Unlike a `.deb`, a `.pkg` install **is** a Velopack install, so the in-app update
+    check runs there exactly as it does on Windows. It is unsigned and un-notarized by the same
+    decision the Windows installer carries.
+    **`release.yml` also answers to `workflow_dispatch`, with every publish step gated on
+    `github.ref_type == 'tag'`.** A tag used to be the only way to run the file, which made a
+    packaging mistake discoverable only once the tag existed and was awkward to retract — the macOS
+    leg was proven this way before it ever saw a version number. The dry run additionally skips the
+    feed-history fetch: without a tag the version falls back to the workspace one, and for any
+    channel that has already shipped that is a version `vpk pack` refuses to pack over.
     **`main.rs` runs `velopack::VelopackApp::build().run()` near the top of `main`**, before tracing,
     the font registration, the tokio runtime and any Floem signal or `Scope`: the installer and the
     updater re-invoke the exe with `--veloapp-*` args, and `run()` services those and then
