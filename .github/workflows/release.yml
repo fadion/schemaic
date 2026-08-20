@@ -71,7 +71,7 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             v="${GITHUB_REF_NAME#v}"
           else
-            v="$(grep -m1 '^version' Cargo.toml | cut -d'\"' -f2)"
+            v="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
             echo "::notice::No tag; packing the workspace version $v as a dry run"
           fi
           echo "VPK_VERSION=$v" >> "$GITHUB_ENV"
