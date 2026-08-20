@@ -2923,6 +2923,13 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
 }
 
 // ── Header ────────────────────────────────────────────────────────────────
+/// The app mark, drawn at the head of the header.
+///
+/// Embedded rather than read from disk: 3.7 KB in the binary costs less than a
+/// load path that can fail, and the header is built before anything that could
+/// report the failure exists.
+const LOGO_PNG: &[u8] = include_bytes!("../../../assets/icon-64.png");
+
 fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
     let connections = ui.conn.connections;
     let active_conn = ui.conn.active_conn;
@@ -3080,8 +3087,11 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
         .style(|s| s.items_center().height_full());
 
     // Environment badge: a capsule filled with the active connection's identity
-    // colour, sitting 20px right of the switcher and shown only when that
-    // connection has an environment set. Rebuilds when the environment changes; the
+    // colour, sitting 12px right of the switcher and shown only when that
+    // connection has an environment set. That 12px is the same figure as the
+    // header's left inset and the logo-to-switcher gap, so the whole left
+    // cluster steps at one rhythm; it was 20 while the switcher led the row and
+    // had only the window edge to balance against. Rebuilds when the environment changes; the
     // fill re-reads the colour inside `.style` so a colour switch follows without a
     // rebuild. The `margin_left` lives on the capsule (not the wrapper) so the
     // empty/no-environment case leaves no gap after the switcher.
@@ -3092,7 +3102,7 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
                 text(lbl).style(|s| s.color(theme::env_badge_text()).font_size(theme::FONT_BODY)),
             )
             .style(move |s| {
-                s.margin_left(20.0)
+                s.margin_left(12.0)
                     .padding_vert(5.0)
                     .padding_horiz(10.0)
                     .border_radius(5.0)
@@ -3103,14 +3113,35 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
         },
     );
 
-    // Left cluster (dot + switcher + environment badge) and the right glyph
+    // **An `img()`, not an `icons::icon()`.** Floem's `svg()` always hands
+    // `draw_svg` a tint brush — `svg_color()`, else `text_color()`, else black,
+    // never `None` — so every SVG it draws comes out in a single colour. That is
+    // exactly what `icons` wants from a Lucide glyph and exactly wrong for a
+    // four-colour mark, which would arrive as a silhouette. `img()` decodes the
+    // PNG once, at construction, and draws it untinted.
+    //
+    // The source is 64px for a 20px box, so it stays crisp past 3x display
+    // scaling, and its corners are fully transparent — it composites straight
+    // onto `bg_chrome()` in either theme with no plate behind it.
+    let logo = img(|| LOGO_PNG.to_vec()).style(|s| {
+        s.width(20.0)
+            .height(20.0)
+            .margin_left(12.0)
+            .flex_shrink(0.0_f32)
+    });
+
+    // Left cluster (logo + switcher + environment badge) and the right glyph
     // cluster, pinned to opposite edges via `justify_between` (a lone flex-grow
-    // spacer under-fills — see the schema title-row note). The dot's own
-    // `margin_left(15)` sets the left inset.
-    // The switcher's left inset matches `section_title`'s 12px, so it lines up
-    // with "SCHEMA" in the panel below it. (There's no status dot ahead of it
-    // any more — health is now told by the Disconnected notice alone.)
+    // spacer under-fills — see the schema title-row note).
+    //
+    // **The 12px left inset belongs to the logo now, and that is a trade rather
+    // than a drift.** It used to sit on the switcher, matching `section_title`'s
+    // inset so the switcher lined up with "SCHEMA" in the panel below; nothing
+    // can hold that alignment once something else stands to its left. The logo
+    // inherits the inset, the switcher follows a 12px gap after it, and the
+    // column below now lines up with the mark instead.
     let left = h_stack((
+        logo,
         container(switcher).style(|s| s.margin_left(12.0)),
         badge,
         disconnected_notice(conn_status, ui.conn_actions.recheck_conn.clone()),
