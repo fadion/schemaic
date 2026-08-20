@@ -5,9 +5,17 @@ name: Release
 #     git push origin v0.1.0
 # Builds a release binary on each OS and attaches it to a GitHub Release for
 # that tag (created automatically if it doesn't exist yet).
+#
+# `workflow_dispatch` runs everything *except* the three publish steps, which
+# are gated on `github.ref_type == 'tag'`. That exists because a tag is the
+# expensive way to discover a packaging mistake: the tag is already pushed and
+# awkward to retract by the time the job fails. A manual run builds and packs
+# every leg with nothing at stake, which is how the macOS leg was proven before
+# it ever saw a version number.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 # Needed so the workflow can create the Release and upload assets.
 permissions:
@@ -42,8 +50,32 @@ jobs:
           - os: windows-latest
             target: windows-x86_64
             channel: win-x64
+          # Apple Silicon only. Intel Macs would need their own permanent
+          # channel (`osx-x64`); adding one later is safe, renaming this one is
+          # not, which is why it says `arm64` rather than a bare `osx`.
+          - os: macos-latest
+            target: macos-arm64
+            channel: osx-arm64
     steps:
       - uses: actions/checkout@v5
+
+      # The version every leg packs with, resolved in one place because the
+      # three `vpk pack` steps used to each derive it their own way — and
+      # because on a `workflow_dispatch` there is no tag to derive it from.
+      # Falls back to the workspace version, which is what the next tag will
+      # carry anyway.
+      - name: Resolve the package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            v="${GITHUB_REF_NAME#v}"
+          else
+            v="$(grep -m1 '^version' Cargo.toml | cut -d'\"' -f2)"
+            echo "::notice::No tag; packing the workspace version $v as a dry run"
+          fi
+          echo "VPK_VERSION=$v" >> "$GITHUB_ENV"
+
       # Bounded and retried: `apt-get update` hung here for an hour on the v0.16.0
       # release and had to be cancelled and re-run by hand, and again on a CI run
       # a release later. A stalled mirror or held lock never fails on its own, and
@@ -94,6 +126,14 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo build --release -p schemaic-app
 
+      # Native: the runner is Apple Silicon and `osx-arm64` is the only macOS
+      # channel, so there is no cross-compilation and no glibc floor to hold —
+      # macOS versions its own SDK, and the deployment target the toolchain
+      # picks covers everything Apple still supports.
+      - name: Build release binary (macOS, arm64)
+        if: runner.os == 'macOS'
+        run: cargo build --release -p schemaic-app
+
       # Stage the binary alongside the license notices that must ship with a
       # distributed build, then archive (.tar.gz on Linux, .zip on Windows).
       - name: Package (Linux)
@@ -122,10 +162,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
           binary=target/x86_64-unknown-linux-gnu/release/schemaic
-          bash packaging/linux/build-deb.sh "$version" "$binary" dist-packages
-          bash packaging/linux/build-rpm.sh "$version" "$binary" dist-packages
+          bash packaging/linux/build-deb.sh "$VPK_VERSION" "$binary" dist-packages
+          bash packaging/linux/build-rpm.sh "$VPK_VERSION" "$binary" dist-packages
           ls -l dist-packages
 
       - name: Package (Windows)
@@ -137,6 +176,37 @@ jobs:
           Copy-Item crates/schemaic-ui/fonts/LICENSE.txt dist/IBMPlex-OFL.txt
           Copy-Item licenses/Lucide-LICENSE.txt dist/
           Compress-Archive -Path dist/* -DestinationPath "schemaic-${{ github.ref_name }}-${{ matrix.target }}.zip"
+
+      # macOS gets no archive of its own: `vpk` emits the .app itself, and a
+      # ditto-zipped .app is a better macOS deliverable than a tarred bare
+      # binary would be. What is staged here is only the input `vpk` builds the
+      # bundle from.
+      - name: Stage the payload (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          mkdir dist
+          cp target/release/schemaic dist/
+          cp LICENSE THIRD-PARTY-NOTICES.md README.md dist/
+          cp crates/schemaic-ui/fonts/LICENSE.txt dist/IBMPlex-OFL.txt
+          cp licenses/Lucide-LICENSE.txt dist/
+
+      # `vpk` validates that --icon ends in .icns, and macOS is the only place
+      # that can build one. `sips` and `iconutil` ship with the OS, so the PNG
+      # stays the single source of truth rather than a second icon checked in
+      # beside it, quietly drifting. 512@2x consumes icon-1024.png whole, which
+      # is why that is the source rather than the 512 one.
+      - name: Build the .icns (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          mkdir -p icon.iconset
+          for sz in 16 32 128 256 512; do
+            sips -z $sz $sz assets/icon-1024.png --out "icon.iconset/icon_${sz}x${sz}.png" >/dev/null
+            sips -z $((sz * 2)) $((sz * 2)) assets/icon-1024.png --out "icon.iconset/icon_${sz}x${sz}@2x.png" >/dev/null
+          done
+          iconutil -c icns icon.iconset -o icon.icns
+          ls -l icon.icns
 
       # ── Velopack: the auto-updating artifacts ────────────────────────────
       # The archives above stay as the *portable* artifacts (no auto-update, no
@@ -205,10 +275,9 @@ jobs:
       - name: Package with Velopack (Windows)
         if: runner.os == 'Windows'
         run: |
-          $version = "${{ github.ref_name }}".TrimStart('v')
           vpk pack `
             --packId Schemaic `
-            --packVersion $version `
+            --packVersion $env:VPK_VERSION `
             --packDir dist `
             --mainExe schemaic.exe `
             --packTitle Schemaic `
@@ -217,7 +286,6 @@ jobs:
             --channel ${{ matrix.channel }} `
             --delta None `
             --noPortable
-          "VPK_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # `--icon` is *required* on Linux and must be a PNG — vpk builds the AppDir
       # (with its .desktop entry and icon) from the pack directory, which is also
@@ -227,10 +295,9 @@ jobs:
       - name: Package with Velopack (Linux)
         if: runner.os == 'Linux'
         run: |
-          version="${GITHUB_REF_NAME#v}"
           vpk pack \
             --packId Schemaic \
-            --packVersion "$version" \
+            --packVersion "$VPK_VERSION" \
             --packDir dist \
             --mainExe schemaic \
             --packTitle Schemaic \
@@ -239,9 +306,43 @@ jobs:
             --categories Development \
             --channel ${{ matrix.channel }} \
             --delta None
-          echo "VPK_VERSION=$version" >> "$GITHUB_ENV"
 
+      # Unsigned and un-notarized, the same decision the Windows installer
+      # carries: an Apple Developer ID is a paid, ongoing thing and this is not
+      # yet an app with an audience to justify it. `vpk` warns and carries on.
+      # Gatekeeper is the cost, and the README says how to get past it.
+      #
+      # `--bundleId` is the same reverse-DNS id the Linux desktop entry and
+      # AppStream metadata use, so one identity covers every platform. It is
+      # mutually exclusive with `--plist`; pass one or the other, never both.
+      #
+      # No `--noPortable` here, unlike Windows: on macOS the portable artifact
+      # is a ditto zip of the .app, which is exactly what someone dragging it
+      # to /Applications wants. On Windows it would be a second, redundant
+      # portable next to the .zip we build ourselves.
+      - name: Package with Velopack (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          vpk pack \
+            --packId Schemaic \
+            --packVersion "$VPK_VERSION" \
+            --packDir dist \
+            --mainExe schemaic \
+            --packTitle Schemaic \
+            --packAuthors "Schemaic contributors" \
+            --icon icon.icns \
+            --bundleId io.github.fadion.Schemaic \
+            --channel ${{ matrix.channel }} \
+            --delta None
+
+      # `ref_type` rather than `event_name`: a dispatch has no tag to publish
+      # against, and `softprops/action-gh-release` would create a release named
+      # after the branch. Skipped on macOS too — that leg builds no archive of
+      # its own, and this step is left strict (no `fail_on_unmatched_files`) so
+      # that a *missing* Linux or Windows archive still fails the release, which
+      # is the mistake worth catching here.
       - name: Publish to the GitHub Release
+        if: github.ref_type == 'tag' && runner.os != 'macOS'
         uses: softprops/action-gh-release@v2
         with:
           files: schemaic-${{ github.ref_name }}-${{ matrix.target }}.*
@@ -262,11 +363,14 @@ jobs:
       # primary artifacts while only ever producing its own — one step covering
       # both beats two nearly identical OS-gated ones.
       - name: Publish the Velopack artifacts
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           files: |
             Releases/Schemaic-${{ matrix.channel }}-Setup.exe
             Releases/Schemaic-${{ matrix.channel }}.AppImage
+            Releases/Schemaic-${{ matrix.channel }}-Setup.pkg
+            Releases/Schemaic-${{ matrix.channel }}-Portable.zip
             Releases/Schemaic-${{ env.VPK_VERSION }}-${{ matrix.channel }}-full.nupkg
             Releases/releases.${{ matrix.channel }}.json
           fail_on_unmatched_files: false
@@ -276,7 +380,7 @@ jobs:
       # `schemaic-0.16.3-1.x86_64.rpm`) and match neither the archive glob nor
       # the Velopack one.
       - name: Publish the distribution packages
-        if: runner.os == 'Linux'
+        if: github.ref_type == 'tag' && runner.os == 'Linux'
         uses: softprops/action-gh-release@v2
         with:
           files: |
