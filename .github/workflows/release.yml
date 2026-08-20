@@ -334,6 +334,10 @@ jobs:
             --bundleId io.github.fadion.Schemaic \
             --channel ${{ matrix.channel }} \
             --delta None
+          # Named, not globbed, in the publish step below, and that step
+          # tolerates unmatched files - so a name vpk changes would drop the
+          # macOS artifacts from a release silently. This is where that shows.
+          ls -l Releases
 
       # `ref_type` rather than `event_name`: a dispatch has no tag to publish
       # against, and `softprops/action-gh-release` would create a release named
