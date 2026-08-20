@@ -245,7 +245,15 @@ jobs:
       # shrugging and carrying on. 5 is roughly sixty times what the real work
       # needs (~25 MB from GitHub's CDN, seconds on a runner), so it never binds
       # in the good case and caps the bad one at something survivable.
+      #
+      # Skipped without a tag, and that is what makes `workflow_dispatch` usable
+      # at all: a dry run falls back to the workspace version, which for every
+      # channel that has already shipped is a version `vpk pack` refuses to pack
+      # over ("There is a release in channel X which is equal or greater").
+      # Fetching no history leaves nothing for it to object to, and a run that
+      # publishes nothing has no feed to carry forward anyway.
       - name: Fetch the previous release for the feed's history
+        if: github.ref_type == 'tag'
         continue-on-error: true
         run: vpk download github --repoUrl https://github.com/${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }} --channel ${{ matrix.channel }} --timeout 5
 
