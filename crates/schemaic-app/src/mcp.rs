@@ -19,8 +19,10 @@
 
 use std::collections::HashSet;
 
+use schemaic_core::ddl::Target;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::ResultSet;
+use schemaic_core::propose::{self, Proposal};
 use schemaic_core::schema::{DbSchema, TableInfo};
 use schemaic_db::Db;
 use serde_json::{Value, json};
@@ -175,6 +177,66 @@ fn tools_list(engine: schemaic_db::Engine) -> Value {
                 },
                 "required": ["table"]
             }
+        },
+        {
+            "name": "propose_table_change",
+            "description": format!(
+                "Check a proposed change to a table and see the {} SQL it would produce. \
+                 **This runs nothing and changes nothing** — it reads the table, applies your ops \
+                 to it, and hands back the DDL plus anything destructive in it. Call it before \
+                 offering a schema change so you find out here, not in front of the user, that a \
+                 column is spelled differently than you thought. When it comes back valid, put the \
+                 *same* JSON in a ```{} fenced block in your reply: Schemaic turns that into a \
+                 change preview the user reviews and applies themselves. Never write the DDL out \
+                 for them to run.\n\n\
+                 Ops are a patch — what you don't name, you don't touch, so send only what should \
+                 change. One op per object: \
+                 {{\"add_column\": {{\"name\", \"type\", \"nullable\"?, \"default\"?, \"comment\"?, \
+                 \"auto_increment\"?, \"generated\"?}}}}, \
+                 {{\"alter_column\": {{\"name\", \"type\"?, \"nullable\"?, \"default\"?, \
+                 \"drop_default\"?, \"comment\"?}}}}, \
+                 {{\"drop_column\": {{\"name\"}}}}, {{\"rename_column\": {{\"from\", \"to\"}}}}, \
+                 {{\"set_primary_key\": {{\"columns\": []}}}}, \
+                 {{\"add_index\": {{\"columns\": [], \"name\"?, \"unique\"?}}}}, \
+                 {{\"drop_index\": {{\"name\"}}}}, \
+                 {{\"add_foreign_key\": {{\"columns\": [], \"ref_table\", \"ref_columns\": [], \
+                 \"name\"?, \"ref_schema\"?, \"on_delete\"?, \"on_update\"?}}}}, \
+                 {{\"drop_foreign_key\": {{\"name\"}}}}, \
+                 {{\"add_check\": {{\"expression\", \"name\"?}}}}, {{\"drop_check\": {{\"name\"}}}}, \
+                 {{\"rename_table\": {{\"to\"}}}}. \
+                 Types are written the way this server writes them ({}). Unknown keys are refused \
+                 rather than ignored.",
+                dialect.engine_label(),
+                schemaic_core::propose::FENCE_TAG,
+                dialect.engine_label(),
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "table": {
+                        "type": "string",
+                        "description": "The table to change, as list_schema printed it."
+                    },
+                    "database": {
+                        "type": "string",
+                        "description": "Defaults to the connection's active database."
+                    },
+                    "schema": {
+                        "type": "string",
+                        "description": "PostgreSQL namespace, when the table is outside the default."
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "One line on what this change is for, shown above the preview."
+                    },
+                    "ops": {
+                        "type": "array",
+                        "description": "The changes to make, applied in order.",
+                        "items": { "type": "object" }
+                    }
+                },
+                "required": ["table", "ops"]
+            }
         }
     ])
 }
@@ -202,6 +264,7 @@ async fn call_tool(
             Some(table) => describe_table(db, database, arg("database"), table, samples).await,
             None => ("describe_table needs a `table`.".to_string(), true),
         },
+        "propose_table_change" => propose_change(db, database, arg("database"), args).await,
         other => (format!("Unknown tool: {other}"), true),
     };
     json!({ "content": [ { "type": "text", "text": text } ], "isError": is_error })
@@ -578,13 +641,167 @@ async fn describe_table(
     (out, false)
 }
 
+/// The proposal inside a `propose_table_change` call's arguments.
+///
+/// `database` is the *tool's* argument, not the proposal's, and
+/// [`Proposal`] refuses unknown keys on purpose — a model that invents a field
+/// has to be told rather than have it quietly dropped — so it comes off here
+/// instead of being tolerated there. Pure, so both halves of that are tested.
+fn proposal_from_args(args: &Value) -> Result<Proposal, String> {
+    let mut fields = args.clone();
+    if let Some(obj) = fields.as_object_mut() {
+        obj.remove("database");
+    }
+    serde_json::from_value(fields).map_err(|e| format!("That isn't a valid proposal: {e}"))
+}
+
+/// `propose_table_change` — check a proposed change and show the DDL it would
+/// produce. **Reads only.** Nothing here executes anything.
+///
+/// The value is the loop it closes: the model finds out *here* that it misread a
+/// column name or asked for something the designer's own validation refuses,
+/// instead of the user being handed a preview that can't be applied. What comes
+/// back is the same SQL the preview modal will show, so the model is looking at
+/// what the user will look at.
+///
+/// It deliberately stops there. The result goes to the *model*, and this process
+/// has no route into the app's overlays — the proposal reaches the user only
+/// when the model echoes it into its reply, where the app picks it up. So a
+/// model that skips this tool has lost a check, not a safety rail: the preview
+/// and the Apply click are downstream of both paths.
+async fn propose_change(
+    db: &Db,
+    default_db: Option<&str>,
+    database: Option<&str>,
+    args: &Value,
+) -> (String, bool) {
+    let Some(database) = database.or(default_db) else {
+        return (
+            "No database given and the connection has no default — pass a `database`.".to_string(),
+            true,
+        );
+    };
+    let proposal = match proposal_from_args(args) {
+        Ok(p) => p,
+        Err(e) => return (e, true),
+    };
+
+    let schema = match db.fetch_schema(database).await {
+        Ok(s) => s,
+        Err(e) => return (format!("Error reading schema for {database}: {e}"), true),
+    };
+    let Some(info) = find_described(&schema, &proposal.table) else {
+        return (
+            format!(
+                "Table {} not found in {database}. Call list_schema to see what exists.",
+                proposal.table
+            ),
+            true,
+        );
+    };
+
+    let dialect = dialect_of(db);
+    let draft = match propose::apply(info, &proposal, dialect) {
+        Ok(d) => d,
+        Err(e) => return (e.to_string(), true),
+    };
+    // The one differ, and the flavour the schema was read with — the MySQL
+    // emitter's `ALTER TABLE` path reads it, so dropping it here would produce a
+    // preview that differs from the designer's for the same change.
+    let changes = schemaic_core::ddl::diff(info, &draft, Target::new(dialect, schema.flavour));
+    if changes.is_empty() {
+        return (
+            format!(
+                "Those ops leave {} exactly as it is — there is nothing to propose.",
+                proposal.table
+            ),
+            true,
+        );
+    }
+
+    // The change list the preview shows, in the preview's own words, so the
+    // model and the user are reading the same account of the change.
+    let mut out = String::from("Valid. Nothing has run.\n\nChanges:\n");
+    for c in &changes.changes {
+        out.push_str(&format!("- {}\n", c.summary()));
+    }
+    out.push_str(&format!("\nSQL:\n{}\n", changes.emit().join("\n")));
+    let risks = changes.destructive();
+    if !risks.is_empty() {
+        out.push_str("\nDestructive — the preview will say so too:\n");
+        for r in &risks {
+            out.push_str(&format!("- {r}\n"));
+        }
+    }
+    out.push_str(&format!(
+        "\nTo offer this to the user, put the same JSON in a ```{} fenced block in your reply. \
+         They get a change preview and apply it themselves — don't hand them the SQL to run.",
+        propose::FENCE_TAG,
+    ));
+    (out, false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         HashSet, SUPPORTED_PROTOCOLS, dialect_of, find_described, format_database_list,
         format_database_schema, format_table, format_table_detail, format_table_heading,
-        listed_databases, negotiate_protocol, normalize_stmt,
+        listed_databases, negotiate_protocol, normalize_stmt, proposal_from_args,
     };
+
+    /// The tool's arguments carry `database` alongside the proposal's own
+    /// fields; the proposal type refuses unknown keys, so it has to come off
+    /// before parsing or every call fails.
+    #[test]
+    fn a_proposal_parses_out_of_the_tools_arguments() {
+        let args = serde_json::json!({
+            "database": "shop",
+            "table": "orders",
+            "ops": [{"add_column": {"name": "deleted_at", "type": "datetime"}}]
+        });
+        let p = proposal_from_args(&args).expect("parses");
+        assert_eq!(p.table, "orders");
+        assert_eq!(p.ops.len(), 1);
+    }
+
+    /// And nothing *else* unknown gets the same pass — a model inventing a field
+    /// must be told, because a silently-dropped key is a change the user was
+    /// promised and wouldn't get.
+    #[test]
+    fn an_invented_argument_is_still_refused() {
+        let args = serde_json::json!({
+            "database": "shop",
+            "table": "orders",
+            "cascade": true,
+            "ops": []
+        });
+        assert!(proposal_from_args(&args).is_err());
+    }
+
+    /// The proposal tool has to advertise the fence tag the app actually reads,
+    /// or the model writes a block nothing picks up and the user is told a
+    /// change is waiting that never arrives.
+    #[test]
+    fn the_proposal_tool_advertises_the_tag_the_app_looks_for() {
+        for engine in [
+            schemaic_db::Engine::MySql,
+            schemaic_db::Engine::Postgres,
+            schemaic_db::Engine::Sqlite,
+        ] {
+            let tools = super::tools_list(engine);
+            let tool = tools
+                .as_array()
+                .expect("a list")
+                .iter()
+                .find(|t| t["name"] == "propose_table_change")
+                .expect("the tool is offered");
+            let description = tool["description"].as_str().expect("a description");
+            assert!(
+                description.contains(schemaic_core::propose::FENCE_TAG),
+                "{engine:?} doesn't name the tag the app extracts on"
+            );
+        }
+    }
 
     /// What `run_query` advertises is what the gate enforces, per engine. The
     /// description used to be a fixed `SELECT/SHOW/DESCRIBE/EXPLAIN/WITH`, so a

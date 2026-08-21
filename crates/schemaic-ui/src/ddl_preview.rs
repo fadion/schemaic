@@ -130,6 +130,75 @@ pub(crate) fn preview_change(
     );
 }
 
+/// Send an **AI proposal** to the preview, or say why it can't go there.
+///
+/// The same modal, the same warnings, the same Apply the designer reaches: a
+/// proposal is a draft like any other by the time it gets here, which is the
+/// whole point of `core::propose` handing back a `TableDraft` rather than SQL.
+/// Nothing on this path runs anything — the user still reads the plan and clicks
+/// Apply.
+///
+/// The `Err` is shown on the proposal card itself rather than in a modal. Every
+/// one of them is the model being wrong about the table, and the card is where
+/// the user can see what it asked for and tell it what it got wrong.
+///
+/// The table comes from [`crate::table_designer::loaded_table`] — the one funnel
+/// every editor seeds from, and it refuses while a re-introspection is in
+/// flight. That refusal matters more here than anywhere: the model may have read
+/// the table minutes ago, and building a draft on a stale `TableInfo` is how an
+/// `ALTER` comes to restate an old column definition and silently revert a
+/// change that has already landed.
+pub(crate) fn preview_proposal(
+    ui: &Ui,
+    database: &str,
+    proposal: &schemaic_core::propose::Proposal,
+) -> Result<(), String> {
+    let ctx = crate::table_designer::edit_ctx(ui);
+    // The model names a namespace only when it means one; otherwise the database's
+    // own default, which is `public` on PostgreSQL and nothing on MySQL.
+    let schema = proposal
+        .schema
+        .clone()
+        .or_else(|| crate::table_designer::default_schema(ui, database));
+    let Some(info) =
+        crate::table_designer::loaded_table(ui, database, schema.as_deref(), &proposal.table)
+    else {
+        return Err(format!(
+            "{} isn't loaded in {database} right now — open the database in the schema tree, or \
+             wait for a refresh to finish, and try again.",
+            proposal.table
+        ));
+    };
+    let draft =
+        schemaic_core::propose::apply(&info, proposal, ctx.dialect).map_err(|e| e.to_string())?;
+    // The flavour the schema was actually introspected with — see `db_flavour`.
+    // The MySQL emitter's `ALTER TABLE` path reads it, so taking the dialect
+    // alone would give this path a different plan than the designer's for the
+    // very same change.
+    let target = schemaic_core::ddl::Target::new(
+        ctx.dialect,
+        crate::table_designer::db_flavour(ui, database),
+    );
+    let cs = schemaic_core::ddl::diff(&info, &draft, target);
+    if cs.is_empty() {
+        return Err(format!(
+            "{} already looks like that — there is nothing to change.",
+            proposal.table
+        ));
+    }
+    open_preview(
+        ui,
+        preview_of(
+            ctx.conn_id,
+            database,
+            schemaic_core::schema::display_name(schema.as_deref(), &proposal.table),
+            &cs,
+            ctx.read_only,
+        ),
+    );
+    Ok(())
+}
+
 /// A bullet line in the change list.
 fn change_line(label: String) -> impl IntoView {
     h_stack((
