@@ -2005,7 +2005,23 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     and a namespace both survive a search that only one of their **objects** matches, or the
     match would be hidden by the row that contains it. `nav_rows` carries the folders and their
     leaves like everything else — it is the function that must stay bug-for-bug identical to
-    the render. **A folder now carries a menu of its own** (`CtxKind::ObjectGroup`), reversing the
+    the render.
+    **Which databases a surface may show is `db_visible`, and every list of databases asks it.**
+    The eye hides a database from *sight*, and sight is not just the tree the eye hangs off: the
+    QUERY toolbar's active-database selector went on offering hidden ones, so a database the user
+    had deliberately put away was still one click from being switched to. The tree's `dyn_stack`,
+    `nav_rows`, the selector's menu and the trigger that opens it all go through the predicate —
+    and "is anything left to offer" is that same filtered set, not the raw node count, or hiding
+    the last database leaves the menu's open flag set with no panel to answer it. **Autocomplete
+    asks it too**, through `completion::suggests_from`: a hidden database contributes no name, no
+    table and no column to the suggestion pool. Three deliberate exceptions. The **eye's own menu**
+    must list a hidden database for it to be unhidden. A **tab's binding** survives — hiding the
+    database a tab already runs against doesn't move the tab, and a toolbar that stopped naming it
+    would be lying about where the next query goes; `suggests_from` carries the same exception, so
+    working inside a hidden database still completes its own tables. And **`build_catalog` never
+    filters**: that catalog is what the diagnostics squiggle against, and a hidden database's tables
+    have not stopped existing — filtering there would mark `archive.orders` as unknown over a view
+    preference. Hiding governs what is *offered*, never what is *true*. **A folder now carries a menu of its own** (`CtxKind::ObjectGroup`), reversing the
     earlier call that a structural row should offer nothing on either the pointer or `Shift+F10`:
     it is the script for everything in the folder and `Refresh`, then the one thing you come to a
     folder for — `Create {kind}`, flat and lower-cased to match the object row's `Edit sequence`.

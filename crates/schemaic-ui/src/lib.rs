@@ -4075,6 +4075,7 @@ fn center(ui: Ui) -> impl IntoView {
                     run_guard,
                     run_anyway: run_anyway.clone(),
                     db_nodes,
+                    hidden_dbs: ui.schema.hidden_dbs,
                     inline_ai,
                     inline_ai_run: inline_ai_run.clone(),
                     inline_ai_cancel: inline_ai_cancel.clone(),

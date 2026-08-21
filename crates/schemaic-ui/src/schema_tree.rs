@@ -444,6 +444,26 @@ fn visible_nav_rows(
     )
 }
 
+/// Is this database one a list may show and a picker may offer?
+///
+/// The SCHEMA panel's eye hides a database from **sight**, and sight is every
+/// surface that lists databases rather than only the tree the eye is attached
+/// to. The QUERY toolbar's active-database selector went on offering hidden
+/// ones, so a database the user had deliberately put away could still be
+/// switched to from the tab beside it — the same failure Find-Anywhere would
+/// have if [`nav_rows`] didn't ask this.
+///
+/// Everything that lists databases asks it: the tree's own `dyn_stack`,
+/// `nav_rows` (the keyboard walk, which has to stay bug-for-bug identical to the
+/// render), the active-database menu, and the trigger that opens it. Two
+/// exceptions, both deliberate — the **eye's own menu**, which must list a
+/// hidden database for it to be unhidden, and a **tab's binding**, since hiding
+/// the database a tab already runs against doesn't move the tab, and a toolbar
+/// that stopped naming it would be lying about where the next query goes.
+pub(crate) fn db_visible(hidden: &HashSet<String>, database: &str) -> bool {
+    !hidden.contains(database)
+}
+
 /// The nav walk. Mirrors the tree's own render rules: hidden DBs dropped; a
 /// non-empty filter force-expands DBs and narrows their tables to name matches;
 /// only expanded tables contribute columns. Pure — this is the function that must
@@ -458,7 +478,7 @@ fn nav_rows(
     let filtering = !filt.is_empty();
     let mut rows = Vec::new();
     for n in dbs {
-        if hidden.contains(&n.database) {
+        if !db_visible(hidden, &n.database) {
             continue;
         }
         // Mirror the tree's search filtering (so arrow-key nav walks exactly what's
@@ -787,7 +807,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                 .into_iter()
                 // `with`, not `get` — this runs per database, and `get` would clone
                 // the whole hidden set each time.
-                .filter(|c| !hidden_dbs.with(|h| h.contains(&c.database)))
+                .filter(|c| hidden_dbs.with(|h| db_visible(h, &c.database)))
                 // While filtering, drop a database with no match — through the
                 // same predicate `nav_rows` uses, so the keyboard walks exactly
                 // what is on screen.
@@ -2598,6 +2618,16 @@ fn schema_search(filter: RwSignal<String>) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The polarity, which is the whole of what this predicate can get wrong —
+    /// and getting it wrong inverts every list of databases in the app at once.
+    #[test]
+    fn a_hidden_database_is_shown_by_nothing_and_an_unhidden_one_by_everything() {
+        let hidden: HashSet<String> = ["archive".to_string()].into_iter().collect();
+        assert!(!db_visible(&hidden, "archive"));
+        assert!(db_visible(&hidden, "sakila"));
+        assert!(db_visible(&HashSet::new(), "archive"));
+    }
 
     fn tbl(ns: Option<&str>, name: &str) -> TableInfo {
         TableInfo {
