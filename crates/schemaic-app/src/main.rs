@@ -145,11 +145,12 @@ use schemaic_core::tx::{
 use schemaic_db::{Db, DbError, Session};
 use schemaic_ui::theme::{EditorThemeKind, UiThemeKind};
 use schemaic_ui::{
-    AiActions, AiEffort, AiModel, AiUi, ChatMessage, Confirm, ConnActions, ConnNode, ConnUi,
-    CtxMenu, DdlOutcome, DraftSignals, HistoryActions, HistoryUi, InlineAiRequest, InlineAiState,
-    LayoutUi, MonitorEntry, OverlayUi, PendingRun, PlanState, ResultPanel, RightPanel, Role,
-    RunGuard, SchemaActions, SchemaScope, SchemaUi, Tab, TabsActions, TabsUi, TermActions,
-    TermCursor, TermUi, TestState, TxChoice, TxPrompt, Ui, pick_connection_color,
+    ActivityActions, ActivityState, ActivityUi, AiActions, AiEffort, AiModel, AiUi, ChatMessage,
+    Confirm, ConnActions, ConnNode, ConnUi, CtxMenu, DdlOutcome, DraftSignals, HistoryActions,
+    HistoryUi, InlineAiRequest, InlineAiState, LayoutUi, MonitorEntry, OverlayUi, PendingRun,
+    PlanState, ResultPanel, RightPanel, Role, RunGuard, SchemaActions, SchemaScope, SchemaUi, Tab,
+    TabsActions, TabsUi, TermActions, TermCursor, TermUi, TestState, TxChoice, TxPrompt, Ui,
+    pick_connection_color,
 };
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -2650,6 +2651,304 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         Rc::new(move |id: usize| (end_tx)(id, false, None))
     };
 
+    // ── Server Activity panel: the sessions on the active connection's server ──
+    //
+    // Everything here is transient except the poll interval. The snapshot belongs
+    // to one connection and is thrown away when the active connection changes —
+    // showing another server's session ids for even one frame is an invitation to
+    // kill the wrong thing.
+    let activity_state: RwSignal<ActivityState> = RwSignal::new(ActivityState::Idle);
+    // The interval is **per connection** — how hard you are willing to lean on a
+    // particular server, not a taste. One number would carry a laptop's two
+    // seconds straight onto a production replica on the next switch.
+    let activity_intervals: RwSignal<Vec<schemaic_core::activity::IntervalRule>> =
+        RwSignal::new(ui_state.activity_intervals);
+    // The active connection's interval, derived. Everything downstream — the
+    // clock's tint, the menu's marked row, the poll timer's re-arm — reads this
+    // one value, so switching connections repoints all three at once.
+    let activity_interval = create_memo(move |_| {
+        let cid = active_conn.get();
+        activity_intervals.with(|r| schemaic_core::activity::interval_for(r, cid))
+    });
+    let set_activity_interval: Rc<dyn Fn(u64)> = Rc::new(move |secs: u64| {
+        let cid = active_conn.get_untracked();
+        activity_intervals.update(|r| schemaic_core::activity::set_interval(r, cid, secs));
+    });
+    let activity_busy = RwSignal::new(false);
+    // The last refused kill. Deliberately *not* `ActivityState::Failed`: that one
+    // means "there is no snapshot", and a kill the server declined leaves the
+    // snapshot perfectly good.
+    let activity_kill_error: RwSignal<Option<String>> = RwSignal::new(None);
+    // The clock's interval dropdown. Its flag and anchor live out here because the
+    // menu is a root-level overlay — the right column is clipped, so a dropdown
+    // drawn inside the panel would be cut off at the panel's edge.
+    let activity_menu_open = RwSignal::new(false);
+    let activity_menu_anchor = RwSignal::new(floem::kurbo::Point::ZERO);
+    // Which generation the in-flight fetch was launched under, or `None`. This is
+    // the de-dup guard, and it is a generation rather than the plain `busy` flag
+    // for one case: a fetch still running when the user switches connections must
+    // not block the *new* connection's first fetch. With auto-refresh off there is
+    // no later tick to recover, and the panel would sit on "Loading…" until
+    // someone pressed refresh.
+    let activity_inflight: RwSignal<Option<u64>> = RwSignal::new(None);
+    // Bumped whenever the panel is opened, closed, or repointed at another
+    // connection. A poll timer carries the generation it was armed under and stops
+    // when it no longer matches — the same guard the live monitor uses, and the
+    // reason switching connections twice doesn't leave two loops polling.
+    let activity_gen = RwSignal::new(0_u64);
+
+    let refresh_activity: Rc<dyn Fn()> = {
+        let db_for = db_for.clone();
+        let handle = handle.clone();
+        Rc::new(move || {
+            // The generation this fetch belongs to; also what the reply is checked
+            // against on arrival.
+            let generation = activity_gen.get_untracked();
+            if activity_inflight.get_untracked() == Some(generation) {
+                return;
+            }
+            let conn_id = active_conn.get_untracked();
+            let db = match db_for(conn_id) {
+                Ok(db) => db,
+                // Usually "the SSH tunnel isn't established yet", which the next
+                // tick resolves. Said out loud rather than left as a permanent
+                // "Loading…", since with auto-refresh off there is no next tick.
+                Err(e) => {
+                    activity_state.set(ActivityState::Failed(e));
+                    return;
+                }
+            };
+            // Settled here rather than by a round trip that would come back with
+            // an error the panel would have to translate back into this.
+            if !schemaic_core::activity::supports_activity(db.engine().dialect()) {
+                activity_state.set(ActivityState::Unsupported);
+                return;
+            }
+            // `Loading` only while there is nothing to show; a refresh over a live
+            // snapshot leaves it on screen (see `ActivityState`).
+            if !matches!(activity_state.get_untracked(), ActivityState::Loaded { .. }) {
+                activity_state.set(ActivityState::Loading);
+            }
+            activity_inflight.set(Some(generation));
+            activity_busy.set(true);
+            // A refused kill is news about one click, not a standing condition —
+            // the next look at the server retires it.
+            activity_kill_error.set(None);
+            let report = create_ext_action(
+                cx,
+                move |res: Result<Vec<schemaic_core::activity::SessionInfo>, String>| {
+                    // Release the guard only if this is still the fetch it is
+                    // holding — a superseded reply landing after a newer fetch
+                    // started must not unlock that one.
+                    if activity_inflight.get_untracked() == Some(generation) {
+                        activity_inflight.set(None);
+                        activity_busy.set(false);
+                    }
+                    // A reply that outlived its generation describes the wrong
+                    // server, or a panel that is no longer open.
+                    if activity_gen.try_get_untracked() != Some(generation) {
+                        return;
+                    }
+                    match res {
+                        Ok(mut sessions) => {
+                            let truncated = schemaic_core::activity::prepare(&mut sessions);
+                            activity_state.set(ActivityState::Loaded {
+                                sessions,
+                                truncated,
+                            });
+                        }
+                        Err(e) => activity_state.set(ActivityState::Failed(e)),
+                    }
+                },
+            );
+            handle.spawn(async move {
+                report(db.fetch_sessions().await.map_err(|e| e.to_string()));
+            });
+        })
+    };
+
+    // **A killed session may be one of ours.** A Manual tab pins a connection
+    // (`Session`), that connection is an ordinary row in the panel, and the
+    // idle-in-transaction holder blocking your other tab is very often exactly
+    // it. Terminating it left the tab holding a dead socket: the footer went on
+    // offering Commit and Rollback, the next statement failed with "An
+    // established connection was aborted", and the only way back was closing the
+    // tab and reopening it.
+    //
+    // `Session::server_id` is what makes the connection recognisable, so the tab
+    // is put back the way a lost transaction leaves it — no transaction open — on
+    // a **fresh** pinned connection, and stays in Manual. The uncommitted work is
+    // gone either way; the confirm said so before the kill.
+    //
+    // A *cancel* is not a kill: it stops the statement and leaves the session and
+    // its transaction alive, so there is nothing to repair.
+    //
+    // **A server id is only unique on its own server**, so `conn_id` is half the
+    // key and not a formality. MySQL thread ids and PostgreSQL backend pids are
+    // small integers each server hands out from its own counter, so two Manual
+    // tabs on two different connections routinely hold the same one — a laptop
+    // MariaDB and a Docker MySQL both sitting at thread 42 is an ordinary
+    // afternoon. Matching on the id alone reached into whichever tab the map
+    // happened to yield first and, if that was the wrong one, closed a
+    // transaction that was still open on a server nobody had touched and
+    // re-pinned its connection underneath it — losing the uncommitted work of a
+    // tab the user never acted on, while the tab that actually lost its socket
+    // stayed broken.
+    let repair_killed_session: Rc<dyn Fn(u64, i64, schemaic_core::activity::KillKind)> = {
+        let sessions = sessions.clone();
+        let open_session = open_session.clone();
+        Rc::new(
+            move |conn_id: u64, id: i64, kind: schemaic_core::activity::KillKind| {
+                if kind != schemaic_core::activity::KillKind::Session {
+                    return;
+                }
+                let owners: Vec<usize> = sessions
+                    .borrow()
+                    .iter()
+                    .filter(|(_, s)| s.server_id() == Some(id))
+                    .map(|(tab_id, _)| *tab_id)
+                    .collect();
+                // The tab has to be on the connection the kill was issued
+                // against; `sessions` is keyed by tab, and the tab is what knows
+                // which server its pinned connection reaches.
+                let owner = owners.into_iter().find_map(|tab_id| {
+                    let tab =
+                        tabs.with_untracked(|v| v.iter().find(|t| t.id == tab_id).copied())?;
+                    (tab.conn_id.get_untracked() == conn_id).then_some(tab)
+                });
+                let Some(tab) = owner else {
+                    return;
+                };
+                tab.tx.set(TxState::closed());
+                // Drops the dead session (its rollback is best effort and will
+                // fail — the server already did it) and opens a replacement.
+                (open_session)(tab.id);
+            },
+        )
+    };
+
+    // Cancel a statement / terminate a session, behind the shared confirm. The
+    // confirm is raised here rather than in the panel so no route to a kill can
+    // skip it, and the refresh afterwards is what makes the list agree with the
+    // server again without waiting for the next tick.
+    let kill_session: Rc<dyn Fn(i64, schemaic_core::activity::KillKind)> = {
+        let db_for = db_for.clone();
+        let handle = handle.clone();
+        let refresh = refresh_activity.clone();
+        Rc::new(move |id: i64, kind: schemaic_core::activity::KillKind| {
+            // The confirm has to name the session, so it is built from the row in
+            // the current snapshot rather than from the id alone.
+            let session = activity_state.with_untracked(|st| match st {
+                ActivityState::Loaded { sessions, .. } => {
+                    sessions.iter().find(|s| s.id == id).cloned()
+                }
+                _ => None,
+            });
+            // Gone between the right-click and the click — a poll landed, or the
+            // session ended on its own. Nothing to ask about and nothing left to
+            // kill, which is the outcome the click wanted.
+            let Some(session) = session else {
+                return;
+            };
+            // **The target is resolved now, not when the button is clicked.**
+            // A session id means nothing without the server that issued it, and a
+            // modal is open across an unbounded stretch of time. Reading
+            // `active_conn` inside `resolve` meant a connection change while the
+            // confirm was up sent `KILL CONNECTION 1148` to a *different* server —
+            // terminating whichever unrelated session there happened to hold that
+            // id, under a modal whose title named the first one. Everything else
+            // in this panel is generation-guarded against exactly this drift;
+            // capturing the handle is that guard for the one destructive path.
+            let conn_id = active_conn.get_untracked();
+            let Ok(db) = db_for(conn_id) else {
+                return;
+            };
+            let dialect = db.engine().dialect();
+            let (title, message) = schemaic_core::activity::kill_confirm(kind, &session, dialect);
+            let (handle, refresh) = (handle.clone(), refresh.clone());
+            let repair_killed_session = repair_killed_session.clone();
+            confirm.set(Some(Confirm {
+                title,
+                message,
+                resolve: Rc::new(move |yes| {
+                    if !yes {
+                        return;
+                    }
+                    let db = db.clone();
+                    let refresh = refresh.clone();
+                    let repair = repair_killed_session.clone();
+                    activity_kill_error.set(None);
+
+                    let report = create_ext_action(cx, move |res: Result<(), String>| {
+                        match res {
+                            // A refused kill (no `CONNECTION_ADMIN`, no
+                            // `pg_signal_backend`) says nothing about the snapshot
+                            // on screen, so it no longer replaces it: routing this
+                            // through `ActivityState::Failed` threw away the list
+                            // someone was reading mid-incident — banner included —
+                            // and with auto-refresh Off nothing brought it back.
+                            Err(e) => activity_kill_error.set(Some(e)),
+                            Ok(()) => {
+                                (repair)(conn_id, id, kind);
+                                (refresh)();
+                            }
+                        }
+                    });
+                    handle.spawn(async move {
+                        report(db.kill_session(id, kind).await.map_err(|e| e.to_string()));
+                    });
+                }),
+            }));
+        })
+    };
+
+    // Open / close / repoint the panel. One effect rather than three, because the
+    // generation bump, the snapshot reset and the re-arm have to happen in that
+    // order and a second effect firing between them is what leaves a stale list on
+    // screen under a new connection's heading.
+    //
+    // The panel is polled only while it is *open* **and the window has focus**: a
+    // two-second query against `information_schema` that nobody can see is pure
+    // load, and the whole point of the panel is to notice load. Every tick is also
+    // a full connect + authenticate against the server being watched (one
+    // connection per operation, ARCHITECTURE §7), so a panel left open behind
+    // another window was opening and tearing down a connection every couple of
+    // seconds, indefinitely, for nobody. This is the rule the health poll already
+    // follows, for the same reason; regaining focus re-runs this effect and the
+    // first thing it does is refresh, so coming back shows current data rather
+    // than whatever was on screen when you left.
+    {
+        let refresh = refresh_activity.clone();
+        create_effect(move |prev: Option<(u64, bool, u64)>| {
+            let open = right_panel.get() == RightPanel::Activity && window_focused.get();
+            let conn = active_conn.get();
+            let secs = activity_interval.get();
+            let conn_changed = prev.is_none_or(|(c, _, _)| c != conn);
+            // An interval change re-arms the timer and nothing else. Refreshing on
+            // it too meant moving a struggling server from 2s to 30s — done
+            // precisely to lean on it less — fired an immediate extra fetch, and
+            // because the generation had just been bumped the in-flight guard
+            // couldn't suppress it: two `PROCESSLIST` queries at once, on the
+            // server that prompted the change.
+            let woke = prev.is_none_or(|(_, was_open, _)| !was_open);
+            // Bumping first is what strands every timer and every in-flight fetch
+            // armed under the old state.
+            let generation = activity_gen.get_untracked().wrapping_add(1);
+            activity_gen.set(generation);
+            if conn_changed {
+                activity_state.set(ActivityState::Idle);
+                activity_kill_error.set(None);
+            }
+            if open {
+                if conn_changed || woke {
+                    (refresh)();
+                }
+                activity_poll(generation, activity_gen, activity_interval, refresh.clone());
+            }
+            (conn, open, secs)
+        });
+    }
+
     // Active-database context. A tab carries its `(conn_id, database)`, so
     // switching the active db just rewrites the active tab's `database` (and binds
     // it to the active connection) — no server-side `USE` / session state to track.
@@ -3978,6 +4277,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             hidden_dbs: hidden_dbs.with_untracked(|s| s.iter().cloned().collect()),
             schema_visible: schema_visible.get_untracked(),
             right_panel: right_panel.get_untracked().into(),
+            activity_intervals: activity_intervals.get_untracked(),
             schema_w: schema_w.get_untracked(),
             right_w: right_w.get_untracked(),
             editor_h: editor_h.get_untracked(),
@@ -4009,6 +4309,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             schema_visible.get();
             right_panel.get();
             table_sizes.get();
+            activity_intervals.get();
             save_ui();
         });
     }
@@ -5530,6 +5831,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             (save_db_colors)();
             db_favorites.update(|v| schemaic_core::favorite::clear_conn(v, id));
             (save_db_favorites)();
+            // Its poll interval too — connection ids are reused, and the next
+            // connection to take this one would inherit a choice nobody made for
+            // it. `save_ui` follows from the effect watching this store.
+            activity_intervals.update(|v| schemaic_core::activity::clear_conn(v, id));
             formats.update(|v| schemaic_core::format::clear_conn(v, id));
             (save_formats)();
             // Diagram layouts live only on disk (no signal) — load, prune, save.
@@ -6872,6 +7177,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             clear: clear_history,
             open: open_history,
         }),
+        activity: ActivityUi {
+            state: activity_state,
+            interval: activity_interval,
+            busy: activity_busy,
+            kill_error: activity_kill_error,
+            menu_open: activity_menu_open,
+            menu_anchor: activity_menu_anchor,
+        },
+        activity_actions: Rc::new(ActivityActions {
+            refresh: refresh_activity,
+            kill: kill_session,
+            set_interval: set_activity_interval,
+        }),
         term: TermUi {
             screen: term_screen,
             focused: term_focused,
@@ -7173,6 +7491,39 @@ fn monitor_reschedule(ctx: MonitorCtx, my_gen: u64) {
     let secs = ctx.interval.get_untracked().max(1);
     floem::action::exec_after(Duration::from_secs(secs), move |_| {
         monitor_tick(ctx, my_gen);
+    });
+}
+
+/// Arm the Server Activity panel's next poll, and keep arming after each one.
+///
+/// `generation` is the value `activity_gen` held when this loop was started. Every
+/// tick re-checks it and stops the moment it differs, which is how closing the
+/// panel, switching connections or changing the interval ends the old loop —
+/// without it, each of those would start a second one and leave the first running
+/// forever.
+///
+/// The interval is read *fresh* on each arm rather than captured, and `0` (off)
+/// ends the loop; turning it back on re-arms through the effect that owns the
+/// generation.
+fn activity_poll(
+    generation: u64,
+    gen_sig: RwSignal<u64>,
+    interval: floem::reactive::Memo<u64>,
+    refresh: Rc<dyn Fn()>,
+) {
+    // `try_get_untracked` throughout: at shutdown these signals are disposed while
+    // a timer may still be pending, and a plain read of a freed signal panics —
+    // the same rule the resource sampler's tick follows.
+    let secs = interval.try_get_untracked().unwrap_or(0);
+    if secs == 0 || gen_sig.try_get_untracked() != Some(generation) {
+        return;
+    }
+    exec_after(Duration::from_secs(secs), move |_| {
+        if gen_sig.try_get_untracked() != Some(generation) {
+            return;
+        }
+        (refresh)();
+        activity_poll(generation, gen_sig, interval, refresh);
     });
 }
 

@@ -37,6 +37,24 @@ const CTX_MENU_W: f64 = 170.0;
 /// glyph it belongs to rather than starting beside it.
 const MENU_ICON_TUCK: f64 = 30.0;
 
+/// The activity panel's interval dropdown, at a fixed width so it can be
+/// right-aligned to its icon exactly (a content-sized panel would have to be
+/// measured first, and the four labels here are two characters each).
+const ACTIVITY_MENU_W: f64 = 96.0;
+
+/// How close to a window edge an anchored menu may sit before it is pushed back.
+const MENU_EDGE_PAD: f64 = 4.0;
+
+/// How far under its icon an anchored dropdown hangs, in px.
+///
+/// **Measured from the icon's padded box, not from the glyph inside it** — which
+/// is what keeps the schema eye's menu and the schema gear's menu level with each
+/// other even though a lens and a slider stack ink to different heights, and what
+/// puts the activity clock's on the same line as both. Tuning it per icon by eye
+/// was tried and is wrong for exactly that reason: the box is the control, the
+/// glyph is only what is drawn in it.
+const MENU_ICON_DROP: f64 = 3.0;
+
 /// Is the active connection read-only? Every schema-editing menu entry asks,
 /// because a write it can't perform is shown dimmed rather than hidden — a
 /// missing item reads as "not supported", a dimmed one as "not here".
@@ -667,10 +685,107 @@ pub(crate) fn db_visibility_overlay(ui: Ui) -> impl IntoView {
             let a = anchor.get();
             s.absolute()
                 .inset_left((a.x - MENU_ICON_TUCK).max(0.0))
-                .inset_top(a.y + 3.0)
+                .inset_top(a.y + MENU_ICON_DROP)
         } else {
             s
         }
+    })
+}
+
+/// The Server Activity panel's poll-interval dropdown (opened by the clock).
+///
+/// Same chrome and the same anchoring machinery as the schema tree's eye menu,
+/// with one difference that is the whole reason it isn't a copy: **this one is
+/// right-aligned**. The schema panel sits against the window's left edge, so its
+/// menus can hang leftward off an icon and never meet an edge; the activity panel
+/// is against the *right* edge, where a left-aligned menu tucked 30px outward
+/// would open past the window and be clipped. So the anchor publishes the icon's
+/// bottom-**right** corner, the panel's right edge is laid against it, and the
+/// result is clamped into the window on both sides — the edge detection is the
+/// clamp, not a special case.
+pub(crate) fn activity_menu_overlay(ui: Ui) -> impl IntoView {
+    let open = ui.activity.menu_open;
+    let anchor = ui.activity.menu_anchor;
+    let interval = ui.activity.interval;
+    let set_interval = ui.activity_actions.set_interval.clone();
+    let right_panel = ui.layout.right_panel;
+
+    // A menu whose panel has gone (the user closed it, or switched to AI) must
+    // not be left showing over another panel. Same flag hygiene as the two schema
+    // dropdowns.
+    create_effect(move |_| {
+        if right_panel.get() != RightPanel::Activity && open.get_untracked() {
+            open.set(false);
+        }
+    });
+
+    dyn_container(
+        move || open.get(),
+        move |is_open| {
+            if !is_open {
+                return empty().into_any();
+            }
+            let set_interval = set_interval.clone();
+            let current = interval.get_untracked();
+            let rows = schemaic_core::activity::POLL_INTERVALS
+                .iter()
+                .map(|&secs| {
+                    let set = set_interval.clone();
+                    text(schemaic_core::activity::interval_label(secs))
+                        .on_click_stop(move |_| {
+                            (set)(secs);
+                            open.set(false);
+                        })
+                        .style(menu_item_style)
+                        .style(move |s| {
+                            // The chosen one in the accent, like every other
+                            // single-choice menu in the app.
+                            let c = if secs == current {
+                                theme::accent()
+                            } else {
+                                theme::text()
+                            };
+                            s.color(c).padding_vert(6.0)
+                        })
+                        .into_any()
+                })
+                .collect::<Vec<_>>();
+            focus_root(v_stack((
+                floem::views::stack_from_iter(rows).style(|s| s.flex_col().width_full()),
+            )))
+            .on_key_down(
+                Key::Named(NamedKey::Escape),
+                |_| true,
+                move |_| open.set(false),
+            )
+            // The panel absorbs its own pointer-downs so the root dismissal
+            // doesn't close it out from under the click that is choosing a row.
+            .on_event_stop(EventListener::PointerDown, |_| {})
+            .style(|s| {
+                panel_style(s)
+                    .background(theme::bg_chrome())
+                    .width(ACTIVITY_MENU_W)
+                    .padding_vert(6.0)
+                    .font_size(theme::FONT_TITLE)
+            })
+            .into_any()
+        },
+    )
+    .style(move |s| {
+        if !open.get() {
+            return s;
+        }
+        let a = anchor.get();
+        let win_w = crate::widgets::window_size().get().0;
+        // Right edge against the icon's, tucked outward by the same amount the
+        // schema menus tuck inward so the panel overlaps its own icon; then
+        // clamped so neither edge leaves the window.
+        let left = (a.x + MENU_ICON_TUCK - ACTIVITY_MENU_W)
+            .min(win_w - ACTIVITY_MENU_W - MENU_EDGE_PAD)
+            .max(MENU_EDGE_PAD);
+        s.absolute()
+            .inset_left(left)
+            .inset_top(a.y + MENU_ICON_DROP)
     })
 }
 
@@ -776,7 +891,7 @@ pub(crate) fn schema_settings_overlay(ui: Ui) -> impl IntoView {
             let a = anchor.get();
             s.absolute()
                 .inset_left((a.x - MENU_ICON_TUCK).max(0.0))
-                .inset_top(a.y + 3.0)
+                .inset_top(a.y + MENU_ICON_DROP)
         } else {
             s
         }
@@ -2415,18 +2530,33 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
         Command {
             name: "toggle panel",
             label: "Toggle Panel",
-            hint: "schema · ai · terminal · query history",
+            hint: "schema · ai · terminal · query history · server activity",
             arg: CmdArg::Options {
-                list: Rc::new(|| {
-                    [
+                // Built when the palette opens, not once: Server Activity is
+                // offered only on an engine that has sessions, which is the same
+                // answer the footer's dimmed toggle gives. Listing it on a SQLite
+                // connection would hand the keyboard a route the mouse refuses.
+                list: Rc::new(move || {
+                    let mut list = vec![
                         ("schema", "Schema"),
                         ("ai", "AI"),
                         ("terminal", "Terminal"),
                         ("history", "Query History"),
-                    ]
-                    .into_iter()
-                    .map(|(v, l)| (v.to_string(), l.to_string()))
-                    .collect()
+                    ];
+                    let cid = active_conn.get_untracked();
+                    let has_sessions = connections.with_untracked(|cs| {
+                        cs.iter().find(|c| c.id == cid).is_some_and(|c| {
+                            schemaic_core::activity::supports_activity(
+                                schemaic_core::intel::SqlDialect::from_db_type(&c.db_type),
+                            )
+                        })
+                    });
+                    if has_sessions {
+                        list.push(("activity", "Server Activity"));
+                    }
+                    list.into_iter()
+                        .map(|(v, l)| (v.to_string(), l.to_string()))
+                        .collect()
                 }),
                 run: {
                     let close = close.clone();
@@ -2442,6 +2572,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                                     let target = match other {
                                         "terminal" => RightPanel::Terminal,
                                         "history" => RightPanel::History,
+                                        "activity" => RightPanel::Activity,
                                         _ => RightPanel::Ai,
                                     };
                                     right_panel.update(|p| {

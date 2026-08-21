@@ -47,6 +47,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
+use schemaic_core::activity::{self, KillKind, SessionInfo};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
     Column, ColumnFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder,
@@ -803,6 +804,135 @@ pub(crate) async fn count_rows(
         .and_then(|r| opt(r, 0))
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| DbError::Query("COUNT(*) returned no row".into()))
+}
+
+/// `pg_stat_activity`, narrowed to the sessions a person opened.
+///
+/// `backend_type = 'client backend'` drops the checkpointer, the WAL writer, the
+/// autovacuum launcher and the rest of the cluster's own processes: they are
+/// permanent, unkillable from here, and every one of them would sort to the top
+/// with an age measured in days. `pid <> pg_backend_pid()` drops the poll itself.
+///
+/// The age is *time in the current state*, matching what MySQL's
+/// `PROCESSLIST.TIME` means, so one column means one thing across the two
+/// engines. `pg_blocking_pids` is the blocking graph in one call — PostgreSQL
+/// resolves it through `pg_locks` internally, including the transitive case a
+/// hand-written join gets wrong.
+///
+/// **Blocked backends first, then longest-standing.** Ordering by age alone
+/// sounds like "keep the interesting end of the list" and is the opposite of it:
+/// the panel ranks lock waits above everything
+/// ([`activity::rank`](schemaic_core::activity::rank)), and a backend that
+/// started waiting four seconds ago has the *smallest* age on the cluster — so
+/// past the cap, a pile of hour-old idle pool connections displaced every row of
+/// the wait the panel exists to show.
+///
+/// The sort is exact here rather than a proxy (MySQL has to settle for
+/// `COMMAND <> 'Sleep'`): the blocking graph is already a column. It reads out of
+/// a subquery so `pg_blocking_pids` is evaluated **once** per backend instead of
+/// once for the projection and again for the `ORDER BY` — it takes locks
+/// internally, and this runs against every backend on the cluster before the
+/// `LIMIT` can apply. The outer projection restates the columns in order because
+/// `simple_query` hands them back positionally.
+const PG_ACTIVITY_SQL: &str = "SELECT s.pid, s.usename, s.client_host, s.datname, s.state, \
+     s.query, s.age, s.blockers FROM ( \
+     SELECT pid, usename, host(client_addr) AS client_host, datname, state, query, \
+     EXTRACT(EPOCH FROM (now() - COALESCE(state_change, query_start, backend_start)))::float8 \
+     AS age, \
+     pg_blocking_pids(pid)::text AS blockers \
+     FROM pg_stat_activity \
+     WHERE backend_type = 'client backend' AND pid <> pg_backend_pid() \
+     ) s ORDER BY (s.blockers <> '{}') DESC, s.age DESC LIMIT ";
+
+/// The PostgreSQL half of [`Db::fetch_sessions`].
+///
+/// `pg_stat_activity` is cluster-wide, so this runs on the maintenance
+/// connection: which database it lands in changes nothing about the answer, and
+/// the panel has no active database to speak of.
+pub(crate) async fn fetch_sessions(db: &Db) -> Result<Vec<SessionInfo>, DbError> {
+    let client = connect_maintenance(db).await?;
+    let sql = format!("{PG_ACTIVITY_SQL}{}", activity::MAX_SESSIONS + 1);
+    let rows = query_all(&client, &sql).await?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let query = opt(r, 5)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let blocked_by = parse_pid_array(opt(r, 7).as_deref().unwrap_or(""));
+            // A row whose pid won't parse is **dropped**, not admitted under a
+            // made-up id. `unwrap_or(0)` here was the same mistake
+            // `parse_pid_array` is written to avoid one screen down: a session
+            // `0` renders a full row with a live "Kill session" entry under it
+            // (`pg_terminate_backend(0)`), and other rows' `blocked_by` edges
+            // would point at it. An identity is the one field there is no
+            // sensible default for.
+            let id: i64 = opt(r, 0)?.parse().ok()?;
+            Some(SessionInfo {
+                id,
+                user: cell(r, 1),
+                client: opt(r, 2),
+                database: opt(r, 3),
+                state: activity::pg_state(
+                    opt(r, 4).as_deref(),
+                    query.is_some(),
+                    !blocked_by.is_empty(),
+                ),
+                sql: query,
+                // Unlike the id, an unreadable age has a safe default: `format_age`
+                // floors it and it only affects where the row sorts.
+                seconds: opt(r, 6).and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                blocked_by,
+                blocks: Vec::new(),
+            })
+        })
+        .collect())
+}
+
+/// Read a PostgreSQL `int[]` as rendered by `::text` — `{}`, `{1234}`,
+/// `{1234,5678}`. `simple_query` hands back every column as text, so the array
+/// arrives as its literal and there is no typed accessor to lean on.
+///
+/// Anything unparseable is skipped rather than defaulting to a pid: a `0` in the
+/// blocking graph would draw an edge to a session that does not exist and put a
+/// "Kill 0" button under it.
+fn parse_pid_array(s: &str) -> Vec<i64> {
+    s.trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .split(',')
+        .filter_map(|p| p.trim().parse::<i64>().ok())
+        .collect()
+}
+
+/// This connection's backend pid, or `None` if the server didn't answer.
+///
+/// The one thing a PostgreSQL client can't learn from the handshake the way a
+/// MySQL one can (`Conn::id()`), and the pinned session needs it to recognise
+/// itself in `pg_stat_activity` — see [`Session::server_id`](crate::Session::server_id).
+pub(crate) async fn backend_pid(client: &Client) -> Option<i64> {
+    let rows = query_all(client, "SELECT pg_backend_pid()").await.ok()?;
+    opt(rows.first()?, 0)?.parse().ok()
+}
+
+/// The PostgreSQL half of [`Db::kill_session`].
+///
+/// Both functions return a boolean rather than raising: `false` means the pid was
+/// gone by the time the request landed (it finished, or someone else killed it),
+/// which is not a failure worth a modal — the next poll will simply not show it.
+/// A missing *privilege*, on the other hand, raises, and that error does surface.
+pub(crate) async fn kill_session(db: &Db, id: i64, kind: KillKind) -> Result<(), DbError> {
+    let client = connect_maintenance(db).await?;
+    let func = match kind {
+        KillKind::Query => "pg_cancel_backend",
+        KillKind::Session => "pg_terminate_backend",
+    };
+    // `id` came from the server as an integer and goes back as a decimal literal.
+    client
+        .simple_query(&format!("SELECT {func}({id})"))
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+    Ok(())
 }
 
 pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, DbError> {
@@ -2813,6 +2943,19 @@ mod tests {
         assert_eq!(cell(&row, 0), "a");
         assert_eq!(cell(&row, 1), ""); // SQL NULL → empty
         assert_eq!(cell(&row, 5), ""); // out of range → empty
+    }
+
+    #[test]
+    fn parse_pid_array_reads_what_pg_blocking_pids_renders() {
+        assert_eq!(parse_pid_array("{}"), Vec::<i64>::new());
+        assert_eq!(parse_pid_array("{1234}"), vec![1234]);
+        assert_eq!(parse_pid_array("{1234,5678}"), vec![1234, 5678]);
+        assert_eq!(parse_pid_array(" {1234, 5678} "), vec![1234, 5678]);
+        // A NULL column, or anything else unexpected, contributes no edges rather
+        // than a pid of 0.
+        assert_eq!(parse_pid_array(""), Vec::<i64>::new());
+        assert_eq!(parse_pid_array("{NULL}"), Vec::<i64>::new());
+        assert_eq!(parse_pid_array("{7,oops}"), vec![7]);
     }
 
     #[test]

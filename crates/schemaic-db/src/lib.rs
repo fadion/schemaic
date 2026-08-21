@@ -25,6 +25,7 @@ use mysql_async::consts::{ColumnFlags, ColumnType};
 use mysql_async::prelude::Queryable;
 use mysql_async::{Column as MyColumn, Conn, Row, Value as MyValue};
 use mysql_async::{OptsBuilder, Params};
+use schemaic_core::activity::{self, KillKind, SessionInfo};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
     Column, ColumnFlags as CoreColFlags, ColumnOrigin, GridWrite, RefetchRow, RefetchTemplate,
@@ -943,6 +944,222 @@ impl Db {
         let _ = conn.disconnect().await;
         out
     }
+
+    /// Every session currently connected to this server, with the lock waits
+    /// between them — the Server Activity panel's whole input.
+    ///
+    /// Unsorted and uncapped here: [`schemaic_core::activity::prepare`] owns the
+    /// ordering and the cut, so the panel and its tests see one answer. The
+    /// queries do ask for [`MAX_SESSIONS`](schemaic_core::activity::MAX_SESSIONS)
+    /// `+ 1` rows so that cut has something to notice.
+    ///
+    /// **Never the caller's own connection.** Every operation here opens a fresh
+    /// one (ARCHITECTURE §7), so the poller would otherwise report itself running
+    /// `SELECT … FROM information_schema.PROCESSLIST` at the top of every refresh
+    /// — a row that exists only because someone looked.
+    ///
+    /// An engine with no sessions errors rather than returning nothing, and the
+    /// app is expected not to ask — the gate is
+    /// [`supports_activity`](schemaic_core::activity::supports_activity), asked
+    /// as a **capability** rather than spelled out as another `== Sqlite`. The
+    /// `match` below dispatches to a query set, which is a different question:
+    /// there is one catalogue per engine and no capability can paper over that.
+    /// What the predicate buys is the arm that *doesn't* exist — a fourth engine
+    /// added to [`Engine`] stops here with one honest error instead of falling
+    /// through to `information_schema.PROCESSLIST` and failing three catalogue
+    /// lookups deep.
+    pub async fn fetch_sessions(&self) -> Result<Vec<SessionInfo>, DbError> {
+        if !activity::supports_activity(self.engine.dialect()) {
+            return Err(DbError::Query(NO_SESSIONS_MSG.to_string()));
+        }
+        match self.engine {
+            Engine::Postgres => return pg::fetch_sessions(self).await,
+            Engine::MySql => {}
+            // Unreachable — `supports_activity` above is the gate.
+            Engine::Sqlite => return Err(DbError::Query(NO_SESSIONS_MSG.to_string())),
+        }
+        let mut conn = self.open(None, false).await?;
+        let out = collect_sessions(&mut conn).await;
+        let _ = conn.disconnect().await;
+        out
+    }
+
+    /// Cancel a statement, or terminate a session outright, by server id.
+    ///
+    /// **A fresh connection, always.** The session being killed may be the one
+    /// holding up everything else, and on MySQL a `KILL` issued from a connection
+    /// that is itself waiting on that lock never gets sent — the same reason
+    /// [`Db::kill_query`] opens its own.
+    ///
+    /// Gated on [`supports_kill`](schemaic_core::activity::supports_kill), the
+    /// capability the panel's own menu asks — see [`Db::fetch_sessions`] for why
+    /// that is not the same thing as the engine `match` below it.
+    pub async fn kill_session(&self, id: i64, kind: KillKind) -> Result<(), DbError> {
+        if !activity::supports_kill(self.engine.dialect()) {
+            return Err(DbError::Query(NO_SESSIONS_MSG.to_string()));
+        }
+        match self.engine {
+            Engine::Postgres => return pg::kill_session(self, id, kind).await,
+            Engine::MySql => {}
+            // Unreachable — `supports_kill` above is the gate.
+            Engine::Sqlite => return Err(DbError::Query(NO_SESSIONS_MSG.to_string())),
+        }
+        // `id` is an `i64` the server itself reported and is formatted back as a
+        // decimal, so there is nothing here a quoter would have to escape.
+        let sql = match kind {
+            KillKind::Query => format!("KILL QUERY {id}"),
+            KillKind::Session => format!("KILL CONNECTION {id}"),
+        };
+        let mut conn = self.open(None, false).await?;
+        let out = conn
+            .query_drop(sql)
+            .await
+            .map_err(|e| DbError::Query(e.to_string()));
+        let _ = conn.disconnect().await;
+        out
+    }
+}
+
+/// Why a connection has no Server Activity to report. One sentence, one place,
+/// so the two methods that raise it can't drift apart.
+///
+/// It names the *capability* rather than the engine, because that is what the
+/// caller asked and because nothing renders this in the ordinary course: the app
+/// checks `supports_activity` itself and shows the panel's own explanation
+/// (`ActivityState::Unsupported`). This is the backstop for a caller that didn't.
+const NO_SESSIONS_MSG: &str = "this connection's engine has no server sessions";
+
+/// `information_schema.PROCESSLIST`, minus this connection and minus the
+/// server's own internal threads.
+///
+/// `COMMAND <> 'Daemon'` drops the event scheduler and friends: they are threads,
+/// not sessions — nobody connected them, nothing can kill them, and they would
+/// sit at the top of the list forever with an uptime-length duration. A
+/// replication `Binlog Dump` *is* a real client and stays.
+///
+/// **Working threads first, then longest-standing** — and the first half of that
+/// is load-bearing. Ordering by `TIME` alone reads as "keep the interesting end
+/// of the list", but the panel's own attention order
+/// ([`activity::rank`](schemaic_core::activity::rank)) puts *blocked* sessions at
+/// the top, and a session that started waiting four seconds ago has the smallest
+/// `TIME` on the server. On a box holding three thousand pool connections idle
+/// for hours, `ORDER BY TIME DESC LIMIT 501` returned five hundred sleepers and
+/// cut every row of the lock pile-up the panel was opened for — a quiet-looking
+/// list during an incident.
+///
+/// `COMMAND <> 'Sleep'` is the proxy for "doing something", and it is a proxy on
+/// purpose: a blocked thread on MySQL sits in `Query` while it waits, but
+/// `PROCESSLIST` itself carries no lock information, and the view that does
+/// (`INNODB_TRX`) needs `PROCESS` privileges this statement deliberately does not
+/// require — see [`collect_sessions`]. Sorting by what every account can see
+/// keeps the required query required.
+const MY_PROCESSLIST_SQL: &str = "SELECT ID, USER, HOST, DB, COMMAND, TIME, INFO \
+     FROM information_schema.PROCESSLIST \
+     WHERE ID <> CONNECTION_ID() AND COMMAND <> 'Daemon' \
+     ORDER BY (COMMAND <> 'Sleep') DESC, TIME DESC LIMIT ";
+
+/// Open InnoDB transactions, keyed by the thread holding them. This is what
+/// separates an idle pool connection from a client that went away mid-transaction
+/// — see [`schemaic_core::activity::mysql_state`].
+const MY_INNODB_TRX_SQL: &str =
+    "SELECT trx_mysql_thread_id, trx_state FROM information_schema.INNODB_TRX";
+
+/// Who is waiting on whom, MySQL 8 spelling. `performance_schema.data_lock_waits`
+/// names transactions, so `INNODB_TRX` maps them back to the thread ids the rest
+/// of the panel is keyed by.
+const MY_LOCK_WAITS_PS_SQL: &str = "SELECT rt.trx_mysql_thread_id, bt.trx_mysql_thread_id \
+     FROM performance_schema.data_lock_waits w \
+     JOIN information_schema.INNODB_TRX rt ON rt.trx_id = w.REQUESTING_ENGINE_TRANSACTION_ID \
+     JOIN information_schema.INNODB_TRX bt ON bt.trx_id = w.BLOCKING_ENGINE_TRANSACTION_ID";
+
+/// The same graph, MariaDB spelling. MariaDB has no `data_lock_waits` and MySQL 8
+/// removed `INNODB_LOCK_WAITS`, so neither statement works on both servers and
+/// the pair is tried in turn.
+///
+/// If *both* fail — an account without `PROCESS`, or a build with InnoDB's lock
+/// views compiled out — the panel still knows **who** is blocked (that comes from
+/// `trx_state`, above) and simply cannot say by whom. That is the honest
+/// degradation: a `Blocked` row with no "waiting on…" note, rather than a list
+/// that quietly claims nothing is wrong.
+const MY_LOCK_WAITS_IS_SQL: &str = "SELECT rt.trx_mysql_thread_id, bt.trx_mysql_thread_id \
+     FROM information_schema.INNODB_LOCK_WAITS w \
+     JOIN information_schema.INNODB_TRX rt ON rt.trx_id = w.requesting_trx_id \
+     JOIN information_schema.INNODB_TRX bt ON bt.trx_id = w.blocking_trx_id";
+
+/// One `PROCESSLIST` row: `(id, user, host, db, command, time, info)`.
+type MyProcessRow = (
+    i64,
+    String,
+    String,
+    Option<String>,
+    String,
+    i64,
+    Option<String>,
+);
+
+/// Run the three activity queries on one connection and fold them into
+/// [`SessionInfo`]s.
+///
+/// The process list is required — without it there is no panel — while the
+/// transaction and lock-wait views are best effort, because they are the two that
+/// need `PROCESS` privileges and differ by server. A user who can see their own
+/// sessions and nothing else still gets a working panel.
+async fn collect_sessions(conn: &mut Conn) -> Result<Vec<SessionInfo>, DbError> {
+    let list_sql = format!("{MY_PROCESSLIST_SQL}{}", activity::MAX_SESSIONS + 1);
+    let rows: Vec<MyProcessRow> = conn
+        .query_map(list_sql, |r: MyProcessRow| r)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+
+    let trx: HashMap<i64, String> = conn
+        .query_map(MY_INNODB_TRX_SQL, |(id, state): (i64, String)| (id, state))
+        .await
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default();
+
+    // MySQL 8 first, MariaDB second — both are cheap, and only one of them exists
+    // on any given server.
+    let mut waits: Vec<(i64, i64)> = conn
+        .query_map(MY_LOCK_WAITS_PS_SQL, |r: (i64, i64)| r)
+        .await
+        .unwrap_or_default();
+    if waits.is_empty() {
+        waits = conn
+            .query_map(MY_LOCK_WAITS_IS_SQL, |r: (i64, i64)| r)
+            .await
+            .unwrap_or_default();
+    }
+    // Raw edges, duplicates and all: both lock views are keyed by *lock*, so one
+    // holder sitting on a record lock and a gap lock the waiter needs reports the
+    // same pair twice. `activity::prepare` deduplicates — there, not here, so the
+    // rule is unit-tested and so PostgreSQL (whose `pg_blocking_pids` is already
+    // distinct) can't drift away from it.
+    let mut blocked_by: HashMap<i64, Vec<i64>> = HashMap::new();
+    for (waiter, blocker) in waits {
+        blocked_by.entry(waiter).or_default().push(blocker);
+    }
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, user, host, db, command, time, info)| {
+            let trx_state = trx.get(&id).map(String::as_str);
+            let client = activity::strip_port(&host);
+            SessionInfo {
+                id,
+                user,
+                client: (!client.is_empty()).then(|| client.to_string()),
+                database: db.filter(|d| !d.is_empty()),
+                state: activity::mysql_state(&command, trx_state),
+                sql: info.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                // `TIME` is signed and goes negative when the system clock steps
+                // back under a live thread; `format_age` floors it, but the sort
+                // key must not hoist such a row to the top of its group.
+                seconds: time.max(0) as f64,
+                blocked_by: blocked_by.remove(&id).unwrap_or_default(),
+                blocks: Vec::new(),
+            }
+        })
+        .collect())
 }
 
 /// One `information_schema.TABLES` statistics row. Every figure is nullable —

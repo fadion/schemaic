@@ -43,6 +43,7 @@ pub enum RightPanelState {
     Ai,
     Terminal,
     History,
+    Activity,
 }
 
 /// Parsing shim for [`RightPanelState`] — the public enum's variants plus a
@@ -70,6 +71,7 @@ enum RightPanelRaw {
     Ai,
     Terminal,
     History,
+    Activity,
     #[serde(other)]
     Unknown,
 }
@@ -81,6 +83,7 @@ impl From<RightPanelRaw> for RightPanelState {
             RightPanelRaw::Ai => RightPanelState::Ai,
             RightPanelRaw::Terminal => RightPanelState::Terminal,
             RightPanelRaw::History => RightPanelState::History,
+            RightPanelRaw::Activity => RightPanelState::Activity,
             RightPanelRaw::Unknown => RightPanelState::default(),
         }
     }
@@ -157,6 +160,13 @@ pub struct UiState {
     /// Which panel occupies the right column. Default: AI.
     #[serde(default)]
     pub right_panel: RightPanelState,
+    /// Server Activity — the auto-refresh interval chosen per connection
+    /// ([`crate::activity::IntervalRule`]). A connection with no entry polls at
+    /// [`crate::activity::DEFAULT_POLL_SECS`]; `0` is off. Read through
+    /// [`crate::activity::interval_for`], which clamps, so a hand-edited file
+    /// can't leave the picker with nothing selected.
+    #[serde(default)]
+    pub activity_intervals: Vec<crate::activity::IntervalRule>,
     /// Schema sidebar width (px), set by its resize divider.
     #[serde(default = "default_schema_w")]
     pub schema_w: f64,
@@ -228,6 +238,7 @@ impl Default for UiState {
             hidden_dbs: Vec::new(),
             schema_visible: true,
             right_panel: RightPanelState::Ai,
+            activity_intervals: Vec::new(),
             schema_w: default_schema_w(),
             right_w: default_right_w(),
             editor_h: default_editor_h(),
@@ -951,6 +962,40 @@ mod tests {
         let s: UiState = serde_json::from_slice(json).expect("file must still parse");
         assert_eq!(s.schema_w, 123.0, "the rest of the document survives");
         assert_eq!(s.right_panel, RightPanelState::Ai, "unknown → the default");
+    }
+
+    /// Every `RightPanelState` has to survive a write and a read back. The
+    /// `RightPanelRaw` shim is a *second* list of the same variants, and a new one
+    /// added to the public enum and forgotten there reads back as the default —
+    /// the panel silently reverting to AI on every restart, with nothing failing.
+    #[test]
+    fn every_right_panel_round_trips_through_the_shim() {
+        for p in [
+            RightPanelState::None,
+            RightPanelState::Ai,
+            RightPanelState::Terminal,
+            RightPanelState::History,
+            RightPanelState::Activity,
+        ] {
+            let json = serde_json::to_string(&p).expect("serializes");
+            let back: RightPanelState = serde_json::from_str(&json).expect("parses");
+            assert_eq!(back, p, "{json} did not survive the round trip");
+        }
+    }
+
+    #[test]
+    fn activity_intervals_round_trip_and_default_to_none_recorded() {
+        let s: UiState = serde_json::from_slice(br"{}").expect("parses");
+        assert!(s.activity_intervals.is_empty());
+        assert_eq!(
+            crate::activity::interval_for(&s.activity_intervals, 7),
+            crate::activity::DEFAULT_POLL_SECS,
+            "no entry means the default, not zero (which would be 'off')"
+        );
+
+        let json = br#"{"activity_intervals":[{"conn_id":3,"secs":0}]}"#;
+        let s: UiState = serde_json::from_slice(json).expect("parses");
+        assert_eq!(crate::activity::interval_for(&s.activity_intervals, 3), 0);
     }
 
     /// The case that costs the most: a connection file is the one whose loss the

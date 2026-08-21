@@ -194,6 +194,20 @@ pub const TABLE_PROPERTIES: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" wi
 /// Lucide `activity` (Live Monitor — a heartbeat/pulse line, "live" changes).
 pub const ACTIVITY: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/></svg>"#;
 
+/// Lucide `activity` in its older, jagged spelling — the footer's Server
+/// Activity toggle.
+///
+/// A second pulse line rather than a reuse of [`ACTIVITY`]: the two sit two
+/// glyphs apart in the footer, and the Live Monitor's smooth heartbeat against
+/// this stepped one is what keeps them from reading as the same button.
+pub const ACTIVITY_SQUARE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>"#;
+
+/// Lucide `clock` (the activity panel's auto-refresh interval picker).
+pub const CLOCK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 6v6l4 2"/><circle cx="12" cy="12" r="10"/></svg>"#;
+
+/// Lucide `lock` (the activity panel's lock-wait banner).
+pub const LOCK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>"#;
+
 /// Lucide `expand` (results panel → collapse the editor, take full height).
 pub const EXPAND: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 15 6 6"/><path d="m15 9 6-6"/><path d="M21 16v5h-5"/><path d="M21 8V3h-5"/><path d="M3 16v5h5"/><path d="m3 21 6-6"/><path d="M3 8V3h5"/><path d="M9 9 3 3"/></svg>"#;
 
