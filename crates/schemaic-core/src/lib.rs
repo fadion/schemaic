@@ -32,6 +32,7 @@ pub mod palette;
 pub mod persist;
 pub mod plan;
 pub mod prompt;
+pub mod propose;
 pub mod resource;
 pub mod rowjson;
 pub mod schema;

@@ -88,6 +88,22 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
             Rc::new(move |sql: String| (oq)(sql, active_db.get_untracked()))
         },
         run: ui.tab_actions.run.clone(),
+        // A proposed table change goes to the DDL preview — the same modal, the
+        // same Apply. Against that tab's database for the same reason a code
+        // block is: the chat is about what the user is looking at.
+        propose: {
+            let ui = ui.clone();
+            let active_db = ui.tabs_ui.active_db;
+            Rc::new(move |proposal: schemaic_core::propose::Proposal| {
+                let Some(db) = active_db.get_untracked() else {
+                    return Err(
+                        "This tab has no database yet — pick one before applying a schema change."
+                            .to_string(),
+                    );
+                };
+                crate::ddl_preview::preview_proposal(&ui, &db, &proposal)
+            })
+        },
     };
     // Reactive: is Claude reachable for the current CLI-path value? Drives the
     // empty-state message and the disabled message box.
@@ -650,7 +666,7 @@ fn message_bubble(
         let content: AnyView = if m.pending && m.segs.is_empty() {
             verb_spinner(theme::text_muted, 14.0).into_any()
         } else {
-            render_segments(m.segs, m.role, actions).into_any()
+            render_segments(m.segs, m.role, actions, !m.pending).into_any()
         };
         let footer = assistant_footer(
             m.pending, m.stats, elapsed_ms, copy_text, is_last, regenerate,
@@ -725,7 +741,12 @@ fn message_bubble(
 
 // Render an assistant turn: prose segments as markdown, tool segments as chips,
 // then a dim cost footer if the turn reported one.
-fn render_segments(segs: Vec<Seg>, role: Role, actions: CodeActions) -> impl IntoView {
+fn render_segments(
+    segs: Vec<Seg>,
+    role: Role,
+    actions: CodeActions,
+    settled: bool,
+) -> impl IntoView {
     let error_color = role == Role::Error;
     v_stack_from_iter(segs.into_iter().map(move |seg| match seg {
         Seg::Text(t) => {
@@ -738,7 +759,7 @@ fn render_segments(segs: Vec<Seg>, role: Role, actions: CodeActions) -> impl Int
                     })
                     .into_any()
             } else {
-                render_markdown(&t, actions.clone()).into_any()
+                render_markdown(&t, actions.clone(), settled).into_any()
             }
         }
         Seg::Tool(tc) => tool_chip(tc).into_any(),

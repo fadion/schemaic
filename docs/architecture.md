@@ -1249,6 +1249,29 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       of real rows, so enum/format/FK conventions come from data rather than guesswork;
       `parse_fill_response`/`parse_seed_response` read the reply back (fence stripping,
       case-insensitive bare `null`, JSON bool → `"1"`/`"0"` for MySQL `tinyint(1)`).
+    - `propose.rs` — the AI's proposed table change, as a **patch**: `Proposal`/`ProposedOp`
+      deserialize the model's JSON (`{"add_column": {…}}`, externally tagged, `deny_unknown_fields`
+      so an invented key fails loudly instead of being dropped), and `apply` lays the ops over
+      `TableDraft::from_table` to produce a draft that then goes through `ddl::diff` → `emit` → the
+      preview modal like the designer's own. So the model never writes SQL, never writes a
+      `ChangeSet` — `ddl::diff` stays the only differ — and the write stays behind the same Apply
+      click. **A patch rather than a whole-table draft**, because `diff` compares field by field:
+      a model that re-types `varchar(255)` as `VARCHAR(255)` would propose a `MODIFY COLUMN` nobody
+      asked for, and one that omitted a column would propose to **drop** it, with nothing
+      downstream able to tell either from an intended change. What a patch doesn't name, it doesn't
+      touch. Ops compose through the draft's own mutators (`rename_column`, `remove_column`), so a
+      rename carries its indexes and keys and a drop cascades to them; the result is run through
+      `TableDraft::validate` before it is returned, so the designer's rules stand between the model
+      and the preview. Column lookups match case-insensitively — a model routinely writes `Email`
+      for `email` — and keep the server's spelling.
+      `FENCE_TAG`/`is_proposal_tag`/`parse` are the *carriage*: a proposal reaches the user as a
+      fenced block tagged `schemaic-proposal`, which `ui::markdown` renders as a card. Its own tag
+      rather than `json`, because a model discussing a schema prints example JSON constantly and
+      none of it is consent to edit a table — an offer has to be something the model made on
+      purpose. **End to end:** the model calls the MCP `propose_table_change` to check itself,
+      echoes the same JSON into its reply, `markdown::proposal_card` renders it,
+      `ddl_preview::preview_proposal` turns it into a plan, and the user clicks Apply. Every step
+      before that last one is read-only.
     - `transcript.rs` — the rendered shape of one AI turn (`ChatMessage`/`Seg::{Text,Tool}`/
       `TurnStats`), kept here rather than in `schemaic-ai` so the UI crate needn't depend on the
       CLI-integration crate. `ChatMessage::prose` is what copy *and* conversation replay use.
@@ -1875,7 +1898,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     block of stops starts), and the `PopupToken`-tagged `set_open_popup`/`clear_open_popup`/
     `dismiss_open_popup` slot. A field joins through `FieldCfg::focus` instead, since nothing
     outside floem's editor can see a key it has.
-  - `markdown.rs` — AI-chat `render_markdown`/`CodeActions`/`code_block` (pulldown-cmark).
+  - `markdown.rs` — AI-chat `render_markdown`/`CodeActions`/`code_block` (pulldown-cmark). Also
+    `proposal_card`: a fenced block tagged `core::propose::FENCE_TAG` renders as the AI's **proposed
+    table change** — the table, the model's own summary line, the change count, and a Review button
+    that hands the parsed `Proposal` to `CodeActions::propose`. The card is the offer, the DDL
+    preview is the decision: Review runs nothing, it opens the same modal the designer opens.
+    Recognition lives here rather than in a scanner of its own because pulldown-cmark is already
+    parsing the reply and hands over the language tag; `core::propose` owns only the tag
+    (`is_proposal_tag`) and the JSON step (`parse`), so there is one answer to "is this a proposal".
+    **Gated on `settled`** (the turn has stopped streaming): pulldown-cmark closes an unterminated
+    fence at end of input, so mid-stream a proposal would render as a card of half-arrived JSON,
+    flickering "couldn't read this" on every chunk — until then it is an ordinary code block. A
+    block that doesn't parse is neither dropped nor hidden: the user is told it couldn't be read
+    *and* still sees what the model wrote, which is what they need to tell it what went wrong.
   - `settings.rs` — the three settings modals **and the four shared controls every modal's form is
     built from**: `focusable_toggle`/`focusable_toggle_row` (the switch — Space is ours, Enter is
     floem's), `focusable_dropdown` and the picker-agnostic `in_ring_dropdown` under it (which owns
@@ -2043,6 +2078,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     It also owns two things the other editors reuse: `list_pane` — the list-plus-action-bar that
     is **one** Tab stop with Up/Down inside it (over `widgets::list_step`) — and
     `focusable_owned_dropdown`, the picker for a value that isn't `Copy`.
+    `preview_proposal` is the AI's way in, beside `preview_change`'s: it seeds from `loaded_table`
+    like every editor, applies the ops with `propose::apply`, diffs against
+    `Target::new(dialect, db_flavour(…))` — the flavour matters, or the same change would preview
+    differently here than in the designer — and opens the same modal. It returns `Err` rather than
+    raising anything, because the caller is a card in the chat and that is where the user can see
+    what the model asked for. Going through `loaded_table` is what makes it refuse mid-refresh,
+    which matters more on this path than any other: the model may have read the table minutes ago,
+    and a draft seeded from a stale `TableInfo` is how an `ALTER` comes to restate an old column
+    definition and silently revert a change that already landed.
     **The form asks the engine for a capability, not "is this PostgreSQL".** It asked the latter in
     three places, which put SQLite on the side that gets a storage engine, a table collation, table
     and column comments and `ON UPDATE` — it has none of them (a collation is per column there, and
@@ -2726,8 +2770,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   to other same-user processes. Pure clusters split out: `claude_cli.rs` (`claude` binary
   discovery — PATH/PATHEXT/override) and `ai.rs` (`AiSession`/`start_ai_session` streaming,
   MCP-config plumbing, `ai_context`/`inline_system_prompt`). Reactive wiring (`app_view` closures)
-  stays in `main.rs`. The MCP server itself is `mcp.rs` — three tools (`run_query`, `list_schema`,
-  `describe_table`), described for **this** connection's engine: `tools_list(engine)` builds
+  stays in `main.rs`. `render_ai_context` also tells the model how a **schema change** reaches the
+  user — call `propose_table_change`, then echo the JSON in a `FENCE_TAG` block — spelled out in
+  the prompt as well as in the tool's own description, because the shape it replaces (an `ALTER` in
+  a code block for the user to run) is the one every model reaches for by default. It is stated
+  whether or not queries are allowed, since proposing reads the schema and that was never the gated
+  part, and the tag comes from the constant the renderer reads
+  (`the_prompt_names_the_fence_tag_the_renderer_reads`). The MCP server itself is `mcp.rs` — four tools (`run_query`, `list_schema`,
+  `describe_table`, `propose_table_change`), described for **this** connection's engine:
+  `tools_list(engine)` builds
   `run_query`'s advertised statement heads from `schemaic_core::sql::read_only_heads`, the same list
   the gate enforces, and names the engine with `SqlDialect::engine_label()`. A hard-coded
   `SELECT/SHOW/DESCRIBE/EXPLAIN/WITH` told every model that a SQLite connection accepted
@@ -2747,6 +2798,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   the dialect, and a **view** fell through to `ddl::view_ddl`'s MySQL shape, which was only cosmetic
   because SQLite accepts backticks and its views carry no `view_options`. `secrets.rs` is the
   keyring-backed `SecretStore` behind `core::secrets`.
+  `propose_table_change` is the odd one out and stays read-only like the rest: it takes a
+  `core::propose::Proposal`, introspects the table, runs `propose::apply` → `ddl::diff` → `emit`,
+  and hands the model back the change list in the *preview's own words* plus the SQL and anything
+  destructive in it — **it executes nothing**. What it buys is a self-correction loop: the model
+  learns here that it misread a column name, rather than the user being handed an offer that can't
+  be applied. It cannot reach the user directly — this is a separate `--mcp-serve` process with no
+  route into the app's overlays — so a proposal arrives only when the model echoes the same JSON
+  into its reply under `propose::FENCE_TAG`, which the app extracts with `propose::extract`. A model
+  that skips the tool has therefore lost a *check*, not a safety rail: the preview and the Apply
+  click sit downstream of both paths.
+  `proposal_from_args` strips the tool's own `database` argument before parsing, because `Proposal`
+  is `deny_unknown_fields` on purpose — an invented key has to fail loudly, since a silently-dropped
+  one is a change the user was promised and wouldn't get. The tag is advertised from the constant
+  the app extracts on (`the_proposal_tool_advertises_the_tag_the_app_looks_for`), so the two can't
+  drift into a block nothing picks up.
   - `heap.rs` — process-wide heap accounting. `Tracking` is installed as the global allocator and
     adds only two atomics — **live** bytes (allocated − freed) and the running peak — over the
     system allocator. It exists to answer one question the OS can't: whether memory growth is a

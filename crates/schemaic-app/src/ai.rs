@@ -950,6 +950,19 @@ fn render_ai_context(
          you cannot run queries — answer from the schema context and your knowledge. \
          describe_table omits its sample rows while queries are off."
     };
+    // Schema changes: the model proposes, the user applies. Spelled out here as
+    // well as in the tool's own description, because the shape it replaces is
+    // the one every model reaches for by default — writing an `ALTER` in a code
+    // block for the user to run. The fenced block is the only route that reaches
+    // the preview, so the tag comes from the constant the renderer reads.
+    let propose_line = format!(
+        "To change a table's structure, don't write DDL for the user to run. Call \
+         propose_table_change to check the change against the live table, then put the same \
+         JSON in a ```{tag} fenced block in your reply — Schemaic renders that as a change \
+         preview the user reviews and applies themselves. Send only what should change: it is \
+         a patch, and what you don't name, you don't touch.",
+        tag = schemaic_core::propose::FENCE_TAG,
+    );
     let schema_section = if scope == SchemaScope::None {
         String::new()
     } else {
@@ -962,6 +975,7 @@ fn render_ai_context(
          {engine} — write SQL for that engine. \
          Help the user write, fix, and understand SQL. Be concise and return runnable \
          SQL in fenced code blocks. {tools_line}\n\n\
+         {propose_line}\n\n\
          Active connection: {conn_name}\n\
          Active database: {active_db}\n\
          {schema_section}\
@@ -1401,6 +1415,36 @@ mod tests {
         // run_queries = true → mentions run_query.
         assert!(out.contains("run_query"));
         assert!(out.contains("```sql\nSELECT 1\n```"));
+    }
+
+    /// The prompt has to name the same fence tag the renderer picks the block up
+    /// by, and it has to say so whether or not queries are allowed — proposing a
+    /// change reads the schema, which is never the gated part. A prompt naming a
+    /// different tag would have the model write a block that renders as plain
+    /// JSON, so the user is told a change is waiting and no card ever appears.
+    #[test]
+    fn the_prompt_names_the_fence_tag_the_renderer_reads() {
+        let dbs = vec![(
+            "shop".to_string(),
+            Some(schema(vec![table("orders", &["id"])])),
+        )];
+        let cx = ctx_of(&dbs, Some("shop"), "SELECT 1", SchemaScope::Active);
+        for run_queries in [true, false] {
+            let out = render_ai_context(
+                "Local",
+                &cx,
+                SchemaScope::Active,
+                run_queries,
+                "",
+                "",
+                SqlDialect::MySql,
+            );
+            assert!(
+                out.contains(schemaic_core::propose::FENCE_TAG),
+                "run_queries = {run_queries} drops the tag"
+            );
+            assert!(out.contains("propose_table_change"));
+        }
     }
 
     #[test]

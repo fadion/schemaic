@@ -218,7 +218,13 @@ fn md_table(
 /// backslash escapes render correctly. Fenced code blocks become `code_block`s
 /// (with the action bar); everything else maps onto `inline_text`/`md_item`/
 /// `md_table`.
-pub(crate) fn render_markdown(src: &str, actions: CodeActions) -> impl IntoView {
+///
+/// `settled` is whether the turn has finished streaming, and it gates the
+/// proposal card. Mid-stream the fence is still open, and pulldown-cmark closes
+/// an unterminated block at the end of input — so a proposal would render as a
+/// card full of half-arrived JSON, flickering "couldn't read this" on every
+/// chunk. Until the turn settles, a proposal block is just a code block.
+pub(crate) fn render_markdown(src: &str, actions: CodeActions, settled: bool) -> impl IntoView {
     use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
     let base = theme::bubble_claude_text();
@@ -331,8 +337,12 @@ pub(crate) fn render_markdown(src: &str, actions: CodeActions) -> impl IntoView 
                     let code = std::mem::take(&mut code_buf);
                     let trimmed = code.trim_end_matches('\n').to_string();
                     if !trimmed.trim().is_empty() {
-                        let is_sql = code_is_sql(&code_lang, &trimmed);
-                        out.push(code_block(trimmed, actions.clone(), is_sql).into_any());
+                        if settled && schemaic_core::propose::is_proposal_tag(&code_lang) {
+                            out.push(proposal_card(trimmed, actions.clone()).into_any());
+                        } else {
+                            let is_sql = code_is_sql(&code_lang, &trimmed);
+                            out.push(code_block(trimmed, actions.clone(), is_sql).into_any());
+                        }
                     }
                 }
                 TagEnd::Item => {
@@ -429,6 +439,10 @@ pub(crate) fn render_markdown(src: &str, actions: CodeActions) -> impl IntoView 
 pub(crate) struct CodeActions {
     pub insert: Rc<dyn Fn(String)>,
     pub run: Rc<dyn Fn(String)>,
+    /// Send a proposed table change to the DDL preview. `Err` is what to show on
+    /// the card — every failure here is the model being wrong about the table,
+    /// and the card is where the user can see what it asked for.
+    pub propose: Rc<dyn Fn(schemaic_core::propose::Proposal) -> Result<(), String>>,
 }
 
 /// One action-bar icon: 16px, code-text colored, white on hover.
@@ -491,6 +505,128 @@ fn sql_leading_keyword(code: &str) -> bool {
             | "COMMIT"
             | "ROLLBACK"
     )
+}
+
+/// The card's own action button — the small-toolbar chrome, without the modal
+/// focus machinery `widgets::control_button` carries. A chat bubble is not a
+/// focus root and has no tab order to join.
+fn card_button(label: &'static str, on_click: impl Fn() + 'static) -> impl IntoView {
+    text(label).on_click_stop(move |_| on_click()).style(|s| {
+        crate::widgets::control_surface(s)
+            .font_size(crate::widgets::TOOLBAR_FONT)
+            .padding_horiz(10.0)
+            .padding_vert(5.0)
+            .flex_shrink(0.0_f32)
+            .color(theme::text())
+            .hover(|s| s.background(theme::control_hover()))
+    })
+}
+
+/// A `schemaic-proposal` block, once the turn has settled: the change the model
+/// is offering, and a button that opens it in the DDL preview.
+///
+/// **The card is the offer; the preview is the decision.** Review runs nothing —
+/// it opens the same modal the table designer opens, with the same warnings and
+/// the same Apply. So the model can propose freely and still cannot write.
+fn proposal_card(json: String, actions: CodeActions) -> AnyView {
+    let proposal = match schemaic_core::propose::parse(&json) {
+        Ok(p) => p,
+        // Neither dropped nor hidden. The model said it was proposing something,
+        // so the user is told it couldn't be read *and* still gets to see what it
+        // wrote — which is what they need to tell it what went wrong.
+        Err(e) => {
+            return v_stack((
+                text(format!(
+                    "Claude proposed a change that couldn't be read — {e}"
+                ))
+                .style(|s| {
+                    s.width_full()
+                        .font_size(theme::FONT_LABEL)
+                        .color(theme::text_muted())
+                }),
+                code_block(json, actions, false),
+            ))
+            .style(|s| s.flex_col().width_full().gap(5.0))
+            .into_any();
+        }
+    };
+
+    let error = RwSignal::new(None::<String>);
+    let ops = proposal.ops.len();
+
+    let head = h_stack((
+        icons::icon(icons::TABLE_PROPERTIES, 15.0)
+            .style(|s| s.color(theme::text_muted()).flex_shrink(0.0_f32)),
+        text(format!("Proposed change to {}", proposal.table)).style(|s| {
+            s.font_size(theme::FONT_BODY)
+                .color(theme::text())
+                .flex_grow(1.0_f32)
+        }),
+        text(format!(
+            "{ops} {}",
+            schemaic_core::text::plural(ops, "change", "changes")
+        ))
+        .style(|s| {
+            s.font_size(theme::FONT_LABEL)
+                .color(theme::text_faint())
+                .flex_shrink(0.0_f32)
+        }),
+    ))
+    .style(|s| s.flex_row().items_center().width_full().gap(7.0));
+
+    // The model's own line about what the change is for, when it wrote one. Not
+    // load-bearing — the preview lists every change in the app's words — so it
+    // is dim, and absent rather than an empty row when there is none.
+    let summary: AnyView = match proposal.summary.clone() {
+        Some(s) if !s.trim().is_empty() => text(s)
+            .style(|s| {
+                s.width_full()
+                    .font_size(theme::FONT_LABEL)
+                    .color(theme::text_muted())
+            })
+            .into_any(),
+        _ => empty().into_any(),
+    };
+
+    let review = {
+        let propose = actions.propose.clone();
+        card_button("Review change…", move || {
+            // The failure lands on the card, not in a modal: it is the model
+            // being wrong about the table, and this is where the user can see
+            // what it asked for.
+            error.set((propose)(proposal.clone()).err());
+        })
+    };
+    let footer = h_stack((empty().style(|s| s.flex_grow(1.0_f32)), review))
+        .style(|s| s.flex_row().items_center().width_full());
+
+    let error_line = dyn_container(
+        move || error.get(),
+        move |e| match e {
+            Some(msg) => text(msg)
+                .style(|s| {
+                    s.width_full()
+                        .font_size(theme::FONT_LABEL)
+                        .color(theme::error())
+                })
+                .into_any(),
+            None => empty().into_any(),
+        },
+    )
+    .style(|s| s.width_full());
+
+    v_stack((head, summary, error_line, footer))
+        .style(|s| {
+            s.flex_col()
+                .width_full()
+                .gap(7.0)
+                .padding(10.0)
+                .background(theme::bg_deepest())
+                .border(1.0)
+                .border_color(theme::border())
+                .border_radius(6.0)
+        })
+        .into_any()
 }
 
 fn code_block(code: String, actions: CodeActions, is_sql: bool) -> impl IntoView {
