@@ -24,7 +24,7 @@ use schemaic_core::favorite::FavoriteRule;
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::schema::{
     ColumnInfo, ColumnTypeClass, DbSchema, IndexInfo, ObjectItem, SchemaState, TableInfo,
-    TableSource, classify_column_type,
+    TableSource, classify_column_type, db_visible,
 };
 use schemaic_core::text::plural;
 
@@ -442,26 +442,6 @@ fn visible_nav_rows(
         &hidden_dbs.get_untracked(),
         &filter.get_untracked(),
     )
-}
-
-/// Is this database one a list may show and a picker may offer?
-///
-/// The SCHEMA panel's eye hides a database from **sight**, and sight is every
-/// surface that lists databases rather than only the tree the eye is attached
-/// to. The QUERY toolbar's active-database selector went on offering hidden
-/// ones, so a database the user had deliberately put away could still be
-/// switched to from the tab beside it — the same failure Find-Anywhere would
-/// have if [`nav_rows`] didn't ask this.
-///
-/// Everything that lists databases asks it: the tree's own `dyn_stack`,
-/// `nav_rows` (the keyboard walk, which has to stay bug-for-bug identical to the
-/// render), the active-database menu, and the trigger that opens it. Two
-/// exceptions, both deliberate — the **eye's own menu**, which must list a
-/// hidden database for it to be unhidden, and a **tab's binding**, since hiding
-/// the database a tab already runs against doesn't move the tab, and a toolbar
-/// that stopped naming it would be lying about where the next query goes.
-pub(crate) fn db_visible(hidden: &HashSet<String>, database: &str) -> bool {
-    !hidden.contains(database)
 }
 
 /// The nav walk. Mirrors the tree's own render rules: hidden DBs dropped; a
@@ -2618,16 +2598,6 @@ fn schema_search(filter: RwSignal<String>) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The polarity, which is the whole of what this predicate can get wrong —
-    /// and getting it wrong inverts every list of databases in the app at once.
-    #[test]
-    fn a_hidden_database_is_shown_by_nothing_and_an_unhidden_one_by_everything() {
-        let hidden: HashSet<String> = ["archive".to_string()].into_iter().collect();
-        assert!(!db_visible(&hidden, "archive"));
-        assert!(db_visible(&hidden, "sakila"));
-        assert!(db_visible(&HashSet::new(), "archive"));
-    }
 
     fn tbl(ns: Option<&str>, name: &str) -> TableInfo {
         TableInfo {

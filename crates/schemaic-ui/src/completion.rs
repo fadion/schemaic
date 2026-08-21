@@ -24,7 +24,7 @@ use floem::views::editor::core::editor::EditType;
 use floem::views::editor::core::selection::Selection;
 
 use schemaic_core::intel::{self, ClauseCtx, SqlDialect};
-use schemaic_core::schema::{DbSchema, SchemaState, classify_column_type};
+use schemaic_core::schema::{DbSchema, SchemaState, classify_column_type, db_contributes};
 use schemaic_core::sql::statement_range;
 
 use crate::schema_tree::column_type_icon;
@@ -200,24 +200,6 @@ struct SchemaIndex {
     tables_by_db: HashMap<String, Vec<String>>,
 }
 
-/// Does this database contribute to the **suggestion** pool?
-///
-/// The SCHEMA eye's rule ([`crate::schema_tree::db_visible`]) with one
-/// exception: the database the tab is *in*. That one is context rather than an
-/// offer — hiding the database you are working in would otherwise take its own
-/// tables and columns out of your completion while your queries went on running
-/// against it, which is the same reason the toolbar keeps naming it.
-///
-/// Deliberately **not** asked by [`build_catalog`]. That catalog is what the
-/// diagnostics squiggle against, and a hidden database's tables have not stopped
-/// existing: filtering there would mark `archive.orders` as an unknown table for
-/// no reason but a view preference. Hiding governs what is *offered*, never what
-/// is *true*.
-fn suggests_from(hidden: &HashSet<String>, database: &str, active_db: Option<&str>) -> bool {
-    crate::schema_tree::db_visible(hidden, database)
-        || active_db.is_some_and(|a| a.eq_ignore_ascii_case(database))
-}
-
 impl SchemaIndex {
     /// Build the completion index. When `active_db` is `Some`, the *unqualified*
     /// suggestion pool (`tables`/`columns`) is scoped to that database, so a tab with
@@ -228,7 +210,7 @@ impl SchemaIndex {
     ///
     /// A database the SCHEMA eye has hidden contributes nothing at all — not its
     /// name, not its tables, not its columns — unless it is the active one; see
-    /// [`suggests_from`].
+    /// [`schemaic_core::schema::db_contributes`].
     fn build(
         db_nodes: RwSignal<Vec<ConnNode>>,
         hidden: &HashSet<String>,
@@ -240,7 +222,7 @@ impl SchemaIndex {
         let mut columns_by_db: HashMap<(String, String), Rc<Vec<ColMeta>>> = HashMap::new();
         let mut tables_by_db: HashMap<String, Vec<String>> = HashMap::new();
         for node in db_nodes.get_untracked() {
-            if !suggests_from(hidden, &node.database, active_db) {
+            if !db_contributes(hidden, &node.database, active_db) {
                 continue;
             }
             if !databases
@@ -1535,7 +1517,7 @@ mod tests {
     use super::{
         KeyKind, SuggestKind, Suggestion, call_parens_follow, completion_insertion,
         database_suggestion_visible, natural_width, popup_may_open, popup_placement, popup_w,
-        popup_x, recency_bonus, row_width, statement_identifiers, suggests_from, types_a_character,
+        popup_x, recency_bonus, row_width, statement_identifiers, types_a_character,
     };
     use crate::consts::{
         COMPLETION_BORDER, COMPLETION_DETAIL_GAP, COMPLETION_EDGE_PAD, COMPLETION_GAP_W,
@@ -1608,36 +1590,6 @@ mod tests {
         // Backspace isn't typing, but a list already on screen must still refine
         // (and close itself once the prefix is gone) rather than freeze.
         assert!(popup_may_open(false, true, false));
-    }
-
-    // ── What the eye takes out of the suggestion pool ─────────────────────
-
-    #[test]
-    fn a_hidden_database_suggests_nothing() {
-        let hidden: HashSet<String> = ["archive".to_string()].into_iter().collect();
-        assert!(!suggests_from(&hidden, "archive", Some("sakila")));
-        assert!(suggests_from(&hidden, "sakila", Some("sakila")));
-        assert!(suggests_from(&HashSet::new(), "archive", Some("sakila")));
-    }
-
-    #[test]
-    fn the_database_you_are_working_in_suggests_even_when_hidden() {
-        // Hiding is about what is *offered*; the database the tab is bound to is
-        // context, not an offer. Dropping it would take that tab's own tables and
-        // columns out of its completion while its queries still run there.
-        let hidden: HashSet<String> = ["archive".to_string()].into_iter().collect();
-        assert!(suggests_from(&hidden, "archive", Some("archive")));
-        // Case-insensitively, like every other name comparison in this index.
-        assert!(suggests_from(&hidden, "archive", Some("ARCHIVE")));
-        // …but only that one: a *different* hidden database stays out.
-        assert!(!suggests_from(&hidden, "archive", Some("sakila")));
-    }
-
-    #[test]
-    fn with_no_active_database_hiding_is_the_whole_rule() {
-        let hidden: HashSet<String> = ["archive".to_string()].into_iter().collect();
-        assert!(!suggests_from(&hidden, "archive", None));
-        assert!(suggests_from(&hidden, "sakila", None));
     }
 
     #[test]

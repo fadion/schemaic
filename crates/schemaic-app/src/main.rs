@@ -5625,6 +5625,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 connections,
                 active_conn,
                 db_nodes,
+                hidden_dbs,
                 tabs,
                 active,
                 scope: ai_schema_scope.get_untracked(),
@@ -5858,6 +5859,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     connections,
                     active_conn,
                     db_nodes,
+                    hidden_dbs,
                     tabs,
                     active,
                     scope: ai_schema_scope.get_untracked(),
@@ -5876,7 +5878,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         .map(|c| SqlDialect::from_db_type(&c.db_type))
                 })
                 .unwrap_or_default();
-            let system = inline_system_prompt(db_nodes, active_db.as_deref(), &req, dialect);
+            let system =
+                inline_system_prompt(db_nodes, hidden_dbs, active_db.as_deref(), &req, dialect);
             let intent = req.intent.clone();
             let bin = claude_bin(&ai_cli_path.get_untracked());
             // Follow the AI panel's model choice (one place to change it).
