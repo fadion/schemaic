@@ -186,6 +186,20 @@ pub(crate) const PANELS_MIN_SCHEMA_W: f64 = SCHEMA_MIN_W + CENTER_MIN_W; // 650
 /// the two clusters never collide on a narrow window.
 pub(crate) const FOOTER_COLLAPSE_GAP: f64 = 30.0;
 
+/// How far above the footer bar's true centre its contents sit, in px.
+///
+/// A correction, not a design choice: everything in the bar — icons and labels
+/// alike — read low against the 1px rule above it, which is the kind of drift
+/// that is invisible until someone puts a straight edge on it. Applied once, as
+/// `padding_bottom(FOOTER_LIFT * 2)` on the bar, so a later adjustment is one
+/// number rather than a margin on each of fifteen segments.
+///
+/// Tuned by eye against [`theme::FOOTER_H`](crate::theme::FOOTER_H), which it
+/// belongs with. The bar's bottom is pinned to the window, so growing it lifts
+/// its own centre too — when `FOOTER_H` went 26 → 28 this had to come back down
+/// to 2 rather than up to 3, or the contents would have moved twice.
+pub(crate) const FOOTER_LIFT: f64 = 2.0;
+
 // ── Tab bar ─────────────────────────────────────────────────────────────────
 
 /// Tab bar height. Flat, full-height tabs fill it edge to edge.

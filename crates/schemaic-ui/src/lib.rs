@@ -6811,6 +6811,14 @@ fn footer(ui: Ui) -> impl IntoView {
             .flex_shrink(0.0_f32)
             .flex_row()
             .items_center()
+            // Everything in the bar sits 2px high of centre. `items_center`
+            // centres within the **content box**, and 4px of bottom padding takes
+            // 4px off the bottom of it — moving the centre, and so every icon and
+            // label with it, up by exactly half that. Bottom padding rather than a
+            // margin on each group because taffy's `height` here is the border
+            // box: the bar's own height and the footer's edge don't move, only
+            // what is inside it.
+            .padding_bottom(FOOTER_LIFT * 2.0)
             .justify_between()
             .background(theme::bg_deepest())
             .border_top(1.0)

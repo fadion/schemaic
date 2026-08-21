@@ -648,7 +648,7 @@ pub fn scrollbar_hover() -> Color {
 
 // Fixed chrome dimensions (logical px).
 pub const HEADER_H: f64 = 40.0;
-pub const FOOTER_H: f64 = 26.0;
+pub const FOOTER_H: f64 = 28.0;
 pub const SCHEMA_W: f64 = 300.0;
 // AI and Terminal share this width (see `TERM_W` in lib.rs).
 pub const AI_W: f64 = 350.0;
