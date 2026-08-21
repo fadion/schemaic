@@ -369,30 +369,6 @@ impl<'a> BrowseKey<'a> {
     }
 }
 
-/// The `SELECT` Schemaic generates for a table — opening one from the schema
-/// tree, and the AI's bottom-sample.
-///
-/// **Why it orders.** Without an `ORDER BY` neither engine promises anything, so
-/// "the first `limit` rows" is an undefined set: InnoDB usually walks the
-/// primary key, but Postgres returns heap order, where an `UPDATE` can move a
-/// row to the end of the table and change what you see between runs. Ordering by
-/// the key makes the capped page deterministic. The key is also the cheap column
-/// to sort by — on InnoDB it *is* the clustered order.
-///
-/// The `ORDER BY` is written into the statement the user sees rather than
-/// spliced in on the way to the server: the editor text has to stay what
-/// actually runs, or history, EXPLAIN and copy-as-SQL all quietly disagree with
-/// it. It's ordinary SQL in the editor — deletable, editable, and replaced (not
-/// appended to) when a column header is clicked, since [`build_query`] rewrites
-/// an existing `ORDER BY`.
-///
-/// Dialect-aware, matching the write path — the name itself is
-/// [`qualified_table_name`]'s, which every statement the app generates for a
-/// table shares.
-///
-/// See [`BrowseKey`] for what `key` does to the projection — a key that is not one
-/// of the table's columns has to be named in it, and that is what makes a keyless
-/// SQLite table editable.
 /// How a table is named in generated SQL, in `dialect` — **the** spelling, so
 /// two statements the app generates for one table can't disagree about what it
 /// is called.
@@ -435,6 +411,30 @@ pub fn qualified_table_name(
     }
 }
 
+/// The `SELECT` Schemaic generates for a table — opening one from the schema
+/// tree, and the AI's bottom-sample.
+///
+/// **Why it orders.** Without an `ORDER BY` neither engine promises anything, so
+/// "the first `limit` rows" is an undefined set: InnoDB usually walks the
+/// primary key, but Postgres returns heap order, where an `UPDATE` can move a
+/// row to the end of the table and change what you see between runs. Ordering by
+/// the key makes the capped page deterministic. The key is also the cheap column
+/// to sort by — on InnoDB it *is* the clustered order.
+///
+/// The `ORDER BY` is written into the statement the user sees rather than
+/// spliced in on the way to the server: the editor text has to stay what
+/// actually runs, or history, EXPLAIN and copy-as-SQL all quietly disagree with
+/// it. It's ordinary SQL in the editor — deletable, editable, and replaced (not
+/// appended to) when a column header is clicked, since [`build_query`] rewrites
+/// an existing `ORDER BY`.
+///
+/// Dialect-aware, matching the write path — the name itself is
+/// [`qualified_table_name`]'s, which every statement the app generates for a
+/// table shares.
+///
+/// See [`BrowseKey`] for what `key` does to the projection — a key that is not one
+/// of the table's columns has to be named in it, and that is what makes a keyless
+/// SQLite table editable.
 pub fn table_query(
     dialect: SqlDialect,
     database: &str,
