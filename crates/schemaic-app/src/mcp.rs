@@ -17,6 +17,8 @@
 //! SSH, since the tunnel is just a local listener any process can use), and is a
 //! structured `schemaic_db::Db` handle — no credential URL is involved.
 
+use std::collections::HashSet;
+
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::ResultSet;
 use schemaic_core::schema::{DbSchema, TableInfo};
@@ -58,6 +60,7 @@ pub async fn serve(endpoint: crate::ai::McpEndpoint) {
         db,
         database,
         samples,
+        hidden,
     } = endpoint;
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
@@ -95,7 +98,7 @@ pub async fn serve(endpoint: crate::ai::McpEndpoint) {
                     .pointer("/params/arguments")
                     .cloned()
                     .unwrap_or(json!({}));
-                Some(call_tool(&db, database.as_deref(), samples, &name, &args).await)
+                Some(call_tool(&db, database.as_deref(), samples, &hidden, &name, &args).await)
             }
             "ping" => Some(json!({})),
             // Unknown request → empty result; notifications (no id) → nothing.
@@ -180,6 +183,7 @@ async fn call_tool(
     db: &Db,
     database: Option<&str>,
     samples: bool,
+    hidden: &HashSet<String>,
     name: &str,
     args: &Value,
 ) -> Value {
@@ -193,7 +197,7 @@ async fn call_tool(
             let sql = args.get("sql").and_then(|s| s.as_str()).unwrap_or("");
             run_query(db, database, sql).await
         }
-        "list_schema" => list_schema(db, arg("database")).await,
+        "list_schema" => list_schema(db, arg("database"), database, hidden).await,
         "describe_table" => match arg("table") {
             Some(table) => describe_table(db, database, arg("database"), table, samples).await,
             None => ("describe_table needs a `table`.".to_string(), true),
@@ -291,11 +295,43 @@ fn format_table(rs: &ResultSet) -> String {
     out
 }
 
+/// Which databases the server **overview** reports.
+///
+/// The SCHEMA eye's rule, reaching the assistant's tools as well as its prompt:
+/// a database the user has put away is not one the assistant should be
+/// discovering and proposing work in. `schema::db_contributes` carries the same
+/// exception it does everywhere else — the session's own default database is
+/// listed even when hidden, since that is the database the user is *in* and its
+/// queries run there regardless.
+///
+/// **Only the overview.** `list_schema {"database": "archive"}` still answers in
+/// full, and so do `describe_table` and `run_query`, which is the same line the
+/// app draws for itself: hiding governs what is *offered* — a listing is an
+/// offer — and never what is *true*, which a named lookup asks for. A tool that
+/// refused to describe a table the user had explicitly named would be lying
+/// about the server rather than tidying a view, and `run_query` reaching any
+/// database means a half-filtered fence would only be theatre.
+fn listed_databases(
+    names: Vec<String>,
+    hidden: &HashSet<String>,
+    default_db: Option<&str>,
+) -> Vec<String> {
+    names
+        .into_iter()
+        .filter(|n| schemaic_core::schema::db_contributes(hidden, n, default_db))
+        .collect()
+}
+
 /// `list_schema` — the whole server as an overview (databases + table names), or
 /// one database in full (columns, keys, foreign keys) when `database` is given.
 /// Splitting it this way keeps a 50-database server from burning the model's
 /// context on a listing it didn't ask for.
-async fn list_schema(db: &Db, database: Option<&str>) -> (String, bool) {
+async fn list_schema(
+    db: &Db,
+    database: Option<&str>,
+    default_db: Option<&str>,
+    hidden: &HashSet<String>,
+) -> (String, bool) {
     if let Some(name) = database {
         return match db.fetch_schema(name).await {
             Ok(schema) => (format_database_schema(name, &schema), false),
@@ -303,7 +339,7 @@ async fn list_schema(db: &Db, database: Option<&str>) -> (String, bool) {
         };
     }
     let names = match db.fetch_databases().await {
-        Ok(d) => d,
+        Ok(d) => listed_databases(d, hidden, default_db),
         Err(e) => return (format!("Error listing databases: {e}"), true),
     };
     let mut dbs = Vec::with_capacity(names.len());
@@ -545,9 +581,9 @@ async fn describe_table(
 #[cfg(test)]
 mod tests {
     use super::{
-        SUPPORTED_PROTOCOLS, dialect_of, find_described, format_database_list,
+        HashSet, SUPPORTED_PROTOCOLS, dialect_of, find_described, format_database_list,
         format_database_schema, format_table, format_table_detail, format_table_heading,
-        negotiate_protocol, normalize_stmt,
+        listed_databases, negotiate_protocol, normalize_stmt,
     };
 
     /// What `run_query` advertises is what the gate enforces, per engine. The
@@ -671,6 +707,37 @@ mod tests {
         // No columns at this level — that's what the drill-down calls are for.
         assert!(!out.contains("int"));
         assert!(out.contains("describe_table"));
+    }
+
+    #[test]
+    fn the_overview_leaves_out_a_database_the_user_hid() {
+        let names = || {
+            vec![
+                "sakila".to_string(),
+                "archive".to_string(),
+                "shop".to_string(),
+            ]
+        };
+        let hidden: HashSet<String> = ["archive".to_string()].into_iter().collect();
+        assert_eq!(
+            listed_databases(names(), &hidden, Some("sakila")),
+            vec!["sakila".to_string(), "shop".to_string()]
+        );
+        // Nothing hidden → the server's own list, in the server's own order.
+        assert_eq!(listed_databases(names(), &HashSet::new(), None), names());
+    }
+
+    #[test]
+    fn the_session_still_sees_the_database_it_is_pointed_at() {
+        // The exception every other surface makes: hiding the database the user
+        // is working in doesn't move the tab, and an assistant that couldn't
+        // name the database its own queries default to would be useless there.
+        let hidden: HashSet<String> = ["archive".to_string()].into_iter().collect();
+        assert_eq!(
+            listed_databases(vec!["archive".to_string()], &hidden, Some("archive")),
+            vec!["archive".to_string()]
+        );
+        assert!(listed_databases(vec!["archive".to_string()], &hidden, Some("shop")).is_empty());
     }
 
     #[test]
