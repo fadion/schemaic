@@ -908,6 +908,10 @@ pub(crate) struct QueryPaneParams {
     /// The guard bar's "Run anyway" ([`crate::TabsActions::run_anyway`]).
     pub run_anyway: Rc<dyn Fn()>,
     pub db_nodes: RwSignal<Vec<ConnNode>>,
+    /// Databases the SCHEMA panel's eye has hidden — the database selector must
+    /// not offer one (`schema_tree::db_visible`), so its trigger has to know
+    /// whether anything is left to offer.
+    pub hidden_dbs: RwSignal<std::collections::HashSet<String>>,
     pub inline_ai: RwSignal<InlineAiState>,
     pub inline_ai_run: Rc<dyn Fn(InlineAiRequest)>,
     pub inline_ai_cancel: Rc<dyn Fn()>,
@@ -965,6 +969,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         run_guard: guard,
         run_anyway,
         db_nodes,
+        hidden_dbs,
         inline_ai,
         inline_ai_run,
         inline_ai_cancel,
@@ -1340,6 +1345,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     recompute_completions(
                         e,
                         db_nodes,
+                        hidden_dbs,
                         comp,
                         adb.as_deref(),
                         dialect.get_untracked(),
@@ -2184,6 +2190,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     recompute_completions(
                         &ed,
                         db_nodes,
+                        hidden_dbs,
                         comp,
                         adb.as_deref(),
                         dialect.get_untracked(),
@@ -3725,7 +3732,16 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // handler-less sheet over the whole window for it, which swallowed every
     // click in the app until the process was killed.
     .on_click_stop(move |_| {
-        if db_nodes.with_untracked(|ns| ns.is_empty()) {
+        // Nothing *offerable* — no databases, or the eye has hidden them all —
+        // and the menu renders no panel, so setting the flag would leave one
+        // nothing can clear.
+        let any = hidden_dbs.with_untracked(|h| {
+            db_nodes.with_untracked(|ns| {
+                ns.iter()
+                    .any(|n| crate::schema_tree::db_visible(h, &n.database))
+            })
+        });
+        if !any {
             return;
         }
         active_db_menu_open.update(|o| *o = !*o)
