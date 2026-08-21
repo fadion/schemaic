@@ -69,6 +69,11 @@ pub(crate) struct Completion {
     /// handler for every keypress, read by the recompute the resulting edit
     /// schedules — see [`types_a_character`] for why the question cannot be
     /// answered later, and [`popup_may_open`] for what it decides.
+    ///
+    /// **A one-shot, like [`Completion::suppress`]**: `recompute_completions`
+    /// clears it as it reads it. An edit that arrives without a keypress at all
+    /// (context-menu paste, IME commit, dropped text) would otherwise be judged
+    /// by whatever the last key happened to be.
     pub(crate) typed: RwSignal<bool>,
     /// Signature help for the function call enclosing the caret (independent of the
     /// suggestion list — shown whenever the caret is inside a builtin's parens).
@@ -668,6 +673,18 @@ pub(crate) fn recompute_completions(
     // right after accepting it (otherwise `suppress`, set by the accept, would swallow
     // the very next keystroke and the popup wouldn't reopen until another char).
     let after_dot = offset > 0 && text.as_bytes().get(offset - 1) == Some(&b'.');
+    // **A one-shot, consumed here and now** — read before anything can return, so
+    // every path through this function spends it exactly once.
+    //
+    // `typed` is written by the key handler, but not every edit arrives through
+    // one: a paste from the OS context menu, an IME commit and dropped text all
+    // change the document with no keypress in between. Left standing, the verdict
+    // from the *previous* keystroke answered for them — type `sel`, dismiss the
+    // list, then right-click → Paste, and the popup opened on the pasted text
+    // because `typed` was still true from the `l`. Clearing it makes the absence
+    // of a keypress mean what it should: not typing.
+    let typed = comp.typed.get_untracked();
+    comp.typed.set(false);
     if comp.suppress.get_untracked() {
         comp.suppress.set(false);
         if !force && !after_dot {
@@ -680,7 +697,7 @@ pub(crate) fn recompute_completions(
     // isn't wanted stops here — after the `suppress` one-shot above, which has to
     // be consumed by the next recompute either way or it would swallow a later
     // keystroke instead of the edit it was set for.
-    if !popup_may_open(force, comp.open.get_untracked(), comp.typed.get_untracked()) {
+    if !popup_may_open(force, comp.open.get_untracked(), typed) {
         return;
     }
     let word_lo = word_start(&text, offset);
