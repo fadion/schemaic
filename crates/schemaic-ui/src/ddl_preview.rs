@@ -409,6 +409,10 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                     // the plan to something that splits on `;`.
                     let sql = p.script.clone();
                     let open_sql = sql.clone();
+                    // The database the plan would have been applied to — the tab
+                    // has to be the one this script belongs in, or "Open in
+                    // editor" hands you an `ALTER` aimed somewhere else.
+                    let open_db = p.database.clone();
                     let open_query = ui_side.tab_actions.open_query.clone();
                     h_stack((
                         action_button_icon(
@@ -432,7 +436,7 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
                             ring.clone(),
                             ACTION_TAB + 10,
                             move || {
-                                (open_query)(open_sql.clone());
+                                (open_query)(open_sql.clone(), Some(open_db.clone()));
                                 d.preview.set(None);
                                 close_editors(d);
                             },

@@ -386,33 +386,38 @@ impl<'a> BrowseKey<'a> {
 /// appended to) when a column header is clicked, since [`build_query`] rewrites
 /// an existing `ORDER BY`.
 ///
-/// Dialect-aware, matching the write path: MySQL qualifies `` `db`.`table` ``
-/// (its connection is server-level), Postgres emits the double-quoted name
-/// (its connection is already bound to the database) — bare for a table in
-/// `public`, which resolves through `search_path`, and `"schema"."table"` for one
-/// in any other namespace. `schema` is the table's PostgreSQL namespace and is
-/// always `None` on MySQL, where the database already is the namespace.
-///
-/// **SQLite names the table alone.** A connection *is* one file, so there is no
-/// server-level qualifier to add; `database` there is the schema name SQLite
-/// itself uses (`main`, or an `ATTACH`ed one), and qualifying with it would emit
-/// `main.t` — correct but noise on every query the tree generates, and wrong the
-/// moment the same statement is copied into a session where the file is attached
-/// under another name.
+/// Dialect-aware, matching the write path — the name itself is
+/// [`qualified_table_name`]'s, which every statement the app generates for a
+/// table shares.
 ///
 /// See [`BrowseKey`] for what `key` does to the projection — a key that is not one
 /// of the table's columns has to be named in it, and that is what makes a keyless
 /// SQLite table editable.
-pub fn table_query(
+/// How a table is named in generated SQL, in `dialect` — **the** spelling, so
+/// two statements the app generates for one table can't disagree about what it
+/// is called.
+///
+/// MySQL qualifies `` `db`.`table` `` (its connection is server-level).
+/// PostgreSQL emits the name its connection can already reach: bare in `public`,
+/// which resolves through `search_path`, and `"schema"."table"` in any other
+/// namespace — `schema` is the table's PostgreSQL namespace and is always `None`
+/// on MySQL, where the database *is* the namespace. **SQLite names the table
+/// alone**: a connection is one file, so there is no server-level qualifier to
+/// add, and `database` there is the schema name SQLite itself uses (`main`, or
+/// an `ATTACH`ed one) — qualifying with it would emit `main.t`, correct but noise
+/// on every generated query, and wrong the moment the statement is copied into a
+/// session where the file is attached under another name.
+///
+/// Quoted only where the name needs it ([`needs_quoting`]), which is what keeps
+/// generated SQL free of decorative quoting and its names visible to the
+/// mid-edit tokenizer behind completion.
+pub fn qualified_table_name(
     dialect: SqlDialect,
     database: &str,
     schema: Option<&str>,
     table: &str,
-    key: BrowseKey<'_>,
-    order: Order,
-    limit: usize,
 ) -> String {
-    let name = match dialect {
+    match dialect {
         SqlDialect::MySql => format!(
             "{}.{}",
             quote_if_needed(database, dialect),
@@ -427,7 +432,19 @@ pub fn table_query(
             None => quote_if_needed(table, dialect),
         },
         SqlDialect::Sqlite => quote_if_needed(table, dialect),
-    };
+    }
+}
+
+pub fn table_query(
+    dialect: SqlDialect,
+    database: &str,
+    schema: Option<&str>,
+    table: &str,
+    key: BrowseKey<'_>,
+    order: Order,
+    limit: usize,
+) -> String {
+    let name = qualified_table_name(dialect, database, schema, table);
     let (projection, order_cols): (String, Vec<String>) = match key {
         // Not one of the table's columns, so `*` won't return it and it has to be
         // named — nothing can key a write on a value the result doesn't contain.

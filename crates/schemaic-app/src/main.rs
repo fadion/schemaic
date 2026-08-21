@@ -3333,17 +3333,27 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         })
     };
 
-    // Open a new tab with `sql` in the editor but do NOT run it (used by
-    // "Generate DDL" in the schema context menu, and the AI code-block bar).
-    let open_query: Rc<dyn Fn(String)> = {
+    // Open a new tab with `sql` in the editor but do NOT run it (used by the
+    // schema menus' Generate entries, the DDL preview and the AI code-block bar).
+    //
+    // **`database` is the database the statement is *for*.** Without it the tab
+    // fell to `default_tab_target`, which answers "wherever a *new* tab should
+    // start" — the last database the user picked, else the connection's first by
+    // name. That is the right answer for Ctrl+T and the wrong one for a
+    // statement that already names its subject: generating `employees.employees`
+    // opened it bound to `bigschema`, so the toolbar contradicted the SQL and a
+    // run would have gone to the wrong database (or failed, on a name that only
+    // resolves in the other one). `None` still means "no particular database",
+    // which is what the AI bar's free-standing snippets are.
+    let open_query: Rc<dyn Fn(String, Option<String>)> = {
         let next_id = next_id.clone();
         let default_tab_target = default_tab_target.clone();
         let place_tab = place_tab.clone();
-        Rc::new(move |sql: String| {
+        Rc::new(move |sql: String, database: Option<String>| {
             let id = next_id.get();
             next_id.set(id + 1);
-            let (conn_id, database) = default_tab_target();
-            (place_tab)(Tab::new(cx, id, &sql, conn_id, database));
+            let (conn_id, default_db) = default_tab_target();
+            (place_tab)(Tab::new(cx, id, &sql, conn_id, database.or(default_db)));
         })
     };
 

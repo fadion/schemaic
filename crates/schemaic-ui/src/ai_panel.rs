@@ -77,8 +77,16 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     let cli_path = ui.ai.cli_path;
     let cli_ok = ui.ai_actions.cli_ok.clone();
     // Actions for code-block bars: insert into a new query tab, and run.
+    //
+    // The chat is about the tab the user is looking at, so a code block from it
+    // belongs to *that* tab's database — not to whichever database a brand-new
+    // tab would have started on (the last one picked, else the first by name).
     let code_actions = CodeActions {
-        insert: ui.tab_actions.open_query.clone(),
+        insert: {
+            let oq = ui.tab_actions.open_query.clone();
+            let active_db = ui.tabs_ui.active_db;
+            Rc::new(move |sql: String| (oq)(sql, active_db.get_untracked()))
+        },
         run: ui.tab_actions.run.clone(),
     };
     // Reactive: is Claude reachable for the current CLI-path value? Drives the

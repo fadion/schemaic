@@ -36,6 +36,7 @@ pub mod schema;
 pub mod search_history;
 pub mod secrets;
 pub mod seed;
+pub mod skeleton;
 pub mod sql;
 pub mod sqlfile;
 pub mod sqlfmt;

@@ -1596,8 +1596,15 @@ pub struct TabsActions {
     /// Open the table (reusing an existing tab) and select + scroll the named
     /// column into view in the grid (schema-tree column double-click).
     pub open_table_col: Rc<dyn Fn(TableSource, String)>,
-    /// Open a new query tab containing `sql` (does NOT run it).
-    pub open_query: Rc<dyn Fn(String)>,
+    /// Open a new query tab containing `sql` (does NOT run it), bound to the
+    /// database the statement is **for**.
+    ///
+    /// Pass the database whenever the SQL already names its subject — every
+    /// schema-tree Generate entry does — or the tab binds to wherever a *new*
+    /// tab would start, which is the last database picked, else the connection's
+    /// first by name. `None` is for a snippet that belongs to no database in
+    /// particular.
+    pub open_query: Rc<dyn Fn(String, Option<String>)>,
     /// Ctrl+O — pick a `.sql` file and open it in a tab (reusing a blank one, as
     /// every other "open something in a tab" path does). A file already open on
     /// this connection is activated rather than opened twice.
