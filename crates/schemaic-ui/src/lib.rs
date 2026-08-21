@@ -16,6 +16,7 @@ pub mod contrast;
 mod ddl_preview;
 mod diff_view;
 mod editor_pane;
+pub mod erd_raster;
 mod erd_view;
 pub mod fonts;
 mod grid;
@@ -126,6 +127,32 @@ pub struct ExportRequest {
     /// engine the rows came from.
     pub dialect: schemaic_core::intel::SqlDialect,
 }
+
+/// What an ER-diagram export writes.
+///
+/// Rendered **before** the save dialog opens, not after: the dialog is modal and
+/// the diagram's signals belong to the modal behind it, so a callback that went
+/// back for them would be reading a scope that may already be gone. It also means
+/// the file is a picture of what the user was looking at when they chose the
+/// format — the same rule the results grid's snapshot follows.
+#[derive(Clone)]
+pub enum ErdDoc {
+    /// Written as-is (SVG, Mermaid, DBML, PlantUML, Graphviz).
+    Text(String),
+    /// An SVG to rasterise first, at this scale — see [`crate::erd_raster`].
+    Png(String, f32),
+}
+
+/// What to write, and where.
+pub struct ErdExportRequest {
+    pub path: std::path::PathBuf,
+    pub doc: ErdDoc,
+}
+
+/// Write an exported ER diagram to a file **off the UI thread**, reporting via
+/// [`ExportDoneFn`]. Rasterising a whole-database diagram is the slow half and
+/// runs here; the modal owns the save dialog and the rendering of the document.
+pub type ErdExportFn = Rc<dyn Fn(ErdExportRequest, ExportDoneFn)>;
 
 /// The table an import is loading into, captured when the modal opens so a
 /// schema refresh underneath it can't retarget the import.
@@ -1560,6 +1587,10 @@ pub struct TabsActions {
     /// dialog and the snapshot; this does the rendering + writing, so a large
     /// export doesn't block the window.
     pub export_file: ExportFn,
+    /// Write an exported ER diagram to a file on a worker thread. The diagram
+    /// modal owns the save dialog and renders the document; this rasterises (PNG
+    /// only) and writes.
+    pub export_erd: ErdExportFn,
     /// Set a tab's commit mode (by tab id). Switching to Manual only marks the
     /// tab — the connection is pinned and `BEGIN` issued lazily on its first
     /// statement. Switching back to Auto with a transaction still open is the

@@ -37,8 +37,10 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use floem::AnyView;
+use floem::action::save_as;
 use floem::context::PaintCx;
 use floem::event::{Event, EventListener, EventPropagation};
+use floem::file::{FileDialogOptions, FileSpec};
 use floem::keyboard::{Key, NamedKey};
 use floem::kurbo::{BezPath, Line, Point, Stroke};
 use floem::prelude::*;
@@ -50,12 +52,13 @@ use floem_renderer::Renderer;
 use schemaic_core::erd::{
     self, Cardinality, DiagramColumn, DiagramGraph, DiagramNode, NodeKind, Pt, Rect,
 };
+use schemaic_core::erd_export;
 use schemaic_core::schema::{DbSchema, SchemaState, classify_column_type};
 
 use crate::schema_tree::column_type_icon;
 use crate::widgets::{
-    centered_msg, measure_text_px_at, measure_text_px_bold_at, modal_title_borderless, panel_style,
-    window_size,
+    MenuEntry, centered_msg, measure_text_px_at, measure_text_px_bold_at, modal_title_borderless,
+    panel_style, window_size,
 };
 use crate::{ConnNode, Ui, icons, theme};
 
@@ -410,6 +413,18 @@ const EDGE_HOVER_PX: f64 = 7.0;
 const EDGE_STUB: f64 = 20.0;
 const ZOOM_MIN: f64 = 0.25;
 const ZOOM_MAX: f64 = 3.0;
+/// How long a successful export's confirmation stays up before fading. A failure
+/// doesn't fade — see the `say` closure.
+const NOTICE_LINGER: std::time::Duration = std::time::Duration::from_secs(4);
+/// The exported PNG's pixel density. 2× is what makes the text sharp when the
+/// image is dropped into a document and scaled to fit — a 1× export of a diagram
+/// this typographic reads as blurry on every modern display.
+/// `erd_raster::clamp_scale` lowers it when the diagram is large enough that 2×
+/// would blow the pixel budget.
+const EXPORT_PNG_SCALE: f32 = 2.0;
+/// Width of the export dropdown — wider than the grid's, because "PlantUML…" and
+/// the "Copy as" submenu chevron have to sit side by side without crowding.
+const EXPORT_MENU_W: f64 = 190.0;
 
 /// Resolve the active connection's loaded schema for `database`, if introspected.
 fn resolve_schema(
@@ -685,6 +700,185 @@ fn edge_shapes(
         });
     }
     out
+}
+
+// ── Export ──────────────────────────────────────────────────────────────────
+
+/// A theme colour as the hex string an SVG attribute takes. Opaque colours get
+/// the familiar six digits; a translucent one keeps its alpha (`#rrggbbaa`, which
+/// every SVG renderer in the export path reads) rather than being flattened
+/// against a guess at what is behind it.
+fn hex(c: floem::peniko::Color) -> String {
+    if c.a == 255 {
+        format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b)
+    } else {
+        format!("#{:02x}{:02x}{:02x}{:02x}", c.r, c.g, c.b, c.a)
+    }
+}
+
+/// The card metrics the export draws with — the constants above, handed over as
+/// data. The export is a second renderer of the *same* layout, and these are the
+/// numbers that layout was computed from.
+fn export_metrics() -> erd_export::SvgMetrics {
+    erd_export::SvgMetrics {
+        header_h: HEADER_H,
+        row_h: ROW_H,
+        expander_h: EXPANDER_H,
+        pad_x: 10.0,
+        radius: 6.0,
+        title_size: 13.0,
+        name_size: 11.5,
+        type_size: 10.5,
+        edge_width: 1.4,
+        icon_size: 13.0,
+        title_gap: 7.0,
+        row_gap: 8.0,
+    }
+}
+
+/// The diagram as an export scene: the cards where the user actually left them,
+/// the edges as they are actually drawn, in the colours currently on screen.
+///
+/// Built from the same four signals the canvas renders from — so a dragged,
+/// collapsed, colour-tagged diagram exports as itself rather than as the layout it
+/// opened with. `None` when there is nothing to frame (an empty diagram).
+///
+/// Text is ellipsized here rather than in `schemaic-core`, with the measurer that
+/// sized the cards: the core has no fonts, and a name truncated at a different
+/// character than the canvas truncates it at is exactly the drift this whole path
+/// is arranged to avoid.
+fn export_scene(
+    graph: &DiagramGraph,
+    positions: &HashMap<String, (f64, f64)>,
+    sizes: &HashMap<String, (f64, f64)>,
+    collapsed: &HashMap<String, bool>,
+    tint_of: &dyn Fn(&str) -> Option<floem::peniko::Color>,
+) -> Option<erd_export::SvgScene> {
+    let bounds = erd::content_bounds(positions, sizes, CANVAS_PAD)?;
+    let rect = rects(positions, sizes);
+    let vis = visible_map(graph, collapsed);
+    let m = export_metrics();
+
+    let edges = edge_shapes(graph, &rect, &vis)
+        .into_iter()
+        .map(|sh| erd_export::SvgEdge {
+            poly: sh.poly,
+            markers: sh
+                .markers
+                .iter()
+                .map(|l| {
+                    (
+                        Pt {
+                            x: l.p0.x,
+                            y: l.p0.y,
+                        },
+                        Pt {
+                            x: l.p1.x,
+                            y: l.p1.y,
+                        },
+                    )
+                })
+                .collect(),
+        })
+        .collect();
+
+    let mut nodes = Vec::with_capacity(graph.nodes.len());
+    for node in &graph.nodes {
+        let Some(&r) = rect.get(&node.id) else {
+            continue;
+        };
+        let stub = node.kind == NodeKind::Stub;
+        let tint = tint_of(&node.id);
+        // A stub is a bare box: no glyph, no header strip, and a dimmed name.
+        let icon = (!stub).then(|| {
+            if node.kind == NodeKind::View {
+                icons::TABLE_CELLS_MERGE.to_string()
+            } else {
+                icons::TABLE.to_string()
+            }
+        });
+        let title_room = r.w - 2.0 * m.pad_x - if stub { 0.0 } else { m.icon_size + m.title_gap };
+        let rows: Vec<erd_export::SvgRow> = vis
+            .get(&node.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|&ci| node.columns.get(ci))
+            .map(|c| {
+                let type_w = measure_text_px_at(&c.type_name, m.type_size as f32);
+                // icon + gap + name + gap + type, inside the padding.
+                let name_room = r.w - 2.0 * m.pad_x - m.icon_size - 2.0 * m.row_gap - type_w;
+                erd_export::SvgRow {
+                    name: erd_export::ellipsize(&c.name, name_room, |s| {
+                        measure_text_px_at(s, m.name_size as f32)
+                    }),
+                    type_name: c.type_name.clone(),
+                    key: if c.pk {
+                        erd_export::SvgKey::Pk
+                    } else if c.fk {
+                        erd_export::SvgKey::Fk
+                    } else {
+                        erd_export::SvgKey::None
+                    },
+                    icon: Some(column_type_icon(classify_column_type(&c.type_name)).to_string()),
+                }
+            })
+            .collect();
+        // The "+N more" note, but never the "show less" one: the first says the
+        // card is showing part of a table, which is true of the picture wherever
+        // it ends up; the second is an instruction to a canvas that isn't there.
+        let hidden = node.columns.len().saturating_sub(rows.len());
+        nodes.push(erd_export::SvgNode {
+            x: r.x,
+            y: r.y,
+            w: r.w,
+            h: r.h,
+            title: erd_export::ellipsize(&node.id, title_room, |s| {
+                measure_text_px_bold_at(s, m.title_size as f32)
+            }),
+            stub,
+            rows,
+            more: (hidden > 0).then(|| format!("+{hidden} more")),
+            icon,
+            icon_fill: hex(if node.kind == NodeKind::View {
+                theme::view_icon()
+            } else {
+                theme::table_icon()
+            }),
+            title_fill: hex(if stub {
+                theme::text_dim()
+            } else {
+                theme::text()
+            }),
+            header_fill: hex(if stub {
+                theme::erd_node_bg()
+            } else {
+                header_bg(tint)
+            }),
+            border: hex(if stub {
+                theme::text_muted()
+            } else {
+                card_border(tint)
+            }),
+        });
+    }
+
+    Some(erd_export::SvgScene {
+        bounds,
+        nodes,
+        edges,
+        colors: erd_export::SvgColors {
+            canvas: hex(theme::erd_canvas()),
+            card: hex(theme::erd_node_bg()),
+            text: hex(theme::text()),
+            type_text: hex(theme::text_muted()),
+            key_pk: hex(theme::key_primary()),
+            key_fk: hex(theme::key_foreign()),
+            edge: hex(theme::erd_edge()),
+            muted: hex(theme::text_dim()),
+        },
+        metrics: m,
+    })
 }
 
 /// A custom paint view that strokes the FK edges directly (bezier + crow's-foot
@@ -1302,6 +1496,108 @@ fn control_button(glyph: &'static str, action: Rc<dyn Fn()>) -> AnyView {
         .into_any()
 }
 
+/// A [`control_button`] that raises a dropdown instead of acting: it publishes its
+/// own window rect into `at` so the menu can anchor under it, and marks the press
+/// as a menu trigger so the click that opens the menu isn't also the click that
+/// dismisses it.
+///
+/// The **button's** rect, deliberately, not the glyph's — the control is its
+/// vertical padding taller than the 16px icon inside it, and a menu hung off the
+/// glyph's bottom edge rides up into the button. Read from the laid-out view
+/// rather than by adding the padding back on here, so the two can't drift.
+///
+/// The one control on this toolbar carrying a tooltip, and the trailing `…` is
+/// why: Fit and Reset do what their glyph shows, while this one opens a list of
+/// choices — the same convention the grid's menu-opening icons follow.
+fn menu_button(
+    glyph: &'static str,
+    tip: &'static str,
+    at: RwSignal<floem::kurbo::Rect>,
+    action: Rc<dyn Fn()>,
+) -> AnyView {
+    container(icons::icon(glyph, 16.0).style(|s| s.color(theme::text())))
+        // `on_move` reports the view's window origin — floem fires it during
+        // layout, not on pointer movement — so this is right however the menu is
+        // raised, including from the keyboard. `on_resize` carries the size.
+        .on_move(move |p| at.update(|r| *r = floem::kurbo::Rect::from_origin_size(p, r.size())))
+        .on_resize(move |b| {
+            at.update(|r| *r = floem::kurbo::Rect::from_origin_size(r.origin(), b.size()))
+        })
+        .on_click_stop(move |_| (action)())
+        .on_event_stop(
+            EventListener::PointerDown,
+            crate::widgets::menu_trigger_press,
+        )
+        .style(|s| {
+            toolbar_surface(s)
+                .items_center()
+                .justify_center()
+                .padding_horiz(10.0)
+                .padding_vert(5.0)
+                .hover(|s| s.background(theme::erd_node_bg()))
+        })
+        .tooltip(move || text(tip).style(crate::widgets::tooltip_style))
+        .into_any()
+}
+
+/// The export outcome strip: what the last export wrote, or why it didn't.
+///
+/// Bottom-centre rather than beside the find bar in the top-right corner — the two
+/// can be up at once, and a message that had to share a corner with a search box
+/// would either overlap it or push it off the canvas. Click to dismiss, which is
+/// the only way a failure goes away.
+fn notice_bar(notice: RwSignal<Option<(String, bool)>>) -> impl IntoView {
+    dyn_container(
+        move || notice.get(),
+        move |msg| {
+            let Some((msg, failed)) = msg else {
+                return empty().into_any();
+            };
+            h_stack((
+                icons::icon(
+                    if failed {
+                        icons::TRIANGLE_ALERT
+                    } else {
+                        icons::CHECK
+                    },
+                    14.0,
+                )
+                .style(move |s| {
+                    s.color(if failed {
+                        theme::error()
+                    } else {
+                        theme::status_ok()
+                    })
+                }),
+                text(msg).style(|s| s.font_size(theme::FONT_LABEL).color(theme::text())),
+            ))
+            .on_click_stop(move |_| notice.set(None))
+            .style(|s| {
+                s.items_center()
+                    .gap(8.0)
+                    .padding_horiz(10.0)
+                    .padding_vert(6.0)
+                    .background(theme::bg_panel())
+                    .border(1.0)
+                    .border_color(theme::border())
+                    .border_radius(8.0)
+                    .cursor(floem::style::CursorStyle::Default)
+            })
+            .into_any()
+        },
+    )
+    // Centred on the canvas's bottom edge: `inset_left(0)`/`inset_right(0)` make
+    // the wrapper span it, and `justify_center` puts the bar in the middle of that
+    // span whatever its width.
+    .style(|s| {
+        s.absolute()
+            .inset_bottom(12.0)
+            .inset_left(0.0)
+            .inset_right(0.0)
+            .justify_center()
+    })
+}
+
 /// The zoom control as a single segmented unit: `−` │ `100%` │ `+`. One outer
 /// border (`erd_control_border`); the two internal separators share that colour.
 /// The `−`/`+` steps run the supplied `zoom_out`/`zoom_in` actions (which pivot at
@@ -1367,7 +1663,21 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                 return empty().into_any();
             };
             let _ = open;
-            let close: Rc<dyn Fn()> = Rc::new(move || erd_sig.set(None));
+            // Closing takes the export dropdown with it. That menu rides the app's
+            // shared popup channel, which **outlives this modal**, and its entries
+            // hold the diagram's own signals — left up, one click on "PNG image…"
+            // would read a scope that had just been disposed, which is not a
+            // question with an answer. Every exit routes through here: the ✕,
+            // Escape, the dismiss layer, and double-clicking a table to reveal it.
+            let close: Rc<dyn Fn()> = {
+                let popup = ui.overlay.popup_menu;
+                let popup_anchor = ui.overlay.popup_anchor;
+                Rc::new(move || {
+                    popup.set(None);
+                    popup_anchor.set(None);
+                    erd_sig.set(None);
+                })
+            };
 
             // Resolve the schema; if it isn't introspected yet, say so.
             let Some(schema) = resolve_schema(db_nodes, &target.database) else {
@@ -1534,6 +1844,209 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                 })
             };
 
+            // Each card's identity colour, resolved **once** per card. A node id is
+            // the table's display name, which is exactly how `db_color` keys a
+            // table colour, so no reparsing is needed. Untracked, and not read
+            // inside the header's style closure: that closure re-runs for every
+            // card on every pan and zoom, and a scan of the rule list there would
+            // reintroduce the O(cards²) cost the position lookup in `node_card`
+            // exists to avoid. Nothing is lost — a colour is only settable from the
+            // schema tree's menu, which this modal covers, and reopening the
+            // diagram rebuilds every card.
+            //
+            // Owns its captures (rather than borrowing `target`) because the export
+            // renderer below needs a copy that outlives this builder: a card asks
+            // once while it is being built, an export asks whenever the user picks
+            // a format.
+            let tint_of = {
+                let db = target.database.clone();
+                let cid = target.conn_id;
+                move |id: &str| {
+                    table_colors
+                        .with_untracked(|r| schemaic_core::db_color::table_lookup(r, cid, &db, id))
+                        .as_deref()
+                        .and_then(theme::parse_hex)
+                }
+            };
+
+            // ── Export ────────────────────────────────────────────────────────
+            // What the last export did, and whether it failed. The modal has no
+            // error bar, and the app's shared error modal is painted *under* this
+            // one, so the diagram reports for itself.
+            let notice: RwSignal<Option<(String, bool)>> = RwSignal::new(None);
+            // Bumped per notice, so an expiring timer only clears the message it
+            // set — the same guard as the find flash, for the same reason.
+            let notice_seq = RwSignal::new(0_u64);
+            let say: Rc<dyn Fn(String, bool)> = Rc::new(move |msg: String, failed: bool| {
+                let seq = notice_seq.get_untracked().wrapping_add(1);
+                notice_seq.set(seq);
+                notice.set(Some((msg, failed)));
+                // A confirmation fades; a failure stays until it is dismissed,
+                // because it is the only place the reason is written down.
+                if !failed {
+                    floem::action::exec_after(NOTICE_LINGER, move |_| {
+                        // `try_get_untracked`: the diagram may have been closed
+                        // inside the linger, taking this scope with it.
+                        if notice_seq.try_get_untracked() == Some(seq) {
+                            notice.set(None);
+                        }
+                    });
+                }
+            });
+
+            // Render the diagram in one format, **now** — before any dialog opens.
+            // See `ErdDoc`: these signals belong to this modal, and a callback that
+            // came back for them later could be reading a disposed scope.
+            let render: Rc<dyn Fn(erd_export::ErdExportFormat) -> Option<crate::ErdDoc>> = {
+                let graph = graph.clone();
+                let tint_of = tint_of.clone();
+                Rc::new(move |fmt| {
+                    use erd_export::ErdExportFormat as F;
+                    match fmt {
+                        F::Png | F::Svg => {
+                            let scene = export_scene(
+                                &graph,
+                                &positions.get_untracked(),
+                                &sizes.get_untracked(),
+                                &collapsed.get_untracked(),
+                                &tint_of,
+                            )?;
+                            let svg = erd_export::to_svg(&scene);
+                            Some(match fmt {
+                                F::Png => crate::ErdDoc::Png(svg, EXPORT_PNG_SCALE),
+                                _ => crate::ErdDoc::Text(svg),
+                            })
+                        }
+                        F::Mermaid => Some(crate::ErdDoc::Text(erd_export::to_mermaid(&graph))),
+                        F::Dbml => Some(crate::ErdDoc::Text(erd_export::to_dbml(&graph))),
+                        F::PlantUml => Some(crate::ErdDoc::Text(erd_export::to_plantuml(&graph))),
+                        F::Dot => Some(crate::ErdDoc::Text(erd_export::to_dot(&graph))),
+                    }
+                })
+            };
+
+            let save: Rc<dyn Fn(erd_export::ErdExportFormat)> = {
+                let render = render.clone();
+                let export = ui.tab_actions.export_erd.clone();
+                let scope_name = scope.clone();
+                let say = say.clone();
+                Rc::new(move |fmt| {
+                    let Some(doc) = (render)(fmt) else {
+                        (say)("Nothing to export.".to_string(), true);
+                        return;
+                    };
+                    let opts = FileDialogOptions::new()
+                        .title("Export diagram")
+                        .default_name(erd_export::file_stem(&scope_name, fmt))
+                        .allowed_types(vec![FileSpec {
+                            name: fmt.label(),
+                            extensions: fmt.extensions(),
+                        }]);
+                    let export = export.clone();
+                    let say = say.clone();
+                    // `save_as` takes an `Fn`, so the rendered document is cloned
+                    // per invocation rather than moved into the callback.
+                    save_as(opts, move |file| {
+                        let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
+                            return; // cancelled
+                        };
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "the diagram".to_string());
+                        let say = say.clone();
+                        (export)(
+                            crate::ErdExportRequest {
+                                path,
+                                doc: doc.clone(),
+                            },
+                            Rc::new(move |res: Result<(), String>| match res {
+                                Ok(()) => (say)(format!("Saved {name}"), false),
+                                Err(e) => (say)(e, true),
+                            }),
+                        );
+                    });
+                })
+            };
+
+            let copy: Rc<dyn Fn(erd_export::ErdExportFormat)> = {
+                let render = render.clone();
+                let say = say.clone();
+                Rc::new(move |fmt| match (render)(fmt) {
+                    Some(crate::ErdDoc::Text(s)) => {
+                        let _ = floem::Clipboard::set_contents(s);
+                        (say)(format!("Copied as {}", fmt.label()), false);
+                    }
+                    // PNG is the one format this channel can't hold (it is
+                    // text-only), which is why it isn't in the copy menu at all.
+                    _ => (say)("Nothing to copy.".to_string(), true),
+                })
+            };
+
+            // Saves first, pictures and text separated, then one "Copy as" submenu
+            // holding every text format. The submenu is drawn by
+            // `widgets::submenu_layer` at the root of the window rather than under
+            // its row — a menu anchored at the right end of a toolbar flips left on
+            // any window narrow enough, and a flipped submenu nested under its row
+            // is painted but never hit-tested.
+            let export_entries = {
+                let save = save.clone();
+                let copy = copy.clone();
+                move || {
+                    let mut v: Vec<MenuEntry> = Vec::new();
+                    let mut picture_group = true;
+                    for f in erd_export::ErdExportFormat::ALL {
+                        if f.is_picture() != picture_group {
+                            v.push(MenuEntry::Separator);
+                            picture_group = f.is_picture();
+                        }
+                        let save = save.clone();
+                        v.push(MenuEntry::action(f.label(), move || (save)(f)));
+                    }
+                    v.push(MenuEntry::Separator);
+                    v.push(MenuEntry::sub(
+                        "Copy as",
+                        erd_export::ErdExportFormat::ALL
+                            .into_iter()
+                            .filter(|f| f.is_text())
+                            .map(|f| {
+                                let copy = copy.clone();
+                                MenuEntry::action(f.label(), move || (copy)(f))
+                            })
+                            .collect(),
+                    ));
+                    v
+                }
+            };
+
+            // The dropdown rides the app's shared popup channel — the topmost
+            // surface in the window, and the only one painted above this modal.
+            let popup = ui.overlay.popup_menu;
+            let popup_anchor = ui.overlay.popup_anchor;
+            let popup_width = ui.overlay.popup_width;
+            // The anchor is the **button's** rect, so the panel hangs off the
+            // control's bottom edge rather than the glyph's, which sits its padding
+            // higher. It is also what tells the button the menu already up is its
+            // own, so it is computed once here rather than twice.
+            let export_at = RwSignal::new(floem::kurbo::Rect::ZERO);
+            let open_export: Rc<dyn Fn()> = Rc::new(move || {
+                let r = export_at.get_untracked();
+                let mine = crate::PopupAnchor::BelowIcon(r.x0, r.x1, r.y1);
+                // Pressing the icon again closes its own menu instead of reopening
+                // it — the rule the grid's dropdowns follow.
+                if crate::widgets::menu_anchored_at(
+                    popup.get_untracked().is_some(),
+                    popup_anchor.get_untracked(),
+                    mine,
+                ) {
+                    popup.set(None);
+                    return;
+                }
+                popup_width.set(EXPORT_MENU_W);
+                popup_anchor.set(Some(mine));
+                popup.set(Some(export_entries()));
+            });
+
             // Toolbar +/- pivot at the viewport centre.
             let zoom_in: Rc<dyn Fn()> = Rc::new(move || {
                 let (vw, vh) = viewport_size.get_untracked();
@@ -1551,6 +2064,12 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                 zoom_unit(zoom, zoom_out, zoom_in),
                 control_button(icons::SCAN_SQUARE, fit),
                 control_button(icons::ROTATE_CCW, reset),
+                menu_button(
+                    icons::DOWNLOAD,
+                    "Export the diagram…",
+                    export_at,
+                    open_export,
+                ),
             ];
             // Fit-on-open runs once, the first time the canvas reports its real size.
             let did_autofit = RwSignal::new(false);
@@ -1630,29 +2149,6 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                 }
                 find.flash_node(&id);
             });
-
-            // Each card's identity colour, resolved **once** per card. A node id is
-            // the table's display name, which is exactly how `db_color` keys a
-            // table colour, so no reparsing is needed. Untracked, and not read
-            // inside the header's style closure: that closure re-runs for every
-            // card on every pan and zoom, and a scan of the rule list there would
-            // reintroduce the O(cards²) cost the position lookup in `node_card`
-            // exists to avoid. Nothing is lost — a colour is only settable from the
-            // schema tree's menu, which this modal covers, and reopening the
-            // diagram rebuilds every card.
-            let tint_of = |id: &str| {
-                table_colors
-                    .with_untracked(|r| {
-                        schemaic_core::db_color::table_lookup(
-                            r,
-                            target.conn_id,
-                            &target.database,
-                            id,
-                        )
-                    })
-                    .as_deref()
-                    .and_then(theme::parse_hex)
-            };
 
             // Node cards over the edge layer.
             let mut children: Vec<AnyView> = vec![edge_layer.into_any()];
@@ -1816,7 +2312,7 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
             // against this wrapper, which *is* the modal body — so "10px from the
             // top" already means "10px below the toolbar", with no knowledge of how
             // tall the toolbar is. Second child, so it paints over the cards.
-            let canvas = crate::stack((canvas_inner, find_bar(find, matches)))
+            let canvas = crate::stack((canvas_inner, find_bar(find, matches), notice_bar(notice)))
                 .on_resize(move |rect| {
                     let (w, h) = (rect.width(), rect.height());
                     if viewport_size.get_untracked() != (w, h) {

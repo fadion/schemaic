@@ -2296,6 +2296,32 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         )
     };
 
+    // Write an exported ER diagram. The modal renders the document before it opens
+    // the save dialog (see `ErdDoc`); what's left is the part that can take a
+    // noticeable moment — rasterising a whole-database diagram — plus the write.
+    //
+    // Same `spawn_blocking` reasoning as `export_file` above: synchronous file IO,
+    // and a PNG render that is pure CPU for as long as the diagram is large.
+    let export_erd: schemaic_ui::ErdExportFn = {
+        let handle = handle.clone();
+        Rc::new(
+            move |req: schemaic_ui::ErdExportRequest, done: schemaic_ui::ExportDoneFn| {
+                let report = create_ext_action(cx, move |res: Result<(), String>| (done)(res));
+                handle.spawn_blocking(move || {
+                    let bytes = match req.doc {
+                        schemaic_ui::ErdDoc::Text(s) => Ok(s.into_bytes()),
+                        schemaic_ui::ErdDoc::Png(svg, scale) => {
+                            schemaic_ui::erd_raster::png_from_svg(&svg, scale)
+                        }
+                    };
+                    report(bytes.and_then(|b| {
+                        std::fs::write(&req.path, b).map_err(|e| format!("Export failed: {e}"))
+                    }));
+                });
+            },
+        )
+    };
+
     // Commit staged grid changes (cell edits + new-row inserts): run them in one
     // transaction off-thread, then reflect the database's truth (triggers /
     // defaults / computed columns). If the grid supplied a re-fetch request (a
@@ -6951,6 +6977,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // fetched and sitting in memory, so it works fine on a connection
             // that has since gone away.
             export_file,
+            export_erd,
             set_tx_mode,
             commit_tx,
             rollback_tx,

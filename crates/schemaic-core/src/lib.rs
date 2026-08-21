@@ -15,6 +15,7 @@ pub mod ddl;
 pub mod diff;
 pub mod edit;
 pub mod erd;
+pub mod erd_export;
 pub mod export;
 pub mod favorite;
 pub mod filter;

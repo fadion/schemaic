@@ -818,6 +818,36 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     deliberately not done: that resizes the card and re-routes every edge touching it, as a side
     effect of typing. `search_tests` covers case and surrounding space, the empty needle, a stub,
     hits versus cards, and each form of the readout.
+  - `erd_export.rs` — the ER diagram's **export** renderers, one per format, all pure (the UI half
+    is `ui/erd_view.rs`'s scene builder + `ui/erd_raster.rs`). Two families, answering different
+    questions. **Text** — `to_mermaid`, `to_dbml`, `to_plantuml`, `to_dot` — emits the *graph*:
+    every node with all its columns and every FK with its cardinality, ignoring positions and
+    collapse state, because those are properties of this app's canvas and mean nothing to the tool
+    on the other end. **Picture** — `to_svg` — renders the *arrangement*, from an `SvgScene` the UI
+    fills from its live signals rather than re-deriving any geometry, so the file cannot drift from
+    what is on screen; PNG is that same document rasterised, with no second renderer anywhere.
+    The formats that need a bare identifier (Mermaid entities, PlantUML aliases, Graphviz ports)
+    go through `aliases`, which is **collision-broken on purpose**: `sales.orders` and
+    `sales_orders` both slug to `sales_orders`, and a Mermaid file naming two entities the same
+    silently merges them into one card with interleaved columns and no error anywhere. DBML and
+    Graphviz keep the real names, quoted or escaped. `crow_ends` is the shared cardinality notation
+    and reads the *parent* end from `DiagramEdge::optional` — a nullable FK means a child may
+    reference nothing, so "exactly one" drops to "zero or one" — while the child end is "zero or
+    more" or "zero or one" from the uniqueness `core::erd` already worked out. `mermaid_type`
+    exists because a space ends Mermaid's type token: MySQL's `int unsigned` and PostgreSQL's
+    `timestamp with time zone` would otherwise turn the rest of the line into a parse error.
+    `to_dot` deliberately emits **no `pos` attributes**: they bind only under `neato -n`, so a file
+    claiming to carry the user's layout would silently ignore it under plain `dot`.
+    On the picture side, `n()` writes coordinates at two decimals — not cosmetic, since a bezier
+    sample formats as `104.30000000000001`, an edge polyline carries 34 of them, and the noise is
+    both most of the file and what makes two exports of one layout undiffable. Per-card colours
+    (`header_fill`, `border`, `title_fill`, `icon_fill`) live on `SvgNode` rather than in
+    `SvgColors`, because a table with a `db_color` identity colour wears it on the canvas and an
+    export that flattened every card to one grey would lose the only thing telling them apart at a
+    glance. `icon_svg` inlines the UI's Lucide glyphs as nested `<svg>` elements and resolves their
+    `currentColor` to a real value, which nothing in a standalone document would otherwise set.
+    `ellipsize` is here but takes the measurer as an argument: the core has no fonts, and the
+    truncation has to fall on the same character the card's own `text_ellipsis` falls on.
   - `monitor.rs` — the **Live Monitor**'s pure change detector: no DB, no timer, no UI.
     `Snapshot::from_result` captures a `ResultSet` keyed by its table's key columns (cells are
     `Option<String>` so NULL stays distinct from `""`), and `diff_snapshots` matches two snapshots
@@ -2416,6 +2446,47 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     search box. That mirrors the grid's focus-independent Escape rather than trusting the field
     alone. `modal_frame` takes a `find: Option<Find>` and the two message-only bodies pass `None`:
     nothing to search there, so neither binds Ctrl+F.
+    **Export is the toolbar's fourth control**, a `menu_button` raising the app's shared popup
+    channel — `overlay.popup_menu`, the only surface painted *above* this modal (it is last in the
+    workspace stack for exactly that reason). The menu saves any of the six `ErdExportFormat`s and
+    copies the five text ones from a `Copy as` submenu; pressing the icon again closes its own menu,
+    off the same `PopupAnchor::BelowIcon` equality the grid's dropdowns use. This menu is what
+    turned up the hoisted-submenu bug (*Popup menus*): anchored at the right end of a toolbar, its
+    submenu flips left on any window narrow enough, and a flipped submenu used to be unclickable.
+    The anchor is the **button's** rect, taken from `on_move` + `on_resize` rather than by adding
+    the control's padding back onto the glyph's origin: a menu hung off the 16px glyph's bottom edge
+    rides up into the button that opened it.
+    `export_scene` is the bridge to `core::erd_export`: it reads the same four signals the cards
+    render from (`positions`, `sizes`, `collapsed`, plus the resolved tint) and reuses `rects`,
+    `visible_map` and `edge_shapes` — **the very functions `EdgeCanvas::paint` calls** — so a
+    dragged, collapsed, colour-tagged diagram exports as itself and cannot drift from the canvas.
+    The custom paint view was never the obstacle the TODO thought it was: `edge_shapes` already
+    returns a flattened polyline and marker segments, and both drop straight into SVG elements.
+    Text is ellipsized here rather than in the core, with `measure_text_px_at`/`_bold_at` — the
+    same measurer that sized the cards. The "+N more" note is carried into the export but "show
+    less" is not: the first says the card is showing part of a table, which stays true wherever the
+    picture ends up, while the second is an instruction to a canvas that isn't there.
+    Rendering happens **before** the save dialog opens, not in its callback (`ErdDoc`): the dialog
+    is modal and these signals belong to the modal behind it, so a callback that came back for them
+    could be reading a disposed scope — and it also means the file is a picture of what the user
+    was looking at when they chose the format, the rule the grid's row snapshot follows. The
+    outcome lands in the diagram's own `notice_bar` at the canvas's bottom edge rather than the
+    app's shared error modal, which is painted *under* this one. A confirmation fades after
+    `NOTICE_LINGER`; a failure stays until dismissed, since it is the only place the reason is
+    written down. The fade is `flash_seq`-guarded and `try_get_untracked`-read for the same two
+    reasons the find flash is.
+  - `erd_raster.rs` — SVG → PNG for the ER-diagram export, and the only reason `resvg` is a direct
+    dependency (it was already in the tree via floem's `svg` view, same version, so it costs no
+    extra compile). It lives in this crate **because of the fonts**: the cards' widths were
+    measured against the bundled IBM Plex Sans, so `png_from_svg` loads those exact bytes
+    (`fonts::SANS_FACES`) into its own `fontdb` instead of scanning the machine's — deterministic,
+    no startup sweep, and the text lands inside the boxes it was measured for on a build server as
+    much as on a desktop. `clamp_scale` is the guard that matters: a whole-database diagram can be
+    tens of thousands of pixels wide on its own, and the pixmap is RGBA in memory, so the requested
+    2× is reduced until the result fits both `MAX_PNG_DIM` and `MAX_PNG_PIXELS` — returning **less
+    than 1.0** when it has to, because the alternative is a failed allocation at the moment the
+    user asked for the export. It touches no signal and no file, so the app runs it on a worker
+    thread (`export_erd`) and writes the bytes it returns.
   - `monitor_view.rs` — the **Live Monitor** modal (`monitor_overlay`), opened from the results
     title bar with the tab's `(conn_id, database, table)`. It renders `overlay.monitor_log` — built
     by the app's poll loop through `core::monitor::diff_snapshots` — as a Time·Action·ID·Data table,

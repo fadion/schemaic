@@ -12,6 +12,11 @@ floem = { workspace = true }
 # by `floem`; pull it directly. Already in the tree via floem — same version.
 floem_renderer = "0.2.0"
 serde_json = { workspace = true }
+# Rasterise the ER diagram's exported SVG to PNG. Already in the tree via floem
+# (its `svg` view), same version — no extra compile. `default-features = false`
+# +`text`: we want glyph rendering but not the system-font scan, since the export
+# is handed the app's own embedded faces (see `erd_raster`).
+resvg = { version = "0.43", default-features = false, features = ["text"] }
 pulldown-cmark = { version = "0.13.4", default-features = false }
 
 [lints]

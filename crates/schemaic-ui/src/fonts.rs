@@ -14,6 +14,14 @@ const SANS_BOLD: &[u8] = include_bytes!("../fonts/IBMPlexSans-Bold.ttf");
 const MONO_REGULAR: &[u8] = include_bytes!("../fonts/IBMPlexMono-Regular.ttf");
 const MONO_BOLD: &[u8] = include_bytes!("../fonts/IBMPlexMono-Bold.ttf");
 
+/// The bundled sans faces, regular then bold.
+///
+/// Exposed for a renderer that keeps its **own** font database rather than
+/// Floem's — the ER diagram's PNG export ([`crate::erd_raster`]). Its text has to
+/// land inside boxes whose widths were measured against these exact faces, so it
+/// is handed the bytes instead of hunting for a family on the machine.
+pub const SANS_FACES: [&[u8]; 2] = [SANS_REGULAR, SANS_BOLD];
+
 /// Register the bundled faces and point the generic `sans-serif`/`monospace`
 /// families at them. Call once, before building the window.
 pub fn load_fonts() {

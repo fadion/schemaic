@@ -717,7 +717,7 @@ pub struct Pt {
 }
 
 /// A node's rectangle in canvas pixels (top-left origin).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
     pub x: f64,
     pub y: f64,
