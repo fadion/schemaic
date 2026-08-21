@@ -852,6 +852,60 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     rather than in a modal: the log is the only record of what a deleted row held and no poll
     re-reports a change, so throwing it away is irreversible — unless it is empty, or already on
     disk, which is why the confirmation isn't unconditional.
+  - `activity.rs` — the **Server Activity** panel's model and every decision it makes about a
+    snapshot of server sessions: no DB, no timer, no UI. `SessionInfo` is engine-neutral by
+    construction (`id`/`user`/`client`/`database`/`state`/`sql`/`seconds`/`blocked_by`), so a third
+    server engine only has to produce one. `SessionState` has four variants and **their declaration
+    order is the attention order** — `rank` is derived from it, with one addition the states can't
+    express: a session someone is *waiting on* belongs near the top whatever it is doing, because it
+    is the one about to be killed. `prepare` is the single entry point the app calls on a fresh
+    fetch: it derives each session's `blocks` list from the `blocked_by` edges (the engines answer
+    only one direction), **deduplicates both directions**, sorts by rank → longest-standing → id,
+    then cuts to `MAX_SESSIONS` and returns **whether it cut** — on the same rule as the live
+    monitor's `trim_log`, since a silently shortened list looks complete and isn't, but as a `bool`
+    rather than a count. The fetch asks for `MAX_SESSIONS + 1` rows precisely so this can notice,
+    which means a server holding five hundred and one sessions and one holding four thousand arrive
+    here identical: any number derived from them is `1`, and "500 sessions · 1 more not shown" in
+    front of four thousand is a figure that looks precise and is off by three and a half thousand.
+    `ActivitySummary::total_label(truncated)` prints `500+ sessions` for the same reason. The dedup
+    is the other half of the same honesty: MySQL answers the blocking graph out of
+    `performance_schema.data_lock_waits` (or `INNODB_LOCK_WAITS`), which is one row per *lock* pair
+    rather than per transaction pair, so a holder sitting on both a record lock and a gap lock the
+    waiter needs reported the same edge twice — "waiting on a lock held by 1148, 1148" on the waiter,
+    and a "blocks N sessions" on the holder counting locks instead of sessions. PostgreSQL's
+    `pg_blocking_pids` is already distinct, so doing it here is also what stops the two engines
+    disagreeing. `render_slice` is the last cut, and a different one: the panel is rebuilt whole on
+    every poll, so it draws the first `RENDER_CAP` of whatever survived the search and *counts* the
+    rest (an exact figure — it is measured against the list in hand, not a server total nobody
+    fetched). The two classifiers are here rather than in the
+    backends because they are judgements, not queries: `mysql_state(command, trx_state)` is why the
+    transaction view is joined at all — a `Sleep` thread with a live `INNODB_TRX` row is a client
+    that ran `BEGIN` and went away holding every row it touched, and `SHOW PROCESSLIST` alone cannot
+    tell it from an idle pool connection; `pg_state(state, has_query, blocked)` promotes a lock wait
+    (PostgreSQL reports one as an ordinary `active` backend) and falls back on whether a statement is
+    visible for a backend the account isn't privileged to inspect. `lock_wait`/`lock_wait_text` pick
+    the wait worth a banner and write its sentence — deliberately `None` when the holder isn't in
+    the snapshot, since a banner offering to kill a session that isn't there is worse than no
+    banner. `KillKind` is an enum and not a bool because both engines offer both and the
+    consequences differ in kind: cancelling leaves the session and its transaction alive, while
+    terminating rolls back and drops the connection; `applies_to` withholds *cancel* from a session
+    with nothing running, and `kill_confirm(kind, session, dialect)` writes the sentence that names
+    which one is about to happen. It takes the dialect for **one clause, and it is the clause that
+    decides whether the user's work survives**: MySQL's `KILL QUERY` leaves the transaction usable
+    and the client can retry, while PostgreSQL's `pg_cancel_backend` leaves it open but *aborted* —
+    every later statement fails with `25P02` until someone rolls back, so the uncommitted work is
+    gone exactly as under a terminate. Telling a PostgreSQL user their transaction "stays open" is
+    true and useless. `supports_activity` is the capability (**false for SQLite, which is a library in this
+    process and has no other session to see**) and `supports_kill` is *computed* from it rather than
+    spelling out a second `!= Sqlite`. `format_age` prints whole seconds under a minute because
+    MySQL's `PROCESSLIST.TIME` has nothing finer, and steps the unit up rather than running the
+    count on. The **poll interval is stored per connection** (`IntervalRule`, keyed by `conn_id`
+    like the colour and favourite rules, in `ui_state.json`): it is not a taste but how hard you
+    are willing to lean on a particular server, and one global number would carry a laptop's two
+    seconds onto a production replica on the next switch. `interval_for` clamps on the way out and
+    `set_interval` on the way in, so the picker can never be left with nothing marked; a choice
+    equal to the default is still stored, or moving `DEFAULT_POLL_SECS` would silently move every
+    connection someone had deliberately set to the old one.
   - `diff.rs` — `line_diff`/`build_diff_rows` (Ctrl+K preview).
   - `history.rs` — query-history model (`push`/`clear_conn`/`preview`/`relative_time`),
     persisted to `history.json`. An entry is written in **two passes** — `push` when the run
@@ -892,11 +946,22 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     already in flight / the tunnel isn't up). The app owns only the timer, `Db::ping` and the
     landing guard: a ping is up to five seconds of waiting, so `main.rs`'s `check_landing` stamps
     each check with `(connection id, generation)` and a check that lands after a switch — or after
-    a newer check of the same connection — writes **nothing**: not `ConnStatus`, not the failure
-    count `health::record` folds, and not the `with_conn` continuation it may be carrying. Without
-    it, leaving a dead connection for a healthy one repainted the header's "Disconnected · Retry"
-    over a server that was answering, and only the next poll could clear it — the poll the same
-    stale failure had just told to back off.
+    a newer check of the same connection — **writes** nothing: not `ConnStatus`, not the failure
+    count `health::record` folds. Without it, leaving a dead connection for a healthy one repainted
+    the header's "Disconnected · Retry" over a server that was answering, and only the next poll
+    could clear it — the poll the same stale failure had just told to back off.
+    **The `with_conn` continuation it may be carrying is a separate question, and asks
+    `check_continues` — connection identity only, not the generation.** A write is a repaint, where
+    a stale answer is worse than none; a continuation is somebody's click waiting on a reply, and
+    dropping it doesn't leave the screen stale, it makes the control they pressed do nothing at all
+    with no error — precisely what `with_conn` exists to prevent. Gating both alike made that
+    promise false on a timer: a blocked action pings, the ping takes its five seconds against a dead
+    host, and the health poll ticking (or the window regaining focus) inside that window stamped a
+    newer generation and threw the user's own answer away. A superseded result of the *same*
+    connection is still an answer about the same server and a few seconds old — enough to decide
+    whether to proceed. A **different** connection still refuses, which is the case that matters:
+    running an action gated on a server the user has left, or reporting the old one unreachable in a
+    modal over the new one.
   - `window_chrome.rs` — which half of the window frame the app draws itself, now that it launches
     with `WindowConfig::show_titlebar(false)`. `Chrome::current()` answers per `Host`
     (Windows/Linux/macOS): `draws_own_controls`, `draws_own_resize_border`, `wants_drop_shadow`,
@@ -1408,7 +1473,42 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
         panel, four lines under a row count carefully marked `~4.21m (estimated)`.
 - `schemaic-db` — MySQL/MariaDB (`mysql_async`) + SSH tunnels (`ssh.rs`), PostgreSQL in `pg.rs`,
   SQLite in `sqlite.rs`, and
-  the pinned manual-transaction connection in `session.rs`. Populates each result column's
+  the pinned manual-transaction connection in `session.rs`. **`Db::fetch_sessions`/
+  `Db::kill_session`** are the Server Activity panel's whole backend, and they are three queries per
+  engine rather than one: MySQL runs `information_schema.PROCESSLIST` (required — without it there
+  is no panel) plus `INNODB_TRX` and a lock-wait join, both *best effort*, because those two are
+  what need `PROCESS` privileges and what differ by server. The lock-wait join has no single
+  spelling — MySQL 8 removed `information_schema.INNODB_LOCK_WAITS` and MariaDB has no
+  `performance_schema.data_lock_waits` — so the pair is tried in turn, and when neither works the
+  panel still knows *who* is blocked (`trx_state = 'LOCK WAIT'`) and simply cannot say by whom,
+  which is the honest degradation. PostgreSQL needs one query: `pg_stat_activity` filtered to
+  `backend_type = 'client backend'` (the checkpointer and the WAL writer are processes, not
+  sessions, and would sort to the top forever) with `pg_blocking_pids(pid)` for the graph, which
+  resolves the transitive case a hand-written `pg_locks` join gets wrong. A row whose `pid` won't
+  parse is **dropped**, never admitted under id `0`: a session `0` renders a full row with a live
+  "Kill session" under it and can be pointed at by other rows' edges, which is the same reasoning
+  `parse_pid_array` already applies to the graph. **Both exclude the caller's own connection** —
+  every operation here opens a fresh one, so the poller would otherwise report itself running the
+  activity query at the top of every refresh. **Both also sort blocked-or-working sessions above
+  idle ones before the `LIMIT`**, and that is not cosmetic: `activity::rank` puts lock waits at the
+  top of the panel, but a session that started waiting four seconds ago has the *smallest* age on
+  the server, so ordering the fetch by age alone — which reads like "keep the interesting end" —
+  cut every row of a lock pile-up on a box holding three thousand idle pool connections and left a
+  quiet-looking list during an incident. PostgreSQL sorts exactly (`blockers <> '{}'`, read out of a
+  subquery so `pg_blocking_pids` is evaluated once per backend rather than again for the `ORDER BY`);
+  MySQL settles for `COMMAND <> 'Sleep'`, because `PROCESSLIST` carries no lock information and the
+  view that does needs the `PROCESS` privilege this required statement deliberately doesn't. Both
+  methods gate on `activity::supports_activity` / `supports_kill` **before** the engine `match`: the
+  `match` picks a query set, which no capability can paper over, but the predicate is what stops a
+  fourth engine falling through the MySQL arm into `information_schema.PROCESSLIST` and failing
+  three catalogue lookups deep. Kills are `KILL QUERY` /
+  `KILL CONNECTION` and `pg_cancel_backend` / `pg_terminate_backend`, always on a new connection,
+  since the session being killed may be the one holding everything else up. **`Session::server_id`
+  exists for this panel**: MySQL's thread id comes back in the handshake and PostgreSQL's backend
+  pid is asked for at open, and holding it is what lets the app recognise one of its own pinned
+  Manual-mode connections in a list of session ids — see the repair below. SQLite errors rather
+  than answering empty (`core::activity::supports_activity`); the app is gated not to ask.
+  Populates each result column's
   `origin` (real table/column + key flags) from the wire protocol. Connection **identity** is the
   `Db` handle (`Db::connect(&Connection, tunnel_port)`), not a `mysql://…` URL — credentials go
   through `OptsBuilder` (passwords with `@ / # ? %` need no escaping; no plaintext URL anywhere).
@@ -1724,7 +1824,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     to be compact says so with this constant and never with a literal.
   - `widgets.rs` — reusable widgets: `menu_panel`/`MenuEntry`, `modal_title`/`panel_style`/
     `menu_item_style`, `window_size`, `autohide`/`shift_hscroll`/`wheel_hscroll` scroll wrappers,
-    `section_title`/`centered_msg`/`toggle_icon`, `measure_text_px`, `jump_to_bottom_button`.
+    `section_title`/`centered_msg`/`toggle_icon` (and `toggle_icon_gated`, whose panel may not be
+    available at all — the Activity toggle on a SQLite connection, dimmed and inert rather than
+    opening an explanation), `measure_text_px`, `jump_to_bottom_button`.
     Also `focus_root` — the **one** way an overlay claims the keyboard (see the Floem gotcha on
     directed key dispatch): it takes focus on build *and* registers the view so Escape in a
     text field inside it hands focus back rather than dead-ending. Never spell out
@@ -1802,6 +1904,61 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     write used to be unconditional, and the picker has one name per engine where `db_type` has
     several.
   - `diff_view.rs` — Ctrl+K diff preview. `history_panel.rs` — Query History right-column panel.
+  - `activity_panel.rs` — the **Server Activity** right-column panel (`RightPanel::Activity`, the
+    footer's pulse-line toggle): the sessions on the active *connection's* server, a counts line, a
+    lock-wait banner and a search box, over the same chrome as the History panel. It paints
+    `core::activity` and decides nothing itself. Three things are worth knowing. The counts and the
+    banner read the **whole** snapshot while the list reads the filtered one — they are facts about
+    the server, and narrowing the list on screen must not make a blocked session vanish from the
+    tally; the list then draws only `render_slice`'s front `RENDER_CAP` of that, since this whole
+    container is rebuilt on every poll and five hundred rows of teardown and text shaping every two
+    seconds is continuous churn in a panel whose subject is load. A refused kill lands in
+    `ActivityUi::kill_error` and prints **above** the list rather than replacing it: routing it
+    through `ActivityState::Failed` threw away the snapshot someone was reading mid-incident, banner
+    included, and with auto-refresh Off nothing brought it back. `Failed` means "there is no
+    snapshot"; a kill the server declined leaves the snapshot perfectly good.
+    **Left-click is inert on purpose**: everything a row offers ends someone else's work, so
+    both kills live in the right-click menu (with *Cancel query* dimmed rather than absent on a
+    session with nothing running, so the menu keeps one shape), and the confirm is raised by the
+    *app*, not here, so no route to a kill can skip it. The clock in the title bar wears the same grey as
+    the refresh icon beside it: it was tinted while polling, on the reasoning that "Off" and "every
+    2s" look identical between ticks, but two icons a few pixels apart in different colours read as
+    one of them being *active* in the toggle sense. The interval is stated where a state belongs —
+    the menu marks the chosen row, and the tooltip says it in words.
+    Its dropdown is `overlays::activity_menu_overlay` and **not** a `popup_menu`: the panel is
+    clipped for its collapse animation, so a menu built inside it is cut off at the panel's own
+    edge, and a cursor-anchored popup wanders. It follows the schema tree's eye/gear machinery — an
+    open flag plus an anchor the icon publishes from `on_move`/`on_resize` — with the one difference
+    that makes it not a copy: the schema panel is against the window's *left* edge, so its menus can
+    hang leftward and never meet one, while this panel is against the right. The anchor is therefore
+    the icon's bottom-**right** corner, the menu is right-aligned to it at a fixed width, and the
+    result is clamped into the window on both sides. That clamp **is** the edge detection.
+    All three anchored dropdowns — the schema eye, the schema gear and this one — drop by one shared
+    `MENU_ICON_DROP`, measured from the icon's **padded box** rather than from the glyph in it: the
+    gear fills its box where the eye does not, and those two have always sat level, so the box is
+    the reference and per-icon tuning by eye is the mistake it looks like a fix for.
+    The clock's `.style()` is applied **before** its `.tooltip()`, which is not tidiness: `.tooltip()`
+    wraps the view in a new one, so a style after it lands on the *wrapper* while the
+    `on_move`/`on_resize` that publish the anchor stay on the container inside — which then reports a
+    bare 16px glyph box with none of the padding around it, and the menu hangs under the glyph
+    instead of under the control.
+    Two layout facts are written into the rows because getting either wrong is invisible until
+    someone puts a ruler on it. **A text view sizes its own taffy node to the text it measured**, so
+    `width_full()` on the statement preview is not decoration — without something to be 100% *of* it
+    lays out as one long line and the clip merely cuts it off; the width is what it wraps against.
+    And **the age is pinned by `justify_between` on a two-child heading**, not by a `flex_grow`
+    spacer before it: `space-between` says "the last child's right edge is the content box's"
+    directly, where a spacer only arrives there if every base size in the row measured as expected —
+    and a rich text measures ~20px wider than its glyphs, which is exactly how much short of its
+    padding the age sat through two attempts to correct it from the outside. The identity group and
+    the account name inside it both **grow**, which is the other half of the same lesson: nesting
+    the name a level deeper made taffy measure it at min-content on some pass, and a rich text
+    re-wraps to whatever width it is handed and then reports the *wrapped* size — so the next pass
+    hands it the same small width and it stays wrapped. `schemaic@localhost` broke mid-word with
+    half the row empty beside it until both were told to take the space that was there.
+    The lock-wait card is the same lesson in the other direction: it lost its right border to
+    `width: 100%` *plus* a 12px margin, which is 24px too wide because margins sit outside the
+    width — column-flex stretch subtracts them and a percentage does not.
   - `plan_view.rs` — Query Plan modal (`EXPLAIN`/`EXPLAIN ANALYZE` table + warnings + "Ask AI"),
     via `TabsActions::run_plan` → `Db::explain`.
   - `properties.rs` — the **table properties** modal (`properties_overlay`), opened by setting
@@ -2380,6 +2537,52 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   server (`--mcp-serve`) the AI panel talks to. A query tab's identity is `(conn_id, database)`;
   the app resolves `conn_id` → `Db` at run time (`db_for`), so a tab keeps its connection after a
   switch.
+  **The Server Activity poll is generation-guarded, and only runs while the panel is open *and the
+  window has focus*.** One effect watches `(right_panel, active_conn, activity_interval,
+  window_focused)`; it bumps `activity_gen`, clears the snapshot when the *connection* changed, then
+  arms `activity_poll` — refreshing immediately only when the connection changed or the panel just
+  became visible. Focus is in the rule because every tick is a full connect + authenticate against
+  the server being watched (one connection per operation, §7), so a panel left open behind another
+  window was opening and tearing down a connection every couple of seconds, indefinitely, for
+  nobody — the same reason the health poll pauses unfocused. Refreshing on an *interval* change was
+  the mirror-image waste: moving a struggling server from 2s to 30s, done precisely to lean on it
+  less, fired an immediate extra fetch, and since the generation had just been bumped the in-flight
+  guard couldn't suppress it — two `PROCESSLIST` queries at once, on the server that prompted the
+  change. Each timer carries
+  the generation it was armed under and stops the moment it differs, which is what makes closing the
+  panel, switching connections or changing the interval end the old loop instead of starting a second
+  one beside it — the same guard the Live Monitor's tick uses, and the same `try_get_untracked`
+  discipline, since a pending timer can outlive its signals at shutdown. An in-flight fetch carries
+  the generation too and is **dropped** on arrival if it no longer matches: a reply describing the
+  previous server, landing under the new one's heading, is a list of session ids the user might kill.
+  Clearing the snapshot on a connection change is the same rule stated once more. A refresh over a
+  live snapshot leaves it on screen rather than passing back through `Loading`, or a two-second
+  interval would be a panel that flashes instead of one that updates. The interval is the only part
+  persisted, and it is **per connection**: `UiState::activity_intervals` holds the rules and
+  `activity_interval` is a *memo* over `(active_conn, the store)`, which is what makes the clock's
+  tint, the menu's marked row and the timer's re-arm all repoint together on a switch. The panel
+  writes through `ActivityActions::set_interval` rather than to a signal, so there is no effect
+  reading out of the store and another writing back into it.
+  **A killed session may be one of ours, and the tab has to be told.** A Manual tab pins a
+  `Session`, that connection is an ordinary row in the panel, and the idle-in-transaction holder
+  blocking another tab is very often exactly it. Terminating it left the tab holding a dead socket:
+  the footer went on offering Commit and Rollback, the next statement failed with a connection
+  error, and the only way out was closing the tab. `repair_killed_session` matches the killed
+  `(conn_id, server id)` against `Session::server_id` across the session map and, on a hit, clears
+  the tab's `TxState` and reopens a fresh pinned connection through the existing `open_session` —
+  the tab stays in Manual with no transaction open, which is the truth after the kill. **The
+  `conn_id` half of that key is not a formality**: a server id is only unique on its own server, and
+  MySQL thread ids and PostgreSQL backend pids are small integers each server hands out from its own
+  counter, so two Manual tabs on two connections routinely hold the same one. Matching on the id
+  alone reached into whichever tab the map yielded first and, when that was the wrong one, closed a
+  transaction still open on a server nobody had touched and re-pinned its connection underneath it —
+  losing the uncommitted work of a tab the user never acted on, while the tab that actually lost its
+  socket stayed broken. The kill itself resolves its target `Db` **when the confirm is raised**, not
+  when the button is clicked, for the same reason a session id means nothing without its server: a
+  modal is open across an unbounded stretch of time, and reading `active_conn` inside `resolve` sent
+  `KILL CONNECTION 1148` to whatever connection was active by then, under a title naming the first
+  one. A **cancel** is not a kill and repairs nothing: it stops the statement and leaves the session
+  and its transaction alive.
   **Opening and saving a tab's `.sql` file** is `TabsActions::open_sql_file`/`save_sql_file`/
   `save_sql_file_as`/`reload_sql_file` (Ctrl+O / Ctrl+S / Ctrl+Shift+S, bound in `NavKeys::handle`
   so they work at the workspace root and inside the editor alike, and offered as Open File / Save
@@ -3502,8 +3705,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   AltGr cost — while Space is typing however the platform reports it (`Named(Space)` or `" "`),
   because the empty-prefix list after `WHERE ` hangs off it. A list already open keeps recomputing
   on any edit, so Backspace still refines it and closes it when the prefix goes; the rule governs
-  what may **start** showing one. `Completion::suppress` is the other half and a different thing: a
-  one-shot that closes an open list after an edit the app itself made (`edit_untyped`, accept).
+  what may **start** showing one. `Completion::typed` is **a one-shot**, cleared by
+  `recompute_completions` as it reads it — not every edit arrives through a key at all, and a
+  context-menu paste, an IME commit or dropped text would otherwise be judged by whatever the last
+  keystroke was: type `sel`, dismiss the list, right-click → Paste, and the popup opened on the
+  pasted text because the flag was still standing from the `l`. `Completion::suppress` is the other
+  half and a different thing: a one-shot that closes an open list after an edit the app itself made
+  (`edit_untyped`, accept).
 - **`Editor::points_of_offset` returns *content* coords, not viewport-relative** (`.y` is `vline_y`,
   the absolute document y; the gutter view subtracts `viewport.y0` itself). Overlays pinned in
   `editor_area` must subtract `ed.viewport.get()` `x0`/`y0` to follow scroll — see `char_box`

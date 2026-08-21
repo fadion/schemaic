@@ -83,6 +83,14 @@ pub struct Session {
     /// ran in `sakila` reported `world`. Written only while `inner` is held, so
     /// it can't race a statement.
     scope: std::sync::Mutex<Option<String>>,
+    /// The server's own id for this connection — MySQL's thread id, PostgreSQL's
+    /// backend pid. Captured once at open, because it is what lets the app
+    /// recognise **its own** pinned session in the Server Activity panel's list
+    /// and repair the tab when that session is killed from there. Without it a
+    /// kill leaves the tab holding a dead connection it has no way to notice.
+    ///
+    /// `None` only if the server declined to say, which neither engine does.
+    server_id: Option<i64>,
     inner: Mutex<Backend>,
     /// Whether a transaction is currently open on this connection.
     ///
@@ -102,7 +110,10 @@ impl Session {
     /// flipping to Manual and then changing your mind costs nothing on the
     /// server.
     pub async fn open(db: &Db, database: Option<&str>) -> Result<Arc<Session>, DbError> {
-        let backend = match db.engine() {
+        // Paired, because the id is a by-product of opening and each engine
+        // learns it a different way — MySQL from the handshake, PostgreSQL from a
+        // question.
+        let (backend, server_id) = match db.engine() {
             Engine::MySql => {
                 // `client_found_rows` matters: the write path's exactly-one-row
                 // guard counts *matched* rows, not *changed* ones. A pinned
@@ -110,7 +121,7 @@ impl Session {
                 // here or the safety net quietly changes meaning.
                 let conn = db.open(database, true).await?;
                 let conn_id = conn.id();
-                Backend::MySql { conn, conn_id }
+                (Backend::MySql { conn, conn_id }, Some(i64::from(conn_id)))
             }
             Engine::Postgres => {
                 // Postgres has no server-level connection; a session is bound to
@@ -120,7 +131,10 @@ impl Session {
                     Some(d) => pg::connect_to(db, d).await?,
                     None => pg::connect_maintenance(db).await?,
                 };
-                Backend::Postgres { client }
+                // Best effort — a session whose pid we failed to learn still
+                // works, it just can't be recognised as ours later.
+                let pid = pg::backend_pid(&client).await;
+                (Backend::Postgres { client }, pid)
             }
             // **SQLite has no manual-transaction mode here, deliberately.**
             //
@@ -150,9 +164,18 @@ impl Session {
             db: db.clone(),
             database: database.map(|s| s.to_string()),
             scope: std::sync::Mutex::new(database.map(|s| s.to_string())),
+            server_id,
             inner: Mutex::new(backend),
             in_tx: AtomicBool::new(false),
         }))
+    }
+
+    /// The server's id for this pinned connection — see
+    /// [`server_id`](Self::server_id). Matches the `id` on a
+    /// [`SessionInfo`](schemaic_core::activity::SessionInfo) row, which is how
+    /// the app tells its own session apart from everyone else's.
+    pub fn server_id(&self) -> Option<i64> {
+        self.server_id
     }
 
     pub fn engine(&self) -> Engine {

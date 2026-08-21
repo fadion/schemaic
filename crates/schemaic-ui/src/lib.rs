@@ -6,6 +6,7 @@
 //! fn indexes into a shared `Arc<ResultSet>` (no per-row cloning). Layout
 //! follows FEATURES §1.
 
+mod activity_panel;
 mod ai_panel;
 pub use ai_panel::mark_messages_seen;
 mod completion;
@@ -44,6 +45,7 @@ mod view_editor;
 mod widgets;
 mod window_chrome;
 
+use activity_panel::activity_panel;
 use ai_panel::ai_panel;
 use connection_form::manage_modal;
 use consts::*;
@@ -56,9 +58,9 @@ use grid::{
 use history_panel::history_panel;
 use monitor_view::monitor_overlay;
 use overlays::{
-    active_db_menu_overlay, confirm_overlay, conn_menu_overlay, context_menu_overlay,
-    db_visibility_overlay, error_modal_overlay, find_overlay, popup_menu_overlay,
-    schema_settings_overlay, tx_prompt_overlay,
+    active_db_menu_overlay, activity_menu_overlay, confirm_overlay, conn_menu_overlay,
+    context_menu_overlay, db_visibility_overlay, error_modal_overlay, find_overlay,
+    popup_menu_overlay, schema_settings_overlay, tx_prompt_overlay,
 };
 use plan_view::plan_overlay;
 use schema_tree::{schema_panel, schema_panel_w};
@@ -2019,6 +2021,99 @@ pub struct HistoryActions {
     pub open: Rc<dyn Fn(HistoryEntry)>,
 }
 
+/// What the Server Activity panel currently has to show.
+///
+/// A refresh that lands on a `Loaded` panel replaces the snapshot in place — it
+/// never passes back through `Loading`. The list would otherwise blank out on
+/// every poll, which on a two-second interval is a panel that flashes rather than
+/// one that updates.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ActivityState {
+    /// Nothing asked for yet — the panel has not been open on this connection.
+    Idle,
+    /// The first fetch for this connection is in flight.
+    Loading,
+    /// A snapshot, already ordered and capped by
+    /// [`schemaic_core::activity::prepare`]. `truncated` says the cap left
+    /// sessions out, and is `false` in every ordinary case.
+    ///
+    /// A flag rather than a count, because a count would be a lie: the fetch
+    /// asks for `MAX_SESSIONS + 1` rows, so anything `prepare` could subtract is
+    /// `1` whether the server holds five hundred and one sessions or four
+    /// thousand.
+    Loaded {
+        sessions: Vec<schemaic_core::activity::SessionInfo>,
+        truncated: bool,
+    },
+    /// The fetch failed — the message is the server's, shown in place of the list.
+    Failed(String),
+    /// This connection's engine has no server sessions
+    /// ([`schemaic_core::activity::supports_activity`]).
+    Unsupported,
+}
+
+/// Server-activity signals (Copy bundle).
+#[derive(Clone, Copy)]
+pub struct ActivityUi {
+    pub state: RwSignal<ActivityState>,
+    /// The **active connection's** auto-refresh interval in seconds; `0` is off.
+    /// Derived, not settable — the store it comes from is keyed by `conn_id`
+    /// ([`schemaic_core::activity::IntervalRule`]), so the panel reads this and
+    /// writes through [`ActivityActions::set_interval`]. A plain `RwSignal` here
+    /// would need an effect writing back into the store and another reading out
+    /// of it, which is a loop waiting to be closed.
+    pub interval: Memo<u64>,
+    /// A fetch is in flight. Only the refresh button reads it — the list keeps
+    /// showing the previous snapshot meanwhile.
+    pub busy: RwSignal<bool>,
+    /// The last kill that failed, shown as a line above the list and cleared by
+    /// the next refresh or kill.
+    ///
+    /// **Separate from [`ActivityState::Failed`], and that separation is the
+    /// point.** A kill that is refused — no `CONNECTION_ADMIN`, no
+    /// `pg_signal_backend` — says nothing about the snapshot on screen, but
+    /// routing it through the panel's state threw the whole session list away and
+    /// replaced it with the error string. That is the list someone was reading
+    /// mid-incident, and with auto-refresh set to Off nothing brought it back.
+    /// `Failed` is for "there is no snapshot"; this is for "the snapshot stands,
+    /// and the thing you just asked for didn't happen".
+    pub kill_error: RwSignal<Option<String>>,
+    /// Whether the clock's poll-interval dropdown is open.
+    ///
+    /// It lives up here rather than inside the panel because the panel is
+    /// **clipped** — `body` wraps the right column in a `clip()` for the
+    /// collapse animation — so a menu drawn inside it would be cut off at the
+    /// panel's own edge. Like the schema tree's eye and gear menus, it is a
+    /// root-level overlay positioned from an anchor the icon publishes.
+    pub menu_open: RwSignal<bool>,
+    /// The clock icon's bottom-**right** corner in window coordinates, published
+    /// by the icon's `on_move`/`on_resize`. Right, not left, because the panel is
+    /// against the window's right edge and the menu is right-aligned to it — see
+    /// `activity_menu_overlay`.
+    pub menu_anchor: RwSignal<floem::kurbo::Point>,
+}
+
+/// Server-activity callbacks (owned by the app).
+pub struct ActivityActions {
+    /// Fetch the active connection's sessions now. A no-op while one is already
+    /// in flight.
+    ///
+    /// The *timer* behind it runs only while the panel is open and the window has
+    /// focus — every tick is a connect and an authenticate against the server
+    /// being watched, and a panel polling behind another window is load charged to
+    /// a server nobody is looking at. This callback itself always asks, since the
+    /// two things that call it by hand (the refresh button, and the tidy-up after
+    /// a kill) are the user looking.
+    pub refresh: Rc<dyn Fn()>,
+    /// Cancel a statement or terminate a session, behind the shared confirm, then
+    /// refresh. The confirm is raised by the app rather than here so the panel
+    /// can't offer a kill that skips it.
+    pub kill: Rc<dyn Fn(i64, schemaic_core::activity::KillKind)>,
+    /// Set the **active connection's** poll interval (seconds; `0` is off) and
+    /// persist it. Which connection that is belongs to the app, not the panel.
+    pub set_interval: Rc<dyn Fn(u64)>,
+}
+
 /// Panel-layout + appearance signals (Copy bundle), persisted across sessions.
 /// The single `persist_layout` callback stays flat on [`Ui`].
 #[derive(Clone, Copy)]
@@ -2287,6 +2382,9 @@ pub struct Ui {
     // Query history — grouped.
     pub history: HistoryUi,
     pub history_actions: Rc<HistoryActions>,
+    // Server activity (the sessions on the connected server) — grouped.
+    pub activity: ActivityUi,
+    pub activity_actions: Rc<ActivityActions>,
     // Terminal panel — grouped (review §3.3).
     pub term: TermUi,
     pub term_actions: Rc<TermActions>,
@@ -2342,6 +2440,7 @@ pub enum RightPanel {
     Ai,
     Terminal,
     History,
+    Activity,
 }
 
 // Convert to/from the serializable core type so the chosen panel persists.
@@ -2353,6 +2452,7 @@ impl From<schemaic_core::persist::RightPanelState> for RightPanel {
             S::Ai => RightPanel::Ai,
             S::Terminal => RightPanel::Terminal,
             S::History => RightPanel::History,
+            S::Activity => RightPanel::Activity,
         }
     }
 }
@@ -2364,6 +2464,7 @@ impl From<RightPanel> for schemaic_core::persist::RightPanelState {
             RightPanel::Ai => S::Ai,
             RightPanel::Terminal => S::Terminal,
             RightPanel::History => S::History,
+            RightPanel::Activity => S::Activity,
         }
     }
 }
@@ -2542,6 +2643,7 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
     }
     let db_menu_open = ui.schema.db_menu_open;
     let schema_menu_open = ui.schema.schema_menu_open;
+    let activity_menu_open = ui.activity.menu_open;
     // Panel visibility is owned by the app (loaded from / saved to disk), so the
     // layout is restored on the next launch.
     let schema_visible = ui.layout.schema_visible;
@@ -2580,6 +2682,7 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
         active_db_menu_overlay(ui.clone()),
         db_visibility_overlay(ui.clone()),
         schema_settings_overlay(ui.clone()),
+        activity_menu_overlay(ui.clone()),
         context_menu_overlay(ui.clone()),
         find_overlay(ui.clone()),
         // **Before the confirm below, because it raises one.** Siblings paint in
@@ -2683,10 +2786,31 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
                 }
             })
         },
-        term_settings_overlay(ui.clone()),
-        ai_settings_overlay(ui.clone()),
-        theme_settings_overlay(ui.clone()),
-        help_overlay(ui.clone()),
+        // The four settings/help modals share one tuple element — this stack is
+        // at Floem's 16-arity `ViewTuple` limit, the same squeeze the trigger and
+        // function editors are under above. They are mutually exclusive (each is
+        // reached from a different chrome control, and each takes the window with
+        // its own backdrop), and the wrapper fills only while one is open, or an
+        // always-full-window box would eat every click in the app.
+        {
+            let term_open = ui.term.settings_open;
+            let ai_open = ui.ai.settings_open;
+            let theme_open = ui.layout.theme_settings_open;
+            let help_open_g = ui.layout.help_open;
+            stack((
+                term_settings_overlay(ui.clone()),
+                ai_settings_overlay(ui.clone()),
+                theme_settings_overlay(ui.clone()),
+                help_overlay(ui.clone()),
+            ))
+            .style(move |s| {
+                if term_open.get() || ai_open.get() || theme_open.get() || help_open_g.get() {
+                    s.absolute().inset(0.0)
+                } else {
+                    s
+                }
+            })
+        },
         // **Last on purpose.** A sibling paints in tuple order, so anything after
         // this would cover it — and the shared popup menu is opened from *inside*
         // modals too (the designer's type shortcut), where being painted behind
@@ -2825,6 +2949,9 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
         }
         if schema_menu_open.get_untracked() {
             schema_menu_open.set(false);
+        }
+        if activity_menu_open.get_untracked() {
+            activity_menu_open.set(false);
         }
         // The "clear" half of the app's `:focus-visible`
         // (`widgets::keyboard_nav`): from here on the focus ring stays dark until
@@ -3765,6 +3892,7 @@ fn body(
         move |panel| match panel {
             RightPanel::Terminal => terminal_panel(ui_right.clone()).into_any(),
             RightPanel::History => history_panel(ui_right.clone()).into_any(),
+            RightPanel::Activity => activity_panel(ui_right.clone()).into_any(),
             _ => ai_panel(ui_right.clone()).into_any(),
         },
     );
@@ -3940,6 +4068,7 @@ fn center(ui: Ui) -> impl IntoView {
     let schema_menu_open_d = ui.schema.schema_menu_open;
     let conn_menu_open_d = ui.conn.conn_menu_open;
     let active_db_menu_open_d = ui.tabs_ui.active_db_menu_open;
+    let activity_menu_open_d = ui.activity.menu_open;
     let dismiss_menus: Rc<dyn Fn()> = Rc::new(move || {
         if popup.get_untracked().is_some() {
             popup.set(None);
@@ -3958,6 +4087,9 @@ fn center(ui: Ui) -> impl IntoView {
         }
         if active_db_menu_open_d.get_untracked() {
             active_db_menu_open_d.set(false);
+        }
+        if activity_menu_open_d.get_untracked() {
+            activity_menu_open_d.set(false);
         }
     });
     let commit_edits = ui.tab_actions.commit_edits.clone();
@@ -6383,6 +6515,19 @@ fn footer(ui: Ui) -> impl IntoView {
         },
     )
     .style(|s| s.margin_left(5.0));
+    // Does the *active connection's* engine have server sessions to show? The
+    // Activity panel is a property of the connection, not of the focused tab, so
+    // this reads `active_conn` rather than the tab's dialect the way `read_only`
+    // above does.
+    let activity_ok = create_memo(move |_| {
+        let cid = active_conn.get();
+        connections.with(|cs| {
+            cs.iter().find(|c| c.id == cid).is_some_and(|c| {
+                schemaic_core::activity::supports_activity(SqlDialect::from_db_type(&c.db_type))
+            })
+        })
+    });
+
     // The AI icon's left edge (window x) is the reference the left cluster
     // collapses against — it's the leftmost thing in the right-pinned group, so it
     // marches left as the window narrows.
@@ -6398,6 +6543,19 @@ fn footer(ui: Ui) -> impl IntoView {
             icons::TIMELINE,
             move || right_panel.get() == RightPanel::History && right_panel_allowed(),
             move || set_right(RightPanel::History),
+        ),
+        // Server Activity. Inert on a connection whose engine has no sessions —
+        // the toggle is the panel's front door, and a SQLite connection has
+        // nothing behind it (`activity::supports_activity`).
+        toggle_icon_gated(
+            icons::ACTIVITY_SQUARE,
+            // The gate stops the panel being *opened* on an engine with no
+            // sessions — never its being closed. A panel left open by a
+            // connection switch (or restored from the last session) has to stay
+            // dismissable from its own icon, which is the one place anyone looks.
+            move || activity_ok.get() || right_panel.get() == RightPanel::Activity,
+            move || right_panel.get() == RightPanel::Activity && right_panel_allowed(),
+            move || set_right(RightPanel::Activity),
         ),
         toggle_icon(
             icons::TERMINAL,

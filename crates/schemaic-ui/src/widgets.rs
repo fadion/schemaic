@@ -3233,8 +3233,24 @@ pub(crate) fn toggle_icon(
     active: impl Fn() -> bool + 'static,
     on_click: impl Fn() + 'static,
 ) -> floem::views::Container {
-    toggle_icon_view(
+    toggle_icon_gated(glyph, || true, active, on_click)
+}
+
+/// [`toggle_icon`] whose panel isn't always available — dimmed to 30% and inert
+/// while `enabled` is false, the same disabled face [`toolbar_icon`] wears.
+///
+/// For the Server Activity toggle on a SQLite connection: the panel behind it has
+/// nothing to show for that engine, and a toggle that opens an explanation is a
+/// worse answer than one that visibly isn't offered.
+pub(crate) fn toggle_icon_gated(
+    glyph: &'static str,
+    enabled: impl Fn() -> bool + Copy + 'static,
+    active: impl Fn() -> bool + 'static,
+    on_click: impl Fn() + 'static,
+) -> floem::views::Container {
+    toggle_icon_view_gated(
         icons::icon(glyph, 16.0).style(|s| s.flex_shrink(0.0_f32)),
+        enabled,
         active,
         on_click,
     )
@@ -3247,13 +3263,27 @@ pub(crate) fn toggle_icon_view(
     active: impl Fn() -> bool + 'static,
     on_click: impl Fn() + 'static,
 ) -> floem::views::Container {
+    toggle_icon_view_gated(icon, || true, active, on_click)
+}
+
+/// The body of both — see [`toggle_icon_gated`] for what `enabled` is for.
+pub(crate) fn toggle_icon_view_gated(
+    icon: impl IntoView + 'static,
+    enabled: impl Fn() -> bool + Copy + 'static,
+    active: impl Fn() -> bool + 'static,
+    on_click: impl Fn() + 'static,
+) -> floem::views::Container {
     // Wrap the glyph in a container that carries the padding + click handler:
     // Floem hit-tests an `Svg` against its rendered content only (padding on the
     // svg grows layout but not the click target), whereas a container hit-tests its
     // whole padded box. The icon inherits the colour via `currentColor`, so the
     // active/hover tint set on the container reaches the svg.
     container(icon)
-        .on_click_stop(move |_| on_click())
+        .on_click_stop(move |_| {
+            if enabled() {
+                on_click()
+            }
+        })
         .style(move |s| {
             // No pointer cursor — the app uses the normal cursor everywhere.
             let s = s
@@ -3261,7 +3291,9 @@ pub(crate) fn toggle_icon_view(
                 .flex_shrink(0.0_f32)
                 .padding_vert(3.0)
                 .padding_horiz(5.0);
-            if active() {
+            if !enabled() {
+                s.color(theme::chip_idle().multiply_alpha(0.3))
+            } else if active() {
                 s.color(theme::chip_active())
             } else {
                 s.color(theme::chip_idle())
