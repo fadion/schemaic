@@ -23,6 +23,10 @@
 # Private working notes — kept local, never published.
 TODO.md
 
+# Claude Design working files (HTML mockups, design-system tokens, screenshots).
+# Local scratch for designing a feature — never part of a commit.
+/design/
+
 # Codebase-review working notes (plan, ledger, fact sheet). The reusable review
 # skills live in .claude/skills/ and ARE checked in; only the per-round output
 # is private.
