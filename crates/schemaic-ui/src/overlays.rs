@@ -17,6 +17,7 @@ use floem::reactive::create_effect;
 use schemaic_core::connection::Connection;
 use schemaic_core::model::QueryState;
 use schemaic_core::schema::{SchemaState, TableSource};
+use schemaic_core::skeleton::{delete_skeleton, insert_skeleton, update_skeleton};
 
 use crate::consts::{CHAT_PAD_H, CHAT_PAD_V, DB_MENU_W};
 use crate::widgets::{
@@ -840,9 +841,14 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     // than no entry.
                     if !ddl.is_empty() {
                         let oq = open_query.clone();
+                        // This node *is* the database, so that is what the script
+                        // is for — a `CREATE TABLE` script opened against another
+                        // database is one Ctrl+Enter from building the tables
+                        // somewhere else entirely.
+                        let db = menu.name.clone();
                         entries.push(MenuEntry::action("Generate DDL", move || {
                             let _ = floem::Clipboard::set_contents(ddl.clone());
-                            (oq)(ddl.clone());
+                            (oq)(ddl.clone(), Some(db.clone()));
                         }));
                     }
                     // ER diagram of the whole database (every related table).
@@ -963,9 +969,10 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     entries.push(MenuEntry::action("Copy qualified name", copy(qualified)));
                     {
                         let oq = open_query.clone();
+                        let db = database.clone();
                         entries.push(MenuEntry::action("Generate DDL", move || {
                             let _ = floem::Clipboard::set_contents(ddl.clone());
-                            (oq)(ddl.clone());
+                            (oq)(ddl.clone(), Some(db.clone()));
                         }));
                     }
                     {
@@ -1043,9 +1050,10 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                     // case there's nothing to offer.
                     if !ddl.is_empty() {
                         let oq = open_query.clone();
+                        let db = database.clone();
                         entries.push(MenuEntry::action("Generate DDL", move || {
                             let _ = floem::Clipboard::set_contents(ddl.clone());
-                            (oq)(ddl.clone());
+                            (oq)(ddl.clone(), Some(db.clone()));
                         }));
                     }
                     // A namespace is introspected as part of its database, so
@@ -1079,9 +1087,10 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                 } => {
                     if !ddl.is_empty() {
                         let oq = open_query.clone();
+                        let db = database.clone();
                         entries.push(MenuEntry::action("Generate DDL", move || {
                             let _ = floem::Clipboard::set_contents(ddl.clone());
-                            (oq)(ddl.clone());
+                            (oq)(ddl.clone(), Some(db.clone()));
                         }));
                     }
                     {
@@ -1215,11 +1224,67 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                             }));
                         }));
                     }
-                    let oq = open_query.clone();
-                    entries.push(MenuEntry::action("Generate DDL", move || {
-                        let _ = floem::Clipboard::set_contents(ddl.clone());
-                        (oq)(ddl.clone());
-                    }));
+                    // ── Generate ─────────────────────────────────────────────
+                    // Each entry copies its statement *and* opens it in a query
+                    // tab, which is what this entry has always done.
+                    //
+                    // A **submenu only where there is more than one thing to
+                    // generate**: a table has four, and four more flat entries in
+                    // a menu this long is worse than one hover. A view has one —
+                    // its `CREATE` — and a lone child behind a hover is a hover
+                    // spent on nothing, the same rule that keeps the two Copy
+                    // entries flat above.
+                    //
+                    // The DML three are **drafts, not statements**:
+                    // `core::skeleton` writes named placeholders, so one run by
+                    // reflex fails to parse instead of writing empty rows — and
+                    // its `WHERE` is `browse_key_columns`, the key the grid's
+                    // write-back addresses a row with, rather than a second
+                    // opinion about what identifies a row.
+                    let generate = {
+                        let oq = open_query.clone();
+                        let db = database.clone();
+                        move |sql: String| {
+                            let oq = oq.clone();
+                            let db = db.clone();
+                            move || {
+                                let _ = floem::Clipboard::set_contents(sql.clone());
+                                // The tab is bound to *this* table's database,
+                                // not to wherever a new tab would have started.
+                                (oq)(sql.clone(), Some(db.clone()));
+                            }
+                        }
+                    };
+                    match info.as_ref().filter(|_| !is_view) {
+                        Some(t) => {
+                            // Built into a binding first, like the Colour swatches
+                            // — a child constructor within three lines of the
+                            // `entries.push(` reads as a top-level entry to
+                            // `menu_order_gate`, which would then demand a place
+                            // in the skeleton for a label that isn't in the menu.
+                            let dialect = crate::table_designer::edit_ctx(&import_ui).dialect;
+                            let db = database.as_str();
+                            let items = vec![
+                                MenuEntry::action("Create", generate(ddl.clone())),
+                                MenuEntry::action(
+                                    "Insert",
+                                    generate(insert_skeleton(dialect, db, t)),
+                                ),
+                                MenuEntry::action(
+                                    "Update",
+                                    generate(update_skeleton(dialect, db, t)),
+                                ),
+                                MenuEntry::action(
+                                    "Delete",
+                                    generate(delete_skeleton(dialect, db, t)),
+                                ),
+                            ];
+                            entries.push(MenuEntry::sub("Generate", items));
+                        }
+                        // A view, or a table whose schema hasn't loaded — the
+                        // DDL is in hand either way, and nothing else is.
+                        None => entries.push(MenuEntry::action("Generate DDL", generate(ddl))),
+                    }
                     // Refresh closes the read group in every menu in this tree.
                     // It used to sit between Copy and Properties, splitting the
                     // three entries that show you something — and it doesn't act
@@ -4923,6 +4988,10 @@ mod menu_order_gate {
             | "Properties"
             | "Live monitor"
             | "Show diagram"
+            // One node, two spellings, same slot: a table has four things to
+            // generate and gets the submenu, a view has one and keeps the flat
+            // entry rather than spending a hover on a lone child.
+            | "Generate"
             | "Generate DDL"
             | "Refresh"
             | "Collapse all" => 2,
