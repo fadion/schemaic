@@ -56,16 +56,16 @@ const SQL_ROWS: usize = 16;
 /// destroyed the half-written trigger, and "Open in editor" did the same without
 /// applying anything at all.
 ///
-/// The function editor being open *is* the signal that the plan came from it: it
+/// The routine editor being open *is* the signal that the plan came from it: it
 /// renders over the trigger modal, so nothing else can reach Preview while it is.
 pub(crate) fn close_editors(d: crate::DdlUi) {
-    let from_function = d.function.get_untracked().is_some();
+    let from_routine = d.routine.get_untracked().is_some();
     d.designer.set(None);
     d.view.set(None);
-    if !from_function {
+    if !from_routine {
         d.trigger.set(None);
     }
-    d.function.set(None);
+    d.routine.set(None);
     d.object.set(None);
 }
 
@@ -657,8 +657,8 @@ mod tests {
             view_rows: scope.create_rw_signal(14),
             trigger: scope.create_rw_signal(None),
             trigger_draft: scope.create_rw_signal(Default::default()),
-            function: scope.create_rw_signal(None),
-            function_draft: scope.create_rw_signal(Default::default()),
+            routine: scope.create_rw_signal(None),
+            routine_draft: scope.create_rw_signal(Default::default()),
             functions: scope.create_rw_signal(Vec::new()),
             object: scope.create_rw_signal(None),
             object_draft: scope.create_rw_signal(Default::default()),
@@ -756,7 +756,7 @@ mod tests {
             current: Vec::new(),
             read_only: false,
         }));
-        d.function.set(Some(crate::FunctionTarget {
+        d.routine.set(Some(crate::RoutineTarget {
             conn_id: 1,
             database: "db".into(),
             dialect: SqlDialect::Postgres,
@@ -767,7 +767,7 @@ mod tests {
         close_editors(d);
 
         assert!(
-            d.function.get_untracked().is_none(),
+            d.routine.get_untracked().is_none(),
             "the editor the plan came from still closes"
         );
         assert!(

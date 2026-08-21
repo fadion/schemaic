@@ -751,22 +751,44 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     that runs come from one comparison. All PostgreSQL-only; `object_statements` is still
     called from both emitters so a MySQL connection handed such a set emits SQL the server can
     reject rather than dropping it on the floor.
-    **Triggers and PostgreSQL trigger functions** ride the same rails again:
-    `TriggerSetDraft`/`TriggerDraft` → `diff_triggers` and `FunctionDraft` → `diff_function`
-    → `Change::{CreateTrigger, ReplaceTrigger, DropTrigger, CreateFunction, ReplaceFunction,
-    RenameFunction, DropFunction}` → the same preview. None of the three can *alter* a trigger,
+    **Triggers and stored routines** ride the same rails again:
+    `TriggerSetDraft`/`TriggerDraft` → `diff_triggers` and `RoutineDraft` → `diff_routine`
+    → `Change::{CreateTrigger, ReplaceTrigger, DropTrigger, CreateRoutine, ReplaceRoutine,
+    RenameRoutine, DropRoutine}` → the same preview. None of the three can *alter* a trigger,
     so **every** edit is a drop-and-create and `ReplaceTrigger` is that pair — which is why
     `trigger_statements` emits **all the drops, then all the creates** rather than each pair
     together: adjacent pairs collide the moment two triggers swap names, and on MySQL
     statement 1 has already committed when statement 2 fails, so the first trigger is simply
     gone. Same rule, same reason as `GridWrite::plan` in `core::model`.
-    `session_wrapped_create` is the MySQL half of that emitter: `CREATE TRIGGER` has no clause
-    for the `sql_mode`/`character_set_client`/`collation_connection` a trigger was written
-    under, yet all three are part of what it does, so the values are set on the session around
-    the statement and restored after (`run_ddl` runs a MySQL plan in order on one connection,
-    which is what makes that safe). Nothing is emitted when nothing is known — `None` means
-    "not fetched", and inventing a session state is a change nobody asked for. It early-returns
-    on `!= MySql`; the old `== Postgres` test would have handed SQLite `SET SESSION sql_mode = …`.
+    `session_wrapped_with` is the MySQL half of that emitter, shared by triggers
+    (`session_wrapped_create`) and routines (`session_wrapped`): neither `CREATE TRIGGER` nor
+    `CREATE PROCEDURE` has a clause for the `sql_mode`/`character_set_client`/
+    `collation_connection` the object was written under, yet all three are part of what it does,
+    so the values are set on the session around the statement and restored after (`run_ddl` runs
+    a MySQL plan in order on one connection, which is what makes that safe). Nothing is emitted
+    when nothing is known — `None` means "not fetched", and inventing a session state is a change
+    nobody asked for. It early-returns on `!= MySql`; the old `== Postgres` test would have handed
+    SQLite `SET SESSION sql_mode = …`.
+    **A routine's diff is per-engine at the *rename*, and that is the whole shape of
+    `diff_routine`.** PostgreSQL replaces one in place (`supports_or_replace_routine`) and renames
+    it with a statement of its own (`supports_routine_rename`), so a rename is a separate change
+    ordered *after* the redefinition — which has to address the signature the server still holds.
+    MySQL has neither verb: every edit there is a `DROP … IF EXISTS` plus a `CREATE`, so a rename
+    is folded into that recreate (the drop names the old routine, the create the new one) and a
+    bare rename reads as a redefinition, exactly as `diff_view` resolves one on SQLite. Which
+    route a change took rides on `Change::ReplaceRoutine { recreate }` rather than being re-derived
+    at emit time, so the preview's risk sentence and the SQL cannot disagree — and `recreate` is
+    what earns the "a definition the server rejects leaves no procedure at all" warning, the same
+    sentence `ReplaceTrigger` carries and for the same reason. `RoutineInfo::signature_sql` is what
+    knows the two engines address a routine differently: PostgreSQL by its **argument types**
+    (overloads share a name), MySQL by name alone (the parameter list there is a syntax error on a
+    `DROP`). That is also why `ObjectKind::Function`/`Procedure` are on the browse enum but refused
+    by `drop_object`, which has only a name to work with — it returns an **empty** change set for
+    one, so a preview says "no changes" rather than a bare-name statement that is right up until
+    the first overload; `drop_routine` takes the whole `RoutineInfo` and is the route.
+    SQLite has no stored routines at all — a function there is registered by the host program,
+    not stored in the database — so its arms are absent from `supports_change`,
+    `supports_routine_editing` is false, and the tree grows no folder and the Create menu no entry.
     **SQLite got here through the reader, not the emitter.** It publishes no catalogue of a
     trigger's parts — no `information_schema`, no pragma, only the statement text — so
     `sqlite_trigger_info(create_sql)` is what made an editor possible at all, and until it existed
@@ -1135,8 +1157,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `create_ddl_script` already carries for foreign keys, and it is accepted for the same reason —
     the script goes to the clipboard and an editor tab, is read and edited before it is run, and
     `ddl_preview` is still the only thing that runs anything.
-    **`TriggerInfo`/`TriggerAction`/`TriggerEvent`/`TriggerEnabled`/`TriggerSource` +
-    `RoutineInfo`** are the trigger and PG-trigger-function half, and carry three rules the
+    **`TriggerInfo`/`TriggerAction`/`TriggerEvent`/`TriggerEnabled`/`TriggerSource`** are the
+    trigger half, and carry three rules the
     same "restate everything or it silently resets" logic as `ViewOptions`.
     `TriggerAction::Function::name` is **emittable SQL** on both producers — already quoted,
     qualified when it isn't in `public` — never a bare identifier; it once meant both
@@ -1161,11 +1183,52 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     because most SQLite checks have none and `CONSTRAINT "" CHECK (…)` is not a nameless constraint
     but a syntax error — while inventing a name would make a rebuild read as though it renamed
     something.
-    **The standalone PostgreSQL objects** — `EnumInfo`/`DomainInfo`/`SequenceInfo` — sit here
-    beside the tables and, unlike `RoutineInfo`, **on `DbSchema` itself** rather than being
+    **`RoutineInfo`/`RoutineKind`/`SqlDataAccess`/`Volatility`/`RoutineSource`** are the stored
+    functions and procedures, on both engines that have them, under the same rule again — a
+    redefinition replaces the whole routine, so anything the statement doesn't restate reverts.
+    Which fields those are is per-engine: PostgreSQL's `volatility`, `strict`, `language` and the
+    per-routine `SET` clauses (a `SECURITY DEFINER` function that loses its pinned `search_path`
+    is a privilege-escalation hole), MySQL's `deterministic`, `data_access`, `definer` and
+    `comment`. `security_definer` is the one field both engines have and **their defaults are
+    opposite** — PostgreSQL's is INVOKER, MySQL's is DEFINER — which is why the MySQL arm of
+    `create_sql` states the clause in *both* directions instead of leaving the default unwritten
+    as the PostgreSQL arm does, and why `RoutineDraft::blank` seeds it per-engine rather than
+    picking the safer-looking answer for both. `RoutineKind` is a tag rather than "is `returns`
+    empty", because a function and a procedure are different objects to every statement that
+    addresses one — and on PostgreSQL that is not only a keyword: **`CREATE PROCEDURE` takes a
+    strict subset of a function's attributes**, so `pg_create_sql` withholds the return type, the
+    volatility *and* the strictness for one, and `routine_editor` withholds the two controls that
+    would set them. Any of the three on a procedure is
+    `ERROR: invalid attribute in procedure definition`, and guarding only `RETURNS` left a plan
+    that could be built in two clicks and could only fail at Apply.
+    `RoutineInfo::is_editable` is the other gate on that model: the emitter writes the body as the
+    routine's *source*, which is right for every language whose body is source text and wrong for
+    `LANGUAGE c` and `LANGUAGE internal`, where `prosrc` is a link symbol and the recreate needs
+    `AS 'obj_file', 'link_symbol'` — so those are listed and droppable but not editable, the call a
+    materialized view gets.
+    `RoutineSource` is the MySQL body + session state, fetched lazily, and exists
+    for exactly the reason `TriggerSource` does — `information_schema.ROUTINE_DEFINITION` resolves
+    the body's escapes, and every edit on that engine begins with a `DROP` that commits on its own,
+    so a restate built from the resolved text can fail *after* the only copy is gone. Its `body` is
+    an **`Option`** where `TriggerSource`'s is not, because the two halves of that row fail
+    separately: the three session values need no parsing and are always trustworthy, so folding
+    them into the body's success meant a routine with a header the reader didn't understand was
+    later recreated under whatever `sql_mode` the applying session happened to have.
+    **The standalone objects** — `EnumInfo`/`DomainInfo`/`SequenceInfo`, PostgreSQL's, plus the
+    routines above — sit here beside the tables **on `DbSchema` itself** rather than being
     fetched lazily: the tree lists them and a column's type *is* one of them, so a separately
     refreshed second cache would be a second answer to "what is in this database" and the two
-    would diverge on the first refresh that only updated one. An enum's `values` are in
+    would diverge on the first refresh that only updated one. `routines` used to be the exception,
+    fetched only for the trigger editor's dropdown on the grounds that nothing rendered a body
+    until an editor asked; browsing them is exactly the reader that argument said didn't exist, and
+    their bodies are no heavier than the view definitions and trigger bodies this struct already
+    carried. They are held as **`Arc<RoutineInfo>`**, and `ObjectItem::Routine` carries the same
+    `Arc`, because `objects_all` is on the **keyboard-walk** path: `visible_nav_rows` rebuilds the
+    whole row list on every arrow key, through `object_groups` → `objects_all`, so an owned clone
+    there deep-copied every routine body in the database per keypress. Making the clone a refcount
+    bump is the fix rather than giving `nav_rows` a cheaper borrowed view of the objects, because
+    that walk has to stay bug-for-bug identical to the render and a second view of the same list is
+    exactly how the two drifted before. An enum's `values` are in
     `enumsortorder`, not creation order, because that is the order comparisons use and the
     order `ADD VALUE … BEFORE/AFTER` manipulates. A domain's constraints are `CheckInfo`s —
     the same type a table's are, so `ddl::checks_equal` governs both. `SequenceOwner::internal`
@@ -1384,10 +1447,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     - `search_history.rs` — recent Find-Anywhere targets (`MAX_PER_CONN`, newest-first, deduped).
       `push` records only an *activated* result, not every keystroke, and the PG namespace is part
       of the dedup identity so same-named tables in two schemas don't collapse into one. So is
-      `ObjectTag`, which is what makes an entry a PostgreSQL enum/domain/sequence rather than a
-      table (its name rides in `table`, so every file written before objects were searchable still
-      loads): a type and a table may share a name in one namespace and are different places to go
-      back to. The tag is a **persisted** enum of its own rather than `ddl::ObjectKind` so a kind
+      `ObjectTag`, which is what makes an entry an enum/domain/sequence/function/procedure rather
+      than a table (its name rides in `table`, so every file written before objects were searchable
+      still loads): a type and a table may share a name in one namespace and are different places
+      to go back to. The tag is a **persisted** enum of its own rather than `ddl::ObjectKind` so a kind
       written by a newer build degrades instead of failing the file and losing every connection's
       history, the rule `SshAuth`/`Environment` follow; it resolves to no live kind, so the row is
       dropped from the recents list exactly as an entry for a since-renamed table is. `Unknown`
@@ -1722,6 +1785,48 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   `tgisinternal = false` and can only be dropped through its parent), and `UPDATE OF` columns +
   a function's `proconfig` arrive **one row each** rather than string-aggregated — same rule the
   enum labels follow, and for the same reason.
+  **Stored routines** are read with the rest of the schema on both engines that have them.
+  PG has **three** filters over one reader (`routines_where`), and which one a caller stands on is
+  the whole design. `routine_scope` is the floor both share: `prokind IN ('f','p')` (an aggregate or
+  a window function has no body to show and no `CREATE FUNCTION` that would recreate it; the column
+  is PG 11+, and there is no pre-11 spelling that tells a procedure from an aggregate) in a user
+  namespace. `routine_filter` adds **not owned by an extension** (`pg_depend.deptype = 'e'`) and is
+  what the schema tree browses — that exclusion is applied here and not to the types beside it, and
+  the difference is degree rather than principle: an extension installs a handful of types and
+  hundreds of functions, and PostGIS alone would bury a database's own routines under ~1000 `st_*`
+  rows in whichever namespace it was created in. **`trigger_function_filter` does not add it**, and
+  that is not an oversight: a trigger binds to whatever returns `trigger`, extension-owned or not
+  — `moddatetime` is the standard "touch the modified column" function and arrives exactly that
+  way — and the picker reading it is a dropdown with no free-text entry, so a function missing from
+  that list is a function no trigger can be pointed at. It narrows on `prorettype` instead, on the
+  **server**: filtering in Rust meant shipping every routine body in the database over the wire on
+  a call the trigger editor makes every time the routine editor closes back to it. Both queries
+  inside `routines_where` take the same filter string, because the settings fold is keyed on oid
+  and a filter that disagreed would attach one routine's `SET` clauses to nothing.
+  MySQL reads `information_schema.ROUTINES` plus `PARAMETERS` — that server publishes no rendered
+  signature, so `mysql_routines` rebuilds the `IN a INT, OUT b TEXT` form from one row per
+  parameter, keyed by name **and kind** because a function and a procedure may share a name, and
+  excluding `ORDINAL_POSITION = 0`, which is a *function's return value* rather than a parameter.
+  `Db::routine_source` is the fifth text divergence and the counterpart of `Db::trigger_source`:
+  `ROUTINE_DEFINITION` resolves the body's escapes exactly as `ACTION_STATEMENT` does, and every
+  MySQL routine edit begins with a `DROP` that commits on its own, so `SHOW CREATE` is the only
+  source an edit may be built from. `routine_body_of` is its pure reader; unlike `trigger_body_of`
+  it has no keyword to anchor on — a routine has no `FOR EACH ROW` — so it skips the parameter list
+  as a balanced group and then consumes characteristics by keyword until one isn't. Consuming
+  greedily is safe because the two vocabularies are disjoint: no MySQL statement begins with
+  `COMMENT`, `LANGUAGE`, `NOT`, `DETERMINISTIC`, `CONTAINS`, `NO`, `READS`, `MODIFIES`, `SQL`,
+  `DATA`, `SECURITY`, `DEFINER`, `INVOKER` or `RETURNS`. **A `RETURNS` type's modifiers each take
+  their argument with them, or take none** — `TYPE_FLAG` for `UNSIGNED`/`ZEROFILL`/…, `TYPE_NAMED`
+  for `CHARSET x`/`COLLATE x`, and `CHARACTER SET x` matched as the three-word form it is. A
+  keyword consumed without its value leaves that value at the head of what is returned as the body,
+  which is the worst failure this reader has: the editor shows a corrupt body and the Apply emits a
+  1064 *after* the `DROP` has committed. A bare `SET` is on neither list for the same reason from
+  the other side — it swallowed the first word of a body that legitimately begins `SET @x = 1`.
+  Both the `Create` column and
+  `ROUTINE_DEFINITION` are **nullable** — MySQL returns NULL to an account without `SHOW_ROUTINE`
+  or ownership — and an unread body leaves the editor on whatever the schema fetch carried rather
+  than blanking it, while the row's session values are returned either way (see `RoutineSource`).
+  SQLite has neither call: it has no stored routines at all.
   **`sqlite.rs` is the third engine**, and five things make it unlike the other two rather than a
   third set of catalogue queries. **There is no server**: a connection is a *file*
   (`Connection::file`), so host/port/user/password/SSH are all inert, `fetch_databases` has nothing
@@ -2167,8 +2272,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     never under a full-window parent, which would swallow every press in the app (see *Floem 0.2
     gotchas*, "a full-window sibling ends the pointer walk"); they wrap the root rather than
     joining its tuple because that one is at Floem's 16-arity limit.
-  - `trigger_editor.rs` — the **trigger** modal *and* the **function** modal, over `core::ddl`'s
-    `TriggerSetDraft`/`FunctionDraft`. Reached from the schema context menu's per-table
+  - `trigger_editor.rs` — the **trigger** modal, over `core::ddl`'s
+    `TriggerSetDraft`. Reached from the schema context menu's per-table
     **Triggers…** entry — and from a **view's**, on every engine but MySQL, since `INSTEAD OF`
     lives on PostgreSQL and on SQLite, where it is the only way a view is written to at all
     (`overlays::object_entries`, which still excludes a materialized view: PostgreSQL refuses one
@@ -2183,23 +2288,52 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `ALTER TABLE`, which is why checks are and triggers aren't — a trigger needs its own
     statement, so folding it in would turn MySQL's one coalesced `ALTER TABLE` into an `ALTER`
     plus N statements that commit one at a time, and `DdlError::applied` would stop meaning much.
-    Two modals in one module because the second only exists to serve the first: a PG trigger has
-    no body, only a **function** to call, so the trigger form would be a dead end without a way to
-    write one. Three rules are written down because each was a bug waiting: **the form is
+    It reaches `routine_editor.rs` and used to *contain* it: a PG trigger has no body, only a
+    **function** to call, so the trigger form would be a dead end without a way to write one. The
+    function modal lived here for that reason and moved out when routines became browsable in
+    their own right; what didn't change is the handoff below. Three rules are written down because
+    each was a bug waiting: **the form is
     per-engine because the objects are** (MySQL owns a body and one event; PG calls a function,
     takes several events and a `WHEN`; SQLite owns a body, one event, a `WHEN` and `UPDATE OF`
     columns through a "Of columns" field, and offers a view only `INSTEAD OF`), so it *hides* what
     an engine can't express rather than offering it and failing at apply — which is also why
     `blank_trigger`/`trigger_list` take a `SqlDialect` rather than a `pg: bool`, and why the
     MySQL-only `fetch_sources` (`SHOW CREATE TRIGGER`) is gated `== MySql`;
-    **the function list is fetched lazily** (`Db::trigger_functions`
-    via `TriggerFnFn`, the same call `view_algorithm` makes) and arrives a round trip late, so the
+    **the function list is re-fetched on its own** (`Db::trigger_functions`
+    via `TriggerFnFn`) and arrives a round trip late, so the
     picker keeps whatever the draft already names instead of selecting the first entry and silently
-    re-pointing the trigger; and **the trigger target is never cleared while the function modal is
+    re-pointing the trigger — the schema fetch carries the same list, so this is what puts a
+    function *just created* in the dropdown before the next reload; and **the trigger target is
+    never cleared while the routine modal is
     up** — its overlay just renders nothing — so closing that one reveals the half-filled trigger
     form intact, with no "return to trigger" flag to be a second source of truth. `is_editable_trigger`
     is the entry point's gate: a constraint trigger's deferral settings aren't modelled, so it is
     listed and droppable but not editable, the call a materialized view gets.
+  - `routine_editor.rs` — the **stored routine** modal: one form for a function or a procedure,
+    over `core::ddl`'s `RoutineDraft`, on both engines that have them. Reached from the schema
+    tree's Functions/Procedures folders (row **Edit**, folder **Create**), from the database and
+    namespace **Create** submenus, from Find-Anywhere, and from the trigger editor's
+    **New function** / **Edit** buttons — which is the path it was born on and the reason
+    `open_for_new_trigger_function` is a separate entry point from `open_for_new`: a trigger
+    function starts from a different draft (`plpgsql`, `RETURNS trigger`, and the `RETURN` that a
+    first one most often fails at runtime for want of). Same chrome, same
+    seed-local-signals-then-write-back rule and same `ddl_preview` ending as the editors above.
+    Three things are load-bearing: **the form is per-engine *and* per-kind because the objects
+    are** — volatility, strictness, language and per-routine `SET` clauses on PostgreSQL;
+    determinism, data access, definer and comment on MySQL, which has no `LANGUAGE` clause at all;
+    and neither volatility nor strictness on a PostgreSQL *procedure*, whose `CREATE` rejects both
+    outright — so it hides what an engine can't express rather than offering it and failing at
+    apply, which is a rule the kind axis needs as much as the engine one. The Language dropdown
+    carries the routine's own language alongside the two it proposes, for the same reason: a list
+    that didn't would silently retype a `plpython3u` function the moment the control was touched.
+    **MySQL's body is fetched a
+    second time and it is not an optimisation** (`Db::routine_source` via `RoutineSrcFn`, applied
+    to *both* sides of the diff so a routine doesn't open already-changed, and guarded by
+    `DdlUi::session` so a slow reply for a closed modal can't land); and **a new routine's
+    namespace is inherited, not chosen** — there is no Schema field, for the reason the view
+    editor has none, and the title is where the inheritance is disclosed. It clears every sibling
+    overlay's target on open **except the trigger editor's**, which is the handoff described
+    above.
   - `object_editor.rs` — the **enum / domain / sequence** modal, over `core::ddl`'s
     `ObjectDraft`. Reached from a tree object's **Edit**, from a database or schema node's
     **Create ▸ Type / Domain / Sequence** (PostgreSQL only — on MySQL those entries don't
@@ -2211,7 +2345,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     said which kind, so the submenu's other two children would be entries belonging to the folders
     either side of it.
     One modal for three objects because the chrome, the footer, the change count and the
-    ending at `ddl_preview` are identical and only the middle section differs. Same
+    ending at `ddl_preview` are identical and only the middle section differs. **A routine is
+    not one of them**, and the split is made at the type level rather than by convention:
+    `ObjectDraft::from_item`/`blank` return `None` for a routine, and this module's own
+    `open_for_object`/`open_for_new` are what route one to `routine_editor` — so the tree, the
+    palette and the menu all keep asking one function to open an object, and a routine handed
+    to a type form would have to be an explicit mistake rather than whichever arm compiles.
+    Same
     seed-local-signals-then-write-back rule as the other editors, and three more written down:
     the list rows are keyed on `object_rev`, a **structural** counter, so typing into a row
     doesn't tear it down and removing one doesn't leave its neighbour showing the old text;
@@ -2227,10 +2367,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context
     menu, generic grid popup, Find-Anywhere, error modal.
   - `schema_tree.rs` — SCHEMA sidebar (`schema_panel` + db/table/column/key row builders + keyboard
-    nav). PostgreSQL's standalone objects hang off the same levels the tables do, in
-    `Types`/`Domains`/`Sequences` folders after them (`object_groups`/`object_group_node`/
-    `object_row`, over `schema::ObjectItem`); an empty folder isn't rendered, and none of them
-    exist on MySQL, so that tree is untouched. They are scoped by `TableScope` for the reason
+    nav). The standalone objects hang off the same levels the tables do, in
+    `Types`/`Domains`/`Sequences`/`Functions`/`Procedures` folders after them
+    (`object_groups`/`object_group_node`/
+    `object_row`, over `schema::ObjectItem`, keyed by `ddl::ObjectKind::ALL` — one list, because
+    there were four copies of the kind array across the folder builder, its two filter predicates
+    and Find-Anywhere, and a kind added to three of them is a kind the palette silently cannot
+    find). An empty folder isn't rendered; the first three exist on PostgreSQL only and the last
+    two on every engine with stored routines, so a SQLite tree grows none of them. They are
+    scoped by `TableScope` for the reason
     it exists — *flat* means the database has no schema level, not that its objects have no
     namespace. Two filter rules follow from the level above being evaluated first: a database
     and a namespace both survive a search that only one of their **objects** matches, or the
@@ -3039,8 +3184,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   can't end it early — the same thing `sqlite3_complete()` does for SQLite's own shell. MySQL and
   PostgreSQL boundaries are deliberately untouched: MySQL's trigger bodies go behind `DELIMITER`,
   and changing that would silently alter what Run Everything sends a server. The other half of that
-  is `ChangeSet::editor_script`, which asks `!= MySql` before reaching for `DELIMITER $$` so a
-  SQLite plan is never handed a directive the engine has never heard of. **Ask the capability,
+  is `ddl::client_script` — what `ChangeSet::editor_script` and a routine's `Generate DDL` both go
+  through — which asks `== MySql` before reaching for `DELIMITER $$` so a SQLite plan is never
+  handed a directive the engine has never heard of, and **terminates every statement** on the way
+  past. That second rule reads as a no-op because nearly everything already ends in its own `;`;
+  the exception is a MySQL routine's `CREATE`, which deliberately carries none (the apply path
+  sends each step whole) and whose body is full of `;` — so two of them joined for a reader ran
+  together, and one pasted into a query tab was cut mid-body. It is one function rather than two
+  because that is exactly the divergence that produced the bug: `editor_script` knew the rule and
+  the schema tree's copy path didn't. **Ask the capability,
   never the engine** — the rules are predicates on `SqlDialect` (see `sql.rs` above), because
   `dialect == Postgres` / `!= MySql` compiles cleanly while silently sorting a third engine onto
   whichever side it falls, and two of the answers it got wrong for SQLite could hide a `WHERE`

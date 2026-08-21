@@ -31,8 +31,8 @@ use crate::intel::SqlDialect;
 use crate::pairs;
 use crate::schema::{
     CheckInfo, ColumnInfo, DomainInfo, EnumInfo, ForeignKeyInfo, IndexInfo, RoutineInfo,
-    SequenceInfo, ServerFlavour, TableInfo, TriggerAction, TriggerEvent, TriggerInfo, TriggerLevel,
-    TriggerTiming, ViewOptions, ddl_ident_in, ddl_string, definer_sql, sql_qualifier,
+    RoutineKind, SequenceInfo, ServerFlavour, TableInfo, TriggerAction, TriggerEvent, TriggerInfo,
+    TriggerLevel, TriggerTiming, ViewOptions, ddl_ident_in, ddl_string, definer_sql, sql_qualifier,
 };
 use crate::sql;
 
@@ -1116,26 +1116,27 @@ impl TriggerSetDraft {
     }
 }
 
-// ── The desired state of a function ──────────────────────────────────────────
+// ── The desired state of a routine ───────────────────────────────────────────
 
-/// The whole desired shape of one PostgreSQL function.
+/// The whole desired shape of one stored routine.
 ///
 /// Carries a whole [`RoutineInfo`] for the reason [`ViewDraft`] carries
-/// [`ViewOptions`]: `CREATE OR REPLACE FUNCTION` replaces the entire routine, so
-/// anything the statement doesn't restate reverts to the server's default —
-/// including the `SET search_path` that keeps a `SECURITY DEFINER` function from
-/// being a privilege-escalation hole.
+/// [`ViewOptions`]: a redefinition replaces the entire routine, so anything the
+/// statement doesn't restate reverts to the server's default — including the
+/// `SET search_path` that keeps a `SECURITY DEFINER` function from being a
+/// privilege-escalation hole, and MySQL's `DEFINER`, which decides whose rights
+/// the body runs with at all.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct FunctionDraft {
-    /// The function's name on the server, or `None` for a new one. Identity, not
+pub struct RoutineDraft {
+    /// The routine's name on the server, or `None` for a new one. Identity, not
     /// a name: editing `info.name` is a rename.
     pub original: Option<String>,
     pub info: RoutineInfo,
 }
 
-impl FunctionDraft {
-    pub fn from_info(f: &RoutineInfo) -> FunctionDraft {
-        FunctionDraft {
+impl RoutineDraft {
+    pub fn from_info(f: &RoutineInfo) -> RoutineDraft {
+        RoutineDraft {
             original: Some(f.name.clone()),
             info: f.clone(),
         }
@@ -1145,12 +1146,13 @@ impl FunctionDraft {
     /// skeleton every one of them has to end with. A body that doesn't `RETURN`
     /// is the single most common way a first trigger function fails at runtime
     /// rather than at creation, so the starting point supplies it.
-    pub fn blank_trigger(name: impl Into<String>, schema: Option<String>) -> FunctionDraft {
-        FunctionDraft {
+    pub fn blank_trigger(name: impl Into<String>, schema: Option<String>) -> RoutineDraft {
+        RoutineDraft {
             original: None,
             info: RoutineInfo {
                 name: name.into(),
                 schema,
+                kind: RoutineKind::Function,
                 arguments: String::new(),
                 returns: "trigger".to_string(),
                 language: "plpgsql".to_string(),
@@ -1160,23 +1162,94 @@ impl FunctionDraft {
         }
     }
 
+    /// A new ordinary routine, pre-shaped for the engine that will hold it.
+    ///
+    /// The body is a **valid, empty** one rather than a blank box, on the same
+    /// grounds `blank_trigger` supplies its `RETURN NEW`: the first thing a new
+    /// routine has to survive is the server's parse, and the shape of that parse
+    /// is per-engine — PostgreSQL wants a `plpgsql` block and a return type, and
+    /// MySQL a `BEGIN … END` compound with no `LANGUAGE` of its own.
+    ///
+    /// The default kind is a **procedure** on MySQL and a **function**
+    /// everywhere else only when the caller doesn't say; `kind` is passed in,
+    /// so this makes no such guess.
+    pub fn blank(
+        kind: RoutineKind,
+        name: impl Into<String>,
+        schema: Option<String>,
+        dialect: SqlDialect,
+    ) -> RoutineDraft {
+        let postgres = dialect == SqlDialect::Postgres;
+        let returns = match (kind, postgres) {
+            (RoutineKind::Procedure, _) => String::new(),
+            (RoutineKind::Function, true) => "integer".to_string(),
+            (RoutineKind::Function, false) => "INT".to_string(),
+        };
+        let body = match (kind, postgres) {
+            (RoutineKind::Function, true) => "BEGIN\n    RETURN 0;\nEND;",
+            (RoutineKind::Procedure, true) => "BEGIN\nEND;",
+            (RoutineKind::Function, false) => "BEGIN\n    RETURN 0;\nEND",
+            (RoutineKind::Procedure, false) => "BEGIN\n    SELECT 1;\nEND",
+        }
+        .to_string();
+        RoutineDraft {
+            original: None,
+            info: RoutineInfo {
+                name: name.into(),
+                schema,
+                kind,
+                arguments: String::new(),
+                returns,
+                // MySQL reports `SQL` for everything it stores and accepts no
+                // `LANGUAGE` clause of its own, so the field is filled with what
+                // that server would report rather than left empty for
+                // `validate` to complain about.
+                language: if postgres { "plpgsql" } else { "SQL" }.to_string(),
+                body,
+                // **Each engine's own default**, because the emitter states this
+                // clause either way and the two disagree: PostgreSQL's is
+                // INVOKER, MySQL's is DEFINER. Starting from what a plain
+                // `CREATE` would have produced means a routine made here behaves
+                // like one made in SQL — the safer-looking choice of INVOKER
+                // everywhere would silently narrow what a MySQL routine may do,
+                // which is a decision for the toggle rather than the default.
+                security_definer: !postgres,
+                // The rest of MySQL's characteristics already default to what a
+                // bare `CREATE PROCEDURE` produces: `CONTAINS SQL` and
+                // `NOT DETERMINISTIC`. `definer` stays empty, so the statement
+                // names no account and the server uses the applying one.
+                ..Default::default()
+            },
+        }
+    }
+
     /// Problems that would make the generated SQL nonsense. Whether the body
     /// compiles is the server's judgement — PostgreSQL doesn't even check a
     /// `plpgsql` body beyond syntax until it runs.
-    pub fn validate(&self) -> Vec<String> {
+    ///
+    /// Takes the dialect because two of the rules are per-engine and one of them
+    /// used to be asserted for both: a `LANGUAGE` clause is required on
+    /// PostgreSQL and does not exist on MySQL.
+    pub fn validate(&self, dialect: SqlDialect) -> Vec<String> {
         let f = &self.info;
+        let what = f.kind.label();
         let mut out = Vec::new();
         if f.name.trim().is_empty() {
-            out.push("The function needs a name.".to_string());
+            out.push(format!("The {what} needs a name."));
         }
-        if f.language.trim().is_empty() {
-            out.push("The function needs a language (plpgsql, sql).".to_string());
+        if dialect == SqlDialect::Postgres && f.language.trim().is_empty() {
+            out.push(format!("The {what} needs a language (plpgsql, sql)."));
         }
-        if f.returns.trim().is_empty() {
+        // A procedure has no return type on either engine, and `RETURNS` on one
+        // is a syntax error rather than a harmless extra.
+        if f.kind == RoutineKind::Function && f.returns.trim().is_empty() {
             out.push("The function needs a return type.".to_string());
         }
+        if f.kind == RoutineKind::Procedure && !f.returns.trim().is_empty() {
+            out.push("A procedure returns nothing — clear the return type.".to_string());
+        }
         if f.body.trim().is_empty() {
-            out.push("The function needs a body.".to_string());
+            out.push(format!("The {what} needs a body."));
         }
         // Not a syntax error — it creates fine and then fails on every write.
         if f.is_trigger_function() && !f.arguments.trim().is_empty() {
@@ -1192,27 +1265,62 @@ impl FunctionDraft {
 
 // ── The desired state of a standalone object ─────────────────────────────────
 
-/// Which of PostgreSQL's standalone objects a shared change is about.
+/// Which standalone object — one that hangs off the database rather than off a
+/// table — a browsing surface or a shared change is about.
 ///
-/// The three of them spell rename, drop and comment identically apart from one
+/// The first three spell rename, drop and comment identically apart from one
 /// keyword, so those get one [`Change`] arm each with this to say which — rather
 /// than nine arms differing by a string. Everything that genuinely diverges
 /// (adding an enum value, altering a domain's constraints, restarting a
 /// sequence) keeps its own arm.
+///
+/// **A routine is on this list to be *browsed*, not to be changed through those
+/// shared arms.** It is addressed by signature on PostgreSQL rather than by name
+/// ([`crate::schema::RoutineInfo::signature_sql`]), which is a difference the
+/// shared arms have no way to express — so it has its own four changes, and
+/// [`drop_object`] refuses it rather than emitting a bare-name `DROP` that
+/// happens to work until the first overload. What it buys by being here is every
+/// surface that lists objects by kind: the tree's folders, the search filter,
+/// Find-Anywhere and the Create menu, none of which would otherwise know it
+/// exists.
+///
+/// Two routine arms rather than one, because a function and a procedure are
+/// different objects to every statement that addresses one — `DROP FUNCTION`
+/// will not drop a procedure — so the keyword is per-kind here as it is
+/// everywhere else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectKind {
     Enum,
     Domain,
     Sequence,
+    Function,
+    Procedure,
 }
 
 impl ObjectKind {
+    /// Every kind, in the order the schema tree's folders and the Create menu
+    /// list them.
+    ///
+    /// One list, because there were four copies of `[Enum, Domain, Sequence]`
+    /// spread across the tree's folder builder, its two filter predicates and
+    /// Find-Anywhere — and a kind added to three of them is a kind the palette
+    /// silently cannot find.
+    pub const ALL: [ObjectKind; 5] = [
+        ObjectKind::Enum,
+        ObjectKind::Domain,
+        ObjectKind::Sequence,
+        ObjectKind::Function,
+        ObjectKind::Procedure,
+    ];
+
     /// What the object is called in a sentence a person reads.
     pub fn label(self) -> &'static str {
         match self {
             ObjectKind::Enum => "type",
             ObjectKind::Domain => "domain",
             ObjectKind::Sequence => "sequence",
+            ObjectKind::Function => "function",
+            ObjectKind::Procedure => "procedure",
         }
     }
 
@@ -1227,6 +1335,35 @@ impl ObjectKind {
             ObjectKind::Enum => "TYPE",
             ObjectKind::Domain => "DOMAIN",
             ObjectKind::Sequence => "SEQUENCE",
+            ObjectKind::Function => "FUNCTION",
+            ObjectKind::Procedure => "PROCEDURE",
+        }
+    }
+
+    /// Is this a stored routine — the kind the shared `RenameObject` /
+    /// `DropObject` / `SetObjectComment` arms cannot address?
+    ///
+    /// Asked as a capability by the three constructors that build those arms, so
+    /// the refusal is in one place and greppable, rather than each of them
+    /// carrying a `!= Function && != Procedure`.
+    pub fn is_routine(self) -> bool {
+        matches!(self, ObjectKind::Function | ObjectKind::Procedure)
+    }
+
+    /// The routine kind this is, when it is one.
+    pub fn routine_kind(self) -> Option<crate::schema::RoutineKind> {
+        match self {
+            ObjectKind::Function => Some(crate::schema::RoutineKind::Function),
+            ObjectKind::Procedure => Some(crate::schema::RoutineKind::Procedure),
+            _ => None,
+        }
+    }
+
+    /// The object kind a routine is browsed as.
+    pub fn of_routine(kind: crate::schema::RoutineKind) -> ObjectKind {
+        match kind {
+            crate::schema::RoutineKind::Function => ObjectKind::Function,
+            crate::schema::RoutineKind::Procedure => ObjectKind::Procedure,
         }
     }
 }
@@ -1555,21 +1692,37 @@ impl Default for ObjectDraft {
 impl ObjectDraft {
     /// The draft that describes an introspected object exactly — the editor's
     /// starting point, and the input to the round-trip gate.
-    pub fn from_item(o: &crate::schema::ObjectItem) -> ObjectDraft {
+    ///
+    /// `None` for a **routine**, which this modal does not edit: its draft is a
+    /// [`RoutineDraft`] and its form is a different one. Returning an `Option`
+    /// rather than picking an arm is the point — a routine handed to the object
+    /// editor would open a type form over a function, and the type-level refusal
+    /// is what makes the caller route it to [`RoutineDraft`] instead.
+    pub fn from_item(o: &crate::schema::ObjectItem) -> Option<ObjectDraft> {
         match o {
-            crate::schema::ObjectItem::Enum(e) => ObjectDraft::Enum(EnumDraft::from_info(e)),
-            crate::schema::ObjectItem::Domain(d) => ObjectDraft::Domain(DomainDraft::from_info(d)),
-            crate::schema::ObjectItem::Sequence(s) => {
-                ObjectDraft::Sequence(SequenceDraft::from_info(s))
+            crate::schema::ObjectItem::Enum(e) => Some(ObjectDraft::Enum(EnumDraft::from_info(e))),
+            crate::schema::ObjectItem::Domain(d) => {
+                Some(ObjectDraft::Domain(DomainDraft::from_info(d)))
             }
+            crate::schema::ObjectItem::Sequence(s) => {
+                Some(ObjectDraft::Sequence(SequenceDraft::from_info(s)))
+            }
+            crate::schema::ObjectItem::Routine(_) => None,
         }
     }
 
-    pub fn blank(kind: ObjectKind, name: impl Into<String>, schema: Option<String>) -> ObjectDraft {
+    /// A blank draft of one kind, or `None` for a routine — see
+    /// [`ObjectDraft::from_item`].
+    pub fn blank(
+        kind: ObjectKind,
+        name: impl Into<String>,
+        schema: Option<String>,
+    ) -> Option<ObjectDraft> {
         match kind {
-            ObjectKind::Enum => ObjectDraft::Enum(EnumDraft::blank(name, schema)),
-            ObjectKind::Domain => ObjectDraft::Domain(DomainDraft::blank(name, schema)),
-            ObjectKind::Sequence => ObjectDraft::Sequence(SequenceDraft::blank(name, schema)),
+            ObjectKind::Enum => Some(ObjectDraft::Enum(EnumDraft::blank(name, schema))),
+            ObjectKind::Domain => Some(ObjectDraft::Domain(DomainDraft::blank(name, schema))),
+            ObjectKind::Sequence => Some(ObjectDraft::Sequence(SequenceDraft::blank(name, schema))),
+            ObjectKind::Function | ObjectKind::Procedure => None,
         }
     }
 
@@ -1765,19 +1918,30 @@ pub enum Change {
     DropTrigger {
         name: String,
     },
-    /// Create a function that doesn't exist yet — plain `CREATE FUNCTION`, so a
+    /// Create a routine that doesn't exist yet — a plain `CREATE`, so a
     /// signature already taken fails instead of silently replacing someone
     /// else's routine.
-    CreateFunction(Box<FunctionDraft>),
-    /// Redefine an existing function in place, restating every option.
-    ReplaceFunction(Box<FunctionDraft>),
-    /// PostgreSQL renames a function in place, so unlike a trigger this is a
-    /// change of its own and the triggers bound to it keep working.
-    RenameFunction {
+    CreateRoutine(Box<RoutineDraft>),
+    /// Redefine an existing routine, restating every option.
+    ///
+    /// `recreate` says how: PostgreSQL replaces in place with `CREATE OR
+    /// REPLACE`, MySQL has no such form and must `DROP` first. Carried on the
+    /// change rather than re-derived at emit time for the reason
+    /// [`Change::ReplaceView`] carries the same flag — the preview's risk
+    /// sentence and the emitted SQL have to be answering the same question.
+    ReplaceRoutine {
+        draft: Box<RoutineDraft>,
+        recreate: bool,
+    },
+    /// PostgreSQL renames a routine in place, so unlike a trigger this is a
+    /// change of its own and the triggers bound to it keep working. MySQL has no
+    /// verb for it: [`diff_routine`] folds a rename there into the recreate it is
+    /// already performing, so this arm never reaches that emitter.
+    RenameRoutine {
         from: Box<RoutineInfo>,
         to: String,
     },
-    DropFunction(Box<RoutineInfo>),
+    DropRoutine(Box<RoutineInfo>),
     /// Create an enum type that doesn't exist yet.
     CreateEnum(Box<EnumInfo>),
     /// `ALTER TYPE … ADD VALUE`. One change per value, so the preview lists each
@@ -2038,12 +2202,27 @@ impl Change {
                 }
             }
             Change::DropTrigger { name } => format!("Drop trigger {name}"),
-            Change::CreateFunction(d) => format!("Create function {}", d.info.name),
-            Change::ReplaceFunction(d) => format!("Redefine function {}", d.info.name),
-            Change::RenameFunction { from, to } => {
-                format!("Rename function {} to {to}", from.name)
+            Change::CreateRoutine(d) => {
+                format!("Create {} {}", d.info.kind.label(), d.info.name)
             }
-            Change::DropFunction(f) => format!("Drop function {}", f.name),
+            // "Re-create" where the engine has to drop first, "Redefine" where it
+            // replaces in place — the same distinction the trigger and view
+            // summaries draw, and the one thing that tells a reader whether the
+            // routine stops existing for a moment.
+            Change::ReplaceRoutine { draft, recreate } => {
+                let what = draft.info.kind.label();
+                let server = draft.original.as_deref().unwrap_or(&draft.info.name);
+                let verb = if *recreate { "Re-create" } else { "Redefine" };
+                if server != draft.info.name {
+                    format!("{verb} {what} {server} as {}", draft.info.name)
+                } else {
+                    format!("{verb} {what} {}", draft.info.name)
+                }
+            }
+            Change::RenameRoutine { from, to } => {
+                format!("Rename {} {} to {to}", from.kind.label(), from.name)
+            }
+            Change::DropRoutine(f) => format!("Drop {} {}", f.kind.label(), f.name),
             Change::CreateEnum(e) => format!(
                 "Create type {} with {} value{}",
                 e.name,
@@ -2244,14 +2423,33 @@ impl Change {
             // said: a function is shared, so every trigger bound to it starts
             // doing something else the moment this runs — including triggers on
             // tables this edit never mentioned.
-            Change::ReplaceFunction(d) => vec![format!(
-                "Redefines {}. Every trigger bound to it runs the new body from \
-                 now on, including any on other tables.",
-                d.info.name
-            )],
-            Change::DropFunction(f) => vec![format!(
-                "Drops function {}. PostgreSQL refuses while a trigger still \
-                 uses it, so any that do have to be dropped first.",
+            Change::ReplaceRoutine { draft, recreate } => {
+                let f = &draft.info;
+                let mut out = vec![format!(
+                    "Redefines {}. Everything that calls it runs the new body from \
+                     now on, including triggers on other tables this edit never \
+                     mentioned.",
+                    f.name
+                )];
+                // The same sentence `ReplaceTrigger` earns, and for the same
+                // reason: MySQL has no `CREATE OR REPLACE` for a routine and no
+                // transactional DDL, so the `DROP` commits on its own and a
+                // rejected new definition leaves nothing behind at all.
+                if *recreate {
+                    out.push(format!(
+                        "Re-creating {} drops it first. Where DDL isn't transactional \
+                         (MySQL), a new definition the server rejects leaves no \
+                         {} at all.",
+                        f.name,
+                        f.kind.label()
+                    ));
+                }
+                out
+            }
+            Change::DropRoutine(f) => vec![format!(
+                "Drops {} {}. PostgreSQL refuses while a trigger still uses it, so \
+                 any that do have to be dropped first.",
+                f.kind.label(),
                 f.name
             )],
             // Nothing is destroyed and it still has to be said, because it is the
@@ -2695,28 +2893,11 @@ impl ChangeSet {
     /// does — a function body there is dollar-quoted, which `skip_noncode`
     /// already sees through.
     pub fn editor_script(&self) -> String {
-        let stmts = self.emit();
-        let head = self.withheld_header();
-        // `DELIMITER` is **MySQL's client directive**, so this is asked as
-        // `!= MySql` rather than `!= Postgres`: SQLite would be handed a word it
-        // has no idea about, at the top of the very script the escape hatch
-        // exists to make runnable. It needs none of it — `statement_bounds`
-        // knows a SQLite trigger's body runs to the `;` after its `END`.
-        if self.dialect != SqlDialect::MySql
-            || !stmts.iter().any(|s| needs_delimiter(s, self.dialect))
-        {
-            return format!("{head}{}", stmts.join("\n\n"));
-        }
-        let mut out = format!("{head}DELIMITER $$\n\n");
-        out.push_str(
-            &stmts
-                .iter()
-                .map(|s| format!("{}$$", s.trim_end().trim_end_matches(';')))
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        );
-        out.push_str("\n\nDELIMITER ;");
-        out
+        format!(
+            "{}{}",
+            self.withheld_header(),
+            client_script(&self.emit(), self.dialect)
+        )
     }
 
     fn q(&self, name: &str) -> String {
@@ -2742,7 +2923,7 @@ impl ChangeSet {
         // function it executes exists. Today a change set only ever holds one
         // kind, so nothing depends on this yet — which is exactly why it's worth
         // getting right now rather than discovering it later.
-        out.extend(self.function_statements());
+        out.extend(self.routine_statements());
         out.extend(self.trigger_statements());
         // The standalone objects are PostgreSQL's, so this contributes nothing on
         // a MySQL connection. It is still called from *both* emitters rather than
@@ -2910,7 +3091,7 @@ impl ChangeSet {
         // function it executes exists. Today a change set only ever holds one
         // kind, so nothing depends on this yet — which is exactly why it's worth
         // getting right now rather than discovering it later.
-        out.extend(self.function_statements());
+        out.extend(self.routine_statements());
         out.extend(self.trigger_statements());
         out.extend(self.object_statements());
         for c in &self.changes {
@@ -3334,37 +3515,69 @@ impl ChangeSet {
         drops
     }
 
-    /// The function statements, in the order they must run.
+    /// The routine statements, in the order they must run.
     ///
     /// A rename goes **after** the redefinition, not before: `CREATE OR REPLACE`
     /// has to address the signature the server already has, and only then can
     /// `ALTER FUNCTION … RENAME` move it — the same ordering
     /// [`ChangeSet::view_statements`] uses, and for the same reason.
-    fn function_statements(&self) -> Vec<String> {
+    ///
+    /// Every `CREATE` goes out through [`session_wrapped`], which is a no-op
+    /// unless the routine carries MySQL session state. It is not optional there:
+    /// a routine written under `sql_mode = ''` and recreated under a strict one
+    /// starts raising on rows it used to truncate, and MySQL has no clause on
+    /// `CREATE PROCEDURE` to say so.
+    fn routine_statements(&self) -> Vec<String> {
         let d = self.dialect;
         let mut out = Vec::new();
         for c in &self.changes {
             match c {
-                Change::CreateFunction(draft) => out.push(draft.info.create_sql(d, false)),
-                Change::ReplaceFunction(draft) => {
-                    // Address the name the server knows; the rename runs after.
-                    let mut server = draft.info.clone();
-                    if let Some(orig) = &draft.original {
-                        server.name = orig.clone();
-                    }
-                    out.push(server.create_sql(d, true));
+                Change::CreateRoutine(draft) => {
+                    let f = &draft.info;
+                    out.extend(session_wrapped(f.create_sql(d, false), f, d));
                 }
-                Change::RenameFunction { from, to } => out.push(format!(
-                    "ALTER FUNCTION {} RENAME TO {};",
+                Change::ReplaceRoutine { draft, recreate } => {
+                    // **The drop names the routine the server holds; the create
+                    // names the one the draft wants.** They are the same name on
+                    // PostgreSQL — `diff_routine` puts the rename in a change of
+                    // its own there, so the replace addresses the old signature
+                    // and the `ALTER … RENAME` runs after — and they differ on
+                    // MySQL, where a rename has no verb and rides this recreate.
+                    // Taking `original` for both was that engine's rename
+                    // silently doing nothing.
+                    if *recreate {
+                        let mut server = draft.info.clone();
+                        if let Some(orig) = &draft.original {
+                            server.name = orig.clone();
+                        }
+                        // `IF EXISTS`, so a plan that has to drop first still
+                        // applies against a routine someone else already removed,
+                        // rather than failing on step one and leaving the create
+                        // unrun.
+                        out.push(format!(
+                            "DROP {} IF EXISTS {};",
+                            server.kind.sql_keyword(),
+                            server.signature_sql(d)
+                        ));
+                    }
+                    let f = &draft.info;
+                    out.extend(session_wrapped(f.create_sql(d, !*recreate), f, d));
+                }
+                Change::RenameRoutine { from, to } => out.push(format!(
+                    "ALTER {} {} RENAME TO {};",
+                    from.kind.sql_keyword(),
                     from.signature_sql(d),
                     ddl_ident_in(to, d)
                 )),
-                // By signature, not by name: PostgreSQL identifies a function by
+                // By signature, not by name: PostgreSQL identifies a routine by
                 // its argument types, and a bare name is ambiguous the moment an
-                // overload exists.
-                Change::DropFunction(f) => {
-                    out.push(format!("DROP FUNCTION {};", f.signature_sql(d)))
-                }
+                // overload exists. `signature_sql` is what knows that MySQL is
+                // the other way round.
+                Change::DropRoutine(f) => out.push(format!(
+                    "DROP {} {};",
+                    f.kind.sql_keyword(),
+                    f.signature_sql(d)
+                )),
                 _ => {}
             }
         }
@@ -4518,7 +4731,40 @@ fn fks_equal(a: &ForeignKeyInfo, b: &ForeignKeyInfo) -> bool {
 /// nobody asked for. Restoring from a user variable rather than a literal keeps
 /// the connection as it was found, whatever it was.
 fn session_wrapped_create(t: &TriggerInfo, d: SqlDialect) -> Vec<String> {
-    let create = t.create_sql(d);
+    session_wrapped_with(
+        t.create_sql(d),
+        t.sql_mode.as_deref(),
+        t.charset_client.as_deref(),
+        t.collation_connection.as_deref(),
+        d,
+    )
+}
+
+/// The same wrapper for a stored routine, which carries the same three values
+/// for the same reason — `CREATE PROCEDURE` has no clause for any of them
+/// either, and on this engine a routine is dropped and recreated on **every**
+/// edit, so an unwrapped recreate silently re-files the routine under whatever
+/// mode the applying session happened to have.
+///
+/// One helper for both rather than two, because the failure it prevents is the
+/// same failure and the two had already been written once.
+fn session_wrapped(create: String, r: &RoutineInfo, d: SqlDialect) -> Vec<String> {
+    session_wrapped_with(
+        create,
+        r.sql_mode.as_deref(),
+        r.charset_client.as_deref(),
+        r.collation_connection.as_deref(),
+        d,
+    )
+}
+
+fn session_wrapped_with(
+    create: String,
+    sql_mode: Option<&str>,
+    charset_client: Option<&str>,
+    collation_connection: Option<&str>,
+    d: SqlDialect,
+) -> Vec<String> {
     // MySQL's problem alone. PostgreSQL's trigger carries no session state, and
     // SQLite has no `SET SESSION` to carry it with — asked as `!= MySql` so a
     // third engine can't inherit `SET SESSION sql_mode = …` by falling through.
@@ -4526,9 +4772,9 @@ fn session_wrapped_create(t: &TriggerInfo, d: SqlDialect) -> Vec<String> {
         return vec![create];
     }
     let settings: Vec<(&str, &str)> = [
-        ("sql_mode", t.sql_mode.as_deref()),
-        ("character_set_client", t.charset_client.as_deref()),
-        ("collation_connection", t.collation_connection.as_deref()),
+        ("sql_mode", sql_mode),
+        ("character_set_client", charset_client),
+        ("collation_connection", collation_connection),
     ]
     .into_iter()
     .filter_map(|(k, v)| v.map(|v| (k, v)))
@@ -4720,11 +4966,65 @@ fn norm_check_expr(s: &str, dialect: SqlDialect) -> String {
     out
 }
 
+/// Statements as a script a **client** that splits on `;` can run.
+///
+/// Two rules, and both exist because something handed a user a script it could
+/// not run itself.
+///
+/// **Every statement is terminated.** Most already are, but a MySQL routine's
+/// `CREATE` deliberately isn't — its body is a compound statement and
+/// `Db::run_ddl` sends each plan step whole, so the emitter leaves the `;` off.
+/// The moment two of those are joined for a reader (the schema tree's
+/// `Generate DDL` over a Functions folder, or a whole database's script) they
+/// run together with nothing between them.
+///
+/// **A statement carrying an internal `;` is wrapped in `DELIMITER $$` …
+/// `DELIMITER ;`**, the form `mysqldump` writes and [`sql::statement_bounds`]
+/// reads. Nothing is wrapped when nothing needs it, and PostgreSQL never does —
+/// a function body there is dollar-quoted, which `skip_noncode` already sees
+/// through.
+///
+/// `DELIMITER` is **MySQL's client directive**, so the gate is `== MySql` rather
+/// than `!= Postgres`: SQLite would be handed a word it has no idea about, at
+/// the top of the very script the escape hatch exists to make runnable. It needs
+/// none of it — `statement_bounds` knows a SQLite trigger's body runs to the `;`
+/// after its `END`.
+pub fn client_script(stmts: &[String], dialect: SqlDialect) -> String {
+    if dialect != SqlDialect::MySql || !stmts.iter().any(|s| needs_delimiter(s, dialect)) {
+        return stmts
+            .iter()
+            .map(|s| terminated(s))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+    }
+    let mut out = String::from("DELIMITER $$\n\n");
+    out.push_str(
+        &stmts
+            .iter()
+            .map(|s| format!("{}$$", s.trim_end().trim_end_matches(';')))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    );
+    out.push_str("\n\nDELIMITER ;");
+    out
+}
+
+/// One statement, ending in the `;` a client splits on. A no-op for the many
+/// that already carry theirs.
+fn terminated(stmt: &str) -> String {
+    let t = stmt.trim_end();
+    if t.ends_with(';') {
+        t.to_string()
+    } else {
+        format!("{t};")
+    }
+}
+
 /// Does this statement carry a `;` anywhere but at its very end?
 ///
 /// The test for "a client splitting on `;` would cut this in half" — see
-/// [`ChangeSet::editor_script`]. Through [`sql::statement_bounds`], so a `;`
-/// inside a string or a comment doesn't count.
+/// [`client_script`]. Through [`sql::statement_bounds`], so a `;` inside a
+/// string or a comment doesn't count.
 fn needs_delimiter(stmt: &str, dialect: SqlDialect) -> bool {
     let end = stmt.trim_end().len();
     sql::statement_bounds(stmt, dialect)
@@ -4960,6 +5260,64 @@ pub fn supports_trigger_editing(dialect: SqlDialect) -> bool {
                 name: String::new(),
             },
         )
+}
+
+/// Can `dialect` have its **stored routines** edited here?
+///
+/// MySQL and PostgreSQL, not SQLite — which has no stored routines at all, so
+/// the answer there is not "unfinished work" but "there is nothing to edit".
+///
+/// Computed from [`supports_change`] rather than stated, for the reason
+/// [`supports_view_editing`] gives, and over all three statements an editor
+/// cannot do without: an editor that can create a routine but not redefine or
+/// drop one is not an editor, and on the engine that has no replace the drop is
+/// the half every edit depends on.
+pub fn supports_routine_editing(dialect: SqlDialect) -> bool {
+    supports_change(dialect, &Change::CreateRoutine(Box::default()))
+        && supports_change(
+            dialect,
+            &Change::ReplaceRoutine {
+                draft: Box::default(),
+                // The route this engine would really be handed, so the probe is
+                // the change the editor builds rather than a shape of it.
+                recreate: !supports_or_replace_routine(dialect),
+            },
+        )
+        && supports_change(dialect, &Change::DropRoutine(Box::default()))
+}
+
+/// Can `dialect` redefine a routine **in place**, with `CREATE OR REPLACE`?
+///
+/// PostgreSQL can. **MySQL cannot** — `CREATE OR REPLACE PROCEDURE` is not a
+/// statement there, and neither is any `ALTER` that reaches the body — so every
+/// edit is a `DROP` plus a `CREATE`, the same route SQLite takes for a view.
+///
+/// MariaDB *does* have `CREATE OR REPLACE PROCEDURE`, and this deliberately
+/// doesn't ask: it drops and recreates internally, so what it buys is one
+/// round trip rather than atomicity, and the [`ServerFlavour`] fork would have
+/// to be threaded through the emitter to collect it.
+///
+/// An exhaustive `match` rather than a `== Postgres`, so a fourth engine has to
+/// answer rather than inheriting whichever side it falls on.
+pub fn supports_or_replace_routine(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Sqlite => false,
+    }
+}
+
+/// Can `dialect` rename a routine with a statement, leaving its body alone?
+///
+/// PostgreSQL has `ALTER FUNCTION … RENAME TO`. MySQL has nothing: `ALTER
+/// PROCEDURE` there sets the characteristics and the comment and cannot touch
+/// the name, so a rename rides along with the re-create every edit already
+/// performs — which is why [`diff_routine`] treats a bare rename there as a
+/// redefinition, exactly as [`diff_view`] does on SQLite.
+pub fn supports_routine_rename(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Sqlite => false,
+    }
 }
 
 /// Can a table be **designed** on `dialect` — the question every entry that
@@ -5894,6 +6252,13 @@ pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
 /// rebuild in disguise: a foreign key or a constraint-backed index can only
 /// come off by recreating the table around it.
 ///
+/// **Stored routines are absent from the list below, and that absence is the
+/// answer rather than a gap**: SQLite has no `CREATE PROCEDURE`, no
+/// `CREATE FUNCTION` and no catalogue of either — a function there is registered
+/// by the host program, not stored in the database. So
+/// [`supports_routine_editing`] is false, the tree grows no folder and the
+/// Create menu no entry.
+///
 /// **This is the gate now that `run_ddl` executes a SQLite plan instead of
 /// refusing every one.** The menus consult it so an entry that can't work is
 /// absent, and the emitter honours it so a change that slipped through emits
@@ -6729,33 +7094,48 @@ pub fn drop_trigger(t: &TriggerInfo, dialect: SqlDialect) -> ChangeSet {
     }
 }
 
-/// Everything that has to happen to turn the function `current` into `draft`.
+/// Everything that has to happen to turn the routine `current` into `draft`.
 ///
-/// Same round-trip gate as [`diff`]: a function diffed against its own draft
-/// must produce nothing.
+/// Same round-trip gate as [`diff`]: a routine diffed against its own draft must
+/// produce nothing.
 ///
-/// Unlike a trigger, a rename is its own change — PostgreSQL renames a function
-/// in place with `ALTER FUNCTION … RENAME TO`, and every trigger bound to it
-/// keeps working, so there is no reason to pay for a drop-and-create.
-pub fn diff_function(
-    current: &RoutineInfo,
-    draft: &FunctionDraft,
-    dialect: SqlDialect,
-) -> ChangeSet {
+/// **Where a rename lands is per-engine, and it is the whole reason this isn't
+/// two lines.** PostgreSQL renames a routine in place with
+/// `ALTER FUNCTION … RENAME TO`, every trigger bound to it keeps working, and
+/// paying for a drop-and-create would be pure waste — so there a rename is a
+/// change of its own, ordered after the redefinition that addresses the name the
+/// server still knows. MySQL has no verb for it at all, so a rename there is
+/// folded into the recreate: the drop names the old routine and the create names
+/// the new one, which is the same resolution [`diff_view`] performs for SQLite.
+/// A bare rename on MySQL is therefore a *redefinition*, and says so in the
+/// preview rather than emitting an `ALTER` the server would reject.
+pub fn diff_routine(current: &RoutineInfo, draft: &RoutineDraft, dialect: SqlDialect) -> ChangeSet {
     let mut changes: Vec<Change> = Vec::new();
+    let recreate = !supports_or_replace_routine(dialect);
+    let rename_alone = supports_routine_rename(dialect);
     let renamed = draft.info.name != current.name && !draft.info.name.trim().is_empty();
-    // Compare everything *except* the name, which the rename below owns.
+    // Compare everything *except* the name when the rename is its own change;
+    // where it isn't, the name is part of what the recreate carries.
     let mut same_name = draft.info.clone();
-    same_name.name = current.name.clone();
+    if rename_alone {
+        same_name.name = current.name.clone();
+    }
     if same_name != *current {
         let mut d = draft.clone();
-        // The replace addresses the server's signature; the rename runs after.
-        d.info.name = current.name.clone();
+        if rename_alone {
+            // The replace addresses the server's signature; the rename runs after.
+            d.info.name = current.name.clone();
+        }
+        // Either way `original` is the name the server holds — it is what the
+        // `DROP` half of a recreate has to address.
         d.original = Some(current.name.clone());
-        changes.push(Change::ReplaceFunction(Box::new(d)));
+        changes.push(Change::ReplaceRoutine {
+            draft: Box::new(d),
+            recreate,
+        });
     }
-    if renamed {
-        changes.push(Change::RenameFunction {
+    if renamed && rename_alone {
+        changes.push(Change::RenameRoutine {
             from: Box::new(current.clone()),
             to: draft.info.name.clone(),
         });
@@ -6769,25 +7149,25 @@ pub fn diff_function(
     }
 }
 
-/// The `CREATE FUNCTION` for a brand-new function.
-pub fn create_function(draft: &FunctionDraft, dialect: SqlDialect) -> ChangeSet {
+/// The `CREATE` for a brand-new routine.
+pub fn create_routine(draft: &RoutineDraft, dialect: SqlDialect) -> ChangeSet {
     ChangeSet {
         table: draft.info.name.clone(),
         schema: draft.info.schema.clone(),
         dialect,
         flavour: ServerFlavour::Unknown,
-        changes: vec![Change::CreateFunction(Box::new(draft.clone()))],
+        changes: vec![Change::CreateRoutine(Box::new(draft.clone()))],
     }
 }
 
-/// The `DROP FUNCTION` for one function.
-pub fn drop_function(f: &RoutineInfo, dialect: SqlDialect) -> ChangeSet {
+/// The `DROP` for one routine — the context menu's shortcut.
+pub fn drop_routine(f: &RoutineInfo, dialect: SqlDialect) -> ChangeSet {
     ChangeSet {
         table: f.name.clone(),
         schema: f.schema.clone(),
         dialect,
         flavour: ServerFlavour::Unknown,
-        changes: vec![Change::DropFunction(Box::new(f.clone()))],
+        changes: vec![Change::DropRoutine(Box::new(f.clone()))],
     }
 }
 
@@ -7133,13 +7513,35 @@ pub fn create_sequence(draft: &SequenceDraft, dialect: SqlDialect) -> ChangeSet 
 }
 
 /// The `DROP` for one standalone object — the context menu's shortcut.
+///
+/// **Empty for a routine**, which this cannot address: PostgreSQL identifies one
+/// by its argument types and a name is all that arrives here, so the statement
+/// this would build is right up until the first overload and then drops the
+/// wrong routine or none. [`drop_routine`] takes the whole [`RoutineInfo`] and
+/// is the route; an empty set opens a preview that says "no changes" rather than
+/// emitting a guess, which is the visible failure rather than the silent one.
 pub fn drop_object(
     kind: ObjectKind,
     name: &str,
     schema: Option<&str>,
     dialect: SqlDialect,
 ) -> ChangeSet {
+    if kind.is_routine() {
+        return object_set_empty(name, schema, dialect);
+    }
     object_set(name, schema, dialect, Change::DropObject { kind })
+}
+
+/// A no-change set against a named object. See [`drop_object`] for why one is
+/// ever built.
+fn object_set_empty(name: &str, schema: Option<&str>, dialect: SqlDialect) -> ChangeSet {
+    ChangeSet {
+        table: name.to_string(),
+        schema: schema.map(str::to_string),
+        dialect,
+        flavour: ServerFlavour::Unknown,
+        changes: Vec::new(),
+    }
 }
 
 /// A one-change set against a standalone object. [`single`]'s counterpart, kept
@@ -9086,8 +9488,8 @@ mod tests {
         #[test]
         fn an_untouched_function_is_not_a_change() {
             let f = fnc();
-            let d = FunctionDraft::from_info(&f);
-            assert!(diff_function(&f, &d, Postgres).changes.is_empty());
+            let d = RoutineDraft::from_info(&f);
+            assert!(diff_routine(&f, &d, Postgres).changes.is_empty());
         }
 
         /// PostgreSQL renames a function in place and the triggers bound to it
@@ -9095,9 +9497,9 @@ mod tests {
         #[test]
         fn renaming_a_function_is_a_rename_not_a_recreate() {
             let f = fnc();
-            let mut d = FunctionDraft::from_info(&f);
+            let mut d = RoutineDraft::from_info(&f);
             d.info.name = "audit2".into();
-            let cs = diff_function(&f, &d, Postgres);
+            let cs = diff_routine(&f, &d, Postgres);
             assert_eq!(cs.changes.len(), 1);
             assert_eq!(
                 cs.emit(),
@@ -9110,10 +9512,10 @@ mod tests {
         #[test]
         fn a_rename_with_a_body_edit_replaces_under_the_old_name_first() {
             let f = fnc();
-            let mut d = FunctionDraft::from_info(&f);
+            let mut d = RoutineDraft::from_info(&f);
             d.info.name = "audit2".into();
             d.info.body = "BEGIN RETURN OLD; END;".into();
-            let sql = diff_function(&f, &d, Postgres).emit();
+            let sql = diff_routine(&f, &d, Postgres).emit();
             assert_eq!(sql.len(), 2);
             assert!(
                 sql[0].contains("CREATE OR REPLACE FUNCTION \"audit\"()"),
@@ -9129,7 +9531,7 @@ mod tests {
         /// `SET search_path` most of all, since dropping it from a SECURITY
         /// DEFINER function is a privilege-escalation hole.
         #[test]
-        fn create_function_restates_every_option() {
+        fn create_routine_restates_every_option() {
             let mut f = fnc();
             f.security_definer = true;
             f.strict = true;
@@ -9173,11 +9575,11 @@ mod tests {
 
         /// By signature, not by name: an overload makes a bare name ambiguous.
         #[test]
-        fn drop_function_names_the_signature() {
+        fn drop_routine_names_the_signature() {
             let mut f = fnc();
             f.arguments = "a integer, b text".into();
             assert_eq!(
-                drop_function(&f, Postgres).emit(),
+                drop_routine(&f, Postgres).emit(),
                 vec!["DROP FUNCTION \"audit\"(a integer, b text);"]
             );
         }
@@ -9187,17 +9589,17 @@ mod tests {
         #[test]
         fn replacing_a_function_states_the_reach_of_the_change() {
             let f = fnc();
-            let mut d = FunctionDraft::from_info(&f);
+            let mut d = RoutineDraft::from_info(&f);
             d.info.body = "BEGIN RETURN OLD; END;".into();
-            let risks = diff_function(&f, &d, Postgres).destructive();
+            let risks = diff_routine(&f, &d, Postgres).destructive();
             assert_eq!(risks.len(), 1);
             assert!(risks[0].contains("other tables"), "{risks:?}");
         }
 
         #[test]
         fn a_blank_trigger_function_starts_valid_and_returns() {
-            let d = FunctionDraft::blank_trigger("f", None);
-            assert!(d.validate().is_empty());
+            let d = RoutineDraft::blank_trigger("f", None);
+            assert!(d.validate(Postgres).is_empty());
             // The most common first-run failure is a body that never returns.
             assert!(d.info.body.contains("RETURN NEW"));
             assert!(d.info.is_trigger_function());
@@ -9205,15 +9607,334 @@ mod tests {
 
         #[test]
         fn validate_catches_the_empty_draft_and_a_declared_argument() {
-            let d = FunctionDraft::default();
-            let msgs = d.validate().join(" | ");
+            let d = RoutineDraft::default();
+            let msgs = d.validate(Postgres).join(" | ");
             assert!(msgs.contains("needs a name"), "{msgs}");
             assert!(msgs.contains("needs a language"), "{msgs}");
             assert!(msgs.contains("needs a body"), "{msgs}");
 
-            let mut d = FunctionDraft::blank_trigger("f", None);
+            let mut d = RoutineDraft::blank_trigger("f", None);
             d.info.arguments = "a integer".into();
-            assert!(d.validate().join(" | ").contains("TG_ARGV"));
+            assert!(d.validate(Postgres).join(" | ").contains("TG_ARGV"));
+        }
+
+        /// MySQL has no `LANGUAGE` clause on a routine at all, so demanding one
+        /// there would block every MySQL edit on a field the form cannot even
+        /// offer.
+        #[test]
+        fn the_language_rule_is_postgresqls_alone() {
+            let d = RoutineDraft::blank(RoutineKind::Procedure, "p", None, MySql);
+            assert!(d.validate(MySql).is_empty(), "{:?}", d.validate(MySql));
+
+            let mut bare = RoutineDraft::blank(RoutineKind::Function, "f", None, Postgres);
+            bare.info.language = String::new();
+            assert!(
+                bare.validate(Postgres)
+                    .join(" | ")
+                    .contains("needs a language"),
+                "PostgreSQL still requires one"
+            );
+        }
+
+        /// A procedure has no return type on either engine, and `RETURNS` on one
+        /// is a syntax error rather than a harmless extra.
+        #[test]
+        fn a_procedure_is_refused_a_return_type_and_a_function_needs_one() {
+            let mut p = RoutineDraft::blank(RoutineKind::Procedure, "p", None, Postgres);
+            assert!(p.validate(Postgres).is_empty());
+            p.info.returns = "integer".into();
+            assert!(
+                p.validate(Postgres).join(" | ").contains("returns nothing"),
+                "{:?}",
+                p.validate(Postgres)
+            );
+
+            let mut f = RoutineDraft::blank(RoutineKind::Function, "f", None, Postgres);
+            f.info.returns = String::new();
+            assert!(f.validate(Postgres).join(" | ").contains("return type"));
+        }
+
+        /// Both engines' blank drafts have to be *valid* — a New-routine modal
+        /// that opens on a validation error is one the user has to fix before
+        /// they have written anything.
+        #[test]
+        fn every_blank_routine_starts_valid() {
+            for dialect in [Postgres, MySql] {
+                for kind in [RoutineKind::Function, RoutineKind::Procedure] {
+                    let d = RoutineDraft::blank(kind, "r", None, dialect);
+                    assert!(
+                        d.validate(dialect).is_empty(),
+                        "{dialect:?}/{kind:?}: {:?}",
+                        d.validate(dialect)
+                    );
+                    assert_eq!(d.info.kind, kind);
+                }
+                // Each engine's own security default, because the clause is
+                // stated either way and the two disagree.
+                assert_eq!(
+                    RoutineDraft::blank(RoutineKind::Function, "r", None, dialect)
+                        .info
+                        .security_definer,
+                    dialect == MySql,
+                    "{dialect:?}"
+                );
+            }
+        }
+
+        fn my_proc() -> RoutineInfo {
+            RoutineInfo {
+                name: "restock".into(),
+                schema: None,
+                kind: RoutineKind::Procedure,
+                arguments: "IN sku VARCHAR(20), IN qty INT".into(),
+                returns: String::new(),
+                language: "SQL".into(),
+                body: "BEGIN\n    UPDATE stock SET n = n + qty WHERE sku = sku;\nEND".into(),
+                deterministic: false,
+                data_access: crate::schema::SqlDataAccess::ModifiesSqlData,
+                definer: Some("root@localhost".into()),
+                comment: Some("restocks".into()),
+                ..Default::default()
+            }
+        }
+
+        /// MySQL's `CREATE PROCEDURE` restates everything an edit would
+        /// otherwise reset, in the clause order the parser demands — and the
+        /// parameter list is **not** part of the name, which is where the
+        /// PostgreSQL spelling of `signature_sql` would have put it.
+        #[test]
+        fn a_mysql_procedure_restates_every_characteristic() {
+            let sql = my_proc().create_sql(MySql, false);
+            assert!(
+                sql.starts_with("CREATE DEFINER = `root`@`localhost` PROCEDURE `restock`("),
+                "{sql}"
+            );
+            assert!(sql.contains("IN sku VARCHAR(20), IN qty INT)"), "{sql}");
+            // A procedure has no RETURNS on this engine either.
+            assert!(!sql.contains("RETURNS"), "{sql}");
+            assert!(sql.contains("NOT DETERMINISTIC"), "{sql}");
+            assert!(sql.contains("MODIFIES SQL DATA"), "{sql}");
+            assert!(sql.contains("SQL SECURITY INVOKER"), "{sql}");
+            assert!(sql.contains("COMMENT 'restocks'"), "{sql}");
+            assert!(sql.trim_end().ends_with("END"), "{sql}");
+        }
+
+        /// MySQL's `SQL SECURITY` default is **DEFINER**, the opposite of
+        /// PostgreSQL's — so the clause is written either way rather than left
+        /// unstated, which is what the two engines' silence disagreeing means.
+        #[test]
+        fn the_mysql_security_clause_is_stated_in_both_directions() {
+            let mut r = my_proc();
+            assert!(r.create_sql(MySql, false).contains("SQL SECURITY INVOKER"));
+            r.security_definer = true;
+            assert!(r.create_sql(MySql, false).contains("SQL SECURITY DEFINER"));
+            // PostgreSQL's default is INVOKER, and saying so adds nothing.
+            let f = fnc();
+            assert!(!f.create_sql(Postgres, false).contains("SECURITY"));
+        }
+
+        /// MySQL has no `CREATE OR REPLACE` for a routine, so an edit there is a
+        /// `DROP` and a `CREATE` — and the `DROP` has to name the routine the
+        /// server still holds, not the one the draft is renaming it to.
+        #[test]
+        fn a_mysql_edit_drops_then_creates_under_the_new_name() {
+            let cur = my_proc();
+            let mut d = RoutineDraft::from_info(&cur);
+            d.info.name = "restock_v2".into();
+            d.info.body = "BEGIN\n    SELECT 1;\nEND".into();
+            let sql = diff_routine(&cur, &d, MySql).emit();
+            assert_eq!(sql.len(), 2, "{sql:?}");
+            assert_eq!(sql[0], "DROP PROCEDURE IF EXISTS `restock`;");
+            assert!(sql[1].contains("PROCEDURE `restock_v2`("), "{sql:?}");
+            // And never the statement this engine has no form of.
+            assert!(!sql.iter().any(|s| s.contains("OR REPLACE")), "{sql:?}");
+            assert!(!sql.iter().any(|s| s.contains("RENAME TO")), "{sql:?}");
+        }
+
+        /// A bare rename on MySQL is a redefinition, because the engine has no
+        /// verb for it — the same resolution `diff_view` performs on SQLite.
+        #[test]
+        fn a_mysql_rename_alone_is_still_a_recreate() {
+            let cur = my_proc();
+            let mut d = RoutineDraft::from_info(&cur);
+            d.info.name = "restock_v2".into();
+            let cs = diff_routine(&cur, &d, MySql);
+            assert_eq!(cs.changes.len(), 1, "{:?}", cs.changes);
+            assert!(matches!(
+                cs.changes[0],
+                Change::ReplaceRoutine { recreate: true, .. }
+            ));
+            // …and the cost of the drop-first is stated, as it is for a trigger.
+            let risks = cs.destructive().join(" | ");
+            assert!(risks.contains("drops it first"), "{risks}");
+        }
+
+        /// The round-trip gate, on the engine whose emitter is the newer half.
+        #[test]
+        fn an_untouched_mysql_routine_is_not_a_change() {
+            let cur = my_proc();
+            let d = RoutineDraft::from_info(&cur);
+            assert!(diff_routine(&cur, &d, MySql).changes.is_empty());
+        }
+
+        /// A MySQL routine carries the session state it was created under, and
+        /// `CREATE PROCEDURE` has no clause for any of it — so the values are set
+        /// around the statement and restored after, exactly as a trigger's are.
+        #[test]
+        fn a_mysql_routine_is_created_under_its_own_session_state() {
+            let mut cur = my_proc();
+            cur.sql_mode = Some("NO_ENGINE_SUBSTITUTION".into());
+            let mut d = RoutineDraft::from_info(&cur);
+            d.info.body = "BEGIN\n    SELECT 2;\nEND".into();
+            let sql = diff_routine(&cur, &d, MySql).emit();
+            let create = sql
+                .iter()
+                .position(|s| s.contains("CREATE DEFINER"))
+                .expect("a create");
+            assert!(
+                sql[create - 2].starts_with("SET @schemaic_sql_mode = @@SESSION.sql_mode"),
+                "{sql:?}"
+            );
+            assert!(
+                sql[create - 1].contains("SESSION sql_mode = 'NO_ENGINE_SUBSTITUTION'"),
+                "{sql:?}"
+            );
+            assert!(
+                sql[create + 1].contains("SESSION sql_mode = @schemaic_sql_mode"),
+                "{sql:?}"
+            );
+        }
+
+        /// MySQL names a routine without its parameters and PostgreSQL cannot;
+        /// one `signature_sql` answers both, and a `DROP` built the other way
+        /// round is a syntax error on one engine and ambiguous on the other.
+        #[test]
+        fn the_drop_is_spelled_the_way_each_engine_addresses_a_routine() {
+            assert_eq!(
+                drop_routine(&my_proc(), MySql).emit(),
+                vec!["DROP PROCEDURE `restock`;"]
+            );
+            let mut f = fnc();
+            f.arguments = "a integer".into();
+            assert_eq!(
+                drop_routine(&f, Postgres).emit(),
+                vec!["DROP FUNCTION \"audit\"(a integer);"]
+            );
+        }
+
+        /// **PostgreSQL's `CREATE PROCEDURE` takes a strict subset of a
+        /// function's attributes**, and answers the rest with
+        /// `ERROR: invalid attribute in procedure definition`. A draft carrying
+        /// a volatility or a strictness must therefore emit neither — the guard
+        /// covered `RETURNS` alone at first, so touching the Volatility control
+        /// over a procedure produced a plan that could only fail at Apply.
+        #[test]
+        fn a_postgres_procedure_emits_no_function_only_attribute() {
+            let mut p = RoutineInfo {
+                name: "settle".into(),
+                schema: Some("public".into()),
+                kind: RoutineKind::Procedure,
+                language: "plpgsql".into(),
+                body: "BEGIN\nEND;".into(),
+                ..Default::default()
+            };
+            // Set every one of them, including a return type nothing should print.
+            p.volatility = crate::schema::Volatility::Immutable;
+            p.strict = true;
+            p.returns = "integer".into();
+            let sql = p.create_sql(Postgres, true);
+            assert!(
+                sql.starts_with("CREATE OR REPLACE PROCEDURE \"settle\"()"),
+                "{sql}"
+            );
+            assert!(!sql.contains("RETURNS"), "{sql}");
+            assert!(!sql.contains("IMMUTABLE"), "{sql}");
+            assert!(!sql.contains("STRICT"), "{sql}");
+            // The three a procedure *does* take are untouched.
+            p.security_definer = true;
+            p.settings = vec!["search_path=public".into()];
+            let sql = p.create_sql(Postgres, false);
+            assert!(sql.contains("LANGUAGE plpgsql"), "{sql}");
+            assert!(sql.contains("SECURITY DEFINER"), "{sql}");
+            assert!(sql.contains("SET search_path=public"), "{sql}");
+
+            // …and a *function* still restates all three.
+            let mut f = fnc();
+            f.volatility = crate::schema::Volatility::Immutable;
+            f.strict = true;
+            let sql = f.create_sql(Postgres, false);
+            assert!(sql.contains("IMMUTABLE"), "{sql}");
+            assert!(sql.contains("STRICT"), "{sql}");
+            assert!(sql.contains("RETURNS trigger"), "{sql}");
+        }
+
+        /// The preview's change list is what a person reads before approving a
+        /// destructive plan, so it must not call a procedure a function.
+        #[test]
+        fn a_drop_summary_names_the_kind_it_drops() {
+            assert_eq!(
+                drop_routine(&my_proc(), MySql).changes[0].summary(),
+                "Drop procedure restock"
+            );
+            assert_eq!(
+                drop_routine(&fnc(), Postgres).changes[0].summary(),
+                "Drop function audit"
+            );
+        }
+
+        /// A script for a **client** has to be one a client can split. Every
+        /// statement is terminated, and a MySQL statement carrying an internal
+        /// `;` takes the whole script into a `DELIMITER` block.
+        #[test]
+        fn a_client_script_terminates_every_statement() {
+            // The case that motivated it: MySQL's routine `CREATE` deliberately
+            // carries no `;`, so two of them joined ran together.
+            let a = my_proc().create_sql(MySql, false);
+            let mut second = my_proc();
+            second.name = "restock2".into();
+            second.body = "BEGIN SELECT 2; END".into();
+            let script = client_script(&[a, second.create_sql(MySql, false)], MySql);
+            assert!(script.starts_with("DELIMITER $$"), "{script}");
+            assert_eq!(script.matches("$$").count(), 3, "{script}"); // opener + one per statement
+            assert!(script.trim_end().ends_with("DELIMITER ;"), "{script}");
+
+            // No internal `;` anywhere ⇒ no DELIMITER, but still terminated.
+            let plain = client_script(&["CREATE PROCEDURE `p`() SELECT 1".into()], MySql);
+            assert_eq!(plain, "CREATE PROCEDURE `p`() SELECT 1;");
+            // A statement that already ends in one is left exactly as it was.
+            assert_eq!(
+                client_script(&["DROP PROCEDURE `p`;".into()], MySql),
+                "DROP PROCEDURE `p`;"
+            );
+            // PostgreSQL never wraps — its bodies are dollar-quoted.
+            let pg = client_script(&[fnc().create_sql(Postgres, false)], Postgres);
+            assert!(!pg.contains("DELIMITER"), "{pg}");
+            assert!(pg.trim_end().ends_with(';'), "{pg}");
+        }
+
+        /// SQLite has no stored routines, so the whole feature is absent there
+        /// rather than offered and broken — and the answer is computed from the
+        /// statements, not stated.
+        #[test]
+        fn sqlite_has_no_routines_to_edit() {
+            assert!(supports_routine_editing(Postgres));
+            assert!(supports_routine_editing(MySql));
+            assert!(!supports_routine_editing(SqlDialect::Sqlite));
+        }
+
+        /// The shared object drop cannot address a routine, and says so by
+        /// producing nothing rather than a bare-name statement that is right
+        /// until the first overload.
+        #[test]
+        fn the_shared_object_drop_refuses_a_routine() {
+            for kind in [ObjectKind::Function, ObjectKind::Procedure] {
+                assert!(
+                    drop_object(kind, "audit", Some("public"), Postgres).is_empty(),
+                    "{kind:?}"
+                );
+            }
+            // The three it *can* address are untouched.
+            assert!(!drop_object(ObjectKind::Enum, "mood", None, Postgres).is_empty());
         }
 
         fn my_trigger() -> TriggerInfo {

@@ -29,6 +29,7 @@ mod object_editor;
 mod overlays;
 mod plan_view;
 mod properties;
+mod routine_editor;
 mod schema_tree;
 /// The tree-node key builders. Public because the persisted expanded-node set is
 /// the app's to edit (collapsing a database drops every `tbl:<db>:*` key), and
@@ -350,19 +351,43 @@ impl TriggerTarget {
     }
 }
 
-/// What the function editor is editing. Doubles as its open flag.
+/// What the routine editor is editing. Doubles as its open flag.
 ///
-/// Separate from [`TriggerTarget`] rather than a mode of it: a function has its
+/// Separate from [`TriggerTarget`] rather than a mode of it: a routine has its
 /// own lifetime, outlives every trigger bound to it, and is reachable without
-/// going through a trigger at all.
+/// going through a trigger at all — from the schema tree, from Find-Anywhere,
+/// and from the Create menu.
 #[derive(Clone, Debug)]
-pub struct FunctionTarget {
+pub struct RoutineTarget {
     pub conn_id: u64,
     pub database: String,
     pub dialect: SqlDialect,
     pub current: Option<schemaic_core::schema::RoutineInfo>,
     pub read_only: bool,
 }
+
+/// Which routine to read the real body and session state for.
+pub struct RoutineSrcRequest {
+    pub conn_id: u64,
+    pub database: String,
+    /// The routine's name **on the server** — the identity a `SHOW CREATE`
+    /// addresses, not whatever the draft has been renamed to.
+    pub name: String,
+    pub kind: schemaic_core::schema::RoutineKind,
+}
+/// Reports one routine's source on the UI thread, keyed by the name asked for so
+/// a late reply can be matched back to the routine it belongs to. `None` means
+/// the server had nothing to say (PostgreSQL, or a definition the account may
+/// not read).
+pub type RoutineSrcDoneFn = Rc<dyn Fn(String, Option<schemaic_core::schema::RoutineSource>)>;
+/// Read one MySQL routine's body **as written** off-thread.
+///
+/// The counterpart of [`TriggerSrcFn`], and not an optimisation for the same
+/// reason: `information_schema` resolves the body's escapes on MySQL 8, and
+/// every edit on that engine begins with a `DROP` that commits on its own — so
+/// a restate built from the resolved text can fail after the only copy is gone.
+/// See `schemaic_core::schema::RoutineSource`.
+pub type RoutineSrcFn = Rc<dyn Fn(RoutineSrcRequest, RoutineSrcDoneFn)>;
 
 /// What the object editor is editing — an enum type, a domain or a sequence.
 /// Doubles as its open flag.
@@ -576,9 +601,9 @@ pub struct DdlUi {
     /// the structural-edit counter are the designer's `selected`/`rev` — the two
     /// modals are mutually exclusive, so there is nothing to keep apart.
     pub trigger_draft: RwSignal<schemaic_core::ddl::TriggerSetDraft>,
-    /// The function editor's target; doubles as its open flag.
-    pub function: RwSignal<Option<FunctionTarget>>,
-    pub function_draft: RwSignal<schemaic_core::ddl::FunctionDraft>,
+    /// The routine editor's target; doubles as its open flag.
+    pub routine: RwSignal<Option<RoutineTarget>>,
+    pub routine_draft: RwSignal<schemaic_core::ddl::RoutineDraft>,
     /// The object editor's target; doubles as its open flag.
     pub object: RwSignal<Option<ObjectTarget>>,
     /// The enum / domain / sequence being edited. Same rule as `draft`: one
@@ -1347,21 +1372,23 @@ pub enum CtxKind {
     /// A column. Carries its table, because the schema-editing entries act on
     /// the column *in* a table — a bare name can't be dropped.
     Field { source: TableSource, column: String },
-    /// One of PostgreSQL's standalone objects — an enum type, a domain or a
-    /// sequence. Carries the whole object rather than its name, because the menu
-    /// needs it: its `CREATE` for Copy DDL, and its current state to seed the
-    /// editor without a second lookup that could disagree with the row.
+    /// One standalone object — an enum type, a domain, a sequence, or a stored
+    /// function or procedure. Carries the whole object rather than its name,
+    /// because the menu needs it: its `CREATE` for Copy DDL, its current state
+    /// to seed the editor without a second lookup that could disagree with the
+    /// row, and — for a routine — the argument types that a `DROP` has to name
+    /// and a name alone cannot supply.
     Object {
         database: String,
         item: Box<schemaic_core::schema::ObjectItem>,
         /// Its `CREATE`, built when the menu is staged.
         ddl: String,
     },
-    /// One of the `Types`/`Domains`/`Sequences` **folders**, which hold the
-    /// [`CtxKind::Object`] rows. A folder is structural, so its menu is about
-    /// the *set*: the script for what's in it, and creating one more of the one
-    /// kind it holds — which is the entry the database node's `Create` submenu
-    /// makes you find the long way round.
+    /// One of the `Types`/`Domains`/`Sequences`/`Functions`/`Procedures`
+    /// **folders**, which hold the [`CtxKind::Object`] rows. A folder is
+    /// structural, so its menu is about the *set*: the script for what's in it,
+    /// and creating one more of the one kind it holds — which is the entry the
+    /// database node's `Create` submenu makes you find the long way round.
     ObjectGroup {
         database: String,
         /// The namespace the folder sits under (`None` when the tree is flat).
@@ -1890,6 +1917,9 @@ pub struct SchemaActions {
     /// Read a MySQL trigger's body as written, which `information_schema`
     /// cannot report faithfully.
     pub trigger_source: TriggerSrcFn,
+    /// The same for a MySQL routine's body, and for the same reason — see
+    /// [`RoutineSrcFn`].
+    pub routine_source: RoutineSrcFn,
     /// Fetch table statistics for the properties modal (whole database, one
     /// round trip) and drop the result into `overlay.properties_state`.
     pub table_stats: Rc<dyn Fn(PropertiesTarget)>,
@@ -2754,7 +2784,7 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
             let designer_open = ui.ddl.designer;
             let view_open = ui.ddl.view;
             let trigger_open = ui.ddl.trigger;
-            let function_open = ui.ddl.function;
+            let routine_open = ui.ddl.routine;
             let object_open = ui.ddl.object;
             let ddl_preview_open = ui.ddl.preview;
             stack((
@@ -2763,15 +2793,16 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
                 import_view::import_overlay(ui.clone()),
                 table_designer::table_designer_overlay(ui.clone()),
                 view_editor::view_editor_overlay(ui.clone()),
-                // The trigger and function editors share one tuple element —
+                // The trigger and routine editors share one tuple element —
                 // this stack is at Floem's 16-arity `ViewTuple` limit, and only
-                // one of the pair is ever open.
+                // one of the pair is ever painted (the trigger editor renders
+                // nothing while the routine editor it opened is up).
                 stack((
                     trigger_editor::trigger_editor_overlay(ui.clone()),
-                    trigger_editor::function_editor_overlay(ui.clone()),
+                    routine_editor::routine_editor_overlay(ui.clone()),
                 ))
                 .style(move |s| {
-                    if trigger_open.get().is_some() || function_open.get().is_some() {
+                    if trigger_open.get().is_some() || routine_open.get().is_some() {
                         s.absolute().inset(0.0)
                     } else {
                         s
@@ -2797,7 +2828,7 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
                     || designer_open.get().is_some()
                     || view_open.get().is_some()
                     || trigger_open.get().is_some()
-                    || function_open.get().is_some()
+                    || routine_open.get().is_some()
                     || object_open.get().is_some()
                     || ddl_preview_open.get().is_some()
                 {
