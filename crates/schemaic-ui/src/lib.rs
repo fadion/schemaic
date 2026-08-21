@@ -2641,6 +2641,20 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
             }
         });
     }
+    // Drop the hoisted submenu when no menu is open at all. `menu_panel` clears it
+    // whenever its own `open_sub` goes `None`, which covers Escape and running an
+    // entry — but a **click-away dismissal** sets the channel to `None` directly
+    // and takes the panel's whole scope with it, so that effect never runs again
+    // and the submenu would be left floating over the app with nothing behind it.
+    // Both channels, because a submenu can come from either.
+    create_effect(move |_| {
+        if popup_menu.get().is_none()
+            && context_menu.get().is_none()
+            && widgets::hoisted_submenu().get_untracked().is_some()
+        {
+            widgets::hoisted_submenu().set(None);
+        }
+    });
     let db_menu_open = ui.schema.db_menu_open;
     let schema_menu_open = ui.schema.schema_menu_open;
     let activity_menu_open = ui.activity.menu_open;
@@ -2817,6 +2831,16 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
         // the panel and its backdrop made it invisible. It's the topmost surface
         // in the app, which is what a menu should be.
         popup_menu_overlay(ui),
+        // **After even the popup menu**, because it draws that menu's own open
+        // submenu. A submenu is hoisted out of the row it belongs to and drawn
+        // here instead: nested under its row it would be painted but never
+        // hit-tested whenever it had to flip left or up, since Floem grows a
+        // parent's hit area rightward and downward only. See `widgets`'
+        // "the hoisted submenu" and the Floem gotcha it points at.
+        //
+        // Out of flow and shrink-wrapped to the panel, like every other overlay
+        // here — a full-window layer would swallow clicks meant for the app.
+        widgets::submenu_layer(),
     ))
     // Track the pointer in window coordinates (root-local == window) so the
     // schema context menu can anchor at the cursor.
