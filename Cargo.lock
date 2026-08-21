@@ -4936,6 +4936,7 @@ dependencies = [
  "floem",
  "floem_renderer",
  "pulldown-cmark",
+ "resvg",
  "schemaic-core",
  "schemaic-term",
  "serde_json",
