@@ -11,9 +11,9 @@ use std::time::Instant;
 use floem::AnyView;
 use floem::event::{Event, EventListener, EventPropagation};
 use floem::keyboard::{Key, NamedKey};
-use floem::kurbo::Point;
+use floem::kurbo::Rect;
 use floem::prelude::*;
-use floem::reactive::Scope;
+use floem::reactive::{Scope, create_effect};
 use floem::style::Transition;
 use floem::views::Scroll;
 use floem::views::scroll::ScrollCustomStyle;
@@ -2008,55 +2008,49 @@ fn menu_entry_view(i: usize, entry: MenuEntry, level: MenuLevel, close: Rc<dyn F
             icon,
             children,
         } => {
-            let n = children.len();
-            // Submenus keep the standard width (they only appear in the grid menus).
-            // The sub-level's own cursor is the one `menu_panel` drives while this
-            // submenu is the open one.
-            let sub = menu_stack(children, level.sub.into(), close, 170.0);
-            // The parent row's window position/width, to decide edge-flips.
-            let row_origin: RwSignal<Point> = RwSignal::new(Point::ZERO);
-            let row_w = RwSignal::new(0.0_f64);
-            // Wrap the panel in the absolute *container* (an absolute panel would
-            // shrink-wrap and collapse its full-width rows to the text width); the
-            // panel stays in-flow with its `min_width`, so rows fill it.
-            let sub_wrap = container(sub).style(move |s| {
-                if open_sub.get() != Some(i) {
-                    return s.hide();
-                }
-                let (win_w, win_h) = window_size().get();
-                let ro = row_origin.get();
-                let rw = row_w.get();
-                // Conservative size estimates (menu min_width + a row's ~34px).
-                let sub_w = 210.0;
-                let sub_h = n as f64 * 34.0 + 14.0;
-                // Flip left if the submenu would spill past the right edge.
-                let flip_x = win_w > 1.0 && ro.x + rw + sub_w > win_w;
-                // Shift up if it would spill past the bottom edge (align to fit).
-                let top = if win_h > 1.0 && ro.y - 6.0 + sub_h > win_h {
-                    (win_h - sub_h - ro.y).max(-ro.y)
-                } else {
-                    -6.0 // lift so the submenu's first item lines up with this row
-                };
-                let s = s.absolute().inset_top(top);
-                if flip_x {
-                    s.inset_right_pct(100.0)
-                } else {
-                    s.inset_left_pct(100.0)
-                }
-            });
-            stack((
-                menu_row(icon, label, None, true, false, is_cursor),
-                sub_wrap,
-            ))
-            .on_move(move |p| row_origin.set(p))
-            .on_resize(move |r| row_w.set(r.width()))
-            .on_event(EventListener::PointerEnter, move |_| {
-                open_sub.set(Some(i));
-                take_cursor();
-                EventPropagation::Continue
-            })
-            .on_click_stop(|_| {}) // clicking the parent just holds it open
-            .into_any()
+            // The panel itself is **not** built here — see "the hoisted submenu".
+            // This row only publishes what it would take to draw one, and
+            // `submenu_layer` at the root of the window draws it.
+            //
+            // Publishing is an effect on `open_sub` rather than something the
+            // `PointerEnter` below does, because the keyboard opens submenus too
+            // (`MenuAct::Open` sets the same signal, and Right/Enter go through it).
+            // One place, both ways in.
+            let row_rect: RwSignal<Rect> = RwSignal::new(Rect::ZERO);
+            {
+                let children = children.clone();
+                let close = close.clone();
+                create_effect(move |_| {
+                    if open_sub.get() == Some(i) {
+                        hoisted_submenu().set(Some(OpenSubmenu {
+                            entries: children.clone(),
+                            row: row_rect.get(),
+                            level,
+                            close: close.clone(),
+                        }));
+                    }
+                    // Closing is *not* this effect's job: every row's effect runs
+                    // on every change, so clearing here would race the row that is
+                    // opening. `menu_panel` clears when `open_sub` goes `None`.
+                });
+            }
+            container(menu_row(icon, label, None, true, false, is_cursor))
+                // The row's rect in window coordinates — `on_move` reports the
+                // window origin (fired during layout, not on pointer movement),
+                // `on_resize` the size. The layer needs both: it hangs the panel
+                // off the row's right or left edge, and lines its first item up
+                // with the row's top.
+                .on_move(move |p| row_rect.update(|r| *r = Rect::from_origin_size(p, r.size())))
+                .on_resize(move |b| {
+                    row_rect.update(|r| *r = Rect::from_origin_size(r.origin(), b.size()))
+                })
+                .on_event(EventListener::PointerEnter, move |_| {
+                    open_sub.set(Some(i));
+                    take_cursor();
+                    EventPropagation::Continue
+                })
+                .on_click_stop(|_| {}) // clicking the parent just holds it open
+                .into_any()
         }
     }
 }
@@ -2221,7 +2215,7 @@ pub(crate) fn cursor_menu_pos(
 /// [`menu_panel`]'s one key handler drive whichever level is open without walking
 /// a tree it would then have to keep in step with the views.
 #[derive(Clone, Copy)]
-struct MenuLevel {
+pub(crate) struct MenuLevel {
     cursor: RwSignal<Option<usize>>,
     open_sub: RwSignal<Option<usize>>,
     /// The cursor a child [`menu_stack`] uses. Unused at the child's own level.
@@ -2261,6 +2255,187 @@ impl From<MenuSub> for MenuLevel {
             },
         }
     }
+}
+
+// ── The hoisted submenu ─────────────────────────────────────────────────────
+//
+// A submenu is drawn by [`submenu_layer`], a sibling at the **root** of the window
+// stack, rather than as a child of the row it belongs to.
+//
+// It has to be. Floem hit-tests a subtree through `EventCx::should_send`, which
+// tests `id.layout_rect().with_origin(layout.location)` — the *size* of the union
+// of a view and its children, re-anchored at the view's **own** origin. An
+// overflowing child therefore grows its parent's hit area rightward and downward
+// only, and a submenu that flips to the left of its row (or shifts up past it)
+// lands inside the union that produced the size and outside the rectangle that
+// gets tested. It is `continue`d past and the pointer reaches whatever is
+// underneath. Paint never consults `should_send`, so the thing renders perfectly
+// and answers neither hover nor click — the failure reads as "this menu has no
+// event handling", not as an edge-flip, which is how it survived unnoticed in
+// every menu that opens near the right edge of the window.
+//
+// Hoisted, the submenu's only ancestor is the root stack, whose box is the window,
+// so no ancestor can crop it however it flips. The cost is that it is no longer a
+// view-tree descendant of the panel, which two things depended on: dismissal (the
+// panel absorbed its children's pointer-downs — [`menu_stack`] does that for the
+// hoisted copy too, being the same view) and the parent row's hover highlight
+// (the keyboard cursor sits on that row while its submenu is open, and the cursor
+// wears the hover fill, so the row stays lit).
+
+/// The submenu currently expanded out of a [`menu_panel`] row.
+///
+/// Carried as data rather than as a view, because the layer that draws it is built
+/// once at the root of the window and has to be able to draw *any* menu's submenu.
+/// `MenuEntry` is `Clone` and the close action is an `Rc`, so this is cheap.
+#[derive(Clone)]
+pub(crate) struct OpenSubmenu {
+    /// Already through [`tidy_separators`] — the parent panel tidies recursively
+    /// before any row is built, so these are the entries as drawn and as measured.
+    pub entries: Vec<MenuEntry>,
+    /// The parent row's rect in **window** coordinates. The panel hangs off its
+    /// right edge, or its left when there is no room.
+    pub row: Rect,
+    /// The **parent** level. The rows drawn from `entries` read `level.sub`, which
+    /// is the cursor `menu_key` drives while the submenu is the open one.
+    pub level: MenuLevel,
+    /// The whole menu's close action, which an action row runs after its own.
+    pub close: Rc<dyn Fn()>,
+}
+
+/// The stored open-submenu signal plus the scope that owns it.
+type OpenSubmenuSlot = (RwSignal<Option<OpenSubmenu>>, Scope);
+
+thread_local! {
+    static OPEN_SUBMENU: std::cell::RefCell<Option<OpenSubmenuSlot>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The channel [`submenu_layer`] draws from.
+///
+/// A **detached scope**, deliberately: the signal has to outlive any individual
+/// menu, since what publishes into it is a row inside a panel that is disposed the
+/// moment the menu closes. The same arrangement [`window_size`] uses.
+pub(crate) fn hoisted_submenu() -> RwSignal<Option<OpenSubmenu>> {
+    OPEN_SUBMENU.with(|cell| {
+        if cell.borrow().is_none() {
+            let scope = Scope::new();
+            let sig = scope.create_rw_signal(None);
+            *cell.borrow_mut() = Some((sig, scope));
+        }
+        cell.borrow().as_ref().unwrap().0
+    })
+}
+
+/// A submenu panel's `min_width`. Submenus keep the standard menu width whatever
+/// the parent asked for — a wide root menu doesn't make its children wide.
+const SUBMENU_W: f64 = 170.0;
+
+/// Conservative width estimate for the *decision* to flip a submenu left. Only the
+/// decision — the placement itself is exact (`inset_right` pins the real panel's
+/// right edge to the row's left edge whatever it measures), so an estimate here
+/// costs at worst a flip that wasn't needed, never a gap or an open-then-flip
+/// flicker.
+const SUBMENU_FLIP_W: f64 = 210.0;
+
+/// The window-level layer that draws the open submenu. **Last in the root stack**,
+/// so it is over every other surface including the popup menu it belongs to.
+///
+/// It is out of flow and shrink-wrapped to the panel, not a full-window sheet: a
+/// full-window layer would claim every pointer event in the window (Floem stops at
+/// the first child whose bounds contain the point, handled or not), so a click
+/// meant for the app underneath would be swallowed while a menu was open.
+pub(crate) fn submenu_layer() -> impl IntoView {
+    let open = hoisted_submenu();
+    dyn_container(
+        // Keyed on what identifies *which* submenu this is. `dyn_container` is
+        // built on `create_updater` and doesn't diff, so this rebuilds on every
+        // change to the channel, which is what we want: a different row's submenu
+        // is a different panel.
+        move || open.get().map(|s| (s.row, s.entries.len())),
+        move |slot| {
+            if slot.is_none() {
+                return empty().into_any();
+            }
+            let Some(s) = open.get_untracked() else {
+                return empty().into_any();
+            };
+            // `level.sub` is the child level — the cursor `menu_key` drives while
+            // this submenu is open, which is what keeps the keyboard working
+            // across the hoist.
+            menu_stack(s.entries, s.level.sub.into(), s.close, SUBMENU_W).into_any()
+        },
+    )
+    .style(move |st| {
+        let Some(s) = open.get() else {
+            return st;
+        };
+        let (x, y) = submenu_insets(s.row, window_size().get(), menu_panel_height(&s.entries));
+        let st = st.absolute();
+        let st = match x {
+            SubX::Left(v) => st.inset_left(v),
+            SubX::Right(v) => st.inset_right(v),
+        };
+        match y {
+            SubY::Top(v) => st.inset_top(v),
+            SubY::Bottom(v) => st.inset_bottom(v),
+        }
+    })
+}
+
+/// How the hoisted submenu pins horizontally: its left edge at a distance from the
+/// window's left, or its **right** edge at a distance from the window's right.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SubX {
+    Left(f64),
+    Right(f64),
+}
+
+/// How it pins vertically — top edge from the window's top, or bottom edge from
+/// the window's bottom.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SubY {
+    Top(f64),
+    Bottom(f64),
+}
+
+/// Lift, so the submenu's first item lines up with the row it came from rather
+/// than starting below it.
+const SUBMENU_LIFT: f64 = 6.0;
+
+/// Where the hoisted submenu goes for a parent row at `row` (window coordinates),
+/// in a `win` window, given the panel's estimated height `h`.
+///
+/// Flush to the row's right edge, or to its **left** edge when the window has no
+/// room on the right — flush either way, so a diagonal move from the row onto the
+/// submenu never crosses a gap it could close over. The flipped case pins the
+/// *right* edge (`SubX::Right`, an inset from the window's right) rather than
+/// computing a left edge from an assumed width: the panel is `min_width`, so its
+/// real width isn't known here, and a guess would leave a visible gap between the
+/// submenu and the row exactly when the flip happened. Vertically the same trick —
+/// a panel that won't fit below the row pins its bottom to the window's, no
+/// height arithmetic involved.
+///
+/// [`SUBMENU_FLIP_W`] and `h` are *estimates*, and only ever decide **which** edge
+/// to pin. The pin itself is exact, so an estimate that is off costs at worst a
+/// flip that wasn't needed — never a gap, and never an open-then-measure-then-move
+/// flicker.
+///
+/// Pure, and tested, because every way this can be wrong is silent: a sign slip or
+/// an `x1` where an `x0` belongs still renders a submenu, just not next to the row
+/// that opened it. A degenerate window (nothing measured yet) never flips.
+fn submenu_insets(row: Rect, win: (f64, f64), h: f64) -> (SubX, SubY) {
+    let (win_w, win_h) = win;
+    let x = if win_w > 1.0 && row.x1 + SUBMENU_FLIP_W > win_w {
+        SubX::Right(win_w - row.x0)
+    } else {
+        SubX::Left(row.x1)
+    };
+    let y = if win_h > 1.0 && row.y0 - SUBMENU_LIFT + h > win_h {
+        SubY::Bottom(0.0)
+    } else {
+        SubY::Top(row.y0 - SUBMENU_LIFT)
+    };
+    (x, y)
 }
 
 thread_local! {
@@ -2362,6 +2537,21 @@ pub(crate) fn menu_panel(
             (back)();
         }) as Rc<dyn Fn()>,
     };
+    // **Closing the hoisted submenu is this level's job, not a row's.** A `Sub`
+    // row publishes when `open_sub` becomes its own index; every row's effect runs
+    // on every change, so a row that also cleared would race the row that is
+    // opening. Here there is one of them, and `None` means exactly one thing.
+    //
+    // It also runs once on open, with `open_sub` still `None`, which sweeps up a
+    // submenu left behind by a menu that was dismissed by a click rather than
+    // closed — the same case `workspace`'s channel effect covers from the other
+    // side. This is the root level only; a submenu's own `menu_stack` never gets
+    // this effect, and must not, or it would clear the channel it is drawn from.
+    create_effect(move |_| {
+        if level.open_sub.get().is_none() {
+            hoisted_submenu().set(None);
+        }
+    });
     // Taken before the entries become views, which consumes them. Each `Sub`'s
     // children are kept for the same reason, keyed by the row they hang off.
     let stops = Rc::new(menu_stops(&entries));
@@ -3558,6 +3748,80 @@ mod exit_tests {
     }
 }
 
+/// Placing the hoisted submenu. See [`submenu_insets`] for why this is a function
+/// rather than four lines inside a style closure.
+#[cfg(test)]
+mod submenu_place_tests {
+    use super::*;
+
+    /// A row 170 wide, 30 tall, at (400, 200) — a menu comfortably mid-window.
+    fn row() -> Rect {
+        Rect::new(400.0, 200.0, 570.0, 230.0)
+    }
+
+    #[test]
+    fn a_submenu_with_room_sits_flush_on_the_row_s_right_edge() {
+        let (x, y) = submenu_insets(row(), (1400.0, 900.0), 120.0);
+        assert_eq!(x, SubX::Left(570.0));
+        assert_eq!(y, SubY::Top(194.0));
+    }
+
+    #[test]
+    fn a_submenu_with_no_room_pins_its_right_edge_to_the_row_s_left_one() {
+        // 570 + 210 > 700, so it flips. `Right(300)` in a 700-wide window puts the
+        // panel's right edge at x=400 — the row's left edge, flush, whatever the
+        // panel measures.
+        let (x, _) = submenu_insets(row(), (700.0, 900.0), 120.0);
+        assert_eq!(x, SubX::Right(300.0));
+        let win_w = 700.0;
+        let SubX::Right(inset) = x else {
+            panic!("flipped")
+        };
+        assert_eq!(
+            win_w - inset,
+            row().x0,
+            "right edge lands on the row's left"
+        );
+    }
+
+    #[test]
+    fn a_submenu_that_would_overhang_the_bottom_pins_to_it() {
+        // 200 - 6 + 400 > 500.
+        let (_, y) = submenu_insets(row(), (1400.0, 500.0), 400.0);
+        assert_eq!(y, SubY::Bottom(0.0));
+    }
+
+    #[test]
+    fn the_flip_is_by_a_hair_not_by_a_margin() {
+        // Exactly enough room on the right is not a flip; one pixel less is.
+        let win = (570.0 + SUBMENU_FLIP_W, 900.0);
+        assert_eq!(submenu_insets(row(), win, 120.0).0, SubX::Left(570.0));
+        assert_eq!(
+            submenu_insets(row(), (win.0 - 1.0, win.1), 120.0).0,
+            SubX::Right(win.0 - 1.0 - 400.0)
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_window_never_flips() {
+        // `window_size` starts at (0, 0) and is set from the root's `on_resize`. A
+        // submenu opened before that must not be flung to an edge that isn't there.
+        let (x, y) = submenu_insets(row(), (0.0, 0.0), 120.0);
+        assert_eq!(x, SubX::Left(570.0));
+        assert_eq!(y, SubY::Top(194.0));
+    }
+
+    #[test]
+    fn a_row_at_the_window_origin_still_places_forward() {
+        let (x, y) = submenu_insets(Rect::new(0.0, 0.0, 170.0, 30.0), (1400.0, 900.0), 120.0);
+        assert_eq!(x, SubX::Left(170.0));
+        // The lift may take the top negative at the very top of the window; that is
+        // the same 6px the un-hoisted version applied, and clamping it would
+        // misalign the first item against its row.
+        assert_eq!(y, SubY::Top(-6.0));
+    }
+}
+
 /// Driving an open menu from the keyboard. `menu_key` is the whole decision and
 /// takes only signals, so the arrow/Enter behaviour asserts without a window —
 /// which is the point, because every way of getting it wrong is silent: a cursor
@@ -3715,7 +3979,7 @@ mod menu_key_tests {
     /// With a submenu open the arrows drive **it**, and the parent's cursor stays
     /// where it was — it is still on the row holding the submenu open.
     #[test]
-    fn the_arrows_follow_the_open_submenu() {
+    fn the_arrows_follow_the_hoisted_submenu() {
         let m = menu();
         m.press(NamedKey::End);
         m.press(NamedKey::ArrowRight);

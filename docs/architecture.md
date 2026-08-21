@@ -3207,6 +3207,22 @@ Re-introducing the anti-patterns these guard against is a regression:
   class wins. Nest class overrides accordingly (dropdown popup restyle nests under `ListClass`).
 - **`DoubleClick` consumes the second `PointerUp`** — clear drag/press state in the double-click
   handler too, not only in `PointerUp`.
+- **A child that overflows *left* or *up* of its parent is painted but never hit-tested.** Floem
+  hit-tests a subtree through `EventCx::should_send` (`floem-0.2.0/src/context.rs`), which builds the
+  rect it tests as `id.layout_rect().with_origin(layout.location)` — it takes the **size** of the
+  union of the view and its children (window coords, `compute_view_layout`) but re-anchors it at the
+  view's **own** origin. So an overflowing child grows the parent's hit area rightward and downward
+  only: a child placed at a negative offset is inside the union that produced the size, and outside
+  the rectangle that gets tested. It is `continue`d past, and the pointer reaches whatever sits
+  underneath instead. Nothing about this is visible in paint, which doesn't consult `should_send` —
+  the thing renders perfectly and simply doesn't answer the mouse, hover states included, so the
+  failure reads as "this view has no event handling" rather than as a placement bug.
+  **The fix is to hoist the overflowing view to a layer whose own box already contains it**, not to
+  stop flipping — off-screen is not better than unclickable. Menu submenus do exactly that
+  (`widgets::submenu_layer`, last in the root stack: see *Popup menus*), which is the pattern to
+  copy for anything else that has to position a child at a negative inset. A full-window layer is
+  the wrong shape for it — that swallows every click meant for the app, per the overlay rule below;
+  the layer has to shrink-wrap the thing it hoists.
 - **Absolute overlays** (placeholders, action bars, badges) intercept clicks — every one that covers
   something clickable needs `.pointer_events(|| false)` so clicks fall through. Out of flow is not
   out of the hit test: Floem walks a view's children back-to-front looking for a pointer target and
@@ -3799,11 +3815,33 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   arm remembering to push its rule afterwards. It shipped as a rule with nothing under it: an empty
   section between "Copy qualified name" and AI Explain.
 - **Nested submenus**: a `Sub` entry hover-expands a child `menu_stack` anchored to the parent row's
-  right edge (`inset_left_pct(100.0)` + `inset_top(-6.0)`). Recursive for the *pointer* — each level
-  owns its `open_sub` signal — while the **keyboard** stops at one level (`MenuLevel`/`MenuSub`),
-  which is as deep as any menu in the app goes. One flat pair of cursors is what lets `menu_key`
-  drive whichever level is open without walking a tree it would then have to keep in step with the
-  views.
+  right edge. The **keyboard** stops at one level (`MenuLevel`/`MenuSub`), which is as deep as any
+  menu in the app goes; one flat pair of cursors is what lets `menu_key` drive whichever level is
+  open without walking a tree it would then have to keep in step with the views.
+- **The open submenu is drawn at the root of the window, not under its row** (`submenu_layer`, the
+  last element of `workspace`'s root stack, after even `popup_menu_overlay`). It has to be: nested
+  under its row it was painted but never hit-tested whenever it flipped left or shifted up, because
+  Floem grows a parent's hit area rightward and downward only (see *Floem 0.2 gotchas*). It opened,
+  it drew, and it answered neither hover nor click. That went unnoticed for as long as it did
+  because it bites only near a window edge, and it surfaced on the ER diagram's export menu, which
+  is anchored at the right end of a toolbar and so flips on any window narrow enough.
+  A `Sub` row therefore builds no panel. It publishes `OpenSubmenu { entries, row, level, close }`
+  into the `hoisted_submenu()` channel — a thread-local signal on a **detached scope**, since what
+  publishes is a row inside a panel that is disposed the moment the menu closes — and the layer
+  draws from that. Publishing is a `create_effect` on `open_sub`, not something `PointerEnter` does,
+  because the keyboard opens submenus through the same signal (`MenuAct::Open`); one place, both
+  ways in. **Clearing is `menu_panel`'s job, not a row's**: every row's effect re-runs on every
+  change, so a row that also cleared would race the row that is opening. `menu_panel`'s effect fires
+  on `open_sub == None`, which also sweeps up a stale submenu as it opens; `workspace` clears from
+  the other side when both menu channels go empty, which is the click-away case where the panel's
+  whole scope is dropped and its effect never runs again.
+  Two things depended on the submenu being a view-tree descendant, and both survive the hoist:
+  dismissal (the panel absorbed its children's pointer-downs — `menu_stack` does that for the
+  hoisted copy too, being the same view) and the parent row's highlight (the keyboard cursor sits on
+  that row while its submenu is open, and the cursor wears the hover fill).
+  The layer is out of flow and **shrink-wrapped to the panel**, deliberately not a full-window
+  sheet: a full-window layer would claim every pointer event in the window and swallow clicks meant
+  for the app underneath.
 - **Hover intent (no timers)**: entering a leaf clears `open_sub`, entering a submenu row sets it;
   nothing closes on leave. The submenu is flush with the panel's right edge, so a diagonal move never
   crosses a gap — the close-on-diagonal problem is avoided structurally.
@@ -3815,6 +3853,15 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   global (set from `workspace`'s root `on_resize`). `popup_menu_overlay` flips the whole panel the
   same way at the cursor. Size checks use conservative estimates (width ≈ 210, row ≈ 34) so there's no
   open-then-flip flicker.
+  A submenu's own flip is `submenu_insets`, which is a **pure function with tests** rather than four
+  lines inside a style closure, because every way it can be wrong is silent — a sign slip or an `x1`
+  where an `x0` belongs still draws a submenu, just not beside the row that opened it. It pins an
+  *edge* rather than computing a corner: flush to the row's right edge normally, and when there is
+  no room, `inset_right` from the window pins the panel's **right** edge to the row's left one
+  whatever the panel measures. The width estimate therefore only ever decides *which* edge to pin,
+  never where — so being off costs at worst a flip that wasn't needed, never a gap between the row
+  and its submenu, and never an open-then-measure-then-move flicker. Same for the vertical: a panel
+  that won't fit below the row pins its bottom to the window's, with no height arithmetic at all.
 - **Two menu channels**: the schema tree uses `ui.context_menu` (typed `CtxMenu`) +
   `context_menu_overlay`; everything else uses the generic `ui.popup_menu`
   (`RwSignal<Option<Vec<MenuEntry>>>`) + `popup_menu_overlay`. Both overlays live at the workspace
