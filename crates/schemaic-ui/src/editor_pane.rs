@@ -909,7 +909,7 @@ pub(crate) struct QueryPaneParams {
     pub run_anyway: Rc<dyn Fn()>,
     pub db_nodes: RwSignal<Vec<ConnNode>>,
     /// Databases the SCHEMA panel's eye has hidden — the database selector must
-    /// not offer one (`schema_tree::db_visible`), so its trigger has to know
+    /// not offer one (`schema::db_visible`), so its trigger has to know
     /// whether anything is left to offer.
     pub hidden_dbs: RwSignal<std::collections::HashSet<String>>,
     pub inline_ai: RwSignal<InlineAiState>,
@@ -3738,7 +3738,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         let any = hidden_dbs.with_untracked(|h| {
             db_nodes.with_untracked(|ns| {
                 ns.iter()
-                    .any(|n| crate::schema_tree::db_visible(h, &n.database))
+                    .any(|n| schemaic_core::schema::db_visible(h, &n.database))
             })
         });
         if !any {

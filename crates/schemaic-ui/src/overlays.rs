@@ -16,7 +16,7 @@ use floem::reactive::create_effect;
 
 use schemaic_core::connection::Connection;
 use schemaic_core::model::QueryState;
-use schemaic_core::schema::{SchemaState, TableSource};
+use schemaic_core::schema::{SchemaState, TableSource, db_visible};
 use schemaic_core::skeleton::{delete_skeleton, insert_skeleton, update_skeleton};
 
 use crate::consts::{CHAT_PAD_H, CHAT_PAD_V, DB_MENU_W};
@@ -468,15 +468,15 @@ pub(crate) fn active_db_menu_overlay(ui: Ui) -> impl IntoView {
     let anchor = ui.tabs_ui.active_db_anchor;
     let hidden = ui.schema.hidden_dbs;
 
-    // What this menu offers is what the SCHEMA tree shows — `db_visible`, the one
-    // predicate every list of databases asks. The eye hides a database from
-    // *sight*, and a picker that still offers it is a way back to something the
-    // user deliberately put away.
+    // What this menu offers is what the SCHEMA tree shows — `schema::db_visible`,
+    // the one predicate every list of databases asks. The eye hides a database
+    // from *sight*, and a picker that still offers it is a way back to something
+    // the user deliberately put away.
     let offered = move || {
         hidden.with(|h| {
             db_nodes.with(|ns| {
                 ns.iter()
-                    .filter(|n| crate::schema_tree::db_visible(h, &n.database))
+                    .filter(|n| db_visible(h, &n.database))
                     .cloned()
                     .collect::<Vec<_>>()
             })
@@ -485,14 +485,8 @@ pub(crate) fn active_db_menu_overlay(ui: Ui) -> impl IntoView {
     // …and "is there anything to offer" is that same list, not the raw node
     // count: hiding every database has to close this menu exactly as having none
     // does, or the flag below survives with no panel to answer it.
-    let any_offered = move || {
-        hidden.with(|h| {
-            db_nodes.with(|ns| {
-                ns.iter()
-                    .any(|n| crate::schema_tree::db_visible(h, &n.database))
-            })
-        })
-    };
+    let any_offered =
+        move || hidden.with(|h| db_nodes.with(|ns| ns.iter().any(|n| db_visible(h, &n.database))));
 
     // **One predicate, read by the panel and by the layer it sits on.** Two
     // spellings of "is this menu showing" is what froze the app: the content said

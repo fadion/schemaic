@@ -603,6 +603,51 @@ pub fn display_name(schema: Option<&str>, table: &str) -> String {
     }
 }
 
+/// Is this database one a **list** may show and a **picker** may offer?
+///
+/// The SCHEMA panel's eye hides a database from *sight*, and sight is every
+/// surface that lists databases rather than only the tree the eye is attached
+/// to. The QUERY toolbar's selector went on offering hidden ones, so a database
+/// the user had deliberately put away was still one click from being switched
+/// to — the same failure Find-Anywhere would have if the keyboard walk didn't
+/// ask this.
+///
+/// Everything that lists databases asks it: the schema tree's own stack, the
+/// tree's `nav_rows` walk (which has to stay bug-for-bug identical to the
+/// render), the active-database menu, and the trigger that opens it. The one
+/// exception is the **eye's own menu**, which must list a hidden database for it
+/// to be unhidden.
+///
+/// [`db_contributes`] is the same question asked by a surface that *describes*
+/// the schema rather than listing it.
+pub fn db_visible(hidden: &std::collections::HashSet<String>, database: &str) -> bool {
+    !hidden.contains(database)
+}
+
+/// Does this database contribute its tables and columns to a surface that
+/// **describes** the schema — autocomplete's suggestion pool, the AI's context?
+///
+/// [`db_visible`] plus one exception: the database being worked in. That one is
+/// context rather than an offer — hiding the database you are inside would
+/// otherwise take its own tables out of your completion and out of what the
+/// assistant knows, while your queries went on running against it. It is the
+/// same exception [`shown_database`] makes for the toolbar's label, for the same
+/// reason: hiding governs what is *offered*, and a tab's own database is not an
+/// offer.
+///
+/// Deliberately **not** asked by anything that validates. The completion
+/// catalog behind the editor's diagnostics is built unfiltered, because a hidden
+/// database's tables have not stopped existing and squiggling `archive.orders`
+/// as unknown over a view preference would be a false error. Hiding governs what
+/// is offered; never what is true.
+pub fn db_contributes(
+    hidden: &std::collections::HashSet<String>,
+    database: &str,
+    active_db: Option<&str>,
+) -> bool {
+    db_visible(hidden, database) || active_db.is_some_and(|a| a.eq_ignore_ascii_case(database))
+}
+
 /// The database name the QUERY toolbar's selector may show, given the databases
 /// the active connection actually loaded.
 ///
@@ -3830,6 +3875,53 @@ mod tests {
         assert_eq!(display_name(None, "orders"), "orders");
         assert_eq!(display_name(Some("public"), "orders"), "orders");
         assert_eq!(display_name(Some("sales"), "orders"), "sales.orders");
+    }
+
+    /// The polarity, which is the whole of what this predicate can get wrong —
+    /// and getting it wrong inverts every list of databases in the app at once.
+    #[test]
+    fn a_hidden_database_is_listed_by_nothing_and_an_unhidden_one_by_everything() {
+        let hidden: std::collections::HashSet<String> =
+            ["archive".to_string()].into_iter().collect();
+        assert!(!db_visible(&hidden, "archive"));
+        assert!(db_visible(&hidden, "sakila"));
+        assert!(db_visible(&Default::default(), "archive"));
+    }
+
+    #[test]
+    fn a_hidden_database_describes_nothing_either() {
+        let hidden: std::collections::HashSet<String> =
+            ["archive".to_string()].into_iter().collect();
+        assert!(!db_contributes(&hidden, "archive", Some("sakila")));
+        assert!(db_contributes(&hidden, "sakila", Some("sakila")));
+        assert!(db_contributes(
+            &Default::default(),
+            "archive",
+            Some("sakila")
+        ));
+    }
+
+    #[test]
+    fn the_database_being_worked_in_contributes_even_when_hidden() {
+        // Hiding is about what is *offered*; the database the tab is bound to is
+        // context. Dropping it would take that tab's own tables out of its
+        // completion, and out of what the assistant is told, while its queries
+        // still ran there.
+        let hidden: std::collections::HashSet<String> =
+            ["archive".to_string()].into_iter().collect();
+        assert!(db_contributes(&hidden, "archive", Some("archive")));
+        // Case-insensitively, like every other name comparison around it.
+        assert!(db_contributes(&hidden, "archive", Some("ARCHIVE")));
+        // …and only that one: a *different* hidden database stays out.
+        assert!(!db_contributes(&hidden, "archive", Some("sakila")));
+    }
+
+    #[test]
+    fn with_no_active_database_hiding_is_the_whole_rule() {
+        let hidden: std::collections::HashSet<String> =
+            ["archive".to_string()].into_iter().collect();
+        assert!(!db_contributes(&hidden, "archive", None));
+        assert!(db_contributes(&hidden, "sakila", None));
     }
 
     #[test]

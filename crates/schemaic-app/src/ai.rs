@@ -10,6 +10,7 @@
 //! helpers (`inline_system_prompt` / `extract_sql`). These are free functions and
 //! plain types — the reactive wiring that drives them lives in `app_view`.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -671,6 +672,9 @@ pub(crate) struct AiContextParams {
     pub connections: RwSignal<Vec<Connection>>,
     pub active_conn: RwSignal<u64>,
     pub db_nodes: RwSignal<Vec<ConnNode>>,
+    /// Databases the SCHEMA eye has hidden — kept out of every prompt built
+    /// here, bar the one being worked in (see [`snapshot_databases`]).
+    pub hidden_dbs: RwSignal<HashSet<String>>,
     pub tabs: RwSignal<Vec<Tab>>,
     pub active: RwSignal<usize>,
     pub scope: SchemaScope,
@@ -724,7 +728,7 @@ pub(crate) fn turn_context(p: AiContextParams, fallback_db: Option<&str>) -> Tur
     };
     let active_db = active_tab_database(p, fallback_db);
     let query = tab(&|t| Some(t.query.get_untracked())).unwrap_or_default();
-    let databases = snapshot_databases(db_nodes);
+    let databases = snapshot_databases(db_nodes, p.hidden_dbs, active_db.as_deref());
     TurnContext {
         outline: render_schema_outline(&databases, active_db.as_deref(), scope),
         active_db,
@@ -850,17 +854,37 @@ type DbSnapshot = (String, Option<std::sync::Arc<DbSchema>>);
 /// Snapshot each schema-tree node into plain data: `(database, Some(schema))`
 /// when introspection has loaded, `(database, None)` while it's still pending.
 /// Reads the signals once so the prompt builders below can stay pure.
-fn snapshot_databases(db_nodes: RwSignal<Vec<ConnNode>>) -> Vec<DbSnapshot> {
-    db_nodes.with_untracked(|v| {
-        v.iter()
-            .map(|n| {
-                let schema = match n.schema.get_untracked() {
-                    SchemaState::Loaded(s) => Some(s),
-                    _ => None,
-                };
-                (n.database.clone(), schema)
-            })
-            .collect()
+///
+/// **A database the SCHEMA eye has hidden is not in the snapshot**, so it is not
+/// in any prompt: not its name, not its tables, not its columns, and nothing the
+/// assistant writes can reach for it. Hiding a database is the user saying they
+/// are not working with it, and an assistant that keeps proposing joins against
+/// it is the same failure as a picker that keeps offering it. The one database
+/// that survives hiding is the one being worked *in* — `db_contributes`, the same
+/// exception autocomplete makes, since a tab bound to a hidden database still
+/// runs there and an assistant blind to its schema would be useless in it.
+///
+/// This is the single funnel: both the chat panel's context (`turn_context`) and
+/// Ctrl+K's generator prompt (`inline_system_prompt`) snapshot through here, so
+/// neither can be filtered while the other isn't.
+fn snapshot_databases(
+    db_nodes: RwSignal<Vec<ConnNode>>,
+    hidden_dbs: RwSignal<HashSet<String>>,
+    active_db: Option<&str>,
+) -> Vec<DbSnapshot> {
+    hidden_dbs.with_untracked(|hidden| {
+        db_nodes.with_untracked(|v| {
+            v.iter()
+                .filter(|n| schemaic_core::schema::db_contributes(hidden, &n.database, active_db))
+                .map(|n| {
+                    let schema = match n.schema.get_untracked() {
+                        SchemaState::Loaded(s) => Some(s),
+                        _ => None,
+                    };
+                    (n.database.clone(), schema)
+                })
+                .collect()
+        })
     })
 }
 
@@ -980,11 +1004,12 @@ pub(crate) fn extract_sql(text: &str) -> String {
 /// or intent. Every table is still listed by name so the model knows what exists.
 pub(crate) fn inline_system_prompt(
     db_nodes: RwSignal<Vec<ConnNode>>,
+    hidden_dbs: RwSignal<HashSet<String>>,
     active_db: Option<&str>,
     req: &InlineAiRequest,
     dialect: SqlDialect,
 ) -> String {
-    let databases = snapshot_databases(db_nodes);
+    let databases = snapshot_databases(db_nodes, hidden_dbs, active_db);
     render_inline_prompt(&databases, active_db, req, dialect)
 }
 
