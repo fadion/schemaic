@@ -729,12 +729,38 @@ fn load_landing(started: (u64, u64), current: (u64, u64)) -> LoadLanding {
 /// lands `Connected` from the second and then the first's five-second-old
 /// failure on top.
 ///
-/// A dropped check writes nothing at all — not the status, not the failure
-/// count, and not the `with_conn` continuation it may be carrying, which would
-/// otherwise run an action gated on a connection the user has left (or report
-/// the *old* connection unreachable in a modal).
+/// A dropped check writes nothing: not the status, not the failure count.
+///
+/// Its `with_conn` continuation is a separate question — see
+/// [`check_continues`], which is deliberately *not* this.
 fn check_landing(started: (u64, u64), current: (u64, u64)) -> bool {
     started == current
+}
+
+/// May a landed health check run the `with_conn` continuation it was carrying?
+///
+/// **Connection identity only, and not the generation** — which is the whole
+/// distinction. [`check_landing`] governs a *write*, where a stale answer is
+/// worse than none: an old failure repainting "Disconnected" over a server that
+/// is answering is the bug it exists for. A continuation is not a write, it is
+/// the user's action waiting on an answer, and dropping it doesn't leave the
+/// screen stale — it makes the button they clicked do nothing at all, silently,
+/// which is precisely what `with_conn` promises can't happen.
+///
+/// Gating both on the generation made that promise false on a timer. A blocked
+/// action pings, and the ping takes up to five seconds against a dead host; the
+/// health poll ticks (or the window regains focus and re-checks) inside that
+/// window, stamps a newer generation, and the user's own check lands into a guard
+/// that throws it away. No action, no error, no explanation.
+///
+/// A superseded result of the *same* connection is still an answer about the same
+/// server, and a few seconds old — good enough to decide whether to proceed, and
+/// far better than a control that does nothing. A **different** connection is not,
+/// which is the case this still refuses: running an action gated on a server the
+/// user has left, or reporting the old one unreachable in a modal over the new
+/// one.
+fn check_continues(started: (u64, u64), current: (u64, u64)) -> bool {
+    started.0 == current.0
 }
 
 /// What one database of a landed connection load becomes: an existing node kept,
@@ -4213,22 +4239,26 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let stamp = (id, health_gen.get_untracked() + 1);
             health_gen.set(stamp.1);
             let send = create_ext_action(cx, move |ok: bool| {
-                if !check_landing(
-                    stamp,
-                    (active_conn.get_untracked(), health_gen.get_untracked()),
-                ) {
-                    return;
+                let now = (active_conn.get_untracked(), health_gen.get_untracked());
+                if check_landing(stamp, now) {
+                    conn_status.set(if ok {
+                        ConnStatus::Connected
+                    } else {
+                        ConnStatus::Disconnected
+                    });
+                    // Every check counts toward the backoff, not just the polled
+                    // ones — a user hammering Retry against a dead host shouldn't
+                    // reset the timer's patience either.
+                    health_failures.set(health::record(health_failures.get_untracked(), ok));
                 }
-                conn_status.set(if ok {
-                    ConnStatus::Connected
-                } else {
-                    ConnStatus::Disconnected
-                });
-                // Every check counts toward the backoff, not just the polled
-                // ones — a user hammering Retry against a dead host shouldn't
-                // reset the timer's patience either.
-                health_failures.set(health::record(health_failures.get_untracked(), ok));
-                if let Some(f) = &done {
+                // Answered on the looser rule, because this is somebody's click
+                // waiting on a reply rather than a repaint of the header — see
+                // `check_continues`. A poll ticking inside the five seconds this
+                // ping takes used to supersede it and drop the action on the
+                // floor, with nothing shown either way.
+                if check_continues(stamp, now)
+                    && let Some(f) = &done
+                {
                     f(ok);
                 }
             });
@@ -7311,6 +7341,37 @@ mod app_tests {
         // old failure on top, and the banner is back until a poll that has just
         // been told to back off.
         assert!(!check_landing((7, 3), (7, 4)));
+    }
+
+    /// A superseded check must still **answer** the action that asked for it,
+    /// even though it may no longer write the status.
+    ///
+    /// The reported failure mode: a blocked action pings, the ping takes five
+    /// seconds against a dead host, the health poll ticks inside that window and
+    /// bumps the generation — and the user's action vanished with no error, which
+    /// is exactly what `with_conn` exists to prevent.
+    #[test]
+    fn a_superseded_check_still_answers_the_action_that_asked() {
+        use super::{check_continues, check_landing};
+        assert!(
+            !check_landing((7, 3), (7, 4)),
+            "no longer writes the status"
+        );
+        assert!(
+            check_continues((7, 3), (7, 4)),
+            "but it is still an answer about connection 7"
+        );
+        assert!(check_continues((7, 3), (7, 3)), "the ordinary case");
+    }
+
+    #[test]
+    fn a_check_of_a_connection_the_user_left_answers_nothing() {
+        use super::check_continues;
+        // The line the looser rule still holds: running an action gated on a
+        // server the user has walked away from, or reporting the old connection
+        // unreachable in a modal sitting over the new one.
+        assert!(!check_continues((7, 3), (8, 4)));
+        assert!(!check_continues((7, 3), (8, 3)));
     }
 
     /// The level `load_landing` doesn't reach. `try_update` guards a *disposed*
