@@ -2024,9 +2024,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     it. And **`build_catalog` never filters** — that catalog is what the diagnostics squiggle
     against, and a hidden database's tables have not stopped existing, so filtering there would
     mark `archive.orders` as unknown over a view preference. Hiding governs what is *offered*,
-    never what is *true*. Not filtered either, and a separate question: the built-in **MCP
-    server's** `database_list`/`database_schema`, which report what the server has rather than what
-    the tree shows. **A folder now carries a menu of its own** (`CtxKind::ObjectGroup`), reversing the
+    never what is *true*. The same line runs through the built-in **MCP server**: `list_schema`'s
+    *overview* asks `mcp::listed_databases` (so the assistant's tools agree with its prompt about
+    what this session can see), while `list_schema {"database": …}`, `describe_table` and
+    `run_query` answer in full — a named lookup is a fact, and half-filtering a fence `run_query`
+    walks through anyway would be theatre. The MCP subprocess is handed a **blob, not a signal**
+    (`hidden` on the endpoint JSON, absent in older blobs → nothing hidden), so hiding a database
+    mid-session takes effect on the next one, exactly as the system prompt beside it does. **A folder now carries a menu of its own** (`CtxKind::ObjectGroup`), reversing the
     earlier call that a structural row should offer nothing on either the pointer or `Shift+F10`:
     it is the script for everything in the folder and `Refresh`, then the one thing you come to a
     folder for — `Create {kind}`, flat and lower-cased to match the object row's `Edit sequence`.

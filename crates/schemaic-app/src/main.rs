@@ -5666,6 +5666,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             effort: ai_effort.get_untracked().cli().to_string(),
                             run_queries: ai_run_queries.get_untracked(),
                             cli_path: ai_cli_path.get_untracked(),
+                            // Read at spawn, like the system prompt beside it:
+                            // the MCP subprocess is handed a blob, not a signal,
+                            // so hiding a database mid-session takes effect on
+                            // the next one — the same as the schema outline.
+                            hidden: hidden_dbs.get_untracked(),
                         },
                     );
                     *ai_session.borrow_mut() = Some(AiSession {

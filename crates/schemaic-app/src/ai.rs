@@ -97,6 +97,11 @@ pub(crate) struct McpEndpoint {
     /// real data — so with queries off, the section is dropped rather than the
     /// whole tool.
     pub(crate) samples: bool,
+    /// Databases the SCHEMA eye has hidden, as of the moment this session was
+    /// spawned. `list_schema`'s server overview leaves them out — see
+    /// `mcp::listed_databases` for which half of that tool they affect and why
+    /// the other half is answered in full.
+    pub(crate) hidden: HashSet<String>,
 }
 
 /// Parse the MCP DB endpoint from `$SCHEMAIC_MCP_ENDPOINT` (the JSON the app
@@ -151,17 +156,38 @@ fn endpoint_from_value(v: &serde_json::Value) -> McpEndpoint {
         // Absent → on, matching the endpoint blobs written before the flag
         // existed (which also predate any tool that reads rows from schema).
         samples: v.get("samples").and_then(|x| x.as_bool()).unwrap_or(true),
+        // Absent → nothing hidden, which is what every blob written before the
+        // field existed meant.
+        hidden: v
+            .get("hidden")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
 /// Serialize a DB endpoint (host/port/user/pass + default database + the
 /// sample-rows permission) as the JSON blob handed to the MCP subprocess via its
 /// environment.
-fn endpoint_json(db: &Db, database: Option<&str>, samples: bool) -> String {
+fn endpoint_json(
+    db: &Db,
+    database: Option<&str>,
+    samples: bool,
+    hidden: &HashSet<String>,
+) -> String {
     let (host, port, user, pass, file) = db.parts();
+    // Sorted, so the blob is stable for a given set rather than reshuffling with
+    // the hash seed on every spawn.
+    let mut hidden: Vec<&str> = hidden.iter().map(String::as_str).collect();
+    hidden.sort_unstable();
     serde_json::json!({
         "host": host, "port": port, "user": user, "pass": pass, "file": file,
-        "database": database, "engine": db.engine().as_str(), "samples": samples
+        "database": database, "engine": db.engine().as_str(), "samples": samples,
+        "hidden": hidden
     })
     .to_string()
 }
@@ -299,6 +325,9 @@ pub(crate) struct StartAiParams {
     pub effort: String,
     pub run_queries: bool,
     pub cli_path: String,
+    /// Databases the SCHEMA eye has hidden — carried into the MCP endpoint so
+    /// the tools agree with the prompt about what this session can see.
+    pub hidden: HashSet<String>,
 }
 
 pub(crate) fn start_ai_session(
@@ -314,13 +343,19 @@ pub(crate) fn start_ai_session(
         effort,
         run_queries,
         cli_path,
+        hidden,
     } = p;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     // MCP config: launch THIS binary in `--mcp-serve` mode, handing it the
     // (already-tunnelled) DB endpoint via env — written to a temp file so the
     // credentials never appear on a command line (review C6).
-    let mcp_cfg = write_mcp_config(&endpoint_json(&db, database.as_deref(), run_queries));
+    let mcp_cfg = write_mcp_config(&endpoint_json(
+        &db,
+        database.as_deref(),
+        run_queries,
+        &hidden,
+    ));
     let tools = if run_queries {
         AI_TOOLS_WITH_QUERY
     } else {
@@ -1141,7 +1176,7 @@ mod tests {
             "p".into(),
             String::new(),
         );
-        let out = endpoint_json(&db, Some("shop"), true);
+        let out = endpoint_json(&db, Some("shop"), true, &HashSet::new());
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["host"], "h");
         assert_eq!(v["port"], 3307);
@@ -1151,7 +1186,7 @@ mod tests {
         assert_eq!(v["engine"], "postgres"); // engine tag serialized
         assert_eq!(v["samples"], true);
         // No default database → JSON null.
-        let out = endpoint_json(&db, None, false);
+        let out = endpoint_json(&db, None, false, &HashSet::new());
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["database"].is_null());
         // Queries off → the subprocess is told to withhold sample rows.
@@ -1168,12 +1203,33 @@ mod tests {
             "p".into(),
             String::new(),
         );
-        let json = endpoint_json(&db, Some("shop"), false);
+        let json = endpoint_json(&db, Some("shop"), false, &HashSet::new());
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(!endpoint_from_value(&v).samples);
         // An older blob with no flag → samples on (nothing then read rows).
         let v = serde_json::json!({ "host": "h" });
         assert!(endpoint_from_value(&v).samples);
+    }
+
+    #[test]
+    fn endpoint_carries_the_hidden_databases_and_defaults_to_none() {
+        let db = Db::from_parts(
+            schemaic_db::Engine::MySql,
+            "h".into(),
+            3306,
+            "u".into(),
+            "p".into(),
+            String::new(),
+        );
+        let hidden: HashSet<String> = ["archive".to_string()].into_iter().collect();
+        let json = endpoint_json(&db, Some("shop"), true, &hidden);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["hidden"], serde_json::json!(["archive"]));
+        assert_eq!(endpoint_from_value(&v).hidden, hidden);
+        // An older blob with no field → nothing hidden, which is what every
+        // endpoint written before this meant.
+        let v = serde_json::json!({ "host": "h" });
+        assert!(endpoint_from_value(&v).hidden.is_empty());
     }
 
     #[test]
@@ -1188,7 +1244,7 @@ mod tests {
             "pw".into(),
             String::new(),
         );
-        let json = endpoint_json(&db, Some("db1"), true);
+        let json = endpoint_json(&db, Some("db1"), true, &HashSet::new());
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let parsed = endpoint_from_value(&v);
         assert_eq!(parsed.db.parts(), ("host", 3306, "user", "pw", ""));
@@ -1223,7 +1279,7 @@ mod tests {
             String::new(),
             "/data/app.db".into(),
         );
-        let json = endpoint_json(&db, None, true);
+        let json = endpoint_json(&db, None, true, &HashSet::new());
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let parsed = endpoint_from_value(&v);
         assert_eq!(parsed.db.file(), "/data/app.db");
