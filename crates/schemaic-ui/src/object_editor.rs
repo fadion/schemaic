@@ -78,6 +78,9 @@ fn open_editor(ui: &Ui, target: ObjectTarget, draft: ObjectDraft) {
     d.designer.set(None);
     d.view.set(None);
     d.trigger.set(None);
+    // The routine editor is a peer of this one now, not a step inside the
+    // trigger editor — so a leftover target here would paint a second panel.
+    d.routine.set(None);
     d.object.set(Some(target));
 }
 
@@ -102,11 +105,32 @@ fn loaded_schema(
 /// The dependents are read **now**, off the schema the tree is showing: they are
 /// the columns a rebuild would re-cast, found by the type's *current* name, which
 /// the draft may be about to change.
+///
+/// **A routine goes to [`crate::routine_editor`] instead.** It is an
+/// [`ObjectItem`] because it is browsed beside the types — one folder machinery,
+/// one search predicate, one Find-Anywhere pass — but it is not edited by a type
+/// form, and [`ObjectDraft::from_item`] returns `None` for one so the split has
+/// to be made rather than falling through to whichever arm compiles. The routing
+/// lives here rather than at each call site so the tree, the palette and the
+/// menu can all keep asking one function to open an object.
 pub(crate) fn open_for_object(ui: &Ui, database: &str, item: &ObjectItem) {
+    // The gate first, so a path that reaches here without consulting it (a
+    // remembered palette hit, a double-click) can't open an editor on a routine
+    // the emitter would re-write wrongly.
+    if !is_editable_object(item) {
+        return;
+    }
+    if let Some(r) = item.routine() {
+        crate::routine_editor::open_for_routine(ui, database, r);
+        return;
+    }
     let ctx = edit_ctx(ui);
     let dependents = match loaded_schema(ui, database) {
         Some(s) => ddl::type_dependents(&s, item.schema(), item.name()),
         None => Vec::new(),
+    };
+    let Some(draft) = ObjectDraft::from_item(item) else {
+        return;
     };
     open_editor(
         ui,
@@ -119,17 +143,26 @@ pub(crate) fn open_for_object(ui: &Ui, database: &str, item: &ObjectItem) {
             dependents,
             read_only: ctx.read_only,
         },
-        ObjectDraft::from_item(item),
+        draft,
     );
 }
 
-/// Open the editor on a blank draft — Create type / domain / sequence.
+/// Open the editor on a blank draft — Create type / domain / sequence, or the
+/// routine editor for the two kinds this modal doesn't hold.
 pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>, kind: ObjectKind) {
+    if let Some(rk) = kind.routine_kind() {
+        crate::routine_editor::open_for_new(ui, database, schema, rk);
+        return;
+    }
     let ctx = edit_ctx(ui);
     let name = match kind {
-        ObjectKind::Enum => "new_type",
         ObjectKind::Domain => "new_domain",
         ObjectKind::Sequence => "new_sequence",
+        // `Enum`, and the two routine kinds the guard above has already taken.
+        _ => "new_type",
+    };
+    let Some(draft) = ObjectDraft::blank(kind, name, schema.map(str::to_string)) else {
+        return;
     };
     open_editor(
         ui,
@@ -142,7 +175,7 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>, kind: 
             dependents: Vec::new(),
             read_only: ctx.read_only,
         },
-        ObjectDraft::blank(kind, name, schema.map(str::to_string)),
+        draft,
     );
 }
 
@@ -153,7 +186,16 @@ pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>, kind: 
 /// part of its column rather than an object of its own; opening an editor whose
 /// only irreversible action the server refuses would be a dead end, the call a
 /// materialized view gets.
+///
+/// A routine adds the second such case: one whose body is a **link symbol**
+/// rather than source (`LANGUAGE c`, `LANGUAGE internal`) is listed and
+/// droppable but not editable, because the emitter would re-write it as
+/// `AS $$symbol$$` and produce a different routine. See
+/// [`RoutineInfo::is_editable`](schemaic_core::schema::RoutineInfo::is_editable).
 pub(crate) fn is_editable_object(item: &ObjectItem) -> bool {
+    if let Some(r) = item.routine() {
+        return r.is_editable();
+    }
     !item.is_internal()
 }
 

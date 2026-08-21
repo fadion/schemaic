@@ -54,9 +54,9 @@ use schemaic_core::model::{
     ResultSet, Rollback, RowDelete, RowEdit, RowInsert, Value, WriteStep, one_row_verdict,
 };
 use schemaic_core::schema::{
-    CheckInfo, ColumnInfo, DbSchema, DomainInfo, EnumInfo, IndexColumn, RoutineInfo, SequenceInfo,
-    SequenceOwner, TableInfo, TriggerAction, TriggerEnabled, TriggerEvent, TriggerInfo,
-    TriggerLevel, TriggerTiming, ViewOptions, Volatility,
+    CheckInfo, ColumnInfo, DbSchema, DomainInfo, EnumInfo, IndexColumn, RoutineInfo, RoutineKind,
+    SequenceInfo, SequenceOwner, TableInfo, TriggerAction, TriggerEnabled, TriggerEvent,
+    TriggerInfo, TriggerLevel, TriggerTiming, ViewOptions, Volatility,
 };
 use schemaic_core::sql;
 use schemaic_core::stats::{Freshness, IndexStats, SchemaStats, TableStats};
@@ -1419,6 +1419,11 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
         enums,
         domains,
         sequences: pg_sequences(&client).await?,
+        routines: routines_on(&client)
+            .await?
+            .into_iter()
+            .map(std::sync::Arc::new)
+            .collect(),
         // A MySQL-family flavour is meaningless here, and `Unknown` is what
         // makes the emitter withhold MariaDB-specific behaviour rather than
         // assume it.
@@ -1654,17 +1659,90 @@ fn pg_sequence_row(r: &[Option<String>]) -> SequenceInfo {
     }
 }
 
-/// Every trigger function in `database`, read **lazily** — when the trigger or
-/// function editor opens, not on every schema fetch.
+/// Which `pg_proc` rows are routines **at all** — the floor both readers below
+/// stand on.
 ///
-/// The same call `Db::view_algorithm` makes, for the same reason: a function's
-/// source is only needed for the one being bound or edited, and pulling every
-/// body into the schema refresh would cost far more than it answers. It also
-/// keeps `DbSchema` — which is cloned into an `Arc` and read on the completion
-/// path per keystroke — from carrying text nothing on that path looks at.
+/// Two narrowings:
 ///
-/// Narrowed to `RETURNS trigger`: routines are out of scope except as the thing
-/// a PostgreSQL trigger binds to.
+/// * **`prokind IN ('f', 'p')`** — functions and procedures. Aggregates (`a`)
+///   and window functions (`w`) live in the same catalogue and are neither: they
+///   have no body to show (`prosrc` names a transition function or a C symbol)
+///   and no `CREATE FUNCTION` that would recreate them, so listing them would
+///   be a row whose editor cannot open. The column is **PostgreSQL 11 and
+///   later**; 10 went end-of-life in November 2022, and there is no pre-11
+///   spelling that separates a procedure from an aggregate — `proisagg` says
+///   only which one an aggregate is, and procedures did not exist to be told
+///   apart.
+/// * **A user namespace** — the same filter every other query here uses.
+fn routine_scope() -> String {
+    format!(
+        "p.prokind IN ('f', 'p') AND {}",
+        user_schema_filter("n.nspname")
+    )
+}
+
+/// …and of those, the ones the user **owns** — what the schema tree browses.
+///
+/// Adds: **not owned by an extension** (`pg_depend.deptype = 'e'`). This is
+/// *not* applied to the types and sequences beside it, and the difference is one
+/// of degree rather than principle: an extension installs a handful of types and
+/// hundreds of functions. PostGIS alone puts ~1000 into whichever namespace it
+/// was created in, which is `public` by default — so without this the Functions
+/// folder on a PostGIS database is a wall of `st_*` with the user's own routines
+/// lost inside it, and every schema refresh carries their bodies. They remain
+/// callable, completable and documented by the extension that owns them; what
+/// they aren't is the user's to edit.
+///
+/// **Which is why [`trigger_functions`] does not use this one.** A trigger binds
+/// to whatever returns `trigger`, extension-owned or not — `moddatetime` is the
+/// standard "touch the modified column" function and arrives exactly this way —
+/// and the picker that reads it is a dropdown with no free-text entry, so
+/// filtering here would put those triggers permanently out of reach.
+fn routine_filter() -> String {
+    format!(
+        "{} AND NOT EXISTS (SELECT 1 FROM pg_depend d \
+                            WHERE d.objid = p.oid \
+                              AND d.classid = 'pg_proc'::regclass \
+                              AND d.deptype = 'e')",
+        routine_scope()
+    )
+}
+
+/// …and of those, the ones a **trigger can bind to**.
+///
+/// Narrowed on the server rather than in Rust: the alternative is shipping every
+/// routine body in the database over the wire to keep the handful that return
+/// `trigger`, on a call the trigger editor makes every time the routine editor
+/// closes back to it.
+///
+/// Both return types, because [`RoutineInfo::is_trigger_function`] accepts both
+/// and the two lists must agree — an `event_trigger` function the model calls
+/// bindable but the query never returns is a row that can't be selected.
+fn trigger_function_filter() -> String {
+    format!(
+        "{} AND p.prorettype IN ('trigger'::regtype, 'event_trigger'::regtype)",
+        routine_scope()
+    )
+}
+
+/// Every function a trigger can bind to, on its own connection — see
+/// [`trigger_function_filter`] for why this is its own query rather than a
+/// filter over [`routines_on`].
+pub(crate) async fn trigger_functions(
+    db: &Db,
+    database: &str,
+) -> Result<Vec<RoutineInfo>, DbError> {
+    let client = connect_to(db, database).await?;
+    routines_where(&client, &trigger_function_filter()).await
+}
+
+/// The browse list against a client the caller already has — what `fetch_schema`
+/// uses, so a schema refresh doesn't open a second connection for it.
+pub(crate) async fn routines_on(client: &Client) -> Result<Vec<RoutineInfo>, DbError> {
+    routines_where(client, &routine_filter()).await
+}
+
+/// The read itself, over whichever `WHERE` its caller stands on.
 ///
 /// `proconfig` comes back **one row per setting**, keyed on the function's oid.
 ///
@@ -1675,21 +1753,20 @@ fn pg_sequence_row(r: &[Option<String>]) -> SequenceInfo {
 /// [`RoutineInfo::settings`] exists to preserve. Every separator is a value some
 /// database already stores; the fold belongs in Rust, as the enum labels beside
 /// it already do.
-pub(crate) async fn trigger_functions(
-    db: &Db,
-    database: &str,
-) -> Result<Vec<RoutineInfo>, DbError> {
-    let client = connect_to(db, database).await?;
+///
+/// Both queries take the **same** filter: the settings fold is keyed on oid, so
+/// a filter that disagreed with the row query would silently attach one
+/// routine's `SET` clauses to nothing at all.
+async fn routines_where(client: &Client, filter: &str) -> Result<Vec<RoutineInfo>, DbError> {
     let settings_all = query_all(
-        &client,
+        client,
         &format!(
             "SELECT p.oid::text, s.setting \
              FROM pg_proc p \
              JOIN pg_namespace n ON n.oid = p.pronamespace \
              CROSS JOIN LATERAL unnest(p.proconfig) WITH ORDINALITY AS s(setting, ord) \
-             WHERE p.prorettype = 'trigger'::regtype AND {} \
-             ORDER BY p.oid, s.ord",
-            user_schema_filter("n.nspname")
+             WHERE {filter} \
+             ORDER BY p.oid, s.ord"
         ),
     )
     .await?;
@@ -1698,33 +1775,42 @@ pub(crate) async fn trigger_functions(
         settings.entry(cell(r, 0)).or_default().push(cell(r, 1));
     }
     Ok(query_all(
-        &client,
+        client,
         &format!(
             "SELECT n.nspname, p.proname, pg_get_function_arguments(p.oid), \
                     pg_get_function_result(p.oid), l.lanname, p.prosrc, \
                     p.provolatile, p.proisstrict::int, p.prosecdef::int, \
-                    p.oid::text \
+                    p.oid::text, p.prokind \
              FROM pg_proc p \
              JOIN pg_namespace n ON n.oid = p.pronamespace \
              JOIN pg_language l ON l.oid = p.prolang \
-             WHERE p.prorettype = 'trigger'::regtype AND {} \
-             ORDER BY n.nspname, p.proname",
-            user_schema_filter("n.nspname")
+             WHERE {filter} \
+             ORDER BY n.nspname, p.proname"
         ),
     )
     .await?
     .iter()
-    .map(|r| RoutineInfo {
-        schema: Some(cell(r, 0)),
-        name: cell(r, 1),
-        arguments: cell(r, 2),
-        returns: cell(r, 3),
-        language: cell(r, 4),
-        body: cell(r, 5),
-        volatility: Volatility::parse_code(&cell(r, 6)),
-        strict: cell(r, 7) == "1",
-        security_definer: cell(r, 8) == "1",
-        settings: settings.get(&cell(r, 9)).cloned().unwrap_or_default(),
+    .map(|r| {
+        let kind = RoutineKind::parse(&cell(r, 10));
+        RoutineInfo {
+            schema: Some(cell(r, 0)),
+            name: cell(r, 1),
+            kind,
+            arguments: cell(r, 2),
+            // `pg_get_function_result` returns NULL for a procedure, which
+            // `cell` renders as the empty string — which is exactly what the
+            // model wants there, and what `RoutineDraft::validate` demands.
+            returns: cell(r, 3),
+            language: cell(r, 4),
+            body: cell(r, 5),
+            volatility: Volatility::parse_code(&cell(r, 6)),
+            strict: cell(r, 7) == "1",
+            security_definer: cell(r, 8) == "1",
+            settings: settings.get(&cell(r, 9)).cloned().unwrap_or_default(),
+            // MySQL's alone; PostgreSQL has no clause for any of them and the
+            // emitter writes nothing for a `None`.
+            ..Default::default()
+        }
     })
     .collect())
 }
@@ -3108,6 +3194,51 @@ mod tests {
             build_delete(&del),
             "DELETE FROM \"sales\".\"orders\" WHERE \"id\" IS NOT DISTINCT FROM 1"
         );
+    }
+
+    /// **The trigger picker and the browse list are different questions**, and
+    /// the extension exclusion belongs to only one of them. A dropdown with no
+    /// free-text entry means a function missing from this list is a function no
+    /// trigger can be pointed at — and `moddatetime`, the standard "touch the
+    /// modified column" function, arrives owned by its extension.
+    #[test]
+    fn the_trigger_function_filter_keeps_what_an_extension_owns() {
+        let f = trigger_function_filter();
+        assert!(!f.contains("deptype"), "{f}");
+        // Narrowed on the *server*, not by pulling every body over the wire.
+        assert!(
+            f.contains("p.prorettype IN ('trigger'::regtype, 'event_trigger'::regtype)"),
+            "{f}"
+        );
+        // Both return types, because `is_trigger_function` accepts both — a
+        // model that calls one bindable over a query that never returns it is a
+        // row that cannot be selected.
+        assert!(f.contains("event_trigger"), "{f}");
+        // Still routines in a user namespace, on the shared floor.
+        assert!(f.contains("p.prokind IN ('f', 'p')"), "{f}");
+        assert!(f.contains("'pg_catalog', 'information_schema'"), "{f}");
+    }
+
+    /// The three narrowings, asserted on the string because that is all a unit
+    /// test can reach — and each has a wrong answer that produces a plausible
+    /// list rather than an error.
+    #[test]
+    fn the_routine_filter_takes_only_editable_user_routines() {
+        let f = routine_filter();
+        // Functions and procedures, never aggregates or window functions.
+        assert!(f.contains("p.prokind IN ('f', 'p')"), "{f}");
+        // The namespace filter is spliced, not re-spelled, so the five queries
+        // that use it cannot diverge.
+        assert!(f.contains("'pg_catalog', 'information_schema'"), "{f}");
+        // Extension-owned routines are excluded — PostGIS alone would otherwise
+        // put ~1000 into the Functions folder of whichever namespace it was
+        // created in.
+        assert!(f.contains("d.deptype = 'e'"), "{f}");
+        assert!(f.contains("NOT EXISTS"), "{f}");
+        // Scoped to `pg_proc`: an oid is only unique within its catalogue, so a
+        // dependency on some other object with the same numeric oid would
+        // otherwise hide a routine at random.
+        assert!(f.contains("d.classid = 'pg_proc'::regclass"), "{f}");
     }
 
     #[test]

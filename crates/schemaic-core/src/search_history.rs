@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 /// How many entries to keep (and show) per connection.
 pub const MAX_PER_CONN: usize = 10;
 
-/// Which kind of PostgreSQL standalone object an entry points at, when it points
-/// at one rather than at a table.
+/// Which kind of standalone object an entry points at, when it points at one
+/// rather than at a table.
 ///
 /// A tag of its own rather than [`crate::ddl::ObjectKind`] because this one is
 /// **persisted**: a kind written by a newer build must not fail to parse and take
@@ -35,6 +35,8 @@ pub enum ObjectTag {
     Enum,
     Domain,
     Sequence,
+    Function,
+    Procedure,
     /// A kind this build doesn't know, preserved exactly as it was read.
     Unknown(String),
 }
@@ -46,6 +48,8 @@ impl ObjectTag {
             ObjectTag::Enum => Some(crate::ddl::ObjectKind::Enum),
             ObjectTag::Domain => Some(crate::ddl::ObjectKind::Domain),
             ObjectTag::Sequence => Some(crate::ddl::ObjectKind::Sequence),
+            ObjectTag::Function => Some(crate::ddl::ObjectKind::Function),
+            ObjectTag::Procedure => Some(crate::ddl::ObjectKind::Procedure),
             ObjectTag::Unknown(_) => None,
         }
     }
@@ -56,6 +60,8 @@ impl ObjectTag {
             crate::ddl::ObjectKind::Enum => ObjectTag::Enum,
             crate::ddl::ObjectKind::Domain => ObjectTag::Domain,
             crate::ddl::ObjectKind::Sequence => ObjectTag::Sequence,
+            crate::ddl::ObjectKind::Function => ObjectTag::Function,
+            crate::ddl::ObjectKind::Procedure => ObjectTag::Procedure,
         }
     }
 
@@ -66,6 +72,8 @@ impl ObjectTag {
             ObjectTag::Enum => "enum",
             ObjectTag::Domain => "domain",
             ObjectTag::Sequence => "sequence",
+            ObjectTag::Function => "function",
+            ObjectTag::Procedure => "procedure",
             ObjectTag::Unknown(s) => s,
         }
     }
@@ -84,6 +92,8 @@ impl<'de> Deserialize<'de> for ObjectTag {
             "enum" => ObjectTag::Enum,
             "domain" => ObjectTag::Domain,
             "sequence" => ObjectTag::Sequence,
+            "function" => ObjectTag::Function,
+            "procedure" => ObjectTag::Procedure,
             _ => ObjectTag::Unknown(s),
         })
     }

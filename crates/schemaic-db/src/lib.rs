@@ -33,8 +33,9 @@ use schemaic_core::model::{
     one_row_verdict,
 };
 use schemaic_core::schema::{
-    CheckInfo, ColumnInfo, DbSchema, ForeignKeyInfo, IndexInfo, TableInfo, TriggerAction,
-    TriggerEvent, TriggerInfo, TriggerOrder, TriggerSource, TriggerTiming, ViewOptions,
+    CheckInfo, ColumnInfo, DbSchema, ForeignKeyInfo, IndexInfo, RoutineInfo, TableInfo,
+    TriggerAction, TriggerEvent, TriggerInfo, TriggerOrder, TriggerSource, TriggerTiming,
+    ViewOptions,
 };
 use schemaic_core::sql;
 use schemaic_core::stats::{Freshness, IndexStats, SchemaStats, TableStats, count_rows_sql};
@@ -483,13 +484,26 @@ impl Db {
     ///
     /// `Ok(None)` means the server didn't state one (`UNDEFINED`), which is also
     /// what PostgreSQL — with no such concept — returns without asking.
-    /// Every trigger function in `database` — PostgreSQL only, and read lazily
-    /// when the trigger or function editor opens.
+    /// Every trigger function in `database` — PostgreSQL only, and re-read on
+    /// its own when the trigger or routine editor asks.
     ///
-    /// Not part of `fetch_schema` on purpose, the same call [`Db::view_algorithm`]
-    /// makes: a function body is only needed for the one being bound or edited,
-    /// and every schema refresh would otherwise carry every body. Empty on MySQL,
-    /// whose triggers hold their own body and need no function at all.
+    /// The schema fetch carries most of the same list, so this is largely a
+    /// **refresh**: the trigger editor calls it after the routine editor closes,
+    /// because a function just created has to appear in the dropdown and nothing
+    /// else would put it there before the next schema reload.
+    ///
+    /// **It is not the same query as the browse list, and the difference is
+    /// deliberate.** `pg::routines` hides extension-owned routines, which is
+    /// right for a Functions folder the user edits and wrong here: `moddatetime`
+    /// and its kin are exactly what a trigger binds to, and the picker is a
+    /// dropdown with no free-text entry, so a function missing from this list is
+    /// a function no trigger can be pointed at. The narrowing this one does
+    /// instead — to what actually returns `trigger` — happens on the server, so
+    /// a database with hundreds of routines doesn't ship every body over the
+    /// wire to have them filtered here.
+    ///
+    /// Empty on MySQL, whose triggers hold their own body and need no function
+    /// at all, and on SQLite, which has no stored routines.
     pub async fn trigger_functions(
         &self,
         database: &str,
@@ -500,6 +514,54 @@ impl Db {
             Engine::Postgres => pg::trigger_functions(self, database).await,
             Engine::MySql | Engine::Sqlite => Ok(Vec::new()),
         }
+    }
+
+    /// A MySQL routine's body **as written**, plus the session state it was
+    /// written under — read lazily, when the routine editor opens.
+    ///
+    /// The same shape [`Db::trigger_source`] uses, and **not an optimisation**:
+    /// `information_schema.ROUTINES.ROUTINE_DEFINITION` resolves the body's
+    /// escapes on MySQL 8, and every edit on this engine begins with a `DROP`
+    /// that commits on its own — so a restate built from the resolved text can
+    /// fail after the only copy is gone. See
+    /// [`schemaic_core::schema::RoutineSource`].
+    ///
+    /// `Ok(None)` on PostgreSQL (whose `prosrc` is faithful) and on SQLite
+    /// (which has no routines), and for a routine the connected role may not
+    /// read the definition of — `SHOW CREATE` returns a NULL body without
+    /// `SHOW_ROUTINE` or ownership, and a `None` leaves the editor on what the
+    /// schema already carried rather than blanking the body.
+    pub async fn routine_source(
+        &self,
+        database: Option<&str>,
+        kind: schemaic_core::schema::RoutineKind,
+        name: &str,
+    ) -> Result<Option<schemaic_core::schema::RoutineSource>, DbError> {
+        if self.engine != Engine::MySql {
+            return Ok(None);
+        }
+        let mut conn = self.open(database, false).await?;
+        // (Procedure|Function, sql_mode, Create …, character_set_client,
+        //  collation_connection, Database Collation)
+        let sql = format!("SHOW CREATE {} {}", kind.sql_keyword(), ident(name.trim()));
+        let row: Option<MyShowCreateRoutineRow> = conn
+            .query_first(sql.as_str())
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        let _ = conn.disconnect().await;
+        let some = |s: String| Some(s).filter(|s| !s.is_empty());
+        // **The session state survives a body this can't read.** All four values
+        // come from the same row and only the body needs parsing, so folding
+        // them into its success meant a routine with an unfamiliar header was
+        // later recreated under whatever `sql_mode` the applying session had.
+        Ok(row.map(
+            |(_, mode, create, cs, coll, ..)| schemaic_core::schema::RoutineSource {
+                body: create.as_deref().and_then(routine_body_of),
+                sql_mode: some(mode),
+                charset_client: some(cs),
+                collation_connection: some(coll),
+            },
+        ))
     }
 
     /// A MySQL trigger's body **as written**, plus the session state it was
@@ -1586,6 +1648,59 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         .await
         .map_err(qerr)?;
 
+    // Stored routines. `information_schema.ROUTINES` and `PARAMETERS` have both
+    // been there since 5.0, so — as with `TRIGGERS` — there is no
+    // missing-table case to degrade for and a failure here is a real failure.
+    //
+    // `ORDINAL_POSITION = 0` is a *function's return value*, not a parameter;
+    // left in, every function's rendered signature would open with its return
+    // type. `PARAMETER_MODE` is NULL for a function's parameters (they are all
+    // `IN`) and `COALESCE`s to the empty string, so the rendered list carries a
+    // mode only where the server states one.
+    let routine_rows: Vec<MyRoutineRow> = conn
+        .exec_map(
+            "SELECT CAST(ROUTINE_NAME AS CHAR) AS n, CAST(ROUTINE_TYPE AS CHAR) AS ty, \
+                    CAST(COALESCE(DTD_IDENTIFIER, '') AS CHAR) AS rt, \
+                    CAST(ROUTINE_DEFINITION AS CHAR) AS body, \
+                    CAST(IS_DETERMINISTIC AS CHAR) AS det, \
+                    CAST(SQL_DATA_ACCESS AS CHAR) AS acc, \
+                    CAST(SECURITY_TYPE AS CHAR) AS sec, \
+                    CAST(DEFINER AS CHAR) AS df, \
+                    CAST(COALESCE(ROUTINE_COMMENT, '') AS CHAR) AS cmt \
+             FROM information_schema.ROUTINES \
+             WHERE ROUTINE_SCHEMA = ? ORDER BY ROUTINE_TYPE, ROUTINE_NAME",
+            (database,),
+            |r: MyRoutineRow| r,
+        )
+        .await
+        .map_err(qerr)?;
+    let param_rows: Vec<(String, String, String, String, String)> = conn
+        .exec_map(
+            "SELECT CAST(SPECIFIC_NAME AS CHAR) AS n, CAST(ROUTINE_TYPE AS CHAR) AS ty, \
+                    CAST(COALESCE(PARAMETER_MODE, '') AS CHAR) AS mode, \
+                    CAST(COALESCE(PARAMETER_NAME, '') AS CHAR) AS pname, \
+                    CAST(DTD_IDENTIFIER AS CHAR) AS dtd \
+             FROM information_schema.PARAMETERS \
+             WHERE SPECIFIC_SCHEMA = ? AND ORDINAL_POSITION > 0 \
+             ORDER BY SPECIFIC_NAME, ORDINAL_POSITION",
+            (database,),
+            |r: (String, String, String, String, String)| r,
+        )
+        .await
+        .map_err(qerr)?;
+    let mut params: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for (name, ty, mode, pname, dtd) in &param_rows {
+        let rendered = [mode.trim(), pname.trim(), dtd.trim()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        params
+            .entry((name.clone(), ty.to_ascii_uppercase()))
+            .or_default()
+            .push(rendered);
+    }
+
     let mut schema = assemble_schema(
         // MySQL: the database is the namespace, so tables carry none.
         None,
@@ -1595,6 +1710,10 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
         &idx_rows,
         &view_rows,
     );
+    schema.routines = mysql_routines(&routine_rows, &params)
+        .into_iter()
+        .map(std::sync::Arc::new)
+        .collect();
     apply_table_options(&mut schema, &table_opt_rows);
     apply_view_options(&mut schema, &view_opt_rows);
     apply_fk_rules(&mut schema, &fk_rule_rows);
@@ -1707,6 +1826,175 @@ fn trigger_body_of(create_sql: &str) -> Option<String> {
         }
     }
     Some(rest.trim().to_string())
+}
+
+/// One `SHOW CREATE {PROCEDURE|FUNCTION}` row: `(name, sql_mode, Create …,
+/// character_set_client, collation_connection, Database Collation)`.
+///
+/// The `Create` column is **nullable**, and that is not a corner case: MySQL
+/// returns NULL there for a routine the connected account may not see the
+/// definition of (it needs `SHOW_ROUTINE`, or to be the definer). A `None`
+/// leaves the editor on what the schema fetch already carried.
+type MyShowCreateRoutineRow = (String, String, Option<String>, String, String, String);
+
+/// The **body** of a `SHOW CREATE {PROCEDURE|FUNCTION}` statement — everything
+/// after the parameter list and the characteristics that follow it.
+///
+/// The same shape as [`trigger_body_of`] and for the same reason, but it cannot
+/// anchor on a keyword: a routine has no `FOR EACH ROW`, and what separates the
+/// header from the body is *running out of characteristics*. So the parameter
+/// list is skipped as a balanced group (through [`sql::balanced_paren_span`], so
+/// a default or a type inside it can hold a paren in a string), and then the
+/// clauses MySQL prints between it and the body are consumed by keyword.
+///
+/// **Greedy consumption is safe because the two vocabularies are disjoint.** The
+/// characteristic words are `COMMENT`, `LANGUAGE`, `NOT`, `DETERMINISTIC`,
+/// `CONTAINS`, `NO`, `READS`, `MODIFIES`, `SQL`, `DATA`, `SECURITY`, `DEFINER`,
+/// `INVOKER` and `RETURNS`; no MySQL statement — and therefore no routine body —
+/// begins with any of them. The first word that isn't one of them starts the
+/// body, which is returned untouched.
+///
+/// `RETURNS` is the one clause with an argument that isn't a single token: the
+/// type may carry a length (`VARCHAR(10)`) and trailing modifiers, so the word
+/// after it takes an optional balanced group and then any of the type-modifier
+/// words with it.
+///
+/// `None` when there is no parameter list to anchor on, or nothing after the
+/// characteristics — both of which mean this didn't understand the text, and a
+/// caller that gets `None` keeps the body it already had rather than blanking it.
+fn routine_body_of(create_sql: &str) -> Option<String> {
+    const CHARACTERISTIC: &[&str] = &[
+        "NOT",
+        "DETERMINISTIC",
+        "CONTAINS",
+        "NO",
+        "READS",
+        "MODIFIES",
+        "SQL",
+        "DATA",
+        "SECURITY",
+        "DEFINER",
+        "INVOKER",
+    ];
+    // Words that may trail a return type on their own:
+    // `RETURNS DECIMAL(10,2) UNSIGNED`. Each takes no argument.
+    const TYPE_FLAG: &[&str] = &[
+        "UNSIGNED", "SIGNED", "ZEROFILL", "BINARY", "ASCII", "UNICODE",
+    ];
+    // …and the two that take a **name** with them: `CHARSET utf8mb4`,
+    // `COLLATE utf8mb4_bin`. `CHARACTER SET utf8mb4` is the third and is spelled
+    // in two words, which is why it is matched as a pair below rather than by
+    // putting a bare `SET` on either list — a bare `SET` there also swallowed
+    // the first word of a body that legitimately begins `SET @x = 1`.
+    const TYPE_NAMED: &[&str] = &["CHARSET", "COLLATE"];
+
+    let b = create_sql.as_bytes();
+    // The parameter list: the first parenthesis that isn't inside a quoted
+    // identifier, a string or a comment. `CREATE DEFINER=`a`@`b` PROCEDURE
+    // `db`.`p`(…)` has none before it, and a routine named `` `p(x)` `` would.
+    let mut i = 0usize;
+    let after_params = loop {
+        if i >= b.len() {
+            return None;
+        }
+        if let Some(j) = sql::skip_noncode(b, i, SqlDialect::MySql) {
+            i = j;
+            continue;
+        }
+        if b[i] == b'(' {
+            break sql::balanced_paren_span(b, i, SqlDialect::MySql)? + 1;
+        }
+        i += 1;
+    };
+
+    let mut rest = create_sql.get(after_params..)?.trim_start();
+    loop {
+        let word = leading_word(rest);
+        let upper = word.to_ascii_uppercase();
+        if word.is_empty() {
+            break;
+        }
+        if upper == "COMMENT" {
+            // The literal that follows, skipped as a quoted run so an escaped
+            // or doubled quote inside it can't end it early.
+            let after_kw = rest[word.len()..].trim_start();
+            let nb = after_kw.as_bytes();
+            let end = sql::skip_noncode(nb, 0, SqlDialect::MySql)?;
+            rest = after_kw[end..].trim_start();
+            continue;
+        }
+        if upper == "LANGUAGE" {
+            let after_kw = rest[word.len()..].trim_start();
+            let lang = leading_word(after_kw);
+            rest = after_kw[lang.len()..].trim_start();
+            continue;
+        }
+        if upper == "RETURNS" {
+            rest = rest[word.len()..].trim_start();
+            // The type name, then its optional length/precision group.
+            let name = leading_word(rest);
+            rest = rest[name.len()..].trim_start();
+            if rest.as_bytes().first() == Some(&b'(') {
+                let end = sql::balanced_paren_span(rest.as_bytes(), 0, SqlDialect::MySql)? + 1;
+                rest = rest[end..].trim_start();
+            }
+            // The type's trailing modifiers. **Each form takes its argument with
+            // it or takes none — a keyword consumed without its value leaves
+            // that value at the head of what is returned as the body**, which is
+            // a `CREATE` that fails 1064 *after* the `DROP` has committed.
+            loop {
+                let w = leading_word(rest);
+                if w.is_empty() {
+                    break;
+                }
+                let after = || rest[w.len()..].trim_start();
+                if TYPE_FLAG.iter().any(|t| w.eq_ignore_ascii_case(t)) {
+                    rest = after();
+                } else if TYPE_NAMED.iter().any(|t| w.eq_ignore_ascii_case(t)) {
+                    let tail = after();
+                    let v = leading_word(tail);
+                    rest = tail[v.len()..].trim_start();
+                } else if w.eq_ignore_ascii_case("CHARACTER") {
+                    // `CHARACTER SET <name>` — three words, and only as a pair:
+                    // a lone `CHARACTER` isn't a modifier, so an unmatched one
+                    // ends the type rather than eating what follows.
+                    let tail = after();
+                    let set = leading_word(tail);
+                    if !set.eq_ignore_ascii_case("SET") {
+                        break;
+                    }
+                    let tail = tail[set.len()..].trim_start();
+                    let v = leading_word(tail);
+                    rest = tail[v.len()..].trim_start();
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+        if CHARACTERISTIC.iter().any(|c| *c == upper) {
+            rest = rest[word.len()..].trim_start();
+            continue;
+        }
+        break;
+    }
+    let body = rest.trim();
+    (!body.is_empty()).then(|| body.to_string())
+}
+
+/// The identifier-shaped word `s` starts with, or `""` when it doesn't start
+/// with one. On [`sql::is_word_start`]/[`sql::is_word_byte`], which is the one
+/// definition of what a word is here.
+fn leading_word(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.first().is_none_or(|c| !sql::is_word_start(*c)) {
+        return "";
+    }
+    let end = b
+        .iter()
+        .position(|c| !sql::is_word_byte(*c))
+        .unwrap_or(b.len());
+    &s[..end]
 }
 
 /// One `information_schema.CHECK_CONSTRAINTS` row, already joined to its table:
@@ -1903,6 +2191,78 @@ fn apply_triggers(schema: &mut DbSchema, triggers: Vec<TriggerInfo>) {
             .cloned()
             .collect();
     }
+}
+
+/// One `information_schema.ROUTINES` row: `(name, type, return type, body,
+/// deterministic, data access, security type, definer, comment)`.
+///
+/// The body is **nullable** — `ROUTINE_DEFINITION` is NULL for a routine the
+/// connected account can't see the definition of — and is the one column here
+/// that must not be trusted for an edit; see [`Db::routine_source`].
+type MyRoutineRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+/// Fold MySQL's `information_schema.ROUTINES` rows into [`RoutineInfo`]s.
+///
+/// `arguments` arrives separately, from `information_schema.PARAMETERS`: that
+/// table has one row per parameter and MySQL has no rendered-signature column at
+/// all, so the `IN a INT, OUT b TEXT` form the emitter and the tree both want is
+/// rebuilt here. `params` is keyed by routine name **and kind**, because a
+/// function and a procedure may share a name.
+///
+/// A function's own return value is `PARAMETERS` ordinal **0**, which is why the
+/// caller's query excludes it: folded in, every function's parameter list would
+/// open with its return type.
+fn mysql_routines(
+    rows: &[MyRoutineRow],
+    params: &HashMap<(String, String), Vec<String>>,
+) -> Vec<RoutineInfo> {
+    rows.iter()
+        .map(
+            |(name, ty, returns, body, deterministic, access, security, definer, comment)| {
+                let kind = schemaic_core::schema::RoutineKind::parse(ty);
+                let some = |s: &String| Some(s.clone()).filter(|s| !s.is_empty());
+                RoutineInfo {
+                    name: name.clone(),
+                    // MySQL has no namespace level: the database *is* the
+                    // namespace, exactly as it is for a table.
+                    schema: None,
+                    kind,
+                    arguments: params
+                        .get(&(name.clone(), ty.to_ascii_uppercase()))
+                        .map(|p| p.join(", "))
+                        .unwrap_or_default(),
+                    // A procedure's `DTD_IDENTIFIER` is NULL and arrives as the
+                    // empty string, which is what the model wants there.
+                    returns: returns.clone(),
+                    // Everything MySQL stores is `SQL`; the column reports it and
+                    // the emitter never writes a `LANGUAGE` clause for it.
+                    language: "SQL".to_string(),
+                    body: body.clone().unwrap_or_default(),
+                    deterministic: deterministic.eq_ignore_ascii_case("YES"),
+                    data_access: schemaic_core::schema::SqlDataAccess::parse(access),
+                    // **DEFINER is this engine's default**, the opposite of
+                    // PostgreSQL's — so an unreadable value must not fall to
+                    // `false` and quietly re-declare the routine as INVOKER.
+                    security_definer: !security.eq_ignore_ascii_case("INVOKER"),
+                    definer: some(definer),
+                    comment: some(comment),
+                    // PostgreSQL's, and the session state that only
+                    // `SHOW CREATE` carries.
+                    ..Default::default()
+                }
+            },
+        )
+        .collect()
 }
 
 /// One `information_schema.VIEWS` row: `(name, definition, check option, definer,
@@ -4216,6 +4576,194 @@ mod tests {
         apply_triggers(&mut schema, triggers);
         assert_eq!(schema.tables[0].triggers.len(), 1);
         assert_eq!(schema.tables[0].triggers[0].name, "keep");
+    }
+
+    // ── Stored routines ──────────────────────────────────────────────────
+    //
+    // `routine_body_of` is the half `information_schema` cannot answer: every
+    // MySQL routine edit is a `DROP` plus a `CREATE`, so a body that came back
+    // with its escapes resolved fails *after* the only copy is gone. Every
+    // input below is a real `SHOW CREATE` shape.
+
+    /// The plain case: no characteristics at all between the parameter list and
+    /// the body, which is what a bare `CREATE PROCEDURE` produces.
+    #[test]
+    fn routine_body_starts_after_the_parameter_list() {
+        let sql = "CREATE DEFINER=`root`@`localhost` PROCEDURE `restock`(IN sku VARCHAR(20))\n\
+                   BEGIN\n  UPDATE stock SET n = n + 1;\nEND";
+        assert_eq!(
+            routine_body_of(sql).as_deref(),
+            Some("BEGIN\n  UPDATE stock SET n = n + 1;\nEND")
+        );
+    }
+
+    /// Every characteristic MySQL prints, in the order it prints them — and the
+    /// body still starts where the last one ends.
+    #[test]
+    fn routine_body_skips_every_characteristic_clause() {
+        let sql = "CREATE DEFINER=`root`@`localhost` FUNCTION `label`(n INT) \
+                   RETURNS varchar(20) CHARSET utf8mb4 COLLATE utf8mb4_general_ci\n\
+                       DETERMINISTIC\n    NO SQL\n    SQL SECURITY INVOKER\n\
+                       COMMENT 'names a number'\n\
+                   BEGIN\n  RETURN 'x';\nEND";
+        assert_eq!(
+            routine_body_of(sql).as_deref(),
+            Some("BEGIN\n  RETURN 'x';\nEND")
+        );
+    }
+
+    /// The characteristic vocabulary and the statement vocabulary are disjoint,
+    /// which is what makes consuming greedily safe — a body that begins with a
+    /// bare statement survives, and so does one that *mentions* the words.
+    #[test]
+    fn routine_body_may_be_a_bare_statement() {
+        let sql = "CREATE DEFINER=`a`@`b` PROCEDURE `p`() \
+                   MODIFIES SQL DATA SELECT 'contains sql' AS note";
+        assert_eq!(
+            routine_body_of(sql).as_deref(),
+            Some("SELECT 'contains sql' AS note")
+        );
+    }
+
+    /// The escapes `information_schema.ROUTINE_DEFINITION` resolves — the whole
+    /// reason this path exists. Through that column the second comes back as
+    /// `'it's'`, a 1064 on restate.
+    #[test]
+    fn routine_body_survives_the_escapes_information_schema_resolves() {
+        let bs = "CREATE DEFINER=`a`@`b` PROCEDURE `p`() SET @x = 'C:\\temp'";
+        assert_eq!(routine_body_of(bs).as_deref(), Some("SET @x = 'C:\\temp'"));
+        let q = "CREATE DEFINER=`a`@`b` PROCEDURE `p`() SET @x = 'it''s'";
+        assert_eq!(routine_body_of(q).as_deref(), Some("SET @x = 'it''s'"));
+    }
+
+    /// The parameter list is found at a *code* position and skipped as a
+    /// balanced group, so neither a routine named with a paren nor a default
+    /// holding one can end it early.
+    #[test]
+    fn routine_body_is_not_confused_by_a_paren_in_a_name_or_a_literal() {
+        let sql = "CREATE PROCEDURE `p(x)`(IN a VARCHAR(9) ) BEGIN SELECT 1; END";
+        assert_eq!(routine_body_of(sql).as_deref(), Some("BEGIN SELECT 1; END"));
+        // A `COMMENT` holding the word the loop would otherwise stop on.
+        let sql = "CREATE PROCEDURE `p`() COMMENT 'BEGIN here' BEGIN SELECT 1; END";
+        assert_eq!(routine_body_of(sql).as_deref(), Some("BEGIN SELECT 1; END"));
+    }
+
+    /// **A return type's modifiers each take their argument with them.** A
+    /// keyword consumed without its value leaves that value at the head of what
+    /// is returned as the body — and since every MySQL edit is a `DROP` plus a
+    /// `CREATE`, that is a 1064 *after* the only copy is gone.
+    #[test]
+    fn routine_body_survives_every_return_type_modifier() {
+        for ty in [
+            "varchar(20) CHARSET utf8mb4",
+            "varchar(20) CHARACTER SET utf8mb4",
+            "varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+            "varchar(20) CHARSET utf8mb4 COLLATE utf8mb4_bin",
+            "decimal(10,2) UNSIGNED",
+            "int UNSIGNED ZEROFILL",
+            "char(1) BINARY",
+            "int",
+        ] {
+            let sql = format!(
+                "CREATE DEFINER=`a`@`b` FUNCTION `f`(n INT) RETURNS {ty}\n\
+                 DETERMINISTIC\nBEGIN\n  RETURN 'x';\nEND"
+            );
+            assert_eq!(
+                routine_body_of(&sql).as_deref(),
+                Some("BEGIN\n  RETURN 'x';\nEND"),
+                "RETURNS {ty}"
+            );
+        }
+    }
+
+    /// A bare `SET` is **not** a type modifier — it is only ever the second word
+    /// of `CHARACTER SET`. On the trailer list it swallowed the first word of a
+    /// body that legitimately begins `SET @x = 1`, which is a valid routine body
+    /// on its own.
+    #[test]
+    fn routine_body_beginning_with_set_is_not_eaten_as_a_type_modifier() {
+        let sql = "CREATE DEFINER=`a`@`b` FUNCTION `f`() RETURNS INT SET @x = 1";
+        assert_eq!(routine_body_of(sql).as_deref(), Some("SET @x = 1"));
+    }
+
+    /// No parameter list, or nothing after the characteristics: this didn't
+    /// understand the text, and says so rather than handing back a fragment the
+    /// caller would restate.
+    #[test]
+    fn routine_body_is_none_when_the_text_is_not_understood() {
+        assert_eq!(routine_body_of("not a create statement"), None);
+        assert_eq!(routine_body_of("CREATE PROCEDURE `p`() NO SQL"), None);
+    }
+
+    fn rr(name: &str, ty: &str, returns: &str) -> MyRoutineRow {
+        (
+            s(name),
+            s(ty),
+            s(returns),
+            Some(s("BEGIN SELECT 1; END")),
+            s("NO"),
+            s("READS_SQL_DATA"),
+            s("DEFINER"),
+            s("root@localhost"),
+            s("hello"),
+        )
+    }
+
+    /// The rendered parameter list is rebuilt from `PARAMETERS`, because MySQL
+    /// publishes no signature column — and it is keyed by name **and kind**, so
+    /// a procedure and a function of the same name don't take each other's.
+    #[test]
+    fn mysql_routines_render_their_parameter_lists_per_kind() {
+        let mut params: HashMap<(String, String), Vec<String>> = HashMap::new();
+        params.insert(
+            (s("go"), s("PROCEDURE")),
+            vec![s("IN sku VARCHAR(20)"), s("OUT n INT")],
+        );
+        params.insert((s("go"), s("FUNCTION")), vec![s("n INT")]);
+        let out = mysql_routines(
+            &[rr("go", "PROCEDURE", ""), rr("go", "FUNCTION", "int")],
+            &params,
+        );
+        assert_eq!(out[0].kind, schemaic_core::schema::RoutineKind::Procedure);
+        assert_eq!(out[0].arguments, "IN sku VARCHAR(20), OUT n INT");
+        assert!(out[0].returns.is_empty());
+        assert_eq!(out[1].kind, schemaic_core::schema::RoutineKind::Function);
+        assert_eq!(out[1].arguments, "n INT");
+        assert_eq!(out[1].returns, "int");
+    }
+
+    /// Every characteristic the emitter has to restate is read, and the
+    /// security type falls to **DEFINER** — this engine's default, and the
+    /// opposite of PostgreSQL's, so an unreadable value must not read as
+    /// INVOKER and quietly widen what the routine may do.
+    #[test]
+    fn mysql_routines_carry_the_characteristics_a_recreate_would_reset() {
+        let out = mysql_routines(&[rr("p", "PROCEDURE", "")], &HashMap::new());
+        let r = &out[0];
+        assert!(!r.deterministic);
+        assert_eq!(
+            r.data_access,
+            schemaic_core::schema::SqlDataAccess::ReadsSqlData
+        );
+        assert!(r.security_definer);
+        assert_eq!(r.definer.as_deref(), Some("root@localhost"));
+        assert_eq!(r.comment.as_deref(), Some("hello"));
+        // MySQL has no namespace level, and reports `SQL` for everything.
+        assert!(r.schema.is_none());
+        assert_eq!(r.language, "SQL");
+
+        let mut invoker = rr("p", "PROCEDURE", "");
+        invoker.6 = s("INVOKER");
+        assert!(!mysql_routines(&[invoker], &HashMap::new())[0].security_definer);
+    }
+
+    /// A routine whose definition the account may not read arrives with a NULL
+    /// body, which is an empty one here rather than a panic.
+    #[test]
+    fn mysql_routines_tolerate_an_unreadable_body() {
+        let mut row = rr("p", "PROCEDURE", "");
+        row.3 = None;
+        assert!(mysql_routines(&[row], &HashMap::new())[0].body.is_empty());
     }
 
     #[test]

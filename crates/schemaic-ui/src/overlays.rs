@@ -344,6 +344,24 @@ pub(crate) fn create_children(
             }),
         );
     }
+    // Stored routines, on the two engines that have them. A **capability**, not
+    // an engine test — SQLite has no `CREATE PROCEDURE` and no catalogue of one,
+    // so the entries are absent there rather than dimmed, which is the same call
+    // the view entry above makes.
+    if schemaic_core::ddl::supports_routine_editing(dialect) {
+        out.extend(
+            [
+                (ObjectKind::Function, "Function"),
+                (ObjectKind::Procedure, "Procedure"),
+            ]
+            .into_iter()
+            .map(|(kind, label)| CreateEntry {
+                label,
+                kind: CreateKind::Object(kind),
+                disabled: read_only,
+            }),
+        );
+    }
     out
 }
 
@@ -1156,12 +1174,24 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                             return;
                                         }
                                         let ctx = crate::table_designer::edit_ctx(&ui);
-                                        let cs = schemaic_core::ddl::drop_object(
-                                            kind,
-                                            obj.name(),
-                                            obj.schema(),
-                                            ctx.dialect,
-                                        );
+                                        // **A routine is addressed by signature,
+                                        // not by name.** `drop_object` refuses one
+                                        // (and would emit a statement that is right
+                                        // until the first PostgreSQL overload); the
+                                        // whole `RoutineInfo` is already on the row,
+                                        // so `drop_routine` gets it without a second
+                                        // lookup that could disagree.
+                                        let cs = match obj.routine() {
+                                            Some(r) => {
+                                                schemaic_core::ddl::drop_routine(r, ctx.dialect)
+                                            }
+                                            None => schemaic_core::ddl::drop_object(
+                                                kind,
+                                                obj.name(),
+                                                obj.schema(),
+                                                ctx.dialect,
+                                            ),
+                                        };
                                         crate::ddl_preview::open_preview(
                                             &ui,
                                             crate::ddl_preview::preview_of(
@@ -4191,11 +4221,7 @@ fn schema_hits(
     // keystroke**, over every loaded database: the whole-list form cloned every
     // object in the database — an enum's entire value list included — to answer a
     // substring test.
-    for kind in [
-        schemaic_core::ddl::ObjectKind::Enum,
-        schemaic_core::ddl::ObjectKind::Domain,
-        schemaic_core::ddl::ObjectKind::Sequence,
-    ] {
+    for kind in schemaic_core::ddl::ObjectKind::ALL {
         let items = if q.is_empty() {
             schema.objects_all(kind)
         } else {
@@ -4387,20 +4413,42 @@ mod create_menu_tests {
             .collect()
     }
 
-    /// MySQL has none of the three standalone objects, so they are **absent**
-    /// rather than dimmed: a missing entry reads as "not supported", a dimmed one
-    /// as "not here", and offering an entry that fails at apply is the thing this
-    /// gate exists to prevent.
+    /// MySQL has none of the three PostgreSQL standalone objects, so they are
+    /// **absent** rather than dimmed: a missing entry reads as "not supported",
+    /// a dimmed one as "not here", and offering an entry that fails at apply is
+    /// the thing this gate exists to prevent. It *does* have stored routines,
+    /// and gets those.
     #[test]
     fn mysql_offers_only_what_it_has() {
-        assert_eq!(labels(SqlDialect::MySql), vec!["Table", "View"]);
+        assert_eq!(
+            labels(SqlDialect::MySql),
+            vec!["Table", "View", "Function", "Procedure"]
+        );
+    }
+
+    /// SQLite has no stored routines at all — not an unfinished emitter, an
+    /// engine where a function is registered by the host program rather than
+    /// stored in the database.
+    #[test]
+    fn sqlite_is_offered_no_routines() {
+        let labels = labels(SqlDialect::Sqlite);
+        assert!(!labels.contains(&"Function"), "{labels:?}");
+        assert!(!labels.contains(&"Procedure"), "{labels:?}");
     }
 
     #[test]
     fn postgres_offers_its_standalone_objects_too() {
         assert_eq!(
             labels(SqlDialect::Postgres),
-            vec!["Table", "View", "Type", "Domain", "Sequence"]
+            vec![
+                "Table",
+                "View",
+                "Type",
+                "Domain",
+                "Sequence",
+                "Function",
+                "Procedure"
+            ]
         );
         let kinds: Vec<CreateKind> = create_children(SqlDialect::Postgres, false)
             .into_iter()
@@ -4414,6 +4462,8 @@ mod create_menu_tests {
                 CreateKind::Object(ObjectKind::Enum),
                 CreateKind::Object(ObjectKind::Domain),
                 CreateKind::Object(ObjectKind::Sequence),
+                CreateKind::Object(ObjectKind::Function),
+                CreateKind::Object(ObjectKind::Procedure),
             ]
         );
     }
@@ -4493,6 +4543,32 @@ mod find_tests {
                     ..Default::default()
                 },
             ],
+            routines: vec![
+                std::sync::Arc::new(schemaic_core::schema::RoutineInfo {
+                    name: "order_total".into(),
+                    schema: Some("public".into()),
+                    returns: "numeric".into(),
+                    language: "sql".into(),
+                    ..Default::default()
+                }),
+                std::sync::Arc::new(schemaic_core::schema::RoutineInfo {
+                    name: "reorder".into(),
+                    schema: Some("public".into()),
+                    kind: schemaic_core::schema::RoutineKind::Procedure,
+                    language: "plpgsql".into(),
+                    ..Default::default()
+                }),
+                // A C function: listed by the tree, never a palette destination —
+                // the second case of the internal-sequence rule below, and the
+                // reason the two surfaces have to be compared over *every* kind.
+                std::sync::Arc::new(schemaic_core::schema::RoutineInfo {
+                    name: "order_hash".into(),
+                    schema: Some("public".into()),
+                    returns: "bigint".into(),
+                    language: "c".into(),
+                    ..Default::default()
+                }),
+            ],
             ..Default::default()
         }
     }
@@ -4538,7 +4614,7 @@ mod find_tests {
         assert_eq!(object_names("order_counter"), vec!["order_counter"]);
     }
 
-    /// One term reaching a table, all three object kinds and a column, in the
+    /// One term reaching a table, every object kind and a column, in the
     /// order the palette commits to: **names, then objects, then columns.**
     #[test]
     fn a_database_lists_table_names_then_objects_then_columns() {
@@ -4546,10 +4622,16 @@ mod find_tests {
             labels_of(hits("order")),
             vec![
                 "table:orders",
-                // enums, then domains, then sequences — the tree's folder order
+                // types, domains, sequences, functions, procedures — the tree's
+                // folder order, which is `ObjectKind::ALL`'s order.
                 "object:order_status",
                 "object:order_email",
                 "object:order_counter",
+                "object:order_total",
+                "object:reorder",
+                // …and never `order_hash`, the C function: it matches the term
+                // and is not a destination, the same call the internal sequence
+                // gets.
                 "column:order_ref",
             ]
         );
@@ -4741,14 +4823,21 @@ mod find_tests {
     /// exactly the objects the schema tree's filter keeps — the two surfaces read
     /// the same data through the same `ObjectItem::matches_search`.
     ///
-    /// The **one** deliberate divergence is the internal sequence above: a tree
-    /// row is context, a palette row is a destination.
+    /// The **two** deliberate divergences are the ones a tree row can be and a
+    /// palette row can't: an identity column's counter and a routine whose body
+    /// is a link symbol. A tree row is context; a palette row is a destination.
+    ///
+    /// Over `ObjectKind::ALL`, not a hand-written list — this is a *comparison*
+    /// of two surfaces, and a kind missing from the loop asserts nothing about
+    /// it while still passing.
     #[test]
     fn the_palette_finds_what_the_schema_tree_filter_keeps() {
         let schema = fixture();
-        for q in ["order", "status", "o", "mood", "seq", "zzz", "email"] {
+        for q in [
+            "order", "status", "o", "mood", "seq", "zzz", "email", "total", "hash",
+        ] {
             let mut tree: Vec<String> = Vec::new();
-            for kind in [ObjectKind::Enum, ObjectKind::Domain, ObjectKind::Sequence] {
+            for kind in ObjectKind::ALL {
                 let all = schema.objects_all(kind);
                 tree.extend(
                     crate::schema_tree::objects_shown(&all, false, false, q)

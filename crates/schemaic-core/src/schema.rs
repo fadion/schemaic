@@ -1552,7 +1552,100 @@ impl TriggerInfo {
     }
 }
 
-// ── Routines (PostgreSQL functions) ─────────────────────────────────────────
+// ── Routines (stored functions and procedures) ──────────────────────────────
+
+/// Which kind of stored routine this is.
+///
+/// A separate tag rather than "does it have a return type", because the two are
+/// different objects to every statement that addresses one: `DROP FUNCTION` will
+/// not drop a procedure, `COMMENT ON PROCEDURE` is required for one, and MySQL's
+/// `CREATE PROCEDURE` has no `RETURNS` clause at all. PostgreSQL grew procedures
+/// in 11 (`pg_proc.prokind = 'p'`); MySQL has had both since 5.0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RoutineKind {
+    #[default]
+    Function,
+    Procedure,
+}
+
+impl RoutineKind {
+    /// The keyword that addresses it in `CREATE`/`ALTER`/`DROP`/`COMMENT ON`.
+    pub fn sql_keyword(self) -> &'static str {
+        match self {
+            RoutineKind::Function => "FUNCTION",
+            RoutineKind::Procedure => "PROCEDURE",
+        }
+    }
+
+    /// What it is called in a sentence a person reads.
+    pub fn label(self) -> &'static str {
+        match self {
+            RoutineKind::Function => "function",
+            RoutineKind::Procedure => "procedure",
+        }
+    }
+
+    /// Read a server's spelling — MySQL's `information_schema.ROUTINES.
+    /// ROUTINE_TYPE` (`FUNCTION`/`PROCEDURE`) and PostgreSQL's `pg_proc.prokind`
+    /// (`f`/`p`), which `schemaic-db` hands over as the same two words.
+    ///
+    /// An unrecognised answer is [`RoutineKind::Function`], which is what an
+    /// aggregate or a window function is closest to — and both of those are
+    /// filtered out before they reach here, so this is the honest default rather
+    /// than a silent mis-file of something editable.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "procedure" | "p" => RoutineKind::Procedure,
+            _ => RoutineKind::Function,
+        }
+    }
+}
+
+/// MySQL's `SQL_DATA_ACCESS` characteristic — what the routine does with data.
+///
+/// Modelled for the reason [`ViewOptions::definer`] is: MySQL has no statement
+/// that alters a routine's body, so **every** edit here is a `DROP` plus a
+/// `CREATE`, and anything the new `CREATE` doesn't restate reverts to the
+/// server's default. `CONTAINS SQL` is that default, so a `READS SQL DATA`
+/// routine recreated without the clause is silently re-declared as something it
+/// isn't — which changes what the server will let it do under
+/// `--log-bin-trust-function-creators = 0`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SqlDataAccess {
+    /// The server's default.
+    #[default]
+    ContainsSql,
+    NoSql,
+    ReadsSqlData,
+    ModifiesSqlData,
+}
+
+impl SqlDataAccess {
+    pub fn sql(self) -> &'static str {
+        match self {
+            SqlDataAccess::ContainsSql => "CONTAINS SQL",
+            SqlDataAccess::NoSql => "NO SQL",
+            SqlDataAccess::ReadsSqlData => "READS SQL DATA",
+            SqlDataAccess::ModifiesSqlData => "MODIFIES SQL DATA",
+        }
+    }
+
+    /// Read `information_schema.ROUTINES.SQL_DATA_ACCESS`, which spells the
+    /// four with an underscore where the clause has a space.
+    pub fn parse(s: &str) -> Self {
+        match s
+            .trim()
+            .to_ascii_uppercase()
+            .replace(['_', ' '], "")
+            .as_str()
+        {
+            "NOSQL" => SqlDataAccess::NoSql,
+            "READSSQLDATA" => SqlDataAccess::ReadsSqlData,
+            "MODIFIESSQLDATA" => SqlDataAccess::ModifiesSqlData,
+            _ => SqlDataAccess::ContainsSql,
+        }
+    }
+}
 
 /// How often PostgreSQL may assume a function returns the same answer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1582,13 +1675,17 @@ impl Volatility {
     }
 }
 
-/// A PostgreSQL function.
+/// A stored routine — a function or a procedure.
 ///
-/// Modelled because a PostgreSQL trigger holds no body of its own — it is a
-/// binding to one of these — so triggers there are only half a feature without
-/// it. The fields past `body` exist for the reason [`ViewOptions`]'s security
-/// type does: **`CREATE OR REPLACE FUNCTION` replaces the whole routine**, so
-/// anything the statement doesn't restate reverts to the server's default.
+/// Modelled first because a PostgreSQL trigger holds no body of its own — it is
+/// a binding to one of these — so triggers there were only half a feature
+/// without it, and widened afterwards to the routines a database has for their
+/// own sake. The fields past `body` exist for the reason [`ViewOptions`]'s
+/// security type does: **a redefinition replaces the whole routine**, so
+/// anything the statement doesn't restate reverts to the server's default. That
+/// is true of PostgreSQL's `CREATE OR REPLACE FUNCTION` and doubly true of
+/// MySQL, which has no replace at all and reaches every edit through a `DROP`
+/// plus a `CREATE` ([`crate::ddl::supports_or_replace_routine`]).
 ///
 /// `settings` is the sharpest of those. A `SECURITY DEFINER` function runs with
 /// its owner's rights, and the `SET search_path` pinned to it is what stops a
@@ -1596,64 +1693,179 @@ impl Volatility {
 /// own. A replace that drops the `SET` leaves the function running as its owner
 /// with the caller's `search_path` — a privilege-escalation hole opened by an
 /// edit that said nothing about privileges.
+///
+/// Most fields belong to one engine, as [`ViewOptions`]'s do: `volatility`,
+/// `strict` and `settings` are PostgreSQL's, `deterministic`, `data_access`,
+/// `definer`, `comment` and the three session values are MySQL's. The emitter
+/// asks the dialect and writes only the clauses that engine has, so a field the
+/// other server never reported stays at its default and says nothing.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RoutineInfo {
     pub name: String,
     /// PostgreSQL namespace. `None` means unqualified — see [`sql_qualifier`].
+    /// Always `None` on MySQL, where a database *is* the namespace.
     pub schema: Option<String>,
-    /// The argument list as `pg_get_function_arguments` renders it. Empty for a
-    /// trigger function, which receives its arguments through `TG_ARGV` instead.
+    /// Function or procedure. See [`RoutineKind`] for why it is a tag rather
+    /// than "is `returns` empty".
+    pub kind: RoutineKind,
+    /// The parameter list as the server renders it —
+    /// `pg_get_function_arguments` on PostgreSQL, and the `IN a INT, OUT b
+    /// TEXT` form rebuilt from `information_schema.PARAMETERS` on MySQL. Empty
+    /// for a trigger function, which receives its arguments through `TG_ARGV`
+    /// instead.
     pub arguments: String,
-    /// The return type as `pg_get_function_result` renders it — `trigger` for
-    /// the ones a trigger can bind to.
+    /// The return type as `pg_get_function_result` (or MySQL's `DTD_IDENTIFIER`)
+    /// renders it — `trigger` for the ones a trigger can bind to. Empty for a
+    /// procedure, which has no `RETURNS` clause on either engine.
     pub returns: String,
-    /// `plpgsql`, `sql`, `c`, …
+    /// `plpgsql`, `sql`, `c`, … MySQL reports `SQL` for everything it stores.
     pub language: String,
     pub body: String,
+    /// **PostgreSQL.** How often the planner may assume the same answer.
     pub volatility: Volatility,
-    /// `RETURNS NULL ON NULL INPUT`. A replace that omits it makes the function
-    /// start running on NULL arguments it used to short-circuit.
+    /// **PostgreSQL.** `RETURNS NULL ON NULL INPUT`. A replace that omits it
+    /// makes the function start running on NULL arguments it used to
+    /// short-circuit.
     pub strict: bool,
+    /// PostgreSQL's `SECURITY DEFINER` and MySQL's `SQL SECURITY DEFINER` — the
+    /// same question, and the reason the two share a field.
+    ///
+    /// **Their defaults are opposite**, which is why the MySQL arm of
+    /// [`RoutineInfo::create_sql`] states the clause either way instead of
+    /// leaving the default unwritten as the PostgreSQL arm does: omitting it
+    /// there does not mean `INVOKER`, it means `DEFINER`.
     pub security_definer: bool,
-    /// Per-function `SET` clauses, already rendered as `key=value`.
+    /// **PostgreSQL.** Per-function `SET` clauses, already rendered as
+    /// `key=value`.
     pub settings: Vec<String>,
+    /// **MySQL.** `DETERMINISTIC` / `NOT DETERMINISTIC`. Not cosmetic: a
+    /// non-deterministic routine is refused outright on a server with binary
+    /// logging and `log_bin_trust_function_creators = 0`, so a recreate that
+    /// declared the wrong one either fails or quietly relaxes the promise the
+    /// replication setup relies on.
+    pub deterministic: bool,
+    /// **MySQL.** See [`SqlDataAccess`].
+    pub data_access: SqlDataAccess,
+    /// **MySQL.** `DEFINER`, as the catalogue reports it — `root@localhost`,
+    /// unquoted. Modelled for the reason [`ViewOptions::definer`] is: with
+    /// `SQL SECURITY DEFINER` (the default here) the account in this clause is
+    /// whose rights the body runs with, and a recreate that dropped it would
+    /// silently hand the routine to whoever applied the edit.
+    pub definer: Option<String>,
+    /// **MySQL.** The `COMMENT` clause. A recreate that omits it loses it.
+    pub comment: Option<String>,
+    /// **MySQL.** The session state the routine was created under, from
+    /// `SHOW CREATE`. `None` means "not known" — an unfetched routine and every
+    /// PostgreSQL one both are — and nothing is emitted for it. Carried and
+    /// restored around the `CREATE` for the reason [`TriggerSource`] gives.
+    pub sql_mode: Option<String>,
+    pub charset_client: Option<String>,
+    pub collation_connection: Option<String>,
 }
 
 impl RoutineInfo {
     /// Whether a trigger can bind to this function.
     pub fn is_trigger_function(&self) -> bool {
-        self.returns.trim().eq_ignore_ascii_case("trigger")
-            || self.returns.trim().eq_ignore_ascii_case("event_trigger")
+        self.kind == RoutineKind::Function
+            && (self.returns.trim().eq_ignore_ascii_case("trigger")
+                || self.returns.trim().eq_ignore_ascii_case("event_trigger"))
     }
 
-    /// The function's identity in SQL: `schema.name(argument types)`.
+    /// Whether this routine is one Schemaic can **edit** — the entry point's
+    /// gate, the call [`crate::ddl::supports_view_editing`] makes for a
+    /// materialized view and `is_editable_trigger` for a constraint trigger.
     ///
-    /// PostgreSQL identifies a function by its **argument types**, not its name —
-    /// overloads share one name — so `DROP`/`ALTER`/`COMMENT ON` all need this
-    /// form and none of them accept the bare name.
+    /// The emitter writes the body as the routine's *source*: dollar-quoted on
+    /// PostgreSQL, verbatim on MySQL. That is right for every language whose
+    /// body really is source text — `sql`, `plpgsql`, `plpython3u`, `plperl` —
+    /// and wrong for the two where it isn't. A `LANGUAGE c` function's `prosrc`
+    /// is a **link symbol**, and recreating it needs
+    /// `AS 'obj_file', 'link_symbol'`, a form this emitter has no arm for; a
+    /// `LANGUAGE internal` one names a built-in. Re-emitting either as
+    /// `AS $$symbol$$` produces a routine that is not the one that was there.
+    ///
+    /// Such a routine is still **listed and droppable**, exactly as an identity
+    /// column's sequence is: the tree row is context, and hiding it would be a
+    /// worse lie than showing it with Edit greyed out.
+    pub fn is_editable(&self) -> bool {
+        !matches!(
+            self.language.trim().to_ascii_lowercase().as_str(),
+            "c" | "internal"
+        )
+    }
+
+    /// The routine's identity in SQL, as `DROP`/`ALTER`/`COMMENT ON` need it.
+    ///
+    /// **PostgreSQL identifies a routine by its argument types**, not its name —
+    /// overloads share one name — so all three statements need the parameter
+    /// list there and none of them accept the bare name. MySQL is the other way
+    /// round: a name is unique within a database and `DROP PROCEDURE p(...)` is
+    /// a syntax error, so the list must *not* be written.
+    ///
+    /// An exhaustive `match` rather than a `== Postgres`, so a fourth engine has
+    /// to answer for itself instead of inheriting whichever side it fell on.
     pub fn signature_sql(&self, dialect: crate::intel::SqlDialect) -> String {
         let name = qualified_ident(&self.name, self.schema.as_deref(), dialect);
-        format!("{name}({})", self.arguments.trim())
+        match dialect {
+            crate::intel::SqlDialect::Postgres => format!("{name}({})", self.arguments.trim()),
+            crate::intel::SqlDialect::MySql | crate::intel::SqlDialect::Sqlite => name,
+        }
     }
 
-    /// `CREATE [OR REPLACE] FUNCTION`, with every option restated — the single
-    /// function emitter, on the same rule as [`crate::ddl::view_ddl`].
+    /// `CREATE [OR REPLACE] {FUNCTION|PROCEDURE}`, with every option restated —
+    /// the single routine emitter, on the same rule as [`crate::ddl::view_ddl`].
+    ///
+    /// `replace` is honoured only where the engine has the form. MySQL has no
+    /// `CREATE OR REPLACE` for a routine, so the flag is ignored there and
+    /// [`crate::ddl::diff_routine`] emits the `DROP` that has to come first
+    /// instead — the same resolution [`diff_view`] performs for SQLite.
+    ///
+    /// [`diff_view`]: crate::ddl::diff_view
     pub fn create_sql(&self, dialect: crate::intel::SqlDialect, replace: bool) -> String {
+        match dialect {
+            crate::intel::SqlDialect::Postgres => self.pg_create_sql(replace),
+            // SQLite has no stored routines at all; it never reaches here
+            // (`supports_routine_editing` is false for it), and MySQL's shape is
+            // the closer of the two if it somehow does.
+            crate::intel::SqlDialect::MySql | crate::intel::SqlDialect::Sqlite => {
+                self.mysql_create_sql(dialect)
+            }
+        }
+    }
+
+    fn pg_create_sql(&self, replace: bool) -> String {
+        let d = crate::intel::SqlDialect::Postgres;
         let tag = dollar_tag(&self.body);
         let mut out = String::from("CREATE ");
         if replace {
             out.push_str("OR REPLACE ");
         }
-        out.push_str(&format!("FUNCTION {}\n", self.signature_sql(dialect)));
-        out.push_str(&format!("RETURNS {}\n", self.returns.trim()));
+        out.push_str(&format!(
+            "{} {}\n",
+            self.kind.sql_keyword(),
+            self.signature_sql(d)
+        ));
+        // **`CREATE PROCEDURE` takes a strict subset of a function's
+        // attributes**, and the ones it rejects are rejected outright:
+        // PostgreSQL's grammar allows only `LANGUAGE`, `TRANSFORM`, `SECURITY`,
+        // `SET` and `AS` on one, and anything else is
+        // `ERROR: invalid attribute in procedure definition`. So the return
+        // type, the volatility and the strictness are all function-only here —
+        // this guarded `RETURNS` alone at first, which left an edit that merely
+        // *touched* a procedure's Volatility control emitting a statement the
+        // server would refuse.
+        let is_function = self.kind == RoutineKind::Function;
+        if is_function {
+            out.push_str(&format!("RETURNS {}\n", self.returns.trim()));
+        }
         out.push_str(&format!("LANGUAGE {}\n", self.language.trim()));
         // VOLATILE is the default and says nothing, so it isn't restated — the
         // same call `create_view_sql` makes about `ALGORITHM = UNDEFINED`.
-        if self.volatility != Volatility::Volatile {
+        if is_function && self.volatility != Volatility::Volatile {
             out.push_str(self.volatility.sql());
             out.push('\n');
         }
-        if self.strict {
+        if is_function && self.strict {
             out.push_str("STRICT\n");
         }
         if self.security_definer {
@@ -1667,6 +1879,107 @@ impl RoutineInfo {
             self.body.trim_matches('\n')
         ));
         out
+    }
+
+    /// MySQL's shape: `DEFINER`, the name and parameters, `RETURNS`, then the
+    /// characteristics. The first three are positional and the characteristics
+    /// are not — MySQL accepts those in any order — so their sequence here is
+    /// the order `SHOW CREATE` prints them in, chosen so a re-emitted routine
+    /// reads like the one the server would hand back.
+    ///
+    /// **No trailing semicolon.** A routine body is a compound statement whose
+    /// own statements end in `;`, so what is emitted is one statement that
+    /// happens to contain several. `Db::run_ddl` sends each plan step whole, on
+    /// one connection, which is why no `DELIMITER` dance is needed — that is a
+    /// client-side convention of the `mysql` CLI, not part of the protocol.
+    fn mysql_create_sql(&self, d: crate::intel::SqlDialect) -> String {
+        let mut out = String::from("CREATE ");
+        if let Some(def) = self.definer.as_deref().filter(|s| !s.trim().is_empty()) {
+            out.push_str(&definer_sql(def));
+            out.push(' ');
+        }
+        out.push_str(&format!(
+            "{} {}({})\n",
+            self.kind.sql_keyword(),
+            qualified_ident(&self.name, self.schema.as_deref(), d),
+            self.arguments.trim()
+        ));
+        if self.kind == RoutineKind::Function && !self.returns.trim().is_empty() {
+            out.push_str(&format!("RETURNS {}\n", self.returns.trim()));
+        }
+        if self.deterministic {
+            out.push_str("DETERMINISTIC\n");
+        } else {
+            // Stated rather than left to the default for the same reason the
+            // security clause below is: a stored function on a binary-logging
+            // server is judged on this word, and the two engines' silence means
+            // different things.
+            out.push_str("NOT DETERMINISTIC\n");
+        }
+        out.push_str(self.data_access.sql());
+        out.push('\n');
+        out.push_str(if self.security_definer {
+            "SQL SECURITY DEFINER\n"
+        } else {
+            "SQL SECURITY INVOKER\n"
+        });
+        if let Some(c) = self.comment.as_deref().filter(|s| !s.is_empty()) {
+            out.push_str(&format!("COMMENT {}\n", ddl_string(c, d)));
+        }
+        out.push_str(self.body.trim_matches('\n'));
+        out
+    }
+}
+
+/// What one `SHOW CREATE {PROCEDURE|FUNCTION}` round trip yields for a MySQL
+/// routine: the body **as written**, and the session state it was written under.
+///
+/// It exists for the reason [`TriggerSource`] does, and against the same column
+/// family: `information_schema.ROUTINES.ROUTINE_DEFINITION` returns the body
+/// with its escapes already resolved on MySQL 8, so a routine holding `'it''s'`
+/// comes back as `'it's'` — a syntax error on restate, *after* the `DROP` this
+/// engine's every edit begins with has committed and taken the only copy with
+/// it. The same statement is also the only place the three session values live.
+///
+/// Fetched **lazily**, when the editor opens. The eager
+/// `information_schema.ROUTINES` read that fills the schema tree keeps the
+/// resolved body, which is fine for reading and for `Generate DDL` and is not
+/// what an edit is emitted from.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RoutineSource {
+    /// The body as written, or `None` when the `CREATE` text couldn't be
+    /// understood (or the account may not read it).
+    ///
+    /// **Optional so a body this can't parse doesn't take the session state
+    /// with it.** The three values below come from their own columns of the
+    /// same row and are always trustworthy; folding them into the body's
+    /// success meant a routine with an unfamiliar header was later recreated
+    /// under whatever `sql_mode` the applying session happened to have — the
+    /// silent re-filing [`crate::ddl`]'s session wrapper exists to prevent.
+    pub body: Option<String>,
+    pub sql_mode: Option<String>,
+    pub charset_client: Option<String>,
+    pub collation_connection: Option<String>,
+}
+
+impl RoutineSource {
+    /// Copy this onto a [`RoutineInfo`] — the body **and** the session state.
+    ///
+    /// One method because both sides of the diff have to be patched with it
+    /// (`current` and the draft), exactly as [`TriggerSource::apply_to`] does:
+    /// patching only the draft would make every MySQL routine open
+    /// already-changed against a `current` that still held the resolved body.
+    ///
+    /// A `None` body leaves whatever was there — which is `information_schema`'s
+    /// copy, the state every build before this shipped, and better than blanking
+    /// the field.
+    pub fn apply_to(&self, r: &mut RoutineInfo) {
+        if let Some(body) = &self.body {
+            r.body = body.clone();
+        }
+        r.sql_mode = self.sql_mode.clone();
+        r.charset_client = self.charset_client.clone();
+        r.collation_connection = self.collation_connection.clone();
     }
 }
 
@@ -2014,12 +2327,25 @@ pub fn object_name_matches(name: &str, needle_lower: &str) -> bool {
 /// both need a single type that can answer "what are you, what are you called,
 /// and what does your `CREATE` look like" without a three-way match at every
 /// site. The kind tag itself lives in [`crate::ddl::ObjectKind`], next to the
-/// changes that are shared across the three.
+/// changes that are shared across the first three.
+///
+/// `Routine` is behind an [`Arc`](std::sync::Arc) and the others aren't, for two reasons that
+/// point the same way. A [`RoutineInfo`] carries a whole body, so an inline arm
+/// would widen every `ObjectItem` — including the enums and sequences a tree
+/// holds far more of — to the size of the largest. And **`objects_all` is on the
+/// keyboard-walk path**: `visible_nav_rows` rebuilds the whole row list on every
+/// arrow key, through `object_groups` → `objects_all`, so a `Box` there meant
+/// deep-copying every routine body in the database per keypress. An `Arc` makes
+/// that clone a refcount bump and leaves every consumer's code identical, which
+/// is why this is the fix rather than a borrowed second path — `nav_rows` has to
+/// stay bug-for-bug identical to the render, and giving it its own cheaper view
+/// of the objects is exactly how the two drifted before.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ObjectItem {
     Enum(EnumInfo),
     Domain(DomainInfo),
     Sequence(SequenceInfo),
+    Routine(std::sync::Arc<RoutineInfo>),
 }
 
 impl ObjectItem {
@@ -2028,6 +2354,16 @@ impl ObjectItem {
             ObjectItem::Enum(_) => crate::ddl::ObjectKind::Enum,
             ObjectItem::Domain(_) => crate::ddl::ObjectKind::Domain,
             ObjectItem::Sequence(_) => crate::ddl::ObjectKind::Sequence,
+            ObjectItem::Routine(r) => crate::ddl::ObjectKind::of_routine(r.kind),
+        }
+    }
+
+    /// The routine behind this item, when it is one — what the tree's menu and
+    /// the editor both need, and the reason neither has to look it up by name.
+    pub fn routine(&self) -> Option<&RoutineInfo> {
+        match self {
+            ObjectItem::Routine(r) => Some(r),
+            _ => None,
         }
     }
 
@@ -2036,6 +2372,7 @@ impl ObjectItem {
             ObjectItem::Enum(e) => &e.name,
             ObjectItem::Domain(d) => &d.name,
             ObjectItem::Sequence(s) => &s.name,
+            ObjectItem::Routine(r) => &r.name,
         }
     }
 
@@ -2044,6 +2381,7 @@ impl ObjectItem {
             ObjectItem::Enum(e) => e.schema.as_deref(),
             ObjectItem::Domain(d) => d.schema.as_deref(),
             ObjectItem::Sequence(s) => s.schema.as_deref(),
+            ObjectItem::Routine(r) => r.schema.as_deref(),
         }
     }
 
@@ -2105,6 +2443,20 @@ impl ObjectItem {
                 Some(o) => format!("{}.{}", o.table, o.column),
                 None => s.data_type.clone(),
             },
+            // A routine's signature is what tells two overloads apart, so it is
+            // the detail even when it's empty — `()` is the honest rendering of
+            // a routine that takes nothing, and reads as a signature rather than
+            // as a missing summary. The return type follows it for a function,
+            // which is the other half of what picking one out needs.
+            ObjectItem::Routine(r) => {
+                let args = Self::one_line(r.arguments.trim());
+                let returns = r.returns.trim();
+                if r.kind == RoutineKind::Function && !returns.is_empty() {
+                    format!("({args}) → {}", Self::one_line(returns))
+                } else {
+                    format!("({args})")
+                }
+            }
         }
     }
 
@@ -2142,6 +2494,19 @@ impl ObjectItem {
             ObjectItem::Enum(e) => e.create_sql(dialect),
             ObjectItem::Domain(d) => d.create_sql(dialect),
             ObjectItem::Sequence(s) => s.create_sql(dialect),
+            // Not a replace: this is the `CREATE` a reader copies, and one that
+            // said `OR REPLACE` would silently overwrite whatever the target
+            // database already had under that name.
+            //
+            // Through [`crate::ddl::client_script`], which is what makes it
+            // *runnable*: a MySQL routine's `CREATE` carries no terminator (the
+            // apply path sends it whole) and its body is full of `;`, so pasted
+            // into a query tab it was cut mid-body, and two of them joined in a
+            // folder's script ran together. Every other object here already
+            // ends in its own `;` and the call leaves those untouched.
+            ObjectItem::Routine(r) => {
+                crate::ddl::client_script(&[r.create_sql(dialect, false)], dialect)
+            }
         }
     }
 }
@@ -2398,20 +2763,38 @@ fn find_by_ns<'a, T>(
 
 /// The introspected schema of one database.
 ///
-/// The three lists past `tables` are PostgreSQL's standalone objects and stay
-/// empty on MySQL. They live *here*, rather than being fetched lazily the way
-/// [`RoutineInfo`]s are, because they are browsable: the schema tree lists them
-/// beside the tables, and a column's type is one of them. A second, separately
+/// The lists past `tables` are the database's standalone objects — the first
+/// three are PostgreSQL's and stay empty on MySQL, the fourth is on both. They
+/// live *here* because they are browsable: the schema tree lists them beside
+/// the tables, and a column's type is one of them. A second, separately
 /// refreshed cache keyed the same way would be a second answer to "what is in
 /// this database", and the two would diverge on the first refresh that only
-/// updated one. A function body has no such reader — nothing renders it until an
-/// editor asks — which is why that one is lazy and these aren't.
+/// updated one.
+///
+/// `routines` used to be the exception, fetched lazily for the trigger editor's
+/// dropdown alone on the grounds that nothing rendered a body until an editor
+/// asked. Browsing them is exactly the reader that argument said didn't exist —
+/// and completion wants their names as much as it wants a table's — so they
+/// arrive with everything else now. The bodies are no heavier here than the view
+/// definitions and trigger bodies this struct has always carried.
+///
+/// **A MySQL routine's `body` is the one field here that is not trustworthy for
+/// an edit.** It comes from `information_schema`, which resolves the escapes;
+/// [`RoutineSource`] is the correct source and is read lazily when the editor
+/// opens, exactly as [`TriggerSource`] is.
 #[derive(Clone, Debug, Default)]
 pub struct DbSchema {
     pub tables: Vec<TableInfo>,
     pub enums: Vec<EnumInfo>,
     pub domains: Vec<DomainInfo>,
     pub sequences: Vec<SequenceInfo>,
+    /// Stored functions and procedures. Both engines that have them report them;
+    /// SQLite has none and leaves this empty.
+    ///
+    /// `Arc`, not a plain `RoutineInfo`, for the reason [`ObjectItem::Routine`]
+    /// gives: the schema-tree walk turns these into `ObjectItem`s on every arrow
+    /// key, and a body copied per keypress is the cost that buys nothing.
+    pub routines: Vec<std::sync::Arc<RoutineInfo>>,
     /// Which MySQL-family server this came from, when it came from one.
     ///
     /// `SqlDialect` deliberately has no MariaDB arm — the two speak one dialect
@@ -2485,6 +2868,29 @@ impl DbSchema {
         })
     }
 
+    /// One routine by namespace, kind and name, on the same `find_by_ns`
+    /// namespace rule.
+    ///
+    /// **Narrowed by kind first**, because a function and a procedure may share a
+    /// name and are different objects. It still answers with the *first* of a set
+    /// of PostgreSQL overloads: they share a name, a kind and a namespace, so
+    /// nothing short of the argument types tells them apart — which is exactly
+    /// what a remembered palette hit or a search-history entry cannot carry. The
+    /// tree passes the whole [`RoutineInfo`] instead and never comes here.
+    pub fn find_routine(
+        &self,
+        schema: Option<&str>,
+        kind: RoutineKind,
+        name: &str,
+    ) -> Option<&std::sync::Arc<RoutineInfo>> {
+        let of_kind: Vec<&std::sync::Arc<RoutineInfo>> =
+            self.routines.iter().filter(|r| r.kind == kind).collect();
+        find_by_ns(&of_kind, schema, name, |r| {
+            (r.schema.as_deref(), r.name.as_str())
+        })
+        .copied()
+    }
+
     /// Every standalone object in one namespace, of one kind, in introspection
     /// order — what a schema-tree group renders.
     ///
@@ -2530,6 +2936,20 @@ impl DbSchema {
                 .find_sequence(schema, name)
                 .cloned()
                 .map(ObjectItem::Sequence),
+            // Both routine kinds go through one lookup narrowed by kind, so a
+            // procedure and a function of the same name resolve to the one that
+            // was asked for. PostgreSQL's overloads share a name *and* a kind, so
+            // this still answers with the first — a remembered palette hit names
+            // only `(namespace, kind, name)`, which is all a search-history entry
+            // can carry.
+            // Spelled out rather than caught by a `_`, so a sixth `ObjectKind`
+            // has to answer for itself instead of silently resolving to
+            // nothing here and in the two lookups below.
+            k @ (crate::ddl::ObjectKind::Function | crate::ddl::ObjectKind::Procedure) => k
+                .routine_kind()
+                .and_then(|rk| self.find_routine(schema, rk, name))
+                .cloned()
+                .map(ObjectItem::Routine),
         }
     }
 
@@ -2574,6 +2994,15 @@ impl DbSchema {
                 .cloned()
                 .map(ObjectItem::Sequence)
                 .collect(),
+            k @ (crate::ddl::ObjectKind::Function | crate::ddl::ObjectKind::Procedure) => self
+                .routines
+                .iter()
+                .filter(|r| {
+                    Some(r.kind) == k.routine_kind() && object_name_matches(&r.name, needle_lower)
+                })
+                .cloned()
+                .map(ObjectItem::Routine)
+                .collect(),
         }
     }
 
@@ -2594,6 +3023,13 @@ impl DbSchema {
                 .iter()
                 .cloned()
                 .map(ObjectItem::Sequence)
+                .collect(),
+            k @ (crate::ddl::ObjectKind::Function | crate::ddl::ObjectKind::Procedure) => self
+                .routines
+                .iter()
+                .filter(|r| Some(r.kind) == k.routine_kind())
+                .cloned()
+                .map(ObjectItem::Routine)
                 .collect(),
         }
     }
@@ -2701,11 +3137,20 @@ impl DbSchema {
             })
             .map(|o| o.create_sql(dialect))
             .collect();
+        // **Last**, because a routine body names the tables and views above it.
+        // The order is what makes the script runnable end to end rather than a
+        // set of statements that happen to be here.
+        let routines: Vec<String> = [ObjectKind::Function, ObjectKind::Procedure]
+            .into_iter()
+            .flat_map(|k| self.objects_in(schema, k))
+            .map(|o| o.create_sql(dialect))
+            .collect();
         types
             .into_iter()
             .chain(tables.into_iter().map(|t| t.create_ddl(dialect)))
             .chain(views.into_iter().map(|t| t.create_ddl(dialect)))
             .chain(seqs)
+            .chain(routines)
             .collect::<Vec<_>>()
             .join("\n\n")
     }
@@ -2756,6 +3201,7 @@ impl DbSchema {
             .chain(self.enums.iter().filter_map(|e| e.schema.clone()))
             .chain(self.domains.iter().filter_map(|d| d.schema.clone()))
             .chain(self.sequences.iter().filter_map(|s| s.schema.clone()))
+            .chain(self.routines.iter().filter_map(|r| r.schema.clone()))
             .collect();
         out.sort_by(|a, b| {
             let key = |s: &str| (s != PG_DEFAULT_SCHEMA, s.to_string());
@@ -4774,8 +5220,253 @@ mod tests {
                 schema: Some("public".into()),
                 ..Default::default()
             }],
+            // A function and a procedure that **share a name**, which is what
+            // makes the kind part of the lookup rather than a label on the row.
+            routines: vec![
+                std::sync::Arc::new(RoutineInfo {
+                    name: "settle".into(),
+                    schema: Some("public".into()),
+                    kind: RoutineKind::Function,
+                    arguments: "a integer".into(),
+                    returns: "integer".into(),
+                    language: "sql".into(),
+                    body: "SELECT $1".into(),
+                    ..Default::default()
+                }),
+                std::sync::Arc::new(RoutineInfo {
+                    name: "settle".into(),
+                    schema: Some("sales".into()),
+                    kind: RoutineKind::Procedure,
+                    language: "plpgsql".into(),
+                    body: "BEGIN END;".into(),
+                    ..Default::default()
+                }),
+            ],
             ..Default::default()
         }
+    }
+
+    /// The tree, the palette and the Create menu all reach routines through the
+    /// same kind-keyed machinery the types use — which is the whole reason they
+    /// are [`ObjectItem`]s. A kind that answered with the wrong list would show
+    /// procedures in the Functions folder.
+    #[test]
+    fn routines_are_listed_as_objects_of_their_own_kind() {
+        use crate::ddl::ObjectKind;
+        let s = objects();
+        let fns = s.objects_all(ObjectKind::Function);
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].name(), "settle");
+        assert_eq!(fns[0].kind(), ObjectKind::Function);
+        assert_eq!(fns[0].schema(), Some("public"));
+
+        let procs = s.objects_all(ObjectKind::Procedure);
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].kind(), ObjectKind::Procedure);
+        // …and each folder scopes to its namespace like every other one.
+        assert!(s.objects_in(Some("sales"), ObjectKind::Function).is_empty());
+        assert_eq!(s.objects_in(Some("sales"), ObjectKind::Procedure).len(), 1);
+    }
+
+    /// A remembered palette hit carries `(namespace, kind, name)` and nothing
+    /// else, so the kind is what keeps a same-named procedure from answering for
+    /// a function.
+    #[test]
+    fn finding_a_routine_by_name_is_narrowed_by_kind_first() {
+        use crate::ddl::ObjectKind;
+        let s = objects();
+        assert_eq!(
+            s.find_object(Some("public"), ObjectKind::Function, "settle")
+                .map(|o| o.kind()),
+            Some(ObjectKind::Function)
+        );
+        assert_eq!(
+            s.find_object(Some("sales"), ObjectKind::Procedure, "settle")
+                .map(|o| o.kind()),
+            Some(ObjectKind::Procedure)
+        );
+        // The kind that isn't there in that namespace is a miss, not a fallback
+        // to the other one.
+        assert!(
+            s.find_object(Some("sales"), ObjectKind::Function, "settle")
+                .is_none()
+        );
+    }
+
+    /// A routine's row detail is its signature, because that is what tells two
+    /// of them apart — and `()` is the honest rendering of one that takes
+    /// nothing rather than a blank where a summary should be.
+    #[test]
+    fn a_routines_detail_is_its_signature() {
+        let s = objects();
+        assert_eq!(
+            s.objects_all(crate::ddl::ObjectKind::Function)[0].detail(),
+            "(a integer) → integer"
+        );
+        // A procedure returns nothing, so nothing is shown for it.
+        assert_eq!(
+            s.objects_all(crate::ddl::ObjectKind::Procedure)[0].detail(),
+            "()"
+        );
+    }
+
+    /// The three catalogue readers behind a routine. Each has an "unknown"
+    /// answer that must land on the **server's own default**, because the
+    /// emitter restates whatever this produced: a mis-read data access or
+    /// volatility is silently re-declared on the next edit.
+    #[test]
+    fn a_routines_catalogue_codes_read_back_to_the_servers_defaults() {
+        assert_eq!(RoutineKind::parse("PROCEDURE"), RoutineKind::Procedure);
+        assert_eq!(RoutineKind::parse("p"), RoutineKind::Procedure);
+        assert_eq!(RoutineKind::parse("FUNCTION"), RoutineKind::Function);
+        assert_eq!(RoutineKind::parse("f"), RoutineKind::Function);
+        assert_eq!(RoutineKind::parse("nonsense"), RoutineKind::Function);
+
+        assert_eq!(Volatility::parse_code("i"), Volatility::Immutable);
+        assert_eq!(Volatility::parse_code(" s "), Volatility::Stable);
+        assert_eq!(Volatility::parse_code("v"), Volatility::Volatile);
+        assert_eq!(Volatility::parse_code(""), Volatility::Volatile);
+
+        // `information_schema` spells them with an underscore where the clause
+        // has a space, so both forms have to read the same.
+        assert_eq!(
+            SqlDataAccess::parse("READS_SQL_DATA"),
+            SqlDataAccess::ReadsSqlData
+        );
+        assert_eq!(
+            SqlDataAccess::parse("reads sql data"),
+            SqlDataAccess::ReadsSqlData
+        );
+        assert_eq!(SqlDataAccess::parse("NO_SQL"), SqlDataAccess::NoSql);
+        assert_eq!(
+            SqlDataAccess::parse("MODIFIES_SQL_DATA"),
+            SqlDataAccess::ModifiesSqlData
+        );
+        assert_eq!(SqlDataAccess::parse(""), SqlDataAccess::ContainsSql);
+    }
+
+    /// Only a **function** returning `trigger` can be bound to one — a procedure
+    /// cannot, and PostgreSQL has no way to make it so.
+    #[test]
+    fn only_a_function_counts_as_a_trigger_function() {
+        let mut r = RoutineInfo {
+            kind: RoutineKind::Function,
+            returns: "trigger".into(),
+            ..Default::default()
+        };
+        assert!(r.is_trigger_function());
+        r.returns = "event_trigger".into();
+        assert!(r.is_trigger_function());
+        r.returns = "integer".into();
+        assert!(!r.is_trigger_function());
+        r.returns = "trigger".into();
+        r.kind = RoutineKind::Procedure;
+        assert!(!r.is_trigger_function());
+    }
+
+    /// **`Generate DDL` has to hand back something that runs.** A MySQL
+    /// routine's `CREATE` carries no terminator — the apply path sends each
+    /// statement whole — and its body is full of `;`, so the copied form has to
+    /// go through `client_script` or a query tab cuts it mid-body.
+    #[test]
+    fn a_mysql_routines_copied_ddl_is_runnable() {
+        let r = ObjectItem::Routine(std::sync::Arc::new(RoutineInfo {
+            name: "restock".into(),
+            kind: RoutineKind::Procedure,
+            language: "SQL".into(),
+            body: "BEGIN\n    SELECT 1;\nEND".into(),
+            ..Default::default()
+        }));
+        let sql = r.create_sql(crate::intel::SqlDialect::MySql);
+        assert!(sql.starts_with("DELIMITER $$"), "{sql}");
+        assert!(sql.contains("CREATE PROCEDURE `restock`()"), "{sql}");
+        assert!(sql.trim_end().ends_with("DELIMITER ;"), "{sql}");
+        // Never `OR REPLACE`: this is the `CREATE` a reader copies, and it must
+        // not silently overwrite whatever the target database already had.
+        assert!(!sql.contains("OR REPLACE"), "{sql}");
+
+        // PostgreSQL's already terminates itself and needs no wrapper.
+        let pg = ObjectItem::Routine(std::sync::Arc::new(RoutineInfo {
+            name: "audit".into(),
+            schema: Some("public".into()),
+            returns: "trigger".into(),
+            language: "plpgsql".into(),
+            body: "BEGIN RETURN NEW; END;".into(),
+            ..Default::default()
+        }))
+        .create_sql(crate::intel::SqlDialect::Postgres);
+        assert!(!pg.contains("DELIMITER"), "{pg}");
+        assert!(pg.trim_end().ends_with(';'), "{pg}");
+    }
+
+    /// **The session state survives a body the reader couldn't parse.** All four
+    /// values come from one `SHOW CREATE` row and only the body needs
+    /// understanding, so a `None` body must leave what was already there rather
+    /// than blanking it — and must not take the `sql_mode` with it, or the
+    /// recreate runs under whatever mode the applying session had.
+    #[test]
+    fn an_unreadable_body_still_carries_the_session_state() {
+        let mut r = RoutineInfo {
+            body: "the resolved copy".into(),
+            ..Default::default()
+        };
+        RoutineSource {
+            body: None,
+            sql_mode: Some("NO_ENGINE_SUBSTITUTION".into()),
+            charset_client: Some("utf8mb4".into()),
+            collation_connection: None,
+        }
+        .apply_to(&mut r);
+        assert_eq!(r.body, "the resolved copy");
+        assert_eq!(r.sql_mode.as_deref(), Some("NO_ENGINE_SUBSTITUTION"));
+        assert_eq!(r.charset_client.as_deref(), Some("utf8mb4"));
+
+        // A body that *was* read replaces it.
+        RoutineSource {
+            body: Some("BEGIN SELECT 'it''s'; END".into()),
+            ..Default::default()
+        }
+        .apply_to(&mut r);
+        assert_eq!(r.body, "BEGIN SELECT 'it''s'; END");
+        // …and clears the session state it now knows nothing about, so both
+        // sides of the diff agree.
+        assert_eq!(r.sql_mode, None);
+    }
+
+    /// A routine whose body is a **link symbol** rather than source can't be
+    /// re-emitted by an emitter that dollar-quotes it, so it is listed and
+    /// droppable but not editable — the call a materialized view gets.
+    #[test]
+    fn a_routine_whose_body_is_not_source_is_not_editable() {
+        let of = |lang: &str| RoutineInfo {
+            language: lang.into(),
+            ..Default::default()
+        };
+        assert!(!of("c").is_editable());
+        assert!(!of("C").is_editable());
+        assert!(!of(" internal ").is_editable());
+        // Every language whose body really is its source stays editable —
+        // including the ones the form's dropdown doesn't propose.
+        assert!(of("sql").is_editable());
+        assert!(of("plpgsql").is_editable());
+        assert!(of("plpython3u").is_editable());
+        assert!(of("SQL").is_editable());
+    }
+
+    /// A namespace that holds only routines is still a namespace: leaving it out
+    /// of `schemas()` would make its contents unreachable in the tree, which is
+    /// the same fault the enums and sequences were added to fix.
+    #[test]
+    fn a_namespace_holding_only_a_routine_is_still_listed() {
+        let s = DbSchema {
+            routines: vec![std::sync::Arc::new(RoutineInfo {
+                name: "lonely".into(),
+                schema: Some("ops".into()),
+                ..Default::default()
+            })],
+            ..Default::default()
+        };
+        assert_eq!(s.schemas(), vec!["ops".to_string()]);
     }
 
     #[test]
@@ -4887,8 +5578,8 @@ mod tests {
     fn objects_matching_agrees_with_filtering_the_whole_list() {
         use crate::ddl::ObjectKind;
         let s = objects();
-        for q in ["mood", "moo", "email", "counter", "o", "zzz"] {
-            for kind in [ObjectKind::Enum, ObjectKind::Domain, ObjectKind::Sequence] {
+        for q in ["mood", "moo", "email", "counter", "settle", "o", "zzz"] {
+            for kind in ObjectKind::ALL {
                 let expected: Vec<ObjectItem> = s
                     .objects_all(kind)
                     .into_iter()

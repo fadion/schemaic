@@ -5096,6 +5096,35 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         )
     };
 
+    // One `SHOW CREATE {PROCEDURE|FUNCTION}`, for the routine the user just
+    // opened. The counterpart of `trigger_source` above and, like it, not an
+    // optimisation — `information_schema` resolves the body's escapes, and every
+    // MySQL routine edit begins with a `DROP` that commits on its own.
+    let routine_source: schemaic_ui::RoutineSrcFn = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(
+            move |req: schemaic_ui::RoutineSrcRequest, done: schemaic_ui::RoutineSrcDoneFn| {
+                let Ok(db) = db_for(req.conn_id) else {
+                    // Nothing to report: the editor keeps the body it has.
+                    return;
+                };
+                let name = req.name.clone();
+                let report = create_ext_action(cx, move |src| (done)(name.clone(), src));
+                handle.spawn(async move {
+                    // A failed read leaves the editor on `information_schema`'s
+                    // body, which is better than refusing to open at all — and
+                    // is what a role without `SHOW_ROUTINE` will always get.
+                    let src = db
+                        .routine_source(Some(&req.database), req.kind, &req.name)
+                        .await
+                        .unwrap_or(None);
+                    report(src);
+                });
+            },
+        )
+    };
+
     // ── Table properties ────────────────────────────────────────────────────
     // The statistics behind the properties modal. Fetched for the whole database
     // (one round trip either way) and then narrowed to the object asked about,
@@ -7089,6 +7118,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             view_algorithm,
             trigger_functions,
             trigger_source,
+            routine_source,
             table_stats,
             count_rows,
             count_cancel,
@@ -7135,8 +7165,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             view_rows: RwSignal::new(14),
             trigger: RwSignal::new(None),
             trigger_draft: RwSignal::new(schemaic_core::ddl::TriggerSetDraft::default()),
-            function: RwSignal::new(None),
-            function_draft: RwSignal::new(schemaic_core::ddl::FunctionDraft::default()),
+            routine: RwSignal::new(None),
+            routine_draft: RwSignal::new(schemaic_core::ddl::RoutineDraft::default()),
             functions: RwSignal::new(Vec::new()),
             object: RwSignal::new(None),
             object_draft: RwSignal::new(schemaic_core::ddl::ObjectDraft::default()),

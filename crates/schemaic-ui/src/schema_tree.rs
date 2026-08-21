@@ -198,7 +198,7 @@ fn object_key(database: &str, scope: TableScope, kind: ObjectKind, name: &str) -
 /// Fixed order rather than "biggest first" so the tree doesn't rearrange itself
 /// when a type is added.
 fn object_groups(schema: &DbSchema, scope: TableScope) -> Vec<(ObjectKind, Vec<ObjectItem>)> {
-    [ObjectKind::Enum, ObjectKind::Domain, ObjectKind::Sequence]
+    ObjectKind::ALL
         .into_iter()
         .filter_map(|k| {
             let items = match scope {
@@ -216,6 +216,8 @@ fn object_group_label(kind: ObjectKind) -> &'static str {
         ObjectKind::Enum => "Types",
         ObjectKind::Domain => "Domains",
         ObjectKind::Sequence => "Sequences",
+        ObjectKind::Function => "Functions",
+        ObjectKind::Procedure => "Procedures",
     }
 }
 
@@ -226,6 +228,11 @@ pub(crate) fn object_icon(kind: ObjectKind) -> &'static str {
         ObjectKind::Enum => icons::TAG,
         ObjectKind::Domain => icons::SCAN_SQUARE,
         ObjectKind::Sequence => icons::FILE_DIGIT,
+        // Two glyphs, not one: a function returns something and a procedure is
+        // called for its effect, and the folders they sit in are separate for
+        // exactly that reason.
+        ObjectKind::Function => icons::SQUARE_FUNCTION,
+        ObjectKind::Procedure => icons::SQUARE_PLAY,
     }
 }
 
@@ -235,20 +242,18 @@ pub(crate) fn object_icon(kind: ObjectKind) -> &'static str {
 /// type would otherwise hide the very database that defines it — the level above
 /// is dropped before the folder holding the match is ever reached.
 fn has_object_match(schema: &DbSchema, filt: &str) -> bool {
-    [ObjectKind::Enum, ObjectKind::Domain, ObjectKind::Sequence]
+    ObjectKind::ALL
         .into_iter()
         .any(|k| schema.objects_all(k).iter().any(|o| o.matches_search(filt)))
 }
 
 fn namespace_has_object_match(schema: &DbSchema, ns: &str, filt: &str) -> bool {
-    [ObjectKind::Enum, ObjectKind::Domain, ObjectKind::Sequence]
-        .into_iter()
-        .any(|k| {
-            schema
-                .objects_in(Some(ns), k)
-                .iter()
-                .any(|o| o.matches_search(filt))
-        })
+    ObjectKind::ALL.into_iter().any(|k| {
+        schema
+            .objects_in(Some(ns), k)
+            .iter()
+            .any(|o| o.matches_search(filt))
+    })
 }
 
 /// Does this database's row survive the filter?

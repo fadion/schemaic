@@ -1,10 +1,14 @@
-//! The trigger editor, and the function editor that exists to serve it.
+//! The trigger editor.
 //!
-//! Two modals in one module because the second is only reachable through the
-//! first on any path a user cares about: a PostgreSQL trigger holds no body — it
-//! is a binding to a function — so "make a trigger" there means "have a function
-//! to point at", and offering the trigger form without a way to write one would
-//! be a dead end.
+//! It reaches [`crate::routine_editor`] and used to *contain* it: a PostgreSQL
+//! trigger holds no body — it is a binding to a function — so "make a trigger"
+//! there means "have a function to point at", and offering this form without a
+//! way to write one would be a dead end. The function modal lived here for that
+//! reason and moved out when routines became browsable in their own right. What
+//! didn't change is the handoff: this editor's target is deliberately left set
+//! while that one is up, so closing it reveals a half-filled trigger form
+//! exactly as it was, and this module re-fetches its function list when that
+//! happens.
 //!
 //! The trigger modal is the designer's **list-plus-form** shape — a table's
 //! triggers on the left, the selected one's details on the right, with `+`/`−`
@@ -53,7 +57,7 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::create_effect;
 
-use schemaic_core::ddl::{self, FunctionDraft, TriggerDraft, TriggerSetDraft};
+use schemaic_core::ddl::{self, TriggerDraft, TriggerSetDraft};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::schema::{
     RoutineInfo, TriggerAction, TriggerEvent, TriggerInfo, TriggerLevel, TriggerTiming,
@@ -70,8 +74,8 @@ use crate::widgets::{
     form_setting_owned, modal_footer_split, modal_title_owned, panel_style,
 };
 use crate::{
-    DdlPreview, FieldCfg, FunctionTarget, TriggerFnDoneFn, TriggerFnRequest, TriggerSrcDoneFn,
-    TriggerSrcRequest, TriggerTarget, Ui, ddl_preview, edit_field, object_location, theme,
+    DdlPreview, FieldCfg, TriggerFnDoneFn, TriggerFnRequest, TriggerSrcDoneFn, TriggerSrcRequest,
+    TriggerTarget, Ui, ddl_preview, edit_field, object_location, theme,
 };
 
 /// Matches the table designer's, deliberately: this is the same list-plus-form
@@ -108,7 +112,7 @@ fn open_editor(ui: &Ui, target: TriggerTarget, draft: TriggerSetDraft) {
     // Each overlay knows only its own flag, so two open would paint two panels.
     d.designer.set(None);
     d.view.set(None);
-    d.function.set(None);
+    d.routine.set(None);
     d.functions.set(Vec::new());
     let dialect = target.dialect;
     d.trigger.set(Some(target));
@@ -287,70 +291,6 @@ pub(crate) fn is_editable_trigger(t: &TriggerInfo) -> bool {
     !t.constraint
 }
 
-// ── the function editor ──────────────────────────────────────────────────────
-
-fn open_function(ui: &Ui, target: FunctionTarget, draft: FunctionDraft) {
-    let d = ui.ddl;
-    d.function_draft.set(draft);
-    d.view_rows.set(BODY_ROWS);
-    d.error.set(None);
-    d.preview.set(None);
-    d.designer.set(None);
-    d.view.set(None);
-    // The trigger editor's target is deliberately *left set*: its overlay
-    // renders nothing while this one is up (so only one panel paints), and
-    // leaving it means closing this one puts the half-filled trigger form back
-    // exactly as it was, with no target to rebuild and nothing to guess.
-    d.function.set(Some(target));
-}
-
-pub(crate) fn open_for_function(ui: &Ui, database: &str, f: &RoutineInfo) {
-    let ctx = edit_ctx(ui);
-    open_function(
-        ui,
-        FunctionTarget {
-            conn_id: ctx.conn_id,
-            database: database.to_string(),
-            dialect: ctx.dialect,
-            current: Some(f.clone()),
-            read_only: ctx.read_only,
-        },
-        FunctionDraft::from_info(f),
-    );
-}
-
-/// Create a function, from the trigger editor's "New function…".
-///
-/// There is no "return to the trigger" flag: the trigger editor's target is
-/// never cleared, so closing this one simply reveals it again with its draft
-/// intact. A flag would have been a second source of truth for something the
-/// signal already answers.
-pub(crate) fn open_for_new_function(ui: &Ui, database: &str, schema: Option<&str>) {
-    let ctx = edit_ctx(ui);
-    // Against the functions already fetched for this database, so a second
-    // "New function…" doesn't propose a name the first one took.
-    let taken: Vec<String> = ui.ddl.functions.with_untracked(|l| {
-        l.iter()
-            .filter(|f| f.schema.as_deref() == schema)
-            .map(|f| f.name.clone())
-            .collect()
-    });
-    open_function(
-        ui,
-        FunctionTarget {
-            conn_id: ctx.conn_id,
-            database: database.to_string(),
-            dialect: ctx.dialect,
-            current: None,
-            read_only: ctx.read_only,
-        },
-        FunctionDraft::blank_trigger(
-            unique_name(&taken, "new_trigger_fn"),
-            schema.map(str::to_string),
-        ),
-    );
-}
-
 // ── bound controls ───────────────────────────────────────────────────────────
 
 /// A field bound to one place in the trigger draft.
@@ -416,25 +356,6 @@ fn bound_choice(
     .into_any()
 }
 
-/// A field bound to one place in the function draft.
-fn bound_fn_field(
-    ui: &Ui,
-    initial: String,
-    cfg: FieldCfg,
-    apply: impl Fn(&mut FunctionDraft, &str) + 'static,
-) -> AnyView {
-    let draft = ui.ddl.function_draft;
-    let sig = floem::reactive::create_rw_signal(initial);
-    create_effect(move |prev: Option<String>| {
-        let v = sig.get();
-        if prev.is_some_and(|p| p != v) {
-            draft.update(|d| apply(d, &v));
-        }
-        v
-    });
-    edit_field(sig, cfg).into_any()
-}
-
 /// A list of free-text values as **rows**, not one comma-joined box.
 ///
 /// The separator-in-the-data rule, which both layers below this one already
@@ -459,7 +380,7 @@ fn bound_fn_field(
 /// form) cleared the fixed controls by ten indices and were safe only because
 /// each block happened to be last in its form.
 #[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
-fn value_rows(
+pub(crate) fn value_rows(
     ui: &Ui,
     placeholder: &'static str,
     add_label: &'static str,
@@ -887,9 +808,9 @@ fn form(ui: Ui, target: &TriggerTarget, i: usize, ring: FocusRing) -> AnyView {
 ///
 /// Shared because the two "new object" buttons a screen apart disagreed: the
 /// trigger side walked the suffixes, while "New function…" always proposed
-/// `new_trigger_fn`, and `create_function` emits `CREATE FUNCTION` without
+/// `new_trigger_fn`, and `create_routine` emits `CREATE FUNCTION` without
 /// `OR REPLACE` — so a second one failed at apply.
-fn unique_name(taken: &[String], stem: &str) -> String {
+pub(crate) fn unique_name(taken: &[String], stem: &str) -> String {
     let mut name = stem.to_string();
     let mut n = 2;
     while taken.iter().any(|t| t.eq_ignore_ascii_case(&name)) {
@@ -1034,7 +955,7 @@ fn pg_action(
     // 61 and 62: right after the picker at 60 they sit beside, and below the
     // arguments block at `VALUE_TAB`.
     let new_btn = control_button("New function", ring.clone(), 61, move || {
-        open_for_new_function(&new_ui, &database, schema.as_deref());
+        crate::routine_editor::open_for_new_trigger_function(&new_ui, &database, schema.as_deref());
     });
 
     // Editing an existing function lives here rather than in the schema tree
@@ -1057,7 +978,7 @@ fn pg_action(
             let db = edit_db.clone();
             control_button_enabled("Edit", found.is_some(), ring, 62, move || {
                 if let Some(f) = &found {
-                    open_for_function(&ui, &db, f);
+                    crate::routine_editor::open_for_routine(&ui, &db, f);
                 }
             })
         },
@@ -1102,122 +1023,7 @@ fn pg_action(
     .into_any()
 }
 
-// ── the function form ────────────────────────────────────────────────────────
-
-fn function_form(ui: Ui, ring: FocusRing) -> AnyView {
-    let d = ui.ddl.function_draft;
-    let draft = d.get_untracked();
-
-    // No "In {database}" row: the modal title names the place now.
-    let name = form_setting(
-        "Name",
-        bound_fn_field(
-            &ui,
-            draft.info.name.clone(),
-            FieldCfg {
-                placeholder: "audit_fn",
-                focus: Some((ring.clone(), 10)),
-                ..Default::default()
-            },
-            |d, v| d.info.name = v.trim().to_string(),
-        )
-        .style(move |s| s.width(FIELD_W)),
-    );
-
-    let language = form_setting("Language", {
-        let sig = floem::reactive::create_rw_signal(draft.info.language.clone());
-        focusable_owned_dropdown(
-            move || sig.get(),
-            vec!["plpgsql".into(), "sql".into()],
-            FIELD_W,
-            ring.clone(),
-            20,
-            move |v: String| {
-                if sig.get_untracked() != v {
-                    sig.set(v.clone());
-                    d.update(|dr| dr.info.language = v.clone());
-                }
-            },
-        )
-        .into_any()
-    });
-
-    let body = form_setting(
-        "Body",
-        bound_fn_field(
-            &ui,
-            draft.info.body.clone(),
-            FieldCfg {
-                placeholder: "BEGIN\n    RETURN NEW;\nEND;",
-                mono: true,
-                multiline: true,
-                max_rows: Some(ui.ddl.view_rows),
-                // As the trigger body above: logical lines, so the box hugs its
-                // content on the first frame instead of guessing from a width
-                // that hasn't settled.
-                no_wrap: true,
-                focus: Some((ring.clone(), 30)),
-                // It's a function body: Tab indents. Escape leaves.
-                tab_indents: true,
-                ..Default::default()
-            },
-            |d, v| d.info.body = v.to_string(),
-        )
-        .style(|s| s.width_full()),
-    );
-
-    // Shown because they're *carried*: `CREATE OR REPLACE FUNCTION` replaces the
-    // whole routine, so anything not restated reverts — and dropping the
-    // `SET search_path` from a SECURITY DEFINER function is a privilege hole.
-    let secdef = {
-        let sig = floem::reactive::create_rw_signal(draft.info.security_definer);
-        create_effect(move |prev: Option<bool>| {
-            let v = sig.get();
-            if prev.is_some_and(|p| p != v) {
-                d.update(|dr| dr.info.security_definer = v);
-            }
-            v
-        });
-        focusable_toggle_row(
-            "Security definer",
-            "Runs with the owner's rights instead of the caller's. Pin a search_path \
-             below when you use this.",
-            sig,
-            ring.clone(),
-            40,
-        )
-    };
-
-    let settings = form_setting(
-        "Settings",
-        value_rows(
-            &ui,
-            "search_path=public, pg_temp",
-            "Add setting",
-            true,
-            ring,
-            crate::widgets::VALUE_TAB,
-            move || d.with(|s| s.info.settings.clone()),
-            move |v| d.update(|s| s.info.settings = v),
-        )
-        .style(move |s| s.width(FIELD_W * 1.6)),
-    );
-
-    v_stack((
-        form_section("Function"),
-        name,
-        language,
-        form_section("Body").style(|s| s.margin_top(4.0)),
-        body,
-        form_section("Options").style(|s| s.margin_top(4.0)),
-        secdef,
-        settings,
-    ))
-    .style(|s| s.flex_col().gap(FORM_GAP).width_full())
-    .into_any()
-}
-
-// ── the modals ───────────────────────────────────────────────────────────────
+// ── the modal ────────────────────────────────────────────────────────────────
 
 /// The change set the trigger draft currently describes — the same call the
 /// preview emits from, so the footer's count can't disagree with the SQL.
@@ -1312,13 +1118,6 @@ fn trigger_list(
     )
 }
 
-fn fn_change_set(target: &FunctionTarget, draft: &FunctionDraft) -> ddl::ChangeSet {
-    match &target.current {
-        Some(cur) => ddl::diff_function(cur, draft, target.dialect),
-        None => ddl::create_function(draft, target.dialect),
-    }
-}
-
 fn preview_from(target: &TriggerTarget, cs: &ddl::ChangeSet) -> DdlPreview {
     ddl_preview::preview_of(
         target.conn_id,
@@ -1337,14 +1136,14 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
     let d = ui.ddl;
     let close = move || d.trigger.set(None);
 
-    // Re-fetch the function list when the function editor closes back to here:
+    // Re-fetch the function list when the routine editor closes back to here:
     // a function just created has to be in the dropdown, and nothing else would
-    // put it there. Created once, outside the `dyn_container`, so it survives
-    // the panel being rebuilt.
+    // put it there before the next schema reload. Created once, outside the
+    // `dyn_container`, so it survives the panel being rebuilt.
     {
         let ui = ui.clone();
         create_effect(move |prev: Option<bool>| {
-            let fn_open = d.function.get().is_some();
+            let fn_open = d.routine.get().is_some();
             let closed = prev == Some(true) && !fn_open;
             if closed && d.trigger.get_untracked().is_some() {
                 fetch_functions(&ui);
@@ -1356,11 +1155,11 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
     dyn_container(
         // The preview stacks on top and this stays open behind it (Cancel there
         // returns here with the draft intact), but must render nothing. Same for
-        // the function editor, which is reached *from* here and returns here.
+        // the routine editor, which is reached *from* here and returns here.
         move || {
             (
                 d.trigger.get().is_some(),
-                d.preview.get().is_some() || d.function.get().is_some(),
+                d.preview.get().is_some() || d.routine.get().is_some(),
             )
         },
         move |(open, previewing)| {
@@ -1523,166 +1322,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
         },
     )
     .style(move |s| {
-        if d.trigger.get().is_some() && d.preview.get().is_none() && d.function.get().is_none() {
-            s.absolute().inset(0.0)
-        } else {
-            s
-        }
-    })
-}
-
-/// The function editor.
-pub(crate) fn function_editor_overlay(ui: Ui) -> impl IntoView {
-    let d = ui.ddl;
-    // Closing just clears this one. The trigger editor's target was never
-    // cleared, so it reappears underneath with its draft intact — which is why
-    // "New function…" isn't a one-way door out of a half-filled trigger form.
-    let close = move || d.function.set(None);
-
-    dyn_container(
-        move || (d.function.get().is_some(), d.preview.get().is_some()),
-        move |(open, previewing)| {
-            if !open || previewing {
-                return empty().into_any();
-            }
-            let Some(target) = d.function.get_untracked() else {
-                return empty().into_any();
-            };
-            let ui = ui.clone();
-            let title = match &target.current {
-                Some(f) => format!(
-                    "Edit function {}.{}",
-                    object_location(&target.database, f.schema.as_deref()),
-                    f.name
-                ),
-                // A new function's namespace isn't chosen — it is *inherited*
-                // from the table whose trigger is being written, silently, in
-                // `open_for_new_function`. The form has no Schema field to say
-                // so (and shouldn't: a function in another namespace couldn't
-                // be the one this trigger calls), so the title is where it is
-                // disclosed.
-                None => format!(
-                    "Create function in {}",
-                    object_location(
-                        &target.database,
-                        d.function_draft
-                            .with_untracked(|f| f.info.schema.clone())
-                            .as_deref(),
-                    )
-                ),
-            };
-
-            // The form is built once per open, so one ring covers it.
-            let ring = FocusRing::new();
-            let root_ring = ring.clone();
-
-            let body = crate::widgets::autohide(scroll(
-                function_form(ui.clone(), ring.clone())
-                    .style(|s| s.width_full().padding_horiz(MODAL_PAD_H).padding_vert(18.0)),
-            ))
-            .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
-
-            let status_target = target.clone();
-            let status = dyn_container(
-                move || d.function_draft.get(),
-                move |draft| {
-                    let errs = draft.validate();
-                    if let Some(first) = errs.first() {
-                        return text(first.clone())
-                            .style(|s| {
-                                s.color(theme::error())
-                                    .font_size(theme::FONT_LABEL)
-                                    .max_width(460.0)
-                            })
-                            .into_any();
-                    }
-                    let n = fn_change_set(&status_target, &draft).len();
-                    text(match n {
-                        0 => "No changes".to_string(),
-                        1 => "1 change".to_string(),
-                        n => format!("{n} changes"),
-                    })
-                    .style(move |s| {
-                        s.font_size(theme::FONT_LABEL).color(if n == 0 {
-                            theme::text_faint()
-                        } else {
-                            theme::change_count()
-                        })
-                    })
-                    .into_any()
-                },
-            );
-
-            let preview_ui = ui.clone();
-            let preview_target = target.clone();
-            let ring_actions = ring.clone();
-            let actions = dyn_container(
-                move || d.function_draft.get(),
-                move |draft| {
-                    let ui = preview_ui.clone();
-                    let target = preview_target.clone();
-                    let ring = ring_actions.clone();
-                    let cs = fn_change_set(&target, &draft);
-                    let ready = draft.validate().is_empty() && !cs.is_empty();
-                    let subject = draft.info.name.clone();
-                    h_stack((
-                        action_button(
-                            "Cancel",
-                            ActionKind::Neutral,
-                            true,
-                            ring.clone(),
-                            ACTION_TAB,
-                            close,
-                        ),
-                        action_button(
-                            "Preview SQL",
-                            ActionKind::Primary,
-                            ready,
-                            ring,
-                            ACTION_TAB + 10,
-                            move || {
-                                let cs = fn_change_set(&target, &draft);
-                                ddl_preview::open_preview(
-                                    &ui,
-                                    ddl_preview::preview_of(
-                                        target.conn_id,
-                                        &target.database,
-                                        subject.clone(),
-                                        &cs,
-                                        target.read_only,
-                                    ),
-                                );
-                            },
-                        ),
-                    ))
-                    .style(|s| s.flex_row().items_center().gap(ACTION_GAP))
-                    .into_any()
-                },
-            );
-
-            let close_x: Rc<dyn Fn()> = Rc::new(close);
-            let panel = v_stack((
-                modal_title_owned(title, close_x, root_ring.clone()),
-                body,
-                modal_footer_split(status.style(|s| s.min_width(0.0)), actions),
-            ))
-            .on_click_stop(|_| {})
-            .style(|s| panel_style(s).width(PANEL_W).height(PANEL_H));
-
-            focus_root_with_ring(container(panel), root_ring)
-                .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())
-                .style(|s| {
-                    s.size_full()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .background(theme::modal_backdrop())
-                })
-                .into_any()
-        },
-    )
-    .style(move |s| {
-        if d.function.get().is_some() && d.preview.get().is_none() {
+        if d.trigger.get().is_some() && d.preview.get().is_none() && d.routine.get().is_none() {
             s.absolute().inset(0.0)
         } else {
             s
