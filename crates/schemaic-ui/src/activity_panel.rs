@@ -295,12 +295,8 @@ fn interval_button(
     // schema eye's menu sits 3px under its **padded** box, and matching that is
     // the whole point of anchoring this the same way.
     let button = container(icons::icon(icons::CLOCK, 16.0).style(move |s| {
-        let c = if hov.get() {
-            theme::text()
-        } else {
-            theme::text_muted()
-        };
-        s.flex_shrink(0.0_f32).color(c)
+        s.flex_shrink(0.0_f32)
+            .color(crate::widgets::menu_icon_color(menu_open.get(), hov.get()))
     }))
     .on_move(move |p| origin.set(p))
     .on_resize(move |r| size.set((r.width(), r.height())))

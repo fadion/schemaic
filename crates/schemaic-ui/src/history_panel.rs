@@ -154,7 +154,10 @@ pub(crate) fn history_panel(ui: Ui) -> impl IntoView {
                 }),
             }));
         },
-    );
+    )
+    // Named for what it clears: this panel lists one connection's queries, and a
+    // bare "Clear history" beside a filtered list reads as "all of it".
+    .tooltip(|| text("Clear this connection's history…").style(crate::widgets::tooltip_style));
     let title_row = h_stack((section_title("QUERY HISTORY"), trash))
         .style(|s| s.width_full().flex_row().items_start().justify_between());
 

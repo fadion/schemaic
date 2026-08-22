@@ -5401,6 +5401,17 @@ fn grid_toolbar(
             anchor_below(origin.get_untracked()),
         )
     };
+    // The same question asked *reactively*, for the icon's own colour: these run
+    // inside `.style()`, which has to re-evaluate when the menu opens or closes,
+    // so they subscribe where `menu_is_mine` (an event-handler read) deliberately
+    // does not.
+    let menu_is_mine_live = move |origin: RwSignal<Point>| {
+        crate::widgets::menu_anchored_at(
+            gs.popup.with(|p| p.is_some()),
+            gs.popup_anchor.get(),
+            anchor_below(origin.get()),
+        )
+    };
     // Pressing the icon again closes its menu, rather than dismissing and
     // rebuilding the identical panel — the toggle the schema panel's eye and gear
     // and the connection switcher already have.
@@ -5714,12 +5725,11 @@ fn grid_toolbar(
         icons::icon(icons::COPY, 16.0)
             .on_move(move |p| copy_origin.set(p))
             .style(move |s| {
-                let c = if copy_hov.get() {
-                    theme::text()
-                } else {
-                    theme::text_muted()
-                };
-                s.color(c).flex_shrink(0.0_f32)
+                s.color(crate::widgets::menu_icon_color(
+                    menu_is_mine_live(copy_origin),
+                    copy_hov.get(),
+                ))
+                .flex_shrink(0.0_f32)
             }),
     )
     .on_click_stop(move |_| (copy_click)())
@@ -5771,12 +5781,11 @@ fn grid_toolbar(
         icons::icon(icons::DOWNLOAD, 16.0)
             .on_move(move |p| save_origin.set(p))
             .style(move |s| {
-                let c = if save_hov.get() {
-                    theme::text()
-                } else {
-                    theme::text_muted()
-                };
-                s.color(c).flex_shrink(0.0_f32)
+                s.color(crate::widgets::menu_icon_color(
+                    menu_is_mine_live(save_origin),
+                    save_hov.get(),
+                ))
+                .flex_shrink(0.0_f32)
             }),
     )
     .on_click_stop(move |_| (save_click)())
@@ -5887,13 +5896,16 @@ fn grid_toolbar(
                 icons::icon(icons::SPARKLES, 16.0)
                     .on_move(move |p| ai_origin.set(p))
                     .style(move |s| {
-                        // Dimmed + inert while a request is in flight.
+                        // Dimmed + inert while a request is in flight — that arm
+                        // stays first: a busy icon is not a control right now,
+                        // whatever the menu or the pointer is doing.
                         let c = if gs.ai_busy.get() {
                             theme::text_muted().multiply_alpha(0.3)
-                        } else if ai_hov.get() {
-                            theme::text()
                         } else {
-                            theme::text_muted()
+                            crate::widgets::menu_icon_color(
+                                menu_is_mine_live(ai_origin),
+                                ai_hov.get(),
+                            )
                         };
                         s.color(c).flex_shrink(0.0_f32)
                     }),
