@@ -459,15 +459,21 @@ pub fn browse_key_columns(t: &TableInfo) -> Vec<String> {
     t.indexes
         .iter()
         .filter(|ix| ix.unique && !ix.foreign)
+        // **An index with no *column* keys keys nothing.** PostgreSQL models
+        // `CREATE UNIQUE INDEX ON u (lower(email))` as a real index over one
+        // expression, and `column_names()` filters expressions out — so the
+        // `all(…)` below is vacuously true for it and `find` used to *stop*
+        // there and answer with an empty key, hiding a perfectly good unique
+        // index that sorted after it.
+        .filter(|ix| ix.column_names().next().is_some())
         .find(|ix| {
-            !ix.columns.is_empty()
-                && ix.column_names().all(|c| {
-                    t.columns
-                        .iter()
-                        .find(|tc| tc.name == c)
-                        .map(|tc| !tc.nullable)
-                        .unwrap_or(false)
-                })
+            ix.column_names().all(|c| {
+                t.columns
+                    .iter()
+                    .find(|tc| tc.name == c)
+                    .map(|tc| !tc.nullable)
+                    .unwrap_or(false)
+            })
         })
         .map(|ix| ix.column_names().map(str::to_string).collect())
         .unwrap_or_default()
@@ -3805,6 +3811,31 @@ mod browse_key_tests {
     fn a_table_with_neither_has_no_key_of_its_own() {
         let t = table(vec![col("a", true, false), col("b", true, false)], vec![]);
         assert!(browse_key_columns(&t).is_empty());
+    }
+
+    /// **An expression-only unique index keys nothing, and must not end the
+    /// search.** PostgreSQL models `CREATE UNIQUE INDEX ON u (lower(email))` as
+    /// a real index over one expression; `column_names()` skips expressions, so
+    /// the NOT NULL predicate was vacuously true for it and `find` stopped
+    /// there and answered with an *empty* key — hiding the plain unique index
+    /// that sorted after it, and opening a perfectly keyed table read-only.
+    #[test]
+    fn an_expression_only_unique_index_does_not_hide_a_real_one() {
+        let expr = IndexInfo {
+            name: "a_expr".into(),
+            unique: true,
+            columns: vec![IndexColumn::expr("lower(email)")],
+            ..Default::default()
+        };
+        let t = table(
+            vec![col("email", false, false), col("code", false, false)],
+            vec![expr.clone(), IndexInfo::plain("b_code", vec!["code"], true)],
+        );
+        assert_eq!(browse_key_columns(&t), vec!["code".to_string()]);
+
+        // On its own it is simply not a key.
+        let alone = table(vec![col("email", false, false)], vec![expr]);
+        assert!(browse_key_columns(&alone).is_empty());
     }
 
     /// A composite unique index comes back whole and in key order.

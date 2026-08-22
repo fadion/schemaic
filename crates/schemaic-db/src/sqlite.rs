@@ -506,6 +506,13 @@ fn run_query(conn: &SqliteConn, sql: &str, row_cap: usize) -> Result<ResultSet, 
 
     if stmt.column_count() == 0 {
         drop(stmt);
+        // **`execute` with an empty parameter list is load-bearing, not
+        // incidental.** SQLite is the one engine that *accepts* `:name` — it is
+        // a documented bind-parameter form there — so a `skeleton` draft run by
+        // reflex prepares cleanly, and what refuses it is this call's
+        // parameter-count check (`Wrong number of parameters passed to query`).
+        // A raw bind-nothing execution would bind them all as NULL and write the
+        // row `core::skeleton`'s doc promises cannot happen by accident.
         let affected = conn.execute(sql, []).map_err(query_err)?;
         let mut rs = ResultSet::default();
         rs.affected = Some(affected as u64);
@@ -3274,6 +3281,59 @@ mod tests {
                 .map(|(c, v)| (c.to_string(), v.clone()))
                 .collect(),
         }
+    }
+
+    /// **SQLite accepts `:name`, so the driver's parameter count is what stops a
+    /// skeleton run by reflex.**
+    ///
+    /// `core::skeleton`'s whole safety argument is that a generated draft is not
+    /// a statement a server will run. That holds on MySQL and PostgreSQL because
+    /// the parser refuses `:price`; on SQLite it is a documented bind-parameter
+    /// form and the statement *prepares*. What refuses it is `run_query`'s
+    /// `conn.execute(sql, [])` — bind nothing instead, and SQLite would bind
+    /// them all as NULL and write the row.
+    #[tokio::test]
+    async fn a_generated_skeleton_is_refused_rather_than_run() {
+        let (keeper, db) = shared_memory("skeleton_is_refused");
+        keeper
+            .execute_batch("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);")
+            .unwrap();
+
+        let table = crate::TableInfo {
+            name: "notes".to_string(),
+            columns: vec![
+                crate::ColumnInfo {
+                    name: "id".to_string(),
+                    type_name: "INTEGER".to_string(),
+                    primary_key: true,
+                    ..Default::default()
+                },
+                crate::ColumnInfo {
+                    name: "body".to_string(),
+                    type_name: "TEXT".to_string(),
+                    nullable: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let sql = schemaic_core::skeleton::insert_skeleton(
+            schemaic_core::intel::SqlDialect::Sqlite,
+            MAIN,
+            &table,
+        );
+        assert!(sql.contains(":body"), "{sql}");
+
+        assert!(
+            db.fetch_query(None, &sql, 100, CancellationToken::new())
+                .await
+                .is_err(),
+            "{sql}"
+        );
+        let after = keeper
+            .query_row("SELECT count(*) FROM notes", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(after, 0, "the draft wrote a row");
     }
 
     #[tokio::test]

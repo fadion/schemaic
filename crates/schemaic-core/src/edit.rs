@@ -314,6 +314,12 @@ fn resolve_key(
             t.indexes
                 .iter()
                 .filter(|ix| ix.unique && !ix.foreign)
+                // An index with no *column* keys keys nothing — the same guard
+                // `schema::browse_key_columns` states, and for the same
+                // PostgreSQL expression index. Without it `all_present(&[])`
+                // answers `Some(vec![])`, and an empty write key builds
+                // `… WHERE ` with nothing after it.
+                .filter(|ix| ix.column_names().next().is_some())
                 .filter(|ix| {
                     ix.column_names().all(|c| {
                         t.columns
@@ -1069,5 +1075,48 @@ mod tests {
         let m2 = analyze_edit(&r, schema_nullable);
         assert!(!m2.editable(0));
         assert!(!m2.editable(1));
+    }
+
+    /// **An expression-only unique index keys nothing.** PostgreSQL models
+    /// `CREATE UNIQUE INDEX ON u (lower(email))` as a real index over one
+    /// expression, and `column_names()` skips expressions — so the `find_map`
+    /// used to answer `all_present(&[]) == Some(vec![])`, an **empty write
+    /// key**, which builds `… WHERE ` with nothing after it and hides the plain
+    /// unique index sorted behind it.
+    #[test]
+    fn an_expression_only_unique_index_is_not_a_write_key() {
+        let r = rs(vec![
+            col("email", "VARCHAR", "u", false, false),
+            col("code", "VARCHAR", "u", false, false),
+        ]);
+        let column = |name: &str| ColumnInfo {
+            name: name.to_string(),
+            type_name: "varchar".to_string(),
+            nullable: false,
+            ..Default::default()
+        };
+        let expr = crate::schema::IndexInfo {
+            name: "a_expr".to_string(),
+            unique: true,
+            columns: vec![crate::schema::IndexColumn::expr("lower(email)")],
+            ..Default::default()
+        };
+        let schema = move |_db: &str, _s: Option<&str>, t: &str| {
+            (t == "u").then(|| TableInfo {
+                schema: None,
+                name: "u".to_string(),
+                columns: vec![column("email"), column("code")],
+                // The expression index sorts first, exactly as `index_list_sql`
+                // returns it.
+                indexes: vec![
+                    expr.clone(),
+                    crate::schema::IndexInfo::plain("b_code", vec!["code"], true),
+                ],
+                ..Default::default()
+            })
+        };
+        let m = analyze_edit(&r, schema);
+        let t = refetch_template(&r, &m).expect("the plain unique index is still a usable key");
+        assert_eq!(t.key_cols, vec![1]); // code, not an empty key
     }
 }
