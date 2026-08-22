@@ -3206,6 +3206,29 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
 /// report the failure exists.
 const LOGO_PNG: &[u8] = include_bytes!("../../../assets/icon-64.png");
 
+/// The header pill both connection triggers wear — the switcher and, on a first
+/// run with nothing saved, the New connection button that stands in its place.
+///
+/// Shared rather than spelled twice because the two swap in and out of the same
+/// slot: any difference in padding, margin or radius would show up as the header
+/// twitching the moment the first connection is saved. Only the border colour is
+/// the caller's (the active connection's identity colour, or the accent).
+fn switcher_chrome(s: floem::style::Style) -> floem::style::Style {
+    s.padding_left(11.0)
+        .padding_right(7.0)
+        .padding_vert(3.0)
+        .margin_top(7.0)
+        .margin_bottom(7.0)
+        .items_center()
+        // Opaque fill (same color as the header) so the 1px border has a solid
+        // backing and renders crisply — an outline over a transparent interior
+        // anti-aliases on both edges and looks blurry.
+        .background(theme::bg_chrome())
+        .border(1.0)
+        .border_radius(5.0)
+        .hover(|s| s.background(theme::bg_panel()))
+}
+
 fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
     let connections = ui.conn.connections;
     let active_conn = ui.conn.active_conn;
@@ -3225,31 +3248,59 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
                 .unwrap_or_else(|| "No connection".to_string())
         })
     };
-    let switcher = container(
-        h_stack((
-            label(conn_label).style(|s| s.color(theme::text())),
-            icons::icon(icons::CHEVRON_DOWN, 16.0)
-                .style(move |s| s.color(active_conn_color(connections, active_conn))),
-        ))
-        .style(|s| s.flex_row().items_center().gap(6.0)),
-    )
-    .on_click_stop(move |_| conn_menu_open.update(|o| *o = !*o))
-    .style(move |s| {
-        s.padding_left(11.0)
-            .padding_right(7.0)
-            .padding_vert(3.0)
-            .margin_top(7.0)
-            .margin_bottom(7.0)
-            .items_center()
-            // Opaque fill (same color as the header) so the 1px border has a
-            // solid backing and renders crisply — an outline over a transparent
-            // interior anti-aliases on both edges and looks blurry.
-            .background(theme::bg_chrome())
-            .border(1.0)
-            .border_color(active_conn_color(connections, active_conn))
-            .border_radius(5.0)
-            .hover(|s| s.background(theme::bg_panel()))
-    });
+    let switcher = move || {
+        container(
+            h_stack((
+                label(conn_label).style(|s| s.color(theme::text())),
+                icons::icon(icons::CHEVRON_DOWN, 16.0)
+                    .style(move |s| s.color(active_conn_color(connections, active_conn))),
+            ))
+            .style(|s| s.flex_row().items_center().gap(6.0)),
+        )
+        .on_click_stop(move |_| conn_menu_open.update(|o| *o = !*o))
+        .style(move |s| {
+            switcher_chrome(s).border_color(active_conn_color(connections, active_conn))
+        })
+        .into_any()
+    };
+
+    // **Nothing saved yet — so there is nothing to switch between.** The switcher
+    // then reads "No connection" and its menu offers one route to the only thing
+    // a first run can do, three clicks down: open the menu, Manage Connections,
+    // New connection. This is that action, at the top of the funnel, in the
+    // switcher's exact place and chrome so the header doesn't move when the first
+    // connection lands and the switcher takes the slot back. Accent-coloured
+    // throughout, because unlike the switcher it *is* the thing to press.
+    //
+    // The condition is "no connections saved", not "none active": a user who has
+    // connections but hasn't picked one still wants the switcher — that is what
+    // choosing one is done with.
+    let new_conn = ui.conn_actions.new_conn.clone();
+    let manage_open = ui.conn.manage_open;
+    let conn_trigger = dyn_container(
+        move || connections.with(|cs| cs.is_empty()),
+        move |none_saved| {
+            if !none_saved {
+                return switcher();
+            }
+            let new_conn = new_conn.clone();
+            container(
+                h_stack((icons::icon(icons::PLUS, 16.0), text("New connection")))
+                    // One colour on the row, inherited by the label and by the
+                    // `currentColor` glyph — the update chip beside it is built the
+                    // same way, and it is what makes the pair read as one object.
+                    .style(|s| s.flex_row().items_center().gap(6.0).color(theme::accent())),
+            )
+            .on_click_stop(move |_| {
+                // Draft first, then open: the modal reads the draft as it builds,
+                // so opening first shows the previous one for a frame.
+                (new_conn)();
+                manage_open.set(true);
+            })
+            .style(|s| switcher_chrome(s).border_color(theme::accent()))
+            .into_any()
+        },
+    );
 
     // Auto-update offer — the one member of this cluster that isn't always there.
     // `UpdateState::label()` is `None` while idle, while a check is in flight and
@@ -3418,7 +3469,7 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
     // column below now lines up with the mark instead.
     let left = h_stack((
         logo,
-        container(switcher).style(|s| s.margin_left(12.0)),
+        container(conn_trigger).style(|s| s.margin_left(12.0)),
         badge,
         disconnected_notice(conn_status, ui.conn_actions.recheck_conn.clone()),
     ))
