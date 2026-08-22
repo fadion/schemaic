@@ -555,6 +555,13 @@ fn build_placed(graph: &DiagramGraph) -> (Vec<Placed>, HashMap<String, bool>) {
 /// stubs so they stay perpendicular/symmetric regardless of the cards' vertical
 /// offset. When `optional` (a nullable FK — the child may have no parent), a small
 /// "zero" circle is drawn just outside the parent bar (crow's-foot optionality).
+///
+/// **Only the parent end carries a zero here**, where the text exports give the
+/// child one too. That is not drift: the child end's zero would be on every edge
+/// of every diagram (nothing obliges a parent row to have children), so on screen
+/// it separates no two edges and costs twenty more stroked segments each on the
+/// app's heaviest paint. `erd_export::crow_ends` holds the other half of this
+/// argument — read the two together before changing either.
 fn marker_lines(
     p0: Pt,
     p1: Pt,
@@ -2687,6 +2694,137 @@ mod tests {
 
         let svg = erd_export::to_svg(&scene);
         assert!(!svg.contains("font-weight=\"600\""), "{svg}");
+    }
+
+    /// **Every per-card choice the export makes, against the painter's own
+    /// constant.**
+    ///
+    /// `export_scene` restates in arithmetic what the canvas expresses as a floem
+    /// flex layout — which glyph, which weight, which of nine theme colours — and
+    /// the geometry it *shares* with the painter (`rects`, `visible_map`,
+    /// `edge_shapes`) gave no cover to the half it restates. Two of those had
+    /// already drifted before anything held them together: the stub title's
+    /// weight (`a_stub_title_exports_whole_and_regular`) and the header divider
+    /// taking the card's tint. So: one plain table, one tinted, one view, one
+    /// collapsed, one stub, each field read back against the function the painter
+    /// calls rather than against a literal — a literal would only pin today's
+    /// palette, where the point is that the two descriptions move together.
+    #[test]
+    fn a_card_exports_the_glyphs_and_colours_the_painter_draws() {
+        use crate::schema_tree::column_type_icon;
+        use schemaic_core::schema::classify_column_type;
+
+        let tint = theme::parse_hex(crate::CONN_COLOR_PRESETS[0].1).expect("a preset");
+        // Eight columns: past COLLAPSED_COLS, so `plain` (collapsed) keeps five
+        // plus the trailing key and carries a `+N more`.
+        let cols: Vec<DiagramColumn> = (0..7)
+            .map(|i| col(&format!("c{i}"), false, false))
+            .chain(std::iter::once(col("id", true, false)))
+            .collect();
+        let mk = |id: &str, kind: NodeKind, columns: Vec<DiagramColumn>| DiagramNode {
+            id: id.to_string(),
+            kind,
+            columns,
+        };
+        let graph = DiagramGraph {
+            nodes: vec![
+                mk("plain", NodeKind::Table, cols.clone()),
+                mk("tinted", NodeKind::Table, vec![col("id", true, false)]),
+                mk("v", NodeKind::View, vec![col("total", false, false)]),
+                mk("other.stub", NodeKind::Stub, Vec::new()),
+            ],
+            edges: vec![],
+            hidden_islands: vec![],
+            total_tables: 4,
+        };
+        let mut positions = HashMap::new();
+        let mut sizes = HashMap::new();
+        for (i, n) in graph.nodes.iter().enumerate() {
+            positions.insert(n.id.clone(), (i as f64 * 400.0, 0.0));
+            sizes.insert(n.id.clone(), (node_width(n), 400.0));
+        }
+        // Only `plain` is folded, and only it is collapsible.
+        let collapsed: HashMap<String, bool> = [("plain".to_string(), true)].into_iter().collect();
+        let scene = export_scene(&graph, &positions, &sizes, &collapsed, &|id| {
+            (id == "tinted").then_some(tint)
+        })
+        .expect("a scene");
+        let by_id = |id: &str| {
+            scene
+                .nodes
+                .iter()
+                .find(|n| n.title == id)
+                .unwrap_or_else(|| panic!("{id} missing from the scene"))
+        };
+
+        // ── The three real cards share the header/title treatment; only the
+        // glyph, the tint and the fold differ.
+        for (id, glyph, icon_fill, node_tint) in [
+            ("plain", icons::TABLE, theme::table_icon(), None),
+            ("tinted", icons::TABLE, theme::table_icon(), Some(tint)),
+            ("v", icons::TABLE_CELLS_MERGE, theme::view_icon(), None),
+        ] {
+            let n = by_id(id);
+            assert!(!n.stub, "{id}");
+            assert_eq!(n.icon.as_deref(), Some(glyph), "{id} glyph");
+            assert_eq!(n.icon_fill, hex(icon_fill), "{id} glyph colour");
+            assert_eq!(n.title_fill, hex(theme::text()), "{id} title colour");
+            assert_eq!(n.header_fill, hex(header_bg(node_tint)), "{id} header");
+            assert_eq!(n.border, hex(card_border(node_tint)), "{id} border");
+            // **The divider is the plain border, never the card's.** They
+            // coincide for an untinted card, which is why reusing `border` here
+            // went unnoticed until a table wore an identity colour.
+            assert_eq!(n.divider, hex(theme::border()), "{id} divider");
+        }
+        assert_ne!(
+            by_id("tinted").border,
+            by_id("tinted").divider,
+            "a tinted card is exactly the case the two colours differ in"
+        );
+
+        // ── Rows follow the painter's key/glyph mapping, and a folded card
+        // exports folded with the note the canvas shows.
+        let plain = by_id("plain");
+        let (visible, collapsible, _) = card_metrics(&graph.nodes[0], true);
+        assert!(collapsible);
+        assert_eq!(plain.rows.len(), visible.len());
+        assert_eq!(plain.more.as_deref(), Some("+2 more"));
+        for (row, &ci) in plain.rows.iter().zip(&visible) {
+            let c = &cols[ci];
+            assert_eq!(row.name, c.name);
+            assert_eq!(row.type_name, c.type_name);
+            assert_eq!(
+                row.icon.as_deref(),
+                Some(column_type_icon(classify_column_type(&c.type_name)))
+            );
+            let want = if c.pk {
+                erd_export::SvgKey::Pk
+            } else if c.fk {
+                erd_export::SvgKey::Fk
+            } else {
+                erd_export::SvgKey::None
+            };
+            assert_eq!(row.key, want, "{} key", c.name);
+        }
+        // An unfolded card that *could* fold shows everything and says nothing.
+        let v = by_id("v");
+        assert!(v.more.is_none() && v.rows.len() == 1);
+
+        // ── A stub is a bare dimmed box: no glyph, no header strip, no rows.
+        let stub = by_id("other.stub");
+        assert!(stub.stub);
+        assert!(stub.icon.is_none() && stub.rows.is_empty() && stub.more.is_none());
+        assert_eq!(stub.title_fill, hex(theme::text_dim()));
+        assert_eq!(stub.header_fill, hex(theme::erd_node_bg()));
+        assert_eq!(stub.border, hex(theme::text_muted()));
+
+        // ── And the scene-wide palette is the live theme, not a copy of it.
+        assert_eq!(scene.colors.canvas, hex(theme::erd_canvas()));
+        assert_eq!(scene.colors.card, hex(theme::erd_node_bg()));
+        assert_eq!(scene.colors.key_pk, hex(theme::key_primary()));
+        assert_eq!(scene.colors.key_fk, hex(theme::key_foreign()));
+        assert_eq!(scene.colors.edge, hex(theme::erd_edge()));
+        assert_eq!(scene.metrics, export_metrics());
     }
 
     /// The child edge end anchors on the FK column's row, the parent end on the
