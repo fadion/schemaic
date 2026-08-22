@@ -262,6 +262,16 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                     if ai_seen().get_untracked() < i + 1 {
                         ai_seen().set(i + 1);
                     }
+                    // Whether this message's attachment card is expanded, owned
+                    // *here* for the same reason `pop` is: the `dyn_container`
+                    // below rebuilds the bubble when `is_last` flips or the theme
+                    // generation bumps, neither of which is about the card, and a
+                    // flag living inside it was a fresh `false` after each — so
+                    // reading what was sent while the answer streamed in closed
+                    // the card the moment the answer arrived. This scope is the
+                    // `dyn_stack` item's: it survives those rebuilds and is
+                    // disposed with the message.
+                    let attach_open = RwSignal::new(false);
                     // `is_last` rides in the memo rather than being captured: it
                     // drives the regenerate affordance, and appending a message
                     // flips it on the previously-last bubble, which is a change to
@@ -299,6 +309,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                                     regen.clone(),
                                     pop.replace(false),
                                     gutter,
+                                    attach_open,
                                 )
                                 .into_any(),
                                 // The vector shrank under the stack; the next diff
@@ -651,8 +662,18 @@ fn ai_input_row(
 /// A conversation restored from disk has the summary and no rows (see
 /// [`schemaic_core::transcript::Attachment`]), and says so rather than
 /// pretending to an empty table.
-fn sent_attachment(a: schemaic_core::transcript::Attachment) -> impl IntoView {
-    let open = RwSignal::new(false);
+///
+/// `open` is handed in rather than owned here. The bubble around this card is
+/// rebuilt for reasons that have nothing to do with the card — appending
+/// Claude's reply flips `is_last` on the question, and a theme switch bumps the
+/// generation — and a view-local `RwSignal::new(false)` is a *new* signal after
+/// each of those, so a card the reader had opened to check what was sent snapped
+/// shut under them mid-answer. The caller owns it in the `dyn_stack` item's
+/// scope, which outlives the rebuild and dies with the message.
+fn sent_attachment(
+    a: schemaic_core::transcript::Attachment,
+    open: RwSignal<bool>,
+) -> impl IntoView {
     let retained = a.retained();
     // The cells, kept as-is and rendered only when the block is actually opened.
     // Building the table up front cost a 200-row string per bubble on every
@@ -840,6 +861,7 @@ fn ai_input_disabled(placeholder: &'static str) -> impl IntoView {
 // turn is prose on the panel itself, ruled at its right edge. User messages are
 // plain text; assistant/error turns render their segments (prose as light
 // markdown, tool calls as chips) plus a cost footer; pending renders "Thinking…".
+#[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
 fn message_bubble(
     m: ChatMessage,
     actions: CodeActions,
@@ -848,6 +870,7 @@ fn message_bubble(
     regenerate: Rc<dyn Fn()>,
     animate: bool,
     gutter: RwSignal<bool>,
+    attach_open: RwSignal<bool>,
 ) -> impl IntoView {
     let is_user = m.role == Role::User;
     let label_txt = if is_user { "YOU" } else { "CLAUDE" };
@@ -863,7 +886,7 @@ fn message_bubble(
         // also the only one that passes.
         let recap = text(m.text).style(|s| s.width_full().font_size(14.0).color(theme::text()));
         match m.attachment {
-            Some(a) => v_stack((sent_attachment(a), recap))
+            Some(a) => v_stack((sent_attachment(a, attach_open), recap))
                 .style(|s| s.flex_col().width_full().gap(6.0))
                 .into_any(),
             None => recap.into_any(),
