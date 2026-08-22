@@ -190,6 +190,129 @@ pub enum ProposeError {
     EmptyIndex,
     #[error("the proposed table wouldn't be valid: {0}")]
     Invalid(String),
+    #[error("`{0}` is a view — a proposal can only change a table")]
+    NotATable(String),
+    #[error("no table called `{0}` — call list_schema to see what exists")]
+    NoSuchTable(String),
+    #[error("the {what} `{text}` isn't a single SQL expression")]
+    NotAnExpression { what: String, text: String },
+    #[error("`{0}` isn't a foreign-key action")]
+    UnknownAction(String),
+}
+
+/// The referential actions a foreign key may state, as both engines spell them.
+///
+/// A closed vocabulary, because [`crate::ddl`] writes the string straight after
+/// `ON DELETE ` — so an author who could put anything there could close the
+/// constraint and open another `alter_option`.
+const FK_ACTIONS: [&str; 5] = [
+    "CASCADE",
+    "SET NULL",
+    "SET DEFAULT",
+    "RESTRICT",
+    "NO ACTION",
+];
+
+/// Every string this op contributes to a statement **verbatim**, checked before
+/// a single op is applied.
+///
+/// `DEFAULT <text>`, `GENERATED ALWAYS AS (<text>)` and `CHECK (<text>)` splice
+/// the author's SQL in unquoted, and that is deliberate: a default has to be
+/// able to say `CURRENT_TIMESTAMP` or `nextval('s')`, and quoting one would
+/// break every real one. **What is new here is the author.** The designer's
+/// fields are typed by the user who then consents to the preview; a proposal's
+/// are written by a remote model that has itself been reading database content
+/// somebody else may control, so `'x', DROP COLUMN placed_at` is a shape this
+/// path has to refuse rather than merely describe.
+///
+/// The check is structural — [`crate::intel::is_single_expression`], the
+/// project's AST authority — not a search for suspicious characters, so a
+/// legitimate default with a comma inside a call (`concat('a', 'b')`) passes and
+/// a trailing clause does not.
+fn check_free_sql(op: &ProposedOp, dialect: SqlDialect) -> Result<(), ProposeError> {
+    let expr = |what: &str, text: &Option<String>| -> Result<(), ProposeError> {
+        match text {
+            Some(t) if !crate::intel::is_single_expression(t, dialect) => {
+                Err(ProposeError::NotAnExpression {
+                    what: what.to_string(),
+                    text: t.clone(),
+                })
+            }
+            _ => Ok(()),
+        }
+    };
+    let action = |a: &Option<String>| -> Result<(), ProposeError> {
+        match a {
+            Some(a) if !FK_ACTIONS.iter().any(|k| k.eq_ignore_ascii_case(a.trim())) => {
+                Err(ProposeError::UnknownAction(a.clone()))
+            }
+            _ => Ok(()),
+        }
+    };
+    match op {
+        ProposedOp::AddColumn(c) => {
+            expr("default", &c.default)?;
+            expr("generated expression", &c.generated)?;
+        }
+        ProposedOp::AlterColumn(p) => expr("default", &p.default)?,
+        ProposedOp::AddCheck(ck) => {
+            expr("check expression", &Some(ck.expression.clone()))?;
+        }
+        ProposedOp::AddForeignKey(fk) => {
+            action(&fk.on_delete)?;
+            action(&fk.on_update)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The table a proposal is about, resolved out of an introspected schema.
+///
+/// **One resolver, because the two ends of a proposal have to agree.** The tool
+/// checks the ops against a table and reports "Valid. Nothing has run."; the
+/// card then builds the plan the user consents to. They used to read the same
+/// JSON by different rules — the tool ignored `proposal.schema` and the card
+/// required it to match exactly — so on a database with `public.orders` *and*
+/// `sales.orders` the model was told its change was valid for one table and the
+/// user was offered it against the other, and the qualified `sales.orders` form
+/// the tool's own description asks for dead-ended at the card.
+///
+/// Every form the listings can print resolves, in the order a caller means them:
+/// an explicit `schema` field wins, then a qualifier written into `table`, then
+/// the bare name — which [`DbSchema::find_table`] already resolves preferring
+/// `public`, so the ordinary PostgreSQL case needs no separate default.
+///
+/// [`DbSchema::find_table`]: crate::schema::DbSchema::find_table
+///
+/// **A view is refused**, and that is the other half of this being one function.
+/// `DbSchema::tables` holds views too, and every earlier caller of these lookups
+/// arrived from a tree row whose kind the user had already seen. A proposal's
+/// table name comes from an untrusted party, and a view laid under
+/// `TableDraft::from_table` emits `ALTER TABLE` — which PostgreSQL *accepts* for
+/// a rename, under a modal that says "Rename the table".
+pub fn resolve_target<'a>(
+    schema: &'a crate::schema::DbSchema,
+    proposal: &Proposal,
+) -> Result<&'a TableInfo, ProposeError> {
+    let found = match &proposal.schema {
+        Some(ns) => schema.find_table(Some(ns), &proposal.table),
+        None => proposal
+            .table
+            .split_once('.')
+            .and_then(|(ns, name)| schema.find_table(Some(ns), name))
+            .or_else(|| schema.find_table(None, &proposal.table)),
+    };
+    match found {
+        Some(t) if t.is_view => Err(ProposeError::NotATable(display_target(proposal))),
+        Some(t) => Ok(t),
+        None => Err(ProposeError::NoSuchTable(display_target(proposal))),
+    }
+}
+
+/// The table as the proposal named it, for an error the user reads.
+fn display_target(proposal: &Proposal) -> String {
+    crate::schema::display_name(proposal.schema.as_deref(), &proposal.table)
 }
 
 /// Lay `proposal` over `current` and return the draft it describes.
@@ -210,6 +333,13 @@ pub fn apply(
     }
     if proposal.ops.is_empty() {
         return Err(ProposeError::NoOps);
+    }
+
+    // Before anything is applied: every string this proposal would put into a
+    // statement verbatim has to be the *shape* it claims to be. See
+    // [`check_free_sql`] for why this path checks and the designer's doesn't.
+    for op in &proposal.ops {
+        check_free_sql(op, dialect)?;
     }
 
     let mut draft = TableDraft::from_table(current);
@@ -508,6 +638,67 @@ mod tests {
         apply(&orders(), &proposal(ops), SqlDialect::MySql).expect("proposal applies")
     }
 
+    /// **One resolver, or the tool validates one table and the card targets
+    /// another.** Every form the listings can print has to land on the same
+    /// table from both ends: an explicit `schema`, a qualified `sales.orders`
+    /// (which is what the tool's own description asks the model to write), and a
+    /// bare name, which resolves preferring `public`.
+    #[test]
+    fn a_proposal_resolves_the_same_table_from_either_end() {
+        let in_ns = |ns: &str| TableInfo {
+            schema: Some(ns.into()),
+            ..orders()
+        };
+        let schema = crate::schema::DbSchema {
+            tables: vec![in_ns("public"), in_ns("sales")],
+            ..Default::default()
+        };
+        let target = |table: &str, ns: Option<&str>| {
+            resolve_target(
+                &schema,
+                &Proposal {
+                    table: table.into(),
+                    schema: ns.map(str::to_string),
+                    ..Default::default()
+                },
+            )
+            .map(|t| t.schema.clone().unwrap_or_default())
+        };
+        assert_eq!(target("orders", Some("sales")).unwrap(), "sales");
+        assert_eq!(target("sales.orders", None).unwrap(), "sales");
+        assert_eq!(target("orders", None).unwrap(), "public");
+        assert!(matches!(
+            target("nope", None),
+            Err(ProposeError::NoSuchTable(_))
+        ));
+    }
+
+    /// **A view is not a table, and this is the one caller whose name comes from
+    /// an untrusted party.** `DbSchema::tables` holds views too; laid under
+    /// `TableDraft::from_table` a view emits `ALTER TABLE` — which PostgreSQL
+    /// *accepts* for a rename, under a modal reading "Rename the table".
+    #[test]
+    fn a_view_is_refused_before_any_op_is_applied() {
+        let schema = crate::schema::DbSchema {
+            tables: vec![TableInfo {
+                name: "v".into(),
+                is_view: true,
+                ..orders()
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            resolve_target(
+                &schema,
+                &Proposal {
+                    table: "v".into(),
+                    ..Default::default()
+                }
+            ),
+            Err(ProposeError::NotATable(_))
+        ));
+    }
+
     #[test]
     fn untouched_table_produces_no_changes() {
         // The floor the whole design rests on: a patch that names nothing must
@@ -803,6 +994,108 @@ mod tests {
             apply(&orders(), &p, SqlDialect::MySql),
             Err(ProposeError::Invalid(_))
         ));
+    }
+
+    /// **A default is free SQL, and this author is not the user.**
+    ///
+    /// `DEFAULT <text>` splices the string in unquoted — which is right, and has
+    /// to stay right — so `'x', DROP COLUMN placed_at` was a legal MySQL
+    /// `alter_option` list the moment it landed in the statement, while the
+    /// change list said `Add column note text` and the risk block said nothing.
+    /// The shape is refused here, before a single op is applied.
+    #[test]
+    fn a_default_that_closes_the_clause_is_refused() {
+        for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            let smuggle = |op| {
+                assert!(
+                    matches!(
+                        apply(&orders(), &proposal(vec![op]), dialect),
+                        Err(ProposeError::NotAnExpression { .. })
+                    ),
+                    "{dialect:?}"
+                );
+            };
+            smuggle(ProposedOp::AddColumn(NewColumn {
+                name: "note".into(),
+                type_name: "text".into(),
+                nullable: true,
+                default: Some("'x', DROP COLUMN placed_at".into()),
+                ..Default::default()
+            }));
+            smuggle(ProposedOp::AddColumn(NewColumn {
+                name: "n".into(),
+                type_name: "int".into(),
+                nullable: true,
+                generated: Some("1) , DROP COLUMN placed_at, ADD COLUMN z int".into()),
+                ..Default::default()
+            }));
+            smuggle(ProposedOp::AlterColumn(ColumnPatch {
+                name: "placed_at".into(),
+                default: Some("now(); DROP TABLE customers; --".into()),
+                ..Default::default()
+            }));
+            smuggle(ProposedOp::AddCheck(NewCheck {
+                name: None,
+                expression: "id > 0) , DROP COLUMN placed_at, ADD CHECK (1=1".into(),
+            }));
+        }
+    }
+
+    /// …and the happy path is untouched. A default is genuinely arbitrary SQL,
+    /// so a guard that refused these would be worse than the hole.
+    #[test]
+    fn an_ordinary_default_is_still_accepted() {
+        for text in [
+            "CURRENT_TIMESTAMP",
+            "0",
+            "'draft'",
+            "nextval('s')",
+            "concat('a', 'b')",
+            "-1",
+            "(1 + 2)",
+            "NULL",
+            "true",
+        ] {
+            let p = proposal(vec![ProposedOp::AddColumn(NewColumn {
+                name: "note".into(),
+                type_name: "text".into(),
+                nullable: true,
+                default: Some(text.into()),
+                ..Default::default()
+            })]);
+            assert!(
+                apply(&orders(), &p, SqlDialect::Postgres).is_ok(),
+                "refused a legitimate default: {text}"
+            );
+        }
+    }
+
+    /// A referential action is a closed vocabulary, and [`crate::ddl`] writes it
+    /// straight after `ON DELETE ` — so anything else could close the constraint
+    /// and open another `alter_option`.
+    #[test]
+    fn a_foreign_key_action_outside_the_vocabulary_is_refused() {
+        let fk = |action: &str| {
+            proposal(vec![ProposedOp::AddForeignKey(NewForeignKey {
+                name: Some("fk_c".into()),
+                columns: vec!["customer_id".into()],
+                ref_table: "customers".into(),
+                ref_columns: vec!["id".into()],
+                on_delete: Some(action.into()),
+                ..Default::default()
+            })])
+        };
+        assert!(matches!(
+            apply(
+                &orders(),
+                &fk("CASCADE, DROP COLUMN placed_at"),
+                SqlDialect::MySql
+            ),
+            Err(ProposeError::UnknownAction(_))
+        ));
+        // The real ones, in either casing.
+        assert!(apply(&orders(), &fk("cascade"), SqlDialect::MySql).is_ok());
+        assert!(apply(&orders(), &fk("SET NULL"), SqlDialect::MySql).is_ok());
     }
 
     #[test]

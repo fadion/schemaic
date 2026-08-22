@@ -154,23 +154,25 @@ pub(crate) fn preview_proposal(
     proposal: &schemaic_core::propose::Proposal,
 ) -> Result<(), String> {
     let ctx = crate::table_designer::edit_ctx(ui);
-    // The model names a namespace only when it means one; otherwise the database's
-    // own default, which is `public` on PostgreSQL and nothing on MySQL.
-    let schema = proposal
-        .schema
-        .clone()
-        .or_else(|| crate::table_designer::default_schema(ui, database));
-    let Some(info) =
-        crate::table_designer::loaded_table(ui, database, schema.as_deref(), &proposal.table)
-    else {
+    let Some(loaded) = crate::table_designer::loaded_schema(ui, database) else {
         return Err(format!(
             "{} isn't loaded in {database} right now — open the database in the schema tree, or \
              wait for a refresh to finish, and try again.",
             proposal.table
         ));
     };
+    // **The same resolver `propose_table_change` uses.** The tool tells the
+    // model its change is valid against one table; this is what the user is
+    // offered, and the two reading the JSON by different rules is how those
+    // could be different tables.
+    let info =
+        schemaic_core::propose::resolve_target(&loaded, proposal).map_err(|e| e.to_string())?;
+    // The table as the *server* spells it, not as the proposal wrote it: the
+    // resolver accepts `sales.orders` and an explicit `schema`, so the subject
+    // has to come off what was found.
+    let subject = schemaic_core::schema::display_name(info.schema.as_deref(), &info.name);
     let draft =
-        schemaic_core::propose::apply(&info, proposal, ctx.dialect).map_err(|e| e.to_string())?;
+        schemaic_core::propose::apply(info, proposal, ctx.dialect).map_err(|e| e.to_string())?;
     // The flavour the schema was actually introspected with — see `db_flavour`.
     // The MySQL emitter's `ALTER TABLE` path reads it, so taking the dialect
     // alone would give this path a different plan than the designer's for the
@@ -179,22 +181,15 @@ pub(crate) fn preview_proposal(
         ctx.dialect,
         crate::table_designer::db_flavour(ui, database),
     );
-    let cs = schemaic_core::ddl::diff(&info, &draft, target);
+    let cs = schemaic_core::ddl::diff(info, &draft, target);
     if cs.is_empty() {
         return Err(format!(
-            "{} already looks like that — there is nothing to change.",
-            proposal.table
+            "{subject} already looks like that — there is nothing to change."
         ));
     }
     open_preview(
         ui,
-        preview_of(
-            ctx.conn_id,
-            database,
-            schemaic_core::schema::display_name(schema.as_deref(), &proposal.table),
-            &cs,
-            ctx.read_only,
-        ),
+        preview_of(ctx.conn_id, database, subject, &cs, ctx.read_only),
     );
     Ok(())
 }
@@ -352,6 +347,19 @@ fn apply(ui: Ui) {
 
 /// The DDL preview modal. Absolutely positioned over the workspace when
 /// `ui.ddl.preview` is `Some`.
+/// The connection this plan runs against, by name.
+///
+/// Falls back to the id rather than to nothing: a title that silently drops the
+/// connection is the state this exists to end.
+fn connection_label(ui: &Ui, conn_id: u64) -> String {
+    ui.conn.connections.with_untracked(|list| {
+        list.iter()
+            .find(|c| c.id == conn_id)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| format!("connection {conn_id}"))
+    })
+}
+
 pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
     let d = ui.ddl;
     // Closing returns to the designer when it's still open behind — the draft is
@@ -380,6 +388,13 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
             let Some(p) = d.preview.get_untracked() else {
                 return empty().into_any();
             };
+            // Read before `ui` is moved into the footer's closures.
+            let title = format!(
+                "Apply changes to {} · {}.{}",
+                connection_label(&ui, p.conn_id),
+                p.database,
+                p.subject
+            );
 
             // The script box, then the footer. The box is read-only, but it is
             // the thing this modal exists to be *read*, and Tab is how a keyboard
@@ -596,11 +611,12 @@ pub(crate) fn ddl_preview_overlay(ui: Ui) -> impl IntoView {
 
             let close_x: Rc<dyn Fn()> = Rc::new(exit);
             let panel = v_stack((
-                modal_title_owned(
-                    format!("Apply changes to {}", p.subject),
-                    close_x,
-                    root_ring.clone(),
-                ),
+                // **The title names where the plan is going, not just what it is
+                // about.** The modal has always carried `conn_id` and
+                // `database` and printed neither — which was survivable while
+                // every plan came from a tree row the user had clicked, and
+                // stopped being so when a proposal card became a second author.
+                modal_title_owned(title, close_x, root_ring.clone()),
                 autohide(scroll(v_stack((body, err)).style(|s| {
                     s.flex_col()
                         .width_full()

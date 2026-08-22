@@ -155,17 +155,32 @@ pub(crate) fn loaded_table(
     schema: Option<&str>,
     table: &str,
 ) -> Option<schemaic_core::schema::TableInfo> {
+    loaded_schema(ui, database).and_then(|db| {
+        db.tables
+            .iter()
+            .find(|t| t.name == table && t.schema.as_deref() == schema)
+            .cloned()
+    })
+}
+
+/// The whole introspected database behind [`loaded_table`], on the same
+/// refresh-in-flight rule.
+///
+/// For the one caller that has to resolve a name it was *given* rather than one
+/// the user clicked: a proposal's table, which is resolved by
+/// [`schemaic_core::propose::resolve_target`] so the card and the MCP tool land
+/// on the same table.
+pub(crate) fn loaded_schema(
+    ui: &Ui,
+    database: &str,
+) -> Option<std::sync::Arc<schemaic_core::schema::DbSchema>> {
     ui.schema.db_nodes.with_untracked(|nodes| {
         nodes
             .iter()
             .find(|n| n.database == database)
             .filter(|n| !n.refreshing.get_untracked())
             .and_then(|n| match n.schema.get_untracked() {
-                schemaic_core::schema::SchemaState::Loaded(db) => db
-                    .tables
-                    .iter()
-                    .find(|t| t.name == table && t.schema.as_deref() == schema)
-                    .cloned(),
+                schemaic_core::schema::SchemaState::Loaded(db) => Some(db),
                 _ => None,
             })
     })
