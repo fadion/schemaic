@@ -11,6 +11,7 @@ pub mod aggregate;
 pub mod chat;
 pub mod connection;
 pub mod db_color;
+pub mod db_hidden;
 pub mod ddl;
 pub mod diff;
 pub mod edit;

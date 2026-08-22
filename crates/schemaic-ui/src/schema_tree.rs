@@ -419,7 +419,7 @@ struct NavDb {
 fn visible_nav_rows(
     db_nodes: RwSignal<Vec<ConnNode>>,
     expanded: RwSignal<HashSet<String>>,
-    hidden_dbs: RwSignal<HashSet<String>>,
+    hidden_dbs: Memo<HashSet<String>>,
     filter: RwSignal<String>,
     db_favorites: RwSignal<Vec<FavoriteRule>>,
     active_conn: RwSignal<u64>,

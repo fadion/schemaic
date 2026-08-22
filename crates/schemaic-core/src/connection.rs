@@ -228,8 +228,15 @@ impl AiData {
     /// consented to is the same either way (`no_level_names_a_vendor`).
     pub fn hint(self) -> &'static str {
         match self {
+            // **"Structure", not "names and types".** `describe_table` answers
+            // with a table's whole `CREATE`: `DEFAULT` literals, column
+            // `COMMENT` text, `CHECK` expressions, an enum's value list and a
+            // view's full body. Every one of those is a definition rather than a
+            // row, so the *promise* holds — but "names and types only" describes
+            // less than what leaves, and this line is the consent gesture.
             AiData::SchemaOnly => {
-                "Names and types only. No row ever leaves this machine — attaching is refused."
+                "Structure only — names, types and definitions. No row ever leaves this \
+                 machine, and attaching is refused."
             }
             AiData::OnRequest => {
                 "The assistant reads no data on its own. Rows you attach from a result leave \
@@ -796,6 +803,28 @@ mod tests {
             assert!(!lvl.label().is_empty());
             let hint = lvl.hint();
             assert!(hint.contains("this machine"), "{:?}: {hint}", lvl);
+        }
+        // **A substring check accepts its own negation**, which is how this test
+        // could have gone on passing over "Nothing ever leaves this machine" on
+        // the two levels where things do. So each level's hint is asserted
+        // against its actual answer, not against a phrase.
+        for lvl in AiData::ALL {
+            let hint = lvl.hint().to_lowercase();
+            let says_never = hint.contains("no row ever leaves")
+                || hint.contains("nothing ever leaves")
+                || hint.contains("never leaves");
+            assert_eq!(
+                says_never,
+                !lvl.may_attach(),
+                "{lvl:?} promises the opposite of what it permits: {hint}"
+            );
+            // …and the two that do send say so in the active voice.
+            if lvl.may_attach() {
+                assert!(
+                    hint.contains("leave this machine") || hint.contains("leaves this machine"),
+                    "{lvl:?}: {hint}"
+                );
+            }
         }
     }
 

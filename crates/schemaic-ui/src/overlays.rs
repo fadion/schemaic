@@ -12,7 +12,7 @@ use floem::AnyView;
 use floem::event::EventListener;
 use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
-use floem::reactive::create_effect;
+use floem::reactive::{Memo, create_effect};
 
 use schemaic_core::connection::Connection;
 use schemaic_core::model::QueryState;
@@ -3098,7 +3098,7 @@ fn build_items(
     parsed: schemaic_core::palette::Parsed,
     commands: &[Command],
     db_nodes: RwSignal<Vec<ConnNode>>,
-    hidden: RwSignal<HashSet<String>>,
+    hidden: Memo<HashSet<String>>,
     active_conn: RwSignal<u64>,
     search_history: RwSignal<Vec<schemaic_core::search_history::SearchEntry>>,
     open_table: &Rc<dyn Fn(TableSource)>,
@@ -4124,7 +4124,7 @@ struct FindHit {
 
 fn find_matches(
     db_nodes: RwSignal<Vec<ConnNode>>,
-    hidden: RwSignal<HashSet<String>>,
+    hidden: Memo<HashSet<String>>,
     q: &str,
     limit: usize,
 ) -> Vec<FindHit> {

@@ -150,10 +150,19 @@ pub struct UiState {
     /// something every session pays for.
     #[serde(default)]
     pub show_table_sizes: bool,
-    /// Names of databases hidden from the schema panel and search. Default: none
-    /// hidden (every database is shown).
+    /// **Legacy.** Bare names of databases hidden from the schema panel and
+    /// search, with no connection dimension — read once at startup and folded
+    /// into `hidden_db_rules` by [`crate::db_hidden::migrate_flat`], then never
+    /// written again. Kept as a field so an upgrade does not lose the setting,
+    /// and *not* removed silently, since a `Vec<String>` where a `Vec<Rule>` is
+    /// expected would fail the whole file's parse.
     #[serde(default)]
     pub hidden_dbs: Vec<String>,
+    /// Databases hidden from the schema panel and search, keyed by connection —
+    /// see [`crate::db_hidden`] for why the key has to carry one. Default: none
+    /// hidden (every database is shown).
+    #[serde(default)]
+    pub hidden_db_rules: Vec<crate::db_hidden::DbHiddenRule>,
     /// Whether the schema sidebar is shown. Default: shown.
     #[serde(default = "default_true")]
     pub schema_visible: bool,
@@ -251,6 +260,7 @@ impl Default for UiState {
             expanded: Vec::new(),
             show_table_sizes: false,
             hidden_dbs: Vec::new(),
+            hidden_db_rules: Vec::new(),
             schema_visible: true,
             right_panel: RightPanelState::Ai,
             activity_intervals: Vec::new(),
@@ -716,6 +726,22 @@ pub fn load_ui_state() -> UiState {
 /// Persist UI state (best effort — errors are intentionally ignored).
 pub fn save_ui_state(state: &UiState) {
     write_json(config_path(), state);
+}
+
+/// The legacy `ai_run_queries` flag **as a file actually recorded it**, or
+/// `None` when no file did.
+///
+/// [`load_ui_state`] cannot answer this: it is best-effort, and its default for
+/// the flag is `true` — so an *absent* `ui_state.json` (a restored
+/// `connections.json`, a moved config directory, deleted preferences) reads as
+/// "the user had the assistant running queries", and the one-way `AiData`
+/// migration promotes every saved connection to [`crate::connection::AiData::Full`]
+/// on that evidence. Widening a consent setting is not a decision to make from
+/// an absence, and the migration never re-resolves.
+pub fn legacy_ai_run_queries() -> Option<bool> {
+    let bytes = std::fs::read(config_path()?).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("ai_run_queries")?.as_bool()
 }
 
 /// Load a JSON value from `<config>/<file>` (best effort → default on error).

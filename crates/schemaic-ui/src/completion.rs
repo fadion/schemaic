@@ -18,6 +18,7 @@ use std::sync::Arc;
 use floem::keyboard::{Key, NamedKey};
 use floem::kurbo::{Point, Rect};
 use floem::prelude::*;
+use floem::reactive::Memo;
 use floem::views::editor::Editor;
 use floem::views::editor::core::cursor::CursorAffinity;
 use floem::views::editor::core::editor::EditType;
@@ -661,7 +662,7 @@ pub(crate) fn popup_may_open(force: bool, already_open: bool, typed: bool) -> bo
 pub(crate) fn recompute_completions(
     ed: &Editor,
     db_nodes: RwSignal<Vec<ConnNode>>,
-    hidden_dbs: RwSignal<HashSet<String>>,
+    hidden_dbs: Memo<HashSet<String>>,
     comp: Completion,
     active_db: Option<&str>,
     dialect: SqlDialect,

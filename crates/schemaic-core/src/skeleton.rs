@@ -22,7 +22,7 @@
 //! browse `SELECT` above it spell the table identically) and the `WHERE` is
 //! [`crate::schema::browse_key_columns`], falling back to the table's implicit
 //! key — the same three sources, in the same order, that
-//! [`crate::edit::resolve_key`] gives the grid's write-back. A table with no key
+//! `edit::resolve_key` gives the grid's write-back. A table with no key
 //! at all gets a `WHERE` that says so and does not parse, because the
 //! alternative — omitting it — is a statement that runs against every row.
 //!

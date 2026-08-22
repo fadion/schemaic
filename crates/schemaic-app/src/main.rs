@@ -934,12 +934,21 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // an upgrade neither hands the assistant access the user never granted nor
     // silently withdraws the access they had.
     {
+        // **Read from the file, not from the loaded struct.** `load_ui_state` is
+        // best effort and defaults the old flag to `true`, so an *absent*
+        // `ui_state.json` — a restored `connections.json`, a moved config
+        // directory, deleted preferences — would read as "the assistant was
+        // running queries" and widen every saved connection to `Full`, once and
+        // for good. With nothing to migrate *from*, the ordinary default is the
+        // honest answer: the user can still raise it, and is shown the level.
+        let settled = match persist::legacy_ai_run_queries() {
+            Some(flag) => schemaic_core::connection::migrated_ai_data(flag),
+            None => schemaic_core::connection::AiData::default(),
+        };
         let mut changed = false;
         for c in cf.connections.iter_mut() {
             if c.ai_data.is_none() {
-                c.ai_data = Some(schemaic_core::connection::migrated_ai_data(
-                    ui_state.ai_run_queries,
-                ));
+                c.ai_data = Some(settled);
                 changed = true;
             }
         }
@@ -1217,8 +1226,22 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let db_nodes: RwSignal<Vec<ConnNode>> = RwSignal::new(Vec::new());
     let expanded: RwSignal<HashSet<String>> =
         RwSignal::new(ui_state.expanded.into_iter().collect());
-    let hidden_dbs: RwSignal<HashSet<String>> =
-        RwSignal::new(ui_state.hidden_dbs.into_iter().collect());
+    // Hidden databases, keyed by connection — see `core::db_hidden` for why the
+    // key has to carry one, and `migrate_flat` for what a file written before
+    // this means. The rules are the persisted truth; `hidden_dbs` is the set for
+    // the connection currently being *looked at*, which is the question every
+    // consumer is asking, so it is derived rather than kept in step by hand.
+    let hidden_db_rules: RwSignal<Vec<schemaic_core::db_hidden::DbHiddenRule>> = RwSignal::new({
+        let mut rules = ui_state.hidden_db_rules;
+        if rules.is_empty() && !ui_state.hidden_dbs.is_empty() {
+            let ids: Vec<u64> = cf.connections.iter().map(|c| c.id).collect();
+            rules = schemaic_core::db_hidden::migrate_flat(&ui_state.hidden_dbs, &ids);
+        }
+        rules
+    });
+    let hidden_dbs: floem::reactive::Memo<HashSet<String>> = create_memo(move |_| {
+        hidden_db_rules.with(|rules| schemaic_core::db_hidden::names_for(rules, active_conn.get()))
+    });
     // Persisted panel layout: whether the schema sidebar is shown, and which
     // panel (AI / Terminal / None) fills the right column.
     let schema_visible: RwSignal<bool> = RwSignal::new(ui_state.schema_visible);
@@ -3052,7 +3075,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             last_db
                 .get_untracked()
                 .filter(|name| v.iter().any(|n| &n.database == name))
-                .or_else(|| v.first().map(|n| n.database.clone()))
+                .or_else(|| {
+                    // The first database a *list* would show — the same rule the
+                    // schema load's binding uses. Ctrl+T before ever touching
+                    // the selector otherwise landed the tab in a hidden one.
+                    let names: Vec<String> = v.iter().map(|n| n.database.clone()).collect();
+                    hidden_dbs.with_untracked(|h| {
+                        schemaic_core::schema::first_bindable(&names, h).map(str::to_string)
+                    })
+                })
         });
         (conn_id, database)
     });
@@ -4306,7 +4337,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let save_ui: Rc<dyn Fn()> = Rc::new(move || {
         persist::save_ui_state(&UiState {
             expanded: expanded.with_untracked(|s| s.iter().cloned().collect()),
-            hidden_dbs: hidden_dbs.with_untracked(|s| s.iter().cloned().collect()),
+            // The legacy flat field is written empty from here on: it is read
+            // once, at the upgrade, and `hidden_db_rules` is the truth after.
+            hidden_dbs: Vec::new(),
+            hidden_db_rules: hidden_db_rules.get_untracked(),
             schema_visible: schema_visible.get_untracked(),
             right_panel: right_panel.get_untracked().into(),
             activity_intervals: activity_intervals.get_untracked(),
@@ -4505,10 +4539,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let toggle_db_hidden: Rc<dyn Fn(String)> = {
         let save_ui = save_ui.clone();
         Rc::new(move |db: String| {
-            hidden_dbs.update(move |set| {
-                if !set.remove(&db) {
-                    set.insert(db);
-                }
+            let conn_id = active_conn.get_untracked();
+            hidden_db_rules.update(move |rules| {
+                schemaic_core::db_hidden::toggle(rules, conn_id, &db);
             });
             save_ui();
         })
@@ -4923,8 +4956,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         }
                         *nodes_conn_cb.borrow_mut() = Some(conn_send.clone());
                         // Bind any tab of THIS connection that doesn't yet have a
-                        // database (e.g. the initial tab) to the first database.
-                        if let Some(first) = names.first() {
+                        // database (e.g. the initial tab) to the first database
+                        // **the SCHEMA panel would show** — see
+                        // `schema::first_bindable` for why the filter belongs
+                        // here of all places.
+                        if let Some(first) = hidden_dbs
+                            .with_untracked(|h| {
+                                schemaic_core::schema::first_bindable(&names, h).map(str::to_string)
+                            })
+                            .as_ref()
+                        {
                             tabs.with_untracked(|v| {
                                 for t in v {
                                     if t.conn_id.get_untracked() == conn_send.id
@@ -5781,6 +5822,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let save_db_colors = save_db_colors.clone();
         let save_db_favorites = save_db_favorites.clone();
         let save_formats = save_formats.clone();
+        let save_ui = save_ui.clone();
         Rc::new(move |id: u64| {
             let was_active = active_conn.get_untracked() == id;
             // Release any pinned transaction connection on the connection being
@@ -5904,6 +5946,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // connection to take this one would inherit a choice nobody made for
             // it. `save_ui` follows from the effect watching this store.
             activity_intervals.update(|v| schemaic_core::activity::clear_conn(v, id));
+            // Same rule for what it had put away with the eye. The flat set this
+            // replaced could not do it at all, so a deleted connection's hidden
+            // names went on hiding same-named databases forever.
+            hidden_db_rules.update(|v| schemaic_core::db_hidden::clear_conn(v, id));
+            (save_ui)();
             formats.update(|v| schemaic_core::format::clear_conn(v, id));
             (save_formats)();
             // Diagram layouts live only on disk (no signal) — load, prune, save.
@@ -6013,6 +6060,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         cli_path: ai_cli_path.get_untracked(),
         instructions: ai_instructions.get_untracked(),
         schema_scope: ai_schema_scope.get_untracked(),
+        hidden: hidden_dbs.get_untracked(),
     };
 
     let ai_send: Rc<dyn Fn(String)> = {
@@ -6031,10 +6079,18 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // tightening (or widening) the connection's data access has to
             // respawn — otherwise the setting the user just changed keeps not
             // applying, which is the worst possible failure for this control.
+            // The hidden set rides in the same once-written MCP blob, so it has
+            // the same rule: hiding a database mid-session used to leave
+            // `list_schema` enumerating it and its tables to the vendor.
+            let hidden_now = hidden_dbs.get_untracked();
             let need_new = ai_session
                 .borrow()
                 .as_ref()
-                .map(|s| s.conn_id != active_id || s.settings.data != data_now)
+                .map(|s| {
+                    s.conn_id != active_id
+                        || s.settings.data != data_now
+                        || s.settings.hidden != hidden_now
+                })
                 .unwrap_or(true);
             // The live context as it stands *now* — the system prompt is written
             // once at spawn, so every later turn carries the delta (see
@@ -6108,7 +6164,16 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     // through it would run `run_query` against a connection the
                     // user has just locked down, which is this control failing
                     // open. Say so and leave the question in the box.
+                    //
+                    // **Put it back if it isn't there.** Regenerate hands its
+                    // question in as `msg` *after* deleting it from the
+                    // transcript, so returning here without it lost the
+                    // question and its answer durably — the one path into this
+                    // arm where the box is not already holding the text.
                     ai_session.borrow_mut().take();
+                    if ai_input.with_untracked(|s| s.trim().is_empty()) {
+                        ai_input.set(msg.clone());
+                    }
                     ai_messages.update(|v| {
                         v.push(ChatMessage {
                             role: Role::Error,
@@ -6363,16 +6428,32 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         .map(|c| SqlDialect::from_db_type(&c.db_type))
                 })
                 .unwrap_or_default();
-            let system =
-                inline_system_prompt(db_nodes, hidden_dbs, active_db.as_deref(), &req, dialect);
+            let system = inline_system_prompt(
+                db_nodes,
+                hidden_dbs,
+                active_db.as_deref(),
+                &req,
+                dialect,
+                ai_schema_scope.get_untracked(),
+            );
             let intent = req.intent.clone();
             let bin = claude_bin(&ai_cli_path.get_untracked());
             // Follow the AI panel's model choice (one place to change it).
             let model = ai_model.get_untracked().cli().to_string();
             let send = create_ext_action(cx, move |state: InlineAiState| inline_ai.set(state));
+            // **The same pre-spawn check the chat panel makes**, because it is
+            // the same argv entry and the same platform limit. Without it an
+            // oversize prompt surfaced as `os error 206`, which names the one
+            // cause that isn't the problem — and Ctrl+K on a large catalogue was
+            // simply broken with nothing on screen to say why.
+            let args = schemaic_ai::inline_args(&intent, &system, &model);
+            if let Some(why) = schemaic_ai::oversize_reason(&args, schemaic_ai::arg_limit()) {
+                inline_ai.set(InlineAiState::Failed(why));
+                return;
+            }
             let jh = handle.spawn(async move {
                 let out = Command::new(bin)
-                    .args(schemaic_ai::inline_args(&intent, &system, &model))
+                    .args(args)
                     .kill_on_drop(true)
                     .output()
                     .await;

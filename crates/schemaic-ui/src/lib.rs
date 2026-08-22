@@ -1928,7 +1928,7 @@ pub struct SchemaUi {
     /// The active tab's source table, highlighted in the tree.
     pub active_table: RwSignal<Option<TableSource>>,
     /// Names of databases hidden from the schema panel and search.
-    pub hidden_dbs: RwSignal<HashSet<String>>,
+    pub hidden_dbs: Memo<HashSet<String>>,
     /// Show each table's on-disk size at the right edge of its tree row.
     ///
     /// Off by default and persisted. It is the cheap half of the properties
