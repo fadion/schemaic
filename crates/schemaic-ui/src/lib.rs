@@ -643,6 +643,17 @@ pub struct DdlUi {
     /// The routine editor's target; doubles as its open flag.
     pub routine: RwSignal<Option<RoutineTarget>>,
     pub routine_draft: RwSignal<schemaic_core::ddl::RoutineDraft>,
+    /// **The Body field's text, owned outside the form.**
+    ///
+    /// Every other control in that modal seeds a view-local signal once at
+    /// build, which is right for a field only the user writes. The body is not
+    /// one: MySQL's `SHOW CREATE` reply lands after the form is up and has to
+    /// correct it. Routing that correction through `routine` — the overlay's own
+    /// `dyn_container` key — meant the whole modal was torn down and rebuilt to
+    /// deliver it, `FocusRing` and all, and the caret went with the old scope if
+    /// the reply arrived mid-word. Written here instead, `edit_field` reconciles
+    /// the doc in place and keeps the caret (see its signal → doc effect).
+    pub routine_body: RwSignal<String>,
     /// Whether the routine editor is still waiting for its `SHOW CREATE`.
     ///
     /// MySQL only, and load-bearing rather than cosmetic: until the read lands
@@ -2993,11 +3004,12 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
                 }
             })
         },
-        // **Last on purpose.** A sibling paints in tuple order, so anything after
-        // this would cover it — and the shared popup menu is opened from *inside*
-        // modals too (the designer's type shortcut), where being painted behind
-        // the panel and its backdrop made it invisible. It's the topmost surface
-        // in the app, which is what a menu should be.
+        // **After every modal, on purpose.** A sibling paints in tuple order, so
+        // anything before this is covered by it — and the shared popup menu is
+        // opened from *inside* modals too (the designer's type shortcut), where
+        // being painted behind the panel and its backdrop made it invisible. Only
+        // `submenu_layer` below sits above it, and that is this menu's own
+        // submenu rather than a surface competing with it.
         popup_menu_overlay(ui),
         // **After even the popup menu**, because it draws that menu's own open
         // submenu. A submenu is hoisted out of the row it belongs to and drawn

@@ -1156,6 +1156,18 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
         // The preview stacks on top and this stays open behind it (Cancel there
         // returns here with the draft intact), but must render nothing. Same for
         // the routine editor, which is reached *from* here and returns here.
+        //
+        // **Deliberately not a memo**, unlike the routine and view editors'
+        // keys. `dyn_container` never dedups, so `fetch_sources`' patch of
+        // `current` rebuilds this modal — and here that rebuild is *load-bearing*
+        // rather than merely wasteful: `form` is built once per `(selected, rev)`
+        // and its Body field seeds itself from the draft at build, so the
+        // escape-corrected trigger body reaches the screen no other way. Dedup
+        // this key and a MySQL trigger silently keeps editing
+        // `information_schema`'s resolved copy. The cost is the routine editor's
+        // old bug — a reply landing mid-keystroke drops the caret — and the fix
+        // is the same one: give the Body field a signal the fetch can write
+        // (there, `Ui::routine_body`), which needs one per row here.
         move || {
             (
                 d.trigger.get().is_some(),
