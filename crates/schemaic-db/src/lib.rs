@@ -1111,7 +1111,7 @@ const NO_SESSIONS_MSG: &str = "this connection's engine has no server sessions";
 /// **Working threads first, then longest-standing** — and the first half of that
 /// is load-bearing. Ordering by `TIME` alone reads as "keep the interesting end
 /// of the list", but the panel's own attention order
-/// ([`activity::rank`](schemaic_core::activity::rank)) puts *blocked* sessions at
+/// ([`schemaic_core::activity::rank`]) puts *blocked* sessions at
 /// the top, and a session that started waiting four seconds ago has the smallest
 /// `TIME` on the server. On a box holding three thousand pool connections idle
 /// for hours, `ORDER BY TIME DESC LIMIT 501` returned five hundred sleepers and

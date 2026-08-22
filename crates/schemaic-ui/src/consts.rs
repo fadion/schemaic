@@ -194,7 +194,7 @@ pub(crate) const FOOTER_COLLAPSE_GAP: f64 = 30.0;
 /// `padding_bottom(FOOTER_LIFT * 2)` on the bar, so a later adjustment is one
 /// number rather than a margin on each of fifteen segments.
 ///
-/// Tuned by eye against [`theme::FOOTER_H`](crate::theme::FOOTER_H), which it
+/// Tuned by eye against [`crate::theme::FOOTER_H`], which it
 /// belongs with. The bar's bottom is pinned to the window, so growing it lifts
 /// its own centre too — when `FOOTER_H` went 26 → 28 this had to come back down
 /// to 2 rather than up to 3, or the contents would have moved twice.

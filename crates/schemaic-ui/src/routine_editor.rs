@@ -17,7 +17,7 @@
 //!   volatility, strictness, a language and per-routine `SET` clauses; MySQL has
 //!   a definer, a determinism promise, a data-access declaration and a comment,
 //!   and no `LANGUAGE` clause at all. Both are modelled on one
-//!   [`RoutineInfo`](schemaic_core::schema::RoutineInfo) so introspection never
+//!   [`schemaic_core::schema::RoutineInfo`] so introspection never
 //!   has to lie about what a server reported, and the form shows what the engine
 //!   in front of it can express rather than offering the rest and failing at
 //!   apply time.
