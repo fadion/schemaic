@@ -117,12 +117,10 @@ pub fn ai_send_icon_hover() -> Color {
     ui().ai_send_icon_hover
 }
 
-// AI chat bubbles. User = a dim recap (right-aligned); Claude = the response.
+// AI chat. The user's question keeps a bubble — a dim right-aligned recap; the
+// assistant's answer has no surface of its own, so its text sits on `bg_panel`.
 pub fn bubble_user_bg() -> Color {
     ui().bubble_user_bg
-}
-pub fn bubble_claude_bg() -> Color {
-    ui().bubble_claude_bg
 }
 pub fn bubble_claude_text() -> Color {
     ui().bubble_claude_text
@@ -603,11 +601,6 @@ pub fn dropdown_hover() -> Color {
 }
 pub fn dropdown_active() -> Color {
     ui().dropdown_active
-}
-
-// Code-block action bar (copy / insert / run), floated over the block.
-pub fn code_action_bar() -> Color {
-    ui().code_action_bar
 }
 
 // AI-panel jump-to-bottom button: chevron icon, resting + hover.

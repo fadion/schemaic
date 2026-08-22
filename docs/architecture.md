@@ -2037,7 +2037,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     block of stops starts), and the `PopupToken`-tagged `set_open_popup`/`clear_open_popup`/
     `dismiss_open_popup` slot. A field joins through `FieldCfg::focus` instead, since nothing
     outside floem's editor can see a key it has.
-  - `markdown.rs` — AI-chat `render_markdown`/`CodeActions`/`code_block` (pulldown-cmark). Also
+  - `markdown.rs` — AI-chat `render_markdown`/`CodeActions`/`code_block` (pulldown-cmark). A code
+    block carries a **standing** 24px header — the language on the left, `Copy` and (for SQL only)
+    `Insert` / `Run` on the right, as words rather than icons, since a permanent icon row over every
+    block is noise. The header repeats the block's own `border_radius`: floem does not clip a child
+    to a rounded parent, so a square-cornered fill would paint over the wrapper's arc. Also
     `proposal_card`: a fenced block tagged `core::propose::FENCE_TAG` renders as the AI's **proposed
     table change** — the table, the model's own summary line, the change count, and a Review button
     that hands the parsed `Proposal` to `CodeActions::propose`. The card is the offer, the DDL
@@ -2397,13 +2401,23 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `is_editable_object` is the entry point's gate: an identity column's counter is listed
     and alterable but not editable-as-an-object, the call a materialized view gets.
   - `ai_panel.rs` — AI Assistant panel (`ai_panel`/`message_bubble`/`render_segments`/`tool_chip`/
-    `assistant_footer`). Two views carry an attachment: `attachment_chip` sits over the message box
-    showing what the *next* question will send, with an × that is a real cancel — the last point
-    before rows leave the machine — and `sent_attachment` sits above a past question showing what
-    it *did* send, expanding to the exact block the model was given rather than a re-rendering of
-    the grid, so "what did I send?" is answered by looking. A restored conversation has the summary
-    without the rows and says so (`Attachment::retained`). The chip's `dyn_container` keys on the
-    summary alone, never the rows: a key clones what it reads on every notification.
+    `assistant_footer`). The two roles are drawn **asymmetrically**, and deliberately: the user's
+    question is a shrink-wrapped right-aligned bubble on `bubble_user_bg`, while Claude's turn has
+    no surface at all — full-width prose on the panel, marked only by a 2px `accent` rule down its
+    *right* edge, with the cost footer separated by space rather than a rule. That is why there is
+    no `bubble_claude_bg`: the assistant's text (`bubble_claude_text`) is a foreground with no
+    paired background, and `contrast.rs` audits it against `bg_panel`. The rule is a setting
+    (`AiUi::gutter`, persisted as `UiState::ai_gutter`, flipped in AI Settings); the padding that
+    clears it is read from the same signal, so turning it off gives the reply equal insets instead
+    of leaving it off-centre. It is also the one AI setting outside `ai_settings_now()`, so flipping
+    it never respawns the session. Two views carry an attachment: `attachment_chip` sits over the
+    message box showing what the *next* question will send, with an × that is a real cancel — the
+    last point before rows leave the machine — and `sent_attachment` sits above a past question
+    showing what it *did* send, expanding to the exact block the model was given rather than a
+    re-rendering of the grid, so "what did I send?" is answered by looking. A restored conversation
+    has the summary without the rows and says so (`Attachment::retained`). The chip's
+    `dyn_container` keys on the summary alone, never the rows: a key clones what it reads on every
+    notification.
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context
     menu, generic grid popup, Find-Anywhere, error modal.
   - `schema_tree.rs` — SCHEMA sidebar (`schema_panel` + db/table/column/key row builders + keyboard

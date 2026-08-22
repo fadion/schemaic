@@ -191,6 +191,13 @@ pub struct UiState {
     /// AI Assistant — schema context scope: `active` / `all` / `none`.
     #[serde(default = "default_ai_scope")]
     pub ai_schema_scope: String,
+    /// AI Assistant — draw the accent rule down the right edge of the
+    /// assistant's replies. Default: on. Purely presentational, and off is a
+    /// taste rather than a fallback: with no rule the reply keeps equal insets
+    /// on both sides, and the small-caps `CLAUDE` label alone marks whose turn
+    /// it is.
+    #[serde(default = "default_true")]
+    pub ai_gutter: bool,
     /// **Legacy.** The old global "let the assistant run read-only queries"
     /// switch, replaced by the per-connection
     /// [`AiData`](crate::connection::AiData) level.
@@ -255,6 +262,7 @@ impl Default for UiState {
             ai_effort: default_ai_effort(),
             ai_instructions: String::new(),
             ai_schema_scope: default_ai_scope(),
+            ai_gutter: true,
             ai_run_queries: true,
             ui_theme: default_ui_theme(),
             editor_theme: default_editor_theme(),

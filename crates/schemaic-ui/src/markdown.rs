@@ -1,8 +1,9 @@
 //! AI-chat markdown rendering: a `pulldown-cmark` (CommonMark + tables +
 //! strikethrough) event stream mapped onto Floem views. Renders tables, nested
 //! lists, blockquotes, links, strikethrough, and backslash escapes correctly;
-//! fenced code blocks become `code_block`s with a hover action bar (Copy, and —
-//! for SQL — Insert / Insert-&-Run via [`CodeActions`]).
+//! fenced code blocks become `code_block`s with a standing header bar — the
+//! language on the left, Copy and (for SQL) Insert / Run on the right, via
+//! [`CodeActions`].
 //!
 //! Entry point: [`render_markdown`]; the AI panel builds a [`CodeActions`] and
 //! calls it per assistant text segment.
@@ -10,7 +11,6 @@
 use std::rc::Rc;
 
 use floem::AnyView;
-use floem::event::{EventListener, EventPropagation};
 use floem::prelude::*;
 use floem::text::{
     Attrs, AttrsList, FamilyOwned, LineHeightValue, Style as FontStyle, TextLayout, Weight,
@@ -341,7 +341,9 @@ pub(crate) fn render_markdown(src: &str, actions: CodeActions, settled: bool) ->
                             out.push(proposal_card(trimmed, actions.clone()).into_any());
                         } else {
                             let is_sql = code_is_sql(&code_lang, &trimmed);
-                            out.push(code_block(trimmed, actions.clone(), is_sql).into_any());
+                            out.push(
+                                code_block(trimmed, actions.clone(), &code_lang, is_sql).into_any(),
+                            );
                         }
                     }
                 }
@@ -445,15 +447,16 @@ pub(crate) struct CodeActions {
     pub propose: Rc<dyn Fn(schemaic_core::propose::Proposal) -> Result<(), String>>,
 }
 
-/// One action-bar icon: 16px, code-text colored, white on hover.
-fn code_action_icon(svg: &'static str, on_click: impl Fn() + 'static) -> impl IntoView {
-    container(icons::icon(svg, 16.0))
-        .on_click_stop(move |_| on_click())
-        .style(|s| {
-            s.items_center()
-                .color(theme::text())
-                .hover(|s| s.color(floem::peniko::Color::WHITE))
-        })
+/// One header action: a text link, dim until hovered, then accent. Words rather
+/// than icons because the header is always on screen — an icon row standing
+/// permanently over every code block is noise, and "Run" said in a word can't be
+/// mistaken for "Insert".
+fn code_action_link(label: &'static str, on_click: impl Fn() + 'static) -> impl IntoView {
+    text(label).on_click_stop(move |_| on_click()).style(|s| {
+        s.font_size(theme::FONT_LABEL)
+            .color(theme::text_dim())
+            .hover(|s| s.color(theme::accent()))
+    })
 }
 
 /// Is a fenced block SQL? An explicit language tag is authoritative; an untagged
@@ -544,7 +547,7 @@ fn proposal_card(json: String, actions: CodeActions) -> AnyView {
                         .font_size(theme::FONT_LABEL)
                         .color(theme::text_muted())
                 }),
-                code_block(json, actions, false),
+                code_block(json, actions, "json", false),
             ))
             .style(|s| s.flex_col().width_full().gap(5.0))
             .into_any();
@@ -629,22 +632,35 @@ fn proposal_card(json: String, actions: CodeActions) -> AnyView {
         .into_any()
 }
 
-fn code_block(code: String, actions: CodeActions, is_sql: bool) -> impl IntoView {
-    let hovered = RwSignal::new(false);
-
+fn code_block(code: String, actions: CodeActions, lang: &str, is_sql: bool) -> impl IntoView {
     let body = text(code.trim_end().to_string()).style(|s| {
         s.width_full()
             .font_family("monospace".to_string())
             .font_size(theme::FONT_BODY)
             .color(theme::text())
+            .padding_horiz(9.0)
+            .padding_vert(7.0)
     });
 
-    // Bar icons: Copy for any block; Insert (square-pen) and Insert-&-Run
-    // (circle-play) only for SQL, since they target the SQL editor.
-    let mut buttons: Vec<AnyView> = Vec::new();
+    // What the block *is*, said once on the left. `is_sql` is the authority
+    // rather than the tag, because an untagged block that starts `SELECT` is
+    // treated as SQL everywhere else here (`code_is_sql`) — labelling it "CODE"
+    // while offering it Run would be the header contradicting the buttons.
+    let kind = if is_sql {
+        "SQL".to_string()
+    } else if lang.trim().is_empty() {
+        "CODE".to_string()
+    } else {
+        lang.trim().to_ascii_uppercase()
+    };
+
+    // Copy for any block; Insert and Run only for SQL, since they target the SQL
+    // editor. Run is Insert-&-Run: it lands in a new tab and executes there, so
+    // what ran is on screen afterwards rather than having happened invisibly.
+    let mut links: Vec<AnyView> = Vec::new();
     let copy_code = code.clone();
-    buttons.push(
-        code_action_icon(icons::COPY, move || {
+    links.push(
+        code_action_link("Copy", move || {
             let _ = floem::Clipboard::set_contents(copy_code.clone());
         })
         .into_any(),
@@ -652,8 +668,8 @@ fn code_block(code: String, actions: CodeActions, is_sql: bool) -> impl IntoView
     if is_sql {
         let insert_code = code.clone();
         let insert = actions.insert.clone();
-        buttons.push(
-            code_action_icon(icons::SQUARE_PEN, move || {
+        links.push(
+            code_action_link("Insert", move || {
                 (insert)(insert_code.clone());
             })
             .into_any(),
@@ -661,9 +677,8 @@ fn code_block(code: String, actions: CodeActions, is_sql: bool) -> impl IntoView
         let run_code = code.clone();
         let run_insert = actions.insert.clone();
         let run = actions.run.clone();
-        buttons.push(
-            code_action_icon(icons::CIRCLE_PLAY, move || {
-                // Insert into a new tab, then run it there.
+        links.push(
+            code_action_link("Run", move || {
                 (run_insert)(run_code.clone());
                 (run)(run_code.clone());
             })
@@ -671,37 +686,41 @@ fn code_block(code: String, actions: CodeActions, is_sql: bool) -> impl IntoView
         );
     }
 
-    // Floated top-right inside the block; revealed only while the block is hovered.
-    let bar = h_stack_from_iter(buttons).style(move |s| {
-        let s = s
-            .absolute()
-            .inset_top(3.0)
-            .inset_right(3.0)
+    // The header carries the block's own radius, not just the wrapper's: floem
+    // does not clip a child to a rounded parent, so a square-cornered fill here
+    // would paint over the top of the wrapper's arc and square the block off.
+    let header = h_stack((
+        text(kind).style(|s| {
+            s.font_size(theme::FONT_LABEL)
+                .font_bold()
+                .color(theme::text_muted())
+        }),
+        empty().style(|s| s.flex_grow(1.0_f32)),
+        h_stack_from_iter(links).style(|s| s.flex_row().items_center().gap(10.0)),
+    ))
+    .style(|s| {
+        s.width_full()
             .flex_row()
             .items_center()
-            .gap(10.0)
+            .height(24.0)
             .padding_horiz(8.0)
-            .padding_vert(5.0)
-            .border_radius(6.0)
-            .background(theme::code_action_bar());
-        if hovered.get() { s } else { s.hide() }
+            .gap(10.0)
+            .background(theme::group_header_bg())
+            .border_radius(CODE_RADIUS)
+            .border_bottom(1.0)
+            .border_color(theme::border())
     });
 
-    stack((body, bar))
-        .on_event(EventListener::PointerEnter, move |_| {
-            hovered.set(true);
-            EventPropagation::Continue
-        })
-        .on_event(EventListener::PointerLeave, move |_| {
-            hovered.set(false);
-            EventPropagation::Continue
-        })
-        .style(|s| {
-            s.width_full()
-                .padding(8.0)
-                .background(theme::bg_deepest())
-                .border(1.0)
-                .border_color(theme::border())
-                .border_radius(6.0)
-        })
+    v_stack((header, body)).style(|s| {
+        s.flex_col()
+            .width_full()
+            .background(theme::bg_editor())
+            .border(1.0)
+            .border_color(theme::border())
+            .border_radius(CODE_RADIUS)
+    })
 }
+
+/// Corner radius of a code block, shared by the block and its header so the two
+/// arcs agree — see the note in [`code_block`].
+const CODE_RADIUS: f64 = 5.0;
