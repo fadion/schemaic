@@ -328,6 +328,21 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `a_real_key_still_wins_over_a_projected_implicit_one` and
     `refetch_template_keys_on_the_implicit_key` — the last because a read-only key column is still
     part of the row the splice re-reads.
+    **Three grid gestures resolve to a decision here rather than in the view.**
+    `selected_data_rows(order, selection, pos)` is what a gutter gesture acts on: the highlighted
+    range when the click landed inside it, otherwise the row it pointed at alone, mapped through the
+    grid's display→data `order` and with pending new rows (which live past `order.len()`) left out.
+    It is pure because it decides *which rows are deleted* — on a sorted grid the display index and
+    the data index are different numbers, and the write-back's 1-row net checks the count and not the
+    identity, so an inverted mapping deletes the wrong row and reports success. `copy_scope` answers
+    what a cell menu's Copy takes — `CopyScope::Selection` for a right-click inside a multi-cell
+    block (which no longer collapses the selection, so the menu is about the block),
+    `CopyScope::Cell` otherwise — and `CopyScope::label` gives the two amounts two words, because an
+    entry reading "Copy" that took one cell out of nine said what Ctrl+C and the gutter menu's own
+    Copy say for three different amounts. `attach_span(r0, r1, cap)` returns *sent* and *selected*
+    as two numbers: `prompt::ATTACH_ROW_CAP` is about the context window rather than about consent,
+    so exceeding it is reported in the header instead of silently applied, and a figure derived from
+    the rows that survived would tell a user who picked 900 that 200 went.
   - `export.rs` — CSV/JSON/SQL/Markdown/HTML export (incl. CSV formula-injection guard;
     Markdown pipe/backslash escaping; HTML entity escaping). Every renderer has a **streaming**
     `*_to<W: io::Write>` form (`ExportFormat::render_to`) — what file export uses, so a large
@@ -765,7 +780,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `CREATE PROCEDURE` has a clause for the `sql_mode`/`character_set_client`/
     `collation_connection` the object was written under, yet all three are part of what it does,
     so the values are set on the session around the statement and restored after (`run_ddl` runs
-    a MySQL plan in order on one connection, which is what makes that safe). Nothing is emitted
+    a MySQL plan in order on one connection, which is what makes that safe). **The routine half is
+    the later of the two and closes a hole of its own**: every MySQL edit to a routine is a `DROP`
+    that commits on its own followed by a `CREATE`, so an unwrapped recreate re-filed the routine
+    under whatever `sql_mode` the applying session happened to have — one written under
+    `sql_mode = ''` and recreated under a strict one starts raising on rows it used to truncate,
+    with the original already gone. One helper rather than two because it is the same failure, and
+    the wrap goes on **every** `CREATE` the routine emitter produces, not only a recreate's.
+    Nothing is emitted
     when nothing is known — `None` means "not fetched", and inventing a session state is a change
     nobody asked for. It early-returns on `!= MySql`; the old `== Postgres` test would have handed
     SQLite `SET SESSION sql_mode = …`.
@@ -782,7 +804,23 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     sentence `ReplaceTrigger` carries and for the same reason. `RoutineInfo::signature_sql` is what
     knows the two engines address a routine differently: PostgreSQL by its **argument types**
     (overloads share a name), MySQL by name alone (the parameter list there is a syntax error on a
-    `DROP`). That is also why `ObjectKind::Function`/`Procedure` are on the browse enum but refused
+    `DROP`). The list it writes is `RoutineInfo::identity_arguments` —
+    `pg_get_function_identity_arguments`, fetched alongside `pg_get_function_arguments` and empty on
+    MySQL, whose routine identity is the bare name. A second field rather than a reformatting,
+    because the two strings genuinely differ and each is a syntax error where the other belongs:
+    `CREATE` needs the defaults (`b boolean DEFAULT false`), while `DROP`/`ALTER … RENAME` take
+    `[argmode] [argname] argtype` and answer `syntax error at or near "DEFAULT"` to anything more —
+    so while the `CREATE` form was spliced in here, a routine with a defaulted parameter could not be
+    dropped or renamed from the app at all. It falls back to `arguments` for a routine assembled by
+    hand rather than read from a catalogue, where the two are the same string.
+    `Change::ReplaceRoutine` therefore carries the routine **as the server holds it**
+    (`server: Box<RoutineInfo>`) beside the draft: a recreate's `DROP` must name that one and not
+    `draft.info`, which differs in the *name* on MySQL (where a rename rides the recreate) and in the
+    *parameter list* on PostgreSQL (where an edited list is a different function, so the `DROP`
+    dropped nothing and the `CREATE` left the original standing beside a new overload). It is what
+    `summary` names as the thing being changed, and what `risks` compares against to warn that
+    callers passing the old arguments no longer resolve.
+    That is also why `ObjectKind::Function`/`Procedure` are on the browse enum but refused
     by `drop_object`, which has only a name to work with — it returns an **empty** change set for
     one, so a preview says "no changes" rather than a bare-name statement that is right up until
     the first overload; `drop_routine` takes the whole `RoutineInfo` and is the route.
@@ -855,7 +893,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     Graphviz keep the real names, quoted or escaped. `crow_ends` is the shared cardinality notation
     and reads the *parent* end from `DiagramEdge::optional` — a nullable FK means a child may
     reference nothing, so "exactly one" drops to "zero or one" — while the child end is "zero or
-    more" or "zero or one" from the uniqueness `core::erd` already worked out. `mermaid_type`
+    more" (`o{`) or "zero or one" (`o|`) from the uniqueness `core::erd` already worked out: zero
+    either way, since nothing obliges a parent row to have children. **All four text exports say
+    that the same way.** Mermaid and PlantUML take the two strings as they are; Graphviz cannot, so
+    `to_dot` spells the child end as the composite `crowodot`/`teeodot` — the `o` *modifier* applies
+    only to Graphviz's fillable primitives, so `ocrow` parses and then draws exactly like `crow`,
+    and in a composite the later shape sits farther from the node, which is where crow's-foot puts
+    the zero. Without it the `.dot`'s tail read "exactly one" and asserted every parent row has a
+    child, which the `.mmd` and `.puml` of the same diagram explicitly deny. The **canvas** is the
+    one surface that draws no zero at the child end, and deliberately: on screen that marker would
+    be on every edge of every diagram without exception, so it separates nothing and costs twenty
+    more stroked segments per edge on the app's heaviest paint — `crow_ends` and `erd_view`'s
+    `marker_lines` each carry that argument in their rustdoc, so read both before changing either.
+    `mermaid_type`
     exists because a space ends Mermaid's type token: MySQL's `int unsigned` and PostgreSQL's
     `timestamp with time zone` would otherwise turn the rest of the line into a parse error.
     `to_dot` deliberately emits **no `pos` attributes**: they bind only under `neato -n`, so a file
@@ -929,7 +979,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     disagreeing. `render_slice` is the last cut, and a different one: the panel is rebuilt whole on
     every poll, so it draws the first `RENDER_CAP` of whatever survived the search and *counts* the
     rest (an exact figure — it is measured against the list in hand, not a server total nobody
-    fetched). The two classifiers are here rather than in the
+    fetched). **The row→`SessionInfo` folds are here too** — `from_mysql_rows(rows, trx, waits)` over
+    `MyProcessRow`, `from_pg_rows` over `PgActivityRow` (every `pg_stat_activity` column as the text
+    `simple_query` hands back) — with the backends reduced to fetching and reshaping. Each fold is a
+    pile of decisions, not an I/O wrapper: which of MySQL's three result sets wins for a thread,
+    whether a host becomes an address or nothing, whether a whitespace-only `INFO` is a statement,
+    that a negative `TIME` clamps before it becomes a sort key, that PostgreSQL keeps a row the role
+    may not inspect (`pid` and `pg_blocking_pids` stay real, so it is still killable and still a node
+    in the graph) while dropping the `PG_MASKED_QUERY` sentinel so it is neither classified `Running`
+    nor drawn as a statement, and that a row whose **pid** won't parse is dropped rather than
+    admitted under a made-up id — a session `0` renders a full row with a live "Kill session" under
+    it. None of that was reachable from a test while it sat inside an `async fn` holding a
+    connection, written out once per engine beside the query that fetched the rows.
+    The two classifiers are here rather than in the
     backends because they are judgements, not queries: `mysql_state(command, trx_state)` is why the
     transaction view is joined at all — a `Sleep` thread with a live `INNODB_TRX` row is a client
     that ran `BEGIN` and went away holding every row it touched, and `SHOW PROCESSLIST` alone cannot
@@ -1199,10 +1261,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     **`RoutineInfo`/`RoutineKind`/`SqlDataAccess`/`Volatility`/`RoutineSource`** are the stored
     functions and procedures, on both engines that have them, under the same rule again — a
     redefinition replaces the whole routine, so anything the statement doesn't restate reverts.
-    Which fields those are is per-engine: PostgreSQL's `volatility`, `strict`, `language` and the
+    Which fields those are is per-engine: PostgreSQL's `volatility`, `strict`, `language`, the
     per-routine `SET` clauses (a `SECURITY DEFINER` function that loses its pinned `search_path`
-    is a privilege-escalation hole), MySQL's `deterministic`, `data_access`, `definer` and
-    `comment`. `security_definer` is the one field both engines have and **their defaults are
+    is a privilege-escalation hole) and `identity_arguments` (the parameter list in the form that
+    *identifies* a routine, which is not the form a `CREATE` takes — see `ddl.rs`), MySQL's
+    `deterministic`, `data_access`, `definer` and `comment`. `security_definer` is the one field both engines have and **their defaults are
     opposite** — PostgreSQL's is INVOKER, MySQL's is DEFINER — which is why the MySQL arm of
     `create_sql` states the clause in *both* directions instead of leaving the default unwritten
     as the PostgreSQL arm does, and why `RoutineDraft::blank` seeds it per-engine rather than
@@ -1319,9 +1382,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       count, cap, elapsed, database and (on a failure) the engine's error verbatim — *never a cell
       value* — while `result_attachment` renders the rows the user deliberately attached, capped at
       `ATTACH_ROW_CAP` with the cap stated in its own header so a model handed 200 of 5,000 rows
-      can't mistake the sample for the set. Both build on `pipe_table`, the one table renderer for
-      anything a model reads (the MCP tools call it too), so a cell containing `|`, a newline or a
-      megabyte of JSON is handled identically wherever it appears.
+      can't mistake the sample for the set. **The error text is the one arm gated on `AiData`**, and
+      `result_shape` takes the level as an argument for it: an engine's error is not shape.
+      `Duplicate entry 'alice@corp.com' for key 'users.email'` is a stored cell quoted back by the
+      server, which is exactly what a **Schema only** connection says may not leave — so below
+      `may_attach` the failure is still reported and the text withheld, naming the setting so the
+      model asks the user to paste it rather than retrying blind
+      (`a_schema_only_connection_withholds_the_engines_error`). Both build on `pipe_table`, the one
+      table renderer for anything a model reads (the MCP tools call it too), so a cell containing
+      `|`, a newline or a megabyte of JSON is handled identically wherever it appears.
     - `summary.rs` — the grid's "AI Summary" cell/column prompts. `sample_column` spreads its
       sample *evenly* across loaded rows rather than taking the first N, because a sorted result's
       head often shares a date/status/prefix that reads as a pattern that isn't real; `sample_row`
@@ -1347,6 +1416,20 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       `TableDraft::validate` before it is returned, so the designer's rules stand between the model
       and the preview. Column lookups match case-insensitively — a model routinely writes `Email`
       for `email` — and keep the server's spelling.
+      **`resolve_target` is the one resolver for *which table* a proposal is about**, and it is one
+      function because the two ends of a proposal have to agree: the MCP tool checks the ops against
+      a table and answers "Valid. Nothing has run.", and the card then builds the plan the user
+      consents to. They read the same JSON by different rules — the tool ignored `proposal.schema`
+      while the card required an exact match — so on a database holding both `public.orders` and
+      `sales.orders` the model was told its change was valid for one table and the user was offered
+      it against the other, and the qualified `sales.orders` form the tool's own description asks for
+      dead-ended at the card. The order is the one a caller means: an explicit `schema` field, then a
+      qualifier written into `table`, then the bare name — which `DbSchema::find_table` already
+      resolves preferring `public`, so the ordinary PostgreSQL case needs no separate default. **It
+      refuses a view**, which is the other half of being one function: `DbSchema::tables` holds views
+      too, every earlier caller of these lookups came from a tree row whose kind the user had already
+      seen, and a view laid under `TableDraft::from_table` emits `ALTER TABLE` — which PostgreSQL
+      *accepts* for a rename, under a modal that says "Rename the table".
       `FENCE_TAG`/`is_proposal_tag`/`parse` are the *carriage*: a proposal reaches the user as a
       fenced block tagged `schemaic-proposal`, which `ui::markdown` renders as a card. Its own tag
       rather than `json`, because a model discussing a schema prints example JSON constantly and
@@ -1826,10 +1909,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   Read **lazily, per trigger**, when the editor opens. MariaDB returns everything verbatim.
   `mysql_triggers` also gives a group's *leading* trigger a `PRECEDES` anchor: MySQL appends a
   no-clause `CREATE TRIGGER` **last**, so replacing the leader silently reversed the firing order.
-  On the PG side, `pg_triggers` filters `tgparentid = 0` (a partition's cloned trigger is
-  `tgisinternal = false` and can only be dropped through its parent), and `UPDATE OF` columns +
-  a function's `proconfig` arrive **one row each** rather than string-aggregated — same rule the
-  enum labels follow, and for the same reason.
+  On the PG side, both of `pg::fetch_schema`'s trigger queries filter `tgparentid = 0` inline (a
+  partition's cloned trigger is `tgisinternal = false` and can only be dropped through its parent),
+  and `UPDATE OF` columns + a function's `proconfig` arrive **one row each** rather than
+  string-aggregated — same rule the enum labels follow, and for the same reason.
   **Stored routines** are read with the rest of the schema on both engines that have them.
   PG has **three** filters over one reader (`routines_where`), and which one a caller stands on is
   the whole design. `routine_scope` is the floor both share: `prokind IN ('f','p')` (an aggregate or
@@ -2029,7 +2112,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `menu_item_style`, `window_size`, `autohide`/`shift_hscroll`/`wheel_hscroll` scroll wrappers,
     `section_title`/`centered_msg`/`toggle_icon` (and `toggle_icon_gated`, whose panel may not be
     available at all — the Activity toggle on a SQLite connection, dimmed and inert rather than
-    opening an explanation), `measure_text_px`, `jump_to_bottom_button`.
+    opening an explanation), `measure_text_px`, `jump_to_bottom_button`. Also `MenuId`/`MenuFlags` —
+    the single list of the app's mutually-exclusive dropdowns, which every trigger closes the others
+    through (*Popup menus*).
     Also `focus_root` — the **one** way an overlay claims the keyboard (see the Floem gotcha on
     directed key dispatch): it takes focus on build *and* registers the view so Escape in a
     text field inside it hands focus back rather than dead-ending. Never spell out
@@ -2347,7 +2432,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     columns through a "Of columns" field, and offers a view only `INSTEAD OF`), so it *hides* what
     an engine can't express rather than offering it and failing at apply — which is also why
     `blank_trigger`/`trigger_list` take a `SqlDialect` rather than a `pg: bool`, and why the
-    MySQL-only `fetch_sources` (`SHOW CREATE TRIGGER`) is gated `== MySql`;
+    MySQL-only `fetch_sources` (`SHOW CREATE TRIGGER`) is gated `== MySql` — whose reply is also why
+    **this overlay's `dyn_container` key is deliberately not the memo the routine and view editors
+    took** (*Floem 0.2 gotchas*): `form` is built once per `(selected, rev)` and its Body seeds at
+    build, so the rebuild that key causes is the only delivery of the escape-corrected body;
     **the function list is re-fetched on its own** (`Db::trigger_functions`
     via `TriggerFnFn`) and arrives a round trip late, so the
     picker keeps whatever the draft already names instead of selecting the first entry and silently
@@ -2366,7 +2454,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `open_for_new_trigger_function` is a separate entry point from `open_for_new`: a trigger
     function starts from a different draft (`plpgsql`, `RETURNS trigger`, and the `RETURN` that a
     first one most often fails at runtime for want of). Same chrome, same
-    seed-local-signals-then-write-back rule and same `ddl_preview` ending as the editors above.
+    seed-local-signals-then-write-back rule and same `ddl_preview` ending as the editors above —
+    **with one exception, and it is the Body field.** Its text lives on `Ui::routine_body`, owned
+    outside the form and written by `bound_field_on` (`bound_field` over a caller's signal) rather
+    than by a view-local one, because a field only the user writes is not what this is: MySQL's
+    `SHOW CREATE` reply lands after the form is up and has to correct it. Routing that correction
+    through the overlay's own `dyn_container` key meant the modal was torn down and rebuilt to
+    deliver it — the seeding *was* the delivery, so the write order inside `done` was load-bearing
+    with nothing saying so and nothing testing it — and a reply arriving mid-word took the caret
+    with the old scope. `edit_field` now reconciles its doc from the signal in place. The
+    write-back contract is unchanged: `prev` is `None` on the first run, so seeding is never
+    mistaken for an edit, and an external correction reaches the draft exactly as a keystroke does.
     Three things are load-bearing: **the form is per-engine *and* per-kind because the objects
     are** — volatility, strictness, language and per-routine `SET` clauses on PostgreSQL;
     determinism, data access, definer and comment on MySQL, which has no `LANGUAGE` clause at all;
@@ -2428,7 +2526,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     re-rendering of the grid, so "what did I send?" is answered by looking. A restored conversation
     has the summary without the rows and says so (`Attachment::retained`). The chip's
     `dyn_container` keys on the summary alone, never the rows: a key clones what it reads on every
-    notification.
+    notification. **`sent_attachment`'s expand flag is handed in, not owned by the card** — it lives
+    in the `dyn_stack` item's scope beside `pop`, because the bubble's own `dyn_container` is keyed
+    on `(fingerprint, is_last)` and the theme generation, and neither a reply arriving (which flips
+    `is_last` on the question above it) nor a theme switch is about the card. A view-local
+    `RwSignal::new(false)` is a *new* signal after each rebuild, so a card the reader had opened to
+    check what was sent snapped shut the moment the answer landed. That scope outlives the rebuilds
+    and dies with the message.
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context
     menu, generic grid popup, Find-Anywhere, error modal.
   - `schema_tree.rs` — SCHEMA sidebar (`schema_panel` + db/table/column/key row builders + keyboard
@@ -2455,7 +2559,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     name, no table and no column. They live in core because three crates ask them — the tree and
     the selector in `schemaic-ui`, the prompt builders in `schemaic-app` — and the rule was
     originally a filter inlined per surface, which is exactly why the selector, autocomplete and
-    the assistant each went on showing databases the user had deliberately put away. "Is anything
+    the assistant each went on showing databases the user had deliberately put away. **The set they
+    take is one connection's**, resolved by `db_hidden::names_for` from the persisted
+    `(conn_id, database)` rules: the store was a flat `Vec<String>` of bare names, so hiding `world`
+    on a MariaDB connection took a live `world` off every other server at once — out of the tree,
+    Find-Anywhere, the selector, autocomplete, the assistant's context and `list_schema`'s overview
+    — with nothing on the second connection saying why. `db_visible` stays a two-argument predicate
+    over a `HashSet<String>` because that is still the question each surface asks; the app derives
+    the set as a memo over `(active_conn, the rules)`, the shape the activity interval already used,
+    so a connection switch repoints every consumer together. "Is anything
     left to offer" is the same filtered set, not the raw node count, or hiding the last database
     leaves the selector's open flag set with no panel to answer it. Three deliberate exceptions.
     The **eye's own menu** must list a hidden database for it to be unhidden. The **database being
@@ -2720,10 +2832,24 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     same measurer that sized the cards. The "+N more" note is carried into the export but "show
     less" is not: the first says the card is showing part of a table, which stays true wherever the
     picture ends up, while the second is an instruction to a canvas that isn't there.
-    Rendering happens **before** the save dialog opens, not in its callback (`ErdDoc`): the dialog
+    A column *type* is measured **once per distinct string**, not once per row (the `type_w` map):
+    each `measure_text_px_at` builds a fresh cosmic-text layout, and a type is the most repeated
+    string in a schema — a database is mostly `int`, `varchar(255)` and `datetime` — so per row that
+    was one layout for every row of every card, keyed by the string it is a few dozen for the whole
+    diagram. The column *names* are deliberately not cached: a hit there would be the exception.
+    The capture happens **before** the save dialog opens, not in its callback (`ErdDoc`): the dialog
     is modal and these signals belong to the modal behind it, so a callback that came back for them
     could be reading a disposed scope — and it also means the file is a picture of what the user
-    was looking at when they chose the format, the rule the grid's row snapshot follows. The
+    was looking at when they chose the format, the rule the grid's row snapshot follows. **What is
+    captured is as little as the UI thread is obliged to do.** `ErdDoc` is `Text(String)` for the
+    four text formats and `Scene(Box<SvgScene>, Option<f32>)` for a picture: `export_scene` must run
+    here because it measures through floem's font system, but `to_svg` is pure, so building the
+    document, rasterising a PNG and writing the file are all the worker's (`ErdDoc::into_bytes`,
+    called inside the app's `export_erd` `spawn_blocking`). Measured at 500 tables × 20 columns, that
+    took the UI-thread stall between the click and the save dialog from 65 ms to 25.5 ms.
+    `ErdDoc::into_text` is the exception and says why: the clipboard is synchronous, so *Copy as SVG*
+    is the one caller with nowhere to hand the work and pays for the document here — and it answers
+    `None` for a PNG, which that channel cannot hold, which is why PNG is not in the copy menu. The
     outcome lands in the diagram's own `notice_bar` at the canvas's bottom edge rather than the
     app's shared error modal, which is painted *under* this one. A confirmation fades after
     `NOTICE_LINGER`; a failure stays until dismissed, since it is the only place the reason is
@@ -2782,7 +2908,8 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     avoid. **Export** raises the shared `overlay.popup_menu` over
     `core::monitor::LOG_FORMATS`, anchored `PopupAnchor::BelowIcon` from the ring wrapper's
     `layout_rect()` exactly as `table_designer::suggest_chevron` does (it paints above the modal
-    because `popup_menu_overlay` is mounted last in the workspace stack); choosing a format runs
+    because `popup_menu_overlay` is mounted after every modal in the workspace stack — only
+    `submenu_layer`, which draws this menu's own submenu, sits above it); choosing a format runs
     `save_log`, which mirrors `grid::save_export` in snapshotting the log **before** the file dialog
     opens — the dialog is modal and slow and the poll keeps appending behind it — then renders
     through `log_result_set` and hands an `ExportRequest` to the app's `ExportFn` worker with
@@ -2931,7 +3058,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   alone reached into whichever tab the map yielded first and, when that was the wrong one, closed a
   transaction still open on a server nobody had touched and re-pinned its connection underneath it —
   losing the uncommitted work of a tab the user never acted on, while the tab that actually lost its
-  socket stayed broken. The kill itself resolves its target `Db` **when the confirm is raised**, not
+  socket stayed broken. **The kill asks `may_launch_destructive` before it raises the confirm** —
+  the shared guard every other destructive modal action asks, which this path asked nothing at all —
+  and a read-only connection gets the refusal in words rather than a modal it cannot complete.
+  The kill itself resolves its target `Db` **when the confirm is raised**, not
   when the button is clicked, for the same reason a session id means nothing without its server: a
   modal is open across an unbounded stretch of time, and reading `active_conn` inside `resolve` sent
   `KILL CONNECTION 1148` to whatever connection was active by then, under a title naming the first
@@ -3007,8 +3137,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   **What the assistant knows about the result on screen, and how rows reach it.** `TurnContext`
   carries a `result` — `core::prompt::result_shape` over `Tab::shown_result`, which is
   `shown_panel` again rather than a second fallback rule (a stale `active_result` shows panel 0 in
-  the pane, and the AI has to describe the same statement) — so columns, types, counts, the cap, the
-  elapsed time and a failed run's error text ride on every turn, and *no cell value ever does*. It is
+  the pane, and the AI has to describe the same statement) — so columns, types, counts, the cap and
+  the elapsed time ride on every turn, and *no cell value ever does*. A failed run's error text rides
+  only where the connection's `AiData` allows it, since the server quotes stored values into its
+  messages; `ai_context` passes the level in beside the dialect. It is
   diffed like the rest of the context, and a cleared panel is reported as cleared rather than
   omitted: a stale shape would have the model explaining an error the user has already fixed. The
   same snapshot sends the editor **selection** in place of the whole buffer when there is one
@@ -3091,9 +3223,9 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   learns here that it misread a column name, rather than the user being handed an offer that can't
   be applied. It cannot reach the user directly — this is a separate `--mcp-serve` process with no
   route into the app's overlays — so a proposal arrives only when the model echoes the same JSON
-  into its reply under `propose::FENCE_TAG`, which the app extracts with `propose::extract`. A model
-  that skips the tool has therefore lost a *check*, not a safety rail: the preview and the Apply
-  click sit downstream of both paths.
+  into its reply in a `propose::FENCE_TAG` block, which `ui::markdown` picks up through
+  `is_proposal_tag`. A model that skips the tool has therefore lost a *check*, not a safety rail:
+  the preview and the Apply click sit downstream of both paths.
   `proposal_from_args` strips the tool's own `database` argument before parsing, because `Proposal`
   is `deny_unknown_fields` on purpose — an invented key has to fail loudly, since a silently-dropped
   one is a change the user was promised and wouldn't get. The tag is advertised from the constant
@@ -3502,15 +3634,23 @@ Re-introducing the anti-patterns these guard against is a regression:
   executors call them: `GridWrite::plan` is the statement order and `one_row_verdict` is the
   per-statement verdict *and* its message — so neither can drift between MySQL and PostgreSQL, and
   a change to `affected != 1` fails a test rather than passing silently.
-- **A destructive modal action guards its own launch, in the same step that launches it.** Import
-  and the DDL preview's Apply are the two, and they go through `widgets::accept_launch(in_flight,
-  read_only)` — not through the disabled button, which is what *says* the action is unavailable and
-  takes effect on a later update pass. `run_import` set a busy flag and never read it, resting on a
-  comment that "its Import button is disabled while one is in flight": true of the next pass and
-  false within a single key dispatch, so one Space started **two** bulk loads of the same file,
-  both committing, with the second launch overwriting the cancellation token so the first could no
-  longer be stopped. A new destructive action asks the same function; a guard re-derived per site
+- **A destructive modal action guards its own launch, in the same step that launches it.** Import,
+  the DDL preview's Apply and Server Activity's kill are the three, and they go through
+  `widgets::accept_launch(in_flight, read_only)` — not through the disabled button, which is what
+  *says* the action is unavailable and takes effect on a later update pass. `run_import` set a busy
+  flag and never read it, resting on a comment that "its Import button is disabled while one is in
+  flight": true of the next pass and false within a single key dispatch, so one Space started
+  **two** bulk loads of the same file, both committing, with the second launch overwriting the
+  cancellation token so the first could no longer be stopped. A new destructive action asks the same function; a guard re-derived per site
   is one that will be derived differently.
+  **`read_only` covers server administration, not only data writes** — an open question the
+  codebase had never recorded, until the kill arrived and answered it by asking nothing at all. The
+  flag is the protection with no "Run anyway", and terminating a live client session — rolling its
+  transaction back under it — is the most destructive thing the app can do to a server it has been
+  told not to write to. So the session row menu's two kill entries and the lock-wait banner's
+  one-click terminate all ask at the click, through the app-side `may_launch_destructive` re-export
+  of the same function, and a refusal says why in the panel's `kill_error` line rather than doing
+  nothing.
 - **One identifier quoter, as there is one boundary lexer.** Every path that quotes an identifier
   ends at `export::ident_sql` (unconditional — for SQL that is only executed) or its sibling
   `export::ident_if_needed` (only when a bare name would name something else — for SQL the user
@@ -3739,6 +3879,28 @@ Re-introducing the anti-patterns these guard against is a regression:
   discard had already put in flight. `grid::clear_if_any` is the guard (`Clearable`, over `Option`
   as well as the collections, so "the editor is already closed" is the same case), and
   `grid::clear_tests` pins the floem fact itself by counting effect runs.
+  **A `dyn_container` key re-runs on notification, not on change**, which is the same fact where it
+  costs most. The view has no equality check of its own — `create_updater` calls `on_change` on every
+  re-run and `swap_val` then disposes the child scope and rebuilds it unconditionally — so a key
+  closure reading the target signal *directly* rebuilds the whole modal on any write to it, including
+  one that leaves `is_some()` exactly where it was. Both DDL editors that fetch something after
+  opening were spelled that way, and a fetch patching `current` is such a write: landing mid-keystroke
+  on a slow link it took the caret with the disposed scope (floem clears `app_state.focus` when a
+  view is removed), the following characters went nowhere, and `FocusRing`'s remembered cursor reset
+  with the ring. `widgets::overlay_open_key(session, open, over)` is that key as a **memo** — *am I
+  open, and is something stacked over me?* — taken by the routine and view editors, with
+  `an_overlay_key_ignores_a_patch_to_what_it_is_keyed_on` counting rebuilds against both spellings.
+  **The `session` term is what makes dedupping the two bools safe:** presence alone answers
+  `(true, false)` on both sides of *reopening the editor on a different object*, so the form would
+  keep the one that just closed; `DdlUi::session` is bumped by each editor's `open` and written
+  nowhere else, so it says "these contents were replaced wholesale" exactly when a fetch's patch does
+  not. **The trigger editor's key is deliberately left un-memoised**, and that asymmetry is the part
+  a tidy-up would break: its `form` is built once per `(selected, rev)` and its Body field seeds at
+  build, so there the rebuild is the only thing that delivers MySQL's escape-corrected trigger body —
+  dedup that key and a trigger silently goes on editing `information_schema`'s resolved copy. Doing
+  it properly needs a body signal per row, the way the routine editor got one; there is a note at the
+  key saying so. The view editor took the memo safely for the opposite reason: `fetch_algorithm`
+  patches a term in the diff and not a control, so its rebuild delivered nothing to the screen.
 - **An effect that writes the signals it reads must read them untracked — and an outside write to
   them is then invisible, so it needs a generation counter.** The schema tree's size-column effect
   scans every `ConnNode::stats` slot for `Idle` and writes `Loading` into each one it fetches;
@@ -4292,12 +4454,17 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   crosses a gap — the close-on-diagonal problem is avoided structurally.
 - **Dismissal**: the panel `on_event_stop`s its own pointer-downs, so the root "pointer-down anywhere
   closes" handler (in `workspace`) fires only for outside clicks. Escape and any action also call
-  `close`. Submenus are view-tree descendants, so their clicks are absorbed by the root panel too.
-- **Edge-flipping**: submenus flip left (`inset_right_pct(100)`) past the right edge and shift up past
-  the bottom — from the parent row's window position (`on_move`/`on_resize`) + the live `window_size()`
-  global (set from `workspace`'s root `on_resize`). `popup_menu_overlay` flips the whole panel the
-  same way at the cursor. Size checks use conservative estimates (width ≈ 210, row ≈ 34) so there's no
-  open-then-flip flicker.
+  `close`. A hoisted submenu is a sibling at the window root, not a descendant, so the panel absorbs
+  nothing on its behalf — it stops its own pointer-downs, `menu_stack` carrying that
+  `on_event_stop` for both copies because it *is* the same view.
+- **Edge-flipping**: submenus flip left past the right edge and shift up past the bottom — from the
+  parent row's window position (`on_move`/`on_resize`) + the live `window_size()` global (set from
+  `workspace`'s root `on_resize`). `popup_menu_overlay` flips the whole panel the same way at the
+  cursor. Only the width is a flat estimate (`SUBMENU_FLIP_W = 210` for a submenu; the popup uses the
+  panel's real `min_width`); the height both ask for is `menu_panel_height`, which sums the entries
+  that will actually be drawn — 30.5 per action row, 9 per separator, plus 14 — because counting
+  separators as full rows shoved an upward-flipped panel tens of px too high. Neither is measured
+  from a laid-out panel, so there's no open-then-flip flicker.
   A submenu's own flip is `submenu_insets`, which is a **pure function with tests** rather than four
   lines inside a style closure, because every way it can be wrong is silent — a sign slip or an `x1`
   where an `x0` belongs still draws a submenu, just not beside the row that opened it. It pins an
@@ -4434,6 +4601,20 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   stale the moment anything else filled the channel — open a segment's menu, right-click a grid
   cell, press the segment again, and it closed the cell's menu instead of opening its own. All three
   surfaces ask the anchor now.
+- **The app's menus are mutually exclusive, and the list of them is `widgets::MenuFlags`** — the
+  seven `MenuId`s (`Popup`, `Context`, and the five panel-owned flags: the schema eye and gear, the
+  connection switcher, the active-database selector, the Server Activity clock), gathered by
+  `MenuFlags::of(&ui)` and closed by `close_except(keep)`. A trigger has to enforce this *itself*,
+  because it absorbs its own pointer-down — it must, or the root's dismissal would close the menu the
+  click is about to open — so the root handler never runs for it. That list was written out three
+  times in three files, and the third one added a flag the other two never learned about: opening the
+  activity clock's interval dropdown and then clicking the schema tree's eye left **both** on screen.
+  A stranded dropdown is not merely visible — its `focus_root` stays registered, and
+  `innermost_focus_root()` being `Some` makes every newly opened query tab decline the keyboard.
+  `close_except` is guarded per flag (`RwSignal::set` never dedups, and an unguarded write re-runs
+  every style closure reading it), the workspace root passes `None` so a pointer-down keeps nothing,
+  and `closing_leaves_exactly_the_one_menu_that_asked_to_stay` walks every id. Add a new dropdown by
+  adding a variant and a field here, not a fourth copy of the list.
 - **A trigger says it is open in the accent** — `widgets::menu_icon_color(open, hovered)`, one
   function for the schema panel's eye and gear, the Server Activity clock, and the results strip's
   copy, download and AI icons, each of which had spelled its own two-arm hover match. **Open
@@ -4557,7 +4738,10 @@ for keyboard nav.
   invisible. Copy (Ctrl+C / toolbar) emits TSV; a lone cell copies its raw value.
 - **Right-click menus** (generic `menu_panel` / `ui.popup_menu`): a header offers `Copy › CSV / JSON`
   of that column's values (`export_column_csv`/`_json`); a data cell offers `View`, `Edit` (editable
-  cells only), `Copy`, `Set to NULL` (editable **and** nullable — stages `dirty` `None`), and
+  cells only), a Copy entry whose scope and wording come from `edit::copy_scope` (**Copy** for the
+  whole block when the right-click was inside a multi-cell selection, **Copy value** for one cell —
+  the same word for three different amounts was the bug), `Set to NULL` (editable **and** nullable —
+  stages `dirty` `None`), and
   `AI summary` (reveals the AI panel, prompts with source table + column for context). The
   **gutter** has its own menu (`gutter_menu`) rather than the cell one — `Copy`, the row actions,
   and the attach entry — because a row-number click has picked out no cell, and offering

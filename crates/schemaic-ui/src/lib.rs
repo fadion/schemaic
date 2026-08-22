@@ -696,8 +696,10 @@ pub struct DdlUi {
     /// Bumped on every **preview** open. An apply is off-thread and can outlive
     /// the modal that asked for it, so its callback checks this before writing.
     pub generation: RwSignal<u64>,
-    /// Bumped when a DDL **editor session** starts — a designer, view, trigger
-    /// or object editor opening on a new target.
+    /// Bumped when a DDL **editor session** starts. Every editor's `open` does
+    /// it — designer, view, trigger, routine and object — and nothing else
+    /// writes it, which is what lets [`crate::widgets::overlay_open_key`] treat
+    /// it as "these contents were replaced wholesale".
     ///
     /// Separate from `generation` because the two answer different questions and
     /// one counter could not answer both. The lazy per-object fetches
@@ -706,9 +708,16 @@ pub struct DdlUi {
     /// `open_preview` — so an in-flight fetch from `db1.orders` landed with the
     /// generation unchanged and overwrote the list for a modal now open on
     /// `db2.invoices`, while opening the *preview* mid-fetch discarded the
-    /// result permanently and left the dropdown empty for good. Opening a
-    /// nested function editor deliberately does **not** bump this: it runs
-    /// inside the trigger session that asked for the list.
+    /// result permanently and left the dropdown empty for good.
+    ///
+    /// **A nested function editor bumps it too, and that is a rough edge rather
+    /// than a decision.** `open_for_new_trigger_function` goes through the same
+    /// `open`, so pressing *New function…* while `fetch_functions` is still in
+    /// flight discards that reply and leaves the trigger editor's function
+    /// dropdown empty behind it. The window is one round trip wide and nothing
+    /// re-fetches on the way back. Narrowing it means a session identity a
+    /// nested open can inherit, not simply skipping the bump — the bump is also
+    /// what invalidates the routine editor's own `fetch_source`.
     pub session: RwSignal<u64>,
 }
 
