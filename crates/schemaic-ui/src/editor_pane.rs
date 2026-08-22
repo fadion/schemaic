@@ -1694,6 +1694,18 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     }
                     PairAction::Skip { caret } => {
                         e.cursor.update(|c| c.set_offset(caret, false, false));
+                        // **Spend the typing one-shot here**, because nothing
+                        // else will. It is set for every key before any branch
+                        // can return, and consumed in exactly one place —
+                        // `recompute_completions`, which only runs from the
+                        // editor's `.update`, which floem fires only for
+                        // *document deltas*. A type-over moves the caret and
+                        // edits nothing, so the flag stood until the next
+                        // document change — and if that arrived without a
+                        // keypress (an OS-menu paste, a drop) it was judged as
+                        // typing and popped the suggestion list. That is the
+                        // exact bug the one-shot was introduced to fix.
+                        comp.typed.set(false);
                     }
                 }
                 true

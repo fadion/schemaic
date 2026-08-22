@@ -634,8 +634,16 @@ pub(crate) fn db_visibility_overlay(ui: Ui) -> impl IntoView {
     // must not leave its flag set, or a later load pops a menu nobody asked for.
     // (This one is anchored to the eye rather than stretched over the window, so
     // it never swallowed the app the way that one did.)
+    //
+    // **`open` is read tracked**, so a flag set while the list is empty is
+    // cleared on the spot rather than waiting for the list to change. Read
+    // untracked, this effect's only dependency was `db_nodes`: the click never
+    // re-ran it, and when the databases finally arrived `is_empty()` was false
+    // so it did nothing — while the panel's own predicate had just become true
+    // and the dropdown opened by itself, which is the outcome this exists to
+    // prevent.
     create_effect(move |_| {
-        if db_nodes.with(|n| n.is_empty()) && open.get_untracked() {
+        if db_nodes.with(|n| n.is_empty()) && open.get() {
             open.set(false);
         }
     });

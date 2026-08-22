@@ -5465,6 +5465,25 @@ fn grid_toolbar(
             anchor_below(origin.get()),
         )
     };
+    // **An icon that moves under its own open menu carries the anchor with it.**
+    // Identity here is the anchor (see `menu_anchored_at`), and these icons are
+    // right-aligned in the strip — so a window resize, or the AI panel opening,
+    // changed `o.x` and the two stopped comparing equal: the panel stayed at the
+    // pixel it opened at, the icon reverted from the accent although its menu was
+    // still up, and clicking it re-opened instead of closing. Re-stamping keeps
+    // the two the same value *and* makes the overlay place the panel under the
+    // icon, since it reads the stored anchor.
+    let follow_menu = move |origin: RwSignal<Point>, p: Point| {
+        let was_mine = crate::widgets::menu_anchored_at(
+            gs.popup.with_untracked(|m| m.is_some()),
+            gs.popup_anchor.get_untracked(),
+            anchor_below(origin.get_untracked()),
+        );
+        origin.set(p);
+        if was_mine {
+            gs.popup_anchor.set(Some(anchor_below(p)));
+        }
+    };
     // Pressing the icon again closes its menu, rather than dismissing and
     // rebuilding the identical panel — the toggle the schema panel's eye and gear
     // and the connection switcher already have.
@@ -5776,7 +5795,7 @@ fn grid_toolbar(
     let copy_click = open_copy.clone();
     let copy_menu = container(
         icons::icon(icons::COPY, 16.0)
-            .on_move(move |p| copy_origin.set(p))
+            .on_move(move |p| follow_menu(copy_origin, p))
             .style(move |s| {
                 s.color(crate::widgets::menu_icon_color(
                     menu_is_mine_live(copy_origin),
@@ -5832,7 +5851,7 @@ fn grid_toolbar(
     let save_click = open_save.clone();
     let save_menu = container(
         icons::icon(icons::DOWNLOAD, 16.0)
-            .on_move(move |p| save_origin.set(p))
+            .on_move(move |p| follow_menu(save_origin, p))
             .style(move |s| {
                 s.color(crate::widgets::menu_icon_color(
                     menu_is_mine_live(save_origin),
@@ -5947,7 +5966,7 @@ fn grid_toolbar(
             let ai_click = open_ai.clone();
             let face = container(
                 icons::icon(icons::SPARKLES, 16.0)
-                    .on_move(move |p| ai_origin.set(p))
+                    .on_move(move |p| follow_menu(ai_origin, p))
                     .style(move |s| {
                         // Dimmed + inert while a request is in flight — that arm
                         // stays first: a busy icon is not a control right now,
