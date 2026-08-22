@@ -67,6 +67,7 @@ pub(crate) fn activity_panel(ui: Ui) -> impl IntoView {
     let refresh = ui.activity_actions.refresh.clone();
     let kill = ui.activity_actions.kill.clone();
     let overlay = ui.overlay;
+    let menus = crate::widgets::MenuFlags::of(&ui);
 
     // Panel-local search filter, debounced like the history panel's so a burst of
     // typing re-filters once. Local to this panel build.
@@ -86,7 +87,7 @@ pub(crate) fn activity_panel(ui: Ui) -> impl IntoView {
             move || (refresh)(),
         )
         .tooltip(|| text("Refresh now").style(tooltip_style));
-        let clock = interval_button(interval, menu_open, menu_anchor, overlay);
+        let clock = interval_button(interval, menu_open, menu_anchor, menus);
         let icons_group = h_stack((refresh_btn, clock))
             .style(|s| s.flex_row().items_start().flex_shrink(0.0_f32));
         h_stack((section_title("SERVER ACTIVITY"), icons_group))
@@ -146,10 +147,14 @@ pub(crate) fn activity_panel(ui: Ui) -> impl IntoView {
                 // different messages would only ever flicker.
                 _ => return list_message("Loading…", theme::text_muted),
             };
+            // **References, not copies.** This filtered up to five hundred
+            // `SessionInfo` into a fresh `Vec` — each carrying an unbounded `sql`
+            // — and then `render_slice` discarded all but a hundred and fifty of
+            // them. The rows that are actually drawn are cloned below, once
+            // each, into the view that owns them.
             let matched = sessions
                 .iter()
                 .filter(|s| activity::matches_query(s, &q))
-                .cloned()
                 .collect::<Vec<_>>();
             if matched.is_empty() {
                 return list_message(
@@ -176,7 +181,7 @@ pub(crate) fn activity_panel(ui: Ui) -> impl IntoView {
             // context menu share it rather than taking a copy each.
             let mut items = rows
                 .iter()
-                .map(|s| session_row(Rc::new(s.clone()), term.clone(), kill.clone(), overlay))
+                .map(|s| session_row(Rc::new((*s).clone()), term.clone(), kill.clone(), overlay))
                 .collect::<Vec<_>>();
             if undrawn > 0 {
                 items.push(list_message(
@@ -275,7 +280,7 @@ fn interval_button(
     interval: floem::reactive::Memo<u64>,
     menu_open: RwSignal<bool>,
     menu_anchor: RwSignal<Point>,
-    overlay: crate::OverlayUi,
+    menus: crate::widgets::MenuFlags,
 ) -> impl IntoView {
     let hov = RwSignal::new(false);
     // The icon's bottom-right corner in window coordinates, which is what the
@@ -304,8 +309,13 @@ fn interval_button(
         // Toggle, not open: clicking the icon of an open menu closes it, the way
         // the schema tree's eye and gear do. Opening unconditionally left the only
         // way out a click somewhere else.
-        overlay.context_menu.set(None);
-        overlay.popup_menu.set(None);
+        //
+        // Through the shared list, so this closes the schema tree's dropdowns
+        // too — it cleared only the two overlay signals, and the tree's own
+        // closer had never heard of this one, so opening either then clicking
+        // the other left both on screen and the stranded `focus_root` made every
+        // newly opened query tab refuse the keyboard.
+        menus.close_except(Some(crate::widgets::MenuId::ActivityClock));
         menu_open.update(|o| *o = !*o);
     })
     // The root closes every open menu on pointer-down; this stops that from
@@ -538,7 +548,10 @@ fn session_row(
     // the whole question, and a third line of `WHERE` clause pushes the next
     // session off screen.
     let max_h = (FONT_BODY as f64) * 1.4 * 2.0;
-    let sql_view: Option<floem::AnyView> = s.sql.as_deref().map(|sql| {
+    // `running_sql`, not `sql`: PostgreSQL keeps an idle backend's *last*
+    // statement in `query` indefinitely, and drawing it here made a wall of pool
+    // connections each look like it was running something.
+    let sql_view: Option<floem::AnyView> = s.running_sql().map(|sql| {
         highlight_mono(
             schemaic_core::history::preview(sql),
             term.clone(),

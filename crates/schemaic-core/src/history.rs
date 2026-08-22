@@ -427,7 +427,9 @@ pub fn preview(sql: &str) -> String {
 /// The two are separate so a term past [`PREVIEW_MAX`] still finds its entry:
 /// clamping what is drawn is a rendering decision, and it must not quietly become
 /// a decision about what is findable.
-fn full_preview(sql: &str) -> String {
+/// `pub(crate)` for [`crate::activity::matches_query`], which had the same
+/// problem for the same reason and must not grow a second collapser.
+pub(crate) fn full_preview(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 

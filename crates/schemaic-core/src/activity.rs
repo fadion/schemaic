@@ -240,6 +240,24 @@ impl SessionInfo {
         }
     }
 
+    /// The statement this session is **running now**, as opposed to the last one
+    /// it ran.
+    ///
+    /// The two engines answer the panel's own question differently:
+    /// `PROCESSLIST.INFO` is NULL for a `Sleep` thread, while
+    /// `pg_stat_activity.query` keeps the last statement for an `idle` backend
+    /// indefinitely. So a wall of PostgreSQL pool connections each drew a real,
+    /// plausible statement in the same monospace block a running one gets, with
+    /// the grey state word underneath as the only thing saying otherwise — on
+    /// the panel whose one decision is *what to kill*.
+    ///
+    /// Decided here rather than per surface, and rather than by dropping the
+    /// column at the reader: `sql` is still wanted for *Copy statement*, and a
+    /// second surface that draws a statement should not have to rediscover this.
+    pub fn running_sql(&self) -> Option<&str> {
+        (self.state != SessionState::Idle).then_some(self.sql.as_deref())?
+    }
+
     /// The one-line explanation under the row's state, or `None` when the
     /// session's state already says everything.
     ///
@@ -351,7 +369,11 @@ pub fn prepare(sessions: &mut Vec<SessionInfo>) -> bool {
 ///
 /// Returned as a slice so the caller builds views straight out of the snapshot
 /// instead of cloning the rows it is about to render.
-pub fn render_slice(rows: &[SessionInfo]) -> (&[SessionInfo], usize) {
+///
+/// Generic over `T` so the caller can hand over a `Vec<&SessionInfo>` — the
+/// search filter's natural shape, and the one that doesn't copy four hundred
+/// rows this function is about to drop.
+pub fn render_slice<T>(rows: &[T]) -> (&[T], usize) {
     let shown = rows.len().min(RENDER_CAP);
     (&rows[..shown], rows.len() - shown)
 }
@@ -405,9 +427,34 @@ pub fn summarize(sessions: &[SessionInfo]) -> ActivitySummary {
     out
 }
 
+/// Should the panel be polling right now?
+///
+/// Every tick is a full connect + authenticate + three `information_schema`
+/// statements against the server being watched, forever, at an interval as short
+/// as two seconds — so "nobody can see this" is the whole question, and it has
+/// three answers, not two.
+///
+/// `fits` is the one that was missing. Narrowing the window past the responsive
+/// breakpoint gives the right column zero width: the panel is invisible, its
+/// footer toggle is inert (`set_right` returns early below the breakpoint) and
+/// the palette's toggle is behind the same guard — so the poll could be neither
+/// seen nor stopped from inside the app, and went on opening a connection every
+/// couple of seconds for nobody.
+pub fn should_poll(panel_is_activity: bool, fits: bool, focused: bool) -> bool {
+    panel_is_activity && fits && focused
+}
+
 /// Does this session match the panel's search box? Matches the id, the account,
 /// the client address, the database, the state word and the statement — the
 /// panel shows all six, so all six are searchable.
+///
+/// **The statement is matched whitespace-collapsed**, because that is how the
+/// row draws it (`history::preview`). `PROCESSLIST.INFO` keeps whatever newlines
+/// the client typed, so a session running a three-line `SELECT * FROM orders`
+/// reads as one line on screen and was filtered *out* by the phrase visibly on
+/// it. `history::matches_query` solved exactly this, one module over, and this
+/// one was written without that half — so it borrows the same collapser rather
+/// than growing a second.
 pub fn matches_query(s: &SessionInfo, query: &str) -> bool {
     let q = query.trim();
     if q.is_empty() {
@@ -421,7 +468,7 @@ pub fn matches_query(s: &SessionInfo, query: &str) -> bool {
             .is_some_and(|d| contains_ignore_ascii_case(d, q))
         || s.sql
             .as_deref()
-            .is_some_and(|sql| contains_ignore_ascii_case(sql, q))
+            .is_some_and(|sql| contains_ignore_ascii_case(&crate::history::full_preview(sql), q))
 }
 
 /// The lock wait worth putting a banner on, if there is one.
@@ -445,8 +492,22 @@ pub fn lock_wait(sessions: &[SessionInfo]) -> Option<(&SessionInfo, &SessionInfo
                 .partial_cmp(&b.seconds)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })?;
-    let holder_id = *waiter.blocked_by.first()?;
-    let holder = sessions.iter().find(|s| s.id == holder_id)?;
+    // **The longest-standing holder, not the lowest id.** `prepare` sorts
+    // `blocked_by` ascending, so `first()` was "numerically smallest pid", which
+    // carries no meaning — and a wait with several holders is ordinary, since
+    // more than one session can hold a conflicting lock on a row. Choosing the
+    // same way the waiter is chosen at least makes the banner's action the one
+    // most likely to matter; how many others there are is `lock_wait_text`'s
+    // job to say.
+    let holder = waiter
+        .blocked_by
+        .iter()
+        .filter_map(|id| sessions.iter().find(|s| s.id == *id))
+        .max_by(|a, b| {
+            a.seconds
+                .partial_cmp(&b.seconds)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
     Some((waiter, holder))
 }
 
@@ -456,6 +517,11 @@ pub fn lock_wait(sessions: &[SessionInfo]) -> Option<(&SessionInfo, &SessionInfo
 /// The holder's *state* is the point — "idle in transaction for 4m 12s" is a
 /// stuck client, "running for 4m 12s" is a slow statement, and the two want
 /// different reactions from the person reading it.
+///
+/// **It says when there are others.** A wait with three holders is ordinary, and
+/// naming one of them as *the* holder invites a kill that leaves the waiter
+/// blocked by the other two, with the banner immediately re-rendering the next
+/// one and nothing having said more existed.
 pub fn lock_wait_text(waiter: &SessionInfo, holder: &SessionInfo) -> String {
     let holder_doing = match holder.state {
         SessionState::IdleInTx => "idle in transaction",
@@ -463,8 +529,18 @@ pub fn lock_wait_text(waiter: &SessionInfo, holder: &SessionInfo) -> String {
         SessionState::Running => "running",
         SessionState::Idle => "idle",
     };
+    let others = waiter.blocked_by.len().saturating_sub(1);
+    let and_others = if others == 0 {
+        String::new()
+    } else {
+        format!(
+            " {others} other {} also hold{} a lock it needs.",
+            plural(others, "session", "sessions"),
+            if others == 1 { "s" } else { "" }
+        )
+    };
     format!(
-        "Session {} ({}) has been waiting {} for a lock held by session {} ({}), {} for {}.",
+        "Session {} ({}) has been waiting {} for a lock held by session {} ({}), {} for {}.{}",
         waiter.id,
         waiter.who(),
         format_age(waiter.seconds),
@@ -472,6 +548,7 @@ pub fn lock_wait_text(waiter: &SessionInfo, holder: &SessionInfo) -> String {
         holder.who(),
         holder_doing,
         format_age(holder.seconds),
+        and_others,
     )
 }
 
@@ -550,6 +627,135 @@ pub fn strip_port(host: &str) -> &str {
     }
 }
 
+/// What PostgreSQL puts in `query` for a backend the connecting role may not
+/// inspect. It is a *message*, not a statement, and rendering it as one — or
+/// letting it stand in for "this backend is doing something" — is how a masked
+/// row would claim to be `Running` with a query nobody can act on.
+pub const PG_MASKED_QUERY: &str = "<insufficient privilege>";
+
+/// One `information_schema.PROCESSLIST` row, in the order the MySQL backend
+/// selects the columns.
+///
+/// **The fold below is a decision, not an I/O wrapper**, which is why the row
+/// shape lives here: it chooses which of three result sets wins for a thread,
+/// whether a host becomes an address or nothing, whether an empty `DB` is a
+/// database, whether a whitespace-only `INFO` is a statement, and that a
+/// negative `TIME` clamps before it becomes a sort key. None of that was
+/// reachable from a test while it sat inside an `async fn` holding a connection.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MyProcessRow {
+    pub id: i64,
+    pub user: String,
+    pub host: String,
+    pub database: Option<String>,
+    pub command: String,
+    pub seconds: i64,
+    pub info: Option<String>,
+}
+
+/// Fold MySQL's three activity result sets into [`SessionInfo`]s.
+///
+/// `trx` is `INNODB_TRX` keyed by thread, `waits` the raw `(waiter, holder)`
+/// edges — duplicates and all, because both lock views are keyed by *lock* and
+/// one holder sitting on a record lock and a gap lock the waiter needs reports
+/// the same pair twice. [`prepare`] deduplicates, so the rule is unit-tested in
+/// one place and PostgreSQL (whose `pg_blocking_pids` is already distinct)
+/// cannot drift from it.
+pub fn from_mysql_rows(
+    rows: &[MyProcessRow],
+    trx: &std::collections::HashMap<i64, String>,
+    waits: &[(i64, i64)],
+) -> Vec<SessionInfo> {
+    let mut blocked_by: std::collections::HashMap<i64, Vec<i64>> = std::collections::HashMap::new();
+    for (waiter, blocker) in waits {
+        blocked_by.entry(*waiter).or_default().push(*blocker);
+    }
+    rows.iter()
+        .map(|r| {
+            let client = strip_port(&r.host);
+            SessionInfo {
+                id: r.id,
+                user: r.user.clone(),
+                client: (!client.is_empty()).then(|| client.to_string()),
+                database: r.database.clone().filter(|d| !d.is_empty()),
+                state: mysql_state(&r.command, trx.get(&r.id).map(String::as_str)),
+                sql: r
+                    .info
+                    .as_ref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                // `TIME` is signed and goes negative when the system clock steps
+                // back under a live thread; `format_age` floors it, but the sort
+                // key must not hoist such a row to the top of its group.
+                seconds: r.seconds.max(0) as f64,
+                blocked_by: blocked_by.remove(&r.id).unwrap_or_default(),
+                blocks: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+/// One `pg_stat_activity` row, every column as the text `simple_query` returns:
+/// `(pid, usename, client_host, datname, state, query, age, blockers)`.
+pub type PgActivityRow = [Option<String>; 8];
+
+/// Fold PostgreSQL's activity rows into [`SessionInfo`]s.
+///
+/// **A row the role may not inspect is kept, and says so by saying nothing.**
+/// PostgreSQL masks `usename`, `datname`, `state`, `client_addr` and friends to
+/// NULL for such a backend and puts [`PG_MASKED_QUERY`] in `query` — while `pid`
+/// and `pg_blocking_pids(pid)` stay real, so the row is still a killable session
+/// and still a usable node in the blocking graph. Dropping the sentinel is what
+/// keeps it from being classified `Running` and from being drawn as a statement.
+///
+/// A row whose **pid** won't parse is dropped, not admitted under a made-up id:
+/// a session `0` renders a full row with a live "Kill session" under it, and
+/// other rows' `blocked_by` edges would point at it. An unreadable *age* has a
+/// safe default — it only decides where the row sorts.
+pub fn from_pg_rows(rows: &[PgActivityRow]) -> Vec<SessionInfo> {
+    let text = |r: &PgActivityRow, i: usize| r[i].clone().filter(|s| !s.is_empty());
+    rows.iter()
+        .filter_map(|r| {
+            let query = text(r, 5)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && s != PG_MASKED_QUERY);
+            let blocked_by = parse_pid_array(r[7].as_deref().unwrap_or(""));
+            let id: i64 = r[0].as_deref()?.trim().parse().ok()?;
+            Some(SessionInfo {
+                id,
+                user: text(r, 1).unwrap_or_default(),
+                client: text(r, 2),
+                database: text(r, 3),
+                state: pg_state(
+                    text(r, 4).as_deref(),
+                    query.is_some(),
+                    !blocked_by.is_empty(),
+                ),
+                sql: query,
+                seconds: text(r, 6).and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                blocked_by,
+                blocks: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+/// Read a PostgreSQL `int[]` as rendered by `::text` — `{}`, `{1234}`,
+/// `{1234,5678}`. `simple_query` hands back every column as text, so the array
+/// arrives as its literal and there is no typed accessor to lean on.
+///
+/// Anything unparseable is skipped rather than defaulting to a pid: a `0` in the
+/// blocking graph would draw an edge to a session that does not exist and put a
+/// "Kill 0" button under it.
+pub fn parse_pid_array(s: &str) -> Vec<i64> {
+    s.trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .split(',')
+        .filter_map(|p| p.trim().parse::<i64>().ok())
+        .collect()
+}
+
 /// Which of the two things "kill" can mean.
 ///
 /// Both engines offer both, and the difference is the whole reason this is an
@@ -577,12 +783,26 @@ impl KillKind {
         }
     }
 
-    /// Is this offered for `s`? Cancelling needs a statement to cancel — on an
-    /// idle session the server accepts the request and does nothing, which is a
-    /// button that lies.
+    /// Is this offered for `s`? Cancelling needs a statement **executing** — on
+    /// a session that isn't running one the server accepts the request and does
+    /// nothing, which is a button that lies.
+    ///
+    /// Keyed on the state being one where a statement is in flight, not on it
+    /// merely not being `Idle`. PostgreSQL keeps the *last* statement in `query`
+    /// for an `idle in transaction` backend — the panel's headline case, a
+    /// client that ran `BEGIN` and went away holding locks — so the row offered
+    /// **Cancel query** and its confirm promised an abort `pg_cancel_backend`
+    /// discards while the backend is reading a command. MySQL escaped it by
+    /// luck: `PROCESSLIST.INFO` is NULL for a `Sleep` thread, so `sql` was
+    /// already `None` there.
+    ///
+    /// `Blocked` counts as executing — it is waiting *inside* a statement, and
+    /// cancelling it is the whole point of the panel.
     pub fn applies_to(self, s: &SessionInfo) -> bool {
         match self {
-            KillKind::Query => s.sql.is_some() && s.state != SessionState::Idle,
+            KillKind::Query => {
+                s.sql.is_some() && matches!(s.state, SessionState::Running | SessionState::Blocked)
+            }
             KillKind::Session => true,
         }
     }
@@ -908,7 +1128,7 @@ mod tests {
             .map(|i| sess(i, SessionState::Idle, 0.0))
             .collect();
         assert_eq!(render_slice(&exact).1, 0);
-        assert_eq!(render_slice(&[]).1, 0);
+        assert_eq!(render_slice::<SessionInfo>(&[]).1, 0);
     }
 
     #[test]
@@ -1012,6 +1232,43 @@ mod tests {
         );
     }
 
+    /// **A wait with several holders is ordinary**, and naming one of them as
+    /// *the* holder invited a kill that left the waiter blocked by the other
+    /// two, with the banner immediately re-rendering the next-lowest id. The
+    /// holder is chosen the way the waiter is — longest-standing — and the rest
+    /// are counted out loud.
+    #[test]
+    fn a_wait_with_several_holders_says_so() {
+        let mut v = vec![
+            sess(1, SessionState::IdleInTx, 10.0),
+            sess(2, SessionState::IdleInTx, 400.0),
+            sess(3, SessionState::IdleInTx, 90.0),
+            sess(9, SessionState::Blocked, 130.0),
+        ];
+        v[3].blocked_by = vec![3, 1, 2];
+        prepare(&mut v);
+        let (waiter, holder) = lock_wait(&v).expect("a wait to report");
+        assert_eq!(waiter.id, 9);
+        assert_eq!(
+            holder.id, 2,
+            "the longest-standing holder, not the lowest id"
+        );
+        let text = lock_wait_text(waiter, holder);
+        assert!(text.contains("2 other sessions"), "{text}");
+
+        // One holder says nothing extra. Rebuilt rather than mutated: `prepare`
+        // reorders the vector, so the indices above no longer mean what they did.
+        let mut v = vec![
+            sess(2, SessionState::IdleInTx, 400.0),
+            sess(9, SessionState::Blocked, 130.0),
+        ];
+        v[1].blocked_by = vec![2];
+        prepare(&mut v);
+        let (w, h) = lock_wait(&v).expect("a wait to report");
+        let text = lock_wait_text(w, h);
+        assert!(!text.contains("other"), "{text}");
+    }
+
     #[test]
     fn no_wait_no_banner() {
         let mut v = vec![
@@ -1020,6 +1277,189 @@ mod tests {
         ];
         prepare(&mut v);
         assert!(lock_wait(&v).is_none());
+    }
+
+    /// **The search reads what the row draws.** `PROCESSLIST.INFO` keeps the
+    /// client's original newlines and the row renders `history::preview`, which
+    /// collapses them — so typing the phrase that is visibly on screen filtered
+    /// the one row containing it *out*. `history::matches_query` solved this one
+    /// module over; this one was written without that half.
+    #[test]
+    fn the_search_reads_the_statement_the_way_the_row_draws_it() {
+        let mut s = sess(1, SessionState::Running, 1.0);
+        s.sql = Some("SELECT *\nFROM orders\nWHERE id = 7".to_string());
+        assert!(matches_query(&s, "select * from"));
+        assert!(matches_query(&s, "FROM ORDERS WHERE"));
+        // And a term that really isn't there still isn't.
+        assert!(!matches_query(&s, "delete from"));
+    }
+
+    /// The two engines answer the panel's own question differently:
+    /// `PROCESSLIST.INFO` is NULL for a `Sleep` thread, while
+    /// `pg_stat_activity.query` keeps the last statement of an `idle` backend
+    /// indefinitely — so a wall of PostgreSQL pool connections each drew a real,
+    /// plausible statement on the panel whose one decision is what to kill.
+    #[test]
+    fn an_idle_session_is_not_running_the_statement_it_last_ran() {
+        let mut idle = sess(1, SessionState::Idle, 400.0);
+        idle.sql = Some("SELECT 1234 AS probe_marker".to_string());
+        assert_eq!(idle.running_sql(), None);
+        // Still available for *Copy statement*, which is why the field stays.
+        assert!(idle.sql.is_some());
+
+        for state in [
+            SessionState::Running,
+            SessionState::Blocked,
+            SessionState::IdleInTx,
+        ] {
+            let mut s = sess(2, state, 1.0);
+            s.sql = Some("UPDATE orders SET total = 1".to_string());
+            assert!(s.running_sql().is_some(), "{state:?}");
+        }
+    }
+
+    /// The poll is a full connect + authenticate + three `information_schema`
+    /// statements, as often as every two seconds. `fits` is the answer that was
+    /// missing: below the responsive breakpoint the right column is 0px wide and
+    /// its toggle is inert, so the poll could be neither seen nor stopped.
+    #[test]
+    fn the_poll_stops_when_the_panel_cannot_be_seen() {
+        assert!(should_poll(true, true, true));
+        assert!(!should_poll(false, true, true));
+        assert!(!should_poll(true, false, true));
+        assert!(!should_poll(true, true, false));
+    }
+
+    // ── The folds (the seam between a server's answer and `SessionInfo`) ──
+
+    fn my_row(id: i64, command: &str) -> MyProcessRow {
+        MyProcessRow {
+            id,
+            user: "app".to_string(),
+            host: "10.0.4.12:54388".to_string(),
+            database: Some("shop".to_string()),
+            command: command.to_string(),
+            seconds: 12,
+            info: Some("SELECT 1".to_string()),
+        }
+    }
+
+    /// Every decision the MySQL fold makes, in one place — none of it was
+    /// reachable from a test while it sat inside an `async fn` holding a
+    /// connection, which is where the first three findings of this pass lived.
+    #[test]
+    fn the_mysql_fold_decides_each_field_from_the_three_result_sets() {
+        let trx: std::collections::HashMap<i64, String> =
+            [(2, "RUNNING".to_string()), (3, "LOCK WAIT".to_string())]
+                .into_iter()
+                .collect();
+        let mut rows = vec![
+            my_row(1, "Sleep"),
+            my_row(2, "Sleep"),
+            my_row(3, "Query"),
+            my_row(4, "Query"),
+        ];
+        // A `Sleep` thread's `INFO` is NULL on this engine.
+        rows[0].info = None;
+        rows[1].info = None;
+        // Socket connections report a bare `localhost`; an empty host is no
+        // address at all; an empty `DB` is not a database; a whitespace-only
+        // `INFO` is not a statement; a negative `TIME` clamps before it sorts.
+        rows[2].host = "localhost".to_string();
+        rows[2].database = Some(String::new());
+        rows[3].host = String::new();
+        rows[3].info = Some("   ".to_string());
+        rows[3].seconds = -5;
+
+        // The same edge twice — both lock views are keyed by lock, not by pair.
+        let out = from_mysql_rows(&rows, &trx, &[(3, 2), (3, 2)]);
+        assert_eq!(out.len(), 4);
+
+        // A plain `Sleep` with no transaction is idle; with one it is the
+        // holder the panel exists to surface.
+        assert_eq!(out[0].state, SessionState::Idle);
+        assert_eq!(out[1].state, SessionState::IdleInTx);
+        assert_eq!(out[2].state, SessionState::Blocked);
+        assert_eq!(out[3].state, SessionState::Running);
+
+        assert_eq!(out[0].client.as_deref(), Some("10.0.4.12"));
+        assert_eq!(out[2].client.as_deref(), Some("localhost"));
+        assert_eq!(out[3].client, None);
+        assert_eq!(out[2].database, None);
+        assert_eq!(out[3].sql, None);
+        assert_eq!(out[3].seconds, 0.0);
+        // Duplicates survive here; `prepare` is the one place they are dropped.
+        assert_eq!(out[2].blocked_by, vec![2, 2]);
+    }
+
+    fn pg_row(pid: &str) -> PgActivityRow {
+        [
+            Some(pid.to_string()),
+            Some("app".to_string()),
+            Some("10.0.0.4".to_string()),
+            Some("shop".to_string()),
+            Some("active".to_string()),
+            Some("SELECT 1".to_string()),
+            Some("12.5".to_string()),
+            Some("{}".to_string()),
+        ]
+    }
+
+    /// **A masked backend is kept, and does not claim to be running.**
+    /// PostgreSQL nulls `usename`/`datname`/`state`/`client_addr` for a backend
+    /// the role may not inspect and puts `<insufficient privilege>` in `query`,
+    /// while `pid` and `pg_blocking_pids(pid)` stay real — so the row is still a
+    /// killable session and a usable node in the graph, but its "statement" is a
+    /// message and must not be drawn as one.
+    #[test]
+    fn the_pg_fold_keeps_a_masked_backend_without_inventing_anything() {
+        let mut masked = pg_row("41207");
+        masked[1] = None;
+        masked[2] = None;
+        masked[3] = None;
+        masked[4] = None;
+        masked[5] = Some(PG_MASKED_QUERY.to_string());
+        masked[6] = None;
+        masked[7] = Some("{4102}".to_string());
+
+        let mut unparseable = pg_row("not-a-pid");
+        unparseable[7] = Some("{}".to_string());
+
+        let out = from_pg_rows(&[pg_row("100"), masked, unparseable]);
+        // The row with no readable identity is dropped; a session `0` would
+        // render a full row with a live "Kill session" under it.
+        assert_eq!(out.len(), 2);
+
+        assert_eq!(out[0].state, SessionState::Running);
+        assert_eq!(out[0].seconds, 12.5);
+
+        let m = &out[1];
+        assert_eq!(m.id, 41207);
+        assert_eq!(m.sql, None, "the sentinel is not a statement");
+        assert_eq!(m.user, "");
+        assert_eq!(m.client, None);
+        assert_eq!(m.database, None);
+        assert_eq!(m.blocked_by, vec![4102], "the graph is not masked");
+        // Blocked because the graph says so — not `Running` off a sentinel.
+        assert_eq!(m.state, SessionState::Blocked);
+        // …and with no blocker it would be the far more common idle backend.
+        let mut alone = pg_row("41207");
+        alone[4] = None;
+        alone[5] = Some(PG_MASKED_QUERY.to_string());
+        assert_eq!(from_pg_rows(&[alone])[0].state, SessionState::Idle);
+    }
+
+    #[test]
+    fn parse_pid_array_reads_what_pg_blocking_pids_renders() {
+        assert_eq!(parse_pid_array("{}"), Vec::<i64>::new());
+        assert_eq!(parse_pid_array("{1234}"), vec![1234]);
+        assert_eq!(parse_pid_array("{1234,5678}"), vec![1234, 5678]);
+        assert_eq!(parse_pid_array(" {1234, 5678} "), vec![1234, 5678]);
+        // A NULL column, or anything else unexpected, contributes no edges rather
+        // than a pid of 0.
+        assert_eq!(parse_pid_array(""), Vec::<i64>::new());
+        assert_eq!(parse_pid_array("{NULL}"), Vec::<i64>::new());
+        assert_eq!(parse_pid_array("{7,oops}"), vec![7]);
     }
 
     #[test]
@@ -1038,9 +1478,23 @@ mod tests {
 
         // The case the panel exists for: an idle-in-transaction holder has no
         // statement running but must stay killable.
+        //
+        // **And must not be offered a cancel.** PostgreSQL keeps the *last*
+        // statement in `query` for such a backend, so `sql` is `Some` and the
+        // row offered "Cancel query" over a confirm promising an abort — which
+        // `pg_cancel_backend` discards while the backend is reading a command.
+        // MySQL escaped this by luck: `PROCESSLIST.INFO` is NULL for a `Sleep`
+        // thread, so `sql` was already `None` there.
         let mut holder = sess(3, SessionState::IdleInTx, 300.0);
         holder.sql = Some("UPDATE salaries SET salary = 0".to_string());
         assert!(KillKind::Session.applies_to(&holder));
+        assert!(!KillKind::Query.applies_to(&holder));
+
+        // A blocked session *is* executing — it is waiting inside a statement,
+        // and cancelling it is the whole point of the panel.
+        let mut blocked = sess(5, SessionState::Blocked, 12.0);
+        blocked.sql = Some("UPDATE orders SET total = 1".to_string());
+        assert!(KillKind::Query.applies_to(&blocked));
 
         // A server that still reports the last statement of an idle session must
         // not turn that into a cancel button.

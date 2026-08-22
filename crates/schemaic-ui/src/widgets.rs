@@ -1783,6 +1783,82 @@ pub(crate) fn menu_trigger_press(_: &floem::event::Event) {
     }
 }
 
+// ── The app's menus are mutually exclusive ──────────────────────────────────
+
+/// One of the app's dropdowns, named so a trigger can say "close the others".
+///
+/// **The list is the invariant.** A menu trigger absorbs its own pointer-down —
+/// it has to, or the root's dismissal would close the menu the click is about to
+/// open — so the root handler cannot enforce mutual exclusivity for them and
+/// each trigger has to. That was written out three times, in three files, and
+/// the third one added a flag the other two never learned about: opening the
+/// activity clock's interval dropdown and then clicking the schema tree's eye
+/// left **both** on screen. A stranded one is not merely visible — its
+/// `focus_root` stays registered, and `innermost_focus_root()` being `Some`
+/// makes every newly opened query tab decline the keyboard.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MenuId {
+    Popup,
+    Context,
+    SchemaEye,
+    SchemaGear,
+    Connection,
+    ActiveDb,
+    ActivityClock,
+}
+
+/// Every menu-open flag in the app, gathered once so a new one is added in a
+/// single place and `git grep MenuFlags` finds every trigger.
+#[derive(Clone, Copy)]
+pub(crate) struct MenuFlags {
+    pub popup: RwSignal<Option<Vec<MenuEntry>>>,
+    pub context: RwSignal<Option<crate::CtxMenu>>,
+    pub schema_eye: RwSignal<bool>,
+    pub schema_gear: RwSignal<bool>,
+    pub connection: RwSignal<bool>,
+    pub active_db: RwSignal<bool>,
+    pub activity_clock: RwSignal<bool>,
+}
+
+impl MenuFlags {
+    pub(crate) fn of(ui: &crate::Ui) -> Self {
+        Self {
+            popup: ui.overlay.popup_menu,
+            context: ui.overlay.context_menu,
+            schema_eye: ui.schema.db_menu_open,
+            schema_gear: ui.schema.schema_menu_open,
+            connection: ui.conn.conn_menu_open,
+            active_db: ui.tabs_ui.active_db_menu_open,
+            activity_clock: ui.activity.menu_open,
+        }
+    }
+
+    /// Close every open menu but `keep`.
+    ///
+    /// Guarded per flag, because `RwSignal::set` never dedups and an unguarded
+    /// write re-runs every style closure reading it.
+    pub(crate) fn close_except(&self, keep: Option<MenuId>) {
+        let live = |id: MenuId| keep != Some(id);
+        if live(MenuId::Popup) && self.popup.get_untracked().is_some() {
+            self.popup.set(None);
+        }
+        if live(MenuId::Context) && self.context.get_untracked().is_some() {
+            self.context.set(None);
+        }
+        for (id, flag) in [
+            (MenuId::SchemaEye, self.schema_eye),
+            (MenuId::SchemaGear, self.schema_gear),
+            (MenuId::Connection, self.connection),
+            (MenuId::ActiveDb, self.active_db),
+            (MenuId::ActivityClock, self.activity_clock),
+        ] {
+            if live(id) && flag.get_untracked() {
+                flag.set(false);
+            }
+        }
+    }
+}
+
 // ── Reusable themed popup menu (with nested submenus) ───────────────────────
 //
 // `menu_panel(entries, close, width)` renders a themed popup (matching the schema
@@ -3627,8 +3703,21 @@ pub(crate) fn exit_action(busy: bool, cancellable: bool) -> ExitAction {
 /// differently, so it is one function with the launch inside the same
 /// synchronous step that reads it. The disabled button stays: it is what *says*
 /// the action is unavailable. This is what makes it so.
+///
+/// **`read_only` covers server administration too**, which was an open question
+/// until Server Activity's kill arrived and answered it by not asking. The flag
+/// is the protection with no "Run anyway", and terminating a live client session
+/// — rolling back its transaction under it — is the most destructive thing the
+/// app can do to a server it has been told not to write to. So the row menu's
+/// two kill entries and the lock-wait banner's one-click ask this, at the click.
 pub(crate) fn accept_launch(in_flight: bool, read_only: bool) -> bool {
     !in_flight && !read_only
+}
+
+/// [`accept_launch`] for the app crate, whose destructive actions are the same
+/// class and must not re-derive the answer.
+pub fn may_launch_destructive(in_flight: bool, read_only: bool) -> bool {
+    accept_launch(in_flight, read_only)
 }
 
 #[cfg(test)]
@@ -5002,6 +5091,69 @@ mod follow_tests {
 /// start of the file). That is a stand-in for "in the same opener, before it" —
 /// openers don't interleave, and a thirteenth one that forgets the anchor has
 /// nothing between it and its predecessor's fill.
+#[cfg(test)]
+mod menu_exclusivity {
+    use super::*;
+    use floem::reactive::Scope;
+
+    fn flags(scope: Scope) -> MenuFlags {
+        MenuFlags {
+            popup: scope.create_rw_signal(Some(Vec::new())),
+            context: scope.create_rw_signal(None),
+            schema_eye: scope.create_rw_signal(true),
+            schema_gear: scope.create_rw_signal(true),
+            connection: scope.create_rw_signal(true),
+            active_db: scope.create_rw_signal(true),
+            activity_clock: scope.create_rw_signal(true),
+        }
+    }
+
+    /// **All the app's menus are mutually exclusive**, and a trigger has to
+    /// enforce it itself: it absorbs its own pointer-down, so the root's
+    /// dismissal never runs for it. The list was written out three times in
+    /// three files and the third one added a flag the other two never learned
+    /// about, which left two dropdowns on screen at once — and a stranded one
+    /// keeps its `focus_root` registered, so every newly opened query tab
+    /// declines the keyboard.
+    #[test]
+    fn closing_leaves_exactly_the_one_menu_that_asked_to_stay() {
+        let scope = Scope::new();
+        let open = |f: &MenuFlags| {
+            [
+                (MenuId::Popup, f.popup.get_untracked().is_some()),
+                (MenuId::Context, f.context.get_untracked().is_some()),
+                (MenuId::SchemaEye, f.schema_eye.get_untracked()),
+                (MenuId::SchemaGear, f.schema_gear.get_untracked()),
+                (MenuId::Connection, f.connection.get_untracked()),
+                (MenuId::ActiveDb, f.active_db.get_untracked()),
+                (MenuId::ActivityClock, f.activity_clock.get_untracked()),
+            ]
+            .into_iter()
+            .filter(|(_, on)| *on)
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>()
+        };
+
+        for keep in [
+            MenuId::Popup,
+            MenuId::SchemaEye,
+            MenuId::SchemaGear,
+            MenuId::Connection,
+            MenuId::ActiveDb,
+            MenuId::ActivityClock,
+        ] {
+            let f = flags(scope);
+            f.close_except(Some(keep));
+            assert_eq!(open(&f), vec![keep], "closing all but {keep:?}");
+        }
+
+        // The root's own dismissal keeps none of them.
+        let f = flags(scope);
+        f.close_except(None);
+        assert!(open(&f).is_empty());
+    }
+}
+
 #[cfg(test)]
 mod popup_anchor_gate {
     use std::collections::BTreeSet;
