@@ -914,7 +914,7 @@ pub(crate) struct QueryPaneParams {
     /// Databases the SCHEMA panel's eye has hidden — the database selector must
     /// not offer one (`schema::db_visible`), so its trigger has to know
     /// whether anything is left to offer.
-    pub hidden_dbs: RwSignal<std::collections::HashSet<String>>,
+    pub hidden_dbs: floem::reactive::Memo<std::collections::HashSet<String>>,
     pub inline_ai: RwSignal<InlineAiState>,
     pub inline_ai_run: Rc<dyn Fn(InlineAiRequest)>,
     pub inline_ai_cancel: Rc<dyn Fn()>,

@@ -654,6 +654,33 @@ pub fn db_contributes(
     db_visible(hidden, database) || active_db.is_some_and(|a| a.eq_ignore_ascii_case(database))
 }
 
+/// The database to bind a tab to when nothing has chosen one — the first the
+/// SCHEMA panel would actually *show*.
+///
+/// **The two sites that choose a tab's database are the ones [`db_visible`] has
+/// to reach most.** They took `names.first()` unfiltered, so hiding the
+/// alphabetically-first database and then switching to a connection with no open
+/// tab (or pressing Ctrl+T before touching the selector) put the tab *inside*
+/// it. [`db_contributes`]' active-database exception then fired for a database
+/// the user had deliberately put away — it exists because "hiding it doesn't
+/// move the tab", and here the app moved the tab into it — carrying it into the
+/// toolbar's label, autocomplete's pool, both AI prompts with full column detail
+/// and the MCP overview, from a state the user never asked for.
+///
+/// Falls back to the first name when **every** database is hidden: a connection
+/// whose databases are all put away should still open a usable tab, and the
+/// exception is then honest — the user is inside the one thing they can see.
+pub fn first_bindable<'a>(
+    names: &'a [String],
+    hidden: &std::collections::HashSet<String>,
+) -> Option<&'a str> {
+    names
+        .iter()
+        .find(|n| db_visible(hidden, n))
+        .or_else(|| names.first())
+        .map(String::as_str)
+}
+
 /// The database name the QUERY toolbar's selector may show, given the databases
 /// the active connection actually loaded.
 ///
@@ -4444,6 +4471,45 @@ mod tests {
         assert!(!db_visible(&hidden, "archive"));
         assert!(db_visible(&hidden, "sakila"));
         assert!(db_visible(&Default::default(), "archive"));
+    }
+
+    /// **The picker that binds a tab has to ask the same question every list
+    /// asks.** It took the raw first name, so hiding the alphabetically-first
+    /// database put the next new tab inside it — and `db_contributes`' active
+    /// exception then handed it to autocomplete, both prompts and the MCP
+    /// overview, from a state the user never chose.
+    #[test]
+    fn a_new_tab_is_never_bound_to_a_hidden_database() {
+        let names: Vec<String> = ["actdemo", "bigschema", "sakila"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let hidden = |v: &[&str]| -> std::collections::HashSet<String> {
+            v.iter().map(|s| s.to_string()).collect()
+        };
+        assert_eq!(first_bindable(&names, &hidden(&[])), Some("actdemo"));
+        assert_eq!(
+            first_bindable(&names, &hidden(&["actdemo"])),
+            Some("bigschema")
+        );
+        assert_eq!(
+            first_bindable(&names, &hidden(&["actdemo", "bigschema"])),
+            Some("sakila")
+        );
+        // Everything hidden: a usable tab beats no tab, and the exception is
+        // then honest — the user is inside the one thing they can see.
+        assert_eq!(
+            first_bindable(&names, &hidden(&["actdemo", "bigschema", "sakila"])),
+            Some("actdemo")
+        );
+        assert_eq!(first_bindable(&[], &hidden(&[])), None);
+
+        // The composed property: what gets bound never resurrects a hidden
+        // database through the active-database exception.
+        let h = hidden(&["actdemo"]);
+        let bound = first_bindable(&names, &h).unwrap();
+        assert!(db_contributes(&h, bound, Some(bound)));
+        assert!(!db_contributes(&h, "actdemo", Some(bound)));
     }
 
     #[test]

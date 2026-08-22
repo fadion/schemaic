@@ -695,11 +695,19 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
     // it, the connection form owns it.
     let connections = ui.conn.connections;
     let active_conn = ui.conn.active_conn;
+    // **Named**, because it is the *active connection's* level and the grid a
+    // step away obeys its own result's `conn_id`. Unnamed, the line could read
+    // "Let it read data" over a grid whose attach actions are refused, and the
+    // user would have no way to tell which of the two was lying.
     let active_ai_data = floem::reactive::create_memo(move |_| {
         let id = active_conn.get();
-        connections
-            .with(|cs| cs.iter().find(|c| c.id == id).and_then(|c| c.ai_data))
-            .unwrap_or_default()
+        connections.with(|cs| {
+            let c = cs.iter().find(|c| c.id == id);
+            (
+                c.map(|c| c.name.clone()).unwrap_or_default(),
+                c.and_then(|c| c.ai_data).unwrap_or_default(),
+            )
+        })
     });
     let apply = ui.ai_actions.apply.clone();
     let detected = ui.ai_actions.detected_path.clone();
@@ -807,8 +815,12 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
             let data_section = v_stack((
                 settings_group_label("Data access"),
                 label(move || {
-                    let lvl = active_ai_data.get();
-                    format!("{} — {}", lvl.label(), lvl.hint())
+                    let (name, lvl) = active_ai_data.get();
+                    if name.is_empty() {
+                        format!("{} — {}", lvl.label(), lvl.hint())
+                    } else {
+                        format!("{name}: {} — {}", lvl.label(), lvl.hint())
+                    }
                 })
                 .style(|s| {
                     s.width_full()

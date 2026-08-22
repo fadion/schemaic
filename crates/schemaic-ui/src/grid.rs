@@ -6474,6 +6474,14 @@ fn header_cell(
                     "AI summary",
                     (icons::SPARKLES, theme::key_foreign),
                     move || {
+                        // Asked again at the launch, not only at the build.
+                        // `msg` was captured with real cell values in it, and a
+                        // menu can outlive the level that permitted it — the
+                        // connection's data access is changed from a settings
+                        // panel that does not close an open menu.
+                        if !ai_data_of(gs).may_attach() {
+                            return;
+                        }
                         if let Some(s) = &sum {
                             (s)(msg.clone());
                         }
@@ -6978,6 +6986,14 @@ fn data_cell(
                     "AI summary",
                     (icons::SPARKLES, theme::key_foreign),
                     move || {
+                        // Asked again at the launch, not only at the build.
+                        // `msg` was captured with real cell values in it, and a
+                        // menu can outlive the level that permitted it — the
+                        // connection's data access is changed from a settings
+                        // panel that does not close an open menu.
+                        if !ai_data_of(gs).may_attach() {
+                            return;
+                        }
                         if let Some(s) = &sum {
                             (s)(msg.clone());
                         }

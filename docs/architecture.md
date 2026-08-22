@@ -1496,6 +1496,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     - `favorite.rs` — the `(conn_id, database)` star list. `toggle` appends newest-**last** on
       purpose: `rank` (0 = that connection's oldest) is what the schema tree sorts by, so order in
       the `Vec` *is* the sort key.
+    - `db_hidden.rs` — the `(conn_id, database)` set behind the SCHEMA panel's eye, the third store
+      on that context menu and the last one to be keyed by connection. A flat `Vec<String>` of bare
+      names meant hiding `world` on one server hid a live `world` on every other — out of the tree,
+      Find-Anywhere, the toolbar selector, autocomplete, the assistant's context and `list_schema`'s
+      overview — and left a deleted connection's names hiding databases forever, since there was
+      nothing to `clear_conn`. What every consumer reads is still a `HashSet<String>`: `names_for`
+      resolves the rules for the connection being looked at, which is the question each surface is
+      asking and what keeps `schema::db_visible` a two-argument predicate. `migrate_flat` reads a
+      file written before this and applies its names to **every** connection — the only honest
+      reading of a set that had no connection dimension, since re-scoping it to whichever connection
+      happened to be active would silently unhide databases on all the others.
     - `db_color.rs` — identity colours: a per-`(connection, database)` one and a
       per-`(connection, database, table)` one. Display-only — a dot in the tree, the active-DB
       selector and tabs for a database; a dot on the table row and a tint on that table's card
