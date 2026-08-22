@@ -52,6 +52,19 @@ pub fn clamp_scale(w: f32, h: f32, want: f32) -> f32 {
 /// fallback chain ends at the generic and a machine without Plex installed would
 /// otherwise resolve it to whatever `usvg` defaults to.
 pub fn png_from_svg(svg: &str, scale: f32) -> Result<Vec<u8>, String> {
+    render_png(svg, scale, font_options())
+}
+
+/// The parse options carrying the bundled faces — the whole reason this module
+/// lives in the UI crate.
+///
+/// Split out so a test can build a **face-less** one and assert the two renders
+/// differ. Without that, the only content assertion the end-to-end test could
+/// make was `png.len() > 1000`, which passes by a factor of ten with the font
+/// database empty and every `<text>` silently dropped: a renamed `SANS_FACES`, a
+/// rejected face, or `resvg`'s `text` feature going away would ship label-less
+/// exports with `cargo test --workspace` still green.
+fn font_options() -> usvg::Options<'static> {
     let mut opt = usvg::Options {
         font_family: "IBM Plex Sans".to_string(),
         ..Default::default()
@@ -63,6 +76,10 @@ pub fn png_from_svg(svg: &str, scale: f32) -> Result<Vec<u8>, String> {
         }
         db.set_sans_serif_family("IBM Plex Sans");
     }
+    opt
+}
+
+fn render_png(svg: &str, scale: f32, opt: usvg::Options<'_>) -> Result<Vec<u8>, String> {
     let tree = usvg::Tree::from_str(svg, &opt).map_err(|e| format!("Invalid SVG: {e}"))?;
     let size = tree.size();
     let scale = clamp_scale(size.width(), size.height(), scale);
@@ -174,6 +191,7 @@ mod tests {
                 title_fill: "#f0f0f0".to_string(),
                 header_fill: "#303030".to_string(),
                 border: "#404040".to_string(),
+                divider: "#404040".to_string(),
             }],
             edges: vec![SvgEdge {
                 poly: vec![Pt { x: 0.0, y: 0.0 }, Pt { x: 100.0, y: 60.0 }],
@@ -204,7 +222,8 @@ mod tests {
                 row_gap: 8.0,
             },
         };
-        let png = png_from_svg(&to_svg(&scene), 2.0).expect("renders");
+        let svg = to_svg(&scene);
+        let png = png_from_svg(&svg, 2.0).expect("renders");
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "PNG magic");
         let w = u32::from_be_bytes(png[16..20].try_into().unwrap());
         let h = u32::from_be_bytes(png[20..24].try_into().unwrap());
@@ -212,5 +231,18 @@ mod tests {
         // Not a blank canvas: something other than the background colour was
         // drawn. A silent parse failure would still encode a valid, empty PNG.
         assert!(png.len() > 1000, "suspiciously small: {} bytes", png.len());
+
+        // **And the text really came from the bundled faces.** With the font
+        // database empty every `<text>` is silently dropped and the PNG is
+        // *still* a valid, plausibly-sized image of the same cards — 10 KB
+        // against 16 KB in the measurement this test replaces — so the size
+        // assertion above cannot see the one thing this module exists to
+        // guarantee. A whole-image non-background pixel count can't either: it
+        // is identical either way, because the glyphs sit on the card fill.
+        let bare = render_png(&svg, 2.0, usvg::Options::default()).expect("renders");
+        assert_ne!(
+            png, bare,
+            "the render is identical with no fonts loaded — the bundled faces are not reaching it"
+        );
     }
 }
