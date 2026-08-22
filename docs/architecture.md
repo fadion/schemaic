@@ -3007,14 +3007,30 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   whether or not queries are allowed, since proposing reads the schema and that was never the gated
   part, and the tag comes from the constant the renderer reads
   (`the_prompt_names_the_fence_tag_the_renderer_reads`). The MCP server itself is `mcp.rs` — four tools (`run_query`, `list_schema`,
-  `describe_table`, `propose_table_change`), described for **this** connection's engine:
-  `tools_list(engine)` builds
+  `describe_table`, `propose_table_change`), described for **this** connection's engine and listed
+  for **this** connection's access level: `tools_list(engine, reads_data)` builds
   `run_query`'s advertised statement heads from `schemaic_core::sql::read_only_heads`, the same list
   the gate enforces, and names the engine with `SqlDialect::engine_label()`. A hard-coded
   `SELECT/SHOW/DESCRIBE/EXPLAIN/WITH` told every model that a SQLite connection accepted
   `SHOW TABLES`, so a model reasoning from the tool's own text spent turns on statements that could
   only come back as parser errors; `run_query_advertises_exactly_the_heads_its_gate_allows` walks
-  every advertised head back through the gate. Everything dialect-shaped here reads `dialect_of` →
+  every advertised head back through the gate. Below `AiData::Full` the tool is **withheld, not
+  merely refused**: `reads_row_data` is the one predicate `tools_list` filters on and `refusal_for`
+  turns a call away with (`NO_DATA_ACCESS`, which names the setting so the model asks the user for
+  values instead of retrying). Listing `run_query` and denying the call is worse than not listing
+  it — the CLI's `--allowedTools` withheld it while `tools/list` still advertised it, so the model
+  planned a turn around a tool it could see, offered to run a query and analyse the results, and
+  learned only after the user agreed that the call was denied. No system-prompt sentence outranks a
+  tool the model can see, which is why the listing is where the level has to bite; the server-side
+  refusal is the backstop for a client working from a stale listing. The mirror of that listing is
+  `ai.rs`'s `AI_TOOLS_WITH_QUERY` / `AI_TOOLS_READ_ONLY`, the `--allowedTools` the CLI is spawned
+  with: it runs non-interactively, so a tool missing from its level's list has nobody to approve it
+  and the call is simply denied. Two lists in two files drift —
+  `propose_table_change` was offered by the server from the day it landed and named by neither
+  list, so the assistant's check of a proposed change against the live table was denied every time,
+  invisibly, since the model then writes the fenced block from the schema it already has and the
+  user sees a preview either way. `every_offered_tool_is_allow_listed_at_its_level` holds the two
+  sides equal per engine and per level. Everything dialect-shaped here reads `dialect_of` →
   `Engine::dialect()`, whose match is exhaustive, and so does `main.rs`'s namesake (via
   `dialect_for`). Both were `if engine == Postgres { Postgres } else { MySql }`, which compiled
   cleanly when SQLite arrived and sorted it onto the MySQL side: the read-only gate lexed AI-issued
