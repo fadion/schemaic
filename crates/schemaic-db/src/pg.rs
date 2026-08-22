@@ -1777,10 +1777,16 @@ async fn routines_where(client: &Client, filter: &str) -> Result<Vec<RoutineInfo
     Ok(query_all(
         client,
         &format!(
+            // Both argument renderings, because they are different strings and
+            // each is a syntax error where the other belongs:
+            // `pg_get_function_arguments` prints `DEFAULT` expressions the
+            // `CREATE` needs, and `…_identity_arguments` omits them because
+            // `DROP`/`ALTER … RENAME` have no grammar for them.
             "SELECT n.nspname, p.proname, pg_get_function_arguments(p.oid), \
                     pg_get_function_result(p.oid), l.lanname, p.prosrc, \
                     p.provolatile, p.proisstrict::int, p.prosecdef::int, \
-                    p.oid::text, p.prokind \
+                    p.oid::text, p.prokind, \
+                    pg_get_function_identity_arguments(p.oid) \
              FROM pg_proc p \
              JOIN pg_namespace n ON n.oid = p.pronamespace \
              JOIN pg_language l ON l.oid = p.prolang \
@@ -1797,6 +1803,7 @@ async fn routines_where(client: &Client, filter: &str) -> Result<Vec<RoutineInfo
             name: cell(r, 1),
             kind,
             arguments: cell(r, 2),
+            identity_arguments: cell(r, 11),
             // `pg_get_function_result` returns NULL for a procedure, which
             // `cell` renders as the empty string — which is exactly what the
             // model wants there, and what `RoutineDraft::validate` demands.

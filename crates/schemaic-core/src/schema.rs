@@ -1714,6 +1714,17 @@ pub struct RoutineInfo {
     /// for a trigger function, which receives its arguments through `TG_ARGV`
     /// instead.
     pub arguments: String,
+    /// **PostgreSQL.** The same list in the form that *identifies* the routine —
+    /// `pg_get_function_identity_arguments`. Empty on MySQL, whose identity is
+    /// the bare name.
+    ///
+    /// A second field rather than a reformatting of `arguments`, because the two
+    /// strings genuinely differ and the difference is a syntax error either way
+    /// round: `CREATE FUNCTION` needs the defaults (`b boolean DEFAULT false`),
+    /// while `DROP`/`ALTER … RENAME` take `[argmode] [argname] argtype` and
+    /// answer `syntax error at or near "DEFAULT"` to anything more. Neither form
+    /// can be derived from the other without re-parsing the expression.
+    pub identity_arguments: String,
     /// The return type as `pg_get_function_result` (or MySQL's `DTD_IDENTIFIER`)
     /// renders it — `trigger` for the ones a trigger can bind to. Empty for a
     /// procedure, which has no `RETURNS` clause on either engine.
@@ -1804,11 +1815,46 @@ impl RoutineInfo {
     ///
     /// An exhaustive `match` rather than a `== Postgres`, so a fourth engine has
     /// to answer for itself instead of inheriting whichever side it fell on.
+    ///
+    /// The list is [`RoutineInfo::identity_arguments`], **not** `arguments`:
+    /// only the identity form is grammatical here, and a routine with a
+    /// defaulted parameter could not be dropped or renamed from the app at all
+    /// while this spliced in the `CREATE` form. It falls back to `arguments` for
+    /// a routine assembled by hand rather than read from a catalogue — a draft's
+    /// own, where the two are the same string.
     pub fn signature_sql(&self, dialect: crate::intel::SqlDialect) -> String {
         let name = qualified_ident(&self.name, self.schema.as_deref(), dialect);
         match dialect {
-            crate::intel::SqlDialect::Postgres => format!("{name}({})", self.arguments.trim()),
+            crate::intel::SqlDialect::Postgres => {
+                let args = match self.identity_arguments.trim() {
+                    "" => self.arguments.trim(),
+                    ident => ident,
+                };
+                format!("{name}({args})")
+            }
             crate::intel::SqlDialect::MySql | crate::intel::SqlDialect::Sqlite => name,
+        }
+    }
+
+    /// The parameter list to show **beside a name in prose**, or empty where the
+    /// engine doesn't identify a routine by it.
+    ///
+    /// Unquoted and unqualified, unlike [`RoutineInfo::signature_sql`]: this
+    /// goes in a modal title, not in SQL. It exists because a remembered
+    /// Find-Anywhere hit carries only `(namespace, kind, name)` and resolves a
+    /// PostgreSQL overload to the *first* of them — so the editor could open on
+    /// `add(text, text)` when `add(integer, integer)` was searched for, with
+    /// nothing on screen distinguishing the two.
+    pub fn identity_suffix(&self, dialect: crate::intel::SqlDialect) -> String {
+        match dialect {
+            crate::intel::SqlDialect::Postgres => {
+                let args = match self.identity_arguments.trim() {
+                    "" => self.arguments.trim(),
+                    ident => ident,
+                };
+                format!("({args})")
+            }
+            crate::intel::SqlDialect::MySql | crate::intel::SqlDialect::Sqlite => String::new(),
         }
     }
 
@@ -1840,10 +1886,15 @@ impl RoutineInfo {
         if replace {
             out.push_str("OR REPLACE ");
         }
+        // **`arguments`, not `signature_sql`** — the two differ here. A `CREATE`
+        // wants the declaration form, defaults and all; `signature_sql` answers
+        // the *identity* form, which omits them because `DROP`/`ALTER` have no
+        // grammar for them.
         out.push_str(&format!(
-            "{} {}\n",
+            "{} {}({})\n",
             self.kind.sql_keyword(),
-            self.signature_sql(d)
+            qualified_ident(&self.name, self.schema.as_deref(), d),
+            self.arguments.trim()
         ));
         // **`CREATE PROCEDURE` takes a strict subset of a function's
         // attributes**, and the ones it rejects are rejected outright:
@@ -1974,12 +2025,42 @@ impl RoutineSource {
     /// copy, the state every build before this shipped, and better than blanking
     /// the field.
     pub fn apply_to(&self, r: &mut RoutineInfo) {
+        self.apply_body_to(r);
+        self.apply_session_to(r);
+    }
+
+    /// The body alone.
+    ///
+    /// Split from the session state because the two answer different questions,
+    /// and the caller has to gate them differently: the body is the user's to
+    /// overwrite and must not be patched over an edit they have already made,
+    /// while the session state is not editable anywhere in the app and is only
+    /// ever *more* correct than what was there.
+    pub fn apply_body_to(&self, r: &mut RoutineInfo) {
         if let Some(body) = &self.body {
             r.body = body.clone();
         }
-        r.sql_mode = self.sql_mode.clone();
-        r.charset_client = self.charset_client.clone();
-        r.collation_connection = self.collation_connection.clone();
+    }
+
+    /// The session state alone, and **only where this read has a value**.
+    ///
+    /// MySQL's `information_schema.ROUTINES` carries the same three columns
+    /// `SHOW CREATE` prints, so a routine arrives with them already set; a
+    /// `SHOW CREATE` that came back short must not blank them and leave the
+    /// recreate unwrapped. Applied unconditionally — with the body-equality
+    /// guard on the body alone — because a keystroke landing before this reply
+    /// is no reason to strip the wrapper off a `CREATE` whose `DROP` has
+    /// already committed.
+    pub fn apply_session_to(&self, r: &mut RoutineInfo) {
+        if self.sql_mode.is_some() {
+            r.sql_mode = self.sql_mode.clone();
+        }
+        if self.charset_client.is_some() {
+            r.charset_client = self.charset_client.clone();
+        }
+        if self.collation_connection.is_some() {
+            r.collation_connection = self.collation_connection.clone();
+        }
     }
 }
 
@@ -4672,6 +4753,59 @@ mod tests {
         assert!(ty < tbl && dom < tbl, "{out}");
     }
 
+    /// **The script carries the routines the tree lists under the same node.**
+    /// Last, because a body names the tables above it — and through
+    /// `ObjectItem::create_sql`, so MySQL's `DELIMITER` wrapper is the one that
+    /// already works when the script is pasted into a query tab. A database
+    /// recreated from a script that had quietly dropped them would answer
+    /// "function does not exist" to its own triggers.
+    #[test]
+    fn create_ddl_script_emits_the_namespaces_routines() {
+        use crate::intel::SqlDialect::{MySql, Postgres};
+        let s = DbSchema {
+            tables: vec![TableInfo {
+                name: "payment".into(),
+                columns: vec![col("id", "int", false, true)],
+                ..Default::default()
+            }],
+            routines: vec![std::sync::Arc::new(RoutineInfo {
+                name: "rewards_report".into(),
+                kind: RoutineKind::Procedure,
+                language: "SQL".into(),
+                body: "BEGIN SELECT 1 FROM payment; END".into(),
+                ..Default::default()
+            })],
+            ..Default::default()
+        };
+        let out = s.create_ddl_script(None, MySql);
+        let tbl = out.find("CREATE TABLE").expect("table emitted");
+        let proc = out.find("rewards_report").expect("routine emitted");
+        assert!(tbl < proc, "{out}");
+        // Runnable when pasted, not bare: the client script sets a delimiter
+        // around a body that contains `;`.
+        assert!(out.contains("DELIMITER"), "{out}");
+
+        // The whole-database script is the per-namespace one where there are no
+        // namespaces, so it carries them too.
+        assert!(s.create_ddl_script_all(MySql).contains("rewards_report"));
+
+        // PostgreSQL dollar-quotes instead, and has no delimiter directive.
+        let pg = DbSchema {
+            routines: vec![std::sync::Arc::new(RoutineInfo {
+                name: "audit".into(),
+                schema: Some("public".into()),
+                returns: "trigger".into(),
+                language: "plpgsql".into(),
+                body: "BEGIN RETURN NEW; END;".into(),
+                ..Default::default()
+            })],
+            ..Default::default()
+        };
+        let out = pg.create_ddl_script(Some("public"), Postgres);
+        assert!(out.contains("CREATE FUNCTION") || out.contains("CREATE OR REPLACE FUNCTION"));
+        assert!(!out.contains("DELIMITER"), "{out}");
+    }
+
     /// A `serial`'s counter is created by the column, so restating it would make
     /// the script fail on a name that already exists. A standalone sequence is
     /// the user's own object and belongs in the script.
@@ -5428,9 +5562,41 @@ mod tests {
         }
         .apply_to(&mut r);
         assert_eq!(r.body, "BEGIN SELECT 'it''s'; END");
-        // …and clears the session state it now knows nothing about, so both
-        // sides of the diff agree.
-        assert_eq!(r.sql_mode, None);
+        // …and leaves the session state alone, because it has none to offer.
+        // The catalogue read is where these come from now, so a `SHOW CREATE`
+        // that came back short must not blank them and leave the recreate
+        // unwrapped.
+        assert_eq!(r.sql_mode.as_deref(), Some("NO_ENGINE_SUBSTITUTION"));
+    }
+
+    /// **A keystroke before the reply lands must not cost the wrapper.** The
+    /// editor holds the body patch behind an equality guard so it can't
+    /// overwrite what somebody typed; the session state is not editable
+    /// anywhere, so it is applied either way — and on MySQL the `CREATE` it
+    /// wraps is preceded by a `DROP` that has already committed.
+    #[test]
+    fn session_state_survives_a_body_the_user_already_edited() {
+        let mut r = RoutineInfo {
+            body: "what the user typed".into(),
+            ..Default::default()
+        };
+        let src = RoutineSource {
+            body: Some("the source as written".into()),
+            sql_mode: Some("TRADITIONAL".into()),
+            charset_client: Some("utf8mb3".into()),
+            collation_connection: Some("utf8mb3_general_ci".into()),
+        };
+        src.apply_session_to(&mut r);
+        assert_eq!(r.body, "what the user typed");
+        assert_eq!(r.sql_mode.as_deref(), Some("TRADITIONAL"));
+        assert_eq!(r.charset_client.as_deref(), Some("utf8mb3"));
+        assert_eq!(
+            r.collation_connection.as_deref(),
+            Some("utf8mb3_general_ci")
+        );
+
+        src.apply_body_to(&mut r);
+        assert_eq!(r.body, "the source as written");
     }
 
     /// A routine whose body is a **link symbol** rather than source can't be

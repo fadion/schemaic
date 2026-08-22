@@ -1931,6 +1931,16 @@ pub enum Change {
     /// sentence and the emitted SQL have to be answering the same question.
     ReplaceRoutine {
         draft: Box<RoutineDraft>,
+        /// The routine **as the server holds it** — what a recreate's `DROP` has
+        /// to address, and what the summary names as the thing being changed.
+        ///
+        /// A whole [`RoutineInfo`] rather than [`RoutineDraft::original`]'s
+        /// name, because on PostgreSQL a name does not identify a routine: an
+        /// edit to the parameter list makes `draft.info`'s signature a
+        /// *different* function, so a `DROP` built from it would drop nothing
+        /// and the `CREATE` would leave the original standing beside a new
+        /// overload.
+        server: Box<RoutineInfo>,
         recreate: bool,
     },
     /// PostgreSQL renames a routine in place, so unlike a trigger this is a
@@ -2209,12 +2219,20 @@ impl Change {
             // replaces in place — the same distinction the trigger and view
             // summaries draw, and the one thing that tells a reader whether the
             // routine stops existing for a moment.
-            Change::ReplaceRoutine { draft, recreate } => {
+            Change::ReplaceRoutine {
+                draft,
+                server,
+                recreate,
+            } => {
                 let what = draft.info.kind.label();
-                let server = draft.original.as_deref().unwrap_or(&draft.info.name);
+                let held = if server.name.is_empty() {
+                    draft.original.as_deref().unwrap_or(&draft.info.name)
+                } else {
+                    &server.name
+                };
                 let verb = if *recreate { "Re-create" } else { "Redefine" };
-                if server != draft.info.name {
-                    format!("{verb} {what} {server} as {}", draft.info.name)
+                if held != draft.info.name {
+                    format!("{verb} {what} {held} as {}", draft.info.name)
                 } else {
                     format!("{verb} {what} {}", draft.info.name)
                 }
@@ -2423,7 +2441,11 @@ impl Change {
             // said: a function is shared, so every trigger bound to it starts
             // doing something else the moment this runs — including triggers on
             // tables this edit never mentioned.
-            Change::ReplaceRoutine { draft, recreate } => {
+            Change::ReplaceRoutine {
+                draft,
+                server,
+                recreate,
+            } => {
                 let f = &draft.info;
                 let mut out = vec![format!(
                     "Redefines {}. Everything that calls it runs the new body from \
@@ -2431,6 +2453,20 @@ impl Change {
                      mentioned.",
                     f.name
                 )];
+                // The parameter list is the routine's *identity* where the
+                // engine overloads, so this is not a redefinition at all — the
+                // old signature is dropped and a differently-shaped routine
+                // takes its place. Anything calling the old shape stops
+                // resolving, and that has to be said before consent, not after.
+                if !server.arguments.trim().is_empty()
+                    && server.arguments.trim() != f.arguments.trim()
+                {
+                    out.push(format!(
+                        "Changes {}'s parameter list. Callers that pass the old \
+                         arguments no longer resolve to it.",
+                        f.name
+                    ));
+                }
                 // The same sentence `ReplaceTrigger` earns, and for the same
                 // reason: MySQL has no `CREATE OR REPLACE` for a routine and no
                 // transactional DDL, so the `DROP` commits on its own and a
@@ -3536,19 +3572,25 @@ impl ChangeSet {
                     let f = &draft.info;
                     out.extend(session_wrapped(f.create_sql(d, false), f, d));
                 }
-                Change::ReplaceRoutine { draft, recreate } => {
+                Change::ReplaceRoutine {
+                    draft,
+                    server,
+                    recreate,
+                } => {
                     // **The drop names the routine the server holds; the create
-                    // names the one the draft wants.** They are the same name on
-                    // PostgreSQL — `diff_routine` puts the rename in a change of
-                    // its own there, so the replace addresses the old signature
-                    // and the `ALTER … RENAME` runs after — and they differ on
-                    // MySQL, where a rename has no verb and rides this recreate.
-                    // Taking `original` for both was that engine's rename
-                    // silently doing nothing.
+                    // names the one the draft wants.** They differ in the name on
+                    // MySQL, where a rename has no verb and rides this recreate,
+                    // and in the *parameter list* on PostgreSQL, where a changed
+                    // list is a different routine. Taking either from the draft
+                    // was that engine's edit silently doing nothing: the rename,
+                    // and then the drop.
                     if *recreate {
-                        let mut server = draft.info.clone();
-                        if let Some(orig) = &draft.original {
-                            server.name = orig.clone();
+                        let mut held = (**server).clone();
+                        if held.name.is_empty() {
+                            held = draft.info.clone();
+                            if let Some(orig) = &draft.original {
+                                held.name = orig.clone();
+                            }
                         }
                         // `IF EXISTS`, so a plan that has to drop first still
                         // applies against a routine someone else already removed,
@@ -3556,8 +3598,8 @@ impl ChangeSet {
                         // unrun.
                         out.push(format!(
                             "DROP {} IF EXISTS {};",
-                            server.kind.sql_keyword(),
-                            server.signature_sql(d)
+                            held.kind.sql_keyword(),
+                            held.signature_sql(d)
                         ));
                     }
                     let f = &draft.info;
@@ -5278,6 +5320,7 @@ pub fn supports_routine_editing(dialect: SqlDialect) -> bool {
             dialect,
             &Change::ReplaceRoutine {
                 draft: Box::default(),
+                server: Box::default(),
                 // The route this engine would really be handed, so the probe is
                 // the change the editor builds rather than a shape of it.
                 recreate: !supports_or_replace_routine(dialect),
@@ -7111,8 +7154,22 @@ pub fn drop_trigger(t: &TriggerInfo, dialect: SqlDialect) -> ChangeSet {
 /// preview rather than emitting an `ALTER` the server would reject.
 pub fn diff_routine(current: &RoutineInfo, draft: &RoutineDraft, dialect: SqlDialect) -> ChangeSet {
     let mut changes: Vec<Change> = Vec::new();
-    let recreate = !supports_or_replace_routine(dialect);
-    let rename_alone = supports_routine_rename(dialect);
+    // **A changed signature defeats `CREATE OR REPLACE`.** The form addresses a
+    // routine by its *identity*, and where the engine overloads (PostgreSQL) the
+    // parameter list is part of that: replacing on a new list creates a second
+    // routine and leaves the original standing with the old body, while
+    // replacing on a new return type is refused outright
+    // (`cannot change return type of existing function`). So the edit has to
+    // drop the old signature first — which is what `recreate` means, and what
+    // earns `destructive()`'s "drops it first" sentence.
+    let signature_changed = draft.info.arguments.trim() != current.arguments.trim()
+        || draft.info.returns.trim() != current.returns.trim();
+    let recreate = !supports_or_replace_routine(dialect) || signature_changed;
+    // A rename is its own statement only where the routine *survives* the
+    // replace. Once the plan drops the old signature there is nothing left for
+    // an `ALTER … RENAME` to address, so the recreate carries the new name
+    // itself — which is the route MySQL always takes.
+    let rename_alone = supports_routine_rename(dialect) && !recreate;
     let renamed = draft.info.name != current.name && !draft.info.name.trim().is_empty();
     // Compare everything *except* the name when the rename is its own change;
     // where it isn't, the name is part of what the recreate carries.
@@ -7131,6 +7188,7 @@ pub fn diff_routine(current: &RoutineInfo, draft: &RoutineDraft, dialect: SqlDia
         d.original = Some(current.name.clone());
         changes.push(Change::ReplaceRoutine {
             draft: Box::new(d),
+            server: Box::new(current.clone()),
             recreate,
         });
     }
@@ -9524,6 +9582,130 @@ mod tests {
             assert!(
                 sql[1].starts_with("ALTER FUNCTION \"audit\"() RENAME TO"),
                 "{sql:?}"
+            );
+        }
+
+        /// **PostgreSQL identifies a routine by its argument types.** Replacing
+        /// on a *new* parameter list creates a second function and leaves the
+        /// original standing with the old body — while the preview said
+        /// "Redefine". The edit has to drop the old signature first, and the
+        /// `DROP` has to name that signature and not the draft's.
+        #[test]
+        fn changing_a_postgres_signature_drops_the_old_one() {
+            let mut f = fnc();
+            f.name = "tally".into();
+            f.arguments = "a integer".into();
+            f.identity_arguments = "a integer".into();
+            f.returns = "integer".into();
+            let mut d = RoutineDraft::from_info(&f);
+            d.info.arguments = "a integer, b integer".into();
+
+            let cs = diff_routine(&f, &d, Postgres);
+            let sql = cs.emit();
+            assert_eq!(sql.len(), 2, "{sql:?}");
+            assert_eq!(
+                sql[0], "DROP FUNCTION IF EXISTS \"tally\"(a integer);",
+                "{sql:?}"
+            );
+            assert!(
+                sql[1].starts_with("CREATE FUNCTION \"tally\"(a integer, b integer)"),
+                "{sql:?}"
+            );
+            // No `OR REPLACE`: this is not a replacement of anything.
+            assert!(!sql[1].contains("OR REPLACE"), "{sql:?}");
+            // And the modal has to say both halves before consent.
+            let risks = cs.destructive();
+            assert!(
+                risks.iter().any(|r| r.contains("parameter list")),
+                "{risks:?}"
+            );
+            assert!(
+                risks.iter().any(|r| r.contains("drops it first")),
+                "{risks:?}"
+            );
+            assert_eq!(cs.changes[0].summary(), "Re-create function tally");
+        }
+
+        /// A rename *and* a signature change: the drop has to name what the
+        /// server holds and the create has to carry the new name itself, because
+        /// there is nothing left for an `ALTER … RENAME` to address afterwards.
+        #[test]
+        fn a_rename_with_a_signature_change_carries_the_name_in_the_create() {
+            let mut f = fnc();
+            f.name = "tally".into();
+            f.arguments = "a integer".into();
+            f.identity_arguments = "a integer".into();
+            f.returns = "integer".into();
+            let mut d = RoutineDraft::from_info(&f);
+            d.info.name = "tally2".into();
+            d.info.arguments = "a bigint".into();
+            let sql = diff_routine(&f, &d, Postgres).emit();
+            assert_eq!(sql.len(), 2, "{sql:?}");
+            assert_eq!(
+                sql[0], "DROP FUNCTION IF EXISTS \"tally\"(a integer);",
+                "{sql:?}"
+            );
+            assert!(
+                sql[1].starts_with("CREATE FUNCTION \"tally2\"(a bigint)"),
+                "{sql:?}"
+            );
+        }
+
+        /// Same rule from the other end: a changed **return type** is refused
+        /// outright by `CREATE OR REPLACE` (`cannot change return type of
+        /// existing function`), so it takes the same route.
+        #[test]
+        fn changing_a_postgres_return_type_drops_the_old_one() {
+            let mut f = fnc();
+            f.name = "tally".into();
+            f.returns = "integer".into();
+            let mut d = RoutineDraft::from_info(&f);
+            d.info.returns = "bigint".into();
+            let sql = diff_routine(&f, &d, Postgres).emit();
+            assert_eq!(sql.len(), 2, "{sql:?}");
+            assert!(sql[0].starts_with("DROP FUNCTION IF EXISTS"), "{sql:?}");
+        }
+
+        /// A body-only edit still replaces **in place** — the cheap, safe route,
+        /// and the one that keeps the routine existing throughout.
+        #[test]
+        fn a_body_edit_alone_still_replaces_in_place() {
+            let f = fnc();
+            let mut d = RoutineDraft::from_info(&f);
+            d.info.body = "BEGIN RETURN OLD; END;".into();
+            let sql = diff_routine(&f, &d, Postgres).emit();
+            assert_eq!(sql.len(), 1, "{sql:?}");
+            assert!(sql[0].contains("CREATE OR REPLACE FUNCTION"), "{sql:?}");
+        }
+
+        /// **`DROP`/`ALTER … RENAME` take the identity form, which omits
+        /// defaults; `CREATE` takes the declaration form, which needs them.**
+        /// Splicing one into the other's place is a syntax error either way
+        /// round, and it made a defaulted routine undroppable from the app.
+        #[test]
+        fn a_routines_identity_omits_a_parameters_default() {
+            let mut f = fnc();
+            f.name = "f".into();
+            f.arguments = "a integer, b boolean DEFAULT false".into();
+            f.identity_arguments = "a integer, b boolean".into();
+            f.returns = "integer".into();
+
+            assert_eq!(
+                drop_routine(&f, Postgres).emit(),
+                vec!["DROP FUNCTION \"f\"(a integer, b boolean);"]
+            );
+            let mut d = RoutineDraft::from_info(&f);
+            d.info.name = "g".into();
+            assert_eq!(
+                diff_routine(&f, &d, Postgres).emit(),
+                vec!["ALTER FUNCTION \"f\"(a integer, b boolean) RENAME TO \"g\";"]
+            );
+            // …and the `CREATE` keeps the default it would otherwise lose.
+            assert!(
+                f.create_sql(Postgres, true)
+                    .contains("(a integer, b boolean DEFAULT false)"),
+                "{}",
+                f.create_sql(Postgres, true)
             );
         }
 

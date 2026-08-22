@@ -106,6 +106,9 @@ impl SqlDialect {
 /// comments (every dialect; non-nesting).
 fn skip_comment(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
     let n = b.len();
+    if i >= n {
+        return None;
+    }
     if b[i] == b'-'
         && i + 1 < n
         && b[i + 1] == b'-'
@@ -257,9 +260,17 @@ fn scan_bracket(b: &[u8], i: usize) -> usize {
 /// reads `"` as a string; PostgreSQL uses `"` identifiers, `$tag$` strings and
 /// `\`-escapes only in `E'…'`; SQLite reads `"`, `` ` `` *and* `[…]` as
 /// identifiers and has no backslash escape at all.
+///
+/// **`i` past the end is `None`, not a panic.** Most callers walk a slice they
+/// have already bounded, but the ones that hand over "whatever is left after the
+/// keyword" can arrive here with an empty slice — and the answer there is the
+/// same as for any byte that starts no literal: there is nothing to skip.
 pub fn skip_noncode(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
     if let Some(j) = skip_comment(b, i, dialect) {
         return Some(j);
+    }
+    if i >= b.len() {
+        return None;
     }
     match b[i] {
         b'\'' => {
@@ -2141,6 +2152,20 @@ mod tests {
         assert_eq!(skip_noncode(b"abc", 0), None);
         // `--` without trailing whitespace is NOT a comment.
         assert_eq!(skip_noncode(b"--x", 0), None);
+    }
+
+    /// A caller that hands over "whatever follows the keyword" can arrive with
+    /// nothing left. That is `None` — the same answer as for a byte that starts
+    /// no literal — and not a panic on `b[0]` of an empty slice, which is how
+    /// `CREATE PROCEDURE \`p\`() COMMENT` used to take the process down through
+    /// the MySQL routine header reader.
+    #[test]
+    fn skip_noncode_on_an_empty_slice_is_none() {
+        assert_eq!(skip_noncode(b"", 0), None);
+        assert_eq!(skip_noncode(b"abc", 3), None);
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            assert_eq!(super::skip_noncode(b"", 0, d), None);
+        }
     }
 
     // ── The write guard (`run_verdict`) ──

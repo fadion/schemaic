@@ -1654,52 +1654,56 @@ async fn collect_schema(conn: &mut Conn, database: &str) -> Result<DbSchema, DbE
     //
     // `ORDINAL_POSITION = 0` is a *function's return value*, not a parameter;
     // left in, every function's rendered signature would open with its return
-    // type. `PARAMETER_MODE` is NULL for a function's parameters (they are all
-    // `IN`) and `COALESCE`s to the empty string, so the rendered list carries a
-    // mode only where the server states one.
+    // type. `PARAMETER_MODE` is reported as `IN` for a **function's** parameters
+    // too, where `CREATE FUNCTION` has no grammar for it — which is
+    // [`mysql_parameters`]' first job, and why the mode is not simply joined in
+    // here.
+    //
+    // `SQL_MODE`/`CHARACTER_SET_CLIENT`/`COLLATION_CONNECTION` are the session
+    // state the recreate has to restore, and the catalogue carries the same
+    // values `SHOW CREATE` prints. Read here so a draft is never without them:
+    // the editor's lazy `SHOW CREATE` corrects the *body*, and a keystroke that
+    // lands first must not be able to strip the wrapper off a `CREATE` whose
+    // `DROP` has already committed.
     let routine_rows: Vec<MyRoutineRow> = conn
         .exec_map(
             "SELECT CAST(ROUTINE_NAME AS CHAR) AS n, CAST(ROUTINE_TYPE AS CHAR) AS ty, \
                     CAST(COALESCE(DTD_IDENTIFIER, '') AS CHAR) AS rt, \
+                    CAST(CHARACTER_SET_NAME AS CHAR) AS rtcs, \
+                    CAST(COLLATION_NAME AS CHAR) AS rtcoll, \
                     CAST(ROUTINE_DEFINITION AS CHAR) AS body, \
                     CAST(IS_DETERMINISTIC AS CHAR) AS det, \
                     CAST(SQL_DATA_ACCESS AS CHAR) AS acc, \
                     CAST(SECURITY_TYPE AS CHAR) AS sec, \
                     CAST(DEFINER AS CHAR) AS df, \
-                    CAST(COALESCE(ROUTINE_COMMENT, '') AS CHAR) AS cmt \
+                    CAST(COALESCE(ROUTINE_COMMENT, '') AS CHAR) AS cmt, \
+                    CAST(SQL_MODE AS CHAR) AS sqlmode, \
+                    CAST(CHARACTER_SET_CLIENT AS CHAR) AS cscl, \
+                    CAST(COLLATION_CONNECTION AS CHAR) AS collconn \
              FROM information_schema.ROUTINES \
              WHERE ROUTINE_SCHEMA = ? ORDER BY ROUTINE_TYPE, ROUTINE_NAME",
             (database,),
-            |r: MyRoutineRow| r,
+            |r: Row| my_routine_row(&r),
         )
         .await
         .map_err(qerr)?;
-    let param_rows: Vec<(String, String, String, String, String)> = conn
+    let param_rows: Vec<MyParamRow> = conn
         .exec_map(
             "SELECT CAST(SPECIFIC_NAME AS CHAR) AS n, CAST(ROUTINE_TYPE AS CHAR) AS ty, \
                     CAST(COALESCE(PARAMETER_MODE, '') AS CHAR) AS mode, \
                     CAST(COALESCE(PARAMETER_NAME, '') AS CHAR) AS pname, \
-                    CAST(DTD_IDENTIFIER AS CHAR) AS dtd \
+                    CAST(DTD_IDENTIFIER AS CHAR) AS dtd, \
+                    CAST(CHARACTER_SET_NAME AS CHAR) AS cs, \
+                    CAST(COLLATION_NAME AS CHAR) AS coll \
              FROM information_schema.PARAMETERS \
              WHERE SPECIFIC_SCHEMA = ? AND ORDINAL_POSITION > 0 \
              ORDER BY SPECIFIC_NAME, ORDINAL_POSITION",
             (database,),
-            |r: (String, String, String, String, String)| r,
+            |r: MyParamRow| r,
         )
         .await
         .map_err(qerr)?;
-    let mut params: HashMap<(String, String), Vec<String>> = HashMap::new();
-    for (name, ty, mode, pname, dtd) in &param_rows {
-        let rendered = [mode.trim(), pname.trim(), dtd.trim()]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        params
-            .entry((name.clone(), ty.to_ascii_uppercase()))
-            .or_default()
-            .push(rendered);
-    }
+    let params = mysql_parameters(&param_rows);
 
     let mut schema = assemble_schema(
         // MySQL: the database is the namespace, so tables carry none.
@@ -2193,31 +2197,142 @@ fn apply_triggers(schema: &mut DbSchema, triggers: Vec<TriggerInfo>) {
     }
 }
 
-/// One `information_schema.ROUTINES` row: `(name, type, return type, body,
-/// deterministic, data access, security type, definer, comment)`.
+/// One `information_schema.ROUTINES` row, in the order `collect_schema` selects
+/// the columns.
+///
+/// A struct rather than the tuple its siblings here are, for two reasons: the
+/// query selects fourteen columns, past `mysql_common`'s twelve-element
+/// `FromRow` ceiling, and past the point where a positional `.6` in a test says
+/// anything about which column it means.
 ///
 /// The body is **nullable** — `ROUTINE_DEFINITION` is NULL for a routine the
 /// connected account can't see the definition of — and is the one column here
 /// that must not be trusted for an edit; see [`Db::routine_source`].
-type MyRoutineRow = (
+#[derive(Clone, Debug, Default)]
+struct MyRoutineRow {
+    name: String,
+    /// `ROUTINE_TYPE` — `FUNCTION` or `PROCEDURE`, as the server spells it.
+    kind: String,
+    /// `DTD_IDENTIFIER`: a function's return type, empty for a procedure.
+    returns: String,
+    /// The return type's declared character set and collation, which
+    /// `DTD_IDENTIFIER` does **not** carry. NULL for anything but a string type.
+    returns_charset: Option<String>,
+    returns_collation: Option<String>,
+    body: Option<String>,
+    deterministic: String,
+    data_access: String,
+    security: String,
+    definer: String,
+    comment: String,
+    /// The session state the routine was created under. See
+    /// [`schemaic_core::schema::RoutineSource`] for why a recreate has to
+    /// restore it.
+    sql_mode: Option<String>,
+    charset_client: Option<String>,
+    collation_connection: Option<String>,
+}
+
+/// Read one `information_schema.ROUTINES` row positionally.
+///
+/// Every column is `CAST(… AS CHAR)`, so a value that fails to convert is a
+/// server this app can't read at all; it degrades to the empty string (or
+/// `None`) here for the same reason the neighbouring queries `COALESCE` — a
+/// missing characteristic must not cost the whole schema.
+fn my_routine_row(r: &Row) -> MyRoutineRow {
+    let opt = |i: usize| r.get::<Option<String>, usize>(i).flatten();
+    let text = |i: usize| opt(i).unwrap_or_default();
+    MyRoutineRow {
+        name: text(0),
+        kind: text(1),
+        returns: text(2),
+        returns_charset: opt(3),
+        returns_collation: opt(4),
+        body: opt(5),
+        deterministic: text(6),
+        data_access: text(7),
+        security: text(8),
+        definer: text(9),
+        comment: text(10),
+        sql_mode: opt(11),
+        charset_client: opt(12),
+        collation_connection: opt(13),
+    }
+}
+
+/// One `information_schema.PARAMETERS` row: `(specific name, routine type, mode,
+/// parameter name, DTD_IDENTIFIER, character set, collation)`.
+type MyParamRow = (
+    String,
+    String,
     String,
     String,
     String,
     Option<String>,
-    String,
-    String,
-    String,
-    String,
-    String,
+    Option<String>,
 );
+
+/// Restate a declared character set and collation onto a type the catalogue
+/// publishes without them.
+///
+/// `DTD_IDENTIFIER` renders `longtext`, never `longtext CHARACTER SET utf8mb3`,
+/// and the two clauses live in their own columns. A recreate that emits only the
+/// type re-declares the parameter under the *database's* default character set —
+/// a silent change to what the routine accepts, with nothing on screen to say
+/// so. MySQL reports both columns only for string types, so a non-NULL value is
+/// exactly the case that needs restating.
+fn mysql_type_with_charset(dtd: &str, charset: Option<&str>, collation: Option<&str>) -> String {
+    let mut out = dtd.trim().to_string();
+    if out.is_empty() {
+        return out;
+    }
+    if let Some(cs) = charset.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(" CHARACTER SET ");
+        out.push_str(cs);
+    }
+    if let Some(coll) = collation.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(" COLLATE ");
+        out.push_str(coll);
+    }
+    out
+}
+
+/// Fold `information_schema.PARAMETERS` into the rendered parameter list each
+/// routine's emitter wants, keyed by name **and kind** because a function and a
+/// procedure may share a name.
+///
+/// **The mode is rendered only for a procedure.** The catalogue reports
+/// `PARAMETER_MODE = 'IN'` for a function's parameters too, but `CREATE
+/// FUNCTION`'s grammar is `param_name type` — the mode keywords belong to
+/// `proc_parameter` alone, and both vendors' manuals say specifying one "is
+/// valid only for a PROCEDURE". Joining the mode in for a function emitted a
+/// `CREATE` the server answers 1064 to, *after* the recreate's `DROP` had
+/// committed on its own: the function was destroyed and nothing replaced it.
+fn mysql_parameters(rows: &[MyParamRow]) -> HashMap<(String, String), Vec<String>> {
+    let mut params: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for (name, ty, mode, pname, dtd, charset, collation) in rows {
+        let kind = ty.to_ascii_uppercase();
+        let mode = if kind == "PROCEDURE" { mode.trim() } else { "" };
+        let dtd = mysql_type_with_charset(dtd, charset.as_deref(), collation.as_deref());
+        let rendered = [mode, pname.trim(), dtd.as_str()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        params
+            .entry((name.clone(), kind))
+            .or_default()
+            .push(rendered);
+    }
+    params
+}
 
 /// Fold MySQL's `information_schema.ROUTINES` rows into [`RoutineInfo`]s.
 ///
 /// `arguments` arrives separately, from `information_schema.PARAMETERS`: that
 /// table has one row per parameter and MySQL has no rendered-signature column at
 /// all, so the `IN a INT, OUT b TEXT` form the emitter and the tree both want is
-/// rebuilt here. `params` is keyed by routine name **and kind**, because a
-/// function and a procedure may share a name.
+/// rebuilt by [`mysql_parameters`].
 ///
 /// A function's own return value is `PARAMETERS` ordinal **0**, which is why the
 /// caller's query excludes it: folded in, every function's parameter list would
@@ -2227,41 +2342,48 @@ fn mysql_routines(
     params: &HashMap<(String, String), Vec<String>>,
 ) -> Vec<RoutineInfo> {
     rows.iter()
-        .map(
-            |(name, ty, returns, body, deterministic, access, security, definer, comment)| {
-                let kind = schemaic_core::schema::RoutineKind::parse(ty);
-                let some = |s: &String| Some(s.clone()).filter(|s| !s.is_empty());
-                RoutineInfo {
-                    name: name.clone(),
-                    // MySQL has no namespace level: the database *is* the
-                    // namespace, exactly as it is for a table.
-                    schema: None,
-                    kind,
-                    arguments: params
-                        .get(&(name.clone(), ty.to_ascii_uppercase()))
-                        .map(|p| p.join(", "))
-                        .unwrap_or_default(),
-                    // A procedure's `DTD_IDENTIFIER` is NULL and arrives as the
-                    // empty string, which is what the model wants there.
-                    returns: returns.clone(),
-                    // Everything MySQL stores is `SQL`; the column reports it and
-                    // the emitter never writes a `LANGUAGE` clause for it.
-                    language: "SQL".to_string(),
-                    body: body.clone().unwrap_or_default(),
-                    deterministic: deterministic.eq_ignore_ascii_case("YES"),
-                    data_access: schemaic_core::schema::SqlDataAccess::parse(access),
-                    // **DEFINER is this engine's default**, the opposite of
-                    // PostgreSQL's — so an unreadable value must not fall to
-                    // `false` and quietly re-declare the routine as INVOKER.
-                    security_definer: !security.eq_ignore_ascii_case("INVOKER"),
-                    definer: some(definer),
-                    comment: some(comment),
-                    // PostgreSQL's, and the session state that only
-                    // `SHOW CREATE` carries.
-                    ..Default::default()
-                }
-            },
-        )
+        .map(|r| {
+            let kind = schemaic_core::schema::RoutineKind::parse(&r.kind);
+            let some = |s: &String| Some(s.clone()).filter(|s| !s.is_empty());
+            RoutineInfo {
+                name: r.name.clone(),
+                // MySQL has no namespace level: the database *is* the
+                // namespace, exactly as it is for a table.
+                schema: None,
+                kind,
+                arguments: params
+                    .get(&(r.name.clone(), r.kind.to_ascii_uppercase()))
+                    .map(|p| p.join(", "))
+                    .unwrap_or_default(),
+                // A procedure's `DTD_IDENTIFIER` is NULL and arrives as the
+                // empty string, which is what the model wants there.
+                returns: mysql_type_with_charset(
+                    &r.returns,
+                    r.returns_charset.as_deref(),
+                    r.returns_collation.as_deref(),
+                ),
+                // Everything MySQL stores is `SQL`; the column reports it and
+                // the emitter never writes a `LANGUAGE` clause for it.
+                language: "SQL".to_string(),
+                body: r.body.clone().unwrap_or_default(),
+                deterministic: r.deterministic.eq_ignore_ascii_case("YES"),
+                data_access: schemaic_core::schema::SqlDataAccess::parse(&r.data_access),
+                // **DEFINER is this engine's default**, the opposite of
+                // PostgreSQL's — so an unreadable value must not fall to
+                // `false` and quietly re-declare the routine as INVOKER.
+                security_definer: !r.security.eq_ignore_ascii_case("INVOKER"),
+                definer: some(&r.definer),
+                comment: some(&r.comment),
+                // The catalogue carries the same session state `SHOW CREATE`
+                // prints, so a draft has it from the first frame and the lazy
+                // read only ever corrects the *body*.
+                sql_mode: r.sql_mode.clone(),
+                charset_client: r.charset_client.clone(),
+                collation_connection: r.collation_connection.clone(),
+                // PostgreSQL's.
+                ..Default::default()
+            }
+        })
         .collect()
 }
 
@@ -4695,20 +4817,32 @@ mod tests {
     fn routine_body_is_none_when_the_text_is_not_understood() {
         assert_eq!(routine_body_of("not a create statement"), None);
         assert_eq!(routine_body_of("CREATE PROCEDURE `p`() NO SQL"), None);
+        // Nothing at all after the keyword: the `COMMENT` arm used to index
+        // byte 0 of an empty slice and take the process down rather than
+        // degrade to the body it already had.
+        assert_eq!(routine_body_of("CREATE PROCEDURE `p`() COMMENT"), None);
     }
 
     fn rr(name: &str, ty: &str, returns: &str) -> MyRoutineRow {
-        (
-            s(name),
-            s(ty),
-            s(returns),
-            Some(s("BEGIN SELECT 1; END")),
-            s("NO"),
-            s("READS_SQL_DATA"),
-            s("DEFINER"),
-            s("root@localhost"),
-            s("hello"),
-        )
+        MyRoutineRow {
+            name: s(name),
+            kind: s(ty),
+            returns: s(returns),
+            body: Some(s("BEGIN SELECT 1; END")),
+            deterministic: s("NO"),
+            data_access: s("READS_SQL_DATA"),
+            security: s("DEFINER"),
+            definer: s("root@localhost"),
+            comment: s("hello"),
+            ..Default::default()
+        }
+    }
+
+    /// A `PARAMETERS` row as the server sends one. The mode is what the server
+    /// states, **including for a function** — see
+    /// [`mysql_parameters_drop_the_mode_from_a_functions_parameters`].
+    fn pr(name: &str, ty: &str, mode: &str, pname: &str, dtd: &str) -> MyParamRow {
+        (s(name), s(ty), s(mode), s(pname), s(dtd), None, None)
     }
 
     /// The rendered parameter list is rebuilt from `PARAMETERS`, because MySQL
@@ -4716,12 +4850,11 @@ mod tests {
     /// a procedure and a function of the same name don't take each other's.
     #[test]
     fn mysql_routines_render_their_parameter_lists_per_kind() {
-        let mut params: HashMap<(String, String), Vec<String>> = HashMap::new();
-        params.insert(
-            (s("go"), s("PROCEDURE")),
-            vec![s("IN sku VARCHAR(20)"), s("OUT n INT")],
-        );
-        params.insert((s("go"), s("FUNCTION")), vec![s("n INT")]);
+        let params = mysql_parameters(&[
+            pr("go", "PROCEDURE", "IN", "sku", "VARCHAR(20)"),
+            pr("go", "PROCEDURE", "OUT", "n", "INT"),
+            pr("go", "FUNCTION", "IN", "n", "INT"),
+        ]);
         let out = mysql_routines(
             &[rr("go", "PROCEDURE", ""), rr("go", "FUNCTION", "int")],
             &params,
@@ -4732,6 +4865,82 @@ mod tests {
         assert_eq!(out[1].kind, schemaic_core::schema::RoutineKind::Function);
         assert_eq!(out[1].arguments, "n INT");
         assert_eq!(out[1].returns, "int");
+    }
+
+    /// The catalogue reports `PARAMETER_MODE = 'IN'` for a **function's**
+    /// parameters — measured on MariaDB 10.11 — and `CREATE FUNCTION` has no
+    /// grammar for it. Emitting it cost the routine: the recreate's `DROP` had
+    /// already committed when the `CREATE` came back 1064.
+    #[test]
+    fn mysql_parameters_drop_the_mode_from_a_functions_parameters() {
+        let params = mysql_parameters(&[
+            pr("f", "FUNCTION", "IN", "n", "INT"),
+            pr("p", "PROCEDURE", "IN", "n", "INT"),
+            pr("p", "PROCEDURE", "INOUT", "acc", "DECIMAL(9,2)"),
+        ]);
+        assert_eq!(params[&(s("f"), s("FUNCTION"))], vec![s("n INT")]);
+        assert_eq!(
+            params[&(s("p"), s("PROCEDURE"))],
+            vec![s("IN n INT"), s("INOUT acc DECIMAL(9,2)")]
+        );
+    }
+
+    /// `DTD_IDENTIFIER` renders `longtext`, never the character set the
+    /// parameter was declared with — that lives in its own column. A recreate
+    /// that dropped it re-declared the parameter under the database default.
+    #[test]
+    fn mysql_routines_keep_a_parameters_character_set() {
+        let params = mysql_parameters(&[(
+            s("execute_prepared_stmt"),
+            s("PROCEDURE"),
+            s("IN"),
+            s("in_query"),
+            s("longtext"),
+            Some(s("utf8mb3")),
+            Some(s("utf8mb3_general_ci")),
+        )]);
+        assert_eq!(
+            params[&(s("execute_prepared_stmt"), s("PROCEDURE"))],
+            vec![s(
+                "IN in_query longtext CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci"
+            )]
+        );
+
+        // The same column pair on `ROUTINES` is a function's *return* type.
+        let mut row = rr("extract_schema", "FUNCTION", "varchar(64)");
+        row.returns_charset = Some(s("utf8mb3"));
+        row.returns_collation = Some(s("utf8mb3_general_ci"));
+        let out = mysql_routines(&[row], &HashMap::new());
+        assert_eq!(
+            out[0].returns,
+            "varchar(64) CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci"
+        );
+
+        // NULL for every non-string type, and a procedure has no return type at
+        // all — neither may grow a dangling clause.
+        assert_eq!(mysql_type_with_charset("int", None, None), "int");
+        assert_eq!(mysql_type_with_charset("", Some("utf8mb4"), None), "");
+    }
+
+    /// The session state a recreate has to restore comes from the catalogue, so
+    /// a draft carries it from the first frame — the editor's lazy
+    /// `SHOW CREATE` only ever corrects the body.
+    #[test]
+    fn mysql_routines_carry_the_session_state_a_recreate_restores() {
+        let mut row = rr("rewards_report", "PROCEDURE", "");
+        row.sql_mode = Some(s("STRICT_TRANS_TABLES,TRADITIONAL"));
+        row.charset_client = Some(s("utf8mb3"));
+        row.collation_connection = Some(s("utf8mb3_general_ci"));
+        let out = mysql_routines(&[row], &HashMap::new());
+        assert_eq!(
+            out[0].sql_mode.as_deref(),
+            Some("STRICT_TRANS_TABLES,TRADITIONAL")
+        );
+        assert_eq!(out[0].charset_client.as_deref(), Some("utf8mb3"));
+        assert_eq!(
+            out[0].collation_connection.as_deref(),
+            Some("utf8mb3_general_ci")
+        );
     }
 
     /// Every characteristic the emitter has to restate is read, and the
@@ -4755,7 +4964,7 @@ mod tests {
         assert_eq!(r.language, "SQL");
 
         let mut invoker = rr("p", "PROCEDURE", "");
-        invoker.6 = s("INVOKER");
+        invoker.security = s("INVOKER");
         assert!(!mysql_routines(&[invoker], &HashMap::new())[0].security_definer);
     }
 
@@ -4764,7 +4973,7 @@ mod tests {
     #[test]
     fn mysql_routines_tolerate_an_unreadable_body() {
         let mut row = rr("p", "PROCEDURE", "");
-        row.3 = None;
+        row.body = None;
         assert!(mysql_routines(&[row], &HashMap::new())[0].body.is_empty());
     }
 

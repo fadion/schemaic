@@ -77,6 +77,10 @@ fn open(ui: &Ui, target: RoutineTarget, draft: RoutineDraft) {
     // now for the wrong target and must not land.
     d.session.update(|g| *g += 1);
     d.routine_draft.set(draft);
+    // Cleared here rather than on close, so the one path that raises it —
+    // `fetch_source`, at the end of this function — is the only one that can
+    // leave it raised.
+    d.routine_source_pending.set(false);
     d.view_rows.set(BODY_ROWS);
     d.error.set(None);
     d.preview.set(None);
@@ -199,10 +203,17 @@ fn taken_names(ui: &Ui, database: &str, schema: Option<&str>, kind: RoutineKind)
 /// routine open already-changed against a `current` that still held the resolved
 /// body, and the footer would say "1 change" over an edit nobody made.
 ///
-/// A draft the user has already edited is left alone — the round trip lands in
-/// milliseconds, but "unlikely" is not a reason to overwrite what somebody
+/// A draft the user has already edited keeps its **body** — the round trip lands
+/// in milliseconds, but "unlikely" is not a reason to overwrite what somebody
 /// typed. The body the editor *opened* with is what says whether they have, so
-/// it is read before `current` is corrected.
+/// it is read before `current` is corrected. The session state is patched either
+/// way: it is not editable anywhere in the app, and the `CREATE` it wraps is
+/// preceded by a `DROP` that commits on its own, so a keystroke landing first
+/// must not be able to strip the wrapper off it.
+///
+/// Until this lands, Preview is disabled (`routine_source_pending`) — the draft
+/// is holding `information_schema`'s escape-resolved copy, and a routine
+/// recreated from that is not the one that was there.
 ///
 /// The session guard is what makes a slow reply safe — the user can close this
 /// modal and open another routine while the read is in flight.
@@ -220,15 +231,21 @@ fn fetch_source(ui: &Ui) {
     }
     let session = d.session.get_untracked();
     let name = current.name.clone();
+    d.routine_source_pending.set(true);
     let done: RoutineSrcDoneFn = Rc::new(move |asked: String, src| {
-        // A late reply for a routine this modal is no longer editing.
+        // A late reply for a routine this modal is no longer editing. The flag
+        // belongs to *that* session and was cleared with it.
         if d.session.get_untracked() != session {
             return;
         }
-        let Some(src) = src else { return };
         if asked != name {
             return;
         }
+        // Cleared even for a failed read: a role without `SHOW_ROUTINE` gets
+        // `information_schema`'s body and always will, so waiting past this
+        // point would disable Preview for good.
+        d.routine_source_pending.set(false);
+        let Some(src) = src else { return };
         let opened_with = d.routine.with_untracked(|t| {
             t.as_ref()
                 .and_then(|t| t.current.as_ref())
@@ -243,8 +260,9 @@ fn fetch_source(ui: &Ui) {
             }
         });
         d.routine_draft.update(|dr| {
+            src.apply_session_to(&mut dr.info);
             if opened_with.as_deref() == Some(dr.info.body.as_str()) {
-                src.apply_to(&mut dr.info);
+                src.apply_body_to(&mut dr.info);
             }
         });
     });
@@ -709,11 +727,16 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
             let ui = ui.clone();
             let dialect = target.dialect;
             let title = match &target.current {
+                // The parameter list is part of the title where the engine
+                // overloads: a remembered palette hit resolves by name alone, so
+                // this is what says *which* `add` is open before Apply rewrites
+                // it.
                 Some(f) => format!(
-                    "Edit {} {}.{}",
+                    "Edit {} {}.{}{}",
                     f.kind.label(),
                     object_location(&target.database, f.schema.as_deref()),
-                    f.name
+                    f.name,
+                    f.identity_suffix(dialect)
                 ),
                 // A new routine's namespace isn't chosen — it is *inherited*
                 // from wherever the modal was opened, so the title is where it
@@ -742,8 +765,16 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
 
             let status_target = target.clone();
             let status = dyn_container(
-                move || d.routine_draft.get(),
-                move |draft| {
+                move || (d.routine_draft.get(), d.routine_source_pending.get()),
+                move |(draft, pending)| {
+                    // Said before the change count, because until the source
+                    // lands the count is over `information_schema`'s resolved
+                    // body rather than the routine as written.
+                    if pending {
+                        return text("Reading the routine's source…")
+                            .style(|s| s.color(theme::text_faint()).font_size(theme::FONT_LABEL))
+                            .into_any();
+                    }
                     let errs = draft.validate(dialect);
                     if let Some(first) = errs.first() {
                         return text(first.clone())
@@ -775,13 +806,16 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
             let preview_target = target.clone();
             let ring_actions = ring.clone();
             let actions = dyn_container(
-                move || d.routine_draft.get(),
-                move |draft| {
+                move || (d.routine_draft.get(), d.routine_source_pending.get()),
+                move |(draft, pending)| {
                     let ui = preview_ui.clone();
                     let target = preview_target.clone();
                     let ring = ring_actions.clone();
                     let cs = change_set(&target, &draft);
-                    let ready = draft.validate(dialect).is_empty() && !cs.is_empty();
+                    // `!pending`: the draft is still on the escape-resolved
+                    // copy until the `SHOW CREATE` lands, and a MySQL recreate
+                    // `DROP`s before it `CREATE`s.
+                    let ready = !pending && draft.validate(dialect).is_empty() && !cs.is_empty();
                     let subject = draft.info.name.clone();
                     h_stack((
                         action_button(

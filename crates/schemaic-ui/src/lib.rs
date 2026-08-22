@@ -604,6 +604,14 @@ pub struct DdlUi {
     /// The routine editor's target; doubles as its open flag.
     pub routine: RwSignal<Option<RoutineTarget>>,
     pub routine_draft: RwSignal<schemaic_core::ddl::RoutineDraft>,
+    /// Whether the routine editor is still waiting for its `SHOW CREATE`.
+    ///
+    /// MySQL only, and load-bearing rather than cosmetic: until the read lands
+    /// the draft holds `information_schema`'s **escape-resolved** copy of the
+    /// body, and applying that recreates a routine whose literals are no longer
+    /// what was written — after a `DROP` that committed on its own. So Preview
+    /// waits for it, and the footer says why.
+    pub routine_source_pending: RwSignal<bool>,
     /// The object editor's target; doubles as its open flag.
     pub object: RwSignal<Option<ObjectTarget>>,
     /// The enum / domain / sequence being edited. Same rule as `draft`: one
