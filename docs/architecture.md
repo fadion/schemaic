@@ -2820,6 +2820,18 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     terminal panel. The shared types living in the crate root is what stalls further splitting: the
     root depends on the leaves (`mod`) and the leaves depend on the root (types), so a view builder
     can't move out until the types do.
+    **A first launch saves nothing and selects nothing.** `app_view` used to seed a "Local
+    MariaDB" connection (127.0.0.1:3306, this repo's development credentials) whenever the loaded
+    list came back empty, and write it to disk on the spot — so a fresh install opened onto a
+    connection its user never made and probably couldn't reach, and deleting `connections.json`
+    only made the next launch write it back. It is gone; the empty list stands, and the header's
+    button is what that state offers. `Connection::startup_active_id(saved, &connections)` picks the
+    active id — the saved one while it still names a connection, else the first, else
+    `next_id(&[])`, **the id the first connection saved this session will take**, because
+    `save_conn` loads the schema for a connection only when it is the active one and a new user's
+    first connection should connect on save rather than wait to be selected. That last arm was
+    unreachable while the seed existed and read `unwrap_or(1)`; the number is the same and the
+    coupling to `next_id` is the part under test.
     The header's **connection trigger** is one slot with two occupants, chosen by
     `connections.is_empty()`: the switcher normally, and on a first run with nothing saved a
     `New connection` button in the accent that drafts a connection and opens Manage Connections in
