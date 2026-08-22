@@ -1069,8 +1069,8 @@ fn conn_form(
     //
     // The hint under it changes with the level and always names the consequence
     // — a picker whose options read "Schema only / Only what I attach / Let it
-    // read data" is choosable without knowing that the last two send rows to
-    // Anthropic, so the sentence says so.
+    // read data" is choosable without knowing that the last two send rows off
+    // this machine, so the sentence says so.
     let ai_data_field = v_stack((
         text("AI data access").style(form_label_style),
         container(focusable_dropdown(

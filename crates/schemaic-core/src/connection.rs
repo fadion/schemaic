@@ -221,18 +221,23 @@ impl AiData {
 
     /// The one-line consequence, shown under the picker. Each says plainly that
     /// rows leave the machine, because that is the fact a label can't carry.
+    ///
+    /// It says *that* they leave, never who receives them: the recipient is
+    /// whichever assistant the CLI is pointed at, so naming one would be copy
+    /// that goes stale and reads as an endorsement, while the fact being
+    /// consented to is the same either way (`no_level_names_a_vendor`).
     pub fn hint(self) -> &'static str {
         match self {
             AiData::SchemaOnly => {
                 "Names and types only. No row ever leaves this machine — attaching is refused."
             }
             AiData::OnRequest => {
-                "The assistant reads no data on its own. Rows you attach from a result are \
-                 sent to Anthropic with that question."
+                "The assistant reads no data on its own. Rows you attach from a result leave \
+                 this machine with that question."
             }
             AiData::Full => {
                 "The assistant may run read-only queries and read sample rows by itself. \
-                 Whatever it reads is sent to Anthropic."
+                 Whatever it reads leaves this machine."
             }
         }
     }
@@ -734,12 +739,29 @@ mod tests {
     #[test]
     fn every_level_says_the_rows_leave_the_machine() {
         // The hint is the consent copy; a level that doesn't name the
-        // consequence is the setting people click through.
+        // consequence is the setting people click through. The consequence is
+        // that the rows leave the user's machine — which is what they are
+        // consenting to, and it is true whichever assistant is on the other end.
         for lvl in AiData::ALL {
             assert!(!lvl.label().is_empty());
             let hint = lvl.hint();
-            let names_it = hint.contains("Anthropic") || hint.contains("leaves this machine");
-            assert!(names_it, "{:?}: {hint}", lvl);
+            assert!(hint.contains("this machine"), "{:?}: {hint}", lvl);
+        }
+    }
+
+    /// Naming a vendor in the consent line dates it and buys nothing: the fact
+    /// that matters is that the rows leave, not who receives them, and Schemaic
+    /// is not the place to advertise whoever is behind the CLI it drives.
+    #[test]
+    fn no_level_names_a_vendor() {
+        for lvl in AiData::ALL {
+            for vendor in ["Anthropic", "Claude", "OpenAI", "ChatGPT"] {
+                assert!(
+                    !lvl.hint().contains(vendor) && !lvl.label().contains(vendor),
+                    "{:?} names {vendor}",
+                    lvl
+                );
+            }
         }
     }
 

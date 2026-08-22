@@ -720,7 +720,7 @@ const ATTACH_VIEW_CHARS: usize = 200;
 ///
 /// It is the last point before data leaves the machine, so it says how much and
 /// from where, and its × is a real cancel — the one gesture between "I clicked
-/// Attach" and "my customers' rows went to Anthropic". Absent (zero height) when
+/// Attach" and "my customers' rows left this machine". Absent (zero height) when
 /// nothing is staged.
 fn attachment_chip(
     staged: RwSignal<Option<schemaic_core::transcript::Attachment>>,
