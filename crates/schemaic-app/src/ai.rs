@@ -31,16 +31,27 @@ use schemaic_ui::{AiEffort, AiModel, ConnNode, InlineAiRequest, SchemaScope, Tab
 use crate::claude_cli::claude_bin;
 
 // ===== moved from main.rs (AI session + context) =====
+// The `claude` CLI runs non-interactively, so a tool that isn't named here has
+// no one to approve it: the call is denied outright. Both lists must therefore
+// name every tool `mcp::tools_list` offers at that level, which
+// `every_offered_tool_is_allow_listed_at_its_level` holds them to.
 const AI_TOOLS_WITH_QUERY: &[&str] = &[
     "mcp__schemaic__run_query",
     "mcp__schemaic__list_schema",
     "mcp__schemaic__describe_table",
+    "mcp__schemaic__propose_table_change",
 ];
 // `describe_table` stays available with queries off — it's a schema tool, and the
 // server drops its sample-rows section when the endpoint says samples are off.
+// `run_query` is withheld at both ends: absent from this allow-list, and absent
+// from the MCP server's own `tools/list` so the model never plans a turn around
+// a tool it would only be denied on (see `mcp::tools_list`).
+// `propose_table_change` is on both lists: it reads the table's *structure* and
+// runs nothing, which is not the access `AiData` gates.
 const AI_TOOLS_READ_ONLY: &[&str] = &[
     "mcp__schemaic__list_schema",
     "mcp__schemaic__describe_table",
+    "mcp__schemaic__propose_table_change",
 ];
 
 /// A live AI conversation: the CLI child's stdin channel plus which connection
@@ -96,10 +107,12 @@ impl Drop for AiSession {
 pub(crate) struct McpEndpoint {
     pub(crate) db: Db,
     pub(crate) database: Option<String>,
-    /// Mirrors the AI panel's "run queries" setting. `describe_table` is a schema
-    /// tool the assistant keeps either way, but its sample-rows section reads
-    /// real data — so with queries off, the section is dropped rather than the
-    /// whole tool.
+    /// Mirrors the AI panel's "run queries" setting — the one flag the MCP
+    /// subprocess has for [`AiData::may_query`]. With it off the server neither
+    /// advertises nor answers `run_query` (`mcp::tools_list`, `mcp::refusal_for`).
+    /// `describe_table` is a schema tool the assistant keeps either way, but its
+    /// sample-rows section reads real data — so that section is dropped rather
+    /// than the whole tool.
     pub(crate) samples: bool,
     /// Databases the SCHEMA eye has hidden, as of the moment this session was
     /// spawned. `list_schema`'s server overview leaves them out — see
@@ -1212,6 +1225,39 @@ fn render_inline_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every tool the MCP server advertises at a level is allow-listed at that
+    /// level, and nothing else is. Two lists written in two files drift: the
+    /// server offered `propose_table_change` from the day it was added while
+    /// neither allow-list named it, so the call the assistant made to check a
+    /// change against the live table was denied — and the failure is invisible,
+    /// because the model falls back to writing the fenced block from the schema
+    /// it already has and the user sees a preview either way.
+    #[test]
+    fn every_offered_tool_is_allow_listed_at_its_level() {
+        for (allowed, reads_data) in [(AI_TOOLS_WITH_QUERY, true), (AI_TOOLS_READ_ONLY, false)] {
+            for engine in [
+                schemaic_db::Engine::MySql,
+                schemaic_db::Engine::Postgres,
+                schemaic_db::Engine::Sqlite,
+            ] {
+                let mut offered: Vec<String> = crate::mcp::tools_list(engine, reads_data)
+                    .as_array()
+                    .expect("a list")
+                    .iter()
+                    .map(|t| format!("mcp__schemaic__{}", t["name"].as_str().expect("a name")))
+                    .collect();
+                offered.sort();
+                let mut allowed: Vec<String> = allowed.iter().map(|t| (*t).to_string()).collect();
+                allowed.sort();
+                assert_eq!(
+                    offered, allowed,
+                    "{engine:?} at reads_data={reads_data}: the server's tools and the \
+                     allow-list disagree"
+                );
+            }
+        }
+    }
 
     #[test]
     fn extract_sql_returns_bare_text_unchanged() {

@@ -66,7 +66,7 @@ pub async fn serve(endpoint: crate::ai::McpEndpoint) {
     let crate::ai::McpEndpoint {
         db,
         database,
-        samples,
+        samples: reads_data,
         hidden,
     } = endpoint;
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -94,7 +94,7 @@ pub async fn serve(endpoint: crate::ai::McpEndpoint) {
                     "serverInfo": { "name": "schemaic", "version": env!("CARGO_PKG_VERSION") }
                 }))
             }
-            "tools/list" => Some(json!({ "tools": tools_list(db.engine()) })),
+            "tools/list" => Some(json!({ "tools": tools_list(db.engine(), reads_data) })),
             "tools/call" => {
                 let name = req
                     .pointer("/params/name")
@@ -105,7 +105,7 @@ pub async fn serve(endpoint: crate::ai::McpEndpoint) {
                     .pointer("/params/arguments")
                     .cloned()
                     .unwrap_or(json!({}));
-                Some(call_tool(&db, database.as_deref(), samples, &hidden, &name, &args).await)
+                Some(call_tool(&db, database.as_deref(), reads_data, &hidden, &name, &args).await)
             }
             "ping" => Some(json!({})),
             // Unknown request → empty result; notifications (no id) → nothing.
@@ -120,6 +120,31 @@ pub async fn serve(endpoint: crate::ai::McpEndpoint) {
     }
 }
 
+/// Which tools read row data, and so exist only on a connection whose
+/// [`AiData`](schemaic_core::connection::AiData) level lets the assistant fetch
+/// rows for itself.
+///
+/// One predicate, consulted twice — [`tools_list`] leaves the tool out and
+/// [`refusal_for`] turns a call to it away — so a tool can never be advertised
+/// by one rule and denied by another.
+fn reads_row_data(tool: &str) -> bool {
+    tool == "run_query"
+}
+
+/// What the server says when a withheld tool is called anyway. It names the
+/// setting, because the model's next move should be to ask the user for the
+/// values (or to change the level) rather than to retry the same call.
+const NO_DATA_ACCESS: &str = "Refused: this connection's AI data access is set so the assistant \
+     reads no rows on its own, so run_query is unavailable. Ask the user for the values you need \
+     — they can attach rows from a result grid, or raise the connection's AI data access \
+     setting.";
+
+/// The refusal a tool call earns from the connection's data-access level, if
+/// any. Pure, so the gate is unit-tested without a live endpoint.
+fn refusal_for(tool: &str, reads_data: bool) -> Option<&'static str> {
+    (!reads_data && reads_row_data(tool)).then_some(NO_DATA_ACCESS)
+}
+
 /// The tools this server offers, described for **this** connection's engine.
 ///
 /// `run_query`'s advertised statement heads come from
@@ -128,10 +153,16 @@ pub async fn serve(endpoint: crate::ai::McpEndpoint) {
 /// connection accepted `SHOW TABLES` and `DESCRIBE t`, which SQLite has no syntax
 /// for, so a model reasoning from the tool's own text would spend turns on
 /// statements that could only ever come back as parser errors.
-fn tools_list(engine: schemaic_db::Engine) -> Value {
+///
+/// `reads_data` is the connection's level: with it off, the tools that read rows
+/// are not advertised at all. Listing a tool and then denying the call is worse
+/// than not listing it — the model plans a turn around the tool it can see,
+/// offers the user an analysis it cannot deliver, and only discovers the denial
+/// once the user has said yes.
+pub(crate) fn tools_list(engine: schemaic_db::Engine, reads_data: bool) -> Value {
     let dialect = engine.dialect();
     let heads = schemaic_core::sql::read_only_heads(dialect).join("/");
-    json!([
+    let mut tools = json!([
         {
             "name": "run_query",
             "description": format!(
@@ -243,17 +274,27 @@ fn tools_list(engine: schemaic_db::Engine) -> Value {
                 "required": ["table", "ops"]
             }
         }
-    ])
+    ]);
+    if !reads_data && let Some(list) = tools.as_array_mut() {
+        list.retain(|t| !reads_row_data(t["name"].as_str().unwrap_or("")));
+    }
+    tools
 }
 
 async fn call_tool(
     db: &Db,
     database: Option<&str>,
-    samples: bool,
+    reads_data: bool,
     hidden: &HashSet<String>,
     name: &str,
     args: &Value,
 ) -> Value {
+    // The level gates the call as well as the listing: a client working from a
+    // stale `tools/list` must not reach the DB through a tool this connection
+    // withheld.
+    if let Some(why) = refusal_for(name, reads_data) {
+        return json!({ "content": [ { "type": "text", "text": why } ], "isError": true });
+    }
     let arg = |key: &str| {
         args.get(key)
             .and_then(|s| s.as_str())
@@ -266,7 +307,7 @@ async fn call_tool(
         }
         "list_schema" => list_schema(db, arg("database"), database, hidden).await,
         "describe_table" => match arg("table") {
-            Some(table) => describe_table(db, database, arg("database"), table, samples).await,
+            Some(table) => describe_table(db, database, arg("database"), table, reads_data).await,
             None => ("describe_table needs a `table`.".to_string(), true),
         },
         "propose_table_change" => propose_change(db, database, arg("database"), args).await,
@@ -748,10 +789,87 @@ async fn propose_change(
 #[cfg(test)]
 mod tests {
     use super::{
-        HashSet, SUPPORTED_PROTOCOLS, dialect_of, find_described, format_database_list,
-        format_database_schema, format_table, format_table_detail, format_table_heading,
-        listed_databases, negotiate_protocol, normalize_stmt, proposal_from_args,
+        HashSet, NO_DATA_ACCESS, SUPPORTED_PROTOCOLS, dialect_of, find_described,
+        format_database_list, format_database_schema, format_table, format_table_detail,
+        format_table_heading, listed_databases, negotiate_protocol, normalize_stmt,
+        proposal_from_args, reads_row_data, refusal_for,
     };
+
+    /// Tool names the server advertises, in order.
+    fn offered(engine: schemaic_db::Engine, reads_data: bool) -> Vec<String> {
+        super::tools_list(engine, reads_data)
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|t| t["name"].as_str().expect("a name").to_string())
+            .collect()
+    }
+
+    /// A connection that lets the assistant read rows is offered every tool.
+    #[test]
+    fn the_query_tool_is_offered_when_the_connection_sends_rows() {
+        for engine in [
+            schemaic_db::Engine::MySql,
+            schemaic_db::Engine::Postgres,
+            schemaic_db::Engine::Sqlite,
+        ] {
+            assert!(
+                offered(engine, true).contains(&"run_query".to_string()),
+                "{engine:?} withholds run_query from a connection that allows it"
+            );
+        }
+    }
+
+    /// The tool is *withheld*, not merely refused, when the connection sends no
+    /// rows on the assistant's own initiative. A model that can see the tool
+    /// plans around it — it offers to "run a query and analyse the results for
+    /// you", the user says yes, and only then does the call come back denied.
+    /// Nothing in a system prompt reliably outranks a tool the model can see, so
+    /// the listing is where the setting has to bite.
+    #[test]
+    fn the_query_tool_is_withheld_when_the_connection_sends_no_rows() {
+        for engine in [
+            schemaic_db::Engine::MySql,
+            schemaic_db::Engine::Postgres,
+            schemaic_db::Engine::Sqlite,
+        ] {
+            let names = offered(engine, false);
+            assert!(
+                !names.contains(&"run_query".to_string()),
+                "{engine:?} still advertises run_query: {names:?}"
+            );
+            // The schema tools are untouched — the level withholds *data*, not
+            // the ability to look at the shape of the database.
+            for kept in ["list_schema", "describe_table", "propose_table_change"] {
+                assert!(
+                    names.contains(&kept.to_string()),
+                    "{engine:?} dropped {kept}: {names:?}"
+                );
+            }
+        }
+    }
+
+    /// One predicate decides both halves, so a tool can never be listed by one
+    /// rule and refused by another.
+    #[test]
+    fn only_the_query_tool_counts_as_reading_rows() {
+        assert!(reads_row_data("run_query"));
+        for schema_tool in ["list_schema", "describe_table", "propose_table_change"] {
+            assert!(!reads_row_data(schema_tool));
+        }
+    }
+
+    /// A client that calls the withheld tool anyway — an older `claude` that
+    /// cached the listing, or one that never asked — is refused by the server
+    /// itself, and told which setting to point the user at.
+    #[test]
+    fn a_call_to_the_withheld_tool_is_refused_with_the_reason() {
+        assert_eq!(refusal_for("run_query", false), Some(NO_DATA_ACCESS));
+        assert_eq!(refusal_for("run_query", true), None);
+        for schema_tool in ["list_schema", "describe_table", "propose_table_change"] {
+            assert_eq!(refusal_for(schema_tool, false), None);
+        }
+    }
 
     /// The tool's arguments carry `database` alongside the proposal's own
     /// fields; the proposal type refuses unknown keys, so it has to come off
@@ -792,7 +910,7 @@ mod tests {
             schemaic_db::Engine::Postgres,
             schemaic_db::Engine::Sqlite,
         ] {
-            let tools = super::tools_list(engine);
+            let tools = super::tools_list(engine, true);
             let tool = tools
                 .as_array()
                 .expect("a list")
@@ -820,7 +938,7 @@ mod tests {
             schemaic_db::Engine::Sqlite,
         ] {
             let dialect = engine.dialect();
-            let tools = super::tools_list(engine);
+            let tools = super::tools_list(engine, true);
             let desc = tools[0]["description"].as_str().expect("a description");
             assert_eq!(tools[0]["name"], "run_query");
             assert!(
