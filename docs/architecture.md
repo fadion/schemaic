@@ -2840,9 +2840,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     Manage Connections, New connection), which is a funnel with no traffic at the top. The test is
     "none saved", not "none active": a user with connections and no active one still wants the
     switcher, since choosing is what it is for. Both wear `switcher_chrome`, shared rather than
-    spelled twice **because they swap in and out of the same slot** — a padding or radius that
-    differed would show as the header twitching the moment the first connection is saved — and only
-    the border colour is the caller's (the active connection's identity colour, or the accent).
+    spelled twice **because they swap in and out of the same slot** — a margin or radius that
+    differed would show as the header twitching the moment the first connection is saved. The
+    caller sets the border colour (the active connection's identity colour, or the accent) and may
+    re-state the horizontal padding: the button does (9px/10px against 11px/7px), because its
+    content is the switcher's mirrored — glyph leading, label trailing — so the plus carries its own
+    sidebearing into the left inset while a label ending flush needs more room after it. The pill's
+    outer edges still land where the switcher's do, which is the part that keeps the header still.
     The switcher is the *only* thing that sets `conn_menu_open`, so the button leaves no menu
     behind it that nothing can raise.
     The header's **update chip** (`update_state` + `apply_update` on `Ui`, alongside `resources`) is
