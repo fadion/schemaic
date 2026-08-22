@@ -262,13 +262,40 @@ pub fn to_mermaid(graph: &DiagramGraph) -> String {
             continue;
         };
         let (p, c) = crow_ends(e);
-        let label = e.from_columns.join(", ");
+        let label = label_text(&e.from_columns.join(", "));
         out.push_str(&format!("    {to} {p}--{c} {from} : \"{label}\"\n"));
     }
     out
 }
 
 // ── DBML ────────────────────────────────────────────────────────────────────
+
+/// A server-authored string on its way **inside a double-quoted label** in one
+/// of the plain-text formats.
+///
+/// The backslash first, then the quote, or the escape swallows itself. A column
+/// named `a"b` is legal on all three engines (`` `a"b` ``, `"a""b"`) and closed
+/// DOT's `label="…"` early, so `dot` rejected the whole file at that line; a
+/// column named `a\` swallowed the closing quote and the rest of the line. The
+/// module escapes correctly everywhere else — `dot_text` through
+/// `export::html_escape`, `dbml_name` by doubling — and these three sites are one
+/// missing habit rather than three oversights.
+///
+/// **Not** `html_escape`: that escapes `&<>` for a text node and leaves `"`
+/// alone, which is right for the SVG and exactly wrong here.
+///
+/// A control character becomes a space as well, because all three formats end a
+/// label at the end of its line — PlantUML's runs unquoted to one.
+fn label_text(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .flat_map(|c| match c {
+            '\\' => vec!['\\', '\\'],
+            '"' => vec!['\\', '"'],
+            c => vec![c],
+        })
+        .collect()
+}
 
 /// A DBML name, quoted when it isn't a bare identifier. DBML keeps the real name —
 /// `Table "sales.orders"` is legal — so nothing is renamed here.
@@ -298,6 +325,32 @@ fn dbml_ref_side(table: &str, cols: &[String]) -> String {
     }
 }
 
+/// Every column name an edge points at on `node`, in first-seen order and
+/// deduplicated — the placeholder columns a stub table has to declare for the
+/// `Ref`s naming them to resolve.
+fn stub_columns(graph: &DiagramGraph, node: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for e in &graph.edges {
+        let cols = if e.from == node {
+            &e.from_columns
+        } else if e.to == node {
+            &e.to_columns
+        } else {
+            continue;
+        };
+        for c in cols {
+            if !out.iter().any(|s| s == c) {
+                out.push(c.clone());
+            }
+        }
+    }
+    // A stub nothing points at still needs a body, so the grammar is satisfied.
+    if out.is_empty() {
+        out.push("id".to_string());
+    }
+    out
+}
+
 /// The graph as DBML (dbdiagram.io / dbdocs.io).
 ///
 /// Unlike Mermaid this keeps qualified names verbatim, quoting where the grammar
@@ -306,11 +359,19 @@ pub fn to_dbml(graph: &DiagramGraph) -> String {
     let mut out = String::new();
     for n in &graph.nodes {
         if n.kind == NodeKind::Stub {
-            // Declared empty so the `Ref` below resolves rather than dangling.
-            out.push_str(&format!(
-                "Table {} {{\n  Note: 'cross-database reference'\n}}\n\n",
-                dbml_name(&n.id)
-            ));
+            // **A DBML table body needs at least one column**, and every `Ref`
+            // endpoint has to name a column its table declares. A stub has no
+            // introspected columns — it stands for a table outside the schema —
+            // so it is given exactly the ones the edges point at. Declared empty
+            // instead, with the `Ref`s left dangling on it, the whole file was
+            // rejected by the parser (`Expected " " but ":" found`), so the
+            // export was unusable on any diagram carrying a cross-database FK
+            // *or* a privilege-filtered one.
+            out.push_str(&format!("Table {} {{\n", dbml_name(&n.id)));
+            for name in stub_columns(graph, &n.id) {
+                out.push_str(&format!("  {} unknown\n", dbml_name(&name)));
+            }
+            out.push_str("  Note: 'cross-database reference'\n}\n\n");
             continue;
         }
         out.push_str(&format!("Table {} {{\n", dbml_name(&n.id)));
@@ -378,7 +439,11 @@ pub fn to_plantuml(graph: &DiagramGraph) -> String {
         let cols = columns(n);
         let (keys, rest): (Vec<_>, Vec<_>) = cols.iter().partition(|c| c.pk);
         for c in &keys {
-            out.push_str(&format!("  * {} : {}\n", c.name, c.type_name));
+            out.push_str(&format!(
+                "  * {} : {}\n",
+                label_text(&c.name),
+                label_text(&c.type_name)
+            ));
         }
         if !keys.is_empty() && !rest.is_empty() {
             out.push_str("  --\n");
@@ -386,7 +451,11 @@ pub fn to_plantuml(graph: &DiagramGraph) -> String {
         for c in &rest {
             let req = if c.nullable { "  " } else { "* " };
             let fk = if c.fk { " <<FK>>" } else { "" };
-            out.push_str(&format!("  {req}{} : {}{fk}\n", c.name, c.type_name));
+            out.push_str(&format!(
+                "  {req}{} : {}{fk}\n",
+                label_text(&c.name),
+                label_text(&c.type_name)
+            ));
         }
         out.push_str("}\n\n");
     }
@@ -397,7 +466,7 @@ pub fn to_plantuml(graph: &DiagramGraph) -> String {
         let (p, c) = crow_ends(e);
         out.push_str(&format!(
             "{to} {p}--{c} {from} : {}\n",
-            e.from_columns.join(", ")
+            label_text(&e.from_columns.join(", "))
         ));
     }
     out.push_str("\n@enduml\n");
@@ -481,7 +550,7 @@ pub fn to_dot(graph: &DiagramGraph) -> String {
         let head = if e.optional { "odot" } else { "tee" };
         out.push_str(&format!(
             "  {from}{fp} -> {to}{tp} [arrowtail={tail}, arrowhead={head}, label=\"{}\"];\n",
-            e.from_columns.join(", ")
+            label_text(&e.from_columns.join(", "))
         ));
     }
     out.push_str("}\n");
@@ -560,6 +629,11 @@ pub struct SvgNode {
     /// the only thing distinguishing the cards at a glance.
     pub header_fill: String,
     pub border: String,
+    /// The line under the header strip. **Not `border`**: the painter draws it
+    /// with the theme's plain border while the card's outline takes the tint, so
+    /// reusing `border` here coincided for an untinted table and diverged for
+    /// exactly the coloured ones the export goes out of its way to preserve.
+    pub divider: String,
 }
 
 /// One relationship's drawn geometry, straight from the canvas: the flattened
@@ -632,6 +706,13 @@ pub struct SvgScene {
 /// Truncation walks *characters*, not bytes: a `…` spliced into the middle of a
 /// UTF-8 sequence is a panic on the next slice, and schema identifiers are not
 /// reliably ASCII.
+///
+/// **Binary search, not a walk down.** `measure` is a full cosmic-text layout —
+/// ~10 µs each, measured — and this runs once per column row plus once per card
+/// title on the UI thread, before the save dialog opens. Stepping down one
+/// character at a time cost 40 calls for a 48-character name against a narrow
+/// box; the search costs 6. Width is monotone in the character count for every
+/// shaper this is handed, so the answer is the same.
 pub fn ellipsize(s: &str, max_px: f64, measure: impl Fn(&str) -> f64) -> String {
     if max_px <= 0.0 {
         return String::new();
@@ -640,13 +721,21 @@ pub fn ellipsize(s: &str, max_px: f64, measure: impl Fn(&str) -> f64) -> String 
         return s.to_string();
     }
     let chars: Vec<char> = s.chars().collect();
-    for keep in (0..chars.len()).rev() {
+    // Largest `keep` in `0..chars.len()` whose candidate still fits. `lo` is
+    // known-fitting only in the sense that 0 is the fallback (`"…"` alone).
+    let (mut lo, mut hi) = (0usize, chars.len());
+    let mut best: Option<String> = None;
+    while lo < hi {
+        let keep = lo + (hi - lo).div_ceil(2);
         let candidate: String = chars[..keep].iter().collect::<String>() + "…";
         if measure(&candidate) <= max_px {
-            return candidate;
+            lo = keep;
+            best = Some(candidate);
+        } else {
+            hi = keep - 1;
         }
     }
-    "…".to_string()
+    best.unwrap_or_else(|| "…".to_string())
 }
 
 /// A Lucide glyph inlined as a nested `<svg>` at `(x, y)`, `size` px square.
@@ -794,7 +883,7 @@ pub fn to_svg(scene: &SvgScene) -> String {
                 n(hy),
                 n(node.x + node.w),
                 n(hy),
-                node.border
+                node.divider
             );
         }
         // Header: glyph, gap, bold name — the card's own order, so the two line up
@@ -810,9 +899,18 @@ pub fn to_svg(scene: &SvgScene) -> String {
             ));
             tx += m.icon_size + m.title_gap;
         }
+        // A stub's title is drawn **regular** on canvas, and its card is sized to
+        // exactly that regular measurement — so emitting it bold made every
+        // name past the minimum card width truncate in the file and nowhere
+        // else. The weight follows `stub`, as `export_scene`'s measurer does.
+        let weight = if node.stub {
+            ""
+        } else {
+            " font-weight=\"600\""
+        };
         let _ = write!(
             out,
-            "<text x=\"{}\" y=\"{}\" font-size=\"{}\" font-weight=\"600\" fill=\"{}\" dominant-baseline=\"central\">{}</text>",
+            "<text x=\"{}\" y=\"{}\" font-size=\"{}\"{weight} fill=\"{}\" dominant-baseline=\"central\">{}</text>",
             n(tx),
             n(node.y + m.header_h / 2.0),
             n(m.title_size),
@@ -860,10 +958,14 @@ pub fn to_svg(scene: &SvgScene) -> String {
         }
         if let Some(more) = &node.more {
             let cy = node.y + m.header_h + node.rows.len() as f64 * m.row_h + m.expander_h / 2.0;
+            // Left, at the same inset every column name uses — the painter
+            // renders this as a plain `text` in a `width_full()` box with
+            // `padding_horiz`, so a centred one was a difference repeated once
+            // per collapsed card on a whole-database diagram.
             let _ = write!(
                 out,
-                "<text x=\"{}\" y=\"{}\" font-size=\"{}\" fill=\"{}\" text-anchor=\"middle\" dominant-baseline=\"central\">{}</text>",
-                n(node.x + node.w / 2.0),
+                "<text x=\"{}\" y=\"{}\" font-size=\"{}\" fill=\"{}\" dominant-baseline=\"central\">{}</text>",
+                n(node.x + m.pad_x),
                 n(cy),
                 n(m.type_size),
                 c.muted,
@@ -1109,17 +1211,137 @@ mod tests {
         assert!(to_dbml(&g).contains("Ref: orders.user_id - users.id"));
     }
 
+    /// **A DBML table body needs a column, and every `Ref` endpoint has to name
+    /// one the table declares.** The stub arm used to emit a `Note:` and nothing
+    /// else, and this test asserted that form was correct — so the suite
+    /// defended a file `@dbml/core` rejects outright
+    /// (`Expected " " but ":" found`), on every diagram carrying a
+    /// cross-database FK or a privilege-filtered one.
     #[test]
-    fn dbml_notes_a_view_and_a_stub() {
-        let mut g = sample();
+    fn dbml_notes_a_view_and_gives_a_stub_the_columns_its_refs_name() {
+        let mut g = stubbed();
         g.nodes[0].kind = NodeKind::View;
-        g.nodes.push(node("other.audit", NodeKind::Stub, vec![]));
         let out = to_dbml(&g);
         assert!(out.contains("  Note: 'view'\n"), "{out}");
         assert!(
-            out.contains("Table \"other.audit\" {\n  Note: 'cross-database reference'\n}"),
+            out.contains(
+                "Table \"other.audit\" {\n  order_id unknown\n  \
+                 Note: 'cross-database reference'\n}"
+            ),
             "{out}"
         );
+        assert!(
+            out.contains("Ref: orders.id > \"other.audit\".order_id"),
+            "{out}"
+        );
+        dbml_bodies_and_refs_resolve(&out);
+    }
+
+    /// **A column name is server text going inside a quoted label.** `a"b` is
+    /// legal on all three engines and closed DOT's `label="…"` early, so `dot`
+    /// rejected the whole file at that line; `a\` swallowed the closing quote
+    /// and the rest of it. The SVG was already clean — every string there goes
+    /// through `html_escape` into a text node — and these three plain-text
+    /// formats were the gap.
+    #[test]
+    fn a_column_name_cannot_break_a_label() {
+        let mut g = sample();
+        g.edges[0].from_columns = vec!["a\"b\\".to_string()];
+        g.nodes[1].columns[1].name = "a\"b\\".to_string();
+        for out in [to_dot(&g), to_mermaid(&g), to_plantuml(&g)] {
+            for line in out.lines().filter(|l| l.contains("a\\\"b")) {
+                // Every quote in the line is either a delimiter or escaped, so
+                // the delimiters still pair up. Walked rather than counted with
+                // a lookbehind, because `\\"` ends in a backslash that is itself
+                // escaped and the quote after it is real.
+                let mut escaped = false;
+                let mut delimiters = 0usize;
+                for c in line.chars() {
+                    match c {
+                        _ if escaped => escaped = false,
+                        '\\' => escaped = true,
+                        '"' => delimiters += 1,
+                        _ => {}
+                    }
+                }
+                assert_eq!(delimiters % 2, 0, "odd quote count: {line:?}");
+                assert!(line.contains("a\\\"b\\\\"), "{line:?}");
+            }
+        }
+    }
+
+    /// The sample graph plus a stub something actually points at — the shape
+    /// `erd::build_graph` produces for a cross-database FK, and for a MySQL
+    /// schema whose `TABLES` is privilege-filtered while `KEY_COLUMN_USAGE`
+    /// still reports the constraint.
+    fn stubbed() -> DiagramGraph {
+        let mut g = sample();
+        g.nodes.push(node("other.audit", NodeKind::Stub, vec![]));
+        g.edges.push(DiagramEdge {
+            from: "orders".to_string(),
+            from_columns: vec!["id".to_string()],
+            to: "other.audit".to_string(),
+            to_columns: vec!["order_id".to_string()],
+            cardinality: Cardinality::OneToMany,
+            optional: false,
+        });
+        g
+    }
+
+    /// The two grammar rules the reference parser enforces and this suite can:
+    /// **no table body is empty**, and **every `Ref` endpoint names a column its
+    /// table declares.** Both fail on a stub emitted the old way.
+    ///
+    /// The external parsers (`@dbml/core`, `mermaid`, `@viz-js/viz`, `plantuml`)
+    /// are JS and Java and cannot be `cargo test` dependencies, so what is
+    /// enforceable in-tree is the invariants *they* check — which is what the 41
+    /// `assert!(out.contains(…))` tests around this could never do: they answer
+    /// "did we write what we meant to", never "is what we meant to write legal".
+    fn dbml_bodies_and_refs_resolve(out: &str) {
+        let mut columns: HashMap<String, Vec<String>> = HashMap::new();
+        let mut table: Option<String> = None;
+        for line in out.lines() {
+            if let Some(rest) = line.strip_prefix("Table ") {
+                let name = rest.trim_end_matches(" {").trim_matches('"').to_string();
+                table = Some(name.clone());
+                columns.entry(name).or_default();
+            } else if line == "}" {
+                table = None;
+            } else if let (Some(t), Some(word)) = (
+                table.as_ref(),
+                line.split_whitespace()
+                    .next()
+                    .filter(|w| !w.starts_with("Note")),
+            ) {
+                columns
+                    .get_mut(t)
+                    .expect("the table was declared")
+                    .push(word.trim_matches('"').to_string());
+            }
+        }
+        for (t, cols) in &columns {
+            assert!(!cols.is_empty(), "table {t} has an empty body:\n{out}");
+        }
+        for line in out.lines().filter(|l| l.starts_with("Ref: ")) {
+            for side in line.trim_start_matches("Ref: ").split([' ', '>', '-']) {
+                let side = side.trim();
+                if side.is_empty() {
+                    continue;
+                }
+                let (t, c) = side.rsplit_once('.').expect("table.column");
+                let t = t.trim_matches('"');
+                let declared = columns
+                    .get(t)
+                    .unwrap_or_else(|| panic!("Ref names undeclared table {t}:\n{out}"));
+                for c in c.trim_matches(['(', ')']).split(", ") {
+                    let c = c.trim_matches('"');
+                    assert!(
+                        declared.iter().any(|d| d == c),
+                        "Ref names {t}.{c}, which {t} does not declare:\n{out}"
+                    );
+                }
+            }
+        }
     }
 
     // ── PlantUML ────────────────────────────────────────────────────────────
@@ -1299,7 +1521,8 @@ mod tests {
                 icon_fill: "#7080a0".to_string(),
                 title_fill: "#f0f0f0".to_string(),
                 header_fill: "#303030".to_string(),
-                border: "#404040".to_string(),
+                border: "#c04040".to_string(),
+                divider: "#404040".to_string(),
             }],
             edges: vec![SvgEdge {
                 poly: vec![
@@ -1377,10 +1600,25 @@ mod tests {
         // Row centres: header (30) + (i + 0.5) * row_h (24) → 42, 66.
         assert!(out.contains("y=\"42\""), "{out}");
         assert!(out.contains("y=\"66\""), "{out}");
-        // Expander sits below the last row: 30 + 2*24 + 22/2 = 89.
+        // Expander sits below the last row: 30 + 2*24 + 22/2 = 89, and **left**,
+        // at the same 10 px inset every column name uses — the painter renders
+        // it in a `width_full()` box with `padding_horiz`, so a centred one
+        // differed from the canvas once per collapsed card.
         assert!(
-            out.contains("y=\"89\"") && out.contains(">+3 more</text>"),
+            out.contains("<text x=\"10\" y=\"89\"") && out.contains(">+3 more</text>"),
             "{out}"
+        );
+        assert!(!out.contains("text-anchor=\"middle\""), "{out}");
+        // The header divider takes the *theme's* border, not the card's tint:
+        // the painter draws them from different colours, and they coincide only
+        // for an untinted table.
+        assert!(
+            out.contains("y1=\"30\" x2=\"200\" y2=\"30\" stroke=\"#404040\""),
+            "{out}"
+        );
+        assert!(
+            out.contains("stroke=\"#c04040\""),
+            "the card outline is tinted: {out}"
         );
     }
 
@@ -1467,6 +1705,24 @@ mod tests {
         assert_eq!(ellipsize("customers", 5.0, m), "cust…");
         assert_eq!(ellipsize("customers", 1.0, m), "…");
         assert_eq!(ellipsize("customers", 0.0, m), "");
+    }
+
+    /// **The search costs `O(log n)` measurements, not `O(n)`.** `measure` is a
+    /// full cosmic-text layout (~10 µs), and this runs once per column row plus
+    /// once per card title on the UI thread before the save dialog opens — so a
+    /// 500-table diagram was paying for ~20,000 of them, with every truncating
+    /// row adding 5–15 more from the walk down.
+    #[test]
+    fn ellipsize_measures_a_logarithmic_number_of_times() {
+        let calls = std::cell::Cell::new(0usize);
+        let m = |s: &str| {
+            calls.set(calls.get() + 1);
+            s.chars().count() as f64
+        };
+        let long = "a".repeat(512);
+        assert_eq!(ellipsize(&long, 4.0, m), "aaa…");
+        // 1 for the whole string + ~log2(512); the walk was 509.
+        assert!(calls.get() <= 12, "{} measurements", calls.get());
     }
 
     #[test]

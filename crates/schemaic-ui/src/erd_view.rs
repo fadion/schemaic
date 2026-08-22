@@ -833,8 +833,18 @@ fn export_scene(
             y: r.y,
             w: r.w,
             h: r.h,
+            // **Measured with the weight it is drawn in.** A stub card's title
+            // is regular on canvas and its width comes from a *regular*
+            // measurement of the same string, so ellipsizing it against a bold
+            // one — always wider — truncated in the file every name past
+            // `NODE_MIN_W - 20` that the app shows whole. `title_bold` below
+            // carries the same answer to the emitter.
             title: erd_export::ellipsize(&node.id, title_room, |s| {
-                measure_text_px_bold_at(s, m.title_size as f32)
+                if stub {
+                    measure_text_px_at(s, m.title_size as f32)
+                } else {
+                    measure_text_px_bold_at(s, m.title_size as f32)
+                }
             }),
             stub,
             rows,
@@ -860,6 +870,9 @@ fn export_scene(
             } else {
                 card_border(tint)
             }),
+            // The painter's header uses `theme::border()` under the strip while
+            // the card outline takes the tint, so this is not `border`.
+            divider: hex(theme::border()),
         });
     }
 
@@ -1878,7 +1891,17 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
             // set — the same guard as the find flash, for the same reason.
             let notice_seq = RwSignal::new(0_u64);
             let say: Rc<dyn Fn(String, bool)> = Rc::new(move |msg: String, failed: bool| {
-                let seq = notice_seq.get_untracked().wrapping_add(1);
+                // `try_get_untracked`, like the linger below and `flash_node`
+                // above: this is called from the export's **completion**, whose
+                // ext action is built on the app scope, and the rasterise takes
+                // 1.1 s at 200 tables and 2.2 s at 500. Closing the diagram
+                // inside that window disposes this scope, and a bare
+                // `get_untracked` is `try_get_untracked().unwrap()` — a panic on
+                // the UI thread. Nothing to report to a modal that is gone.
+                let Some(prev) = notice_seq.try_get_untracked() else {
+                    return;
+                };
+                let seq = prev.wrapping_add(1);
                 notice_seq.set(seq);
                 notice.set(Some((msg, failed)));
                 // A confirmation fades; a failure stays until it is dismissed,
@@ -2628,6 +2651,42 @@ mod tests {
             pk,
             fk,
         }
+    }
+
+    /// **A stub card's title is measured with the weight it is drawn in.**
+    ///
+    /// It is regular on canvas and the card is sized to exactly that regular
+    /// measurement (`node_width`'s stub arm), so ellipsizing against a *bold*
+    /// measurement — always wider — truncated in the exported file every name
+    /// past the minimum card width that the app shows whole. The emitter's
+    /// `font-weight` follows the same flag, so the two agree end to end.
+    #[test]
+    fn a_stub_title_exports_whole_and_regular() {
+        // Long enough that the bold measurement of it exceeds the regular one
+        // the card was sized from, and short enough to fit that card.
+        let id = "warehouse_eu.shipment_tracking_events";
+        let graph = DiagramGraph {
+            nodes: vec![DiagramNode {
+                id: id.to_string(),
+                kind: NodeKind::Stub,
+                columns: Vec::new(),
+            }],
+            edges: vec![],
+            hidden_islands: vec![],
+            total_tables: 1,
+        };
+        let w = node_width(&graph.nodes[0]);
+        let positions: HashMap<String, (f64, f64)> =
+            [(id.to_string(), (0.0, 0.0))].into_iter().collect();
+        let sizes: HashMap<String, (f64, f64)> =
+            [(id.to_string(), (w, HEADER_H))].into_iter().collect();
+        let scene =
+            export_scene(&graph, &positions, &sizes, &HashMap::new(), &|_| None).expect("a scene");
+        assert_eq!(scene.nodes[0].title, id, "the stub's name was truncated");
+        assert!(scene.nodes[0].stub);
+
+        let svg = erd_export::to_svg(&scene);
+        assert!(!svg.contains("font-weight=\"600\""), "{svg}");
     }
 
     /// The child edge end anchors on the FK column's row, the parent end on the
