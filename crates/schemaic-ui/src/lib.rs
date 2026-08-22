@@ -131,17 +131,55 @@ pub struct ExportRequest {
 
 /// What an ER-diagram export writes.
 ///
-/// Rendered **before** the save dialog opens, not after: the dialog is modal and
+/// Captured **before** the save dialog opens, not after: the dialog is modal and
 /// the diagram's signals belong to the modal behind it, so a callback that went
 /// back for them would be reading a scope that may already be gone. It also means
 /// the file is a picture of what the user was looking at when they chose the
 /// format — the same rule the results grid's snapshot follows.
+///
+/// What is captured is as little as the UI thread is *obliged* to do. For a
+/// picture that is the measured [`SvgScene`](schemaic_core::erd_export::SvgScene)
+/// and nothing more: the measuring goes through floem's font system and so cannot
+/// leave this thread, but building the document out of it is pure — 34 ms of
+/// string work and a 5 MB allocation at 500 tables — and joins the rasterise and
+/// the write on the worker.
 #[derive(Clone)]
 pub enum ErdDoc {
-    /// Written as-is (SVG, Mermaid, DBML, PlantUML, Graphviz).
+    /// A finished document, written as-is (Mermaid, DBML, PlantUML, Graphviz).
     Text(String),
-    /// An SVG to rasterise first, at this scale — see [`crate::erd_raster`].
-    Png(String, f32),
+    /// A measured scene, plus the scale to rasterise at when the target is a PNG.
+    /// `None` writes the SVG itself — see [`crate::erd_raster`] for the raster.
+    Scene(Box<schemaic_core::erd_export::SvgScene>, Option<f32>),
+}
+
+impl ErdDoc {
+    /// The document as text, building it here if this is still a scene.
+    ///
+    /// The clipboard is synchronous, so *Copy as SVG* — the one caller that
+    /// cannot hand the work to a worker and come back — pays for the document on
+    /// the UI thread. `None` for a PNG, which this channel cannot hold at all.
+    pub fn into_text(self) -> Option<String> {
+        match self {
+            ErdDoc::Text(s) => Some(s),
+            ErdDoc::Scene(scene, None) => Some(schemaic_core::erd_export::to_svg(&scene)),
+            ErdDoc::Scene(_, Some(_)) => None,
+        }
+    }
+
+    /// The bytes to write. Called on the worker: this is where the document is
+    /// built and, for a PNG, rasterised.
+    pub fn into_bytes(self) -> Result<Vec<u8>, String> {
+        match self {
+            ErdDoc::Text(s) => Ok(s.into_bytes()),
+            ErdDoc::Scene(scene, scale) => {
+                let svg = schemaic_core::erd_export::to_svg(&scene);
+                match scale {
+                    Some(scale) => crate::erd_raster::png_from_svg(&svg, scale),
+                    None => Ok(svg.into_bytes()),
+                }
+            }
+        }
+    }
 }
 
 /// What to write, and where.
@@ -151,8 +189,9 @@ pub struct ErdExportRequest {
 }
 
 /// Write an exported ER diagram to a file **off the UI thread**, reporting via
-/// [`ExportDoneFn`]. Rasterising a whole-database diagram is the slow half and
-/// runs here; the modal owns the save dialog and the rendering of the document.
+/// [`ExportDoneFn`]. Building the document and rasterising it are the slow halves
+/// and run here ([`ErdDoc::into_bytes`]); the modal owns the save dialog and the
+/// measurement the font system pins to the UI thread.
 pub type ErdExportFn = Rc<dyn Fn(ErdExportRequest, ExportDoneFn)>;
 
 /// The table an import is loading into, captured when the modal opens so a
