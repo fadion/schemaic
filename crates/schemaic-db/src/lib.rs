@@ -825,10 +825,19 @@ fn err_clone(e: &DbError) -> DbError {
     }
 }
 
+/// How long any "is this connection up" check may take before it is a failure.
+///
+/// Named because two paths ask it — the health check through [`Db::ping`], and
+/// SQLite's database listing, which *is* a ping — and they used to disagree: the
+/// listing was unbounded, so a file on a share that had gone away hung the schema
+/// tree and held a blocking-pool thread while the health check beside it gave up
+/// and said "Disconnected".
+pub const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl Db {
     /// Lightweight reachability check: connect and run `SELECT 1`, all bounded by
     /// `timeout` so a dead host/tunnel can't hang the caller. `Ok(())` means the
-    /// server answered.
+    /// server answered. [`PING_TIMEOUT`] is the app's answer for `timeout`.
     pub async fn ping(&self, timeout: std::time::Duration) -> Result<(), DbError> {
         match self.engine {
             Engine::Postgres => return pg::ping(self, timeout).await,
