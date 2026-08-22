@@ -850,27 +850,6 @@ fn run_id_seed(entries: &[schemaic_core::history::HistoryEntry]) -> u64 {
     entries.iter().map(|e| e.run_id).max().unwrap_or(0)
 }
 
-/// The default connection created on first launch (matches the local WSL
-/// MariaDB used in development).
-fn seed_connection() -> Connection {
-    Connection {
-        id: 1,
-        name: "Local MariaDB".to_string(),
-        db_type: "MySQL".to_string(),
-        host: "127.0.0.1".to_string(),
-        port: 3306,
-        user: "schemaic".to_string(),
-        password: "schemaic".to_string(),
-        file: String::new(),
-        ssh: Default::default(),
-        color: None,
-        prominent_color: false,
-        read_only: false,
-        environment: Default::default(),
-        ai_data: None,
-    }
-}
-
 /// What a finished run should record in history, or `None` for one that reached
 /// no verdict — still running, or cancelled, where the honest answer is the
 /// nothing the entry already says.
@@ -916,18 +895,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // too (`restore_tabs`).
     let ui_state = persist::load_ui_state();
 
-    // Load (or seed) saved connections. Secrets are hydrated from the OS keyring
-    // (and any legacy plaintext migrated into it) by `secrets::load_connections`.
+    // Load saved connections. Secrets are hydrated from the OS keyring (and any
+    // legacy plaintext migrated into it) by `secrets::load_connections`.
+    //
+    // **An empty list stays empty.** A first launch used to seed a "Local
+    // MariaDB" pointing at 127.0.0.1 with this repo's development credentials and
+    // save it immediately, so a fresh install opened onto a connection its user
+    // never made and almost certainly couldn't reach — and no connections.json
+    // could be deleted, since the next launch wrote it straight back. The header
+    // offers a New connection button in that state now, which is the answer a
+    // seed was standing in for.
     let mut cf = secrets::load_connections();
-    if cf.connections.is_empty() {
-        let seed = seed_connection();
-        cf.active = Some(seed.id);
-        cf.connections.push(seed);
-        secrets::save_connections(&cf);
-    }
-    // Backfill an identity colour for any connection saved before colours existed
-    // (and the freshly-seeded one), so every connection always has one. Colours
-    // stay distinct while presets last; persist only if we changed something.
+    // Backfill an identity colour for any connection saved before colours
+    // existed, so every connection always has one. Colours stay distinct while
+    // presets last; persist only if we changed something.
     {
         let mut used: Vec<String> = cf
             .connections
@@ -966,11 +947,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             secrets::save_connections(&cf);
         }
     }
-    let active_id = cf
-        .active
-        .filter(|id| cf.connections.iter().any(|c| c.id == *id))
-        .or_else(|| cf.connections.first().map(|c| c.id))
-        .unwrap_or(1);
+    let active_id = Connection::startup_active_id(cf.active, &cf.connections);
     let connections = RwSignal::new(cf.connections.clone());
     let active_conn = RwSignal::new(active_id);
 

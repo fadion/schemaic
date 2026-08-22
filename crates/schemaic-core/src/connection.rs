@@ -519,6 +519,29 @@ impl Connection {
         existing.iter().map(|c| c.id).max().unwrap_or(0) + 1
     }
 
+    /// Which connection is active at startup, given the id the last session
+    /// saved and the connections that actually loaded.
+    ///
+    /// The saved id wins when it still names a connection; otherwise the first
+    /// one does, since a list with nothing selected is a worse start than an
+    /// arbitrary selection.
+    ///
+    /// **With no connections at all it answers [`Connection::next_id`] of
+    /// nothing** — the id the first connection saved in this session is about to
+    /// take. That is not a placeholder: `save_conn` loads the schema for a
+    /// connection it saves *only* when it is the active one, so the first
+    /// connection a new user creates connects on save rather than sitting there
+    /// until they switch to it by hand. Until the seed connection was removed
+    /// this arm was unreachable and spelled `unwrap_or(1)`, which happens to be
+    /// the same number — the coupling to `next_id` is the part that has to hold,
+    /// and it is what this states.
+    pub fn startup_active_id(saved: Option<u64>, connections: &[Connection]) -> u64 {
+        saved
+            .filter(|id| connections.iter().any(|c| c.id == *id))
+            .or_else(|| connections.first().map(|c| c.id))
+            .unwrap_or_else(|| Connection::next_id(&[]))
+    }
+
     /// Do these two point at the same server — everything that decides *which*
     /// server the next query reaches, and nothing else?
     ///
@@ -729,6 +752,33 @@ mod tests {
 
     /// The upgrade must not change what the assistant can reach: someone who had
     /// `run_query` keeps it, someone who had turned it off does not get it back.
+    /// The saved id wins while it names something; a stale one falls back to the
+    /// first connection rather than to nothing.
+    #[test]
+    fn startup_keeps_the_last_active_connection_when_it_still_exists() {
+        let cs = vec![
+            Connection { id: 4, ..conn() },
+            Connection { id: 9, ..conn() },
+        ];
+        assert_eq!(Connection::startup_active_id(Some(9), &cs), 9);
+        assert_eq!(Connection::startup_active_id(Some(77), &cs), 4);
+        assert_eq!(Connection::startup_active_id(None, &cs), 4);
+    }
+
+    /// With nothing saved, the active id is the one the *first* connection
+    /// created this session will be given — so saving it makes it active, and
+    /// the save path connects it instead of leaving the user on a connection
+    /// they have to select by hand. A number picked any other way would break
+    /// that silently.
+    #[test]
+    fn an_empty_list_points_at_the_id_the_first_connection_will_take() {
+        assert_eq!(
+            Connection::startup_active_id(None, &[]),
+            Connection::next_id(&[])
+        );
+        assert_eq!(Connection::startup_active_id(Some(3), &[]), 1);
+    }
+
     #[test]
     fn the_migration_keeps_the_access_the_old_flag_granted() {
         assert_eq!(migrated_ai_data(true), AiData::Full);
