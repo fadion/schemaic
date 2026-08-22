@@ -5113,7 +5113,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         Rc::new(
             move |req: schemaic_ui::RoutineSrcRequest, done: schemaic_ui::RoutineSrcDoneFn| {
                 let Ok(db) = db_for(req.conn_id) else {
-                    // Nothing to report: the editor keeps the body it has.
+                    // Nothing to report — but the editor is *waiting* on this
+                    // callback, so it has to arrive either way; dropping it
+                    // leaves Preview disabled for the life of the modal.
+                    (done)(req.name.clone(), None);
                     return;
                 };
                 let name = req.name.clone();
@@ -7254,6 +7257,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             trigger_draft: RwSignal::new(schemaic_core::ddl::TriggerSetDraft::default()),
             routine: RwSignal::new(None),
             routine_draft: RwSignal::new(schemaic_core::ddl::RoutineDraft::default()),
+            routine_source_pending: RwSignal::new(false),
             functions: RwSignal::new(Vec::new()),
             object: RwSignal::new(None),
             object_draft: RwSignal::new(schemaic_core::ddl::ObjectDraft::default()),
