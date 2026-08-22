@@ -229,6 +229,23 @@ macro_rules! disabled {
     };
 }
 
+/// Like [`pair`], for a foreground the *view* fades — a label painted at a
+/// fraction of a theme colour (`accent().multiply_alpha(0.6)`), where what the
+/// eye reads is the composite against the surface, not the colour named in the
+/// style. The counterpart of [`wash`], which fades the background instead.
+macro_rules! faded {
+    ($fg:ident($alpha:expr) on $bg:ident, $role:ident, $site:expr) => {
+        Pairing {
+            fg: concat!(stringify!($fg), "@", stringify!($alpha)),
+            bg: stringify!($bg),
+            role: Legibility::$role,
+            site: $site,
+            fg_of: |t| over(t.$fg.multiply_alpha($alpha), t.$bg),
+            bg_of: |t| t.$bg,
+        }
+    };
+}
+
 /// Like [`pair`], for a foreground on a translucent wash over a surface — the
 /// results grid paints most of its cell states that way, and what the eye reads
 /// is the composite, not the wash.
@@ -335,7 +352,8 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     // new surface is exactly what it cannot see.
     pair!(text on row_hover_soft, Body, "history: a hovered row"),
     pair!(text_faint on row_hover_soft, Recessive, "history: its timestamp and outcome line"),
-    pair!(text_faint on group_header_bg, Recessive, "history: the TODAY / THIS WEEK band"),
+    pair!(accent on group_header_bg, Recessive, "history: the TODAY / THIS WEEK label"),
+    faded!(accent(0.6) on group_header_bg, Recessive, "history: that band's count"),
     pair!(text on row_active, Body, "schema tree: the selected row"),
     pair!(text on row_selected, Body, "schema tree: the keyboard-nav cursor row"),
     pair!(text_dim on row_selected, Body, "designer list: a selected row's detail"),
