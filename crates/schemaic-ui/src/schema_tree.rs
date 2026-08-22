@@ -723,23 +723,9 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     // Close every *other* dropdown when the eye/settings menus open, so all the
     // app's menus are mutually exclusive (the eye/gear absorb their own pointer-down,
     // so the root dismissal handler never runs for them).
-    let popup_menu = ui.overlay.popup_menu;
-    let conn_menu_open = ui.conn.conn_menu_open;
-    let active_db_menu_open = ui.tabs_ui.active_db_menu_open;
-    let close_other_menus = move || {
-        if popup_menu.get_untracked().is_some() {
-            popup_menu.set(None);
-        }
-        if context_menu.get_untracked().is_some() {
-            context_menu.set(None);
-        }
-        if conn_menu_open.get_untracked() {
-            conn_menu_open.set(false);
-        }
-        if active_db_menu_open.get_untracked() {
-            active_db_menu_open.set(false);
-        }
-    };
+    // One list, in `widgets::MenuFlags` — three copies of it in three files is
+    // how the activity clock's dropdown came to be missing from this one.
+    let menus = crate::widgets::MenuFlags::of(&ui);
     // Search filter (local to the panel). `filter_input` is bound to the search box
     // (updates per keystroke); `filter` is its debounced mirror — the tree filters,
     // highlights, and re-expands off `filter`, so a burst of typing churns the
@@ -1109,8 +1095,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     .on_move(move |p| eye_origin.set(p))
     .on_resize(move |r| eye_size.set((r.width(), r.height())))
     .on_click_stop(move |_| {
-        close_other_menus();
-        schema_menu_open.set(false);
+        menus.close_except(Some(crate::widgets::MenuId::SchemaEye));
         db_menu_open.update(|o| *o = !*o);
     })
     .on_event_stop(
@@ -1142,8 +1127,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     .on_move(move |p| gear_origin.set(p))
     .on_resize(move |r| gear_size.set((r.width(), r.height())))
     .on_click_stop(move |_| {
-        close_other_menus();
-        db_menu_open.set(false);
+        menus.close_except(Some(crate::widgets::MenuId::SchemaGear));
         schema_menu_open.update(|o| *o = !*o);
     })
     .on_event_stop(

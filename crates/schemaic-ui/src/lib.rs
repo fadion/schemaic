@@ -2166,8 +2166,13 @@ pub enum ActivityState {
     /// asks for `MAX_SESSIONS + 1` rows, so anything `prepare` could subtract is
     /// `1` whether the server holds five hundred and one sessions or four
     /// thousand.
+    /// `Rc`, not a plain `Vec`: this state is read out of a signal by three
+    /// `dyn_container` keys per poll, and each read used to deep-copy up to five
+    /// hundred `SessionInfo` — every one carrying an unbounded `sql`, which on
+    /// MySQL is `PROCESSLIST.INFO`, the client's **complete** statement text
+    /// with no server-side clip. A refcount bump says the same thing.
     Loaded {
-        sessions: Vec<schemaic_core::activity::SessionInfo>,
+        sessions: Rc<Vec<schemaic_core::activity::SessionInfo>>,
         truncated: bool,
     },
     /// The fetch failed — the message is the server's, shown in place of the list.
@@ -2780,9 +2785,7 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
             widgets::hoisted_submenu().set(None);
         }
     });
-    let db_menu_open = ui.schema.db_menu_open;
-    let schema_menu_open = ui.schema.schema_menu_open;
-    let activity_menu_open = ui.activity.menu_open;
+    let root_menus = widgets::MenuFlags::of(&ui);
     // Panel visibility is owned by the app (loaded from / saved to disk), so the
     // layout is restored on the next launch.
     let schema_visible = ui.layout.schema_visible;
@@ -3088,21 +3091,9 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
     // right-click on another row closes the old menu here (on down) while that
     // row's own handler opens the new one (on up) — one gesture.
     .on_event(EventListener::PointerDown, move |_| {
-        if context_menu.get_untracked().is_some() {
-            context_menu.set(None);
-        }
-        if popup_menu.get_untracked().is_some() {
-            popup_menu.set(None);
-        }
-        if db_menu_open.get_untracked() {
-            db_menu_open.set(false);
-        }
-        if schema_menu_open.get_untracked() {
-            schema_menu_open.set(false);
-        }
-        if activity_menu_open.get_untracked() {
-            activity_menu_open.set(false);
-        }
+        // The shared list, so a menu added later is closed here without anyone
+        // remembering to extend this.
+        root_menus.close_except(None);
         // The "clear" half of the app's `:focus-visible`
         // (`widgets::keyboard_nav`): from here on the focus ring stays dark until
         // the next Tab, because on a pointer gesture it marks what the user just
@@ -3818,6 +3809,21 @@ pub(crate) fn right_panel_allowed() -> bool {
     right_panel_fits(window_size().get().0)
 }
 
+pub use widgets::may_launch_destructive;
+
+/// [`right_panel_allowed`] for the app crate.
+///
+/// **Tracked**, deliberately: the one caller is the Server Activity poll's gate,
+/// which has to re-arm when the window crosses the breakpoint in either
+/// direction. Every other consumer of "is the right panel actually showing"
+/// already pairs the panel signal with this one — the four footer toggles and
+/// the resize handle — and the poll was the one place reading the signal alone,
+/// so it kept a connect + authenticate + `PROCESSLIST` going every couple of
+/// seconds for a 0px panel whose toggle was inert.
+pub fn right_panel_visible() -> bool {
+    right_panel_allowed()
+}
+
 /// Reveal the AI panel before sending it a message — every "Ask AI" / "AI
 /// Explain" / "AI Summary" entry point goes through here.
 ///
@@ -4288,34 +4294,9 @@ fn center(ui: Ui) -> impl IntoView {
     // dismissal handler never fires for clicks inside the grid, and the toolbar Copy
     // dropdown calls this before opening so it's mutually exclusive with the schema
     // eye/settings (and other) dropdowns.
-    let db_menu_open_d = ui.schema.db_menu_open;
-    let schema_menu_open_d = ui.schema.schema_menu_open;
-    let conn_menu_open_d = ui.conn.conn_menu_open;
-    let active_db_menu_open_d = ui.tabs_ui.active_db_menu_open;
-    let activity_menu_open_d = ui.activity.menu_open;
-    let dismiss_menus: Rc<dyn Fn()> = Rc::new(move || {
-        if popup.get_untracked().is_some() {
-            popup.set(None);
-        }
-        if context_menu.get_untracked().is_some() {
-            context_menu.set(None);
-        }
-        if db_menu_open_d.get_untracked() {
-            db_menu_open_d.set(false);
-        }
-        if schema_menu_open_d.get_untracked() {
-            schema_menu_open_d.set(false);
-        }
-        if conn_menu_open_d.get_untracked() {
-            conn_menu_open_d.set(false);
-        }
-        if active_db_menu_open_d.get_untracked() {
-            active_db_menu_open_d.set(false);
-        }
-        if activity_menu_open_d.get_untracked() {
-            activity_menu_open_d.set(false);
-        }
-    });
+    // The same list every menu trigger uses — see `widgets::MenuFlags`.
+    let all_menus = widgets::MenuFlags::of(&ui);
+    let dismiss_menus: Rc<dyn Fn()> = Rc::new(move || all_menus.close_except(None));
     let commit_edits = ui.tab_actions.commit_edits.clone();
     let export_file = ui.tab_actions.export_file.clone();
     let apply_view = ui.tab_actions.apply_view.clone();

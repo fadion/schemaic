@@ -834,6 +834,27 @@ pub(crate) async fn count_rows(
 /// internally, and this runs against every backend on the cluster before the
 /// `LIMIT` can apply. The outer projection restates the columns in order because
 /// `simple_query` hands them back positionally.
+///
+/// **`backend_type IS NULL` keeps the rows the role may not inspect.**
+/// PostgreSQL masks `pg_stat_activity` for backends the caller has no
+/// `HAS_PGSTAT_PERMISSIONS` over, and `backend_type` is one of the masked
+/// columns — so `backend_type = 'client backend'` is `NULL` for them and the
+/// rows were filtered out entirely rather than merely showing blanks. Connected
+/// as an ordinary application role, the panel listed only that role's own
+/// sessions and stated the count as the server's total; a blocked row could name
+/// a holder that was nowhere in the list, so the banner never appeared and there
+/// was nothing to kill. `pid` and `pg_blocking_pids(pid)` are *not* masked, so a
+/// kept row is still killable and still a usable node in the graph — verified
+/// live on PostgreSQL 16.15 under a non-privileged role: 7 rows unfiltered
+/// against 0 through the old predicate.
+///
+/// **The state term in the sort** is the half MySQL's query has and this one
+/// didn't. Blocked-ness is only rank 0 of `activity::rank`'s four; an idle pool
+/// connection's age grows without bound while a fresh lock holder's is near
+/// zero, so past the `LIMIT` a wall of hour-old idle backends displaced the
+/// running statement and the `idle in transaction` holder the panel exists to
+/// show — while keeping the waiter, whose note then named a holder that had been
+/// cut.
 const PG_ACTIVITY_SQL: &str = "SELECT s.pid, s.usename, s.client_host, s.datname, s.state, \
      s.query, s.age, s.blockers FROM ( \
      SELECT pid, usename, host(client_addr) AS client_host, datname, state, query, \
@@ -841,8 +862,10 @@ const PG_ACTIVITY_SQL: &str = "SELECT s.pid, s.usename, s.client_host, s.datname
      AS age, \
      pg_blocking_pids(pid)::text AS blockers \
      FROM pg_stat_activity \
-     WHERE backend_type = 'client backend' AND pid <> pg_backend_pid() \
-     ) s ORDER BY (s.blockers <> '{}') DESC, s.age DESC LIMIT ";
+     WHERE (backend_type = 'client backend' OR backend_type IS NULL) \
+     AND pid <> pg_backend_pid() \
+     ) s ORDER BY (s.blockers <> '{}') DESC, \
+     (s.state IS DISTINCT FROM 'idle') DESC, s.age DESC LIMIT ";
 
 /// The PostgreSQL half of [`Db::fetch_sessions`].
 ///
@@ -853,56 +876,13 @@ pub(crate) async fn fetch_sessions(db: &Db) -> Result<Vec<SessionInfo>, DbError>
     let client = connect_maintenance(db).await?;
     let sql = format!("{PG_ACTIVITY_SQL}{}", activity::MAX_SESSIONS + 1);
     let rows = query_all(&client, &sql).await?;
-    Ok(rows
+    // The fold is `activity::from_pg_rows` — where every decision about what a
+    // `SessionInfo` says lives, reachable from a test with a literal row vector.
+    let rows: Vec<activity::PgActivityRow> = rows
         .iter()
-        .filter_map(|r| {
-            let query = opt(r, 5)
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            let blocked_by = parse_pid_array(opt(r, 7).as_deref().unwrap_or(""));
-            // A row whose pid won't parse is **dropped**, not admitted under a
-            // made-up id. `unwrap_or(0)` here was the same mistake
-            // `parse_pid_array` is written to avoid one screen down: a session
-            // `0` renders a full row with a live "Kill session" entry under it
-            // (`pg_terminate_backend(0)`), and other rows' `blocked_by` edges
-            // would point at it. An identity is the one field there is no
-            // sensible default for.
-            let id: i64 = opt(r, 0)?.parse().ok()?;
-            Some(SessionInfo {
-                id,
-                user: cell(r, 1),
-                client: opt(r, 2),
-                database: opt(r, 3),
-                state: activity::pg_state(
-                    opt(r, 4).as_deref(),
-                    query.is_some(),
-                    !blocked_by.is_empty(),
-                ),
-                sql: query,
-                // Unlike the id, an unreadable age has a safe default: `format_age`
-                // floors it and it only affects where the row sorts.
-                seconds: opt(r, 6).and_then(|s| s.parse().ok()).unwrap_or(0.0),
-                blocked_by,
-                blocks: Vec::new(),
-            })
-        })
-        .collect())
-}
-
-/// Read a PostgreSQL `int[]` as rendered by `::text` — `{}`, `{1234}`,
-/// `{1234,5678}`. `simple_query` hands back every column as text, so the array
-/// arrives as its literal and there is no typed accessor to lean on.
-///
-/// Anything unparseable is skipped rather than defaulting to a pid: a `0` in the
-/// blocking graph would draw an edge to a session that does not exist and put a
-/// "Kill 0" button under it.
-fn parse_pid_array(s: &str) -> Vec<i64> {
-    s.trim()
-        .trim_start_matches('{')
-        .trim_end_matches('}')
-        .split(',')
-        .filter_map(|p| p.trim().parse::<i64>().ok())
-        .collect()
+        .map(|r| std::array::from_fn(|i| opt(r, i)))
+        .collect();
+    Ok(activity::from_pg_rows(&rows))
 }
 
 /// This connection's backend pid, or `None` if the server didn't answer.
@@ -3036,19 +3016,6 @@ mod tests {
         assert_eq!(cell(&row, 0), "a");
         assert_eq!(cell(&row, 1), ""); // SQL NULL → empty
         assert_eq!(cell(&row, 5), ""); // out of range → empty
-    }
-
-    #[test]
-    fn parse_pid_array_reads_what_pg_blocking_pids_renders() {
-        assert_eq!(parse_pid_array("{}"), Vec::<i64>::new());
-        assert_eq!(parse_pid_array("{1234}"), vec![1234]);
-        assert_eq!(parse_pid_array("{1234,5678}"), vec![1234, 5678]);
-        assert_eq!(parse_pid_array(" {1234, 5678} "), vec![1234, 5678]);
-        // A NULL column, or anything else unexpected, contributes no edges rather
-        // than a pid of 0.
-        assert_eq!(parse_pid_array(""), Vec::<i64>::new());
-        assert_eq!(parse_pid_array("{NULL}"), Vec::<i64>::new());
-        assert_eq!(parse_pid_array("{7,oops}"), vec![7]);
     }
 
     #[test]

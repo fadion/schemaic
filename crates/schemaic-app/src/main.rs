@@ -2808,7 +2808,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         Ok(mut sessions) => {
                             let truncated = schemaic_core::activity::prepare(&mut sessions);
                             activity_state.set(ActivityState::Loaded {
-                                sessions,
+                                sessions: Rc::new(sessions),
                                 truncated,
                             });
                         }
@@ -2863,13 +2863,28 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     .filter(|(_, s)| s.server_id() == Some(id))
                     .map(|(tab_id, _)| *tab_id)
                     .collect();
-                // The tab has to be on the connection the kill was issued
-                // against; `sessions` is keyed by tab, and the tab is what knows
-                // which server its pinned connection reaches.
+                // The tab has to be on **the same server**, which is not the same
+                // question as the same `conn_id`. Two Schemaic connections
+                // routinely point at one server — `local (app)` and
+                // `local (root)`, or two entries differing only in default
+                // database — and a `conn_id` comparison rejected exactly that
+                // true match, leaving the tab holding a dead socket with Commit
+                // and Rollback still offered. `targets_same_server` is the
+                // predicate that separates "the same box" from "a different box
+                // that happens to have handed out thread 42 too".
+                let killed_on =
+                    connections.with_untracked(|cs| cs.iter().find(|c| c.id == conn_id).cloned());
                 let owner = owners.into_iter().find_map(|tab_id| {
                     let tab =
                         tabs.with_untracked(|v| v.iter().find(|t| t.id == tab_id).copied())?;
-                    (tab.conn_id.get_untracked() == conn_id).then_some(tab)
+                    let tab_conn = tab.conn_id.get_untracked();
+                    if tab_conn == conn_id {
+                        return Some(tab);
+                    }
+                    let killed_on = killed_on.as_ref()?;
+                    let owner_conn = connections
+                        .with_untracked(|cs| cs.iter().find(|c| c.id == tab_conn).cloned())?;
+                    owner_conn.targets_same_server(killed_on).then_some(tab)
                 });
                 let Some(tab) = owner else {
                     return;
@@ -2918,6 +2933,25 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let Ok(db) = db_for(conn_id) else {
                 return;
             };
+            // **The shared destructive guard, at the launch.** A connection
+            // marked read-only is the protection with no "Run anyway", and
+            // terminating a live client session — rolling back its transaction
+            // under it — is the most destructive thing this app can do to a
+            // server it has been told not to write to. Every other destructive
+            // modal action asks this function; this one asked nothing at all.
+            let read_only = connections.with_untracked(|cs| {
+                cs.iter()
+                    .find(|c| c.id == conn_id)
+                    .is_some_and(|c| c.read_only)
+            });
+            if !schemaic_ui::may_launch_destructive(false, read_only) {
+                activity_kill_error.set(Some(
+                    "This connection is marked read-only, so Schemaic won't terminate \
+                     sessions on it. Clear read-only in the connection's settings first."
+                        .to_string(),
+                ));
+                return;
+            }
             let dialect = db.engine().dialect();
             let (title, message) = schemaic_core::activity::kill_confirm(kind, &session, dialect);
             let (handle, refresh) = (handle.clone(), refresh.clone());
@@ -2945,6 +2979,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             Err(e) => activity_kill_error.set(Some(e)),
                             Ok(()) => {
                                 (repair)(conn_id, id, kind);
+                                // **Bump the generation first.** The refresh is
+                                // guarded against a fetch already in flight, and
+                                // a poll started while the kill was travelling
+                                // swallowed it silently — so with auto-refresh
+                                // Off the killed session stayed on the list with
+                                // a live *Kill session* under it, and nothing
+                                // said the kill had worked. Bumping strands the
+                                // in-flight reply (it would be describing a
+                                // server state that no longer holds) and frees
+                                // the guard for this one.
+                                activity_gen.update(|g| *g = g.wrapping_add(1));
                                 (refresh)();
                             }
                         }
@@ -2975,7 +3020,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     {
         let refresh = refresh_activity.clone();
         create_effect(move |prev: Option<(u64, bool, u64)>| {
-            let open = right_panel.get() == RightPanel::Activity && window_focused.get();
+            // `right_panel_visible()` is the conjunct that was missing: below the
+            // responsive breakpoint the right column is 0px wide, the panel
+            // cannot be seen, and its toggle is inert — so the poll could be
+            // neither watched nor stopped from inside the app. It reads the
+            // tracked window size, so crossing the breakpoint either way re-arms
+            // this effect exactly as a focus change does.
+            let open = schemaic_core::activity::should_poll(
+                right_panel.get() == RightPanel::Activity,
+                schemaic_ui::right_panel_visible(),
+                window_focused.get(),
+            );
             let conn = active_conn.get();
             let secs = activity_interval.get();
             let conn_changed = prev.is_none_or(|(c, _, _)| c != conn);

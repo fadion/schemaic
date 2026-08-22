@@ -1115,9 +1115,19 @@ const NO_SESSIONS_MSG: &str = "this connection's engine has no server sessions";
 /// (`INNODB_TRX`) needs `PROCESS` privileges this statement deliberately does not
 /// require — see [`collect_sessions`]. Sorting by what every account can see
 /// keeps the required query required.
+///
+/// **`USER <> 'system user'` drops the server's own threads.** A replica's
+/// applier and receiver are threads, not sessions — nobody connected them, they
+/// have no host, their `TIME` is the replica's uptime, and terminating one stops
+/// replication — but they are not `COMMAND = 'Daemon'` (MariaDB reports
+/// `Slave_IO`/`Slave_SQL`, MySQL 8 `Connect`/`Query`) and not `Sleep` either, so
+/// they sat at the very *top* of the list forever with a live "Kill session"
+/// under them. The account is what both engines have in common for them, and it
+/// is what `SHOW PROCESSLIST` readers filter on. `Binlog Dump` still stays: that
+/// is the primary side, and it really is a client.
 const MY_PROCESSLIST_SQL: &str = "SELECT ID, USER, HOST, DB, COMMAND, TIME, INFO \
      FROM information_schema.PROCESSLIST \
-     WHERE ID <> CONNECTION_ID() AND COMMAND <> 'Daemon' \
+     WHERE ID <> CONNECTION_ID() AND COMMAND <> 'Daemon' AND USER <> 'system user' \
      ORDER BY (COMMAND <> 'Sleep') DESC, TIME DESC LIMIT ";
 
 /// Open InnoDB transactions, keyed by the thread holding them. This is what
@@ -1148,7 +1158,9 @@ const MY_LOCK_WAITS_IS_SQL: &str = "SELECT rt.trx_mysql_thread_id, bt.trx_mysql_
      JOIN information_schema.INNODB_TRX rt ON rt.trx_id = w.requesting_trx_id \
      JOIN information_schema.INNODB_TRX bt ON bt.trx_id = w.blocking_trx_id";
 
-/// One `PROCESSLIST` row: `(id, user, host, db, command, time, info)`.
+/// One `PROCESSLIST` row as `mysql_async` hands it back:
+/// `(id, user, host, db, command, time, info)`. Reshaped into
+/// [`activity::MyProcessRow`] for the fold.
 type MyProcessRow = (
     i64,
     String,
@@ -1179,49 +1191,43 @@ async fn collect_sessions(conn: &mut Conn) -> Result<Vec<SessionInfo>, DbError> 
         .map(|v| v.into_iter().collect())
         .unwrap_or_default();
 
-    // MySQL 8 first, MariaDB second — both are cheap, and only one of them exists
-    // on any given server.
-    let mut waits: Vec<(i64, i64)> = conn
+    // MySQL 8 first, MariaDB second — only one of them exists on any given
+    // server.
+    //
+    // **The fallback fires on an *error*, not on an empty result**, which is the
+    // condition it actually means. `waits.is_empty()` could not tell "the
+    // performance_schema view found no waits" — the ordinary case, since most
+    // polls find none — from "the view does not exist", so on MySQL 8 every
+    // quiet poll went on to run `information_schema.INNODB_LOCK_WAITS`, which
+    // 8.0 removed, and paid a guaranteed round-trip failure forever.
+    let waits: Vec<(i64, i64)> = match conn
         .query_map(MY_LOCK_WAITS_PS_SQL, |r: (i64, i64)| r)
         .await
-        .unwrap_or_default();
-    if waits.is_empty() {
-        waits = conn
+    {
+        Ok(v) => v,
+        Err(_) => conn
             .query_map(MY_LOCK_WAITS_IS_SQL, |r: (i64, i64)| r)
             .await
-            .unwrap_or_default();
-    }
-    // Raw edges, duplicates and all: both lock views are keyed by *lock*, so one
-    // holder sitting on a record lock and a gap lock the waiter needs reports the
-    // same pair twice. `activity::prepare` deduplicates — there, not here, so the
-    // rule is unit-tested and so PostgreSQL (whose `pg_blocking_pids` is already
-    // distinct) can't drift away from it.
-    let mut blocked_by: HashMap<i64, Vec<i64>> = HashMap::new();
-    for (waiter, blocker) in waits {
-        blocked_by.entry(waiter).or_default().push(blocker);
-    }
-
-    Ok(rows
+            .unwrap_or_default(),
+    };
+    // The fold is `activity::from_mysql_rows` — it is where every decision about
+    // what a `SessionInfo` *says* lives, and it needs to be reachable from a
+    // test with a literal row vector.
+    let rows: Vec<activity::MyProcessRow> = rows
         .into_iter()
-        .map(|(id, user, host, db, command, time, info)| {
-            let trx_state = trx.get(&id).map(String::as_str);
-            let client = activity::strip_port(&host);
-            SessionInfo {
+        .map(
+            |(id, user, host, database, command, seconds, info)| activity::MyProcessRow {
                 id,
                 user,
-                client: (!client.is_empty()).then(|| client.to_string()),
-                database: db.filter(|d| !d.is_empty()),
-                state: activity::mysql_state(&command, trx_state),
-                sql: info.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
-                // `TIME` is signed and goes negative when the system clock steps
-                // back under a live thread; `format_age` floors it, but the sort
-                // key must not hoist such a row to the top of its group.
-                seconds: time.max(0) as f64,
-                blocked_by: blocked_by.remove(&id).unwrap_or_default(),
-                blocks: Vec::new(),
-            }
-        })
-        .collect())
+                host,
+                database,
+                command,
+                seconds,
+                info,
+            },
+        )
+        .collect();
+    Ok(activity::from_mysql_rows(&rows, &trx, &waits))
 }
 
 /// One `information_schema.TABLES` statistics row. Every figure is nullable —
