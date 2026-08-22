@@ -789,6 +789,15 @@ fn export_scene(
         })
         .collect();
 
+    // **One layout per distinct type, not per row.** Each `measure_*` call builds
+    // a fresh cosmic-text `TextLayout` (~10 µs), and a column's type is the most
+    // repeated string in a schema — a whole database is mostly `int`,
+    // `varchar(255)` and `datetime`. Measured per row this was one layout for
+    // every row of every card, half of the ~20,000 that made a 500-table export
+    // stall for a quarter of a second before the save dialog opened; keyed by the
+    // string it is a few dozen for the whole diagram. The names are not cached:
+    // they are the column names, so a hit would be the exception.
+    let mut type_w: HashMap<&str, f64> = HashMap::new();
     let mut nodes = Vec::with_capacity(graph.nodes.len());
     for node in &graph.nodes {
         let Some(&r) = rect.get(&node.id) else {
@@ -812,9 +821,11 @@ fn export_scene(
             .iter()
             .filter_map(|&ci| node.columns.get(ci))
             .map(|c| {
-                let type_w = measure_text_px_at(&c.type_name, m.type_size as f32);
+                let tw = *type_w
+                    .entry(c.type_name.as_str())
+                    .or_insert_with(|| measure_text_px_at(&c.type_name, m.type_size as f32));
                 // icon + gap + name + gap + type, inside the padding.
-                let name_room = r.w - 2.0 * m.pad_x - m.icon_size - 2.0 * m.row_gap - type_w;
+                let name_room = r.w - 2.0 * m.pad_x - m.icon_size - 2.0 * m.row_gap - tw;
                 erd_export::SvgRow {
                     name: erd_export::ellipsize(&c.name, name_room, |s| {
                         measure_text_px_at(s, m.name_size as f32)
@@ -1924,9 +1935,15 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                 }
             });
 
-            // Render the diagram in one format, **now** — before any dialog opens.
+            // Capture the diagram in one format, **now** — before any dialog opens.
             // See `ErdDoc`: these signals belong to this modal, and a callback that
             // came back for them later could be reading a disposed scope.
+            //
+            // For a picture that capture is the *measured scene* and stops there.
+            // `export_scene` has to run here — it measures through floem's font
+            // system — but `to_svg` is pure, and building a 5 MB document between
+            // the click and the save dialog is a stall with nothing to show for
+            // it. The worker gets the scene and does the rest.
             let render: Rc<dyn Fn(erd_export::ErdExportFormat) -> Option<crate::ErdDoc>> = {
                 let graph = graph.clone();
                 let tint_of = tint_of.clone();
@@ -1941,11 +1958,10 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                                 &collapsed.get_untracked(),
                                 &tint_of,
                             )?;
-                            let svg = erd_export::to_svg(&scene);
-                            Some(match fmt {
-                                F::Png => crate::ErdDoc::Png(svg, EXPORT_PNG_SCALE),
-                                _ => crate::ErdDoc::Text(svg),
-                            })
+                            Some(crate::ErdDoc::Scene(
+                                Box::new(scene),
+                                matches!(fmt, F::Png).then_some(EXPORT_PNG_SCALE),
+                            ))
                         }
                         F::Mermaid => Some(crate::ErdDoc::Text(erd_export::to_mermaid(&graph))),
                         F::Dbml => Some(crate::ErdDoc::Text(erd_export::to_dbml(&graph))),
@@ -2002,15 +2018,20 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
             let copy: Rc<dyn Fn(erd_export::ErdExportFormat)> = {
                 let render = render.clone();
                 let say = say.clone();
-                Rc::new(move |fmt| match (render)(fmt) {
-                    Some(crate::ErdDoc::Text(s)) => {
-                        let _ = floem::Clipboard::set_contents(s);
-                        (say)(format!("Copied as {}", fmt.label()), false);
-                    }
-                    // PNG is the one format this channel can't hold (it is
-                    // text-only), which is why it isn't in the copy menu at all.
-                    _ => (say)("Nothing to copy.".to_string(), true),
-                })
+                // `into_text` builds an SVG's document here rather than on the
+                // worker: the clipboard is synchronous, so this is the one caller
+                // that has nowhere to hand the work to. It answers `None` for a
+                // PNG, which this channel can't hold — which is also why PNG isn't
+                // in the copy menu at all.
+                Rc::new(
+                    move |fmt| match (render)(fmt).and_then(crate::ErdDoc::into_text) {
+                        Some(s) => {
+                            let _ = floem::Clipboard::set_contents(s);
+                            (say)(format!("Copied as {}", fmt.label()), false);
+                        }
+                        None => (say)("Nothing to copy.".to_string(), true),
+                    },
+                )
             };
 
             // Saves first, pictures and text separated, then one "Copy as" submenu
@@ -2825,6 +2846,52 @@ mod tests {
         assert_eq!(scene.colors.key_fk, hex(theme::key_foreign()));
         assert_eq!(scene.colors.edge, hex(theme::erd_edge()));
         assert_eq!(scene.metrics, export_metrics());
+    }
+
+    /// **The two ends of the export split produce one document.**
+    ///
+    /// A picture leaves the UI thread as a measured scene, and the document is
+    /// built at whichever end needs it: the worker's, via `into_bytes`, or the
+    /// clipboard's, via `into_text` — the one caller that has nowhere to hand the
+    /// work to. Two builders is exactly the shape that drifts, so this asserts
+    /// they are the same bytes, and that a PNG scale is what makes a scene
+    /// uncopyable rather than the format being asked twice.
+    #[test]
+    fn a_scene_writes_and_copies_the_same_svg() {
+        let graph = DiagramGraph {
+            nodes: vec![DiagramNode {
+                id: "orders".into(),
+                kind: NodeKind::Table,
+                columns: vec![col("id", true, false), col("user_id", false, true)],
+            }],
+            edges: vec![],
+            hidden_islands: vec![],
+            total_tables: 1,
+        };
+        let positions: HashMap<String, (f64, f64)> =
+            [("orders".to_string(), (0.0, 0.0))].into_iter().collect();
+        let sizes: HashMap<String, (f64, f64)> = [(
+            "orders".to_string(),
+            (node_width(&graph.nodes[0]), HEADER_H + 2.0 * ROW_H),
+        )]
+        .into_iter()
+        .collect();
+        let scene =
+            export_scene(&graph, &positions, &sizes, &HashMap::new(), &|_| None).expect("a scene");
+
+        let doc = || crate::ErdDoc::Scene(Box::new(scene.clone()), None);
+        let copied = doc().into_text().expect("an SVG is copyable");
+        let written = doc().into_bytes().expect("an SVG writes");
+        assert_eq!(copied.as_bytes(), written.as_slice());
+        assert_eq!(copied, erd_export::to_svg(&scene));
+
+        // A PNG is the same scene with a scale on it, and the clipboard can't
+        // hold one — the copy menu's "Nothing to copy." comes from here.
+        assert!(
+            crate::ErdDoc::Scene(Box::new(scene), Some(EXPORT_PNG_SCALE))
+                .into_text()
+                .is_none()
+        );
     }
 
     /// The child edge end anchors on the FK column's row, the parent end on the
