@@ -4394,6 +4394,23 @@ renders the themed panel; the caller positions it absolutely. Used by the schema
   stale the moment anything else filled the channel — open a segment's menu, right-click a grid
   cell, press the segment again, and it closed the cell's menu instead of opening its own. All three
   surfaces ask the anchor now.
+- **A trigger says it is open in the accent** — `widgets::menu_icon_color(open, hovered)`, one
+  function for the schema panel's eye and gear, the Server Activity clock, and the results strip's
+  copy, download and AI icons, each of which had spelled its own two-arm hover match. **Open
+  outranks hover**, which is the ordering the whole rule turns on: the pointer is still on the icon
+  it just clicked, so a hover that won would paint "this menu is open" and "you are about to open
+  this menu" the same colour for as long as the menu is up. The trigger is the only part of an open
+  dropdown in the user's eyeline — the panel drops *below* it — so a menu raised over a busy grid
+  used to have nothing on screen naming what raised it. The grid's three ask
+  `menu_anchored_at` **reactively** (`menu_is_mine_live`, a `.get()` twin of the `get_untracked`
+  `menu_is_mine` the click path uses) so the style closure re-runs when the channel changes; the
+  panels' four read their own `RwSignal<bool>`. The results strip's AI icon keeps its busy arm
+  *first*: a request in flight makes the glyph inert, whatever the menu and the pointer are doing.
+  The query pane's database selector follows the same order in its own colours — it rests in
+  `bubble_claude_text` rather than `text_muted`, so it states the rule inline rather than calling
+  the helper, and both halves (label and chevron) take the answer, the label by inheriting it from
+  the stack (never by reading `db_hov` inside its `dyn_container`, which is disposed-signal
+  territory — see the note there).
 - **A trigger that toggles must also stop its own `PointerDown`**, and the two halves are not
   alternatives. The workspace root closes `popup_menu` on any pointer-down (`lib.rs`, the same
   handler that clears `keyboard_nav`), so a trigger that doesn't stop the press has its menu closed
@@ -4698,6 +4715,15 @@ for keyboard nav.
   left focused on nothing — the next Ctrl+F reached nobody until the user clicked a cell. The bar
   can't do it either, being built a level up where `focus_id` doesn't exist, which is why the rule
   lives on the flag in `grid_view`. A new panel-level bar over the grid inherits this obligation.
+- **Every control on a panel toolbar carries a tooltip too** — the schema panel's eye
+  ("Show or hide databases") and gear ("Schema options"), the AI panel's new-chat and gear, Query
+  History's trash ("Clear this connection's history…", named for what it clears, since a bare
+  "Clear history" beside a per-connection list reads as all of it), and the terminal's
+  open-DB-CLI / restart / gear. Server Activity had them already. Each is `.tooltip()` chained
+  *after* the control's own `.style()`, for the reason the clock documents at `interval_button`:
+  `.tooltip()` wraps the view, so a style applied after it lands on the wrapper while
+  `on_move`/`on_resize` stay on the padded container inside — and that box is what the dropdown
+  hangs off.
 - **Every control on the results toolbar carries a tooltip**, and where it sits is a correctness
   rule. The eight are commit ✓, discard ✗, ＋, －, clone, ✦ AI, copy and save; before they were added
   nothing in the strip was labelled but the commit count, which is a bare number saying neither what

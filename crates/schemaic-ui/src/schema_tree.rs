@@ -1100,11 +1100,11 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     });
     let eye_hov = RwSignal::new(false);
     let eye = container(icons::icon(icons::EYE, 16.0).style(move |s| {
-        s.flex_shrink(0.0_f32).color(if eye_hov.get() {
-            theme::text()
-        } else {
-            theme::text_muted()
-        })
+        s.flex_shrink(0.0_f32)
+            .color(crate::widgets::menu_icon_color(
+                db_menu_open.get(),
+                eye_hov.get(),
+            ))
     }))
     .on_move(move |p| eye_origin.set(p))
     .on_resize(move |r| eye_size.set((r.width(), r.height())))
@@ -1125,14 +1125,19 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
             .margin_right(2.0)
             .padding_horiz(5.0)
             .padding_vert(3.0)
-    });
+    })
+    // Tooltips, on the wrapper — `.tooltip()` wraps the view, so it goes *after*
+    // the style, leaving `on_move`/`on_resize` on the padded container inside.
+    // That box is what the dropdown hangs off; anchoring to a bare glyph would
+    // put the menu 3px under the icon's ink rather than under its hitbox.
+    .tooltip(|| text("Show or hide databases").style(crate::widgets::tooltip_style));
     let gear_hov = RwSignal::new(false);
     let gear = container(icons::icon(icons::SLIDERS_VERTICAL, 16.0).style(move |s| {
-        s.flex_shrink(0.0_f32).color(if gear_hov.get() {
-            theme::text()
-        } else {
-            theme::text_muted()
-        })
+        s.flex_shrink(0.0_f32)
+            .color(crate::widgets::menu_icon_color(
+                schema_menu_open.get(),
+                gear_hov.get(),
+            ))
     }))
     .on_move(move |p| gear_origin.set(p))
     .on_resize(move |r| gear_size.set((r.width(), r.height())))
@@ -1153,7 +1158,8 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
             .margin_right(9.0)
             .padding_horiz(5.0)
             .padding_vert(3.0)
-    });
+    })
+    .tooltip(|| text("Schema options").style(crate::widgets::tooltip_style));
     // Title left, icon group right. `justify_between` pins the group's right edge
     // to the panel edge (a lone flex-grow spacer under-fills here — its default
     // `flex_basis: auto` leaves ~18px unclaimed — so we don't rely on it). The

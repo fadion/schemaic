@@ -5088,15 +5088,18 @@ fn terminal_panel(ui: Ui) -> impl IntoView {
 
     // Title row: "TERMINAL" left; open-DB-CLI + restart + settings gear right,
     // each 10px apart (gear 12px from the edge), matching the AI panel's spacing.
-    let db_cli_btn = toolbar_icon(icons::DATABASE, 5.0, 2.0, || true, move || (open_cli)(None));
-    let restart_btn = toolbar_icon(icons::REFRESH_CW, 5.0, 2.0, || true, move || (restart)());
+    let db_cli_btn = toolbar_icon(icons::DATABASE, 5.0, 2.0, || true, move || (open_cli)(None))
+        .tooltip(|| text("Open the database CLI").style(widgets::tooltip_style));
+    let restart_btn = toolbar_icon(icons::REFRESH_CW, 5.0, 2.0, || true, move || (restart)())
+        .tooltip(|| text("Restart the terminal").style(widgets::tooltip_style));
     let gear = toolbar_icon(
         icons::SLIDERS_VERTICAL,
         5.0,
         7.0,
         || true,
         move || settings_open.set(true),
-    );
+    )
+    .tooltip(|| text("Terminal settings…").style(widgets::tooltip_style));
     let icons_group = h_stack((db_cli_btn, restart_btn, gear))
         .style(|s| s.flex_row().items_start().flex_shrink(0.0_f32));
     // The engine, but only while this is a DB CLI session — see `TermUi::db_label`.

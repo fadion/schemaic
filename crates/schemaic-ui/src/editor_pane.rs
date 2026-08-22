@@ -3707,9 +3707,17 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     // when `active_db` changes *while the query pane is being disposed* (opening a
     // table), which would read the freed `db_hov` signal and panic (disposed-signal
     // read). The chevron reads it directly — safe, it's not inside that container.
+    // Open outranks hover for the same reason the menu-opening icons take the
+    // accent (`widgets::menu_icon_color`): the pointer is still on the trigger it
+    // just clicked, so a hover that won would leave the open state unmarked for
+    // as long as the menu is up. Not that helper itself — this control rests in
+    // its own colour rather than `text_muted`, and both halves of it (label and
+    // chevron) take the answer.
     let db_hov = RwSignal::new(false);
     let db_color = move || {
-        if db_hov.get() {
+        if active_db_menu_open.get() {
+            theme::accent()
+        } else if db_hov.get() {
             theme::text()
         } else {
             theme::bubble_claude_text()

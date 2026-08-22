@@ -446,14 +446,16 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
         2.0,
         || true,
         move || (new_chat_cb)(),
-    );
+    )
+    .tooltip(|| text("New chat").style(crate::widgets::tooltip_style));
     let gear = toolbar_icon(
         icons::SLIDERS_VERTICAL,
         5.0,
         7.0,
         || true,
         move || settings_open.set(true),
-    );
+    )
+    .tooltip(|| text("AI settings…").style(crate::widgets::tooltip_style));
     let icons_group =
         h_stack((new_chat, gear)).style(|s| s.flex_row().items_start().flex_shrink(0.0_f32));
     let title_row = h_stack((section_title("AI ASSISTANT"), icons_group))

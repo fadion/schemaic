@@ -1533,6 +1533,29 @@ pub(crate) fn panel_style(s: floem::style::Style) -> floem::style::Style {
         .border_radius(10.0)
 }
 
+/// The colour an icon that *opens a menu* paints itself: the accent while its
+/// menu is up, `text()` under the pointer, `text_muted()` at rest.
+///
+/// **Open outranks hover**, which is the whole ordering question here — the
+/// pointer is still on the icon it just clicked, so a hover that won would make
+/// "this menu is open" and "you are about to open this menu" the same colour for
+/// as long as the menu is up. The accent is what the rest of the app tints the
+/// thing currently in play, and it is the one state a user can't otherwise see
+/// on a dropdown that opens *below* the icon they are looking at.
+///
+/// One function because the app has six of these controls in five files (the
+/// schema eye and gear, the activity clock, the results strip's copy, download
+/// and AI icons), each of which had spelled its own two-arm hover match.
+pub(crate) fn menu_icon_color(open: bool, hovered: bool) -> Color {
+    if open {
+        theme::accent()
+    } else if hovered {
+        theme::text()
+    } else {
+        theme::text_muted()
+    }
+}
+
 /// The app's tooltip chrome, applied globally to Floem's `TooltipClass` (see the
 /// root stylesheet in `lib.rs`) so every `.tooltip(…)` gets it — a compact
 /// bordered panel matching the app's popovers, with a soft drop shadow lifting it
@@ -3606,6 +3629,25 @@ pub(crate) fn exit_action(busy: bool, cancellable: bool) -> ExitAction {
 /// the action is unavailable. This is what makes it so.
 pub(crate) fn accept_launch(in_flight: bool, read_only: bool) -> bool {
     !in_flight && !read_only
+}
+
+#[cfg(test)]
+mod menu_icon_tests {
+    use super::*;
+
+    /// Open wins over hover, and the three states are three different colours.
+    /// The pointer is still on an icon the moment after it is clicked, so an
+    /// order that let hover win would leave the open state invisible exactly
+    /// when it is true.
+    #[test]
+    fn open_outranks_hover_and_every_state_is_distinct() {
+        assert_eq!(menu_icon_color(true, false), theme::accent());
+        assert_eq!(menu_icon_color(true, true), theme::accent());
+        assert_eq!(menu_icon_color(false, true), theme::text());
+        assert_eq!(menu_icon_color(false, false), theme::text_muted());
+        assert_ne!(menu_icon_color(true, true), menu_icon_color(false, true));
+        assert_ne!(menu_icon_color(false, true), menu_icon_color(false, false));
+    }
 }
 
 #[cfg(test)]
