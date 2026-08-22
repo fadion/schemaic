@@ -640,10 +640,15 @@ fn sent_attachment(a: schemaic_core::transcript::Attachment) -> impl IntoView {
     let cells = Rc::new((a.columns, a.rows));
     let head = h_stack((
         icons::icon(icons::TABLE, 12.0).style(|s| s.color(theme::key_foreign())),
+        // **`text_dim`, not `text_muted`.** These are body prose on a surface
+        // where `text_muted` measures 2.42:1 (Light) — under AA and under the
+        // icon floor — and it passed the gate only because the one row for that
+        // pairing was written down at `Icon`. See `contrast::UI_PAIRINGS`, where
+        // both of these now have `Body` rows of their own.
         text(a.summary).style(|s| {
             s.font_size(theme::FONT_HINT)
                 .font_family("IBM Plex Sans".to_string())
-                .color(theme::text_muted())
+                .color(theme::text_dim())
                 .flex_grow(1.0_f32)
                 .min_width(0.0)
         }),
@@ -691,7 +696,7 @@ fn sent_attachment(a: schemaic_core::transcript::Attachment) -> impl IntoView {
                     |s| {
                         s.font_family("monospace".to_string())
                             .font_size(theme::FONT_HINT)
-                            .color(theme::text_muted())
+                            .color(theme::text_dim())
                     },
                 )))
                 .style(|s| s.width_full().max_height(220.0))
@@ -735,10 +740,13 @@ fn attachment_chip(
             None => empty().into_any(),
             Some(summary) => h_stack((
                 icons::icon(icons::TABLE, 13.0).style(|s| s.color(theme::key_foreign())),
+                // The app's last consent surface — the sentence saying how many
+                // of the user's rows are about to leave the machine — so it is
+                // the last place to paint prose below the icon floor.
                 text(summary).style(|s| {
                     s.font_size(theme::FONT_HINT)
                         .font_family("IBM Plex Sans".to_string())
-                        .color(theme::text_muted())
+                        .color(theme::text_dim())
                         .flex_grow(1.0_f32)
                         .min_width(0.0)
                 }),

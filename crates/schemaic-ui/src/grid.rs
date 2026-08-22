@@ -704,44 +704,59 @@ impl GridState {
         idx
     }
 
-    /// Append a pending row pre-filled from data-row `data_idx` (Clone / Duplicate),
-    /// and return its index. Copies every editable column's value (or explicit NULL)
-    /// **except** auto-increment columns, which are left for the server to assign.
-    fn add_cloned_row(&self, data_idx: usize) -> usize {
+    /// Append a pending row per entry of `data_idxs` (Clone / Duplicate),
+    /// returning the first one's index. Copies every editable column's value (or
+    /// explicit NULL) **except** auto-increment columns, which are left for the
+    /// server to assign.
+    ///
+    /// **One `new_rows.update` for the whole batch**, not one per row.
+    ///
+    /// One write, not N, and that is the whole of it: `new_rows` is the body
+    /// `dyn_container`'s key, so each write tears the grid down and rebuilds it,
+    /// re-running `compute_order` over the *whole* result. "Duplicate 100 rows"
+    /// on a 200,000-row result was a hundred full rebuilds and a hundred
+    /// O(n log n) sorts, on the UI thread, for one menu click.
+    fn add_cloned_rows(&self, data_idxs: &[usize]) -> usize {
         let model = self.edit_model.get_untracked();
         let rs = self.rs.get_untracked();
         let ncols = rs.col_count();
-        let mut map: HashMap<usize, Option<String>> = HashMap::new();
-        if data_idx < rs.row_count() {
-            for ci in 0..ncols {
-                if !model.editable(ci) {
-                    continue;
+        let maps: Vec<HashMap<usize, Option<String>>> = data_idxs
+            .iter()
+            .map(|&data_idx| {
+                let mut map: HashMap<usize, Option<String>> = HashMap::new();
+                if data_idx < rs.row_count() {
+                    for ci in 0..ncols {
+                        if !model.editable(ci) {
+                            continue;
+                        }
+                        let auto = rs
+                            .columns
+                            .get(ci)
+                            .and_then(|c| c.origin.as_ref())
+                            .map(|o| o.flags.auto_increment)
+                            .unwrap_or(false);
+                        if auto {
+                            continue; // server assigns the auto-increment key
+                        }
+                        if let Some(c) = rs.cell(data_idx, ci) {
+                            map.insert(
+                                ci,
+                                if c.is_null() {
+                                    None
+                                } else {
+                                    Some(c.display().to_string())
+                                },
+                            );
+                        }
+                    }
                 }
-                let auto = rs
-                    .columns
-                    .get(ci)
-                    .and_then(|c| c.origin.as_ref())
-                    .map(|o| o.flags.auto_increment)
-                    .unwrap_or(false);
-                if auto {
-                    continue; // server assigns the auto-increment key
-                }
-                if let Some(c) = rs.cell(data_idx, ci) {
-                    map.insert(
-                        ci,
-                        if c.is_null() {
-                            None
-                        } else {
-                            Some(c.display().to_string())
-                        },
-                    );
-                }
-            }
-        }
+                map
+            })
+            .collect();
         let mut idx = 0;
         self.new_rows.update(|rows| {
             idx = rows.len();
-            rows.push(map);
+            rows.extend(maps);
         });
         if self.commit_err.get_untracked().is_some() {
             self.commit_err.set(None);
@@ -1299,6 +1314,41 @@ fn pending_cell_text(row: Option<&HashMap<usize, Option<String>>>, ci: usize) ->
     }
 }
 
+/// The text one cell **shows**, resolving the three sources in the order the
+/// painter resolves them: a staged edit, then a pending new row's value, then
+/// the stored cell.
+///
+/// **One function, because three surfaces have to agree.** The painted cell, the
+/// clipboard and an AI attachment are all answering "what is in this cell", and
+/// they read it out of the same grid — so a fourth spelling of the resolution is
+/// a fourth chance to disagree. `attached_rows` had one: it read `rs.cell` and
+/// never `gs.dirty`, so a green, uncommitted edit was on screen while the
+/// **pre-edit** value went to the model, and the `sent_attachment` card the user
+/// opens to check what they sent agreed with the wrong copy.
+///
+/// `i` is a **display** row and `di` its data row; the caller has already
+/// resolved the mapping (it differs by sort) and knows the pending boundary.
+fn displayed_cell_text(
+    gs: GridState,
+    rs: &ResultSet,
+    di: usize,
+    ci: usize,
+    pending: Option<Option<&HashMap<usize, Option<String>>>>,
+) -> String {
+    if let Some(row) = pending {
+        return pending_cell_text(row, ci).to_string();
+    }
+    match gs.dirty.with_untracked(|d| d.get(&(di, ci)).cloned()) {
+        Some(Some(t)) => t,
+        // A staged SQL NULL, spelled the way the cell paints it.
+        Some(None) => "NULL".to_string(),
+        None => rs
+            .cell(di, ci)
+            .map(|c| c.display().to_string())
+            .unwrap_or_default(),
+    }
+}
+
 /// Set the focused cell, optionally extending the range (shift) from the anchor.
 fn set_active(gs: GridState, i: usize, ci: usize, extend: bool) {
     if extend {
@@ -1434,10 +1484,7 @@ fn copy_selection(gs: GridState) {
             if ci > c0 {
                 out.push('\t');
             }
-            match pending {
-                Some(row) => out.push_str(pending_cell_text(row, ci)),
-                None => out.push_str(rs.cell(di, ci).map(|c| c.display()).unwrap_or_default()),
-            }
+            out.push_str(&displayed_cell_text(gs, &rs, di, ci, pending));
         }
     }
     let _ = floem::Clipboard::set_contents(out);
@@ -1467,22 +1514,19 @@ fn attached_rows(
                 .unwrap_or_default()
         })
         .collect();
-    let total = r1.saturating_sub(r0) + 1;
+    // Two figures, and the header says the second: the cap is about the context
+    // window, not about consent, so going over it is *reported*.
+    let (send, total) =
+        schemaic_core::edit::attach_span(r0, r1, schemaic_core::prompt::ATTACH_ROW_CAP);
     let rows: Vec<Vec<String>> = (r0..=r1)
-        .take(schemaic_core::prompt::ATTACH_ROW_CAP)
+        .take(send)
         .map(|i| {
             // Display rows past the real ones are pending new rows, whose values
             // live in `new_rows` — see `copy_selection`.
             let pending = (i >= nreal).then(|| new_rows.get(i - nreal));
             let di = order.get(i).copied().unwrap_or(i);
             (c0..=c1)
-                .map(|ci| match pending {
-                    Some(row) => pending_cell_text(row, ci).to_string(),
-                    None => rs
-                        .cell(di, ci)
-                        .map(|c| c.display().to_string())
-                        .unwrap_or_default(),
-                })
+                .map(|ci| displayed_cell_text(gs, &rs, di, ci, pending))
                 .collect()
         })
         .collect();
@@ -3724,7 +3768,16 @@ fn advance_edit(gs: GridState, i: usize, ci: usize, pending: Option<usize>, forw
 /// view + selected. Not auto-opened for editing — it's already populated, so the
 /// user tweaks what they need (e.g. a natural key) and commits.
 fn clone_row(gs: GridState, data_idx: usize) {
-    let pidx = gs.add_cloned_row(data_idx);
+    clone_rows(gs, &[data_idx]);
+}
+
+/// [`clone_row`] for a gutter selection: one `new_rows` write for the whole
+/// batch, one scroll, one selection — see [`GridState::add_cloned_rows`].
+fn clone_rows(gs: GridState, data_idxs: &[usize]) {
+    if data_idxs.is_empty() {
+        return;
+    }
+    let pidx = gs.add_cloned_rows(data_idxs);
     let rs = gs.rs.get_untracked();
     let nrows = rs.row_count();
     let ncols = rs.col_count();
@@ -6117,17 +6170,13 @@ fn gutter_cell(gs: GridState, pos: usize, ncols: usize, pending: Option<usize>) 
 ///
 /// Pending new rows are left out: they have no committed row to duplicate or
 /// mark for deletion, and the row actions are offered only for real ones.
+/// The decision is `edit::selected_data_rows` — it decides which rows a delete
+/// acts on, and the write-back's 1-row net checks the count rather than the
+/// identity, so it belongs where it can be tested.
 fn selected_data_rows(gs: GridState, pos: usize) -> Vec<usize> {
     let order = gs.order.get_untracked();
-    let nreal = order.len();
-    let range = match gs.bounds_untracked() {
-        Some((r0, _, r1, _)) if pos >= r0 && pos <= r1 => r0..=r1,
-        _ => pos..=pos,
-    };
-    range
-        .filter(|i| *i < nreal)
-        .map(|i| order.get(i).copied().unwrap_or(i))
-        .collect()
+    let selection = gs.bounds_untracked().map(|(r0, _, r1, _)| (r0, r1));
+    schemaic_core::edit::selected_data_rows(&order, selection, pos)
 }
 
 /// Mark (or unmark) every row in `idxs` for deletion, touching only the ones
@@ -6173,9 +6222,7 @@ fn gutter_menu(gs: GridState, pos: usize, pending: Option<usize>) -> Vec<MenuEnt
         entries.push(MenuEntry::Separator);
         let dup = idxs.clone();
         entries.push(MenuEntry::action(plural("Duplicate"), move || {
-            for di in &dup {
-                clone_row(gs, *di);
-            }
+            clone_rows(gs, &dup);
         }));
         let del = idxs;
         entries.push(MenuEntry::action(
@@ -6825,6 +6872,9 @@ fn data_cell(
                     .with_untracked(|rows| rows.get(p).and_then(|r| r.get(&ci).cloned())),
                 None => gs.dirty.with_untracked(|d| d.get(&dkey).cloned()),
             };
+            // The painter's own three-way resolution; `displayed_cell_text` is
+            // the same rule for the clipboard and the AI attachment, which read
+            // the grid rather than paint it.
             let val = match staged_here_val {
                 Some(Some(t)) => t,
                 Some(None) => "NULL".to_string(),
@@ -6924,8 +6974,15 @@ fn data_cell(
                     open_edit_row(gs, data_idx)
                 }));
             }
-            entries.push(MenuEntry::action("Copy", move || {
-                let _ = floem::Clipboard::set_contents(v_copy.clone());
+            // Right-clicking inside a block keeps it selected, so the entry is
+            // about the block — and says which of the two it is, since Ctrl+C
+            // and the gutter menu's Copy both mean the whole selection.
+            let scope = schemaic_core::edit::copy_scope(gs.bounds_untracked(), i, ci);
+            entries.push(MenuEntry::action(scope.label(), move || match scope {
+                schemaic_core::edit::CopyScope::Selection => copy_selection(gs),
+                schemaic_core::edit::CopyScope::Cell => {
+                    let _ = floem::Clipboard::set_contents(v_copy.clone());
+                }
             }));
             // Only when this column shows a formatted (non-raw) value.
             if fmt != ColumnFormat::None {

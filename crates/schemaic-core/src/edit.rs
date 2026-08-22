@@ -1,5 +1,12 @@
 //! Result-set editability analysis — pure over [`ResultSet`] + schema, no UI.
 //!
+//! It also owns the **display↔data row mapping** the grid's destructive row
+//! actions run on ([`selected_data_rows`], [`attach_span`]): a sorted grid draws
+//! rows in `order` while every write addresses a *data* row, and getting that
+//! backwards deletes a row the user was not pointing at. The 1-row write-back
+//! net checks the *count*, never the identity, so nothing downstream would
+//! notice.
+//!
 //! From each column's wire provenance (real table/column + key flags, see
 //! [`crate::model::ColumnOrigin`]) this decides which columns can be written
 //! back and, per base table, which result columns reconstruct a row's `WHERE`
@@ -386,6 +393,92 @@ fn resolve_key(
         }
     }
     Some(key)
+}
+
+/// The **data** rows a gutter gesture at display row `pos` acts on, in display
+/// order.
+///
+/// `order` is the grid's display→data map, `selection` the display-row range the
+/// user has highlighted. When the click landed outside that range the gesture
+/// means the row it pointed at and nothing else — a menu must act on what was
+/// clicked, not on a selection somewhere up the list.
+///
+/// **Pending new rows are left out.** They live past `order.len()` and have no
+/// committed row to duplicate or mark for deletion.
+///
+/// Pure and here rather than in the grid because it decides *which rows are
+/// deleted*: on a sorted grid the display index and the data index are different
+/// numbers, and the write-back's 1-row net checks the count, not the identity —
+/// so an inverted mapping deletes the wrong row and reports success.
+pub fn selected_data_rows(
+    order: &[usize],
+    selection: Option<(usize, usize)>,
+    pos: usize,
+) -> Vec<usize> {
+    let (r0, r1) = match selection {
+        Some((r0, r1)) if pos >= r0 && pos <= r1 => (r0, r1),
+        _ => (pos, pos),
+    };
+    (r0..=r1)
+        .filter(|i| *i < order.len())
+        .map(|i| order.get(i).copied().unwrap_or(i))
+        .collect()
+}
+
+/// What a cell menu's **Copy** takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyScope {
+    /// The one cell the menu was opened on.
+    Cell,
+    /// The whole highlighted block, exactly as Ctrl+C takes it.
+    Selection,
+}
+
+impl CopyScope {
+    /// The entry's label. **The two amounts get two words**: "Copy" over a block
+    /// means the block, and one cell out of a block is a different act that has
+    /// to say so.
+    pub fn label(self) -> &'static str {
+        match self {
+            CopyScope::Cell => "Copy value",
+            CopyScope::Selection => "Copy",
+        }
+    }
+}
+
+/// What Copy means for a right-click at display cell `(i, ci)`, given the
+/// selection `(r0, c0, r1, c1)`.
+///
+/// A right-click **inside** a multi-cell selection no longer collapses it — that
+/// was the point of preserving it — so the menu is about the block, and an entry
+/// reading "Copy" that took one cell out of nine said the same word Ctrl+C and
+/// the gutter menu's own Copy say for three different amounts.
+pub fn copy_scope(
+    selection: Option<(usize, usize, usize, usize)>,
+    i: usize,
+    ci: usize,
+) -> CopyScope {
+    match selection {
+        Some((r0, c0, r1, c1))
+            if (r0 != r1 || c0 != c1) && (r0..=r1).contains(&i) && (c0..=c1).contains(&ci) =>
+        {
+            CopyScope::Selection
+        }
+        _ => CopyScope::Cell,
+    }
+}
+
+/// How many rows an attachment **sends** and how many the user **selected**,
+/// given the cap.
+///
+/// Two numbers because they differ, and the header has to say the second one:
+/// `crate::prompt::ATTACH_ROW_CAP` is about the context window, not about
+/// consent, so going over it is reported rather than silently applied. Returning
+/// only the capped figure would tell the user 200 rows went when they picked
+/// 900.
+pub fn attach_span(r0: usize, r1: usize, cap: usize) -> (usize, usize) {
+    let total = r1.saturating_sub(r0) + 1;
+    (total.min(cap), total)
 }
 
 #[cfg(test)]
@@ -1075,6 +1168,41 @@ mod tests {
         let m2 = analyze_edit(&r, schema_nullable);
         assert!(!m2.editable(0));
         assert!(!m2.editable(1));
+    }
+
+    /// **A sorted grid's display index is not its data index**, and the gutter's
+    /// destructive entries act on the second. The write-back's 1-row net checks
+    /// the *count*, never the identity, so an inverted mapping deletes the wrong
+    /// row and reports success.
+    #[test]
+    fn a_gutter_gesture_acts_on_the_data_rows_the_display_rows_stand_for() {
+        // Sorted descending: display 0 is data row 2.
+        let order = [2usize, 1, 0];
+
+        // Clicked inside the selection → the whole selection, in display order.
+        assert_eq!(
+            selected_data_rows(&order, Some((0, 1)), 1),
+            vec![2, 1],
+            "display rows 0..=1 are data rows 2 and 1"
+        );
+        // Clicked outside it → the row that was pointed at, and only that one.
+        assert_eq!(selected_data_rows(&order, Some((0, 1)), 2), vec![0]);
+        // No selection at all is the same gesture.
+        assert_eq!(selected_data_rows(&order, None, 0), vec![2]);
+        // Pending new rows live past `order` and have no committed row to act on.
+        assert_eq!(selected_data_rows(&order, Some((1, 5)), 3), vec![1, 0]);
+        assert!(selected_data_rows(&order, None, 9).is_empty());
+        assert!(selected_data_rows(&[], None, 0).is_empty());
+    }
+
+    /// The cap is about the context window, not about consent — so it is
+    /// reported rather than silently applied, which needs both figures.
+    #[test]
+    fn an_attachment_says_how_many_were_picked_as_well_as_how_many_go() {
+        assert_eq!(attach_span(0, 2, 200), (3, 3));
+        assert_eq!(attach_span(0, 899, 200), (200, 900));
+        // One row is one row, not zero.
+        assert_eq!(attach_span(5, 5, 200), (1, 1));
     }
 
     /// **An expression-only unique index keys nothing.** PostgreSQL models
