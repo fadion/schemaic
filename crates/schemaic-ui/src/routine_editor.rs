@@ -76,6 +76,10 @@ fn open(ui: &Ui, target: RoutineTarget, draft: RoutineDraft) {
     // A new editing session: any lazy fetch still in flight for the last one is
     // now for the wrong target and must not land.
     d.session.update(|g| *g += 1);
+    // The Body field reads this rather than seeding itself from the draft, so
+    // `fetch_source` can correct the text without rebuilding the modal. Seeded
+    // before the draft goes in, while the body is still the one we opened with.
+    d.routine_body.set(draft.info.body.clone());
     d.routine_draft.set(draft);
     // Cleared here rather than on close, so the one path that raises it —
     // `fetch_source`, at the end of this function — is the only one that can
@@ -251,40 +255,39 @@ fn fetch_source(ui: &Ui) {
                 .and_then(|t| t.current.as_ref())
                 .map(|c| c.body.clone())
         });
-        // The draft first, and without touching `d.routine`: **that signal is
-        // the overlay's own `dyn_container` key**, and floem never dedups a
-        // `set`, so writing it tears the whole modal down and rebuilds it —
-        // `FocusRing` and all — dropping the caret mid-word.
+        // Has the user typed in Body since the modal opened? The body it opened
+        // with is the only thing that can answer, so it is read before `current`
+        // is corrected below.
+        let untouched = d
+            .routine_draft
+            .with_untracked(|dr| opened_with.as_deref() == Some(dr.info.body.as_str()));
         d.routine_draft.update(|dr| {
             src.apply_session_to(&mut dr.info);
-            if opened_with.as_deref() == Some(dr.info.body.as_str()) {
+            if untouched {
                 src.apply_body_to(&mut dr.info);
             }
         });
-        // `current` — the left-hand side of every diff — but **only when it
-        // would actually change**. Most routines have no escapes to resolve, so
-        // `information_schema`'s copy already equals `SHOW CREATE`'s and the
-        // rebuild bought nothing. Where it does differ the rebuild is still
-        // load-bearing: `bound_field` seeds its local signal once at build, so
-        // the corrected body reaches the screen no other way.
-        let changes_current = d.routine.with_untracked(|t| {
-            t.as_ref()
-                .and_then(|t| t.current.as_ref())
-                .is_some_and(|c| {
-                    let mut probe = c.clone();
-                    src.apply_to(&mut probe);
-                    probe != *c
-                })
-        });
-        if changes_current {
-            d.routine.update(|t| {
-                if let Some(t) = t.as_mut()
-                    && let Some(cur) = t.current.as_mut()
-                {
-                    src.apply_to(cur);
-                }
-            });
+        // …and onto the screen, through the Body field's own signal.
+        // `edit_field` reconciles its doc from that signal in place, caret and
+        // all, where the field seeding itself once at build could only be
+        // corrected by rebuilding the form around it.
+        if untouched && let Some(body) = src.body.clone() {
+            d.routine_body.set(body);
         }
+        // `current` — the left-hand side of every diff — unconditionally. This
+        // used to be guarded on "would it actually change?", because `routine`
+        // is the overlay's `dyn_container` key and floem never dedups a write,
+        // so every patch here tore the modal down and rebuilt it. The key is a
+        // memo now (see `routine_overlay`), which dedups, so the guard has
+        // nothing left to protect and the write order below stops being
+        // load-bearing.
+        d.routine.update(|t| {
+            if let Some(t) = t.as_mut()
+                && let Some(cur) = t.current.as_mut()
+            {
+                src.apply_to(cur);
+            }
+        });
     });
     (ui.schema_actions.routine_source.clone())(
         RoutineSrcRequest {
@@ -310,8 +313,25 @@ fn bound_field(
     cfg: FieldCfg,
     apply: impl Fn(&mut RoutineDraft, &str) + 'static,
 ) -> AnyView {
+    bound_field_on(ui, floem::reactive::create_rw_signal(initial), cfg, apply)
+}
+
+/// [`bound_field`] over a signal the **caller** owns.
+///
+/// One field needs this: Body, whose text a late `SHOW CREATE` reply has to
+/// correct after the form is built (see [`Ui`]'s `routine_body`). A view-local
+/// signal could only be corrected by rebuilding the form around it, which is
+/// how the caret came to be dropped mid-word. The write-back contract is
+/// unchanged — `prev` is `None` on the first run, so seeding is never mistaken
+/// for an edit, and an external correction propagates into the draft the same
+/// way a keystroke does.
+fn bound_field_on(
+    ui: &Ui,
+    sig: RwSignal<String>,
+    cfg: FieldCfg,
+    apply: impl Fn(&mut RoutineDraft, &str) + 'static,
+) -> AnyView {
     let draft = ui.ddl.routine_draft;
-    let sig = floem::reactive::create_rw_signal(initial);
     create_effect(move |prev: Option<String>| {
         let v = sig.get();
         if prev.is_some_and(|p| p != v) {
@@ -507,9 +527,9 @@ fn routine_form(ui: Ui, target: &RoutineTarget, ring: FocusRing) -> AnyView {
 
     let body = form_setting(
         "Body",
-        bound_field(
+        bound_field_on(
             &ui,
-            draft.info.body.clone(),
+            ui.ddl.routine_body,
             FieldCfg {
                 placeholder: if postgres {
                     "BEGIN\n    RETURN NEW;\nEND;"
@@ -735,9 +755,15 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
     // "New function…" isn't a one-way door out of a half-filled trigger form.
     let close = move || d.routine.set(None);
 
+    // **A memo, not the raw pair** — `overlay_open_key` carries the reason. In
+    // short: `fetch_source` patches `d.routine` to correct `current`, and
+    // reading that signal in the key made every such patch tear this modal down
+    // and rebuild it, dropping the caret when the reply landed mid-word.
+    let open_key = crate::widgets::overlay_open_key(d.session, d.routine, d.preview);
+
     dyn_container(
-        move || (d.routine.get().is_some(), d.preview.get().is_some()),
-        move |(open, previewing)| {
+        move || open_key.get(),
+        move |(_session, open, previewing)| {
             if !open || previewing {
                 return empty().into_any();
             }

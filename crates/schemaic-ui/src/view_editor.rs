@@ -463,12 +463,20 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
     let d = ui.ddl;
     let close = move || d.view.set(None);
 
+    // The preview stacks on top and this stays open behind it (Cancel there
+    // returns here with the draft intact), but must render nothing — see the
+    // designer, which has the same pairing for the same reason.
+    //
+    // **A memo**, as in the routine editor and for the reason `overlay_open_key`
+    // gives: `fetch_algorithm` patches `current` after the form is up, and that
+    // rebuilt the whole modal, dropping the caret if the user was typing in the
+    // SELECT. Nothing is lost by not rebuilding — the algorithm is not a control
+    // here, only a term in the diff, so the rebuild delivered nothing to screen.
+    let open_key = crate::widgets::overlay_open_key(d.session, d.view, d.preview);
+
     dyn_container(
-        // The preview stacks on top and this stays open behind it (Cancel there
-        // returns here with the draft intact), but must render nothing — see the
-        // designer, which has the same pairing for the same reason.
-        move || (d.view.get().is_some(), d.preview.get().is_some()),
-        move |(open, previewing)| {
+        move || open_key.get(),
+        move |(_session, open, previewing)| {
             if !open || previewing {
                 return empty().into_any();
             }

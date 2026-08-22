@@ -3692,10 +3692,53 @@ pub(crate) fn exit_action(busy: bool, cancellable: bool) -> ExitAction {
     }
 }
 
+/// A modal overlay's `dyn_container` key: *am I open, and is something stacked
+/// over me?* — as a **memo**, which is the whole point of it existing.
+///
+/// [`floem::views::dyn_container`] has no equality check of its own. Floem's
+/// `create_updater` calls `on_change` on every re-run, and `swap_val` then
+/// disposes the child scope and rebuilds it unconditionally — so a key closure
+/// that reads the target signal directly rebuilds the entire modal on *any*
+/// write to it, including one that leaves `is_some()` exactly where it was.
+///
+/// Both DDL editors that fetch something after opening were built that way, and
+/// the fetch's patch of `current` is such a write. On a slow link it lands
+/// mid-keystroke: floem clears `app_state.focus` when a view is removed, so the
+/// caret vanished mid-word, the next characters went nowhere, and `FocusRing`'s
+/// remembered cursor reset with the ring. A memo notifies only when the pair
+/// actually changes — the modal opening, closing, or handing over to a preview.
+///
+/// `session` is the third term, and it is what keeps the dedup honest: a memo
+/// over presence alone would answer `(true, false)` both before and after
+/// *reopening the editor on a different object*, leaving the form seeded from
+/// the one that closed. The DDL editors bump `DdlUi::session` in every `open`
+/// and nothing else writes it, so it says "these contents were replaced
+/// wholesale" exactly when a fetch's patch does not.
+///
+/// Generic over the payloads because only their presence is the key; that is
+/// also what makes it testable without building a `Ui`.
+///
+/// **Not every such rebuild is spare** — see the trigger editor, whose key is
+/// deliberately left un-memoised because its Body field seeds at build and the
+/// rebuild is the only thing that delivers a corrected trigger body.
+pub(crate) fn overlay_open_key<A: 'static, B: 'static>(
+    session: RwSignal<u64>,
+    open: RwSignal<Option<A>>,
+    over: RwSignal<Option<B>>,
+) -> floem::reactive::Memo<(u64, bool, bool)> {
+    floem::reactive::create_memo(move |_| {
+        (
+            session.get(),
+            open.with(|v| v.is_some()),
+            over.with(|v| v.is_some()),
+        )
+    })
+}
+
 /// Whether a modal's **destructive** action may launch: only when nothing of its
 /// own is already in flight, and only when the plan isn't marked read-only.
 ///
-/// [`exit_action`]'s counterpart, and it exists for the same reason: the app has
+/// [`exit_action`]'s counterpart, and it exists for the same reason: the app had
 /// two of these actions — the DDL preview's Apply and Import — and they
 /// *disagreed*. Apply asked `if p.read_only || d.applying.get_untracked()
 /// { return; }`; Import set its busy flag and never read it, resting instead on
@@ -3884,6 +3927,66 @@ mod exit_tests {
     #[test]
     fn idle_and_writable_launches() {
         assert!(accept_launch(false, false));
+    }
+
+    /// **A patch to what is behind the key is not a change to the key.**
+    ///
+    /// The DDL editors' overlays are `dyn_container`s over "am I open, is
+    /// something over me", and `dyn_container` disposes and rebuilds its child
+    /// on every notification rather than on every *change* — so a key closure
+    /// reading the target signal directly rebuilt the whole modal whenever the
+    /// lazy `SHOW CREATE` fetch patched `current`, taking the caret and the
+    /// focus ring with it. This counts rebuilds the way `clear_tests` counts
+    /// effect runs: a content patch must be silent, opening and closing must not.
+    #[test]
+    fn an_overlay_key_ignores_a_patch_to_what_it_is_keyed_on() {
+        let session: RwSignal<u64> = RwSignal::new(0);
+        let target: RwSignal<Option<String>> = RwSignal::new(None);
+        let over: RwSignal<Option<u8>> = RwSignal::new(None);
+        let key = overlay_open_key(session, target, over);
+
+        let builds = Rc::new(std::cell::Cell::new(0u32));
+        let b = builds.clone();
+        create_effect(move |_| {
+            key.get();
+            b.set(b.get() + 1);
+        });
+        assert_eq!(builds.get(), 1, "the effect's first run");
+
+        target.set(Some("BEGIN SELECT 1; END".into()));
+        assert_eq!(builds.get(), 2, "opening is a real change");
+
+        // What `fetch_source` does: correct the body behind the flag. The pair
+        // is still `(true, false)`, so nothing may rebuild.
+        target.update(|t| *t = Some("BEGIN SELECT 'it''s'; END".into()));
+        assert_eq!(builds.get(), 2, "a patch to `current` rebuilt the modal");
+        // …and the unguarded spelling, for contrast — the floem fact this exists
+        // for, and the whole bug.
+        let raw = Rc::new(std::cell::Cell::new(0u32));
+        let r = raw.clone();
+        create_effect(move |_| {
+            let _ = (target.get().is_some(), over.get().is_some());
+            r.set(r.get() + 1);
+        });
+        let before = raw.get();
+        target.update(|t| *t = Some("BEGIN SELECT 2; END".into()));
+        assert_eq!(before + 1, raw.get(), "reading it raw notifies regardless");
+
+        over.set(Some(1));
+        assert_eq!(builds.get(), 3, "the preview stacking on top is a change");
+        over.set(None);
+        assert_eq!(builds.get(), 4, "and coming back from it");
+
+        // **Reopening on another object, with the modal never closing.** Every
+        // `open` bumps the session, which is the only reason dedupping the two
+        // bools is safe: without it this is `(true, false)` either side and the
+        // form would keep the routine that just closed.
+        session.update(|g| *g += 1);
+        target.set(Some("BEGIN SELECT 3; END".into()));
+        assert_eq!(builds.get(), 5, "a new editing session always rebuilds");
+
+        target.set(None);
+        assert_eq!(builds.get(), 6, "and so is closing");
     }
 }
 

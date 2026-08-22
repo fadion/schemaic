@@ -675,6 +675,7 @@ mod tests {
             trigger_draft: scope.create_rw_signal(Default::default()),
             routine: scope.create_rw_signal(None),
             routine_draft: scope.create_rw_signal(Default::default()),
+            routine_body: scope.create_rw_signal(String::new()),
             routine_source_pending: scope.create_rw_signal(false),
             functions: scope.create_rw_signal(Vec::new()),
             object: scope.create_rw_signal(None),

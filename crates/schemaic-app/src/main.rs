@@ -7435,6 +7435,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             trigger_draft: RwSignal::new(schemaic_core::ddl::TriggerSetDraft::default()),
             routine: RwSignal::new(None),
             routine_draft: RwSignal::new(schemaic_core::ddl::RoutineDraft::default()),
+            routine_body: RwSignal::new(String::new()),
             routine_source_pending: RwSignal::new(false),
             functions: RwSignal::new(Vec::new()),
             object: RwSignal::new(None),
