@@ -1096,6 +1096,17 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     .on_resize(move |r| eye_size.set((r.width(), r.height())))
     .on_click_stop(move |_| {
         menus.close_except(Some(crate::widgets::MenuId::SchemaEye));
+        // **Guards its own launch**, the way the QUERY toolbar's selector does.
+        // With no databases this menu renders no panel, so the flag stayed set
+        // with nothing on screen to clear it — the eye absorbs its own
+        // pointer-down, so the root's dismissal never runs for it — and the
+        // *next* thing to change was the tree finishing its load, at which point
+        // the panel's own predicate became true and the dropdown opened by
+        // itself. The effect that was supposed to cover this reads `open`
+        // untracked, so a click while the list is empty never re-runs it.
+        if db_nodes.with_untracked(|ns| ns.is_empty()) {
+            return;
+        }
         db_menu_open.update(|o| *o = !*o);
     })
     .on_event_stop(

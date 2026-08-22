@@ -2309,7 +2309,9 @@ pub(crate) fn cursor_menu_pos(
 /// is open, and the cursor of *that* submenu.
 ///
 /// One level of nesting, deliberately, and it is the level the widget itself
-/// supports — only the grid menus have submenus, and none of them nests twice.
+/// supports: no `MenuEntry::sub` in the app nests twice. (They are no longer the
+/// grid's alone — most of them are built in `overlays`, and the ER diagram has
+/// one — but the depth is what this claim is about, and that has not changed.)
 /// `sub` being the parent's field rather than the child's own is what lets
 /// [`menu_panel`]'s one key handler drive whichever level is open without walking
 /// a tree it would then have to keep in step with the views.
@@ -2524,8 +2526,14 @@ const SUBMENU_LIFT: f64 = 6.0;
 /// that opened it. A degenerate window (nothing measured yet) never flips.
 fn submenu_insets(row: Rect, win: (f64, f64), h: f64) -> (SubX, SubY) {
     let (win_w, win_h) = win;
+    // **The flipped arm clamps at zero**, the way `cursor_menu_pos` does. There
+    // is no minimum window size, so a window narrower than the row's own left
+    // edge makes `win_w - row.x0` negative and pins the panel's right edge
+    // *outside* the window, painting its left off-screen. The vertical lift is
+    // deliberately not clamped — see
+    // `a_row_at_the_window_origin_still_places_forward`.
     let x = if win_w > 1.0 && row.x1 + SUBMENU_FLIP_W > win_w {
-        SubX::Right(win_w - row.x0)
+        SubX::Right((win_w - row.x0).max(0.0))
     } else {
         SubX::Left(row.x1)
     };
@@ -3931,6 +3939,21 @@ mod submenu_place_tests {
             submenu_insets(row(), (win.0 - 1.0, win.1), 120.0).0,
             SubX::Right(win.0 - 1.0 - 400.0)
         );
+    }
+
+    /// **A window narrower than the row's own left edge still pins inside it.**
+    /// There is no minimum window size, so `win_w - row.x0` goes negative and
+    /// pinned the panel's right edge *outside* the window — its left drawn
+    /// off-screen — where `cursor_menu_pos`, the sibling that places the cursor
+    /// menu, has always clamped.
+    #[test]
+    fn a_flipped_submenu_never_pins_outside_the_window() {
+        let r = Rect::new(600.0, 200.0, 770.0, 230.0);
+        let (x, _) = submenu_insets(r, (400.0, 900.0), 120.0);
+        assert_eq!(x, SubX::Right(0.0));
+        // And an ordinary flip is unchanged.
+        let (x, _) = submenu_insets(r, (800.0, 900.0), 120.0);
+        assert_eq!(x, SubX::Right(200.0));
     }
 
     #[test]
