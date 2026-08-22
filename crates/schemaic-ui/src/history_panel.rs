@@ -194,24 +194,31 @@ fn history_search(filter: RwSignal<String>) -> impl IntoView {
     .style(|s| s.margin_left(12.0).margin_right(12.0).flex_shrink(0.0_f32))
 }
 
+/// How much of the accent the group header's count keeps. Named because the
+/// contrast gate measures the composited colour and has to be given the same
+/// number the view paints (`crate::contrast`).
+const HEADER_COUNT_ALPHA: f32 = 0.6;
+
 /// A recency group's header — `TODAY` and how many ran in it.
 ///
-/// The same weight and colour as the panel's own `section_title`, one step down
-/// in size: it divides a list *inside* a section rather than naming one, and at
-/// equal size the two read as competing titles.
+/// The same weight as the panel's own `section_title`, one step down in size: it
+/// divides a list *inside* a section rather than naming one, and at equal size
+/// the two read as competing titles. In the accent, which is where this list
+/// differs from a section title — the bands are the only thing a long history
+/// is scanned by, so they get the colour the eye already uses to find the start
+/// of a thing (it is the same accent the AI panel names Claude's turns in). The
+/// count rides along at 60%: it belongs to the band rather than beside it, and
+/// at full strength two accents of equal weight compete across the row.
 /// `first` is the topmost header in the list, and the only one that draws its own
 /// top rule: every other one follows a row that already ends in the same 1px
 /// border, and two of them stacked is a 2px seam at every group boundary but the
 /// first — floem doesn't collapse adjacent borders.
 fn group_header(bucket: history::Bucket, count: usize, first: bool) -> floem::AnyView {
-    let label = text(bucket.label()).style(|s| {
-        s.font_size(FONT_LABEL)
-            .font_bold()
-            .color(theme::text_muted())
-    });
+    let label =
+        text(bucket.label()).style(|s| s.font_size(FONT_LABEL).font_bold().color(theme::accent()));
     let n = text(count.to_string()).style(|s| {
         s.font_size(FONT_LABEL)
-            .color(theme::text_faint())
+            .color(theme::accent().multiply_alpha(HEADER_COUNT_ALPHA))
             .flex_shrink(0.0_f32)
     });
     h_stack((label, empty().style(|s| s.flex_grow(1.0_f32)), n))
