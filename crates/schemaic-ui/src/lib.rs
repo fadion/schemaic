@@ -3210,9 +3210,12 @@ const LOGO_PNG: &[u8] = include_bytes!("../../../assets/icon-64.png");
 /// run with nothing saved, the New connection button that stands in its place.
 ///
 /// Shared rather than spelled twice because the two swap in and out of the same
-/// slot: any difference in padding, margin or radius would show up as the header
-/// twitching the moment the first connection is saved. Only the border colour is
-/// the caller's (the active connection's identity colour, or the accent).
+/// slot: a difference in margin or radius would show up as the header twitching
+/// the moment the first connection is saved. The caller sets the border colour
+/// (the active connection's identity colour, or the accent) and may re-state the
+/// horizontal padding — the button does, because its content is the switcher's
+/// mirrored (glyph leading, label trailing) and those two numbers were tuned for
+/// the switcher's order.
 fn switcher_chrome(s: floem::style::Style) -> floem::style::Style {
     s.padding_left(11.0)
         .padding_right(7.0)
@@ -3297,7 +3300,20 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
                 (new_conn)();
                 manage_open.set(true);
             })
-            .style(|s| switcher_chrome(s).border_color(theme::accent()))
+            // Padding tightened 2px on the left and loosened 3px on the right
+            // against `switcher_chrome`'s, which is the one place the two
+            // occupants deliberately differ: those numbers were set for a text
+            // label leading and a chevron trailing, and this row is the mirror
+            // — the plus carries its own sidebearing into the left inset, and a
+            // label ending flush needs more room after it than a glyph does.
+            // Optical, not geometric: the pill's *edges* still land where the
+            // switcher's do, which is what keeps the header still.
+            .style(|s| {
+                switcher_chrome(s)
+                    .padding_left(9.0)
+                    .padding_right(10.0)
+                    .border_color(theme::accent())
+            })
             .into_any()
         },
     );
