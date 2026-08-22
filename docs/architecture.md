@@ -2820,6 +2820,19 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     terminal panel. The shared types living in the crate root is what stalls further splitting: the
     root depends on the leaves (`mod`) and the leaves depend on the root (types), so a view builder
     can't move out until the types do.
+    The header's **connection trigger** is one slot with two occupants, chosen by
+    `connections.is_empty()`: the switcher normally, and on a first run with nothing saved a
+    `New connection` button in the accent that drafts a connection and opens Manage Connections in
+    one press. With nothing saved there is nothing to switch *between* — the switcher reads "No
+    connection" and its menu puts the only action a first run has three clicks down (open the menu,
+    Manage Connections, New connection), which is a funnel with no traffic at the top. The test is
+    "none saved", not "none active": a user with connections and no active one still wants the
+    switcher, since choosing is what it is for. Both wear `switcher_chrome`, shared rather than
+    spelled twice **because they swap in and out of the same slot** — a padding or radius that
+    differed would show as the header twitching the moment the first connection is saved — and only
+    the border colour is the caller's (the active connection's identity colour, or the accent).
+    The switcher is the *only* thing that sets `conn_menu_open`, so the button leaves no menu
+    behind it that nothing can raise.
     The header's **update chip** (`update_state` + `apply_update` on `Ui`, alongside `resources`) is
     built in `header()` and goes in first in the right-hand cluster —
     `h_stack((update_chip, search, help, settings, chrome.controls()))` — because a muted text
