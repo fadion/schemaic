@@ -1073,12 +1073,25 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `pg` and `PostgreSQL`, and as do `MySQL` and the empty label that predates the field — so the
     question is not a string comparison. It is what the connection form's Type picker tells its own
     change apart from a load with.
+    `AiData` is the connection's **AI data-access level** — `SchemaOnly` / `OnRequest` (the
+    default) / `Full` — and the single gate over every path that can carry this connection's rows
+    off the machine: the `run_query` tool, `describe_table`'s sample rows, the grid's
+    attach-to-chat, and the value sampling behind AI Summary / Fill / Seed. Per connection because
+    a local scratch database and a client's production server are not the same risk, and one global
+    answer forces the careless setting on one of them. It is `Option<AiData>` on `Connection`:
+    `None` means "saved before the setting existed", which `migrated_ai_data` settles once at
+    startup from the old global `ai_run_queries` flag, so an upgrade neither grants access nobody
+    chose nor withdraws access that was working. There is deliberately **no masking option** — a
+    model cannot tell a masked value from a real one, so it reasons confidently about fiction, and
+    the questions where values matter are exactly the ones masking ruins.
     `SshTunnel`/`SshAuth` cover the tunnel's own
     auth, including `Agent` (delegates to the running SSH agent, storing no secret at all).
     `ConnStatus::is_down` treats `Unknown` (not yet checked, or a tunnel still coming up) as
-    *non*-blocking — only a confirmed failure gates work. `SshAuth`/`Environment` deserialize
-    through a `…Raw` shim with `#[serde(other)]`, so a value written by a newer build degrades to a
-    default instead of failing all of `connections.json`. There is deliberately no
+    *non*-blocking — only a confirmed failure gates work. `SshAuth`/`Environment`/`AiData`
+    deserialize through a `…Raw` shim with `#[serde(other)]`, so a value written by a newer build
+    degrades to a default instead of failing all of `connections.json` — and for `AiData` that
+    default is deliberately the *safe* level, since an unknown one written by a newer build means
+    more access than this one understands. There is deliberately no
     `mysql://user:pass@host` builder, and the password fields here aren't what's on disk — see
     `secrets.rs`. `duplicate` is the copy the connection list's right-click menu makes — a
     **struct update**, so a field added to `Connection` later is carried by construction; the
@@ -1301,7 +1314,14 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   - **AI prompt + reply plumbing** (all pure, all dialect-aware — a prompt that hardcodes
     "MySQL/MariaDB" asks a Postgres connection for backtick-quoted SQL the server rejects):
     - `prompt.rs` — fences DB content so an embedded ` ``` ` can't escape into prose. Every prompt
-      built from server-controlled text goes through it.
+      built from server-controlled text goes through it. It also owns **what the assistant is told
+      about the result on screen**: `result_shape` renders a `QueryState` as columns + types, row
+      count, cap, elapsed, database and (on a failure) the engine's error verbatim — *never a cell
+      value* — while `result_attachment` renders the rows the user deliberately attached, capped at
+      `ATTACH_ROW_CAP` with the cap stated in its own header so a model handed 200 of 5,000 rows
+      can't mistake the sample for the set. Both build on `pipe_table`, the one table renderer for
+      anything a model reads (the MCP tools call it too), so a cell containing `|`, a newline or a
+      megabyte of JSON is handled identically wherever it appears.
     - `summary.rs` — the grid's "AI Summary" cell/column prompts. `sample_column` spreads its
       sample *evenly* across loaded rows rather than taking the first N, because a sorted result's
       head often shares a date/status/prefix that reads as a pattern that isn't real; `sample_row`
@@ -1338,6 +1358,16 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     - `transcript.rs` — the rendered shape of one AI turn (`ChatMessage`/`Seg::{Text,Tool}`/
       `TurnStats`), kept here rather than in `schemaic-ai` so the UI crate needn't depend on the
       CLI-integration crate. `ChatMessage::prose` is what copy *and* conversation replay use.
+      A user turn may carry an `Attachment` — the result rows sent with that question. Its
+      `summary` persists so a reopened conversation still shows that data went with the turn, but
+      the cells are `#[serde(skip)]`: sending the rows was the consent, keeping a client's customers
+      in `chat.json` afterwards is a second thing nobody asked for. `retained()` is how a view tells
+      a live attachment from a restored one. `total_rows` is the count **before** the cap and is not
+      derivable from `rows`: the builder caps on the way in, so a header computed from what survived
+      reported "200 of 200" for a 5,000-row selection and handed the model a sample it read as the
+      set — the cap notice exists precisely for that case, so the number it needs has to travel.
+      `fingerprint` folds the attachment in, per its own rule that a field a mutation can change
+      belongs there.
       Also the message box's **prompt recall** (Ctrl+Up/Down): `user_prompts` (the user's own
       questions, newest first, blanks dropped and a repeat kept only at its newest spot) +
       `recall_step`, which is a **cycle** — `None → newest → … → oldest → None` — rather than a
@@ -1364,6 +1394,10 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
       session's system prompt, tool calls never are.
   - `text_ops.rs` — Ctrl+/ `toggle_line_comment` + `find_matches`/`replace_all`/
     `contains_ignore_ascii_case` (find bars). Pure, ASCII-case-insensitive, byte-offset-preserving.
+    `selected_text` resolves a mirrored byte range against the buffer for the AI panel: the range
+    comes from the mounted editor while the text comes from the tab's own signal, so the two can
+    disagree by a keystroke — an empty, reversed, out-of-range or mid-character range yields `None`
+    ("no selection"), never a panic.
   - `sqlfmt.rs` — `format_sql` (Ctrl+Alt+L pretty-printer): re-flows whitespace/indent/line-breaks
     "block" style, **preserving keyword case**; built on `skip_noncode` so comments/strings/backtick
     idents pass through untouched; indent follows editor tab-width/soft-tabs.
@@ -2363,7 +2397,13 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `is_editable_object` is the entry point's gate: an identity column's counter is listed
     and alterable but not editable-as-an-object, the call a materialized view gets.
   - `ai_panel.rs` — AI Assistant panel (`ai_panel`/`message_bubble`/`render_segments`/`tool_chip`/
-    `assistant_footer`).
+    `assistant_footer`). Two views carry an attachment: `attachment_chip` sits over the message box
+    showing what the *next* question will send, with an × that is a real cancel — the last point
+    before rows leave the machine — and `sent_attachment` sits above a past question showing what
+    it *did* send, expanding to the exact block the model was given rather than a re-rendering of
+    the grid, so "what did I send?" is answered by looking. A restored conversation has the summary
+    without the rows and says so (`Attachment::retained`). The chip's `dyn_container` keys on the
+    summary alone, never the rows: a key clones what it reads on every notification.
   - `overlays.rs` — absolutely-positioned popups: connection/active-db/schema menus, schema context
     menu, generic grid popup, Find-Anywhere, error modal.
   - `schema_tree.rs` — SCHEMA sidebar (`schema_panel` + db/table/column/key row builders + keyboard
@@ -2910,6 +2950,37 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   user can retype or a table they can reopen, so nothing else is stored against their preference; the
   same subset is read back so a full session left over from when the setting was *on* isn't silently
   restored either.
+  **What the assistant knows about the result on screen, and how rows reach it.** `TurnContext`
+  carries a `result` — `core::prompt::result_shape` over `Tab::shown_result`, which is
+  `shown_panel` again rather than a second fallback rule (a stale `active_result` shows panel 0 in
+  the pane, and the AI has to describe the same statement) — so columns, types, counts, the cap, the
+  elapsed time and a failed run's error text ride on every turn, and *no cell value ever does*. It is
+  diffed like the rest of the context, and a cleared panel is reported as cleared rather than
+  omitted: a stale shape would have the model explaining an error the user has already fixed. The
+  same snapshot sends the editor **selection** in place of the whole buffer when there is one
+  (`core::text_ops::selected_text` over the range `Tab::selection` mirrors out of the mounted
+  editor), labelled as a selection by `editor_section_label` — one function, because the system
+  prompt and every later delta have to agree about whether the model is looking at a fragment or
+  the script. Rows themselves travel only as an `Attachment`: the grid's *Attach N rows to chat*
+  stages one in `AiUi::attachment`, the panel shows it as a chip with an ×, and `ai_send` takes it
+  (clearing the signal, so a second question can't silently re-send it), puts it on the
+  `ChatMessage` for the transcript and prepends `prompt_block()` to the turn. The take is gated on
+  the level of the connection the turn is **going to**, and the chip is cleared by a connection
+  switch and by New Chat: rows are staged against the connection they came from, and the user can
+  switch before sending. `ai_regenerate` carries the attachment back into the signal, since the
+  rows travel with the turn rather than in `ChatMessage::text` and a regenerated question without
+  them asks about data the model cannot see. The whole path is
+  governed by the connection's `AiData`: `ai_context` reads the level from the same lookup that
+  gives it the dialect — rather than taking it as a parameter that could disagree with the tools
+  the session was actually given — `start_ai_session` turns it into the tools list and the MCP
+  blob's `samples` flag, and `ai_send` respawns the session when it changes, since both were fixed
+  at spawn and a data-access setting that doesn't take effect is the worst kind of lie. **A respawn
+  that can't happen refuses the turn** rather than falling through to the old session: with no
+  `Db` (a tunnel still coming up) the previous session is dropped and the panel says the database
+  is unreachable, because answering through a session built for the previous level is this control
+  failing open. The grid
+  asks `ai_data_of` (the *result's* connection, not the active one) and checks it at each action as
+  well as when building the menu.
   The MCP subprocess gets its DB endpoint as JSON in `$SCHEMAIC_MCP_ENDPOINT` via a
   per-session temp `--mcp-config` file (removed on drop) — never argv, so credentials don't leak
   to other same-user processes. Pure clusters split out: `claude_cli.rs` (`claude` binary
@@ -3167,6 +3238,21 @@ Re-introducing the anti-patterns these guard against is a regression:
   verdict** — a new protection is an arm of `run_verdict`, and a `RunVerdict::Block` must stay
   un-overridable. (`plan_view`'s `contains_write` is not a second guard: it decides whether
   `EXPLAIN ANALYZE` may run a statement for its timings.)
+- **A row reaches the model only where `AiData` says it may, and the level is the connection's.**
+  Every path that can put a cell value in a prompt — `run_query`, `describe_table`'s samples, the
+  grid's attach-to-chat, AI Summary, AI Fill, AI Seed — is gated on
+  `connection::AiData::{may_query, may_attach}`, resolved from **the connection the data came
+  from** (`grid::ai_data_of` reads the result's `conn_id`, not the active one). Don't add a path
+  that samples, quotes or forwards result values without asking, and don't answer the question
+  from a new flag: three unrelated toggles is precisely how a user comes to believe they are
+  protected while a fourth path ships samples anyway — which is the state this replaced, where the
+  AI panel's global "run queries" switch left `describe_table`'s five sample rows, the cell
+  summary's column sample and Seed Table's bottom sample all flowing regardless. Gate at the
+  action as well as at the menu: a menu built a moment before the connection was locked down is
+  still on screen. The default (`OnRequest`) grants **no** automatic access — rows go only where
+  the user attached them, so the gesture is the consent and there is no setting to forget. And
+  what is sent is kept honest at both ends: `result_shape` states out loud that no rows were sent,
+  and `result_attachment` states the cap it applied.
 - **One SQL boundary lexer.** Any code scanning SQL for string / `-- ` / `#` / `/* */` / backtick /
   `$tag$` boundaries MUST build on `schemaic_core::sql::skip_noncode` (statement split, WHERE guard, AI
   read-only gate, `intel`'s tokenizer, `sql_highlight`, `sqlfmt`). Never hand-roll a second
@@ -4374,12 +4460,24 @@ for keyboard nav.
   `.style()` so resize is live. Every cell/header uses `flex_shrink(0)` so the row overflows (enabling
   h-scroll) instead of squeezing.
 - **Selection**: click sets `active`+`anchor`; `PointerEnter` while `selecting` extends the range
-  (drag-select, no capture); gutter click selects the row. Copy (Ctrl+C / toolbar) emits TSV; a lone
-  cell copies its raw value.
+  (drag-select, no capture); a gutter press selects the whole row and arms `row_selecting`, whose
+  own `PointerEnter` extends by **rows** (`model::row_range_selection`) — a second flag, because
+  sharing `selecting` would collapse a gutter drag to one column the moment it crossed a cell.
+  Shift+click in the gutter extends from the current anchor. **A right-click inside the selection
+  keeps it**, in the gutter and in the cells alike: collapsing to the clicked cell (which the cell
+  menu used to do unconditionally) destroys the very block the menu is about, and the entries then
+  describe one cell. Outside it, the press selects first, so a menu never describes something
+  invisible. Copy (Ctrl+C / toolbar) emits TSV; a lone cell copies its raw value.
 - **Right-click menus** (generic `menu_panel` / `ui.popup_menu`): a header offers `Copy › CSV / JSON`
   of that column's values (`export_column_csv`/`_json`); a data cell offers `View`, `Edit` (editable
   cells only), `Copy`, `Set to NULL` (editable **and** nullable — stages `dirty` `None`), and
-  `AI Summary` (reveals the AI panel, prompts with source table + column for context). The grid's app
+  `AI summary` (reveals the AI panel, prompts with source table + column for context). The
+  **gutter** has its own menu (`gutter_menu`) rather than the cell one — `Copy`, the row actions,
+  and the attach entry — because a row-number click has picked out no cell, and offering
+  Edit field / Filter by this value there would answer a gesture about rows with actions about a
+  column. Its row actions take **every selected row** (`selected_data_rows` → `set_rows_deleted` /
+  `clone_row`) and count them in the label: the same menu naming five rows in one entry and acting
+  on one in the next is how four deletions go missing unnoticed. The grid's app
   context (`source`, `db_nodes`, `connections`/`active_conn`, `popup`, `summarize`, `dismiss`, …) is
   bundled in `GridCtx`, threaded `results_section → results_view/multi → loaded_view → grid_view`,
   then stashed in `GridState` (whose `Rc` callbacks live in `RwSignal<Option<…>>` since it's `Copy`).

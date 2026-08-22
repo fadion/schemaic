@@ -162,6 +162,7 @@ mod tests {
             segs: vec![Seg::Text(text.to_string())],
             stats: None,
             pending: false,
+            attachment: None,
         }
     }
 

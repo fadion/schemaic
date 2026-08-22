@@ -191,7 +191,15 @@ pub struct UiState {
     /// AI Assistant — schema context scope: `active` / `all` / `none`.
     #[serde(default = "default_ai_scope")]
     pub ai_schema_scope: String,
-    /// AI Assistant — allow the assistant to run read-only queries.
+    /// **Legacy.** The old global "let the assistant run read-only queries"
+    /// switch, replaced by the per-connection
+    /// [`AiData`](crate::connection::AiData) level.
+    ///
+    /// Still loaded, because it is what a first run after the upgrade resolves
+    /// each connection's unset level from, and still written back **unchanged**
+    /// so downgrading to an older build finds the setting it left. Nothing else
+    /// reads it: a global answer to "may the assistant read data" is exactly
+    /// what the per-connection level exists to stop.
     #[serde(default = "default_true")]
     pub ai_run_queries: bool,
     /// Interface (chrome) theme key: `dark` / `light`.
@@ -1025,6 +1033,7 @@ mod tests {
             prominent_color: false,
             read_only: false,
             environment: Environment::Production,
+            ai_data: None,
         };
         let file = ConnectionsFile {
             connections: vec![c],

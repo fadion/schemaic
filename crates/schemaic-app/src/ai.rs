@@ -19,7 +19,7 @@ use floem::reactive::{RwSignal, SignalGet, SignalWith};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-use schemaic_core::connection::Connection;
+use schemaic_core::connection::{AiData, Connection};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::persist;
 use schemaic_core::prompt::{UNTRUSTED_NOTE, inline_datum};
@@ -73,7 +73,11 @@ pub(crate) struct AiSession {
 pub(crate) struct AiSettings {
     pub(crate) model: AiModel,
     pub(crate) effort: AiEffort,
-    pub(crate) run_queries: bool,
+    /// The active connection's data-access level. It sits with the *session*
+    /// settings because it is fixed at spawn — the tools list and the MCP blob
+    /// are written once — so a change to it has to respawn, exactly like a
+    /// change of model.
+    pub(crate) data: AiData,
     pub(crate) cli_path: String,
     pub(crate) instructions: String,
     pub(crate) schema_scope: SchemaScope,
@@ -323,7 +327,9 @@ pub(crate) struct StartAiParams {
     pub ai_tx: crossbeam_channel::Sender<AiStreamMsg>,
     pub model: String,
     pub effort: String,
-    pub run_queries: bool,
+    /// What this connection lets the assistant read ([`AiData`]) — decides both
+    /// the tools it is given and whether the MCP subprocess samples rows.
+    pub data: AiData,
     pub cli_path: String,
     /// Databases the SCHEMA eye has hidden — carried into the MCP endpoint so
     /// the tools agree with the prompt about what this session can see.
@@ -341,7 +347,7 @@ pub(crate) fn start_ai_session(
         ai_tx,
         model,
         effort,
-        run_queries,
+        data,
         cli_path,
         hidden,
     } = p;
@@ -353,10 +359,10 @@ pub(crate) fn start_ai_session(
     let mcp_cfg = write_mcp_config(&endpoint_json(
         &db,
         database.as_deref(),
-        run_queries,
+        data.may_query(),
         &hidden,
     ));
-    let tools = if run_queries {
+    let tools = if data.may_query() {
         AI_TOOLS_WITH_QUERY
     } else {
         AI_TOOLS_READ_ONLY
@@ -531,6 +537,17 @@ pub(crate) struct TurnContext {
     pub(crate) active_db: Option<String>,
     pub(crate) outline: String,
     pub(crate) query: String,
+    /// Whether `query` is the user's **selection** rather than the whole buffer.
+    /// It changes what the section is called, and a mislabelled selection is
+    /// worse than either: the model would take a fragment for the whole script.
+    pub(crate) selected: bool,
+    /// What the result panel is holding — **shape only**, never a cell value
+    /// (`core::prompt::result_shape`). `None` before the tab has run anything.
+    ///
+    /// The rows themselves reach the model only when the user attaches them, so
+    /// this is what makes "your query returned 0 rows" or "it failed with
+    /// ER_BAD_FIELD" askable without any data leaving the machine.
+    pub(crate) result: Option<String>,
 }
 
 /// Render the context block prepended to a user turn: only the parts that
@@ -576,11 +593,27 @@ fn render_turn_delta(
             cur.outline
         ));
     }
-    if prev.query != cur.query {
+    if prev.query != cur.query || prev.selected != cur.selected {
         out.push_str(&format!(
-            "Current query editor:\n```sql\n{}\n```\n",
+            "{}:\n```sql\n{}\n```\n",
+            editor_section_label(cur.selected),
             cur.query
         ));
+    }
+    // A result that changed is the most perishable section here: every run
+    // replaces it, and a stale shape is worse than none — it invites the model
+    // to explain an error the user already fixed.
+    if prev.result != cur.result {
+        match &cur.result {
+            Some(shape) => {
+                out.push_str(shape);
+                out.push('\n');
+            }
+            // Cleared (a fresh tab, or one that has not run): say so, or the
+            // shape from the *previous* tab stands as the model's last word on
+            // what is on screen.
+            None => out.push_str("The result panel is empty — nothing has been run.\n"),
+        }
     }
     Some(out)
 }
@@ -713,7 +746,6 @@ pub(crate) struct AiContextParams {
     pub tabs: RwSignal<Vec<Tab>>,
     pub active: RwSignal<usize>,
     pub scope: SchemaScope,
-    pub run_queries: bool,
 }
 
 pub(crate) fn ai_context(
@@ -722,21 +754,30 @@ pub(crate) fn ai_context(
     history: &[ChatMessage],
     instructions: &str,
 ) -> String {
-    // Name *and* engine come from the same lookup: the assistant is told which
-    // dialect to write for, and that has to be the connection it is pointed at.
-    let (conn_name, dialect) = p
+    // Name, engine *and* data-access level come from the same lookup: the
+    // assistant is told which dialect to write for and what it may read, and
+    // both have to be the connection it is pointed at. Reading the level here
+    // rather than taking it as a parameter is what stops a caller passing one
+    // that disagrees with the tools the session was actually given.
+    let (conn_name, dialect, data) = p
         .connections
         .with_untracked(|cs| {
             cs.iter()
                 .find(|c| c.id == p.active_conn.get_untracked())
-                .map(|c| (c.name.clone(), SqlDialect::from_db_type(&c.db_type)))
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        SqlDialect::from_db_type(&c.db_type),
+                        c.ai_data.unwrap_or_default(),
+                    )
+                })
         })
-        .unwrap_or_else(|| ("(none)".to_string(), SqlDialect::MySql));
+        .unwrap_or_else(|| ("(none)".to_string(), SqlDialect::MySql, AiData::default()));
     render_ai_context(
         &conn_name,
         &turn_context(p, fallback_db),
         p.scope,
-        p.run_queries,
+        data,
         &render_history(history, HISTORY_TURNS),
         instructions,
         dialect,
@@ -754,20 +795,34 @@ pub(crate) fn turn_context(p: AiContextParams, fallback_db: Option<&str>) -> Tur
         scope,
         ..
     } = p;
-    let tab = |f: &dyn Fn(&Tab) -> Option<String>| {
-        tabs.with_untracked(|v| {
-            v.iter()
-                .find(|t| t.id == active.get_untracked())
-                .and_then(f)
-        })
-    };
     let active_db = active_tab_database(p, fallback_db);
-    let query = tab(&|t| Some(t.query.get_untracked())).unwrap_or_default();
+    let (query, selected, result) = tabs.with_untracked(|v| {
+        let Some(t) = v.iter().find(|t| t.id == active.get_untracked()) else {
+            return (String::new(), false, None);
+        };
+        // The user's selection stands in for the buffer when there is one: it
+        // is both the part they mean and the only part they chose to send.
+        // Ctrl+K has always respected the selection; the panel shipped the
+        // whole script regardless — a 47 KB file of unrelated statements.
+        let full = t.query.get_untracked();
+        let (query, selected) =
+            match schemaic_core::text_ops::selected_text(&full, t.selection.get_untracked()) {
+                Some(sel) => (sel.to_string(), true),
+                None => (full, false),
+            };
+        (
+            query,
+            selected,
+            schemaic_core::prompt::result_shape(&t.shown_result()),
+        )
+    });
     let databases = snapshot_databases(db_nodes, p.hidden_dbs, active_db.as_deref());
     TurnContext {
         outline: render_schema_outline(&databases, active_db.as_deref(), scope),
         active_db,
         query,
+        selected,
+        result,
     }
 }
 
@@ -923,32 +978,59 @@ fn snapshot_databases(
     })
 }
 
+/// What to call the SQL block carrying the editor's contents.
+///
+/// One function, because the system prompt and every later delta must agree:
+/// the model has to know whether it is looking at the whole script or the part
+/// the user highlighted, and a section that silently changes meaning mid-session
+/// is how "rewrite this query" ends up rewriting a fragment.
+fn editor_section_label(selected: bool) -> &'static str {
+    if selected {
+        "The user's SELECTION in the query editor (the buffer holds more, \
+         which has not been sent)"
+    } else {
+        "Current query editor"
+    }
+}
+
 /// Pure core of [`ai_context`]: assemble the AI-panel system prompt from an
-/// already-snapshotted connection name, [`TurnContext`], scope, and run-queries
-/// flag. No signals — so the prompt shape (tools line, schema section) is
+/// already-snapshotted connection name, [`TurnContext`], scope, and data-access
+/// level. No signals — so the prompt shape (tools line, schema section) is
 /// unit-tested. Every live section it writes is one [`render_turn_delta`] can
 /// supersede later in the session.
 fn render_ai_context(
     conn_name: &str,
     cx: &TurnContext,
     scope: SchemaScope,
-    run_queries: bool,
+    data: AiData,
     history: &str,
     instructions: &str,
     dialect: SqlDialect,
 ) -> String {
     let engine = dialect.engine_label();
     // Tools line — kept truthful: the assistant always has `list_schema`, and
-    // `run_query` only when the setting allows it.
-    let tools_line = if run_queries {
-        "You can inspect the live schema with the list_schema and describe_table tools \
-         (describe_table gives one table's DDL, foreign keys, and sample rows) and run \
-         read-only queries (a single SELECT/SHOW/DESCRIBE/EXPLAIN/WITH statement) with the \
-         run_query tool. Use them when they help you answer."
-    } else {
-        "You can inspect the live schema with the list_schema and describe_table tools, but \
-         you cannot run queries — answer from the schema context and your knowledge. \
-         describe_table omits its sample rows while queries are off."
+    // `run_query` only where this connection allows it. The no-query arms also
+    // say *why*, so the model answers "I can't see the data, attach some rows or
+    // change the connection's setting" instead of apologising vaguely.
+    let tools_line = match data {
+        AiData::Full => {
+            "You can inspect the live schema with the list_schema and describe_table tools \
+             (describe_table gives one table's DDL, foreign keys, and sample rows) and run \
+             read-only queries (a single SELECT/SHOW/DESCRIBE/EXPLAIN/WITH statement) with the \
+             run_query tool. Use them when they help you answer."
+        }
+        AiData::OnRequest => {
+            "You can inspect the live schema with the list_schema and describe_table tools, but \
+             you cannot read any data: this connection is set to send rows only when the user \
+             attaches them. describe_table omits its sample rows. When you need values, say so \
+             — the user can select rows in the result grid and attach them to a question."
+        }
+        AiData::SchemaOnly => {
+            "You can inspect the live schema with the list_schema and describe_table tools. \
+             This connection sends no data at all — no queries, no sample rows, and the user \
+             cannot attach rows either. Answer from the schema and your knowledge, and say \
+             plainly when a question needs data you cannot have."
+        }
     };
     // Schema changes: the model proposes, the user applies. Spelled out here as
     // well as in the tool's own description, because the shape it replaces is
@@ -968,6 +1050,12 @@ fn render_ai_context(
     } else {
         format!("Databases and tables ({UNTRUSTED_NOTE}):\n{}\n", cx.outline)
     };
+    // The result panel's shape — never its rows. Absent entirely when nothing
+    // has run, so a fresh session doesn't carry a paragraph about emptiness.
+    let result_section = match &cx.result {
+        Some(shape) => format!("{shape}\n"),
+        None => String::new(),
+    };
     let current = &cx.query;
 
     let mut out = format!(
@@ -979,8 +1067,10 @@ fn render_ai_context(
          Active connection: {conn_name}\n\
          Active database: {active_db}\n\
          {schema_section}\
-         Current query editor:\n```sql\n{current}\n```",
+         {editor_label}:\n```sql\n{current}\n```\n\
+         {result_section}",
         active_db = cx.active_db.as_deref().unwrap_or("(none)"),
+        editor_label = editor_section_label(cx.selected),
     );
     if !history.is_empty() {
         out.push_str(&format!("\n\n{history}"));
@@ -1383,7 +1473,152 @@ mod tests {
             outline: render_schema_outline(dbs, active_db, scope),
             active_db: active_db.map(str::to_string),
             query: query.to_string(),
+            selected: false,
+            result: None,
         }
+    }
+
+    /// A loaded two-column grid, as the turn context would carry it.
+    fn with_result(mut cx: TurnContext) -> TurnContext {
+        let rs = schemaic_core::model::ResultSet::from_rows(
+            vec![schemaic_core::model::Column {
+                name: "email".to_string(),
+                type_name: "VARCHAR".to_string(),
+                origin: None,
+            }],
+            vec![vec![schemaic_core::model::Value::Str(
+                "secret@client.com".into(),
+            )]],
+        );
+        cx.result = schemaic_core::prompt::result_shape(&schemaic_core::model::QueryState::Loaded(
+            std::sync::Arc::new(rs),
+        ));
+        cx
+    }
+
+    /// A selection is sent *instead of* the buffer, so the block has to say so —
+    /// unlabelled, the model reads a fragment as the whole script and rewrites
+    /// accordingly.
+    #[test]
+    fn a_selection_is_labelled_as_one_in_the_prompt_and_the_delta() {
+        let mut cx = ctx_of(
+            &[],
+            Some("shop"),
+            "SELECT id FROM orders",
+            SchemaScope::None,
+        );
+        cx.selected = true;
+        let out = render_ai_context(
+            "Local",
+            &cx,
+            SchemaScope::None,
+            AiData::Full,
+            "",
+            "",
+            SqlDialect::MySql,
+        );
+        assert!(out.contains("SELECTION"), "{out}");
+        assert!(out.contains("```sql\nSELECT id FROM orders\n```"), "{out}");
+
+        // And the same text, now merely *unselected*, is a change worth sending:
+        // the block means something different.
+        let unselected = ctx_of(
+            &[],
+            Some("shop"),
+            "SELECT id FROM orders",
+            SchemaScope::None,
+        );
+        let block = render_turn_delta(&cx, &unselected, Some("shop")).expect("the label moved");
+        assert!(block.contains("Current query editor"), "{block}");
+        assert!(!block.contains("SELECTION"), "{block}");
+    }
+
+    /// The tools line is what the assistant believes it can do. Promising
+    /// `run_query` on a connection whose session never got the tool produces an
+    /// assistant that keeps trying and apologising; withholding the reason
+    /// produces one that can't tell the user how to fix it.
+    #[test]
+    fn the_tools_line_matches_the_level_the_session_was_given() {
+        let cx = ctx_of(&[], Some("shop"), "", SchemaScope::None);
+        let line = |data| {
+            render_ai_context(
+                "Local",
+                &cx,
+                SchemaScope::None,
+                data,
+                "",
+                "",
+                SqlDialect::MySql,
+            )
+        };
+        // Only Full advertises the query tool.
+        assert!(line(AiData::Full).contains("run_query tool"));
+        assert!(!line(AiData::OnRequest).contains("run_query tool"));
+        assert!(!line(AiData::SchemaOnly).contains("run_query tool"));
+        // Where the assistant can't fetch data, it is told how the user can
+        // supply it — and where they can't either, that too.
+        assert!(line(AiData::OnRequest).contains("attach"));
+        assert!(line(AiData::SchemaOnly).contains("cannot attach"));
+        // Schema inspection survives every level: it is not data.
+        for data in AiData::ALL {
+            assert!(line(data).contains("list_schema"), "{data:?}");
+        }
+    }
+
+    #[test]
+    fn the_system_prompt_describes_the_result_without_its_rows() {
+        let dbs = vec![(
+            "shop".to_string(),
+            Some(schema(vec![table("orders", &["id"])])),
+        )];
+        let cx = with_result(ctx_of(&dbs, Some("shop"), "SELECT 1", SchemaScope::Active));
+        let out = render_ai_context(
+            "Local",
+            &cx,
+            SchemaScope::Active,
+            AiData::Full,
+            "",
+            "",
+            SqlDialect::MySql,
+        );
+        assert!(out.contains("email VARCHAR"), "{out}");
+        assert!(!out.contains("secret@client.com"), "{out}");
+    }
+
+    #[test]
+    fn a_tab_that_has_run_nothing_contributes_no_result_section() {
+        let cx = ctx_of(&[], None, "", SchemaScope::None);
+        let out = render_ai_context(
+            "Local",
+            &cx,
+            SchemaScope::None,
+            AiData::Full,
+            "",
+            "",
+            SqlDialect::MySql,
+        );
+        assert!(!out.contains("Result panel"), "{out}");
+    }
+
+    #[test]
+    fn a_new_result_reaches_the_model_as_a_delta() {
+        let prev = ctx_of(&[], Some("shop"), "SELECT 1", SchemaScope::None);
+        let cur = with_result(prev.clone());
+        let block = render_turn_delta(&prev, &cur, Some("shop")).expect("the result moved");
+        assert!(block.contains("email VARCHAR"), "{block}");
+        assert!(!block.contains("secret@client.com"), "{block}");
+    }
+
+    /// Switching to a tab that has not run anything must retract the last
+    /// shape — otherwise the model keeps answering about the previous tab's
+    /// grid, which is exactly the confusion this section exists to remove.
+    #[test]
+    fn a_cleared_panel_retracts_the_last_shape() {
+        let prev = with_result(ctx_of(&[], Some("shop"), "", SchemaScope::None));
+        let cur = ctx_of(&[], Some("shop"), "", SchemaScope::None);
+        let block = render_turn_delta(&prev, &cur, Some("shop")).expect("the result moved");
+        assert!(block.contains("empty"), "{block}");
+        assert!(!block.contains("email VARCHAR"), "{block}");
     }
 
     #[test]
@@ -1403,7 +1638,7 @@ mod tests {
             "Local",
             &cx,
             SchemaScope::Active,
-            true,
+            AiData::Full,
             "",
             "",
             SqlDialect::MySql,
@@ -1429,19 +1664,19 @@ mod tests {
             Some(schema(vec![table("orders", &["id"])])),
         )];
         let cx = ctx_of(&dbs, Some("shop"), "SELECT 1", SchemaScope::Active);
-        for run_queries in [true, false] {
+        for data in AiData::ALL {
             let out = render_ai_context(
                 "Local",
                 &cx,
                 SchemaScope::Active,
-                run_queries,
+                data,
                 "",
                 "",
                 SqlDialect::MySql,
             );
             assert!(
                 out.contains(schemaic_core::propose::FENCE_TAG),
-                "run_queries = {run_queries} drops the tag"
+                "data = {data:?} drops the tag"
             );
             assert!(out.contains("propose_table_change"));
         }
@@ -1461,15 +1696,15 @@ mod tests {
             "Local",
             &cx,
             SchemaScope::All,
-            false,
+            AiData::OnRequest,
             "",
             "",
             SqlDialect::MySql,
         );
         assert!(out.contains("- shop: orders"));
         assert!(out.contains("- blog\n")); // unloaded → name only, no ": tables"
-        // run_queries = false → the no-queries tools line.
-        assert!(out.contains("cannot run"));
+        // No autonomous access → the no-queries tools line.
+        assert!(out.contains("cannot read any data"));
         assert!(!out.contains("with the run_query"));
     }
 
@@ -1484,7 +1719,7 @@ mod tests {
             "Local",
             &cx,
             SchemaScope::None,
-            true,
+            AiData::Full,
             "",
             "  Prefer CTEs.  ",
             SqlDialect::MySql,
@@ -1550,6 +1785,8 @@ mod tests {
             active_db: active_db.map(str::to_string),
             outline: outline.to_string(),
             query: query.to_string(),
+            selected: false,
+            result: None,
         }
     }
 
@@ -1564,6 +1801,7 @@ mod tests {
                 segs: vec![Seg::Text(prose.to_string())],
                 stats: None,
                 pending: false,
+                attachment: None,
             },
         }
     }

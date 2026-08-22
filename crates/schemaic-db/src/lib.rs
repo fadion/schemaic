@@ -3968,6 +3968,7 @@ mod tests {
             prominent_color: false,
             read_only: false,
             environment: Default::default(),
+            ai_data: None,
         };
         // No tunnel → direct host/port passthrough.
         let direct = Db::connect(&conn, None);
@@ -3998,6 +3999,7 @@ mod tests {
             prominent_color: false,
             read_only: false,
             environment: Default::default(),
+            ai_data: None,
         };
         let db = Db::connect(&conn, Some(55001));
         assert_eq!(db.engine(), Engine::Sqlite);

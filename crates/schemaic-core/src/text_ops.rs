@@ -493,9 +493,49 @@ pub fn offset_of_line(text: &str, line: usize) -> Option<usize> {
     None
 }
 
+/// The text `range` covers in `text`, or `None` when there is no usable
+/// selection — an empty or reversed range, one reaching past the end, or one
+/// whose ends fall inside a multi-byte character.
+///
+/// Every caller holds a byte range mirrored out of the mounted editor while the
+/// text comes from the tab's own signal, so the two can disagree by a keystroke.
+/// A disagreement must degrade to "no selection", never to a panic: `SELECT
+/// 'città'` with a stale offset is a slice through the middle of `à`.
+pub fn selected_text(text: &str, range: Option<(usize, usize)>) -> Option<&str> {
+    let (a, b) = range?;
+    if a >= b {
+        return None;
+    }
+    text.get(a..b).filter(|s| !s.trim().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_selection_is_the_text_between_its_ends() {
+        assert_eq!(selected_text("SELECT a FROM t", Some((7, 8))), Some("a"));
+    }
+
+    #[test]
+    fn a_caret_is_not_a_selection() {
+        assert_eq!(selected_text("SELECT 1", Some((3, 3))), None);
+        assert_eq!(selected_text("SELECT 1", None), None);
+        // Whitespace only: the user has selected nothing worth sending.
+        assert_eq!(selected_text("a   b", Some((1, 4))), None);
+    }
+
+    #[test]
+    fn a_stale_or_split_range_yields_nothing_rather_than_panicking() {
+        // Past the end (the buffer shrank since the mirror).
+        assert_eq!(selected_text("SELECT 1", Some((0, 99))), None);
+        // Reversed.
+        assert_eq!(selected_text("SELECT 1", Some((5, 2))), None);
+        // Mid-character: `à` is two bytes, so 5 lands inside it and 4 doesn't.
+        assert_eq!(selected_text("città", Some((0, 5))), None);
+        assert_eq!(selected_text("città", Some((0, 4))), Some("citt"));
+    }
 
     fn toggled(text: &str, a: usize, b: usize) -> String {
         toggle_line_comment(text, a, b, SqlDialect::MySql).text

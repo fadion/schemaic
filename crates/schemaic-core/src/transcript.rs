@@ -18,6 +18,51 @@ pub enum Role {
     Error,
 }
 
+/// Result rows the user attached to one question.
+///
+/// **The rows are session-only, deliberately.** `summary` persists — a reopened
+/// conversation still shows that data went with this turn, which is the audit
+/// trail — but the cells are `#[serde(skip)]`, so a grid of a client's customers
+/// never lands in `chat.json` on disk because someone asked one question about
+/// it. Sending the rows was the consent; keeping them at rest is a second thing
+/// nobody asked for.
+///
+/// Restored, an attachment is `summary` with no rows — [`Attachment::retained`]
+/// is how a caller tells the two apart.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Attachment {
+    /// One line naming what was sent ("42 rows × 3 columns"). Persisted.
+    pub summary: String,
+    /// How many rows the user actually **selected**, before the cap.
+    ///
+    /// Not derivable from `rows`: the builder caps at
+    /// [`ATTACH_ROW_CAP`](crate::prompt::ATTACH_ROW_CAP) on the way in, so a
+    /// header computed from what survived would report 200 of 200 for a
+    /// 5,000-row selection and hand the model a sample it reads as the set.
+    #[serde(default)]
+    pub total_rows: usize,
+    /// Column headers of the attached block.
+    #[serde(skip)]
+    pub columns: Vec<String>,
+    /// The attached cells, already rendered as display text and already capped
+    /// (`core::prompt::ATTACH_ROW_CAP`) by whoever built this.
+    #[serde(skip)]
+    pub rows: Vec<Vec<String>>,
+}
+
+impl Attachment {
+    /// Whether the rows are still here — false for one restored from disk, where
+    /// only the summary survived.
+    pub fn retained(&self) -> bool {
+        !self.columns.is_empty() && !self.rows.is_empty()
+    }
+
+    /// The block to put in the prompt, or empty when there is nothing to send.
+    pub fn prompt_block(&self) -> String {
+        crate::prompt::result_attachment(&self.columns, &self.rows, self.total_rows)
+    }
+}
+
 /// One message in the AI panel conversation.
 ///
 /// `PartialEq` is load-bearing rather than incidental: the panel renders one view
@@ -39,6 +84,9 @@ pub struct ChatMessage {
     /// Never persisted as true — a restored turn is always finished.
     #[serde(default)]
     pub pending: bool,
+    /// Result rows the user attached to this question (user messages only).
+    #[serde(default)]
+    pub attachment: Option<Attachment>,
 }
 
 impl ChatMessage {
@@ -49,8 +97,18 @@ impl ChatMessage {
             segs: Vec::new(),
             stats: None,
             pending: false,
+            attachment: None,
         }
     }
+
+    /// A user turn that carried result rows with it.
+    pub fn user_with(text: String, attachment: Option<Attachment>) -> ChatMessage {
+        ChatMessage {
+            attachment,
+            ..ChatMessage::user(text)
+        }
+    }
+
     /// Placeholder assistant message shown while the CLI runs.
     pub fn pending() -> ChatMessage {
         ChatMessage {
@@ -59,6 +117,7 @@ impl ChatMessage {
             segs: Vec::new(),
             stats: None,
             pending: true,
+            attachment: None,
         }
     }
 
@@ -137,6 +196,17 @@ impl ChatMessage {
                     mix(c.result.as_ref().map_or(ABSENT, |s| s.len() as u64));
                     mix(c.is_error as u64);
                 }
+            }
+        }
+        // The attachment, so a bubble that gains or loses one (a restore, a
+        // regenerate) can't collide with the message it replaced at the same
+        // index — the rule this doc states, applied to the newest field.
+        match &self.attachment {
+            None => mix(ABSENT),
+            Some(a) => {
+                mix(3);
+                mix(a.summary.len() as u64);
+                mix(a.rows.len() as u64);
             }
         }
         MessageFingerprint {
@@ -459,6 +529,7 @@ mod tests {
             segs: vec![Seg::Text(text.to_string())],
             stats: None,
             pending: false,
+            attachment: None,
         }
     }
 
@@ -638,6 +709,34 @@ mod tests {
         assert!(
             changed(|m| m.segs.push(Seg::Text("hi".into()))),
             "a first segment"
+        );
+        // A bubble that gains rows, and one whose rows were dropped by a restore
+        // — the same summary with and without them are different bubbles.
+        assert!(
+            changed(|m| m.attachment = Some(Attachment {
+                summary: "3 rows".into(),
+                total_rows: 3,
+                columns: vec!["id".into()],
+                rows: vec![vec!["1".into()]],
+            })),
+            "rows were attached"
+        );
+        let mut attached = base.clone();
+        attached.attachment = Some(Attachment {
+            summary: "3 rows".into(),
+            total_rows: 3,
+            columns: vec!["id".into()],
+            rows: vec![vec!["1".into()]],
+        });
+        let mut restored = attached.clone();
+        restored.attachment = Some(Attachment {
+            summary: "3 rows".into(),
+            ..Default::default()
+        });
+        assert_ne!(
+            fp(&attached),
+            fp(&restored),
+            "the same attachment without its rows is a different bubble"
         );
 
         // Extending an existing text segment, which is the common case.

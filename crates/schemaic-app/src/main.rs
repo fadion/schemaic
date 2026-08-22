@@ -867,6 +867,7 @@ fn seed_connection() -> Connection {
         prominent_color: false,
         read_only: false,
         environment: Default::default(),
+        ai_data: None,
     }
 }
 
@@ -910,6 +911,11 @@ fn tx_engine(db: &Db) -> TxEngine {
 fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> impl IntoView {
     let cx = Scope::current();
 
+    // Persisted UI state. Loaded up here because the connection migration below
+    // reads the *old* global AI flag out of it; tab restore further down needs it
+    // too (`restore_tabs`).
+    let ui_state = persist::load_ui_state();
+
     // Load (or seed) saved connections. Secrets are hydrated from the OS keyring
     // (and any legacy plaintext migrated into it) by `secrets::load_connections`.
     let mut cf = secrets::load_connections();
@@ -934,6 +940,25 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let col = pick_connection_color(&used);
                 used.push(col.clone());
                 c.color = Some(col);
+                changed = true;
+            }
+        }
+        if changed {
+            secrets::save_connections(&cf);
+        }
+    }
+    // Settle the AI data-access level for every connection saved before it
+    // existed, from the global flag it replaces. Done once, at load, so nothing
+    // downstream has to keep asking "and what did the old setting say?" — and so
+    // an upgrade neither hands the assistant access the user never granted nor
+    // silently withdraws the access they had.
+    {
+        let mut changed = false;
+        for c in cf.connections.iter_mut() {
+            if c.ai_data.is_none() {
+                c.ai_data = Some(schemaic_core::connection::migrated_ai_data(
+                    ui_state.ai_run_queries,
+                ));
                 changed = true;
             }
         }
@@ -1016,9 +1041,6 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             },
         );
     });
-
-    // Persisted UI state (loaded here so tab restore below can read `restore_tabs`).
-    let ui_state = persist::load_ui_state();
 
     // Tab state. When "restore tabs on startup" is on and the last session saved
     // any tabs, rebuild them (query text + connection + source); otherwise start
@@ -1241,7 +1263,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let ai_effort = RwSignal::new(AiEffort::from_cli(&ui_state.ai_effort));
     let ai_instructions = RwSignal::new(ui_state.ai_instructions.clone());
     let ai_schema_scope = RwSignal::new(SchemaScope::from_key(&ui_state.ai_schema_scope));
-    let ai_run_queries = RwSignal::new(ui_state.ai_run_queries);
+    // The legacy global flag, carried verbatim from load to save. It is read once
+    // (the connection migration above) and never again — see
+    // `UiState::ai_run_queries` for why it is still written back at all.
+    let legacy_ai_run_queries = ui_state.ai_run_queries;
+    // Rows the grid has staged for the next question. Session-only by design:
+    // an attachment is consent for one turn, not a standing setting.
+    let ai_attachment = RwSignal::new(None::<schemaic_core::transcript::Attachment>);
     // Appearance (Settings → theme picker), restored from disk. Seed the live
     // theme registry from the persisted choice *before* any view builds, then
     // mirror the signals into it whenever the picker mutates them (live switch).
@@ -4312,7 +4340,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             ai_effort: ai_effort.get_untracked().cli().to_string(),
             ai_instructions: ai_instructions.get_untracked(),
             ai_schema_scope: ai_schema_scope.get_untracked().key().to_string(),
-            ai_run_queries: ai_run_queries.get_untracked(),
+            ai_run_queries: legacy_ai_run_queries,
             ui_theme: ui_theme.get_untracked().key().to_string(),
             editor_theme: editor_theme.get_untracked().key().to_string(),
             editor_font_size: editor_font.get_untracked(),
@@ -5612,6 +5640,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // session can't be reused, so the restored turns are transcript;
             // the next message spawns a session that gets them replayed.
             *ai_session.borrow_mut() = None;
+            // Staged rows belong to the connection they were taken from. Leaving
+            // the chip up would carry one connection's data into a question
+            // asked on another — past that connection's own data-access level.
+            ai_attachment.set(None);
             let restored = schemaic_core::chat::for_conn(&saved_chats.get_untracked(), id);
             // Reappearing, not arriving — mount them without the entrance pop.
             schemaic_ui::mark_messages_seen(restored.len());
@@ -5983,10 +6015,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // the CLI's stdin. Replies stream back via `ai_stream` (above).
     // Snapshot the session-affecting AI settings (Copy signals → this closure is
     // Copy, usable from both `ai_send` and `ai_apply`).
+    // The active connection's AI data-access level. One lookup, used by the
+    // session settings and by the spawn, so the tools list and the prompt that
+    // describes it can never disagree.
+    let conn_ai_data = move || -> schemaic_core::connection::AiData {
+        let id = active_conn.get_untracked();
+        connections
+            .with_untracked(|cs| cs.iter().find(|c| c.id == id).and_then(|c| c.ai_data))
+            .unwrap_or_default()
+    };
     let ai_settings_now = move || AiSettings {
         model: ai_model.get_untracked(),
         effort: ai_effort.get_untracked(),
-        run_queries: ai_run_queries.get_untracked(),
+        data: conn_ai_data(),
         cli_path: ai_cli_path.get_untracked(),
         instructions: ai_instructions.get_untracked(),
         schema_scope: ai_schema_scope.get_untracked(),
@@ -6003,10 +6044,15 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 return;
             }
             let active_id = active_conn.get_untracked();
+            let data_now = conn_ai_data();
+            // A live session's tools and MCP blob were fixed at spawn, so
+            // tightening (or widening) the connection's data access has to
+            // respawn — otherwise the setting the user just changed keeps not
+            // applying, which is the worst possible failure for this control.
             let need_new = ai_session
                 .borrow()
                 .as_ref()
-                .map(|s| s.conn_id != active_id)
+                .map(|s| s.conn_id != active_id || s.settings.data != data_now)
                 .unwrap_or(true);
             // The live context as it stands *now* — the system prompt is written
             // once at spawn, so every later turn carries the delta (see
@@ -6019,7 +6065,6 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 tabs,
                 active,
                 scope: ai_schema_scope.get_untracked(),
-                run_queries: ai_run_queries.get_untracked(),
             };
             // The active tab's database counts only when that tab is on the
             // active connection (a tab keeps its own); otherwise the new-tab
@@ -6054,7 +6099,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             ai_tx: ai_tx.clone(),
                             model: ai_model.get_untracked().cli().to_string(),
                             effort: ai_effort.get_untracked().cli().to_string(),
-                            run_queries: ai_run_queries.get_untracked(),
+                            data: data_now,
                             cli_path: ai_cli_path.get_untracked(),
                             // Read at spawn, like the system prompt beside it:
                             // the MCP subprocess is handed a blob, not a signal,
@@ -6073,11 +6118,48 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         last_context: context_now.clone(),
                         mcp_database,
                     });
+                } else {
+                    // No `Db` (tunnel still coming up, credentials refused) — so
+                    // no session was spawned. **Drop the old one rather than
+                    // sending this turn to it.** It was built for the previous
+                    // connection, or the previous data-access level: answering
+                    // through it would run `run_query` against a connection the
+                    // user has just locked down, which is this control failing
+                    // open. Say so and leave the question in the box.
+                    ai_session.borrow_mut().take();
+                    ai_messages.update(|v| {
+                        v.push(ChatMessage {
+                            role: Role::Error,
+                            text: String::new(),
+                            segs: vec![schemaic_core::transcript::Seg::Text(
+                                "Can't reach the database, so the assistant can't be started \
+                                 for this connection. Check the connection and try again."
+                                    .to_string(),
+                            )],
+                            stats: None,
+                            pending: false,
+                            attachment: None,
+                        });
+                    });
+                    return;
                 }
             }
 
+            // The staged rows travel with *this* turn and no other: taken here,
+            // so a second question doesn't quietly re-send the same data.
+            //
+            // Gated one last time on the level of the connection the turn is
+            // actually going to. Rows are staged against the connection they
+            // came from, and the user can switch connections before sending —
+            // so this is what stops a production grid being sent to a
+            // schema-only connection's session by a path the grid already
+            // refused.
+            let attachment = ai_attachment
+                .get_untracked()
+                .filter(|_| data_now.may_attach());
+            ai_attachment.set(None);
             ai_messages.update(|v| {
-                v.push(ChatMessage::user(msg.clone()));
+                v.push(ChatMessage::user_with(msg.clone(), attachment.clone()));
                 v.push(ChatMessage::pending());
             });
             ai_input.set(String::new());
@@ -6096,16 +6178,30 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             } else {
                 render_recap(&prior, RECAP_QUESTIONS)
             };
+            // Attached rows go in with the question, ahead of it: they are state
+            // the question refers to, like the context delta above them.
+            let asked = match attachment.as_ref().map(|a| a.prompt_block()) {
+                Some(block) if !block.is_empty() => format!("{block}\n\n{msg}"),
+                _ => msg.clone(),
+            };
             if let Some(s) = ai_session.borrow_mut().as_mut() {
                 let turn = apply_turn_delta(
                     &s.last_context,
                     &context_now,
                     s.mcp_database.as_deref(),
                     &recap,
-                    &msg,
+                    &asked,
                 );
                 s.last_context = context_now;
                 let _ = s.stdin_tx.send(schemaic_ai::user_message_line(&turn));
+            } else {
+                // Unreachable by construction (`need_new` either spawned one or
+                // returned above), but the cost of being wrong is a spinner that
+                // never stops and staged rows the user has to reselect — so put
+                // both back rather than trust the reasoning.
+                ai_attachment.set(attachment);
+                ai_busy.set(false);
+                mark_stopped(ai_messages);
             }
         })
     };
@@ -6167,6 +6263,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             ai_messages.set(Vec::new());
             ai_busy.set(false);
             ai_stopping.set(false);
+            // "New chat" clears everything else about the conversation; a chip
+            // left hanging over the fresh box would attach to a question the
+            // user never staged it for.
+            ai_attachment.set(None);
             (persist_chat)(active_conn.get_untracked());
         })
     };
@@ -6182,13 +6282,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             if ai_busy.get_untracked() {
                 return;
             }
+            // The attachment travels with the question, not in its text, so it
+            // has to be carried over too — regenerating "what stands out about
+            // these rows?" without them asks the model about data it can't see,
+            // and the rebuilt bubble would lose the record that any went.
             let last_user = ai_messages.with_untracked(|v| {
                 v.iter()
                     .rev()
                     .find(|m| m.role == Role::User)
-                    .map(|m| m.text.clone())
+                    .map(|m| (m.text.clone(), m.attachment.clone()))
             });
-            let Some(text) = last_user else {
+            let Some((text, attachment)) = last_user else {
                 return;
             };
             // Remove the last turn from the transcript: the trailing assistant/
@@ -6206,6 +6310,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // like `ai_cancel`, this resets multi-turn context — acceptable since
             // regenerate targets the latest answer.
             ai_session.borrow_mut().take();
+            // Re-stage the rows the question came with, so `ai_send` picks them
+            // up exactly as it did the first time. A restored conversation has
+            // the summary without them (`retained` false) — nothing to re-send
+            // there, and the filter says so rather than attaching an empty block.
+            ai_attachment.set(attachment.filter(|a| a.retained()));
             (ai_send)(text);
         })
     };
@@ -6258,7 +6367,6 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     tabs,
                     active,
                     scope: ai_schema_scope.get_untracked(),
-                    run_queries: ai_run_queries.get_untracked(),
                 },
                 default_tab_target().1.as_deref(),
             );
@@ -7211,8 +7319,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             effort: ai_effort,
             instructions: ai_instructions,
             schema_scope: ai_schema_scope,
-            run_queries: ai_run_queries,
             inline: inline_ai,
+            attachment: ai_attachment,
         },
         ai_actions: Rc::new(AiActions {
             // The assistant's DB tools can't reach a dead connection and its
@@ -7933,6 +8041,7 @@ mod app_tests {
             prominent_color: false,
             read_only: false,
             environment: Default::default(),
+            ai_data: None,
         }
     }
 

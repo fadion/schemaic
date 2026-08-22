@@ -23,8 +23,8 @@ use schemaic_core::transcript::{
 use crate::consts::{CHAT_PAD_H, FOLLOW_SLACK};
 use crate::markdown::{CodeActions, render_markdown};
 use crate::widgets::{
-    autohide_state, follow_after_scroll, jump_to_bottom_button, next_floor, section_title,
-    thin_scroll, toolbar_icon, verb_spinner, with_scroll_gesture,
+    autohide, autohide_state, follow_after_scroll, jump_to_bottom_button, next_floor,
+    section_title, shift_hscroll, thin_scroll, toolbar_icon, verb_spinner, with_scroll_gesture,
 };
 use crate::{ChatMessage, FieldCfg, Role, Ui, edit_field, icons, theme};
 
@@ -455,7 +455,12 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     let title_row = h_stack((section_title("AI ASSISTANT"), icons_group))
         .style(|s| s.width_full().flex_row().items_start().justify_between());
 
-    v_stack((title_row, convo, input_row)).style(move |s| {
+    // The chip sits between the conversation and the box, so "what will go with
+    // this question" is read on the way to typing it.
+    let staged = v_stack((attachment_chip(ui.ai.attachment), input_row))
+        .style(|s| s.flex_col().width_full().flex_shrink(0.0_f32));
+
+    v_stack((title_row, convo, staged)).style(move |s| {
         s.width(right_w.get())
             .flex_shrink(0.0_f32)
             .height_full()
@@ -610,6 +615,163 @@ fn ai_input_row(
     })
 }
 
+/// What a past turn actually carried, above the question it went with.
+///
+/// Collapsed to the summary line, expanding to **the exact text the model was
+/// given** — not a re-rendering of the grid, the block itself. "What did I send
+/// it?" should be answerable by looking, without trusting this code twice.
+///
+/// A conversation restored from disk has the summary and no rows (see
+/// [`schemaic_core::transcript::Attachment`]), and says so rather than
+/// pretending to an empty table.
+fn sent_attachment(a: schemaic_core::transcript::Attachment) -> impl IntoView {
+    let open = RwSignal::new(false);
+    let retained = a.retained();
+    // The cells, kept as-is and rendered only when the block is actually opened.
+    // Building the table up front cost a 200-row string per bubble on every
+    // rebuild, and a restored attachment (no rows by design) rendered a
+    // two-line empty table nobody ever sees.
+    let cells = Rc::new((a.columns, a.rows));
+    let head = h_stack((
+        icons::icon(icons::TABLE, 12.0).style(|s| s.color(theme::key_foreign())),
+        text(a.summary).style(|s| {
+            s.font_size(theme::FONT_HINT)
+                .font_family("IBM Plex Sans".to_string())
+                .color(theme::text_muted())
+                .flex_grow(1.0_f32)
+                .min_width(0.0)
+        }),
+        // The chevron *is* the affordance: a restored attachment has no rows to
+        // expand into, so it simply doesn't get one — nothing to say in words.
+        dyn_container(
+            move || retained.then(|| open.get()),
+            move |open| match open {
+                None => empty().into_any(),
+                Some(open) => icons::icon(
+                    if open {
+                        icons::CHEVRON_UP
+                    } else {
+                        icons::CHEVRON_DOWN
+                    },
+                    12.0,
+                )
+                .into_any(),
+            },
+        )
+        .style(|s| s.color(theme::text_muted())),
+    ))
+    .on_click_stop(move |_| {
+        if retained {
+            open.update(|o| *o = !*o);
+        }
+    })
+    .style(move |s| {
+        s.width_full()
+            .flex_row()
+            .items_center()
+            .gap(6.0)
+            .apply_if(retained, |s| s.cursor(CursorStyle::Default))
+    });
+    let rows = dyn_container(move || open.get() && retained, {
+        let cells = cells.clone();
+        move |show| match show {
+            false => empty().into_any(),
+            // A wide table is the normal case here, so the horizontal bar has to
+            // behave like every other one in the app: Shift+wheel drives it, and
+            // it auto-hides instead of sitting permanently across the block.
+            true => {
+                let body = schemaic_core::prompt::pipe_table(&cells.0, &cells.1, ATTACH_VIEW_CHARS);
+                autohide(shift_hscroll(text(body.trim_end().to_string()).style(
+                    |s| {
+                        s.font_family("monospace".to_string())
+                            .font_size(theme::FONT_HINT)
+                            .color(theme::text_muted())
+                    },
+                )))
+                .style(|s| s.width_full().max_height(220.0))
+                .into_any()
+            }
+        }
+    })
+    .style(|s| s.width_full());
+    v_stack((head, rows)).style(|s| {
+        s.flex_col()
+            .width_full()
+            .gap(6.0)
+            .padding(8.0)
+            .background(theme::bg_deepest())
+            .border(1.0)
+            .border_color(theme::border())
+            .border_radius(6.0)
+    })
+}
+
+/// Cell width in the transcript's copy of an attachment. Wider than the prompt's
+/// own cap would matter for: this is only ever read by a person, and a value cut
+/// short here would misrepresent what was sent.
+const ATTACH_VIEW_CHARS: usize = 200;
+
+/// The staged-attachment chip: what the *next* question will carry, sitting
+/// directly over the message box.
+///
+/// It is the last point before data leaves the machine, so it says how much and
+/// from where, and its × is a real cancel — the one gesture between "I clicked
+/// Attach" and "my customers' rows went to Anthropic". Absent (zero height) when
+/// nothing is staged.
+fn attachment_chip(
+    staged: RwSignal<Option<schemaic_core::transcript::Attachment>>,
+) -> impl IntoView {
+    dyn_container(
+        // Only the summary drives the rebuild: the rows can be megabytes, and a
+        // `dyn_container` key clones whatever it reads on every notification.
+        move || staged.with(|a| a.as_ref().map(|a| a.summary.clone())),
+        move |summary| match summary {
+            None => empty().into_any(),
+            Some(summary) => h_stack((
+                icons::icon(icons::TABLE, 13.0).style(|s| s.color(theme::key_foreign())),
+                text(summary).style(|s| {
+                    s.font_size(theme::FONT_HINT)
+                        .font_family("IBM Plex Sans".to_string())
+                        .color(theme::text_muted())
+                        .flex_grow(1.0_f32)
+                        .min_width(0.0)
+                }),
+                container(icons::icon(icons::X, 12.0))
+                    .on_click_stop(move |_| staged.set(None))
+                    .style(|s| {
+                        s.items_center()
+                            .color(theme::text_muted())
+                            .cursor(CursorStyle::Default)
+                            .hover(|s| s.color(theme::text()))
+                    }),
+            ))
+            .style(|s| {
+                s.width_full()
+                    .flex_row()
+                    .items_center()
+                    .gap(6.0)
+                    .padding_horiz(8.0)
+                    .padding_vert(5.0)
+                    .border(1.0)
+                    .border_radius(6.0)
+                    .border_color(theme::border())
+                    .background(theme::bg_panel())
+            })
+            .into_any(),
+        },
+    )
+    // The padding is the chip's, not the slot's — an unconditional one would
+    // leave an 8px band over the message box in every conversation that never
+    // attaches anything. `with(is_some)` rather than `get`: this re-runs on each
+    // change and the rows can be megabytes.
+    .style(move |s| {
+        let on = staged.with(|a| a.is_some());
+        s.width_full().apply_if(on, |s| {
+            s.padding_horiz(8.0).padding_top(8.0).padding_bottom(4.0)
+        })
+    })
+}
+
 // The disabled message box shown when Claude isn't connected — matches the real
 // box's metrics but is inert (dim placeholder, no send icon, no pointer events).
 fn ai_input_disabled(placeholder: &'static str) -> impl IntoView {
@@ -653,10 +815,16 @@ fn message_bubble(
     let label_txt = if is_user { "You" } else { "Claude" };
 
     let body: AnyView = if is_user {
-        // User's own message: a dim recap.
-        text(m.text)
-            .style(|s| s.width_full().font_size(14.0).color(theme::text_muted()))
-            .into_any()
+        // User's own message: a dim recap, under whatever data went with it —
+        // the record of what was sent, kept where it was sent.
+        let recap =
+            text(m.text).style(|s| s.width_full().font_size(14.0).color(theme::text_muted()));
+        match m.attachment {
+            Some(a) => v_stack((sent_attachment(a), recap))
+                .style(|s| s.flex_col().width_full().gap(6.0))
+                .into_any(),
+            None => recap.into_any(),
+        }
     } else {
         // Assistant turn: "Thinking…" until the first token, then the streamed
         // segments — with a footer underneath (a live elapsed timer while the turn

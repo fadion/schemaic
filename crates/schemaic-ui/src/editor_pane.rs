@@ -884,6 +884,9 @@ pub(crate) struct QueryPaneParams {
     pub query: RwSignal<String>,
     /// Caret byte offset, mirrored out of the editor for the status-bar Ln/Col.
     pub cursor_offset: RwSignal<usize>,
+    /// The selected byte range, mirrored out alongside it — see
+    /// [`Tab::selection`](crate::Tab::selection).
+    pub selection: RwSignal<Option<(usize, usize)>>,
     /// Opens the Go-to-line popup (Ctrl+G, or a status-bar Ln/Col click).
     pub goto_open: RwSignal<bool>,
     /// When set, jump the caret to this byte offset (move + centre + focus), then
@@ -959,6 +962,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     let QueryPaneParams {
         query,
         cursor_offset,
+        selection,
         goto_open,
         jump_offset,
         format_req,
@@ -1791,10 +1795,22 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
     });
 
     // Mirror the caret's byte offset into the tab's `cursor_offset` signal so the
-    // status bar can render Ln/Col. Tracks `ed.cursor`, so it fires on every caret
-    // move / selection change; disposed with this pane when the tab closes.
+    // status bar can render Ln/Col, and its selected range into `selection` for
+    // the AI panel. Tracks `ed.cursor`, so it fires on every caret move /
+    // selection change; disposed with this pane when the tab closes.
     create_effect(move |_| {
-        cursor_offset.set(ed_cursor.cursor.get().offset());
+        let cur = ed_cursor.cursor.get();
+        cursor_offset.set(cur.offset());
+        // A point selection is floem's spelling of "no selection" (a caret is
+        // still a region, `a == b`), and the tab's signal must mean the same, or
+        // every turn reports a selection of nothing.
+        // Ordered, because a selection dragged upwards arrives end-first and a
+        // reversed range reads as "nothing selected" downstream.
+        selection.set(
+            cur.get_selection()
+                .map(|(a, b)| (a.min(b), a.max(b)))
+                .filter(|(a, b)| a != b),
+        );
     });
 
     // Bracket matching: recompute the matched-paren offsets on every caret move
@@ -2654,7 +2670,7 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                     h_stack((
                         icons::icon(icons::SPARKLES, 16.0)
                             .style(|s| s.color(theme::err_fix_btn()).margin_right(5.0)),
-                        text("AI Fix")
+                        text("AI fix")
                             .style(|s| s.color(theme::err_fix_btn()).font_size(theme::FONT_BODY)),
                     ))
                     .on_click_stop(move |_| (ai_fix)())
