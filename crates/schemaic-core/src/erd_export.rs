@@ -210,6 +210,15 @@ fn key_tags(c: &DiagramColumn) -> Option<String> {
 /// may reference nothing and it drops to "zero or one". The child end is "zero or
 /// more" for a 1:many FK and "zero or one" for a unique one — zero either way,
 /// since nothing obliges a parent row to have children.
+///
+/// **Every text export says this the same way.** Mermaid and PlantUML take the
+/// two strings straight; Graphviz can't use them but spells the same pair
+/// `crowodot`/`teeodot` (see [`to_dot`]). The *canvas* is the one surface that
+/// draws no zero at the child end, and deliberately: on screen the marker would
+/// be on every edge of every diagram without exception, so it distinguishes
+/// nothing and only adds twenty stroked segments per edge to a view that is
+/// already the app's heaviest paint. A file is read by another tool, where the
+/// notation has to be complete rather than informative.
 fn crow_ends(e: &DiagramEdge) -> (&'static str, &'static str) {
     let parent = if e.optional { "|o" } else { "||" };
     let child = match e.cardinality {
@@ -542,10 +551,21 @@ pub fn to_dot(graph: &DiagramGraph) -> String {
             .first()
             .map(|c| format!(":{}", slug(c)))
             .unwrap_or_default();
-        // The edge runs child → parent, so the *tail* carries the many-end crow.
+        // The edge runs child → parent, so the *tail* carries the many-end crow —
+        // and the zero-circle behind it, because the child end is optional either
+        // way ([`crow_ends`] says why). Without it the tail read "exactly one" and
+        // the `.dot` asserted every parent row has a child, which the `.mmd` and
+        // the `.puml` of the same diagram explicitly deny.
+        //
+        // Spelled as a *composite*, not with the `o` modifier: Graphviz applies
+        // `o` only to the fillable primitives, so `ocrow`/`otee` parse and then
+        // render exactly like `crow`/`tee` (checked against graphviz itself — an
+        // `ocrow` edge draws one fewer circle than a `crowodot` one). In a
+        // composite the later shape sits farther from the node, which is where
+        // crow's-foot puts the zero.
         let tail = match e.cardinality {
-            Cardinality::OneToMany => "crow",
-            Cardinality::OneToOne => "tee",
+            Cardinality::OneToMany => "crowodot",
+            Cardinality::OneToOne => "teeodot",
         };
         let head = if e.optional { "odot" } else { "tee" };
         out.push_str(&format!(
@@ -1421,7 +1441,7 @@ mod tests {
         );
         assert!(
             out.contains(
-                "orders:user_id -> users:id [arrowtail=crow, arrowhead=tee, label=\"user_id\"];"
+                "orders:user_id -> users:id [arrowtail=crowodot, arrowhead=tee, label=\"user_id\"];"
             ),
             "{out}"
         );
@@ -1432,6 +1452,39 @@ mod tests {
         let mut g = sample();
         g.edges[0].optional = true;
         assert!(to_dot(&g).contains("arrowhead=odot"));
+    }
+
+    /// **The four exports must not disagree about the same edge.** `to_dot` used
+    /// to end its tail at a bare `crow`/`tee`, which in crow's-foot reads
+    /// "one or more" / "exactly one" — asserting that every parent row has a
+    /// child, where the `.mmd` and `.puml` of the same graph say `o{`/`o|`
+    /// ("zero or …"). The circle belongs on the child end in all of them.
+    ///
+    /// Spelled as a composite because Graphviz's `o` modifier does not apply to
+    /// `crow` or `tee`: `ocrow` parses and draws a plain crow, so the obvious
+    /// spelling would have been a silent no-op.
+    #[test]
+    fn dot_gives_the_child_end_the_same_zero_the_other_formats_do() {
+        for (card, tail, mermaid_child) in [
+            (Cardinality::OneToMany, "crowodot", "o{"),
+            (Cardinality::OneToOne, "teeodot", "o|"),
+        ] {
+            let mut g = sample();
+            g.edges[0].cardinality = card;
+            let dot = to_dot(&g);
+            assert!(
+                dot.contains(&format!("arrowtail={tail},")),
+                "{card:?} tail should be {tail}:\n{dot}"
+            );
+            assert!(
+                !dot.contains("arrowtail=crow,") && !dot.contains("arrowtail=tee,"),
+                "a bare tail is the mandatory-child reading:\n{dot}"
+            );
+            // The same edge, in the notation the other two formats share.
+            assert_eq!(crow_ends(&g.edges[0]).1, mermaid_child);
+            assert!(to_mermaid(&g).contains(mermaid_child), "{card:?}");
+            assert!(to_plantuml(&g).contains(mermaid_child), "{card:?}");
+        }
     }
 
     #[test]
