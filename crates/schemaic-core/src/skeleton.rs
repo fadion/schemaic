@@ -4,18 +4,34 @@
 //!
 //! **These are drafts for a human, not statements for a server**, and every
 //! decision below follows from that. Values are named placeholders (`:price`),
-//! which no engine accepts — so a skeleton that reaches the editor and is run by
-//! reflex *fails to parse* rather than writing a row of empty strings or
-//! updating every row in the table. Filling one in is the user's next act, and
-//! until they do, nothing can happen by accident.
+//! which MySQL and PostgreSQL do not accept — so a skeleton that reaches the
+//! editor and is run by reflex *fails to parse* rather than writing a row of
+//! empty strings or updating every row in the table. Filling one in is the
+//! user's next act, and until they do, nothing can happen by accident.
+//!
+//! **SQLite is the exception and it is worth stating plainly**, because the rest
+//! of the module used to rest on a claim that was false there: `:name` is a
+//! documented SQLite bind-parameter form, so a skeleton *prepares* cleanly on
+//! that engine. What stops it is one layer down — `db::sqlite`'s `execute` binds
+//! no parameters and the driver refuses the statement on its parameter count.
+//! That refusal is load-bearing, not incidental, and `db/sqlite.rs` says so at
+//! the call.
 //!
 //! What each statement addresses is not invented here: the table name is
 //! [`crate::filter::qualified_table_name`] (so a generated `UPDATE` and the
 //! browse `SELECT` above it spell the table identically) and the `WHERE` is
-//! [`crate::schema::browse_key_columns`], the same key the grid's write-back
-//! addresses a row with. A table with no key at all gets a `WHERE` that says so
-//! and does not parse, because the alternative — omitting it — is a statement
-//! that runs against every row.
+//! [`crate::schema::browse_key_columns`], falling back to the table's implicit
+//! key — the same three sources, in the same order, that
+//! [`crate::edit::resolve_key`] gives the grid's write-back. A table with no key
+//! at all gets a `WHERE` that says so and does not parse, because the
+//! alternative — omitting it — is a statement that runs against every row.
+//!
+//! **Every server-authored string here is flattened on its way in**, whichever
+//! shape it is going into: a column name becomes one placeholder token, a table
+//! name in the comment can't close it, and the identifiers go through
+//! [`crate::export::ident_if_needed`]. A generated draft is put on the clipboard
+//! by a right-click alone, so a name that split it into extra statements needed
+//! no further consent from anybody.
 //!
 //! The `CREATE` half of that menu is not here: it is `DbSchema`'s own
 //! `create_ddl_script`, which emits real DDL rather than a draft.
@@ -29,8 +45,47 @@ use crate::schema::{ColumnInfo, TableInfo, browse_key_columns};
 /// Named rather than `?` so a wide `INSERT` still says which slot is which once
 /// the column list has scrolled off, and deliberately *not* a literal of any
 /// kind — see the module note on why a skeleton must not be runnable.
+///
+/// **A placeholder is one token, so the name is flattened into one.** The column
+/// name is server-authored text, and it is the one thing here that cannot go
+/// through [`crate::export::ident_if_needed`] — a quoted identifier is not a
+/// placeholder. Left raw, a column named ``id; DROP TABLE users; -- `` split the
+/// draft into three statements, one of them the attacker's, and the menu put
+/// that on the clipboard on a right-click alone. The benign half needed no
+/// hostility at all: a column named `first name` yielded `:first name`, which is
+/// not a placeholder and does not parse, on an ordinary spreadsheet import.
 fn placeholder(column: &str) -> String {
-    format!(":{column}")
+    let flat: String = column
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    // A name with nothing word-like in it at all still needs a slot to fill in.
+    if flat.chars().all(|c| c == '_') {
+        return ":value".to_string();
+    }
+    format!(":{flat}")
+}
+
+/// Server-authored text on its way into a `/* … */` the user reads.
+///
+/// A comment is closed by `*/` and by nothing else, so a name carrying that
+/// sequence ends the comment early — and what follows it is then SQL. On the
+/// no-key `WHERE` that mattered more than anywhere else: the draft the module's
+/// doc promises twice is *unparseable* became a `DELETE … WHERE 1=1` that
+/// **succeeds**, so a Run Everything went on to whatever statement the name
+/// appended. The `*` and the `/` both survive here — they are simply never
+/// adjacent — and a control character becomes a space so the sentence stays on
+/// its own line.
+fn comment_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let c = if c.is_control() { ' ' } else { c };
+        if c == '/' && out.ends_with('*') {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Is this column worth typing a value for in a generated statement?
@@ -45,17 +100,33 @@ fn worth_writing(c: &ColumnInfo) -> bool {
     !c.is_server_assigned() && !c.auto_increment
 }
 
-/// The columns a skeleton names, longest-standing rule first: everything worth
-/// writing, or — when that leaves nothing, as it does for a table that is one
-/// `AUTO_INCREMENT` key — every column, since a statement naming no columns at
-/// all is not a draft of anything.
+/// The columns a skeleton names, in three stages: everything worth writing;
+/// failing that, everything the server would at least *accept* a value for
+/// (which is the `AUTO_INCREMENT`-key-only table the fallback was written for);
+/// failing that, every column, since a statement naming none is not a draft of
+/// anything.
+///
+/// **The middle stage is the one that has to be there.** Collapsing straight to
+/// "every column" named the `is_server_assigned` ones, which the server refuses
+/// however the user fills them in — `cannot insert a non-DEFAULT value into
+/// column "twice"` — so the draft was of nothing reachable. A key that merely
+/// *generates* a value when you omit one is a different thing from a column
+/// that refuses one, which is exactly the distinction [`worth_writing`] draws
+/// and this fallback used to throw away.
 fn skeleton_columns(t: &TableInfo) -> Vec<&ColumnInfo> {
     let worth: Vec<&ColumnInfo> = t.columns.iter().filter(|c| worth_writing(c)).collect();
-    if worth.is_empty() {
-        t.columns.iter().collect()
-    } else {
-        worth
+    if !worth.is_empty() {
+        return worth;
     }
+    let accepted: Vec<&ColumnInfo> = t
+        .columns
+        .iter()
+        .filter(|c| !c.is_server_assigned())
+        .collect();
+    if !accepted.is_empty() {
+        return accepted;
+    }
+    t.columns.iter().collect()
 }
 
 /// The `WHERE` line addressing one row, or the comment that says why there
@@ -66,11 +137,22 @@ fn skeleton_columns(t: &TableInfo) -> Vec<&ColumnInfo> {
 /// a `WHERE` the parser rejects is a question the user has to answer first, and
 /// the reason is written where they are already looking.
 fn where_clause(t: &TableInfo, dialect: SqlDialect) -> String {
-    let key = browse_key_columns(t);
+    let mut key = browse_key_columns(t);
+    // The third source `edit::resolve_key` has and `browse_key_columns`
+    // deliberately doesn't: SQLite's `rowid`, which the grid beside this draft
+    // is already writing back through. Without it a hand-made
+    // `CREATE TABLE notes (body TEXT)` was told it had no way to address a row
+    // while the application had one, and the module's parity claim with
+    // write-back was false on that engine.
+    if key.is_empty()
+        && let Some(implicit) = &t.implicit_key
+    {
+        key = vec![implicit.clone()];
+    }
     if key.is_empty() {
         return format!(
             "WHERE /* no primary key or unique index on {} — add a condition */",
-            t.name
+            comment_text(&t.name)
         );
     }
     let conds: Vec<String> = key
@@ -276,6 +358,160 @@ mod tests {
         assert!(!sql.contains("''"), "{sql}");
         assert!(!sql.contains("NULL"), "{sql}");
         assert!(sql.contains(":first_name"), "{sql}");
+    }
+
+    /// **A draft is one statement, whatever the server named its objects.**
+    ///
+    /// A table named ``orders */ 1=1; DROP TABLE users; -- `` closed the no-key
+    /// comment, and the `DELETE … WHERE /* … */ 1=1;` that came out *succeeds* —
+    /// so Run Everything went on to the `DROP TABLE` the name appended, with the
+    /// literal `WHERE` disarming the missing-`WHERE` net on the way. A column
+    /// named the same way split the draft from inside the `VALUES` list, and
+    /// both reach the clipboard on a right-click alone.
+    #[test]
+    fn a_hostile_name_cannot_add_a_statement_to_the_draft() {
+        // The name really does contain the words — quoted, or inside the
+        // comment. What must not happen is a *second statement*: the boundary
+        // lexer is the authority on where one ends, and it is the same one the
+        // editor's splitter and Run Everything use.
+        let one_statement = |sql: &str, dialect: SqlDialect| {
+            assert_eq!(crate::sql::statement_ranges(sql, dialect).len(), 1, "{sql}");
+        };
+
+        for dialect in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
+            // The table name, in the comment the keyless branch writes.
+            let mut t = actor();
+            t.name = "orders */ 1=1; DROP TABLE users; -- ".to_string();
+            t.columns = vec![col("body", false, false)];
+            let sql = delete_skeleton(dialect, "sales", &t);
+            one_statement(&sql, dialect);
+            // The comment runs to the end of the sentence it opened, so nothing
+            // the name carries is ever outside it.
+            assert!(sql.ends_with("— add a condition */;"), "{sql}");
+            one_statement(&update_skeleton(dialect, "sales", &t), dialect);
+
+            // The column name, in every placeholder.
+            let mut t = actor();
+            t.columns = vec![
+                col("id; DROP TABLE users; -- ", true, false),
+                col("x) VALUES (1", false, false),
+            ];
+            one_statement(&insert_skeleton(dialect, "sakila", &t), dialect);
+            one_statement(&update_skeleton(dialect, "sakila", &t), dialect);
+            one_statement(&delete_skeleton(dialect, "sakila", &t), dialect);
+        }
+    }
+
+    /// The flattening is not only a guard: a column named `first name` is an
+    /// ordinary shape on a spreadsheet import, and `:first name` is not a
+    /// placeholder on any engine.
+    #[test]
+    fn a_placeholder_is_one_token() {
+        assert_eq!(placeholder("first name"), ":first_name");
+        assert_eq!(placeholder("id"), ":id");
+        assert_eq!(placeholder("naïve"), ":naïve");
+        // Nothing word-like at all still needs a slot to fill in.
+        assert_eq!(placeholder("*/"), ":value");
+    }
+
+    /// SQLite's `rowid` is the third key source, and the grid beside this draft
+    /// is already writing back through it — so the draft must not claim the row
+    /// cannot be addressed.
+    #[test]
+    fn a_keyless_sqlite_table_is_addressed_by_its_rowid() {
+        let t = TableInfo {
+            name: "notes".to_string(),
+            columns: vec![col("body", false, false)],
+            implicit_key: Some("rowid".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            delete_skeleton(SqlDialect::Sqlite, "main", &t),
+            "DELETE FROM notes\nWHERE rowid = :rowid;"
+        );
+        assert!(
+            update_skeleton(SqlDialect::Sqlite, "main", &t)
+                .ends_with("SET body = :body\nWHERE rowid = :rowid;")
+        );
+        // …and a table that really has no key still says so.
+        let mut keyless = t.clone();
+        keyless.implicit_key = None;
+        assert!(delete_skeleton(SqlDialect::Sqlite, "main", &keyless).contains("no primary key"));
+    }
+
+    /// A unique index is the second key source, and the no-key comment's own
+    /// wording promises the user it is consulted — but every other test here
+    /// uses a primary key or nothing.
+    #[test]
+    fn a_unique_index_keys_the_draft_where_there_is_no_primary_key() {
+        let mut t = actor();
+        t.columns = vec![col("email", false, false), col("name", false, false)];
+        t.indexes = vec![crate::schema::IndexInfo {
+            name: "u_email".to_string(),
+            unique: true,
+            columns: vec![crate::schema::IndexColumn::plain("email")],
+            ..Default::default()
+        }];
+        assert!(
+            delete_skeleton(SqlDialect::MySql, "sakila", &t).ends_with("WHERE email = :email;"),
+            "{}",
+            delete_skeleton(SqlDialect::MySql, "sakila", &t)
+        );
+        // A *nullable* unique column identifies nothing — any number of rows may
+        // share a NULL — so that arm has to decline.
+        t.columns[0].nullable = true;
+        assert!(delete_skeleton(SqlDialect::MySql, "sakila", &t).contains("no primary key"));
+    }
+
+    /// The three generators on the two engines the module's tests never reach.
+    /// `ident_if_needed`'s *quote byte* is per dialect, and only `delete` was
+    /// ever exercised outside MySQL — so the `INSERT`/`UPDATE` column quoting
+    /// was pinned on one engine of three. The placeholder is not quoted on any
+    /// of them: it is a token, not an identifier.
+    #[test]
+    fn every_generator_quotes_per_dialect() {
+        let mut t = actor();
+        t.columns = vec![col("id", true, false), col("FirstName", false, false)];
+        let pg = insert_skeleton(SqlDialect::Postgres, "shop", &t);
+        assert!(pg.contains("(id, \"FirstName\")"), "{pg}");
+        assert!(pg.contains(":FirstName"), "{pg}");
+        let lite = update_skeleton(SqlDialect::Sqlite, "main", &t);
+        assert!(lite.contains("\"FirstName\" = :FirstName"), "{lite}");
+        let my = insert_skeleton(SqlDialect::MySql, "sakila", &t);
+        assert!(my.contains("(id, `FirstName`)"), "{my}");
+    }
+
+    /// `GENERATED ALWAYS AS IDENTITY` is the other half of `is_server_assigned`,
+    /// and a defaulted column is still named — an `INSERT` that says nothing
+    /// about it is not what the user is drafting.
+    #[test]
+    fn an_identity_column_is_dropped_and_a_defaulted_one_is_kept() {
+        let mut t = actor();
+        let mut id = col("id", true, false);
+        id.identity_always = true;
+        let mut created = col("created_at", false, false);
+        created.default = Some("now()".to_string());
+        t.columns = vec![id, created];
+        let sql = insert_skeleton(SqlDialect::Postgres, "shop", &t);
+        assert_eq!(
+            sql,
+            "INSERT INTO created_at_holder (created_at)\nVALUES (:created_at);"
+                .replace("created_at_holder", "actor")
+        );
+    }
+
+    /// Every column is server-assigned, so nothing is "worth writing" — but the
+    /// fallback must not reach for the ones the server *refuses* a value for.
+    /// `INSERT`ing a generated column is rejected however the user fills it in.
+    #[test]
+    fn the_fallback_never_names_a_column_the_server_refuses() {
+        let mut t = actor();
+        let mut generated = col("twice", false, false);
+        generated.generated = Some("id * 2".to_string());
+        t.columns = vec![col("id", true, true), generated];
+        let sql = insert_skeleton(SqlDialect::MySql, "sakila", &t);
+        assert_eq!(sql, "INSERT INTO sakila.actor (id)\nVALUES (:id);");
+        assert!(!update_skeleton(SqlDialect::MySql, "sakila", &t).contains("twice"));
     }
 
     #[test]
