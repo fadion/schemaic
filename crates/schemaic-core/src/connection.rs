@@ -784,6 +784,13 @@ mod tests {
             Connection::next_id(&[])
         );
         assert_eq!(Connection::startup_active_id(Some(3), &[]), 1);
+        // **Reached mid-session too**, since deleting the last connection lands
+        // in the same empty state and answers it the same way. It used to leave
+        // `active_conn` on the deleted id, so the connection created next was
+        // saved, took the switcher slot, and never connected — `save_conn` loads
+        // a schema only for the connection that is active, and the new one takes
+        // `next_id(&[])`.
+        assert_eq!(Connection::startup_active_id(Some(2), &[]), 1);
     }
 
     #[test]

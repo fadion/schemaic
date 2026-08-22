@@ -99,16 +99,37 @@ fn query_err(e: rusqlite::Error) -> DbError {
 /// it as a connection that worked, and the user would go looking for their tables
 /// in a file that never had any. A missing file is an error here, and says so.
 ///
-/// **`SQLITE_OPEN_URI` is absent in a release build**, and present only under
-/// `cfg(test)`, where the shared in-memory databases the suites use are reached
-/// by a `file:name?mode=memory&cache=shared` URI. Setting it in production put a
-/// second, invisible meaning on the one field the user types: a saved path
-/// beginning `file:` would be parsed as a URI, so `file:reports?x` opens
-/// `reports` and quietly discards the rest — and `?mode=memory` on a real path
-/// opens a scratch database that accepts every write and keeps none.
+/// **A `file:` path is refused**, and the refusal — not the flag — is the guard.
+///
+/// `SQLITE_OPEN_URI` is set only under `cfg(test)`, where the shared in-memory
+/// databases the suites use are reached by a `file:name?mode=memory&cache=shared`
+/// URI, and that gate was believed to keep URI parsing out of a release build.
+/// **It does not.** `rusqlite` is taken `features = ["bundled"]`, and the bundled
+/// amalgamation compiles SQLite's URI-filename handling in — so `sqlite3_open_v2`
+/// reads any name beginning `file:` as a URI whatever the flag says. Reproduced
+/// in a non-test build: `file:vanish?mode=memory` reported **Connected**, listed
+/// `main`, answered `Ok` to `run_ddl`, and the next operation — on the fresh
+/// connection this module's one-connection-per-operation rule mandates — saw an
+/// empty database. Every write kept nowhere, reported as success.
+///
+/// So the second meaning is rejected at the boundary instead. The field is a
+/// database *file*; a URI is a different thing that happens to fit in the same
+/// box, and [`rejects_uri_filename`] is where that is decided, in string logic a
+/// test can reach.
 fn open(db: &Db) -> Result<SqliteConn, DbError> {
     if db.file.trim().is_empty() {
         return Err(DbError::Connect("no database file is set".to_string()));
+    }
+    // The test suites' own shared-memory URIs are the one exception, and they
+    // are the reason the flag exists at all.
+    #[cfg(not(test))]
+    if rejects_uri_filename(&db.file) {
+        return Err(DbError::Connect(format!(
+            "{}: this is a URI, not a database file — SQLite would read the part after `?` \
+             as open options, and `?mode=memory` opens a scratch database that accepts every \
+             write and keeps none. Give the path to the file itself.",
+            db.file
+        )));
     }
     #[allow(unused_mut)]
     let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE;
@@ -118,6 +139,22 @@ fn open(db: &Db) -> Result<SqliteConn, DbError> {
     }
     SqliteConn::open_with_flags(&db.file, flags)
         .map_err(|e| DbError::Connect(format!("{}: {e}", db.file)))
+}
+
+/// Would SQLite read this path as a **URI** rather than as a filename?
+///
+/// Its rule is exactly "the name begins `file:`", so this is that rule and
+/// nothing cleverer. A Windows path (`C:/db.sqlite`) and a relative one that
+/// merely *contains* the word (`./file:weird.sqlite`) are ordinary filenames and
+/// stay allowed.
+///
+/// Pure string logic on purpose: the production flag set is unreachable from
+/// `cargo test` — the suites need `SQLITE_OPEN_URI` for their own in-memory
+/// databases — so a test of `open`'s release behaviour could not exist, and the
+/// belief that the `cfg(test)` gate was doing this job went unchecked for three
+/// releases.
+fn rejects_uri_filename(path: &str) -> bool {
+    path.trim_start().starts_with("file:")
 }
 
 /// Run `f` against a fresh connection on a blocking thread.
@@ -1176,8 +1213,20 @@ fn fk_violations(conn: &SqliteConn) -> Result<FkViolations, DbError> {
 /// [`ping`] is the check, so "can this connection be listed" and "is this
 /// connection up" cannot drift apart: both are `PRAGMA schema_version` against a
 /// freshly opened file. It costs one local `open` per selection.
+///
+/// **And both are bounded by the same deadline**, which is the other half of not
+/// drifting apart. The listing called the module-private `ping` directly, past
+/// the `tokio::time::timeout` `Db::ping` wraps it in — so a file on a share that
+/// has gone away blocked inside `open` for as long as the OS allowed (minutes on
+/// SMB, indefinitely for some mount options), holding a blocking-pool thread per
+/// selection, while the health check on the same connection gave up after five
+/// seconds and said "Disconnected". The hazard is the one `Db::ping`'s own
+/// comment names.
 pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
-    ping(db).await?;
+    match tokio::time::timeout(crate::PING_TIMEOUT, ping(db)).await {
+        Ok(r) => r?,
+        Err(_) => return Err(DbError::Connect("timed out".to_string())),
+    }
     Ok(vec![MAIN.to_string()])
 }
 
@@ -3281,6 +3330,26 @@ mod tests {
                 .map(|(c, v)| (c.to_string(), v.clone()))
                 .collect(),
         }
+    }
+
+    /// **A `file:` path is a URI, and SQLite reads it as one whatever the flag
+    /// says.** The `cfg(test)` gate on `SQLITE_OPEN_URI` was believed to keep
+    /// that out of a release build; the bundled amalgamation compiles URI
+    /// handling in, so `file:vanish?mode=memory` reported Connected, accepted
+    /// every write and kept none. The guard is the refusal, and this is it —
+    /// pure string logic, because `open`'s release flag set is unreachable from
+    /// `cargo test` and so a test of the flag could never have failed.
+    #[test]
+    fn a_uri_is_not_a_database_file() {
+        assert!(rejects_uri_filename("file:vanish?mode=memory"));
+        assert!(rejects_uri_filename("file:///c:/db.sqlite"));
+        assert!(rejects_uri_filename("  file:x?cache=shared"));
+        // Ordinary paths, including the two that look close.
+        assert!(!rejects_uri_filename("C:/db.sqlite"));
+        assert!(!rejects_uri_filename("/var/lib/app/db.sqlite"));
+        assert!(!rejects_uri_filename("./file:weird.sqlite"));
+        assert!(!rejects_uri_filename("db.sqlite"));
+        assert!(!rejects_uri_filename(""));
     }
 
     /// **SQLite accepts `:name`, so the driver's parameter count is what stops a

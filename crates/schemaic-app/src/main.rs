@@ -4635,10 +4635,22 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let tunnels = tunnels.clone();
         Rc::new(move |done: Option<CheckDoneFn>| {
             let id = active_conn.get_untracked();
+            // **Both early returns answer the continuation before leaving.**
+            // Dropping an `Rc<dyn Fn(bool)>` does nothing, so a `with_conn`-gated
+            // control that landed here simply did *nothing at all* — no query, no
+            // modal, no log — which is precisely what `with_conn` exists to
+            // prevent. `false` is the honest answer: the endpoint genuinely
+            // cannot be reached at this instant, and `with_conn` then says so.
+            let answer_none = |done: &Option<CheckDoneFn>| {
+                conn_status.set(ConnStatus::Unknown);
+                if let Some(f) = done {
+                    f(false);
+                }
+            };
             let Some(conn) =
                 connections.with_untracked(|cs| cs.iter().find(|c| c.id == id).cloned())
             else {
-                conn_status.set(ConnStatus::Unknown);
+                answer_none(&done);
                 return;
             };
             // Effective endpoint — through the tunnel for SSH connections. If the
@@ -4647,7 +4659,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 match tunnels.borrow().get(&conn.id).map(|h| h.port()) {
                     Some(port) => Some(port),
                     None => {
-                        conn_status.set(ConnStatus::Unknown);
+                        answer_none(&done);
                         return;
                     }
                 }
@@ -4678,6 +4690,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 // `check_continues`. A poll ticking inside the five seconds this
                 // ping takes used to supersede it and drop the action on the
                 // floor, with nothing shown either way.
+                //
+                // **The looser rule is asymmetric, and it has to be.** A
+                // superseded result is good enough to *proceed* on — it is an
+                // answer about the same server, seconds old. It is not good
+                // enough to *refuse* on: the very interleaving the generation
+                // exists for is "the server came back mid-ping", and a stale
+                // `false` then raised "Not connected" over a header a newer check
+                // had just set to Connected, on a connection that was up. A
+                // superseded failure defers to whatever the newer check said.
+                let superseded = !check_landing(stamp, now);
+                if superseded && !ok {
+                    return;
+                }
                 if check_continues(stamp, now)
                     && let Some(f) = &done
                 {
@@ -4685,7 +4710,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 }
             });
             handle.spawn(async move {
-                let ok = db.ping(std::time::Duration::from_secs(5)).await.is_ok();
+                let ok = db.ping(schemaic_db::PING_TIMEOUT).await.is_ok();
                 send(ok);
             });
         })
@@ -5829,7 +5854,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     None
                 };
                 let db = Db::connect(&conn, tunnel.as_ref().map(|h| h.port()));
-                let ok = db.ping(std::time::Duration::from_secs(5)).await.is_ok();
+                let ok = db.ping(schemaic_db::PING_TIMEOUT).await.is_ok();
                 drop(tunnel);
                 send(ok);
             });
@@ -5928,12 +5953,33 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 }
             }
             if was_active {
+                // Whatever was on screen is about a connection the user has just
+                // left — the same case `switch_conn` resets both of these for.
+                // Without it the empty state could show the accent "New
+                // connection" button and "Disconnected · Retry" side by side,
+                // the notice being about a connection that no longer exists.
+                conn_status.set(ConnStatus::Unknown);
+                health_failures.set(0);
                 match connections.with_untracked(|cs| cs.first().cloned()) {
                     Some(conn) => {
                         active_conn.set(conn.id);
                         load_schema(conn);
                     }
-                    None => db_nodes.set(Vec::new()),
+                    None => {
+                        db_nodes.set(Vec::new());
+                        // **"The list is empty" has one meaning wherever it is
+                        // reached.** Leaving `active_conn` on the deleted id was
+                        // invisible until the empty state grew a New-connection
+                        // button: `save_conn` loads the schema for a connection
+                        // it saves only when it is the active one, and the new
+                        // one takes `next_id(&[])` — so the first connection
+                        // created after deleting the last was saved, took the
+                        // switcher slot, said "No connection", and never
+                        // connected. This is `startup_active_id`'s answer for
+                        // the same state, which is where the coupling is
+                        // documented and tested.
+                        active_conn.set(Connection::startup_active_id(None, &[]));
+                    }
                 }
             }
             // The connection's tabs go with it. Folding them into another
