@@ -12,6 +12,7 @@ use floem::event::{Event, EventListener, EventPropagation};
 use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::create_effect;
+use schemaic_core::connection::AiData;
 use schemaic_core::connection::Connection;
 use schemaic_core::connection::Environment;
 
@@ -1060,6 +1061,37 @@ fn conn_form(
     ))
     .style(|s| s.flex_col().gap(6.0).width_full());
 
+    // AI data access — the one switch over every path that can carry this
+    // connection's rows off the machine. It lives beside Read-only because it is
+    // the same kind of thing: a per-connection guard-rail, set once where the
+    // connection is described, rather than a global answer that would force one
+    // setting on a scratch database and a client's production server alike.
+    //
+    // The hint under it changes with the level and always names the consequence
+    // — a picker whose options read "Schema only / Only what I attach / Let it
+    // read data" is choosable without knowing that the last two send rows to
+    // Anthropic, so the sentence says so.
+    let ai_data_field = v_stack((
+        text("AI data access").style(form_label_style),
+        container(focusable_dropdown(
+            draft.ai_data,
+            AiData::ALL,
+            AiData::label,
+            ring.clone(),
+            // 35: between Read-only (30) and Environment (40), matching where
+            // the field sits on screen. Tab order that disagrees with the eye
+            // makes the keyboard skip a control and come back to it.
+            35,
+        ))
+        .style(|s| s.width(200.0)),
+        label(move || draft.ai_data.get().hint().to_string()).style(|s| {
+            s.width_full()
+                .font_size(theme::FONT_HINT)
+                .color(theme::text_muted())
+        }),
+    ))
+    .style(|s| s.flex_col().gap(6.0).width_full());
+
     // Environment picker → the top-bar badge. Defaults to None (no badge).
     let env_field = v_stack((
         text("Environment").style(form_label_style),
@@ -1087,6 +1119,7 @@ fn conn_form(
         name_color,
         prominent_toggle,
         read_only_toggle,
+        ai_data_field,
         env_field,
         type_field,
         engine_block,

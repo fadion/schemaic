@@ -148,6 +148,126 @@ impl From<EnvironmentRaw> for Environment {
     }
 }
 
+/// How much of **this connection's data** the AI assistant may see.
+///
+/// One switch over every path that can carry rows off the machine, because
+/// three unrelated toggles is how a user ends up believing they are protected
+/// while some third path ships samples anyway. The paths it governs are
+/// `run_query`, `describe_table`'s sample rows, the grid's attach-to-chat, and
+/// the value-sampling behind AI Summary / Fill / Seed.
+///
+/// It is per connection rather than global because a local scratch database and
+/// a client's production server are not the same risk, and a single global
+/// answer forces the careless setting on one of them.
+///
+/// **What it does not offer is masking.** A model cannot tell a masked value
+/// from a real one, so it reasons confidently about fiction — and the cases
+/// where values matter at all are exactly the ones masking ruins. Send the rows
+/// or don't.
+///
+/// Deserialized through [`AiDataRaw`]; see [`crate::persist::RightPanelState`]
+/// for why every persisted enum has a shim.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(from = "AiDataRaw")]
+pub enum AiData {
+    /// Schema only. No path sends a row: the assistant cannot query or sample,
+    /// and the grid's attach actions are refused rather than merely hidden.
+    SchemaOnly,
+    /// The default. The assistant fetches nothing on its own, but the user may
+    /// attach rows from the grid to a question — the gesture *is* the consent,
+    /// and it can't be forgotten the way a flipped setting can.
+    #[default]
+    OnRequest,
+    /// The assistant may read rows itself: `run_query`, sample rows in
+    /// `describe_table`, and the value samples behind AI Fill / Seed.
+    Full,
+}
+
+/// Parsing shim for [`AiData`]; see [`crate::persist::RightPanelState`].
+#[derive(Deserialize)]
+enum AiDataRaw {
+    SchemaOnly,
+    OnRequest,
+    Full,
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<AiDataRaw> for AiData {
+    fn from(raw: AiDataRaw) -> Self {
+        match raw {
+            AiDataRaw::SchemaOnly => AiData::SchemaOnly,
+            AiDataRaw::OnRequest => AiData::OnRequest,
+            AiDataRaw::Full => AiData::Full,
+            // A level written by a newer build means *more* access than this one
+            // understands, so it degrades to the default rather than to `Full`.
+            AiDataRaw::Unknown => AiData::default(),
+        }
+    }
+}
+
+impl AiData {
+    /// All variants, in dropdown order (most restrictive first).
+    pub const ALL: [AiData; 3] = [AiData::SchemaOnly, AiData::OnRequest, AiData::Full];
+
+    /// Human label for the picker.
+    pub fn label(self) -> &'static str {
+        match self {
+            AiData::SchemaOnly => "Schema only",
+            AiData::OnRequest => "Only what I attach",
+            AiData::Full => "Let it read data",
+        }
+    }
+
+    /// The one-line consequence, shown under the picker. Each says plainly that
+    /// rows leave the machine, because that is the fact a label can't carry.
+    pub fn hint(self) -> &'static str {
+        match self {
+            AiData::SchemaOnly => {
+                "Names and types only. No row ever leaves this machine — attaching is refused."
+            }
+            AiData::OnRequest => {
+                "The assistant reads no data on its own. Rows you attach from a result are \
+                 sent to Anthropic with that question."
+            }
+            AiData::Full => {
+                "The assistant may run read-only queries and read sample rows by itself. \
+                 Whatever it reads is sent to Anthropic."
+            }
+        }
+    }
+
+    /// May the assistant fetch rows **on its own** — `run_query`, and the sample
+    /// rows in `describe_table`?
+    pub fn may_query(self) -> bool {
+        self == AiData::Full
+    }
+
+    /// May rows reach the model **at the user's own request** — the grid's
+    /// attach-to-chat, and the value samples an AI Summary / Fill / Seed carries?
+    ///
+    /// True for [`AiData::Full`] too: a level that lets the assistant fetch what
+    /// it likes cannot coherently refuse what the user hands it.
+    pub fn may_attach(self) -> bool {
+        self != AiData::SchemaOnly
+    }
+}
+
+/// The level a connection saved before [`AiData`] existed should take, given the
+/// old global "let the assistant run queries" flag it replaces.
+///
+/// The flag defaulted to *on*, so most upgrades land on [`AiData::Full`] — the
+/// access those users already had, kept rather than silently withdrawn. Turning
+/// it off never meant "and don't let me attach anything either", which nothing
+/// could do at the time, so the off case lands on the ordinary default.
+pub fn migrated_ai_data(legacy_run_queries: bool) -> AiData {
+    if legacy_run_queries {
+        AiData::Full
+    } else {
+        AiData::OnRequest
+    }
+}
+
 impl Environment {
     /// All variants, in dropdown order (unset first).
     pub const ALL: [Environment; 6] = [
@@ -260,6 +380,15 @@ pub struct Connection {
     /// Production / …), shown as a badge in the top bar. Defaults to none.
     #[serde(default)]
     pub environment: Environment,
+    /// How much of this connection's data the AI assistant may see
+    /// ([`AiData`]).
+    ///
+    /// `None` means "never chosen here" — a connection saved before the setting
+    /// existed. The app resolves that once at startup from the old global
+    /// `ai_run_queries` flag, so an upgrade neither silently grants the
+    /// assistant more access nor silently takes away what the user had.
+    #[serde(default)]
+    pub ai_data: Option<AiData>,
 }
 
 fn default_db_type() -> String {
@@ -546,6 +675,74 @@ pub fn default_port(db_type: &str) -> u16 {
 mod tests {
     use super::*;
 
+    // ── AI data access ──
+
+    #[test]
+    fn only_full_access_lets_the_assistant_fetch_rows_itself() {
+        assert!(AiData::Full.may_query());
+        assert!(!AiData::OnRequest.may_query());
+        assert!(!AiData::SchemaOnly.may_query());
+    }
+
+    #[test]
+    fn schema_only_refuses_even_a_row_the_user_hands_over() {
+        // The point of the strictest level: no path, deliberate or not.
+        assert!(!AiData::SchemaOnly.may_attach());
+        assert!(AiData::OnRequest.may_attach());
+        // A level that lets the assistant read what it likes cannot coherently
+        // refuse what the user chose to send.
+        assert!(AiData::Full.may_attach());
+    }
+
+    #[test]
+    fn the_default_grants_no_automatic_access() {
+        assert_eq!(AiData::default(), AiData::OnRequest);
+        assert!(!AiData::default().may_query());
+    }
+
+    /// A newer build's level must degrade to the *safe* one, not to `Full` and
+    /// not by failing the whole file (which would lose every connection).
+    #[test]
+    fn an_unknown_level_degrades_to_the_default() {
+        let c: Connection =
+            serde_json::from_str(r#"{"id":1,"name":"n","host":"h","port":3306,"user":"u","password":"","ai_data":"ReadEverything"}"#)
+                .expect("an unknown level still parses");
+        assert_eq!(c.ai_data, Some(AiData::default()));
+        assert!(!c.ai_data.unwrap().may_query());
+    }
+
+    /// Absent is not the same as default: a connection saved before the setting
+    /// existed carries `None`, which the app resolves from the old global flag.
+    #[test]
+    fn a_connection_saved_before_the_setting_has_no_level_at_all() {
+        let c: Connection = serde_json::from_str(
+            r#"{"id":1,"name":"n","host":"h","port":3306,"user":"u","password":""}"#,
+        )
+        .unwrap();
+        assert_eq!(c.ai_data, None);
+    }
+
+    /// The upgrade must not change what the assistant can reach: someone who had
+    /// `run_query` keeps it, someone who had turned it off does not get it back.
+    #[test]
+    fn the_migration_keeps_the_access_the_old_flag_granted() {
+        assert_eq!(migrated_ai_data(true), AiData::Full);
+        assert!(migrated_ai_data(true).may_query());
+        assert!(!migrated_ai_data(false).may_query());
+    }
+
+    #[test]
+    fn every_level_says_the_rows_leave_the_machine() {
+        // The hint is the consent copy; a level that doesn't name the
+        // consequence is the setting people click through.
+        for lvl in AiData::ALL {
+            assert!(!lvl.label().is_empty());
+            let hint = lvl.hint();
+            let names_it = hint.contains("Anthropic") || hint.contains("leaves this machine");
+            assert!(names_it, "{:?}: {hint}", lvl);
+        }
+    }
+
     #[test]
     fn endpoint_is_host_colon_port() {
         let c = Connection {
@@ -562,6 +759,7 @@ mod tests {
             prominent_color: false,
             read_only: false,
             environment: Environment::None,
+            ai_data: None,
         };
         assert_eq!(c.endpoint(), "db.example.com:3307");
         // A server connection has no file to label.
@@ -655,6 +853,7 @@ mod tests {
             prominent_color: false,
             read_only: false,
             environment: Environment::None,
+            ai_data: None,
         }
     }
 

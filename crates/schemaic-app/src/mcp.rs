@@ -33,6 +33,11 @@ use tokio_util::sync::CancellationToken;
 // model reasons over a sample, not the full result). Distinct from QUERY_ROW_CAP.
 const MCP_ROW_CAP: usize = 200;
 
+// Characters of one cell a tool result carries. Deliberately narrower than a
+// chat attachment's: this rides along on every turn that calls a tool, where the
+// attachment was asked for once.
+const MCP_CELL_CHARS: usize = 60;
+
 /// The MCP protocol revisions this server actually implements, newest first.
 const SUPPORTED_PROTOCOLS: &[&str] = &["2024-11-05"];
 
@@ -330,25 +335,24 @@ fn format_table(rs: &ResultSet) -> String {
     if rs.columns.is_empty() {
         return "(no columns)".to_string();
     }
-    let mut out = String::new();
-    let header: Vec<&str> = rs.columns.iter().map(|c| c.name.as_str()).collect();
-    out.push_str(&format!("| {} |\n", header.join(" | ")));
-    out.push_str(&format!("| {} |\n", vec!["---"; header.len()].join(" | ")));
+    let header: Vec<String> = rs.columns.iter().map(|c| c.name.clone()).collect();
     let ncols = rs.col_count();
-    for r in 0..rs.row_count() {
-        let cells: Vec<String> = (0..ncols)
-            .map(|c| {
-                let raw = rs.cell(r, c).map(|cell| cell.display()).unwrap_or_default();
-                let s = raw.replace('|', "\\|").replace('\n', " ");
-                if s.chars().count() > 60 {
-                    format!("{}…", s.chars().take(60).collect::<String>())
-                } else {
-                    s
-                }
-            })
-            .collect();
-        out.push_str(&format!("| {} |\n", cells.join(" | ")));
-    }
+    let rows: Vec<Vec<String>> = (0..rs.row_count())
+        .map(|r| {
+            (0..ncols)
+                .map(|c| {
+                    rs.cell(r, c)
+                        .map(|cell| cell.display().to_string())
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .collect();
+    // One table renderer for everything a model reads (`core::prompt`), so a
+    // cell carrying `|`, a newline or a novel is handled the same here as in a
+    // chat attachment. The width is this call site's: a tool result rides along
+    // on every turn, so it stays narrow.
+    let mut out = schemaic_core::prompt::pipe_table(&header, &rows, MCP_CELL_CHARS);
     let more = if rs.truncated {
         format!("\n({}+ rows, capped)", rs.row_count())
     } else {

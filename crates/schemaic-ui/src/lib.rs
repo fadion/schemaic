@@ -95,7 +95,7 @@ use floem::views::{
     Decorators, Delay, LabelClass, TextInputClass, TooltipClass, TooltipContainerClass,
 };
 use floem::window::WindowId;
-use schemaic_core::connection::{ConnStatus, Connection, Environment, SshAuth};
+use schemaic_core::connection::{AiData, ConnStatus, Connection, Environment, SshAuth};
 use schemaic_core::db_color::{DbColorRule, TableColorRule};
 use schemaic_core::favorite::FavoriteRule;
 use schemaic_core::format::ColumnFormatRule;
@@ -696,6 +696,15 @@ pub type AiFillDoneFn = Rc<dyn Fn(AiFillResult)>;
 /// AI-fill a single cell (grid → app), reporting via [`AiFillDoneFn`].
 pub type AiFillFn = Rc<dyn Fn(AiFillRequest, AiFillDoneFn)>;
 
+/// Stage result rows as an attachment on the AI panel's next question (grid →
+/// app): reveal the panel and put the rows in [`AiUi::attachment`].
+///
+/// It **stages**, and that is the whole design. Nothing is sent until the user
+/// types a question and hits send, so the rows on their screen reach the model
+/// by one deliberate gesture with a visible chip in between — never as a side
+/// effect of asking something unrelated.
+pub type AttachFn = Rc<dyn Fn(schemaic_core::transcript::Attachment)>;
+
 /// A grid → app request to AI-generate `count` seed rows (Insert Row = 1, Seed
 /// Table = N). The app samples the base table, builds a prompt, runs the one-shot
 /// call, parses a JSON array of rows, and reports back via [`AiSeedDoneFn`].
@@ -772,6 +781,17 @@ pub struct Tab {
     /// Caret byte offset in `query`, mirrored out of the editor by an effect in
     /// `query_pane` so the status bar can show Ln/Col for the active tab.
     pub cursor_offset: RwSignal<usize>,
+    /// The editor's selected byte range, mirrored out by the same effect;
+    /// `None` when the caret is a point.
+    ///
+    /// Read by the AI panel, which sends the **selection** as the editor context
+    /// when there is one rather than the whole buffer — a 47 KB script's worth of
+    /// unrelated statements is both noise to the model and text the user never
+    /// meant to send. It is a *range*, not the text, so nothing is duplicated
+    /// per keystroke; resolve it through `core::text_ops::selected_text`, which
+    /// degrades to `None` when the mirror has drifted a keystroke out of step
+    /// with `query`.
+    pub selection: RwSignal<Option<(usize, usize)>>,
     /// Opens this tab's Go-to-line popup. Set by Ctrl+G in the editor or by
     /// clicking the Ln/Col segment in the status bar; the editor pane owns the view.
     pub goto_open: RwSignal<bool>,
@@ -865,6 +885,21 @@ pub struct Tab {
 }
 
 impl Tab {
+    /// The result state the user is actually **looking at** in this tab.
+    ///
+    /// A Run-Everything batch fills `result_tabs` and shows the one
+    /// [`shown_panel`] picks — which is *not* always `result_tabs[active_result]`:
+    /// a stale index (Result 7 selected, then a batch of three) falls back to the
+    /// first panel, and the AI has to describe the same statement the pane does.
+    /// Every other run leaves `result_tabs` empty and uses `results`.
+    pub fn shown_result(&self) -> QueryState {
+        self.result_tabs
+            .with_untracked(|panels| {
+                shown_panel(panels, self.active_result.get_untracked()).map(|p| p.state.clone())
+            })
+            .unwrap_or_else(|| self.results.get_untracked())
+    }
+
     /// `parent` is the app root scope; the tab creates its own child scope under
     /// it so `dispose()` on close frees exactly this tab's signals (C14).
     pub fn new(
@@ -891,6 +926,7 @@ impl Tab {
             editing: cx.create_rw_signal(false),
             edit_buf: cx.create_rw_signal(String::new()),
             cursor_offset: cx.create_rw_signal(0),
+            selection: cx.create_rw_signal(None),
             goto_open: cx.create_rw_signal(false),
             jump_offset: cx.create_rw_signal(None),
             format_req: cx.create_rw_signal(false),
@@ -1220,6 +1256,10 @@ pub struct DraftSignals {
     /// Environment this connection points at, shown as a top-bar badge. Defaults
     /// to `Environment::None` (no badge).
     pub environment: RwSignal<Environment>,
+    /// How much of this connection's data the AI assistant may see. The form
+    /// always holds a resolved level, so saving an old connection also settles
+    /// its `None` — the user has now been shown a value and left it standing.
+    pub ai_data: RwSignal<AiData>,
 }
 
 impl DraftSignals {
@@ -1245,6 +1285,7 @@ impl DraftSignals {
             prominent_color: cx.create_rw_signal(false),
             read_only: cx.create_rw_signal(false),
             environment: cx.create_rw_signal(Environment::None),
+            ai_data: cx.create_rw_signal(AiData::default()),
         }
     }
 
@@ -1270,6 +1311,9 @@ impl DraftSignals {
         self.prominent_color.set(c.prominent_color);
         self.read_only.set(c.read_only);
         self.environment.set(c.environment);
+        // An unset level resolves to the default here, so the form shows the
+        // level actually in force rather than a blank the user has to guess at.
+        self.ai_data.set(c.ai_data.unwrap_or_default());
     }
 
     /// Reset the form for a brand-new connection.
@@ -1294,6 +1338,7 @@ impl DraftSignals {
         self.prominent_color.set(false);
         self.read_only.set(false);
         self.environment.set(Environment::None);
+        self.ai_data.set(AiData::default());
     }
 
     /// Build a `Connection` from the current form values (with the given id).
@@ -1337,6 +1382,7 @@ impl DraftSignals {
             prominent_color: self.prominent_color.get_untracked(),
             read_only: self.read_only.get_untracked(),
             environment: self.environment.get_untracked(),
+            ai_data: Some(self.ai_data.get_untracked()),
         }
         .sanitized()
     }
@@ -1535,10 +1581,16 @@ pub struct AiUi {
     pub instructions: RwSignal<String>,
     /// How much schema context to inject into the system prompt.
     pub schema_scope: RwSignal<SchemaScope>,
-    /// Whether the assistant may run read-only queries (the `run_query` tool).
-    pub run_queries: RwSignal<bool>,
     /// Latest inline (Ctrl+K) generation result, previewed by the popup.
     pub inline: RwSignal<InlineAiState>,
+    /// Result rows staged for the next question by the grid's "Attach to chat",
+    /// shown as a chip over the input until the turn is sent or the chip is
+    /// dismissed.
+    ///
+    /// Staging rather than sending straight away is the consent step: attaching
+    /// is one gesture, the chip says exactly how much data it holds, and nothing
+    /// leaves the machine until the user sends the question it belongs to.
+    pub attachment: RwSignal<Option<schemaic_core::transcript::Attachment>>,
 }
 
 /// AI-panel callbacks (owned by the app), plus the auto-detected CLI path.
@@ -4087,6 +4139,7 @@ fn center(ui: Ui) -> impl IntoView {
     let db_nodes = ui.schema.db_nodes;
     let stats_gen = ui.schema.stats_gen;
     let inline_ai = ui.ai.inline;
+    let ai_attachment = ui.ai.attachment;
     let inline_ai_run = ui.ai_actions.inline_run.clone();
     let inline_ai_cancel = ui.ai_actions.inline_cancel.clone();
     let error_modal_open = ui.overlay.error_modal_open;
@@ -4146,6 +4199,12 @@ fn center(ui: Ui) -> impl IntoView {
             (ai)(msg);
         })
     };
+    // Stage grid rows for the AI panel's next question: reveal the panel and put
+    // them in `AiUi::attachment`. Nothing is sent here — see [`AttachFn`].
+    let attach: AttachFn = Rc::new(move |a: schemaic_core::transcript::Attachment| {
+        reveal_ai_panel(right_panel);
+        ai_attachment.set(Some(a));
+    });
     // Close any other open menu — grid cells consume the pointer-down, so the root
     // dismissal handler never fires for clicks inside the grid, and the toolbar Copy
     // dropdown calls this before opening so it's mutually exclusive with the schema
@@ -4283,6 +4342,7 @@ fn center(ui: Ui) -> impl IntoView {
                 Some(tab) => query_pane(QueryPaneParams {
                     query: tab.query,
                     cursor_offset: tab.cursor_offset,
+                    selection: tab.selection,
                     goto_open: tab.goto_open,
                     jump_offset: tab.jump_offset,
                     format_req: tab.format_req,
@@ -4364,6 +4424,7 @@ fn center(ui: Ui) -> impl IntoView {
                     popup_anchor,
                     popup_width,
                     summarize: summarize.clone(),
+                    attach: attach.clone(),
                     follow_fk: follow_fk.clone(),
                     open_monitor: open_monitor.clone(),
                     open_properties: open_properties.clone(),
@@ -4669,9 +4730,9 @@ fn results_section(
 /// the first when that index is stale — a click that selected Result 7 outlives a
 /// later batch of three, and the strip is regenerated on every run.
 ///
-/// One function so the pane, the error bar and the bars-clearing effect can't
-/// disagree about which statement they are describing.
-fn shown_panel(panels: &[ResultPanel], active: usize) -> Option<&ResultPanel> {
+/// One function so the pane, the error bar, the bars-clearing effect **and the
+/// AI panel** can't disagree about which statement they are describing.
+pub fn shown_panel(panels: &[ResultPanel], active: usize) -> Option<&ResultPanel> {
     panels.get(active).or_else(|| panels.first())
 }
 

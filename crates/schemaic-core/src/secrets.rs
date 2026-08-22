@@ -325,6 +325,7 @@ mod tests {
             prominent_color: false,
             read_only: false,
             environment: crate::connection::Environment::None,
+            ai_data: None,
         }
     }
 

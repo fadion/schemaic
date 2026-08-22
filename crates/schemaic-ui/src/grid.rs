@@ -26,7 +26,7 @@ use floem::views::{VirtualDirection, VirtualItemSize, VirtualVector};
 use floem::action::save_as;
 use floem::file::{FileDialogOptions, FileSpec};
 
-use schemaic_core::connection::Connection;
+use schemaic_core::connection::{AiData, Connection};
 use schemaic_core::edit::{EditModel, analyze_edit, refetch_key, refetch_template, row_key};
 use schemaic_core::export::{ExportFormat, suggested_filename};
 use schemaic_core::filter::{FilterError, build_query, eq_condition};
@@ -300,6 +300,11 @@ struct GridState {
     /// **and** by a double-click, since floem's `DoubleClick` swallows the second
     /// `PointerUp` and the flag would otherwise stay armed with no button down.
     selecting: RwSignal<bool>,
+    /// The same gate for a drag down the **gutter**, kept separate on purpose:
+    /// one shared flag would let a row drag that wandered over a data cell
+    /// collapse to that cell's column, which is the opposite of what dragging
+    /// row numbers asks for. Cleared by the same pointer-up effect.
+    row_selecting: RwSignal<bool>,
     /// Which columns are editable + each base table's WHERE key (from the
     /// result's per-column provenance). Computed once per result set.
     edit_model: RwSignal<Arc<EditModel>>,
@@ -331,6 +336,9 @@ struct GridState {
     /// reveals the AI panel + sends a message; `dismiss` closes any open menu;
     /// `commit` executes staged edits.
     summarize: RwSignal<Option<SummarizeFn>>,
+    /// Stage result rows for the AI panel's next question (see
+    /// [`crate::AttachFn`]) — the "Attach to chat" menu actions.
+    attach: RwSignal<Option<crate::AttachFn>>,
     dismiss: RwSignal<Option<Rc<dyn Fn()>>>,
     commit: RwSignal<Option<crate::CommitFn>>,
     /// Writes an export to disk on a worker thread (see [`crate::ExportFn`]).
@@ -345,6 +353,10 @@ struct GridState {
     formats: RwSignal<Vec<ColumnFormat>>,
     /// This tab's connection id (keys formatter rules with `source`).
     conn_id: RwSignal<u64>,
+    /// Saved connections, for this result's AI data-access level (`ai_data_of`).
+    /// Held as the signal rather than resolved once at build, so locking a
+    /// connection down takes effect on the grid already on screen.
+    connections: RwSignal<Vec<Connection>>,
     /// This tab's SQL dialect (from its connection's engine) — used to build
     /// engine-correct SQL for grid actions like Follow-FK.
     dialect: SqlDialect,
@@ -478,6 +490,7 @@ impl GridState {
             new_rows: RwSignal::new(Vec::new()),
             del_rows: RwSignal::new(HashSet::new()),
             selecting: RwSignal::new(false),
+            row_selecting: RwSignal::new(false),
             edit_model: RwSignal::new(Arc::new(EditModel::default())),
             commit_busy: RwSignal::new(false),
             commit_seq: RwSignal::new(0),
@@ -490,12 +503,14 @@ impl GridState {
             popup_width: gctx.popup_width,
             source: gctx.source,
             summarize: RwSignal::new(Some(gctx.summarize.clone())),
+            attach: RwSignal::new(Some(gctx.attach.clone())),
             dismiss: RwSignal::new(Some(gctx.dismiss.clone())),
             commit: RwSignal::new(Some(gctx.commit.clone())),
             export_file: RwSignal::new(Some(gctx.export_file.clone())),
             sync_canonical: RwSignal::new(gctx.sync_canonical.clone()),
             formats: RwSignal::new(formats),
             conn_id: gctx.conn_id,
+            connections: gctx.connections,
             dialect,
             base_sql: gctx.base_sql,
             grid_query: gctx.grid_query,
@@ -1428,6 +1443,161 @@ fn copy_selection(gs: GridState) {
     let _ = floem::Clipboard::set_contents(out);
 }
 
+/// Rows of the grid as the user sees them — display order, staged edits and
+/// pending new rows included — over the rectangle `(r0, c0, r1, c1)`, capped at
+/// `core::prompt::ATTACH_ROW_CAP`.
+///
+/// Reads the *displayed* value, not the stored one, for the same reason the
+/// clipboard does: what the user selected is what is on screen, and an
+/// attachment that quietly disagreed with the grid would be answered about as
+/// though it were the grid.
+fn attached_rows(
+    gs: GridState,
+    (r0, c0, r1, c1): (usize, usize, usize, usize),
+) -> (Vec<String>, Vec<Vec<String>>, usize) {
+    let rs = gs.rs.get_untracked();
+    let order = gs.order.get_untracked();
+    let nreal = rs.row_count();
+    let new_rows = gs.new_rows.get_untracked();
+    let columns: Vec<String> = (c0..=c1)
+        .map(|ci| {
+            rs.columns
+                .get(ci)
+                .map(|c| c.name.clone())
+                .unwrap_or_default()
+        })
+        .collect();
+    let total = r1.saturating_sub(r0) + 1;
+    let rows: Vec<Vec<String>> = (r0..=r1)
+        .take(schemaic_core::prompt::ATTACH_ROW_CAP)
+        .map(|i| {
+            // Display rows past the real ones are pending new rows, whose values
+            // live in `new_rows` — see `copy_selection`.
+            let pending = (i >= nreal).then(|| new_rows.get(i - nreal));
+            let di = order.get(i).copied().unwrap_or(i);
+            (c0..=c1)
+                .map(|ci| match pending {
+                    Some(row) => pending_cell_text(row, ci).to_string(),
+                    None => rs
+                        .cell(di, ci)
+                        .map(|c| c.display().to_string())
+                        .unwrap_or_default(),
+                })
+                .collect()
+        })
+        .collect();
+    (columns, rows, total)
+}
+
+/// How much of **this result's** connection the assistant may see.
+///
+/// The result's own connection, not the active one: a tab keeps the connection
+/// it was opened on, so reading the active one would let a grid of production
+/// rows be judged by a local database's setting.
+fn ai_data_of(gs: GridState) -> AiData {
+    let id = gs.conn_id.get_untracked();
+    gs.connections
+        .with_untracked(|cs| cs.iter().find(|c| c.id == id).and_then(|c| c.ai_data))
+        .unwrap_or_default()
+}
+
+/// What the *current selection* would send, as the phrase the attach entry reads
+/// — `core::model::attach_scope_label` over the selected rectangle, with the row
+/// count capped at what an attachment actually carries.
+fn selection_scope_label(gs: GridState) -> String {
+    let (rows, cols) = match gs.bounds_untracked() {
+        Some((r0, c0, r1, c1)) => (r1.saturating_sub(r0) + 1, c1.saturating_sub(c0) + 1),
+        None => (1, 1),
+    };
+    schemaic_core::model::attach_scope_label(
+        rows.min(schemaic_core::prompt::ATTACH_ROW_CAP),
+        cols,
+        gs.rs.get_untracked().col_count(),
+    )
+}
+
+/// Label for the whole-result attach action, counting what would actually be
+/// sent — a result over the cap says so *before* the click.
+///
+/// Phrased by `attach_scope_label` like the selection one, so the two entries
+/// can't come to describe the same thing differently.
+fn attach_label(gs: GridState) -> String {
+    let ncols = gs.rs.get_untracked().col_count();
+    let n = gs
+        .order
+        .get_untracked()
+        .len()
+        .min(schemaic_core::prompt::ATTACH_ROW_CAP);
+    format!(
+        "Attach {} to chat",
+        schemaic_core::model::attach_scope_label(n, ncols, ncols)
+    )
+}
+
+/// Stage the current selection (or the whole result, when `whole`) as the AI
+/// panel's next attachment.
+fn attach_to_chat(gs: GridState, whole: bool) {
+    // Checked here as well as on the menu entries. The entries are the UI; this
+    // is the rule — a keyboard path, a future caller or a menu built a moment
+    // before the connection was locked down all arrive here.
+    if !ai_data_of(gs).may_attach() {
+        return;
+    }
+    let rs = gs.rs.get_untracked();
+    let bounds = if whole {
+        // The committed rows in display order (filters and sort applied) —
+        // pending new rows are the user's unsaved draft, not a result.
+        let (nrows, ncols) = (gs.order.get_untracked().len(), rs.col_count());
+        if nrows == 0 || ncols == 0 {
+            return;
+        }
+        (0, 0, nrows - 1, ncols - 1)
+    } else {
+        match gs.bounds_untracked() {
+            Some(b) => b,
+            None => return,
+        }
+    };
+    let (columns, rows, total) = attached_rows(gs, bounds);
+    if columns.is_empty() || rows.is_empty() {
+        return;
+    }
+    // The summary is what survives to disk, and what the user reads back later
+    // to know what they sent — so it counts what was *taken*, not what was
+    // selected, and names the source when the result has one.
+    let source = source_table(gs)
+        .map(|t| format!(" from {t}"))
+        .unwrap_or_default();
+    let capped = if total > rows.len() {
+        format!(" (the first {} of {total} selected)", rows.len())
+    } else {
+        String::new()
+    };
+    let summary = format!(
+        "{} {} × {} {}{source}{capped}",
+        rows.len(),
+        if rows.len() == 1 { "row" } else { "rows" },
+        columns.len(),
+        if columns.len() == 1 {
+            "column"
+        } else {
+            "columns"
+        },
+    );
+    if let Some(f) = gs.attach.get_untracked() {
+        (f)(schemaic_core::transcript::Attachment {
+            summary,
+            // The count **before** the cap. `rows` is already capped, so this is
+            // the only place the prompt's "the first 200 of 5,000" note can come
+            // from — computed from `rows.len()` it would read 200 of 200 and the
+            // model would take the sample for the set.
+            total_rows: total,
+            columns,
+            rows,
+        });
+    }
+}
+
 // Thin clipboard-facing wrappers over `schemaic_core::export` — unwrap the
 // grid's live `ResultSet` + display order and delegate to the pure functions.
 
@@ -1840,6 +2010,8 @@ pub(crate) struct GridCtx {
     pub(crate) popup_width: RwSignal<f64>,
     /// Reveal the AI panel + send a message (used for the cell "AI Summary").
     pub(crate) summarize: Rc<dyn Fn(String)>,
+    /// Stage result rows as an attachment on the AI panel's next question.
+    pub(crate) attach: crate::AttachFn,
     /// Follow a foreign key: open the referenced `(database, table)` in a new tab
     /// running the given filter `sql` (built by the grid from a FK + the row).
     pub(crate) follow_fk: FollowFn,
@@ -2754,6 +2926,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
             // past the last row, or outside the grid entirely.
             .on_event_cont(EventListener::PointerUp, move |_| {
                 gs.selecting.set(false);
+                gs.row_selecting.set(false);
             })
             .on_event(EventListener::KeyDown, move |e| {
                 // **F6 steps out to the toolbar** — the OS-conventional "next
@@ -2815,6 +2988,7 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                 // drag).
                 .on_event_cont(EventListener::PointerUp, move |_| {
                     gs.selecting.set(false);
+                    gs.row_selecting.set(false);
                 })
                 .style(|s| {
                     s.flex_grow(1.0_f32)
@@ -3005,8 +3179,14 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
     // clicked anything.
     create_effect(move |_| {
         crate::widgets::pointer_released().track();
-        if gs.alive() && gs.selecting.get_untracked() {
+        if !gs.alive() {
+            return;
+        }
+        if gs.selecting.get_untracked() {
             gs.selecting.set(false);
+        }
+        if gs.row_selecting.get_untracked() {
+            gs.row_selecting.set(false);
         }
     });
     one_bar_at_a_time(gs.find_open, gs.goto_open);
@@ -3644,7 +3824,10 @@ fn stage_fill(gs: GridState, disp: usize, ci: usize, pending: Option<usize>, val
 /// table + runs the one-shot AI call), and stage the parsed result as a normal
 /// green edit. Nothing auto-commits. A no-op unless an editable cell is selected.
 fn ai_fill_value(gs: GridState) {
-    if gs.ai_busy.get_untracked() {
+    // The prompt carries this row's other values and a sample of the column, so
+    // this is a data path — refused here as well as hidden from the menu, for
+    // the same reason `attach_to_chat` checks twice.
+    if gs.ai_busy.get_untracked() || !ai_data_of(gs).may_attach() {
         return;
     }
     let Some((disp, ci)) = gs.active.get_untracked() else {
@@ -3754,7 +3937,9 @@ fn ai_insert_row(gs: GridState) {
 /// row. On failure the skeleton rows are rolled back and the error surfaced.
 /// Nothing auto-commits — the staged rows commit like any manual `+ Row`.
 fn ai_seed_rows(gs: GridState, count: usize) {
-    if gs.ai_busy.get_untracked() || count == 0 {
+    // Seeding samples the table to imitate it, so it sends rows like the rest —
+    // one gate, checked at the action rather than only at the menu.
+    if gs.ai_busy.get_untracked() || count == 0 || !ai_data_of(gs).may_attach() {
         return;
     }
     let model = gs.edit_model.get_untracked();
@@ -3869,7 +4054,11 @@ fn remove_pending_rows(gs: GridState, pidxs: &[usize]) {
 
 /// Open the "AI Seed Table" count popover, seeding the input with a default of 10.
 fn open_seed_popover(gs: GridState) {
-    if gs.ai_busy.get_untracked() {
+    // Gated like the generation it leads to: a popover that takes a row count
+    // and then silently does nothing (because `ai_seed_rows` refuses) is worse
+    // than one that never opens. Reachable if the level is tightened while the
+    // menu is up.
+    if gs.ai_busy.get_untracked() || !ai_data_of(gs).may_attach() {
         return;
     }
     gs.seed_buf.set("10".to_string());
@@ -5648,24 +5837,50 @@ fn grid_toolbar(
                     .get_untracked()
                     .map(|(_, ci)| gs.edit_model.get_untracked().editable(ci))
                     .unwrap_or(false);
-                gs.popup.set(Some(vec![
-                    MenuEntry::action_icon(
-                        "AI Fill Value",
-                        (icons::SPARKLES, theme::key_foreign),
-                        move || ai_fill_value(gs),
-                    )
-                    .disabled(!fill_enabled),
-                    MenuEntry::action_icon(
-                        "AI Insert Row",
-                        (icons::SPARKLES, theme::key_foreign),
-                        move || ai_insert_row(gs),
-                    ),
-                    MenuEntry::action_icon(
-                        "AI Seed Table…",
-                        (icons::SPARKLES, theme::key_foreign),
-                        move || open_seed_popover(gs),
-                    ),
-                ]));
+                // Every entry in this menu puts real values in a prompt: Fill and
+                // Insert carry the row being completed, Seed samples the table
+                // to imitate it, and Attach is rows outright. So on a
+                // schema-only connection the menu has nothing to offer, and says
+                // that rather than opening empty.
+                let entries = if !ai_data_of(gs).may_attach() {
+                    // One `popup.set` per opener (see the `popup_anchor_gate`
+                    // test): the refusal is an entry, not an early return.
+                    vec![
+                        MenuEntry::action("AI actions send data — off for this connection", || {})
+                            .disabled(true),
+                    ]
+                } else {
+                    vec![
+                        MenuEntry::action_icon(
+                            "AI fill value",
+                            (icons::SPARKLES, theme::key_foreign),
+                            move || ai_fill_value(gs),
+                        )
+                        .disabled(!fill_enabled),
+                        MenuEntry::action_icon(
+                            "AI insert row",
+                            (icons::SPARKLES, theme::key_foreign),
+                            move || ai_insert_row(gs),
+                        ),
+                        MenuEntry::action_icon(
+                            "AI seed table…",
+                            (icons::SPARKLES, theme::key_foreign),
+                            move || open_seed_popover(gs),
+                        ),
+                        MenuEntry::Separator,
+                        // Below the separator because it is the one entry here that
+                        // *sends rows out* rather than asking for rows in. The label
+                        // says how many, so the count is read before the click, not
+                        // discovered in the chip afterwards.
+                        MenuEntry::action_icon(
+                            attach_label(gs),
+                            (icons::SPARKLES, theme::key_foreign),
+                            move || attach_to_chat(gs, true),
+                        )
+                        .disabled(gs.order.get_untracked().is_empty()),
+                    ]
+                };
+                gs.popup.set(Some(entries));
             });
             let ai_click = open_ai.clone();
             let face = container(
@@ -5790,8 +6005,9 @@ fn cell_at(
     data_cell(gs, pos, data_idx, ci, numeric, pending)
 }
 
-/// Row-number gutter cell (frozen). Clicking selects the whole display row. A
-/// pending new row shows a `*` marker instead of a number.
+/// Row-number gutter cell (frozen). Clicking selects the whole display row, and
+/// dragging down the gutter selects the rows it crosses. A pending new row shows
+/// a `*` marker instead of a number.
 fn gutter_cell(gs: GridState, pos: usize, ncols: usize, pending: Option<usize>) -> impl IntoView {
     let label = if pending.is_some() {
         "*".to_string()
@@ -5799,14 +6015,70 @@ fn gutter_cell(gs: GridState, pos: usize, ncols: usize, pending: Option<usize>) 
         format!("{}", pos + 1)
     };
     container(text(label).style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_faint())))
-        .on_click_stop(move |_| {
-            gs.dismiss_overlays();
-            let (anchor, active) = schemaic_core::model::row_selection(pos, ncols);
-            gs.anchor.set(Some(anchor));
-            gs.active.set(Some(active));
-            if let Some(f) = gs.focus_id.get_untracked() {
-                f.request_focus();
+        // Selection happens on **press**, not on click, because that is what arms
+        // the drag — a click fires only after the release, by which time the
+        // rows the pointer crossed are gone.
+        .on_event(EventListener::PointerDown, move |e| {
+            if let Event::PointerDown(pe) = e {
+                gs.dismiss_overlays();
+                if pe.button.is_primary() {
+                    // Shift extends from the row the last gesture anchored on, so
+                    // click-then-shift-click picks a range like everywhere else.
+                    let anchor_row = if pe.modifiers.shift() {
+                        gs.anchor.get_untracked().map(|(r, _)| r).unwrap_or(pos)
+                    } else {
+                        pos
+                    };
+                    let (anchor, active) =
+                        schemaic_core::model::row_range_selection(anchor_row, pos, ncols);
+                    gs.anchor.set(Some(anchor));
+                    gs.active.set(Some(active));
+                    // A *row* drag, kept apart from the cells' `selecting` flag:
+                    // sharing one would let a drag that started in the gutter
+                    // collapse to a single column the moment it crossed a cell.
+                    gs.row_selecting.set(true);
+                    if let Some(f) = gs.focus_id.get_untracked() {
+                        f.request_focus();
+                    }
+                    return EventPropagation::Stop;
+                }
             }
+            EventPropagation::Continue
+        })
+        // Drag-select down the gutter: the anchor stays on the row the press
+        // landed on, the active end follows the pointer. Ended by the body's
+        // pointer-up effect, wherever the release happens.
+        .on_event_cont(EventListener::PointerEnter, move |_| {
+            if gs.row_selecting.get_untracked() {
+                let anchor_row = gs.anchor.get_untracked().map(|(r, _)| r).unwrap_or(pos);
+                let (anchor, active) =
+                    schemaic_core::model::row_range_selection(anchor_row, pos, ncols);
+                gs.anchor.set(Some(anchor));
+                gs.active.set(Some(active));
+            }
+        })
+        // `DoubleClick` swallows the second `PointerUp`, so neither this cell's
+        // release nor the body's ever arrives to end the drag — the flag would
+        // stay armed with no button held and the next hover would drag a
+        // selection out of nowhere. Exactly the guard `data_cell` carries.
+        .on_double_click_stop(move |_| {
+            gs.row_selecting.set(false);
+            gs.selecting.set(false);
+        })
+        // Right-click → the row menu. A press inside the current selection keeps
+        // it (that is how "attach these 5 rows" is reached at all); outside, it
+        // selects the row under the cursor first, so the menu always describes
+        // something the user can see.
+        .on_secondary_click_stop(move |_| {
+            let inside =
+                matches!(gs.bounds_untracked(), Some((r0, _, r1, _)) if pos >= r0 && pos <= r1);
+            if !inside {
+                let (anchor, active) = schemaic_core::model::row_selection(pos, ncols);
+                gs.anchor.set(Some(anchor));
+                gs.active.set(Some(active));
+            }
+            gs.popup_anchor.set(None); // right-click → open at the cursor
+            gs.popup.set(Some(gutter_menu(gs, pos, pending)));
         })
         .style(move |s| {
             let in_sel = matches!(gs.bounds(), Some((r0, _, r1, _)) if pos >= r0 && pos <= r1);
@@ -5825,6 +6097,93 @@ fn gutter_cell(gs: GridState, pos: usize, ncols: usize, pending: Option<usize>) 
                 s.background(theme::bg_header_row())
             }
         })
+}
+
+/// The **real** data-row indices the selection covers, in display order, or just
+/// `pos`'s when the selection doesn't include it (a menu must act on what the
+/// click pointed at).
+///
+/// Pending new rows are left out: they have no committed row to duplicate or
+/// mark for deletion, and the row actions are offered only for real ones.
+fn selected_data_rows(gs: GridState, pos: usize) -> Vec<usize> {
+    let order = gs.order.get_untracked();
+    let nreal = order.len();
+    let range = match gs.bounds_untracked() {
+        Some((r0, _, r1, _)) if pos >= r0 && pos <= r1 => r0..=r1,
+        _ => pos..=pos,
+    };
+    range
+        .filter(|i| *i < nreal)
+        .map(|i| order.get(i).copied().unwrap_or(i))
+        .collect()
+}
+
+/// Mark (or unmark) every row in `idxs` for deletion, touching only the ones
+/// that would change — `toggle_delete` on a mixed selection would flip half of
+/// it the wrong way.
+fn set_rows_deleted(gs: GridState, idxs: &[usize], deleted: bool) {
+    for di in idxs {
+        let is = gs.del_rows.with_untracked(|d| d.contains(di));
+        if is != deleted {
+            gs.toggle_delete(*di);
+        }
+    }
+}
+
+/// The gutter's right-click menu: what can be done to **rows** as such.
+///
+/// Deliberately not the cell menu. That one is built around one cell's value —
+/// Edit Field, Copy, Filter by this value — none of which a row-number click has
+/// picked out, and offering them would answer a gesture about rows with actions
+/// about a column.
+fn gutter_menu(gs: GridState, pos: usize, pending: Option<usize>) -> Vec<MenuEntry> {
+    let mut entries = vec![MenuEntry::action("Copy", move || copy_selection(gs))];
+    // Row actions, on the same terms the cell menu offers them: real (already
+    // committed) rows of a single writable table.
+    let model = gs.edit_model.get_untracked();
+    if pending.is_none() && model.insert_target().is_some() {
+        // **Every selected row, not just the one clicked.** The gesture that
+        // opened this menu selected rows, and the attach entry below already
+        // counts them — narrowing to one here would have the same menu describe
+        // five rows in one line and quietly act on one in the next.
+        let idxs = selected_data_rows(gs, pos);
+        let n = idxs.len();
+        let all_deleted = gs
+            .del_rows
+            .with_untracked(|d| idxs.iter().all(|i| d.contains(i)));
+        let plural = |verb: &str| {
+            if n == 1 {
+                format!("{verb} row")
+            } else {
+                format!("{verb} {n} rows")
+            }
+        };
+        entries.push(MenuEntry::Separator);
+        let dup = idxs.clone();
+        entries.push(MenuEntry::action(plural("Duplicate"), move || {
+            for di in &dup {
+                clone_row(gs, *di);
+            }
+        }));
+        let del = idxs;
+        entries.push(MenuEntry::action(
+            if all_deleted {
+                "Undo delete".to_string()
+            } else {
+                plural("Delete")
+            },
+            move || set_rows_deleted(gs, &del, !all_deleted),
+        ));
+    }
+    if ai_data_of(gs).may_attach() {
+        entries.push(MenuEntry::Separator);
+        entries.push(MenuEntry::action_icon(
+            format!("Attach {} to chat", selection_scope_label(gs)),
+            (icons::SPARKLES, theme::key_foreign),
+            move || attach_to_chat(gs, false),
+        ));
+    }
+    entries
 }
 
 /// Zebra-stripe an odd display row (shared by the frozen and data panes so both
@@ -6078,7 +6437,7 @@ fn header_cell(
                 &summary::sample_column(&rs, ci, summary::COLUMN_SAMPLE),
             );
             gs.popup_anchor.set(None); // right-click → open at the cursor
-            gs.popup.set(Some(vec![
+            let mut entries = vec![
                 freeze_item,
                 MenuEntry::sub("Format as", format_submenu(gs, ci)),
                 MenuEntry::Separator,
@@ -6093,17 +6452,23 @@ fn header_cell(
                         }),
                     ],
                 ),
-                MenuEntry::Separator,
-                MenuEntry::action_icon(
-                    "AI Summary",
+            ];
+            // The column summary's prompt carries a sample of the values, so it
+            // is a data path like the cell one and is absent on a schema-only
+            // connection. (Copy is not: the clipboard is the user's own machine.)
+            if ai_data_of(gs).may_attach() {
+                entries.push(MenuEntry::Separator);
+                entries.push(MenuEntry::action_icon(
+                    "AI summary",
                     (icons::SPARKLES, theme::key_foreign),
                     move || {
                         if let Some(s) = &sum {
                             (s)(msg.clone());
                         }
                     },
-                ),
-            ]));
+                ));
+            }
+            gs.popup.set(Some(entries));
         })
         .style(move |s| {
             // `with`, not `get`: `get` clones the whole widths `Vec` to read one
@@ -6405,10 +6770,11 @@ fn data_cell(
             }
         })
         .on_double_click_stop(move |_| {
-            // `DoubleClick` consumes the second `PointerUp`, so the drag flag has
-            // to be cleared here too or it stays armed with no button held and the
-            // next hover drags a selection out of nowhere.
+            // `DoubleClick` consumes the second `PointerUp`, so the drag flags
+            // have to be cleared here too or one stays armed with no button held
+            // and the next hover drags a selection out of nowhere.
             gs.selecting.set(false);
+            gs.row_selecting.set(false);
             // Double-click edits an editable cell; on a read-only cell it does
             // nothing (viewing is via the right-click menu's View item).
             if gs.edit_model.get_untracked().editable(ci) {
@@ -6418,10 +6784,18 @@ fn data_cell(
                 gs.anchor.set(Some((i, ci)));
             }
         })
-        // Right-click → View · Edit · Copy · Set to NULL · AI Summary.
+        // Right-click → View · Edit · Copy · Set to NULL · AI summary.
         .on_secondary_click_stop(move |_| {
-            gs.active.set(Some((i, ci)));
-            gs.anchor.set(Some((i, ci)));
+            // A right-click **inside** the selection keeps it. It used to
+            // collapse to the clicked cell unconditionally, which made the menu
+            // unable to act on a block: selecting 3×3 and reaching for the menu
+            // destroyed the very thing the entry was about, and the entry then
+            // offered one cell. Outside the selection it still starts a new one,
+            // since that click means "this cell".
+            if !cell_in(gs.bounds_untracked(), i, ci) {
+                gs.active.set(Some((i, ci)));
+                gs.anchor.set(Some((i, ci)));
+            }
             let rs = gs.rs.get_untracked();
             // Effective value: staged text/NULL, else the original (real rows only —
             // a pending new row has no original, so unset cells are empty).
@@ -6521,12 +6895,12 @@ fn data_cell(
             // committed row to open in the panel (it's filled via inline cell edits).
             let mut entries: Vec<MenuEntry> = Vec::new();
             if editable && !deleted {
-                entries.push(MenuEntry::action("Edit Field", move || {
+                entries.push(MenuEntry::action("Edit field", move || {
                     start_edit(gs, i, ci)
                 }));
             }
             if pending.is_none() {
-                entries.push(MenuEntry::action("Edit Row", move || {
+                entries.push(MenuEntry::action("Edit row", move || {
                     open_edit_row(gs, data_idx)
                 }));
             }
@@ -6579,18 +6953,34 @@ fn data_cell(
                     gs.toggle_delete(data_idx);
                 }));
             }
-            // Set off from the row actions above it — asking about a value is a
-            // different kind of act from editing or deleting one.
-            entries.push(MenuEntry::Separator);
-            entries.push(MenuEntry::action_icon(
-                "AI Summary",
-                (icons::SPARKLES, theme::key_foreign),
-                move || {
-                    if let Some(s) = &sum {
-                        (s)(msg.clone());
-                    }
-                },
-            ));
+            // Both of these send *values* — the summary prompt carries this
+            // cell, its row and a sample of its column — so both are absent
+            // entirely on a connection set to schema-only. Absent rather than
+            // disabled: a greyed "AI Summary" invites a hunt for the reason,
+            // while the connection form is where the answer lives.
+            if ai_data_of(gs).may_attach() {
+                // Set off from the row actions above it — asking about a value is a
+                // different kind of act from editing or deleting one.
+                entries.push(MenuEntry::Separator);
+                entries.push(MenuEntry::action_icon(
+                    "AI summary",
+                    (icons::SPARKLES, theme::key_foreign),
+                    move || {
+                        if let Some(s) = &sum {
+                            (s)(msg.clone());
+                        }
+                    },
+                ));
+                // Attaching sends data the user picked, so it is spelled out with
+                // the count rather than hidden behind "Ask AI": the label is the
+                // consent notice, and it names exactly what is about to travel —
+                // a lone cell is one *column*, a gutter selection is whole rows.
+                entries.push(MenuEntry::action_icon(
+                    format!("Attach {} to chat", selection_scope_label(gs)),
+                    (icons::SPARKLES, theme::key_foreign),
+                    move || attach_to_chat(gs, false),
+                ));
+            }
             gs.popup_anchor.set(None); // right-click → open at the cursor
             gs.popup.set(Some(entries));
         })

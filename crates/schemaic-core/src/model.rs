@@ -997,6 +997,40 @@ pub fn row_selection(row: usize, ncols: usize) -> ((usize, usize), (usize, usize
     ((row, 0), (row, ncols.saturating_sub(1)))
 }
 
+/// The selection a whole-row **drag** makes: every column, from the row the drag
+/// started on to the row under the pointer.
+///
+/// The anchor keeps the starting row even when the drag runs upwards — the
+/// rectangle is normalised downstream (`bounds`), and keeping the anchor where
+/// the gesture began is what lets a drag reverse without the selection jumping.
+pub fn row_range_selection(
+    anchor_row: usize,
+    active_row: usize,
+    ncols: usize,
+) -> ((usize, usize), (usize, usize)) {
+    ((anchor_row, 0), (active_row, ncols.saturating_sub(1)))
+}
+
+/// How a grid selection names itself in the "Attach … to chat" action — the
+/// phrase between `Attach` and `to chat`.
+///
+/// The label is the consent notice for a gesture that sends data off the
+/// machine, so it has to describe what is actually going: a lone cell is one
+/// *column* of one row, not "1 row" (which reads as the whole row), and a
+/// selection covering every column **is** whole rows, where naming the columns
+/// as well is noise. Between those, both halves matter and both are said.
+pub fn attach_scope_label(rows: usize, cols: usize, ncols: usize) -> String {
+    let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    // Every column selected → whole rows, however many.
+    if ncols > 0 && cols >= ncols {
+        return plural(rows, "row");
+    }
+    if rows == 1 {
+        return plural(cols, "column");
+    }
+    format!("{} and {}", plural(rows, "row"), plural(cols, "column"))
+}
+
 /// Where a Go-to-row jump lands: the selection to make, and the column to scroll
 /// to. `None` when the input names no row — see [`goto_row_index`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1923,6 +1957,48 @@ mod tests {
     #[test]
     fn goto_row_clamps_a_number_wider_than_usize() {
         assert_eq!(goto_row_index("99999999999999999999999999", 100), Some(99));
+    }
+
+    #[test]
+    fn a_row_drag_covers_every_column_of_every_row_it_crossed() {
+        assert_eq!(row_range_selection(2, 5, 4), ((2, 0), (5, 3)));
+        // Dragging upwards keeps the anchor where the gesture began, so
+        // reversing the drag doesn't move the far end of the selection.
+        assert_eq!(row_range_selection(5, 2, 4), ((5, 0), (2, 3)));
+        // One row is the same shape a click makes.
+        assert_eq!(row_range_selection(3, 3, 4), row_selection(3, 4));
+        // No columns saturates rather than underflowing.
+        assert_eq!(row_range_selection(1, 2, 0), ((1, 0), (2, 0)));
+    }
+
+    // ── The attach action's label ──
+
+    #[test]
+    fn a_lone_cell_is_one_column_not_one_row() {
+        // "1 row" would read as the whole row, which is not what is sent.
+        assert_eq!(attach_scope_label(1, 1, 5), "1 column");
+        assert_eq!(attach_scope_label(1, 3, 5), "3 columns");
+    }
+
+    #[test]
+    fn covering_every_column_is_whole_rows_and_says_only_that() {
+        assert_eq!(attach_scope_label(3, 5, 5), "3 rows");
+        assert_eq!(attach_scope_label(1, 5, 5), "1 row");
+        // A single-column result: covering the one column is covering the row.
+        assert_eq!(attach_scope_label(4, 1, 1), "4 rows");
+    }
+
+    #[test]
+    fn a_block_names_both_halves() {
+        assert_eq!(attach_scope_label(3, 1, 5), "3 rows and 1 column");
+        assert_eq!(attach_scope_label(3, 2, 5), "3 rows and 2 columns");
+    }
+
+    #[test]
+    fn a_result_with_no_columns_still_labels_its_rows() {
+        // `ncols == 0` can't mean "every column is selected" — with nothing to
+        // select the honest phrase is still about rows.
+        assert_eq!(attach_scope_label(2, 0, 0), "2 rows and 0 columns");
     }
 
     /// The gutter click and the Ctrl+G jump make the **same** gesture, which is

@@ -690,7 +690,16 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
     let effort = ui.ai.effort;
     let instructions = ui.ai.instructions;
     let scope = ui.ai.schema_scope;
-    let run_queries = ui.ai.run_queries;
+    // The active connection's data-access level, reactively — the modal reports
+    // it, the connection form owns it.
+    let connections = ui.conn.connections;
+    let active_conn = ui.conn.active_conn;
+    let active_ai_data = floem::reactive::create_memo(move |_| {
+        let id = active_conn.get();
+        connections
+            .with(|cs| cs.iter().find(|c| c.id == id).and_then(|c| c.ai_data))
+            .unwrap_or_default()
+    });
     let apply = ui.ai_actions.apply.clone();
     let detected = ui.ai_actions.detected_path.clone();
     let cli_ok = ui.ai_actions.cli_ok.clone();
@@ -787,14 +796,31 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
                 v_stack((settings_group_label("Custom instructions"), instr_field)).style(group);
             let scope_section =
                 v_stack((settings_group_label("Schema context"), scope_dd)).style(group);
-            // Self-describing toggle row (label + hint on the left, switch right).
-            let queries_section = focusable_toggle_row(
-                "Let the assistant run queries",
-                "Read-only queries (SELECT/SHOW/…) to inspect your data.",
-                run_queries,
-                ring.clone(),
-                60,
-            );
+            // Data access is *not* settable here: it belongs to the connection,
+            // because a scratch database and a client's production server are
+            // not the same risk and one global answer forces the careless
+            // setting on one of them. This section states what the connection in
+            // front of the user says, and where to change it — a modal that
+            // silently omitted the subject would read as "there is no such
+            // setting".
+            let data_section = v_stack((
+                settings_group_label("Data access"),
+                label(move || {
+                    let lvl = active_ai_data.get();
+                    format!("{} — {}", lvl.label(), lvl.hint())
+                })
+                .style(|s| {
+                    s.width_full()
+                        .font_size(theme::FONT_HINT)
+                        .color(theme::text_muted())
+                }),
+                text("Set per connection, in the connection's settings.").style(|s| {
+                    s.width_full()
+                        .font_size(theme::FONT_HINT)
+                        .color(theme::text_muted())
+                }),
+            ))
+            .style(group);
             // Kept for the root, which answers Tab by entering the ring.
             let root_ring = ring;
 
@@ -804,7 +830,7 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
                 effort_section,
                 instr_section,
                 scope_section,
-                queries_section,
+                data_section,
             ))
             .style(|s| s.flex_col().gap(25.0).padding(14.0).width_full());
 
