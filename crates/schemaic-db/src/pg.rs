@@ -822,7 +822,7 @@ pub(crate) async fn count_rows(
 /// **Blocked backends first, then longest-standing.** Ordering by age alone
 /// sounds like "keep the interesting end of the list" and is the opposite of it:
 /// the panel ranks lock waits above everything
-/// ([`activity::rank`](schemaic_core::activity::rank)), and a backend that
+/// ([`schemaic_core::activity::rank`]), and a backend that
 /// started waiting four seconds ago has the *smallest* age on the cluster — so
 /// past the cap, a pile of hour-old idle pool connections displaced every row of
 /// the wait the panel exists to show.

@@ -232,7 +232,7 @@ macro_rules! disabled {
 /// Like [`pair`], for a foreground the *view* fades — a label painted at a
 /// fraction of a theme colour (`accent().multiply_alpha(0.6)`), where what the
 /// eye reads is the composite against the surface, not the colour named in the
-/// style. The counterpart of [`wash`], which fades the background instead.
+/// style. The counterpart of `wash!` below, which fades the background instead.
 ///
 /// **Unused, deliberately kept.** Its one caller was the history band's count,
 /// and the alpha there turned out to be how a number the reader is meant to read
