@@ -214,6 +214,27 @@ fn fetch_sources(ui: &Ui) {
 /// preview opens. See [`crate::DdlUi::session`]: with the old guard an in-flight
 /// fetch from one database landed on a modal since reopened on another, and
 /// opening the preview mid-fetch threw the result away for good.
+/// Whether the nested function editor closing back to here should re-fetch the
+/// function list. `prev` is the last-seen open state, `None` on the effect's
+/// first run.
+///
+/// **This is the whole reason a nested open may bump `DdlUi::session`.** Every
+/// editor's `open` does, including the *New function…* and *Edit function…*
+/// that are reached from this panel — so a `fetch_functions` reply still in
+/// flight when one is pressed comes back stamped with the old session and is
+/// dropped. The list is not left stale by that, because the return trip asks
+/// again: the cost is one wasted round trip, over a window in which this panel
+/// renders nothing anyway (its own key treats an open routine editor exactly as
+/// it treats the preview).
+///
+/// It has to fire on the *edge*, not on `!fn_open`: the effect also re-runs
+/// whenever `fetch_source` patches `d.routine`, and a level test would refetch
+/// the list on every one of those. And a first run with `prev == None` is the
+/// panel mounting, not a return from anywhere.
+fn refetch_functions_on_return(prev: Option<bool>, fn_open: bool, trigger_open: bool) -> bool {
+    prev == Some(true) && !fn_open && trigger_open
+}
+
 fn fetch_functions(ui: &Ui) {
     let d = ui.ddl;
     let Some((conn_id, database)) = d
@@ -1144,8 +1165,7 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
         let ui = ui.clone();
         create_effect(move |prev: Option<bool>| {
             let fn_open = d.routine.get().is_some();
-            let closed = prev == Some(true) && !fn_open;
-            if closed && d.trigger.get_untracked().is_some() {
+            if refetch_functions_on_return(prev, fn_open, d.trigger.get_untracked().is_some()) {
                 fetch_functions(&ui);
             }
             fn_open
@@ -1345,6 +1365,44 @@ pub(crate) fn trigger_editor_overlay(ui: Ui) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The return trip is what makes the shared session counter harmless
+    /// here.** Opening the nested function editor bumps `DdlUi::session` like
+    /// any other `open`, so a `fetch_functions` reply in flight at that moment
+    /// is dropped — and the only thing that stops the dropdown being stale
+    /// afterwards is this edge firing on the way back. It is also the only
+    /// thing that puts a *newly created* function in the list before the next
+    /// schema reload, which is the worse failure of the two.
+    ///
+    /// Nothing tested it, and each of the three terms fails silently: a level
+    /// test refetches on every `fetch_source` patch, dropping `trigger_open`
+    /// fires for a routine editor opened from the schema tree, and treating the
+    /// first run as a return refetches for a panel that never opened one.
+    #[test]
+    fn returning_from_the_function_editor_refetches_the_list() {
+        // The gesture: mount, open the nested editor, close it again.
+        assert!(
+            !refetch_functions_on_return(None, false, true),
+            "the panel mounting is not a return from anywhere"
+        );
+        assert!(
+            !refetch_functions_on_return(Some(false), true, true),
+            "opening it is not the edge"
+        );
+        assert!(
+            refetch_functions_on_return(Some(true), false, true),
+            "closing it back to an open trigger editor must ask again"
+        );
+
+        // `fetch_source` patching `d.routine` re-runs the effect with the
+        // editor still open — a level test would refetch the whole list on
+        // every one of those.
+        assert!(!refetch_functions_on_return(Some(true), true, true));
+
+        // A routine editor opened from the schema tree closes to no trigger
+        // editor, and there is no list to refresh.
+        assert!(!refetch_functions_on_return(Some(true), false, false));
+    }
 
     fn routine(schema: &str, name: &str) -> RoutineInfo {
         RoutineInfo {

@@ -710,14 +710,18 @@ pub struct DdlUi {
     /// `db2.invoices`, while opening the *preview* mid-fetch discarded the
     /// result permanently and left the dropdown empty for good.
     ///
-    /// **A nested function editor bumps it too, and that is a rough edge rather
-    /// than a decision.** `open_for_new_trigger_function` goes through the same
-    /// `open`, so pressing *New function…* while `fetch_functions` is still in
-    /// flight discards that reply and leaves the trigger editor's function
-    /// dropdown empty behind it. The window is one round trip wide and nothing
-    /// re-fetches on the way back. Narrowing it means a session identity a
-    /// nested open can inherit, not simply skipping the bump — the bump is also
-    /// what invalidates the routine editor's own `fetch_source`.
+    /// **A nested function editor bumps it too, and that costs a round trip
+    /// rather than correctness.** The trigger editor's *New function…* and
+    /// *Edit function…* go through `routine_editor::open` like any other, so a
+    /// `fetch_functions` reply in flight at that moment comes back stamped with
+    /// the old session and is dropped. Nothing is left stale by it: the panel
+    /// renders nothing while that editor is up (its key treats an open routine
+    /// editor as it treats the preview), and the return trip asks again —
+    /// `trigger_editor::refetch_functions_on_return`, which has to run anyway
+    /// so that a function just *created* reaches the dropdown. Don't "fix" the
+    /// bump by skipping it: it is also what invalidates the routine editor's
+    /// own `fetch_source`, and what tells [`crate::widgets::overlay_open_key`]
+    /// the contents were replaced.
     pub session: RwSignal<u64>,
 }
 
