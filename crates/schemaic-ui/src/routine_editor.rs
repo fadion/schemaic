@@ -251,20 +251,40 @@ fn fetch_source(ui: &Ui) {
                 .and_then(|t| t.current.as_ref())
                 .map(|c| c.body.clone())
         });
-        // `current` — the left-hand side of every diff.
-        d.routine.update(|t| {
-            if let Some(t) = t.as_mut()
-                && let Some(cur) = t.current.as_mut()
-            {
-                src.apply_to(cur);
-            }
-        });
+        // The draft first, and without touching `d.routine`: **that signal is
+        // the overlay's own `dyn_container` key**, and floem never dedups a
+        // `set`, so writing it tears the whole modal down and rebuilds it —
+        // `FocusRing` and all — dropping the caret mid-word.
         d.routine_draft.update(|dr| {
             src.apply_session_to(&mut dr.info);
             if opened_with.as_deref() == Some(dr.info.body.as_str()) {
                 src.apply_body_to(&mut dr.info);
             }
         });
+        // `current` — the left-hand side of every diff — but **only when it
+        // would actually change**. Most routines have no escapes to resolve, so
+        // `information_schema`'s copy already equals `SHOW CREATE`'s and the
+        // rebuild bought nothing. Where it does differ the rebuild is still
+        // load-bearing: `bound_field` seeds its local signal once at build, so
+        // the corrected body reaches the screen no other way.
+        let changes_current = d.routine.with_untracked(|t| {
+            t.as_ref()
+                .and_then(|t| t.current.as_ref())
+                .is_some_and(|c| {
+                    let mut probe = c.clone();
+                    src.apply_to(&mut probe);
+                    probe != *c
+                })
+        });
+        if changes_current {
+            d.routine.update(|t| {
+                if let Some(t) = t.as_mut()
+                    && let Some(cur) = t.current.as_mut()
+                {
+                    src.apply_to(cur);
+                }
+            });
+        }
     });
     (ui.schema_actions.routine_source.clone())(
         RoutineSrcRequest {

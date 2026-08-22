@@ -94,11 +94,32 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
         // block is: the chat is about what the user is looking at.
         propose: {
             let ui = ui.clone();
-            let active_db = ui.tabs_ui.active_db;
+            let tabs = ui.tabs_ui.tabs;
+            let active = ui.tabs_ui.active;
+            let active_conn = ui.conn.active_conn;
             Rc::new(move |proposal: schemaic_core::propose::Proposal| {
-                let Some(db) = active_db.get_untracked() else {
+                // **The tab's database only counts on the tab's own
+                // connection.** Switching connections doesn't move the focused
+                // tab — a tab keeps the one it was opened on — so the unfiltered
+                // `active_db` memo can name a database that lives somewhere
+                // else, and `preview_proposal` pairs whatever it is given with
+                // `edit_ctx`'s **active** connection and stamps that `conn_id`
+                // into the plan `run_ddl` executes. That pairing is the one
+                // `ai::scoped_database` exists to prevent; here it could run an
+                // `ALTER` on prod against a proposal written about dev.
+                let conn = active_conn.get_untracked();
+                let tab = tabs.with_untracked(|v| {
+                    v.iter()
+                        .find(|t| t.id == active.get_untracked())
+                        .map(|t| (t.conn_id.get_untracked(), t.database.get_untracked()))
+                });
+                let Some(db) = tab
+                    .filter(|(tab_conn, _)| *tab_conn == conn)
+                    .and_then(|(_, db)| db)
+                else {
                     return Err(
-                        "This tab has no database yet — pick one before applying a schema change."
+                        "This change is about a tab on a different connection — switch to it, or \
+                         pick a database on this one, before applying a schema change."
                             .to_string(),
                     );
                 };
