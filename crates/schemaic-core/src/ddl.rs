@@ -539,9 +539,20 @@ impl TableDraft {
                 }
             }
         }
+        // Foreign keys were the last section without a uniqueness arm, though
+        // both siblings have one — so `ADD CONSTRAINT` with a name already in
+        // use validated clean here and came back 1826 / 42710 from the server,
+        // which is exactly what `propose_table_change` exists to catch before
+        // the user sees it.
+        let mut fk_names: HashSet<String> = HashSet::new();
         for fk in &self.foreign_keys {
             if fk.info.name.trim().is_empty() {
                 out.push("Every foreign key needs a name.".to_string());
+            } else if !fk_names.insert(fk.info.name.to_ascii_lowercase()) {
+                out.push(format!(
+                    "Two foreign keys are both called {}.",
+                    fk.info.name
+                ));
             }
             if fk.info.ref_table.trim().is_empty() {
                 out.push(format!("Foreign key {} references no table.", fk.info.name));
@@ -2091,6 +2102,33 @@ fn view_drop_cost(dialect: SqlDialect) -> &'static str {
     }
 }
 
+/// The clauses of a column definition the emitter writes **verbatim**, rendered
+/// for the preview's change list.
+///
+/// **The change list is the consent gesture, so nothing may reach `emit()`
+/// without reaching it.** These four fields are free SQL by design — a default
+/// has to be able to say `nextval('s')` — and the summary used to print only the
+/// name and the type, so `DEFAULT 'x', DROP COLUMN placed_at` produced the line
+/// `Add column note text` with no warning and a `Primary`-coloured Apply. The
+/// SQL box did hold the truth, but it is a `no_wrap` field whose tail is off the
+/// right edge; the list is what the modal is built to be read as.
+fn column_clauses(c: &ColumnInfo) -> String {
+    let mut out = String::new();
+    if let Some(d) = &c.default {
+        out.push_str(&format!(", default {d}"));
+    }
+    if let Some(g) = &c.generated {
+        out.push_str(&format!(", generated as ({g})"));
+    }
+    if let Some(u) = &c.on_update {
+        out.push_str(&format!(", on update {u}"));
+    }
+    if let Some(coll) = &c.collation {
+        out.push_str(&format!(", collate {coll}"));
+    }
+    out
+}
+
 impl Change {
     /// One line of plain language for the preview's change list.
     pub fn summary(&self) -> String {
@@ -2110,14 +2148,27 @@ impl Change {
             Change::TruncateTable => "Delete every row".to_string(),
             Change::RenameTable { to } => format!("Rename the table to {to}"),
             Change::AddColumn { column, .. } => {
-                format!("Add column {} {}", column.name, column.type_name)
+                format!(
+                    "Add column {} {}{}",
+                    column.name,
+                    column.type_name,
+                    column_clauses(column)
+                )
             }
             Change::DropColumn { name, .. } => format!("Drop column {name}"),
             Change::AlterColumn {
                 from, to, position, ..
             } => {
+                // The free-SQL clauses are named on every arm that isn't purely
+                // a move, because a `MODIFY`/`ALTER COLUMN` restates them and
+                // the list is where the user reads what is being restated.
+                let clauses = if column_clauses(from) == column_clauses(to) {
+                    String::new()
+                } else {
+                    column_clauses(to)
+                };
                 if from.name != to.name {
-                    format!("Rename column {} to {}", from.name, to.name)
+                    format!("Rename column {} to {}{clauses}", from.name, to.name)
                 } else if from.as_ref() == to.as_ref() && position.is_some() {
                     match position {
                         Some(Position::First) => format!("Move column {} first", to.name),
@@ -2126,11 +2177,11 @@ impl Change {
                     }
                 } else if from.type_name != to.type_name {
                     format!(
-                        "Change column {} from {} to {}",
+                        "Change column {} from {} to {}{clauses}",
                         to.name, from.type_name, to.type_name
                     )
                 } else {
-                    format!("Change column {}", to.name)
+                    format!("Change column {}{clauses}", to.name)
                 }
             }
             Change::PrimaryKey { from, to, .. } => match (from.is_empty(), to.is_empty()) {
@@ -8572,6 +8623,60 @@ mod tests {
         );
     }
 
+    /// **Nothing may reach `emit()` without reaching the change list.** The
+    /// preview *is* the consent gesture, and a column's free-SQL clauses are
+    /// spliced into the statement verbatim — so a `default` of
+    /// `'x', DROP COLUMN placed_at` used to produce the single line
+    /// `Add column note text`, no risk block, and a `Primary`-coloured Apply,
+    /// over an `ALTER` that also dropped a column.
+    #[test]
+    fn a_columns_free_sql_clauses_are_named_in_the_change_list() {
+        let (t, mut d) = users_and_draft();
+        d.columns.push(ColumnDraft::new(ColumnInfo {
+            name: "note".into(),
+            type_name: "text".into(),
+            nullable: true,
+            default: Some("'x', DROP COLUMN placed_at".into()),
+            ..Default::default()
+        }));
+        let cs = diff(&t, &d, MySql);
+        let line = cs.changes[0].summary();
+        assert!(line.contains("DROP COLUMN placed_at"), "{line}");
+        // And the emitted SQL is what the line described.
+        assert!(cs.emit().join("\n").contains("DROP COLUMN placed_at"));
+
+        // A generated expression the same way.
+        let (t, mut d) = users_and_draft();
+        d.columns.push(ColumnDraft::new(ColumnInfo {
+            name: "n".into(),
+            type_name: "int".into(),
+            nullable: true,
+            generated: Some("1) , DROP COLUMN placed_at, ADD COLUMN z int".into()),
+            ..Default::default()
+        }));
+        assert!(
+            diff(&t, &d, MySql).changes[0]
+                .summary()
+                .contains("DROP COLUMN placed_at")
+        );
+
+        // An *altered* column's default reaches the list too — the arm that
+        // used to fall through to a bare `Change column {name}`.
+        let (t, mut d) = users_and_draft();
+        d.columns[1].info.default = Some("now(); DROP TABLE customers; --".into());
+        let line = diff(&t, &d, MySql).changes[0].summary();
+        assert!(line.contains("DROP TABLE customers"), "{line}");
+
+        // An ordinary default stays readable.
+        let (t, mut d) = users_and_draft();
+        d.columns[1].info.default = Some("CURRENT_TIMESTAMP".into());
+        assert!(
+            diff(&t, &d, MySql).changes[0]
+                .summary()
+                .contains(", default CURRENT_TIMESTAMP")
+        );
+    }
+
     #[test]
     fn clearing_the_comment_is_a_change_and_clears_it() {
         // Unlike the engine, "no comment" is a real state a table can be in.
@@ -8805,6 +8910,44 @@ mod tests {
             errs.iter().any(|e| e.contains("isn't a column")),
             "{errs:?}"
         );
+    }
+
+    /// The uniqueness arm foreign keys were missing while both siblings had
+    /// one. `ADD CONSTRAINT` with a name already in use validated clean and came
+    /// back `Duplicate foreign key constraint name` from the server — and
+    /// `propose_table_change` answered "Valid. Nothing has run." for it.
+    #[test]
+    fn two_foreign_keys_may_not_share_a_name() {
+        let mut d = TableDraft::blank("orders", None);
+        d.columns = vec![
+            ColumnDraft::new(col("customer_id", "int")),
+            ColumnDraft::new(col("placed_at", "datetime")),
+        ];
+        let fk = |columns: Vec<String>, ref_table: &str| {
+            ForeignKeyDraft::new(ForeignKeyInfo {
+                name: "fk_orders_customer".into(),
+                columns,
+                ref_schema: None,
+                ref_table: ref_table.into(),
+                ref_columns: vec!["id".into()],
+                on_delete: None,
+                on_update: None,
+            })
+        };
+        d.foreign_keys = vec![
+            fk(vec!["customer_id".into()], "customers"),
+            fk(vec!["placed_at".into()], "cal"),
+        ];
+        let errs = d.validate(MySql);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("Two foreign keys are both called fk_orders_customer")),
+            "{errs:?}"
+        );
+
+        // Two differently-named keys are fine.
+        d.foreign_keys[1].info.name = "fk_orders_cal".into();
+        assert!(d.validate(MySql).is_empty(), "{:?}", d.validate(MySql));
     }
 
     /// **What "every engine designs from a column row" actually claims.** The

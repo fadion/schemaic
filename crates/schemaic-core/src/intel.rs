@@ -4636,6 +4636,39 @@ pub fn parses(stmt: &str, dialect: SqlDialect) -> bool {
     sqlparser::parser::Parser::parse_sql(&*dialect.parser(), stmt).is_ok()
 }
 
+/// Is `text` **one whole expression** in `dialect`, with nothing after it?
+///
+/// The question a clause that takes free SQL has to be able to ask about text
+/// it did not write. `DEFAULT <text>`, `GENERATED ALWAYS AS (<text>)` and
+/// `CHECK (<text>)` all splice the caller's string into a statement verbatim —
+/// which is right, because a default genuinely has to be able to say
+/// `CURRENT_TIMESTAMP` or `nextval('s')`, and quoting it would break every real
+/// one. What is *not* right is a string that ends the clause and starts
+/// something else: `'x', DROP COLUMN placed_at` is a perfectly legal
+/// `alter_option` list once it has been pasted in.
+///
+/// So the guard is structural rather than lexical: parse the text as an
+/// expression and require the parser to have consumed all of it. A trailing
+/// comma, paren, semicolon or keyword leaves a token behind and fails here.
+///
+/// **This is for text from an untrusted author** — a model's proposal — not for
+/// the designer, where the user typing the string is the one consenting to it.
+pub fn is_single_expression(text: &str, dialect: SqlDialect) -> bool {
+    use sqlparser::tokenizer::Token;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let d = dialect.parser();
+    let Ok(mut parser) = sqlparser::parser::Parser::new(&*d).try_with_sql(trimmed) else {
+        return false;
+    };
+    if parser.parse_expr().is_err() {
+        return false;
+    }
+    parser.peek_token().token == Token::EOF
+}
+
 /// A table a statement reads from, as written: the bare name plus whatever
 /// qualified it.
 #[derive(Clone, Debug, PartialEq, Eq)]

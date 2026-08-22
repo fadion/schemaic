@@ -735,17 +735,16 @@ async fn propose_change(
         Ok(s) => s,
         Err(e) => return (format!("Error reading schema for {database}: {e}"), true),
     };
-    let Some(info) = find_described(&schema, &proposal.table) else {
-        return (
-            format!(
-                "Table {} not found in {database}. Call list_schema to see what exists.",
-                proposal.table
-            ),
-            true,
-        );
-    };
-
     let dialect = dialect_of(db);
+    // **The same resolver the proposal card uses**, so the table this validates
+    // is the table the user is later offered. The two used to disagree about
+    // `proposal.schema` and about a qualified `sales.orders`, which is how a
+    // change reported valid for `public.orders` reached a modal targeting
+    // `sales.orders`.
+    let info = match propose::resolve_target(&schema, &proposal) {
+        Ok(t) => t,
+        Err(e) => return (format!("{e} (in {database})"), true),
+    };
     let draft = match propose::apply(info, &proposal, dialect) {
         Ok(d) => d,
         Err(e) => return (e.to_string(), true),
