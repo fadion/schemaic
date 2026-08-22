@@ -170,6 +170,49 @@ mod tests {
         vec![user(q), reply(a)]
     }
 
+    /// **An attachment's cells never reach the file**, and the rule rested on
+    /// two `#[serde(skip)]` attributes and a fixture whose `attachment` was
+    /// always `None` — so nothing asserted it. The rows a user attaches are the
+    /// production data the whole `AiData` ladder is about: writing them into
+    /// `chats.json` would persist, in plaintext, the one thing the app is
+    /// careful never to store.
+    #[test]
+    fn an_attachments_cells_are_never_written_to_disk() {
+        let secret = "alice@corp.example";
+        let mut q = user("what stands out?");
+        q.attachment = Some(crate::transcript::Attachment {
+            summary: "2 rows × 2 columns".to_string(),
+            total_rows: 900,
+            columns: vec!["id".to_string(), "email".to_string()],
+            rows: vec![
+                vec!["1".to_string(), secret.to_string()],
+                vec!["2".to_string(), "bob@corp.example".to_string()],
+            ],
+        });
+        let mut chats = Vec::new();
+        save(&mut chats, 1, &[q, reply("nothing")]);
+
+        let json = serde_json::to_string(&ChatFile::of(&chats)).expect("serializes");
+        assert!(!json.contains(secret), "{json}");
+        assert!(!json.contains("bob@corp.example"), "{json}");
+        assert!(
+            !json.contains("email"),
+            "even the column names stay out: {json}"
+        );
+        // What *is* kept is the record that something was sent, and how much.
+        assert!(json.contains("2 rows × 2 columns"), "{json}");
+        assert!(json.contains("900"), "{json}");
+
+        // …and a restored one says so rather than pretending it still has them.
+        let restored: ChatFile = serde_json::from_str(&json).expect("round-trips");
+        let a = restored.chats[0].messages[0]
+            .attachment
+            .as_ref()
+            .expect("the summary survived");
+        assert!(!a.retained());
+        assert!(a.prompt_block().is_empty());
+    }
+
     #[test]
     fn save_then_load_round_trips_a_conversation() {
         let mut chats = Vec::new();

@@ -233,6 +233,14 @@ macro_rules! disabled {
 /// fraction of a theme colour (`accent().multiply_alpha(0.6)`), where what the
 /// eye reads is the composite against the surface, not the colour named in the
 /// style. The counterpart of [`wash`], which fades the background instead.
+///
+/// **Unused, deliberately kept.** Its one caller was the history band's count,
+/// and the alpha there turned out to be how a number the reader is meant to read
+/// came to be painted at 2.32:1 — the fix was a colour, not a different fade. It
+/// stays because the *next* faded foreground has to be measured composited, and
+/// re-deriving that is how one gets measured against the colour it was named
+/// with instead.
+#[allow(unused_macros)]
 macro_rules! faded {
     ($fg:ident($alpha:expr) on $bg:ident, $role:ident, $site:expr) => {
         Pairing {
@@ -352,8 +360,17 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     // new surface is exactly what it cannot see.
     pair!(text on row_hover_soft, Body, "history: a hovered row"),
     pair!(text_faint on row_hover_soft, Recessive, "history: its timestamp and outcome line"),
-    pair!(accent on group_header_bg, Recessive, "history: the TODAY / THIS WEEK label"),
-    faded!(accent(0.6) on group_header_bg, Recessive, "history: that band's count"),
+    // **Not `Recessive`.** That floor (2.0) is for placeholders, disabled rows
+    // and watermarks — things meant to recede — and it asserts only that they
+    // are perceptible. These two are what a long history is *scanned* by, which
+    // is the commit's own rationale for them. Filed at the role the content has,
+    // the count's old `accent @ 0.6` measured 2.32:1 in Light: under AA and
+    // under the large/bold level, passing the gate purely because of the role it
+    // was written down at. The label is bold, so `Icon`; the count is ordinary
+    // prose and now takes `text_dim`, the pairing the AI panel already holds to
+    // `Body` on this very surface.
+    pair!(accent on group_header_bg, Icon, "history: the TODAY / THIS WEEK label"),
+    pair!(text_dim on group_header_bg, Body, "history: that band's count"),
     pair!(text on row_active, Body, "schema tree: the selected row"),
     pair!(text on row_selected, Body, "schema tree: the keyboard-nav cursor row"),
     pair!(text_dim on row_selected, Body, "designer list: a selected row's detail"),
@@ -409,6 +426,14 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     // history panel's TODAY / THIS WEEK band already gets: it names what the
     // reader can already see, and nothing depends on reading it. The actions
     // beside it, which do get acted on, are held to Body.
+    // The attachment views. Registered because they were not: three prose sites
+    // arrived with no `UI_PAIRINGS` rows, so the audit measured them against the
+    // `Icon`-class baselines their colour already had — the exact
+    // reuse-at-a-harder-role hole this table's unit is the *pairing* to avoid.
+    // The chip is the app's last consent surface, so it is the last place a
+    // sentence about rows leaving the machine may sit below a reading floor.
+    pair!(text_dim on bg_deepest, Body, "AI panel: a sent attachment's summary and table"),
+    pair!(text_dim on bg_panel, Body, "AI panel: the staged attachment chip"),
     pair!(text_muted on group_header_bg, Recessive, "AI panel: a code block's language label"),
     pair!(text_dim on group_header_bg, Body, "AI panel: a code block's Copy/Insert/Run"),
     pair!(accent on group_header_bg, Body, "AI panel: one of them, hovered"),

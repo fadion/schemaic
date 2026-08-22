@@ -197,11 +197,6 @@ fn history_search(filter: RwSignal<String>) -> impl IntoView {
     .style(|s| s.margin_left(12.0).margin_right(12.0).flex_shrink(0.0_f32))
 }
 
-/// How much of the accent the group header's count keeps. Named because the
-/// contrast gate measures the composited colour and has to be given the same
-/// number the view paints (`crate::contrast`).
-const HEADER_COUNT_ALPHA: f32 = 0.6;
-
 /// A recency group's header — `TODAY` and how many ran in it.
 ///
 /// The same weight as the panel's own `section_title`, one step down in size: it
@@ -219,9 +214,16 @@ const HEADER_COUNT_ALPHA: f32 = 0.6;
 fn group_header(bucket: history::Bucket, count: usize, first: bool) -> floem::AnyView {
     let label =
         text(bucket.label()).style(|s| s.font_size(FONT_LABEL).font_bold().color(theme::accent()));
+    // **`text_dim`, not a faded accent.** The count has to recede from the bold
+    // label beside it — two accents of equal weight compete across the row —
+    // but it is also a number the reader is meant to read, and an alpha on the
+    // accent got there by making it *dimmer than legible*: 2.32:1 in Light,
+    // under AA and under the large/bold level both. This is the same colour the
+    // AI panel's code-block actions use on this exact surface, where the gate
+    // already holds it to `Body`.
     let n = text(count.to_string()).style(|s| {
         s.font_size(FONT_LABEL)
-            .color(theme::accent().multiply_alpha(HEADER_COUNT_ALPHA))
+            .color(theme::text_dim())
             .flex_shrink(0.0_f32)
     });
     h_stack((label, empty().style(|s| s.flex_grow(1.0_f32)), n))
