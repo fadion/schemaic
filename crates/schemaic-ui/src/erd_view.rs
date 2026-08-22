@@ -2070,8 +2070,10 @@ pub(crate) fn erd_overlay(ui: Ui) -> impl IntoView {
                 }
             };
 
-            // The dropdown rides the app's shared popup channel — the topmost
-            // surface in the window, and the only one painted above this modal.
+            // The dropdown rides the app's shared popup channel — the last
+            // surface in `workspace`'s root stack bar `submenu_layer` (which
+            // draws this menu's own "Copy as"), and so the only one painted above
+            // this modal.
             let popup = ui.overlay.popup_menu;
             let popup_anchor = ui.overlay.popup_anchor;
             let popup_width = ui.overlay.popup_width;
