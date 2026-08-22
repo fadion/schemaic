@@ -690,6 +690,7 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
     let effort = ui.ai.effort;
     let instructions = ui.ai.instructions;
     let scope = ui.ai.schema_scope;
+    let gutter = ui.ai.gutter;
     // The active connection's data-access level, reactively — the modal reports
     // it, the connection form owns it.
     let connections = ui.conn.connections;
@@ -821,6 +822,18 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
                 }),
             ))
             .style(group);
+            // Presentation, and the only setting here that is: it changes
+            // nothing about what is sent or how a turn runs, so it does not
+            // enter `ai_settings_now()` and closing the modal after flipping it
+            // leaves the live conversation alone.
+            let gutter_row = focusable_toggle_row(
+                "Accent rule on replies",
+                "Mark Claude's replies with a coloured rule down their right edge. Off gives them \
+                 the same margin on both sides.",
+                gutter,
+                ring.clone(),
+                60,
+            );
             // Kept for the root, which answers Tab by entering the ring.
             let root_ring = ring;
 
@@ -831,6 +844,7 @@ pub(crate) fn ai_settings_overlay(ui: Ui) -> impl IntoView {
                 instr_section,
                 scope_section,
                 data_section,
+                gutter_row,
             ))
             .style(|s| s.flex_col().gap(25.0).padding(14.0).width_full());
 

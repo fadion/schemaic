@@ -1581,6 +1581,10 @@ pub struct AiUi {
     pub instructions: RwSignal<String>,
     /// How much schema context to inject into the system prompt.
     pub schema_scope: RwSignal<SchemaScope>,
+    /// Draw the accent rule down the right edge of the assistant's replies.
+    /// Presentation only — it costs the reply 13px of width when on, and when
+    /// off the reply's two insets are equal.
+    pub gutter: RwSignal<bool>,
     /// Latest inline (Ctrl+K) generation result, previewed by the popup.
     pub inline: RwSignal<InlineAiState>,
     /// Result rows staged for the next question by the grid's "Attach to chat",

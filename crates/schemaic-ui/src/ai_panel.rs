@@ -74,6 +74,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
     let regenerate = ui.ai_actions.regenerate.clone();
     let right_w = ui.layout.right_w;
     let settings_open = ui.ai.settings_open;
+    let gutter = ui.ai.gutter;
     let cli_path = ui.ai.cli_path;
     let cli_ok = ui.ai_actions.cli_ok.clone();
     // Actions for code-block bars: insert into a new query tab, and run.
@@ -217,8 +218,10 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
             let regen = regenerate.clone();
             // Width pinned to the scroll viewport (`panel_w`, measured below) so a
             // scroll's unbounded child width doesn't stop the text wrapping, while
-            // still tracking the panel as it's resized. 10px between messages; the
-            // first label sits 10px below the title; bubbles carry their own margins.
+            // still tracking the panel as it's resized. 16px between messages —
+            // wider than it was, because with Claude's turns unboxed the gap is
+            // the only thing separating one turn from the next; the first label
+            // sits 10px below the title, and messages carry their own margins.
             dyn_stack(
                 move || 0..msg_count.get(),
                 |i| *i,
@@ -274,6 +277,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                                     is_last,
                                     regen.clone(),
                                     pop.replace(false),
+                                    gutter,
                                 )
                                 .into_any(),
                                 // The vector shrank under the stack; the next diff
@@ -288,7 +292,7 @@ pub(crate) fn ai_panel(ui: Ui) -> impl IntoView {
                 s.flex_col()
                     .width(panel_w.get())
                     .min_height(floor.get())
-                    .gap(10.0)
+                    .gap(16.0)
                     .padding_top(10.0)
                     .padding_bottom(10.0)
             })
@@ -800,9 +804,11 @@ fn ai_input_disabled(placeholder: &'static str) -> impl IntoView {
         .pointer_events(|| false)
 }
 
-// One chat bubble, styled by role. User messages are plain text; assistant/
-// error turns render their segments (prose as light markdown, tool calls as
-// chips) plus a cost footer; pending renders "Thinking…".
+// One message, styled by role — and the two roles are deliberately *not*
+// symmetrical. The user's question is a small right-aligned bubble; Claude's
+// turn is prose on the panel itself, ruled at its right edge. User messages are
+// plain text; assistant/error turns render their segments (prose as light
+// markdown, tool calls as chips) plus a cost footer; pending renders "Thinking…".
 fn message_bubble(
     m: ChatMessage,
     actions: CodeActions,
@@ -810,15 +816,21 @@ fn message_bubble(
     is_last: bool,
     regenerate: Rc<dyn Fn()>,
     animate: bool,
+    gutter: RwSignal<bool>,
 ) -> impl IntoView {
     let is_user = m.role == Role::User;
-    let label_txt = if is_user { "You" } else { "Claude" };
+    let label_txt = if is_user { "YOU" } else { "CLAUDE" };
 
     let body: AnyView = if is_user {
         // User's own message: a dim recap, under whatever data went with it —
         // the record of what was sent, kept where it was sent.
-        let recap =
-            text(m.text).style(|s| s.width_full().font_size(14.0).color(theme::text_muted()));
+        // `text()`, not a dimmer step: the recap used to be `text_muted`, which
+        // measures 2.4:1 on the bubble it sits in — the contrast pair claimed
+        // `text` and so never caught it. The bubble has to stay just *above*
+        // `bg_panel` to read as a bubble at all, and no mid-grey clears AA on a
+        // surface that light, so the design's own answer (full text colour) is
+        // also the only one that passes.
+        let recap = text(m.text).style(|s| s.width_full().font_size(14.0).color(theme::text()));
         match m.attachment {
             Some(a) => v_stack((sent_attachment(a), recap))
                 .style(|s| s.flex_col().width_full().gap(6.0))
@@ -844,36 +856,64 @@ fn message_bubble(
             .into_any()
     };
 
-    let label = text(label_txt).style(|s| s.font_size(theme::FONT_LABEL).color(theme::text_dim()));
+    // Who-said-it, as a small caps label rather than a name: uppercase and bold
+    // at the label size, Claude's in the accent colour so the eye finds the start
+    // of an answer without a box around it.
+    let label = text(label_txt).style(move |s| {
+        let s = s.font_size(theme::FONT_LABEL).font_bold();
+        if is_user {
+            s.color(theme::text_muted())
+        } else {
+            s.color(theme::accent())
+        }
+    });
 
     let bubble = if is_user {
-        // Right-aligned: the label sits at the bubble's right edge (15px inset);
-        // the bubble is inset 60px left / 15px right so it reads right-aligned.
+        // Right-aligned and shrink-wrapped: the question sits in a low-contrast
+        // bubble that hugs its own text (up to 88% of the panel), so a one-line
+        // question reads as an aside against Claude's full-width answer. The
+        // label sits at the bubble's right edge (12px inset).
         v_stack((
             h_stack((empty().style(|s| s.flex_grow(1.0_f32)), label))
                 .style(|s| s.width_full().flex_row().padding_right(12.0)),
-            container(body).style(|s| {
-                s.background(theme::bubble_user_bg())
-                    .border_radius(6.0)
-                    .padding(10.0)
-                    .margin_left(60.0)
-                    .margin_right(12.0)
-            }),
+            h_stack((
+                empty().style(|s| s.flex_grow(1.0_f32)),
+                container(body).style(|s| {
+                    s.background(theme::bubble_user_bg())
+                        .border_radius(7.0)
+                        .padding_horiz(10.0)
+                        .padding_vert(8.0)
+                        .max_width_pct(88.0)
+                }),
+            ))
+            .style(|s| s.width_full().flex_row().padding_horiz(12.0)),
         ))
-        .style(|s| s.flex_col().width_full().gap(2.0))
+        .style(|s| s.flex_col().width_full().gap(5.0))
     } else {
-        // Full-width Claude/error bubble; label left-aligned at the bubble's left
-        // edge (15px inset).
+        // Claude's turn is **not** a bubble. It sits directly on the panel and is
+        // marked only by a 2px accent rule down its *right* edge — the side the
+        // user's bubbles are on, so the two voices read as one column with a
+        // margin rather than as two rows of chat. Full width, label left-aligned
+        // at the same 12px inset.
+        //
+        // The rule is a setting (AI Settings → *Accent rule on replies*), so the
+        // padding that clears it is read from the same signal: turned off, the
+        // reply reclaims those 13px and its two insets match — a reply that kept
+        // padding for a rule that isn't drawn would just sit off-centre.
         v_stack((
             container(label).style(|s| s.padding_left(12.0)),
-            container(body).style(|s| {
-                s.background(theme::bubble_claude_bg())
-                    .border_radius(6.0)
-                    .padding(10.0)
-                    .margin_horiz(12.0)
+            container(body).style(move |s| {
+                let s = s.margin_horiz(12.0);
+                if gutter.get() {
+                    s.padding_right(11.0)
+                        .border_right(2.0)
+                        .border_color(theme::accent())
+                } else {
+                    s
+                }
             }),
         ))
-        .style(|s| s.flex_col().width_full().gap(2.0))
+        .style(|s| s.flex_col().width_full().gap(5.0))
     };
 
     // Entrance pop (slide in from the bubble's side + a slight scale), only on a
@@ -947,10 +987,10 @@ fn footer_icon(svg: &'static str, on_click: impl Fn() + 'static) -> impl IntoVie
         })
 }
 
-/// Footer under an assistant turn, below a 1px rule: on the left a live elapsed
-/// timer (while pending) or the final `time · ↑in ↓out` summary; on the right the
-/// Copy action (every done turn) and Regenerate (last turn only), 10px from the
-/// edge, 7px apart. Nothing at all when the turn is empty.
+/// Footer under an assistant turn: on the left a live elapsed timer (while
+/// pending) or the final `time · ↑in ↓out` summary; on the right the Copy action
+/// (every done turn) and Regenerate (last turn only), 10px apart. Nothing at all
+/// when the turn is empty.
 fn assistant_footer(
     pending: bool,
     stats: Option<TurnStats>,
@@ -990,30 +1030,28 @@ fn assistant_footer(
         let copy = footer_icon(icons::COPY, move || {
             let _ = floem::Clipboard::set_contents(copy_text.clone());
         });
+        // Nudged 2px up: the icons are optically low against the summary text
+        // beside them, whose glyphs sit above their own line box's centre.
+        let icons_style =
+            |s: floem::style::Style| s.flex_row().items_center().gap(10.0).margin_top(-2.0);
         if is_last {
             h_stack((copy, footer_icon(icons::REFRESH_CW, move || (regenerate)())))
-                .style(|s| s.flex_row().items_center().gap(10.0))
+                .style(icons_style)
                 .into_any()
         } else {
-            copy.into_any()
+            h_stack((copy,)).style(icons_style).into_any()
         }
     } else {
         empty().into_any()
     };
 
-    // 1px rule spanning the bubble's text column (aligned with the body text): 5px
-    // gap above, 5px between the rule and the row. Row: left content, then the
-    // actions pushed to the right edge.
+    // No rule above it: the turn has no box for a rule to divide, so the footer
+    // is separated by space alone (9px, the gap the rest of a turn's parts use).
+    // Row: left content, then the actions pushed to the right edge.
     let row = h_stack((left, empty().style(|s| s.flex_grow(1.0_f32)), actions))
         .style(|s| s.width_full().flex_row().items_center());
     container(row)
-        .style(|s| {
-            s.width_full()
-                .margin_top(5.0)
-                .border_top(1.0)
-                .border_color(theme::border())
-                .padding_top(5.0)
-        })
+        .style(|s| s.width_full().margin_top(9.0))
         .into_any()
 }
 

@@ -386,8 +386,14 @@ pub const UI_PAIRINGS: &[Pairing<UiTheme>] = &[
     pair!(text_muted on completion_active, Icon, "completion popup: the kind label"),
     // ── AI panel.
     pair!(text on bubble_user_bg, Body, "AI panel: the user's recap bubble"),
-    pair!(bubble_claude_text on bubble_claude_bg, Body, "AI panel: an assistant reply"),
-    pair!(text on code_action_bar, Body, "AI panel: a code block's action icons"),
+    pair!(bubble_claude_text on bg_panel, Body, "AI panel: an assistant reply"),
+    // The language tag is `Recessive` on purpose, and it is the same call the
+    // history panel's TODAY / THIS WEEK band already gets: it names what the
+    // reader can already see, and nothing depends on reading it. The actions
+    // beside it, which do get acted on, are held to Body.
+    pair!(text_muted on group_header_bg, Recessive, "AI panel: a code block's language label"),
+    pair!(text_dim on group_header_bg, Body, "AI panel: a code block's Copy/Insert/Run"),
+    pair!(accent on group_header_bg, Body, "AI panel: one of them, hovered"),
     // ── Query plan modal.
     pair!(text on plan_warn_bg, Body, "query plan: a flagged row"),
     pair!(plan_warn on plan_warn_bg, Body, "query plan: the warning text"),
@@ -515,6 +521,13 @@ pub const UI_SHORTFALL: &[Shortfall] = {
         ("light", "text_faint", "bg_chrome", Recessive, 1.9),
         ("light", "error", "bg_chrome", Body, 4.1),
         ("light", "accent", "bg_chrome", Body, 4.3),
+        // Hovering Copy / Insert / Run on an AI code block's header. The resting
+        // state (`text_dim` on the same band) clears AA; the hover only
+        // brightens it, and lands 0.01 under the floor here. Listed rather than
+        // fixed, because the two ways to close it are re-tuning the app's link
+        // accent or lightening a band the history panel and the grid share —
+        // both far larger than the hundredth of a ratio point they'd buy.
+        ("light", "accent", "group_header_bg", Body, 4.49),
         ("light", "tab_text", "bg_chrome", Body, 2.7),
         ("light", "tab_close", "bg_chrome", Recessive, 1.4),
         ("light", "text_muted", "bg_panel", Icon, 2.8),

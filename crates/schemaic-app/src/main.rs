@@ -1263,6 +1263,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let ai_effort = RwSignal::new(AiEffort::from_cli(&ui_state.ai_effort));
     let ai_instructions = RwSignal::new(ui_state.ai_instructions.clone());
     let ai_schema_scope = RwSignal::new(SchemaScope::from_key(&ui_state.ai_schema_scope));
+    let ai_gutter = RwSignal::new(ui_state.ai_gutter);
     // The legacy global flag, carried verbatim from load to save. It is read once
     // (the connection migration above) and never again — see
     // `UiState::ai_run_queries` for why it is still written back at all.
@@ -4340,6 +4341,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             ai_effort: ai_effort.get_untracked().cli().to_string(),
             ai_instructions: ai_instructions.get_untracked(),
             ai_schema_scope: ai_schema_scope.get_untracked().key().to_string(),
+            ai_gutter: ai_gutter.get_untracked(),
             ai_run_queries: legacy_ai_run_queries,
             ui_theme: ui_theme.get_untracked().key().to_string(),
             editor_theme: editor_theme.get_untracked().key().to_string(),
@@ -7319,6 +7321,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             effort: ai_effort,
             instructions: ai_instructions,
             schema_scope: ai_schema_scope,
+            gutter: ai_gutter,
             inline: inline_ai,
             attachment: ai_attachment,
         },
