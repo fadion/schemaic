@@ -1528,6 +1528,14 @@ fn copy_selection(gs: GridState) {
 /// and a paste that quietly turned text into SQL `NULL` would be editing the
 /// user's data on their behalf.
 fn paste_selection(gs: GridState) {
+    // An open inline editor owns Ctrl+V — it is a text field, and pasting into
+    // the *grid* from inside one would replace the cell being typed into (and
+    // its neighbours) instead of inserting at the caret. Explicit rather than
+    // relying on the field to swallow the key first: this one is destructive
+    // over a block, so being wrong about the dispatch order is expensive.
+    if gs.edit_cell.get_untracked().is_some() {
+        return;
+    }
     let Ok(text) = floem::Clipboard::get_contents() else {
         return;
     };
