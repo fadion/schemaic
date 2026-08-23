@@ -322,6 +322,9 @@ struct GridState {
     tx_holders: RwSignal<Option<TxHoldersFn>>,
     /// Last commit error, shown in the toolbar until the next edit/commit.
     commit_err: RwSignal<Option<String>>,
+    /// The same bar's **note** surface — see [`GridCtx::commit_note`]. Cleared
+    /// alongside `commit_err` by [`GridState::clear_bar`].
+    commit_note: RwSignal<Option<String>>,
     /// Ui-level popup-menu signal, for the header/cell right-click menus.
     popup: RwSignal<Option<Vec<MenuEntry>>>,
     /// Anchor for the popup: `Some(PopupAnchor::BelowIcon(..))` opens it under a
@@ -501,6 +504,7 @@ impl GridState {
             commit_wait: gctx.commit_wait,
             tx_holders: RwSignal::new(Some(gctx.tx_holders.clone())),
             commit_err: gctx.commit_err,
+            commit_note: gctx.commit_note,
             popup: gctx.popup,
             popup_anchor: gctx.popup_anchor,
             popup_width: gctx.popup_width,
@@ -658,6 +662,26 @@ impl GridState {
             .with(|gq| gq.sort.iter().find(|(c, _)| *c == col).map(|(_, asc)| *asc))
     }
 
+    /// Take down whatever the bottom bar is saying — **both** surfaces.
+    ///
+    /// One method rather than the seven identical copies of
+    /// `if commit_err.is_some() { commit_err.set(None) }` this replaced: the
+    /// bar grew a second signal (`commit_note`), and a message left standing on
+    /// the surface one of those copies had never heard of is a note about a
+    /// paste that three edits have since replaced.
+    ///
+    /// The `is_some` guard is kept and is not redundant: a floem signal never
+    /// dedups, so an unconditional `set(None)` on every keystroke would
+    /// invalidate the bar's container for a bar that is already down.
+    fn clear_bar(&self) {
+        if self.commit_err.get_untracked().is_some() {
+            self.commit_err.set(None);
+        }
+        if self.commit_note.get_untracked().is_some() {
+            self.commit_note.set(None);
+        }
+    }
+
     /// Stage a value for data-row `di`, column `ci` (`None` = SQL NULL). If it
     /// equals the original the entry is dropped (no longer dirty).
     fn stage(&self, di: usize, ci: usize, val: Option<String>) {
@@ -697,10 +721,8 @@ impl GridState {
                 }
             }
         });
-        // A fresh edit clears a stale commit error.
-        if self.commit_err.get_untracked().is_some() {
-            self.commit_err.set(None);
-        }
+        // A fresh edit clears a stale message.
+        self.clear_bar();
     }
 
     /// Stage an **explicit** value into a real cell, always recording it as an edit
@@ -713,9 +735,7 @@ impl GridState {
         self.dirty.update(|d| {
             d.insert((di, ci), val);
         });
-        if self.commit_err.get_untracked().is_some() {
-            self.commit_err.set(None);
-        }
+        self.clear_bar();
     }
 
     /// Stage a value into pending new-row `pidx`, column `ci` (`None` = SQL NULL,
@@ -747,9 +767,7 @@ impl GridState {
                 }
             }
         });
-        if self.commit_err.get_untracked().is_some() {
-            self.commit_err.set(None);
-        }
+        self.clear_bar();
     }
 
     /// Append a blank pending row and return its index.
@@ -759,9 +777,7 @@ impl GridState {
             idx = rows.len();
             rows.push(HashMap::new());
         });
-        if self.commit_err.get_untracked().is_some() {
-            self.commit_err.set(None);
-        }
+        self.clear_bar();
         idx
     }
 
@@ -819,9 +835,7 @@ impl GridState {
             idx = rows.len();
             rows.extend(maps);
         });
-        if self.commit_err.get_untracked().is_some() {
-            self.commit_err.set(None);
-        }
+        self.clear_bar();
         idx
     }
 
@@ -841,9 +855,7 @@ impl GridState {
             self.dirty
                 .update(|m| m.retain(|(di, _), _| *di != data_idx));
         }
-        if self.commit_err.get_untracked().is_some() {
-            self.commit_err.set(None);
-        }
+        self.clear_bar();
     }
 
     /// Do this grid's signals still exist?
@@ -876,9 +888,7 @@ impl GridState {
         if let Some(d) = self.dismiss.get_untracked() {
             (d)();
         }
-        if self.commit_err.get_untracked().is_some() {
-            self.commit_err.set(None);
-        }
+        self.clear_bar();
         // A click anywhere on the table also dismisses a filter/sort error bar.
         if self.view_err.get_untracked().is_some() {
             self.view_err.set(None);
@@ -1138,7 +1148,7 @@ impl GridState {
         }
         // These edits are now persisted and reflected as originals.
         self.dirty.update(|d| drop_committed(d, committed));
-        self.commit_err.set(None);
+        self.clear_bar();
     }
 
     /// Selection rectangle `(r0, c0, r1, c1)` inclusive, display coords.
@@ -1559,7 +1569,8 @@ fn paste_selection(gs: GridState) {
     let order = gs.order.get_untracked();
     let del = gs.del_rows.get_untracked();
     let mut skipped_deleted = 0usize;
-    let planned = plan.cells.len();
+    // **Before staging drains the cell list.** See `PastePlan::counts`.
+    let counts = plan.counts();
     // Collected, then staged in **two** signal updates rather than one per cell:
     // `dirty` and `new_rows` are read by the painter and by every derived view,
     // so a per-cell update would invalidate the grid once for every cell of a
@@ -1585,28 +1596,18 @@ fn paste_selection(gs: GridState) {
     // After staging, because `stage` clears this bar on every edit. Silence
     // would be the wrong answer here: a paste that discarded half a spreadsheet
     // looks exactly like one that worked.
-    let mut notes = Vec::new();
-    if plan.dropped > 0 {
-        notes.push(format!("{} outside the grid", plan.dropped));
+    //
+    // **Which surface** is `PasteReport`'s to decide, in `core::edit` where it
+    // is tested: a partial paste is a success with a caveat and goes on the
+    // ordinary chrome, while a paste that landed *nothing* is a failure and
+    // earns the red fill. Both used to be errors, so "Pasted 5 cells, skipping
+    // 1 in read-only columns." was rendered indistinguishably from a write-back
+    // that failed.
+    match schemaic_core::edit::paste_report(counts, skipped_deleted) {
+        schemaic_core::edit::PasteReport::Clean => {}
+        schemaic_core::edit::PasteReport::Notice(m) => gs.commit_note.set(Some(m)),
+        schemaic_core::edit::PasteReport::Failed(m) => gs.commit_err.set(Some(m)),
     }
-    if plan.read_only > 0 {
-        notes.push(format!("{} in read-only columns", plan.read_only));
-    }
-    if skipped_deleted > 0 {
-        notes.push(format!("{skipped_deleted} in rows marked for deletion"));
-    }
-    if notes.is_empty() {
-        return;
-    }
-    // "Pasted, skipping …" would be a lie where nothing landed at all — which is
-    // what a read-only result (a join, an expression column) produces, and the
-    // one case where the user most needs to be told why nothing happened.
-    let staged = planned - skipped_deleted;
-    gs.commit_err.set(Some(if staged == 0 {
-        format!("Nothing pasted: {}.", notes.join(", "))
-    } else {
-        format!("Pasted {staged} cells, skipping {}.", notes.join(", "))
-    }));
 }
 
 /// Rows of the grid as the user sees them — display order, staged edits and
@@ -2235,6 +2236,15 @@ pub(crate) struct GridCtx {
     /// Last commit error (grid write-back), shown in a bottom error bar at the
     /// panel level (like the find bar at the top). Cleared by the next edit/commit.
     pub(crate) commit_err: RwSignal<Option<String>>,
+    /// A **note** for the same bar, on the ordinary chrome rather than the red
+    /// fill: something worth saying about an operation that *worked*.
+    ///
+    /// Its own signal rather than a flag beside `commit_err`, because the two
+    /// are read by different things — the bar picks a surface, and every other
+    /// predicate in this file asks "is an error up". A partial paste used
+    /// `commit_err` and so reported an ordinary success in the colour that means
+    /// a write-back failed. See `core::edit::PasteReport`.
+    pub(crate) commit_note: RwSignal<Option<String>>,
     /// What to say about a write that hasn't come back yet, once it has been
     /// waiting long enough to be worth saying anything (`tx::write_wait_note`).
     /// Shares the bottom bar with `commit_err` — a write is either still waiting
@@ -2258,8 +2268,7 @@ pub(crate) struct GridCtx {
 /// left, a right-aligned **View** that opens the full error in the shared modal
 /// (via a text override). Absolute → overlays the panel out of flow.
 ///
-/// It carries two things, and they can't coincide — a write is either still
-/// waiting or has come back and failed:
+/// It carries three things, and the **surface is the message**:
 /// - an **error** in the red fill: the shown Run-Everything statement's own
 ///   failure (`batch_err` — a batch has no editor bar to put it in), else a commit
 ///   write-back or a filter/sort re-run;
@@ -2267,16 +2276,29 @@ pub(crate) struct GridCtx {
 ///   ([`arm_wait_note`]), on the ordinary chrome surface, with a one-click
 ///   `Rollback` when exactly one transaction of the user's own could be the
 ///   holder. It uses the footer's `tx_rollback` colour deliberately: it is the
-///   same action on the same surface, and the two should never diverge.
+///   same action on the same surface, and the two should never diverge;
+/// - a **note** on that same ordinary surface, for something worth saying about
+///   an operation that *worked* — a partial paste is the one today. It is last
+///   in the order because it is the only one of the three that is not a problem:
+///   an error or a stalled write is more urgent than a caveat, and the three
+///   can only coincide if an edit landed and a write failed in the same frame.
+///
+/// The note exists because there was no non-red channel and a partial paste used
+/// the red one, so "Pasted 5 cells, skipping 1 in read-only columns." — an
+/// ordinary success — was indistinguishable from a write-back that failed.
 pub(crate) fn grid_error_bar(
-    batch_err: Memo<Option<String>>,
-    commit_err: RwSignal<Option<String>>,
-    view_err: RwSignal<Option<String>>,
-    commit_wait: RwSignal<Option<WaitNote>>,
+    bars: BarSignals,
     rollback_tx: Rc<dyn Fn(usize)>,
     error_open: RwSignal<bool>,
     error_text: RwSignal<Option<String>>,
 ) -> impl IntoView {
+    let BarSignals {
+        batch_err,
+        commit_err,
+        commit_note,
+        view_err,
+        commit_wait,
+    } = bars;
     // The batch error leads, because a failed statement has no grid mounted at
     // all: a commit error left over from another result tab's grid would be
     // reporting on something the user isn't looking at, and the statement's own
@@ -2288,14 +2310,16 @@ pub(crate) fn grid_error_bar(
             .get()
             .or_else(|| commit_err.get())
             .or_else(|| view_err.get())
-            .map(Err)
-            .or_else(|| commit_wait.get().map(Ok))
+            .map(BarState::Error)
+            .or_else(|| commit_wait.get().map(BarState::Wait))
+            .or_else(|| commit_note.get().map(BarState::Note))
     };
     dyn_container(current, move |state| {
         let msg = match state {
             None => return empty().into_any(),
-            Some(Ok(note)) => return wait_bar(note, rollback_tx.clone()).into_any(),
-            Some(Err(msg)) => msg,
+            Some(BarState::Wait(note)) => return wait_bar(note, rollback_tx.clone()).into_any(),
+            Some(BarState::Note(m)) => return note_bar(m).into_any(),
+            Some(BarState::Error(msg)) => msg,
         };
         // Collapse to a single line (a multi-line server error would spill out
         // the top); the full text stays available in the View modal.
@@ -2341,11 +2365,7 @@ pub(crate) fn grid_error_bar(
         .into_any()
     })
     .style(move |s| {
-        if batch_err.get().is_some()
-            || commit_err.get().is_some()
-            || view_err.get().is_some()
-            || commit_wait.get().is_some()
-        {
+        if bars.any_up() {
             s.absolute()
                 .inset_left(5.0)
                 .inset_right(5.0)
@@ -2354,6 +2374,78 @@ pub(crate) fn grid_error_bar(
         } else {
             s
         }
+    })
+}
+
+/// Which of the three the bar is showing. An enum rather than the
+/// `Result<WaitNote, String>` this was, because a third arm arrived and
+/// `Ok`/`Err` had already stopped meaning success and failure.
+enum BarState {
+    Error(String),
+    Wait(WaitNote),
+    Note(String),
+}
+
+/// Everything the bottom bar can be showing, as one value.
+///
+/// A struct rather than five parameters, for two reasons that point the same
+/// way. [`grid_error_bar`] was at seven arguments and the note surface made it
+/// eight; and **[`BarSignals::any_up`] is asked from two places** — the bar's own
+/// style and the selection summary that has to lift itself above it — which were
+/// two hand-written copies of the same four-way `is_some`, so the note would
+/// have had to be added to both. A bar that is up while the selection summary
+/// thinks it isn't is the two of them drawn on top of each other.
+#[derive(Clone, Copy)]
+pub(crate) struct BarSignals {
+    /// The shown Run-Everything statement's own failure — a batch has no editor
+    /// bar to put it in.
+    pub(crate) batch_err: Memo<Option<String>>,
+    pub(crate) commit_err: RwSignal<Option<String>>,
+    pub(crate) commit_note: RwSignal<Option<String>>,
+    pub(crate) view_err: RwSignal<Option<String>>,
+    pub(crate) commit_wait: RwSignal<Option<WaitNote>>,
+}
+
+impl BarSignals {
+    /// Is the bar up at all? **The one predicate.**
+    pub(crate) fn any_up(&self) -> bool {
+        self.batch_err.with(Option::is_some)
+            || self.commit_err.with(Option::is_some)
+            || self.commit_note.with(Option::is_some)
+            || self.view_err.with(Option::is_some)
+            || self.commit_wait.with(Option::is_some)
+    }
+}
+
+/// The note half of [`grid_error_bar`]: one line on the ordinary chrome, no
+/// action and no **View**.
+///
+/// No `View` because a note is short by construction — it is a sentence this
+/// codebase wrote, not a server's — and a modal repeating the same words is the
+/// call [`grid_error_bar`] already makes for a one-line error.
+fn note_bar(msg: String) -> impl IntoView {
+    h_stack((
+        text(msg).style(|s| {
+            s.color(theme::text())
+                .font_size(theme::FONT_BODY)
+                .max_width_pct(90.0)
+                .text_ellipsis()
+                .margin_left(8.0)
+        }),
+        empty().style(|s| s.flex_grow(1.0_f32)),
+    ))
+    .style(|s| {
+        s.flex_row()
+            .items_center()
+            .width_full()
+            .height_full()
+            // The wait note's surface exactly: the two are the same kind of
+            // thing (the bar saying something that isn't an error) and a second
+            // neutral fill would read as a third state that doesn't exist.
+            .background(theme::bg_deepest())
+            .border(1.0)
+            .border_color(theme::border())
+            .border_radius(5.0)
     })
 }
 

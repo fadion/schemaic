@@ -4902,6 +4902,7 @@ fn center(ui: Ui) -> impl IntoView {
                     // Commit-status bar (bottom) — its own per-tab-render signals;
                     // "View" opens the shared workspace error modal with its text.
                     commit_err: RwSignal::new(None),
+                    commit_note: RwSignal::new(None),
                     commit_wait: RwSignal::new(None),
                     tx_holders: {
                         // Answered when a write has been waiting a while, not at
@@ -5009,6 +5010,7 @@ fn results_section(
     let (goto_open, goto_query, goto_step) = (gctx.goto_open, gctx.goto_query, gctx.goto_step);
     let sel_summary = gctx.sel_summary;
     let (commit_err, error_open, error_text) = (gctx.commit_err, gctx.error_open, gctx.error_text);
+    let commit_note = gctx.commit_note;
     let (commit_wait, rollback_tx) = (gctx.commit_wait, gctx.rollback_tx.clone());
     let view_err = gctx.view_err;
     // A Run-Everything statement's own error, which the bottom bar carries for the
@@ -5020,6 +5022,14 @@ fn results_section(
         let ai = active_result.get();
         result_tabs.with(|v| shown_panel_error(v, ai))
     });
+    // Everything the bottom bar can show, as one value — see `grid::BarSignals`.
+    let bars = crate::grid::BarSignals {
+        batch_err,
+        commit_err,
+        commit_note,
+        view_err,
+        commit_wait,
+    };
     // **The panel-level bars must not outlive the grid they describe.** All three
     // are mounted here, outside `body`, while their only writer lives inside
     // `grid_view`, which exists only under `Phase::Loaded` — so running a
@@ -5142,24 +5152,14 @@ fn results_section(
             find_open, find_query, find_step, find_total, find_pos, find_more,
         ),
         grid_goto_bar(goto_open, goto_query, goto_step),
-        grid_error_bar(
-            batch_err,
-            commit_err,
-            view_err,
-            commit_wait,
-            rollback_tx,
-            error_open,
-            error_text,
-        ),
-        // Last, so it paints over the panel — and it lifts itself above the error
-        // bar when that one is up, by the same predicate `grid_error_bar` decides
-        // its own visibility with.
-        grid_selection_bar(sel_summary, move || {
-            batch_err.with(Option::is_some)
-                || commit_err.with(Option::is_some)
-                || view_err.with(Option::is_some)
-                || commit_wait.with(Option::is_some)
-        }),
+        grid_error_bar(bars, rollback_tx, error_open, error_text),
+        // Last, so it paints over the panel — and it lifts itself above the
+        // bottom bar when that one is up, through the **same** predicate
+        // `grid_error_bar` decides its own visibility with. It used to be a
+        // second copy of the same four-way `is_some`, which the note surface
+        // would have had to be added to twice; the two disagreeing is the pair
+        // of them drawn on top of each other.
+        grid_selection_bar(sel_summary, move || bars.any_up()),
     ))
     .style(|s| {
         s.width_full()
