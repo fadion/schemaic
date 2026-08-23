@@ -508,10 +508,26 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
 
             // Validation first (it blocks), then the change count.
-            let status_target = target.clone();
+            //
+            // **The target comes from the key, not from the capture above.**
+            // `target` was cloned once when the modal was built, and
+            // `fetch_algorithm` patches `current` *after* that — deliberately,
+            // on both sides, so the diff stays empty. Once the modal's own key
+            // became a memo it stopped rebuilding on that patch, and this footer
+            // kept diffing the draft the fetch had corrected against a `current`
+            // it had not. The result was a view opening with "1 change" and a
+            // live Preview over an edit nobody made.
+            //
+            // Reading `d.view` here is safe where reading it in the *modal's*
+            // key is not: this container already rebuilds on every keystroke
+            // (`d.view_draft`), and it holds the footer, not the form — so no
+            // caret lives inside it. That distinction is the whole of `c11dfb8`.
             let status = dyn_container(
-                move || d.view_draft.get(),
-                move |draft| {
+                move || (d.view.get(), d.view_draft.get()),
+                move |(target, draft)| {
+                    let Some(status_target) = target else {
+                        return empty().into_any();
+                    };
                     let errs = draft.validate();
                     if let Some(first) = errs.first() {
                         return text(first.clone())
@@ -540,13 +556,17 @@ pub(crate) fn view_editor_overlay(ui: Ui) -> impl IntoView {
             );
 
             let preview_ui = ui.clone();
-            let preview_target = target.clone();
             let ring_actions = ring.clone();
+            // Keyed on the target for the same reason `status` is, and it
+            // matters more here: this decides whether **Preview SQL** is enabled
+            // and builds the plan it opens.
             let actions = dyn_container(
-                move || d.view_draft.get(),
-                move |draft| {
+                move || (d.view.get(), d.view_draft.get()),
+                move |(current, draft)| {
                     let ui = preview_ui.clone();
-                    let target = preview_target.clone();
+                    let Some(target) = current else {
+                        return empty().into_any();
+                    };
                     let ring = ring_actions.clone();
                     let cs = change_set(&target, &draft);
                     let ready = draft.validate().is_empty() && !cs.is_empty();

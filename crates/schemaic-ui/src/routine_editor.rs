@@ -809,10 +809,32 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
             ))
             .style(|s| s.width_full().flex_grow(1.0_f32).min_height(0.0));
 
-            let status_target = target.clone();
+            // **The target comes from the key, not from the capture above.**
+            // `fetch_source` corrects `current` after the modal is up — the
+            // escape-resolved body `information_schema` gave becomes the routine
+            // as written, plus its session state. Once the modal's own key
+            // became a memo it stopped rebuilding on that patch, and this footer
+            // went on diffing the draft the fetch had corrected against a
+            // `current` it had not: a phantom change on a routine nobody
+            // touched, and on MySQL the plan it offers is a `DROP` before a
+            // `CREATE`.
+            //
+            // Reading `d.routine` here is safe where reading it in the *modal's*
+            // key is not: this container already rebuilds on every keystroke
+            // (`d.routine_draft`), and it holds the footer, not the form — so no
+            // caret lives inside it. That distinction is the whole of `c11dfb8`.
             let status = dyn_container(
-                move || (d.routine_draft.get(), d.routine_source_pending.get()),
-                move |(draft, pending)| {
+                move || {
+                    (
+                        d.routine.get(),
+                        d.routine_draft.get(),
+                        d.routine_source_pending.get(),
+                    )
+                },
+                move |(status_target, draft, pending)| {
+                    let Some(status_target) = status_target else {
+                        return empty().into_any();
+                    };
                     // Said before the change count, because until the source
                     // lands the count is over `information_schema`'s resolved
                     // body rather than the routine as written.
@@ -849,13 +871,23 @@ pub(crate) fn routine_editor_overlay(ui: Ui) -> impl IntoView {
             );
 
             let preview_ui = ui.clone();
-            let preview_target = target.clone();
             let ring_actions = ring.clone();
+            // Keyed on the target for the same reason `status` is, and it
+            // matters more here: this decides whether **Preview SQL** is enabled
+            // and builds the plan it opens — which on MySQL is a `DROP` first.
             let actions = dyn_container(
-                move || (d.routine_draft.get(), d.routine_source_pending.get()),
-                move |(draft, pending)| {
+                move || {
+                    (
+                        d.routine.get(),
+                        d.routine_draft.get(),
+                        d.routine_source_pending.get(),
+                    )
+                },
+                move |(current, draft, pending)| {
                     let ui = preview_ui.clone();
-                    let target = preview_target.clone();
+                    let Some(target) = current else {
+                        return empty().into_any();
+                    };
                     let ring = ring_actions.clone();
                     let cs = change_set(&target, &draft);
                     // `!pending`: the draft is still on the escape-resolved
