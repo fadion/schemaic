@@ -5163,7 +5163,10 @@ for keyboard nav.
   spreadsheet looks exactly like one that worked; a read-only column is skipped **in place**, never
   shifted, which would write one column's values into the next. Nothing is interpreted: a pasted
   cell reading `NULL` stages the four-character string, because that is what the copy side wrote
-  and turning text into SQL `NULL` would be editing the user's data on their behalf.
+  and turning text into SQL `NULL` would be editing the user's data on their behalf. An open
+  inline editor takes Ctrl+V back — `paste_selection` returns early while `edit_cell` is set,
+  explicitly rather than trusting the text field to swallow the key first, because being wrong
+  about the dispatch order costs a block overwrite instead of a caret insertion.
 - **What a cell *says* is resolved in one place, and it isn't the view.** `copy_selection` and
   `attached_rows` read the signals once into `grid_cells` — a `core::edit::GridCells` borrow over
   `rs`, `order`, `formats`, `dirty` and `new_rows` — and ask it for `tsv(rect)` or
