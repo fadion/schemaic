@@ -308,10 +308,26 @@ mod tests {
     /// hook fires → `tracing::error!` → writer — is the whole feature. Panics
     /// go through a global hook and `catch_unwind`, so this drives the real
     /// path rather than calling the formatter directly.
+    ///
+    /// **The hook is process-global, and this test puts it back.** Tests in a
+    /// crate share one process, so a replacement left standing is one every
+    /// later panic goes through — including a genuine failure in another test,
+    /// which would then print nothing to stderr and report as an
+    /// undiagnosable blank. That is precisely the failure this module exists to
+    /// end, so leaving it behind here would be the module's own bug in its own
+    /// test.
+    ///
+    /// **Restored before the assertions, not in a `Drop` guard.**
+    /// `std::panic::set_hook` panics if called from a panicking thread, so a
+    /// guard restoring during an assertion's unwind would be a panic inside a
+    /// panic and abort the whole run. Asserting after the restore gets the same
+    /// guarantee with none of that: the only code between take and restore is
+    /// the `catch_unwind` this test is about.
     #[test]
     fn an_installed_hook_writes_the_panic_through_tracing() {
         // The hook we chain onto is the default one, which prints to stderr and
         // would litter the test output with a crash that is on purpose.
+        let real_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         install_panic_hook();
 
@@ -326,13 +342,51 @@ mod tests {
         let guard = tracing::subscriber::set_default(subscriber);
 
         let outcome = std::panic::catch_unwind(|| panic!("grid write exploded"));
-        assert!(outcome.is_err(), "the test's own panic should have unwound");
         drop(guard);
 
         let text = String::from_utf8(sink.0.lock().expect("capture lock").clone())
             .expect("subscriber output is utf-8");
+
+        // Everything the process shares is back the way it was found *before*
+        // anything can fail.
+        std::panic::set_hook(real_hook);
+
+        assert!(outcome.is_err(), "the test's own panic should have unwound");
         assert!(text.contains("grid write exploded"), "{text}");
         assert!(text.contains("panic in thread"), "{text}");
         assert!(text.contains("logging.rs:"), "no source location: {text}");
+    }
+
+    /// **The pin on the paragraph above.** A hook left replaced is invisible
+    /// until some *other* test fails, at which point it reports as a blank, so
+    /// nothing about the failure points back here.
+    ///
+    /// It works by identity rather than by behaviour, which is the only thing
+    /// `set_hook`/`take_hook` expose: install a hook this test can recognise,
+    /// run the one above, and check the recognisable one is what the process
+    /// still holds. Ordering is not left to libtest — the test above is called
+    /// directly, in this thread.
+    #[test]
+    fn the_hook_test_puts_the_process_back_as_it_found_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static MARKER_RAN: AtomicBool = AtomicBool::new(false);
+
+        let real_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {
+            MARKER_RAN.store(true, Ordering::SeqCst);
+        }));
+
+        an_installed_hook_writes_the_panic_through_tracing();
+
+        // The marker has to be the hook the process still holds. Firing a panic
+        // is the only way to ask, so fire one and swallow it.
+        let _ = std::panic::catch_unwind(|| panic!("probe"));
+        let restored = MARKER_RAN.load(Ordering::SeqCst);
+        std::panic::set_hook(real_hook);
+
+        assert!(
+            restored,
+            "the hook test replaced the process-global panic hook and left it replaced"
+        );
     }
 }
