@@ -126,25 +126,43 @@ pub(crate) async fn ping(db: &Db, timeout: Duration) -> Result<(), DbError> {
 
 /// List the user databases on the server (excludes templates and the built-in
 /// `postgres` maintenance database), sorted by name.
+///
+/// **Bounded by [`crate::PING_TIMEOUT`], around the whole sequence.** This is
+/// the same connect [`ping`] makes, and it was bounded when it was called a ping
+/// and unbounded when it was called a listing — the asymmetry visible inside one
+/// module. Worse here than on MySQL, because [`connect_maintenance`] tries
+/// `postgres`, the user's own name and `template1` **in turn**: against an
+/// unroutable address that measured 3 × 21.1 s ≈ 63 s for one click on a
+/// connection, while the health check beside it said "Disconnected" at five.
+///
+/// Around the sequence and not per attempt, deliberately. A per-attempt deadline
+/// still costs three of them; and the candidates that are merely *absent* fail
+/// fast with a "database does not exist" rather than by timing out, so nothing
+/// legitimate is cut short by bounding the whole thing at one.
 pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
-    let client = connect_maintenance(db).await?;
-    let msgs = client
-        .simple_query(
-            "SELECT datname FROM pg_database \
-             WHERE datistemplate = false AND datname <> 'postgres' \
-             ORDER BY datname",
-        )
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-    let mut out = Vec::new();
-    for m in msgs {
-        if let SimpleQueryMessage::Row(r) = m
-            && let Some(name) = r.get(0)
-        {
-            out.push(name.to_string());
+    let listing = async {
+        let client = connect_maintenance(db).await?;
+        let msgs = client
+            .simple_query(
+                "SELECT datname FROM pg_database \
+                 WHERE datistemplate = false AND datname <> 'postgres' \
+                 ORDER BY datname",
+            )
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        let mut out = Vec::new();
+        for m in msgs {
+            if let SimpleQueryMessage::Row(r) = m
+                && let Some(name) = r.get(0)
+            {
+                out.push(name.to_string());
+            }
         }
-    }
-    Ok(out)
+        Ok::<Vec<String>, DbError>(out)
+    };
+    tokio::time::timeout(crate::PING_TIMEOUT, listing)
+        .await
+        .map_err(|_| DbError::Connect("timed out".to_string()))?
 }
 
 /// Connect (to `database`, or the maintenance db if unscoped) and run one

@@ -832,11 +832,26 @@ fn err_clone(e: &DbError) -> DbError {
 
 /// How long any "is this connection up" check may take before it is a failure.
 ///
-/// Named because two paths ask it — the health check through [`Db::ping`], and
-/// SQLite's database listing, which *is* a ping — and they used to disagree: the
-/// listing was unbounded, so a file on a share that had gone away hung the schema
-/// tree and held a blocking-pool thread while the health check beside it gave up
-/// and said "Disconnected".
+/// Named because **four** paths ask it — the health check through [`Db::ping`],
+/// and all three database listings, each of which is a ping with a `SELECT`
+/// after it. They used to disagree, and this used to say "two paths": the
+/// listings were unbounded, so a host that stops answering at the packet level
+/// (a dropped VPN, a laptop off the office network, a firewall `DROP`) left the
+/// schema tree empty for the OS TCP connect timeout while the health check
+/// beside it gave up at five seconds and painted "Disconnected".
+///
+/// Measured on this machine against an unroutable address: **21.0 s** on MySQL,
+/// and **63 s** on PostgreSQL, where `pg::connect_maintenance` tries `postgres`,
+/// the user's own name and `template1` in sequence. SQLite's is the same story
+/// with a share that has gone away rather than a host.
+///
+/// **The deadline is on the listing, not on every `open`.** The obvious
+/// alternative — a driver-level connect timeout, which would bound
+/// `fetch_schema` and `fetch_query` too — is not available on both engines:
+/// `tokio_postgres::Config` has `connect_timeout`, and the pinned
+/// `mysql_async` 0.34 `OptsBuilder` has no TCP connect option at all. Doing it
+/// on one engine only would put a five-second cap on PostgreSQL query connects
+/// and nothing on MySQL's, which is a worse asymmetry than the one it fixes.
 pub const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Db {
@@ -872,25 +887,40 @@ impl Db {
 
     /// List the user databases on a server (excludes the built-in system schemas),
     /// sorted by name. Connects at the server level (no specific database needed).
+    ///
+    /// **Bounded by [`PING_TIMEOUT`], on every engine.** The schema sidebar lists
+    /// a connection's databases the moment it is selected, so this is the first
+    /// thing a dead host hangs — and the health check on the same connection
+    /// gives up at the same five seconds and says "Disconnected". They have to
+    /// agree, or the tree sits empty under a header that has already explained
+    /// why and the user has nothing to do but wait out the OS.
     pub async fn fetch_databases(&self) -> Result<Vec<String>, DbError> {
         match self.engine {
+            // Both already bounded inside, and PostgreSQL's needs to be bounded
+            // *around* the sequence rather than per attempt: `connect_maintenance`
+            // tries three candidate databases in turn.
             Engine::Postgres => return pg::fetch_databases(self).await,
             Engine::Sqlite => return sqlite::fetch_databases(self).await,
             Engine::MySql => {}
         }
-        let mut conn = self.open(None, false).await?;
-        let out = conn
-            .query_map(
-                "SELECT CAST(SCHEMA_NAME AS CHAR) AS n FROM information_schema.SCHEMATA \
-             WHERE SCHEMA_NAME NOT IN \
-               ('information_schema','mysql','performance_schema','sys') \
-             ORDER BY SCHEMA_NAME",
-                |n: String| n,
-            )
+        let listing = async {
+            let mut conn = self.open(None, false).await?;
+            let out = conn
+                .query_map(
+                    "SELECT CAST(SCHEMA_NAME AS CHAR) AS n FROM information_schema.SCHEMATA \
+                 WHERE SCHEMA_NAME NOT IN \
+                   ('information_schema','mysql','performance_schema','sys') \
+                 ORDER BY SCHEMA_NAME",
+                    |n: String| n,
+                )
+                .await
+                .map_err(|e| DbError::Query(e.to_string()));
+            let _ = conn.disconnect().await;
+            out
+        };
+        tokio::time::timeout(PING_TIMEOUT, listing)
             .await
-            .map_err(|e| DbError::Query(e.to_string()));
-        let _ = conn.disconnect().await;
-        out
+            .map_err(|_| DbError::Connect("timed out".to_string()))?
     }
 
     /// Introspect one database's schema (tables → columns + indexes) via
