@@ -397,17 +397,28 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `*_to<W: io::Write>` form (`ExportFormat::render_to`) — what file export uses, so a large
     result is never rendered into a second full copy in memory — with the `String` versions kept
     as thin wrappers for the clipboard. A test asserts the two agree byte-for-byte per format;
-    add new formats to both by adding the `*_to` and wrapping it. **The SQL export is the one
-    renderer that must not pass a cell straight through.** A raw-bytes cell is
+    add new formats to both by adding the `*_to` and wrapping it. **The formats anything reads
+    back must not pass a raw-bytes cell straight through.** Such a cell is
     `model::binary_display`'s `<n bytes>` (a `Value` has no bytes variant to hold the real thing),
-    and quoting that into an `INSERT` produces a script which silently stores the *placeholder* as
-    the column's data on re-import. `dropped_binary_columns` finds those cells in a pre-pass —
-    requiring the column's type **and** the cell's text to agree, since either signal alone is
-    wrong in a way that loses data — writes `NULL` in their place, and heads the script with a
-    `-- NOTE:` naming the columns. A comment rather than a refusal: the script still runs, and the
-    one thing it may not do is pretend the placeholder was the data. The note is emitted only when
-    a cell was actually dropped. The human-readable formats (CSV/JSON/Markdown/HTML) keep the
-    placeholder — it is what the grid shows, and it cannot be mistaken for a value.
+    and emitting that produces a file which silently stores the *placeholder* as the column's data
+    on re-import. `dropped_binary_columns` finds those cells in a pre-pass — requiring the column's
+    type **and** the cell's text to agree, since either signal alone is wrong in a way that loses
+    data — and `withheld_binary` is the one per-cell test every withholding emitter shares, so the
+    two-signals rule cannot be spelled differently in one of them.
+    **Which emitters withhold is decided by whether anything reads the format back**, and that is
+    three of the five: the SQL export (`NULL`, plus a `-- NOTE:` heading the script — a comment
+    rather than a refusal, since the script still runs and the one thing it may not do is pretend
+    the placeholder was the data) and **CSV and JSON**, which are exactly `import::ImportFormat`,
+    including their single-column "copy this column" forms. Markdown and HTML keep it, deliberately:
+    nothing reads those back, and there the placeholder is the *useful* rendering — blanking it
+    would make a 4 MB blob indistinguishable from an empty cell and from NULL, which is less than
+    what the grid itself shows. This was the SQL export alone at first, and the commit that made it
+    so named CSV in its own account of the bug.
+    `binary_mask` is the same answer in the shape the cell loop needs — one `bool` per column,
+    indexed by `ci`. Two shapes for one fact because the `-- NOTE:` wants the ordered `Vec<usize>`
+    while the loop asks per *cell*, where `Vec::contains` is a linear scan over the answer (12M of
+    them on a 200k × 60 result); the same hoist `Db::convert_row` and `pg_cell` make for
+    `Column::is_binary`.
   - `import.rs` — the inverse of `export.rs`: CSV/TSV + JSON (array *or* NDJSON) → table. Format
     inference, delimiter/header `sniff` (by *consistency*, quote-aware), `auto_map` (name-match with
     a header, positional without), per-column `coerce` (only the families a wrong answer would

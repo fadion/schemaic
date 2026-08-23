@@ -326,6 +326,9 @@ pub fn export_json(rs: &ResultSet, order: &[usize]) -> String {
 struct RowObject<'a> {
     rs: &'a ResultSet,
     keys: &'a [String],
+    /// Which columns' text stands in for bytes this result never carried —
+    /// [`binary_mask`]. Computed once for the whole export, not per row.
+    mask: &'a [bool],
     di: usize,
 }
 
@@ -337,6 +340,10 @@ impl serde::Serialize for RowObject<'_> {
             let v = self
                 .rs
                 .cell(self.di, ci)
+                // JSON is a format Schemaic reads back, so a blob's placeholder
+                // becomes `null` rather than the string — see
+                // [`dropped_binary_columns`].
+                .filter(|c| !withheld_binary(self.mask, ci, c))
                 .map(|c| value_to_json(&c.to_value()))
                 .unwrap_or(serde_json::Value::Null);
             m.serialize_entry(key, &v)?;
@@ -356,12 +363,14 @@ pub fn export_json_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> i
     use serde::ser::{SerializeSeq, Serializer as _};
 
     let keys = unique_column_keys(rs);
+    let mask = binary_mask(rs, &dropped_binary_columns(rs, order));
     let mut ser = serde_json::Serializer::pretty(w);
     let mut seq = ser.serialize_seq(None).map_err(io::Error::other)?;
     for &di in order.iter().filter(|&&di| di < rs.row_count()) {
         seq.serialize_element(&RowObject {
             rs,
             keys: &keys,
+            mask: &mask,
             di,
         })
         .map_err(io::Error::other)?;
@@ -401,11 +410,13 @@ pub fn export_column_json_to<W: Write>(
 ) -> io::Result<()> {
     use serde::ser::{SerializeSeq, Serializer as _};
 
+    let mask = binary_mask(rs, &dropped_binary_columns(rs, order));
     let mut ser = serde_json::Serializer::pretty(w);
     let mut seq = ser.serialize_seq(None).map_err(io::Error::other)?;
     for &di in order {
         let v = rs
             .cell(di, ci)
+            .filter(|c| !withheld_binary(&mask, ci, c))
             .map(|c| value_to_json(&c.to_value()))
             .unwrap_or(serde_json::Value::Null);
         seq.serialize_element(&v).map_err(io::Error::other)?;
@@ -425,10 +436,15 @@ pub fn export_column_csv_to<W: Write>(
     order: &[usize],
     ci: usize,
 ) -> io::Result<()> {
+    // The same withholding the whole-result CSV does, and it matters as much:
+    // this is the "copy this column" path, and the column being copied is
+    // exactly the one a caller might paste into an `IN (…)` or a spreadsheet.
+    let mask = binary_mask(rs, &dropped_binary_columns(rs, order));
     for &di in order {
         match rs.cell(di, ci) {
             None => {}
             Some(c) if c.is_null() => {}
+            Some(c) if withheld_binary(&mask, ci, &c) => {}
             Some(c) => w.write_all(csv_field(c.display()).as_bytes())?,
         }
         w.write_all(b"\n")?;
@@ -443,6 +459,10 @@ pub fn export_csv(rs: &ResultSet, order: &[usize]) -> String {
 
 /// [`export_csv`], streamed.
 pub fn export_csv_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> io::Result<()> {
+    // CSV is a format Schemaic reads back, so a blob's placeholder must not go
+    // out in it — see [`dropped_binary_columns`]. An empty field, which is
+    // already how this format renders NULL.
+    let mask = binary_mask(rs, &dropped_binary_columns(rs, order));
     for (ci, c) in rs.columns.iter().enumerate() {
         if ci > 0 {
             w.write_all(b",")?;
@@ -461,6 +481,7 @@ pub fn export_csv_to<W: Write>(w: &mut W, rs: &ResultSet, order: &[usize]) -> io
             match rs.cell(di, ci) {
                 None => {}
                 Some(c) if c.is_null() => {}
+                Some(c) if withheld_binary(&mask, ci, &c) => {}
                 Some(c) => w.write_all(csv_field(c.display()).as_bytes())?,
             }
         }
@@ -636,6 +657,14 @@ pub fn qualified_table(
 /// can spell `<12 bytes>` without being a blob.
 /// Returns column *indices*, not names: two result columns can share a name
 /// (`SELECT a.data, b.data`) and only one of them may be the blob.
+///
+/// **Which exports honour this, and which deliberately don't.** The formats
+/// Schemaic itself reads back — `import::ImportFormat` is CSV and JSON — must
+/// not carry the placeholder, because a round trip through one stores it *as*
+/// the column's data; the SQL export must not for the same reason. Markdown and
+/// HTML keep it: nothing reads those back, and there the placeholder is the
+/// useful rendering, since blanking it would make a 4 MB blob indistinguishable
+/// from an empty cell.
 fn dropped_binary_columns(rs: &ResultSet, order: &[usize]) -> Vec<usize> {
     (0..rs.columns.len())
         .filter(|&ci| {
@@ -648,6 +677,35 @@ fn dropped_binary_columns(rs: &ResultSet, order: &[usize]) -> Vec<usize> {
                 })
         })
         .collect()
+}
+
+/// [`dropped_binary_columns`] in the shape the **cell loop** needs: one `bool`
+/// per column, indexed by `ci`.
+///
+/// Two shapes for one answer, because the two readers ask it differently. The
+/// `-- NOTE:` line names the columns in order and wants the `Vec<usize>`; the
+/// loop asks once per *cell*, and `Vec::contains` there is a linear scan over
+/// the answer — 12M of them on a 200k × 60 result, to re-derive a per-column
+/// fact that was already computed. Same hoist `Db::convert_row` and `pg_cell`
+/// make for `Column::is_binary`.
+fn binary_mask(rs: &ResultSet, dropped: &[usize]) -> Vec<bool> {
+    let mut mask = vec![false; rs.columns.len()];
+    for &ci in dropped {
+        if let Some(slot) = mask.get_mut(ci) {
+            *slot = true;
+        }
+    }
+    mask
+}
+
+/// Is this cell one whose real bytes the result never carried?
+///
+/// **The one per-cell test**, shared by every export that withholds the
+/// placeholder, so the two-signals rule (the column says bytes *and* the text is
+/// one this codebase generated) cannot be spelled differently in one of them.
+/// `mask` comes from [`binary_mask`].
+fn withheld_binary(mask: &[bool], ci: usize, c: &crate::model::CellRef<'_>) -> bool {
+    mask.get(ci).copied().unwrap_or(false) && crate::model::is_binary_display(c.text())
 }
 
 /// [`export_inserts`], streamed. One statement per row and no batching, so a row
@@ -675,6 +733,7 @@ pub fn export_inserts_to<W: Write>(
     // must not do is pretend the placeholder was the data. Emitted only when a
     // cell was actually dropped, so an export with nothing to say says nothing.
     let dropped = dropped_binary_columns(rs, order);
+    let mask = binary_mask(rs, &dropped);
     if !dropped.is_empty() {
         writeln!(
             w,
@@ -699,7 +758,7 @@ pub fn export_inserts_to<W: Write>(
             let lit = rs
                 .cell(di, ci)
                 .map(|c| {
-                    if dropped.contains(&ci) && crate::model::is_binary_display(c.text()) {
+                    if withheld_binary(&mask, ci, &c) {
                         "NULL".to_string()
                     } else {
                         sql_literal(&c.to_value(), dialect)
@@ -1196,6 +1255,86 @@ mod tests {
         let rs = ResultSet::from_rows(vec![b], vec![vec![Value::Str("\\x4869".to_string())]]);
         let out = export_inserts(&rs, &[0], None, Postgres);
         assert!(out.contains("4869"), "{out}");
+    }
+
+    fn blob_rs() -> ResultSet {
+        let mut blob = col("thumb");
+        blob.type_name = "BLOB".to_string();
+        ResultSet::from_rows(
+            vec![col("id"), blob],
+            vec![vec![
+                Value::Int(1),
+                Value::Str(crate::model::binary_display(4096)),
+            ]],
+        )
+    }
+
+    /// **The two formats Schemaic itself re-imports.** `import::ImportFormat` is
+    /// CSV and JSON, so a blob exported to either and read back stores the
+    /// placeholder *as the column's data* — the same round trip
+    /// `inserts_never_write_a_binary_placeholder_as_the_data` closed for the SQL
+    /// export, left open at the other two emitters.
+    ///
+    /// Blank rather than the text, which is how both formats already render
+    /// NULL: it is the honest claim, since the bytes genuinely aren't here.
+    #[test]
+    fn the_re_importable_formats_never_carry_a_binary_placeholder() {
+        let rs = blob_rs();
+        let csv = export_csv(&rs, &[0]);
+        assert!(!csv.contains("4096 bytes"), "csv: {csv}");
+        assert_eq!(csv, "id,thumb\n1,\n");
+
+        let json = export_json(&rs, &[0]);
+        assert!(!json.contains("4096 bytes"), "json: {json}");
+        assert!(json.contains("\"thumb\": null"), "{json}");
+
+        // …and the single-column forms, which are the "copy this column" paths.
+        let ccsv = export_column_csv(&rs, &[0], 1);
+        assert!(!ccsv.contains("4096 bytes"), "column csv: {ccsv}");
+        assert_eq!(ccsv, "\n");
+        let cjson = export_column_json(&rs, &[0], 1);
+        assert!(!cjson.contains("4096 bytes"), "column json: {cjson}");
+        assert!(cjson.contains("null"), "{cjson}");
+    }
+
+    /// **Markdown and HTML keep it, deliberately.** Neither is a format anything
+    /// reads back — they are for a person to look at — and there the placeholder
+    /// is the *useful* rendering: blanking it would make a 4 MB blob
+    /// indistinguishable from an empty cell and from NULL, which is strictly
+    /// less than what the grid itself shows.
+    #[test]
+    fn the_presentation_formats_keep_the_placeholder() {
+        let rs = blob_rs();
+        assert!(export_markdown(&rs, &[0]).contains("<4096 bytes>"));
+        // HTML-escaped, but still there.
+        assert!(export_html(&rs, &[0]).contains("&lt;4096 bytes&gt;"));
+    }
+
+    /// Both signals must agree in *every* format, not only in the SQL one: a
+    /// text column whose value reads like the placeholder is real data, and
+    /// blanking it in a CSV would delete it.
+    #[test]
+    fn a_text_column_that_looks_like_a_placeholder_survives_every_format() {
+        let rs = ResultSet::from_rows(
+            vec![col("note")],
+            vec![vec![Value::Str("<12 bytes>".to_string())]],
+        );
+        assert!(export_csv(&rs, &[0]).contains("<12 bytes>"));
+        assert!(export_json(&rs, &[0]).contains("<12 bytes>"));
+        assert!(export_column_csv(&rs, &[0], 0).contains("<12 bytes>"));
+        assert!(export_column_json(&rs, &[0], 0).contains("<12 bytes>"));
+    }
+
+    /// And the inverse, again in every format: a binary column carrying real
+    /// text is not blanked.
+    #[test]
+    fn a_binary_column_with_real_text_survives_every_format() {
+        let mut b = col("payload");
+        b.type_name = "BYTEA".to_string();
+        let rs = ResultSet::from_rows(vec![b], vec![vec![Value::Str("\\x4869".to_string())]]);
+        assert!(export_csv(&rs, &[0]).contains("4869"));
+        assert!(export_json(&rs, &[0]).contains("4869"));
+        assert!(export_column_csv(&rs, &[0], 0).contains("4869"));
     }
 
     // ── export formats + save-file naming ─────────────────────────────────
