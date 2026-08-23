@@ -6246,11 +6246,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             }
             let active_id = active_conn.get_untracked();
             let data_now = conn_ai_data();
-            // A live session's tools and MCP blob were fixed at spawn, so a
-            // change to any setting that decides *what may leave* has to
-            // respawn — otherwise the setting the user just changed keeps not
-            // applying, which is the worst possible failure for those controls.
-            // The rule is `ai::needs_respawn`, where a test can reach it.
+            // A live session's argv, tools list and MCP blob were all fixed at
+            // spawn, so a change to any setting carried in them has to respawn —
+            // otherwise the setting the user just changed keeps not applying,
+            // which is the worst possible failure for the controls that withhold
+            // and a silent lie for the ones that don't. The rule is
+            // `ai::needs_respawn`, where a test can reach it; the one thing it
+            // cannot answer for itself is whether the CLI path names a binary
+            // that exists, so that is resolved here.
             let settings_now = ai_settings_now();
             let scope_now = settings_now.schema_scope;
             let need_new = needs_respawn(
@@ -6260,6 +6263,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     .map(|s| (s.conn_id, &s.settings)),
                 active_id,
                 &settings_now,
+                claude_reachable(&settings_now.cli_path),
             );
             // The live context as it stands *now* — the system prompt is written
             // once at spawn, so every later turn carries the delta (see
@@ -6546,11 +6550,21 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // Only respawn if a session-affecting setting actually changed —
             // closing the modal with no change used to needlessly reset the live
             // conversation (review §7.4).
+            //
+            // **`ai::needs_respawn`, not `!=`.** A whole-struct comparison is a
+            // second rule for the one question `needs_respawn` exists to answer,
+            // and the two had already drifted apart: `!=` counts `cli_path`
+            // unconditionally, so typing a path that resolves to nothing — the
+            // state the field's own red hint is for — threw away a working
+            // conversation for a binary that cannot be spawned. The modal is the
+            // only place that path is typed, so this call site was the only one
+            // where that could happen.
             let current = ai_settings_now();
-            let changed = ai_session
-                .borrow()
-                .as_ref()
-                .is_some_and(|s| s.settings != current);
+            let usable = claude_reachable(&current.cli_path);
+            let conn_now = active_conn.get_untracked();
+            let changed = ai_session.borrow().as_ref().is_some_and(|s| {
+                needs_respawn(Some((s.conn_id, &s.settings)), conn_now, &current, usable)
+            });
             if changed {
                 ai_session.borrow_mut().take();
             }
