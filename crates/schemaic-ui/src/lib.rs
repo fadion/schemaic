@@ -3182,8 +3182,11 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
         // `on_event_stop(PointerDown, …)` in the app hides the press from here.
         // That is why a press-swallowing menu trigger has to repay the clear
         // itself, through `widgets::menu_trigger_press`, which states the rule in
-        // full — and why five sites keep a bare `|_| {}` on purpose, so the flag
-        // survives a click on a menu panel or a popover.
+        // full — and why the panel sites keep a bare `|_| {}` on purpose, so the
+        // flag survives a click on a menu panel or a popover. **Every panel this
+        // handler can close owes that absorb**, or it is torn down on the press
+        // and the row's click lands on nothing; `widgets::menu_panel_gate` is
+        // that half of the bargain.
         //
         // `set` is guarded because it never dedups, and an unguarded write on
         // every click in the app would re-run every button's style closure.

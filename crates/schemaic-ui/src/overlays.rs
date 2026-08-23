@@ -454,6 +454,20 @@ pub(crate) fn conn_menu_overlay(ui: Ui) -> impl IntoView {
                 manage,
             ))
             .on_click_stop(|_| {})
+            // **The panel absorbs its own pointer-downs**, or the root's
+            // dismissal closes this menu on the way *down* and the row's
+            // `Click` — delivered on the way up, and only to a view that still
+            // exists — never fires: the switcher opened and no connection could
+            // be chosen. The `on_click_stop` above is not this. It stops a
+            // different event, one that arrives too late.
+            //
+            // The panel needed nothing here while the root's dismissal was five
+            // hand-written flags with this menu deliberately left off the list;
+            // routing that through `MenuFlags::close_except(None)` widened it to
+            // all seven and put this menu on the hook. Bare `|_| {}`, not
+            // `menu_trigger_press`: this is a panel, so `keyboard_nav` must
+            // survive a click inside it.
+            .on_event_stop(EventListener::PointerDown, |_| {})
             .style(|s| {
                 panel_style(s)
                     .background(theme::bg_chrome())
@@ -580,20 +594,27 @@ pub(crate) fn active_db_menu_overlay(ui: Ui) -> impl IntoView {
             )
             .style(|s| s.flex_col());
 
-            let panel = container(list).on_click_stop(|_| {}).style(move |s| {
-                let a = anchor.get();
-                panel_style(s)
-                    .background(theme::bg_chrome())
-                    .width(DB_MENU_W)
-                    .padding_vert(6.0)
-                    // Right edge aligns to the trigger's right edge. `a.y` is the
-                    // button *box* bottom, which sits 3px below the chevron (the
-                    // trigger's `padding_vert(3)`) — so anchoring flush here puts the
-                    // popup ~3px under the glyph, matching the schema eye/settings menus.
-                    .margin_left((a.x - DB_MENU_W).max(0.0))
-                    .margin_top(a.y)
-                    .font_size(theme::FONT_TITLE)
-            });
+            let panel = container(list)
+                .on_click_stop(|_| {})
+                // Same absorb, same reason as the connection menu's panel: the
+                // root's dismissal now covers this menu too, and without this it
+                // tore the panel down on the press, so the row's `Click` never
+                // landed and the selector could not switch database.
+                .on_event_stop(EventListener::PointerDown, |_| {})
+                .style(move |s| {
+                    let a = anchor.get();
+                    panel_style(s)
+                        .background(theme::bg_chrome())
+                        .width(DB_MENU_W)
+                        .padding_vert(6.0)
+                        // Right edge aligns to the trigger's right edge. `a.y` is the
+                        // button *box* bottom, which sits 3px below the chevron (the
+                        // trigger's `padding_vert(3)`) — so anchoring flush here puts the
+                        // popup ~3px under the glyph, matching the schema eye/settings menus.
+                        .margin_left((a.x - DB_MENU_W).max(0.0))
+                        .margin_top(a.y)
+                        .font_size(theme::FONT_TITLE)
+                });
 
             focus_root(stack((
                 crate::widgets::dismiss_layer(move || open.set(false)),
