@@ -6240,6 +6240,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // the same rule: hiding a database mid-session used to leave
             // `list_schema` enumerating it and its tables to the vendor.
             let hidden_now = hidden_dbs.get_untracked();
+            let scope_now = ai_schema_scope.get_untracked();
             let need_new = ai_session
                 .borrow()
                 .as_ref()
@@ -6247,6 +6248,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     s.conn_id != active_id
                         || s.settings.data != data_now
                         || s.settings.hidden != hidden_now
+                        // The tools list and the MCP blob are both written once
+                        // at spawn, so a mid-session change to this had to
+                        // respawn or the subprocess kept the old answer — the
+                        // same reason `data` and `hidden` are here.
+                        || s.settings.schema_scope != scope_now
                 })
                 .unwrap_or(true);
             // The live context as it stands *now* — the system prompt is written
@@ -6301,6 +6307,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             // so hiding a database mid-session takes effect on
                             // the next one — the same as the schema outline.
                             hidden: hidden_dbs.get_untracked(),
+                            schema_scope: scope_now,
                         },
                     );
                     *ai_session.borrow_mut() = Some(AiSession {

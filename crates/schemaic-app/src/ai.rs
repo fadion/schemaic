@@ -128,6 +128,16 @@ pub(crate) struct McpEndpoint {
     /// `mcp::listed_databases` for which half of that tool they affect and why
     /// the other half is answered in full.
     pub(crate) hidden: HashSet<String>,
+    /// May the assistant read the **catalogue** — the app's *Schema context*
+    /// setting, as of the moment this session was spawned.
+    ///
+    /// `false` is `SchemaScope::None`, where the system prompt carries no
+    /// databases and no tables. Without it here the subprocess still advertised
+    /// `list_schema`, whose first call hands back every database and every table
+    /// name, so the setting was defeated in one call. Plumbed like `samples`
+    /// rather than only into the prompt, for the same reason: a listing the
+    /// model already holds must not reach the DB.
+    pub(crate) schema: bool,
 }
 
 /// Parse the MCP DB endpoint from `$SCHEMAIC_MCP_ENDPOINT` (the JSON the app
@@ -182,6 +192,9 @@ fn endpoint_from_value(v: &serde_json::Value) -> McpEndpoint {
         // Absent → on, matching the endpoint blobs written before the flag
         // existed (which also predate any tool that reads rows from schema).
         samples: v.get("samples").and_then(|x| x.as_bool()).unwrap_or(true),
+        // Absent → on, matching every blob written before the field existed —
+        // where the schema tools were always offered.
+        schema: v.get("schema").and_then(|x| x.as_bool()).unwrap_or(true),
         // Absent → nothing hidden, which is what every blob written before the
         // field existed meant.
         hidden: v
@@ -203,6 +216,7 @@ fn endpoint_json(
     db: &Db,
     database: Option<&str>,
     samples: bool,
+    schema: bool,
     hidden: &HashSet<String>,
 ) -> String {
     let (host, port, user, pass, file) = db.parts();
@@ -213,7 +227,7 @@ fn endpoint_json(
     serde_json::json!({
         "host": host, "port": port, "user": user, "pass": pass, "file": file,
         "database": database, "engine": db.engine().as_str(), "samples": samples,
-        "hidden": hidden
+        "schema": schema, "hidden": hidden
     })
     .to_string()
 }
@@ -356,6 +370,10 @@ pub(crate) struct StartAiParams {
     /// Databases the SCHEMA eye has hidden — carried into the MCP endpoint so
     /// the tools agree with the prompt about what this session can see.
     pub hidden: HashSet<String>,
+    /// The app's *Schema context* setting, carried for the same reason: at
+    /// `None` the prompt describes no database, and the tools must not offer
+    /// the model a way to fetch the whole catalogue anyway.
+    pub schema_scope: SchemaScope,
 }
 
 pub(crate) fn start_ai_session(
@@ -372,6 +390,7 @@ pub(crate) fn start_ai_session(
         data,
         cli_path,
         hidden,
+        schema_scope,
     } = p;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
@@ -382,6 +401,7 @@ pub(crate) fn start_ai_session(
         &db,
         database.as_deref(),
         data.may_query(),
+        schema_scope != SchemaScope::None,
         &hidden,
     ));
     let tools = if data.may_query() {
@@ -1096,8 +1116,20 @@ fn render_ai_context(
          a patch, and what you don't name, you don't touch.",
         tag = schemaic_core::propose::FENCE_TAG,
     );
+    // **At `None`, say that the schema was withheld — don't just omit it.**
+    //
+    // An empty section reads as "this connection has nothing in it", which is a
+    // different fact and one the model will act on. It also used to be untrue in
+    // the way that matters: `list_schema` was still advertised, so the first
+    // thing a model with no schema did was call it and get the whole catalogue.
+    // The tools are withheld now (`mcp::reads_schema`), so this sentence is what
+    // tells the model why and what to do instead — the same sentence
+    // `render_inline_prompt` writes for the same setting.
     let schema_section = if scope == SchemaScope::None {
-        String::new()
+        "The user has set Schema context to None, so you are given no database structure and \
+         the list_schema and describe_table tools are unavailable. Ask them for the table and \
+         column names you need; they can also raise the setting in AI settings.\n"
+            .to_string()
     } else {
         format!("Databases and tables ({UNTRUSTED_NOTE}):\n{}\n", cx.outline)
     };
@@ -1355,7 +1387,7 @@ mod tests {
                 schemaic_db::Engine::Postgres,
                 schemaic_db::Engine::Sqlite,
             ] {
-                let mut offered: Vec<String> = crate::mcp::tools_list(engine, reads_data)
+                let mut offered: Vec<String> = crate::mcp::tools_list(engine, reads_data, true)
                     .as_array()
                     .expect("a list")
                     .iter()
@@ -1440,7 +1472,7 @@ mod tests {
             "p".into(),
             String::new(),
         );
-        let out = endpoint_json(&db, Some("shop"), true, &HashSet::new());
+        let out = endpoint_json(&db, Some("shop"), true, true, &HashSet::new());
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["host"], "h");
         assert_eq!(v["port"], 3307);
@@ -1450,7 +1482,7 @@ mod tests {
         assert_eq!(v["engine"], "postgres"); // engine tag serialized
         assert_eq!(v["samples"], true);
         // No default database → JSON null.
-        let out = endpoint_json(&db, None, false, &HashSet::new());
+        let out = endpoint_json(&db, None, false, true, &HashSet::new());
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["database"].is_null());
         // Queries off → the subprocess is told to withhold sample rows.
@@ -1467,7 +1499,7 @@ mod tests {
             "p".into(),
             String::new(),
         );
-        let json = endpoint_json(&db, Some("shop"), false, &HashSet::new());
+        let json = endpoint_json(&db, Some("shop"), false, true, &HashSet::new());
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(!endpoint_from_value(&v).samples);
         // An older blob with no flag → samples on (nothing then read rows).
@@ -1486,7 +1518,7 @@ mod tests {
             String::new(),
         );
         let hidden: HashSet<String> = ["archive".to_string()].into_iter().collect();
-        let json = endpoint_json(&db, Some("shop"), true, &hidden);
+        let json = endpoint_json(&db, Some("shop"), true, true, &hidden);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["hidden"], serde_json::json!(["archive"]));
         assert_eq!(endpoint_from_value(&v).hidden, hidden);
@@ -1508,7 +1540,7 @@ mod tests {
             "pw".into(),
             String::new(),
         );
-        let json = endpoint_json(&db, Some("db1"), true, &HashSet::new());
+        let json = endpoint_json(&db, Some("db1"), true, true, &HashSet::new());
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let parsed = endpoint_from_value(&v);
         assert_eq!(parsed.db.parts(), ("host", 3306, "user", "pw", ""));
@@ -1543,7 +1575,7 @@ mod tests {
             String::new(),
             "/data/app.db".into(),
         );
-        let json = endpoint_json(&db, None, true, &HashSet::new());
+        let json = endpoint_json(&db, None, true, true, &HashSet::new());
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let parsed = endpoint_from_value(&v);
         assert_eq!(parsed.db.file(), "/data/app.db");
