@@ -699,6 +699,39 @@ pub fn from_mysql_rows(
 /// `(pid, usename, client_host, datname, state, query, age, blockers)`.
 pub type PgActivityRow = [Option<String>; 8];
 
+/// Is this `pg_stat_activity` row a **session** at all, or one of PostgreSQL's
+/// own auxiliary processes?
+///
+/// The checkpointer, background writer, walwriter and the two launchers live in
+/// `pg_stat_activity` alongside real backends. Nobody connected them, there is
+/// nothing to terminate, and `pg_terminate_backend` on one answers `WARNING: PID
+/// 5551 is not a PostgreSQL backend process` and `f`. `backend_type` names them
+/// — but PostgreSQL **masks `backend_type` to NULL** for any row the role has no
+/// `HAS_PGSTAT_PERMISSIONS` over, so widening the query to keep masked client
+/// backends let all five in as ordinary killable sessions for every ordinary
+/// role. This is the same failure MySQL's `USER <> 'system user'` exists for.
+///
+/// The shape that separates them was probed live on PostgreSQL 16.15, a plain
+/// role reading a superuser's backends: **`usename` and `datname` are not
+/// masked**, and a masked client backend keeps both while losing only `state`,
+/// `query`, `backend_type` and the timestamps. Every auxiliary process leaves
+/// `datname` NULL — and it takes both columns, because the logical replication
+/// launcher runs as `postgres` and so passes a `usename` test on its own.
+///
+/// Requiring both also declines two kinds of real backend that the pre-range
+/// `backend_type = 'client backend'` already declined, so nothing is lost:
+/// autovacuum workers (no `usename`) and walsenders (no `datname`).
+///
+/// `blocked` is the escape hatch, and the reason this errs where it does:
+/// `pg_blocking_pids` is **not** masked, an auxiliary process never waits on a
+/// heavyweight lock, and a row that is waiting on one is unarguably a session
+/// however little else it will say. Refusing to draw a lock waiter would cost
+/// the panel the thing it exists for, which is a worse trade than drawing one
+/// extra row.
+pub fn is_pg_session(usename: Option<&str>, datname: Option<&str>, blocked: bool) -> bool {
+    (usename.is_some() && datname.is_some()) || blocked
+}
+
 /// Fold PostgreSQL's activity rows into [`SessionInfo`]s.
 ///
 /// **A row the role may not inspect is kept, and says so by saying nothing.**
@@ -712,6 +745,10 @@ pub type PgActivityRow = [Option<String>; 8];
 /// a session `0` renders a full row with a live "Kill session" under it, and
 /// other rows' `blocked_by` edges would point at it. An unreadable *age* has a
 /// safe default — it only decides where the row sorts.
+///
+/// **A row with no user *or* no database is not a session** — see
+/// [`is_pg_session`]. The `WHERE` clause is the primary guard for that and this
+/// is the second one, at the level a test can reach.
 pub fn from_pg_rows(rows: &[PgActivityRow]) -> Vec<SessionInfo> {
     let text = |r: &PgActivityRow, i: usize| r[i].clone().filter(|s| !s.is_empty());
     rows.iter()
@@ -721,6 +758,13 @@ pub fn from_pg_rows(rows: &[PgActivityRow]) -> Vec<SessionInfo> {
                 .filter(|s| !s.is_empty() && s != PG_MASKED_QUERY);
             let blocked_by = parse_pid_array(r[7].as_deref().unwrap_or(""));
             let id: i64 = r[0].as_deref()?.trim().parse().ok()?;
+            if !is_pg_session(
+                text(r, 1).as_deref(),
+                text(r, 3).as_deref(),
+                !blocked_by.is_empty(),
+            ) {
+                return None;
+            }
             Some(SessionInfo {
                 id,
                 user: text(r, 1).unwrap_or_default(),
@@ -806,6 +850,39 @@ impl KillKind {
             KillKind::Session => true,
         }
     }
+}
+
+/// What PostgreSQL's answer to `pg_terminate_backend` / `pg_cancel_backend`
+/// actually means.
+///
+/// **Both functions answer with a boolean rather than raising**, and `false` is
+/// not a success. It means the request could not be delivered: the pid finished
+/// between the poll and the click, or it is not a signalable backend at all —
+/// PostgreSQL says so with a `WARNING`, which `simple_query` reports as a
+/// notice, not an error. Discarding the cell made every such kill look
+/// completed: the panel ran its killed-session repair, refreshed, and the row
+/// came back unchanged with nothing said anywhere.
+///
+/// `None` — no row, or an unreadable cell — is treated as **success**
+/// deliberately. The statement did not raise, so the request reached the server;
+/// inventing a failure out of a shape we didn't recognise would put an error in
+/// front of a kill that most likely worked. `false` is the only refusal, because
+/// it is the only answer that says so.
+///
+/// MySQL has no counterpart: `KILL CONNECTION <unknown id>` raises 1094, which
+/// surfaces as an ordinary query error.
+pub fn kill_verdict(cell: Option<&str>, kind: KillKind, id: i64) -> Result<(), String> {
+    if cell.map(str::trim) == Some("f") {
+        let what = match kind {
+            KillKind::Query => "cancelled",
+            KillKind::Session => "terminated",
+        };
+        return Err(format!(
+            "Session {id} could not be {what} — the server refused the request. \
+             It may have already ended, or it may not be a session at all."
+        ));
+    }
+    Ok(())
 }
 
 /// The confirm modal's title and body for a kill.
@@ -1447,6 +1524,87 @@ mod tests {
         alone[4] = None;
         alone[5] = Some(PG_MASKED_QUERY.to_string());
         assert_eq!(from_pg_rows(&[alone])[0].state, SessionState::Idle);
+    }
+
+    /// PostgreSQL's own auxiliary processes are not sessions, and under an
+    /// ordinary role `backend_type` is masked to NULL for them — the one column
+    /// that names them. Live on PostgreSQL 16.15 as a plain role, the widened
+    /// `WHERE` returned five rows and **all five were auxiliary processes**:
+    /// checkpointer, background writer, walwriter and both launchers, each drawn
+    /// with a live *Kill session* under it and each counted in `N sessions`.
+    ///
+    /// The rows below are the ones that probe read, verbatim.
+    #[test]
+    fn the_pg_fold_drops_postgres_own_auxiliary_processes() {
+        let row = |pid: &str, usename: Option<&str>, datname: Option<&str>| -> PgActivityRow {
+            [
+                Some(pid.to_string()),
+                usename.map(str::to_string),
+                None,
+                datname.map(str::to_string),
+                None,
+                Some(PG_MASKED_QUERY.to_string()),
+                None,
+                Some("{}".to_string()),
+            ]
+        };
+        // checkpointer, background writer, walwriter, autovacuum launcher —
+        // and the logical replication launcher, which runs as `postgres` and is
+        // why a `usename` test alone is not enough.
+        let aux = [
+            row("5551", None, None),
+            row("5552", None, None),
+            row("5554", None, None),
+            row("5555", None, None),
+            row("5556", Some("postgres"), None),
+        ];
+        assert!(
+            from_pg_rows(&aux).is_empty(),
+            "none of PostgreSQL's own processes is a killable session"
+        );
+        // A masked *client* backend keeps both unmasked identity columns and is
+        // never refused — this is the row the widening was for.
+        assert_eq!(
+            from_pg_rows(&[row("22563", Some("schemaic"), Some("postgres"))]).len(),
+            1,
+            "a masked client backend is still a session"
+        );
+        // …and a lock waiter is a session however little else it will say.
+        let mut waiter = row("5551", None, None);
+        waiter[7] = Some("{4102}".to_string());
+        assert_eq!(from_pg_rows(&[waiter]).len(), 1);
+    }
+
+    /// `pg_terminate_backend` answers `false` with a `WARNING` — a notice, not
+    /// an error — so `simple_query` succeeds and the kill looks completed. Live
+    /// on PostgreSQL 16.15: `SELECT pg_terminate_backend(5551)` as a plain role
+    /// returned `f` and *PID 5551 is not a PostgreSQL backend process*, and the
+    /// panel bumped its generation, ran the killed-session repair, refreshed,
+    /// and put the row straight back with nothing said.
+    #[test]
+    fn a_postgres_kill_that_answered_false_is_not_a_success() {
+        assert!(kill_verdict(Some("f"), KillKind::Session, 5551).is_err());
+        let message = kill_verdict(Some("f"), KillKind::Session, 5551).unwrap_err();
+        assert!(message.contains("5551"), "names the session: {message}");
+        assert!(
+            message.contains("terminated"),
+            "names the action: {message}"
+        );
+        assert!(
+            kill_verdict(Some("f"), KillKind::Query, 42)
+                .unwrap_err()
+                .contains("cancelled"),
+            "a cancel says cancel"
+        );
+        // `t` is the ordinary success.
+        assert!(kill_verdict(Some("t"), KillKind::Session, 5551).is_ok());
+        assert!(kill_verdict(Some(" t "), KillKind::Session, 5551).is_ok());
+        // A shape we don't recognise is *not* turned into a refusal: the
+        // statement didn't raise, so the request reached the server, and
+        // inventing an error would put a modal over a kill that worked.
+        assert!(kill_verdict(None, KillKind::Session, 5551).is_ok());
+        assert!(kill_verdict(Some(""), KillKind::Session, 5551).is_ok());
+        assert!(kill_verdict(Some("false"), KillKind::Session, 5551).is_ok());
     }
 
     #[test]
