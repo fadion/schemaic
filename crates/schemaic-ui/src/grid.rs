@@ -5666,22 +5666,30 @@ fn grid_toolbar(
             if !show {
                 return empty().into_any();
             }
-            let next = schemaic_core::stats::next_row_cap(nrows);
-            // `human_count`, because the stats line to its left prints the rows
-            // read with the same printer — "1k of ~4.2m rows · read 5k rows"
-            // only reads as one sentence if both figures are spelled one way.
-            text(format!(
-                "· read {} rows",
-                schemaic_core::text::human_count(next)
-            ))
+            // A `label`, and for the same reason `stats` beside it is one: the
+            // total arrives from a catalogue query after the strip is built, and
+            // it is what decides whether the offer is a step ("read 5k rows") or
+            // the whole thing ("read all ~292.02k rows"). Built once, the offer
+            // named a million rows for a table with 292 thousand.
+            label(move || {
+                format!(
+                    "· {}",
+                    schemaic_core::stats::read_more_offer(nrows, row_total.get()).1
+                )
+            })
             .on_click_stop(move |_| {
                 let Some(sql) = gs.current_statement() else {
                     return;
                 };
+                // Asked again at the click rather than captured: the total
+                // may have landed since the label was last drawn, and the
+                // cap has to match the words the user just read.
+                let (cap, _) =
+                    schemaic_core::stats::read_more_offer(nrows, row_total.get_untracked());
                 // The override is per-tab and transient: the next manual run
                 // clears it, because getting past the cap once is not a
                 // decision about every query the user will ever run.
-                gs.row_cap_override.set(Some(next));
+                gs.row_cap_override.set(Some(cap));
                 if let Some(run) = gs.apply_view.get_untracked() {
                     run(sql);
                 }

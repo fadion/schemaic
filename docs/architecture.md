@@ -3194,7 +3194,17 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   rows actually **read** (not the configured cap, which differs whenever a filter or a small table
   stopped the read short), floored at a thousand so a three-row result still offers something worth
   pressing, and rounded up to two significant figures so the offer reads as a figure rather than as
-  arithmetic. The re-run goes through `GridState::current_statement`, **not** `apply_grid_query`:
+  arithmetic. **The step alone is not the offer, because it can name rows that do not exist**:
+  `stats::read_more_offer` takes the same `row_total` the stats line prints and, when the step
+  already covers it, says *"read all ~292.02k rows"* instead. That case shipped wrong — a 200k read
+  of a ~292k table stepped to a million and the toolbar read "read 1m rows", on a line that had
+  just described the table as ~292.02k. The total is consulted, never trusted: it is usually the
+  engine's sampled estimate, so the cap that goes with "read all" is the total *rounded up*, and an
+  estimate that was low simply comes back capped and offers again. A total at or below the rows
+  already read is stale and says nothing, the same rule `rows_read_of` follows. The offer is a
+  `label`, not a `text`, for the same reason `stats` beside it is one — the total arrives from a
+  catalogue query after the strip is built — and the click re-asks rather than capturing, so the
+  cap always matches the words the user just read. The re-run goes through `GridState::current_statement`, **not** `apply_grid_query`:
   the latter reports a base it cannot rewrite as a *filter* failure ("not a simple single-table
   SELECT"), and a join is perfectly re-runnable at a bigger cap — telling a user with no filter
   that their filter is at fault is worse than the cap they were trying to get past
