@@ -65,9 +65,11 @@ fn open_editor(ui: &Ui, target: ViewTarget, draft: ViewDraft) {
     d.view_rows.set(BODY_ROWS);
     d.error.set(None);
     d.preview.set(None);
-    // The two editors share the preview stacked on top of them, and each
-    // overlay only knows its own flag — both open would paint two panels.
-    d.designer.set(None);
+    // Every editor shares the preview stacked on top of them, and each overlay
+    // only knows its own flag — two open would paint two panels. This used to
+    // clear the designer and nothing else, from when those were the only two;
+    // it is one list now (`ddl_preview::close_peers`).
+    crate::ddl_preview::close_peers(d, false);
     d.view.set(Some(target));
 }
 

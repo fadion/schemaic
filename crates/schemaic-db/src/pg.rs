@@ -1529,6 +1529,10 @@ pub(crate) async fn fetch_schema(db: &Db, database: &str) -> Result<DbSchema, Db
             .into_iter()
             .map(std::sync::Arc::new)
             .collect(),
+        // PostgreSQL has no scheduled events — `pg_cron` is an extension with
+        // its own catalogue and no `CREATE EVENT` grammar — so this stays empty
+        // and `ddl::supports_event_editing` is false here.
+        events: Vec::new(),
         // A MySQL-family flavour is meaningless here, and `Unknown` is what
         // makes the emitter withhold MariaDB-specific behaviour rather than
         // assume it.

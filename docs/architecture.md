@@ -880,12 +880,47 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `summary` names as the thing being changed, and what `risks` compares against to warn that
     callers passing the old arguments no longer resolve.
     That is also why `ObjectKind::Function`/`Procedure` are on the browse enum but refused
-    by `drop_object`, which has only a name to work with — it returns an **empty** change set for
-    one, so a preview says "no changes" rather than a bare-name statement that is right up until
+    by `drop_object` — the refusal is the capability `ObjectKind::uses_shared_changes`, which is
+    what the three shared-arm constructors ask. It returns an **empty** change set for one, so a
+    preview says "no changes" rather than a bare-name statement that is right up until
     the first overload; `drop_routine` takes the whole `RoutineInfo` and is the route.
     SQLite has no stored routines at all — a function there is registered by the host program,
     not stored in the database — so its arms are absent from `supports_change`,
     `supports_routine_editing` is false, and the tree grows no folder and the Create menu no entry.
+
+    **MySQL's scheduled events** — `EventDraft` → `diff_event` → `event_alter_clauses` → the same
+    preview — are the fourth browsable object kind, and the one whose shape is dictated by what
+    its engine *can* do rather than what it can't: `ALTER EVENT` reaches the schedule, the status,
+    the comment, the definer, the name **and** the body, so every edit here is one statement
+    restating only what changed and there is no drop-and-create anywhere. A rename rides inside
+    that same `ALTER` as its `RENAME TO` clause rather than being a `Change` of its own — split
+    into two, the pair would need an order (rename first and the second statement must address the
+    new name; alter first and a failed rename leaves a half-applied edit) for no gain, since MySQL
+    gives DDL no transaction either way. The header names the event **the server holds** and
+    `RENAME TO` the one the draft wants, which is why `Change::AlterEvent` carries `from` as a
+    whole `EventInfo`.
+    Three details are load-bearing. The clause order is **MySQL's grammar**, not a preference —
+    `ON SCHEDULE`, `ON COMPLETION`, `RENAME TO`, the status, `COMMENT`, `DO`, and any other
+    arrangement is a syntax error. `diff_event`'s emptiness test is `event_alter_clauses` rather
+    than `draft.info == *current`, because the two sides carry session state and a `time_zone` no
+    clause restates, and comparing the whole struct emitted `ALTER EVENT e` with no clauses — itself
+    a syntax error — every time the lazy `SHOW CREATE` corrected one side and not the other. And
+    the **definer is the one edit that lives entirely in the header**: MySQL needs at least one
+    alteration clause after the name, so a definer-only change carries a restatement of
+    `ON COMPLETION` with it, chosen over the status because it is provably a no-op *and* because a
+    stray `ENABLE` in the preview reads as an edit somebody made.
+    The one-shot warning (`Change::risks`) compares **both sides** on the alter arm: an event that
+    was already `AT … NOT PRESERVE` is not made self-deleting by a comment change, and warning
+    about it would make every such edit `is_destructive` and put it behind the preview's
+    destructive gate. It fires where the plan *introduces* the combination — the way every other
+    comparison in this module works.
+    A `CREATE`/`ALTER` that restates the body takes **no trailing semicolon** — the body is a
+    compound whose own statements end in `;` — and a `DROP` does; `event_restates_body` is asked
+    once and answers both the `DO` clause and the terminator. `supports_event_editing` is the
+    capability every surface asks (`supports_change` answers the three event arms with an
+    exhaustive dialect match ahead of its blanket "everything but SQLite"), and
+    `uses_shared_changes` is false for `ObjectKind::Event` for its own reason: the comment is a
+    clause of `ALTER EVENT`, so `SetObjectComment` would emit a `COMMENT ON EVENT` no engine has.
     **SQLite got here through the reader, not the emitter.** It publishes no catalogue of a
     trigger's parts — no `information_schema`, no pragma, only the statement text — so
     `sqlite_trigger_info(create_sql)` is what made an editor possible at all, and until it existed
@@ -1385,8 +1420,30 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     separately: the three session values need no parsing and are always trustworthy, so folding
     them into the body's success meant a routine with a header the reader didn't understand was
     later recreated under whatever `sql_mode` the applying session happened to have.
+    `EventInfo` is the **MySQL scheduled event**, and it is the one object modelled for a single
+    engine's sake: PostgreSQL's nearest equivalent is `pg_cron`, an extension with its own
+    catalogue and no `CREATE EVENT` grammar, and SQLite has no scheduler at all. Three things
+    about the model are decisions rather than transcription. **`EventSchedule` is two shapes, not
+    one nullable set of four fields** — `AT` takes a timestamp and nothing else, `EVERY` takes an
+    interval and optional bounds, and a single struct would have let a draft describe a syntax
+    error the form then had to refuse separately. **Every timestamp and interval quantity is held
+    as SQL, not as a value**: the catalogue reports `2026-01-01 03:00:00` and the reader
+    (`event_time_expr`/`event_interval_expr`) is what quotes it, once, because a field that can
+    only hold a literal cannot express `CURRENT_TIMESTAMP + INTERVAL 1 HOUR` — the same contract a
+    column default already has, and the same reason `event_interval_expr` tests the *value* rather
+    than the unit, so a compound unit this build has never heard of is still quoted. And
+    **`time_zone` is modelled** even though `CREATE EVENT` has no clause for it: the schedule is
+    read in the session's zone, the server records which one, and an edit applied from another
+    zone moves every future firing — so it rides in the session wrapper beside `sql_mode`
+    (`ddl::event_session_wrapped`). `EventStatus::SlavesideDisabled` is a third state rather than
+    a flavour of `Disabled` because a replica sets it for itself and restating the wrong one is a
+    real edit; `EventSource` is the lazy `SHOW CREATE EVENT` read, and exists for exactly the
+    reason `RoutineSource` does, with the consequence one notch milder — `ALTER EVENT` edits in
+    place, so a body restated from the escape-resolved copy is *refused* rather than lost.
+
     **The standalone objects** — `EnumInfo`/`DomainInfo`/`SequenceInfo`, PostgreSQL's, plus the
-    routines above — sit here beside the tables **on `DbSchema` itself** rather than being
+    routines above and the events beside them — sit here beside the tables **on `DbSchema` itself**
+    rather than being
     fetched lazily: the tree lists them and a column's type *is* one of them, so a separately
     refreshed second cache would be a second answer to "what is in this database" and the two
     would diverge on the first refresh that only updated one. `routines` used to be the exception,
@@ -2104,6 +2161,27 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   or ownership — and an unread body leaves the editor on whatever the schema fetch carried rather
   than blanking it, while the row's session values are returned either way (see `RoutineSource`).
   SQLite has neither call: it has no stored routines at all.
+  **Scheduled events read the same way and degrade differently.** `MY_EVENTS_SQL` /
+  `my_event_row` → `my_event_row_from` / `MY_EVENT_COLUMNS` are the routine trio again, sixteen
+  columns instead of fourteen and for the same arity reason; `mysql_events` folds the rows,
+  deciding the schedule's shape from `EVENT_TYPE` rather than from "is `EXECUTE_AT` NULL" (which
+  is also NULL for a recurring row whose interval failed to convert), and quoting the timestamps
+  and the quantity into the SQL expressions the model holds. A `RECURRING` row with no readable
+  interval becomes `EVERY 1 DAY` rather than being dropped: an event Schemaic can't fully describe
+  is still one the user must be able to see, rename, disable and drop — and the `ONE TIME` arm
+  falls back the same way, to `CURRENT_TIMESTAMP`, because an empty `AT` is exactly what
+  `EventDraft::validate` refuses and would have left Preview disabled for the life of the modal.
+  Neither fabrication can reach the server on its own: `event_alter_clauses` restates `ON SCHEDULE`
+  only when it changed, and it hasn't until the user edits the field they are looking at.
+  Unlike the `TRIGGERS` read
+  beside it, a **missing `information_schema.EVENTS` degrades to an empty list** on 1109/1146 — the
+  same two codes `CHECK_CONSTRAINTS` retries on, and for a sharper reason: the MySQL-protocol
+  servers that aren't MySQL are exactly the ones that may not implement the scheduler, and a
+  database whose tables can't be browsed because it has no events catalogue is a far worse outcome
+  than one whose Events folder is empty. `Db::event_source` is the sixth text divergence;
+  `event_body_of` is its pure reader and is the simplest of the three, since `DO` is a keyword it
+  can anchor on — what it still needs is `sql::skip_noncode`, for the event named `` `do` `` and
+  the `COMMENT 'do not touch'` that both sit before the real one.
   **`sqlite.rs` is the third engine**, and five things make it unlike the other two rather than a
   third set of catalogue queries. **There is no server**: a connection is a *file*
   (`Connection::file`), so host/port/user/password/SSH are all inert, `fetch_databases` has nothing
@@ -2532,6 +2610,15 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     `table_designer::open_for_table`/`open_for_new`/`preview_draft_edit` (a shortcut whose
     edit has dependents — dropping a column takes its index and FK with it) and
     `ddl_preview::preview_change` (a lone `Change`).
+    **`ddl_preview::close_peers` is the one editor-target list**, called by every editor's `open`
+    before it sets its own and by `close_editors` after an Apply. Each of those `open`s used to
+    keep its own copy and they had **drifted**: the table designer cleared the view editor and
+    nothing else, the view editor the designer and nothing else, while the object, routine and
+    trigger editors cleared four apiece — every one of them carrying the same comment about two
+    panels being painted at once, which is precisely what a partial list does. Six flags maintained
+    by hand in five places is where one list becomes the only version that stays true. The single
+    exception is the caller's, not the list's: `keep_trigger` is what leaves a half-filled trigger
+    form standing under the routine editor it opened.
     **`open_for_table` takes a `DesignerFocus`** — `Table`, `Column(&str)` or
     `Key { index, foreign_key }` — which is the row the designer lands on once it opens, so the
     tree's column and key right-clicks (`Edit column`, and `Edit index` / `Edit foreign key` /
@@ -2678,6 +2765,26 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     editor has none, and the title is where the inheritance is disclosed. It clears every sibling
     overlay's target on open **except the trigger editor's**, which is the handoff described
     above.
+  - `event_editor.rs` — the **scheduled event** modal, over `core::ddl`'s `EventDraft`, on the
+    one engine that has them. Reached from the schema tree's Events folder (row **Edit**),
+    from the database and namespace **Create ▸ Event** submenus, and from Find-Anywhere.
+    Modelled directly on `routine_editor` — the same chrome, the same
+    seed-local-signals-then-write-back rule, the same `DdlUi::event_body` arrangement for the
+    field a late `SHOW CREATE` has to correct in place, the same `overlay_open_key` memo so that
+    correction doesn't tear the modal down, and the same `ddl_preview` ending. What differs are
+    four consequences of `ALTER EVENT` being in-place: there is no drop-and-create, so a rename
+    can't destroy the original and the footer's clash message says only that the name is taken;
+    the three Preview refusals (`event_source_pending`, `event_body_stale`, `name_clash`) cost a
+    *rejected statement* rather than a lost object, and are still made because an error after
+    Apply is a worse way to learn this than a footer; **the schedule is the one part of the form
+    that rebuilds itself**, keyed on the shape (`EVERY` vs `AT`) alone and never on the draft, with
+    the draft written *before* the flag is flipped so the rebuilt fields seed from the shape being
+    switched to; and every timestamp field holds SQL, so it is monospaced and its placeholder
+    shows the quotes. The Status dropdown offers Enabled and Disabled plus, for an event already in
+    it, the replica state — offering `DISABLE ON SLAVE` freely would be offering a keyword MySQL
+    8.4 has removed, while hiding it would show "Enabled" over an event that isn't.
+    It shares one tuple element with the trigger and routine overlays (Floem's 16-arity
+    `ViewTuple` limit) and clears both of their targets on open, as they clear its.
   - `object_editor.rs` — the **enum / domain / sequence** modal, over `core::ddl`'s
     `ObjectDraft`. Reached from a tree object's **Edit**, from a database or schema node's
     **Create ▸ Type / Domain / Sequence** (PostgreSQL only — on MySQL those entries don't
@@ -2691,10 +2798,11 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     One modal for three objects because the chrome, the footer, the change count and the
     ending at `ddl_preview` are identical and only the middle section differs. **A routine is
     not one of them**, and the split is made at the type level rather than by convention:
-    `ObjectDraft::from_item`/`blank` return `None` for a routine, and this module's own
-    `open_for_object`/`open_for_new` are what route one to `routine_editor` — so the tree, the
-    palette and the menu all keep asking one function to open an object, and a routine handed
-    to a type form would have to be an explicit mistake rather than whichever arm compiles.
+    `ObjectDraft::from_item`/`blank` return `None` for a routine **and for an event**, and this
+    module's own `open_for_object`/`open_for_new` are what route those to `routine_editor` and
+    `event_editor` — so the tree, the palette and the menu all keep asking one function to open an
+    object, and a routine handed to a type form would have to be an explicit mistake rather than
+    whichever arm compiles.
     Same
     seed-local-signals-then-write-back rule as the other editors, and three more written down:
     the list rows are keyed on `object_rev`, a **structural** counter, so typing into a row
@@ -4284,7 +4392,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   is *zero-sized* (the out-of-flow state every one of these overlays takes when closed) gives its
   absolute children a zero box, so a modal left out of the layer's `modal_backdrop_up` predicate
   does not open half-right, it does not open at all. That is deliberate: the loud failure is the
-  guard that keeps the layer and the predicate in step.
+  guard that keeps the layer and the predicate in step — and it is only loud to whoever *opens*
+  that modal, which is not the person adding it. **The event editor shipped absent from the
+  predicate** and painted nothing at all, so the schema-editing half of that list is now
+  `ddl_editors_up(DdlUi)`, split out of `ddl_modals_up(&Ui)` for the one reason that matters here:
+  it can be tested. `ddl_preview::tests::every_editor_raises_the_group_that_gives_it_a_box` raises
+  each editor target **alone** and asserts the group sees it, over the same `DdlUi` fixture
+  `close_editors_clears_every_editor` already builds. The two tests are one invariant read from
+  opposite ends — every editor must be in this list, and every editor must be cleared by that one.
 - **And nothing bounds them.** An absolute child is out of flow, so text in one that is longer than
   the box lays out at its natural width and **paints across the border** into whatever sits beside
   it — not clipped, not ellipsized. `edit_field`'s placeholder did this for every field in the app

@@ -5456,6 +5456,37 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         )
     };
 
+    // One `SHOW CREATE EVENT`, for the event the user just opened. The
+    // counterpart of `routine_source` above and, like it, not an optimisation:
+    // `information_schema` resolves the body's escapes, and it is also the only
+    // place the event's `time_zone` and session state are printed together.
+    let event_source: schemaic_ui::EventSrcFn = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(
+            move |req: schemaic_ui::EventSrcRequest, done: schemaic_ui::EventSrcDoneFn| {
+                let Ok(db) = db_for(req.conn_id) else {
+                    // Nothing to report — but the editor is *waiting* on this
+                    // callback, so it has to arrive either way; dropping it
+                    // leaves Preview disabled for the life of the modal.
+                    (done)(req.name.clone(), None);
+                    return;
+                };
+                let name = req.name.clone();
+                let report = create_ext_action(cx, move |src| (done)(name.clone(), src));
+                handle.spawn(async move {
+                    // A failed read leaves the editor on `information_schema`'s
+                    // body, which is better than refusing to open at all.
+                    let src = db
+                        .event_source(Some(&req.database), &req.name)
+                        .await
+                        .unwrap_or(None);
+                    report(src);
+                });
+            },
+        )
+    };
+
     // ── Table properties ────────────────────────────────────────────────────
     // The statistics behind the properties modal. Fetched for the whole database
     // (one round trip either way) and then narrowed to the object asked about,
@@ -7719,6 +7750,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             trigger_functions,
             trigger_source,
             routine_source,
+            event_source,
             table_stats,
             count_rows,
             count_cancel,
@@ -7770,6 +7802,11 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             routine_body: RwSignal::new(String::new()),
             routine_source_pending: RwSignal::new(false),
             routine_body_stale: RwSignal::new(false),
+            event: RwSignal::new(None),
+            event_draft: RwSignal::new(schemaic_core::ddl::EventDraft::default()),
+            event_body: RwSignal::new(String::new()),
+            event_source_pending: RwSignal::new(false),
+            event_body_stale: RwSignal::new(false),
             functions: RwSignal::new(Vec::new()),
             object: RwSignal::new(None),
             object_draft: RwSignal::new(schemaic_core::ddl::ObjectDraft::default()),

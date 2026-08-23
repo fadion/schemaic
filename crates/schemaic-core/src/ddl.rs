@@ -30,9 +30,10 @@ use std::collections::{HashMap, HashSet};
 use crate::intel::SqlDialect;
 use crate::pairs;
 use crate::schema::{
-    CheckInfo, ColumnInfo, DomainInfo, EnumInfo, ForeignKeyInfo, IndexInfo, RoutineInfo,
-    RoutineKind, SequenceInfo, ServerFlavour, TableInfo, TriggerAction, TriggerEvent, TriggerInfo,
-    TriggerLevel, TriggerTiming, ViewOptions, ddl_ident_in, ddl_string, definer_sql, sql_qualifier,
+    CheckInfo, ColumnInfo, DomainInfo, EnumInfo, EventInfo, EventSchedule, ForeignKeyInfo,
+    IndexInfo, RoutineInfo, RoutineKind, SequenceInfo, ServerFlavour, TableInfo, TriggerAction,
+    TriggerEvent, TriggerInfo, TriggerLevel, TriggerTiming, ViewOptions, ddl_ident_in, ddl_string,
+    definer_sql, qualified_ident, sql_qualifier,
 };
 use crate::sql;
 
@@ -1323,6 +1324,108 @@ impl RoutineDraft {
     }
 }
 
+// ── The desired state of a scheduled event ───────────────────────────────────
+
+/// The whole desired shape of one scheduled event.
+///
+/// Carries a whole [`EventInfo`] for the reason [`RoutineDraft`] carries a
+/// [`RoutineInfo`], with one difference that runs through everything below:
+/// **MySQL can alter an event in place.** `ALTER EVENT` reaches the schedule,
+/// the status, the comment, the definer, the name and the body, so an edit here
+/// is one statement restating only what changed — never the drop-and-create a
+/// routine's every edit begins with. That is why nothing in this module has a
+/// `recreate` flag for an event, and why a rename can't cost the original.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EventDraft {
+    /// The event's name on the server, or `None` for a new one. Identity, not a
+    /// name: editing `info.name` is a rename.
+    pub original: Option<String>,
+    pub info: EventInfo,
+}
+
+impl EventDraft {
+    pub fn from_info(e: &EventInfo) -> EventDraft {
+        EventDraft {
+            original: Some(e.name.clone()),
+            info: e.clone(),
+        }
+    }
+
+    /// A new event, pre-shaped: a daily schedule and a body that parses.
+    ///
+    /// The body is a **valid, empty** compound rather than a blank box, on the
+    /// same grounds [`RoutineDraft::blank`] supplies one — the first thing a new
+    /// object has to survive is the server's parse.
+    ///
+    /// `ON COMPLETION NOT PRESERVE` is left at MySQL's own default, so an event
+    /// made here behaves like one made in SQL. It costs nothing on the recurring
+    /// schedule this starts from, which never completes; the editor says what it
+    /// means the moment the schedule is switched to a one-shot.
+    pub fn blank(name: impl Into<String>, schema: Option<String>) -> EventDraft {
+        EventDraft {
+            original: None,
+            info: EventInfo {
+                name: name.into(),
+                schema,
+                body: "BEGIN\n    SELECT 1;\nEND".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Problems that would make the generated SQL nonsense. Whether the body
+    /// runs is the server's judgement, as it is for a routine.
+    pub fn validate(&self) -> Vec<String> {
+        let e = &self.info;
+        let mut out = Vec::new();
+        if e.name.trim().is_empty() {
+            out.push("The event needs a name.".to_string());
+        }
+        match &e.schedule {
+            EventSchedule::At(at) if at.trim().is_empty() => {
+                out.push("A one-off event needs a time to run at.".to_string());
+            }
+            EventSchedule::Every { value, unit, .. } => {
+                if value.trim().is_empty() {
+                    out.push("A repeating event needs an interval.".to_string());
+                }
+                if unit.trim().is_empty() {
+                    out.push("A repeating event needs an interval unit (DAY, HOUR…).".to_string());
+                }
+            }
+            EventSchedule::At(_) => {}
+        }
+        if e.body.trim().is_empty() {
+            out.push("The event needs a body.".to_string());
+        }
+        out
+    }
+
+    /// Would applying this draft land on an event that is already there?
+    ///
+    /// Milder than [`RoutineDraft::name_clash`] and worth saying anyway: an
+    /// event rename is `ALTER EVENT … RENAME TO`, which the server refuses
+    /// without destroying anything, so this is a refusal in the footer instead
+    /// of a round trip that ends in error 1517.
+    ///
+    /// `taken` is every event name in this database, the server's spelling.
+    /// Case-insensitively compared and case-insensitively self-excluding,
+    /// because MySQL's event names are.
+    pub fn name_clash(&self, current: Option<&EventInfo>, taken: &[String]) -> Option<String> {
+        let want = self.info.name.trim();
+        if want.is_empty() {
+            return None;
+        }
+        if current.is_some_and(|c| c.name.eq_ignore_ascii_case(want)) {
+            return None;
+        }
+        taken
+            .iter()
+            .any(|t| t.trim().eq_ignore_ascii_case(want))
+            .then(|| format!("An event called {want} is already here."))
+    }
+}
+
 /// What the lazy `SHOW CREATE` reply means for the draft the user is editing.
 ///
 /// See [`routine_source_outcome`].
@@ -1407,6 +1510,12 @@ pub enum ObjectKind {
     Sequence,
     Function,
     Procedure,
+    /// A MySQL scheduled event. Here for the same reason a routine is — to be
+    /// **browsed** — and, like a routine, changed through its own three arms
+    /// rather than the shared ones: its comment is a clause of `ALTER EVENT`,
+    /// not a `COMMENT ON`, so `SetObjectComment` would emit a statement no
+    /// engine has.
+    Event,
 }
 
 impl ObjectKind {
@@ -1417,12 +1526,13 @@ impl ObjectKind {
     /// spread across the tree's folder builder, its two filter predicates and
     /// Find-Anywhere — and a kind added to three of them is a kind the palette
     /// silently cannot find.
-    pub const ALL: [ObjectKind; 5] = [
+    pub const ALL: [ObjectKind; 6] = [
         ObjectKind::Enum,
         ObjectKind::Domain,
         ObjectKind::Sequence,
         ObjectKind::Function,
         ObjectKind::Procedure,
+        ObjectKind::Event,
     ];
 
     /// What the object is called in a sentence a person reads.
@@ -1433,6 +1543,7 @@ impl ObjectKind {
             ObjectKind::Sequence => "sequence",
             ObjectKind::Function => "function",
             ObjectKind::Procedure => "procedure",
+            ObjectKind::Event => "event",
         }
     }
 
@@ -1449,17 +1560,32 @@ impl ObjectKind {
             ObjectKind::Sequence => "SEQUENCE",
             ObjectKind::Function => "FUNCTION",
             ObjectKind::Procedure => "PROCEDURE",
+            ObjectKind::Event => "EVENT",
         }
     }
 
-    /// Is this a stored routine — the kind the shared `RenameObject` /
-    /// `DropObject` / `SetObjectComment` arms cannot address?
+    /// Can the shared `RenameObject` / `DropObject` / `SetObjectComment` arms
+    /// address this kind at all?
     ///
-    /// Asked as a capability by the three constructors that build those arms, so
-    /// the refusal is in one place and greppable, rather than each of them
-    /// carrying a `!= Function && != Procedure`.
-    pub fn is_routine(self) -> bool {
-        matches!(self, ObjectKind::Function | ObjectKind::Procedure)
+    /// Asked as a capability by the constructors that build those arms, so the
+    /// refusal is in one place and greppable rather than each of them carrying
+    /// its own list of exclusions.
+    ///
+    /// **A routine cannot**: PostgreSQL identifies one by its argument types,
+    /// which a bare name cannot express. **An event cannot** either, for a
+    /// different reason — `ALTER EVENT … RENAME TO` and `DROP EVENT` would in
+    /// fact be right, but its *comment* is a clause of the same `ALTER` rather
+    /// than a `COMMENT ON`, and one kind answering two of the three would be a
+    /// distinction every call site had to remember. Both go through their own
+    /// changes instead ([`drop_event`], [`diff_event`]).
+    ///
+    /// An exhaustive `match`, so a seventh kind has to answer rather than
+    /// inheriting whichever side it falls on.
+    pub fn uses_shared_changes(self) -> bool {
+        match self {
+            ObjectKind::Enum | ObjectKind::Domain | ObjectKind::Sequence => true,
+            ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Event => false,
+        }
     }
 
     /// The routine kind this is, when it is one.
@@ -1467,7 +1593,9 @@ impl ObjectKind {
         match self {
             ObjectKind::Function => Some(crate::schema::RoutineKind::Function),
             ObjectKind::Procedure => Some(crate::schema::RoutineKind::Procedure),
-            _ => None,
+            ObjectKind::Enum | ObjectKind::Domain | ObjectKind::Sequence | ObjectKind::Event => {
+                None
+            }
         }
     }
 
@@ -1805,11 +1933,12 @@ impl ObjectDraft {
     /// The draft that describes an introspected object exactly — the editor's
     /// starting point, and the input to the round-trip gate.
     ///
-    /// `None` for a **routine**, which this modal does not edit: its draft is a
-    /// [`RoutineDraft`] and its form is a different one. Returning an `Option`
-    /// rather than picking an arm is the point — a routine handed to the object
-    /// editor would open a type form over a function, and the type-level refusal
-    /// is what makes the caller route it to [`RoutineDraft`] instead.
+    /// `None` for a **routine and for an event**, neither of which this modal
+    /// edits: their drafts are a [`RoutineDraft`] and an [`EventDraft`] and each
+    /// has its own form. Returning an `Option` rather than picking an arm is the
+    /// point — a routine handed to the object editor would open a type form over
+    /// a function, and the type-level refusal is what makes the caller route it
+    /// to the right modal instead.
     pub fn from_item(o: &crate::schema::ObjectItem) -> Option<ObjectDraft> {
         match o {
             crate::schema::ObjectItem::Enum(e) => Some(ObjectDraft::Enum(EnumDraft::from_info(e))),
@@ -1819,11 +1948,11 @@ impl ObjectDraft {
             crate::schema::ObjectItem::Sequence(s) => {
                 Some(ObjectDraft::Sequence(SequenceDraft::from_info(s)))
             }
-            crate::schema::ObjectItem::Routine(_) => None,
+            crate::schema::ObjectItem::Routine(_) | crate::schema::ObjectItem::Event(_) => None,
         }
     }
 
-    /// A blank draft of one kind, or `None` for a routine — see
+    /// A blank draft of one kind, or `None` for a routine or an event — see
     /// [`ObjectDraft::from_item`].
     pub fn blank(
         kind: ObjectKind,
@@ -1834,7 +1963,7 @@ impl ObjectDraft {
             ObjectKind::Enum => Some(ObjectDraft::Enum(EnumDraft::blank(name, schema))),
             ObjectKind::Domain => Some(ObjectDraft::Domain(DomainDraft::blank(name, schema))),
             ObjectKind::Sequence => Some(ObjectDraft::Sequence(SequenceDraft::blank(name, schema))),
-            ObjectKind::Function | ObjectKind::Procedure => None,
+            ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Event => None,
         }
     }
 
@@ -2064,6 +2193,28 @@ pub enum Change {
         to: String,
     },
     DropRoutine(Box<RoutineInfo>),
+    /// Create a scheduled event that doesn't exist yet — a plain `CREATE`, so a
+    /// name already taken fails instead of silently replacing someone else's
+    /// event.
+    CreateEvent(Box<EventDraft>),
+    /// `ALTER EVENT`, restating **only** the clauses that changed — the same
+    /// rule [`Change::AlterSequence`] follows, and for the same reason: a
+    /// restated clause the user didn't edit is a change nobody reviewed.
+    ///
+    /// **A rename rides inside this change rather than beside it.** `RENAME TO`
+    /// is a clause of the very same `ALTER EVENT`, so folding it in makes the
+    /// whole edit one statement the server applies or refuses as a unit. Split
+    /// into two, the pair would need an order — rename first and the second
+    /// statement must address the new name, alter first and a failed rename
+    /// leaves a half-applied edit — for no gain, since MySQL gives DDL no
+    /// transaction to undo either way.
+    AlterEvent {
+        /// The event **as the server holds it**: what the `ALTER` addresses, and
+        /// the left-hand side of every clause comparison.
+        from: Box<EventInfo>,
+        to: Box<EventInfo>,
+    },
+    DropEvent(Box<EventInfo>),
     /// Create an enum type that doesn't exist yet.
     CreateEnum(Box<EnumInfo>),
     /// `ALTER TYPE … ADD VALUE`. One change per value, so the preview lists each
@@ -2411,6 +2562,20 @@ impl Change {
                 format!("Rename {} {} to {to}", from.kind.label(), from.name)
             }
             Change::DropRoutine(f) => format!("Drop {} {}", f.kind.label(), f.name),
+            Change::CreateEvent(d) => format!("Create event {}", d.info.name),
+            // Names what the `ALTER` will actually restate, from the **same**
+            // comparison the emitter builds its clauses from
+            // ([`event_alter_clauses`]) — the `TableOptions` rule, which exists
+            // because the sentence and the statement once disagreed.
+            Change::AlterEvent { from, to } => {
+                let edits = event_edits(from, to);
+                if edits.is_empty() {
+                    format!("Alter event {}", from.name)
+                } else {
+                    format!("Alter event {}: {}", from.name, edits.join(", "))
+                }
+            }
+            Change::DropEvent(e) => format!("Drop event {}", e.name),
             Change::CreateEnum(e) => format!(
                 "Create type {} with {} value{}",
                 e.name,
@@ -2681,6 +2846,43 @@ impl Change {
                 f.kind.label(),
                 f.name
             )],
+            Change::DropEvent(e) => vec![format!(
+                "Drops event {}. Its schedule and its body are gone with it — \
+                 nothing else in the database holds a copy.",
+                e.name
+            )],
+            // **The one-shot that deletes itself.** `ON COMPLETION NOT PRESERVE`
+            // is MySQL's default and says nothing on a recurring schedule, which
+            // never completes; on an `AT` schedule it means the server drops the
+            // event the moment it has run, so the edit the user is reviewing
+            // disappears along with it. Said on both arms that can produce that
+            // combination, because it is the one property of an event that is
+            // destructive without any statement here saying `DROP`.
+            Change::CreateEvent(d) if d.info.schedule.is_one_shot() && !d.info.preserve => {
+                vec![
+                    "This event runs once and the server then deletes it — that's \
+                     ON COMPLETION NOT PRESERVE. Turn Preserve on to keep it."
+                        .to_string(),
+                ]
+            }
+            // **The alter arm compares both sides**, because it warns about an
+            // edit rather than about a state. An event that was already a
+            // self-deleting one-shot before this plan is not made so by a
+            // comment change, and reporting it would make every such edit
+            // `is_destructive` — which gates Apply behind the preview's
+            // destructive path. So: fire only where the plan *introduces* the
+            // combination, the way every other comparison here works.
+            Change::AlterEvent { from, to }
+                if to.schedule.is_one_shot()
+                    && !to.preserve
+                    && !(from.schedule.is_one_shot() && !from.preserve) =>
+            {
+                vec![format!(
+                    "Event {} will run once and the server will then delete it — \
+                     that's ON COMPLETION NOT PRESERVE. Turn Preserve on to keep it.",
+                    to.name
+                )]
+            }
             // Nothing is destroyed and it still has to be said, because it is the
             // one edit here that **can't be undone in place**: PostgreSQL has no
             // way to remove an enum value, so taking this one back means
@@ -3154,6 +3356,9 @@ impl ChangeSet {
         // getting right now rather than discovering it later.
         out.extend(self.routine_statements());
         out.extend(self.trigger_statements());
+        // Scheduled events are this engine's alone, and are still called from
+        // *both* emitters on the same rule the objects below follow.
+        out.extend(self.event_statements());
         // The standalone objects are PostgreSQL's, so this contributes nothing on
         // a MySQL connection. It is still called from *both* emitters rather than
         // one, so that such a change set arriving here emits SQL the server can
@@ -3322,6 +3527,7 @@ impl ChangeSet {
         // getting right now rather than discovering it later.
         out.extend(self.routine_statements());
         out.extend(self.trigger_statements());
+        out.extend(self.event_statements());
         out.extend(self.object_statements());
         for c in &self.changes {
             match c {
@@ -3832,6 +4038,67 @@ impl ChangeSet {
         out
     }
 
+    /// The scheduled-event statements.
+    ///
+    /// Every statement that carries a *body* goes out through the same session
+    /// wrapper a routine's `CREATE` does, plus a fourth value: an event's
+    /// schedule is read in the `time_zone` of the session that wrote it, the
+    /// statement has no clause for it, and applying an unwrapped edit moves
+    /// every future firing by the offset between the two zones.
+    ///
+    /// A `DROP` is not wrapped: it restates nothing, so there is no session
+    /// state for it to be filed under.
+    fn event_statements(&self) -> Vec<String> {
+        let d = self.dialect;
+        let mut out = Vec::new();
+        for c in &self.changes {
+            match c {
+                Change::CreateEvent(draft) => {
+                    let e = &draft.info;
+                    out.extend(event_session_wrapped(e.create_sql(d), e, d));
+                }
+                Change::AlterEvent { from, to } => {
+                    let clauses = event_alter_clauses(from, to, d);
+                    // An `ALTER` with nothing to restate is not a statement —
+                    // `ALTER EVENT e` on its own is a syntax error, and a
+                    // change set that somehow holds one emits nothing rather
+                    // than SQL the server will refuse.
+                    if clauses.is_empty() {
+                        continue;
+                    }
+                    // **Addressed by the name the server holds**, not the
+                    // draft's: a rename is one of the clauses, so building the
+                    // header from `to` would alter an event that doesn't exist.
+                    let mut stmt = String::from("ALTER ");
+                    if let Some(def) = event_definer_clause(from, to) {
+                        stmt.push_str(&def);
+                        stmt.push(' ');
+                    }
+                    stmt.push_str(&format!(
+                        "EVENT {}\n  {}",
+                        qualified_ident(&from.name, from.schema.as_deref(), d),
+                        clauses.join("\n  ")
+                    ));
+                    // The terminator is omitted exactly when the statement ends
+                    // in the body, which is the rule `EventInfo::create_sql`
+                    // states: a body is a compound whose own statements end in
+                    // `;`, and one appended after it would close the `ALTER`
+                    // somewhere the reader doesn't expect.
+                    if !event_restates_body(from, to) {
+                        stmt.push(';');
+                    }
+                    out.extend(event_session_wrapped(stmt, to, d));
+                }
+                Change::DropEvent(e) => out.push(format!(
+                    "DROP EVENT {};",
+                    qualified_ident(&e.name, e.schema.as_deref(), d)
+                )),
+                _ => {}
+            }
+        }
+        out
+    }
+
     /// The statements for a standalone object — an enum, a domain or a sequence.
     ///
     /// One builder for all three, on the same grounds as
@@ -4112,6 +4379,167 @@ fn sequence_alter_clauses(from: &SequenceInfo, to: &SequenceInfo, d: SqlDialect)
             ),
             None => "OWNED BY NONE".to_string(),
         });
+    }
+    out
+}
+
+/// Does this `ALTER EVENT` restate the body?
+///
+/// Asked twice — once to decide whether a `DO` clause goes on the end, and once
+/// by the caller to decide whether the statement takes a terminator — so it is
+/// one comparison rather than two that could drift apart.
+fn event_restates_body(from: &EventInfo, to: &EventInfo) -> bool {
+    from.body.trim() != to.body.trim()
+}
+
+/// The `DEFINER = …` clause an `ALTER EVENT` needs, or `None` when the account
+/// is unchanged.
+///
+/// Restated only on a change, like every other clause here: `ALTER DEFINER = x`
+/// requires the privilege to impersonate `x`, so a plan that repeated an
+/// unchanged definer would be refused for an edit that never touched it.
+fn event_definer_clause(from: &EventInfo, to: &EventInfo) -> Option<String> {
+    let want = to
+        .definer
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let held = from
+        .definer
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match want {
+        Some(w) if held != Some(w) => Some(definer_sql(w)),
+        // Cleared, or never set. There is no `ALTER EVENT … DEFINER = DEFAULT`
+        // to say "back to the current user" with, so a cleared field means "stop
+        // restating it" rather than a statement that can't be written.
+        _ => None,
+    }
+}
+
+/// The `ALTER EVENT` clauses for the parts that changed — and only those, in the
+/// **one order** MySQL's grammar accepts them in.
+///
+/// That order is not a preference: `ALTER EVENT` takes `ON SCHEDULE`,
+/// `ON COMPLETION`, `RENAME TO`, the status, `COMMENT` and `DO` in that
+/// sequence, and any other arrangement is a syntax error. The clause list is
+/// kept in step with [`event_edits`], which is what the preview's sentence is
+/// built from — the [`sequence_alter_clauses`] rule, and for the same reason.
+///
+/// The schedule is restated **whole** when any part of it changes: there is no
+/// grammar for altering just the `ENDS` of an existing `EVERY`, and the two
+/// forms aren't interchangeable in the first place.
+///
+/// The `DEFINER` is **not** here — it belongs before the `EVENT` keyword rather
+/// than in this list, which is why [`event_definer_clause`] answers it
+/// separately.
+fn event_alter_clauses(from: &EventInfo, to: &EventInfo, d: SqlDialect) -> Vec<String> {
+    let mut out = Vec::new();
+    if from.schedule != to.schedule {
+        out.push(format!("ON SCHEDULE {}", to.schedule.sql()));
+    }
+    if from.preserve != to.preserve {
+        out.push(
+            if to.preserve {
+                "ON COMPLETION PRESERVE"
+            } else {
+                "ON COMPLETION NOT PRESERVE"
+            }
+            .to_string(),
+        );
+    }
+    // Case-sensitively compared, unlike the *clash* check: MySQL's event names
+    // are case-insensitive as identities, so `Nightly` and `nightly` are one
+    // event — but renaming to change only the case is a real edit the server
+    // performs, and skipping it would silently drop what the user asked for.
+    if from.name != to.name {
+        out.push(format!(
+            "RENAME TO {}",
+            qualified_ident(&to.name, to.schema.as_deref(), d)
+        ));
+    }
+    if from.status != to.status {
+        out.push(to.status.sql_keyword().to_string());
+    }
+    // `None` and `Some("")` are the same event to the server, so a comment
+    // cleared to empty text is restated as the empty literal — which is how
+    // `ALTER EVENT` removes one, there being no `DROP COMMENT`.
+    let comment = |e: &EventInfo| e.comment.clone().unwrap_or_default();
+    if comment(from) != comment(to) {
+        out.push(format!("COMMENT {}", ddl_string(&comment(to), d)));
+    }
+    if event_restates_body(from, to) {
+        out.push(format!("DO\n{}", to.body.trim_matches('\n')));
+    }
+    // **A definer-only edit still needs a clause.** MySQL's `ALTER EVENT`
+    // grammar requires at least one alteration after the name — `ALTER DEFINER =
+    // u EVENT e` on its own is a parse error — so the one edit that lives
+    // entirely in the header would otherwise be an event the form offers and the
+    // emitter silently drops.
+    //
+    // `ON COMPLETION` is the companion, and it is chosen because restating it is
+    // provably a no-op: it is written from `to`, which equals `from` in every
+    // branch that reaches here. The status would do as well and is the *more*
+    // visible clause, which is exactly why it isn't used — an `ENABLE` in the
+    // preview reads as an edit somebody made.
+    if out.is_empty() && event_definer_clause(from, to).is_some() {
+        out.push(
+            if to.preserve {
+                "ON COMPLETION PRESERVE"
+            } else {
+                "ON COMPLETION NOT PRESERVE"
+            }
+            .to_string(),
+        );
+    }
+    out
+}
+
+/// Which of an event's parts differ, named for the preview.
+///
+/// Shared by the summary and — through the same field comparisons —
+/// [`event_alter_clauses`], so the line the user reads and the statement that
+/// runs are answering one question. The [`sequence_edits`] rule.
+fn event_edits(from: &EventInfo, to: &EventInfo) -> Vec<String> {
+    let mut out = Vec::new();
+    if from.name != to.name {
+        out.push(format!("rename to {}", to.name));
+    }
+    if from.schedule != to.schedule {
+        out.push(format!(
+            "schedule to {}",
+            to.schedule
+                .sql()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
+    if from.status != to.status {
+        out.push(format!("status to {}", to.status.label().to_lowercase()));
+    }
+    if from.preserve != to.preserve {
+        out.push(
+            if to.preserve {
+                "keep it after it completes"
+            } else {
+                "delete it after it completes"
+            }
+            .to_string(),
+        );
+    }
+    if event_definer_clause(from, to).is_some() {
+        out.push(format!(
+            "definer to {}",
+            to.definer.as_deref().unwrap_or_default()
+        ));
+    }
+    if from.comment.clone().unwrap_or_default() != to.comment.clone().unwrap_or_default() {
+        out.push("comment".to_string());
+    }
+    if event_restates_body(from, to) {
+        out.push("body".to_string());
     }
     out
 }
@@ -5017,12 +5445,57 @@ fn session_wrapped(
     )
 }
 
+/// The same wrapper for a scheduled event, with a fourth value the other two
+/// don't carry: `time_zone`.
+///
+/// An event's `AT`/`STARTS`/`ENDS` are stored against the session time zone that
+/// wrote them and `CREATE EVENT` has no clause for it, so an edit applied from a
+/// session in another zone moves every future firing by the offset between the
+/// two — a nightly 03:00 job that starts running at 22:00. It rides here for
+/// exactly the reason `sql_mode` does.
+fn event_session_wrapped(stmt: String, e: &EventInfo, d: SqlDialect) -> Vec<String> {
+    session_wrapped_all(
+        None,
+        stmt,
+        e.sql_mode.as_deref(),
+        e.charset_client.as_deref(),
+        e.collation_connection.as_deref(),
+        e.time_zone.as_deref(),
+        d,
+    )
+}
+
 fn session_wrapped_with(
     lead: Option<String>,
     create: String,
     sql_mode: Option<&str>,
     charset_client: Option<&str>,
     collation_connection: Option<&str>,
+    d: SqlDialect,
+) -> Vec<String> {
+    session_wrapped_all(
+        lead,
+        create,
+        sql_mode,
+        charset_client,
+        collation_connection,
+        None,
+        d,
+    )
+}
+
+/// The wrapper itself. `time_zone` is `None` for everything but an event — see
+/// [`event_session_wrapped`] — and a `None` setting is simply not carried, so
+/// the emitted shape for a trigger or a routine is byte-identical to what it was
+/// before events existed.
+#[allow(clippy::too_many_arguments)]
+fn session_wrapped_all(
+    lead: Option<String>,
+    create: String,
+    sql_mode: Option<&str>,
+    charset_client: Option<&str>,
+    collation_connection: Option<&str>,
+    time_zone: Option<&str>,
     d: SqlDialect,
 ) -> Vec<String> {
     // MySQL's problem alone. PostgreSQL's trigger carries no session state, and
@@ -5035,6 +5508,7 @@ fn session_wrapped_with(
         ("sql_mode", sql_mode),
         ("character_set_client", charset_client),
         ("collation_connection", collation_connection),
+        ("time_zone", time_zone),
     ]
     .into_iter()
     .filter_map(|(k, v)| v.map(|v| (k, v)))
@@ -5544,6 +6018,34 @@ pub fn supports_routine_editing(dialect: SqlDialect) -> bool {
             },
         )
         && supports_change(dialect, &Change::DropRoutine(Box::default()))
+}
+
+/// Can `dialect` have its **scheduled events** browsed and edited here?
+///
+/// MySQL and MariaDB, and neither of the others. PostgreSQL's nearest
+/// equivalent is `pg_cron`, an extension with its own catalogue and no
+/// `CREATE EVENT` grammar at all; SQLite has no scheduler. So this is not
+/// unfinished work on those engines — there is no such object to browse.
+///
+/// Computed from [`supports_change`] rather than stated, for the reason
+/// [`supports_view_editing`] gives, and over all three statements an editor
+/// cannot do without.
+///
+/// **Every surface asks this**, and asking it rather than the engine is what
+/// keeps the Events folder, the Create entry and the editor's entry points from
+/// disagreeing: the folder is empty on the other engines anyway (nothing fills
+/// [`crate::schema::DbSchema::events`] there), but the Create entry would have
+/// offered a `CREATE EVENT` PostgreSQL has never heard of.
+pub fn supports_event_editing(dialect: SqlDialect) -> bool {
+    supports_change(dialect, &Change::CreateEvent(Box::default()))
+        && supports_change(
+            dialect,
+            &Change::AlterEvent {
+                from: Box::default(),
+                to: Box::default(),
+            },
+        )
+        && supports_change(dialect, &Change::DropEvent(Box::default()))
 }
 
 /// Can `dialect` redefine a routine **in place**, with `CREATE OR REPLACE`?
@@ -6546,6 +7048,20 @@ pub fn sqlite_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
 /// absent, and the emitter honours it so a change that slipped through emits
 /// nothing rather than MySQL's spelling of it.
 pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
+    // **The one family that is narrower than "everything but SQLite".** A
+    // scheduled event is MySQL's; PostgreSQL has no `CREATE EVENT` and SQLite no
+    // scheduler, so this is asked before the blanket answer below rather than
+    // inheriting it. An exhaustive `match` on the dialect, so a fourth engine
+    // has to say for itself.
+    if matches!(
+        change,
+        Change::CreateEvent(_) | Change::AlterEvent { .. } | Change::DropEvent(_)
+    ) {
+        return match dialect {
+            SqlDialect::MySql => true,
+            SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        };
+    }
     if dialect != SqlDialect::Sqlite {
         return true;
     }
@@ -7576,6 +8092,67 @@ pub fn drop_routine(f: &RoutineInfo, dialect: SqlDialect) -> ChangeSet {
     }
 }
 
+/// Everything that has to happen to turn the event `current` into `draft`.
+///
+/// Same round-trip gate as [`diff`] and [`diff_routine`]: an event diffed
+/// against its own draft must produce nothing.
+///
+/// **One change or none, never a pair.** Every part of an event that this editor
+/// can touch — the schedule, the status, the comment, the definer, the name and
+/// the body — is a clause of the same `ALTER EVENT`, and MySQL applies or
+/// refuses that statement whole. Splitting a rename out the way
+/// [`diff_routine`] does on PostgreSQL would buy nothing and cost an ordering
+/// nobody can make atomic, since MySQL gives DDL no transaction.
+///
+/// The emptiness test is [`event_alter_clauses`] rather than `draft.info ==
+/// *current`, deliberately: the two sides carry session state and a `time_zone`
+/// that no clause restates, and an event whose *only* difference is one of those
+/// has nothing to alter. Comparing the whole struct would have produced an
+/// `ALTER EVENT` with no clauses — a syntax error — every time the lazy
+/// `SHOW CREATE` corrected one side and not the other.
+pub fn diff_event(current: &EventInfo, draft: &EventDraft, dialect: SqlDialect) -> ChangeSet {
+    let changes = if event_alter_clauses(current, &draft.info, dialect).is_empty() {
+        Vec::new()
+    } else {
+        vec![Change::AlterEvent {
+            from: Box::new(current.clone()),
+            to: Box::new(draft.info.clone()),
+        }]
+    };
+    ChangeSet {
+        table: current.name.clone(),
+        schema: current.schema.clone(),
+        dialect,
+        flavour: ServerFlavour::Unknown,
+        changes,
+    }
+}
+
+/// The `CREATE EVENT` for a brand-new event.
+pub fn create_event(draft: &EventDraft, dialect: SqlDialect) -> ChangeSet {
+    ChangeSet {
+        table: draft.info.name.clone(),
+        schema: draft.info.schema.clone(),
+        dialect,
+        flavour: ServerFlavour::Unknown,
+        changes: vec![Change::CreateEvent(Box::new(draft.clone()))],
+    }
+}
+
+/// The `DROP` for one event — the context menu's shortcut.
+///
+/// Its own function rather than [`drop_object`], for the reason
+/// [`ObjectKind::uses_shared_changes`] gives.
+pub fn drop_event(e: &EventInfo, dialect: SqlDialect) -> ChangeSet {
+    ChangeSet {
+        table: e.name.clone(),
+        schema: e.schema.clone(),
+        dialect,
+        flavour: ServerFlavour::Unknown,
+        changes: vec![Change::DropEvent(Box::new(e.clone()))],
+    }
+}
+
 /// The `CREATE VIEW` for a brand-new view.
 pub fn create_view(draft: &ViewDraft, dialect: SqlDialect) -> ChangeSet {
     ChangeSet {
@@ -7931,7 +8508,7 @@ pub fn drop_object(
     schema: Option<&str>,
     dialect: SqlDialect,
 ) -> ChangeSet {
-    if kind.is_routine() {
+    if !kind.uses_shared_changes() {
         return object_set_empty(name, schema, dialect);
     }
     object_set(name, schema, dialect, Change::DropObject { kind })
@@ -16052,5 +16629,430 @@ mod sqlite_designer_tests {
         d.columns[0].info.type_name = "TEXT".into();
         d.indexes.clear();
         assert!(diff(&t, &d, Sqlite).unsupported().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+    use crate::intel::SqlDialect::{MySql, Postgres, Sqlite};
+    use crate::schema::EventStatus;
+
+    fn ev() -> EventInfo {
+        EventInfo {
+            name: "nightly".into(),
+            definer: Some("root@localhost".into()),
+            schedule: EventSchedule::Every {
+                value: "1".into(),
+                unit: "DAY".into(),
+                starts: Some("'2026-01-01 03:00:00'".into()),
+                ends: None,
+            },
+            body: "DELETE FROM sessions".into(),
+            sql_mode: Some("STRICT_TRANS_TABLES".into()),
+            charset_client: Some("utf8mb4".into()),
+            collation_connection: Some("utf8mb4_0900_ai_ci".into()),
+            time_zone: Some("+00:00".into()),
+            ..Default::default()
+        }
+    }
+
+    /// **The round-trip gate.** An event diffed against its own draft must
+    /// produce nothing — the same rule `diff` and `diff_routine` are held to,
+    /// and the one that decides whether opening the editor shows "No changes".
+    #[test]
+    fn an_untouched_event_is_no_change() {
+        let e = ev();
+        let cs = diff_event(&e, &EventDraft::from_info(&e), MySql);
+        assert!(cs.is_empty(), "{:?}", cs.changes);
+        assert!(cs.emit().is_empty());
+    }
+
+    /// The emptiness test is over the **clauses**, not over the struct: an event
+    /// whose only difference is session state no clause restates has nothing to
+    /// alter, and `ALTER EVENT e` with no clauses is a syntax error.
+    ///
+    /// This is the case the lazy `SHOW CREATE` produces — it patches one side of
+    /// the diff before the other — so it is a live path, not a hypothetical.
+    #[test]
+    fn a_session_only_difference_is_not_a_change() {
+        let e = ev();
+        let mut d = EventDraft::from_info(&e);
+        d.info.sql_mode = Some("NO_ENGINE_SUBSTITUTION".into());
+        d.info.time_zone = Some("SYSTEM".into());
+        assert!(diff_event(&e, &d, MySql).is_empty());
+    }
+
+    /// One `ALTER EVENT` restating **only** what changed, in MySQL's own clause
+    /// order — which is a grammar, not a preference.
+    #[test]
+    fn an_alter_restates_only_what_changed_in_the_grammars_order() {
+        let e = ev();
+        let mut d = EventDraft::from_info(&e);
+        d.info.name = "nightly_v2".into();
+        d.info.preserve = true;
+        d.info.status = EventStatus::Disabled;
+        d.info.comment = Some("paused".into());
+        d.info.body = "DELETE FROM sessions WHERE expires_at < NOW()".into();
+        // The schedule is untouched, so no `ON SCHEDULE` clause is restated.
+        let sql = diff_event(&e, &d, MySql).emit();
+        let alter = sql
+            .iter()
+            .find(|s| s.starts_with("ALTER EVENT"))
+            .expect("one ALTER EVENT");
+        assert_eq!(
+            alter,
+            "ALTER EVENT `nightly`\n  \
+             ON COMPLETION PRESERVE\n  \
+             RENAME TO `nightly_v2`\n  \
+             DISABLE\n  \
+             COMMENT 'paused'\n  \
+             DO\nDELETE FROM sessions WHERE expires_at < NOW()"
+        );
+        assert!(
+            !alter.contains("ON SCHEDULE"),
+            "an unchanged schedule must not be restated"
+        );
+    }
+
+    /// **The header names the event the server holds; `RENAME TO` names the one
+    /// the draft wants.** Building the header from the draft would alter an
+    /// event that doesn't exist yet — and the rename rides in the *same*
+    /// statement, so there is no half-applied pair.
+    #[test]
+    fn a_rename_is_one_statement_addressed_to_the_old_name() {
+        let e = ev();
+        let mut d = EventDraft::from_info(&e);
+        d.info.name = "renamed".into();
+        let cs = diff_event(&e, &d, MySql);
+        assert_eq!(cs.len(), 1, "one change, not a rename beside an alter");
+        let alter = cs
+            .emit()
+            .into_iter()
+            .find(|s| s.starts_with("ALTER EVENT"))
+            .expect("one ALTER EVENT");
+        assert!(alter.starts_with("ALTER EVENT `nightly`\n"));
+        assert!(alter.contains("RENAME TO `renamed`"));
+    }
+
+    /// A rename that only changes the case is a real edit MySQL performs, even
+    /// though the two names are one identity to it. Skipping it would silently
+    /// drop what the user asked for.
+    #[test]
+    fn a_case_only_rename_is_still_a_rename() {
+        let e = ev();
+        let mut d = EventDraft::from_info(&e);
+        d.info.name = "Nightly".into();
+        assert!(
+            diff_event(&e, &d, MySql)
+                .emit()
+                .iter()
+                .any(|s| s.contains("RENAME TO `Nightly`"))
+        );
+    }
+
+    /// The terminator rule: a statement that ends in the **body** takes none,
+    /// because a body is a compound whose own statements end in `;`. One that
+    /// doesn't, does.
+    #[test]
+    fn only_a_statement_ending_in_the_body_omits_its_semicolon() {
+        let e = ev();
+
+        let mut with_body = EventDraft::from_info(&e);
+        with_body.info.body = "SELECT 1".into();
+        let sql = diff_event(&e, &with_body, MySql).emit();
+        let alter = sql.iter().find(|s| s.starts_with("ALTER EVENT")).unwrap();
+        assert!(alter.ends_with("DO\nSELECT 1"), "{alter}");
+
+        let mut no_body = EventDraft::from_info(&e);
+        no_body.info.status = EventStatus::Disabled;
+        let sql = diff_event(&e, &no_body, MySql).emit();
+        let alter = sql.iter().find(|s| s.starts_with("ALTER EVENT")).unwrap();
+        assert!(alter.ends_with("DISABLE;"), "{alter}");
+
+        // …and `CREATE EVENT` always ends in its body.
+        let created = create_event(&EventDraft::from_info(&e), MySql).emit();
+        assert!(
+            created
+                .iter()
+                .any(|s| s.starts_with("CREATE DEFINER") && s.ends_with("DELETE FROM sessions"))
+        );
+    }
+
+    /// **The definer is restated only when it changed.** `ALTER DEFINER = x`
+    /// needs the privilege to impersonate `x`, so repeating an unchanged account
+    /// would get an edit that never touched it refused.
+    #[test]
+    fn the_definer_rides_before_the_event_keyword_and_only_on_a_change() {
+        let e = ev();
+        let mut same = EventDraft::from_info(&e);
+        same.info.status = EventStatus::Disabled;
+        let sql = diff_event(&e, &same, MySql).emit();
+        assert!(
+            !sql.iter().any(|s| s.contains("DEFINER")),
+            "an unchanged definer must not be restated: {sql:?}"
+        );
+
+        let mut changed = EventDraft::from_info(&e);
+        changed.info.definer = Some("app@%".into());
+        let sql = diff_event(&e, &changed, MySql).emit();
+        assert!(
+            sql.iter()
+                .any(|s| s.starts_with("ALTER DEFINER = `app`@`%` EVENT `nightly`")),
+            "{sql:?}"
+        );
+    }
+
+    /// **The session wrapper, plus the fourth value only an event carries.** An
+    /// event's schedule is read in the `time_zone` of the session that wrote it
+    /// and the statement has no clause for it, so applying an unwrapped edit
+    /// from another zone moves every future firing.
+    #[test]
+    fn an_event_statement_carries_its_time_zone_through_the_session_wrapper() {
+        let e = ev();
+        let sql = create_event(&EventDraft::from_info(&e), MySql).emit();
+        assert!(sql[0].starts_with("SET @schemaic_sql_mode = @@SESSION.sql_mode"));
+        assert!(sql[0].contains("@schemaic_time_zone = @@SESSION.time_zone"));
+        assert!(sql[1].contains("SESSION time_zone = '+00:00'"));
+        assert!(sql[2].starts_with("CREATE DEFINER"));
+        assert!(sql[3].contains("SESSION time_zone = @schemaic_time_zone"));
+
+        // …and an `ALTER` is wrapped too: MySQL re-records the session state on
+        // one, so an unwrapped edit re-files the event under whatever the
+        // applying connection happened to have.
+        let mut d = EventDraft::from_info(&e);
+        d.info.status = EventStatus::Disabled;
+        let sql = diff_event(&e, &d, MySql).emit();
+        assert!(sql[0].contains("@schemaic_time_zone"));
+        assert!(sql.iter().any(|s| s.starts_with("ALTER EVENT")));
+    }
+
+    /// A `DROP` restates nothing, so there is no session state for it to be
+    /// filed under and no wrapper around it.
+    #[test]
+    fn dropping_an_event_is_one_unwrapped_statement() {
+        let sql = drop_event(&ev(), MySql).emit();
+        assert_eq!(sql, vec!["DROP EVENT `nightly`;".to_string()]);
+    }
+
+    /// The shared `DropObject` arm cannot address an event, so `drop_object`
+    /// refuses rather than emitting a statement that happens to look right —
+    /// the same refusal a routine gets, and the reason [`drop_event`] exists.
+    #[test]
+    fn drop_object_refuses_an_event() {
+        let cs = drop_object(ObjectKind::Event, "nightly", None, MySql);
+        assert!(cs.is_empty());
+        assert!(cs.emit().is_empty());
+    }
+
+    /// **Scheduled events are MySQL's alone**, and this is the capability every
+    /// surface asks — the tree's folder, the Create entry and the editor.
+    #[test]
+    fn only_mysql_supports_events() {
+        assert!(supports_event_editing(MySql));
+        assert!(!supports_event_editing(Postgres));
+        assert!(!supports_event_editing(Sqlite));
+    }
+
+    /// **A definer-only edit is still one statement.** MySQL's grammar needs a
+    /// clause after the name, so the one edit that lives entirely in the header
+    /// carries a provable no-op with it rather than being dropped on the floor —
+    /// which is what an empty clause list would have meant.
+    #[test]
+    fn a_definer_only_edit_carries_a_clause_so_the_grammar_accepts_it() {
+        let e = ev();
+        let mut d = EventDraft::from_info(&e);
+        d.info.definer = Some("app@%".into());
+        let cs = diff_event(&e, &d, MySql);
+        assert_eq!(cs.len(), 1, "a definer change is a change");
+        let alter = cs
+            .emit()
+            .into_iter()
+            .find(|s| s.starts_with("ALTER DEFINER"))
+            .expect("one ALTER");
+        assert_eq!(
+            alter,
+            "ALTER DEFINER = `app`@`%` EVENT `nightly`\n  ON COMPLETION NOT PRESERVE;"
+        );
+        // The no-op restates what the event already says, so applying it can't
+        // change anything but the definer.
+        assert!(!e.preserve);
+    }
+
+    /// An event change set that reaches the **PostgreSQL** emitter still emits
+    /// its statement, so the server rejects it rather than the plan reporting
+    /// success having done nothing — the call `object_statements` already makes
+    /// for the PostgreSQL-only objects arriving at the MySQL emitter.
+    ///
+    /// It cannot happen through the UI: [`supports_event_editing`] gates the
+    /// tree's folder, the Create entry and every way into the editor.
+    #[test]
+    fn a_misrouted_event_plan_is_rejected_by_the_server_not_swallowed() {
+        let sql = create_event(&EventDraft::from_info(&ev()), Postgres).emit();
+        assert!(
+            sql.iter().any(|s| s.starts_with("CREATE DEFINER")),
+            "{sql:?}"
+        );
+        // Unwrapped, because the session `SET`s are MySQL's own spelling and
+        // emitting them here would be the silent inheritance
+        // `session_wrapped_all`'s dialect test exists to stop.
+        assert!(!sql.iter().any(|s| s.contains("@schemaic_")), "{sql:?}");
+    }
+
+    /// The preview's sentence and the emitted statement are built from **one**
+    /// comparison, so the two cannot describe different edits.
+    #[test]
+    fn the_summary_names_what_the_alter_restates() {
+        let e = ev();
+        let mut d = EventDraft::from_info(&e);
+        d.info.name = "renamed".into();
+        d.info.status = EventStatus::Disabled;
+        let cs = diff_event(&e, &d, MySql);
+        let summary = cs.changes[0].summary();
+        assert!(summary.contains("rename to renamed"), "{summary}");
+        assert!(summary.contains("status to disabled"), "{summary}");
+        assert!(!summary.contains("body"), "{summary}");
+    }
+
+    /// **The one-shot that deletes itself.** `ON COMPLETION NOT PRESERVE` is
+    /// MySQL's default and says nothing on a recurring schedule; on an `AT` one
+    /// it means the server drops the event as soon as it has run, which is
+    /// destructive with no `DROP` anywhere in the plan to say so.
+    #[test]
+    fn a_one_shot_that_is_not_preserved_says_it_will_delete_itself() {
+        let mut e = ev();
+        e.schedule = EventSchedule::At("'2026-06-01 00:00:00'".into());
+        let cs = create_event(&EventDraft::from_info(&e), MySql);
+        assert!(cs.changes[0].is_destructive(MySql));
+        assert!(cs.changes[0].risks(MySql)[0].contains("runs once and the server then deletes it"));
+
+        // Preserved, or recurring: nothing to warn about.
+        let mut kept = e.clone();
+        kept.preserve = true;
+        assert!(
+            !create_event(&EventDraft::from_info(&kept), MySql).changes[0].is_destructive(MySql)
+        );
+        assert!(
+            !create_event(&EventDraft::from_info(&ev()), MySql).changes[0].is_destructive(MySql)
+        );
+
+        // …and the same on the edit that *turns* a schedule into a one-shot.
+        let mut d = EventDraft::from_info(&ev());
+        d.info.schedule = EventSchedule::At("'2026-06-01 00:00:00'".into());
+        let cs = diff_event(&ev(), &d, MySql);
+        assert!(cs.changes[0].is_destructive(MySql));
+
+        // **But not on an edit that merely leaves it that way.** The alter arm
+        // warns about what the plan *introduces*: an event that was already a
+        // self-deleting one-shot is not made so by a comment change, and
+        // reporting it would put every such edit behind the preview's
+        // destructive gate.
+        let mut already = e.clone();
+        already.comment = Some("before".into());
+        let mut recommented = EventDraft::from_info(&already);
+        recommented.info.comment = Some("after".into());
+        let cs = diff_event(&already, &recommented, MySql);
+        assert_eq!(cs.len(), 1);
+        assert!(
+            !cs.changes[0].is_destructive(MySql),
+            "{:?}",
+            cs.changes[0].risks(MySql)
+        );
+
+        // Turning Preserve **off** on a one-shot does introduce it, and is
+        // warned about.
+        let mut unkept = EventDraft::from_info(&kept);
+        unkept.info.preserve = false;
+        assert!(diff_event(&kept, &unkept, MySql).changes[0].is_destructive(MySql));
+    }
+
+    /// What would make the generated SQL nonsense, per schedule shape.
+    #[test]
+    fn a_draft_is_validated_against_the_shape_it_holds() {
+        let mut d = EventDraft::blank("e", None);
+        assert!(d.validate().is_empty());
+
+        d.info.name = "  ".into();
+        assert!(d.validate().iter().any(|m| m.contains("needs a name")));
+
+        let mut blank_body = EventDraft::blank("e", None);
+        blank_body.info.body = "\n ".into();
+        assert!(
+            blank_body
+                .validate()
+                .iter()
+                .any(|m| m.contains("needs a body"))
+        );
+
+        let mut no_at = EventDraft::blank("e", None);
+        no_at.info.schedule = EventSchedule::At(String::new());
+        assert!(
+            no_at
+                .validate()
+                .iter()
+                .any(|m| m.contains("time to run at"))
+        );
+
+        let mut no_unit = EventDraft::blank("e", None);
+        no_unit.info.schedule = EventSchedule::Every {
+            value: "1".into(),
+            unit: "  ".into(),
+            starts: None,
+            ends: None,
+        };
+        assert!(
+            no_unit
+                .validate()
+                .iter()
+                .any(|m| m.contains("interval unit"))
+        );
+    }
+
+    /// Editing an event without renaming it is not landing on anything, and the
+    /// comparison is case-insensitive because MySQL's event names are.
+    #[test]
+    fn a_name_clash_is_only_a_rename_onto_a_name_that_exists() {
+        let e = ev();
+        let taken = vec!["Nightly".to_string(), "weekly".to_string()];
+
+        let same = EventDraft::from_info(&e);
+        assert!(same.name_clash(Some(&e), &taken).is_none());
+
+        let mut onto = EventDraft::from_info(&e);
+        onto.info.name = "WEEKLY".into();
+        assert!(onto.name_clash(Some(&e), &taken).is_some());
+
+        let mut free = EventDraft::from_info(&e);
+        free.info.name = "hourly".into();
+        assert!(free.name_clash(Some(&e), &taken).is_none());
+
+        // A *new* event has no `current` to excuse it.
+        let fresh = EventDraft::blank("weekly", None);
+        assert!(fresh.name_clash(None, &taken).is_some());
+    }
+
+    /// **A regression pin on the wrapper the events work widened.** A trigger
+    /// and a routine carry three session values and no time zone; adding a
+    /// fourth slot must not have put a `time_zone` in their statements, and must
+    /// not have changed the shape of the two `SET`s either.
+    #[test]
+    fn widening_the_session_wrapper_left_a_routine_untouched() {
+        let f = RoutineInfo {
+            name: "f".into(),
+            kind: RoutineKind::Procedure,
+            body: "BEGIN SELECT 1; END".into(),
+            sql_mode: Some("STRICT_TRANS_TABLES".into()),
+            charset_client: Some("utf8mb4".into()),
+            collation_connection: Some("utf8mb4_0900_ai_ci".into()),
+            ..Default::default()
+        };
+        let sql = create_routine(&RoutineDraft::from_info(&f), MySql).emit();
+        assert_eq!(
+            sql[0],
+            "SET @schemaic_sql_mode = @@SESSION.sql_mode, \
+             @schemaic_character_set_client = @@SESSION.character_set_client, \
+             @schemaic_collation_connection = @@SESSION.collation_connection;"
+        );
+        assert!(!sql.iter().any(|s| s.contains("time_zone")));
     }
 }

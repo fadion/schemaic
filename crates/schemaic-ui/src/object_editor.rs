@@ -74,13 +74,10 @@ fn open_editor(ui: &Ui, target: ObjectTarget, draft: ObjectDraft) {
     d.error.set(None);
     d.preview.set(None);
     // Every editor shares the preview stacked on top, and each overlay only
-    // knows its own flag — two open would paint two panels.
-    d.designer.set(None);
-    d.view.set(None);
-    d.trigger.set(None);
-    // The routine editor is a peer of this one now, not a step inside the
-    // trigger editor — so a leftover target here would paint a second panel.
-    d.routine.set(None);
+    // knows its own flag — two open would paint two panels. The routine and
+    // event editors are peers of this one, not steps inside the trigger editor,
+    // so a leftover target for either would paint a second panel.
+    crate::ddl_preview::close_peers(d, false);
     d.object.set(Some(target));
 }
 
@@ -124,6 +121,14 @@ pub(crate) fn open_for_object(ui: &Ui, database: &str, item: &ObjectItem) {
         crate::routine_editor::open_for_routine(ui, database, r);
         return;
     }
+    // An event is browsed beside the types for the same reason a routine is, and
+    // edited by its own form for the same reason too — `ObjectDraft::from_item`
+    // returns `None` for one, so the split has to be made here rather than
+    // falling through to whichever arm compiles.
+    if let Some(e) = item.event() {
+        crate::event_editor::open_for_event(ui, database, e);
+        return;
+    }
     let ctx = edit_ctx(ui);
     let dependents = match loaded_schema(ui, database) {
         Some(s) => ddl::type_dependents(&s, item.schema(), item.name()),
@@ -152,6 +157,10 @@ pub(crate) fn open_for_object(ui: &Ui, database: &str, item: &ObjectItem) {
 pub(crate) fn open_for_new(ui: &Ui, database: &str, schema: Option<&str>, kind: ObjectKind) {
     if let Some(rk) = kind.routine_kind() {
         crate::routine_editor::open_for_new(ui, database, schema, rk);
+        return;
+    }
+    if kind == ObjectKind::Event {
+        crate::event_editor::open_for_new(ui, database, schema);
         return;
     }
     let ctx = edit_ctx(ui);
