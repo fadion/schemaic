@@ -3084,20 +3084,28 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // follows, for the same reason; regaining focus re-runs this effect and the
     // first thing it does is refresh, so coming back shows current data rather
     // than whatever was on screen when you left.
+    // **One spelling of "is the panel actually polling"**, because there are two
+    // askers — the effect below and `reset_activity` — and this gate has grown
+    // before: `right_panel_visible()` was added as the conjunct that was missing,
+    // after a 0px panel went on polling because it could be neither watched nor
+    // stopped from inside the app. A second copy is how the next conjunct reaches
+    // one asker and not the other.
+    //
+    // Every read is **tracked**, which is what the effect needs — crossing the
+    // responsive breakpoint or losing focus must re-run it. `reset_activity` calls
+    // this from outside any effect, where the tracking is simply inert and the
+    // answer is the same.
+    let activity_polling = move || {
+        schemaic_core::activity::should_poll(
+            right_panel.get() == RightPanel::Activity,
+            schemaic_ui::right_panel_visible(),
+            window_focused.get(),
+        )
+    };
     {
         let refresh = refresh_activity.clone();
         create_effect(move |prev: Option<(u64, bool, u64)>| {
-            // `right_panel_visible()` is the conjunct that was missing: below the
-            // responsive breakpoint the right column is 0px wide, the panel
-            // cannot be seen, and its toggle is inert — so the poll could be
-            // neither watched nor stopped from inside the app. It reads the
-            // tracked window size, so crossing the breakpoint either way re-arms
-            // this effect exactly as a focus change does.
-            let open = schemaic_core::activity::should_poll(
-                right_panel.get() == RightPanel::Activity,
-                schemaic_ui::right_panel_visible(),
-                window_focused.get(),
-            );
+            let open = activity_polling();
             let conn = active_conn.get();
             let secs = activity_interval.get();
             let conn_changed = prev.is_none_or(|(c, _, _)| c != conn);
@@ -3122,6 +3130,62 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             (conn, open, secs)
         });
     }
+
+    // Throw the Server Activity snapshot away and start again — what the effect
+    // above does on a *switch*, as a thing a caller can ask for.
+    //
+    // **It exists because a switch is not the only way the server under the panel
+    // changes.** The effect keys on `active_conn`, which is an id, and editing a
+    // connection in place does not move it: repoint the active connection from
+    // host X to host Y with the panel open and a snapshot of X's sessions stays on
+    // screen, live-looking, against a connection now pointing elsewhere. A kill
+    // from that list sends X's thread ids to Y — where they name whatever Y
+    // happens to have.
+    //
+    // `save_conn` calls this for **any** save of the active connection, without
+    // asking whether the target actually moved. Comparing would mean carrying the
+    // old connection's host/port/socket alongside the snapshot — a second copy of
+    // connection identity, kept in step by hand, to save one `PROCESSLIST` query
+    // when someone renames a connection. The cheap answer cannot be wrong; the
+    // clever one has a way to be.
+    //
+    // The generation bump is the load-bearing half and comes first: a fetch
+    // already in flight against the *old* host would otherwise land afterwards
+    // and refill the panel with exactly the rows this is throwing away.
+    //
+    // **The refresh is the optional half, and it asks `db_for` first.** Clearing
+    // is always right; *refetching now* is only right when the connection can be
+    // reached this instant, and after an edit it routinely cannot: `save_conn`
+    // drops the cached SSH tunnel, `load_schema` re-establishes it
+    // asynchronously, and in between `db_for` answers "SSH tunnel is not
+    // established yet". Refreshing anyway painted that over the panel as
+    // `Failed` — with the interval off there is no tick to retire it, so a saved
+    // edit left a stuck error where a stale snapshot used to be. `Failed` is the
+    // right answer for a refresh the *user* asked for, which is why
+    // `refresh_activity` says it out loud; it is the wrong answer for a reset
+    // nobody asked for, where "no snapshot yet" is the truth. Deleting the last
+    // connection reaches the same guard by the other door — `db_for` then answers
+    // "connection no longer exists", and an empty panel is what that means.
+    let reset_activity: Rc<dyn Fn()> = {
+        let refresh = refresh_activity.clone();
+        let db_for = db_for.clone();
+        Rc::new(move || {
+            let open = activity_polling();
+            rearm_activity(activity_gen, activity_interval, refresh.clone(), open);
+            // Guarded, like every other write to these: `RwSignal::set` never
+            // dedups, and a rename with the panel closed would otherwise notify
+            // every view reading them for a value that did not move.
+            if !matches!(activity_state.get_untracked(), ActivityState::Idle) {
+                activity_state.set(ActivityState::Idle);
+            }
+            if activity_kill_error.get_untracked().is_some() {
+                activity_kill_error.set(None);
+            }
+            if open && db_for(active_conn.get_untracked()).is_ok() {
+                (refresh)();
+            }
+        })
+    };
 
     // Active-database context. A tab carries its `(conn_id, database)`, so
     // switching the active db just rewrites the active tab's `database` (and binds
@@ -5935,6 +5999,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let save_conn: Rc<dyn Fn()> = {
         let load_schema = load_schema.clone();
         let tunnels = tunnels.clone();
+        let reset_activity = reset_activity.clone();
         Rc::new(move || {
             let id = draft
                 .id
@@ -5955,7 +6020,20 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // down) so `load_schema` re-establishes a fresh one (review H9).
             tunnels.borrow_mut().remove(&id);
             if active_conn.get_untracked() == id {
+                // Same reasoning as the tunnel above, for the other thing that
+                // was taken against wherever this connection pointed *before* the
+                // edit: the Server Activity snapshot. See `reset_activity` — the
+                // effect that clears it cannot see an in-place edit, because the
+                // id it keys on doesn't move.
+                //
+                // **After `load_schema`, not before.** `load_schema` is what
+                // re-opens the tunnel this function just dropped, and the reset
+                // wants to refetch. Ordered the other way the refetch is not
+                // merely at risk of finding no tunnel — it is *guaranteed* to,
+                // because the removal is two lines up and the re-open has not
+                // been asked for yet.
                 load_schema(conn);
+                (reset_activity)();
             }
         })
     };
@@ -5973,6 +6051,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let save_db_favorites = save_db_favorites.clone();
         let save_formats = save_formats.clone();
         let save_ui = save_ui.clone();
+        let reset_activity = reset_activity.clone();
         Rc::new(move |id: u64| {
             let was_active = active_conn.get_untracked() == id;
             // Release any pinned transaction connection on the connection being
@@ -6051,6 +6130,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         active_conn.set(Connection::startup_active_id(None, &[]));
                     }
                 }
+                // **The id does not always move here either**, which is the same
+                // defect `save_conn` calls this for. Delete the *last* connection
+                // and the line above sets `active_conn` to
+                // `startup_active_id(None, &[])` — which is `next_id(&[])`, which
+                // is `1`, which is the id the first connection ever created has.
+                // Deleting that one leaves the signal on the value it already
+                // held, so the effect keyed on it sees no change and never clears:
+                // Server Activity went on listing a deleted connection's sessions,
+                // offering to kill them. Called unconditionally rather than only
+                // on that branch — where a fallback *did* change the id the effect
+                // will clear anyway, and this is guarded, so the cost is nothing
+                // and there is no second condition to keep true.
+                (reset_activity)();
             }
             // The connection's tabs go with it. Folding them into another
             // connection's strip would be a contradiction — tabs scoped to a

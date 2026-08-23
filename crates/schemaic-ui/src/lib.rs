@@ -3911,13 +3911,19 @@ pub use widgets::may_launch_destructive;
 
 /// [`right_panel_allowed`] for the app crate.
 ///
-/// **Tracked**, deliberately: the one caller is the Server Activity poll's gate,
-/// which has to re-arm when the window crosses the breakpoint in either
-/// direction. Every other consumer of "is the right panel actually showing"
-/// already pairs the panel signal with this one — the four footer toggles and
-/// the resize handle — and the poll was the one place reading the signal alone,
-/// so it kept a connect + authenticate + `PROCESSLIST` going every couple of
-/// seconds for a 0px panel whose toggle was inert.
+/// **Tracked**, deliberately, for the caller it was added for: the Server
+/// Activity poll's gate, which has to re-arm when the window crosses the
+/// breakpoint in either direction. Every other consumer of "is the right panel
+/// actually showing" already pairs the panel signal with this one — the four
+/// footer toggles and the resize handle — and the poll was the one place reading
+/// the signal alone, so it kept a connect + authenticate + `PROCESSLIST` going
+/// every couple of seconds for a 0px panel whose toggle was inert.
+///
+/// The app asks it through one `activity_polling` closure with two callers — that
+/// effect, and `reset_activity`, which runs **outside** any effect where the
+/// tracking is simply inert. One closure rather than two spellings because this
+/// gate has already grown once, and a second copy is how the next conjunct
+/// reaches one caller and not the other.
 pub fn right_panel_visible() -> bool {
     right_panel_allowed()
 }
