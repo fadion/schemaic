@@ -3273,16 +3273,34 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
   blob's `samples` flag, and `ai_send` respawns the session when it changes, since both were fixed
   at spawn and a data-access setting that doesn't take effect is the worst kind of lie.
   **Which settings respawn is a rule, and it is `ai::needs_respawn`** — was an inline `need_new`
-  closure in `main.rs`, where no test could reach it. The rule is not "any setting changed": it is
-  **a setting that decides what may leave this machine**. Three do — `data`, `hidden` and
-  `schema_scope` — and all three ride in the tools list and the MCP blob, written once at spawn.
-  `hidden` is the one that shipped without this: hiding a database mid-session left `list_schema`
-  enumerating it and its every table to the vendor while the *prompt* half of the same feature
-  updated per turn, so the user watched the assistant stop volunteering the database with no way to
-  know the tool it can call still saw it. The other four (`model`, `effort`, `cli_path`,
-  `instructions`) decide how the assistant *answers*, and a change to one of them waits for the
-  next session; the function records that split rather than endorsing it. A different connection is
+  closure in `main.rs`, where no test could reach it. The rule is **a setting the spawn froze**,
+  which is very nearly all of them. The gravest decide what may leave this machine — `data`,
+  `hidden` and `schema_scope`, all three riding in the tools list and the MCP blob, written once at
+  spawn. `hidden` is the one that shipped without this: hiding a database mid-session left
+  `list_schema` enumerating it and its every table to the vendor while the *prompt* half of the same
+  feature updated per turn, so the user watched the assistant stop volunteering the database with no
+  way to know the tool it can call still saw it. **`model`, `effort` and `instructions` are frozen
+  just as hard** and the rule used to say they could wait: the first two are argv on the `claude`
+  child and the third is written into the system prompt, which `ai_context` composes once and every
+  later turn only sends deltas against. Nothing was visibly broken, because all three are settable
+  only in the AI settings modal and `ai_apply` compared the whole `AiSettings` with `!=` on close —
+  a second, blunter rule quietly carrying the case the tested one declined, holding only as long as
+  no control outside that modal writes them. A premise, not a design. A different connection is
   always a new session, since the level, the hidden set and the `Db` handle all belong to it.
+  **`cli_path` is the one exception, and it is why the rule takes a `cli_usable` argument.** Every
+  other setting is a value the app can act on the moment it changes; this one names a *binary*, and
+  adopting a name that resolves to nothing trades a working conversation for one that cannot start.
+  So the path counts only when it is spawnable — `claude_cli::claude_reachable`: an override that
+  resolves, or an empty value whose auto-detect succeeds. Two corollaries, both easy to get wrong in
+  the other direction: **manual → empty respawns**, because empty is *auto-detect* rather than
+  "unset" and resolves to a binary the session was not started from; and a broken path is **not** a
+  licence to ignore the rest, the gate sitting on the `cli_path` comparison alone. The filesystem
+  question belongs to the caller because the function is pure — the reason it lives in `ai.rs` at
+  all. Both call sites ask it: `ai_send` before a turn, and `ai_apply` when the settings modal
+  closes. `ai_apply` used to compare the whole `AiSettings` with `!=` instead, which is a second
+  rule for one question and had already drifted — `!=` counts `cli_path` unconditionally, so typing
+  a path that resolves to nothing (the state the field's own red hint is for) threw the live
+  conversation away.
   **A respawn
   that can't happen refuses the turn** rather than falling through to the old session: with no
   `Db` (a tunnel still coming up) the previous session is dropped and the panel says the database

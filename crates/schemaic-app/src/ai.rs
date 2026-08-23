@@ -1053,8 +1053,12 @@ fn visible_snapshot(
 /// Does a change to the AI settings require the live session to be **replaced**,
 /// rather than carried into the next turn?
 ///
-/// The rule is not "any setting changed": it is **a setting that decides what
-/// may leave this machine**. Those three ride in the tools list and the MCP
+/// The rule is **a setting the spawn froze**, which is very nearly all of them —
+/// and the interesting part is now the one exception rather than the split this
+/// used to describe.
+///
+/// The gravest of them decide **what may leave this machine**: `data`, `hidden`
+/// and `schema_scope` ride in the tools list and the MCP
 /// blob, both written once at spawn, so a live session goes on applying the old
 /// answer — which is the worst possible failure for a control whose whole
 /// purpose is to withhold. `hidden` is the one that shipped without this: hiding
@@ -1063,15 +1067,49 @@ fn visible_snapshot(
 /// so the user watched the assistant stop volunteering the database with no way
 /// to know the tool it can call still saw it.
 ///
-/// The other four settings ([`AiSettings::model`], `effort`, `cli_path`,
-/// `instructions`) decide how the assistant *answers*, and a change to one of
-/// them waits for the next session. This function records that split rather
-/// than endorsing it — nothing here is a judgement that waiting is right, only
-/// that waiting is what happens.
+/// **The settings that decide how it *answers* are fixed at spawn too**, and
+/// this function used to say they could wait. [`AiSettings::model`] and `effort`
+/// are argv on the `claude` child, and `instructions` is written into the system
+/// prompt, which [`ai_context`] composes once and every later turn only sends
+/// deltas against. A live session cannot take a new value for any of the three.
+///
+/// Nothing was visibly broken, and the reason is worth knowing rather than
+/// trusting: all three are settable **only** in the AI settings modal, whose
+/// close ran `ai_apply`, which compared the whole `AiSettings` with `!=` and
+/// dropped the session on any difference. So a second, blunter rule was quietly
+/// carrying the case this one declined — while this one was the tested rule, the
+/// documented rule, and the one every other path asks. The two disagreed about
+/// four of eight fields, and the only thing standing between that and a wrong
+/// answer was that no control outside the modal writes them. That is a premise,
+/// not a design. Both call sites ask this function now.
+///
+/// **`cli_path` is the exception, and `cli_usable` is why this takes a fourth
+/// argument.** Every other setting is a value the app can act on the moment it
+/// changes. This one names a *binary*, and adopting a name that resolves to
+/// nothing buys nothing — it trades a working conversation for one that cannot
+/// start. So the path counts only when it is spawnable, which is
+/// `claude_cli::claude_reachable`: an override that resolves, or an empty value
+/// whose auto-detect succeeds. Two consequences worth stating, because both are
+/// easy to get wrong in the other direction:
+///
+/// - **Manual → empty respawns.** Empty is not "unset", it is *auto-detect*, and
+///   it resolves to a binary the live session was not started from.
+/// - **A broken path is not a licence to ignore the rest.** The gate is on the
+///   `cli_path` comparison alone; a model change in the same edit still replaces
+///   the session while the path stays broken.
+///
+/// The filesystem question is the caller's because this function is pure — the
+/// whole point of it living here rather than in the closure in `main.rs` it grew
+/// out of is that a test can reach it.
 ///
 /// A different connection is always a new session: the level, the hidden set
 /// and the `Db` handle all belong to it.
-pub(crate) fn needs_respawn(live: Option<(u64, &AiSettings)>, conn: u64, now: &AiSettings) -> bool {
+pub(crate) fn needs_respawn(
+    live: Option<(u64, &AiSettings)>,
+    conn: u64,
+    now: &AiSettings,
+    cli_usable: bool,
+) -> bool {
     let Some((live_conn, prev)) = live else {
         // No session yet — the next message spawns one.
         return true;
@@ -1080,6 +1118,10 @@ pub(crate) fn needs_respawn(live: Option<(u64, &AiSettings)>, conn: u64, now: &A
         || prev.data != now.data
         || prev.hidden != now.hidden
         || prev.schema_scope != now.schema_scope
+        || prev.model != now.model
+        || prev.effort != now.effort
+        || prev.instructions != now.instructions
+        || (prev.cli_path != now.cli_path && cli_usable)
 }
 
 /// What to call the SQL block carrying the editor's contents.
@@ -2233,13 +2275,13 @@ mod tests {
     fn a_setting_that_decides_what_leaves_replaces_the_session() {
         let live = settings();
         assert!(
-            !needs_respawn(Some((7, &live)), 7, &settings()),
+            !needs_respawn(Some((7, &live)), 7, &settings(), true),
             "nothing changed"
         );
         // No session yet is always a spawn.
-        assert!(needs_respawn(None, 7, &settings()));
+        assert!(needs_respawn(None, 7, &settings(), true));
         // A different connection brings its own level, hidden set and handle.
-        assert!(needs_respawn(Some((9, &live)), 7, &settings()));
+        assert!(needs_respawn(Some((9, &live)), 7, &settings(), true));
 
         for (what, now) in [
             (
@@ -2264,11 +2306,22 @@ mod tests {
                 },
             ),
         ] {
-            assert!(needs_respawn(Some((7, &live)), 7, &now), "{what}");
+            assert!(needs_respawn(Some((7, &live)), 7, &now, true), "{what}");
         }
+    }
 
-        // And the four that decide how it *answers* wait for the next session.
-        // Recorded, not endorsed — see `needs_respawn`.
+    /// The other half, and the one that used to be missing: a setting that
+    /// decides how the assistant **answers** is just as fixed at spawn as one
+    /// that decides what leaves. `model` and `effort` are argv, `instructions`
+    /// is written into the system prompt, which is composed once.
+    ///
+    /// This is the half `ai_apply`'s whole-struct `!=` was carrying instead —
+    /// see [`needs_respawn`] for why that held only as long as no control
+    /// outside the settings modal writes one of the three, which is a premise
+    /// and not a design.
+    #[test]
+    fn a_setting_that_decides_how_it_answers_replaces_the_session_too() {
+        let live = settings();
         for (what, now) in [
             (
                 "model",
@@ -2285,13 +2338,6 @@ mod tests {
                 },
             ),
             (
-                "cli_path",
-                AiSettings {
-                    cli_path: "/usr/local/bin/claude".to_string(),
-                    ..settings()
-                },
-            ),
-            (
                 "instructions",
                 AiSettings {
                     instructions: "be terse".to_string(),
@@ -2299,8 +2345,59 @@ mod tests {
                 },
             ),
         ] {
-            assert!(!needs_respawn(Some((7, &live)), 7, &now), "{what}");
+            assert!(needs_respawn(Some((7, &live)), 7, &now, true), "{what}");
         }
+    }
+
+    /// The `cli_path` exception, which is the whole reason the rule takes a
+    /// `cli_usable` at all. Every other setting is a value the app can act on
+    /// the moment it changes; this one names a **binary**, and a name that does
+    /// not resolve buys nothing by being adopted. Respawning on it trades a
+    /// working conversation for one that cannot start.
+    #[test]
+    fn a_cli_path_that_cannot_spawn_leaves_the_live_session_alone() {
+        let live = settings();
+        let manual = AiSettings {
+            cli_path: "C:/nope/claude.exe".to_string(),
+            ..settings()
+        };
+        assert!(
+            !needs_respawn(Some((7, &live)), 7, &manual, false),
+            "a path that resolves to nothing must not cost the user their session"
+        );
+        // The same edit, once the path is real: a different binary is a
+        // different process, so it cannot be carried into the next turn.
+        assert!(
+            needs_respawn(Some((7, &live)), 7, &manual, true),
+            "a path that resolves is a different `claude`"
+        );
+
+        // **Manual → empty is a change like any other**, and the easy way to get
+        // this wrong is to read "empty" as "nothing set" and skip it. Empty
+        // means *auto-detect*, which resolves to a binary the live session was
+        // not started from.
+        let live_manual = AiSettings {
+            cli_path: "C:/tools/claude.exe".to_string(),
+            ..settings()
+        };
+        assert!(
+            needs_respawn(Some((7, &live_manual)), 7, &settings(), true),
+            "manual → auto is a different binary"
+        );
+        // Unless auto-detect finds nothing either, which is the same trade as
+        // the broken override above.
+        assert!(
+            !needs_respawn(Some((7, &live_manual)), 7, &settings(), false),
+            "auto-detect found nothing — there is nothing better to respawn into"
+        );
+
+        // And an unusable path is not a licence to ignore the rest: a model
+        // change still replaces the session while the path stays broken.
+        let both = AiSettings {
+            model: AiModel::Opus,
+            ..manual.clone()
+        };
+        assert!(needs_respawn(Some((7, &live)), 7, &both, false));
     }
 
     // The `scoped_database` tests moved to `core::tabsel` with the function, so
