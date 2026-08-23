@@ -65,6 +65,12 @@ lands, route the write through `arch-scribe` rather than leaving it for afterwar
     Conversely nothing may act on the type name *alone* — a SQLite `BLOB` column is an affinity,
     not a promise, and may hold ordinary text — which is why every decision that discards a value
     (`export::dropped_binary_columns`, `pg::pg_cell`) requires the type and the value to agree.
+    **The flag is computed once per result, never per cell.** `Column::is_binary` splits a type
+    name and walks a keyword list; the read loops run up to the row cap times the column count, so
+    both backends hoist it out — MySQL into a `Vec<bool>` before `ResultBuilder::new`, PostgreSQL
+    into `pg::binary_columns` riding alongside the per-column type names in the `grid` tuple. Asked
+    per cell it would be tens of millions of string splits for an answer that cannot change between
+    rows.
     `ColumnOrigin::implicit_key` is the one field no
     wire reports: it marks a result column that identifies a row but is no column of the table —
     SQLite's explicitly projected `rowid` — asserted by the backend on the same trust

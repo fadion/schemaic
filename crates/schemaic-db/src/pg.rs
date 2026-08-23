@@ -471,9 +471,15 @@ pub(crate) async fn run_statement(
     // SELECT still reports its columns. Otherwise the first row names them (names
     // only) — an unpreparable statement that still returns rows. Still `None`
     // after the loop ⇒ DML/DDL/utility, which reports affected rows, not a grid.
-    let mut grid: Option<(ResultBuilder, Vec<String>)> = prepared_cols
-        .filter(|c| !c.is_empty())
-        .map(|c| (ResultBuilder::new(c.clone()), type_names_of(&c)));
+    // The binary flags ride along with the type names, and for the same reason:
+    // both are per-column answers, and re-deriving either per cell would put a
+    // string split in the path of every one of up to 200k x N reads.
+    let mut grid: Option<(ResultBuilder, Vec<String>, Vec<bool>)> =
+        prepared_cols.filter(|c| !c.is_empty()).map(|c| {
+            let names = type_names_of(&c);
+            let binary = binary_columns(&names);
+            (ResultBuilder::new(c.clone()), names, binary)
+        });
     let mut affected: u64 = 0;
     let mut truncated = false;
 
@@ -491,7 +497,7 @@ pub(crate) async fn run_statement(
         let Some(msg) = next else { break };
         match msg.map_err(|e| db_err(&e))? {
             SimpleQueryMessage::Row(r) => {
-                let (builder, type_names) = grid.get_or_insert_with(|| {
+                let (builder, type_names, binary) = grid.get_or_insert_with(|| {
                     let cols: Vec<Column> = r
                         .columns()
                         .iter()
@@ -502,7 +508,8 @@ pub(crate) async fn run_statement(
                         })
                         .collect();
                     let names = type_names_of(&cols);
-                    (ResultBuilder::new(cols), names)
+                    let flags = binary_columns(&names);
+                    (ResultBuilder::new(cols), names, flags)
                 });
                 if builder.row_count() >= row_cap {
                     // A row beyond the cap exists → the result is truncated. Drop
@@ -520,7 +527,9 @@ pub(crate) async fn run_statement(
                 let cells: Vec<Value> = (0..type_names.len())
                     .map(|i| match r.get(i) {
                         None => Value::Null,
-                        Some(s) => pg_cell(s, &type_names[i]),
+                        Some(s) => {
+                            pg_cell(s, &type_names[i], binary.get(i).copied().unwrap_or(false))
+                        }
                     })
                     .collect();
                 builder.push_row(&cells);
@@ -531,7 +540,7 @@ pub(crate) async fn run_statement(
     }
 
     // No result columns → DML/DDL/utility: report affected rows, not a grid.
-    let Some((mut builder, _)) = grid else {
+    let Some((mut builder, _, _)) = grid else {
         return Ok(ResultSet::affected_rows(Vec::new(), affected)
             .with_elapsed(start.elapsed().as_millis()));
     };
@@ -559,13 +568,22 @@ fn type_names_of(columns: &[Column]) -> Vec<String> {
 /// other direction. The type name comes from the prepared statement rather than
 /// the catalog, so this reaches a `bytea` expression with no table provenance —
 /// which the wire `ColumnOrigin::binary` flag never did.
-fn pg_cell(text: &str, type_name: &str) -> Value {
-    if schemaic_core::model::type_is_binary(type_name)
-        && let Some(len) = bytea_hex_len(text)
-    {
+/// `binary` is the column's answer, computed once per result by
+/// [`binary_columns`]: `type_is_binary` splits a type name and walks a keyword
+/// list, which is not something to re-derive for every cell of a 200k-row read.
+fn pg_cell(text: &str, type_name: &str, binary: bool) -> Value {
+    if binary && let Some(len) = bytea_hex_len(text) {
         return Value::Str(binary_display(len));
     }
     parse_typed(text.to_string(), type_name)
+}
+
+/// Which of these columns hold raw bytes, in column order.
+fn binary_columns(type_names: &[String]) -> Vec<bool> {
+    type_names
+        .iter()
+        .map(|t| schemaic_core::model::type_is_binary(t))
+        .collect()
 }
 
 /// Byte length of a `bytea` in PostgreSQL's default `hex` output, or `None`
@@ -2745,6 +2763,7 @@ pub(crate) async fn refetch_on(
             Err(_) => vec![String::new(); template.columns.len()],
         }
     };
+    let binary = binary_columns(&type_names);
 
     {
         let mut out = Vec::with_capacity(rows.len());
@@ -2772,7 +2791,9 @@ pub(crate) async fn refetch_on(
                     let cells: Vec<Value> = (0..template.columns.len())
                         .map(|i| match r.get(i) {
                             None => Value::Null,
-                            Some(s) => pg_cell(s, &type_names[i]),
+                            Some(s) => {
+                                pg_cell(s, &type_names[i], binary.get(i).copied().unwrap_or(false))
+                            }
                         })
                         .collect();
                     out.push((row.data_row, cells));
@@ -3173,12 +3194,25 @@ mod tests {
         )));
     }
 
+    /// One column's cell, through the same pair the read loop uses:
+    /// `binary_columns` decides, `pg_cell` renders. Split so the flag is
+    /// computed once per result rather than per cell — and asserted together,
+    /// because a test that passed the flag by hand would still pass if
+    /// `binary_columns` stopped recognising `BYTEA`.
+    fn one_cell(text: &str, type_name: &str) -> Value {
+        let names = vec![type_name.to_string()];
+        pg_cell(text, type_name, binary_columns(&names)[0])
+    }
+
     #[test]
     fn a_hex_bytea_renders_as_its_size() {
         let t = pg_type_name(&Type::BYTEA);
-        assert_eq!(pg_cell("\\x48656c6c6f", &t), Value::Str("<5 bytes>".into()));
+        assert_eq!(
+            one_cell("\\x48656c6c6f", &t),
+            Value::Str("<5 bytes>".into())
+        );
         // An empty bytea is `\x` and has a size like any other.
-        assert_eq!(pg_cell("\\x", &t), Value::Str("<0 bytes>".into()));
+        assert_eq!(one_cell("\\x", &t), Value::Str("<0 bytes>".into()));
     }
 
     /// The `escape` output format (`bytea_output = escape`) is a different
@@ -3188,7 +3222,7 @@ mod tests {
     #[test]
     fn an_escape_format_bytea_keeps_its_text() {
         let t = pg_type_name(&Type::BYTEA);
-        assert_eq!(pg_cell("Hello\\000", &t), Value::Str("Hello\\000".into()));
+        assert_eq!(one_cell("Hello\\000", &t), Value::Str("Hello\\000".into()));
         // Odd-length and non-hex payloads are not hex output either.
         assert_eq!(bytea_hex_len("\\x4"), None);
         assert_eq!(bytea_hex_len("\\xzz"), None);
@@ -3201,7 +3235,7 @@ mod tests {
     #[test]
     fn a_text_cell_that_looks_like_hex_output_is_left_alone() {
         let t = pg_type_name(&Type::TEXT);
-        assert_eq!(pg_cell("\\x4869", &t), Value::Str("\\x4869".into()));
+        assert_eq!(one_cell("\\x4869", &t), Value::Str("\\x4869".into()));
     }
 
     #[test]
